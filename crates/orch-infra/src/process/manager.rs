@@ -52,7 +52,14 @@ fn to_nix(signal: Signal) -> nix::sys::signal::Signal {
 impl ProcessManager for SystemProcessManager {
     /// `kill(pid, 0)` succeeds, **or** fails with `EPERM` — the process exists
     /// but we may not signal it.
+    ///
+    /// Pid **0** is the one value that is not a process: to `kill(2)` it means
+    /// "my own process group", so probing it would report *us* as alive. It is
+    /// answered `false` here and refused in [`SystemProcessManager::kill`].
     fn is_alive(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
         match nix::sys::signal::kill(Pid::from_raw(pid as i32), None) {
             Ok(()) => true,
             Err(Errno::EPERM) => true,
@@ -63,7 +70,17 @@ impl ProcessManager for SystemProcessManager {
     /// Signals the whole process **group** first, so a child's own children
     /// (vitest, playwright, …) are reaped too, and falls back to the bare pid.
     /// Errors are swallowed either way: the process is simply already gone.
+    ///
+    /// Pid 0 is refused: `kill(-0)` and `kill(0)` both signal **the caller's
+    /// own process group**, so a stale or absent pid in `state.json` would
+    /// have the orchestrator terminate itself along with every agent it
+    /// started. Not a divergence worth replicating — node's
+    /// `process.kill(-0)` does the same thing, and no behaviour depends on it.
     fn kill(&self, pid: u32, signal: Signal) {
+        if pid == 0 {
+            tracing::warn!(%signal, "refusing to signal pid 0, which is our own process group");
+            return;
+        }
         let signal = to_nix(signal);
         let pid = pid as i32;
         if nix::sys::signal::kill(Pid::from_raw(-pid), signal).is_ok() {
@@ -450,5 +467,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("the process group outlived the group kill");
+    }
+
+    #[tokio::test]
+    async fn pid_zero_is_never_signalled() {
+        // `kill(-0)`/`kill(0)` mean "my own process group": the test process
+        // would die with its whole group, so a missing guard fails this test
+        // by killing the test runner rather than by asserting.
+        let pm = SystemProcessManager;
+        assert!(!pm.is_alive(0));
+        pm.kill(0, Signal::Term);
+        pm.kill(0, Signal::Kill);
+        pm.kill_with_grace(0, Duration::from_millis(10)).await;
     }
 }

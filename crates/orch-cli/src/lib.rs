@@ -37,8 +37,8 @@ use crate::output::{Styles, print_error};
 use crate::routing::ArgvShape;
 use crate::tree::{
     AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
-    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, OrgCmd, RunCmd, ServeCmd,
-    TaskCmd, TaskSub, TeamCmd, TeamSub,
+    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, OrgCmd, OrgSub, RunCmd,
+    ServeCmd, TaskCmd, TaskSub, TeamCmd, TeamSub,
 };
 
 /// A command that parses but whose service is not wired yet.
@@ -535,15 +535,26 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Org(OrgCmd { command })) => match command {
-            None => Ok(print_group_help(&["org"])),
-            Some(_) => Err(not_wired("org")),
-        },
+        Some(Command::Org(OrgCmd { command })) => {
+            let Some(sub) = command else {
+                return Ok(print_group_help(&["org"]));
+            };
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            match sub {
+                OrgSub::List => {
+                    commands::org::list(&ctx, &styles).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                OrgSub::Deploy { template, goal } => {
+                    commands::org::deploy(&engine, &ctx, &styles, template, goal.as_deref()).await
+                }
+            }
+        }
         Some(Command::Run(RunCmd {
             task_id,
             all,
             watch,
-            ..
+            verbose,
         })) => {
             // The argument check is the command's own, and it exits 2 before
             // anything else happens (`docs/parity/cli.md` §13.1).
@@ -555,7 +566,20 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                 );
                 return Ok(ExitCode::from(2));
             }
-            Err(not_wired("run"))
+            // The full tier: every mode drives the orchestrator.
+            let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+            let styles = ctx.styles(env);
+            let engine = orch_engine::build_full(ctx.project_root.clone()).await?;
+            // `--watch` wins over `--all`, which wins over a task id, as the
+            // original's if/else chain does.
+            if *watch {
+                commands::run::watch(&engine, &styles, *verbose).await
+            } else if *all {
+                commands::run::all(&engine, &styles).await
+            } else {
+                commands::run::single(&engine, &styles, task_id.as_deref().expect("checked above"))
+                    .await
+            }
         }
         Some(Command::Tui) => Err(not_wired("tui")),
 
@@ -635,7 +659,9 @@ async fn run_serve(
         return Ok(ExitCode::from(2));
     };
 
-    let (_ctx, _styles, engine) = build(cli, env, cwd).await?;
+    // The full tier: `serve` is the orchestrator.
+    let ctx = CliContext::resolve(cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+    let engine = orch_engine::build_full(ctx.project_root.clone()).await?;
     serve::run(
         engine,
         serve::ServeArgs {

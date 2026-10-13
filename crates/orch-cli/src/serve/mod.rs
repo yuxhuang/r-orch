@@ -59,7 +59,7 @@ pub fn open_sinks(log_file: Option<&str>) -> Result<Vec<LogSink>> {
 /// The full command, given an orchestrator.
 pub async fn run_with(
     orchestrator: &dyn ServeOrchestrator,
-    engine: Engine,
+    engine: &Engine,
     args: ServeArgs,
 ) -> Result<ExitCode> {
     let poll_interval_ms = resolved_poll_interval(
@@ -127,15 +127,37 @@ pub async fn run_with(
     Ok(code)
 }
 
-/// The entry point the CLI calls today.
+/// [`ServeOrchestrator`] over the real orchestrator.
 ///
-/// Everything `serve` needs except the orchestrator exists; WP-4 lands that
-/// and this becomes a call to [`run_with`].
-pub async fn run(_engine: Engine, _args: ServeArgs) -> Result<ExitCode> {
-    Err(Error::other(
-        "serve needs the orchestrator, which is not wired yet in this build \
-         (see crates/orch-cli/TEST-MAP.md)",
-    ))
+/// The only translation is the watch options: `serve` chooses whether to seed
+/// autonomous tasks, and always handles signals — it is a daemon, and
+/// `SIGTERM` from systemd or pm2 is its normal way to stop.
+struct EngineOrchestrator(Arc<orch_engine::Orchestrator>);
+
+#[async_trait::async_trait]
+impl ServeOrchestrator for EngineOrchestrator {
+    async fn start_watch(&self, skip_autonomous_seeding: bool) -> Result<()> {
+        self.0
+            .start_watch(orch_engine::WatchOptions {
+                skip_autonomous_seeding,
+                handle_signals: true,
+            })
+            .await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.0.stop().await
+    }
+
+    async fn wait_for_stop(&self) {
+        self.0.wait_for_stop().await;
+    }
+}
+
+/// The entry point the CLI calls, over the full container.
+pub async fn run(engine: orch_engine::FullEngine, args: ServeArgs) -> Result<ExitCode> {
+    let orchestrator = EngineOrchestrator(Arc::clone(&engine.orchestrator));
+    run_with(&orchestrator, &engine.engine, args).await
 }
 
 #[cfg(test)]

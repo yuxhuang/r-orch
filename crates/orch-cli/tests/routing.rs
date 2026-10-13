@@ -413,27 +413,18 @@ fn doctor_json_prints_the_two_header_lines_before_the_json() {
 
 #[test]
 fn a_commands_not_wired_yet_is_an_error_rather_than_a_silent_success() {
-    // The honest interim behaviour for the service-dependent commands: they
-    // parse, so V1's surface check is real, and they fail loudly rather than
-    // succeeding with nothing done. Keep this pointed at a command that is
-    // still waiting on WP-4 — see crates/orch-cli/TEST-MAP.md.
+    // The honest interim behaviour for a command another work package owns:
+    // it parses, so V1's surface check is real, and it fails loudly rather
+    // than succeeding with nothing done. `tui` is the last one left — see
+    // crates/orch-cli/TEST-MAP.md.
     let dir = initialized_project();
-    for argv in [vec!["org", "list"], vec!["run", "--all"], vec!["tui"]] {
-        let output = orch(dir.path()).args(&argv).output().expect("run");
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "orch {}: {}",
-            argv.join(" "),
-            stderr_of(&output)
-        );
-        assert!(
-            stderr_of(&output).contains("not wired yet"),
-            "orch {}: {}",
-            argv.join(" "),
-            stderr_of(&output)
-        );
-    }
+    let output = orch(dir.path()).arg("tui").output().expect("run");
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("not wired yet"),
+        "{}",
+        stderr_of(&output)
+    );
 }
 
 #[test]

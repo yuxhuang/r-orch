@@ -127,6 +127,12 @@ pub struct StepOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    /// The step outlived the scenario's budget and was killed.
+    ///
+    /// A **scenario failure**, not a harness error: one non-terminating step
+    /// must not abort the whole corpus, or a single hang hides every other
+    /// result. The partial output is kept and reported with it.
+    pub timed_out: bool,
 }
 
 /// A prepared, hermetic project directory.
@@ -266,6 +272,10 @@ const WIRED_COMMANDS: &[&str] = &[
     "msg inbox",
     "msg list",
     "msg send",
+    "org deploy",
+    "org list",
+    "run",
+    "serve",
     "status",
     "task add",
     "task approve",
@@ -422,6 +432,15 @@ pub fn run_scenario(
                     output.stderr.trim()
                 ));
             }
+            if output.timed_out {
+                failures.push(format!(
+                    "step `{step}`: the {} binary did not finish within {:?} and was \
+                     killed — the shared tree is left mid-flight, so nothing after this \
+                     step is comparable",
+                    output.runner,
+                    scenario.timeout()
+                ));
+            }
             outputs.push(output);
         }
 
@@ -436,6 +455,13 @@ pub fn run_scenario(
             let rust_out = execute(bins, &project, scenario, step, Runner::Rust, &ids)?;
             let ts_out = execute(bins, &project, scenario, step, Runner::Ts, &ids)?;
 
+            if rust_out.timed_out || ts_out.timed_out {
+                failures.push(format!(
+                    "verify `{step}`: a binary did not finish within {:?} and was killed",
+                    scenario.timeout()
+                ));
+                continue;
+            }
             if rust_out.exit_code != ts_out.exit_code {
                 failures.push(format!(
                     "verify `{step}`: exit code {} (rust) vs {} (ts) over the shared tree",
@@ -537,6 +563,25 @@ pub fn run_scenario(
 
             failures.extend(usage_error_failure(scenario, step, &ts_out.stderr));
 
+            // A step that had to be killed says nothing about parity, and its
+            // partial output would produce a misleading diff — so it is
+            // reported on its own and the rest of the step is skipped.
+            let timed_out: Vec<&str> = [(&rust_out, "rust"), (&ts_out, "ts")]
+                .into_iter()
+                .filter(|(out, _)| out.timed_out)
+                .map(|(_, label)| label)
+                .collect();
+            if !timed_out.is_empty() {
+                failures.push(format!(
+                    "step `{step}`: {} did not finish within {:?} and was killed — \
+                     either the command does not terminate (`run --watch`, `serve` without \
+                     `--once`) or the scenario waits for a status the tasks never reach \
+                     (`review` is not terminal)",
+                    timed_out.join(" and "),
+                    scenario.timeout()
+                ));
+                continue;
+            }
             if rust_out.exit_code != ts_out.exit_code {
                 failures.push(format!(
                     "step `{step}`: exit code {} (rust) vs {} (ts)",
@@ -783,8 +828,8 @@ fn execute(
         .env_remove("ORCHESTRY_DEBUG")
         .stdin(std::process::Stdio::null());
 
-    let output = match Scenario::kill_after(step) {
-        Some(after) => run_and_kill(command, after, label, step)?,
+    let (output, timed_out) = match Scenario::kill_after(step) {
+        Some(after) => (run_and_kill(command, after, label, step)?, false),
         None => run_with_timeout(command, scenario.timeout(), label, step)?,
     };
 
@@ -794,6 +839,7 @@ fn execute(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(-1),
+        timed_out,
     })
 }
 
@@ -874,7 +920,7 @@ fn run_with_timeout(
     timeout: std::time::Duration,
     label: &str,
     step: &str,
-) -> Result<std::process::Output> {
+) -> Result<(std::process::Output, bool)> {
     let scratch = tempfile::tempdir().context("create stdio scratch dir")?;
     let (out_path, err_path) = (scratch.path().join("stdout"), scratch.path().join("stderr"));
     command
@@ -886,27 +932,27 @@ fn run_with_timeout(
         .with_context(|| format!("spawn {label} step `{step}`"))?;
 
     let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
     let status = loop {
         match child.try_wait().context("poll child")? {
             Some(status) => break status,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
-                bail!(
-                    "{label} step `{step}` did not finish within {timeout:?} — a \
-                     non-terminating command (`run --watch`, `serve` without `--once`) \
-                     cannot be a scenario step"
-                );
+                timed_out = true;
+                break child.wait().context("reap the timed-out child")?;
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
 
-    Ok(std::process::Output {
-        status,
-        stdout: std::fs::read(&out_path).context("read captured stdout")?,
-        stderr: std::fs::read(&err_path).context("read captured stderr")?,
-    })
+    Ok((
+        std::process::Output {
+            status,
+            stdout: std::fs::read(&out_path).context("read captured stdout")?,
+            stderr: std::fs::read(&err_path).context("read captured stderr")?,
+        },
+        timed_out,
+    ))
 }
 
 /// The byte-level properties of a JSON artifact that **are** contract even
@@ -1645,6 +1691,7 @@ mod tests {
             stdout: String::new(),
             stderr: "Usage: orchestry task [options] [command]\n".into(),
             exit_code: 1,
+            timed_out: false,
         };
         assert!(is_group_help(&output));
 
@@ -1825,6 +1872,10 @@ mod tests {
         ];
         let no = [
             // No `--json`: the human renderer never prints the raw Set.
+            "org deploy",
+            "org list",
+            "run",
+            "serve",
             "status",
             // Other commands also carry `state`-shaped output; the exclusion
             // §14.1 grants is for `status --json` and nothing else.

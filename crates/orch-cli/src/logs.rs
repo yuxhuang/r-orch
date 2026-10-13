@@ -487,8 +487,15 @@ fn local_time(timestamp: &str) -> String {
     }
 }
 
-fn now_time() -> String {
+pub(crate) fn now_time() -> String {
     format_zoned(jiff::Timestamp::now())
+}
+
+/// The same clock at minute precision, which is what `run --watch` prints —
+/// `toLocaleTimeString` there omits `second`.
+pub(crate) fn now_time_minutes() -> String {
+    let zoned = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system());
+    format!("{:02}:{:02}", zoned.hour(), zoned.minute())
 }
 
 fn format_zoned(ts: jiff::Timestamp) -> String {

@@ -768,8 +768,14 @@ mod tests {
             });
 
         // The first poll is immediate, so the start arrives without waiting a
-        // full interval.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // full interval — but "immediate" is still a spawned task, so this
+        // waits for it rather than assuming it has been scheduled already.
+        for _ in 0..200 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(!seen.lock().unwrap().is_empty());
 
         let before = seen.lock().unwrap().len();
