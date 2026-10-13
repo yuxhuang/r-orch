@@ -29,6 +29,10 @@ tokio = { version = "1.53", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 futures = "0.3"
 async-trait = "0.1"
+# Lets the adapter event generators be written as straight-line async code, so
+# they map onto the TS async generators one statement at a time and keep their
+# pull-based semantics (ARCHITECTURE §4.8, PARITY.md §8.1).
+async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 # preserve_order keeps Value key order on round-trip (ARCHITECTURE §5.2 rule 2).
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -61,6 +65,12 @@ dirs = "7.0"
 which = "8.0"
 shell-words = "1.1"
 globset = "0.4"
+# Model-discovery parsers (PARITY.md §8.12). `fancy-regex` is pinned to the
+# version liquid already resolves, so it costs no extra compile unit; it is
+# needed for the one Claude `--help` pattern that uses a lookahead, which the
+# `regex` crate cannot express.
+regex = "1.13"
+fancy-regex = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = { version = "2.14", features = ["serde"] }
