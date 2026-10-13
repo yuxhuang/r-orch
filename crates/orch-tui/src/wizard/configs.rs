@@ -693,6 +693,12 @@ pub fn edit_agent_wizard_steps(
 ///
 /// `effort` is preserved as `""` so the field can be *cleared* — deliberately
 /// different from the create mapper, which drops empties.
+///
+/// `role` is **not** clearable, by parity: the `Skip` preset maps to `None`
+/// ("unchanged"), exactly as `vals.role || undefined` does in TS. The engine
+/// would accept a clear, but this mapping is L0 (PARITY §12) — making `Skip`
+/// erase a stored role would write different data than the TS binary for the
+/// same keystrokes, so it needs a PARITY §14 entry first.
 pub fn edit_agent_wizard_to_fields(values: &Values) -> (AgentFields, Option<String>) {
     let adapter = values.get("adapter").cloned();
     let is_shell = adapter.as_deref() == Some("shell");

@@ -169,7 +169,16 @@ orch_tui::run(backend)?;
    `command`, `effort` and `model`. The TUI never sends `Some("")` for `role`:
    choosing the `Skip` preset maps to `None`, so a role cannot be cleared from
    the UI — that is TS behaviour (`vals.role || undefined`), not an oversight.
-   Supporting clears for all four is fine; only three are exercised.
+   The engine accepts a clear for all four, so **`role` is the one place where
+   the backend is more capable than the UI on purpose.** Do not "fix" the
+   mapper: the wizard → entity field mapping is **L0** (PARITY §12), so making
+   `Skip` clear a stored role would write different data than the TS binary for
+   the same keystrokes. If we ever want that behaviour it goes through a
+   PARITY §14 entry first; `edit_agent_wizard_to_fields` carries the same note.
+
+   `approval_policy` is deliberately absent from `AgentFields`: the TS prop type
+   declares it but the edit-agent wizard never passes it (`App.tsx:1242`), and
+   its step is `skip: () => true`, so no edit path can produce one.
 3. **Fire-and-forget is about *dispatch*, not validation.** `run_task`,
    `run_all` and `start_watch` must return `Err` for anything knowable before an
    agent starts — a lock conflict, an unknown id, no eligible agent — because
