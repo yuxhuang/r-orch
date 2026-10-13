@@ -11,6 +11,7 @@ repository.workspace = true
 orch-domain.workspace = true
 orch-core.workspace = true
 
+arboard.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
@@ -22,6 +23,7 @@ liquid.workspace = true
 # Pinned for the toolchain MSRV — see the root manifest.
 kstring.workspace = true
 nanoid.workspace = true
+png.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

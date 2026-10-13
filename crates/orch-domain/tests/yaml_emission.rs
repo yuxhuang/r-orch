@@ -223,3 +223,72 @@ fn a_user_supplied_date_shaped_string_is_also_emitted_unquoted() {
     let yaml = serde_yaml_ng::to_string(&t).expect("serializes");
     assert!(yaml.contains("description: 2026-10-13\n"), "{yaml}");
 }
+
+// ── Merge keys (PARITY.md §6.4.2, V38) ─────────────────────────────────────
+
+/// A hand-authored `config.yml` using a merge key. This is reachable only
+/// here: nothing ORCH writes emits `<<`.
+const MERGE_KEY_CONFIG: &str = "\
+base: &b
+  max_turns: 99
+  adapter: codex
+scheduling:
+  <<: *b
+  poll_interval_ms: 5
+";
+
+/// The bifurcation, pinned: `serde_yaml_ng` leaves `<<` as a **literal key**
+/// where js-yaml resolves it. A reader that forgets `apply_merge()` sees
+/// `scheduling.max_turns` as absent, falls back to `DEFAULT_CONFIG`, and runs
+/// the project with different scheduling than the TS binary — while both trees
+/// still compare equal under the Rust parser.
+#[test]
+fn merge_keys_are_not_resolved_by_default() {
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(MERGE_KEY_CONFIG).expect("parses");
+    let scheduling = &value["scheduling"];
+    assert!(
+        scheduling.get("<<").is_some(),
+        "serde_yaml_ng now resolves merge keys on its own — re-check whether \
+         WP-1 still needs apply_merge():\n{scheduling:#?}"
+    );
+    assert!(scheduling.get("max_turns").is_none());
+    assert!(scheduling.get("adapter").is_none());
+}
+
+/// `apply_merge()` reproduces js-yaml's result. This is the shape WP-1's
+/// `read_yaml` must produce; key order differs from js-yaml's and §1.4
+/// excludes key order.
+#[test]
+fn apply_merge_reproduces_the_js_yaml_result() {
+    let mut value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(MERGE_KEY_CONFIG).expect("parses");
+    value.apply_merge().expect("merge applies");
+
+    let scheduling = &value["scheduling"];
+    assert!(
+        scheduling.get("<<").is_none(),
+        "the literal key survived: {scheduling:#?}"
+    );
+    assert_eq!(scheduling["max_turns"].as_u64(), Some(99));
+    assert_eq!(scheduling["adapter"].as_str(), Some("codex"));
+    assert_eq!(scheduling["poll_interval_ms"].as_u64(), Some(5));
+}
+
+/// `apply_merge()` is a no-op on every document ORCH itself writes, so WP-1
+/// can call it unconditionally on every read.
+#[test]
+fn apply_merge_is_a_no_op_on_documents_without_merge_keys() {
+    for document in [
+        serde_yaml_ng::to_string(&task()).unwrap(),
+        serde_yaml_ng::to_string(&serde_json::to_value(orch_domain::default_config()).unwrap())
+            .unwrap(),
+    ] {
+        let before: serde_yaml_ng::Value = serde_yaml_ng::from_str(&document).expect("parses");
+        let mut after = before.clone();
+        after.apply_merge().expect("merge applies");
+        assert_eq!(
+            after, before,
+            "apply_merge changed a merge-free document:\n{document}"
+        );
+    }
+}

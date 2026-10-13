@@ -1,0 +1,26 @@
+name = "walking-skeleton-rust-then-ts"
+kind = "rust_then_ts"
+split_at = 4
+description = """
+V39 cross-compat: r-orch creates the project, the bootstrap agent, a shell \
+agent and the tasks; the TypeScript binary then reads and extends the same \
+directory. This is the direction that proves the shared-format claim — a \
+quoting bug in our YAML writer is invisible to a same-binary test, and the \
+agt_creator role prompt crosses the boundary as a block scalar."""
+# Read-only only: a verify step runs once per binary over the shared tree.
+verify = [
+  "task list --json",
+  "task list",
+  "task list --quiet",
+  "task list --status todo",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "agent add shelly --adapter shell --command 'echo hello'",
+  "task add 'Written by rust' --assignee shelly",
+  "task list --json",
+  "task list --json",
+  "task add 'Written by ts' --priority 2",
+  "agent add tess --adapter shell --command 'echo ts'",
+  "task list --json",
+]

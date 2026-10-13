@@ -1,0 +1,55 @@
+{
+  "name": "custom.empty-template",
+  "template": {
+    "inline": ""
+  },
+  "context": {
+    "project": {
+      "name": "demo-project",
+      "description": null
+    },
+    "task": {
+      "id": "tsk_abc1234",
+      "title": "Fix login bug",
+      "description": "Fix the login bug\nin auth.",
+      "priority": 3,
+      "labels": [],
+      "scope": null,
+      "is_autonomous": false,
+      "goal_id": null
+    },
+    "agent": {
+      "id": "agt_aaa1111",
+      "name": "Backend A",
+      "role": "Senior Dev"
+    },
+    "agents": [
+      {
+        "id": "agt_aaa1111",
+        "name": "Backend A",
+        "role": null,
+        "adapter": "claude"
+      },
+      {
+        "id": "agt_bbb2222",
+        "name": "QA B",
+        "role": "QA Engineer\n## WORKFLOW\nrun tests",
+        "adapter": "codex"
+      },
+      {
+        "id": "agt_ccc3333",
+        "name": "Shelly",
+        "role": null,
+        "adapter": "shell"
+      }
+    ],
+    "attempt": null,
+    "workspace_path": "/tmp/work/tsk_abc1234",
+    "retry": null,
+    "feedback": null,
+    "shared_context": null,
+    "messages": null,
+    "goal": null
+  },
+  "expected": ""
+}
