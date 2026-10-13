@@ -54,8 +54,21 @@ PY
     return
   fi
 
-  cargo build -p orch-cli >/dev/null 2>&1
-  if cargo xtask parity 2>&1 | grep -q FAILED; then
+  if ! cargo build -p orch-cli >/dev/null 2>&1; then
+    # A mutation that does not compile proves nothing about the harness.
+    printf '  BUILD BROKE   %s\n' "$label"
+    missed=$((missed + 1))
+    git checkout -- "$file"
+    cargo build -p orch-cli >/dev/null 2>&1
+    return
+  fi
+
+  # Capture before grepping: `pipefail` would otherwise make the condition
+  # reflect `cargo`'s non-zero exit (the harness bails on failure) rather than
+  # grep's match, inverting every result.
+  local out
+  out=$(cargo xtask parity 2>&1)
+  if printf '%s' "$out" | grep -q FAILED; then
     printf '  detected      %s\n' "$label"
     detected=$((detected + 1))
   else
@@ -69,8 +82,10 @@ PY
 
 echo "building the baseline"
 cargo build -p orch-cli >/dev/null 2>&1
-if cargo xtask parity 2>&1 | grep -q FAILED; then
+baseline=$(cargo xtask parity 2>&1)
+if printf '%s' "$baseline" | grep -q FAILED; then
   echo "refusing to run: the harness is already red on a clean tree" >&2
+  printf '%s\n' "$baseline" >&2
   exit 1
 fi
 
@@ -113,8 +128,12 @@ probe 'init drops workspace-exclude (§6.11 file set)' \
 
 probe 'table padding changed (§5.1)' \
   crates/orch-cli/src/commands/task.rs \
-  'print_table(styles, &["STATUS", "PRI", "TASK", "AGENT", "TIME"], &rows, 2);' \
-  'print_table(styles, &["STATUS", "PRI", "TASK", "AGENT", "TIME"], &rows, 3);'
+  '        &rows,
+        2,
+    );' \
+  '        &rows,
+        3,
+    );'
 
 echo
 echo "$detected detected, $missed missed"
