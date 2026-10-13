@@ -23,6 +23,13 @@ enum Task {
         /// Only scenarios whose name contains this substring.
         #[arg(long)]
         filter: Option<String>,
+        /// Skip scenarios whose name contains this substring.
+        ///
+        /// For the mutation probes, which run the suite once per probe and
+        /// need none of the agent-driven scenarios: `--exclude o7-` turns an
+        /// hour back into a few minutes.
+        #[arg(long)]
+        exclude: Option<String>,
         /// Print the id mapping and per-step output even when a scenario passes.
         #[arg(long)]
         verbose: bool,
@@ -48,7 +55,11 @@ fn main() -> Result<()> {
     let repo_root = repo_root()?;
 
     match cli.command {
-        Task::Parity { filter, verbose } => parity(&repo_root, filter.as_deref(), verbose),
+        Task::Parity {
+            filter,
+            exclude,
+            verbose,
+        } => parity(&repo_root, filter.as_deref(), exclude.as_deref(), verbose),
         Task::LintScenarios { filter } => lint_scenarios(&repo_root, filter.as_deref()),
     }
 }
@@ -120,7 +131,12 @@ fn repo_root() -> Result<PathBuf> {
         .context("xtask manifest has no parent directory")
 }
 
-fn parity(repo_root: &Path, filter: Option<&str>, verbose: bool) -> Result<()> {
+fn parity(
+    repo_root: &Path,
+    filter: Option<&str>,
+    exclude: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
     let bins = harness::Binaries::discover(repo_root)?;
     let scenarios_dir = repo_root.join("fixtures/scenarios");
     let scenarios = scenario::load_all(&scenarios_dir)?;
@@ -128,6 +144,7 @@ fn parity(repo_root: &Path, filter: Option<&str>, verbose: bool) -> Result<()> {
     let selected: Vec<_> = scenarios
         .into_iter()
         .filter(|(_, s)| filter.is_none_or(|f| s.name.contains(f)))
+        .filter(|(_, s)| !exclude.is_some_and(|e| s.name.contains(e)))
         .collect();
 
     if selected.is_empty() {

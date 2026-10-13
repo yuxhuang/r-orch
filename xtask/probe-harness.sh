@@ -124,7 +124,11 @@ last_failing=""
 parity_ran=0
 run_parity() {
   local out
-  out=$(cargo xtask parity 2>&1)
+  # Every probe below mutates something the `cmd-*`, `walking-skeleton` and
+  # `index-tie-order` scenarios cover; none needs the agent-driven `o7-*`
+  # ones, which cost about a minute each and would make this gate take over
+  # an hour now that they are runnable.
+  out=$(cargo xtask parity --exclude o7- 2>&1)
   last_failing=$(printf '%s' "$out" \
     | sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' | sort)
   if printf '%s' "$out" | grep -q 'scenario(s):'; then
