@@ -44,15 +44,16 @@ pub struct Binaries {
 impl Binaries {
     /// Build this tree's CLI and take a private copy of it.
     ///
-    /// Both halves matter, because the parallel work packages run in separate
-    /// git worktrees that **share** one `CARGO_TARGET_DIR`. So
-    /// `target/debug/orch` is not this tree's binary — it is whichever tree
-    /// built last, and a parity run that reads it can silently grade a
-    /// different branch. (Observed: a run reported 11 scenarios failing with
-    /// rich diffs because it was testing a worktree that had the full command
-    /// surface, while this tree had three commands.) Building first makes the
-    /// binary ours; snapshotting it means a rebuild elsewhere cannot swap it
-    /// out from under a run that takes minutes.
+    /// Both halves matter. The work packages originally shared one
+    /// `CARGO_TARGET_DIR` across git worktrees, and artifacts from two trees
+    /// hash identically, so `target/debug/orch` was whichever tree built last
+    /// and a parity run reading it could silently grade a different branch.
+    /// (Observed: a run reported 11 scenarios failing with rich diffs because
+    /// it was testing a worktree with the full command surface while this tree
+    /// had three commands.) The worktrees have their own target directories
+    /// now, but both halves still earn their keep: building is what makes the
+    /// binary *this source*, and the snapshot is what stops a concurrent
+    /// rebuild swapping it out from under a run that takes minutes.
     pub fn discover(repo_root: &Path) -> Result<Binaries> {
         let built = build_cli(repo_root)?;
 

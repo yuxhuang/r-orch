@@ -211,13 +211,27 @@ The tmpdir must also have **no `.orchestry` ancestor**, because
 somewhere outside any ORCH project.
 
 Finally, the harness **builds `orch-cli` from this tree and runs a private copy
-of the binary**, rather than reading `target/debug/orch`. The parallel work
-packages live in separate git worktrees sharing one `CARGO_TARGET_DIR`, so
-`target/debug/orch` is whichever tree built last. This was observed, not
-anticipated: a run reported eleven scenarios failing with rich, plausible diffs
-because it was grading a worktree with the full command surface while this tree
-had three commands. Building makes the binary ours; the snapshot means a
-rebuild elsewhere cannot swap it out mid-run.
+of the binary**, rather than reading `target/debug/orch`.
+
+This was observed, not anticipated. The work packages originally shared one
+`CARGO_TARGET_DIR` across git worktrees, and artifacts from two trees hash
+identically, so `target/debug/orch` was simply whichever tree built last: a run
+reported eleven scenarios failing with rich, plausible diffs because it was
+grading a worktree that had the full command surface while this tree had three
+commands. The worktrees now have their own target directories, but the build
+and the snapshot stay — building is what makes the binary *this source*, and
+the snapshot is what stops a concurrent rebuild swapping it out mid-run.
+
+Nothing in the harness hard-codes a target path: the binary comes from cargo's
+own `--message-format=json` output, and `concurrent_index.rs` derives its from
+`CARGO_TARGET_DIR` with a `<repo>/target` fallback.
+
+One non-obvious thing the snapshot depends on: `resolve_library_dir()` probes
+the executable's directory and its ancestors for `skills/library` and *then*
+falls back to the repository the crate was built from. From a tempdir the probe
+finds nothing, so the snapshot works only because of that fallback — removing
+it would break every skill-dependent scenario in a way that looks like a parity
+failure.
 
 Where a scenario needs a program to exist, it gets a fixture rather than the
 machine's own:
