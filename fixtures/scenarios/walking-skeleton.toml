@@ -1,0 +1,18 @@
+name = "walking-skeleton"
+kind = "differential"
+description = """
+V39: init / agent add / task add / task list compared end to end. Uses the \
+claude adapter so `init` writes agents/agt_creator.yml — that file carries the \
+~3.5 KB multi-line role prompt, which is the highest-risk L0 artifact in the \
+tree (a block-scalar round trip that feeds straight into agent prompts)."""
+steps = [
+  "init --name proj --adapter claude",
+  "agent add shelly --adapter shell --command 'echo hello'",
+  "task add 'First task' --assignee shelly",
+  "task add 'Second task' --priority 1",
+  "task add 'Third task' --assignee agt_creator --labels 'urgent,backend'",
+  "task list",
+  "task list --json",
+  "task list --quiet",
+  "task list --status todo",
+]
