@@ -26,7 +26,7 @@ use orch_core::storage::{
 use orch_core::template::TemplateEngine;
 use orch_core::workspace::WorkspaceManager;
 use orch_domain::{GlobalConfig, OrchestratorConfig};
-use orch_infra::adapters::build_registry;
+use orch_infra::adapters::build_registry_with_clock;
 use orch_infra::storage::{
     FileAgentStore, FileConfigStore, FileContextStore, FileGlobalConfigStore, FileGoalStore,
     FileMessageStore, FileRunStore, FileStateStore, FileTaskStore, FileTeamStore, Paths,
@@ -259,7 +259,13 @@ pub async fn build_full_with(
     engine.global_config = engine.global_config_store.read().await?;
 
     let processes: Arc<dyn ProcessManager> = Arc::new(orch_infra::process::SystemProcessManager);
-    let adapters = Arc::new(build_registry(Arc::clone(&processes)));
+    // Adapters stamp the events they parse out of a child's stdout, so they
+    // get the injected clock too — otherwise the seam would reach every
+    // timestamp except the ones a differential scenario actually reads.
+    let adapters = Arc::new(build_registry_with_clock(
+        Arc::clone(&processes),
+        Arc::clone(&engine.clock),
+    ));
     let workspace: Arc<dyn WorkspaceManager> = Arc::new(GitWorkspaceManager::new(
         project_root.clone(),
         engine.paths.root(),

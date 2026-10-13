@@ -31,6 +31,6 @@ pub use cursor::CursorAdapter;
 pub use grok::GrokAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiAdapter;
-pub use registry::{REGISTRATION_ORDER, build_registry};
+pub use registry::{REGISTRATION_ORDER, build_registry, build_registry_with_clock};
 pub use shell::ShellAdapter;
 pub use util::{SystemClock, build_full_prompt, extract_tokens};

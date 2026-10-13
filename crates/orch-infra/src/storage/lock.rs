@@ -159,9 +159,19 @@ pub async fn check_lock(lock_path: &Path) -> LockResult {
 
 /// Acquire or fail with `LockConflictError` (exit 4).
 ///
-/// Note the TS guard: it throws **only when a holder PID is known**. An
-/// acquisition that fails without one — the file exists but holds garbage —
-/// returns without error, which is replicated.
+/// A faithful port of the TS `requireLock`, which throws **only when a holder
+/// PID is known**: an acquisition that fails without one — the file exists but
+/// holds garbage — returns without error.
+///
+/// **`requireLock` has no callers in the TypeScript.** It is dead code there,
+/// so this quirk describes nothing ORCH actually does, and it must not be read
+/// as "ORCH proceeds without the lock on a corrupt lock file" — it does not.
+/// The live path is `Orchestrator::with_temporary_lock` / `start_watch`, which
+/// call `acquire` and reject **any** failed acquisition. Measured against the
+/// oracle: a garbage or empty lock file makes `serve --once` and `run <id>`
+/// exit 4 with `Orchestrator already running (PID: undefined)`, leaving the
+/// lock file untouched. Kept in step with the TS only so that a future caller
+/// there has a matching counterpart here.
 pub async fn require_lock(lock_path: &Path) -> Result<()> {
     let result = acquire_lock(lock_path).await?;
     match (result.acquired, result.pid) {

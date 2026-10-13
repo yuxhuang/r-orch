@@ -1,7 +1,6 @@
 name = "cmd-status-and-doctor"
 kind = "differential"
 requires = ["status", "doctor"]
-fake_agents = true
 description = """
 `status` and `doctor`. Two measured oddities: `status --json` emits \
 `state.claimed` and `state.running` as `{}` rather than arrays, because \

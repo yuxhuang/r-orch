@@ -1,7 +1,6 @@
 name = "o7-review-approve"
 kind = "differential"
 requires = ["serve", "config set", "task approve", "task show"]
-fake_agents = true
 timeout_secs = 90
 description = """
 Red-team O7: the review path. resolveCompletionStatus always returns \

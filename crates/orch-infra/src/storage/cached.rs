@@ -26,10 +26,18 @@ use orch_core::storage::{AgentStore, GoalFilter, GoalStore, TaskFilter, TaskStor
 use orch_domain::{Agent, Goal, Task};
 use tokio::sync::Mutex;
 
-/// Anything whose memoized reads can be dropped.
-pub trait Invalidate {
-    fn invalidate(&self);
-}
+// A sync `Invalidate` trait used to live here. It called `blocking_lock()`,
+// which **panics** when called from inside a tokio runtime — which is the only
+// place these stores are ever used, so the one safe way to call it was not to.
+// It had a single impl and no callers; every real invalidation goes through
+// `invalidate_async`. Removed rather than made non-panicking, because a
+// `try_lock`-and-defer version would silently skip an invalidation under
+// contention, and a cache that *might* still be stale after you cleared it is
+// worse than no sync entry point at all.
+//
+// If something genuinely needs to invalidate from a sync context later, it
+// wants `Handle::block_on` at the call site, where the caller can see what it
+// is doing.
 
 // ── Tasks ──────────────────────────────────────────────────────────────────
 
@@ -65,12 +73,6 @@ impl CachedTaskStore {
             filter.status.map(|s| s.as_str()).unwrap_or(""),
             filter.goal_id.as_deref().unwrap_or("")
         )
-    }
-}
-
-impl Invalidate for CachedTaskStore {
-    fn invalidate(&self) {
-        self.cache.blocking_lock().clear();
     }
 }
 

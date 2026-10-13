@@ -502,6 +502,44 @@ pub fn run_scenario(
                     }
                     (Err(problem), _) | (_, Err(problem)) => Some(("status --json", problem)),
                 }
+            } else if toolchain_mask::applies_to(&argv) {
+                // §13: the toolchain row's label and value legitimately
+                // differ; its position does not.
+                match (
+                    toolchain_mask::mask(&rust_out.stdout),
+                    toolchain_mask::mask(&ts_out.stdout),
+                ) {
+                    (Some((rust_masked, rust_row)), Some((ts_masked, ts_row))) => {
+                        if rust_row != ts_row {
+                            Some((
+                                "doctor toolchain row position",
+                                format!(
+                                    "§13 keeps the row's position; it moved\n    ts:   line \
+                                     {ts_row}\n    rust: line {rust_row}"
+                                ),
+                            ))
+                        } else {
+                            let left = rust_norm.text(&rust_masked);
+                            let right = ts_norm.text(&ts_masked);
+                            (left != right).then(|| {
+                                (
+                                    "doctor output (toolchain row masked, §13)",
+                                    unified_diff(&right, &left),
+                                )
+                            })
+                        }
+                    }
+                    (rust_row, ts_row) => Some((
+                        "doctor output",
+                        format!(
+                            "no toolchain row to mask, so the comparison would assert nothing \
+                             — §13 says the row keeps its position and format (present in \
+                             rust: {}, in ts: {})",
+                            rust_row.is_some(),
+                            ts_row.is_some()
+                        ),
+                    )),
+                }
             } else if scenario.stdout_is_json_records(step) {
                 let left = json_records(&rust_out.stdout, &mut rust_norm);
                 let right = json_records(&ts_out.stdout, &mut ts_norm);
@@ -647,9 +685,7 @@ fn execute(
         }
     };
 
-    if scenario.fake_agents || scenario.fake_editor.is_some() {
-        command.env("PATH", stand_in_path(bins, scenario)?);
-    }
+    command.env("PATH", stand_in_path(bins, scenario)?);
     if let Some(editor) = &scenario.fake_editor {
         // `VISUAL` wins over `EDITOR` in some editors but not in the oracle,
         // which checks `EDITOR` first — so set both to the same script and
@@ -737,10 +773,13 @@ fn run_and_kill(
 /// both binaries spawn the fixtures rather than whatever the machine has
 /// installed.
 fn stand_in_path(bins: &Binaries, scenario: &Scenario) -> Result<String> {
-    let mut dirs = Vec::new();
-    if scenario.fake_agents {
-        dirs.push("fixtures/fake-agents");
-    }
+    // Always, for every scenario. `doctor` probes whatever is on `PATH`, and
+    // the adapters spawn from it, so a scenario that inherited the developer's
+    // `PATH` would compare two runs against whatever that machine happens to
+    // have installed — green here, red on the next machine, and silently
+    // testing the real `claude` CLI rather than the fixture. It was opt-in
+    // once; an opt-in that every scenario should set is just a trap.
+    let mut dirs = vec!["fixtures/fake-agents"];
     if scenario.fake_editor.is_some() {
         dirs.push("fixtures/fake-editors");
     }
@@ -988,6 +1027,71 @@ mod claimed_mask {
             .get_mut("state")?
             .as_object_mut()?
             .shift_remove("claimed")
+    }
+}
+
+/// The second named exclusion: `doctor`'s toolchain row (PARITY.md §13).
+///
+/// §13 replaces the `node` version check with the r-orch build identity. The
+/// row keeps its **position and format**; only its label and value change. So
+/// the harness masks that one row rather than pretending the two match — and,
+/// because position is the part §13 actually promises, checks that the row sits
+/// at the same index on both sides.
+///
+/// Like the §14.1 mask, this is a hole in the gate, so it is as narrow as it
+/// can be: `doctor` steps only, one row, and a missing row is a failure rather
+/// than a free pass.
+mod toolchain_mask {
+    /// The TS label and the r-orch label, which are the only two this may hit.
+    const LABELS: [&str; 2] = ["node", "toolchain"];
+
+    /// Whether the §13 mask applies to this step.
+    pub fn applies_to(argv: &[String]) -> bool {
+        argv.iter()
+            .find(|arg| !arg.starts_with('-'))
+            .map(String::as_str)
+            == Some("doctor")
+    }
+
+    /// Replace the toolchain row with a placeholder, reporting which line it
+    /// was on so the two sides' positions can be compared.
+    ///
+    /// `None` when there is no such row: masking a row that is not there would
+    /// assert nothing, and a `doctor` that stopped printing a toolchain row
+    /// would otherwise pass by having nothing to mask.
+    pub fn mask(stdout: &str) -> Option<(String, usize)> {
+        let mut index = None;
+        let mut out = Vec::new();
+
+        for (line_number, line) in stdout.lines().enumerate() {
+            match (index, label_of(line)) {
+                // Only the first match is masked; a second row with the same
+                // label would be a real difference worth seeing.
+                (None, Some(_)) => {
+                    index = Some(line_number);
+                    out.push("  <TOOLCHAIN ROW>".to_owned());
+                }
+                _ => out.push(line.to_owned()),
+            }
+        }
+
+        let index = index?;
+        let mut masked = out.join("\n");
+        if stdout.ends_with('\n') {
+            masked.push('\n');
+        }
+        Some((masked, index))
+    }
+
+    /// The row's label, if the line is `<glyph> <label> <value>`.
+    fn label_of(line: &str) -> Option<&'static str> {
+        let rest = line.trim_start();
+        // The glyph is ✓/✕ normally and +/x under --ascii; take whatever the
+        // first whitespace-delimited token is and look at the one after it.
+        let mut tokens = rest.split_whitespace();
+        let _glyph = tokens.next()?;
+        let label = tokens.next()?;
+        LABELS.into_iter().find(|known| *known == label)
     }
 }
 
@@ -1404,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn stand_in_directories_go_on_the_path_only_when_asked_for() {
+    fn the_fake_agents_are_always_on_the_path_and_editors_on_request() {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1417,13 +1521,16 @@ mod tests {
             _snapshot: None,
         };
 
+        // Unconditional: `doctor` probes PATH and the adapters spawn from it,
+        // so inheriting the developer's PATH would compare two runs against
+        // whatever that machine has installed.
         let plain = scenario_with("name = \"s\"\nkind = \"differential\"\nsteps = [\"a\"]\n");
         let path = stand_in_path(&bins, &plain).unwrap();
-        assert!(!path.contains("fake-agents"), "{path}");
+        assert!(path.contains("fake-agents"), "{path}");
         assert!(!path.contains("fake-editors"), "{path}");
 
         let both = scenario_with(
-            "name = \"s\"\nkind = \"differential\"\nfake_agents = true\n\
+            "name = \"s\"\nkind = \"differential\"\n\
              fake_editor = \"orch-edit-title\"\nsteps = [\"a\"]\n",
         );
         let path = stand_in_path(&bins, &both).unwrap();
@@ -1615,6 +1722,78 @@ mod tests {
         let failures = compare_trees(&rust, &ts);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn the_toolchain_mask_applies_only_to_doctor() {
+        for step in ["doctor", "doctor --json", "--ascii doctor"] {
+            let argv = shell_words::split(step).unwrap();
+            assert!(toolchain_mask::applies_to(&argv), "{step}");
+        }
+        for step in [
+            "status --json",
+            "task list",
+            "agent list --json",
+            "serve --once",
+        ] {
+            let argv = shell_words::split(step).unwrap();
+            assert!(!toolchain_mask::applies_to(&argv), "{step}");
+        }
+    }
+
+    #[test]
+    fn the_toolchain_row_is_masked_in_place_and_nothing_else_is() {
+        // Shaped like the real output, measured from the oracle.
+        let ts = concat!(
+            "\n  orch doctor · checking adapters and dependencies\n\n",
+            "  ✓  claude       2.1.296 (Claude Code)\n",
+            "  ✓  git          git version 2.47.3\n",
+            "  ✓  node         v24.21.0\n",
+            "\n  8 of 8 adapters ready\n"
+        );
+        let rust = ts.replace(
+            "  ✓  node         v24.21.0",
+            "  ✓  toolchain    rustc 1.94.1",
+        );
+
+        let (ts_masked, ts_row) = toolchain_mask::mask(ts).expect("ts row");
+        let (rust_masked, rust_row) = toolchain_mask::mask(&rust).expect("rust row");
+
+        // Same position, and the differing row is gone from both.
+        assert_eq!(ts_row, rust_row);
+        assert_eq!(ts_masked, rust_masked);
+        assert!(ts_masked.contains("<TOOLCHAIN ROW>"));
+        // Everything around it survives, so a real divergence still shows.
+        assert!(ts_masked.contains("git version 2.47.3"));
+        assert!(ts_masked.contains("8 of 8 adapters ready"));
+        assert!(!ts_masked.contains("v24.21.0"));
+        assert!(!rust_masked.contains("rustc 1.94.1"));
+    }
+
+    #[test]
+    fn a_doctor_output_with_no_toolchain_row_masks_nothing() {
+        // Would otherwise pass vacuously; the caller turns this into a failure.
+        assert!(toolchain_mask::mask("  ✓  git  git version 2.47.3\n").is_none());
+        assert!(toolchain_mask::mask("").is_none());
+    }
+
+    #[test]
+    fn the_toolchain_mask_survives_the_ascii_glyphs() {
+        // --ascii swaps ✓ for +, so matching on the glyph itself would make
+        // the mask silently stop applying under one flag.
+        let (masked, row) = toolchain_mask::mask("  +  node         v24.21.0\n").expect("row");
+        assert_eq!(row, 0);
+        assert!(masked.contains("<TOOLCHAIN ROW>"));
+    }
+
+    #[test]
+    fn only_the_first_toolchain_row_is_masked() {
+        // A second row with the same label is a real difference, not another
+        // licensed exclusion.
+        let two = "  ✓  node  v1\n  ✓  node  v2\n";
+        let (masked, _) = toolchain_mask::mask(two).expect("row");
+        assert!(masked.contains("<TOOLCHAIN ROW>"));
+        assert!(masked.contains("v2"), "{masked}");
     }
 
     #[test]

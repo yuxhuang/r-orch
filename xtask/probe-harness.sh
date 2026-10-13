@@ -218,6 +218,18 @@ probe_pending status \
             .shift_remove("claimed")' \
   '        document.as_object_mut()?.shift_remove("state")'
 
+# The §13 toolchain-row exclusion. Same reasoning as §14.1 above: masking one
+# `doctor` row must not blind the harness to the rest of the command's output.
+probe_pending doctor \
+  'the toolchain mask spreads to every command (§13 scope)' \
+  xtask/src/harness.rs \
+  '        argv.iter()
+            .find(|arg| !arg.starts_with('"'"'-'"'"'))
+            .map(String::as_str)
+            == Some("doctor")' \
+  '        let _ = argv;
+        true'
+
 echo
 if [ "$pending" -gt 0 ]; then
   echo "$detected detected, $missed missed, $pending pending on commands that do not exist yet"

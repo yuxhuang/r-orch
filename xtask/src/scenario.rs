@@ -51,10 +51,6 @@ pub struct Scenario {
     /// un-ignore it. The oracle has every command, so only our side gates.
     #[serde(default)]
     pub requires: Vec<String>,
-    /// Put `fixtures/fake-agents/` first on `PATH` for both binaries, so the
-    /// adapters spawn the stand-in CLIs rather than the real ones.
-    #[serde(default)]
-    pub fake_agents: bool,
     /// Put `fixtures/fake-editors/` first on `PATH` and set `EDITOR` to this
     /// script, making `task edit` and `agent edit` reachable.
     ///

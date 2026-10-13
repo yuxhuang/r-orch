@@ -315,7 +315,12 @@ mod tests {
         let mut child = pm
             .spawn(
                 "sh",
-                &sh("printf '%s' \"$$\"; exec ps -o pgid= -p $$"),
+                // The trailing space is load-bearing: `ps -o pgid=` pads its
+                // column only while the value is narrower than the header
+                // width, so at a 7-digit pid — routine here, pid_max is
+                // 4194304 — it emits no leading whitespace and the two
+                // numbers ran together into one unsplittable token.
+                &sh("printf '%s ' \"$$\"; exec ps -o pgid= -p $$"),
                 SpawnOptions::default(),
             )
             .expect("spawn");
@@ -328,7 +333,13 @@ mod tests {
             .read_to_string(&mut out)
             .await
             .expect("read");
-        let (pid, pgid) = out.split_at(out.find(|c: char| c.is_whitespace()).unwrap_or(out.len()));
+        // Split on the separator rather than tolerating its absence: without
+        // one, `pgid` was the empty string and the failure read as
+        // `"15068721506872" != ""`, which says nothing about process groups.
+        let (pid, pgid) = out
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or_else(|| panic!("expected `<pid> <pgid>`, got {out:?}"));
         assert_eq!(pid.trim(), pgid.trim(), "the child leads its own group");
         assert_eq!(pid.trim().parse::<u32>().expect("pid"), child.pid);
     }
