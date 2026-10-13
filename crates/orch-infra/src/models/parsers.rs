@@ -32,8 +32,7 @@ static CURSOR_STATUS: LazyLock<Regex> =
 static PI_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^provider\s{2,}model\s{2,}").expect("static regex"));
 
-static PI_COLUMNS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\s{2,}").expect("static regex"));
+static PI_COLUMNS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s{2,}").expect("static regex"));
 
 static GROK_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*([*-])\s+([^\s].*?)(?:\s+\(default\))?\s*$").expect("static regex")
@@ -380,7 +379,11 @@ openai     gpt-5.4            1M       128K     yes       yes
                     "claude-sonnet-4-6 (anthropic)",
                     "200K · 64K · yes · yes",
                 ),
-                ModelOption::new("openai/gpt-5.4", "gpt-5.4 (openai)", "1M · 128K · yes · yes"),
+                ModelOption::new(
+                    "openai/gpt-5.4",
+                    "gpt-5.4 (openai)",
+                    "1M · 128K · yes · yes"
+                ),
             ]
         );
     }

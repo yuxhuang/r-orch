@@ -24,8 +24,8 @@ use nix::errno::Errno;
 use nix::unistd::Pid;
 use orch_core::error::{Error, Result};
 use orch_core::process::{
-    ExitOutcome, ExitSignal, KILL_POLL_INTERVAL, ProcessManager, Signal, SpawnOptions, SpawnedChild,
-    StdioMode,
+    ExitOutcome, ExitSignal, KILL_POLL_INTERVAL, ProcessManager, Signal, SpawnOptions,
+    SpawnedChild, StdioMode,
 };
 
 /// The real process manager. Stateless and cheap to clone.
@@ -120,9 +120,9 @@ impl ProcessManager for SystemProcessManager {
         // The TS throws `Failed to spawn process: <command>` when node hands
         // back a child with no pid; in Rust that case is the `Err` above, and
         // a successfully spawned child always has one until it is reaped.
-        let pid = child.id().ok_or_else(|| {
-            Error::other(format!("Failed to spawn process: {command}"))
-        })?;
+        let pid = child
+            .id()
+            .ok_or_else(|| Error::other(format!("Failed to spawn process: {command}")))?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -208,7 +208,11 @@ mod tests {
     async fn spawn_pipes_stdout_and_reports_the_exit_code() {
         let pm = SystemProcessManager::new();
         let mut child = pm
-            .spawn("sh", &sh("printf 'hello\\n'; exit 3"), SpawnOptions::default())
+            .spawn(
+                "sh",
+                &sh("printf 'hello\\n'; exit 3"),
+                SpawnOptions::default(),
+            )
             .expect("spawn");
 
         let mut out = String::new();
@@ -312,7 +316,11 @@ mod tests {
     async fn spawn_creates_a_new_process_group_led_by_the_child() {
         let pm = SystemProcessManager::new();
         let mut child = pm
-            .spawn("sh", &sh("printf '%s' \"$$\"; exec ps -o pgid= -p $$"), SpawnOptions::default())
+            .spawn(
+                "sh",
+                &sh("printf '%s' \"$$\"; exec ps -o pgid= -p $$"),
+                SpawnOptions::default(),
+            )
             .expect("spawn");
 
         let mut out = String::new();

@@ -37,7 +37,11 @@ pub struct ModelOption {
 }
 
 impl ModelOption {
-    pub fn new(value: impl Into<String>, label: impl Into<String>, hint: impl Into<String>) -> Self {
+    pub fn new(
+        value: impl Into<String>,
+        label: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
         ModelOption {
             value: value.into(),
             label: label.into(),
@@ -423,7 +427,10 @@ mod tests {
                 "cursor-agent --list-models",
                 "Available models\ncurrent - Current Model (default)",
             ),
-            ("grok models", "Available models:\n  * grok-current (default)"),
+            (
+                "grok models",
+                "Available models:\n  * grok-current (default)",
+            ),
             ("agy models", "antigravity-current"),
             ("opencode models", "provider/opencode-current"),
             (
@@ -509,7 +516,11 @@ mod tests {
 
         let discovery = ModelDiscovery::with_runtime(Arc::new(StderrOnly));
         let options = discovery.discover(AdapterKind::Pi).await;
-        assert!(options.iter().any(|option| option.value == "openai/pi-stderr"));
+        assert!(
+            options
+                .iter()
+                .any(|option| option.value == "openai/pi-stderr")
+        );
     }
 
     #[tokio::test]
@@ -528,7 +539,10 @@ mod tests {
             catalog.keys().copied().collect::<Vec<_>>(),
             [AdapterKind::Shell, AdapterKind::Grok]
         );
-        assert_eq!(catalog[&AdapterKind::Shell], fallback_model_options("shell"));
+        assert_eq!(
+            catalog[&AdapterKind::Shell],
+            fallback_model_options("shell")
+        );
     }
 
     #[tokio::test]
@@ -537,7 +551,10 @@ mod tests {
         let catalog = discovery
             .load_catalog(&[AdapterKind::Claude], |_, _| {})
             .await;
-        assert_eq!(catalog[&AdapterKind::Claude], fallback_model_options("claude"));
+        assert_eq!(
+            catalog[&AdapterKind::Claude],
+            fallback_model_options("claude")
+        );
     }
 
     #[test]
@@ -570,7 +587,10 @@ mod tests {
             .run_command("sh", &["-c", "printf oops >&2; exit 2"])
             .await
             .expect_err("non-zero exit is a failure");
-        assert_eq!(err.to_string(), "sh -c printf oops >&2; exit 2 failed: 2 oops");
+        assert_eq!(
+            err.to_string(),
+            "sh -c printf oops >&2; exit 2 failed: 2 oops"
+        );
     }
 
     #[tokio::test]

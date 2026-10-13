@@ -48,12 +48,32 @@ pub enum StderrPolicy {
 /// [`StderrPolicy::Discard`]/[`StderrPolicy::Stream`] and for a child with no
 /// stderr, which is what makes "no tail in the message" the default.
 #[derive(Debug, Clone, Default)]
-pub struct StderrTail(Option<Arc<Mutex<Vec<u8>>>>);
+pub struct StderrTail {
+    buf: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Flips to `true` when the drain task reaches EOF.
+    eof: Option<tokio::sync::watch::Receiver<bool>>,
+}
 
 impl StderrTail {
     /// The captured tail, decoded and `trimEnd()`-ed as the TS getter is.
-    pub fn get(&self) -> String {
-        let Some(buf) = self.0.as_ref() else {
+    ///
+    /// Awaits stderr EOF first. In node the `'data'` events are delivered on
+    /// the same event loop that fires `'close'`, so a synchronous getter
+    /// already sees everything the child wrote; here the drain runs in its own
+    /// task, and every caller is on an error path after the child exited, so
+    /// EOF is imminent and waiting for it is what makes the message
+    /// deterministic rather than racy.
+    pub async fn tail(&self) -> String {
+        if let Some(mut eof) = self.eof.clone() {
+            // An `Err` means the drain task is gone, which is also settled.
+            let _ = eof.wait_for(|done| *done).await;
+        }
+        self.captured()
+    }
+
+    /// The tail as captured so far, without waiting for EOF.
+    pub fn captured(&self) -> String {
+        let Some(buf) = self.buf.as_ref() else {
             return String::new();
         };
         let bytes = buf.lock().unwrap_or_else(|err| err.into_inner());
@@ -123,12 +143,17 @@ pub fn apply_stderr_policy(io: &mut ChildIo, stderr: Option<ChildReader>, policy
     match policy {
         StderrPolicy::Stream => io.stderr = Some(stderr),
         StderrPolicy::Discard => {
-            tokio::spawn(drain(stderr, None));
+            let (eof, _) = tokio::sync::watch::channel(false);
+            tokio::spawn(drain(stderr, None, eof));
         }
         StderrPolicy::Tail => {
             let buf = Arc::new(Mutex::new(Vec::new()));
-            io.stderr_tail = StderrTail(Some(Arc::clone(&buf)));
-            tokio::spawn(drain(stderr, Some(buf)));
+            let (sender, receiver) = tokio::sync::watch::channel(false);
+            io.stderr_tail = StderrTail {
+                buf: Some(Arc::clone(&buf)),
+                eof: Some(receiver),
+            };
+            tokio::spawn(drain(stderr, Some(buf), sender));
         }
     }
 }
@@ -136,11 +161,15 @@ pub fn apply_stderr_policy(io: &mut ChildIo, stderr: Option<ChildReader>, policy
 /// Read stderr to EOF, optionally retaining the trailing
 /// [`STDERR_TAIL_BYTES`]. Read errors are swallowed, mirroring the TS no-op
 /// `'error'` handler.
-async fn drain(mut stderr: ChildReader, tail: Option<Arc<Mutex<Vec<u8>>>>) {
+async fn drain(
+    mut stderr: ChildReader,
+    tail: Option<Arc<Mutex<Vec<u8>>>>,
+    eof: tokio::sync::watch::Sender<bool>,
+) {
     let mut chunk = vec![0u8; STDERR_TAIL_BYTES];
     loop {
         match stderr.read(&mut chunk).await {
-            Ok(0) => return,
+            Ok(0) => break,
             Ok(read) => {
                 if let Some(tail) = tail.as_ref() {
                     let mut buf = tail.lock().unwrap_or_else(|err| err.into_inner());
@@ -155,10 +184,11 @@ async fn drain(mut stderr: ChildReader, tail: Option<Arc<Mutex<Vec<u8>>>>) {
             }
             Err(err) => {
                 tracing::debug!(error = %err, "stderr read failed; dropping the rest");
-                return;
+                break;
             }
         }
     }
+    let _ = eof.send(true);
 }
 
 #[cfg(test)]
@@ -184,12 +214,6 @@ mod tests {
         Box::new(std::io::Cursor::new(bytes))
     }
 
-    async fn settle() {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-    }
-
     #[tokio::test]
     async fn the_tail_policy_keeps_only_the_last_4_kib() {
         let mut io = empty_io();
@@ -199,9 +223,7 @@ mod tests {
             Some(reader(payload.into_bytes())),
             StderrPolicy::Tail,
         );
-        settle().await;
-
-        let tail = io.stderr_tail.get();
+        let tail = io.stderr_tail.tail().await;
         assert_eq!(tail.len(), STDERR_TAIL_BYTES);
         assert!(tail.ends_with("ACTIONABLE_ERROR"));
     }
@@ -214,8 +236,7 @@ mod tests {
             Some(reader(b"boom\n\n".to_vec())),
             StderrPolicy::Tail,
         );
-        settle().await;
-        assert_eq!(io.stderr_tail.get(), "boom");
+        assert_eq!(io.stderr_tail.tail().await, "boom");
     }
 
     #[tokio::test]
@@ -226,24 +247,28 @@ mod tests {
             Some(reader(b"rate limit reached".to_vec())),
             StderrPolicy::Discard,
         );
-        settle().await;
-        assert_eq!(io.stderr_tail.get(), "");
+        assert_eq!(io.stderr_tail.tail().await, "");
         assert!(io.stderr.is_none());
     }
 
     #[tokio::test]
     async fn the_stream_policy_hands_stderr_to_the_adapter() {
         let mut io = empty_io();
-        apply_stderr_policy(&mut io, Some(reader(b"line\n".to_vec())), StderrPolicy::Stream);
+        apply_stderr_policy(
+            &mut io,
+            Some(reader(b"line\n".to_vec())),
+            StderrPolicy::Stream,
+        );
         assert!(io.stderr.is_some());
-        assert_eq!(io.stderr_tail.get(), "");
+        assert_eq!(io.stderr_tail.tail().await, "");
     }
 
-    #[test]
-    fn a_child_without_stderr_has_an_empty_tail() {
+    #[tokio::test]
+    async fn a_child_without_stderr_has_an_empty_tail() {
         let mut io = empty_io();
         apply_stderr_policy(&mut io, None, StderrPolicy::Tail);
-        assert_eq!(io.stderr_tail.get(), "");
+        assert_eq!(io.stderr_tail.tail().await, "");
+        assert_eq!(io.stderr_tail.captured(), "");
     }
 
     #[tokio::test]
