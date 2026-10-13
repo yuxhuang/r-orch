@@ -58,6 +58,15 @@ pub async fn run(project_root: PathBuf, version: &str) -> Result<ExitCode> {
     // observer is on the WP-5a branch; until it lands, an observer-mode
     // dashboard renders from the stores on every refresh but sees no live
     // events.
+    //
+    // Expect exactly three visible differences in observer mode once it is
+    // attached, all of them TS-faithful: the `● OBSERVING` header chip, a 3 s
+    // poll instead of 5 s, and **stale teams** — the periodic refresh passes
+    // `include_teams = false` (`App.tsx:826`), so a team another process
+    // creates or disbands does not appear until something team-related
+    // happens locally. Not a bug in either half; changing it needs a
+    // PARITY §14 entry, since which collections the poll re-reads is
+    // observable.
 
     // The draw loop must not run on a runtime thread: `TuiBackend` is
     // synchronous and its methods call `Handle::block_on`, which panics inside
