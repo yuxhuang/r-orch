@@ -1,0 +1,62 @@
+{
+  "name": "messages-1-reply.system",
+  "template": "system",
+  "context": {
+    "project": {
+      "name": "demo-project",
+      "description": null
+    },
+    "task": {
+      "id": "tsk_abc1234",
+      "title": "Fix login bug",
+      "description": "Fix the login bug\nin auth.",
+      "priority": 3,
+      "labels": [],
+      "scope": null,
+      "is_autonomous": false,
+      "goal_id": null
+    },
+    "agent": {
+      "id": "agt_aaa1111",
+      "name": "Backend A",
+      "role": "Senior Dev"
+    },
+    "agents": [
+      {
+        "id": "agt_aaa1111",
+        "name": "Backend A",
+        "role": null,
+        "adapter": "claude"
+      },
+      {
+        "id": "agt_bbb2222",
+        "name": "QA B",
+        "role": "QA Engineer\n## WORKFLOW\nrun tests",
+        "adapter": "codex"
+      },
+      {
+        "id": "agt_ccc3333",
+        "name": "Shelly",
+        "role": null,
+        "adapter": "shell"
+      }
+    ],
+    "attempt": null,
+    "workspace_path": "/tmp/work/tsk_abc1234",
+    "retry": null,
+    "feedback": null,
+    "shared_context": null,
+    "messages": [
+      {
+        "id": "msg_1",
+        "from": "Agent 1",
+        "subject": "Subject 1",
+        "body": "Body line 1\nsecond line",
+        "sent_at": "2026-01-02T03:04:05.678Z",
+        "reply_to": "msg_0"
+      }
+    ],
+    "goal": null
+  },
+  "expected": "You are Backend A (Senior Dev).\n\n## Orchestrator CLI\nManage tasks and coordinate with other agents using `orch`:\n\n**Tasks:**\n- `orch task add \"<title>\" -d \"<description>\" -p <1-4> --assignee <agent-id>` — create and assign a task\n- `orch task add \"<title>\" -d \"<description>\" --scope \"src/path/**\" --depends-on <task-id>` — scoped task with dependency\n- `orch task list [--status todo|in_progress|done|failed]` — list tasks\n\n**Messaging:**\n- `orch msg send <agent-id> \"<body>\" -s \"<subject>\"` — direct message\n- `orch msg broadcast \"<body>\" -s \"<subject>\"` — broadcast to all\n- `orch msg inbox agt_aaa1111` — your pending messages\n\n**Shared context:**\n- `orch context set <key> <value>` / `orch context get <key>` / `orch context list`\n\n\n\n## Rules\n- Do NOT ask clarifying questions. You are running autonomously without human input.\n- Make reasonable assumptions and proceed with the best approach.\n- If critical information is missing, document your assumptions and continue.\n- When a task is too large or spans multiple domains, break it into subtasks using `orch task add`.\n- When creating subtasks, use `--scope` to declare which files each task will touch, and `--depends-on` to order dependent work.\n"
+}
