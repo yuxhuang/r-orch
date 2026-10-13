@@ -155,3 +155,74 @@ let backend = EngineBackend::new(container, handle);
 orch_tui::run(backend)?;
 // then: stop watch mode or the disk observer, and clear the event bus.
 ```
+
+## Implementer answers (asked by WP-4, settled here)
+
+1. **`goal_progress` with no report.** Map "absent" to `Ok(String::new())`, not
+   `Err` — `Err` renders `Failed: …` and "nothing recorded yet" is not a
+   failure. The TUI treats an empty-or-whitespace report as absent and renders
+   no `progress` section (case `v094`).
+2. **Stringly-typed enums.** Parse `AgentOpts::{effort, approval_policy}` and
+   `AgentFields::effort` with `FromStr`; an unparseable value is
+   `Err("Unknown effort: \"{v}\"")` — the TUI shows it verbatim. On clearing:
+   `Some(String::new())` means *clear* and `None` means *unchanged* for
+   `command`, `effort` and `model`. The TUI never sends `Some("")` for `role`:
+   choosing the `Skip` preset maps to `None`, so a role cannot be cleared from
+   the UI — that is TS behaviour (`vals.role || undefined`), not an oversight.
+   Supporting clears for all four is fine; only three are exercised.
+3. **Fire-and-forget is about *dispatch*, not validation.** `run_task`,
+   `run_all` and `start_watch` must return `Err` for anything knowable before an
+   agent starts — a lock conflict, an unknown id, no eligible agent — because
+   that is the TS behaviour (the promise rejected and the TUI printed
+   `Failed: {err}`), and because **the TUI does not render
+   `orchestrator:error`**: `formatEvent` has no case for it in the TS original
+   and none here, so an error delivered only through the event stream is
+   invisible. Everything that happens *after* the run starts belongs in
+   `poll_events`.
+4. **`stop_watch`** may spawn and return `Ok(())` — the TUI only needs the
+   request accepted. It sets `watch_active = false` and prints
+   `✓ Watch mode paused` on `Ok`; the header chip follows that flag.
+5. **The update facade is intentionally inert.** Leave `poll_update`,
+   `background_install` and `installed_version` at their trait defaults
+   (PARITY §13: no self-update, no network). No test requires a real version —
+   case `v070` scripts one through `FakeBackend`. The header update chip then
+   simply never appears.
+6. **`refresh_state`** re-reads `state.json` on every call; no caching. The TUI
+   calls it on launch, after each mutation, on the 150 ms event-driven refresh
+   and on the periodic poll (3 s observer / 5 s watch), and always commits the
+   result — unlike the entity lists, which it commits only when
+   `entityListChanged`.
+7. **`poll_history` — the exact two batches** (`src/cli/commands/tui.ts`,
+   `onLoadHistory`):
+   * list **all** runs once (not per task), sort by `started_at` **descending**,
+     keep only `succeeded` and `failed`;
+   * batch 1 = runs `[0..3)`, batch 2 = runs `[3..10)`;
+   * per run, read the **last 30** events (`readEventsTail(run.id, 30)`) and map
+     each to `HistoryEntry { timestamp: event.timestamp, run_id: run.id,
+     agent_id: run.agent_id, task_id: run.task_id, event_type: event.type,
+     data: event.data }`;
+   * flatten each batch, sort **ascending** by timestamp, keep the **last 200**;
+   * deliver batch 1 as soon as it is ready and batch 2 afterwards (the TS host
+     loads it in the background). Failures go to stderr and must never bubble
+     into the UI.
+   The TUI prepends each batch and re-truncates to 500 messages, de-duplicates
+   repeated nested provider errors per `run_id`, and skips entries whose
+   formatter yields no summary.
+8. **`save_max_concurrent`** writing `scheduling.max_concurrent_agents` with
+   silent-until-restart semantics is correct — it is what the TS does. The TUI
+   prints `Settings saved` and shows the new value in the wizard default.
+9. **Capability flags in observer mode** all stay `true`; let
+   `run_task`/`run_all`/`start_watch` fail with the lock holder's PID (see #3).
+   The flags mean "this build supports the operation", not "it will succeed now".
+10. **`bell()`** is yours: write `\x07` to stdout directly, outside the draw
+    loop. The TUI calls it only for `failed` and `review` transitions and only
+    when `notifications.bell` is set — never for `done`.
+
+Two notes back:
+
+* **A lossy `poll_events` is fine.** The TUI's 80 ms batching, 500-message ring
+  and 2 KB detail caps already assume `agent:output` can be dropped under load
+  (ARCHITECTURE §6.5). Log the lag; never fail the call.
+* **Feeding `DiskObserver` into the same queue is exactly right.** The TUI has
+  no way to tell the sources apart and must not: `observer_mode` in
+  `LaunchContext` only drives the header chip and the 3 s poll interval.

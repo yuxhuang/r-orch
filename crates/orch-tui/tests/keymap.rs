@@ -914,3 +914,17 @@ fn k092_the_command_bar_consumes_navigation_keys() {
     assert_eq!(harness.app.state.command_bar.input.value(), "/task");
     assert_eq!(harness.app.state.view, ViewId::Tasks);
 }
+
+#[test]
+fn k093_ctrl_s_is_refused_when_the_default_adapter_is_shell() {
+    // The Agent Shop needs an AI provider; the shortcut must refuse rather
+    // than open an unusable wizard (docs/parity/tui.md §5.2).
+    let mut backend = FakeBackend::new();
+    backend.context.default_adapter = "shell".into();
+    let mut harness = Harness::with(backend);
+    harness.app.state.view = ViewId::Agents;
+    harness.key('n');
+    harness.press_mod(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    harness.refute_text("AGENT SHOP");
+    harness.assert_message("Agent Shop requires an AI provider. Press N to create a Shell agent.");
+}

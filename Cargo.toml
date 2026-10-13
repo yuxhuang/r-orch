@@ -57,14 +57,14 @@ kstring = "2.0.2"
 # ── TUI (ARCHITECTURE §4.4) ────────────────────────────────────────────────
 ratatui = "0.30"
 crossterm = "0.29"
-# ARCHITECTURE §4.8 library-first: the wizard textarea step (multi-line editing,
-# undo, word motions, soft wrapping, line numbers). `tui-textarea` 0.7 is pinned
-# to ratatui 0.29 and would pull a second ratatui+crossterm stack; `-2` is the
-# maintained ratatui-0.30 continuation and also adds the soft-wrap/visual-row
-# cursor support the wizard needs (docs/parity/tui.md §5.1).
+# ARCHITECTURE §4.8 library-first, for the multi-line wizard textarea step
+# (buffer, undo, word motions, soft wrapping, line numbers). This is the
+# maintained ratatui-0.30 fork of `tui-textarea`, whose own 0.7.0 is pinned to
+# ratatui 0.29 / crossterm 0.28 and cannot render into a 0.30 `Frame` (see the
+# §4.8 block below). Verified: one ratatui and one crossterm in the graph.
 tui-textarea-2 = "0.13"
-unicode-segmentation = "1.13"
-unicode-width = "0.2"
+# NFC normalisation for the grapheme cursor; the segmentation and width crates
+# live in the §4.8 block below.
 unicode-normalization = "0.1"
 
 # ── Support (ARCHITECTURE §4.5) ────────────────────────────────────────────
@@ -94,9 +94,12 @@ toml = "1.1"
 # `tui-textarea` is deliberately ABSENT: 0.7.0 (its latest) hard-depends on
 # ratatui 0.29.0 and crossterm 0.28.1, so a `TextArea` cannot be rendered into
 # a ratatui 0.30 `Frame` and adding it puts two ratatui versions in the graph.
-# WP-6 therefore gets `tui-input` for single-line fields and must either wrap
-# it for the multi-line wizard steps or hand-roll those — see §4.8 and record
-# the choice.
+# WP-6 resolved this by adopting `tui-textarea-2` 0.13 (the maintained 0.30
+# fork, declared in the TUI block above) for the multi-line wizard steps.
+#
+# `tui-input` is unused: WP-6's single-line editor needs a kill ring, two undo
+# flavours and a 500 ms snapshot debounce (docs/parity/tui.md §2.4), none of
+# which `tui-input` models, so it is hand-written over the crates below.
 #
 # Process groups: prefer this over a hand-rolled setsid + kill(-pid); keep
 # `nix` for kill(pid, 0) liveness (ARCHITECTURE §4.8, §5.5).

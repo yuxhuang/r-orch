@@ -1037,3 +1037,14 @@ fn v093_the_activity_feed_renders_its_filter_suffix() {
     harness.assert_text("ACTIVITY");
     harness.assert_text("F:ALL");
 }
+
+#[test]
+fn v094_an_empty_progress_report_renders_no_progress_section() {
+    // The engine returns no report until one is recorded; that is not an error
+    // and must not leave an empty `progress` divider behind (BACKEND.md).
+    let mut backend = linked_backend();
+    backend.goal_progress_report = String::new();
+    let mut harness = harness_for(ViewId::Goals, backend);
+    harness.press(KeyCode::Enter);
+    harness.refute_text("progress");
+}
