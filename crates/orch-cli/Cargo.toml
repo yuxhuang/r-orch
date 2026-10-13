@@ -49,6 +49,10 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 tokio-util.workspace = true
+# Real `mkdtemp` for the TUI's clipboard-paste directory (docs/parity/tui.md
+# §8.2): atomic, 0700 and collision-free, which a hand-built name is not.
+# Already a production dependency of orch-infra.
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
