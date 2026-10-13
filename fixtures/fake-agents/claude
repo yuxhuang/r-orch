@@ -1,0 +1,26 @@
+#!/bin/sh
+# Fake `claude` — `--print --output-format stream-json`, JSONL on stdout.
+. "$(dirname "$0")/_common.sh"
+
+fake_handle_version "$@"
+prompt=$(fake_last_arg "$@")
+scenario=$(fake_scenario "$prompt")
+reply=$(fake_reply)
+
+fake_before_output "$scenario"
+
+if [ "$scenario" != "silent" ]; then
+  printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s"}]}}\n' \
+    "$(fake_json_string "$reply")"
+fi
+
+case "$scenario" in
+  fail|rate_limit)
+    fake_failure_stderr "$scenario"
+    ;;
+  *)
+    printf '{"type":"result","subtype":"success","usage":{"input_tokens":11,"output_tokens":7}}\n'
+    ;;
+esac
+
+exit "$(fake_exit_code "$scenario")"

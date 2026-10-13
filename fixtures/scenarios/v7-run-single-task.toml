@@ -1,0 +1,17 @@
+name = "v7-run-single-task"
+kind = "differential"
+requires = ["run", "logs"]
+timeout_secs = 90
+description = """
+V7 through the run path: one `run <task-id>` producing a run record, its \
+JSONL event log and the resulting task state. The event log is the only \
+JSONL artifact in the tree, so this also exercises the appendJsonl line \
+shape and the PIPE_BUF rule end to end."""
+steps = [
+  "init --name proj --adapter claude",
+  "agent add worker --adapter claude --quiet",
+  "task add 'Do the thing' --assignee ${agent.0} --quiet",
+  "run ${task.0}",
+  "task list --json",
+  "logs --task ${task.0} --json",
+]

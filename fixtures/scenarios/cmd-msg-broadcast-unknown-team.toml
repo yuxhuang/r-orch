@@ -1,0 +1,24 @@
+name = "cmd-msg-broadcast-unknown-team"
+kind = "differential"
+requires = ["msg broadcast", "team create", "msg list"]
+description = """
+`msg broadcast --team <nonexistent>` silently fans out to EVERY agent. \
+message-service.ts resolves the team and filters only `if (team)` — there \
+is no else branch, so an unknown team id leaves the recipient list \
+unfiltered rather than erroring or sending nothing. Replicated, not fixed: \
+it is the difference between a two-member broadcast and an everyone \
+broadcast, so an implementation that validates the team id would send \
+strictly fewer messages than the oracle. The scenario puts a real two- \
+member team beside it, so the fan-out counts differ and the bug is visible \
+as a count rather than needing the reader to know it."""
+steps = [
+  "init --name proj --adapter claude",
+  "agent add second --adapter claude --quiet",
+  "agent add third --adapter claude --quiet",
+  "agent add fourth --adapter claude --quiet",
+  "team create duo --lead agt_creator --members ${agent.0} --quiet",
+  "msg broadcast 'to the duo' -s Duo --team ${team.0} --json",
+  "msg broadcast 'to nobody in particular' -s Ghost --team team_nosuch --json",
+  "msg list --json",
+  "msg inbox ${agent.2} --json",
+]

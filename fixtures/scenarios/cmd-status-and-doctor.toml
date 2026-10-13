@@ -1,0 +1,22 @@
+name = "cmd-status-and-doctor"
+kind = "differential"
+requires = ["status", "doctor"]
+description = """
+`status` and `doctor`. Two measured oddities: `status --json` emits \
+`state.claimed` and `state.running` as `{}` rather than arrays, because \
+the in-memory values are JS Sets/Maps; and `doctor --json` prints two \
+human lines before the JSON document, so a consumer piping it has to skip \
+them. `doctor` always exits 0 — it diagnoses, it does not gate. The fake \
+agents are first on PATH so the probe results are reproducible rather than \
+depending on what the machine has installed."""
+steps = [
+  "init --name proj --adapter claude",
+  "status",
+  "status --json",
+  "task add 'One' --quiet",
+  "agent add worker --adapter shell --command 'echo hi' --quiet",
+  "status",
+  "status --json",
+  "doctor",
+  "doctor --json",
+]

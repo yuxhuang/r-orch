@@ -1,0 +1,11 @@
+name = "walking-skeleton-shell"
+kind = "differential"
+description = """
+The shell-adapter init path, which deliberately creates **no** bootstrap \
+agent, plus the config.yml the adapter choice produces."""
+steps = [
+  "init --name shellproj --adapter shell",
+  "agent add runner --adapter shell --command 'npm test'",
+  "task add 'Run the suite' --assignee runner --priority 2",
+  "task list --json",
+]

@@ -1,1 +1,251 @@
+//! File-based config store — ported from
+//! `src/infrastructure/storage/config-store.ts`.
+//!
+//! Everything goes through the **raw merged value**, never through a typed
+//! `OrchestratorConfig`: the TS store deep-merges the parsed YAML over
+//! `DEFAULT_CONFIG` as plain objects, so unknown keys in a hand-authored
+//! `config.yml` survive a `config set` round trip. Deserializing to the typed
+//! struct and writing it back would silently delete them.
 
+use async_trait::async_trait;
+use orch_core::error::{Error, Result};
+use orch_core::storage::ConfigStore;
+use orch_domain::{OrchestratorConfig, deep_merge, default_config, get_by_path, set_by_path};
+use serde_json::Value;
+
+use super::fs_utils::{read_yaml_value, write_yaml};
+use super::paths::Paths;
+
+#[derive(Debug)]
+pub struct FileConfigStore {
+    paths: Paths,
+}
+
+impl FileConfigStore {
+    pub fn new(paths: Paths) -> Self {
+        FileConfigStore { paths }
+    }
+
+    /// The on-disk file deep-merged over the defaults, as a value tree.
+    /// A missing file yields the defaults.
+    pub async fn read_merged(&self) -> Result<Value> {
+        let defaults = serde_json::to_value(default_config())
+            .map_err(|err| Error::other(format!("serialize default config: {err}")))?;
+
+        let path = self.paths.config_path();
+        let Some(on_disk) = read_yaml_value(&path).await? else {
+            return Ok(defaults);
+        };
+        // YAML → JSON value so one merge implementation serves both.
+        let on_disk: Value = serde_json::to_value(&on_disk)
+            .map_err(|err| Error::serde(format!("convert {}", path.display()), &path, err))?;
+
+        // An empty file parses as `null`, and js-yaml returns `undefined` for
+        // it; the TS store then merges `{}`. Anything that is not a mapping
+        // gets the same treatment rather than replacing the whole tree.
+        if !on_disk.is_object() {
+            return Ok(defaults);
+        }
+        Ok(deep_merge(&defaults, &on_disk))
+    }
+
+    async fn write_merged(&self, value: &Value) -> Result<()> {
+        write_yaml(&self.paths.config_path(), value).await
+    }
+}
+
+#[async_trait]
+impl ConfigStore for FileConfigStore {
+    async fn read(&self) -> Result<OrchestratorConfig> {
+        let merged = self.read_merged().await?;
+        let path = self.paths.config_path();
+        serde_json::from_value(merged)
+            .map_err(|err| Error::serde(format!("parse {}", path.display()), &path, err))
+    }
+
+    async fn write(&self, config: &OrchestratorConfig) -> Result<()> {
+        let value = serde_json::to_value(config)
+            .map_err(|err| Error::other(format!("serialize config: {err}")))?;
+        self.write_merged(&value).await
+    }
+
+    async fn get(&self, key_path: &str) -> Result<Option<Value>> {
+        Ok(get_by_path(&self.read_merged().await?, key_path).cloned())
+    }
+
+    async fn set(&self, key_path: &str, value: Value) -> Result<()> {
+        let mut merged = self.read_merged().await?;
+        set_by_path(&mut merged, key_path, value);
+        self.write_merged(&merged).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::fs_utils::{atomic_write, clear_ensured_dirs, ensure_dir};
+    use orch_domain::{ApprovalPolicy, WorkspaceMode};
+    use serde_json::json;
+
+    async fn store(root: &std::path::Path) -> FileConfigStore {
+        clear_ensured_dirs();
+        let paths = Paths::new(root);
+        ensure_dir(&paths.root()).await.unwrap();
+        FileConfigStore::new(paths)
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_reads_as_the_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        let config = store.read().await.unwrap();
+        assert_eq!(config, default_config());
+    }
+
+    #[tokio::test]
+    async fn a_partial_file_merges_over_the_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        atomic_write(
+            &store.paths.config_path(),
+            "project:\n  name: proj\nscheduling:\n  max_concurrent_agents: 2\n",
+        )
+        .await
+        .unwrap();
+
+        let config = store.read().await.unwrap();
+        assert_eq!(config.project.name, "proj");
+        assert_eq!(config.scheduling.max_concurrent_agents, 2);
+        // Untouched keys keep their defaults.
+        assert_eq!(config.scheduling.poll_interval_ms, 10_000);
+        assert_eq!(config.defaults.agent.adapter, "claude");
+        assert_eq!(
+            config.defaults.agent.workspace_mode,
+            WorkspaceMode::Worktree
+        );
+    }
+
+    #[tokio::test]
+    async fn written_config_matches_the_init_file_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        let mut config = default_config();
+        config.project.name = "proj".into();
+        store.write(&config).await.unwrap();
+
+        // PARITY.md §6.5, as written by `init`.
+        assert_eq!(
+            tokio::fs::read_to_string(store.paths.config_path())
+                .await
+                .unwrap(),
+            "project:\n  name: proj\ndefaults:\n  agent:\n    adapter: claude\n    approval_policy: auto\n    max_turns: 50\n    timeout_ms: 3600000\n    stall_timeout_ms: 600000\n    workspace_mode: worktree\n  task:\n    max_attempts: 3\n    priority: 3\nscheduling:\n  poll_interval_ms: 10000\n  max_concurrent_agents: 6\n  retry_base_delay_ms: 10000\n  retry_max_delay_ms: 300000\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_and_set_use_dot_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        assert_eq!(
+            store.get("defaults.agent.max_turns").await.unwrap(),
+            Some(json!(50))
+        );
+        assert_eq!(
+            store.get("project.name").await.unwrap(),
+            Some(json!("my-project"))
+        );
+        assert_eq!(store.get("nope").await.unwrap(), None);
+        assert_eq!(
+            store.get("defaults.agent.max_turns.deeper").await.unwrap(),
+            None
+        );
+
+        store
+            .set("defaults.agent.approval_policy", json!("manual"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read().await.unwrap().defaults.agent.approval_policy,
+            ApprovalPolicy::Manual
+        );
+    }
+
+    #[tokio::test]
+    async fn set_creates_missing_intermediate_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        store
+            .set("prompt.system_template", json!("custom.md"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .read()
+                .await
+                .unwrap()
+                .prompt
+                .unwrap()
+                .system_template
+                .as_deref(),
+            Some("custom.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_keys_survive_a_set_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        atomic_write(
+            &store.paths.config_path(),
+            "project:\n  name: proj\nmy_extension:\n  k: v\n",
+        )
+        .await
+        .unwrap();
+
+        store.set("project.name", json!("renamed")).await.unwrap();
+
+        let raw = tokio::fs::read_to_string(store.paths.config_path())
+            .await
+            .unwrap();
+        assert!(
+            raw.contains("my_extension"),
+            "unknown key was dropped:\n{raw}"
+        );
+        assert_eq!(store.get("my_extension.k").await.unwrap(), Some(json!("v")));
+        assert_eq!(
+            store.get("project.name").await.unwrap(),
+            Some(json!("renamed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_keys_resolve_the_way_js_yaml_resolves_them() {
+        // PARITY.md §6.4.2, V38. Reachable only in a hand-authored file.
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        atomic_write(
+            &store.paths.config_path(),
+            "base: &b\n  max_concurrent_agents: 99\n  poll_interval_ms: 5\nscheduling:\n  <<: *b\n",
+        )
+        .await
+        .unwrap();
+
+        let config = store.read().await.unwrap();
+        assert_eq!(config.scheduling.max_concurrent_agents, 99);
+        assert_eq!(config.scheduling.poll_interval_ms, 5);
+        assert_eq!(
+            store.get("scheduling.max_concurrent_agents").await.unwrap(),
+            Some(json!(99))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_reads_as_the_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        atomic_write(&store.paths.config_path(), "").await.unwrap();
+        // An empty YAML document is `null`, which deep_merge replaces with —
+        // so the result must still be usable.
+        assert_eq!(store.read().await.unwrap(), default_config());
+    }
+}

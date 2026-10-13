@@ -1,0 +1,28 @@
+name = "o7-concurrency-cap"
+kind = "differential"
+requires = ["serve", "config set", "status"]
+timeout_secs = 90
+description = """
+Red-team O7 / V36: six ready tasks against max_concurrent_agents = 2. The \
+cap must never be exceeded, and the dispatch order, the claim/release \
+sequence and the final tree must match the oracle. The priorities are \
+deliberately tied in pairs so the tie-break order is exercised too — §14.4 \
+is REPLICATE, so ties resolve by _index.json last-write order rather than \
+by anything intrinsic to the agent."""
+steps = [
+  "init --name proj --adapter claude",
+  "config set scheduling.max_concurrent_agents 2",
+  "config set scheduling.poll_interval_ms 300",
+  "agent add a1 --adapter claude --quiet",
+  "agent add a2 --adapter claude --quiet",
+  "agent add a3 --adapter claude --quiet",
+  "task add one --priority 1 --quiet",
+  "task add two --priority 1 --quiet",
+  "task add three --priority 2 --quiet",
+  "task add four --priority 2 --quiet",
+  "task add five --priority 3 --quiet",
+  "task add six --priority 4 --quiet",
+  "serve --once --log-format json",
+  "task list --json",
+  "status --json",
+]

@@ -1,0 +1,13 @@
+{
+  "events": [
+    {
+      "type": "output",
+      "data": "hello world"
+    },
+    {
+      "type": "output",
+      "data": "second line"
+    }
+  ],
+  "error": null
+}

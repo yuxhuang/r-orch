@@ -1,0 +1,97 @@
+{
+  "name": "everything.user",
+  "template": "user",
+  "context": {
+    "project": {
+      "name": "demo-project",
+      "description": "A demo."
+    },
+    "task": {
+      "id": "tsk_abc1234",
+      "title": "Fix login bug",
+      "description": "Fix the login bug\nin auth.",
+      "priority": 3,
+      "labels": [
+        "autonomous",
+        "x"
+      ],
+      "scope": [
+        "src/api/**"
+      ],
+      "is_autonomous": true,
+      "goal_id": "goal_123"
+    },
+    "agent": {
+      "id": "agt_aaa1111",
+      "name": "Backend A",
+      "role": "Senior Dev"
+    },
+    "agents": [
+      {
+        "id": "agt_aaa1111",
+        "name": "Backend A",
+        "role": null,
+        "adapter": "claude"
+      },
+      {
+        "id": "agt_bbb2222",
+        "name": "QA B",
+        "role": "QA Engineer\n## WORKFLOW\nrun tests",
+        "adapter": "codex"
+      },
+      {
+        "id": "agt_ccc3333",
+        "name": "Shelly",
+        "role": null,
+        "adapter": "shell"
+      }
+    ],
+    "attempt": 2,
+    "workspace_path": "/tmp/work/tsk_abc1234",
+    "retry": {
+      "previous_error": "e",
+      "previous_output": "o"
+    },
+    "feedback": "fb",
+    "shared_context": [
+      [
+        "goal_123-progress",
+        "half"
+      ],
+      [
+        "k",
+        "v"
+      ]
+    ],
+    "messages": [
+      {
+        "id": "msg_1",
+        "from": "Agent 1",
+        "subject": "Subject 1",
+        "body": "Body line 1\nsecond line",
+        "sent_at": "2026-01-02T03:04:05.678Z",
+        "reply_to": null
+      },
+      {
+        "id": "msg_2",
+        "from": "Agent 2",
+        "subject": "Subject 2",
+        "body": "Body line 2\nsecond line",
+        "sent_at": "2026-01-02T03:04:05.678Z",
+        "reply_to": null
+      }
+    ],
+    "goal": {
+      "id": "goal_123",
+      "title": "Ship v2",
+      "description": "Make it fast.\nAnd safe.",
+      "status": "active",
+      "task_names": [
+        "[todo] A",
+        "[done] B"
+      ],
+      "progress": "prog"
+    }
+  },
+  "expected": "## Task: Fix login bug\nFix the login bug\nin auth.\n\nPriority: 3\nAttempt: 2\n\n## Previous attempt failed\n**Error:** e\n\n**Last output:**\n```\no\n```\n\n**Important:** The previous approach failed. Analyze the error above and try a different strategy. Do NOT repeat the same steps that led to the failure.\n\n\n## Context\nProject: demo-project\nWorking directory: /tmp/work/tsk_abc1234\n\n## Team\nYou are part of a multi-agent team. Available agents:\n- **Backend A** (claude) · ID: `agt_aaa1111`\n- **QA B** (codex) — QA Engineer\n## WORKFLOW\nrun tests · ID: `agt_bbb2222`\n- **Shelly** (shell) · ID: `agt_ccc3333`\n\nUse `orch agent list` to check current agent statuses. Find teammates by name/role — do NOT hardcode agent IDs.\n\n\n## Review Feedback\nThis task was previously completed but **rejected** during review with the following feedback:\n> fb\n\n**Important:** Address the feedback above. Focus on what the reviewer asked to change. Do NOT redo work that was already accepted.\n\n\n\n## Shared Context\nOther agents have shared the following information:\n- **goal_123-progress**: half\n- **k**: v\n\n\n\n\n## Inbox (2 messages)\n\n---\n**From:** Agent 1 · **Subject:** Subject 1\nBody line 1\nsecond line\n\n---\n\n---\n**From:** Agent 2 · **Subject:** Subject 2\nBody line 2\nsecond line\n\n---\n\n\n\n\n## Goal: Ship v2\n**Status:** active · **ID:** `goal_123`\n\nMake it fast.\nAnd safe.\n\n\n**Linked tasks (2):**\n- [todo] A\n- [done] B\n\nUse `orch task list --goal-id goal_123` and `orch task show <id>` to inspect details.\n\n\n**Latest progress report:**\nprog\n\n\n"
+}

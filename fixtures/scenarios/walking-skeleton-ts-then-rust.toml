@@ -1,0 +1,23 @@
+name = "walking-skeleton-ts-then-rust"
+kind = "ts_then_rust"
+split_at = 3
+description = """
+The reverse direction: the TypeScript binary writes the project and r-orch \
+reads and extends it. Catches a reader that is stricter than js-yaml's writer \
+— for instance a folded `>-` scalar at lineWidth 120, which js-yaml emits and \
+serde_yaml_ng does not."""
+# Read-only only: a verify step runs once per binary over the shared tree.
+verify = [
+  "task list --json",
+  "task list",
+  "task list --quiet",
+  "task list --status todo",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "agent add shelly --adapter shell --command 'echo hello'",
+  "task add 'Written by ts' --assignee shelly",
+  "task list --json",
+  "task add 'Written by rust' --priority 1",
+  "task list --json",
+]

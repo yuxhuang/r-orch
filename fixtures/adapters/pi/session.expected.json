@@ -1,0 +1,112 @@
+{
+  "events": [
+    {
+      "type": "output",
+      "data": {
+        "text": "Reading sources…"
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "read",
+        "input": {
+          "path": "src/foo.ts"
+        },
+        "raw": {
+          "type": "tool_execution_start",
+          "toolName": "read",
+          "args": {
+            "path": "src/foo.ts"
+          }
+        }
+      }
+    },
+    {
+      "type": "command",
+      "data": {
+        "command": "npm test",
+        "result": "passed",
+        "raw": {
+          "type": "tool_execution_end",
+          "toolName": "bash",
+          "args": {
+            "command": "npm test"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "passed"
+              }
+            ],
+            "details": {
+              "exitCode": 0
+            }
+          },
+          "isError": false
+        }
+      }
+    },
+    {
+      "type": "file_change",
+      "data": {
+        "paths": [
+          "src/foo.ts"
+        ],
+        "raw": {
+          "type": "tool_execution_end",
+          "toolName": "write",
+          "args": {
+            "path": "src/foo.ts"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "written"
+              }
+            ]
+          },
+          "isError": false
+        }
+      }
+    },
+    {
+      "type": "done",
+      "data": {
+        "result": "Implementation complete.",
+        "raw": {
+          "type": "agent_end",
+          "messages": [
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Implementation complete."
+                }
+              ],
+              "usage": {
+                "input": 42,
+                "output": 17,
+                "reasoning": 3,
+                "cache_read": 5,
+                "cache_write": 0
+              }
+            }
+          ]
+        }
+      },
+      "tokens": {
+        "input": 42,
+        "output": 17,
+        "reasoning": 3,
+        "total": 62,
+        "cache_read": 5,
+        "cache_write": 0
+      }
+    }
+  ],
+  "error": null
+}

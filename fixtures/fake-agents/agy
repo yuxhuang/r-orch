@@ -1,0 +1,16 @@
+#!/bin/sh
+# Fake `agy` (Antigravity) — `-p <prompt>`, plain text on stdout.
+. "$(dirname "$0")/_common.sh"
+
+fake_handle_version "$@"
+prompt=$(fake_value_after "-p" "$@")
+scenario=$(fake_scenario "$prompt")
+
+fake_before_output "$scenario"
+
+if [ "$scenario" != "silent" ]; then
+  printf '%s\n' "$(fake_reply)"
+fi
+
+fake_failure_stderr "$scenario"
+exit "$(fake_exit_code "$scenario")"

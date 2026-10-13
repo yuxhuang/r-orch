@@ -1,0 +1,26 @@
+name = "cmd-logs"
+kind = "differential"
+requires = ["logs"]
+description = """
+`logs` argument validation, an explicit process.exit(2) guard: none of \
+[run-id], --task, --agent or --since is an error reading `Specify a run \
+ID, --task, --agent, or --since <duration>`. The --since duration parser \
+is hand-written in both implementations, so several shapes are compared — \
+a bad one is also exit 2, with `Invalid duration: "nonsense". Use format: \
+5m, 1h, 30s, 1d`. A query that simply matches nothing is exit 0 and an \
+empty array."""
+steps = [
+  "init --name proj --adapter claude",
+  "logs",
+  "logs --since 30s --json",
+  "logs --since 5m --json",
+  "logs --since 1h --json",
+  "logs --since 1d --json",
+  "logs --since nonsense",
+  "logs --since 5",
+  "logs --since 5x",
+  "logs --task tsk_nosuch --json",
+  "logs --agent agt_creator --json",
+  "logs run_nosuch --json",
+  "logs --since 5m",
+]

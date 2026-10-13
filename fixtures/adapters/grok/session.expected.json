@@ -1,0 +1,31 @@
+{
+  "events": [
+    {
+      "type": "tool_call",
+      "data": {
+        "type": "tool_call",
+        "name": "read",
+        "input": {
+          "path": "src/index.ts"
+        }
+      }
+    },
+    {
+      "type": "output",
+      "data": {
+        "text": "ORCH_OK"
+      }
+    },
+    {
+      "type": "done",
+      "data": {
+        "result": "ORCH_OK",
+        "raw": {
+          "type": "end",
+          "stopReason": "EndTurn"
+        }
+      }
+    }
+  ],
+  "error": null
+}

@@ -1,0 +1,78 @@
+{
+  "name": "messages-3.user",
+  "template": "user",
+  "context": {
+    "project": {
+      "name": "demo-project",
+      "description": null
+    },
+    "task": {
+      "id": "tsk_abc1234",
+      "title": "Fix login bug",
+      "description": "Fix the login bug\nin auth.",
+      "priority": 3,
+      "labels": [],
+      "scope": null,
+      "is_autonomous": false,
+      "goal_id": null
+    },
+    "agent": {
+      "id": "agt_aaa1111",
+      "name": "Backend A",
+      "role": "Senior Dev"
+    },
+    "agents": [
+      {
+        "id": "agt_aaa1111",
+        "name": "Backend A",
+        "role": null,
+        "adapter": "claude"
+      },
+      {
+        "id": "agt_bbb2222",
+        "name": "QA B",
+        "role": "QA Engineer\n## WORKFLOW\nrun tests",
+        "adapter": "codex"
+      },
+      {
+        "id": "agt_ccc3333",
+        "name": "Shelly",
+        "role": null,
+        "adapter": "shell"
+      }
+    ],
+    "attempt": null,
+    "workspace_path": "/tmp/work/tsk_abc1234",
+    "retry": null,
+    "feedback": null,
+    "shared_context": null,
+    "messages": [
+      {
+        "id": "msg_1",
+        "from": "Agent 1",
+        "subject": "Subject 1",
+        "body": "Body line 1\nsecond line",
+        "sent_at": "2026-01-02T03:04:05.678Z",
+        "reply_to": null
+      },
+      {
+        "id": "msg_2",
+        "from": "Agent 2",
+        "subject": "",
+        "body": "Body line 2\nsecond line",
+        "sent_at": "2026-01-02T03:04:05.678Z",
+        "reply_to": "msg_1"
+      },
+      {
+        "id": "msg_3",
+        "from": "Agent 3",
+        "subject": "Subject 3",
+        "body": "Body line 3\nsecond line",
+        "sent_at": "2026-01-02T03:04:05.678Z",
+        "reply_to": null
+      }
+    ],
+    "goal": null
+  },
+  "expected": "## Task: Fix login bug\nFix the login bug\nin auth.\n\nPriority: 3\n\n\n\n## Context\nProject: demo-project\nWorking directory: /tmp/work/tsk_abc1234\n\n## Team\nYou are part of a multi-agent team. Available agents:\n- **Backend A** (claude) · ID: `agt_aaa1111`\n- **QA B** (codex) — QA Engineer\n## WORKFLOW\nrun tests · ID: `agt_bbb2222`\n- **Shelly** (shell) · ID: `agt_ccc3333`\n\nUse `orch agent list` to check current agent statuses. Find teammates by name/role — do NOT hardcode agent IDs.\n\n\n\n\n\n\n## Inbox (3 messages)\n\n---\n**From:** Agent 1 · **Subject:** Subject 1\nBody line 1\nsecond line\n\n---\n\n---\n**From:** Agent 2\nBody line 2\nsecond line\n*(Reply to: msg_1)*\n---\n\n---\n**From:** Agent 3 · **Subject:** Subject 3\nBody line 3\nsecond line\n\n---\n\n\n\n\n"
+}

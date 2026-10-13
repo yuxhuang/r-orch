@@ -1,0 +1,960 @@
+[
+  {
+    "name": "empty",
+    "entries": [],
+    "filter": {
+      "agentName": "Backend A"
+    },
+    "expected": []
+  },
+  {
+    "name": "goal-prefix",
+    "entries": [
+      [
+        "other",
+        "x"
+      ],
+      [
+        "Goal_1-progress",
+        "y"
+      ],
+      [
+        "zzz",
+        "z"
+      ]
+    ],
+    "filter": {
+      "agentName": "Backend A",
+      "goalId": "goal_1"
+    },
+    "expected": [
+      [
+        "Goal_1-progress",
+        "y"
+      ],
+      [
+        "other",
+        "x"
+      ],
+      [
+        "zzz",
+        "z"
+      ]
+    ]
+  },
+  {
+    "name": "agent-name-in-key-or-value",
+    "entries": [
+      [
+        "a",
+        "nothing"
+      ],
+      [
+        "b",
+        "mentions BACKEND A here"
+      ],
+      [
+        "backend a-notes",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Backend A"
+    },
+    "expected": [
+      [
+        "b",
+        "mentions BACKEND A here"
+      ],
+      [
+        "backend a-notes",
+        "v"
+      ],
+      [
+        "a",
+        "nothing"
+      ]
+    ]
+  },
+  {
+    "name": "scope",
+    "entries": [
+      [
+        "x",
+        "y"
+      ],
+      [
+        "api-refactor",
+        "done"
+      ],
+      [
+        "docs",
+        "src/api/ is hot"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed",
+      "taskScope": [
+        "src/api/**"
+      ]
+    },
+    "expected": [
+      [
+        "docs",
+        "src/api/ is hot"
+      ],
+      [
+        "x",
+        "y"
+      ],
+      [
+        "api-refactor",
+        "done"
+      ]
+    ]
+  },
+  {
+    "name": "scope-wildcard-only",
+    "entries": [
+      [
+        "x",
+        "y"
+      ],
+      [
+        "z",
+        "w"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed",
+      "taskScope": [
+        "**",
+        "*",
+        "/"
+      ]
+    },
+    "expected": [
+      [
+        "x",
+        "y"
+      ],
+      [
+        "z",
+        "w"
+      ]
+    ]
+  },
+  {
+    "name": "scope-first-match-breaks",
+    "entries": [
+      [
+        "k",
+        "src/a and lib/b"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed",
+      "taskScope": [
+        "src/a",
+        "lib/b"
+      ]
+    },
+    "expected": [
+      [
+        "k",
+        "src/a and lib/b"
+      ]
+    ]
+  },
+  {
+    "name": "role-prefix",
+    "entries": [
+      [
+        "frontend-x",
+        "v"
+      ],
+      [
+        "backend-x",
+        "v"
+      ],
+      [
+        "backend_y",
+        "v"
+      ],
+      [
+        "backend",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Backend A"
+    },
+    "expected": [
+      [
+        "backend-x",
+        "v"
+      ],
+      [
+        "backend_y",
+        "v"
+      ],
+      [
+        "frontend-x",
+        "v"
+      ],
+      [
+        "backend",
+        "v"
+      ]
+    ]
+  },
+  {
+    "name": "front-end-keywords",
+    "entries": [
+      [
+        "backend-1",
+        "v"
+      ],
+      [
+        "tui-1",
+        "v"
+      ],
+      [
+        "frontend-1",
+        "v"
+      ],
+      [
+        "front-end-1",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Front-End"
+    },
+    "expected": [
+      [
+        "front-end-1",
+        "v"
+      ],
+      [
+        "tui-1",
+        "v"
+      ],
+      [
+        "frontend-1",
+        "v"
+      ],
+      [
+        "backend-1",
+        "v"
+      ]
+    ]
+  },
+  {
+    "name": "marketing-keywords",
+    "entries": [
+      [
+        "marketer-1",
+        "v"
+      ],
+      [
+        "cmo_1",
+        "v"
+      ],
+      [
+        "marketing-1",
+        "v"
+      ],
+      [
+        "x",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Marketing Lead"
+    },
+    "expected": [
+      [
+        "marketer-1",
+        "v"
+      ],
+      [
+        "cmo_1",
+        "v"
+      ],
+      [
+        "marketing-1",
+        "v"
+      ],
+      [
+        "x",
+        "v"
+      ]
+    ]
+  },
+  {
+    "name": "role-first-word",
+    "entries": [
+      [
+        "senior-x",
+        "v"
+      ],
+      [
+        "x",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed",
+      "agentRole": "Senior Dev"
+    },
+    "expected": [
+      [
+        "senior-x",
+        "v"
+      ],
+      [
+        "x",
+        "v"
+      ]
+    ]
+  },
+  {
+    "name": "role-first-word-short",
+    "entries": [
+      [
+        "qa-x",
+        "v"
+      ],
+      [
+        "x",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed",
+      "agentRole": "qa engineer"
+    },
+    "expected": [
+      [
+        "qa-x",
+        "v"
+      ],
+      [
+        "x",
+        "v"
+      ]
+    ]
+  },
+  {
+    "name": "role-dup-keyword",
+    "entries": [
+      [
+        "backend-x",
+        "v"
+      ],
+      [
+        "y",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Backend A",
+      "agentRole": "Backend dev"
+    },
+    "expected": [
+      [
+        "backend-x",
+        "v"
+      ],
+      [
+        "y",
+        "v"
+      ]
+    ]
+  },
+  {
+    "name": "generic-prefixes",
+    "entries": [
+      [
+        "unrelated",
+        "v"
+      ],
+      [
+        "bug-1",
+        "v"
+      ],
+      [
+        "PERF-2",
+        "v"
+      ],
+      [
+        "stability-3",
+        "v"
+      ],
+      [
+        "docs-4",
+        "v"
+      ],
+      [
+        "arch-5",
+        "v"
+      ],
+      [
+        "spec-6",
+        "v"
+      ],
+      [
+        "bugs",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed"
+    },
+    "expected": [
+      [
+        "bug-1",
+        "v"
+      ],
+      [
+        "PERF-2",
+        "v"
+      ],
+      [
+        "stability-3",
+        "v"
+      ],
+      [
+        "docs-4",
+        "v"
+      ],
+      [
+        "arch-5",
+        "v"
+      ],
+      [
+        "spec-6",
+        "v"
+      ],
+      [
+        "unrelated",
+        "v"
+      ],
+      [
+        "bugs",
+        "v"
+      ]
+    ]
+  },
+  {
+    "name": "stable-ties",
+    "entries": [
+      [
+        "c",
+        "1"
+      ],
+      [
+        "a",
+        "2"
+      ],
+      [
+        "b",
+        "3"
+      ],
+      [
+        "bug-z",
+        "4"
+      ],
+      [
+        "bug-a",
+        "5"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed"
+    },
+    "expected": [
+      [
+        "bug-z",
+        "4"
+      ],
+      [
+        "bug-a",
+        "5"
+      ],
+      [
+        "c",
+        "1"
+      ],
+      [
+        "a",
+        "2"
+      ],
+      [
+        "b",
+        "3"
+      ]
+    ]
+  },
+  {
+    "name": "limit-15",
+    "entries": [
+      [
+        "k00",
+        "v0"
+      ],
+      [
+        "k01",
+        "v1"
+      ],
+      [
+        "k02",
+        "v2"
+      ],
+      [
+        "k03",
+        "v3"
+      ],
+      [
+        "k04",
+        "v4"
+      ],
+      [
+        "k05",
+        "v5"
+      ],
+      [
+        "k06",
+        "v6"
+      ],
+      [
+        "k07",
+        "v7"
+      ],
+      [
+        "k08",
+        "v8"
+      ],
+      [
+        "k09",
+        "v9"
+      ],
+      [
+        "k10",
+        "v10"
+      ],
+      [
+        "k11",
+        "v11"
+      ],
+      [
+        "k12",
+        "v12"
+      ],
+      [
+        "k13",
+        "v13"
+      ],
+      [
+        "k14",
+        "v14"
+      ],
+      [
+        "k15",
+        "v15"
+      ],
+      [
+        "k16",
+        "v16"
+      ],
+      [
+        "k17",
+        "v17"
+      ],
+      [
+        "k18",
+        "v18"
+      ],
+      [
+        "k19",
+        "v19"
+      ],
+      [
+        "k20",
+        "v20"
+      ],
+      [
+        "k21",
+        "v21"
+      ],
+      [
+        "k22",
+        "v22"
+      ],
+      [
+        "k23",
+        "v23"
+      ],
+      [
+        "k24",
+        "v24"
+      ],
+      [
+        "k25",
+        "v25"
+      ],
+      [
+        "k26",
+        "v26"
+      ],
+      [
+        "k27",
+        "v27"
+      ],
+      [
+        "k28",
+        "v28"
+      ],
+      [
+        "k29",
+        "v29"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed"
+    },
+    "expected": [
+      [
+        "k00",
+        "v0"
+      ],
+      [
+        "k01",
+        "v1"
+      ],
+      [
+        "k02",
+        "v2"
+      ],
+      [
+        "k03",
+        "v3"
+      ],
+      [
+        "k04",
+        "v4"
+      ],
+      [
+        "k05",
+        "v5"
+      ],
+      [
+        "k06",
+        "v6"
+      ],
+      [
+        "k07",
+        "v7"
+      ],
+      [
+        "k08",
+        "v8"
+      ],
+      [
+        "k09",
+        "v9"
+      ],
+      [
+        "k10",
+        "v10"
+      ],
+      [
+        "k11",
+        "v11"
+      ],
+      [
+        "k12",
+        "v12"
+      ],
+      [
+        "k13",
+        "v13"
+      ],
+      [
+        "k14",
+        "v14"
+      ]
+    ]
+  },
+  {
+    "name": "limit-15-mixed",
+    "entries": [
+      [
+        "bug-0",
+        "v0"
+      ],
+      [
+        "k1",
+        "v1"
+      ],
+      [
+        "k2",
+        "v2"
+      ],
+      [
+        "bug-3",
+        "v3"
+      ],
+      [
+        "k4",
+        "v4"
+      ],
+      [
+        "k5",
+        "v5"
+      ],
+      [
+        "bug-6",
+        "v6"
+      ],
+      [
+        "k7",
+        "v7"
+      ],
+      [
+        "k8",
+        "v8"
+      ],
+      [
+        "bug-9",
+        "v9"
+      ],
+      [
+        "k10",
+        "v10"
+      ],
+      [
+        "k11",
+        "v11"
+      ],
+      [
+        "bug-12",
+        "v12"
+      ],
+      [
+        "k13",
+        "v13"
+      ],
+      [
+        "k14",
+        "v14"
+      ],
+      [
+        "bug-15",
+        "v15"
+      ],
+      [
+        "k16",
+        "v16"
+      ],
+      [
+        "k17",
+        "v17"
+      ],
+      [
+        "bug-18",
+        "v18"
+      ],
+      [
+        "k19",
+        "v19"
+      ],
+      [
+        "k20",
+        "v20"
+      ],
+      [
+        "bug-21",
+        "v21"
+      ],
+      [
+        "k22",
+        "v22"
+      ],
+      [
+        "k23",
+        "v23"
+      ],
+      [
+        "bug-24",
+        "v24"
+      ],
+      [
+        "k25",
+        "v25"
+      ],
+      [
+        "k26",
+        "v26"
+      ],
+      [
+        "bug-27",
+        "v27"
+      ],
+      [
+        "k28",
+        "v28"
+      ],
+      [
+        "k29",
+        "v29"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed"
+    },
+    "expected": [
+      [
+        "bug-0",
+        "v0"
+      ],
+      [
+        "bug-3",
+        "v3"
+      ],
+      [
+        "bug-6",
+        "v6"
+      ],
+      [
+        "bug-9",
+        "v9"
+      ],
+      [
+        "bug-12",
+        "v12"
+      ],
+      [
+        "bug-15",
+        "v15"
+      ],
+      [
+        "bug-18",
+        "v18"
+      ],
+      [
+        "bug-21",
+        "v21"
+      ],
+      [
+        "bug-24",
+        "v24"
+      ],
+      [
+        "bug-27",
+        "v27"
+      ],
+      [
+        "k1",
+        "v1"
+      ],
+      [
+        "k2",
+        "v2"
+      ],
+      [
+        "k4",
+        "v4"
+      ],
+      [
+        "k5",
+        "v5"
+      ],
+      [
+        "k7",
+        "v7"
+      ]
+    ]
+  },
+  {
+    "name": "long-value",
+    "entries": [
+      [
+        "k",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ]
+    ],
+    "filter": {
+      "agentName": "Zed"
+    },
+    "expected": [
+      [
+        "k",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ]
+    ]
+  },
+  {
+    "name": "unicode-case",
+    "entries": [
+      [
+        "ÄGENT-notes",
+        "v"
+      ],
+      [
+        "x",
+        "ÄGENT here"
+      ]
+    ],
+    "filter": {
+      "agentName": "Ägent"
+    },
+    "expected": [
+      [
+        "ÄGENT-notes",
+        "v"
+      ],
+      [
+        "x",
+        "ÄGENT here"
+      ]
+    ]
+  },
+  {
+    "name": "empty-agent-name",
+    "entries": [
+      [
+        "a",
+        "b"
+      ]
+    ],
+    "filter": {
+      "agentName": ""
+    },
+    "expected": [
+      [
+        "a",
+        "b"
+      ]
+    ]
+  },
+  {
+    "name": "short-first-word",
+    "entries": [
+      [
+        "a-x",
+        "v"
+      ]
+    ],
+    "filter": {
+      "agentName": "A B"
+    },
+    "expected": [
+      [
+        "a-x",
+        "v"
+      ]
+    ]
+  }
+]

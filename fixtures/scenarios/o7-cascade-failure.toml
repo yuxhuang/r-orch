@@ -1,0 +1,26 @@
+name = "o7-cascade-failure"
+kind = "differential"
+requires = ["serve", "config set", "status"]
+timeout_secs = 120
+env = { ORCH_FAKE_SCENARIO = "fail" }
+description = """
+Red-team O7 / V26: a diamond dependency graph whose root fails. Both \
+branches and the shared leaf must be cascade-failed with the same reason \
+text, and the leaf exactly once even though two paths reach it. The \
+${task.N} placeholders resolve per tree, since the two binaries mint \
+different ids — without them a dependency graph is not expressible in a \
+differential scenario at all."""
+steps = [
+  "init --name proj --adapter claude",
+  "config set scheduling.poll_interval_ms 200",
+  "config set defaults.task.max_attempts 1",
+  "agent add worker --adapter claude --quiet",
+  "task add root --assignee ${agent.0} --quiet",
+  "task add left --depends-on ${task.0} --quiet",
+  "task add right --depends-on ${task.0} --quiet",
+  "task add leaf --depends-on ${task.1},${task.2} --quiet",
+  "task list --json",
+  "serve --once --log-format json",
+  "task list --json",
+  "status --json",
+]

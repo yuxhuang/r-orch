@@ -1,0 +1,21 @@
+name = "cmd-msg-body-trimming"
+kind = "differential"
+requires = ["msg send", "msg list"]
+description = """
+The body is validated **trimmed** and stored **untrimmed**: message- \
+service.ts rejects on `!input.body.trim()` but then stores \
+`input.body.slice(0, 4000)`. So a body of three spaces is an error while ' \
+padded ' is accepted and keeps both spaces on disk. An implementation that \
+trims before storing passes every "it was rejected" test and still \
+diverges on every message anyone sends with a trailing newline. The \
+subject is not trimmed or validated at all — empty becomes the literal \
+'(no subject)'."""
+steps = [
+  "init --name proj --adapter claude",
+  "msg send agt_creator ' padded ' -s ' spaced subject ' --json",
+  "msg send agt_creator '\n\tleading whitespace' -s S --json",
+  "msg send agt_creator '' -s S",
+  "msg send agt_creator '   ' -s S",
+  "msg send agt_creator ' body ' -s ''",
+  "msg list --json",
+]

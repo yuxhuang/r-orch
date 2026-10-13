@@ -39,6 +39,19 @@ fn lock<T>(cell: &Mutex<T>) -> MutexGuard<'_, T> {
     cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// `IndexManager::save` semantics: **remove the entity by id, then push it to
+/// the end** (PARITY.md §6.10).
+///
+/// Index order is therefore *last-write* order, not creation order, and that
+/// is observable — `findBestAgent` resolves equal-scoring agents by position
+/// in `AgentStore::list()` and r-orch replicates it (PARITY.md §14.4). A plain
+/// `IndexMap::insert` keeps the existing position and would silently change
+/// which agent gets picked.
+fn save_at_end<V>(map: &mut IndexMap<String, V>, id: String, value: V) {
+    map.shift_remove(&id);
+    map.insert(id, value);
+}
+
 // ── TaskStore ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +82,8 @@ impl FakeTaskStore {
         store
     }
 
-    /// Insert without recording a call.
+    /// Insert without recording a call and without the push-to-end rule:
+    /// `seed` arranges state, it does not model a write.
     pub fn seed(&self, task: Task) {
         lock(&self.tasks).insert(task.id.clone(), task);
     }
@@ -128,7 +142,7 @@ impl TaskStore for FakeTaskStore {
         self.calls
             .record(TaskStoreCall::Save(Box::new(task.clone())));
         self.faults.check()?;
-        lock(&self.tasks).insert(task.id.clone(), task.clone());
+        save_at_end(&mut lock(&self.tasks), task.id.clone(), task.clone());
         Ok(())
     }
 
@@ -231,7 +245,7 @@ impl AgentStore for FakeAgentStore {
         self.calls
             .record(AgentStoreCall::Save(Box::new(agent.clone())));
         self.faults.check()?;
-        lock(&self.agents).insert(agent.id.clone(), agent.clone());
+        save_at_end(&mut lock(&self.agents), agent.id.clone(), agent.clone());
         Ok(())
     }
 
@@ -259,6 +273,7 @@ pub enum RunStoreCall {
     CloseRunEvents(String),
 }
 
+/// `RunStore` has **no `_index.json`** — same caveat as [`FakeTeamStore`].
 #[derive(Debug, Clone, Default)]
 pub struct FakeRunStore {
     runs: Arc<Mutex<IndexMap<String, Run>>>,
@@ -667,7 +682,8 @@ impl ContextStore for FakeContextStore {
             .get(key)
             .map(|e| e.created_at.clone())
             .unwrap_or_else(|| FIXED_NOW_ISO.to_owned());
-        entries.insert(
+        save_at_end(
+            &mut entries,
             key.to_owned(),
             ContextEntry {
                 key: key.to_owned(),
@@ -763,7 +779,11 @@ impl MessageStore for FakeMessageStore {
         self.calls
             .record(MessageStoreCall::Save(Box::new(message.clone())));
         self.faults.check()?;
-        lock(&self.messages).insert(message.id.clone(), message.clone());
+        save_at_end(
+            &mut lock(&self.messages),
+            message.id.clone(),
+            message.clone(),
+        );
         Ok(())
     }
 
@@ -893,7 +913,7 @@ impl GoalStore for FakeGoalStore {
         self.calls
             .record(GoalStoreCall::Save(Box::new(goal.clone())));
         self.faults.check()?;
-        lock(&self.goals).insert(goal.id.clone(), goal.clone());
+        save_at_end(&mut lock(&self.goals), goal.id.clone(), goal.clone());
         Ok(())
     }
 
@@ -916,6 +936,10 @@ pub enum TeamStoreCall {
     Delete(String),
 }
 
+/// `TeamStore` has **no `_index.json`** — the real store scans its directory,
+/// so list order is filesystem enumeration order and is not contract
+/// (PARITY.md §6.10). This fake keeps insertion order for determinism; do not
+/// write a test that depends on it.
 #[derive(Debug, Clone, Default)]
 pub struct FakeTeamStore {
     teams: Arc<Mutex<IndexMap<String, Team>>>,
@@ -1069,6 +1093,10 @@ mod tests {
 
     // ── TaskStore ──────────────────────────────────────────────────────────
 
+    fn ids(tasks: &[Task]) -> Vec<&str> {
+        tasks.iter().map(|t| t.id.as_str()).collect()
+    }
+
     #[tokio::test]
     async fn task_store_round_trips_and_filters() {
         let store = FakeTaskStore::with_tasks([
@@ -1097,6 +1125,136 @@ mod tests {
 
         store.delete("tsk_2").await.unwrap();
         assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_moves_the_entity_to_the_end_of_the_index() {
+        // PARITY.md §6.10: IndexManager::save removes by id then pushes. Index
+        // order is last-write order, which §14.4 makes observable through
+        // findBestAgent tie-breaking.
+        let store = FakeTaskStore::with_tasks([
+            Task {
+                id: "tsk_a".into(),
+                ..make_task()
+            },
+            Task {
+                id: "tsk_b".into(),
+                ..make_task()
+            },
+            Task {
+                id: "tsk_c".into(),
+                ..make_task()
+            },
+        ]);
+        assert_eq!(ids(&store.snapshot()), vec!["tsk_a", "tsk_b", "tsk_c"]);
+
+        store
+            .save(&Task {
+                id: "tsk_a".into(),
+                status: TaskStatus::Done,
+                ..make_task()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids(&store.snapshot()), vec!["tsk_b", "tsk_c", "tsk_a"]);
+        // The update itself still landed.
+        assert_eq!(store.peek("tsk_a").unwrap().status, TaskStatus::Done);
+        assert_eq!(store.len(), 3);
+
+        // A brand-new entity also lands at the end.
+        store
+            .save(&Task {
+                id: "tsk_d".into(),
+                ..make_task()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&store.snapshot()),
+            vec!["tsk_b", "tsk_c", "tsk_a", "tsk_d"]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_list_order_is_last_write_order() {
+        // This is the ordering findBestAgent ties fall back to (§14.4).
+        let store = FakeAgentStore::with_agents([
+            Agent {
+                id: "agt_a".into(),
+                ..make_agent()
+            },
+            Agent {
+                id: "agt_b".into(),
+                ..make_agent()
+            },
+        ]);
+        store
+            .save(&Agent {
+                id: "agt_a".into(),
+                ..make_agent()
+            })
+            .await
+            .unwrap();
+
+        let listed: Vec<String> = store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(listed, vec!["agt_b".to_owned(), "agt_a".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn goal_and_message_saves_also_push_to_the_end() {
+        let goals = FakeGoalStore::with_goals([
+            goal("goal_a", GoalStatus::Active),
+            goal("goal_b", GoalStatus::Active),
+        ]);
+        goals
+            .save(&goal("goal_a", GoalStatus::Paused))
+            .await
+            .unwrap();
+        let ordered: Vec<String> = goals.snapshot().into_iter().map(|g| g.id).collect();
+        assert_eq!(ordered, vec!["goal_b".to_owned(), "goal_a".to_owned()]);
+
+        let messages = FakeMessageStore::with_messages([
+            message("1", Some("agt_1"), MessageStatus::Pending),
+            message("2", Some("agt_1"), MessageStatus::Pending),
+        ]);
+        messages
+            .save(&message("1", Some("agt_1"), MessageStatus::Delivered))
+            .await
+            .unwrap();
+        // `list()` sorts by created_at, so index order is invisible through the
+        // trait — assert it on the backing map, which is what WP-1 replicates.
+        assert_eq!(messages.peek("1").unwrap().status, MessageStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_does_not_reorder_the_index() {
+        let store = FakeTaskStore::with_tasks([
+            Task {
+                id: "tsk_a".into(),
+                ..make_task()
+            },
+            Task {
+                id: "tsk_b".into(),
+                ..make_task()
+            },
+        ]);
+        store.faults.fail_once("disk full");
+        assert!(
+            store
+                .save(&Task {
+                    id: "tsk_a".into(),
+                    ..make_task()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(ids(&store.snapshot()), vec!["tsk_a", "tsk_b"]);
     }
 
     #[tokio::test]

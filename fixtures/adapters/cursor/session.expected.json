@@ -1,0 +1,36 @@
+{
+  "events": [
+    {
+      "type": "output",
+      "data": "hi"
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "type": "tool_use",
+        "name": "edit"
+      }
+    },
+    {
+      "type": "done",
+      "data": {
+        "type": "result",
+        "usage": {
+          "inputTokens": 50,
+          "outputTokens": 25,
+          "cacheReadTokens": 10,
+          "cacheWriteTokens": 5
+        }
+      },
+      "tokens": {
+        "input": 50,
+        "output": 25,
+        "reasoning": 0,
+        "total": 75,
+        "cache_read": 10,
+        "cache_write": 5
+      }
+    }
+  ],
+  "error": null
+}

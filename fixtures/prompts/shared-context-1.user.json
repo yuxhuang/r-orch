@@ -1,0 +1,58 @@
+{
+  "name": "shared-context-1.user",
+  "template": "user",
+  "context": {
+    "project": {
+      "name": "demo-project",
+      "description": null
+    },
+    "task": {
+      "id": "tsk_abc1234",
+      "title": "Fix login bug",
+      "description": "Fix the login bug\nin auth.",
+      "priority": 3,
+      "labels": [],
+      "scope": null,
+      "is_autonomous": false,
+      "goal_id": null
+    },
+    "agent": {
+      "id": "agt_aaa1111",
+      "name": "Backend A",
+      "role": "Senior Dev"
+    },
+    "agents": [
+      {
+        "id": "agt_aaa1111",
+        "name": "Backend A",
+        "role": null,
+        "adapter": "claude"
+      },
+      {
+        "id": "agt_bbb2222",
+        "name": "QA B",
+        "role": "QA Engineer\n## WORKFLOW\nrun tests",
+        "adapter": "codex"
+      },
+      {
+        "id": "agt_ccc3333",
+        "name": "Shelly",
+        "role": null,
+        "adapter": "shell"
+      }
+    ],
+    "attempt": null,
+    "workspace_path": "/tmp/work/tsk_abc1234",
+    "retry": null,
+    "feedback": null,
+    "shared_context": [
+      [
+        "api-design",
+        "REST over gRPC"
+      ]
+    ],
+    "messages": null,
+    "goal": null
+  },
+  "expected": "## Task: Fix login bug\nFix the login bug\nin auth.\n\nPriority: 3\n\n\n\n## Context\nProject: demo-project\nWorking directory: /tmp/work/tsk_abc1234\n\n## Team\nYou are part of a multi-agent team. Available agents:\n- **Backend A** (claude) · ID: `agt_aaa1111`\n- **QA B** (codex) — QA Engineer\n## WORKFLOW\nrun tests · ID: `agt_bbb2222`\n- **Shelly** (shell) · ID: `agt_ccc3333`\n\nUse `orch agent list` to check current agent statuses. Find teammates by name/role — do NOT hardcode agent IDs.\n\n\n\n\n## Shared Context\nOther agents have shared the following information:\n- **api-design**: REST over gRPC\n\n\n\n\n\n\n"
+}

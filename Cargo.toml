@@ -7,6 +7,7 @@ members = [
     "crates/orch-engine",
     "crates/orch-cli",
     "crates/orch-tui",
+    "xtask",
 ]
 
 [workspace.package]
@@ -29,6 +30,10 @@ tokio = { version = "1.53", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 futures = "0.3"
 async-trait = "0.1"
+# Lets the adapter event generators be written as straight-line async code, so
+# they map onto the TS async generators one statement at a time and keep their
+# pull-based semantics (ARCHITECTURE §4.8, PARITY.md §8.1).
+async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 # preserve_order keeps Value key order on round-trip (ARCHITECTURE §5.2 rule 2).
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -70,10 +75,43 @@ dirs = "7.0"
 which = "8.0"
 shell-words = "1.1"
 globset = "0.4"
+# Model-discovery parsers (PARITY.md §8.12). `fancy-regex` is pinned to the
+# version liquid already resolves, so it costs no extra compile unit; it is
+# needed for the one Claude `--help` pattern that uses a lookahead, which the
+# `regex` crate cannot express.
+regex = "1.13"
+fancy-regex = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = { version = "2.14", features = ["serde"] }
 toml = "1.1"
+
+# ── Library-first candidates (ARCHITECTURE §4.8) ───────────────────────────
+# All verified on 2026-10-13 to resolve on rustc 1.94.1 *and* alongside
+# ratatui 0.30.2 with a single ratatui in the graph. None is used yet; they are
+# declared here so the owning package does not have to touch this manifest.
+#
+# `tui-textarea` is deliberately ABSENT: 0.7.0 (its latest) hard-depends on
+# ratatui 0.29.0 and crossterm 0.28.1, so a `TextArea` cannot be rendered into
+# a ratatui 0.30 `Frame` and adding it puts two ratatui versions in the graph.
+# WP-6 therefore gets `tui-input` for single-line fields and must either wrap
+# it for the multi-line wizard steps or hand-roll those — see §4.8 and record
+# the choice.
+#
+# Process groups: prefer this over a hand-rolled setsid + kill(-pid); keep
+# `nix` for kill(pid, 0) liveness (ARCHITECTURE §4.8, §5.5).
+process-wrap = { version = "10", features = ["tokio1"] }
+# Single-line text editing for the TUI command bar and `text` wizard steps.
+tui-input = "0.15"
+# Replaces Intl.Segmenter + width logic for `text-cursor` parity.
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+# Clipboard. Degrade to "empty" on any failure, exactly as the TS does.
+arboard = "3.6"
+# PNG-encodes clipboard images (already in the tree via arboard).
+png = "0.18"
+# Version comparison for the update check.
+semver = "1.0"
 
 # ── Dev (ARCHITECTURE §4.6) ────────────────────────────────────────────────
 insta = "1.49"
@@ -82,6 +120,9 @@ predicates = "3.1"
 # Not used yet. Declared so WP-2/WP-5 can reach for it without touching the
 # root manifest (ARCHITECTURE §4.6).
 proptest = "1.12"
+# Diffs in the parity harness and in test failures (ARCHITECTURE §4.8).
+similar = "3.2"
+pretty_assertions = "1.4"
 
 # Disk is tight and debuginfo is the bulk of a dev build's target/ size.
 [profile.dev]

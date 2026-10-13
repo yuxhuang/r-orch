@@ -1,0 +1,332 @@
+//! The shared adapter spawn path.
+//!
+//! Every adapter goes through [`spawn_child`], which is where **stderr
+//! draining lives** — structurally, so an adapter cannot forget it
+//! (ARCHITECTURE §9 WP-2, PARITY.md §14.12). A child that writes past one
+//! pipe buffer (~64 KiB on Linux) to an unread stderr blocks forever; in the
+//! TS original `grok` and `antigravity` never attach a consumer and hang until
+//! stall detection fires ten minutes later.
+//!
+//! Three policies, and the difference between the first two is observable:
+//!
+//! | Policy | Adapters | Behaviour |
+//! |---|---|---|
+//! | [`StderrPolicy::Tail`] | claude, codex, cursor, opencode, pi | drain, keep a bounded 4096-byte tail that is appended to the error message and *then* classified |
+//! | [`StderrPolicy::Discard`] | grok, antigravity | drain and throw away — attaching the tail would change L0 error text, the `classifyAdapterError` result and the persisted `agent.last_error` |
+//! | [`StderrPolicy::Stream`] | shell | handed to the adapter, which turns each line into an `error` event |
+//!
+//! The streams themselves are `orch_core::process::{ChildReader, ChildWriter}`
+//! — boxed `AsyncRead`/`AsyncWrite` rather than `tokio::process::Child*`
+//! handles — so the adapter event generators can be driven from in-memory
+//! pipes (TRAITS-FROZEN Amendment 1).
+
+use std::sync::{Arc, Mutex};
+
+use orch_core::adapter::AdapterError;
+use orch_core::process::{ExitSignal, ProcessManager, Signal, SpawnOptions};
+use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
+
+/// Bounded stderr retained for diagnostics (`utils.ts:15`).
+const STDERR_TAIL_BYTES: usize = 4096;
+
+pub use orch_core::process::{ChildReader, ChildWriter};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrPolicy {
+    /// Drain and keep the last [`STDERR_TAIL_BYTES`] bytes.
+    Tail,
+    /// Drain to EOF and discard.
+    Discard,
+    /// Hand stderr to the adapter; it is responsible for reading it
+    /// concurrently with stdout.
+    Stream,
+}
+
+/// A handle onto the bounded stderr tail. Empty for
+/// [`StderrPolicy::Discard`]/[`StderrPolicy::Stream`] and for a child with no
+/// stderr, which is what makes "no tail in the message" the default.
+#[derive(Debug, Clone, Default)]
+pub struct StderrTail {
+    buf: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Flips to `true` when the drain task reaches EOF.
+    eof: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl StderrTail {
+    /// The captured tail, decoded and `trimEnd()`-ed as the TS getter is.
+    ///
+    /// Awaits stderr EOF first. In node the `'data'` events are delivered on
+    /// the same event loop that fires `'close'`, so a synchronous getter
+    /// already sees everything the child wrote; here the drain runs in its own
+    /// task, and every caller is on an error path after the child exited, so
+    /// EOF is imminent and waiting for it is what makes the message
+    /// deterministic rather than racy.
+    pub async fn tail(&self) -> String {
+        if let Some(mut eof) = self.eof.clone() {
+            // An `Err` means the drain task is gone, which is also settled.
+            let _ = eof.wait_for(|done| *done).await;
+        }
+        self.captured()
+    }
+
+    /// The tail as captured so far, without waiting for EOF.
+    pub fn captured(&self) -> String {
+        let Some(buf) = self.buf.as_ref() else {
+            return String::new();
+        };
+        let bytes = buf.lock().unwrap_or_else(|err| err.into_inner());
+        String::from_utf8_lossy(&bytes).trim_end().to_owned()
+    }
+}
+
+/// A spawned child, decoupled from `tokio::process`.
+pub struct ChildIo {
+    pub pid: u32,
+    pub stdout: Option<ChildReader>,
+    /// Only populated under [`StderrPolicy::Stream`].
+    pub stderr: Option<ChildReader>,
+    pub stdin: Option<ChildWriter>,
+    pub exit: ExitSignal,
+    pub stderr_tail: StderrTail,
+}
+
+impl std::fmt::Debug for ChildIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildIo")
+            .field("pid", &self.pid)
+            .field("has_stdout", &self.stdout.is_some())
+            .field("has_stderr", &self.stderr.is_some())
+            .field("has_stdin", &self.stdin.is_some())
+            .finish()
+    }
+}
+
+/// Spawn through the process manager, install the stderr policy, and arrange
+/// for the child to be signalled if the run is cancelled.
+///
+/// A spawn failure becomes an [`AdapterError`] carrying the TS message
+/// (`Failed to spawn process: <command>`) and its classification, because the
+/// TS `ProcessManager.spawn` throws synchronously out of `execute()` when node
+/// reports a child with no pid.
+pub fn spawn_child(
+    process_manager: &Arc<dyn ProcessManager>,
+    command: &str,
+    args: &[String],
+    opts: SpawnOptions,
+    policy: StderrPolicy,
+    cancel: &CancellationToken,
+) -> std::result::Result<ChildIo, AdapterError> {
+    let child = process_manager
+        .spawn(command, args, opts)
+        .map_err(|err| AdapterError::new(err.to_string(), None))?;
+
+    let mut io = ChildIo {
+        pid: child.pid,
+        stdout: child.stdout,
+        stderr: None,
+        stdin: child.stdin,
+        exit: child.exit,
+        stderr_tail: StderrTail::default(),
+    };
+
+    apply_stderr_policy(&mut io, child.stderr, policy);
+    kill_on_cancel(Arc::clone(process_manager), io.pid, io.exit.clone(), cancel);
+    Ok(io)
+}
+
+/// Every TS adapter passes `signal: params.signal` to `spawn`, which makes
+/// **node** signal the child when the `AbortController` fires — so cancelling
+/// a run reaps the agent process whether or not the orchestrator also calls
+/// `killWithGrace`. Nothing in a `CancellationToken` does that, so the shared
+/// spawn path does it here, and every adapter inherits it.
+///
+/// The signal goes through [`ProcessManager::kill`], which tries the process
+/// group before the bare pid. node kills only the pid; the group is what the
+/// orchestrator's own `kill_with_grace` would reach a moment later anyway, and
+/// using the contract's kill rather than a weaker one keeps a cancelled run
+/// from leaving a subtree behind.
+fn kill_on_cancel(
+    process_manager: Arc<dyn ProcessManager>,
+    pid: u32,
+    exit: ExitSignal,
+    cancel: &CancellationToken,
+) {
+    let cancel = cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            // Already-cancelled resolves immediately, as node's
+            // already-aborted signal does.
+            _ = cancel.cancelled() => {
+                tracing::debug!(pid, "run cancelled; signalling the child");
+                process_manager.kill(pid, Signal::Term);
+            }
+            // The child got there first: nothing to do, and the watcher must
+            // not outlive it.
+            _ = exit.wait() => {}
+        }
+    });
+}
+
+/// The policy half of [`spawn_child`], split out so the adapter tests can
+/// drive it with an in-memory stderr.
+pub fn apply_stderr_policy(io: &mut ChildIo, stderr: Option<ChildReader>, policy: StderrPolicy) {
+    let Some(stderr) = stderr else {
+        return;
+    };
+    match policy {
+        StderrPolicy::Stream => io.stderr = Some(stderr),
+        StderrPolicy::Discard => {
+            let (eof, _) = tokio::sync::watch::channel(false);
+            tokio::spawn(drain(stderr, None, eof));
+        }
+        StderrPolicy::Tail => {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let (sender, receiver) = tokio::sync::watch::channel(false);
+            io.stderr_tail = StderrTail {
+                buf: Some(Arc::clone(&buf)),
+                eof: Some(receiver),
+            };
+            tokio::spawn(drain(stderr, Some(buf), sender));
+        }
+    }
+}
+
+/// Read stderr to EOF, optionally retaining the trailing
+/// [`STDERR_TAIL_BYTES`]. Read errors are swallowed, mirroring the TS no-op
+/// `'error'` handler.
+async fn drain(
+    mut stderr: ChildReader,
+    tail: Option<Arc<Mutex<Vec<u8>>>>,
+    eof: tokio::sync::watch::Sender<bool>,
+) {
+    let mut chunk = vec![0u8; STDERR_TAIL_BYTES];
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Some(tail) = tail.as_ref() {
+                    let mut buf = tail.lock().unwrap_or_else(|err| err.into_inner());
+                    buf.extend_from_slice(&chunk[..read]);
+                    if buf.len() > STDERR_TAIL_BYTES {
+                        // Keep an exactly-sized tail rather than growing
+                        // forever behind a chatty child.
+                        let excess = buf.len() - STDERR_TAIL_BYTES;
+                        buf.drain(..excess);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "stderr read failed; dropping the rest");
+                break;
+            }
+        }
+    }
+    let _ = eof.send(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_core::process::ExitOutcome;
+
+    fn empty_io() -> ChildIo {
+        ChildIo {
+            pid: 1,
+            stdout: None,
+            stderr: None,
+            stdin: None,
+            exit: ExitSignal::resolved(ExitOutcome {
+                code: Some(0),
+                signal: None,
+            }),
+            stderr_tail: StderrTail::default(),
+        }
+    }
+
+    fn reader(bytes: Vec<u8>) -> ChildReader {
+        Box::new(std::io::Cursor::new(bytes))
+    }
+
+    #[tokio::test]
+    async fn the_tail_policy_keeps_only_the_last_4_kib() {
+        let mut io = empty_io();
+        let payload = format!("{}ACTIONABLE_ERROR", "x".repeat(5000));
+        apply_stderr_policy(
+            &mut io,
+            Some(reader(payload.into_bytes())),
+            StderrPolicy::Tail,
+        );
+        let tail = io.stderr_tail.tail().await;
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert!(tail.ends_with("ACTIONABLE_ERROR"));
+    }
+
+    #[tokio::test]
+    async fn the_tail_is_trimmed_at_the_end() {
+        let mut io = empty_io();
+        apply_stderr_policy(
+            &mut io,
+            Some(reader(b"boom\n\n".to_vec())),
+            StderrPolicy::Tail,
+        );
+        assert_eq!(io.stderr_tail.tail().await, "boom");
+    }
+
+    #[tokio::test]
+    async fn the_discard_policy_keeps_no_tail_but_still_drains() {
+        let mut io = empty_io();
+        apply_stderr_policy(
+            &mut io,
+            Some(reader(b"rate limit reached".to_vec())),
+            StderrPolicy::Discard,
+        );
+        assert_eq!(io.stderr_tail.tail().await, "");
+        assert!(io.stderr.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_stream_policy_hands_stderr_to_the_adapter() {
+        let mut io = empty_io();
+        apply_stderr_policy(
+            &mut io,
+            Some(reader(b"line\n".to_vec())),
+            StderrPolicy::Stream,
+        );
+        assert!(io.stderr.is_some());
+        assert_eq!(io.stderr_tail.tail().await, "");
+    }
+
+    #[tokio::test]
+    async fn a_child_without_stderr_has_an_empty_tail() {
+        let mut io = empty_io();
+        apply_stderr_policy(&mut io, None, StderrPolicy::Tail);
+        assert_eq!(io.stderr_tail.tail().await, "");
+        assert_eq!(io.stderr_tail.captured(), "");
+    }
+
+    #[tokio::test]
+    async fn a_spawn_failure_becomes_a_classified_adapter_error() {
+        use crate::process::SystemProcessManager;
+        use orch_domain::AdapterErrorKind;
+
+        let pm: Arc<dyn ProcessManager> = Arc::new(SystemProcessManager::new());
+        let err = spawn_child(
+            &pm,
+            "orch-definitely-not-a-binary",
+            &[],
+            SpawnOptions::default(),
+            StderrPolicy::Tail,
+            &CancellationToken::new(),
+        )
+        .expect_err("spawn should fail");
+
+        assert_eq!(
+            err.message,
+            "Failed to spawn process: orch-definitely-not-a-binary"
+        );
+        // "Failed to spawn process" matches none of the classifier's
+        // substrings and there is no exit code, exactly as in the TS.
+        assert_eq!(err.kind, AdapterErrorKind::Unknown);
+    }
+}

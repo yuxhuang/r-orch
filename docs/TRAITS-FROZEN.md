@@ -4,6 +4,18 @@ Quick index of everything `orch-core` exports, for the five packages compiling
 against it. Changing anything here needs an explicit amendment — it breaks
 `orch-infra`, `orch-engine`, `orch-cli` and `orch-tui` at once.
 
+> **Revised for the amendments in commit `aea84ca` / `946da84`.** Trait
+> *signatures* are unchanged; three behavioural rules and the library-first
+> dependency set were added. If you branched before this revision, the items
+> that affect you are **§2's three storage rules** (a `save()` that preserves
+> position is now a defect), the **`clippy.toml` stable-sort denial**, and the
+> new **`[workspace.dependencies]` entries** in §10. Nothing else moved.
+>
+> **Amendment 1 changes one type.** `SpawnedChild`'s three pipes are now boxed
+> `AsyncRead`/`AsyncWrite` trait objects instead of `tokio::process::Child*`
+> handles — see [Amendment 1](#amendment-1--spawnedchild-stdio-is-boxed-wp-2)
+> below. Build with `SpawnedChild::from_tokio(..)` and nothing else changes.
+
 Everything returns `orch_core::Result<T>` = `Result<T, orch_core::Error>` unless
 stated otherwise. Every trait is `Send + Sync` and takes `&self`, never
 `&mut self`: stores are shared as `Arc<dyn …>` and own their interior
@@ -39,6 +51,29 @@ impl Error {
 domain functions and adapter calls.
 
 ## 2. `orch_core::storage` — 10 traits
+
+**Three rules every implementation owes the contract**, all added by the
+amendments and all replicated by the fakes — so a fake-backed test will *not*
+catch a store that skips one:
+
+1. **`save` removes by id, then pushes to the end of `_index.json`**
+   (PARITY.md §6.10). Index order is *last-write* order. It is observable:
+   `findBestAgent` breaks score ties by position in `AgentStore::list()`, and
+   §14.4 was **reversed to REPLICATE**, so an in-place update that preserves
+   position silently changes which agent runs a task. Applies to the five
+   index-backed stores (task, agent, goal, context, message); `TeamStore` and
+   `RunStore` have no index and scan their directories, so their order is
+   filesystem enumeration order and is **not** contract.
+2. **Sorts over index order must be stable.** `slice::sort_unstable`,
+   `sort_unstable_by` and `sort_unstable_by_key` are **denied workspace-wide**
+   in `clippy.toml` with that reason attached; the lint is verified to fire.
+   Override only with an `#[allow]` and a one-line justification.
+3. **Every YAML read must call `Value::apply_merge()`.** js-yaml resolves `<<`;
+   `serde_yaml_ng` leaves it as a literal `"<<"` key (PARITY.md §6.4.2, V38).
+   Forgetting it makes a hand-authored `config.yml` silently fall back to
+   `DEFAULT_CONFIG` for everything the merge supplied — while both trees still
+   compare equal under the Rust parser. See §Evidence below for the
+   ready-made regression tests.
 
 ```rust
 pub struct TaskFilter { pub status: Option<TaskStatus>, pub goal_id: Option<String> }
@@ -118,7 +153,12 @@ pub struct ExitOutcome { code: Option<i32>, signal: Option<i32> }  // fn success
 pub struct ExitSignal;                           // Clone; fn wait().await, fn try_get()
 pub struct ExitNotifier;                         // fn notify(ExitOutcome) — first call wins
 impl ExitSignal { fn channel() -> (ExitNotifier, ExitSignal); fn resolved(ExitOutcome) -> ExitSignal }
-pub struct SpawnedChild { pid: u32, stdout, stderr, stdin, exit: ExitSignal }
+pub type ChildReader = Box<dyn AsyncRead + Send + Unpin>;    // Amendment 1
+pub type ChildWriter = Box<dyn AsyncWrite + Send + Unpin>;   // Amendment 1
+pub struct SpawnedChild { pid: u32, stdout: Option<ChildReader>,
+                          stderr: Option<ChildReader>, stdin: Option<ChildWriter>,
+                          exit: ExitSignal }
+impl SpawnedChild { fn from_tokio(pid, stdout, stderr, stdin, exit) -> SpawnedChild }
 
 pub trait ProcessManager {
     fn is_alive(&self, pid: u32) -> bool;
@@ -131,7 +171,11 @@ pub const DEFAULT_KILL_GRACE: Duration;   // 10 s, the TS default
 pub const KILL_POLL_INTERVAL: Duration;   // 200 ms
 ```
 
-`stdout`/`stderr`/`stdin` are `tokio::process::Child*` handles.
+`stdout`/`stderr`/`stdin` are **boxed trait objects** (Amendment 1).
+`SpawnedChild::from_tokio` wraps the real `tokio::process::Child*` handles, so
+a real implementation is a one-line change from the original shape.
+
+`spawn` does **not** handle cancellation — see the spec issue below.
 
 ## 5. `orch_core::workspace`
 
@@ -208,7 +252,7 @@ Take it as `orch-core = { workspace = true, features = ["test-support"] }` under
 | `Recorder<C>` | Replaces `vi.fn()` call assertions: `calls()`, `first()`, `last()`, `len()`, `matching(pred)`, `count_matching(pred)`, `contains(&c)`, `count_of(&c)`, `clear()`. Cloning shares the log. |
 | `Faults` | Replaces `mockRejectedValue`: `fail_once`, `fail_next(n, msg)`, `fail_always`, `fail_once_with(DomainError)`, `clear()`, `is_armed()`. Queued failures beat the persistent one. |
 | `FakeTaskStore`, `FakeAgentStore`, `FakeRunStore`, `FakeStateStore`, `FakeConfigStore`, `FakeContextStore`, `FakeMessageStore`, `FakeGoalStore`, `FakeTeamStore`, `FakeGlobalConfigStore` | Clone on read **and** write. Public `calls` + `faults`. `seed_*`/`peek_*`/`snapshot()` do not record. `saved()`/`written()` give the write history, which is what the orchestrator tests assert on. |
-| `FakeProcessManager` | pid 12345, `is_alive → true`; `set_dead(pid)`, `set_all_dead(bool)`, `with_exit(ExitOutcome)`; `killed()`, `killed_with_grace()`, `spawned()`. `stdout`/`stderr`/`stdin` are `None` — real handles cannot be fabricated without a process. |
+| `FakeProcessManager` | pid 12345, `is_alive → true`; `set_dead(pid)`, `set_all_dead(bool)`, `with_exit(ExitOutcome)`; `killed()`, `killed_with_grace()`, `spawned()`. **Since Amendment 1 it also drives the child's streams**: `with_stdout(bytes)`, `with_stdout_lines([..])`, `with_stderr(bytes)`, `set_stdout`/`set_stderr`, and `stdin_bytes()` / `stdin_text()` / `stdin_written().await` for what the adapter wrote. `stdin` is `Some` only for `StdioMode::Pipe`, as with the real manager. |
 | `FakeAdapter` | `with_events([...])`, `failing_after([...], err)`, `with_kind`, `with_pid`, `set_events`, `set_execute_error`, `set_test_result`; `execute_calls`, `stop_calls`. Helpers `output_event`, `done_event`, `error_event` build canonical `data` shapes. |
 | `FakeWorkspaceManager` | `prepare → { path: "/tmp/ws" }`, `merge_back → Success`; `set_prepare_result`, `set_merge_result`, `set_changed_files`; `merged()`, `cleaned()`. |
 | `FakeTemplateEngine` | Renders `"rendered prompt"`; `returning(..)`, `set_output`, `contexts()`. |
@@ -221,6 +265,90 @@ Take it as `orch-core = { workspace = true, features = ["test-support"] }` under
 parts above. Per ARCHITECTURE §8.1 that builder should default
 `poll_interval_ms` to `100_000` so the tick loop never self-fires and tests
 drive ticks explicitly.
+
+---
+
+## 10. `[workspace.dependencies]` — library-first set (ARCHITECTURE §4.8)
+
+Verified on 2026-10-13 to resolve on rustc 1.94.1 **and** to `cargo check`
+clean in one graph alongside our exact pins (ratatui 0.30.2, crossterm 0.29,
+tokio 1.53, liquid 0.26.11 + kstring 2.0.2, nix 0.31, serde_yaml_ng 0.10,
+jiff 0.2), with a **single** ratatui and a single crossterm. Declared but
+unused, so the owning package does not have to touch the root manifest.
+
+| Crate | Version | For |
+|---|---|---|
+| `process-wrap` | `10` (`tokio1`) | process groups / session spawn + group kill (WP-2). Keep `nix` for `kill(pid, 0)` liveness. |
+| `tui-input` | `0.15` | single-line editing: command bar, `text` wizard steps (WP-6) |
+| `unicode-segmentation` | `1.13` | grapheme segmentation, replacing `Intl.Segmenter` (WP-6) |
+| `unicode-width` | `0.2` | display width (WP-6) |
+| `arboard` | `3.6` | clipboard (WP-3); degrade to "empty" on any failure, as the TS does |
+| `semver` | `1.0` | version comparison in the update check (WP-5) |
+| `similar`, `pretty_assertions` | `3.2`, `1.4` | diffs in the harness and test failures (dev-only) |
+| `proptest` | `1.12` | property tests, if a package wants them (dev-only) |
+
+### `tui-textarea` is rejected — **WP-6 read this**
+
+`tui-textarea` 0.7.0, its latest release, **hard-depends on `ratatui 0.29.0`
+and `crossterm 0.28.1`**:
+
+```
+tui-textarea 0.7.0 → ratatui 0.29.0, crossterm 0.28.1, unicode-width 0.2.0
+```
+
+Adding it puts two incompatible ratatui versions in the graph (measured: the
+lockfile resolves `ratatui 0.29.0` *and* `0.30.2`), and a `TextArea` from it
+cannot be rendered into a 0.30 `Frame` — the widget traits are different
+types. It is therefore **not** in `[workspace.dependencies]`.
+
+`tui-input` 0.15.5 *is* ratatui-0.30 compatible (verified: single ratatui
+0.30.2 in the graph) but is **single-line only**. So the multi-line `textarea`
+wizard steps have no off-the-shelf option on ratatui 0.30: either wrap
+`tui-input` with your own line handling, or hand-roll the editor. §4.8 says to
+say which in a code comment — this is the "no maintained crate fits" case, and
+it is a finding, not a licence to skip the search.
+
+## Amendments to the frozen surface
+
+### Amendment 1 — `SpawnedChild` stdio is boxed (WP-2)
+
+```rust
+// before
+pub struct SpawnedChild { pid: u32, stdout: Option<ChildStdout>,
+                          stderr: Option<ChildStderr>, stdin: Option<ChildStdin>,
+                          exit: ExitSignal }
+// after
+pub struct SpawnedChild { pid: u32, stdout: Option<ChildReader>,
+                          stderr: Option<ChildReader>, stdin: Option<ChildWriter>,
+                          exit: ExitSignal }
+pub type ChildReader = Box<dyn AsyncRead + Send + Unpin>;
+pub type ChildWriter = Box<dyn AsyncWrite + Send + Unpin>;
+```
+
+**Why.** `tokio::process::Child{Stdout,Stderr,Stdin}` cannot be constructed
+without a process, so `FakeProcessManager` could only ever return `None` for
+all three. That made two things untestable with an in-memory double: every
+adapter's **event stream** (the parsing is the part under test, and
+`FakeAdapter` bypasses it) and the two **stdin protocols** — codex's single
+write of the combined prompt, and pi's one JSONL frame with stdin left open.
+WP-2 worked around it inside `orch-infra` and the adapter suites do not need
+this, but WP-4's orchestrator tests do: they want a real adapter driven by a
+fake process.
+
+**What it costs.** One `Box` per pipe per spawned child, and a `Debug` impl
+written by hand rather than derived. Nothing else: `AsyncRead`/`AsyncWrite`
+are the only things any consumer ever used these for.
+
+**What changes for you.** Build the struct with
+`SpawnedChild::from_tokio(pid, stdout, stderr, stdin, exit)`, which takes the
+concrete handles and boxes them — a `ProcessManager` implementation is a
+one-line change. Anything that *reads* a pipe is unaffected. `orch-infra`'s
+`spawn_child` no longer boxes anything itself, and
+`orch_infra::process::{ChildReader, ChildWriter}` are re-exports of these.
+
+**Landed** on `wp2` together with the `FakeProcessManager` scripting support
+and `crates/orch-infra/tests/fake_process_manager.rs`, which is the pattern
+WP-4 should copy.
 
 ---
 
@@ -279,6 +407,10 @@ old empty returns.**
   same reason.
 - `FakeContextStore` — real key-ascending `list`, real `created_at`
   preservation across overwrites; entries never expire.
+- `FakeProcessManager` — since Amendment 1, real in-memory pipes: scripted
+  stdout/stderr and a captured stdin, so a real adapter can be driven by a
+  fake process. The TS mock passes `{} as any` for the child and can drive
+  nothing.
 
 ## Evidence handed to WP-1
 
@@ -297,6 +429,15 @@ emit through `serde_yaml_ng` — the "before" half of V8/R1:
 - `AgentConfig.env` round-trips in insertion order, and YAML key order matches
   the TS interface declaration order.
 
+`crates/orch-domain/tests/yaml_emission.rs` also pins the **merge-key
+bifurcation** (PARITY.md §6.4.2, V38), measured not assumed:
+
+- `serde_yaml_ng` leaves `<<` as a **literal key**: `scheduling.max_turns` and
+  `scheduling.adapter` are simply **absent** from the parse.
+- `Value::apply_merge()` reproduces js-yaml's result exactly (99 / `codex` / 5).
+- `apply_merge()` is a **no-op** on every document ORCH itself writes, so WP-1
+  can call it unconditionally on every read rather than sniffing for `<<`.
+
 ## Test port status for `test/unit/domain/**`
 
 `cargo test -p orch-domain -p orch-core` is green: **204** domain + **136**
@@ -311,7 +452,7 @@ domain layer:
 |---|---|---|
 | `run-token-usage.test.ts` | the `extractTokens` half (`infrastructure/adapters/utils.ts`) | WP-2 |
 | `agent-shop.test.ts` | `getShopWizardSteps`, `applyShopTemplate`, `agentWizardToInput` (`src/tui/wizardConfigs.ts`) | WP-6 |
-| `agent-shop-skills.test.ts` | the library-file integrity half (needs `skills/library/` on disk) | WP-3 |
+| `agent-shop-skills.test.ts` | *(nothing — now ported in full)* | — |
 
 V9 (exhaustive 7×7 transition table), V10 (retry arithmetic, overflow
 included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
@@ -338,11 +479,134 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
 4. **`ARCHITECTURE §5.4`'s `AgentEventKind` naming differs from
    `RunEventType`** and the doc does not say so. The mapping is in PARITY §8.1
    and is now `AgentEventKind::to_run_event_type`.
-5. **Nobody owns `skills/library/`.** PARITY §9.6 requires the 26 `.md` files
-   to ship with the binary, byte-identical to
-   `parity/orch-ts/skills/library/`, and `agent-shop-skills.test.ts` asserts
-   every non-MCP template skill resolves against it. WP-3 owns the loader but
-   the asset copy is unassigned.
+5. ~~**Nobody owns `skills/library/`.**~~ **Closed** — the team lead shipped
+   the 26 `.md` files in `60a259f`, verified byte-identical to
+   `parity/orch-ts/skills/library/`.
+   `crates/orch-domain/tests/shop_skill_references.rs` now runs the
+   reference-integrity half of `agent-shop-skills.test.ts`, and additionally
+   cross-checks that the `agt_creator` role prompt advertises exactly the 26
+   skills that exist — a check the TS suite does not have.
 6. **`fixtures/shop/` was unassigned**, so WP-0 created it (plus the two
    generator scripts and a README) to make V28 a real test rather than a
    transcription. `fixtures/{prompts,adapters,yaml}` remain WP-2/WP-3's.
+7. **Cancellation is missing from the adapter spawn contract — WP-4 read
+   this.** Every TS adapter passes `signal: params.signal` to
+   `ProcessManager.spawn`, which makes **node itself** send the child a
+   `SIGTERM` when the `AbortController` fires. Neither PARITY.md §8.2 nor
+   §8.4 mentions it, and `docs/parity/adapters.md` §4.1's table of kill call
+   sites omits it too — it is only visible in the `spawn` options of all eight
+   adapters. It matters twice over:
+
+   - a `CancellationToken` does nothing of the kind, so a cancelled run whose
+     child is still alive would await `ExitSignal` **forever**; and
+   - it means cancelling reaps the agent process even on a path where the
+     orchestrator does not itself call `kill_with_grace`.
+
+   Reproduced in `orch-infra`'s shared adapter spawn path
+   (`process/spawn.rs::kill_on_cancel`), so every adapter inherits it and a
+   new adapter cannot forget it. The signal goes through
+   `ProcessManager::kill`, which tries the process **group** first; node kills
+   only the pid, and the group is what the orchestrator's own grace kill would
+   reach a moment later anyway. **The orchestrator's grace-period kills are
+   still required** — this path sends one `SIGTERM` and never escalates to
+   `SIGKILL`.
+
+8. **`PARITY.md §3` says a bare command group prints its help to stdout — it
+   prints to stderr.** Measured against the vendored oracle in a hermetic
+   tmpdir, for three groups:
+
+   | argv | stdout | stderr | exit |
+   |---|---|---|---|
+   | `orch task` | 0 B | 735 B | 1 |
+   | `orch agent` | 0 B | 654 B | 1 |
+   | `orch config` | 0 B | 407 B | 1 |
+
+   The first stderr line is `Usage: orchestry task [options] [command]`. This
+   is Commander's `help({ error: true })` path, which is what a subcommand
+   without an `.action()` falls into. The exit code in §3 is right; only the
+   stream is wrong. `fixtures/scenarios/cmd-exit-codes-groups.toml` encodes the
+   measured behaviour, and `harness.rs::is_group_help` documents it where the
+   lint needs to recognise it. **WP-5: write to stderr.**
+
+9. **`config global get` cannot read a nested key, and that is L0.** In the
+   same tree, `config global show --json` prints
+   `{"tui":{"palette":"amber",…}}` while `config global get tui.palette --json`
+   prints `{"key":"tui.palette"}` — no `value` at all, exit 0. `config global
+   get tui` is likewise empty. The project-level `config get` *does* walk dot
+   paths (`config get defaults.agent.max_turns` → `{"key":…,"value":50}`), so
+   the two commands differ. Replicated as measured in
+   `fixtures/scenarios/cmd-config.toml`: the CLI contract is byte parity, not
+   sanity. **WP-5: do not "fix" this.**
+
+10. **`task edit` and `agent edit` take no options whatsoever.** §2.2 lists
+    them beside flag-taking verbs, which invites the assumption that they
+    accept `--title`/`--description`/`--model`. They do not: each serializes
+    the entity into a `---` frontmatter temp file, spawns `$EDITOR` (then
+    `$VISUAL`, then `vi`) on it, and parses what comes back, writing only the
+    fields that changed. Four scenarios were originally written with invented
+    flags and would have asserted nothing; `cargo xtask lint-scenarios` now
+    catches that class of mistake, and `fixtures/fake-editors/` makes the two
+    commands reachable from a scenario at all. The editor protocol itself is
+    L0 surface nobody had enumerated: the frontmatter keys per entity, the
+    "No changes." path when nothing is edited, and `Editor exited with code N`
+    on a non-zero editor exit — all four are now scenarios.
+
+11. **One `msg send` can write a message file that `serde_json` cannot parse —
+    this needs an architect decision.** Measured, and reachable from the CLI
+    with a single command.
+
+    `MessageService.send` truncates with JS `.slice()`, which counts **UTF-16
+    code units**: `subject.slice(0, 200)` and `body.slice(0, 4000)`. A non-BMP
+    character is two code units, so a body of 3999 ASCII characters followed by
+    `😀` (4001 code units) is cut **between the surrogates**, and the stored
+    value ends in a **lone high surrogate**. What the oracle then does with it
+    differs by output path:
+
+    | path | bytes | valid UTF-8 |
+    |---|---|---|
+    | `.orchestry/messages/<id>.json` | `…aaa\ud83d` (the 6-byte escape) | yes |
+    | `msg list --json` on stdout | `…aaa\ud83d` (same escape) | yes |
+    | `msg inbox` human output | `…aaa` + `ef bf bd` (U+FFFD) | yes |
+
+    Both renderings are byte-reproducible from Rust only deliberately, because
+    a Rust `String` cannot hold a lone surrogate at all. The **read** path is
+    the harder half: `serde_json` rejects a lone surrogate escape outright —
+    `from_str(r#"{"body":"aaa\ud83d"}"#)` fails with `unexpected end of hex
+    escape`, whatever follows it — so our storage layer cannot read back a
+    file the oracle wrote. `msg list` would fail entirely rather than diverge
+    in one field.
+
+    Three options, none free, hence the escalation:
+
+    - **Model the body as UTF-16.** Byte-exact in every path, and poisons the
+      domain type for every consumer.
+    - **Replace lone surrogates with U+FFFD on read.** Keeps `String`, matches
+      the human path, and breaks byte parity on re-save (the escape becomes
+      `ef bf bd`), so a round-trip through r-orch silently rewrites the file.
+    - **Declare it L2 above the limit** and record the deviation. Honest, and
+      concedes a documented L0 field.
+
+    Not a hypothetical about hostile input: it needs one `msg send` with a long
+    body ending in an emoji. `fixtures/scenarios/cmd-msg-truncation.toml` is
+    the test for whichever option is chosen, with a `${repeat:…}` control case
+    one character shorter where the cut falls between characters and no special
+    handling is needed. The harness now reports a file only one side can parse
+    as a failure instead of aborting the run, which it previously did.
+
+12. **`msg broadcast --team <nonexistent>` fans out to every agent.**
+    `message-service.ts` resolves the team and filters only `if (team)`, with
+    no else branch, so an unknown team id leaves the recipient list unfiltered.
+    Measured in a four-agent tree: `--team <real two-member team>` → 2
+    messages, `--team team_nosuch` → 4, and `team_id: "team_nosuch"` is
+    persisted on all four, leaving a dangling reference in the store. An
+    implementation that validates the team id sends strictly fewer messages
+    than the oracle. Replicated in `cmd-msg-broadcast-unknown-team.toml`.
+
+13. **A message body is validated trimmed and stored untrimmed.**
+    `send` rejects on `!input.body.trim()` and then stores
+    `input.body.slice(0, 4000)` — the original. So `'   '` is an error while
+    `' padded '` is accepted and keeps both spaces on disk. The subject is
+    neither trimmed nor validated: empty becomes the literal `(no subject)`.
+    Trimming before storing passes every rejection test and diverges on every
+    message anyone sends with a trailing newline.
+    Covered by `cmd-msg-body-trimming.toml`.

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Fake `codex` — `exec --json -`, prompt on stdin, JSONL on stdout.
+. "$(dirname "$0")/_common.sh"
+
+fake_handle_version "$@"
+# The prompt arrives on stdin and must be drained, or the writer blocks.
+prompt=$(cat)
+scenario=$(fake_scenario "$prompt")
+reply=$(fake_reply)
+
+fake_before_output "$scenario"
+
+printf '{"type":"thread.started","thread_id":"th_fake"}\n'
+printf '{"type":"turn.started"}\n'
+
+if [ "$scenario" != "silent" ]; then
+  printf '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"%s"}}\n' \
+    "$(fake_json_string "$reply")"
+fi
+
+case "$scenario" in
+  fail|rate_limit)
+    printf '{"type":"turn.failed","error":{"message":"%s"}}\n' \
+      "$(fake_json_string "fake-agent failure: $scenario")"
+    fake_failure_stderr "$scenario"
+    ;;
+  *)
+    printf '{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":7}}\n'
+    ;;
+esac
+
+exit "$(fake_exit_code "$scenario")"

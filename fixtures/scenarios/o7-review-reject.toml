@@ -1,0 +1,19 @@
+name = "o7-review-reject"
+kind = "differential"
+requires = ["serve", "config set", "task reject", "task show"]
+timeout_secs = 90
+description = """
+Red-team O7: the reject path. A rejected review goes back to todo with \
+attempts reset and the feedback recorded on the task, which the next \
+dispatch injects into the prompt. The flag is `-r, --reason` (measured; \
+there is no --feedback)."""
+steps = [
+  "init --name proj --adapter claude",
+  "config set scheduling.poll_interval_ms 200",
+  "agent add reviewer --adapter claude --approval-policy manual --quiet",
+  "task add 'Needs review' --assignee ${agent.0} --quiet",
+  "serve --once --log-format json",
+  "task reject ${task.0} --reason 'try again, with feeling'",
+  "task show ${task.0} --json",
+  "task list --json",
+]

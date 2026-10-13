@@ -1,0 +1,34 @@
+{
+  "name": "empty-agents.user",
+  "template": "user",
+  "context": {
+    "project": {
+      "name": "demo-project",
+      "description": null
+    },
+    "task": {
+      "id": "tsk_abc1234",
+      "title": "Fix login bug",
+      "description": "Fix the login bug\nin auth.",
+      "priority": 3,
+      "labels": [],
+      "scope": null,
+      "is_autonomous": false,
+      "goal_id": null
+    },
+    "agent": {
+      "id": "agt_aaa1111",
+      "name": "Backend A",
+      "role": "Senior Dev"
+    },
+    "agents": [],
+    "attempt": null,
+    "workspace_path": "/tmp/work/tsk_abc1234",
+    "retry": null,
+    "feedback": null,
+    "shared_context": null,
+    "messages": null,
+    "goal": null
+  },
+  "expected": "## Task: Fix login bug\nFix the login bug\nin auth.\n\nPriority: 3\n\n\n\n## Context\nProject: demo-project\nWorking directory: /tmp/work/tsk_abc1234\n\n## Team\nYou are part of a multi-agent team. Available agents:\n\nUse `orch agent list` to check current agent statuses. Find teammates by name/role — do NOT hardcode agent IDs.\n\n\n\n\n\n\n\n\n"
+}

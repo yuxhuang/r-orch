@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Close without saving. Both binaries must then report no changes rather than
+# writing an identical file back and bumping updated_at.
+set -euo pipefail
+exit 0
