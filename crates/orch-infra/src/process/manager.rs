@@ -150,13 +150,7 @@ impl ProcessManager for SystemProcessManager {
             notifier.notify(outcome);
         });
 
-        Ok(SpawnedChild {
-            pid,
-            stdout,
-            stderr,
-            stdin,
-            exit,
-        })
+        Ok(SpawnedChild::from_tokio(pid, stdout, stderr, stdin, exit))
     }
 }
 
@@ -194,8 +188,11 @@ mod tests {
         args(&["-c", script])
     }
 
+    /// Reaping is asynchronous, and these tests run alongside a dozen other
+    /// test binaries, so the bound is generous: it returns the moment the
+    /// condition holds, and a short one would only buy a flake.
     async fn wait_until_dead(pm: &SystemProcessManager, pid: u32) -> bool {
-        for _ in 0..100 {
+        for _ in 0..1_000 {
             if !pm.is_alive(pid) {
                 return true;
             }
@@ -431,8 +428,10 @@ mod tests {
         pm.kill_with_grace(child.pid, Duration::from_secs(2)).await;
         assert!(wait_until_dead(&pm, child.pid).await);
 
-        // Signalling the group must fail: nothing is left in it.
-        for _ in 0..100 {
+        // Signalling the group must fail: nothing is left in it. The
+        // grandchildren are reparented to init when their shell dies, so this
+        // waits on init's reaping as well as the kill.
+        for _ in 0..1_000 {
             if nix::sys::signal::kill(Pid::from_raw(-(child.pid as i32)), None).is_err() {
                 return;
             }

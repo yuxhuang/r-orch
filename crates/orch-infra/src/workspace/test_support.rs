@@ -118,12 +118,6 @@ impl ProcessManager for TestProcessManager {
             let code = child.wait().await.ok().and_then(|s| s.code());
             notifier.notify(ExitOutcome { code, signal: None });
         });
-        Ok(SpawnedChild {
-            pid,
-            stdout,
-            stderr,
-            stdin: None,
-            exit,
-        })
+        Ok(SpawnedChild::from_tokio(pid, stdout, stderr, None, exit))
     }
 }

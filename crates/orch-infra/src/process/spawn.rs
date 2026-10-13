@@ -15,24 +15,22 @@
 //! | [`StderrPolicy::Discard`] | grok, antigravity | drain and throw away — attaching the tail would change L0 error text, the `classifyAdapterError` result and the persisted `agent.last_error` |
 //! | [`StderrPolicy::Stream`] | shell | handed to the adapter, which turns each line into an `error` event |
 //!
-//! It also hides `tokio::process::Child*` behind boxed `AsyncRead`/`AsyncWrite`
-//! so the adapter event generators can be unit-tested against in-memory pipes.
-//! Real child handles cannot be fabricated, which is why
-//! `orch_core::test_support::FakeProcessManager` hands back `None` for all
-//! three.
+//! The streams themselves are `orch_core::process::{ChildReader, ChildWriter}`
+//! — boxed `AsyncRead`/`AsyncWrite` rather than `tokio::process::Child*`
+//! handles — so the adapter event generators can be driven from in-memory
+//! pipes (TRAITS-FROZEN Amendment 1).
 
 use std::sync::{Arc, Mutex};
 
 use orch_core::adapter::AdapterError;
 use orch_core::process::{ExitSignal, ProcessManager, Signal, SpawnOptions};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 /// Bounded stderr retained for diagnostics (`utils.ts:15`).
 const STDERR_TAIL_BYTES: usize = 4096;
 
-pub type ChildReader = Box<dyn AsyncRead + Send + Unpin>;
-pub type ChildWriter = Box<dyn AsyncWrite + Send + Unpin>;
+pub use orch_core::process::{ChildReader, ChildWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StderrPolicy {
@@ -125,15 +123,14 @@ pub fn spawn_child(
 
     let mut io = ChildIo {
         pid: child.pid,
-        stdout: child.stdout.map(|out| Box::new(out) as ChildReader),
+        stdout: child.stdout,
         stderr: None,
-        stdin: child.stdin.map(|input| Box::new(input) as ChildWriter),
+        stdin: child.stdin,
         exit: child.exit,
         stderr_tail: StderrTail::default(),
     };
 
-    let stderr = child.stderr.map(|err| Box::new(err) as ChildReader);
-    apply_stderr_policy(&mut io, stderr, policy);
+    apply_stderr_policy(&mut io, child.stderr, policy);
     kill_on_cancel(Arc::clone(process_manager), io.pid, io.exit.clone(), cancel);
     Ok(io)
 }

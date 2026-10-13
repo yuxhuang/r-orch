@@ -35,7 +35,7 @@ fn spawn_sleep(pm: &SystemProcessManager, seconds: u32) -> u32 {
 /// Reaping is asynchronous: the background task has to run before the kernel
 /// releases the pid.
 async fn wait_until_dead(pm: &SystemProcessManager, pid: u32) -> bool {
-    for _ in 0..200 {
+    for _ in 0..1_000 {
         if !pm.is_alive(pid) {
             return true;
         }
@@ -145,7 +145,7 @@ async fn the_group_kill_cleans_up_the_children_of_the_child() {
 
     // Nothing is left in the group.
     let group = nix::unistd::Pid::from_raw(-(child.pid as i32));
-    for _ in 0..200 {
+    for _ in 0..1_000 {
         if nix::sys::signal::kill(group, None).is_err() {
             return;
         }

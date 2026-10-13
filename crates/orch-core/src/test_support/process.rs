@@ -1,14 +1,21 @@
-//! A process manager that spawns nothing.
+//! A process manager that spawns nothing, but still drives a child's streams.
 
 use std::collections::HashSet;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::AsyncWrite;
 
 use crate::error::Result;
-use crate::process::{ExitOutcome, ExitSignal, ProcessManager, Signal, SpawnOptions, SpawnedChild};
+use crate::process::{
+    ChildReader, ChildWriter, ExitOutcome, ExitSignal, ProcessManager, Signal, SpawnOptions,
+    SpawnedChild, StdioMode,
+};
 use crate::test_support::recorder::Recorder;
 
 /// The pid the TS `createMockProcessManager` hands back.
@@ -36,6 +43,12 @@ pub struct FakeProcessManager {
     dead_pids: Arc<Mutex<HashSet<u32>>>,
     /// The outcome every spawned child's [`ExitSignal`] resolves to.
     exit: ExitOutcome,
+    /// Bytes the next spawned child writes to stdout, then EOF.
+    stdout: Arc<Mutex<Vec<u8>>>,
+    /// Bytes the next spawned child writes to stderr, then EOF.
+    stderr: Arc<Mutex<Vec<u8>>>,
+    /// Everything written to the children's stdin, in order.
+    stdin: Arc<Mutex<Vec<u8>>>,
     pub calls: Recorder<FakeProcessManagerCall>,
 }
 
@@ -55,6 +68,9 @@ impl FakeProcessManager {
                 code: Some(0),
                 signal: None,
             },
+            stdout: Arc::new(Mutex::new(Vec::new())),
+            stderr: Arc::new(Mutex::new(Vec::new())),
+            stdin: Arc::new(Mutex::new(Vec::new())),
             calls: Recorder::new(),
         }
     }
@@ -67,6 +83,69 @@ impl FakeProcessManager {
     pub fn with_exit(mut self, exit: ExitOutcome) -> Self {
         self.exit = exit;
         self
+    }
+
+    /// Script the child's stdout.
+    pub fn with_stdout(self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.set_stdout(bytes);
+        self
+    }
+
+    /// Script the child's stdout as newline-terminated lines — the JSONL
+    /// shape every adapter but `shell` and `antigravity` reads.
+    pub fn with_stdout_lines<I, S>(self, lines: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut joined = String::new();
+        for line in lines {
+            joined.push_str(line.as_ref());
+            joined.push('\n');
+        }
+        self.with_stdout(joined)
+    }
+
+    /// Script the child's stderr.
+    pub fn with_stderr(self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.set_stderr(bytes);
+        self
+    }
+
+    pub fn set_stdout(&self, bytes: impl Into<Vec<u8>>) {
+        *self.stdout.lock().unwrap_or_else(|e| e.into_inner()) = bytes.into();
+    }
+
+    pub fn set_stderr(&self, bytes: impl Into<Vec<u8>>) {
+        *self.stderr.lock().unwrap_or_else(|e| e.into_inner()) = bytes.into();
+    }
+
+    /// Everything written to the children's stdin, which is how the two stdin
+    /// protocols (codex's single write, pi's JSONL frame) are asserted.
+    pub fn stdin_bytes(&self) -> Vec<u8> {
+        self.stdin.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn stdin_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdin_bytes()).into_owned()
+    }
+
+    /// The captured stdin, waiting for the writer to get there.
+    ///
+    /// An adapter writes stdin from a spawned task — `execute` is sync and a
+    /// long prompt can block on a full pipe — so a read taken immediately
+    /// after `execute` races it. This yields until something arrives (or the
+    /// bound is hit, which fails the assertion that follows rather than
+    /// hanging).
+    pub async fn stdin_written(&self) -> String {
+        for _ in 0..1_000 {
+            let written = self.stdin_text();
+            if !written.is_empty() {
+                return written;
+            }
+            tokio::task::yield_now().await;
+        }
+        String::new()
     }
 
     /// The pid `spawn` reports.
@@ -164,16 +243,58 @@ impl ProcessManager for FakeProcessManager {
             args: args.to_vec(),
             cwd: opts.cwd.to_string_lossy().into_owned(),
         });
+        let stdout = self
+            .stdout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let stderr = self
+            .stderr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         Ok(SpawnedChild {
             pid: self.pid,
-            // Real `ChildStdout`/`ChildStderr`/`ChildStdin` cannot be
-            // fabricated without a process; the TS mock passes `{} as any` for
-            // the same reason. Drive adapter streams with `FakeAdapter`.
-            stdout: None,
-            stderr: None,
-            stdin: None,
+            // Scripted in-memory pipes: an empty one is simply a child that
+            // said nothing and exited (Amendment 1).
+            stdout: Some(Box::new(io::Cursor::new(stdout)) as ChildReader),
+            stderr: Some(Box::new(io::Cursor::new(stderr)) as ChildReader),
+            // `Ignore` means /dev/null for the real manager, so there is no
+            // writer to hand back.
+            stdin: match opts.stdin {
+                StdioMode::Ignore => None,
+                StdioMode::Pipe => {
+                    Some(Box::new(CaptureWriter(Arc::clone(&self.stdin))) as ChildWriter)
+                }
+            },
             exit: ExitSignal::resolved(self.exit),
         })
+    }
+}
+
+/// Stands in for a child's stdin by appending to a shared buffer.
+#[derive(Debug)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl AsyncWrite for CaptureWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -194,11 +315,85 @@ mod tests {
         let pm = FakeProcessManager::new();
         let child = pm.spawn("git", &["status".to_owned()], opts()).unwrap();
         assert_eq!(child.pid, 12345);
-        assert!(child.stdout.is_none());
         assert_eq!(
             pm.spawned(),
             vec![("git".to_owned(), vec!["status".to_owned()])]
         );
+    }
+
+    #[tokio::test]
+    async fn a_scripted_child_streams_stdout_and_stderr_then_ends() {
+        use tokio::io::AsyncReadExt;
+
+        let pm = FakeProcessManager::new()
+            .with_stdout_lines(["{\"type\":\"a\"}", "{\"type\":\"b\"}"])
+            .with_stderr("boom\n");
+        let mut child = pm.spawn("agent", &[], opts()).unwrap();
+
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .expect("scripted stdout")
+            .read_to_string(&mut out)
+            .await
+            .unwrap();
+        assert_eq!(out, "{\"type\":\"a\"}\n{\"type\":\"b\"}\n");
+
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .expect("scripted stderr")
+            .read_to_string(&mut err)
+            .await
+            .unwrap();
+        assert_eq!(err, "boom\n");
+    }
+
+    #[tokio::test]
+    async fn stdin_is_only_piped_on_request_and_is_captured() {
+        use tokio::io::AsyncWriteExt;
+
+        let pm = FakeProcessManager::new();
+        assert!(
+            pm.spawn("agent", &[], opts()).unwrap().stdin.is_none(),
+            "Ignore is /dev/null, so there is nothing to write to"
+        );
+
+        let mut child = pm
+            .spawn(
+                "codex",
+                &[],
+                SpawnOptions {
+                    stdin: StdioMode::Pipe,
+                    ..opts()
+                },
+            )
+            .unwrap();
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin.write_all(b"the prompt").await.unwrap();
+        stdin.shutdown().await.unwrap();
+
+        assert_eq!(pm.stdin_text(), "the prompt");
+        assert_eq!(pm.stdin_bytes(), b"the prompt");
+    }
+
+    #[tokio::test]
+    async fn a_silent_child_yields_an_immediately_empty_stdout() {
+        use tokio::io::AsyncReadExt;
+
+        let pm = FakeProcessManager::new();
+        let mut child = pm.spawn("agent", &[], opts()).unwrap();
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
     }
 
     #[tokio::test]
