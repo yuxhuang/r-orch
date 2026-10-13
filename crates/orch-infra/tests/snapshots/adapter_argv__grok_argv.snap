@@ -1,0 +1,55 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm| Box::new(GrokAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: grok
+  argv[1]: "-p"
+  argv[2]: "the user prompt"
+  argv[3]: "--output-format"
+  argv[4]: "streaming-json"
+  argv[5]: "--permission-mode"
+  argv[6]: "bypassPermissions"
+  argv[7]: "--always-approve"
+  argv[8]: "--cwd"
+  argv[9]: "/ws"
+cwd: /ws
+stdin: Ignore
+
+[full]
+command: grok
+  argv[1]: "-p"
+  argv[2]: "the user prompt"
+  argv[3]: "--output-format"
+  argv[4]: "streaming-json"
+  argv[5]: "--permission-mode"
+  argv[6]: "bypassPermissions"
+  argv[7]: "--always-approve"
+  argv[8]: "--cwd"
+  argv[9]: "/ws"
+  argv[10]: "--model"
+  argv[11]: "a-model"
+  argv[12]: "--effort"
+  argv[13]: "high"
+  argv[14]: "--max-turns"
+  argv[15]: "7"
+  argv[16]: "--system-prompt-override"
+  argv[17]: "the system prompt"
+cwd: /ws
+stdin: Ignore
+
+[agent-system-prompt-only]
+command: grok
+  argv[1]: "-p"
+  argv[2]: "the user prompt"
+  argv[3]: "--output-format"
+  argv[4]: "streaming-json"
+  argv[5]: "--permission-mode"
+  argv[6]: "bypassPermissions"
+  argv[7]: "--always-approve"
+  argv[8]: "--cwd"
+  argv[9]: "/ws"
+  argv[10]: "--system-prompt-override"
+  argv[11]: "the agent prompt"
+cwd: /ws
+stdin: Ignore

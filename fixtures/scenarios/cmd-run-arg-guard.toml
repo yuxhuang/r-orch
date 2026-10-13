@@ -1,0 +1,13 @@
+name = "cmd-run-arg-guard"
+kind = "differential"
+requires = ["run"]
+description = """
+The `run` argument guard, an explicit process.exit(2): neither a task id \
+nor --all nor --watch. Separate from the run scenarios above because it \
+needs no agent process, so it goes green as soon as the command is \
+registered — before the engine can actually run anything."""
+steps = [
+  "init --name proj --adapter claude",
+  "run",
+  "run tsk_nosuch",
+]

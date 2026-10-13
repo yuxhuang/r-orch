@@ -1,0 +1,30 @@
+name = "cmd-config"
+kind = "differential"
+requires = ["config get", "config set"]
+description = """
+config get/set over dot paths. `config get --json` prints a compact \
+{"key":...,"value":...} object, unlike the pretty-printed entity commands, \
+and a missing key omits `value` entirely rather than emitting null. One \
+measured quirk worth replicating exactly: `config global get tui.palette` \
+reports no value at all, even though `config global show` shows palette = \
+amber — `global get` does not walk nested keys."""
+steps = [
+  "init --name proj --adapter claude",
+  "config get defaults.agent.max_turns",
+  "config get defaults.agent.max_turns --json",
+  "config get project.name --json",
+  "config get nope.nope --json",
+  "config get scheduling --json",
+  "config set defaults.agent.max_turns 5",
+  "config get defaults.agent.max_turns --json",
+  "config set defaults.agent.workspace_mode shared",
+  "config set scheduling.poll_interval_ms 2000",
+  "config get scheduling --json",
+  "config get defaults --json",
+  "config global show --json",
+  "config global get tui --json",
+  "config global get tui.palette --json",
+  "config global set tui.palette ocean",
+  "config global get tui.palette --json",
+  "config global show --json",
+]

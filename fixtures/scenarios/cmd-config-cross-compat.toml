@@ -1,0 +1,22 @@
+name = "cmd-config-cross-compat"
+kind = "rust_then_ts"
+split_at = 4
+requires = ["config get", "config set"]
+description = """
+Cross-compat over config.yml, the one file where unknown keys must survive \
+a write: the stores round-trip it through a generic value tree rather than \
+a typed struct, so a config written by a newer version keeps its extra \
+keys when an older one edits a single path."""
+# Read-only steps only: each runs once per binary.
+verify = [
+  "config get scheduling --json",
+  "config get defaults --json",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "config set scheduling.max_concurrent_agents 4",
+  "config set defaults.agent.max_turns 7",
+  "config set project.description 'set by rust'",
+  "config set scheduling.poll_interval_ms 3000",
+  "config get scheduling --json",
+]

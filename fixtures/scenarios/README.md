@@ -1,14 +1,15 @@
 # Parity scenarios
 
-Each `*.toml` here is one differential scenario. `cargo xtask parity` runs them
-all against the vendored TypeScript oracle.
+Each `*.toml` here is one scenario. `cargo xtask parity` runs them all against
+the vendored TypeScript oracle.
 
 ```sh
-# Prerequisites: `cargo build -p orch-cli`, and parity/orch-ts/dist built by
-# parity/setup.sh.
+# Prerequisite: parity/orch-ts/dist, built by parity/setup.sh. The harness
+# builds and snapshots the Rust binary itself.
 cargo xtask parity                       # all scenarios
 cargo xtask parity --filter shell        # name substring
 cargo xtask parity --verbose             # also print the id mapping
+cargo xtask lint-scenarios               # check the scenarios themselves
 ```
 
 A failing scenario prints a unified diff — `---` is the oracle, `+++` is
@@ -16,22 +17,82 @@ r-orch — plus the id mapping, which is the first thing to read when a diff
 looks nonsensical: a wrong mapping means two entities were matched up wrongly
 rather than that a value diverged.
 
+Most of the corpus is written **ahead** of the commands it exercises and skips
+itself until they exist, so a run normally reports a large skip count. See
+[Capability gating](#capability-gating-and-why-most-scenarios-skip).
+
 ## Format
 
 ```toml
 name = "walking-skeleton"
 kind = "differential"       # differential | rust_then_ts | ts_then_rust | interleaved
 split_at = 4                # required for rust_then_ts / ts_then_rust
+requires = ["task show"]    # skip until the Rust binary has these subcommands
+fake_agents = true          # fixtures/fake-agents first on PATH, both binaries
+fake_editor = "orch-edit-title"   # fixtures/fake-editors on PATH + $EDITOR
+timeout_secs = 90           # per step; default 30
+env = { ORCH_FAKE_SCENARIO = "fail" }   # inline table — see the warning below
 description = "..."         # printed on failure and under --verbose
 steps = [
   "init --name proj --adapter claude",
-  "task add 'A title with spaces'",
+  "task add 'A title with spaces' --quiet",
+  "task show ${task.0} --json",
 ]
 verify = ["task list --json"]   # required for the cross-compat kinds
 ```
 
-Steps are argv lines, shell-quoted. They are run with the project directory as
-the working directory.
+Steps are argv lines, shell-quoted, run with the project directory as the
+working directory.
+
+> **`env` must be an inline table.** An `[env]` section header swallows every
+> key that follows it, `steps` included, and TOML then reports
+> `invalid type: sequence, expected a string` from somewhere unrelated. Write
+> `env = { KEY = "value" }` on one line.
+
+### `${task.N}` — referring to an entity the scenario created
+
+The two binaries mint different ids, so an id cannot be written literally.
+`${task.0}` is the **first task id this tree printed**, resolved per tree; the
+prefixes are `task`/`tsk`, `agent`/`agt`, `goal`, `team`, `msg`, `run`.
+
+Ids are learned from each step's stdout in order, which is why most steps that
+create something pass `--quiet`: that prints the bare id. A placeholder with no
+matching id is a hard error naming what the tree did produce, never a silent
+pass-through of the literal text.
+
+`agt_creator` is deliberately **not** learned or normalized — `init` writes it
+as a fixed string, so masking it would hide a divergence rather than tolerate
+one (PARITY.md §6.2).
+
+### `${repeat:<text>:<count>}` — long arguments
+
+`${repeat:a:3999}😀` expands at parse time to 3999 `a`s followed by the emoji.
+The truncation limits are 200 characters for a subject and 4000 for a body, so
+testing them needs arguments of that size; written out literally they would
+make the scenario unreadable and bury the one character that matters — the
+multi-byte one sitting astride the cut. Unlike `${task.N}` this depends on
+nothing the tree produced, so the loader and the lint both see the real
+argument. Expansions over 64 KiB are rejected as typos.
+
+### Step directives
+
+A step may carry leading `@directive` tokens:
+
+- **`@kill-after:<ms>`** — run it and kill it after `<ms>`. There is no argv
+  line meaning "a `serve --once` that dies mid-run", which V25/V35 need. Pair
+  it with a **cross-compat** kind so the kill lands once in one shared tree; in
+  two separate trees it lands at two different points and the trees diverge
+  legitimately, making the scenario flaky rather than wrong.
+- **`@exit-only`** / **`@exit-only:<reason>`** — compare the exit code and
+  ignore stdout/stderr, for the few steps whose *output* is L2 while the exit
+  code is L0: Commander's usage wording and help layout (§1.3, §3). Clap will
+  never reproduce Commander's phrasing, so comparing the text would keep those
+  steps red for a reason the contract says not to care about.
+
+  Give a reason whenever the oracle actually *runs* the step. `lint-scenarios`
+  objects to a bare `@exit-only` on a step that produced real output, because
+  that is almost always someone silencing a diff rather than a genuine L2 case;
+  the reason is the author overriding that, on the record.
 
 ### Kinds
 
@@ -56,9 +117,59 @@ output must match exactly: ids and timestamps included, because there is only
 one set of them.
 
 They must therefore be **read-only**. The loader enforces this against an
-allowlist (`task list`, `agent list` today) rather than trusting the author — a
-mutating step would fail its own second run on a duplicate and report a
-divergence it caused itself.
+allowlist in `scenario.rs` rather than trusting the author — a mutating step
+would fail its own second run on a duplicate and report a divergence it caused
+itself. Extend `READ_ONLY_VERIFY_STEPS` when a new read command lands.
+
+## Capability gating, and why most scenarios skip
+
+A scenario lists the Rust subcommands it needs in `requires`. The harness
+probes `<cmd> --help` once per run and **skips** the scenario while any are
+missing, naming them. The oracle has every command, so only our side gates.
+
+That is what lets the corpus be written before the implementation: it is a red
+bar WP-4/WP-5 land against, and each scenario goes live on its own the moment
+its commands exist — nobody has to remember to un-ignore anything. A skip is
+reported as a coverage gap on every run, not as a pass, so the number cannot
+quietly grow.
+
+Two rules follow from this:
+
+- **Gate on everything a scenario touches, not just its subject.** An ungated
+  scenario that uses a missing command goes red with "unrecognized subcommand",
+  which is noise. Red should mean *behaviour differs*.
+- **But do not gate what is testable today.** `cmd-exit-codes-uninitialized`
+  is deliberately ungated: it needs only commands that already exist, and it is
+  currently red for a real reason (see below).
+
+## `lint-scenarios`: checking the scenarios, not the implementation
+
+Because most of the corpus is skipped on any given day, and a skipped scenario
+is never parsed past its `requires`, a misspelled flag could sit undetected for
+weeks and then fail for the wrong reason. `cargo xtask lint-scenarios` replays
+every step through the **oracle alone**, which has every command today, and
+reports three classes of mistake:
+
+1. an argv the oracle rejects at parse time (a misspelled flag or subcommand);
+2. a `${task.N}` whose index the earlier steps never produced;
+3. an `@exit-only` marker on a step that produces real output.
+
+Steps are allowed to *fail* — many assert error paths — so a non-zero exit is
+not itself a finding.
+
+It paid for itself on first run: `task edit` and `agent edit` take **no flags
+at all** (they round-trip the entity through `$EDITOR`), and four scenarios had
+invented `--title`/`--description`/`--model` options that would have silently
+asserted nothing.
+
+## The same hazard inside a differential run
+
+A step with a misspelled flag makes *both* binaries print a usage error and
+exit the same way, so it passes while asserting nothing — silently vacuous,
+which is worse than red. So the harness fails any step the **oracle** rejected
+at parse time unless it is marked `@exit-only`. Commander writes `error: …` on
+stderr while every ORCH domain error is rendered with `✕`, which makes the
+prefix an unambiguous discriminator.
 
 ## What is compared
 
@@ -99,6 +210,25 @@ The tmpdir must also have **no `.orchestry` ancestor**, because
 — measured, not hypothetical. That is asserted at setup, so point `TMPDIR`
 somewhere outside any ORCH project.
 
+Finally, the harness **builds `orch-cli` from this tree and runs a private copy
+of the binary**, rather than reading `target/debug/orch`. The parallel work
+packages live in separate git worktrees sharing one `CARGO_TARGET_DIR`, so
+`target/debug/orch` is whichever tree built last. This was observed, not
+anticipated: a run reported eleven scenarios failing with rich, plausible diffs
+because it was grading a worktree with the full command surface while this tree
+had three commands. Building makes the binary ours; the snapshot means a
+rebuild elsewhere cannot swap it out mid-run.
+
+Where a scenario needs a program to exist, it gets a fixture rather than the
+machine's own:
+
+- `fake_agents = true` puts `fixtures/fake-agents/` first on `PATH`, so the
+  adapters spawn stand-in CLIs. Set it for `doctor` too, or the probe results
+  depend on what happens to be installed.
+- `fake_editor = "<script>"` puts `fixtures/fake-editors/` on `PATH` and points
+  `EDITOR` and `VISUAL` at `<script>`. This is the only way to reach `task
+  edit` and `agent edit`, which take no flags.
+
 ## Proving the gate can fail
 
 `xtask/probe-harness.sh` introduces a known divergence, asserts the harness
@@ -106,18 +236,54 @@ catches it, and reverts — one probe per numbered PARITY requirement. It found
 two real blind spots when it was first written, so run it after changing the
 harness.
 
+## Contract findings from writing this corpus
+
+Two things measured against the oracle that **contradict `docs/PARITY.md`**.
+The scenarios encode the measured behaviour; the doc is the architect's to fix.
+
+1. **§3: a bare command group prints its help to stdout.** It prints to
+   **stderr**. `orch task` with no subcommand: 0 bytes on stdout, 735 on
+   stderr, exit 1 — Commander's `help({ error: true })` path. Measured for
+   `task`, `agent` and `config`.
+2. **`config global get` cannot read a nested key.** `config global get
+   tui.palette` reports no value at all, while `config global show` reports
+   `palette: "amber"` in the same tree. Replicated as-is in `cmd-config`,
+   because the CLI contract is byte parity, not sanity.
+
+Separately, `task edit` and `agent edit` take **no options**; §2.2's listing of
+them alongside flag-taking verbs invites exactly the mistake four of these
+scenarios originally made.
+
+And one that needs an architect decision rather than a scenario: **a single
+`msg send` can write a file `serde_json` cannot parse.** Bodies are truncated
+by JS `.slice()`, which counts UTF-16 code units, so a 4001-code-unit body
+ending in a non-BMP emoji is cut between the surrogates and stored as a lone
+high surrogate — written as the escape `\ud83d`, which serde_json rejects
+outright. `cmd-msg-truncation.toml` is the test for whichever way it is
+resolved; the detail and the three options are in docs/TRAITS-FROZEN.md §11.
+
 ## Known coverage gaps
 
-Honest limits of the current scenario set, to be closed as WP-5 lands more
-commands:
+Honest limits of the current scenario set:
 
-- **Index tie order under a re-save** is unit-tested but not oracle-verified:
-  the four walking-skeleton commands never re-save an entity, so push-to-end
-  and in-place update produce the same `_index.json`. A `task assign` or
-  `agent edit` step closes this.
+- **`tui`** is interactive and has no scenario. It cannot have one in this
+  harness; it needs a separate pty-driven test.
+- **`update`** is deliberately excluded: `update --check` queries the npm
+  registry, so a scenario for it would not be hermetic. The pre-seeded cache
+  covers the *implicit* check every other command performs.
+- **Index tie order under a re-save** is unit-tested but not oracle-verified
+  for the walking-skeleton commands, which never re-save an entity, so
+  push-to-end and in-place update produce the same `_index.json`.
+  `cmd-task-lifecycle` (via `task assign`) and `cmd-interleaved` close this as
+  soon as those commands land.
 - **Stable-sort ties** in `task list` need two tasks sharing a status *and* an
   `updated_at`, which the clock makes unreliable to produce from the CLI.
 - **Multi-entity index rebuild** is deliberately not exercised:
   `rebuildIndex` derives order from `fs.readdir`, so two tmpdirs can enumerate
   the same logical set differently (PARITY.md §14.4). Do not add a scenario
   that deletes `_index.json` with ≥2 entities present.
+- **Timing-dependent O7 scenarios** drive their clocks through *config*
+  (`stall_timeout_ms`, `retry_base_delay_ms`, `poll_interval_ms`) rather than
+  an injected Rust-side clock. An injected clock only one binary has would
+  make the comparison non-differential; a config key both honour keeps the
+  arithmetic itself under test.

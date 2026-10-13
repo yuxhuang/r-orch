@@ -1,0 +1,9 @@
+{"type": "extension_ui_request", "method": "setTitle", "title": "noise"}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "Reading"}}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": " sources\u2026"}}
+{"type": "message_update", "assistantMessageEvent": {"type": "text_end", "content": "Reading sources\u2026"}}
+{"type": "tool_execution_start", "toolName": "read", "args": {"path": "src/foo.ts"}}
+{"type": "tool_execution_update", "toolName": "bash", "result": {"content": [{"type": "text", "text": "partial"}]}}
+{"type": "tool_execution_end", "toolName": "bash", "args": {"command": "npm test"}, "result": {"content": [{"type": "text", "text": "passed"}], "details": {"exitCode": 0}}, "isError": false}
+{"type": "tool_execution_end", "toolName": "write", "args": {"path": "src/foo.ts"}, "result": {"content": [{"type": "text", "text": "written"}]}, "isError": false}
+{"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": "Implementation complete."}], "usage": {"input": 42, "output": 17, "reasoning": 3, "cache_read": 5, "cache_write": 0}}]}

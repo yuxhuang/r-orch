@@ -21,31 +21,49 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::normalize::Normalizer;
+use crate::normalize::{IdRegistry, Normalizer};
 use crate::scenario::{Kind, Runner, Scenario};
 
 /// The version the oracle reports, so the seeded cache never looks like an
 /// available update.
 const ORACLE_VERSION: &str = "1.0.34";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Binaries {
-    /// `target/debug/orch`.
+    /// A private snapshot of this tree's `orch`, not `target/debug/orch`
+    /// itself — see [`Binaries::discover`].
     pub rust: PathBuf,
     /// `parity/orch-ts/dist/cli.js`.
     pub oracle_entry: PathBuf,
     pub node: PathBuf,
+    pub repo_root: PathBuf,
+    /// Holds the snapshot directory open for the lifetime of the run.
+    _snapshot: Option<tempfile::TempDir>,
 }
 
 impl Binaries {
+    /// Build this tree's CLI and take a private copy of it.
+    ///
+    /// Both halves matter, because the parallel work packages run in separate
+    /// git worktrees that **share** one `CARGO_TARGET_DIR`. So
+    /// `target/debug/orch` is not this tree's binary — it is whichever tree
+    /// built last, and a parity run that reads it can silently grade a
+    /// different branch. (Observed: a run reported 11 scenarios failing with
+    /// rich diffs because it was testing a worktree that had the full command
+    /// surface, while this tree had three commands.) Building first makes the
+    /// binary ours; snapshotting it means a rebuild elsewhere cannot swap it
+    /// out from under a run that takes minutes.
     pub fn discover(repo_root: &Path) -> Result<Binaries> {
-        let rust = repo_root.join("target/debug/orch");
-        if !rust.exists() {
-            bail!(
-                "{} is missing — run `cargo build -p orch-cli` first",
-                rust.display()
-            );
-        }
+        let built = build_cli(repo_root)?;
+
+        let snapshot = tempfile::Builder::new()
+            .prefix("r-orch-parity-bin-")
+            .tempdir()
+            .context("create binary snapshot dir")?;
+        let rust = snapshot.path().join("orch");
+        std::fs::copy(&built, &rust)
+            .with_context(|| format!("snapshot {} for this run", built.display()))?;
+
         let oracle_entry = repo_root.join("parity/orch-ts/dist/cli.js");
         if !oracle_entry.exists() {
             bail!(
@@ -57,8 +75,47 @@ impl Binaries {
             rust,
             oracle_entry,
             node: PathBuf::from("node"),
+            repo_root: repo_root.to_path_buf(),
+            _snapshot: Some(snapshot),
         })
     }
+}
+
+/// `cargo build -p orch-cli` against *this* tree's manifest, returning the
+/// executable cargo reports.
+fn build_cli(repo_root: &Path) -> Result<PathBuf> {
+    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args([
+            "build",
+            "-p",
+            "orch-cli",
+            "--message-format=json-render-diagnostics",
+            "--manifest-path",
+        ])
+        .arg(repo_root.join("Cargo.toml"))
+        .current_dir(repo_root)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("run cargo build -p orch-cli")?;
+
+    if !output.status.success() {
+        bail!("cargo build -p orch-cli failed — fix the build before running the harness");
+    }
+
+    // The last `compiler-artifact` message carrying an executable is the bin.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let executable = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact")
+        .filter_map(|message| message["executable"].as_str().map(PathBuf::from))
+        .next_back();
+
+    executable.context(
+        "cargo reported no executable for orch-cli — the harness needs the binary path from \
+         cargo rather than a guessed target/debug/orch, because the target directory is shared \
+         between worktrees",
+    )
 }
 
 /// One executed step.
@@ -156,6 +213,52 @@ fn git(cwd: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Which subcommands the Rust binary actually has.
+///
+/// Probed with `<cmd> --help`, which clap answers during parsing: exit 0 for a
+/// command it knows, non-zero (`unrecognized subcommand`) for one it does not.
+/// That happens before the container is built, so an uninitialized directory
+/// does not confuse it.
+#[derive(Debug, Default)]
+pub struct Capabilities {
+    probed: std::cell::RefCell<BTreeMap<String, bool>>,
+}
+
+impl Capabilities {
+    pub fn new() -> Self {
+        Capabilities::default()
+    }
+
+    /// Every requirement this scenario declares that the Rust binary lacks.
+    pub fn missing(&self, bins: &Binaries, requires: &[String]) -> Vec<String> {
+        requires
+            .iter()
+            .filter(|command| !self.supports(bins, command))
+            .cloned()
+            .collect()
+    }
+
+    fn supports(&self, bins: &Binaries, command: &str) -> bool {
+        if let Some(known) = self.probed.borrow().get(command) {
+            return *known;
+        }
+        let argv = shell_words::split(command).unwrap_or_default();
+        let supported = Command::new(&bins.rust)
+            .args(&argv)
+            .arg("--help")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        self.probed
+            .borrow_mut()
+            .insert(command.to_owned(), supported);
+        supported
+    }
+}
+
 /// The outcome of comparing one scenario.
 #[derive(Debug)]
 pub struct ScenarioResult {
@@ -166,11 +269,29 @@ pub struct ScenarioResult {
     /// under `--verbose`, and the thing to read first when a diff looks
     /// nonsensical: a wrong mapping means two entities were matched up wrongly.
     pub id_mapping: Vec<(String, String)>,
+    /// Set when the scenario did not run, with the reason. A skipped scenario
+    /// is **not** a pass: it is counted and reported separately, so the corpus
+    /// cannot quietly stop covering anything.
+    pub skipped: Option<String>,
 }
 
 impl ScenarioResult {
     pub fn passed(&self) -> bool {
-        self.failures.is_empty()
+        self.skipped.is_none() && self.failures.is_empty()
+    }
+
+    pub fn ran(&self) -> bool {
+        self.skipped.is_none()
+    }
+
+    fn skipped(scenario: &Scenario, reason: String) -> ScenarioResult {
+        ScenarioResult {
+            name: scenario.name.clone(),
+            kind: scenario.kind,
+            failures: Vec::new(),
+            id_mapping: Vec::new(),
+            skipped: Some(reason),
+        }
     }
 
     /// `rust_then_ts` over 8 steps, say — the one-line shape of what ran.
@@ -188,7 +309,19 @@ fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
-pub fn run_scenario(bins: &Binaries, scenario: &Scenario) -> Result<ScenarioResult> {
+pub fn run_scenario(
+    bins: &Binaries,
+    capabilities: &Capabilities,
+    scenario: &Scenario,
+) -> Result<ScenarioResult> {
+    let missing = capabilities.missing(bins, &scenario.requires);
+    if !missing.is_empty() {
+        return Ok(ScenarioResult::skipped(
+            scenario,
+            format!("the Rust binary has no {}", missing.join(", ")),
+        ));
+    }
+
     let mut failures = Vec::new();
 
     if scenario.kind.is_cross_compat() {
@@ -199,9 +332,14 @@ pub fn run_scenario(bins: &Binaries, scenario: &Scenario) -> Result<ScenarioResu
         let project = Project::create(&scenario.name)?;
         let plan = scenario.plan();
         let mut outputs = Vec::new();
+        let mut ids = IdRegistry::new();
 
         for (step, runner) in scenario.steps.iter().zip(&plan) {
-            let output = execute(bins, &project, scenario, step, *runner)?;
+            let output = execute(bins, &project, scenario, step, *runner, &ids)?;
+            ids.learn(&output.stdout);
+            if output.runner == "ts" {
+                failures.extend(usage_error_failure(scenario, step, &output.stderr));
+            }
             if output.exit_code != 0 {
                 failures.push(format!(
                     "step `{step}` ({}) exited {} — cross-compat steps must all succeed\n\
@@ -222,8 +360,8 @@ pub fn run_scenario(bins: &Binaries, scenario: &Scenario) -> Result<ScenarioResu
         // it.
         let mut norm = Normalizer::new().with_root(&project.root, "<ROOT>");
         for step in &scenario.verify {
-            let rust_out = execute(bins, &project, scenario, step, Runner::Rust)?;
-            let ts_out = execute(bins, &project, scenario, step, Runner::Ts)?;
+            let rust_out = execute(bins, &project, scenario, step, Runner::Rust, &ids)?;
+            let ts_out = execute(bins, &project, scenario, step, Runner::Ts, &ids)?;
 
             if rust_out.exit_code != ts_out.exit_code {
                 failures.push(format!(
@@ -253,6 +391,7 @@ pub fn run_scenario(bins: &Binaries, scenario: &Scenario) -> Result<ScenarioResu
             kind: scenario.kind,
             failures,
             id_mapping: mapping_of(&norm),
+            skipped: None,
         });
     }
     {
@@ -261,17 +400,23 @@ pub fn run_scenario(bins: &Binaries, scenario: &Scenario) -> Result<ScenarioResu
 
         let mut rust_norm = Normalizer::new().with_root(&rust.root, "<ROOT>");
         let mut ts_norm = Normalizer::new().with_root(&ts.root, "<ROOT>");
+        let (mut rust_ids, mut ts_ids) = (IdRegistry::new(), IdRegistry::new());
 
         for step in &scenario.steps {
-            let rust_out = execute(bins, &rust, scenario, step, Runner::Rust)?;
-            let ts_out = execute(bins, &ts, scenario, step, Runner::Ts)?;
+            let rust_out = execute(bins, &rust, scenario, step, Runner::Rust, &rust_ids)?;
+            let ts_out = execute(bins, &ts, scenario, step, Runner::Ts, &ts_ids)?;
 
             // Learn ids in step order, so the Nth created entity maps to the
-            // same placeholder on both sides.
+            // same placeholder on both sides — and so a later step can refer
+            // to it by position.
             rust_norm.learn(&rust_out.stdout);
             rust_norm.learn(&rust_out.stderr);
             ts_norm.learn(&ts_out.stdout);
             ts_norm.learn(&ts_out.stderr);
+            rust_ids.learn(&rust_out.stdout);
+            ts_ids.learn(&ts_out.stdout);
+
+            failures.extend(usage_error_failure(scenario, step, &ts_out.stderr));
 
             if rust_out.exit_code != ts_out.exit_code {
                 failures.push(format!(
@@ -279,18 +424,39 @@ pub fn run_scenario(bins: &Binaries, scenario: &Scenario) -> Result<ScenarioResu
                     rust_out.exit_code, ts_out.exit_code
                 ));
             }
-            for (channel, rust_text, ts_text) in [
-                ("stdout", &rust_out.stdout, &ts_out.stdout),
-                ("stderr", &rust_out.stderr, &ts_out.stderr),
-            ] {
-                let left = rust_norm.text(rust_text);
-                let right = ts_norm.text(ts_text);
-                if left != right {
-                    failures.push(format!(
-                        "step `{step}`: {channel} differs\n{}",
-                        unified_diff(&right, &left)
-                    ));
-                }
+            // `@exit-only` steps have already had the only L0 thing about them
+            // compared, just above.
+            if Scenario::exit_only(step) {
+                continue;
+            }
+            // `serve --log-format json` emits records, not prose: the record
+            // *fields* are L0 and the text format is L2 (PARITY.md §11.1), so
+            // compare those parsed and normalized, and everything else as text.
+            let stdout_diff = if scenario.stdout_is_json_records(step) {
+                let left = json_records(&rust_out.stdout, &mut rust_norm);
+                let right = json_records(&ts_out.stdout, &mut ts_norm);
+                (left != right).then(|| {
+                    (
+                        "log records",
+                        unified_diff(&records_text(&right), &records_text(&left)),
+                    )
+                })
+            } else {
+                let left = rust_norm.text(&rust_out.stdout);
+                let right = ts_norm.text(&ts_out.stdout);
+                (left != right).then(|| ("stdout", unified_diff(&right, &left)))
+            };
+            if let Some((what, diff)) = stdout_diff {
+                failures.push(format!("step `{step}`: {what} differ(s)\n{diff}"));
+            }
+
+            let left = rust_norm.text(&rust_out.stderr);
+            let right = ts_norm.text(&ts_out.stderr);
+            if left != right {
+                failures.push(format!(
+                    "step `{step}`: stderr differs\n{}",
+                    unified_diff(&right, &left)
+                ));
             }
         }
 
@@ -305,11 +471,82 @@ pub fn run_scenario(bins: &Binaries, scenario: &Scenario) -> Result<ScenarioResu
             kind: scenario.kind,
             failures,
             id_mapping: mapping_of(&rust_norm),
+            skipped: None,
         })
     }
 }
 
 /// Real id → placeholder, in first-seen order.
+/// Replay a scenario's steps through the oracle alone and report anything that
+/// makes the scenario itself wrong rather than the implementation.
+///
+/// Three classes of mistake, all of which would otherwise sit undetected in a
+/// skipped scenario until the command it needs lands:
+///
+/// 1. a misspelled flag or subcommand, which the oracle rejects at parse time;
+/// 2. a `${task.N}` whose index the earlier steps never produced;
+/// 3. a `@exit-only` marker on a step that does *not* produce a usage error,
+///    which silently discards a real output comparison.
+///
+/// Steps are allowed to *fail* — plenty of them assert error paths — so a
+/// non-zero exit is not itself a problem. Only the oracle is consulted, so the
+/// Rust side's gaps do not enter into it.
+pub fn lint_against_oracle(bins: &Binaries, scenario: &Scenario) -> Result<Vec<String>> {
+    let project = Project::create(&format!("lint-{}", scenario.name))?;
+    let mut problems = Vec::new();
+    let mut ids = IdRegistry::new();
+
+    for step in scenario.steps.iter().chain(&scenario.verify) {
+        // A `@kill-after` step is meant to be interrupted; replaying it in
+        // full would just burn the timeout, and the kill itself is what the
+        // scenario asserts.
+        if Scenario::kill_after(step).is_some() {
+            continue;
+        }
+        let output = match execute(bins, &project, scenario, step, Runner::Ts, &ids) {
+            Ok(output) => output,
+            // An unresolvable placeholder is reported as an error by `execute`;
+            // here it is a finding about the scenario, not a reason to stop.
+            Err(err) => {
+                problems.push(format!("{err:#}"));
+                continue;
+            }
+        };
+        ids.learn(&output.stdout);
+
+        let usage_error = crate::scenario::is_usage_error(&output.stderr);
+        if usage_error && !Scenario::exit_only(step) {
+            problems.push(format!(
+                "step `{step}`: the oracle rejected this argv at parse time, so the step \
+                 asserts nothing — fix the flag, or mark it `@exit-only` if that is the point\n\
+                 stderr: {}",
+                output.stderr.trim()
+            ));
+        }
+        if !usage_error
+            && Scenario::exit_only(step)
+            && !Scenario::exit_only_reason(step)
+            && !is_group_help(&output)
+        {
+            problems.push(format!(
+                "step `{step}`: marked `@exit-only`, but the oracle ran it and produced real \
+                 output, so the marker throws away a comparison that would have counted. \
+                 Drop it, or say why the output is L2 with `@exit-only:<reason>`.\nstdout: {}",
+                output.stdout.trim().chars().take(200).collect::<String>()
+            ));
+        }
+    }
+
+    Ok(problems)
+}
+
+/// A command group invoked with no subcommand: Commander prints the group's
+/// help to stderr and exits 1, which is not an `error:` line but is still
+/// output whose layout is L2 (PARITY.md §1.3), so `@exit-only` is right there.
+fn is_group_help(output: &StepOutput) -> bool {
+    output.exit_code == 1 && output.stdout.is_empty() && output.stderr.starts_with("Usage:")
+}
+
 fn mapping_of(norm: &Normalizer) -> Vec<(String, String)> {
     norm.mapping()
         .iter()
@@ -323,8 +560,13 @@ fn execute(
     scenario: &Scenario,
     step: &str,
     runner: Runner,
+    ids: &IdRegistry,
 ) -> Result<StepOutput> {
-    let argv = scenario.argv(step)?;
+    // Expanded per tree: the two binaries mint different ids, so `${task.0}`
+    // resolves to whatever *this* tree produced.
+    let argv = ids
+        .expand(&scenario.argv(step)?)
+        .map_err(|err| anyhow!("step `{step}`: {err}"))?;
     let (mut command, label) = match runner {
         Runner::Rust | Runner::Both => (Command::new(&bins.rust), "rust"),
         Runner::Ts => {
@@ -333,6 +575,19 @@ fn execute(
             (command, "ts")
         }
     };
+
+    if scenario.fake_agents || scenario.fake_editor.is_some() {
+        command.env("PATH", stand_in_path(bins, scenario)?);
+    }
+    if let Some(editor) = &scenario.fake_editor {
+        // `VISUAL` wins over `EDITOR` in some editors but not in the oracle,
+        // which checks `EDITOR` first — so set both to the same script and
+        // leave the precedence question to a test of its own.
+        command.env("EDITOR", editor).env("VISUAL", editor);
+    }
+    for (key, value) in &scenario.env {
+        command.env(key, value);
+    }
 
     command
         .args(&argv)
@@ -354,9 +609,10 @@ fn execute(
         .env_remove("ORCHESTRY_DEBUG")
         .stdin(std::process::Stdio::null());
 
-    let output = command
-        .output()
-        .with_context(|| format!("run {label} step `{step}` in {}", project.root.display()))?;
+    let output = match Scenario::kill_after(step) {
+        Some(after) => run_and_kill(command, after, label, step)?,
+        None => run_with_timeout(command, scenario.timeout(), label, step)?,
+    };
 
     Ok(StepOutput {
         step: step.to_owned(),
@@ -364,6 +620,118 @@ fn execute(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(-1),
+    })
+}
+
+/// Run a step and `SIGKILL` it after `after`, for the crash-recovery
+/// scenarios. The exit code is whatever the kill produced, which the scenario
+/// is expected to tolerate — what is compared is the state the next step finds.
+fn run_and_kill(
+    mut command: Command,
+    after: std::time::Duration,
+    label: &str,
+    step: &str,
+) -> Result<std::process::Output> {
+    let scratch = tempfile::tempdir().context("create stdio scratch dir")?;
+    let (out_path, err_path) = (scratch.path().join("stdout"), scratch.path().join("stderr"));
+    command
+        .stdout(std::fs::File::create(&out_path).context("create stdout file")?)
+        .stderr(std::fs::File::create(&err_path).context("create stderr file")?);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn {label} step `{step}`"))?;
+
+    std::thread::sleep(after);
+    // Already finished is fine: the point is that it did not outlive the
+    // deadline, not that it was necessarily still running.
+    let status = match child.try_wait().context("poll child")? {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            child.wait().context("reap killed child")?
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: std::fs::read(&out_path).context("read captured stdout")?,
+        stderr: std::fs::read(&err_path).context("read captured stderr")?,
+    })
+}
+
+/// `fixtures/fake-agents/` first on `PATH`, with the inherited `PATH` after
+/// it so `git` and `sh` still resolve.
+/// `PATH` with the stand-in directories this scenario asked for in front, so
+/// both binaries spawn the fixtures rather than whatever the machine has
+/// installed.
+fn stand_in_path(bins: &Binaries, scenario: &Scenario) -> Result<String> {
+    let mut dirs = Vec::new();
+    if scenario.fake_agents {
+        dirs.push("fixtures/fake-agents");
+    }
+    if scenario.fake_editor.is_some() {
+        dirs.push("fixtures/fake-editors");
+    }
+
+    let mut path = String::new();
+    for dir in dirs {
+        let resolved = bins
+            .repo_root
+            .join(dir)
+            .canonicalize()
+            .with_context(|| format!("locate {dir}"))?;
+        path.push_str(&resolved.display().to_string());
+        path.push(':');
+    }
+    path.push_str(&std::env::var("PATH").unwrap_or_default());
+    Ok(path)
+}
+
+/// Run to completion or kill at the deadline.
+///
+/// `Command::output()` has no timeout, and a `run --watch` or a `serve`
+/// without `--once` never terminates — so a scenario that names one must fail
+/// on its own rather than hanging the harness. stdio goes to temp files
+/// instead of pipes, which also removes any chance of deadlocking on a full
+/// pipe while we wait.
+fn run_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+    label: &str,
+    step: &str,
+) -> Result<std::process::Output> {
+    let scratch = tempfile::tempdir().context("create stdio scratch dir")?;
+    let (out_path, err_path) = (scratch.path().join("stdout"), scratch.path().join("stderr"));
+    command
+        .stdout(std::fs::File::create(&out_path).context("create stdout file")?)
+        .stderr(std::fs::File::create(&err_path).context("create stderr file")?);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn {label} step `{step}`"))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().context("poll child")? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "{label} step `{step}` did not finish within {timeout:?} — a \
+                     non-terminating command (`run --watch`, `serve` without `--once`) \
+                     cannot be a scenario step"
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: std::fs::read(&out_path).context("read captured stdout")?,
+        stderr: std::fs::read(&err_path).context("read captured stderr")?,
     })
 }
 
@@ -405,6 +773,7 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
     files.sort();
 
     let mut framing = BTreeMap::new();
+    let mut unparseable = BTreeMap::new();
     let mut tree = BTreeMap::new();
     for relative in files {
         let path = root.join(&relative);
@@ -412,10 +781,21 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         // Parse first, normalize second: substituting placeholders into the
         // raw text would make `"pid": 360135` invalid JSON.
-        let parsed = parse_by_extension(&relative, &raw)
-            .with_context(|| format!("parse {}", path.display()))?;
-        let value = norm.value(&parsed);
+        //
+        // A file that will not parse is a *finding*, not a harness error. The
+        // oracle can legitimately write JSON that serde_json rejects — a
+        // message body truncated mid-surrogate-pair comes out as the escape
+        // `\ud83d`, and serde_json refuses a lone surrogate outright — and
+        // that divergence is exactly what a scenario would be testing. So
+        // fall back to comparing the raw text and record why.
         let key = norm.path(&relative.to_string_lossy());
+        let value = match parse_by_extension(&relative, &raw) {
+            Ok(parsed) => norm.value(&parsed),
+            Err(err) => {
+                unparseable.insert(key.clone(), format!("{err}"));
+                norm.value(&Value::String(raw.clone()))
+            }
+        };
         if relative.extension().is_some_and(|e| e == "json") {
             framing.insert(key.clone(), JsonFraming::of(&raw));
         }
@@ -430,14 +810,19 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
     Ok(Tree {
         values: tree,
         framing,
+        unparseable,
     })
 }
 
 /// A collected `.orchestry/` tree.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Tree {
     values: BTreeMap<String, Value>,
     framing: BTreeMap<String, JsonFraming>,
+    /// Files whose own extension's parser rejected them, and why. Compared
+    /// between trees, so "one binary wrote something the other's parser
+    /// cannot read" is reported rather than crashing the run.
+    unparseable: BTreeMap<String, String>,
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -480,8 +865,47 @@ fn parse_by_extension(relative: &Path, text: &str) -> Result<Value> {
     }
 }
 
+/// Fail a step the oracle rejected at parse time, unless the scenario says it
+/// means to.
+///
+/// Both binaries reject a misspelled flag the same way, so such a step is
+/// green and vacuous: it compares two usage messages and never reaches the
+/// code under test. Scenarios that deliberately test usage errors set
+/// `allow_usage_errors`.
+fn usage_error_failure(_scenario: &Scenario, step: &str, ts_stderr: &str) -> Option<String> {
+    if Scenario::exit_only(step) || !crate::scenario::is_usage_error(ts_stderr) {
+        return None;
+    }
+    Some(format!(
+        "step `{step}`: the oracle rejected this argv at parse time, so the step asserts \
+         nothing about behaviour — fix the flag, or prefix the step with `@exit-only` if the \
+         usage error is the point\nstderr: {}",
+        ts_stderr.trim()
+    ))
+}
+
 fn compare_trees(rust: &Tree, ts: &Tree) -> Vec<String> {
     let mut failures = compare_values(&rust.values, &ts.values);
+
+    // A file only one side could parse is the sharpest possible signal: the
+    // two implementations do not even agree that it is well-formed.
+    for (path, why) in &ts.unparseable {
+        if !rust.unparseable.contains_key(path) {
+            failures.push(format!(
+                "`.orchestry/{path}`: the oracle wrote a file our parser rejects ({why}) \
+                 while r-orch's own file parses — the two are not interchangeable, whatever \
+                 the values compare as"
+            ));
+        }
+    }
+    for (path, why) in &rust.unparseable {
+        if !ts.unparseable.contains_key(path) {
+            failures.push(format!(
+                "`.orchestry/{path}`: r-orch wrote a file our parser rejects ({why}) while \
+                 the oracle's parses"
+            ));
+        }
+    }
 
     for (path, ts_framing) in &ts.framing {
         if let Some(rust_framing) = rust.framing.get(path)
@@ -670,6 +1094,27 @@ struct JsYamlResult {
     error: Option<String>,
 }
 
+/// Parse JSONL stdout into normalized records. A line that is not JSON is
+/// kept as a string record, so a stray human line still shows in the diff
+/// rather than vanishing.
+fn json_records(stdout: &str, norm: &mut Normalizer) -> Vec<Value> {
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(value) => norm.value(&value),
+            Err(_) => Value::String(norm.text(line)),
+        })
+        .collect()
+}
+
+fn records_text(records: &[Value]) -> String {
+    records
+        .iter()
+        .map(|record| format!("{}\n", pretty(record)))
+        .collect()
+}
+
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
@@ -700,6 +1145,87 @@ fn unified_diff(expected: &str, actual: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scenario_with(body: &str) -> Scenario {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("s.toml");
+        std::fs::write(&path, body).unwrap();
+        Scenario::load(&path).unwrap()
+    }
+
+    #[test]
+    fn a_step_the_oracle_rejected_at_parse_time_fails_unless_declared() {
+        let scenario =
+            scenario_with("name = \"s\"\nkind = \"differential\"\nsteps = [\"task list\"]\n");
+        let stderr = "error: unknown option '--nosuchflag'\n";
+
+        let failure = usage_error_failure(&scenario, "task list --nosuchflag", stderr)
+            .expect("a misspelled flag must fail rather than pass vacuously");
+        assert!(failure.contains("asserts nothing"), "{failure}");
+
+        // Declared, so it is the point of the step rather than a typo.
+        assert!(
+            usage_error_failure(&scenario, "@exit-only task list --nosuchflag", stderr).is_none()
+        );
+        // A domain error is not a usage error.
+        assert!(
+            usage_error_failure(&scenario, "task show tsk_nosuch", "  ✕ Task not found\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stand_in_directories_go_on_the_path_only_when_asked_for() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let bins = Binaries {
+            rust: PathBuf::from("/nonexistent"),
+            oracle_entry: PathBuf::from("/nonexistent"),
+            node: PathBuf::from("node"),
+            repo_root,
+            _snapshot: None,
+        };
+
+        let plain = scenario_with("name = \"s\"\nkind = \"differential\"\nsteps = [\"a\"]\n");
+        let path = stand_in_path(&bins, &plain).unwrap();
+        assert!(!path.contains("fake-agents"), "{path}");
+        assert!(!path.contains("fake-editors"), "{path}");
+
+        let both = scenario_with(
+            "name = \"s\"\nkind = \"differential\"\nfake_agents = true\n\
+             fake_editor = \"orch-edit-title\"\nsteps = [\"a\"]\n",
+        );
+        let path = stand_in_path(&bins, &both).unwrap();
+        let agents = path.find("fake-agents").expect("fake-agents on PATH");
+        let editors = path.find("fake-editors").expect("fake-editors on PATH");
+        // Both ahead of the inherited PATH, so the fixtures win over anything
+        // the machine happens to have installed.
+        let inherited = path.find("/usr/bin").unwrap_or(usize::MAX);
+        assert!(agents < inherited && editors < inherited, "{path}");
+    }
+
+    #[test]
+    fn a_group_help_step_is_recognized_as_l2_output() {
+        // `orch task` with no subcommand: Commander prints the group's help to
+        // stderr and exits 1 — measured, and contrary to PARITY.md §3, which
+        // says stdout. The lint must accept a bare `@exit-only` on it.
+        let output = StepOutput {
+            step: "task".into(),
+            runner: "ts",
+            stdout: String::new(),
+            stderr: "Usage: orchestry task [options] [command]\n".into(),
+            exit_code: 1,
+        };
+        assert!(is_group_help(&output));
+
+        let with_stdout = StepOutput {
+            stdout: "something real\n".into(),
+            ..output.clone()
+        };
+        assert!(!is_group_help(&with_stdout));
+    }
 
     #[test]
     fn a_tmpdir_with_an_orchestry_ancestor_is_rejected() {
@@ -860,6 +1386,49 @@ mod tests {
         let failures = compare_trees(&rust, &ts);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_file_only_one_side_can_parse_is_reported_not_crashed_on() {
+        // The real case: a message body truncated mid-surrogate-pair is
+        // written by the oracle as the escape `\ud83d`, which serde_json
+        // rejects outright. Aborting the run would turn the divergence under
+        // test into a harness error.
+        let mut rust = Tree::default();
+        rust.values
+            .insert("messages/m.json".to_owned(), Value::Null);
+        let mut ts = Tree::default();
+        ts.values.insert("messages/m.json".to_owned(), Value::Null);
+        ts.unparseable.insert(
+            "messages/m.json".to_owned(),
+            "unexpected end of hex escape at line 1 column 19".to_owned(),
+        );
+
+        let failures = compare_trees(&rust, &ts);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("our parser rejects"),
+            "{}",
+            failures[0]
+        );
+        assert!(failures[0].contains("hex escape"), "{}", failures[0]);
+
+        // Both sides unparseable in the same way is not a divergence; the raw
+        // text comparison still covers the content.
+        let mut both = rust.clone();
+        both.unparseable = ts.unparseable.clone();
+        assert!(compare_trees(&both, &ts).is_empty());
+    }
+
+    #[test]
+    fn parse_by_extension_reports_a_lone_surrogate_rather_than_accepting_it() {
+        let err = parse_by_extension(Path::new("m.json"), r#"{"body":"aaa\ud83d"}"#)
+            .expect_err("serde_json must reject a lone surrogate escape");
+        assert!(format!("{err}").contains("hex escape"), "{err}");
+
+        // A whole pair is fine, so the rejection is specific to the split.
+        let ok = parse_by_extension(Path::new("m.json"), "{\"body\":\"\u{1F600}\"}").unwrap();
+        assert_eq!(ok["body"], Value::String("\u{1F600}".to_owned()));
     }
 
     #[test]

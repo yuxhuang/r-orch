@@ -1,0 +1,25 @@
+name = "o7-serve-once-exit-codes"
+kind = "differential"
+requires = ["serve", "config set"]
+fake_agents = true
+timeout_secs = 120
+description = """
+V21: `serve --once` exits 1 if and only if a task ended failed. An empty \
+queue exits 0 and a cancelled task does not make it non-zero. Four runs in \
+one scenario, so a regression in the aggregation shows up as an exit-code \
+difference rather than a tree difference."""
+steps = [
+  "init --name proj --adapter claude",
+  "config set scheduling.poll_interval_ms 200",
+  "config set defaults.task.max_attempts 1",
+  "serve --once --log-format json",
+  "agent add worker --adapter claude --quiet",
+  "task add 'passes' --assignee ${agent.0} --quiet",
+  "serve --once --log-format json",
+  "task add 'cancel me' --assignee ${agent.0} --quiet",
+  "task cancel ${task.1}",
+  "serve --once --log-format json",
+  "task add 'fails ORCH_FAKE_FAIL' --assignee ${agent.0} --quiet",
+  "serve --once --log-format json",
+  "task list --json",
+]

@@ -1,0 +1,22 @@
+name = "cmd-context-cross-compat"
+kind = "rust_then_ts"
+split_at = 3
+requires = ["context set", "context list"]
+description = """
+Cross-compat over the context store's JSON files and its _index.json. \
+Context is the only .json-backed indexed store the CLI touches, so this is \
+what catches an index whose file filter forgets to exclude itself from a \
+rebuild."""
+# Read-only steps only: each runs once per binary.
+verify = [
+  "context list --json",
+  "context get both --json",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "context set from-rust 'written by rust'",
+  "context set both 'rust first'",
+  "context set from-ts 'written by ts'",
+  "context set both 'ts second'",
+  "context list --json",
+]

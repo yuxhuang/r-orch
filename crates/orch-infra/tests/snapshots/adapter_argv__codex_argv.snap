@@ -1,0 +1,35 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm| Box::new(CodexAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: codex
+  argv[1]: "exec"
+  argv[2]: "--json"
+  argv[3]: "--sandbox"
+  argv[4]: "danger-full-access"
+  argv[5]: "-"
+cwd: /ws
+stdin: Pipe
+
+[full]
+command: codex
+  argv[1]: "exec"
+  argv[2]: "--json"
+  argv[3]: "--sandbox"
+  argv[4]: "danger-full-access"
+  argv[5]: "--model"
+  argv[6]: "a-model"
+  argv[7]: "-"
+cwd: /ws
+stdin: Pipe
+
+[agent-system-prompt-only]
+command: codex
+  argv[1]: "exec"
+  argv[2]: "--json"
+  argv[3]: "--sandbox"
+  argv[4]: "danger-full-access"
+  argv[5]: "-"
+cwd: /ws
+stdin: Pipe

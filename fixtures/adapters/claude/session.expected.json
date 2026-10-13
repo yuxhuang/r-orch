@@ -1,0 +1,54 @@
+{
+  "events": [
+    {
+      "type": "output",
+      "data": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reading sources"
+          }
+        ]
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "type": "tool_use",
+        "name": "read",
+        "input": {
+          "path": "src/index.ts"
+        }
+      }
+    },
+    {
+      "type": "output",
+      "data": {
+        "type": "tool_result",
+        "content": "export const a = 1;"
+      }
+    },
+    {
+      "type": "done",
+      "data": {
+        "type": "result",
+        "subtype": "success",
+        "usage": {
+          "input_tokens": 100,
+          "output_tokens": 50,
+          "cache_read_input_tokens": 10
+        }
+      },
+      "tokens": {
+        "input": 100,
+        "output": 50,
+        "reasoning": 0,
+        "total": 150,
+        "cache_read": 10,
+        "cache_write": 0
+      }
+    }
+  ],
+  "error": null
+}

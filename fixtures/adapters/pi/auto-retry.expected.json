@@ -1,0 +1,39 @@
+{
+  "events": [
+    {
+      "type": "done",
+      "data": {
+        "result": "Recovered after retry.",
+        "raw": {
+          "type": "agent_end",
+          "willRetry": false,
+          "messages": [
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Recovered after retry."
+                }
+              ],
+              "stopReason": "stop",
+              "usage": {
+                "input": 12,
+                "output": 5
+              }
+            }
+          ]
+        }
+      },
+      "tokens": {
+        "input": 12,
+        "output": 5,
+        "reasoning": 0,
+        "total": 17,
+        "cache_read": 0,
+        "cache_write": 0
+      }
+    }
+  ],
+  "error": null
+}

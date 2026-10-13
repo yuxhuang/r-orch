@@ -1,0 +1,53 @@
+#!/bin/sh
+# Fake `pi` — `--mode rpc`: one JSONL prompt frame in, RPC events out, and the
+# session stays alive until the adapter kills it.
+. "$(dirname "$0")/_common.sh"
+
+fake_handle_version "$@"
+
+# `--list-models` is the model-discovery probe, not a session.
+for arg in "$@"; do
+  if [ "$arg" = "--list-models" ]; then
+    printf 'provider  model       context  max-out  thinking  images\n'
+    printf 'fake      fake-model  1M       64K      yes       yes\n'
+    exit 0
+  fi
+done
+
+# One frame; stdin deliberately stays open afterwards.
+frame=$(head -n 1)
+prompt=$(printf '%s' "$frame" | sed -e 's/.*"message":"//' -e 's/"[,}].*$//')
+scenario=$(fake_scenario "$prompt")
+reply=$(fake_reply)
+
+fake_before_output "$scenario"
+
+printf '{"type":"response","id":"orch-fake","command":"prompt","success":true}\n'
+printf '{"type":"agent_start"}\n'
+
+if [ "$scenario" != "silent" ]; then
+  printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"%s"}}\n' \
+    "$(fake_json_string "$reply")"
+  printf '{"type":"message_update","assistantMessageEvent":{"type":"text_end","content":"%s"}}\n' \
+    "$(fake_json_string "$reply")"
+fi
+
+case "$scenario" in
+  fail|rate_limit)
+    message="fake-agent failure: $scenario"
+    [ "$scenario" = "rate_limit" ] && message="Reached overall message rate limit"
+    printf '{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"%s"}]}\n' \
+      "$(fake_json_string "$message")"
+    printf '{"type":"agent_settled"}\n'
+    fake_failure_stderr "$scenario"
+    ;;
+  *)
+    printf '{"type":"agent_end","willRetry":false,"messages":[{"role":"assistant","content":[{"type":"text","text":"%s"}],"stopReason":"stop","usage":{"input":11,"output":7}}]}\n' \
+      "$(fake_json_string "$reply")"
+    printf '{"type":"agent_settled"}\n'
+    ;;
+esac
+
+# A real pi RPC session does not exit on its own; the adapter reaps it with a
+# 1 s grace right after the terminal event.
+sleep 30

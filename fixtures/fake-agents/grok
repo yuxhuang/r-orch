@@ -1,0 +1,28 @@
+#!/bin/sh
+# Fake `grok` — `-p <prompt> --output-format streaming-json`.
+. "$(dirname "$0")/_common.sh"
+
+fake_handle_version "$@"
+prompt=$(fake_value_after "-p" "$@")
+scenario=$(fake_scenario "$prompt")
+reply=$(fake_reply)
+
+fake_before_output "$scenario"
+
+printf '{"type":"thought","data":"fake thinking"}\n'
+
+if [ "$scenario" != "silent" ]; then
+  printf '{"type":"text","data":"%s"}\n' "$(fake_json_string "$reply")"
+fi
+
+case "$scenario" in
+  fail|rate_limit)
+    printf '{"type":"error","data":"%s"}\n' "$(fake_json_string "fake-agent failure: $scenario")"
+    fake_failure_stderr "$scenario"
+    ;;
+  *)
+    printf '{"type":"end","stopReason":"EndTurn"}\n'
+    ;;
+esac
+
+exit "$(fake_exit_code "$scenario")"

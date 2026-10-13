@@ -122,6 +122,16 @@ where
         Ok(items)
     }
 
+    /// Replace the index wholesale, serialized against every other index
+    /// mutation.
+    ///
+    /// Used by the context store's lazy expiry purge, which deletes a batch of
+    /// files and then rewrites the index **once** rather than per entry.
+    pub async fn write_index(&self, items: &[T]) -> Result<()> {
+        let _guard = self.mutex.lock().await;
+        self.write_index_unlocked(items).await
+    }
+
     /// Apply a mutation to the index and write it back, serialized against
     /// every other index mutation in this process.
     pub async fn update_index(&self, mutate: impl FnOnce(Vec<T>) -> Vec<T> + Send) -> Result<()> {
@@ -331,6 +341,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(index.rebuild_index().await.unwrap(), vec![item("a", 1)]);
+    }
+
+    #[tokio::test]
+    async fn write_index_replaces_the_whole_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = manager(temp.path());
+        index
+            .update_index(|items| replace_at_end(items, item("a", 1), |i| &i.id))
+            .await
+            .unwrap();
+        index
+            .update_index(|items| replace_at_end(items, item("b", 2), |i| &i.id))
+            .await
+            .unwrap();
+
+        index.write_index(&[item("c", 3)]).await.unwrap();
+        assert_eq!(index.read_index().await.unwrap(), vec![item("c", 3)]);
+
+        index.write_index(&[]).await.unwrap();
+        assert!(index.read_index().await.unwrap().is_empty());
     }
 
     #[test]

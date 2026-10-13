@@ -1,0 +1,5 @@
+{"type": "step_start", "timestamp": 1234, "sessionID": "ses_1", "part": {"type": "step-start", "snapshot": "abc123"}}
+{"type": "text", "timestamp": 1234, "sessionID": "ses_1", "part": {"type": "text", "text": "hello world"}}
+{"type": "tool_use", "part": {"type": "tool", "tool": "write", "state": {"status": "completed", "input": {"filePath": "/tmp/test.txt", "content": "test"}}}}
+{"type": "step_finish", "part": {"type": "step-finish", "reason": "tool-calls", "tokens": {"total": 500, "input": 400, "output": 100}}}
+{"type": "step_finish", "part": {"type": "step-finish", "reason": "stop", "tokens": {"total": 14502, "input": 12416, "output": 2, "reasoning": 0}, "cost": 0}}

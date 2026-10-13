@@ -42,6 +42,35 @@ pub struct Scenario {
     pub split_at: Option<usize>,
     /// Each step is an argv line, shell-quoted (`task add 'Some title'`).
     pub steps: Vec<String>,
+    /// Rust subcommands this scenario needs, as they appear on the command
+    /// line (`"task approve"`, `"run"`, `"serve"`).
+    ///
+    /// The harness probes the Rust binary for each and **skips** the scenario
+    /// when one is missing, so a scenario written against a command WP-5 has
+    /// not landed yet goes live the moment it does — nobody has to remember to
+    /// un-ignore it. The oracle has every command, so only our side gates.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Put `fixtures/fake-agents/` first on `PATH` for both binaries, so the
+    /// adapters spawn the stand-in CLIs rather than the real ones.
+    #[serde(default)]
+    pub fake_agents: bool,
+    /// Put `fixtures/fake-editors/` first on `PATH` and set `EDITOR` to this
+    /// script, making `task edit` and `agent edit` reachable.
+    ///
+    /// Those two subcommands take no flags at all — they round-trip the entity
+    /// through `$EDITOR` — so without a scriptable editor they are the only
+    /// part of PARITY §2.2 a scenario cannot touch.
+    #[serde(default)]
+    pub fake_editor: Option<String>,
+    /// Per-step wall-clock budget. A `run` or `serve --once` that hangs must
+    /// fail the scenario rather than the whole harness.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Extra environment for every step, applied to both binaries. Used for
+    /// the fake agents' knobs (`ORCH_FAKE_*`).
+    #[serde(default)]
+    pub env: indexmap::IndexMap<String, String>,
     /// Read-only steps run by **both** binaries over the finished tree, whose
     /// output must match exactly.
     ///
@@ -87,7 +116,10 @@ impl Scenario {
             // tree. A mutating step would therefore fail its second run on a
             // duplicate — so the allowlist is a guard against a scenario that
             // reports a divergence it actually caused itself.
-            if !READ_ONLY_VERIFY_STEPS.contains(&(command, sub)) {
+            let known = READ_ONLY_VERIFY_STEPS.contains(&(command, sub))
+                // `status`/`logs` take no verb, so slot 1 holds a flag or an id.
+                || READ_ONLY_VERIFY_STEPS.contains(&(command, ""));
+            if !known {
                 bail!(
                     "verify step `{step}` is not known to be read-only; `verify` steps run \
                      once per binary over the same directory, so a mutating step fails its \
@@ -122,8 +154,59 @@ impl Scenario {
         }
     }
 
+    /// A step's argv, with any leading directives stripped and `${repeat:…}`
+    /// expanded.
     pub fn argv(&self, step: &str) -> Result<Vec<String>> {
-        shell_words::split(step).with_context(|| format!("split step {step:?}"))
+        let argv = shell_words::split(Directives::parse(step).1)
+            .with_context(|| format!("split step {step:?}"))?;
+        argv.iter()
+            .map(|arg| expand_repeats(arg))
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("expand step {step:?}"))
+    }
+
+    /// `@kill-after:<ms> <argv…>` runs the step and kills it after `<ms>`.
+    ///
+    /// Needed for crash recovery (V25, V35): there is no argv line that means
+    /// "a `serve --once` that dies mid-run". Pair it with a **cross-compat**
+    /// scenario so the kill lands once in one shared tree — in two separate
+    /// trees the kill would land at two different points and the trees would
+    /// legitimately diverge.
+    pub fn kill_after(step: &str) -> Option<std::time::Duration> {
+        Directives::parse(step).0.kill_after
+    }
+
+    /// Whether only this step's exit code is compared, its output being L2.
+    pub fn exit_only(step: &str) -> bool {
+        Directives::parse(step).0.exit_only
+    }
+
+    /// Whether the author gave a reason for `@exit-only` (`@exit-only:<why>`).
+    pub fn exit_only_reason(step: &str) -> bool {
+        Directives::parse(step).0.exit_only_reason
+    }
+
+    /// The per-step budget, defaulting to 30 s — enough for a fake agent to
+    /// run and short enough that a hang is caught rather than waited out.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(30))
+    }
+
+    /// Whether a step's stdout is a stream of JSON records rather than human
+    /// text — `serve --log-format json`.
+    ///
+    /// Those records carry wall-clock timestamps and measured durations, so
+    /// comparing them parsed (after normalization) is both stricter about the
+    /// fields and tolerant of the values, which is what §11.1 asks for: the
+    /// record *fields* are L0, the text format is L2.
+    pub fn stdout_is_json_records(&self, step: &str) -> bool {
+        let Ok(argv) = self.argv(step) else {
+            return false;
+        };
+        argv.windows(2)
+            .any(|pair| pair[0] == "--log-format" && pair[1] == "json")
+            || (argv.first().map(String::as_str) == Some("serve")
+                && !argv.iter().any(|arg| arg == "--log-format"))
     }
 
     /// Which binary runs each step, as a list the runner can walk.
@@ -149,10 +232,137 @@ impl Scenario {
     }
 }
 
+/// Expand `${repeat:<text>:<count>}` in one argument.
+///
+/// The truncation limits are 200 characters for a subject and 4000 for a body,
+/// so testing them needs arguments of that length. Written out literally they
+/// would make the scenario unreadable and hide the one character that matters
+/// — the multi-byte one sitting astride the cut.
+///
+/// This is deliberately separate from `${task.N}`: a repeat depends on nothing
+/// the tree produced, so it expands at parse time and the loader and the lint
+/// both see the real argument.
+fn expand_repeats(arg: &str) -> Result<String> {
+    const MARKER: &str = "${repeat:";
+    let mut out = String::new();
+    let mut rest = arg;
+
+    while let Some(start) = rest.find(MARKER) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + MARKER.len()..];
+        let Some(end) = after.find('}') else {
+            bail!("unterminated `{MARKER}` in {arg:?}");
+        };
+        let (text, count) = after[..end]
+            .rsplit_once(':')
+            .with_context(|| format!("`{MARKER}` needs `<text>:<count>` in {arg:?}"))?;
+        let count: usize = count
+            .parse()
+            .with_context(|| format!("`{MARKER}` count must be a number in {arg:?}"))?;
+        // A scenario that asks for a megabyte is a typo, not an intention:
+        // argv has an OS limit and the diff would be unreadable either way.
+        if count * text.len() > 64 * 1024 {
+            bail!("`{MARKER}{text}:{count}}}` would expand past 64 KiB in {arg:?}");
+        }
+        out.push_str(&text.repeat(count));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Leading `@name[:arg]` tokens on a step, which modify how it is run and
+/// compared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Directives {
+    pub kill_after: Option<std::time::Duration>,
+    /// `@exit-only` — compare the exit code and ignore stdout/stderr.
+    ///
+    /// For the handful of steps whose *output* is explicitly L2 while the exit
+    /// code is L0: Commander's usage errors and help layout (PARITY.md §1.3,
+    /// §3). Clap will never reproduce Commander's wording, so comparing the
+    /// text would make those steps permanently red for a reason the contract
+    /// says not to care about. Marking the step also declares the usage error
+    /// as deliberate, exempting it from the vacuity guard.
+    pub exit_only: bool,
+    /// `@exit-only:<reason>` — the same, with the author stating why.
+    ///
+    /// The reason exists for the lint's benefit. A bare `@exit-only` on a step
+    /// the oracle happily runs is almost always someone silencing a real diff,
+    /// so the lint objects to it; a reason is the author saying "no, this
+    /// output genuinely is L2", which the lint then accepts. It is also the
+    /// one place a reader of the scenario finds out which L2 clause applies.
+    pub exit_only_reason: bool,
+}
+
+impl Directives {
+    /// Split leading directives from the argv. Unknown `@…` tokens are left in
+    /// place so they surface as a bogus first argument rather than being
+    /// silently ignored.
+    pub fn parse(step: &str) -> (Directives, &str) {
+        let mut directives = Directives::default();
+        let mut rest = step.trim_start();
+
+        loop {
+            let (token, tail) = match rest.split_once(' ') {
+                Some((token, tail)) => (token, tail.trim_start()),
+                None => (rest, ""),
+            };
+            match token {
+                "@exit-only" => directives.exit_only = true,
+                _ if token.starts_with("@exit-only:") => {
+                    directives.exit_only = true;
+                    directives.exit_only_reason = true;
+                }
+                _ => match token.strip_prefix("@kill-after:") {
+                    Some(millis) => match millis.parse::<u64>() {
+                        Ok(millis) => {
+                            directives.kill_after = Some(std::time::Duration::from_millis(millis));
+                        }
+                        Err(_) => return (directives, rest),
+                    },
+                    None => return (directives, rest),
+                },
+            }
+            rest = tail;
+        }
+    }
+}
+
+/// Whether the oracle rejected a step before running it.
+///
+/// Commander writes its own errors as `error: …` on stderr, while every ORCH
+/// domain error is rendered with the `✕` glyph by `printError`, so the prefix
+/// is an unambiguous discriminator. Only the oracle is consulted: if
+/// *Commander* never reached the command body then the step exercises argument
+/// parsing and nothing else, whatever clap made of the same argv.
+pub fn is_usage_error(stderr: &str) -> bool {
+    stderr.lines().any(|line| line.starts_with("error: "))
+}
+
 /// `(command, subcommand)` pairs that mutate nothing, so they are safe to run
 /// once per binary over a shared tree. Extend as WP-5 lands more read-only
 /// commands (`task show`, `agent list`, `status`, `config get`, …).
-const READ_ONLY_VERIFY_STEPS: &[(&str, &str)] = &[("task", "list"), ("agent", "list")];
+const READ_ONLY_VERIFY_STEPS: &[(&str, &str)] = &[
+    ("task", "list"),
+    ("task", "show"),
+    ("agent", "list"),
+    ("agent", "status"),
+    ("goal", "list"),
+    ("goal", "show"),
+    ("team", "list"),
+    ("team", "show"),
+    ("msg", "list"),
+    ("msg", "inbox"),
+    ("context", "list"),
+    ("context", "get"),
+    ("config", "get"),
+    ("org", "list"),
+    // `status` and `logs` take no subcommand, so the second argv slot is a
+    // flag or an id rather than a verb; match on the command alone.
+    ("status", ""),
+    ("logs", ""),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Runner {
@@ -208,6 +418,160 @@ steps = ["init --adapter shell", "task list"]
                 "--adapter".to_owned(),
                 "shell".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn a_kill_after_directive_is_stripped_from_the_argv() {
+        assert_eq!(
+            Scenario::kill_after("@kill-after:500 serve --once"),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(Scenario::kill_after("serve --once"), None);
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            temp.path(),
+            "s.toml",
+            "name = \"s\"\nkind = \"differential\"\nsteps = [\"@kill-after:500 serve --once\"]\n",
+        );
+        let scenario = Scenario::load(&path).unwrap();
+        assert_eq!(
+            scenario.argv(&scenario.steps[0]).unwrap(),
+            vec!["serve".to_owned(), "--once".to_owned()]
+        );
+    }
+
+    #[test]
+    fn exit_only_marks_a_step_whose_output_is_l2() {
+        assert!(Scenario::exit_only("@exit-only task nosuchsub"));
+        assert!(!Scenario::exit_only("task list"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            temp.path(),
+            "s.toml",
+            "name = \"s\"\nkind = \"differential\"\nsteps = [\"@exit-only task nosuchsub\"]\n",
+        );
+        let scenario = Scenario::load(&path).unwrap();
+        assert_eq!(
+            scenario.argv(&scenario.steps[0]).unwrap(),
+            vec!["task".to_owned(), "nosuchsub".to_owned()]
+        );
+    }
+
+    #[test]
+    fn repeat_expands_at_parse_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            temp.path(),
+            "s.toml",
+            "name = \"s\"\nkind = \"differential\"\n\
+             steps = [\"msg send a '${repeat:x:5}\u{1F600}' -s '${repeat:y:3}'\"]\n",
+        );
+        let scenario = Scenario::load(&path).unwrap();
+        let argv = scenario.argv(&scenario.steps[0]).unwrap();
+        assert_eq!(argv[3], "xxxxx\u{1F600}");
+        assert_eq!(argv[5], "yyy");
+    }
+
+    #[test]
+    fn a_malformed_repeat_is_an_error_not_a_literal() {
+        for arg in [
+            "${repeat:x}",
+            "${repeat:x:notanumber}",
+            "${repeat:x:5",
+            // 64 KiB guard: a count this large is a typo, not an intention.
+            "${repeat:x:99999}",
+        ] {
+            assert!(expand_repeats(arg).is_err(), "{arg}");
+        }
+        assert_eq!(
+            expand_repeats("no markers here").unwrap(),
+            "no markers here"
+        );
+        // A zero count is legal and expands to nothing.
+        assert_eq!(expand_repeats("a${repeat:x:0}b").unwrap(), "ab");
+    }
+
+    #[test]
+    fn exit_only_can_carry_a_reason() {
+        // The reason is what tells the lint apart a declared L2 output from
+        // someone silencing a diff they did not want to look at.
+        assert!(Scenario::exit_only("@exit-only:help-layout-is-l2 --help"));
+        assert!(Scenario::exit_only_reason(
+            "@exit-only:help-layout-is-l2 --help"
+        ));
+        assert!(!Scenario::exit_only_reason("@exit-only --help"));
+
+        let (_, argv) = Directives::parse("@exit-only:help-layout-is-l2 --help");
+        assert_eq!(argv, "--help");
+    }
+
+    #[test]
+    fn directives_combine_in_either_order() {
+        for step in [
+            "@exit-only @kill-after:500 serve --once",
+            "@kill-after:500 @exit-only serve --once",
+        ] {
+            let (directives, argv) = Directives::parse(step);
+            assert!(directives.exit_only, "{step}");
+            assert_eq!(
+                directives.kill_after,
+                Some(std::time::Duration::from_millis(500)),
+                "{step}"
+            );
+            assert_eq!(argv, "serve --once", "{step}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_directive_is_left_in_the_argv() {
+        // Silently ignoring it would let a typo'd directive disable the
+        // behaviour it was meant to request.
+        let (directives, argv) = Directives::parse("@exit-onlyy task list");
+        assert_eq!(directives, Directives::default());
+        assert_eq!(argv, "@exit-onlyy task list");
+    }
+
+    #[test]
+    fn commander_usage_errors_are_told_apart_from_domain_errors() {
+        // Measured against the oracle: Commander writes `error: …`, while
+        // every ORCH domain error is rendered with the `✕` glyph.
+        for stderr in [
+            "error: unknown option '--nosuchflag'\n",
+            "error: unknown command 'nosuchsub'\n",
+            "error: required option '--adapter <adapter>' not specified\n",
+        ] {
+            assert!(is_usage_error(stderr), "{stderr:?}");
+        }
+        for stderr in [
+            "  ✕ Task not found: tsk_nosuch\n",
+            "  ✕ Priority must be an integer between 1 and 4\n",
+            "  ✕ Not initialized\n    Run: orch init\n",
+            // A bare command group prints its help to stderr (measured —
+            // PARITY.md §3 says stdout). It is not a Commander `error:` line.
+            "Usage: orchestry task [options] [command]\n",
+            "",
+        ] {
+            assert!(!is_usage_error(stderr), "{stderr:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_kill_after_directive_is_rejected_at_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            temp.path(),
+            "s.toml",
+            "name = \"s\"\nkind = \"differential\"\nsteps = [\"@kill-after:soon serve\"]\n",
+        );
+        // It falls through to argv parsing, which keeps the directive as a
+        // bogus first argument rather than silently ignoring it.
+        let scenario = Scenario::load(&path).unwrap();
+        assert_eq!(
+            scenario.argv(&scenario.steps[0]).unwrap()[0],
+            "@kill-after:soon"
         );
     }
 

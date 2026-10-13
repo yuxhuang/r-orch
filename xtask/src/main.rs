@@ -27,6 +27,20 @@ enum Task {
         #[arg(long)]
         verbose: bool,
     },
+    /// Replay every scenario against the oracle alone, checking that the
+    /// scenarios themselves are well-formed.
+    ///
+    /// The corpus is written ahead of the commands it exercises, so most of it
+    /// is skipped on any given day — and a skipped scenario is never parsed
+    /// past its `requires`, so a misspelled flag or a `${task.3}` that does
+    /// not exist hides until the command lands, months later. The oracle has
+    /// every command today, so running the steps through it alone tells us now
+    /// whether each scenario *says* what its author meant.
+    LintScenarios {
+        /// Only scenarios whose name contains this substring.
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -35,7 +49,52 @@ fn main() -> Result<()> {
 
     match cli.command {
         Task::Parity { filter, verbose } => parity(&repo_root, filter.as_deref(), verbose),
+        Task::LintScenarios { filter } => lint_scenarios(&repo_root, filter.as_deref()),
     }
+}
+
+fn lint_scenarios(repo_root: &Path, filter: Option<&str>) -> Result<()> {
+    let bins = harness::Binaries::discover(repo_root)?;
+    let scenarios_dir = repo_root.join("fixtures/scenarios");
+    let selected: Vec<_> = scenario::load_all(&scenarios_dir)?
+        .into_iter()
+        .filter(|(_, s)| filter.is_none_or(|f| s.name.contains(f)))
+        .collect();
+
+    if selected.is_empty() {
+        bail!("no scenarios matched in {}", scenarios_dir.display());
+    }
+
+    println!(
+        "linting {} scenario(s) against the oracle\n",
+        selected.len()
+    );
+    let mut bad = 0usize;
+
+    for (path, scenario) in &selected {
+        print!("  {} ... ", scenario.name);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        let problems = harness::lint_against_oracle(&bins, scenario)
+            .with_context(|| format!("lint scenario {}", path.display()))?;
+        if problems.is_empty() {
+            println!("ok");
+        } else {
+            bad += 1;
+            println!("{} problem(s)", problems.len());
+            for problem in &problems {
+                println!("    {}", problem.replace('\n', "\n    "));
+            }
+        }
+    }
+
+    println!();
+    if bad > 0 {
+        bail!("{bad} of {} scenario(s) are malformed", selected.len());
+    }
+    println!("all {} scenario(s) well-formed", selected.len());
+    Ok(())
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -67,24 +126,34 @@ fn parity(repo_root: &Path, filter: Option<&str>, verbose: bool) -> Result<()> {
 
     println!("running {} parity scenario(s)\n", selected.len());
 
-    let mut failed = 0usize;
+    let capabilities = harness::Capabilities::new();
+    let (mut failed, mut skipped) = (0usize, 0usize);
+    let mut skipped_names: Vec<(String, String)> = Vec::new();
+
     for (path, scenario) in &selected {
         print!("  {} ... ", scenario.name);
         // Flush so a hang is attributable to the scenario that caused it.
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
-        let result = harness::run_scenario(&bins, scenario)
+        let result = harness::run_scenario(&bins, &capabilities, scenario)
             .with_context(|| format!("run scenario {}", path.display()))?;
 
-        if result.passed() {
-            println!("ok  {}", result.headline());
-        } else {
-            failed += 1;
-            println!("FAILED ({} difference(s))", result.failures.len());
+        match (&result.skipped, result.failures.is_empty()) {
+            (Some(reason), _) => {
+                skipped += 1;
+                println!("skipped — {reason}");
+                skipped_names.push((scenario.name.clone(), reason.clone()));
+            }
+            (None, true) => println!("ok  {}", result.headline()),
+            (None, false) => {
+                failed += 1;
+                println!("FAILED ({} difference(s))", result.failures.len());
+            }
         }
 
-        if verbose || !result.passed() {
+        let show_detail = verbose || (result.ran() && !result.passed());
+        if show_detail {
             if let Some(description) = &scenario.description {
                 println!("      {}", description.trim().replace('\n', "\n      "));
             }
@@ -100,10 +169,31 @@ fn parity(repo_root: &Path, filter: Option<&str>, verbose: bool) -> Result<()> {
         }
     }
 
+    let total = selected.len();
+    let runnable = total - skipped;
+    let green = runnable - failed;
+
     println!();
-    if failed > 0 {
-        bail!("{failed} of {} parity scenario(s) failed", selected.len());
+    println!(
+        "{total} scenario(s): {runnable} runnable, {green} green, {failed} failed, {skipped} skipped"
+    );
+    if skipped > 0 && verbose {
+        println!("\nskipped, and why:");
+        for (name, reason) in &skipped_names {
+            println!("  {name}: {reason}");
+        }
     }
-    println!("all {} parity scenario(s) green", selected.len());
+    if skipped > 0 {
+        // A skip is a gap in coverage, not a pass. Say so every run so the
+        // number cannot quietly grow.
+        println!(
+            "\n{skipped} scenario(s) are waiting on commands the Rust binary does not have \
+             yet — they go live on their own as those land (`--verbose` lists them)."
+        );
+    }
+    if failed > 0 {
+        bail!("{failed} of {runnable} runnable parity scenario(s) failed");
+    }
+    println!("\nall {runnable} runnable parity scenario(s) green");
     Ok(())
 }
