@@ -1147,7 +1147,29 @@ Rust must mirror this (`#[serde(default)]` plus explicit coercion for `onboardin
 ### 6.7 `orchestry.lock`
 
 Content: the holder's PID as a decimal string, written with `O_CREAT|O_EXCL` (`fs.open(path, 'wx')`), **no
-trailing newline**. Semantics in §8.5.
+trailing newline**. Acquisition semantics in §7.13.
+
+**Parsing (L0).** `parseInt(content.trim(), 10)`, then `isNaN ? null : pid`. A read error is also `null`. So
+an **unparseable or empty lock file is indistinguishable from a missing PID** — and that is *not* treated as
+"no lock":
+
+| Lock file contents | Outcome | Lock file afterwards |
+|---|---|---|
+| absent | **acquired** | created with our PID |
+| decimal PID, process **alive**, mtime fresh | **refused**, `pid` reported | untouched |
+| decimal PID, process **alive**, mtime older than `LOCK_STALE_MS` (60 s) | **acquired** (PID-recycling defence) | replaced |
+| decimal PID, process **dead** | **acquired** | replaced |
+| **garbage** (e.g. `xyz`) | **REFUSED** | **untouched** |
+| **empty** | **REFUSED** | **untouched** |
+
+Measured against the oracle with `serve --once` and `run <id>` (fake agent). The garbage and empty cases
+**refuse with exit 4** and the message **`Orchestrator already running (PID: undefined)`** — the literal
+string `undefined`. See §14.17; this is **L0 and replicated verbatim**.
+
+Why: `readLockPid` returns `null` for garbage, which makes the `existing !== null` guard in `doAcquire` false,
+so the entire stale-handling branch — including the `unlink` — is **skipped**. The subsequent
+`fs.open(path, 'wx')` then fails `EEXIST` because the file does exist, and the error path re-reads the PID,
+gets `null` again, and returns `{ acquired: false, pid: undefined }`.
 
 ### 6.8 Task / Agent / Goal / Team YAML
 
@@ -1663,11 +1685,16 @@ Each tick (unless suppressed), for every agent with `autonomous == true` **and**
 
 | Operation | Behaviour |
 |---|---|
-| `acquireLock(path)` | Serialized in-process. If a lock file exists and its PID is alive **and** the file's mtime is newer than `LOCK_STALE_MS = 60000`, fail with `{ acquired: false, pid }`. Otherwise unlink the stale lock and create a new one with `O_CREAT\|O_EXCL`. An `EEXIST` race re-reads the PID and reports failure. |
+| `acquireLock(path)` | Serialized in-process. Reads the PID first. **If the PID parses**: a live PID with a fresh mtime fails with `{ acquired: false, pid }`; otherwise the stale lock is unlinked and a new one created with `O_CREAT\|O_EXCL`. **If the PID does not parse** (garbage, empty, unreadable) the whole stale-handling branch is **skipped — nothing is unlinked** — and the `O_CREAT\|O_EXCL` create then fails `EEXIST`, returning `{ acquired: false, pid: undefined }`. See §6.7 for the full table. |
 | `releaseLock(path)` | Unlink, errors ignored. |
 | `touchLock(path)` | `utimes(now, now)`, errors ignored. Called once per tick. |
-| `checkLock(path)` | `{ locked, pid? }` — `locked` is false for a missing file or a dead PID. **Does not consider mtime.** |
-| `requireLock(path)` | Acquire or throw `LockConflictError(pid)`. |
+| `checkLock(path)` | `{ locked, pid? }` — `locked` is false for a missing file **or a dead PID or a garbage PID**. **Does not consider mtime.** So `checkLock` reports "not locked" for a garbage lock that `acquireLock` will refuse — the two disagree. |
+| `requireLock(path)` | **Dead code — no caller.** Its single occurrence is its own definition. Note it would also be *wrong* if used: `if (!result.acquired && result.pid)` is falsy when `pid` is `undefined`, so it would silently **succeed** on a garbage lock. Port it only if the ported tests require it; nothing else does. |
+
+**The live acquisition path** is `withTemporaryLock` / `startWatch`, both of which do
+`if (!lockResult.acquired) throw new LockConflictError(lockResult.pid!)` — unconditionally, with the non-null
+assertion. That is why an `undefined` pid still throws (and prints `PID: undefined`) rather than being
+swallowed the way `requireLock` would swallow it.
 
 **PID liveness** = `kill(pid, 0)` succeeds, **or** fails with `EPERM` (process exists, not ours). Any other
 error ⇒ dead.
@@ -2761,6 +2788,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.14 msg surrogate truncation | DIVERGENCE (lead ruling) | `scenario exclusion required (cmd-msg-truncation, mid-pair case only)` |
 | §14.15 `stop()` wedges the lock | FIX | `none` |
 | §14.16 DiskObserver straddling line | FIX | `none` |
+| §14.17 corrupt lock wedges, `PID: undefined` | REPLICATE | `none` |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3011,6 +3039,34 @@ activity row in the TUI, which is why it went unnoticed.
 **Decision: fix.** Carry the partial-line remainder across ticks explicitly and prepend it to the next chunk.
 TUI-only, no on-disk or wire effect.
 
+### 14.17 A corrupt lock file wedges the project, and reports `PID: undefined` — **REPLICATE**
+
+**Effect on differential comparison: `none`.**
+
+Three defects compound here. All three are **replicated**, including the literal `undefined`.
+
+1. **A garbage or empty `orchestry.lock` refuses acquisition** (exit 4) instead of being treated as stale.
+   `readLockPid` returns `null`, the `existing !== null` guard short-circuits the stale-handling branch, and
+   the `O_CREAT|O_EXCL` create then fails `EEXIST` (§6.7).
+2. **The error message interpolates `undefined`**: `Orchestrator already running (PID: undefined)`. The live
+   path throws `LockConflictError(lockResult.pid!)` unconditionally, and `pid` is `undefined` for an
+   unparseable lock. **This exact string is L0** — it appears on stderr and a user may well be grepping for
+   it.
+3. **Nothing ever clears it.** The garbage lock is never unlinked, no command repairs it, and `orch status`
+   does not clear it either (`checkLock` even reports the project *unlocked*, disagreeing with
+   `acquireLock`). **The project is wedged until the file is deleted by hand** — the 60 s `LOCK_STALE_MS`
+   escape hatch does not apply, because that path is only reached when the PID parses.
+
+**Decision: replicate all three.** This is the inherited behaviour at the pinned commit, the message is
+user-visible output, and "fixing" it changes an exit code and a stderr line that the harness compares. The
+remedy belongs in user-facing documentation — *delete `.orchestry/orchestry.lock` if you see
+`PID: undefined`* — not in a silent behavioural divergence.
+
+Related, same measurement run: **`serve:started` is logged before the lock is acquired**
+(`serve.ts:84` vs the `runOnce`/`startWatch` calls at `:113`/`:131`), so a `serve` invocation that is about to
+fail with exit 4 still emits one `serve:started` record first. Replicate the ordering — it is part of the
+§11.1 log contract.
+
 ---
 
 ## 15. Verification matrix
@@ -3042,6 +3098,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V20 | `serve --json` log record fields per §11.1 | L0 | Differential harness on a scenario with a fake agent |
 | V21 | `serve --once` exit code semantics | L0 | Scenario tests: all-pass → 0; one failed → 1; one cancelled → 0; empty → 0 |
 | V22 | Lock acquisition, staleness and PID-recycling defence | L1 | Integration test with a real second process |
+| V22b | **Corrupt-lock matrix** (§6.7): absent / live+fresh / live+stale / dead / garbage / empty — each yields the measured outcome, exit code and post-state of the lock file, including `PID: undefined` on stderr for the garbage and empty cases | L0 | Oracle-compared scenarios with a fake agent, one per row |
 | V23 | Concurrency cap is never exceeded | L1 | Integration test with N fake agents and `max_concurrent_agents = 2` |
 | V24 | Stall detection fires at the configured timeout | L1 | Integration test with a fake agent that sleeps |
 | V25 | Crash recovery: dead PID → task `cancelled`, claims cleared, `preparing` runs finalized | L1 | Integration test that kills the orchestrator mid-run |
