@@ -81,6 +81,17 @@ pub struct Scenario {
     /// ids and timestamps must agree.
     #[serde(default)]
     pub verify: Vec<String>,
+    /// Files under `.orchestry/` whose top-level JSON **array** order is not
+    /// contract, relative to that directory (`messages/_index.json`).
+    ///
+    /// The same exemption as the `@unordered:<reason>` step directive, for the
+    /// file the step reads: `_index.json` is maintained in last-write order,
+    /// which PARITY.md §6.10 states is not contract. Keep this list to the
+    /// files a scenario genuinely cannot order — every other `_index.json`
+    /// stays compared element by element, which is what catches an
+    /// implementation that appends on update instead of moving to the end.
+    #[serde(default)]
+    pub unordered_files: Vec<String>,
     /// Why this scenario exists, printed with the results.
     #[serde(default)]
     pub description: Option<String>,
@@ -137,6 +148,19 @@ impl Scenario {
             if argv.is_empty() {
                 bail!("step {step:?} parses to an empty argv");
             }
+            // `@unordered` only means anything for a JSON document, and
+            // without `--json` the output is a table whose row order *is*
+            // contract — so a marker there would silence a real difference.
+            if Scenario::unordered(step) && !argv.iter().any(|arg| arg == "--json") {
+                bail!(
+                    "step {step:?} is marked `@unordered` but does not pass `--json`;                      only a JSON array is compared as a multiset"
+                );
+            }
+        }
+        for path in &self.unordered_files {
+            if path.is_empty() || path.starts_with('/') || path.contains("..") {
+                bail!("`unordered_files` entry {path:?} must be a plain path under .orchestry/");
+            }
         }
         match (self.kind, self.split_at) {
             (Kind::TsThenRust | Kind::RustThenTs, None) => {
@@ -184,6 +208,12 @@ impl Scenario {
     /// Whether the author gave a reason for `@exit-only` (`@exit-only:<why>`).
     pub fn exit_only_reason(step: &str) -> bool {
         Directives::parse(step).0.exit_only_reason
+    }
+
+    /// Whether this step's JSON array is compared as a multiset
+    /// (`@unordered:<why>`).
+    pub fn unordered(step: &str) -> bool {
+        Directives::parse(step).0.unordered
     }
 
     /// The per-step budget, defaulting to 30 s — enough for a fake agent to
@@ -293,6 +323,19 @@ pub struct Directives {
     /// output genuinely is L2", which the lint then accepts. It is also the
     /// one place a reader of the scenario finds out which L2 clause applies.
     pub exit_only_reason: bool,
+    /// `@unordered:<reason>` — this step prints a JSON **array** whose element
+    /// order is not contract, so the two sides are compared as multisets.
+    ///
+    /// The one case that needs it today is a `broadcast` fan-out: the oracle
+    /// saves the messages with `Promise.all`, so the order they reach
+    /// `_index.json` is a libuv scheduling artifact, and `MessageStore.list`
+    /// sorts only by `created_at` — identical for every message in one
+    /// fan-out — leaving `_index.json` order as the stable-sort tie-break.
+    /// PARITY.md §6.10 states that index order is not contract.
+    ///
+    /// A bare `@unordered` is not accepted: the reason is the whole point, so
+    /// it falls through as an unknown token and breaks the step loudly.
+    pub unordered: bool,
 }
 
 impl Directives {
@@ -314,6 +357,7 @@ impl Directives {
                     directives.exit_only = true;
                     directives.exit_only_reason = true;
                 }
+                _ if token.starts_with("@unordered:") => directives.unordered = true,
                 _ => match token.strip_prefix("@kill-after:") {
                     Some(millis) => match millis.parse::<u64>() {
                         Ok(millis) => {

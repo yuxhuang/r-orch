@@ -419,9 +419,9 @@ fn a_commands_not_wired_yet_is_an_error_rather_than_a_silent_success() {
     // still waiting on WP-4 — see crates/orch-cli/TEST-MAP.md.
     let dir = initialized_project();
     for argv in [
-        vec!["goal", "list"],
-        vec!["msg", "list"],
-        vec!["team", "list"],
+        vec!["org", "list"],
+        vec!["task", "show", "tsk_nosuch"],
+        vec!["agent", "status", "agt_nosuch"],
     ] {
         let output = orch(dir.path()).args(&argv).output().expect("run");
         assert_eq!(

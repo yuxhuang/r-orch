@@ -37,8 +37,8 @@ use crate::output::{Styles, print_error};
 use crate::routing::ArgvShape;
 use crate::tree::{
     AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
-    ContextCmd, ContextSub, GoalCmd, InitCmd, MsgCmd, OrgCmd, RunCmd, ServeCmd, TaskCmd, TaskSub,
-    TeamCmd,
+    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, OrgCmd, RunCmd, ServeCmd,
+    TaskCmd, TaskSub, TeamCmd, TeamSub,
 };
 
 /// A command that parses but whose service is not wired yet.
@@ -365,18 +365,168 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Msg(MsgCmd { command })) => match command {
-            None => Ok(print_group_help(&["msg"])),
-            Some(_) => Err(not_wired("msg")),
-        },
-        Some(Command::Goal(GoalCmd { command })) => match command {
-            None => Ok(print_group_help(&["goal"])),
-            Some(_) => Err(not_wired("goal")),
-        },
-        Some(Command::Team(TeamCmd { command })) => match command {
-            None => Ok(print_group_help(&["team"])),
-            Some(_) => Err(not_wired("team")),
-        },
+        Some(Command::Msg(MsgCmd { command })) => {
+            let Some(sub) = command else {
+                return Ok(print_group_help(&["msg"]));
+            };
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            match sub {
+                MsgSub::Send {
+                    to_agent_id,
+                    body,
+                    subject,
+                    from,
+                    ttl,
+                    reply_to,
+                } => {
+                    commands::msg::send(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        commands::msg::MsgSendArgs {
+                            to_agent_id,
+                            body,
+                            subject: subject.as_deref(),
+                            from: from.as_deref(),
+                            ttl_ms: parse_ttl(ttl.as_deref())?,
+                            reply_to: reply_to.as_deref(),
+                        },
+                    )
+                    .await?;
+                }
+                MsgSub::Broadcast {
+                    body,
+                    subject,
+                    from,
+                    team,
+                    ttl,
+                } => {
+                    commands::msg::broadcast(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        commands::msg::MsgBroadcastArgs {
+                            body,
+                            subject: subject.as_deref(),
+                            from: from.as_deref(),
+                            team: team.as_deref(),
+                            ttl_ms: parse_ttl(ttl.as_deref())?,
+                        },
+                    )
+                    .await?;
+                }
+                MsgSub::Inbox { agent_id } => {
+                    commands::msg::inbox(&engine, &ctx, &styles, agent_id).await?;
+                }
+                MsgSub::List { agent } => {
+                    commands::msg::list(&engine, &ctx, &styles, agent.as_deref()).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Goal(GoalCmd { command })) => {
+            let Some(sub) = command else {
+                return Ok(print_group_help(&["goal"]));
+            };
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            match sub {
+                GoalSub::Add {
+                    title,
+                    description,
+                    assignee,
+                } => {
+                    commands::goal::add(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        title,
+                        description.as_deref(),
+                        assignee.as_deref(),
+                    )
+                    .await?;
+                }
+                GoalSub::List { status } => {
+                    commands::goal::list(&engine, &ctx, &styles, status.as_deref()).await?;
+                }
+                GoalSub::Show { id } => commands::goal::show(&engine, &ctx, &styles, id).await?,
+                GoalSub::Status { id, status, force } => {
+                    // The only subcommand that reports a failure without
+                    // raising: an unknown status name exits 1 from here.
+                    return commands::goal::status(&engine, &ctx, &styles, id, status, *force)
+                        .await;
+                }
+                GoalSub::Update {
+                    id,
+                    title,
+                    description,
+                    assignee,
+                } => {
+                    commands::goal::update(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        id,
+                        orch_engine::goal_service::UpdateGoalFields {
+                            title: title.clone(),
+                            description: description.clone(),
+                            assignee: assignee.clone(),
+                        },
+                    )
+                    .await?;
+                }
+                GoalSub::Delete { id } => {
+                    commands::goal::delete(&engine, &ctx, &styles, id).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Team(TeamCmd { command })) => {
+            let Some(sub) = command else {
+                return Ok(print_group_help(&["team"]));
+            };
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            match sub {
+                TeamSub::Create {
+                    name,
+                    lead,
+                    members,
+                    description,
+                    no_auto_claim,
+                } => {
+                    commands::team::create(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        commands::team::TeamCreateArgs {
+                            name,
+                            lead,
+                            members: members.as_deref(),
+                            description: description.as_deref(),
+                            no_auto_claim: *no_auto_claim,
+                        },
+                    )
+                    .await?;
+                }
+                TeamSub::List => commands::team::list(&engine, &ctx, &styles).await?,
+                TeamSub::Show { id } => commands::team::show(&engine, &ctx, &styles, id).await?,
+                TeamSub::Join { team_id, agent_id } => {
+                    commands::team::join(&engine, &styles, team_id, agent_id).await?;
+                }
+                TeamSub::Leave { team_id, agent_id } => {
+                    commands::team::leave(&engine, &styles, team_id, agent_id).await?;
+                }
+                TeamSub::AddTask { team_id, task_id } => {
+                    commands::team::add_task(&engine, &styles, team_id, task_id).await?;
+                }
+                TeamSub::SetLead { team_id, agent_id } => {
+                    commands::team::set_lead(&engine, &styles, team_id, agent_id).await?;
+                }
+                TeamSub::Disband { id } => {
+                    commands::team::disband(&engine, &styles, id).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Org(OrgCmd { command })) => match command {
             None => Ok(print_group_help(&["org"])),
             Some(_) => Err(not_wired("org")),
@@ -438,7 +588,7 @@ async fn run_init(
         return Ok(ExitCode::from(2));
     }
 
-    let outcome = commands::init::run(
+    commands::init::run(
         &styles,
         cwd,
         &commands::init::InitArgs {
@@ -448,13 +598,12 @@ async fn run_init(
         },
     )
     .await?;
-    if !outcome.already_initialized {
-        println!(
-            "  Next: {}",
-            styles.dim(commands::init::next_hint(&outcome.adapter))
-        );
-        println!();
-    }
+    // Unconditional: a re-init prints `Already initialized` *and* the hint.
+    println!(
+        "  Next: {}",
+        styles.dim(commands::init::next_hint(args.adapter.as_deref()))
+    );
+    println!();
     Ok(ExitCode::SUCCESS)
 }
 
@@ -541,6 +690,16 @@ pub(crate) fn parse_int(raw: &str, flag: &str) -> Result<i64> {
     raw.trim()
         .parse::<i64>()
         .map_err(|_| Error::invalid_arguments(format!("--{flag} must be an integer")))
+}
+
+/// `opts.ttl ? parseInt(opts.ttl, 10) : undefined` — a TTL of `0` is a real
+/// value (the string `"0"` is truthy), so it reaches the service and fails its
+/// range check rather than being treated as absent.
+fn parse_ttl(raw: Option<&str>) -> Result<Option<u64>> {
+    match raw {
+        None | Some("") => Ok(None),
+        Some(raw) => Ok(Some(parse_int(raw, "ttl")? as u64)),
+    }
 }
 
 /// Parse an enum-valued flag, naming the accepted values on failure.

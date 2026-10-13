@@ -10,7 +10,17 @@ it is the difference between a two-member broadcast and an everyone \
 broadcast, so an implementation that validates the team id would send \
 strictly fewer messages than the oracle. The scenario puts a real two- \
 member team beside it, so the fan-out counts differ and the bug is visible \
-as a count rather than needing the reader to know it."""
+as a count rather than needing the reader to know it.
+
+The three messages of one fan-out share a `created_at` to the \
+millisecond, and `MessageStore.list` sorts only on that field, so their \
+relative order is the `_index.json` tie-break — and the oracle saves them \
+with `Promise.all`, so the order they reach the index is a libuv \
+scheduling artifact (measured: the reverse of the recipient order). \
+PARITY.md §6.10 says index order is not contract, so the listing step and \
+the index file are compared as multisets; every count, id and field is \
+still compared."""
+unordered_files = ["messages/_index.json"]
 steps = [
   "init --name proj --adapter claude",
   "agent add second --adapter claude --quiet",
@@ -19,6 +29,6 @@ steps = [
   "team create duo --lead agt_creator --members ${agent.0} --quiet",
   "msg broadcast 'to the duo' -s Duo --team ${team.0} --json",
   "msg broadcast 'to nobody in particular' -s Ghost --team team_nosuch --json",
-  "msg list --json",
+  "@unordered:index-order-tie-break-§6.10 msg list --json",
   "msg inbox ${agent.2} --json",
 ]

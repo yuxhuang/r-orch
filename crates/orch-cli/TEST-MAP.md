@@ -38,8 +38,7 @@ scenario is added with each one, not before.
 
 | Command | Needs |
 |---|---|
-| `config get/set/edit`, `config global *` | WP-4 `ConfigService` semantics: deep merge, dot paths, the four **compact** `--json` sites |
-| `context *`, `msg *`, `goal *`, `team *`, `org *` | WP-4 services (`ContextService`, `MessageService`, `GoalService`, `TeamService`, org deploy) |
+| `org *` | org deploy (§18.2) |
 | `task show/edit/cancel/approve/reject/retry` | WP-4 `TaskService` methods; `task cancel` additionally needs the orchestrator for an `in_progress` task |
 | `agent status/edit/remove/autonomous` | WP-4 `AgentService` methods |
 | `run` (`--all`, `--watch`, a single task) | WP-4 orchestrator. The argument check (`exit 2`) is wired already |
@@ -58,6 +57,9 @@ a unit test cannot: the exact stdout of `init`, `task add`, `task list`,
 | `walking-skeleton*` | V39: init / agent add / task add / task list, in both cross-compat directions |
 | `index-tie-order*` | the `_index.json` last-write order under a re-save (PARITY.md §14.4), in both directions |
 | `cmd-status-and-doctor` | `status`/`doctor` human and `--json`, including the masked `state.claimed` (§14.1) and doctor's two header lines |
+| `cmd-config*`, `cmd-context*` | the config/context stores through the CLI: compact `--json`, the dropped `value` key, `context get`'s exit-0 miss, the unclamped TTL column |
+| `cmd-goal*`, `cmd-team` | the goal state machine's two exit codes out of one subcommand, the team membership rules, `disband` leaving the file readable |
+| `cmd-msg*` | the fan-out shape of `send`/`broadcast`, the unknown-team no-op, the disabled-recipient filter, and body/subject trimming |
 | `cmd-logs`, `cmd-init`, `cmd-ascii-and-quiet`, `cmd-exit-codes-uninitialized` | from master's corpus; green as of this work package |
 
 Two notes on the harness as it now stands:

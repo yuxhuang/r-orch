@@ -4,7 +4,16 @@ requires = ["msg broadcast", "agent disable"]
 description = """
 The broadcast recipient filter in isolation: a disabled agent receives \
 nothing. Separate from cmd-msg so the fan-out count is the only thing that \
-varies between the two runs of the same command."""
+varies between the two runs of the same command.
+
+One fan-out writes several messages with the same `created_at`, and \
+`MessageStore.list` sorts only on that field, so their relative order is \
+the `_index.json` tie-break — which the oracle fills via `Promise.all`, \
+making it a libuv scheduling artifact that varies between runs. PARITY.md \
+§6.10 says index order is not contract, so the listing steps and the index \
+file are compared as multisets; every count, id and field is still \
+compared."""
+unordered_files = ["messages/_index.json"]
 steps = [
   "init --name proj --adapter claude",
   "agent add second --adapter claude --quiet",
@@ -12,6 +21,6 @@ steps = [
   "msg broadcast 'all three' -s One --json",
   "agent disable ${agent.0}",
   "msg broadcast 'only two' -s Two --json",
-  "msg list --json",
+  "@unordered:index-order-tie-break-§6.10 msg list --json",
   "msg inbox ${agent.0} --json",
 ]

@@ -93,6 +93,23 @@ A step may carry leading `@directive` tokens:
   objects to a bare `@exit-only` on a step that produced real output, because
   that is almost always someone silencing a diff rather than a genuine L2 case;
   the reason is the author overriding that, on the record.
+- **`@unordered:<reason>`** — the step prints a JSON **array** whose element
+  order is not contract, so the two sides are compared as multisets (every
+  element, count and field still compared). Only valid on a `--json` step: a
+  human table's row order *is* contract, and a marker there would hide a real
+  difference. A bare `@unordered` is rejected — the reason is the point.
+
+  The case that needs it is a `msg broadcast` fan-out. All of its messages
+  share a `created_at`, `MessageStore.list` sorts on that field alone, and JS
+  sort is stable, so their relative order is the `_index.json` tie-break — and
+  the oracle fills the index from `Promise.all`, making the order a libuv
+  scheduling artifact that varies between runs of the *same* binary. PARITY.md
+  §6.10 says index order is not contract. The scenario-level
+  `unordered_files = ["messages/_index.json"]` is the same exemption for the
+  file the step reads; keep that list to the files a scenario genuinely cannot
+  order, because element-by-element comparison of every other `_index.json` is
+  what catches an implementation that appends on update instead of moving the
+  entity to the end.
 
 ### Kinds
 
@@ -213,6 +230,14 @@ compares any more.
 Per step: stdout, stderr and the exit code. At the end: a recursive walk of
 `.orchestry/`, every file parsed by extension (YAML, JSON, JSONL, else raw
 text) and deep-compared.
+
+A stdout that is exactly one JSON object or array is compared **parsed**, not
+as text: PARITY.md §1.4 states that JSON object key order is not contract, and
+it genuinely differs — TS emits JS insertion order, which depends on when a
+field was first assigned (a goal that gains an `assignee` after creation emits
+it last, after `updated_at`), while serde emits declaration order. Everything
+else, scalars and human output included, is compared as text, which is the
+stricter test.
 
 Then two things the parsed comparison cannot see on its own:
 

@@ -250,12 +250,30 @@ const WIRED_COMMANDS: &[&str] = &[
     "context list",
     "context set",
     "doctor",
+    "goal add",
+    "goal delete",
+    "goal list",
+    "goal show",
+    "goal status",
+    "goal update",
     "init",
     "logs",
+    "msg broadcast",
+    "msg inbox",
+    "msg list",
+    "msg send",
     "status",
     "task add",
     "task assign",
     "task list",
+    "team add-task",
+    "team create",
+    "team disband",
+    "team join",
+    "team leave",
+    "team list",
+    "team set-lead",
+    "team show",
     "update",
 ];
 
@@ -432,6 +450,20 @@ pub fn run_scenario(
                     }
                     Err(problem) => Some(("status --json", problem)),
                 }
+            } else if let Some((rust_doc, ts_doc)) =
+                json_documents(&rust_out.stdout, &ts_out.stdout)
+            {
+                json_framing_diff(&rust_out.stdout, &ts_out.stdout).or_else(|| {
+                    let unordered = Scenario::unordered(step);
+                    let left = as_compared(&norm.value(&rust_doc), unordered);
+                    let right = as_compared(&norm.value(&ts_doc), unordered);
+                    (left != right).then(|| {
+                        (
+                            "json document",
+                            unified_diff(&pretty(&right), &pretty(&left)),
+                        )
+                    })
+                })
             } else {
                 let left = norm.text(&rust_out.stdout);
                 let right = norm.text(&ts_out.stdout);
@@ -545,6 +577,20 @@ pub fn run_scenario(
                     }
                     (Err(problem), _) | (_, Err(problem)) => Some(("status --json", problem)),
                 }
+            } else if let Some((rust_doc, ts_doc)) =
+                json_documents(&rust_out.stdout, &ts_out.stdout)
+            {
+                json_framing_diff(&rust_out.stdout, &ts_out.stdout).or_else(|| {
+                    let unordered = Scenario::unordered(step);
+                    let left = as_compared(&rust_norm.value(&rust_doc), unordered);
+                    let right = as_compared(&ts_norm.value(&ts_doc), unordered);
+                    (left != right).then(|| {
+                        (
+                            "json document",
+                            unified_diff(&pretty(&right), &pretty(&left)),
+                        )
+                    })
+                })
             } else if scenario.stdout_is_json_records(step) {
                 let left = json_records(&rust_out.stdout, &mut rust_norm);
                 let right = json_records(&ts_out.stdout, &mut ts_norm);
@@ -575,7 +621,11 @@ pub fn run_scenario(
 
         let rust_tree = collect_tree(&rust.root, &mut rust_norm)?;
         let ts_tree = collect_tree(&ts.root, &mut ts_norm)?;
-        failures.extend(compare_trees(&rust_tree, &ts_tree));
+        failures.extend(compare_trees(
+            &rust_tree,
+            &ts_tree,
+            &scenario.unordered_files,
+        ));
         failures.extend(claimed_matches_state_file(&masked_claimed, &rust_tree));
 
         failures.extend(cross_parse_failures(bins, &rust)?);
@@ -1164,8 +1214,8 @@ fn usage_error_failure(_scenario: &Scenario, step: &str, ts_stderr: &str) -> Opt
     ))
 }
 
-fn compare_trees(rust: &Tree, ts: &Tree) -> Vec<String> {
-    let mut failures = compare_values(&rust.values, &ts.values);
+fn compare_trees(rust: &Tree, ts: &Tree, unordered_files: &[String]) -> Vec<String> {
+    let mut failures = compare_values(&rust.values, &ts.values, unordered_files);
 
     // A file only one side could parse is the sharpest possible signal: the
     // two implementations do not even agree that it is well-formed.
@@ -1201,7 +1251,11 @@ fn compare_trees(rust: &Tree, ts: &Tree) -> Vec<String> {
     failures
 }
 
-fn compare_values(rust: &BTreeMap<String, Value>, ts: &BTreeMap<String, Value>) -> Vec<String> {
+fn compare_values(
+    rust: &BTreeMap<String, Value>,
+    ts: &BTreeMap<String, Value>,
+    unordered_files: &[String],
+) -> Vec<String> {
     let mut failures = Vec::new();
 
     for path in ts.keys() {
@@ -1219,9 +1273,12 @@ fn compare_values(rust: &BTreeMap<String, Value>, ts: &BTreeMap<String, Value>) 
         }
     }
     for (path, ts_value) in ts {
-        if let Some(rust_value) = rust.get(path)
-            && rust_value != ts_value
+        let unordered = unordered_files.iter().any(|named| named == path);
+        if let Some(rust_value) = rust.get(path).map(|value| as_compared(value, unordered))
+            && rust_value != as_compared(ts_value, unordered)
         {
+            let ts_value = &as_compared(ts_value, unordered);
+            let rust_value = &rust_value;
             failures.push(format!(
                 "`.orchestry/{path}` differs\n{}",
                 unified_diff(&pretty(ts_value), &pretty(rust_value))
@@ -1377,6 +1434,87 @@ struct JsYamlResult {
 /// Parse JSONL stdout into normalized records. A line that is not JSON is
 /// kept as a string record, so a stray human line still shows in the diff
 /// rather than vanishing.
+/// A value as it is compared: identical, unless the caller declared its
+/// top-level array order non-contract, in which case the elements are sorted
+/// canonically so the two sides are compared as multisets.
+///
+/// Sorting by the rendered element is safe because both sides are normalized
+/// first — ids are placeholders assigned per entity, in the same order on both
+/// sides — so equal multisets sort to equal sequences.
+fn as_compared(value: &Value, unordered: bool) -> Value {
+    match value {
+        Value::Array(items) if unordered => {
+            let mut sorted = items.clone();
+            // Keyed on a *key-sorted* rendering: two sides that agree on the
+            // pairs but not their order must sort to the same sequence, or
+            // this would invent a difference instead of ignoring one.
+            sorted.sort_by_cached_key(|item| pretty(&with_sorted_keys(item)));
+            Value::Array(sorted)
+        }
+        other => other.clone(),
+    }
+}
+
+/// The same document with every object's keys in sorted order, so it renders
+/// identically whatever insertion order produced it.
+fn with_sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut pairs: Vec<_> = map.iter().collect();
+            pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+            Value::Object(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), with_sorted_keys(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(with_sorted_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Both stdouts parsed, when **both** are exactly one JSON object or array —
+/// which is what every `--json` command prints.
+///
+/// PARITY.md §1.4: JSON object key order is **not** contract. TS emits JS
+/// insertion order, which depends on when a field was first assigned — a goal
+/// that gains an `assignee` after creation emits it last, after `updated_at`,
+/// and `Message` emits `id`/`to_agent_id` last after an object spread — while
+/// serde emits declaration order. So these are compared as parsed values
+/// (`serde_json::Map` is an `IndexMap` under `preserve_order`, whose `Eq`
+/// ignores order) plus the framing that *is* contract, and never as text.
+///
+/// A scalar (`null`, a bare number) and anything with surrounding human text
+/// fall through to the text comparison: key order only exists inside a
+/// container, and text is the stricter test.
+fn json_documents(rust_stdout: &str, ts_stdout: &str) -> Option<(Value, Value)> {
+    Some((json_document(rust_stdout)?, json_document(ts_stdout)?))
+}
+
+fn json_document(stdout: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => Some(value),
+        _ => None,
+    }
+}
+
+/// The byte-level framing both sides must share even where key order is free
+/// (§6.4): 2-space indent and a trailing newline, or neither for a compact
+/// document.
+fn json_framing_diff(rust_stdout: &str, ts_stdout: &str) -> Option<(&'static str, String)> {
+    let (rust_framing, ts_framing) = (JsonFraming::of(rust_stdout), JsonFraming::of(ts_stdout));
+    (rust_framing != ts_framing).then(|| {
+        (
+            "json framing",
+            format!(
+                "indent and trailing newline are contract (§6.4)\n    ts:   \
+                 {ts_framing:?}\n    rust: {rust_framing:?}"
+            ),
+        )
+    })
+}
+
 fn json_records(stdout: &str, norm: &mut Normalizer) -> Vec<Value> {
     stdout
         .lines()
@@ -1587,7 +1725,7 @@ mod tests {
         ts.insert("a.json".to_owned(), serde_json::json!({ "v": 2 }));
         ts.insert("only-ts.json".to_owned(), Value::Null);
 
-        let failures = compare_values(&rust, &ts);
+        let failures = compare_values(&rust, &ts, &[]);
         assert_eq!(failures.len(), 3);
         assert!(
             failures
@@ -1610,7 +1748,7 @@ mod tests {
     fn identical_trees_produce_no_failures() {
         let mut tree = BTreeMap::new();
         tree.insert("a.json".to_owned(), serde_json::json!({ "v": 1 }));
-        assert!(compare_values(&tree, &tree).is_empty());
+        assert!(compare_values(&tree, &tree, &[]).is_empty());
     }
 
     #[test]
@@ -1663,7 +1801,7 @@ mod tests {
             },
         );
 
-        let failures = compare_trees(&rust, &ts);
+        let failures = compare_trees(&rust, &ts, &[]);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
     }
@@ -1823,7 +1961,7 @@ mod tests {
             "unexpected end of hex escape at line 1 column 19".to_owned(),
         );
 
-        let failures = compare_trees(&rust, &ts);
+        let failures = compare_trees(&rust, &ts, &[]);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(
             failures[0].contains("our parser rejects"),
@@ -1836,7 +1974,7 @@ mod tests {
         // text comparison still covers the content.
         let mut both = rust.clone();
         both.unparseable = ts.unparseable.clone();
-        assert!(compare_trees(&both, &ts).is_empty());
+        assert!(compare_trees(&both, &ts, &[]).is_empty());
     }
 
     #[test]
@@ -1857,5 +1995,39 @@ mod tests {
         assert!(diff.contains("+++ rust"));
         assert!(diff.contains("-expected"));
         assert!(diff.contains("+actual"));
+    }
+
+    #[test]
+    fn a_json_document_compares_regardless_of_key_order() {
+        let rust = "{\n  \"assignee\": \"agt_1\",\n  \"updated_at\": \"x\"\n}\n";
+        let ts = "{\n  \"updated_at\": \"x\",\n  \"assignee\": \"agt_1\"\n}\n";
+        // §1.4: the same pairs in a different order are the same document.
+        assert_eq!(json_document(rust), json_document(ts));
+        // …and the framing both sides must still share is unchanged by it.
+        assert_eq!(JsonFraming::of(rust), JsonFraming::of(ts));
+    }
+
+    #[test]
+    fn a_json_document_still_notices_a_changed_value_or_framing() {
+        let base = "{\n  \"a\": 1,\n  \"b\": 2\n}\n";
+        assert_ne!(
+            json_document(base),
+            json_document("{\n  \"b\": 2,\n  \"a\": 9\n}\n")
+        );
+        assert_ne!(json_document(base), json_document("{\n  \"a\": 1\n}\n"));
+        // A compact document has no indent, so the framing check catches it
+        // even though the parsed values match.
+        let compact = "{\"a\":1,\"b\":2}\n";
+        assert_eq!(json_document(base), json_document(compact));
+        assert_ne!(JsonFraming::of(base), JsonFraming::of(compact));
+    }
+
+    #[test]
+    fn only_a_container_takes_the_json_path() {
+        assert!(json_document("null\n").is_none());
+        assert!(json_document("5\n").is_none());
+        assert!(json_document("  key = 5\n").is_none());
+        assert!(json_document("{\"a\":1}\ntrailing\n").is_none());
+        assert!(json_document("[]\n").is_some());
     }
 }

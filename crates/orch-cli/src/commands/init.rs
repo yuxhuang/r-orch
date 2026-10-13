@@ -163,9 +163,12 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
     })
 }
 
-/// The `Next:` hint the command prints after a successful init.
-pub fn next_hint(adapter: &str) -> &'static str {
-    if adapter == "shell" {
+/// The `Next:` hint, keyed on the **`--adapter` flag** rather than the adapter
+/// `init` settled on, and printed even when the project was already
+/// initialized — both as the original does (`init.ts:264-268`, outside
+/// `runInit`).
+pub fn next_hint(adapter: Option<&str>) -> &'static str {
+    if adapter == Some("shell") {
         "orch agent add \"Test Runner\" --adapter shell --command \"npm test\""
     } else {
         "orch task add \"Create backend agent\" --assignee agt_creator"
@@ -626,11 +629,17 @@ mod tests {
     #[test]
     fn the_next_hint_depends_on_the_adapter() {
         assert_eq!(
-            next_hint("shell"),
+            next_hint(Some("shell")),
             "orch agent add \"Test Runner\" --adapter shell --command \"npm test\""
         );
         assert_eq!(
-            next_hint("claude"),
+            next_hint(Some("claude")),
+            "orch task add \"Create backend agent\" --assignee agt_creator"
+        );
+        // No `--adapter` at all takes the task hint, whatever `init`
+        // auto-detected: the original reads the flag, not the outcome.
+        assert_eq!(
+            next_hint(None),
             "orch task add \"Create backend agent\" --assignee agt_creator"
         );
     }
