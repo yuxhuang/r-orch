@@ -317,6 +317,25 @@ pub async fn build_full_with(
     })
 }
 
+/// Both tiers, and the orchestrator, must be movable and shareable across
+/// threads.
+///
+/// This is load-bearing rather than hygiene: the TUI's facade is
+/// **synchronous** while every service here is `async`, and `orch-cli` already
+/// runs `dispatch` inside `Runtime::block_on`. So the draw loop has to live on
+/// a thread that is *not* driving the runtime — `Handle::block_on` panics on
+/// one that is — which means the engine gets moved onto a plain
+/// `std::thread`. A stray `Rc` or `RefCell` anywhere in the container would
+/// make that impossible, and the error would land on whoever wires the TUI
+/// rather than on whoever introduced it. Hence a static assertion here.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync + 'static>() {}
+    assert_send_sync::<Engine>();
+    assert_send_sync::<FullEngine>();
+    assert_send_sync::<Orchestrator>();
+    assert_send_sync::<EngineSeams>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

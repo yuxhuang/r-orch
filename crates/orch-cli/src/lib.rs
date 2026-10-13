@@ -20,6 +20,7 @@ pub mod editor;
 pub mod output;
 pub mod serve;
 pub mod shop_picker;
+pub mod tui;
 pub mod update_check;
 
 use std::process::ExitCode;
@@ -62,6 +63,8 @@ pub enum Command {
     Task(TaskCmd),
     /// Manage agents
     Agent(AgentCmd),
+    /// Launch interactive TUI dashboard
+    Tui,
 }
 
 #[derive(Debug, Args)]
@@ -355,8 +358,21 @@ async fn dispatch(cli: &Cli, env: EnvFlags) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
-        // Bare `orch` launches the TUI in the original. WP-6 owns that; until
-        // it lands, print help rather than pretending.
+        Some(Command::Tui) => {
+            let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+            // The dashboard needs the orchestrator, so this is the one command
+            // that builds the full container up front.
+            tui::run(
+                ctx.project_root,
+                Cli::command().get_version().unwrap_or("0.0.0"),
+            )
+            .await
+        }
+
+        // Bare `orch` is the first-run experience in the original (init, then
+        // the dashboard). The routing guard owns that path; until it chains the
+        // two, print help rather than pretending. `orch tui` above is the
+        // dashboard on its own.
         None => Ok(print_group_help_root()),
     }
 }
