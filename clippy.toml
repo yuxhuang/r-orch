@@ -1,0 +1,14 @@
+# Agent tie-breaking replicates the TypeScript `_index.json` last-write order
+# (PARITY.md §14.4, REPLICATE). That only holds if every sort over index order
+# is stable — ECMAScript guarantees it for `Array.prototype.sort`, Rust does
+# not for the `*_unstable_*` family. The requirement is invisible in review and
+# silently changes which agent gets picked, so it is enforced mechanically here
+# rather than documented and hoped for.
+#
+# For a sort provably not over index order where the performance matters, add
+# `#[allow(clippy::disallowed_methods)]` with a one-line reason.
+disallowed-methods = [
+    { path = "slice::sort_unstable", reason = "PARITY.md §14.4 needs a stable sort — use sort()" },
+    { path = "slice::sort_unstable_by", reason = "PARITY.md §14.4 needs a stable sort — use sort_by()" },
+    { path = "slice::sort_unstable_by_key", reason = "PARITY.md §14.4 needs a stable sort — use sort_by_key()" },
+]

@@ -95,3 +95,99 @@ fn the_agent_creator_role_is_byte_identical_to_the_typescript_source() {
     let expected_role = expected["claude"][0]["role"].as_str().expect("role");
     assert_eq!(orch_domain::AGENT_CREATOR_ROLE, expected_role);
 }
+
+// ── The catalogue keys as L0 data, enumerated in PARITY.md §9.6 ────────────
+
+#[test]
+fn the_fifteen_agent_shop_keys_are_exactly_these_in_this_order() {
+    let keys: Vec<&str> = AGENT_SHOP_TEMPLATES.iter().map(|t| t.key).collect();
+    assert_eq!(
+        keys,
+        [
+            "backend-dev",
+            "frontend-dev",
+            "qa-engineer",
+            "code-reviewer",
+            "architect",
+            "devops-engineer",
+            "bug-hunter",
+            "tech-writer",
+            "marketer",
+            "content-creator",
+            "growth-hacker",
+            "security-auditor",
+            "performance-engineer",
+            "data-engineer",
+            "fullstack-dev",
+        ]
+    );
+}
+
+#[test]
+fn exactly_three_templates_are_capable_plus_suggest_and_the_rest_balanced_plus_auto() {
+    use orch_domain::{ApprovalPolicy, ModelTier};
+
+    let capable: Vec<&str> = AGENT_SHOP_TEMPLATES
+        .iter()
+        .filter(|t| t.tier == ModelTier::Capable)
+        .map(|t| t.key)
+        .collect();
+    assert_eq!(capable, ["code-reviewer", "architect", "security-auditor"]);
+
+    for template in &AGENT_SHOP_TEMPLATES {
+        let (expected_tier, expected_policy) = if capable.contains(&template.key) {
+            (ModelTier::Capable, ApprovalPolicy::Suggest)
+        } else {
+            (ModelTier::Balanced, ApprovalPolicy::Auto)
+        };
+        assert_eq!(template.tier, expected_tier, "{}", template.key);
+        assert_eq!(
+            template.approval_policy, expected_policy,
+            "{}",
+            template.key
+        );
+    }
+    // No template is `fast`, and none is `manual`.
+    assert!(
+        AGENT_SHOP_TEMPLATES
+            .iter()
+            .all(|t| t.tier != ModelTier::Fast)
+    );
+    assert!(
+        AGENT_SHOP_TEMPLATES
+            .iter()
+            .all(|t| t.approval_policy != ApprovalPolicy::Manual)
+    );
+}
+
+#[test]
+fn the_ten_org_shop_keys_are_exactly_these_and_all_lead_index_zero() {
+    let keys: Vec<&str> = ORG_TEMPLATES.iter().map(|t| t.key).collect();
+    assert_eq!(
+        keys,
+        [
+            "startup-mvp",
+            "pr-review-corp",
+            "migration-squad",
+            "security-dept",
+            "test-factory",
+            "content-agency",
+            "data-lab",
+            "sales-machine",
+            "bugfix-dept",
+            "docs-team",
+        ]
+    );
+    for template in &ORG_TEMPLATES {
+        assert_eq!(template.lead_index, 0, "{}", template.key);
+    }
+}
+
+#[test]
+fn init_creates_exactly_one_default_agent() {
+    // PARITY.md §9.6: "Default agents: exactly one — agt_creator".
+    let agents = default_agents("claude");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0].id, "agt_creator");
+    assert_eq!(agents[0].name, "Agent Creator");
+}

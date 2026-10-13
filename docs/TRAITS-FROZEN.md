@@ -4,6 +4,13 @@ Quick index of everything `orch-core` exports, for the five packages compiling
 against it. Changing anything here needs an explicit amendment — it breaks
 `orch-infra`, `orch-engine`, `orch-cli` and `orch-tui` at once.
 
+> **Revised for the amendments in commit `aea84ca` / `946da84`.** Trait
+> *signatures* are unchanged; three behavioural rules and the library-first
+> dependency set were added. If you branched before this revision, the items
+> that affect you are **§2's three storage rules** (a `save()` that preserves
+> position is now a defect), the **`clippy.toml` stable-sort denial**, and the
+> new **`[workspace.dependencies]` entries** in §10. Nothing else moved.
+
 Everything returns `orch_core::Result<T>` = `Result<T, orch_core::Error>` unless
 stated otherwise. Every trait is `Send + Sync` and takes `&self`, never
 `&mut self`: stores are shared as `Arc<dyn …>` and own their interior
@@ -39,6 +46,29 @@ impl Error {
 domain functions and adapter calls.
 
 ## 2. `orch_core::storage` — 10 traits
+
+**Three rules every implementation owes the contract**, all added by the
+amendments and all replicated by the fakes — so a fake-backed test will *not*
+catch a store that skips one:
+
+1. **`save` removes by id, then pushes to the end of `_index.json`**
+   (PARITY.md §6.10). Index order is *last-write* order. It is observable:
+   `findBestAgent` breaks score ties by position in `AgentStore::list()`, and
+   §14.4 was **reversed to REPLICATE**, so an in-place update that preserves
+   position silently changes which agent runs a task. Applies to the five
+   index-backed stores (task, agent, goal, context, message); `TeamStore` and
+   `RunStore` have no index and scan their directories, so their order is
+   filesystem enumeration order and is **not** contract.
+2. **Sorts over index order must be stable.** `slice::sort_unstable`,
+   `sort_unstable_by` and `sort_unstable_by_key` are **denied workspace-wide**
+   in `clippy.toml` with that reason attached; the lint is verified to fire.
+   Override only with an `#[allow]` and a one-line justification.
+3. **Every YAML read must call `Value::apply_merge()`.** js-yaml resolves `<<`;
+   `serde_yaml_ng` leaves it as a literal `"<<"` key (PARITY.md §6.4.2, V38).
+   Forgetting it makes a hand-authored `config.yml` silently fall back to
+   `DEFAULT_CONFIG` for everything the merge supplied — while both trees still
+   compare equal under the Rust parser. See §Evidence below for the
+   ready-made regression tests.
 
 ```rust
 pub struct TaskFilter { pub status: Option<TaskStatus>, pub goal_id: Option<String> }
@@ -224,6 +254,46 @@ drive ticks explicitly.
 
 ---
 
+## 10. `[workspace.dependencies]` — library-first set (ARCHITECTURE §4.8)
+
+Verified on 2026-10-13 to resolve on rustc 1.94.1 **and** to `cargo check`
+clean in one graph alongside our exact pins (ratatui 0.30.2, crossterm 0.29,
+tokio 1.53, liquid 0.26.11 + kstring 2.0.2, nix 0.31, serde_yaml_ng 0.10,
+jiff 0.2), with a **single** ratatui and a single crossterm. Declared but
+unused, so the owning package does not have to touch the root manifest.
+
+| Crate | Version | For |
+|---|---|---|
+| `process-wrap` | `10` (`tokio1`) | process groups / session spawn + group kill (WP-2). Keep `nix` for `kill(pid, 0)` liveness. |
+| `tui-input` | `0.15` | single-line editing: command bar, `text` wizard steps (WP-6) |
+| `unicode-segmentation` | `1.13` | grapheme segmentation, replacing `Intl.Segmenter` (WP-6) |
+| `unicode-width` | `0.2` | display width (WP-6) |
+| `arboard` | `3.6` | clipboard (WP-3); degrade to "empty" on any failure, as the TS does |
+| `semver` | `1.0` | version comparison in the update check (WP-5) |
+| `similar`, `pretty_assertions` | `3.2`, `1.4` | diffs in the harness and test failures (dev-only) |
+| `proptest` | `1.12` | property tests, if a package wants them (dev-only) |
+
+### `tui-textarea` is rejected — **WP-6 read this**
+
+`tui-textarea` 0.7.0, its latest release, **hard-depends on `ratatui 0.29.0`
+and `crossterm 0.28.1`**:
+
+```
+tui-textarea 0.7.0 → ratatui 0.29.0, crossterm 0.28.1, unicode-width 0.2.0
+```
+
+Adding it puts two incompatible ratatui versions in the graph (measured: the
+lockfile resolves `ratatui 0.29.0` *and* `0.30.2`), and a `TextArea` from it
+cannot be rendered into a 0.30 `Frame` — the widget traits are different
+types. It is therefore **not** in `[workspace.dependencies]`.
+
+`tui-input` 0.15.5 *is* ratatui-0.30 compatible (verified: single ratatui
+0.30.2 in the graph) but is **single-line only**. So the multi-line `textarea`
+wizard steps have no off-the-shelf option on ratatui 0.30: either wrap
+`tui-input` with your own line handling, or hand-roll the editor. §4.8 says to
+say which in a code comment — this is the "no maintained crate fits" case, and
+it is a finding, not a licence to skip the search.
+
 ## Deviations from ARCHITECTURE §5, and why
 
 1. **One `Error` type across the trait surface** instead of a per-module
@@ -297,6 +367,15 @@ emit through `serde_yaml_ng` — the "before" half of V8/R1:
 - `AgentConfig.env` round-trips in insertion order, and YAML key order matches
   the TS interface declaration order.
 
+`crates/orch-domain/tests/yaml_emission.rs` also pins the **merge-key
+bifurcation** (PARITY.md §6.4.2, V38), measured not assumed:
+
+- `serde_yaml_ng` leaves `<<` as a **literal key**: `scheduling.max_turns` and
+  `scheduling.adapter` are simply **absent** from the parse.
+- `Value::apply_merge()` reproduces js-yaml's result exactly (99 / `codex` / 5).
+- `apply_merge()` is a **no-op** on every document ORCH itself writes, so WP-1
+  can call it unconditionally on every read rather than sniffing for `<<`.
+
 ## Test port status for `test/unit/domain/**`
 
 `cargo test -p orch-domain -p orch-core` is green: **204** domain + **136**
@@ -311,7 +390,7 @@ domain layer:
 |---|---|---|
 | `run-token-usage.test.ts` | the `extractTokens` half (`infrastructure/adapters/utils.ts`) | WP-2 |
 | `agent-shop.test.ts` | `getShopWizardSteps`, `applyShopTemplate`, `agentWizardToInput` (`src/tui/wizardConfigs.ts`) | WP-6 |
-| `agent-shop-skills.test.ts` | the library-file integrity half (needs `skills/library/` on disk) | WP-3 |
+| `agent-shop-skills.test.ts` | *(nothing — now ported in full)* | — |
 
 V9 (exhaustive 7×7 transition table), V10 (retry arithmetic, overflow
 included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
@@ -338,11 +417,13 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
 4. **`ARCHITECTURE §5.4`'s `AgentEventKind` naming differs from
    `RunEventType`** and the doc does not say so. The mapping is in PARITY §8.1
    and is now `AgentEventKind::to_run_event_type`.
-5. **Nobody owns `skills/library/`.** PARITY §9.6 requires the 26 `.md` files
-   to ship with the binary, byte-identical to
-   `parity/orch-ts/skills/library/`, and `agent-shop-skills.test.ts` asserts
-   every non-MCP template skill resolves against it. WP-3 owns the loader but
-   the asset copy is unassigned.
+5. ~~**Nobody owns `skills/library/`.**~~ **Closed** — the team lead shipped
+   the 26 `.md` files in `60a259f`, verified byte-identical to
+   `parity/orch-ts/skills/library/`.
+   `crates/orch-domain/tests/shop_skill_references.rs` now runs the
+   reference-integrity half of `agent-shop-skills.test.ts`, and additionally
+   cross-checks that the `agt_creator` role prompt advertises exactly the 26
+   skills that exist — a check the TS suite does not have.
 6. **`fixtures/shop/` was unassigned**, so WP-0 created it (plus the two
    generator scripts and a README) to make V28 a real test rather than a
    transcription. `fixtures/{prompts,adapters,yaml}` remain WP-2/WP-3's.
