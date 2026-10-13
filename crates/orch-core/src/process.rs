@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 
 use crate::error::Result;
@@ -143,13 +144,57 @@ impl ExitSignal {
     }
 }
 
-#[derive(Debug)]
+/// A child's stdout or stderr.
+pub type ChildReader = Box<dyn AsyncRead + Send + Unpin>;
+
+/// A child's stdin.
+pub type ChildWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// A spawned child, with its pipes as trait objects rather than
+/// `tokio::process::Child*` handles.
+///
+/// **Amendment 1** (see `docs/TRAITS-FROZEN.md`): the concrete handles cannot
+/// be fabricated without a process, so a fake could only ever hand back
+/// `None` — which left every adapter's event stream and the two stdin
+/// protocols (codex, pi) untestable with an in-memory double.
+/// [`crate::test_support::FakeProcessManager`] now scripts both output streams
+/// and captures stdin.
 pub struct SpawnedChild {
     pub pid: u32,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
-    pub stdin: Option<ChildStdin>,
+    pub stdout: Option<ChildReader>,
+    pub stderr: Option<ChildReader>,
+    pub stdin: Option<ChildWriter>,
     pub exit: ExitSignal,
+}
+
+impl SpawnedChild {
+    /// Wrap the real handles a `tokio::process::Child` hands out.
+    pub fn from_tokio(
+        pid: u32,
+        stdout: Option<ChildStdout>,
+        stderr: Option<ChildStderr>,
+        stdin: Option<ChildStdin>,
+        exit: ExitSignal,
+    ) -> Self {
+        SpawnedChild {
+            pid,
+            stdout: stdout.map(|out| Box::new(out) as ChildReader),
+            stderr: stderr.map(|err| Box::new(err) as ChildReader),
+            stdin: stdin.map(|input| Box::new(input) as ChildWriter),
+            exit,
+        }
+    }
+}
+
+impl std::fmt::Debug for SpawnedChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnedChild")
+            .field("pid", &self.pid)
+            .field("has_stdout", &self.stdout.is_some())
+            .field("has_stderr", &self.stderr.is_some())
+            .field("has_stdin", &self.stdin.is_some())
+            .finish()
+    }
 }
 
 #[async_trait]
@@ -172,6 +217,12 @@ pub trait ProcessManager: Send + Sync {
 
     /// Spawns in a new process group (`setsid`), so the group kill above
     /// reaches the whole tree.
+    ///
+    /// Cancellation is **not** handled here. The TS passes an `AbortSignal` to
+    /// `spawn`, which makes node signal the child itself; the Rust equivalent
+    /// lives in `orch-infra`'s shared adapter spawn path, which every adapter
+    /// goes through. The orchestrator's own grace-period kills are still
+    /// required — see the spec issue in `docs/TRAITS-FROZEN.md`.
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild>;
 }
 

@@ -1,0 +1,29 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm|\nBox::new(AntigravityAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: agy
+  argv[1]: "-p"
+  argv[2]: "the user prompt"
+  argv[3]: "--dangerously-skip-permissions"
+cwd: /ws
+stdin: Ignore
+
+[full]
+command: agy
+  argv[1]: "-p"
+  argv[2]: "the system prompt\n\nthe user prompt"
+  argv[3]: "--dangerously-skip-permissions"
+  argv[4]: "--model"
+  argv[5]: "a-model"
+cwd: /ws
+stdin: Ignore
+
+[agent-system-prompt-only]
+command: agy
+  argv[1]: "-p"
+  argv[2]: "the agent prompt\n\nthe user prompt"
+  argv[3]: "--dangerously-skip-permissions"
+cwd: /ws
+stdin: Ignore

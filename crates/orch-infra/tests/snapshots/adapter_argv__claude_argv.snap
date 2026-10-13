@@ -1,0 +1,50 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm| Box::new(ClaudeAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: claude
+  argv[1]: "--print"
+  argv[2]: "--output-format"
+  argv[3]: "stream-json"
+  argv[4]: "--max-turns"
+  argv[5]: "50"
+  argv[6]: "--verbose"
+  argv[7]: "--dangerously-skip-permissions"
+  argv[8]: "the user prompt"
+cwd: /ws
+stdin: Ignore
+
+[full]
+command: claude
+  argv[1]: "--print"
+  argv[2]: "--output-format"
+  argv[3]: "stream-json"
+  argv[4]: "--max-turns"
+  argv[5]: "7"
+  argv[6]: "--verbose"
+  argv[7]: "--dangerously-skip-permissions"
+  argv[8]: "--model"
+  argv[9]: "a-model"
+  argv[10]: "--effort"
+  argv[11]: "high"
+  argv[12]: "--system-prompt"
+  argv[13]: "the system prompt"
+  argv[14]: "the user prompt"
+cwd: /ws
+stdin: Ignore
+
+[agent-system-prompt-only]
+command: claude
+  argv[1]: "--print"
+  argv[2]: "--output-format"
+  argv[3]: "stream-json"
+  argv[4]: "--max-turns"
+  argv[5]: "50"
+  argv[6]: "--verbose"
+  argv[7]: "--dangerously-skip-permissions"
+  argv[8]: "--system-prompt"
+  argv[9]: "the agent prompt"
+  argv[10]: "the user prompt"
+cwd: /ws
+stdin: Ignore

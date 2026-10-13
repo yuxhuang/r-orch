@@ -1,0 +1,10 @@
+{"type": "thread.started", "thread_id": "th_1"}
+{"type": "turn.started"}
+{"type": "item.started", "item": {"type": "command_execution", "command": "ls", "status": "in_progress"}}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "hello"}}
+{"type": "item.completed", "item": {"type": "reasoning", "text": "thinking"}}
+{"type": "item.completed", "item": {"type": "command_execution", "command": "ls", "aggregated_output": "file.txt\n", "exit_code": 0}}
+{"type": "item.completed", "item": {"type": "file_change", "changes": [{"path": "a.ts"}, {"path": "b.ts"}]}}
+{"type": "item.completed", "item": {"type": "tool_use", "name": "search", "input": {"query": "orch"}}}
+{"type": "item.completed", "item": {"id": "call_1", "type": "web_search", "query": "privacy preserving AI", "action": {"type": "search", "queries": ["privacy preserving AI"]}}}
+{"type": "turn.completed", "usage": {"input_tokens": 200, "output_tokens": 80}}

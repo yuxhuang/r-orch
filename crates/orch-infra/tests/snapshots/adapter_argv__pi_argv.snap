@@ -1,0 +1,32 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm| Box::new(PiAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: pi
+  argv[1]: "--mode"
+  argv[2]: "rpc"
+cwd: /ws
+stdin: Pipe
+
+[full]
+command: pi
+  argv[1]: "--mode"
+  argv[2]: "rpc"
+  argv[3]: "--model"
+  argv[4]: "a-model"
+  argv[5]: "--thinking"
+  argv[6]: "high"
+  argv[7]: "--append-system-prompt"
+  argv[8]: "the system prompt"
+cwd: /ws
+stdin: Pipe
+
+[agent-system-prompt-only]
+command: pi
+  argv[1]: "--mode"
+  argv[2]: "rpc"
+  argv[3]: "--append-system-prompt"
+  argv[4]: "the agent prompt"
+cwd: /ws
+stdin: Pipe

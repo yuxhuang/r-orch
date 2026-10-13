@@ -1,0 +1,5 @@
+{"type": "thought", "data": "skip me"}
+{"type": "text", "data": "ORCH"}
+{"type": "text", "data": "_OK"}
+{"type": "tool_call", "name": "read", "input": {"path": "src/index.ts"}}
+{"type": "end", "stopReason": "EndTurn"}

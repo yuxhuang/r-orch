@@ -1,0 +1,2 @@
+{"type": "tool_use", "part": {"type": "tool", "tool": "write", "state": {"status": "error", "error": "The user rejected permission"}}}
+{"type": "step_finish", "part": {"type": "step-finish", "reason": "error", "error": "model overloaded"}}

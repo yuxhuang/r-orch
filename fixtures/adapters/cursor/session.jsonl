@@ -1,0 +1,3 @@
+{"type": "assistant", "message": "hi"}
+{"type": "tool_use", "name": "edit"}
+{"type": "result", "usage": {"inputTokens": 50, "outputTokens": 25, "cacheReadTokens": 10, "cacheWriteTokens": 5}}

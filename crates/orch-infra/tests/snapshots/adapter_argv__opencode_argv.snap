@@ -1,0 +1,32 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm| Box::new(OpenCodeAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: opencode
+  argv[1]: "run"
+  argv[2]: "--format"
+  argv[3]: "json"
+  argv[4]: "the user prompt"
+cwd: /ws
+stdin: Ignore
+
+[full]
+command: opencode
+  argv[1]: "run"
+  argv[2]: "--format"
+  argv[3]: "json"
+  argv[4]: "--model"
+  argv[5]: "a-model"
+  argv[6]: "the system prompt\n\nthe user prompt"
+cwd: /ws
+stdin: Ignore
+
+[agent-system-prompt-only]
+command: opencode
+  argv[1]: "run"
+  argv[2]: "--format"
+  argv[3]: "json"
+  argv[4]: "the user prompt"
+cwd: /ws
+stdin: Ignore

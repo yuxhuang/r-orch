@@ -1,0 +1,4 @@
+{"type": "agent_end", "willRetry": true, "messages": [{"role": "assistant", "content": [], "stopReason": "error", "errorMessage": "Rate limit exceeded; retrying"}]}
+{"type": "auto_retry_start", "attempt": 1}
+{"type": "agent_end", "willRetry": false, "messages": [{"role": "assistant", "content": [{"type": "text", "text": "Recovered after retry."}], "stopReason": "stop", "usage": {"input": 12, "output": 5}}]}
+{"type": "agent_settled"}
