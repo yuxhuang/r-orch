@@ -98,31 +98,52 @@ r-orch/
              orch-core                      (traits only; depends on orch-domain)
                  ▲
         ┌────────┴────────┐
-    orch-infra ◄───── orch-engine           (engine → infra: assembly + two faithful
-        ▲                 ▲                  couplings — see below)
+    orch-infra ◄───── orch-engine           (engine → infra: 5 sites, see below)
+        ▲                 ▲
         └────────┬────────┘
                  │
-        ┌────────┴────────┐
-    orch-cli          orch-tui              (both depend on engine; tui never on cli)
+             orch-cli                       (top of the stack; may name anything below)
+                 │
+                 ▼  implements TuiBackend
+             orch-tui                       (depends on orch-domain ONLY)
 ```
 
-**`orch-engine` does depend on `orch-infra`.** An earlier revision of this diagram said "engine depends on
-core, NOT on infra", which was wrong. The edge is real and comes from three places:
+Two things in this diagram were wrong in earlier revisions, and both are now enforced rather than described.
+
+**1. `orch-engine` does depend on `orch-infra`.** An earlier revision said "engine depends on core, NOT on
+infra". The edge is real, and it is **five** non-test sites:
 
 | Site | What it names | Why it is acceptable |
 |---|---|---|
-| `container.rs` | every concrete infra type it assembles — stores, adapters, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `NanoIdGenerator`, `SystemClock` | Assembly has to name implementations somewhere. This is the TS `container.ts` in Rust form. |
+| `container.rs` | every concrete infra type it assembles — stores, adapters, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `FileSkillLoader`, `NanoIdGenerator`, `SystemClock`, `REGISTRATION_ORDER` | Assembly has to name implementations somewhere. The TS `container.ts` in Rust form. |
 | `orchestrator.rs` | `CachedTaskStore`, `CachedAgentStore`, `CachedGoalStore` | Faithful: `orchestrator.ts` likewise constructs the tick-scoped cache wrappers itself (`new CachedTaskStore(deps.taskStore)`). |
 | `orchestrator/dispatch.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE`, `build_prompt_context`, `BuildPromptOptions` | Faithful: `orchestrator.ts` imports exactly these from `template-engine.ts`. |
+| `task_service.rs` | `Paths`, `fs_utils` — for attachment paths | Faithful: `task-service.ts` imports `paths.ts` for the same reason. |
+| `lock.rs` | `storage::lock`, re-exporting `LOCK_STALE` and `LockResult` | The lock *mechanism* is infra; `ProjectLock` is a thin wrapper over it. |
 
 **What actually holds is the narrower, more useful property: every *service* takes only `orch-core` traits.**
-Concrete types appear at assembly and in the two orchestrator modules where the TypeScript couples the same
-way. So `orch-engine` remains unit-testable against `test_support` fakes, and `orch-infra` is still swappable
+Concrete types appear at assembly and in the four modules where the TypeScript couples the same way. So
+`orch-engine` remains unit-testable against `test_support` fakes, and `orch-infra` is still swappable
 wholesale — which is what the boundary was for.
 
-If the edge ever needs to be severed, the moves are known: lift `storage::cached` into `orch-core` (it is
-generic over the traits already) and the two template constants into `orch-domain`. Neither is worth doing now
-— both would diverge from the TS layering for no behavioural gain.
+If the edge ever needs severing, the moves are known: lift `storage::cached` into `orch-core` (already
+generic over the traits) and the two template constants into `orch-domain`. Neither is worth doing — both
+would diverge from the TS layering for no behavioural gain.
+
+**2. `orch-tui` depends on `orch-domain` alone — not on the engine.** An earlier revision of this diagram had
+the TUI depending on `orch-engine`. WP-6 **inverted** it: everything the dashboard needs crosses a single
+trait, `orch_tui::backend::TuiBackend` (§12 of PARITY.md, `crates/orch-tui/BACKEND.md`), so the TUI names only
+the domain types that pass through it. `orch-cli` implements that trait over the DI container
+(`crates/orch-cli/src/tui/backend.rs`), and the TUI's own tests use an in-crate `FakeBackend`. **The real
+layering is tighter than this document originally specified** — a genuine improvement, recorded rather than
+quietly absorbed.
+
+**The authoritative enumeration lives in the check, not in this prose.** `ENGINE_INFRA_SITES` in
+`xtask/src/crate_graph.rs` lists each permitted site with its justification, and it is bidirectional: **a new
+engine file naming `orch_infra` fails the build until it is justified, and a stale entry fails too.** The
+stale-entry half is what caught the TUI inversion above — it turned "someone quietly improved the layering"
+into a failure somebody had to look at, rather than a diff nobody read. The table above keeps the *rationale*;
+the check keeps the *list*. If they disagree, the check is right.
 
 **Enforced invariant: `orch-engine` has zero dependency on `orch-cli` or `orch-tui`.** This mirrors the TS
 layering ("the core engine has zero dependencies on CLI/TUI layers").
@@ -170,7 +191,7 @@ All three names are the same program, matching the npm `bin` map:
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output`, `context`, `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
-| `orch-tui` | `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
+| `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
 
 ---
 
@@ -1125,7 +1146,8 @@ WP-0b walking skeleton + harness  ◄── HARD GATE (V39)
                              │
                              ├──► WP-4 engine ──► WP-5 CLI
                              │
-                             └──► WP-6 wires to the real engine
+                             └──► WP-5 implements TuiBackend over the container,
+                                  replacing WP-6's FakeBackend (§3.1)
 ```
 
 - **WP-0b is a hard gate**: WP-4 and WP-5 may not begin until V39 is green. WP-1/2/3/6 may begin in parallel
