@@ -610,3 +610,73 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
     Trimming before storing passes every rejection test and diverges on every
     message anyone sends with a trailing newline.
     Covered by `cmd-msg-body-trimming.toml`.
+
+14. **The oracle's `run` and `serve --once` do not dispatch anything from the
+    CLI — the process exits first.** `orch run <id>` and
+    `orch serve --once` print their header and exit **0** having done nothing:
+    the task stays `todo`, no run record is written, and
+    `.orchestry/orchestry.lock` plus a stale `claimed` entry are left behind.
+    Reproduced outside the harness, inside a git repo and outside one, in
+    `worktree` and `shared` workspace modes, on node 24.21.0. The same
+    invocation under a `node -r <preload>` that holds the event loop open with
+    an interval timer completes the task correctly, so every await does
+    resolve — the process simply exits before they do.
+
+    The mechanism is `ProcessManager.spawn` (`process-manager.ts:63-77`),
+    which `unref()`s every child on the stated assumption that "pipes
+    (stdout/stderr) still hold refs while being read", plus the callers that
+    never read them —`WorkspaceManager.spawnAndWait`
+    (`workspace-manager.ts:171-181`) awaits `close` with no `data` listener.
+    Seven lines reproduce it with no ORCH code at all:
+
+    ```js
+    const p = spawn('sh', ['-c', 'sleep 1'],
+      { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    p.unref();
+    new Promise((r) => p.on('close', r)).then((c) => console.log('close', c));
+    // → node exits 0 immediately; `close` never fires
+    ```
+
+    The oracle's own vitest suite cannot see this: it drives the orchestrator
+    in-process, where vitest keeps the loop alive. `unref()` has these
+    semantics on every supported node, so an older runtime is unlikely to
+    change it.
+
+    Consequence for the corpus: `v7-run-single-task` and all nine `o7-*`
+    scenarios cannot be compared against the oracle as written —
+    r-orch does the work and the oracle does nothing, so every artifact
+    differs. `v7-run-cross-compat` is unaffected, because there the oracle
+    only *reads* what r-orch wrote. Needs a decision: patch the vendored
+    oracle (recorded as such), convert those ten to rust-only snapshots, or
+    leave them red. Not something r-orch can or should reproduce.
+
+15. **`review` is not terminal, so `serve --once` waits forever for a task
+    that lands there.** Both implementations' `waitForAllTerminal` poll until
+    every task `isTerminal`, and `review` is not — by design, since a task
+    without `review_criteria` is auto-approved only when its agent's
+    `approval_policy` is `auto`. `o7-concurrency-cap` dispatches six tasks to
+    agents that mostly lack that policy, so it cannot terminate in either
+    implementation; it needs `task approve` steps or auto-policy agents. The
+    harness now reports a timed-out step as a scenario failure rather than
+    aborting the whole run.
+
+16. **`Orchestrator::stop()` aborted the task it was running in, so `serve`
+    and `run --watch` ignored Ctrl+C.** `stop()` takes the stored watch-loop
+    `JoinHandle` and aborts it — but both the signal arms and the tick circuit
+    breaker call `stop()` **from inside that very task**, so it cancelled
+    itself at the next await that actually pends. In the real binary that is
+    the state save, which happens *before* the lock release and before
+    `stopped.send(true)`, so `wait_for_stop()` never returned: `orch run
+    --watch` and `orch serve` printed `Shutting down…` and then sat there
+    until something killed them, leaving `.orchestry/orchestry.lock` behind.
+
+    Invisible to the orchestrator's own tests, which is why it survived: with
+    the in-memory fakes nothing inside `stop()` ever pends, so the task runs
+    to completion even while cancelled, and `tests/resilience.rs` drives
+    `handle_signal` from the *test* task rather than from the loop. Fixed with
+    a `IN_WATCH_LOOP` task-local that `stop()` checks before aborting —
+    `shutdown.cancel()` already breaks the loop cooperatively, so the abort
+    was never needed from inside it. Covered end to end by
+    `crates/orch-cli/tests/watch_shutdown.rs`, at the only level where it is
+    real: SIGINT to `run --watch`, SIGTERM to `serve`, both asserting the
+    process exits and the lock file is gone.
