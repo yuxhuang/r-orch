@@ -510,3 +510,103 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
    reach a moment later anyway. **The orchestrator's grace-period kills are
    still required** — this path sends one `SIGTERM` and never escalates to
    `SIGKILL`.
+
+8. **`PARITY.md §3` says a bare command group prints its help to stdout — it
+   prints to stderr.** Measured against the vendored oracle in a hermetic
+   tmpdir, for three groups:
+
+   | argv | stdout | stderr | exit |
+   |---|---|---|---|
+   | `orch task` | 0 B | 735 B | 1 |
+   | `orch agent` | 0 B | 654 B | 1 |
+   | `orch config` | 0 B | 407 B | 1 |
+
+   The first stderr line is `Usage: orchestry task [options] [command]`. This
+   is Commander's `help({ error: true })` path, which is what a subcommand
+   without an `.action()` falls into. The exit code in §3 is right; only the
+   stream is wrong. `fixtures/scenarios/cmd-exit-codes-groups.toml` encodes the
+   measured behaviour, and `harness.rs::is_group_help` documents it where the
+   lint needs to recognise it. **WP-5: write to stderr.**
+
+9. **`config global get` cannot read a nested key, and that is L0.** In the
+   same tree, `config global show --json` prints
+   `{"tui":{"palette":"amber",…}}` while `config global get tui.palette --json`
+   prints `{"key":"tui.palette"}` — no `value` at all, exit 0. `config global
+   get tui` is likewise empty. The project-level `config get` *does* walk dot
+   paths (`config get defaults.agent.max_turns` → `{"key":…,"value":50}`), so
+   the two commands differ. Replicated as measured in
+   `fixtures/scenarios/cmd-config.toml`: the CLI contract is byte parity, not
+   sanity. **WP-5: do not "fix" this.**
+
+10. **`task edit` and `agent edit` take no options whatsoever.** §2.2 lists
+    them beside flag-taking verbs, which invites the assumption that they
+    accept `--title`/`--description`/`--model`. They do not: each serializes
+    the entity into a `---` frontmatter temp file, spawns `$EDITOR` (then
+    `$VISUAL`, then `vi`) on it, and parses what comes back, writing only the
+    fields that changed. Four scenarios were originally written with invented
+    flags and would have asserted nothing; `cargo xtask lint-scenarios` now
+    catches that class of mistake, and `fixtures/fake-editors/` makes the two
+    commands reachable from a scenario at all. The editor protocol itself is
+    L0 surface nobody had enumerated: the frontmatter keys per entity, the
+    "No changes." path when nothing is edited, and `Editor exited with code N`
+    on a non-zero editor exit — all four are now scenarios.
+
+11. **One `msg send` can write a message file that `serde_json` cannot parse —
+    this needs an architect decision.** Measured, and reachable from the CLI
+    with a single command.
+
+    `MessageService.send` truncates with JS `.slice()`, which counts **UTF-16
+    code units**: `subject.slice(0, 200)` and `body.slice(0, 4000)`. A non-BMP
+    character is two code units, so a body of 3999 ASCII characters followed by
+    `😀` (4001 code units) is cut **between the surrogates**, and the stored
+    value ends in a **lone high surrogate**. What the oracle then does with it
+    differs by output path:
+
+    | path | bytes | valid UTF-8 |
+    |---|---|---|
+    | `.orchestry/messages/<id>.json` | `…aaa\ud83d` (the 6-byte escape) | yes |
+    | `msg list --json` on stdout | `…aaa\ud83d` (same escape) | yes |
+    | `msg inbox` human output | `…aaa` + `ef bf bd` (U+FFFD) | yes |
+
+    Both renderings are byte-reproducible from Rust only deliberately, because
+    a Rust `String` cannot hold a lone surrogate at all. The **read** path is
+    the harder half: `serde_json` rejects a lone surrogate escape outright —
+    `from_str(r#"{"body":"aaa\ud83d"}"#)` fails with `unexpected end of hex
+    escape`, whatever follows it — so our storage layer cannot read back a
+    file the oracle wrote. `msg list` would fail entirely rather than diverge
+    in one field.
+
+    Three options, none free, hence the escalation:
+
+    - **Model the body as UTF-16.** Byte-exact in every path, and poisons the
+      domain type for every consumer.
+    - **Replace lone surrogates with U+FFFD on read.** Keeps `String`, matches
+      the human path, and breaks byte parity on re-save (the escape becomes
+      `ef bf bd`), so a round-trip through r-orch silently rewrites the file.
+    - **Declare it L2 above the limit** and record the deviation. Honest, and
+      concedes a documented L0 field.
+
+    Not a hypothetical about hostile input: it needs one `msg send` with a long
+    body ending in an emoji. `fixtures/scenarios/cmd-msg-truncation.toml` is
+    the test for whichever option is chosen, with a `${repeat:…}` control case
+    one character shorter where the cut falls between characters and no special
+    handling is needed. The harness now reports a file only one side can parse
+    as a failure instead of aborting the run, which it previously did.
+
+12. **`msg broadcast --team <nonexistent>` fans out to every agent.**
+    `message-service.ts` resolves the team and filters only `if (team)`, with
+    no else branch, so an unknown team id leaves the recipient list unfiltered.
+    Measured in a four-agent tree: `--team <real two-member team>` → 2
+    messages, `--team team_nosuch` → 4, and `team_id: "team_nosuch"` is
+    persisted on all four, leaving a dangling reference in the store. An
+    implementation that validates the team id sends strictly fewer messages
+    than the oracle. Replicated in `cmd-msg-broadcast-unknown-team.toml`.
+
+13. **A message body is validated trimmed and stored untrimmed.**
+    `send` rejects on `!input.body.trim()` and then stores
+    `input.body.slice(0, 4000)` — the original. So `'   '` is an error while
+    `' padded '` is accepted and keeps both spaces on disk. The subject is
+    neither trimmed nor validated: empty becomes the literal `(no subject)`.
+    Trimming before storing passes every rejection test and diverges on every
+    message anyone sends with a trailing newline.
+    Covered by `cmd-msg-body-trimming.toml`.

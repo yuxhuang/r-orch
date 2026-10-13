@@ -14,6 +14,7 @@ that says *why* a TS test file has no Rust counterpart.
 | `commands-init.test.ts` | validation, idempotency, files written, adapter detection, the multi-adapter prompt | `src/commands/init.rs` + `tests/routing.rs` |
 | `commands-doctor.test.ts` | both tiers, check list, the two header lines before `--json`, always exit 0 | `src/doctor.rs` + `tests/routing.rs` |
 | `commands-logs.test.ts` | five routes, fetch sizes, display slices, four `--json` payloads, `--follow` shapes | `src/logs.rs` + `tests/routing.rs` |
+| — (no TS unit file; §6 + §14.1) | `status` human block, `{tasks, agents, state}`, `claimed` as an **array** | `src/commands/status.rs` + `tests/routing.rs` |
 | `commands-logs-since-all.test.ts` | the `--since`-only route, its run window and its 20-run cap | `src/logs.rs` |
 | `commands-serve.test.ts` | `--log-format` validation, `--tick-interval` parsing, `--log-file` append, subscribe-before-watch | `src/serve/mod.rs` + `tests/routing.rs` |
 | `serve-once-runner.test.ts` | the terminal rule, the empty-project exit, `has_failed` vs `all_done` | `src/serve/once.rs` |
@@ -37,7 +38,6 @@ scenario is added with each one, not before.
 
 | Command | Needs |
 |---|---|
-| `status` | WP-4: nothing beyond the stores, but `status --json`'s `{tasks, agents, state}` shape and the `claimed: {}` quirk (§14.1) belong with the service work |
 | `config get/set/edit`, `config global *` | WP-4 `ConfigService` semantics: deep merge, dot paths, the four **compact** `--json` sites |
 | `context *`, `msg *`, `goal *`, `team *`, `org *` | WP-4 services (`ContextService`, `MessageService`, `GoalService`, `TeamService`, org deploy) |
 | `task show/edit/cancel/approve/reject/retry` | WP-4 `TaskService` methods; `task cancel` additionally needs the orchestrator for an `in_progress` task |
@@ -57,11 +57,19 @@ a unit test cannot: the exact stdout of `init`, `task add`, `task list`,
 |---|---|
 | `walking-skeleton*` | V39: init / agent add / task add / task list, in both cross-compat directions |
 | `index-tie-order*` | the `_index.json` last-write order under a re-save (PARITY.md §14.4), in both directions |
+| `cmd-status-and-doctor` | `status`/`doctor` human and `--json`, including the masked `state.claimed` (§14.1) and doctor's two header lines |
+| `cmd-logs`, `cmd-init`, `cmd-ascii-and-quiet`, `cmd-exit-codes-uninitialized` | from master's corpus; green as of this work package |
 
-Two harness notes for whoever owns it next:
+Two notes on the harness as it now stands:
 
-- **`fixtures/fake-agents/` is not on the scenarios' `PATH`.** Until it is,
-  `doctor`, `run` and `serve` scenarios are non-hermetic: their output depends
-  on which real CLIs the machine has installed.
-- **A step cannot name a generated id**, which is why `task assign` has unit
-  coverage but no scenario. See `fixtures/scenarios/README.md`.
+- **A scenario's `requires` is gated on *wired*, not *declared*.** WP-5a
+  declares the whole command tree, so `<cmd> --help` exits 0 for every command
+  and is no longer a usable probe: the gate is `WIRED_COMMANDS` in
+  `xtask/src/harness.rs`, intersected with the `--help` check. Add a command
+  there in the same commit that wires it, and the scenarios waiting on it go
+  live.
+- **`state.claimed` in `status --json` is the corpus's one masked field**
+  (§14.1). `xtask/src/harness.rs::masked_status_json` removes it from the
+  comparison and `claimed_matches_state_json` asserts r-orch's array against
+  the `state.json` on disk — including the case where no `state.json` exists
+  yet, where the default empty set is the right answer.

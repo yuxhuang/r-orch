@@ -1,0 +1,24 @@
+name = "cmd-task-cross-compat"
+kind = "ts_then_rust"
+split_at = 4
+requires = ["task show", "task assign"]
+description = """
+Cross-compat over the task and agent YAML the CLI writes: the TypeScript \
+binary creates and edits, then r-orch continues in the same directory. The \
+edit matters — it rewrites a file js-yaml originally emitted, which is \
+where a reader stricter than js-yaml's writer would show up."""
+# Read-only steps only: each runs once per binary.
+verify = [
+  "task list --json",
+  "agent list --json",
+  "task show ${task.0} --json",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "agent add shelly --adapter shell --command 'echo hello' --quiet",
+  "task add 'Written by ts' --assignee ${agent.0} --priority 1 --quiet",
+  "task add 'Also by ts' --labels x,y --quiet",
+  "task add 'Written by rust' --quiet",
+  "task assign ${task.1} ${agent.0}",
+  "task list --json",
+]

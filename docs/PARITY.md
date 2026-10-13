@@ -582,11 +582,13 @@ Note `config.model` and `config.effort` are **forced to absent** for `adapter: "
 { "tasks": [ ...Task ], "agents": [ ...Agent ], "state": { ...OrchestratorState } }
 ```
 
-**The `state.claimed` field is emitted as `{}`, never as an array.** The in-memory `OrchestratorState.claimed`
-is a JS `Set`, and `JSON.stringify` of a `Set` yields `{}` regardless of its contents. This is a bug in the
-original (§14.1) that is **replicated**, because `--json` is a declared machine contract.
+**r-orch emits `state.claimed` as a JSON array of task ids** — the same shape as `state.json` on disk. The TS
+original always emits `{}` here (its in-memory `claimed` is a JS `Set`, and `JSON.stringify` of a `Set` is `{}`).
+That is a bug, and it is **fixed** in r-orch by user decision (§14.1). The differential harness masks
+`state.claimed` in `status --json` comparisons and instead asserts that r-orch's value equals the `claimed` array
+in the resulting `state.json`.
 
-`state` otherwise matches the `state.json` schema in §6.5, *except* that `claimed` on disk is a JSON array.
+`state` otherwise matches the `state.json` schema in §6.5 exactly.
 
 ### 4.4 `goal show --json`
 
@@ -2637,7 +2639,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 
 | Entry | Decision | Effect |
 |---|---|---|
-| §14.1 `claimed: {}` | REPLICATE | `none` |
+| §14.1 `claimed: {}` | **FIX** (user decision) | `scenario exclusion required (named)`: `state.claimed` masked in `status --json`, replaced by an equality check against `state.json` |
 | §14.2 `goalId` camelCase | REPLICATE | `none` |
 | §14.3 bad hint text | REPLICATE | `none` |
 | §14.4 `findBestAgent` ties | **REPLICATE** *(reversed)* | `none` |
@@ -2655,20 +2657,20 @@ Note that §14.4 and §14.12 were *both* originally specified as fixes that woul
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
 point of having it.
 
-### 14.1 `status --json` emits `"claimed": {}` — **REPLICATE**
+### 14.1 `status --json` emits `"claimed": {}` — **FIX (user decision, 2026-10-13)**
 
 `OrchestratorState.claimed` is a JS `Set`. `status --json` serializes the in-memory state object directly, and
-`JSON.stringify(new Set([...]))` is `{}` for any contents. So `state.claimed` in `status --json` is **always**
+`JSON.stringify(new Set([...]))` is `{}` for any contents. So `state.claimed` in TS `status --json` is **always**
 an empty object, while `state.json` on disk correctly holds an array.
 
-**Decision: replicate.** **Effect on differential comparison: `none`.**
+**Decision: fix.** r-orch emits `state.claimed` as the array of claimed task ids, identical to `state.json`.
+**Effect on differential comparison: `scenario exclusion required (named)`** — the harness masks
+`state.claimed` in every `status --json` comparison and instead asserts r-orch's array equals the `claimed` array
+read from the resulting `.orchestry/state.json`.
 
-`--json` is a declared machine contract (§1.1); a consumer may have a schema that expects an object there, and
-emitting `[]` would be the breaking change. The on-disk array is unaffected.
-
-This is the one place where "replicate the bug" and "fix by default" genuinely conflict. It was escalated and
-**decided by the team lead**, who owns it; it is recorded in the project report as a user-visible call. It
-remains reversible — the change is one line in the `status` command, and the on-disk format does not move.
+History: the architect and team lead initially chose REPLICATE (a consumer might expect an object). The user
+reviewed the work-in-progress report and decided to fix it. Consumers parsing `status --json` that relied on
+`claimed` being an object will now see an array — called out in release notes.
 
 ### 14.2 `goalId` is camelCase among snake_case fields — **REPLICATE**
 

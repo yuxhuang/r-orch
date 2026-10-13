@@ -1,0 +1,23 @@
+name = "cmd-msg-cross-compat"
+kind = "rust_then_ts"
+split_at = 4
+requires = ["msg send", "msg list"]
+description = """
+Cross-compat over the message store and its index. Messages carry \
+`expires_at` as well as `created_at`, so two timestamp fields per file \
+have to survive the round trip — and R1 (js-yaml resolving an unquoted ISO \
+instant to a Date, after which MessageStore.list() throws on \
+localeCompare) is specifically a message hazard."""
+# Read-only steps only: each runs once per binary.
+verify = [
+  "msg list --json",
+  "msg inbox agt_creator --json",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "agent add second --adapter claude --quiet",
+  "msg send agt_creator 'from rust' -s Rust --quiet",
+  "msg broadcast 'rust broadcast' -s RustAll --quiet",
+  "msg send agt_creator 'from ts' -s Ts --quiet",
+  "msg list --json",
+]

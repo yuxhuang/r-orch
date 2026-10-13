@@ -1,0 +1,26 @@
+name = "cmd-goal-team-cross-compat"
+kind = "rust_then_ts"
+split_at = 5
+requires = ["goal add", "team create", "team join"]
+description = """
+Cross-compat over goal and team YAML, including the nested member list and \
+the task_pool array. Teams are the only entity with a list of objects in \
+them, so a writer that emits a flow sequence where js-yaml emitted a block \
+one shows up here and nowhere else."""
+# Read-only steps only: each runs once per binary.
+verify = [
+  "goal list --json",
+  "team list --json",
+  "team show ${team.0} --json",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "agent add second --adapter claude --quiet",
+  "goal add 'Written by rust' --description 'with a description' --quiet",
+  "team create rust-squad --lead agt_creator --quiet",
+  "task add 'Pool task' --goal-id ${goal.0} --quiet",
+  "team join ${team.0} ${agent.0}",
+  "team add-task ${team.0} ${task.0}",
+  "goal add 'Written by ts' --quiet",
+  "goal list --json",
+]

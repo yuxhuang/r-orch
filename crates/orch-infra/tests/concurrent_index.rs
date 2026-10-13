@@ -23,7 +23,7 @@
 //! notices until the index is rebuilt.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TASKS: usize = 12;
@@ -35,21 +35,53 @@ struct Harness {
     oracle: PathBuf,
 }
 
+/// Where cargo put this build's binaries.
+///
+/// Derived rather than hard-coded as `<repo>/target`: the target directory
+/// moves with `CARGO_TARGET_DIR`, and a stale or foreign `target/debug/orch`
+/// is the dangerous failure here — the test would spawn a *different build*
+/// and report green about code that was never exercised. Build artifacts from
+/// two trees hash identically, so nothing else would notice.
+fn target_dir(repo_root: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => repo_root.join("target"),
+    }
+}
+
 impl Harness {
-    /// `None` when the Rust binary or the vendored oracle is missing, so the
-    /// suite still runs without them.
+    /// `None` only when the caller has explicitly opted out.
+    ///
+    /// A missing binary used to `return None` with an `eprintln`, which cargo
+    /// hides for a passing test — so the whole file reported green while
+    /// asserting nothing. That is the one outcome a cross-binary test must not
+    /// have, so a missing prerequisite now fails loudly and says what to run.
     fn new() -> Option<Harness> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let rust = repo_root.join("target/debug/orch");
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let rust = target_dir(&repo_root).join(profile).join("orch");
         let oracle = repo_root.join("parity/orch-ts/dist/cli.js");
-        if !rust.exists() {
-            eprintln!("skipping: run `cargo build -p orch-cli` first");
+
+        if std::env::var_os("ORCH_SKIP_CROSS_BINARY").is_some() {
+            eprintln!("skipping: ORCH_SKIP_CROSS_BINARY is set");
             return None;
         }
-        if !oracle.exists() {
-            eprintln!("skipping: run parity/setup.sh to build the oracle");
-            return None;
-        }
+        assert!(
+            rust.exists(),
+            "{} is missing — run `cargo build -p orch-cli` (or set \
+             ORCH_SKIP_CROSS_BINARY=1 to skip the cross-binary tests)",
+            rust.display()
+        );
+        assert!(
+            oracle.exists(),
+            "{} is missing — run parity/setup.sh to build the vendored oracle (or set \
+             ORCH_SKIP_CROSS_BINARY=1 to skip the cross-binary tests)",
+            oracle.display()
+        );
 
         let project = tempfile::Builder::new()
             .prefix("r-orch-a2-")

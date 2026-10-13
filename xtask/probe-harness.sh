@@ -63,13 +63,17 @@ PY
     return
   fi
 
-  # Capture before grepping: `pipefail` would otherwise make the condition
-  # reflect `cargo`'s non-zero exit (the harness bails on failure) rather than
-  # grep's match, inverting every result.
-  local out
-  out=$(cargo xtask parity 2>&1)
-  if printf '%s' "$out" | grep -q FAILED; then
-    printf '  detected      %s\n' "$label"
+  # Compare against the baseline *set* of failing scenarios, not against
+  # "anything failed". The corpus is written ahead of the implementation, so
+  # some scenarios are legitimately red — grepping for FAILED would then match
+  # the standing red bar and report every probe as detected, which would make
+  # this suite the very thing it exists to prevent: a gate that cannot fail.
+  local now newly
+  now=$(failing_scenarios)
+  newly=$(comm -13 <(printf '%s\n' "$baseline") <(printf '%s\n' "$now"))
+
+  if [ -n "$newly" ]; then
+    printf '  detected      %s  (%s)\n' "$label" "$(printf '%s' "$newly" | tr '\n' ' ')"
     detected=$((detected + 1))
   else
     printf '  ** MISSED **  %s\n' "$label"
@@ -80,13 +84,18 @@ PY
   cargo build -p orch-cli >/dev/null 2>&1
 }
 
+# The sorted names of every scenario the harness currently reports as failing.
+failing_scenarios() {
+  cargo xtask parity 2>&1 | sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' | sort
+}
+
 echo "building the baseline"
 cargo build -p orch-cli >/dev/null 2>&1
-baseline=$(cargo xtask parity 2>&1)
-if printf '%s' "$baseline" | grep -q FAILED; then
-  echo "refusing to run: the harness is already red on a clean tree" >&2
-  printf '%s\n' "$baseline" >&2
-  exit 1
+baseline=$(failing_scenarios)
+if [ -n "$baseline" ]; then
+  # Expected while the corpus runs ahead of the CLI: these are the red bar
+  # WP-4/WP-5 land against. A probe counts only if it adds to this set.
+  echo "  baseline red bar: $(printf '%s' "$baseline" | tr '\n' ' ')"
 fi
 
 echo "running mutation probes"

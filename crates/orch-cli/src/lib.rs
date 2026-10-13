@@ -304,7 +304,11 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
         Some(Command::Serve(args)) => run_serve(cli, env, &cwd, args).await,
 
-        Some(Command::Status) => Err(not_wired("status")),
+        Some(Command::Status) => {
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            commands::status::run(&engine, &ctx, &styles).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Config(ConfigCmd { command })) => match command {
             None => Ok(print_group_help(&["config"])),
             Some(ConfigSub::Global(global)) if global.command.is_none() => {

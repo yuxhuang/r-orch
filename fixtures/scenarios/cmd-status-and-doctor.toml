@@ -1,0 +1,27 @@
+name = "cmd-status-and-doctor"
+kind = "differential"
+requires = ["status", "doctor"]
+fake_agents = true
+description = """
+`status` and `doctor`. Three things to know: `status --json`'s \
+`state.claimed` is the corpus's **one deliberate divergence** — the oracle \
+stringifies a JS `Set` and emits `{}`, r-orch emits the array of ids \
+(PARITY.md §14.1, user decision), so the harness masks that field and \
+asserts r-orch's value against the `state.json` it wrote; `state.running` \
+*is* an object on both sides, being a JS Map keyed by run id; and \
+`doctor --json` prints two human lines before the JSON document, so a \
+consumer piping it has to skip them. `doctor` always exits 0 — it \
+diagnoses, it does not gate. The fake agents are first on PATH so the probe \
+results are reproducible rather than depending on what the machine has \
+installed."""
+steps = [
+  "init --name proj --adapter claude",
+  "status",
+  "status --json",
+  "task add 'One' --quiet",
+  "agent add worker --adapter shell --command 'echo hi' --quiet",
+  "status",
+  "status --json",
+  "doctor",
+  "doctor --json",
+]

@@ -5,4 +5,5 @@
 
 pub mod agent;
 pub mod init;
+pub mod status;
 pub mod task;

@@ -150,6 +150,83 @@ impl Normalizer {
     }
 }
 
+/// Ids a scenario can refer to by position, per tree.
+///
+/// The two trees mint different random ids, so a step that names one — `task
+/// approve <id>`, `--depends-on <id>` — cannot hard-code it. A scenario writes
+/// `${task.0}` and the harness substitutes the id **that tree** produced,
+/// numbered in the order the ids first appeared in its own output. Without
+/// this, every command that takes an id is unreachable from a scenario.
+#[derive(Debug, Default)]
+pub struct IdRegistry {
+    by_prefix: IndexMap<String, Vec<String>>,
+}
+
+impl IdRegistry {
+    pub fn new() -> Self {
+        IdRegistry::default()
+    }
+
+    /// Record every id in a step's output, in order, ignoring repeats.
+    pub fn learn(&mut self, text: &str) {
+        for (id, prefix) in find_ids(text) {
+            let seen = self.by_prefix.entry(prefix).or_default();
+            if !seen.contains(&id) {
+                seen.push(id);
+            }
+        }
+    }
+
+    /// Substitute `${<prefix>.<index>}` placeholders. An unknown placeholder
+    /// is an error rather than a silent pass-through: a scenario that
+    /// references an id it never created would otherwise run with a literal
+    /// `${task.0}` as the argument and fail with a confusing message.
+    pub fn expand(&self, argv: &[String]) -> std::result::Result<Vec<String>, String> {
+        argv.iter().map(|arg| self.expand_one(arg)).collect()
+    }
+
+    fn expand_one(&self, arg: &str) -> std::result::Result<String, String> {
+        let mut out = String::with_capacity(arg.len());
+        let mut rest = arg;
+
+        while let Some(start) = rest.find("${") {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 2..];
+            let Some(end) = after.find('}') else {
+                return Err(format!("unterminated placeholder in {arg:?}"));
+            };
+            let token = &after[..end];
+            let (prefix, index) = token
+                .split_once('.')
+                .ok_or_else(|| format!("placeholder {token:?} is not `<prefix>.<index>`"))?;
+            let index: usize = index
+                .parse()
+                .map_err(|_| format!("placeholder {token:?} has a non-numeric index"))?;
+
+            // `task` reads better in a scenario than the on-disk `tsk`.
+            let prefix = match prefix {
+                "task" => "tsk",
+                "agent" => "agt",
+                other => other,
+            };
+            let id = self
+                .by_prefix
+                .get(prefix)
+                .and_then(|ids| ids.get(index))
+                .ok_or_else(|| {
+                    format!(
+                        "no `{prefix}` id at index {index} yet — this tree has produced {:?}",
+                        self.by_prefix.get(prefix).map(Vec::as_slice).unwrap_or(&[])
+                    )
+                })?;
+            out.push_str(id);
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+}
+
 /// Every `<prefix>_<7 chars>` id in `text`, in order of appearance, excluding
 /// the known fixed ids.
 fn find_ids(text: &str) -> Vec<(String, String)> {
@@ -498,6 +575,94 @@ mod tests {
         use serde_json::json;
         let mut n = Normalizer::new();
         assert_eq!(n.value(&json!({ "pid": null })), json!({ "pid": null }));
+    }
+
+    #[test]
+    fn the_registry_substitutes_ids_by_position() {
+        let mut registry = IdRegistry::new();
+        registry.learn("created tsk_AAAAAAA\ncreated tsk_BBBBBBB\nagent agt_CCCCCCC\n");
+
+        assert_eq!(
+            registry
+                .expand(&["task".into(), "approve".into(), "${task.0}".into()])
+                .unwrap(),
+            vec!["task", "approve", "tsk_AAAAAAA"]
+        );
+        assert_eq!(
+            registry.expand(&["${task.1}".into()]).unwrap(),
+            vec!["tsk_BBBBBBB"]
+        );
+        // `agent` is an alias for the on-disk `agt` prefix.
+        assert_eq!(
+            registry.expand(&["${agent.0}".into()]).unwrap(),
+            vec!["agt_CCCCCCC"]
+        );
+        assert_eq!(
+            registry.expand(&["${agt.0}".into()]).unwrap(),
+            vec!["agt_CCCCCCC"]
+        );
+    }
+
+    #[test]
+    fn a_placeholder_can_sit_inside_a_larger_argument() {
+        let mut registry = IdRegistry::new();
+        registry.learn("tsk_AAAAAAA tsk_BBBBBBB");
+        assert_eq!(
+            registry.expand(&["${task.0},${task.1}".into()]).unwrap(),
+            vec!["tsk_AAAAAAA,tsk_BBBBBBB"]
+        );
+        assert_eq!(
+            registry
+                .expand(&["prefix-${task.0}-suffix".into()])
+                .unwrap(),
+            vec!["prefix-tsk_AAAAAAA-suffix"]
+        );
+    }
+
+    #[test]
+    fn an_argument_without_a_placeholder_is_untouched() {
+        let registry = IdRegistry::new();
+        assert_eq!(
+            registry
+                .expand(&["task".into(), "list".into(), "--json".into()])
+                .unwrap(),
+            vec!["task", "list", "--json"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_placeholder_is_an_error_not_a_pass_through() {
+        let mut registry = IdRegistry::new();
+        registry.learn("tsk_AAAAAAA");
+
+        let err = registry
+            .expand(&["${task.5}".into()])
+            .expect_err("out of range");
+        assert!(err.contains("no `tsk` id at index 5"), "{err}");
+        assert!(
+            err.contains("tsk_AAAAAAA"),
+            "the error should show what exists: {err}"
+        );
+
+        assert!(registry.expand(&["${goal.0}".into()]).is_err());
+        assert!(registry.expand(&["${task}".into()]).is_err());
+        assert!(registry.expand(&["${task.x}".into()]).is_err());
+        assert!(registry.expand(&["${task.0".into()]).is_err());
+    }
+
+    #[test]
+    fn repeated_ids_are_recorded_once_in_first_seen_order() {
+        let mut registry = IdRegistry::new();
+        registry.learn("tsk_BBBBBBB tsk_AAAAAAA tsk_BBBBBBB");
+        assert_eq!(
+            registry.expand(&["${task.0}".into()]).unwrap(),
+            vec!["tsk_BBBBBBB"]
+        );
+        assert_eq!(
+            registry.expand(&["${task.1}".into()]).unwrap(),
+            vec!["tsk_AAAAAAA"]
+        );
+        assert!(registry.expand(&["${task.2}".into()]).is_err());
     }
 
     #[test]

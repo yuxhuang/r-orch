@@ -1,0 +1,18 @@
+name = "cmd-agent-errors"
+kind = "differential"
+requires = ["agent list", "agent remove", "agent status"]
+description = """
+Agent error paths: a shell agent with no command is 2, an unknown id is 1. \
+Both measured."""
+steps = [
+  "init --name proj --adapter claude",
+  "agent add noshell --adapter shell",
+  "agent remove agt_nosuch",
+  "agent status agt_nosuch",
+  "agent edit agt_nosuch",
+  "agent disable agt_nosuch",
+  "agent enable agt_nosuch",
+  "agent add ok --adapter claude --quiet",
+  "agent add ok --adapter claude",
+  "agent list --json",
+]

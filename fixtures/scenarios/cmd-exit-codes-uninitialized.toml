@@ -1,0 +1,22 @@
+name = "cmd-exit-codes-uninitialized"
+kind = "differential"
+description = """
+The rule from PARITY.md §3 that is easiest to get wrong and is testable \
+today: **any** command in an uninitialized directory exits 3, including \
+`orch <sub> --help` and an unknown command, because the container is built \
+before Commander parses — so NotInitializedError beats both help and usage \
+errors. `--help` and `--version` with no subcommand are the two exemptions \
+and exit 0. Deliberately ungated: it needs only commands that already \
+exist, so it is a real red bar rather than a missing-command one. The help \
+and usage steps are @exit-only because Commander's layout and wording are \
+L2 (§1.3) while the exit code is L0."""
+steps = [
+  "task list",
+  "task list --json",
+  "task --help",
+  "agent --help",
+  "nosuchcommand",
+  "task nosuchsub",
+  "@exit-only:version-value-is-ours --version",
+  "@exit-only:help-layout-is-l2 --help",
+]

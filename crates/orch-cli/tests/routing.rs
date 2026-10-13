@@ -414,14 +414,57 @@ fn doctor_json_prints_the_two_header_lines_before_the_json() {
 #[test]
 fn a_commands_not_wired_yet_is_an_error_rather_than_a_silent_success() {
     // The honest interim behaviour for the service-dependent commands: they
-    // parse, so V1's surface check is real, and they fail loudly.
+    // parse, so V1's surface check is real, and they fail loudly rather than
+    // succeeding with nothing done. Keep this pointed at a command that is
+    // still waiting on WP-4 — see crates/orch-cli/TEST-MAP.md.
     let dir = initialized_project();
+    for argv in [
+        vec!["goal", "list"],
+        vec!["msg", "list"],
+        vec!["team", "list"],
+    ] {
+        let output = orch(dir.path()).args(&argv).output().expect("run");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "orch {}: {}",
+            argv.join(" "),
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("not wired yet"),
+            "orch {}: {}",
+            argv.join(" "),
+            stderr_of(&output)
+        );
+    }
+}
+
+#[test]
+fn status_reports_the_project_and_emits_claimed_as_an_array() {
+    // PARITY §14.1's fix, from outside: the oracle emits `claimed: {}`.
+    let dir = initialized_project();
+
     let output = orch(dir.path()).arg("status").output().expect("run");
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
     assert!(
-        stderr_of(&output).contains("not wired yet"),
+        stdout_of(&output).starts_with("\norch · "),
         "{}",
-        stderr_of(&output)
+        stdout_of(&output)
+    );
+
+    let output = orch(dir.path())
+        .args(["--json", "status"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("pure JSON");
+    assert!(report["tasks"].is_array());
+    assert!(report["agents"].is_array());
+    assert!(
+        report["state"]["claimed"].is_array(),
+        "claimed must be an array, got {}",
+        report["state"]["claimed"]
     );
 }
 

@@ -1,0 +1,25 @@
+name = "o7-review-approve"
+kind = "differential"
+requires = ["serve", "config set", "task approve", "task show"]
+fake_agents = true
+timeout_secs = 90
+description = """
+Red-team O7: the review path. resolveCompletionStatus always returns \
+review on success; auto-approve is a separate review-to-done transition \
+the orchestrator applies afterwards, so an agent whose approval_policy is \
+manual is what leaves a task sitting in review for an explicit approve. \
+Measured: `task approve` on a todo task is rejected as `Invalid transition \
+for <id>: todo → done`, so reaching review first is the whole point of the \
+run."""
+steps = [
+  "init --name proj --adapter claude",
+  "config set scheduling.poll_interval_ms 200",
+  "agent add reviewer --adapter claude --approval-policy manual --quiet",
+  "task add 'Needs review' --assignee ${agent.0} --quiet",
+  "serve --once --log-format json",
+  "task list --json",
+  "task show ${task.0} --json",
+  "task approve ${task.0}",
+  "task show ${task.0} --json",
+  "task list --json",
+]

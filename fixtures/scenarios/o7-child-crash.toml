@@ -1,0 +1,22 @@
+name = "o7-child-crash"
+kind = "differential"
+requires = ["serve", "config set", "status"]
+fake_agents = true
+timeout_secs = 90
+env = { ORCH_FAKE_SCENARIO = "crash" }
+description = """
+Red-team O7: the agent process dies by signal rather than exiting. The \
+exit code is then null and the run must be classified from the signal \
+instead — `Shell command terminated by signal <sig>` for the shell \
+adapter, and the stream adapters' own exit handling otherwise. A \
+classifier that reads a null code as 0 would call this a success."""
+steps = [
+  "init --name proj --adapter claude",
+  "config set scheduling.poll_interval_ms 200",
+  "config set defaults.task.max_attempts 1",
+  "agent add crasher --adapter claude --quiet",
+  "task add 'A task whose agent dies' --assignee ${agent.0} --quiet",
+  "serve --once --log-format json",
+  "task list --json",
+  "status --json",
+]
