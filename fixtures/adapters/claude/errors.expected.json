@@ -1,0 +1,21 @@
+{
+  "events": [
+    {
+      "type": "error",
+      "data": "Request unauthorized",
+      "errorKind": "auth_failed"
+    },
+    {
+      "type": "output",
+      "data": "not json at all"
+    },
+    {
+      "type": "output",
+      "data": {
+        "type": "unknown_type",
+        "info": "data"
+      }
+    }
+  ],
+  "error": null
+}

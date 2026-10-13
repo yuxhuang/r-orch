@@ -1,0 +1,22 @@
+{
+  "events": [
+    {
+      "type": "error",
+      "data": {
+        "status": "error",
+        "error": "The user rejected permission"
+      },
+      "errorKind": "unknown"
+    },
+    {
+      "type": "error",
+      "data": {
+        "type": "step-finish",
+        "reason": "error",
+        "error": "model overloaded"
+      },
+      "errorKind": "unknown"
+    }
+  ],
+  "error": null
+}

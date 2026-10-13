@@ -254,8 +254,12 @@ impl ScriptedProcessManager {
             // Backgrounded so a long-lived session can keep writing while the
             // script emits stdout, and with its own stdio redirected so it
             // never holds the parent's pipes open past the script's exit.
+            // `exec 3<&0` first: a POSIX shell redirects a background job's
+            // stdin to /dev/null when job control is off, so the capture has
+            // to read the real stdin through its own descriptor.
+            script.push_str("exec 3<&0\n");
             script.push_str(&format!(
-                "( cat >> '{sink}'; printf '%s' '{marker}' >> '{sink}' ) >/dev/null 2>&1 &\n",
+                "( cat <&3 >> '{sink}'; printf '%s' '{marker}' >> '{sink}' ) >/dev/null 2>&1 &\n",
                 sink = dir.join("stdin").display(),
                 marker = STDIN_EOF_MARKER,
             ));

@@ -1,0 +1,111 @@
+{
+  "events": [
+    {
+      "type": "output",
+      "data": {
+        "text": "hello",
+        "raw": {
+          "id": "item_0",
+          "type": "agent_message",
+          "text": "hello"
+        }
+      }
+    },
+    {
+      "type": "command",
+      "data": {
+        "command": "ls",
+        "result": "file.txt\n",
+        "raw": {
+          "type": "command_execution",
+          "command": "ls",
+          "aggregated_output": "file.txt\n",
+          "exit_code": 0
+        }
+      }
+    },
+    {
+      "type": "file_change",
+      "data": {
+        "paths": [
+          "a.ts",
+          "b.ts"
+        ],
+        "raw": {
+          "type": "file_change",
+          "changes": [
+            {
+              "path": "a.ts"
+            },
+            {
+              "path": "b.ts"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "search",
+        "input": {
+          "query": "orch"
+        },
+        "raw": {
+          "type": "tool_use",
+          "name": "search",
+          "input": {
+            "query": "orch"
+          }
+        }
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "web_search",
+        "input": {
+          "query": "privacy preserving AI",
+          "action": {
+            "type": "search",
+            "queries": [
+              "privacy preserving AI"
+            ]
+          }
+        },
+        "raw": {
+          "id": "call_1",
+          "type": "web_search",
+          "query": "privacy preserving AI",
+          "action": {
+            "type": "search",
+            "queries": [
+              "privacy preserving AI"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "done",
+      "data": {
+        "raw": {
+          "type": "turn.completed",
+          "usage": {
+            "input_tokens": 200,
+            "output_tokens": 80
+          }
+        }
+      },
+      "tokens": {
+        "input": 200,
+        "output": 80,
+        "reasoning": 0,
+        "total": 280,
+        "cache_read": 0,
+        "cache_write": 0
+      }
+    }
+  ],
+  "error": null
+}

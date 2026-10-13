@@ -1,0 +1,25 @@
+{
+  "events": [
+    {
+      "type": "error",
+      "data": "Request unauthorized",
+      "errorKind": "auth_failed"
+    },
+    {
+      "type": "output",
+      "data": "not json at all"
+    },
+    {
+      "type": "output",
+      "data": {
+        "type": "unknown_type",
+        "info": "data"
+      }
+    }
+  ],
+  "error": {
+    "message": "Claude process exited with code 1",
+    "kind": "process_crash",
+    "exitCode": 1
+  }
+}

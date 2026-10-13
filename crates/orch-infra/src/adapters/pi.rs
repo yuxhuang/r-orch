@@ -934,6 +934,86 @@ mod tests {
         assert_eq!(tool_result_text(None), "");
     }
 
+    /// A stdout that fails on first read, which is what pi's own `catch` is
+    /// there for (ECONNRESET/EPIPE before any terminal event). A real child
+    /// cannot be made to do this, so the reader is injected at the `ChildIo`
+    /// seam.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("ECONNRESET")))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stdout_failure_before_a_terminal_event_is_surfaced_and_then_raised() {
+        use futures::StreamExt;
+        use orch_core::process::{ExitOutcome, ExitSignal};
+        use orch_core::test_support::FakeProcessManager;
+
+        let pm = Arc::new(FakeProcessManager::new());
+        let io = ChildIo {
+            pid: 4242,
+            stdout: Some(Box::new(FailingReader)),
+            stderr: None,
+            stdin: None,
+            exit: ExitSignal::resolved(ExitOutcome {
+                code: Some(1),
+                signal: None,
+            }),
+            stderr_tail: Default::default(),
+        };
+
+        let mut events = pi_events(
+            io,
+            Arc::new(tokio::sync::Mutex::new(None)),
+            Arc::clone(&pm) as Arc<dyn ProcessManager>,
+            system_clock(),
+            CancellationToken::new(),
+        );
+
+        // The failure is reported as an event first, so the orchestrator sees
+        // a cause rather than a silent hang.
+        let first = events
+            .next()
+            .await
+            .expect("an event")
+            .expect("not an error yet");
+        assert_eq!(first.kind, AgentEventKind::Error);
+        assert!(
+            first.data["message"]
+                .as_str()
+                .expect("message")
+                .contains("ECONNRESET"),
+            "{:?}",
+            first.data
+        );
+
+        // …and then raised, with the exit code folded into the class.
+        let err = events
+            .next()
+            .await
+            .expect("a second item")
+            .expect_err("the run failed");
+        assert!(err.message.contains("ECONNRESET"));
+        assert_eq!(err.kind, AdapterErrorKind::ProcessCrash);
+        assert!(events.next().await.is_none(), "the stream ends after Err");
+
+        // The session is long-lived, so a dead stream must still reap it.
+        for _ in 0..50 {
+            if !pm.killed_with_grace().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pm.killed_with_grace(), [(4242, TERMINAL_GRACE)]);
+    }
+
     #[test]
     fn a_write_without_a_path_falls_back_to_a_generic_output() {
         let parsed = parse_tool_execution_end(

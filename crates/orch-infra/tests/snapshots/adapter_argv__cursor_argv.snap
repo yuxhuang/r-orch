@@ -1,0 +1,44 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm| Box::new(CursorAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: cursor-agent
+  argv[1]: "-p"
+  argv[2]: "--output-format"
+  argv[3]: "stream-json"
+  argv[4]: "--workspace"
+  argv[5]: "/ws"
+  argv[6]: "--yolo"
+  argv[7]: "--trust"
+  argv[8]: "the user prompt"
+cwd: /ws
+stdin: Ignore
+
+[full]
+command: cursor-agent
+  argv[1]: "-p"
+  argv[2]: "--output-format"
+  argv[3]: "stream-json"
+  argv[4]: "--workspace"
+  argv[5]: "/ws"
+  argv[6]: "--yolo"
+  argv[7]: "--trust"
+  argv[8]: "--model"
+  argv[9]: "a-model"
+  argv[10]: "the system prompt\n\nthe user prompt"
+cwd: /ws
+stdin: Ignore
+
+[agent-system-prompt-only]
+command: cursor-agent
+  argv[1]: "-p"
+  argv[2]: "--output-format"
+  argv[3]: "stream-json"
+  argv[4]: "--workspace"
+  argv[5]: "/ws"
+  argv[6]: "--yolo"
+  argv[7]: "--trust"
+  argv[8]: "the user prompt"
+cwd: /ws
+stdin: Ignore

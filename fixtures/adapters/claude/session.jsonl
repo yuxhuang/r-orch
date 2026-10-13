@@ -1,0 +1,4 @@
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Reading sources"}]}}
+{"type": "tool_use", "name": "read", "input": {"path": "src/index.ts"}}
+{"type": "tool_result", "content": "export const a = 1;"}
+{"type": "result", "subtype": "success", "usage": {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 10}}

@@ -1,0 +1,41 @@
+{
+  "events": [
+    {
+      "type": "output",
+      "data": "hello world"
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "name": "write",
+        "input": {
+          "filePath": "/tmp/test.txt",
+          "content": "test"
+        }
+      }
+    },
+    {
+      "type": "done",
+      "data": {
+        "type": "step-finish",
+        "reason": "stop",
+        "tokens": {
+          "total": 14502,
+          "input": 12416,
+          "output": 2,
+          "reasoning": 0
+        },
+        "cost": 0
+      },
+      "tokens": {
+        "input": 12416,
+        "output": 2,
+        "reasoning": 0,
+        "total": 12418,
+        "cache_read": 0,
+        "cache_write": 0
+      }
+    }
+  ],
+  "error": null
+}

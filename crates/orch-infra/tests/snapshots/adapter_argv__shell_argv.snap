@@ -1,0 +1,27 @@
+---
+source: crates/orch-infra/tests/adapter_argv.rs
+expression: "snapshot_of(|pm| Box::new(ShellAdapter::new(pm).with_clock(fixed_clock())))"
+---
+[minimal]
+command: bash
+  argv[1]: "-lc"
+  argv[2]: "npm test"
+cwd: /ws
+stdin: Ignore
+env: ORCHESTRY_TASK_PROMPT="the user prompt"
+
+[full]
+command: bash
+  argv[1]: "-lc"
+  argv[2]: "npm test"
+cwd: /ws
+stdin: Ignore
+env: ORCHESTRY_TASK_PROMPT="the system prompt\n\nthe user prompt"
+
+[agent-system-prompt-only]
+command: bash
+  argv[1]: "-lc"
+  argv[2]: "npm test"
+cwd: /ws
+stdin: Ignore
+env: ORCHESTRY_TASK_PROMPT="the user prompt"
