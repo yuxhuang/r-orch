@@ -26,7 +26,7 @@ pub use container::{Engine, EngineSeams, build_light, build_light_with};
 pub use doctor_service::{CheckStatus, DoctorCheck, DoctorReport, DoctorService};
 pub use events::{EventBus, EventHandler, EventSubscription, Unsubscribe};
 pub use goal_service::GoalService;
-pub use lock::{FileLock, InMemoryLock, LockOutcome, LockState, ProjectLock};
+pub use lock::{FileLock, InMemoryLock, LockResult, ProjectLock};
 pub use message_service::MessageService;
 pub use review_runner::{
     CommandOutcome, CommandRunner, ProcessCommandRunner, ReviewRunner, ReviewRunnerOptions,

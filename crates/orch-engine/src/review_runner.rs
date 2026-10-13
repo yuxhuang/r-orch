@@ -70,6 +70,21 @@ pub trait CommandRunner: Send + Sync {
     ) -> CommandOutcome;
 }
 
+/// Delegation, so an `Arc<dyn CommandRunner>` can be handed to a
+/// [`ReviewRunner`] directly — which is how the orchestrator injects one.
+#[async_trait]
+impl CommandRunner for std::sync::Arc<dyn CommandRunner> {
+    async fn run(
+        &self,
+        command: &str,
+        args: &[&str],
+        cwd: &Path,
+        timeout: Duration,
+    ) -> CommandOutcome {
+        (**self).run(command, args, cwd, timeout).await
+    }
+}
+
 /// The real runner. Drains stdout and stderr **concurrently** — reading them
 /// in sequence deadlocks on a full pipe (ARCHITECTURE §6.3).
 #[derive(Debug, Default, Clone, Copy)]
