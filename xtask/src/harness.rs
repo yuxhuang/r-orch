@@ -360,6 +360,7 @@ pub fn run_scenario(
         // parses an artifact successfully but reads a different value out of
         // it.
         let mut norm = Normalizer::new().with_root(&project.root, "<ROOT>");
+        let mut verified_claimed: Option<Value> = None;
         for step in &scenario.verify {
             let rust_out = execute(bins, &project, scenario, step, Runner::Rust, &ids)?;
             let ts_out = execute(bins, &project, scenario, step, Runner::Ts, &ids)?;
@@ -370,22 +371,51 @@ pub fn run_scenario(
                     rust_out.exit_code, ts_out.exit_code
                 ));
             }
-            for (channel, rust_text, ts_text) in [
-                ("stdout", &rust_out.stdout, &ts_out.stdout),
-                ("stderr", &rust_out.stderr, &ts_out.stderr),
-            ] {
-                let left = norm.text(rust_text);
-                let right = norm.text(ts_text);
-                if left != right {
-                    failures.push(format!(
-                        "verify `{step}`: {channel} differs over the shared tree — one binary \
-                         misreads what the other wrote\n{}",
-                        unified_diff(&right, &left)
-                    ));
+            // The §14.1 exclusion applies here too: a cross-compat scenario
+            // can verify with `status --json`, and the oracle's `claimed` is
+            // `{}` whichever tree it reads. Without this the mask would hold
+            // in one code path and not the other, which is the sort of gap
+            // that shows up as a mystery failure months later.
+            let verify_argv = scenario.argv(step)?;
+            let masked_stdout = if claimed_mask::applies_to(&verify_argv) {
+                // One tree, so both sides share a normalizer — the ids and
+                // timestamps they print are literally the same ones.
+                match compare_status_json(&rust_out.stdout, &ts_out.stdout, |value| {
+                    norm.value(value)
+                }) {
+                    Ok((claimed, diff)) => {
+                        verified_claimed = Some(claimed);
+                        diff
+                    }
+                    Err(problem) => Some(("status --json", problem)),
                 }
+            } else {
+                let left = norm.text(&rust_out.stdout);
+                let right = norm.text(&ts_out.stdout);
+                (left != right).then(|| ("stdout", unified_diff(&right, &left)))
+            };
+            if let Some((channel, diff)) = masked_stdout {
+                failures.push(format!(
+                    "verify `{step}`: {channel} differs over the shared tree — one binary \
+                     misreads what the other wrote\n{diff}"
+                ));
+            }
+
+            let left = norm.text(&rust_out.stderr);
+            let right = norm.text(&ts_out.stderr);
+            if left != right {
+                failures.push(format!(
+                    "verify `{step}`: stderr differs over the shared tree — one binary \
+                     misreads what the other wrote\n{}",
+                    unified_diff(&right, &left)
+                ));
             }
         }
 
+        if verified_claimed.is_some() {
+            let tree = collect_tree(&project.root, &mut norm)?;
+            failures.extend(claimed_matches_state_file(&verified_claimed, &tree));
+        }
         failures.extend(cross_parse_failures(bins, &project)?);
         return Ok(ScenarioResult {
             name: scenario.name.clone(),
@@ -439,17 +469,38 @@ pub fn run_scenario(
             // `state.json` after the tree is collected.
             let argv = scenario.argv(step)?;
             let stdout_diff = if claimed_mask::applies_to(&argv) {
-                match mask_claimed_and_compare(
-                    &rust_out.stdout,
-                    &ts_out.stdout,
-                    &mut rust_norm,
-                    &mut ts_norm,
+                // Each side gets its own normalizer: two trees, two sets of ids.
+                // Each side gets its own normalizer: two trees, two sets of
+                // ids, so `<tsk_1>` must mean "whatever this tree made first".
+                match (
+                    mask_claimed(&rust_out.stdout, "r-orch"),
+                    mask_claimed(&ts_out.stdout, "the oracle"),
                 ) {
-                    Ok((claimed, diff)) => {
+                    (Ok((rust_doc, claimed)), Ok((ts_doc, _))) => {
                         masked_claimed = Some(claimed);
-                        diff
+                        let rust_framing = JsonFraming::of(&rust_out.stdout);
+                        let ts_framing = JsonFraming::of(&ts_out.stdout);
+                        if rust_framing != ts_framing {
+                            Some((
+                                "status --json framing",
+                                format!(
+                                    "2-space indent plus a trailing newline is contract \
+                                     (§6.4)\n    ts:   {ts_framing:?}\n    rust: \
+                                     {rust_framing:?}"
+                                ),
+                            ))
+                        } else {
+                            let left = rust_norm.value(&rust_doc);
+                            let right = ts_norm.value(&ts_doc);
+                            (left != right).then(|| {
+                                (
+                                    "status --json (state.claimed masked, §14.1)",
+                                    unified_diff(&pretty(&right), &pretty(&left)),
+                                )
+                            })
+                        }
                     }
-                    Err(problem) => Some(("status --json", problem)),
+                    (Err(problem), _) | (_, Err(problem)) => Some(("status --json", problem)),
                 }
             } else if scenario.stdout_is_json_records(step) {
                 let left = json_records(&rust_out.stdout, &mut rust_norm);
@@ -940,62 +991,62 @@ mod claimed_mask {
     }
 }
 
-/// Compare a `status --json` document with `state.claimed` masked, returning
-/// r-orch's masked value and any difference in the rest.
-///
-/// The documents are compared parsed rather than as text, which is what lets
-/// one path be removed. Two things keep that from weakening the check:
-/// `serde_json` is built with `preserve_order`, so re-serializing preserves
-/// key order, and the raw framing (2-space indent, trailing newline — §6.4) is
-/// compared separately below.
 /// What differed about a step's output: a label for the message, and the diff.
 type StepDiff = Option<(&'static str, String)>;
 
-fn mask_claimed_and_compare(
-    rust_stdout: &str,
-    ts_stdout: &str,
-    rust_norm: &mut Normalizer,
-    ts_norm: &mut Normalizer,
-) -> std::result::Result<(Value, StepDiff), String> {
-    let mut rust_doc: Value = serde_json::from_str(rust_stdout)
-        .map_err(|err| format!("r-orch's `status --json` is not valid JSON: {err}"))?;
-    let mut ts_doc: Value = serde_json::from_str(ts_stdout)
-        .map_err(|err| format!("the oracle's `status --json` is not valid JSON: {err}"))?;
+/// Strip `state.claimed` from a `status --json` document, returning the rest
+/// of the document and the value taken out.
+///
+/// Masking is done on the parsed document, which is what lets one path be
+/// removed; `serde_json` is built with `preserve_order`, so key order still
+/// survives a round trip, and the caller compares the raw framing separately.
+/// Normalization is deliberately left to the caller: a differential run needs
+/// one normalizer per tree (the two mint different ids), while a cross-compat
+/// run must use the *same* one for both sides, because there is only one tree
+/// and therefore only one set of ids.
+fn mask_claimed(stdout: &str, side: &str) -> std::result::Result<(Value, Value), String> {
+    let mut document: Value = serde_json::from_str(stdout)
+        .map_err(|err| format!("{side}'s `status --json` is not valid JSON: {err}"))?;
 
     // A document with nothing to mask would pass vacuously, so the absence of
     // the path is a failure rather than a no-op.
-    let rust_claimed = claimed_mask::take(&mut rust_doc).ok_or_else(|| {
+    let claimed = claimed_mask::take(&mut document).ok_or_else(|| {
         format!(
-            "r-orch's `status --json` has no `{}` to mask — the field is contract (§6.6), \
-             and masking a path that is missing would assert nothing",
+            "{side}'s `status --json` has no `{}` to mask — the field is contract (§6.6), \
+             and masking a path that is missing would assert nothing. If the *oracle* \
+             stopped emitting it, re-read §14.1 before touching the mask",
             claimed_mask::PATH
         )
     })?;
-    claimed_mask::take(&mut ts_doc).ok_or_else(|| {
-        format!(
-            "the oracle's `status --json` has no `{}`, so the §14.1 exclusion no longer \
-             describes the oracle — re-read the contract before touching the mask",
-            claimed_mask::PATH
-        )
-    })?;
+    Ok((document, claimed))
+}
 
-    let framing = (JsonFraming::of(rust_stdout), JsonFraming::of(ts_stdout));
-    if framing.0 != framing.1 {
+/// Compare two `status --json` documents with `state.claimed` masked out,
+/// returning r-orch's masked value and any difference in the rest.
+fn compare_status_json(
+    rust_stdout: &str,
+    ts_stdout: &str,
+    mut normalize: impl FnMut(&Value) -> Value,
+) -> std::result::Result<(Value, StepDiff), String> {
+    let (rust_doc, rust_claimed) = mask_claimed(rust_stdout, "r-orch")?;
+    let (ts_doc, _) = mask_claimed(ts_stdout, "the oracle")?;
+
+    let (rust_framing, ts_framing) = (JsonFraming::of(rust_stdout), JsonFraming::of(ts_stdout));
+    if rust_framing != ts_framing {
         return Ok((
             rust_claimed,
             Some((
                 "status --json framing",
                 format!(
                     "2-space indent plus a trailing newline is contract (§6.4)\n    ts:   \
-                     {:?}\n    rust: {:?}",
-                    framing.1, framing.0
+                     {ts_framing:?}\n    rust: {rust_framing:?}"
                 ),
             )),
         ));
     }
 
-    let left = rust_norm.value(&rust_doc);
-    let right = ts_norm.value(&ts_doc);
+    let left = normalize(&rust_doc);
+    let right = normalize(&ts_doc);
     let diff = (left != right).then(|| {
         (
             "status --json (state.claimed masked, §14.1)",
@@ -1619,15 +1670,15 @@ mod tests {
     fn masking_lets_the_set_and_the_array_through_but_nothing_else() {
         let ts = "{\n  \"state\": {\n    \"claimed\": {},\n    \"version\": 1\n  }\n}\n";
         let rust = "{\n  \"state\": {\n    \"claimed\": [\n      \"tsk_a\"\n    ],\n    \"version\": 1\n  }\n}\n";
-        let (mut rn, mut tn) = (Normalizer::new(), Normalizer::new());
+        let mut norm = Normalizer::new();
 
-        let (claimed, diff) = mask_claimed_and_compare(rust, ts, &mut rn, &mut tn).unwrap();
+        let (claimed, diff) = compare_status_json(rust, ts, |value| norm.value(value)).unwrap();
         assert_eq!(claimed, serde_json::json!(["tsk_a"]));
         assert!(diff.is_none(), "{diff:?}");
 
         // A difference anywhere else in the same document still fails.
         let changed = rust.replace("\"version\": 1", "\"version\": 2");
-        let (_, diff) = mask_claimed_and_compare(&changed, ts, &mut rn, &mut tn).unwrap();
+        let (_, diff) = compare_status_json(&changed, ts, |value| norm.value(value)).unwrap();
         assert!(
             diff.is_some(),
             "a non-masked field diverged and was not reported"
@@ -1635,14 +1686,31 @@ mod tests {
     }
 
     #[test]
-    fn a_status_json_without_claimed_is_a_failure_not_a_free_pass() {
-        let (mut rn, mut tn) = (Normalizer::new(), Normalizer::new());
+    fn status_json_framing_is_still_compared_under_the_mask() {
+        // Masking works on the parsed document, so the framing that the raw
+        // text comparison used to cover (§6.4) has to be checked explicitly
+        // or it is silently lost.
         let ts = "{\n  \"state\": {\n    \"claimed\": {}\n  }\n}\n";
-        let no_claimed = "{\n  \"state\": {\n    \"version\": 1\n  }\n}\n";
+        let no_newline = "{\n  \"state\": {\n    \"claimed\": []\n  }\n}";
+        let mut norm = Normalizer::new();
 
-        let err = mask_claimed_and_compare(no_claimed, ts, &mut rn, &mut tn)
-            .expect_err("a missing field must not mask silently");
+        let (_, diff) = compare_status_json(no_newline, ts, |value| norm.value(value)).unwrap();
+        let (what, _) = diff.expect("a dropped trailing newline must be reported");
+        assert_eq!(what, "status --json framing");
+    }
+
+    #[test]
+    fn a_status_json_without_claimed_is_a_failure_not_a_free_pass() {
+        let no_claimed = "{\n  \"state\": {\n    \"version\": 1\n  }\n}\n";
+        let err =
+            mask_claimed(no_claimed, "r-orch").expect_err("a missing field must not mask silently");
         assert!(err.contains("no `state.claimed` to mask"), "{err}");
+
+        // The message names the side, so "the oracle changed" stays
+        // distinguishable from "we regressed" — they need opposite fixes.
+        let err = mask_claimed("{}", "the oracle").expect_err("missing");
+        assert!(err.contains("the oracle's"), "{err}");
+        assert!(err.contains("re-read §14.1"), "{err}");
     }
 
     #[test]
