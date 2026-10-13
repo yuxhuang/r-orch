@@ -897,3 +897,31 @@ async fn a_dispatch_that_cannot_take_the_lock_fails_the_call_with_the_holders_pi
     orch_engine::ProjectLock::release(&held).await;
     drop(temp);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_observer_mode_a_refresh_sees_another_process_writing_state() {
+    let (temp, engine) = project().await;
+    // Another process owns the orchestrator and the lock.
+    let held = orch_engine::FileLock::new(engine.paths.lock_path());
+    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
+
+    let backend = launch(Arc::clone(&engine)).await;
+    assert!(backend.context().observer_mode);
+
+    // A second engine on the same tree stands in for that other process.
+    let external = build_full(temp.path()).await.expect("second engine");
+    let mut state = external.state.read().await.expect("read state");
+    state.pid = Some(4242);
+    external.state.write(&state).await.expect("write state");
+
+    let (_backend, observed) =
+        on_draw_thread(backend, |backend| backend.refresh_state().expect("refresh")).await;
+
+    // `refresh_state` must re-read `state.json` on every call and never cache:
+    // in observer mode the periodic poll is the only thing moving, so a cached
+    // read would freeze the dashboard at launch for as long as it is open.
+    assert_eq!(observed.pid, Some(4242));
+
+    orch_engine::ProjectLock::release(&held).await;
+    drop(temp);
+}

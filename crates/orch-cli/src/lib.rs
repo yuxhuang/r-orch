@@ -369,12 +369,35 @@ async fn dispatch(cli: &Cli, env: EnvFlags) -> Result<ExitCode> {
             .await
         }
 
-        // Bare `orch` is the first-run experience in the original (init, then
-        // the dashboard). The routing guard owns that path; until it chains the
-        // two, print help rather than pretending. `orch tui` above is the
-        // dashboard on its own.
+        // Bare `orch` is the first-run experience (PARITY.md §2.3).
+        //
+        // `argv_is_bare` is this branch's stand-in for WP-5's
+        // `ArgvShape::is_bare`; when the routing guard lands, this arm becomes
+        // `None if shape.is_bare =>` and the helper goes away.
+        None if argv_is_bare() => {
+            tui::first_run(
+                &styles_for(cli, env),
+                &cwd,
+                &commands::init::InitArgs {
+                    name: None,
+                    adapter: None,
+                },
+                Cli::command().get_version().unwrap_or("0.0.0"),
+            )
+            .await
+        }
+
+        // Flags but no subcommand (`orch --json`). The reference appends `tui`
+        // only for a *bare* argv (`cli.ts:206`), so this prints the root help
+        // rather than launching the dashboard.
         None => Ok(print_group_help_root()),
     }
+}
+
+/// `process.argv.length <= 2` — no arguments at all, which is the first-run
+/// path rather than a flag-only invocation.
+fn argv_is_bare() -> bool {
+    std::env::args_os().count() <= 1
 }
 
 fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {
