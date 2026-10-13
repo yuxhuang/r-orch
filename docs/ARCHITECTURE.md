@@ -29,12 +29,43 @@ Load-bearing, stated so they can be challenged:
 | # | Assumption | If wrong |
 |---|---|---|
 | A1 | **Scale is small.** Tens of agents, hundreds of tasks, thousands of run events per run. The TS code's caps (16 KB lines, 8 KB events, 1024-event buffer, 500-entry LRU) are generous. | Nothing in the design changes; the file-per-entity store would need an index rework only at ~10⁵ tasks. |
-| A2 | **Single writer.** The PID lock means exactly one process mutates orchestrator state. Read-only CLI commands may run concurrently and may observe torn-free-but-stale data — atomic rename guarantees no partial reads. | Concurrent writers would need real file locking; the `_index.json` read-modify-write is only mutex-protected *within* a process. This is a pre-existing property, not a regression. |
+| A2 | **Single *orchestrator*, multiple concurrent mutators.** The PID lock serializes *orchestrators* only. One-shot commands never take it, and some "reads" write. See A2-detail below. | This is **already true in the reference implementation** — not a hypothetical. The exposure is now advertised, so it must be documented rather than assumed away. Verified by V37. |
 | A3 | **POSIX only.** The TS code uses process groups (`kill(-pid)`), `bash -lc`, `rsync`, and `O_APPEND` atomicity. Windows support is already partial at best. | Windows would need a separate process-group strategy (job objects) and no `bash`. Out of scope; keep platform code behind a `cfg` boundary so it can be added. |
 | A4 | **The TS binary is available as a test oracle** at `parity/orch-ts/dist/cli.js` with node 24. | The differential harness is the main parity guarantee; without it we fall back to the written spec alone, which is materially weaker. |
 | A5 | **Latency budget is human-scale.** Tick interval 10 s; CLI commands should feel instant (<100 ms). The TS container tiering exists purely to keep read-only commands fast. | Rust startup is ~1 ms either way, so the tiering becomes an optional optimization rather than a requirement. |
 | A6 | **Prompt text must be byte-exact** because agents are prompt-sensitive and the system prompt is a cache key. | If approximate were acceptable, the Liquid risk (§4.3) would mostly evaporate. It is not acceptable. |
 | A7 | **No external Rust consumer of the library crates yet.** | Public API stability is not a constraint; we are free to pick idiomatic signatures. |
+
+### 2.1 A2 in detail — the concurrency story is weaker than "single writer"
+
+An earlier revision of this document asserted "single writer … this is a pre-existing property, not a
+regression." That was wrong on both counts, and [PARITY.md §1.1](PARITY.md)'s promise that "both binaries must
+operate on the same project directory interchangeably, in either order" converts an accident into an
+**advertised feature**, multiplying the exposure. Three facts from the source:
+
+1. **One-shot commands never take the lock.** `src/infrastructure/storage/lock.ts`'s own header: "Only one
+   `orch run --watch` can run at a time. One-shot commands do not acquire the lock." So `orch task add` while
+   the orchestrator runs is a second mutator — and that is the *normal* workflow, not an edge case.
+2. **Some reads write.** `IndexManager.readIndex` falls through to `rebuildIndex` when the index is missing or
+   corrupt, and `rebuildIndex` calls `ensureDir` and **writes `_index.json`**
+   (`index-manager.ts:79-124`). `orch task list` on a fresh project therefore creates directories and writes
+   a file.
+3. **The mutex is in-process only.** It is a JavaScript promise chain — invisible to a second node process,
+   and certainly to a Rust one.
+
+**Lost-update mechanism, stated plainly.** Two processes interleaving the `_index.json` read-modify-write can
+drop entries: `tasks/tsk_X.yml` exists on disk but is absent from the index, so `task list`, `status` and
+**dispatch** do not see the task, while `task show tsk_X` does. It self-heals only when the index is deleted or
+corrupted into a rebuild.
+
+**This cannot be fixed unilaterally.** Any lock r-orch takes around its index writes is invisible to the TS
+binary, so serialization is unachievable while interchangeable operation is a goal. The honest response is to
+**document the behaviour and verify that it is what we documented** (V37), not to claim a guarantee we cannot
+provide. Two consequences:
+
+- The `--allow-foreign-project` valve (§11, Rollback) stays **default-on** until V32 is green, not merely V8.
+- Concurrent mutation while an orchestrator is running is a **known, documented hazard inherited from the
+  original**, and belongs in user-facing docs — not only here.
 
 ---
 
@@ -731,8 +762,21 @@ fixtures/scenarios/*.toml
 Rules:
 
 - **Both tmpdirs are `git init`ed identically** with one commit, because worktree mode requires a repo.
-- `ORCHESTRY_GLOBAL_CONFIG_PATH` is pointed into each tmpdir so the user's real `~/.orchestry/` is never
-  touched and global config is part of the comparison.
+- **Hermeticity — the harness must isolate the home directory, not just the global config.**
+  `ORCHESTRY_GLOBAL_CONFIG_PATH` redirects `global.yml` **alone**; `src/cli/update-check.ts:15-16,125`
+  hard-codes its cache to `path.join(os.homedir(), '.orchestry')` with **no override**, and
+  `src/bin/cli.ts:210-231` runs the check after every command except `tui`/`update`/`serve`, writes a
+  notification to **stderr**, and spawns `npm install -g` when an update exists. Since the harness compares
+  stderr and is a required merge gate, that makes the gate non-deterministic *and* gives it a side effect on
+  the host. So every scenario:
+  1. sets **`HOME` and `USERPROFILE`** per tmpdir,
+  2. sets `ORCHESTRY_GLOBAL_CONFIG_PATH` inside it,
+  3. **pre-seeds `$HOME/.orchestry/update-check.json`** with a fresh `checked_at` so the SWR cache is warm and
+     no registry query happens,
+  4. **asserts the oracle spawned no `npm` and opened no socket** (V31). CI runs the parity job with
+     networking disabled.
+  Without step 3 the gate is green in an offline container and red on a laptop — or the reverse — with no code
+  change, and a parity run can leave the developer's real TUI claiming a restart is needed.
 - **No real AI CLI is ever needed.** Agents use the `shell` adapter, or a **fake agent script** — a small
   `bash`/Rust binary on `PATH` under the name `claude`/`codex`/… that replays a recorded JSONL stream from a
   fixture file. This is how adapter-level behaviour (token accounting, `done` events, file-change extraction)
@@ -740,6 +784,13 @@ Rules:
 - Comparison covers: **stdout**, **stderr**, **exit code**, and a **recursive walk of `.orchestry/`** —
   every file, parsed according to its extension (YAML/JSON/JSONL), normalized, deep-compared. Files present
   in one tree and absent in the other are failures.
+- **Every YAML artifact is additionally re-parsed in the TS process with js-yaml** and deep-compared against
+  the Rust parse (V32). This is a harness *step*, not a hand-written test. Without it, both trees are verified
+  by a single parser that shares the writer's assumptions, and **every bug of the form "js-yaml reads r-orch's
+  bytes differently" is invisible by construction** — which is precisely the failure class R1 and the
+  `--allow-foreign-project` valve exist to prevent. It is ~50 lines of Node glue, it subsumes V8's timestamp
+  assertion as a special case, and it catches the schema deltas in [PARITY.md §6.4.2](PARITY.md) (merge keys,
+  `!!binary`, `!!timestamp` tags, complex keys) without anyone having to enumerate them correctly in advance.
 - **Cross-compat scenarios** are a separate scenario kind, and they are the part that actually proves the
   shared-format claim:
   - `ts_then_rust`: TS runs steps 1..k, Rust runs k+1..n in the *same* directory.
@@ -831,6 +882,38 @@ Sized so one engineer agent completes a package in one session (~3–6k LOC Rust
 `cargo clippy -D warnings` clean. **The trait surface is then frozen** — later changes need an explicit
 amendment, because five packages compile against it.
 
+**Standing rule from the freeze onward:** any package that finds itself **working around** a trait **files an
+amendment instead**. With six agents building in parallel against a frozen surface, the cheap local move is
+always to work around it — and the result is two caches with different lifetimes over the same store, or
+duplicated invalidation logic, surfacing as an intermittent invalid-transition error that no unit test
+reproduces (because `test_support`'s fakes clone on every read). Working around a trait is a **defect**, not a
+shortcut.
+
+---
+
+### WP-0b — Walking skeleton *(hard gate: WP-4 and WP-5 may not begin until this is green)*
+
+**Owner:** the WP-0 engineer. **Cost:** days, not weeks.
+
+**Why it exists.** An earlier revision of this plan ordered WP-5 (CLI) last and claimed "the differential
+harness becomes meaningful the moment this package lands." That built the **measuring instrument** early and
+the **measurable surface** last: a scenario step is an argv line executed against a binary, so until
+`orch init` and `orch task list` exist end to end, *every* scenario fails at step 1 and zero rows of V1–V8,
+V20, V21 can run. Six packages would ship individually green against six readings of PARITY.md, and integrate
+in one week through a harness that had never been green, with no last-known-good to bisect against. The
+schedule response to that is to relax the normalizers until green — which is how an L0 contract quietly
+becomes an L1 one.
+
+**Delivers:** a thin vertical slice — `orch init`, `orch agent add`, `orch task add`, `orch task list` **only**
+— cutting through domain → storage → services → CLI, plus the harness skeleton (`cargo xtask parity`, the
+scenario format, the normalizers of [PARITY.md §1.4](PARITY.md), the hermeticity setup of §8.2).
+
+**Acceptance (V39):** **≥1 green differential scenario** and **≥1 green `rust_then_ts` cross-compat
+scenario** over those four commands. Nothing else counts as done.
+
+This converts the harness from a final exam into a **ratchet**: from here on, every package lands against a
+gate that is already green and must stay green.
+
 ---
 
 ### WP-1 — Storage and serialization *(riskiest package — assign the strongest engineer)*
@@ -863,9 +946,20 @@ message sorting. Ship V8 before anything else in this package.
 backpressure; all 8 adapters with exact argv and parsing; `AdapterRegistry` preserving order; model discovery
 with its parsers and fallback lists.
 
+**Stderr draining is structural, not per-adapter.** `grok` and `antigravity` in the original never attach a
+stderr consumer, so a child writing past one pipe buffer blocks forever ([PARITY.md §14.12](PARITY.md)).
+Put draining in the **shared spawn path** so an adapter *cannot* forget it. Two distinct behaviours, and the
+difference is observable:
+
+- claude / codex / cursor / opencode / pi → drain **and keep** the bounded 4096-byte tail, which is appended
+  to the error message and then classified.
+- grok / antigravity → drain and **discard**. Do *not* attach the tail capture: appending it would change L0
+  error message text, the `classifyAdapterError` result, and the persisted `agent.last_error`, diverging from
+  the oracle on a change we intended to be invisible.
+
 **Acceptance:** all 8 `*-adapter.test.ts` files plus `adapter-error-kind`, `error-paths`,
-`process-endurance`, `model-discovery` ported; **V14 and V15 pass**; the fake-agent scripts used by the parity
-harness exist and work.
+`process-endurance`, `model-discovery` ported; **V14, V15 and V40 pass**; the fake-agent scripts used by the
+parity harness exist and work.
 
 ---
 
@@ -943,41 +1037,77 @@ the 80 ms batching, 2 KB detail caps and 500-entry LRU.
 **Acceptance:** [PARITY.md §12](PARITY.md) checklist complete; **V27 passes**; the two F1 tests that were
 unskippable in Ink are green.
 
-**Note:** this is the largest *volume* of code but the lowest *risk* — it is L2, has no on-disk or wire
-contract, and failures are visible immediately. It is also the most independent, so it can run in parallel
-with everything after WP-0. Do **not** port the dead code listed in [PARITY.md §13](PARITY.md).
+**Risk: medium** — on **schedule** grounds (7k LOC), with its **correctness risk unmeasured rather than low.**
+
+An earlier revision rated this the lowest-risk package because "it is L2, has no on-disk or wire contract, and
+failures are visible immediately." All three clauses were wrong in the same way. The TUI is the **default
+command** (bare `orch` launches it), so it is most users' entire experience; "no wire contract" is not "no
+contract" — the **wizard → entity field mapping is L0** ([PARITY.md §12](PARITY.md)) because a wizard with an
+inverted skip predicate writes corrupt L0 data; and "visible immediately" means visible *to a user*, which is
+the argument for catching it first, not for relaxing the gate. A shipped inverted `skip` predicate or a
+no-op filter picker would leave `cargo test`, `cargo xtask parity` and every V-row green, because none of them
+would look.
+
+Hence V33: the checklist is not the gate — the **counted `TestBackend` case inventory** is.
+
+Do **not** port the dead code listed in [PARITY.md §13](PARITY.md).
 
 ---
 
 ### Integration order and parallelism
 
 ```
-WP-0 (foundation, blocking — freezes the trait surface)
-   │
-   ├──► WP-1 storage  ────────┐
-   ├──► WP-2 adapters ────────┤
-   ├──► WP-3 templates ───────┼──► WP-4 engine ──► WP-5 CLI ──► differential harness green
-   └──► WP-6 TUI ─────────────┘                        │
-                                                       └──► WP-6 wires to the real engine
+WP-0  foundation — freezes the trait surface
+  │
+  ▼
+WP-0b walking skeleton + harness  ◄── HARD GATE (V39)
+  │
+  ├──► WP-1 storage  ────────┐
+  ├──► WP-2 adapters ────────┤
+  ├──► WP-3 templates ───────┤
+  └──► WP-6 TUI ─────────────┤
+                             │
+                   ╔═════════▼═══════════════════════════╗
+                   ║ TRAIT RE-SYNC CHECKPOINT             ║
+                   ║ owner: WP-0 engineer                 ║
+                   ║ trigger: WP-1, WP-2, WP-3 each have  ║
+                   ║   one vertical slice                 ║
+                   ║ one amendment round, then re-freeze  ║
+                   ╚═════════┬═══════════════════════════╝
+                             │
+                             ├──► WP-4 engine ──► WP-5 CLI
+                             │
+                             └──► WP-6 wires to the real engine
 ```
 
-- WP-1, WP-2, WP-3 and WP-6 are **fully parallel** after WP-0, over disjoint directories.
-- WP-4 compiles against the WP-0 traits and tests against `test_support` fakes, so it can start in parallel
-  too and only needs WP-1/2/3 at *integration* time, not to begin.
-- WP-5 needs WP-4's service surface. It can be started against fakes but lands after.
-- The differential harness skeleton (`xtask parity`, scenario format, normalizers) should be built during
-  WP-0/WP-1 by whoever has slack — it is the acceptance mechanism for everything else, and building it late is
-  the classic way this kind of project fails.
+- **WP-0b is a hard gate**: WP-4 and WP-5 may not begin until V39 is green. WP-1/2/3/6 may begin in parallel
+  right after it.
+- **WP-1, WP-2, WP-3 and WP-6 are fully parallel**, over disjoint directories, because none of their
+  acceptance oracles depends on CLI integration:
+  - WP-2's oracle is argv snapshots + stream-parsing fixtures, both derived from the TS **unit tests**.
+  - WP-6's oracle is `TestBackend` cases written from `docs/parity/tui.md`; there is no TS oracle at all.
+  - WP-3's oracle is golden prompts from the TS engine — **but only if generated the right way.**
+    `src/index.ts` does **not** export the template engine or the default templates, so they are unreachable
+    through the package entry point, and generating prompts via `orch run` + `run.prompt` would make WP-3
+    depend on the skeleton. **Generate them with `npx tsx` against
+    `parity/orch-ts/src/infrastructure/template/template-engine.ts` directly** (`tsx` is already a
+    devDependency and `npm run dev` uses it). `xtask gen-prompts` must do this; discovering it at fixture time
+    would stall WP-3.
+- **The trait re-sync checkpoint is a scheduled slot, not a risk-register aspiration.** One amendment round,
+  owned by the WP-0 engineer, triggered when WP-1/2/3 each have a vertical slice. Then the surface re-freezes.
+- WP-4 compiles against the WP-0 traits and tests against `test_support` fakes, so it needs WP-1/2/3 only at
+  *integration* time. WP-5 needs WP-4's service surface.
 
 | Package | Est. LOC (impl + test) | Risk |
 |---|---|---|
 | WP-0 foundation | 3.5k + 1.5k | Medium — a wrong trait costs five packages a rework |
+| WP-0b walking skeleton | 0.8k + 0.6k | Low effort, **highest leverage** — it turns the gate into a ratchet |
 | WP-1 storage | 2.5k + 2k | **Highest** — silent cross-compat corruption |
-| WP-2 adapters | 3.5k + 2.5k | Medium-high — eight external CLI formats |
+| WP-2 adapters | 3.5k + 2.5k | Medium-high — eight external CLI formats, plus the stderr deadlock fix |
 | WP-3 templates | 2k + 1.5k | Medium-high — the Liquid gate |
 | WP-4 engine | 5k + 4k | High — largest behaviour surface, long bug-fix history |
 | WP-5 CLI | 5k + 2k | Medium — wide but shallow |
-| WP-6 TUI | 7k + 3k | Low — L2, no wire contract |
+| WP-6 TUI | 7k + 3k | **Medium** — on schedule grounds; correctness risk **unmeasured** until V33 |
 
 ---
 
@@ -1001,6 +1131,13 @@ quoting pass — buys one of those two.
   embarrassing. They are all documented and reversible.
 - **A node dependency in CI.** The parity harness needs the TS binary. Without it the written spec is the only
   guarantee, which is a materially weaker position.
+- **Self-update, deliberately.** The TS binary updates itself via npm after almost every command; r-orch does
+  not update itself at all ([PARITY.md §11.5](PARITY.md)). This is the one place the project **declines**
+  functional parity outright, on security grounds: a CLI overwriting its own executable as a side effect of
+  `orch task list` is a supply-chain surface, not a feature, and it is unverifiable by the harness by
+  construction. Users must update r-orch the way they installed it.
+- **Interchangeable concurrent operation is documented, not guaranteed.** §2.1 — the index read-modify-write
+  can lose updates across binaries, and no lock r-orch takes is visible to the TS binary.
 - **Shelling out to `git`** rather than linking libgit2 — slower per call, but it is the only way to match
   exact command behaviour and exit codes, and it drops a C dependency.
 
@@ -1010,12 +1147,14 @@ quoting pass — buys one of those two.
 
 | # | Risk | Severity | Mitigation / trigger |
 |---|---|---|---|
-| R1 | **YAML timestamp quoting leaks**, silently corrupting projects for the TS binary | **High** | V8 as the *first* deliverable of WP-1, exercised through the real TS process. Trigger for escalation to a hand-written emitter: any entity type that round-trips to a non-string timestamp. |
+| R1 | **YAML divergence** — timestamp quoting, merge keys, or a schema construct — silently bifurcating a project between the two binaries | **High** | **V32 (generalized js-yaml cross-parse) is the real mitigation**, not V8; V8 is one special case of it. Build V32 in WP-0b alongside the harness skeleton, not in WP-1. Merge keys are already a confirmed divergence — `apply_merge()` on every read ([PARITY.md §6.4.2](PARITY.md)). Escalation trigger for a hand-written emitter: any artifact where V32 reports a parse mismatch that quoting cannot fix. |
+| R1b | **The harness itself is non-hermetic** — the TS oracle queries npm and writes to the real `$HOME`, making a required gate environment-dependent and host-mutating | **High** | V31: per-tmpdir `HOME`/`USERPROFILE`, pre-seeded `update-check.json`, assert no `npm` spawn and no socket; CI runs the parity job with networking disabled. |
 | R2 | **`liquid` cannot reproduce prompt bytes** despite the mitigations | Medium-high | Golden fixtures first in WP-3. Measured evidence says whitespace and truthiness already match, so the residual risk is a construct I did not enumerate. Fallback: a ~400-line renderer for 7 constructs. |
 | R3 | **Orchestrator behaviour regression** — a race the TS code already fixed and I did not transcribe | **High** | Port `orchestrator-bugfixes-2026-03`, `-resilience`, `-retry-race`, `-parallel-race`, `-endurance` **before** the orchestrator code. They are the encoded institutional memory. |
 | R4 | **`broadcast` event loss** under high adapter output | Medium | Dedicated consumer task for the run-store writer; 4096 capacity; `Lagged` logged as a warning, never swallowed. If a *correctness* consumer ever needs lossless delivery, give it an `mpsc` instead. |
 | R5 | **WP-0's trait surface is wrong**, forcing a cross-package rework | Medium | §5 is deliberately detailed so the freeze is informed. Mitigation if it happens: the trait crate is small, and `cargo` will point at every break. Budget one re-sync checkpoint after WP-1/2/3 each have a vertical slice. |
-| R6 | **Differential harness built late**, so parity is asserted only by prose | Medium | Build the skeleton during WP-0/WP-1. Make `cargo xtask parity` required for merge from the first green scenario. |
+| R6 | **Differential harness built late**, so parity is asserted only by prose | Medium | **WP-0b is the mitigation** — a hard gate requiring one green differential and one green `rust_then_ts` scenario before WP-4/WP-5 begin (V39). Building the *harness* early without the *measurable surface* satisfies this risk's letter and none of its intent. `cargo xtask parity` is required for merge from that point on. |
+| R6b | **Live/streaming behaviour is prose-verified only** — `tui`, watch-mode `serve`, `run --watch` and `logs --follow` cannot be expressed as differential scenarios, so §7's timing constants rest on this document's reading of `orchestrator.ts` | Medium-high | V34–V36 pull the highest-density parts back into oracle-verified territory via `serve --once` (stall past timeout, killed mid-run, concurrency saturation). The residual gap is **stated explicitly** in [PARITY.md §15.1](PARITY.md) rather than implied. Port the regression tests named in R3 before the code. |
 | R7 | **Adapter argv drift** — an external CLI changes its flags | Low (for parity) | Parity is against the pinned commit, not against the live CLIs. Snapshot tests pin our argv; real-CLI breakage is a separate, post-parity concern. |
 | R8 | **`kstring` MSRV and similar toolchain friction** recurs as dependencies move | Low | `rust-toolchain.toml` pins the toolchain; `Cargo.lock` is committed; the `kstring = "2.0.2"` pin is commented with its reason. |
 | R9 | **TUI scope creep** — 10k LOC of React, much of it dead | Medium (schedule) | [PARITY.md §13](PARITY.md) lists exactly what is not ported. WP-6 is checklist-driven; it is also the most deferrable package. |

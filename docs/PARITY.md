@@ -74,7 +74,9 @@ The differential harness ([ARCHITECTURE.md §8.2](ARCHITECTURE.md)) compares aft
 | Aspect | Rule | Why |
 |---|---|---|
 | JSON object key order | **Not contract.** Compare parsed values. | TS key order is JS *insertion* order (e.g. `Run` emits `pid` and `finished_at` after `prompt` because they are assigned later; `Message` emits `id`/`to_agent_id` last after an object spread). Rust `serde` emits struct declaration order. RFC 8259 objects are unordered. |
-| YAML emitted bytes | **Not contract.** Compare parsed values. | js-yaml folds long single-line scalars with `>-` at `lineWidth: 120`; Rust emitters use `|-`/plain. Both round-trip to the same string. |
+| YAML emitted bytes | **Not contract.** Compare parsed values — **parsed by both parsers and cross-checked**, see below. | js-yaml folds long single-line scalars with `>-` at `lineWidth: 120`; Rust emitters pick `\|-` or a quoted style. Measured to round-trip identically in both directions across all multiline edge cases (§6.4.1). |
+| Toolchain row in `doctor` output | **Masked.** The `node` row becomes the r-orch build identity (§13). | A named, deliberate divergence — masking it is honest; calling it "L2 decoration" would not be. |
+| `~/.orchestry/update-check.json`, `update-installed.json` | **Excluded.** The TS binary writes them, r-orch never does (§6.1, §11.5). | Not shared state in r-orch. The harness neutralizes them rather than comparing them. |
 | YAML mapping key order | **Not contract**, but SHOULD match the TS interface field order for human diff friendliness. | `writeYaml` uses `sortKeys: false`. |
 | IDs | Replace `/(tsk|agt|run|goal|team|msg)_[A-Za-z0-9_-]{7}/` with `<\1_ID>`, consistently per-run. | nanoid is random. |
 | Timestamps | Replace ISO-8601 instants with `<TS>`; preserve ordering relations separately where asserted. | Wall clock. |
@@ -83,6 +85,14 @@ The differential harness ([ARCHITECTURE.md §8.2](ARCHITECTURE.md)) compares aft
 | Durations / `*_ms` measured values | Replace with `<MS>`. | Timing. |
 | ANSI escapes | Strip from human stdout before comparing. | L2 styling. |
 | Trailing whitespace on human table rows | Significant — do **not** strip. See §5.1. | The TS table writer pads every cell including the last. |
+
+**"Compare parsed values" means parsed by *both* implementations' parsers, cross-checked.** Verifying both
+trees with the Rust parser alone would make every bug of the form *"js-yaml reads r-orch's bytes differently"*
+invisible by construction — the two trees would agree under a parser that shares the writer's assumptions. So
+every YAML artifact in both trees is **additionally re-parsed in the TS process with js-yaml** and
+deep-compared against the Rust parse, as a harness step (ARCHITECTURE §8.2, V32). That step subsumes the
+timestamp assertion (V8) as a special case and is the only check that actually tests what §6.4 calls the
+cross-compat crux.
 
 ---
 
@@ -845,6 +855,16 @@ Directory constant: `ORCHESTRY_DIR = ".orchestry"`, at the project root.
 | `.orchestry/workspaces/<task-id>/` | directory | `WorkspaceManager` | Worktree or clone. gitignored |
 | `.orchestry/logs/` | — | reserved | Path exists in `Paths`; nothing writes it. gitignored |
 | `~/.orchestry/global.yml` | YAML | `GlobalConfigStore` | Global, cross-project. Overridable via `ORCHESTRY_GLOBAL_CONFIG_PATH` |
+| `~/.orchestry/update-check.json` | JSON | TS `update-check.ts` only | npm update-check SWR cache, 4 h TTL. **r-orch must never read or write it.** See below |
+| `~/.orchestry/update-installed.json` | JSON | TS `update-check.ts` only | "restart needed" marker, read by the TS TUI. **r-orch must never read or write it.** |
+
+**The two update files are cross-binary state that r-orch deliberately does not participate in.** Their path
+is `path.join(os.homedir(), '.orchestry')`, hard-coded in `src/cli/update-check.ts:15-16` and `:125` with
+**no environment override** — `ORCHESTRY_GLOBAL_CONFIG_PATH` redirects `global.yml` alone. Because the TS
+binary writes them from almost every command (§11.5) and r-orch writes neither, they are excluded from
+differential comparison, and the harness must neutralize them (ARCHITECTURE §8.2): set `HOME`/`USERPROFILE`
+per tmpdir **and** pre-seed a fresh `update-check.json` so the oracle's cache is warm and it makes no network
+call.
 
 `init` creates **only**: `config.yml`, `agents/agt_creator.yml`, `templates/default.md`, `.gitignore`,
 `workspace-exclude`. It does **not** create `tasks/`, `runs/`, `logs/`, or any `_index.json`. Everything else
@@ -905,6 +925,62 @@ force quoting on any scalar that would re-parse as a YAML 1.1 timestamp or date.
 Scalars that js-yaml quotes and a YAML-1.2 emitter may not: anything matching the 1.1 timestamp/date grammar.
 Scalars safe either way (verified): `yes`, `no`, `on`, `off` are plain strings under js-yaml's core schema;
 `null`, `true`, `false`, and numeric-looking strings are quoted by both.
+
+#### 6.4.1 Multiline strings — measured, both directions
+
+Agent `role` and `system_prompt` values are multi-line and are injected verbatim into prompts (§9.1, L0), so a
+lossy block scalar would be a silent prompt corruption. **Measured across all ten edge cases, in both
+directions — every one round-trips.**
+
+| Case | js-yaml emits | serde_yaml_ng emits | Rust reads js-yaml's bytes |
+|---|---|---|---|
+| plain multiline | `\|-` | `\|-` | OK |
+| line with **trailing space** | `\|-` (preserved) | **double-quoted** | OK |
+| line of **only spaces** | `\|-` (preserved) | **double-quoted** | OK |
+| trailing newline | `\|` | `\|` | OK |
+| two trailing newlines | `\|+` | `\|+` | OK |
+| leading space on a line | `\|-` | `\|-` | OK |
+| tab inside / CRLF | double-quoted | double-quoted | OK |
+| only a newline / empty string | `\|+` / `''` | `\|2+` / `''` | OK |
+
+Both emitters detect when a literal block scalar would be lossy and fall back to a quoted style — they just
+choose **different** styles. Different bytes, identical parsed value. This is why §1.4 excludes YAML bytes from
+the contract and compares parsed values instead.
+
+#### 6.4.2 Schema constructs — merge keys are a real bifurcation
+
+Nothing ORCH *writes* produces these; they are reachable only in a **hand-authored `config.yml`**, which §6.5
+reads as a free-form value tree. Measured:
+
+| Construct | js-yaml (DEFAULT_SCHEMA) | serde_yaml_ng (YAML 1.2 core) | Decision |
+|---|---|---|---|
+| **merge keys `<<`** | **resolved by default** | **left as a literal `"<<"` key** unless `apply_merge()` is called | **r-orch MUST call `apply_merge()` on every YAML read** |
+| duplicate keys | throws | rejects | agree — reject, no action |
+| anchors / aliases (`&`/`*`) | resolved | resolved | agree |
+| `!!binary aGk=` | byte map `{"0":104,"1":105}` | string `"aGk="` | documented delta |
+| `!!timestamp 2026-01-01` | `"2026-01-01T00:00:00.000Z"` (normalized) | `"2026-01-01"` (verbatim) | documented delta |
+| complex key `? [a,b]` | `{"a,b": 1}` | parses, different representation | documented delta |
+
+**Merge keys are the load-bearing one.** Verified:
+
+```yaml
+base: &b
+  max_turns: 99
+  adapter: codex
+scheduling:
+  <<: *b
+  poll_interval_ms: 5
+```
+js-yaml → `scheduling = {max_turns: 99, adapter: codex, poll_interval_ms: 5}`
+serde_yaml_ng → `scheduling = {"<<": {max_turns: 99, adapter: codex}, poll_interval_ms: 5}`
+
+Without `apply_merge()`, r-orch would see a literal `<<` key, fall back to `DEFAULT_CONFIG` for everything the
+merge supplied, and **run the same project with a different `max_concurrent_agents` and different adapter
+defaults than the TS binary** — with both trees comparing equal under the Rust parser. Calling `apply_merge()`
+reproduces js-yaml's result exactly (key order differs; §1.4 excludes key order).
+
+The three documented deltas are not individually specified further because the generalized cross-parse check
+(§1.4, V32) catches them automatically — which is the argument for that check over enumerating constructs.
 
 ### 6.5 `config.yml`
 
@@ -1276,6 +1352,22 @@ For each entry in `state.running`, in insertion order:
 4. **Stall** — `now - entry.last_event_at > (agent.config.stall_timeout_ms ?? config.defaults.agent.stall_timeout_ms)`
    (strictly greater) ⇒ emit `orchestrator:stall_detected { runId }`, abort the controller,
    `killWithGrace(pid, 5000)`, then `_handleRunFailure(taskId, entry, "Agent stalled (no events)")`.
+
+   > **The stall clock is per emitted `AgentEvent`, not per stdout line.** `collectEvents` assigns
+   > `state.running[taskId].last_event_at = eventTimestamp` **inside** the `for await (const event of
+   > generator)` loop, so only events the adapter's parser actually yields refresh it. Consequences, which a
+   > loosely-worded spec would leave open to two incompatible readings:
+   >
+   > - A line the parser maps to `null` (e.g. a blank line — `readLines` already skips empties, and parsers
+   >   return `null` for whitespace-only input) does **not** refresh the timer.
+   > - An **unparseable non-blank** line **does** refresh it for `claude`, because its parser's `catch` falls
+   >   back to emitting `{ type: 'output', data: <raw line> }`. Adapters differ here; follow each adapter's
+   >   parser in [docs/parity/adapters.md §2](parity/adapters.md).
+   > - The write is **debounced** by `saveStateLazy()` (500 ms), so the *persisted* `last_event_at` can lag
+   >   the in-memory value. Reconcile reads the in-memory value.
+   >
+   > Getting this wrong produces a divergence that only a chatty agent emitting unparseable output reveals —
+   > one binary reaps the run, the other does not. V34 exercises it against the oracle.
 
 Then, project-wide:
 
@@ -2292,18 +2384,61 @@ Agent-shop templates reference a semantic `tier` (`capable|balanced|fast`) rathe
   an update is available it also kicks off a detached background install.
 - Cache location and TTL: see `src/cli/update-check.ts`.
 
-**r-orch divergence:** npm is not the distribution channel for a Rust binary. The `update` command and the
-background check are **reimplemented against the r-orch release channel**, keeping the command, its `--check`
-flag, and its exit codes. The notification text may differ (L2). Flagged in §13.
+#### What the TypeScript binary actually does
+
+Verified in source, because this decides the r-orch behaviour:
+
+- `src/cli/update-check.ts:15-16,125` — `CACHE_DIR = path.join(os.homedir(), '.orchestry')`, holding
+  `update-check.json` and `update-installed.json`. **No environment override.**
+- `:61` — spawns `npm view @oxgeneral/orch version --json`, 5 s timeout.
+- `:146` — spawns `npm` to install.
+- `src/bin/cli.ts:210-231` — runs after every command except `tui`/`update`/`serve`; prints the notification
+  to **stderr**; calls `backgroundInstall` when an update exists.
+
+#### r-orch behaviour — **no network, no self-update**
+
+| Aspect | Decision |
+|---|---|
+| `orch update` / `orch update --check` | Command, flag and **exit 0** preserved. Prints the current version and **how to install** an update. |
+| Network access | **None.** No registry query, no release-channel query. |
+| Self-replacement | **None.** The binary never downloads or overwrites itself. |
+| Post-command background check | **Removed entirely.** |
+| `update-check.json` / `update-installed.json` | **Never read or written** (§6.1). |
+
+**This is a deliberate scope cut on security grounds, recorded in §13 as OUT OF SCOPE — not as
+"reimplemented".** The reasoning: in the original, `npm install -g` replaces a package directory managed by a
+package manager the user installed on purpose. The same behaviour in a Rust port means **a CLI silently
+downloading and overwriting its own executable as a side effect of `orch task list`**. That is a new
+supply-chain and integrity surface — there is no channel, no signing story, and no atomic-replace story — it
+requires network access from a command that otherwise needs none, and it is **unverifiable by the harness by
+construction**, since the TS side queries npm and r-orch would query nothing. It buys neither external
+compatibility nor test determinism, which are the only two things the architecture claims to optimize for.
+
+A real release channel, with signing and atomic replacement specified, is a **feature** to be designed on its
+own merits later. It is not parity.
 
 ---
 
-## 12. TUI feature checklist (L2 overall; the keymap is L1)
+## 12. TUI feature checklist
 
-The TUI is reimplemented with `ratatui` + `crossterm`. **Views, keybindings, command-bar verbs and wizard
-steps are behavioural parity (L1); layout, colour and glyphs are L2.** The exhaustive inventory —
-every key, every wizard field, every validation message, every layout constant — is in
-[docs/parity/tui.md](parity/tui.md); this section is the acceptance checklist.
+The TUI is reimplemented with `ratatui` + `crossterm`. Grading is **not** uniform, and treating it as
+uniformly L2 was a real defect in an earlier revision of this document:
+
+| Surface | Level | Why |
+|---|---|---|
+| **Wizard → domain-entity field mapping** | **L0** | A wizard writes `Task`/`Agent`/`Goal`/`Team` records. One with an inverted skip predicate or a wrong default **corrupts L0 data through a UI surface**. "No wire contract" is not "no contract". |
+| Keybindings, command-bar verbs, wizard step sequencing, skip predicates, validation messages, filter predicates | **L1** | Functional behaviour, not presentation. |
+| Layout, colour, glyph choice, pixel arrangement | **L2** | Presentation. |
+
+The TUI is **~10k of ~26k lines and is the default command** (§2.3: bare `orch` launches it), so it is most
+users' entire experience of the product. Gating it on a human reading a checklist is therefore not acceptable:
+a failure "visible immediately" is visible to a *user*, which is the reason to catch it first.
+[docs/parity/tui.md](parity/tui.md) must be **enumerated into counted `TestBackend` cases** — one per wizard
+field, one per validation message, one per command-bar verb, one per filter predicate, plus key dispatch per
+view including the overloaded `a`/`g`/`s`/`c`/`x`/`f` — with a counted total tracked the way V1 tracks the
+generated command-tree test. See **V33**.
+
+This section is the acceptance checklist; the exhaustive inventory is in the appendix.
 
 ### 12.1 Views
 
@@ -2346,10 +2481,14 @@ Normal mode highlights (full table in [docs/parity/tui.md §2](parity/tui.md)):
 > Getting one wrong means a key destroys the wrong entity.
 
 **Layout constants** (L2, but they make the split behave): `fixedRows = 9`; the list is capped at **50 %** of
-content height; `maxSplitOffset = contentH - 7`; resize steps are **3** rows. There are **no responsive
-breakpoints and no minimum-terminal-size guard** in the original — decide whether to add one (recommended) and
-record it as a deliberate improvement. `Ctrl+Enter` vs `Enter` requires Kitty CSI-u support; degrade cleanly
-when absent.
+content height; `maxSplitOffset = contentH - 7`; resize steps are **3** rows. `Ctrl+Enter` vs `Enter` requires
+Kitty CSI-u support; degrade cleanly when absent.
+
+**Minimum terminal size guard — ADD (deliberate L2 improvement, decided by the team lead).** The original has
+**no responsive breakpoints and no minimum-size guard**: below roughly `fixedRows = 9` plus a usable split the
+layout arithmetic produces negative heights. r-orch renders a single centred "terminal too small — need at
+least N×M" message instead of attempting the layout. This is an **addition**, not parity; it is recorded here
+so it is not mistaken for a port and not silently removed.
 
 ### 12.3 Overlays and modes
 
@@ -2447,8 +2586,8 @@ solid text, selection); exact hex values are L2.
 | **A TUI path that *sets* `task.goalId`** | The goal↔task linking UI is **read-only** — it displays linked tasks and goal badges, but no TUI action assigns a goal to a task. Linking happens only via `task add --goal-id`. Reproduce the display; do not invent the editor. |
 | **`TeamConfig.auto_claim` / `max_concurrent_tasks` behaviour** | Stored and surfaced by the CLI but never read by the orchestrator. Data model and CLI are preserved; the (absent) behaviour is not invented. |
 | **`.orchestry/logs/`** | A path exists in `Paths`; nothing writes it. Kept in the path API, unused. |
-| **npm-based `update`** | Reimplemented against the r-orch release channel (same command, flags and exit codes; different mechanism and message text). |
-| **`doctor`'s `node` check** | Replaced by a check of the r-orch build/toolchain identity. The row keeps its position in the output so the shape of the report is unchanged. |
+| **npm self-update, and the post-command background update check** | **OUT OF SCOPE — security.** Not "reimplemented". A Rust CLI overwriting its own executable as a side effect of an unrelated command is a supply-chain and integrity surface with no channel, no signing story and no atomic-replace story, and it is unverifiable by the harness. `orch update [--check]` keeps its name, flag and exit 0, and prints the current version plus install instructions. No network access. See §11.5. |
+| **`doctor`'s `node` check** | Replaced by a check of the r-orch build/toolchain identity. The row keeps its **position and format**; only its label and value change. Because that is a divergence in L0 human output, the harness **masks the toolchain row** (§1.4) rather than pretending it matches. |
 | **`readJsonl`'s 50 MB fallback stderr warning wording** | L1 behaviour (tail-read) is kept; the exact warning string is not contract. |
 
 ### 13.1 Rust library surface replacing the JS API
@@ -2480,16 +2619,56 @@ that the *same capabilities* are reachable from a library consumer without going
 
 Default policy: **fix**, and document. Exceptions are called out.
 
+### 14.0 Every entry must state its effect on the differential comparison
+
+The differential harness compares r-orch against the **unfixed** oracle. A `FIX` therefore does not merely
+change our behaviour — it changes whether the harness can still verify that behaviour at all. Asserting a
+fix's benefit *in terms of the harness* is incoherent unless this is traced.
+
+**Every entry below carries a required `Effect on differential comparison` field**, with exactly one of:
+
+| Value | Meaning |
+|---|---|
+| `none` | Observable output is unchanged, or the surface is outside the harness. The row stays verified. |
+| `scenario exclusion required (<named>)` | The harness cannot compare this; the named scenarios must avoid it. The row becomes **unverified** and that is now visible. |
+| `oracle patched` | We patch the vendored oracle to match. Requires an explicit note of what was patched and why. |
+
+**An entry marked `FIX` without this field is incomplete.** Summary:
+
+| Entry | Decision | Effect |
+|---|---|---|
+| §14.1 `claimed: {}` | REPLICATE | `none` |
+| §14.2 `goalId` camelCase | REPLICATE | `none` |
+| §14.3 bad hint text | REPLICATE | `none` |
+| §14.4 `findBestAgent` ties | **REPLICATE** *(reversed)* | `none` |
+| §14.5 npm review commands | REPLICATE | `none` |
+| §14.6 unknown Liquid filters | DIVERGENCE | `scenario exclusion required (custom-template-*)` |
+| §14.7 `1 entries` | REPLICATE | `none` |
+| §14.8 TUI type picker | FIX | `none` — TUI is outside the harness (§15) |
+| §14.9 suite flakiness | n/a | `none` — not a behaviour |
+| §14.10 JSONL truncation | REPLICATE | `none` |
+| §14.11 merge output guard | REPLICATE | `none` |
+| §14.12 grok/antigravity stderr | **FIX (drain-and-discard)** | `none` |
+| §14.13 pi line reader | REPLICATE | `none` |
+
+Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
+exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
+point of having it.
+
 ### 14.1 `status --json` emits `"claimed": {}` — **REPLICATE**
 
 `OrchestratorState.claimed` is a JS `Set`. `status --json` serializes the in-memory state object directly, and
 `JSON.stringify(new Set([...]))` is `{}` for any contents. So `state.claimed` in `status --json` is **always**
 an empty object, while `state.json` on disk correctly holds an array.
 
-**Decision: replicate.** `--json` is a declared machine contract (§1.1); a consumer may have a schema that
-expects an object there, and emitting `[]` would be the breaking change. The on-disk array is unaffected.
-Recorded here so the choice is visible and reversible. *(Flagged for review — this is the one place where
-"replicate the bug" and "fix by default" genuinely conflict.)*
+**Decision: replicate.** **Effect on differential comparison: `none`.**
+
+`--json` is a declared machine contract (§1.1); a consumer may have a schema that expects an object there, and
+emitting `[]` would be the breaking change. The on-disk array is unaffected.
+
+This is the one place where "replicate the bug" and "fix by default" genuinely conflict. It was escalated and
+**decided by the team lead**, who owns it; it is recorded in the project report as a user-visible call. It
+remains reversible — the change is one line in the `status` command, and the on-disk format does not move.
 
 ### 14.2 `goalId` is camelCase among snake_case fields — **REPLICATE**
 
@@ -2502,15 +2681,35 @@ It suggests `orch config set agent_timeout <ms>`; the real path is `defaults.age
 is user-visible output asserted by tests. **Replicate**, and open a follow-up issue to fix it in both
 implementations together.
 
-### 14.4 `findBestAgent` ties are resolved by `_index.json` order — **FIX (make deterministic)**
+### 14.4 `findBestAgent` ties are resolved by `_index.json` order — **REPLICATE**
+
+**Effect on differential comparison: `none`.**
 
 Equal-scoring agents are resolved by position in `agentStore.list()`, which is `_index.json` order, which is
-**last-write order**. Two implementations will legitimately disagree, and so will two runs of the same
-implementation.
+last-write order.
 
-**Decision: fix** by adding a final deterministic tiebreaker — sort by `(score desc, agent.id asc)`. This
-changes which agent is picked in a tie, which is unobservable to any correctness property, and makes the
-differential harness able to assert agent selection at all. Document in the changelog.
+> **This entry reversed an earlier decision.** It previously specified a fix — a final
+> `(score desc, agent.id asc)` tiebreaker — justified on the grounds that it "makes the differential harness
+> able to assert agent selection at all." That reasoning was **wrong**: the harness compares r-orch against
+> the *unfixed* oracle, so making our side deterministic does not make it *agree*. The fix would have forced
+> every scenario to avoid ties, leaving tie behaviour entirely unverified. Replicating instead makes it
+> oracle-verifiable. See [architect-rebuttal.md O4](reviews/architect-rebuttal.md).
+
+TS tie order **is** deterministic for a given operation sequence, and replicating it is therefore achievable.
+It depends on three properties, all of which are now requirements:
+
+1. **`save()` must replicate index semantics exactly**: remove the entity by id, then **push it to the end**
+   of the array (§6.10). Index order is consequently last-write order, not creation order.
+2. **The scoring sort must be stable.** ECMAScript ≥2019 mandates a stable `Array.prototype.sort`. In Rust
+   this means **`slice::sort_by` is mandatory and `sort_unstable_by` is forbidden** on this path — a detail
+   that is invisible until it silently changes agent selection.
+3. **One hole remains.** `rebuildIndex` derives order from `fs.readdir`, i.e. filesystem enumeration order.
+   Entity filenames embed random nanoids, so **two tmpdirs can enumerate the same logical set differently**.
+   This is reachable only when `_index.json` is missing or corrupt **and** ≥2 entities exist.
+
+   **Scenario rule:** do not construct a differential scenario that triggers a multi-entity index rebuild.
+   Single-entity rebuilds are safe (trivially ordered), which covers the common `init` → first `agent add`
+   path. This is the one tie-order case that stays unverifiable, and it is recorded rather than hidden.
 
 ### 14.5 `ReviewRunner` commands are hard-coded to npm/npx — **REPLICATE**
 
@@ -2520,9 +2719,17 @@ tests. **Replicate.** Making them configurable is a feature, not parity.
 
 ### 14.6 `strictFilters: false` cannot be reproduced — **DOCUMENTED DIVERGENCE**
 
+**Effect on differential comparison: `scenario exclusion required`.**
+
 A user-supplied template in `config.prompt.*` that references an unknown filter renders in TS (the value
 passes through) and **fails to parse** in Rust. Shipped templates are unaffected. Surface a clear error naming
 the unknown filter; do not panic.
+
+**This is the only entry in §14 that costs the harness a verified row.** Named exclusion: scenarios matching
+`custom-template-*` must not set `config.prompt.template`, `prompt.system_template` or `prompt.user_template`
+to a value containing a filter outside the stdlib. A scenario that exercises a *valid* custom template is
+still compared normally — the exclusion is specifically the unknown-filter case, and it is therefore
+**unverified against the oracle**.
 
 ### 14.7 `context list` prints `1 entries` — **REPLICATE**
 
@@ -2587,12 +2794,27 @@ spawn with `stderr: 'pipe'` and **never attach a consumer**. A child that writes
 (~64 KB on Linux) to stderr **blocks forever** on the write, and ORCH sees a hang that only stall detection
 eventually clears — 10 minutes by default.
 
-**Decision: fix.** Attach the same bounded 4096-byte tail capture these two adapters are missing. This is a
-latent deadlock, it is invisible until a verbose or crashing child triggers it, and the fix cannot change any
-behaviour that currently works (an unread pipe produces no events either way). The tail then also enriches
-their error messages, matching the other adapters.
+**Decision: fix, by draining and discarding.** Attach a consumer that reads stderr to EOF and **throws the
+bytes away**. Do **not** attach `createStderrTailCapture`, and do **not** append a tail to these two adapters'
+error messages.
 
-This is a `blocking`-severity correctness issue in the original, not a cosmetic one.
+**Effect on differential comparison: `none`** — and that is the whole reason for this form of the fix.
+
+> **An earlier version of this entry claimed the fix "cannot change any behaviour that currently works" and
+> then, one sentence later, that "the tail then also enriches their error messages." Both cannot be true.**
+> Attaching the *tail capture* is **not** observationally neutral: `utils.ts:152-158` appends the tail to the
+> error message and **then** classifies that string, so it would change L0 message text (§3.1), the error kind
+> from `classifyAdapterError` (§8.8, V13 — the classifier pattern-matches a string that would now contain the
+> child's stderr, so a `rate limit` or `ENOENT` substring in stderr flips the classification), **and** the
+> persisted `agent.last_error` in `agents/<id>.yml` (§6.1). Draining without capturing fixes the deadlock at
+> zero observable cost. See [architect-rebuttal.md O9](reviews/architect-rebuttal.md).
+
+Draining is still mandatory: a child writing past one pipe buffer (~64 KB on Linux) **blocks forever**, and
+ORCH only recovers when stall detection fires — 10 minutes at the default `stall_timeout_ms`. This is a
+`blocking`-severity correctness issue in the original, not a cosmetic one.
+
+**Structural requirement** (ARCHITECTURE §9 WP-2): stderr draining belongs in the **shared spawn path**, so an
+adapter cannot forget it. Every adapter gets a test that writes 256 KB to stderr and asserts the run completes.
 
 ### 14.13 `pi` diverges from the shared line reader — **REPLICATE**
 
@@ -2646,3 +2868,30 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V28 | Agent-shop / org-shop / default-agent catalogue data | L0 | Byte comparison against strings extracted from the TS source |
 | V29 | ID format: prefix + 7 chars from the 64-char URL-safe alphabet | L0 | Property test |
 | V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
+| V31 | **Harness hermeticity**: `HOME`/`USERPROFILE` redirected per tmpdir; a fresh `update-check.json` pre-seeded; the oracle spawns **no `npm`** and makes **no network call** | L0 | Scenario asserting the process tree contains no `npm` and no socket; run with the network namespace disabled in CI |
+| V32 | **Generalized YAML cross-parse**: every YAML artifact in **both** trees re-parsed **in the TS process with js-yaml** and deep-compared against the Rust parse | L0 | Harness step (~50 lines of Node glue). **Subsumes V8.** The single highest-value check in the plan |
+| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
+| V34 | **Stall clock semantics**: a run emitting blank lines stalls; a run emitting unparseable non-blank lines does not | L1 | Cross-compat `serve --once` scenario with a fake agent, compared against the oracle |
+| V35 | **`serve --once` killed mid-run** → task recovery, run finalization and `--json` records match the oracle | L1 | Cross-compat scenario with a fake agent and an external kill |
+| V36 | **`max_concurrent_agents` saturation**: N ready tasks, cap 2 — dispatch order, claim/release and final tree match the oracle | L1 | Cross-compat scenario with fake agents |
+| V37 | **Concurrent cross-binary `_index.json` mutation** — documents the lost-update behaviour rather than asserting it away | L1 | Two processes (TS + Rust) interleaving `task add`; asserts the **documented** outcome of ARCHITECTURE A2, including that an entity file can exist while absent from the index |
+| V38 | **`config.yml` merge keys** (`<<`) resolve identically in both binaries | L0 | Hand-authored `config.yml` fixture; `config get` compared across binaries (§6.4.2) |
+| V39 | **Walking skeleton gate** (WP-0b): ≥1 green differential scenario and ≥1 green `rust_then_ts` cross-compat scenario over `init`/`agent add`/`task add`/`task list` | L0 | `cargo xtask parity` — the first ratchet, required before WP-4 and WP-5 begin |
+| V40 | **Adapter stderr draining**: every adapter completes a run in which the child writes 256 KB to stderr | L1 | Per-adapter integration test (§14.12) |
+
+### 15.1 Deliberately outside the harness
+
+A scenario step is an argv line run to completion, so four surfaces **cannot** be expressed as differential
+scenarios. Stating them makes the gap visible instead of implied:
+
+| Surface | Why it cannot be compared | Covered instead by |
+|---|---|---|
+| `tui` | Interactive, never terminates, renders to a TTY | V33 (`TestBackend` counted cases) |
+| `serve` **without** `--once` | Never terminates | V20, V34–V36 via `--once` |
+| `run --watch` | Never terminates | V22–V25 (Rust-side integration tests) |
+| `logs --follow` | Streams from the event bus until interrupted (`src/cli/commands/logs.ts:22,34-35,204-207`) | Rust-side integration test only |
+
+Everything in this table is verified **against the specification, not against the oracle.** That is a real
+limitation: §7's timing constants and the orchestrator's live behaviour rest on this document's reading of
+`orchestrator.ts`, and V34–V36 exist specifically to pull the highest-density parts of that behaviour back
+into oracle-verified territory via `--once`.
