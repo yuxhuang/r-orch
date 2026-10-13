@@ -1,0 +1,236 @@
+//! Startup recovery and graceful shutdown (PARITY.md §7.6, §7.14).
+
+use orch_core::error::Result;
+use orch_core::storage::TaskStore;
+use orch_domain::{
+    AgentStatus, OrchestratorState, RunStatus, TaskStatus, is_terminal, resolve_failure_status,
+};
+
+use super::Orchestrator;
+
+impl Orchestrator {
+    /// Clean up after a crashed or restarted process.
+    ///
+    /// Orphaned tasks are **cancelled, not failed**: a failed task retries,
+    /// and retrying work an agent already committed is worse than stopping.
+    /// A user can reactivate a specific task by hand.
+    pub(super) async fn cleanup_stale_running_entries(
+        &self,
+        state: &mut OrchestratorState,
+    ) -> Result<()> {
+        let dead: Vec<(String, orch_domain::RunningEntry)> = state
+            .running
+            .iter()
+            .filter(|(_, entry)| !self.deps().processes.is_alive(entry.pid))
+            .map(|(task_id, entry)| (task_id.clone(), entry.clone()))
+            .collect();
+
+        for (task_id, _) in &dead {
+            state.running.shift_remove(task_id);
+        }
+
+        futures::future::join_all(dead.iter().map(|(task_id, entry)| async move {
+            if let Err(err) = self
+                .deps()
+                .agent_service
+                .set_status(&entry.agent_id, AgentStatus::Idle)
+                .await
+            {
+                self.emit_error(
+                    err,
+                    format!(
+                        "startup cleanup: setStatus idle for agent {}",
+                        entry.agent_id
+                    ),
+                );
+            }
+            self.force_task_cancelled(task_id).await;
+            if let Err(err) = self
+                .deps()
+                .run_service
+                .finish(
+                    &entry.run_id,
+                    RunStatus::Cancelled,
+                    None,
+                    Some("Orchestrator restarted".to_owned()),
+                )
+                .await
+            {
+                self.emit_error(err, format!("startup cleanup: finish run {}", entry.run_id));
+            }
+        }))
+        .await;
+
+        // **Always** cleared: any claim that survived a restart is stale by
+        // definition, because the process that set it is gone. This is what
+        // unsticks tasks left "claimed" by a crash.
+        state.claimed.clear();
+
+        // Only when a restart was actually detected. Without dead PIDs, an
+        // orphan is just a task reconcile has not reached yet, and cancelling
+        // it would be wrong.
+        if !dead.is_empty() {
+            let all_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
+            let orphaned: Vec<String> = all_tasks
+                .into_iter()
+                .filter(|task| {
+                    task.status == TaskStatus::InProgress && !state.running.contains_key(&task.id)
+                })
+                .map(|task| task.id)
+                .collect();
+            futures::future::join_all(
+                orphaned
+                    .iter()
+                    .map(|task_id| self.force_task_cancelled(task_id)),
+            )
+            .await;
+
+            let cancelled: std::collections::HashSet<&str> = dead
+                .iter()
+                .map(|(task_id, _)| task_id.as_str())
+                .chain(orphaned.iter().map(String::as_str))
+                .collect();
+            state
+                .retry_queue
+                .retain(|retry| !cancelled.contains(retry.task_id.as_str()));
+            self.save_state(state).await?;
+        }
+
+        self.cleanup_orphaned_preparing_runs(state).await;
+        Ok(())
+    }
+
+    /// Finalize runs created but never started — a crash between
+    /// `run_service.create` and `run_service.start`. They have no running
+    /// entry, so reconcile cannot see them and they would stay `preparing`
+    /// forever.
+    async fn cleanup_orphaned_preparing_runs(&self, state: &OrchestratorState) {
+        let all_runs = match self.deps().run_store.list_all().await {
+            Ok(runs) => runs,
+            Err(err) => {
+                self.emit_error(err, "startup cleanup: cleanupOrphanedPreparingRuns");
+                return;
+            }
+        };
+
+        // A run belonging to a *live* entry may legitimately be `preparing`
+        // for a moment during this process's own dispatch.
+        let active: std::collections::HashSet<&str> = state
+            .running
+            .values()
+            .map(|entry| entry.run_id.as_str())
+            .collect();
+        let orphaned: Vec<&orch_domain::Run> = all_runs
+            .iter()
+            .filter(|run| run.status == RunStatus::Preparing && !active.contains(run.id.as_str()))
+            .collect();
+        if orphaned.is_empty() {
+            return;
+        }
+
+        futures::future::join_all(orphaned.iter().map(|run| async move {
+            if let Err(err) = self
+                .deps()
+                .run_service
+                .finish(
+                    &run.id,
+                    RunStatus::Cancelled,
+                    None,
+                    Some("Orphaned preparing run (orchestrator restarted)".to_owned()),
+                )
+                .await
+            {
+                self.emit_error(
+                    err,
+                    format!("startup cleanup: finish orphaned preparing run {}", run.id),
+                );
+            }
+        }))
+        .await;
+    }
+
+    /// Cancel a task, falling back to a direct store write when the
+    /// transition is rejected. One of the recovery paths that deliberately
+    /// bypasses the state machine (PARITY.md §7.1).
+    async fn force_task_cancelled(&self, task_id: &str) {
+        if self
+            .deps()
+            .task_service
+            .update_status(task_id, TaskStatus::Cancelled)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let Ok(Some(mut task)) = self.deps().task_store.get(task_id).await else {
+            return;
+        };
+        if is_terminal(task.status) {
+            return;
+        }
+        task.status = TaskStatus::Cancelled;
+        task.updated_at = self.deps().clock.now_iso();
+        if let Err(err) = self.deps().task_store.save(&task).await {
+            self.emit_error(err, format!("startup cleanup: force-cancel task {task_id}"));
+        }
+    }
+
+    /// Wind down every running agent during `stop`.
+    ///
+    /// Each task goes to `resolve_failure_status`, so one with attempts left
+    /// comes back as `retrying` on the next start rather than being lost.
+    ///
+    /// **Divergence worth naming:** the TS loop `await`s without catching, so
+    /// one failing store call aborts `stop()` before it releases the lock —
+    /// which leaves the project wedged for every later invocation. Here each
+    /// entry's failures are reported as `orchestrator:error` and the wind-down
+    /// continues, so the lock is always released. No ported test distinguishes
+    /// the two (nothing throws with the in-memory fakes).
+    pub(super) async fn shutdown_running_entries(&self, state: &OrchestratorState) {
+        let entries: Vec<(String, orch_domain::RunningEntry)> = state
+            .running
+            .iter()
+            .map(|(task_id, entry)| (task_id.clone(), entry.clone()))
+            .collect();
+
+        for (task_id, entry) in entries {
+            self.take_cancel(&task_id).await;
+            self.deps()
+                .processes
+                .kill_with_grace(entry.pid, orch_core::process::DEFAULT_KILL_GRACE)
+                .await;
+
+            if let Err(err) = self
+                .deps()
+                .run_service
+                .finish(&entry.run_id, RunStatus::Cancelled, None, None)
+                .await
+            {
+                self.emit_error(err, format!("stop: finish run {}", entry.run_id));
+            }
+
+            match self.deps().task_store.get(&task_id).await {
+                Ok(Some(task)) => {
+                    let next = resolve_failure_status(&task);
+                    if let Err(err) = self.deps().task_service.update_status(&task_id, next).await {
+                        self.emit_error(err, format!("stop: set task {task_id} to {next}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => self.emit_error(err, format!("stop: read task {task_id}")),
+            }
+
+            if let Err(err) = self
+                .deps()
+                .agent_service
+                .set_status(&entry.agent_id, AgentStatus::Idle)
+                .await
+            {
+                self.emit_error(
+                    err,
+                    format!("stop: setStatus idle for agent {}", entry.agent_id),
+                );
+            }
+        }
+    }
+}

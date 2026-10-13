@@ -1,19 +1,30 @@
-//! Agent factory — shop template → `CreateAgentInput`, ported from
-//! `src/application/agent-factory.ts`.
+//! Agent factory — ported from `src/application/agent-factory.ts`.
 //!
-//! Two rules, both observable in the created agent: the model comes from the
-//! template's semantic **tier** resolved against the chosen adapter, and MCP
-//! skills (the colon-separated ones) are **dropped for every adapter except
-//! claude**, because they only work through the Claude CLI.
+//! Turns an Agent Shop template into a [`CreateAgentInput`]: resolves the
+//! template's semantic tier to a concrete model string for the chosen adapter,
+//! and drops MCP skills for every adapter but `claude`, which is the only one
+//! whose CLI handles them natively.
 
 use orch_core::error::{Error, Result};
-use orch_core::skills::is_mcp_skill;
 use orch_domain::{AgentShopTemplate, CreateAgentInput, resolve_model};
 
-/// Convert a shop template into the input `AgentService::create` takes.
+/// MCP skills use colon-separated names (e.g. `feature-dev:code-explorer`).
 ///
-/// `shell` is rejected: a shop template has no command, and a shell agent
-/// without one cannot run.
+/// Re-exported here because the TS module exports it and the CLI imports it
+/// from this module; the canonical implementation is
+/// [`orch_core::skills::is_mcp_skill`].
+pub fn is_mcp_skill(skill: &str) -> bool {
+    orch_core::skills::is_mcp_skill(skill)
+}
+
+/// Build the input for `agent add` from a shop template.
+///
+/// `shell` is refused: a shop template carries a role and a model tier, never
+/// an executable command, so a shell agent built from one could never run.
+/// An **unknown** adapter is *not* refused — `resolve_model` yields `""` for
+/// it, which becomes an absent `model`, and the agent is created with the
+/// adapter string as given. That asymmetry is the TS behaviour and the suite
+/// asserts it.
 pub fn template_to_agent_input(
     template: &AgentShopTemplate,
     adapter: &str,
@@ -36,84 +47,75 @@ pub fn template_to_agent_input(
         name: template.name.to_owned(),
         adapter: adapter.to_owned(),
         role: Some(template.role.to_owned()),
-        command: None,
-        // An empty resolution (the `balanced` tier of some adapters) means
-        // "the adapter's own default", not an empty model string.
         model: (!model.is_empty()).then(|| model.to_owned()),
-        effort: None,
-        approval_policy: Some(template.approval_policy),
-        max_turns: None,
-        timeout_ms: None,
-        stall_timeout_ms: None,
-        env: None,
-        system_prompt: None,
-        workspace_mode: None,
         skills: Some(skills),
+        approval_policy: Some(template.approval_policy),
+        ..Default::default()
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orch_domain::{AGENT_SHOP_TEMPLATES, ApprovalPolicy, ModelTier, get_shop_template_by_key};
+    use orch_domain::{ApprovalPolicy, ModelTier};
 
-    fn template(key: &str) -> &'static AgentShopTemplate {
-        get_shop_template_by_key(key).unwrap_or_else(|| panic!("no template {key}"))
+    /// The `baseTemplate` from `agent-factory.test.ts`, which is deliberately
+    /// not one of the shipped catalogue entries.
+    const BASE: AgentShopTemplate = AgentShopTemplate {
+        key: "test",
+        name: "Test Agent",
+        description: "A test agent",
+        tier: ModelTier::Balanced,
+        approval_policy: ApprovalPolicy::Auto,
+        skills: &[
+            "review",
+            "careful",
+            "feature-dev:feature-dev",
+            "testing-suite:generate-tests",
+        ],
+        role: "Test role",
+    };
+
+    fn skills(input: &CreateAgentInput) -> Vec<String> {
+        input.skills.clone().unwrap_or_default()
     }
 
     #[test]
-    fn the_model_comes_from_the_tier_resolved_against_the_adapter() {
-        let backend = template("backend-dev");
-        assert_eq!(backend.tier, ModelTier::Balanced);
-
-        let claude = template_to_agent_input(backend, "claude").expect("claude");
-        assert_eq!(claude.model.as_deref(), Some("claude-sonnet-4-6"));
-
-        let codex = template_to_agent_input(backend, "codex").expect("codex");
-        assert_eq!(codex.model.as_deref(), Some("gpt-5.3-codex"));
+    fn mcp_skills_are_the_colon_separated_ones() {
+        assert!(is_mcp_skill("feature-dev:feature-dev"));
+        assert!(is_mcp_skill("testing-suite:generate-tests"));
+        assert!(!is_mcp_skill("review"));
+        assert!(!is_mcp_skill("careful"));
+        assert!(!is_mcp_skill("qa"));
     }
 
     #[test]
-    fn an_empty_tier_resolution_means_the_adapter_default() {
-        // opencode's `balanced` entry is the empty string.
-        let input = template_to_agent_input(template("backend-dev"), "opencode").expect("opencode");
-        assert_eq!(input.model, None);
+    fn claude_gets_its_balanced_model_and_every_field_from_the_template() {
+        let input = template_to_agent_input(&BASE, "claude").unwrap();
+        assert_eq!(input.adapter, "claude");
+        assert_eq!(input.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(input.name, "Test Agent");
+        assert_eq!(input.role.as_deref(), Some("Test role"));
+        assert_eq!(input.approval_policy, Some(ApprovalPolicy::Auto));
     }
 
     #[test]
-    fn mcp_skills_survive_only_for_claude() {
-        let qa = template("qa-engineer");
-        assert!(
-            qa.skills.iter().any(|skill| is_mcp_skill(skill)),
-            "the fixture needs an MCP skill to be meaningful"
-        );
-
-        let claude = template_to_agent_input(qa, "claude").expect("claude");
-        assert_eq!(
-            claude.skills.as_deref().expect("skills").len(),
-            qa.skills.len()
-        );
-
-        let codex = template_to_agent_input(qa, "codex").expect("codex");
-        let kept = codex.skills.expect("skills");
-        assert!(kept.iter().all(|skill| !is_mcp_skill(skill)));
-        assert!(kept.len() < qa.skills.len());
+    fn codex_gets_its_own_balanced_model() {
+        let input = template_to_agent_input(&BASE, "codex").unwrap();
+        assert_eq!(input.adapter, "codex");
+        assert_eq!(input.model.as_deref(), Some("gpt-5.3-codex"));
     }
 
     #[test]
-    fn the_name_role_and_approval_policy_come_straight_from_the_template() {
-        let reviewer = template("code-reviewer");
-        let input = template_to_agent_input(reviewer, "claude").expect("claude");
-        assert_eq!(input.name, reviewer.name);
-        assert_eq!(input.role.as_deref(), Some(reviewer.role));
-        assert_eq!(input.approval_policy, Some(reviewer.approval_policy));
-        assert_eq!(input.command, None);
+    fn pi_gets_its_own_balanced_model() {
+        let input = template_to_agent_input(&BASE, "pi").unwrap();
+        assert_eq!(input.adapter, "pi");
+        assert_eq!(input.model.as_deref(), Some("openai-codex/gpt-5.5"));
     }
 
     #[test]
-    fn shell_is_rejected_with_exit_two() {
-        let err = template_to_agent_input(template("backend-dev"), "shell")
-            .expect_err("shell has no command");
+    fn shell_is_refused_because_a_template_carries_no_command() {
+        let err = template_to_agent_input(&BASE, "shell").expect_err("refused");
         assert_eq!(
             err.to_string(),
             "Agent Shop templates require an AI adapter; create shell agents with --command"
@@ -122,26 +124,43 @@ mod tests {
     }
 
     #[test]
-    fn every_shipped_template_converts_for_every_ai_adapter() {
-        for template in &AGENT_SHOP_TEMPLATES {
-            for adapter in [
-                "claude",
-                "codex",
-                "cursor",
-                "opencode",
-                "pi",
-                "grok",
-                "antigravity",
-            ] {
-                let input = template_to_agent_input(template, adapter)
-                    .unwrap_or_else(|err| panic!("{}/{adapter}: {err}", template.key));
-                assert_eq!(input.adapter, adapter);
-                assert!(!input.name.is_empty());
-                assert!(matches!(
-                    input.approval_policy,
-                    Some(ApprovalPolicy::Auto | ApprovalPolicy::Suggest | ApprovalPolicy::Manual)
-                ));
-            }
+    fn claude_keeps_every_skill_including_the_mcp_ones() {
+        let input = template_to_agent_input(&BASE, "claude").unwrap();
+        assert_eq!(
+            skills(&input),
+            [
+                "review",
+                "careful",
+                "feature-dev:feature-dev",
+                "testing-suite:generate-tests"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_other_adapter_drops_the_mcp_skills() {
+        for adapter in ["pi", "opencode", "codex", "cursor", "grok", "antigravity"] {
+            let input = template_to_agent_input(&BASE, adapter).unwrap();
+            assert_eq!(skills(&input), ["review", "careful"], "adapter={adapter}");
         }
+    }
+
+    #[test]
+    fn the_capable_tier_resolves_to_the_capable_model() {
+        let capable = AgentShopTemplate {
+            tier: ModelTier::Capable,
+            ..BASE
+        };
+        let input = template_to_agent_input(&capable, "claude").unwrap();
+        assert_eq!(input.model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn an_unknown_adapter_is_accepted_with_no_model() {
+        let input = template_to_agent_input(&BASE, "unknown-adapter").unwrap();
+        assert_eq!(input.adapter, "unknown-adapter");
+        assert_eq!(input.model, None);
+        // And it is treated as non-claude, so MCP skills are dropped.
+        assert_eq!(skills(&input), ["review", "careful"]);
     }
 }

@@ -171,6 +171,43 @@ at parse time unless it is marked `@exit-only`. Commander writes `error: …` on
 stderr while every ORCH domain error is rendered with `✕`, which makes the
 prefix an unambiguous discriminator.
 
+## The one named exclusion: `state.claimed` (§14.1)
+
+PARITY.md §14.1 was decided **FIX**, so there is exactly one path the harness
+does not compare. TS `status --json` serializes the in-memory state object, and
+`JSON.stringify` of a JS `Set` is `{}` whatever it holds — so the oracle's
+`state.claimed` is always empty while `state.json` on disk correctly holds an
+array. r-orch emits the array, and §14.1 grants a **named** exclusion for that
+path in `status --json` comparisons.
+
+A masked value is an unasserted value, so the mask is paired with a replacement
+assertion instead of being left as a hole: **r-orch's array must equal the
+`claimed` array in the `state.json` it wrote.** The cross-implementation check
+on the same data still happens too — `state.json` is an ordinary file in the
+tree walk, where both sides agree on the array — so the mask drops a duplicate
+comparison in a format that legitimately differs, not the only one.
+
+It is scoped as narrowly as it can be, and the scope is tested:
+
+- `status` with `--json`, and nothing else. `state.running` has the same JS-Map
+  problem but §14.1 does not cover it, so it stays compared.
+- Masking a path that is **absent** would assert nothing, so a `status --json`
+  with no `state.claimed` is a failure on either side. If the *oracle* stops
+  emitting it, the message says to re-read the contract rather than to adjust
+  the mask.
+- Comparing parsed documents could have lost the JSON framing the raw-text
+  comparison was covering, so indent and trailing newline (§6.4) are compared
+  separately. Key order survives because `serde_json` is built with
+  `preserve_order`.
+- Two mutation probes assert the hole is exactly its intended size: widening
+  the mask to every command is caught, and deepening it to swallow the whole
+  `state` object is caught. The second is `probe_pending` until `orch status`
+  exists, since nothing exercises it before then.
+
+If a second named exclusion is ever needed, it needs the same four things, and
+a line in PARITY.md naming it. An unnamed exclusion is just a field nobody
+compares any more.
+
 ## What is compared
 
 Per step: stdout, stderr and the exit code. At the end: a recursive walk of
