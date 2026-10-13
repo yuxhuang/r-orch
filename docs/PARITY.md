@@ -12,6 +12,20 @@ This document is the **authoritative specification** for the Rust rewrite. Where
 source disagree, the TypeScript source wins and this document is a bug — except for the items in
 [§14 Known bugs](#14-known-bugs-in-the-original), which record deliberate divergences.
 
+### Normative appendices
+
+This document is the contract; the appendices under `docs/parity/` are the **exhaustive per-file detail** behind
+it, derived directly from the source. They are normative — where this document summarizes, they specify. Read
+the appendix for your work package before implementing.
+
+| Appendix | Covers | Lines |
+|---|---|---|
+| [`docs/parity/cli.md`](parity/cli.md) | Every command: globals and routing (§1), output primitives (§2), errors and exit codes (§3), one section per command (§4–19), storage/ids/serialization (§20), interactive and non-TTY degradation (§21), ranked parity gotchas (§22) | 3384 |
+| [`docs/parity/adapters.md`](parity/adapters.md) | Shared machinery, per-adapter argv/parsing/errors, the `Adapter` contract verbatim, `ProcessManager`, model discovery, model tiers, platform notes, hazards | 3493 |
+| [`docs/parity/infra.md`](parity/infra.md) | Template engine (incl. byte-exact template dumps), skill loader, workspace/git, clipboard, the full agent-shop and org-shop catalogues, scope, doctor, review-runner, event bus | 2496 |
+| [`docs/parity/tui.md`](parity/tui.md) | Views and columns, the complete key-dispatch chain, overlays, command bar, all 11 wizards, layout math, live-update timers, dead code, test inventory | 1001 |
+| [`docs/parity/tests.md`](parity/tests.md) | Per-file test inventory with classifications, helper/mock infrastructure, process-faking mechanisms, vitest config, flakiness analysis, ranked parity oracles | 743 |
+
 ---
 
 ## 1. Parity levels
@@ -115,8 +129,13 @@ works). Results are cached per start-dir for the process lifetime.
 
 - *Light* (stores + services): `task`, `agent`, `status`, `logs`, `config`, `context`, `msg`, `goal`, `team`, `org`
 - *Full* (+ orchestrator, adapters, process manager, template engine, skill loader, workspace manager, doctor):
-  `run`, `doctor`, `tui`, `serve`
+  `run`, `doctor`, `tui`, `serve`, **and no subcommand at all** (bare `orch` → TUI)
 - *No container*: `init`, `update`
+- **`task cancel` lazily upgrades to Full** — but only when the target task is `in_progress` (it needs the
+  orchestrator to kill the child process). This is observable as a latency difference only.
+- **`doctor` runs in either tier**: with a container it probes **8** adapters; container-less (uninitialized
+  project) it probes **5**. The adapter count in the trailing `<n> of 8 adapters ready` line changes
+  accordingly.
 
 ### 2.2 Command table
 
@@ -269,12 +288,32 @@ Source of truth: `src/domain/errors.ts`.
 | `5` | Agent adapter unavailable | `AgentAdapterError` |
 | `6` | Workspace error | `WorkspaceError` |
 
-Additional exit paths:
+Additional exit paths (all L0):
 
-- `serve --once` → `1` if any task reached a failed terminal status, else `0`.
+- **Any command in an uninitialized directory exits `3`** — *including* `orch <sub> --help` and unknown
+  commands. The container is built **before** Commander parses, so `NotInitializedError` wins over help and
+  over usage errors. Only `init`, `doctor` and `update` are exempt.
+- **A command group invoked with no subcommand** (`orch task`, `orch agent`, …) prints its help to **stdout**
+  and exits **`1`**.
 - Commander errors (unknown command, unknown option, missing required option) → **exit 1**, message on stderr
-  in Commander's own format (`error: unknown command 'x'`, optionally followed by `(Did you mean y?)`). The exact
-  wording is **L2**; the exit code is L0.
+  in Commander's own format (`error: unknown command 'x'`, optionally followed by `(Did you mean y?)`). The
+  exact wording is **L2**; the exit code is L0.
+- Explicit `process.exit(2)` argument guards: `logs` with none of
+  `[run-id]`/`--task`/`--agent`/`--since`; `run` with neither a task id nor `--all`/`--watch`;
+  `serve --log-format <invalid>`; `init --adapter <invalid>`.
+- `goal status <id> <invalid-status>` → **1**. All `org deploy` failures → **1**.
+- `run <task-id>` whose run fails sets exit **1**.
+- `serve --once` → `1` **iff any task ended in status `failed`**, else `0`. A `cancelled` task does **not**
+  produce a non-zero exit.
+- `update` network or install failure → **1**.
+
+**Commands that exit `0` while printing an error** — these are contract and easy to get wrong:
+
+| Command | Behaviour |
+|---|---|
+| `context get <missing-key>` | prints an error / `null`, **exits 0** |
+| `config global set` with an invalid value or unknown key | prints an error, **exits 0** |
+| `doctor` | reports failing checks, **always exits 0** — it diagnoses, it does not gate |
 
 ### 3.1 Error message format (L0 for the message and hint text, L2 for colour)
 
@@ -344,8 +383,14 @@ Validation messages (all `InvalidArgumentsError`, exit 2) — exact text is L0:
 `--json` is a **global** flag; each command decides whether to honour it. Where a command does not implement
 `--json`, it prints its normal human output — do not add JSON where the original has none.
 
-All JSON goes to **stdout**, pretty-printed with **2-space indent and a trailing newline**
+JSON goes to **stdout**. Most commands pretty-print with **2-space indent and a trailing newline**
 (`JSON.stringify(value, null, 2)` then `console.log`, which appends `\n`).
+
+**Four commands emit compact JSON** (`JSON.stringify(value)`, no indent) — L0, do not normalize this away:
+`config get`, `config global get`, `config global show`, `goal delete`.
+
+**`doctor --json` is not pure JSON** — it prints **two human header lines before** the JSON document. A
+consumer piping it to a parser must skip them. Replicate exactly.
 
 **Key order is not contract** (§1.4). Field *presence* is: a field whose TS value is `undefined` is **omitted**;
 a field whose value is `null` is **emitted as `null`**. The only `null`-valued field in the domain is
@@ -375,9 +420,31 @@ a field whose value is `null` is **emitted as `null`**. The only `null`-valued f
 | `context list` | array of `ContextEntry` |
 | `logs` | array of `Run` objects (metadata, including the full `prompt`) |
 | `status` | `{ tasks, agents, state }` — see §4.3 |
-| `config get` | the raw value at the dot path, JSON-encoded |
-| `config global show` | the `GlobalConfig` object |
-| `doctor` | adapter/dependency check results |
+| `config get` | **compact.** the raw value at the dot path, JSON-encoded. **The `value` key is omitted entirely for a missing key** |
+| `config global get` | **compact** |
+| `config global show` | **compact.** the `GlobalConfig` object |
+| `agent edit` | a single `Agent` object |
+| `agent autonomous` | a single `Agent` object |
+| `context set` | the written `ContextEntry` |
+| `goal status` | the updated `Goal` |
+| `goal update` | the updated `Goal` |
+| `goal delete` | **compact** |
+| `org list` | array of org templates |
+| `org deploy` | the deployment result |
+| `doctor` | adapter/dependency check results, **after two human header lines** |
+
+Empty collections are `[]`. A **missing context entry** (`context get <unknown> --json`) prints the literal
+line `null`.
+
+### 4.1.1 Commands that do NOT support `--json` (L0 — they print human text even with the flag)
+
+`run`, `serve`, `tui`, `init`, `update`, `agent shop`, `agent remove`, `agent disable`, `agent enable`,
+`task edit`, `task assign`, `task cancel`, `task approve`, `task reject`, `task retry`, `config set`,
+`config edit`, `team join`, `team leave`, `team add-task`, `team set-lead`, `team disband`.
+
+`context delete` suppresses output entirely.
+
+Do **not** add JSON where the original has none — a consumer passing `--json` globally must get the same bytes.
 
 ### 4.2 Entity shapes
 
@@ -1632,10 +1699,21 @@ flag**.
 | `antigravity` | `agy` | `-p`, `<fullPrompt>` (**argv[2], not last**), `--dangerously-skip-permissions`, [`--model <m>`] |
 | `shell` | `bash` | `-lc`, `<config.command>` — **prompt passed via the `ORCHESTRY_TASK_PROMPT` env var** |
 
+**stdin protocols** (the two adapters that use stdin — L0):
+
+- **`codex`**: a **single write** of the combined prompt with **no trailing newline**, then `end()` to close
+  stdin. `buildFullPrompt` joins with `\n\n`, so the bytes are `"<system>\n\nuser"` or just `"<user>"`.
+- **`pi`**: writes one JSONL RPC frame — `{"id":"orch-<epoch_ms>","type":"prompt","message":<prompt>}` followed
+  by `"\n"` — and then **leaves stdin open** (it is a bidirectional session). After a terminal event the
+  adapter itself calls `killWithGrace(pid, 1000)` — a **1000 ms** grace, unique to pi.
+
 Notes that are easy to get wrong:
 
 - `claude` always passes `--max-turns`, defaulting to **50** (`?? 50`). `grok` passes `--max-turns` only when
   `config.max_turns` is **truthy**, so `0` omits it.
+- `opencode` has **no `--dir`/workspace flag** — the workspace is conveyed only through the spawn `cwd`.
+- The shell adapter's `ORCHESTRY_TASK_PROMPT` is the **only** environment variable any adapter sets itself;
+  everything else comes from the orchestrator's `params.env`.
 - `pi` uses **`--thinking`** for effort and **`--append-system-prompt`** (never `--system-prompt`). It
   deliberately does **not** pass `--no-session`.
 - `grok` passes `--cwd <workspace>` *in addition to* setting the spawn cwd.
@@ -1969,8 +2047,9 @@ reproduces them byte for byte. See [ARCHITECTURE.md §8.3](ARCHITECTURE.md).
   `skills/library/`; fall back to `<dir>/../../../skills/library`. In r-orch this becomes: the directory
   containing the binary, then `$CARGO_MANIFEST_DIR` in debug builds, then an installed share path. The
   **library content is shipped with the binary** and must be byte-identical to `parity/orch-ts/skills/library/`.
-- **Name validity**: `^[a-z0-9-]+$`. A name failing this returns `None` **without touching the filesystem** —
-  this is the path-traversal defence.
+- **Name validity**: `^[a-z0-9-]+$`. The check runs **after** the cache lookup but **before** any filesystem
+  access — this is the path-traversal defence. A rejected name returns `None` and is **not** cached (unlike a
+  missing file, which is).
 - **Library vs MCP**: a skill name **containing `:`** is an MCP skill, handled natively by the Claude CLI, and
   is **silently skipped** by the loader.
 - **Missing skill**: logs `[orch] skill library: "<name>" not found in <dir>` to **stderr**, caches the empty
@@ -1978,6 +2057,9 @@ reproduces them byte for byte. See [ARCHITECTURE.md §8.3](ARCHITECTURE.md).
 - **Caching**: per-loader-instance, process lifetime, including negative results.
 - **Output format** (L0): `## Skills\n\n` followed by, per resolved skill, `### <name>\n\n<file content>`,
   joined by `\n\n`. Returns `""` when no library skills resolve (and the caller then appends nothing).
+- **The file content is injected raw, including its YAML frontmatter.** The loader never parses or strips it.
+  The library has **26** `.md` files whose frontmatter keys are `name`, `version`, `description` (plus
+  `benefits-from`, only in `plan-eng-review.md`) — all of it lands verbatim in the agent's system prompt.
 - Skill order follows the order of `agent.config.skills`, not the directory order.
 - `listAvailable()` → `.md` basenames, **sorted**, cached.
 
@@ -2185,6 +2267,18 @@ instantiates one — creating the agent set, a team, and optionally a goal. The 
 **data that must be reproduced verbatim**, including every long role description, because those strings are
 injected into prompts. See [docs/parity/infra.md §5–§7](parity/infra.md).
 
+**Agent-shop keys (15, array order — L0):** `backend-dev`, `frontend-dev`, `qa-engineer`, `code-reviewer`,
+`architect`, `devops-engineer`, `bug-hunter`, `tech-writer`, `marketer`, `content-creator`, `growth-hacker`,
+`security-auditor`, `performance-engineer`, `data-engineer`, `fullstack-dev`.
+`code-reviewer`, `architect` and `security-auditor` are `tier: capable` + `approval_policy: suggest`; the
+other twelve are `balanced` + `auto`.
+
+**Org-shop keys (10 — L0):** `startup-mvp`, `pr-review-corp`, `migration-squad`, `security-dept`,
+`test-factory`, `content-agency`, `data-lab`, `sales-machine`, `bugfix-dept`, `docs-team`. All have
+`lead_index: 0`.
+
+**Default agents:** exactly one — `agt_creator` / "Agent Creator" (§6.11).
+
 Agent-shop templates reference a semantic `tier` (`capable|balanced|fast`) rather than a model string;
 `templateToAgentInput(template, adapter)` resolves it via §8.13 and **filters out MCP skills (names containing
 `:`) for every adapter except `claude`**. Passing `adapter: "shell"` throws
@@ -2241,8 +2335,21 @@ Normal mode highlights (full table in [docs/parity/tui.md §2](parity/tui.md)):
 - [ ] `q`/`Q` quit — **tested first, so `q` can never be typed in normal mode**
 - [ ] `Esc` closes the detail panel, else returns the log view to tail; **`Esc` never quits**
 - [ ] `+`/`=` and `-` resize the split by 3 rows; interact with the maximized state
-- [ ] `j`/`k`/`↑`/`↓` navigate; `Enter` opens detail; `?` opens help; `:` or `/` opens the command bar
+- [ ] `j`/`k`/`↑`/`↓` navigate; `Enter` opens detail; `?` and **F1** open help; `/` opens the command bar
+- [ ] `M` toggles maximize; `n`/`e`/`d`/`z`/`r`/`u` = new/edit/soft-delete/undo/run/autonomous
 - [ ] `N` opens the task wizard; the unreachable `'new_task'` input mode is **not** ported (§14.8)
+
+> **`a`, `g`, `s`, `c`, `x` and `f` are overloaded per view** — e.g. `a` approves when a review task is
+> selected, otherwise jumps to the agents tab, otherwise opens the logs agent picker; `s` is "show all" on
+> tasks but "force-stop" on agents; `c` cancels a task but *achieves* a goal. These collisions must be
+> resolved from the dispatch chain in [docs/parity/tui.md §2.2](parity/tui.md) **explicitly**, not guessed.
+> Getting one wrong means a key destroys the wrong entity.
+
+**Layout constants** (L2, but they make the split behave): `fixedRows = 9`; the list is capped at **50 %** of
+content height; `maxSplitOffset = contentH - 7`; resize steps are **3** rows. There are **no responsive
+breakpoints and no minimum-terminal-size guard** in the original — decide whether to add one (recommended) and
+record it as a deliberate improvement. `Ctrl+Enter` vs `Enter` requires Kitty CSI-u support; degrade cleanly
+when absent.
 
 ### 12.3 Overlays and modes
 
@@ -2279,25 +2386,41 @@ Registry order determines suggestion order:
 - [ ] `resolveCompletion` returns only the ghost **suffix**; input must start with `/`; an exact match yields
       `null`. Pinned vectors: `'task'`→`null`, `'/'`→`null`, `'/ta'`→`'sk'`, `'/task'`→`null`,
       `'/task c'`→`'ancel'`, `'/config pal'`→`'ette'`, `'/xyz'`→`null`
+- [ ] **Legacy bare shortcuts** (no leading `/`) are still accepted: `cancel`, `retry`, `assign`, `disable`,
+      `enable`
+- [ ] Subcommand aliases: `agent delete|remove`, `agent autonomous|auto`, `team create|add`,
+      `goal add|create`
+- [ ] Suggestions are **category-grouped for a bare `/`** (3 separators: MANAGEMENT / MONITORING / SETTINGS)
+      and **flat for any prefix**
+- [ ] History **dedupes consecutive** entries and caps at **100**
 
 ### 12.5 Wizards
 
-- [ ] **NEW AGENT** — 11 steps (`name, adapter, command, model, effort, role, role_custom, skills,
-      approval_policy, team`), with conditional skips: `command` only for `shell`; `model`/`role`/`skills`/
-      `team` skipped for `shell`; `effort` only for `{claude, pi, grok}`; `approval_policy` **always** skipped;
-      `team` skipped when there are fewer than 2 options. `effort` **must sit immediately after `model`**.
-      Shell forces `approval_policy = "auto"` and clears model/effort/role/skills/team.
-- [ ] **NEW TASK**, **NEW GOAL**, **NEW TEAM**, **AGENT SHOP** wizards — see
-      [docs/parity/tui.md §5.2](parity/tui.md)
-- [ ] Complete validation-message catalogue reproduced verbatim (e.g. `Name is required`,
-      `Agent with this name already exists`, `Command is required for Shell`)
+**Eleven** wizards, all driven by one `FormWizard` engine with `text` / `textarea` / `select` / `multiselect`
+step types. Validation is **300 ms debounced** for text and textarea, **synchronous** for select.
+
+- [ ] **NEW AGENT** — **10 steps**, 6 of them conditional: `name, adapter, command, model, effort, role,
+      role_custom, skills, approval_policy, team`. Skips: `command` only for `shell`;
+      `model`/`role`/`skills`/`team` skipped for `shell`; `effort` only for `{claude, pi, grok}`;
+      `approval_policy` **always** skipped; `team` skipped when there are fewer than 2 options. `effort`
+      **must sit immediately after `model`**. Shell collapses the wizard to `name`/`adapter`/`command` and
+      forces `approval_policy = "auto"`, clearing model/effort/role/skills/team.
+- [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) · **EDIT AGENT** (9) ·
+      **NEW TASK** (4) · **EDIT TASK** (4) · **NEW TEAM** (4) · **New Goal** (3) · **Edit Goal** (3) ·
+      **SETTINGS** (5 single-step variants, one per config setting)
+- [ ] Validation messages verbatim: `Title is required`, `Priority must be 1-4`, `Name is required`,
+      `Agent with this name already exists`, `Team with this name already exists`,
+      `Command is required for Shell`, `Fix the error above`
+
+Full step/field tables in [docs/parity/tui.md §5.2](parity/tui.md).
 
 ### 12.6 Live-update mechanics (L1 — these are OOM defences, not cosmetics)
 
 - [ ] Batched message queue with an **80 ms** flush interval
+- [ ] **150 ms** refresh debounce
+- [ ] **120 ms** animation tick; **10-frame braille** spinner
 - [ ] Detail strings capped at **2 KB**
 - [ ] RunId-keyed maps capped at **500** entries (LRU)
-- [ ] Animation tick for spinners
 - [ ] Defensive `formatAgentOutput` that accepts both the canonical and every legacy adapter `data` shape
 
 ### 12.7 Theme
@@ -2321,6 +2444,7 @@ solid text, selection); exact hex values are L2.
 | **`InputMode` value `'new_task'`** | Unreachable — nothing sets it. Not ported. |
 | **The `W` key hint** | `onboarding-config.ts` advertises `W start orchestrator` but **no handler exists**. The hint is dropped (watch mode stays reachable via `/watch`). |
 | **`team:task_claimed` emission** | Declared in the event union, never emitted. The variant is kept in the type for forward compatibility; nothing emits it. |
+| **A TUI path that *sets* `task.goalId`** | The goal↔task linking UI is **read-only** — it displays linked tasks and goal badges, but no TUI action assigns a goal to a task. Linking happens only via `task add --goal-id`. Reproduce the display; do not invent the editor. |
 | **`TeamConfig.auto_claim` / `max_concurrent_tasks` behaviour** | Stored and surfaced by the CLI but never read by the orchestrator. Data model and CLI are preserved; the (absent) behaviour is not invented. |
 | **`.orchestry/logs/`** | A path exists in `Paths`; nothing writes it. Kept in the path API, unused. |
 | **npm-based `update`** | Reimplemented against the r-orch release channel (same command, flags and exit codes; different mechanism and message text). |
@@ -2454,6 +2578,34 @@ the arithmetic exactly — changing it changes where the `…` lands, which is o
 
 The length check happens before appending, so the buffer can exceed 2000 by one chunk. `conflictInfo` is
 always sliced to 1000, so this is unobservable. **Replicate** the simple form.
+
+### 14.12 `grok` and `antigravity` never read stderr — **FIX**
+
+Every other adapter either streams stderr (shell) or attaches the bounded tail capture via
+`createStreamingEvents` (claude, codex, cursor, opencode) or its own reader (pi). `grok` and `antigravity`
+spawn with `stderr: 'pipe'` and **never attach a consumer**. A child that writes more than one pipe buffer
+(~64 KB on Linux) to stderr **blocks forever** on the write, and ORCH sees a hang that only stall detection
+eventually clears — 10 minutes by default.
+
+**Decision: fix.** Attach the same bounded 4096-byte tail capture these two adapters are missing. This is a
+latent deadlock, it is invisible until a verbose or crashing child triggers it, and the fix cannot change any
+behaviour that currently works (an unread pipe produces no events either way). The tail then also enriches
+their error messages, matching the other adapters.
+
+This is a `blocking`-severity correctness issue in the original, not a cosmetic one.
+
+### 14.13 `pi` diverges from the shared line reader — **REPLICATE**
+
+`pi` does its own framing rather than using `readLines`, and consequently:
+- it **strips `\r`**, which `readLines` retains;
+- it does **not** apply the 16384-character line cap.
+
+Both are **replicated** — pi's RPC frames are newline-delimited JSON where a stray `\r` would break parsing,
+and the missing cap is reachable only with a pathological frame. Documented so the asymmetry is intentional
+rather than an oversight in the port.
+
+Also: pi's `waitForSettled` tests **key presence**, not value — an `agent_settled` frame with a falsy value
+still settles. Replicate.
 
 ---
 

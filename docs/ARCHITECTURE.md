@@ -664,8 +664,20 @@ Mapping of the TS suite (counts from [docs/parity/tests.md](parity/tests.md)):
 | `test/unit/infrastructure` | 38 | ~562 | `orch-infra/tests/` + inline | Mix of pure (fs-utils, index, scope) and PROCESS/IO (tempdirs, real `bash`). |
 | `test/unit/cli` | 18 + helper | ~224 | `orch-cli/tests/` | Output formatting, flag parsing, serve logger, disk observer. |
 | `test/unit/tui` | 30 | ~681 | `orch-tui/tests/` via `TestBackend` | **Re-expressed, not ported** — see §8.4. |
-| `test/integration` | 4 | 6 | `tests/` workspace-level | Two are NEEDS-REAL-CLI → convert to fake-agent scripts. |
+| `test/integration` | 4 | 6 | `tests/` workspace-level | |
 | `test/smoke-*.ts`, `test/battle/`, `test/e2e/*.pty.ts` | 6 | — | `xtask` subcommands | Not part of `cargo test`; deliberately outside the suite in the original too. |
+
+**No test in the reference suite requires a real AI CLI.** Verified: there are no `which` / `command -v` /
+binary-presence skip guards anywhere in `test/`. Every adapter test injects a fake `IProcessManager` whose
+`spawn()` returns a hand-built `EventEmitter` with `PassThrough` streams, and drives it from outside (write
+bytes, emit `exit`/`error`), asserting exact argv and exact stdin writes. **No fake shell scripts are written
+to disk anywhere in the TS suite.** So there is no AI-CLI boundary to stub at the unit level, and the Rust
+ports inject `FakeProcessManager` the same way.
+
+The **fake agent scripts** in §8.2 are therefore a *new* requirement specific to the differential harness, not
+a port of anything: the harness drives both binaries as subprocesses, so it cannot inject a trait object
+across that boundary and must instead put a replay script named `claude`/`codex`/… on `PATH`. Keep the two
+mechanisms distinct — unit tests inject, the harness shims `PATH`.
 
 **Port the helper infrastructure first** (WP-0). The TS suite rests on exactly two shared helpers; the Rust
 equivalent is a `test-support` module in `orch-core` (behind a feature flag so it does not ship):
@@ -1008,6 +1020,7 @@ quoting pass — buys one of those two.
 | R8 | **`kstring` MSRV and similar toolchain friction** recurs as dependencies move | Low | `rust-toolchain.toml` pins the toolchain; `Cargo.lock` is committed; the `kstring = "2.0.2"` pin is commented with its reason. |
 | R9 | **TUI scope creep** — 10k LOC of React, much of it dead | Medium (schedule) | [PARITY.md §13](PARITY.md) lists exactly what is not ported. WP-6 is checklist-driven; it is also the most deferrable package. |
 | R10 | **Process-group kill behaves differently** than node's `detached` on some platform | Low | `process-endurance` tests spawn real `bash`/`sleep` and assert the tree dies. These are skipped under CI in the original; **run them everywhere** in Rust. |
+| R11 | **An adapter that does not drain stderr deadlocks** on a chatty child once the pipe fills (~64 KB) | Medium | This is a live bug in the original's `grok` and `antigravity` adapters ([PARITY.md §14.12](PARITY.md)) — fixed, not replicated. Structural mitigation: make the stderr tail capture part of the **shared** spawn path in WP-2 so an adapter cannot forget it, rather than per-adapter opt-in. Add a test per adapter that writes 256 KB to stderr and asserts completion. |
 
 ### Rollback
 
