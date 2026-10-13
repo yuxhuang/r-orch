@@ -31,6 +31,25 @@ fi
 export TMPDIR="${TMPDIR:-/tmp}"
 detected=0
 missed=0
+pending=0
+
+# probe_pending <subcommand> <label> <file> <old> <new>
+#
+# A probe for a mask or a code path that no scenario exercises yet, because the
+# command it needs does not exist. Such a probe cannot fail, and reporting it as
+# MISSED would make the suite red for something that is not a defect — the same
+# erosion a flaky test causes. So it is reported as pending while the Rust
+# binary lacks <subcommand>, and runs for real the moment that lands. Dropping
+# it instead would mean nobody writes it later.
+probe_pending() {
+  local subcommand="$1"; shift
+  if ! eval "./target/debug/orch $subcommand --help" >/dev/null 2>&1; then
+    printf '  pending       %s  (no `orch %s` yet)\n' "$1" "$subcommand"
+    pending=$((pending + 1))
+    return
+  fi
+  probe "$@"
+}
 
 # probe <label> <file> <python-replacement-expression>
 #
@@ -69,16 +88,16 @@ PY
   # some scenarios are legitimately red — grepping for FAILED would then match
   # the standing red bar and report every probe as detected, which would make
   # this suite the very thing it exists to prevent: a gate that cannot fail.
-  local now newly
-  now=$(failing_scenarios)
-  if ! parity_ran; then
+  local newly
+  run_parity
+  if [ "$parity_ran" -eq 0 ]; then
     printf '  HARNESS BROKE %s\n' "$label"
     missed=$((missed + 1))
     git checkout -- "$file"
     cargo build -p orch-cli -p xtask >/dev/null 2>&1
     return
   fi
-  newly=$(comm -13 <(printf '%s\n' "$baseline") <(printf '%s\n' "$now"))
+  newly=$(comm -13 <(printf '%s\n' "$baseline") <(printf '%s\n' "$last_failing"))
 
   if [ -n "$newly" ]; then
     printf '  detected      %s  (%s)\n' "$label" "$(printf '%s' "$newly" | tr '\n' ' ')"
@@ -92,26 +111,37 @@ PY
   cargo build -p orch-cli -p xtask >/dev/null 2>&1
 }
 
-# The sorted names of every scenario the harness currently reports as failing.
+# Run the harness, setting $last_failing (sorted names of failing scenarios)
+# and $parity_ran (whether it got as far as reporting a summary).
 #
-# Writes the raw run to $last_parity_output so the caller can tell "every
-# scenario passed" from "the harness never got as far as reporting", which
-# would otherwise look identical — an empty list — and read as a missed probe.
-last_parity_output=""
-failing_scenarios() {
-  last_parity_output=$(cargo xtask parity 2>&1)
-  printf '%s' "$last_parity_output" \
-    | sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' | sort
-}
-
-# Whether the harness actually ran to completion.
-parity_ran() {
-  printf '%s' "$last_parity_output" | grep -q 'scenario(s):'
+# These are globals rather than a return value on purpose: `x=$(run_parity)`
+# would run the function in a subshell, and anything it assigned would be
+# discarded — which is exactly the bug that first made every probe report
+# HARNESS BROKE. The distinction matters because "nothing failed" and "the
+# harness never ran" are both an empty list, and only the first is a missed
+# probe.
+last_failing=""
+parity_ran=0
+run_parity() {
+  local out
+  out=$(cargo xtask parity 2>&1)
+  last_failing=$(printf '%s' "$out" \
+    | sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' | sort)
+  if printf '%s' "$out" | grep -q 'scenario(s):'; then
+    parity_ran=1
+  else
+    parity_ran=0
+  fi
 }
 
 echo "building the baseline"
 cargo build -p orch-cli -p xtask >/dev/null 2>&1
-baseline=$(failing_scenarios)
+run_parity
+if [ "$parity_ran" -eq 0 ]; then
+  echo "refusing to run: the harness does not run on a clean tree" >&2
+  exit 1
+fi
+baseline="$last_failing"
 if [ -n "$baseline" ]; then
   # Expected while the corpus runs ahead of the CLI: these are the red bar
   # WP-4/WP-5 land against. A probe counts only if it adds to this set.
@@ -175,12 +205,12 @@ probe 'table padding changed (§5.1)' \
 probe 'the claimed mask spreads to every command (§14.1 scope)' \
   xtask/src/harness.rs \
   '        let subcommand = argv.iter().find(|arg| !arg.starts_with('"'"'-'"'"'));
-        subcommand.map(String::as_str) == Some("status")
-            && argv.iter().any(|arg| arg == "--json")' \
+        subcommand.map(String::as_str) == Some("status") && argv.iter().any(|arg| arg == "--json")' \
   '        let _ = argv;
         true'
 
-probe 'the claimed mask swallows the whole state object (§14.1 depth)' \
+probe_pending status \
+  'the claimed mask swallows the whole state object (§14.1 depth)' \
   xtask/src/harness.rs \
   '        document
             .get_mut("state")?
@@ -189,7 +219,11 @@ probe 'the claimed mask swallows the whole state object (§14.1 depth)' \
   '        document.as_object_mut()?.shift_remove("state")'
 
 echo
-echo "$detected detected, $missed missed"
+if [ "$pending" -gt 0 ]; then
+  echo "$detected detected, $missed missed, $pending pending on commands that do not exist yet"
+else
+  echo "$detected detected, $missed missed"
+fi
 if [ "$missed" -gt 0 ]; then
   echo "a missed probe means the harness has a blind spot — fix the harness, not the probe" >&2
   exit 1
