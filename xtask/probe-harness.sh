@@ -94,19 +94,22 @@ PY
 
 # The sorted names of every scenario the harness currently reports as failing.
 #
-# Writes the raw run to $last_parity_output so the caller can tell "every
-# scenario passed" from "the harness never got as far as reporting", which
-# would otherwise look identical — an empty list — and read as a missed probe.
-last_parity_output=""
+# The raw run goes to a **file**, not a variable: every caller uses
+# `$(failing_scenarios)`, which is a subshell, so an assignment inside would
+# never reach the parent — `parity_ran` would then be false for every probe and
+# the whole suite would report HARNESS BROKE without evaluating anything.
+# Writing it out lets the caller tell "every scenario passed" from "the harness
+# never got as far as reporting", which otherwise look identical: an empty list.
+last_parity_output=$(mktemp "${TMPDIR%/}/probe-harness-parity.XXXXXX")
+trap 'rm -f "$last_parity_output"' EXIT
 failing_scenarios() {
-  last_parity_output=$(cargo xtask parity 2>&1)
-  printf '%s' "$last_parity_output" \
-    | sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' | sort
+  cargo xtask parity >"$last_parity_output" 2>&1
+  sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' "$last_parity_output" | sort
 }
 
 # Whether the harness actually ran to completion.
 parity_ran() {
-  printf '%s' "$last_parity_output" | grep -q 'scenario(s):'
+  grep -q 'scenario(s):' "$last_parity_output"
 }
 
 echo "building the baseline"
@@ -175,8 +178,7 @@ probe 'table padding changed (§5.1)' \
 probe 'the claimed mask spreads to every command (§14.1 scope)' \
   xtask/src/harness.rs \
   '        let subcommand = argv.iter().find(|arg| !arg.starts_with('"'"'-'"'"'));
-        subcommand.map(String::as_str) == Some("status")
-            && argv.iter().any(|arg| arg == "--json")' \
+        subcommand.map(String::as_str) == Some("status") && argv.iter().any(|arg| arg == "--json")' \
   '        let _ = argv;
         true'
 
