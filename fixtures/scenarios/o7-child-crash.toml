@@ -1,7 +1,6 @@
 name = "o7-child-crash"
 kind = "differential"
 requires = ["serve", "config set", "status"]
-fake_agents = true
 timeout_secs = 90
 env = { ORCH_FAKE_SCENARIO = "crash" }
 description = """

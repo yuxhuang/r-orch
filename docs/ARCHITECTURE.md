@@ -319,7 +319,9 @@ pub trait RunStore: Send + Sync {
     async fn append_event(&self, run_id: &str, event: &RunEvent) -> Result<()>;
     async fn read_events(&self, run_id: &str) -> Result<Vec<RunEvent>>;
     async fn read_events_tail(&self, run_id: &str, count: usize) -> Result<Vec<RunEvent>>;
-    /// Tail-follow for `logs --follow`. Ends when `token` is cancelled.
+    /// Reads the JSONL file to EOF and ends — **not** a tail-follow. Waits up to 30 s
+    /// for the file to appear. Cancellable. Has no production caller (tests only);
+    /// `logs --follow` subscribes to the EventBus instead. See PARITY.md §6.9.
     fn stream_events(&self, run_id: &str, token: CancellationToken)
         -> BoxStream<'static, Result<RunEvent>>;
     /// Release the cached O_APPEND handle for this run.

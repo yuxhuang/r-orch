@@ -57,6 +57,15 @@ kstring = "2.0.2"
 # ── TUI (ARCHITECTURE §4.4) ────────────────────────────────────────────────
 ratatui = "0.30"
 crossterm = "0.29"
+# ARCHITECTURE §4.8 library-first: the wizard textarea step (multi-line editing,
+# undo, word motions, soft wrapping, line numbers). `tui-textarea` 0.7 is pinned
+# to ratatui 0.29 and would pull a second ratatui+crossterm stack; `-2` is the
+# maintained ratatui-0.30 continuation and also adds the soft-wrap/visual-row
+# cursor support the wizard needs (docs/parity/tui.md §5.1).
+tui-textarea-2 = "0.13"
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+unicode-normalization = "0.1"
 
 # ── Support (ARCHITECTURE §4.5) ────────────────────────────────────────────
 jiff = "0.2"

@@ -20,7 +20,6 @@ futures.workspace = true
 indexmap.workspace = true
 # Parses the ISO-8601 timestamps the stall clock and the retry queue compare.
 # `orch_core::clock` owns the formatter; there is no shared parser yet.
-jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

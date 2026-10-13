@@ -1560,7 +1560,6 @@ dependencies = [
  "futures",
  "indexmap",
  "insta",
- "jiff",
  "orch-core",
  "orch-domain",
  "orch-infra",
@@ -1612,19 +1611,15 @@ name = "orch-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "futures",
  "indexmap",
- "insta",
- "orch-core",
  "orch-domain",
- "orch-engine",
  "ratatui",
- "serde",
  "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
  "tracing",
+ "tui-textarea-2",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -2602,6 +2597,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2741,6 +2742,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tui-textarea-2"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdf2865f7f32ae9e779f6185986fd920fa6b00ac878e906927ec7e78d32316ed"
+dependencies = [
+ "crossterm",
+ "portable-atomic",
+ "ratatui-core",
+ "ratatui-widgets",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2757,6 +2772,15 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

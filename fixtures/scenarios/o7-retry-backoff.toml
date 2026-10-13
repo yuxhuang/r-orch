@@ -1,7 +1,6 @@
 name = "o7-retry-backoff"
 kind = "differential"
 requires = ["serve", "config set", "status", "logs"]
-fake_agents = true
 timeout_secs = 120
 env = { ORCH_FAKE_SCENARIO = "fail" }
 description = """
