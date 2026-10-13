@@ -134,3 +134,44 @@ fn filter_relevant_context_matches_ts() {
         assert_eq!(got, c.expected, "filter case {}", c.name);
     }
 }
+
+fn plain_context() -> PromptContext {
+    render_cases().remove(0).context
+}
+
+#[tokio::test]
+async fn render_timeout_error_message_is_exact() {
+    let engine = LiquidTemplateEngine::with_render_timeout_ms(1);
+    let err = engine
+        .render("{% for i in (1..400000) %}x{% endfor %}", &plain_context())
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Template render timed out after 1ms");
+}
+
+#[tokio::test]
+async fn zero_timeout_disables_the_limit() {
+    let engine = LiquidTemplateEngine::with_render_timeout_ms(0);
+    let out = engine
+        .render("{% for i in (1..200000) %}x{% endfor %}", &plain_context())
+        .await
+        .unwrap();
+    assert_eq!(out.len(), 200_000);
+}
+
+#[tokio::test]
+async fn default_engine_renders_within_the_timeout() {
+    let out = LiquidTemplateEngine::default()
+        .render("Hello {{ agent.name }}", &plain_context())
+        .await
+        .unwrap();
+    assert!(out.starts_with("Hello "));
+}
+
+#[tokio::test]
+async fn a_syntax_error_is_an_error_not_a_panic() {
+    let res = LiquidTemplateEngine::new()
+        .render("{% if %}", &plain_context())
+        .await;
+    assert!(res.is_err());
+}

@@ -243,3 +243,241 @@ pub fn build_prompt_context(
         goal: options.goal,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_core::test_support::{make_agent, make_task};
+    use orch_domain::{MessageChannel, MessageStatus, default_config};
+
+    fn retry() -> RetryContext {
+        RetryContext {
+            previous_error: "boom".into(),
+            previous_output: "out".into(),
+        }
+    }
+
+    fn build(attempt: u32, options: BuildPromptOptions<'_>) -> PromptContext {
+        build_prompt_context(
+            &make_task(),
+            &make_agent(),
+            attempt,
+            "/ws",
+            &default_config(),
+            options,
+        )
+    }
+
+    fn ctx(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn keys(entries: &[SharedContextEntry]) -> Vec<&str> {
+        entries.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    fn filter<'a>(name: &'a str) -> ContextFilterInput<'a> {
+        ContextFilterInput {
+            agent_name: name,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn first_attempt_has_no_attempt_or_retry_even_when_supplied() {
+        let c = build(
+            1,
+            BuildPromptOptions {
+                retry_context: Some(retry()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.attempt, None);
+        assert_eq!(c.retry, None);
+    }
+
+    #[test]
+    fn later_attempt_carries_the_retry_context() {
+        let c = build(
+            2,
+            BuildPromptOptions {
+                retry_context: Some(retry()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.attempt, Some(2));
+        assert_eq!(c.retry, Some(retry()));
+        assert_eq!(build(2, BuildPromptOptions::default()).retry, None);
+    }
+
+    #[test]
+    fn team_listing_blanks_only_the_current_agents_role() {
+        let me = Agent {
+            role: Some("Mine".into()),
+            ..make_agent()
+        };
+        let other = Agent {
+            id: "agt_other".into(),
+            name: "other".into(),
+            role: Some("Senior Backend Developer\n## WORKFLOW\nx".into()),
+            ..make_agent()
+        };
+        let no_role = Agent {
+            id: "agt_none".into(),
+            role: None,
+            ..make_agent()
+        };
+        let all = [me.clone(), other.clone(), no_role];
+        let c = build_prompt_context(
+            &make_task(),
+            &me,
+            1,
+            "/ws",
+            &default_config(),
+            BuildPromptOptions {
+                all_agents: &all,
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.agent.role.as_deref(), Some("Mine"));
+        assert_eq!(c.agents[0].role, None);
+        assert_eq!(c.agents[1].role, other.role);
+        assert_eq!(c.agents[2].role, None);
+    }
+
+    #[test]
+    fn messages_resolve_sender_names_and_empty_means_none() {
+        let sender = Agent {
+            id: "agt_s".into(),
+            name: "Sender".into(),
+            ..make_agent()
+        };
+        let msg = |from: &str| Message {
+            id: "msg_1".into(),
+            channel: MessageChannel::Direct,
+            from_agent_id: from.into(),
+            to_agent_id: None,
+            subject: "s".into(),
+            body: "b".into(),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            expires_at: None,
+            status: MessageStatus::Pending,
+            delivered_at: None,
+            team_id: None,
+            reply_to: None,
+        };
+        let all = [sender];
+        let c = build(
+            1,
+            BuildPromptOptions {
+                all_agents: &all,
+                messages: &[msg("agt_s"), msg("agt_unknown")],
+                ..Default::default()
+            },
+        );
+        let m = c.messages.unwrap();
+        assert_eq!(m[0].from, "Sender");
+        assert_eq!(m[1].from, "agt_unknown");
+        assert_eq!(build(1, BuildPromptOptions::default()).messages, None);
+    }
+
+    #[test]
+    fn autonomous_label_and_goal_id_flow_into_the_task_context() {
+        let task = Task {
+            labels: vec!["autonomous".into()],
+            goal_id: Some("goal_1".into()),
+            ..make_task()
+        };
+        let c = build_prompt_context(
+            &task,
+            &make_agent(),
+            1,
+            "/ws",
+            &default_config(),
+            BuildPromptOptions::default(),
+        );
+        assert!(c.task.is_autonomous);
+        assert_eq!(c.task.goal_id.as_deref(), Some("goal_1"));
+    }
+
+    #[test]
+    fn shared_context_is_filtered_and_empty_means_none() {
+        let all = ctx(&[("a", "1")]);
+        let c = build(
+            1,
+            BuildPromptOptions {
+                shared_context: Some(&all),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.shared_context, Some(vec![("a".into(), "1".into())]));
+        let empty = IndexMap::new();
+        let c = build(
+            1,
+            BuildPromptOptions {
+                shared_context: Some(&empty),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.shared_context, None);
+    }
+
+    #[test]
+    fn filter_ranks_goal_then_agent_then_scope_then_role_then_generic() {
+        let all = ctx(&[
+            ("zz", "none"),
+            ("bug-1", "x"),
+            ("backend-x", "x"),
+            ("api", "x"),
+            ("n", "mentions backend a"),
+            ("goal_1-progress", "x"),
+        ]);
+        let scope = vec!["api/**".to_owned()];
+        let got = filter_relevant_context(
+            &all,
+            &ContextFilterInput {
+                agent_name: "Backend A",
+                goal_id: Some("goal_1"),
+                task_scope: Some(&scope),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            keys(&got),
+            ["goal_1-progress", "n", "api", "backend-x", "bug-1", "zz"]
+        );
+    }
+
+    #[test]
+    fn filter_caps_at_fifteen_and_pads_with_unscored_entries() {
+        let pairs: Vec<(String, String)> = (0..30).map(|i| (format!("k{i:02}"), "v".into())).collect();
+        let all: IndexMap<_, _> = pairs.into_iter().collect();
+        let got = filter_relevant_context(&all, &filter("Zed"));
+        assert_eq!(got.len(), MAX_CONTEXT_ENTRIES);
+        assert_eq!(got[0].0, "k00");
+    }
+
+    #[test]
+    fn long_values_are_never_truncated() {
+        let long = "x".repeat(600);
+        let all = ctx(&[("k", &long)]);
+        assert_eq!(filter_relevant_context(&all, &filter("Zed"))[0].1, long);
+    }
+
+    #[test]
+    fn role_keywords_cover_name_special_cases_and_role() {
+        assert_eq!(extract_role_keywords("backend a", None), ["backend"]);
+        assert_eq!(
+            extract_role_keywords("front-end", None),
+            ["front", "front-end", "frontend", "tui"]
+        );
+        assert_eq!(
+            extract_role_keywords("cmo", Some("Marketing lead")),
+            ["cmo", "marketer", "marketing", "cmo"]
+        );
+        assert_eq!(extract_role_keywords("a b", Some("qa")), Vec::<String>::new());
+    }
+}
