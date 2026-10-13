@@ -1,5 +1,6 @@
 //! Dev tooling for r-orch. `cargo xtask <command>`.
 
+mod crate_graph;
 mod harness;
 mod normalize;
 mod scenario;
@@ -27,6 +28,8 @@ enum Task {
         #[arg(long)]
         verbose: bool,
     },
+    /// Assert the crate layering from ARCHITECTURE §3.1.
+    CrateGraph,
     /// Replay every scenario against the oracle alone, checking that the
     /// scenarios themselves are well-formed.
     ///
@@ -50,6 +53,7 @@ fn main() -> Result<()> {
     match cli.command {
         Task::Parity { filter, verbose } => parity(&repo_root, filter.as_deref(), verbose),
         Task::LintScenarios { filter } => lint_scenarios(&repo_root, filter.as_deref()),
+        Task::CrateGraph => crate_graph::run(&repo_root),
     }
 }
 
