@@ -1,0 +1,16 @@
+name = "cmd-init"
+kind = "differential"
+requires = ["config get", "agent list"]
+description = """
+`init` itself: a second init reports `Already initialized` and exits 0 \
+rather than erroring, and must not disturb what the first one wrote — note \
+the third step asks for a different name and adapter and must still change \
+nothing."""
+steps = [
+  "init --name proj --adapter claude",
+  "init --name proj --adapter claude",
+  "init --name other --adapter shell",
+  "config get project.name --json",
+  "agent list --json",
+  "task list --json",
+]

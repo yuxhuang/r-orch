@@ -1,0 +1,25 @@
+name = "cmd-exit-codes-groups"
+kind = "differential"
+requires = ["config get", "context set", "goal add", "team list", "msg list", "org list"]
+description = """
+A command group invoked with no subcommand: exit 1, help text printed. \
+Measured correction to the contract — §3 says that help goes to \
+**stdout**, and it goes to **stderr** (0 bytes out, 735 bytes err for \
+`orch task`). Also the Commander usage errors, whose exit code is L0 and \
+whose wording is L2, hence @exit-only throughout."""
+steps = [
+  "init --name proj --adapter claude",
+  "@exit-only task",
+  "@exit-only agent",
+  "@exit-only config",
+  "@exit-only context",
+  "@exit-only goal",
+  "@exit-only team",
+  "@exit-only msg",
+  "@exit-only org",
+  "@exit-only config global",
+  "@exit-only task list --nosuchflag",
+  "@exit-only agent add missing-adapter-flag",
+  "@exit-only task add",
+  "@exit-only task show",
+]

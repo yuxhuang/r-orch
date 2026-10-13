@@ -1,0 +1,29 @@
+name = "cmd-agent-lifecycle"
+kind = "differential"
+requires = ["agent list", "agent status", "agent disable", "agent enable", "agent remove"]
+description = """
+The agent subcommands: add, list, status, edit, disable, enable, \
+autonomous, remove, and `agent shop --list`, which prints the catalogue \
+table non-interactively instead of opening the picker. The read verb is \
+`agent status <id>`, not `agent show`."""
+steps = [
+  "init --name proj --adapter claude",
+  "agent add shelly --adapter shell --command 'echo hello' --quiet",
+  "agent add claudia --adapter claude --model claude-sonnet-4-6 --effort high --quiet",
+  "agent list",
+  "agent list --json",
+  "agent status ${agent.0}",
+  "agent status ${agent.0} --json",
+  "agent status ${agent.1} --json",
+  "agent shop --list",
+  "agent disable ${agent.0}",
+  "agent list --json",
+  "agent enable ${agent.0}",
+  "agent list --json",
+  "agent autonomous ${agent.1} --on",
+  "agent status ${agent.1} --json",
+  "agent autonomous ${agent.1} --off",
+  "agent status ${agent.1} --json",
+  "agent remove ${agent.0}",
+  "agent list --json",
+]

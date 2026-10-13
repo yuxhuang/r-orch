@@ -1,0 +1,24 @@
+name = "o7-stall-detection"
+kind = "differential"
+requires = ["serve", "config set", "status"]
+fake_agents = true
+timeout_secs = 90
+env = { ORCH_FAKE_SCENARIO = "slow", ORCH_FAKE_SLOW_SECONDS = "25" }
+description = """
+Red-team O7 / V24: a run emitting nothing past stall_timeout_ms must be \
+reaped, and both binaries must reap it identically. Driven through config \
+rather than an injected clock — defaults.agent.stall_timeout_ms is a key \
+both binaries honour, so the scenario stays genuinely differential instead \
+of needing a Rust-only knob the oracle has no equivalent for. The stall \
+clock advances per emitted AgentEvent, not per stdout line, so a sleeping \
+agent stalls and a chatty one does not."""
+steps = [
+  "init --name proj --adapter claude",
+  "config set defaults.agent.stall_timeout_ms 2000",
+  "config set scheduling.poll_interval_ms 500",
+  "agent add slowpoke --adapter claude --quiet",
+  "task add 'A task that stalls' --assignee ${agent.0} --quiet",
+  "serve --once --log-format json",
+  "task list --json",
+  "status --json",
+]

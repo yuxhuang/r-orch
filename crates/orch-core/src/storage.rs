@@ -125,8 +125,16 @@ pub trait RunStore: Send + Sync {
     async fn append_event(&self, run_id: &str, event: &RunEvent) -> Result<()>;
     async fn read_events(&self, run_id: &str) -> Result<Vec<RunEvent>>;
     async fn read_events_tail(&self, run_id: &str, count: usize) -> Result<Vec<RunEvent>>;
-    /// Tail-follow for `logs --follow`. The stream ends when `token` is
-    /// cancelled, mirroring the TS `AbortSignal` parameter.
+    /// Read the events file once, from the beginning, **to EOF**.
+    ///
+    /// Despite the name this does **not** tail-follow: the TS version opens a
+    /// `createReadStream` and its generator ends at EOF. `logs --follow`
+    /// re-invokes it. The token only lets a consumer stop early, mirroring the
+    /// `AbortSignal` parameter.
+    ///
+    /// *(Doc-only amendment. The signature is unchanged; the original comment
+    /// said "tail-follow", which would have had WP-5 build `logs --follow` on
+    /// a guarantee the implementation never made.)*
     fn stream_events(
         &self,
         run_id: &str,

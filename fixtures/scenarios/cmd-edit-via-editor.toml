@@ -1,0 +1,26 @@
+name = "cmd-edit-via-editor"
+kind = "differential"
+requires = ["task edit", "agent edit"]
+fake_editor = "orch-edit-title"
+description = """
+`task edit` and `agent edit`, the two subcommands in §2.2 that take no \
+flags: each serializes the entity into a `---` frontmatter temp file, \
+spawns $EDITOR on it, and parses what comes back. $EDITOR here is a \
+scripted filter from fixtures/fake-editors, so both binaries receive byte- \
+identical edits and what gets compared is the protocol — which frontmatter \
+keys a changed line updates, and whether anything else moves. Measured \
+from the oracle's editor.ts: the task file carries `title` and `priority` \
+with the description as the body, the agent file carries `name`, `command` \
+and `model` with the role as the body, and only *changed* fields are \
+written back."""
+steps = [
+  "init --name proj --adapter claude",
+  "task add 'Before the edit' --description 'original body' --priority 3 --quiet",
+  "agent add shelly --adapter shell --command 'echo hi' --quiet",
+  "task edit ${task.0}",
+  "task show ${task.0} --json",
+  "agent edit ${agent.0}",
+  "agent status ${agent.0} --json",
+  "agent list --json",
+  "task edit tsk_nosuch",
+]

@@ -1,0 +1,34 @@
+name = "cmd-team"
+kind = "differential"
+requires = ["team create", "team list", "team show", "team join", "team leave", "team add-task", "team set-lead", "team disband"]
+description = """
+The team subcommands. The create flag is `--lead <agent-id>`. Two measured \
+rules that are easy to lose: the lead cannot leave (exit 2, `Lead cannot \
+leave team. Disband the team or transfer lead first.`) and re-joining is \
+an error rather than a no-op (exit 2). `disband` sets status to disbanded \
+without deleting the file, so the team stays readable afterwards."""
+steps = [
+  "init --name proj --adapter claude",
+  "agent add second --adapter claude --quiet",
+  "agent add third --adapter claude --quiet",
+  "team create squad --lead agt_creator --description 'the squad' --quiet",
+  "team list",
+  "team list --json",
+  "team show ${team.0}",
+  "team show ${team.0} --json",
+  "team join ${team.0} ${agent.0}",
+  "team join ${team.0} ${agent.0}",
+  "team show ${team.0} --json",
+  "team leave ${team.0} agt_creator",
+  "team set-lead ${team.0} ${agent.0}",
+  "team show ${team.0} --json",
+  "team leave ${team.0} agt_creator",
+  "task add 'Team work' --quiet",
+  "team add-task ${team.0} ${task.0}",
+  "team add-task ${team.0} ${task.0}",
+  "team show ${team.0} --json",
+  "team create nolead --lead agt_nosuch",
+  "team disband ${team.0}",
+  "team list --json",
+  "team show ${team.0} --json",
+]

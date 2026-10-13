@@ -1,0 +1,20 @@
+name = "cmd-goal-pending-tasks"
+kind = "differential"
+requires = ["goal add", "goal status"]
+description = """
+The achieved guard: a goal with a non-terminal linked task cannot be \
+achieved. Measured exit 1, with the count and a task summary in the \
+message (`1 task(s) still pending — <id> (todo)`) and a hint line pointing \
+at --force; --force then cancels the pending tasks and marks the goal \
+achieved."""
+steps = [
+  "init --name proj --adapter claude",
+  "goal add 'Blocked goal' --quiet",
+  "task add 'Still pending' --goal-id ${goal.0} --quiet",
+  "task add 'Also pending' --goal-id ${goal.0} --quiet",
+  "goal status ${goal.0} achieved",
+  "task list --json",
+  "goal status ${goal.0} achieved --force --json",
+  "task list --json",
+  "goal list --json",
+]

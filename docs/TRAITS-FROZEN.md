@@ -510,3 +510,43 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
    reach a moment later anyway. **The orchestrator's grace-period kills are
    still required** — this path sends one `SIGTERM` and never escalates to
    `SIGKILL`.
+
+8. **`PARITY.md §3` says a bare command group prints its help to stdout — it
+   prints to stderr.** Measured against the vendored oracle in a hermetic
+   tmpdir, for three groups:
+
+   | argv | stdout | stderr | exit |
+   |---|---|---|---|
+   | `orch task` | 0 B | 735 B | 1 |
+   | `orch agent` | 0 B | 654 B | 1 |
+   | `orch config` | 0 B | 407 B | 1 |
+
+   The first stderr line is `Usage: orchestry task [options] [command]`. This
+   is Commander's `help({ error: true })` path, which is what a subcommand
+   without an `.action()` falls into. The exit code in §3 is right; only the
+   stream is wrong. `fixtures/scenarios/cmd-exit-codes-groups.toml` encodes the
+   measured behaviour, and `harness.rs::is_group_help` documents it where the
+   lint needs to recognise it. **WP-5: write to stderr.**
+
+9. **`config global get` cannot read a nested key, and that is L0.** In the
+   same tree, `config global show --json` prints
+   `{"tui":{"palette":"amber",…}}` while `config global get tui.palette --json`
+   prints `{"key":"tui.palette"}` — no `value` at all, exit 0. `config global
+   get tui` is likewise empty. The project-level `config get` *does* walk dot
+   paths (`config get defaults.agent.max_turns` → `{"key":…,"value":50}`), so
+   the two commands differ. Replicated as measured in
+   `fixtures/scenarios/cmd-config.toml`: the CLI contract is byte parity, not
+   sanity. **WP-5: do not "fix" this.**
+
+10. **`task edit` and `agent edit` take no options whatsoever.** §2.2 lists
+    them beside flag-taking verbs, which invites the assumption that they
+    accept `--title`/`--description`/`--model`. They do not: each serializes
+    the entity into a `---` frontmatter temp file, spawns `$EDITOR` (then
+    `$VISUAL`, then `vi`) on it, and parses what comes back, writing only the
+    fields that changed. Four scenarios were originally written with invented
+    flags and would have asserted nothing; `cargo xtask lint-scenarios` now
+    catches that class of mistake, and `fixtures/fake-editors/` makes the two
+    commands reachable from a scenario at all. The editor protocol itself is
+    L0 surface nobody had enumerated: the frontmatter keys per entity, the
+    "No changes." path when nothing is edited, and `Editor exited with code N`
+    on a non-zero editor exit — all four are now scenarios.
