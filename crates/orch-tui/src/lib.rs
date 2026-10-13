@@ -1,7 +1,14 @@
+pub mod app;
 pub mod backend;
 pub mod clock;
 pub mod command_bar;
+pub mod commands;
 pub mod format;
+pub mod keys;
+pub mod layout;
+pub mod messages;
+pub mod onboarding;
+pub mod state;
 pub mod text;
 pub mod theme;
 pub mod wizard;

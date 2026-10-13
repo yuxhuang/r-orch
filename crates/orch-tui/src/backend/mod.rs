@@ -17,9 +17,9 @@
 //!    they are `poll_*` methods drained once per frame, which is what makes the
 //!    TUI tests synchronous (ARCHITECTURE §8.4).
 
-mod fake;
+pub mod fake;
 
-pub use fake::{Call, FakeBackend};
+pub use fake::{Call, FakeBackend, make_agent, make_goal, make_task, make_team};
 
 use indexmap::IndexMap;
 use orch_domain::{
