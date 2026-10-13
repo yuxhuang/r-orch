@@ -385,30 +385,26 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     String::new()
                 };
                 if adapter == "shell" && command.is_empty() {
-                    // Open the wizard pre-filled instead of creating.
-                    let mut wizard = configs::new_agent_wizard(
+                    // A shell agent with no command opens the wizard pre-filled
+                    // with the name and adapter instead of creating anything.
+                    let steps = configs::agent_wizard_steps(
                         &self.state.agents,
                         &self.state.teams,
                         &self.model_catalog,
                         &self.state.default_adapter,
-                    );
-                    let steps = wizard
-                        .all_steps()
-                        .iter()
-                        .cloned()
-                        .map(|step| match step.id.as_str() {
-                            "name" => step.default_value(&name),
-                            "adapter" => step.default_value("shell"),
-                            _ => step,
-                        })
-                        .collect();
-                    wizard.replace_steps(steps);
-                    let wizard = crate::wizard::Wizard::new(
+                    )
+                    .into_iter()
+                    .map(|step| match step.id.as_str() {
+                        "name" => step.default_value(&name),
+                        "adapter" => step.default_value("shell"),
+                        _ => step,
+                    })
+                    .collect();
+                    self.open_wizard(crate::wizard::Wizard::new(
                         crate::wizard::WizardKind::Agent,
                         "NEW AGENT",
-                        wizard.all_steps().to_vec(),
-                    );
-                    self.open_wizard(wizard);
+                        steps,
+                    ));
                     return;
                 }
                 self.pending(&format!("Creating agent \"{name}\"..."));

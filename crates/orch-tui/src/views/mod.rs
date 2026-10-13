@@ -123,41 +123,69 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         // The overlay replaces the content area and the bottom panel.
         let overlay_h = area.height.saturating_sub(7);
         widgets::help_overlay::render(frame, Rect::new(area.x, y, area.width, overlay_h), ctx);
-        y += overlay_h;
     } else {
+        // The main region's section label is one of the nine fixed rows, so it
+        // sits *above* `main_h` rather than inside it (docs/parity/tui.md §6).
+        render_main_label(frame, Rect::new(area.x, y, area.width, 1), ctx);
+        y += 1;
         if r.main_h > 0 {
-            let main = Rect::new(area.x, y, area.width, r.main_h.min(area.height - y));
+            let mut main_h = r.main_h.min(area.bottom().saturating_sub(y));
+            // A logs picker takes the lower part of the content area: the logs
+            // list shrinks to `max(3, mainH - 16)` (docs/parity/tui.md §6).
+            let picker_open = state.show_agent_picker || state.show_type_picker;
+            if state.view == ViewId::Logs && picker_open {
+                let list_h = main_h.saturating_sub(16).max(3);
+                let picker_h = main_h.saturating_sub(list_h);
+                main_h = list_h;
+                if picker_h > 0 {
+                    let picker = Rect::new(area.x, y + list_h, area.width, picker_h);
+                    if state.show_agent_picker {
+                        widgets::pickers::render_agent_picker(frame, picker, ctx);
+                    } else {
+                        widgets::pickers::render_type_picker(frame, picker, ctx);
+                    }
+                }
+            }
+            let main = Rect::new(area.x, y, area.width, main_h);
             render_main(frame, main, ctx);
-            y += main.height;
+            y += r.main_h.min(area.bottom().saturating_sub(y));
         }
         // Blank spacer between the regions.
         if y < area.bottom() {
             y += 1;
         }
-        if r.feed_h > 0 && y < area.bottom() {
-            let feed = Rect::new(area.x, y, area.width, r.feed_h.min(area.bottom() - y));
-            render_bottom(frame, feed, ctx);
-            y += feed.height;
+        // Toasts and the undo banner are bottom-anchored above the command
+        // bar. Ink let them push the layout; with fixed regions they take their
+        // rows from the bottom panel, which is the only elastic region.
+        let banner_rows = (state.visible_toasts().len() + state.pending_deletions.len()) as u16;
+        let available = area.bottom().saturating_sub(y + 1);
+        let feed_h = r
+            .feed_h
+            .min(available)
+            .saturating_sub(banner_rows.min(available.saturating_sub(1)));
+        if feed_h > 0 {
+            render_bottom(frame, Rect::new(area.x, y, area.width, feed_h), ctx);
         }
     }
 
-    // Toasts, the undo banner and the command bar are bottom-anchored.
-    let mut bottom = area.bottom();
-    bottom -= 1;
+    // The command bar always owns the last row.
+    let mut bottom = area.bottom() - 1;
     widgets::command_bar::render(frame, Rect::new(area.x, bottom, area.width, 1), ctx);
 
-    let undo_rows = state.pending_deletions.len() as u16;
-    if undo_rows > 0 && bottom > y {
-        let rows = undo_rows.min(bottom - y);
-        bottom -= rows;
-        widgets::undo_banner::render(frame, Rect::new(area.x, bottom, area.width, rows), ctx);
+    let undo_rows = (state.pending_deletions.len() as u16).min(bottom.saturating_sub(area.y));
+    if undo_rows > 0 {
+        bottom -= undo_rows;
+        widgets::undo_banner::render(frame, Rect::new(area.x, bottom, area.width, undo_rows), ctx);
     }
 
-    let toast_rows = state.visible_toasts().len() as u16;
-    if toast_rows > 0 && bottom > y {
-        let rows = toast_rows.min(bottom - y);
-        bottom -= rows;
-        widgets::toast::render(frame, Rect::new(area.x, bottom, area.width, rows), ctx);
+    let toast_rows = (state.visible_toasts().len() as u16).min(bottom.saturating_sub(area.y));
+    if toast_rows > 0 {
+        bottom -= toast_rows;
+        widgets::toast::render(
+            frame,
+            Rect::new(area.x, bottom, area.width, toast_rows),
+            ctx,
+        );
     }
 }
 
@@ -171,31 +199,16 @@ fn render_too_small(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
 }
 
+fn render_main_label(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    section_label(frame, area, ctx, ctx.state.view.label(), None);
+}
+
 fn render_main(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    let label_area = Rect::new(area.x, area.y, area.width, 1);
-    let list_area = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(1),
-    );
     match ctx.state.view {
-        ViewId::Goals => {
-            section_label(frame, label_area, ctx, "GOALS", None);
-            goals::render(frame, list_area, ctx);
-        }
-        ViewId::Tasks => {
-            section_label(frame, label_area, ctx, "TASKS", None);
-            tasks::render(frame, list_area, ctx);
-        }
-        ViewId::Agents => {
-            section_label(frame, label_area, ctx, "AGENTS", None);
-            agents::render(frame, list_area, ctx);
-        }
-        ViewId::Logs => {
-            section_label(frame, label_area, ctx, "ACTIONS", None);
-            logs::render(frame, list_area, ctx);
-        }
+        ViewId::Goals => goals::render(frame, area, ctx),
+        ViewId::Tasks => tasks::render(frame, area, ctx),
+        ViewId::Agents => agents::render(frame, area, ctx),
+        ViewId::Logs => logs::render(frame, area, ctx),
     }
 }
 

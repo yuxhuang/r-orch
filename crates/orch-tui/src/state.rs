@@ -788,11 +788,20 @@ impl AppState {
     pub fn list_item_count(&self, _can_create: bool) -> usize {
         match self.view {
             ViewId::Goals => self.sorted_goals().len() + 1,
+            // The welcome screen replaces the list, and the onboarding nudge
+            // sits under it; both need rows of their own.
+            ViewId::Tasks if self.onboarding == OnboardingStep::Welcome => 6,
             ViewId::Tasks => {
                 self.visible_tasks().len()
                     + 1
                     + usize::from(self.hidden_task_count() > 0)
                     + self.task_group_section_rows()
+                    + usize::from(matches!(
+                        self.onboarding,
+                        OnboardingStep::TaskCreated
+                            | OnboardingStep::RunStarted
+                            | OnboardingStep::Completed
+                    ))
             }
             ViewId::Agents => self.agents.len() + 1 + self.agent_section_rows(),
             ViewId::Logs => 0,
