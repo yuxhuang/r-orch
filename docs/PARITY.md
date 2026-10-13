@@ -2696,7 +2696,7 @@ solid text, selection); exact hex values are L2.
 
 ### 12.8 Deliberate divergences in r-orch's TUI
 
-WP-6 is complete: **740 tests, 100 % of this section's checklist.** Seven divergences from the Ink original
+WP-6 is complete: **740 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
 
@@ -2709,6 +2709,7 @@ each is justified on its own merits rather than by the gate.
 | e | The `W` hint is dropped | L2 | Advertised by `onboarding-config.ts`, **no handler exists**. | §13 |
 | f | Toast and undo rows come from the elastic bottom panel | **L2** | Pure layout. The rows exist and carry the same text; where the space is taken from differs. | here |
 | g | `log_selected_index` consistently indexes the **filtered** list | L1 | The original mixes filtered and unfiltered indexing, so the highlighted row and the detail shown disagree whenever a filter is active. | §14.20 |
+| h | Pre-dispatch failures reported synchronously as `Err` | L1 | The TUI renders no `orchestrator:error` case, so a stream-only dispatch error is **invisible**. | §12.10 |
 
 Items (b) and (f) are recorded only here, because they are additions/layout rather than behaviours of the
 original. The other five have §13 or §14 entries.
