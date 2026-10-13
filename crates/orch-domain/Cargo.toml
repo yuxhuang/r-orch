@@ -1,0 +1,29 @@
+[package]
+name = "orch-domain"
+description = "Pure domain types and functions for r-orch. No I/O, no async."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+# RunEvent.data / AgentEvent.data are `unknown` in TS; config deep-merge and the
+# tolerant state read both operate on a JSON value tree.
+serde_json.workspace = true
+thiserror.workspace = true
+# Insertion-ordered map/set, to mirror JS object and Set iteration order
+# (OrchestratorState.running, OrchestratorState.claimed).
+indexmap.workspace = true
+
+[dev-dependencies]
+# Only to assert what the frozen types emit as YAML, so WP-1 inherits evidence
+# rather than a guess. The domain crate itself does no serialization.
+serde_yaml_ng.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

@@ -1,0 +1,36 @@
+[package]
+name = "orch-core"
+description = "Port traits for r-orch: storage, adapters, process, workspace, templates, clock, ids."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# In-memory fakes and entity factories. Other crates take orch-core with this
+# feature as a dev-dependency so the fakes never ship in a release binary.
+test-support = []
+
+[dependencies]
+orch-domain.workspace = true
+
+async-trait.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# `process` for the child stdio handles in SpawnedChild, `sync` for the exit
+# watch channel, `time` for the fake clock's sleep-free timers.
+tokio = { workspace = true, features = ["process", "sync", "time", "io-util"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

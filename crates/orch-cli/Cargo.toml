@@ -1,0 +1,66 @@
+[package]
+name = "orch-cli"
+description = "clap command tree, output rendering and serve mode for r-orch. Hosts the three binaries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# All three names are the same program, matching the npm `bin` map. The clap
+# program name stays `orchestry` so `--help` matches. They are three one-line
+# shims over `orch_cli::run` rather than three targets sharing one `main.rs`:
+# cargo warns on the latter ("found to be present in multiple build targets")
+# and compiles it three times.
+[[bin]]
+name = "orch"
+path = "src/bin/orch.rs"
+
+[[bin]]
+name = "orchestry"
+path = "src/bin/orchestry.rs"
+
+[[bin]]
+name = "ao"
+path = "src/bin/ao.rs"
+
+[dependencies]
+orch-domain.workspace = true
+orch-core.workspace = true
+orch-engine.workspace = true
+orch-infra.workspace = true
+orch-tui.workspace = true
+
+# anyhow is allowed here and in xtask only — never in a library signature.
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "process",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+orch-core = { workspace = true, features = ["test-support"] }
+assert_cmd.workspace = true
+insta.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

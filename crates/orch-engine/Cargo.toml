@@ -1,0 +1,46 @@
+[package]
+name = "orch-engine"
+description = "Services, orchestrator, event bus and container for r-orch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orch-domain.workspace = true
+orch-core.workspace = true
+# The engine depends on orch-infra only to assemble the container in
+# `container::build_light`/`build_full`; every service takes orch-core traits.
+# It must NOT depend on orch-cli or orch-tui — asserted by `xtask crate-graph`.
+orch-infra.workspace = true
+
+async-trait.workspace = true
+futures.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "process",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+orch-core = { workspace = true, features = ["test-support"] }
+insta.workspace = true
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
