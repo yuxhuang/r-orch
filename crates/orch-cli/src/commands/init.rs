@@ -64,6 +64,10 @@ __pycache__
 pub struct InitArgs {
     pub name: Option<String>,
     pub adapter: Option<String>,
+    /// Both stdout and stdin are a TTY, which is what gates the multi-adapter
+    /// prompt (`docs/parity/cli.md` §15.4). The parity harness runs every
+    /// scenario with stdin on `/dev/null`, so it never takes that branch.
+    pub interactive: bool,
 }
 
 /// What `init` did, so the caller can print the `Next:` line without
@@ -87,7 +91,7 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
 
     let adapter = match &args.adapter {
         Some(adapter) => adapter.clone(),
-        None => detect_adapter(styles).await,
+        None => detect_adapter(styles, args.interactive).await,
     };
 
     for dir in [
@@ -170,11 +174,10 @@ pub fn next_hint(adapter: &str) -> &'static str {
 
 /// Probe each adapter's `--version` and pick one.
 ///
-/// Non-interactive only: with several adapters available the TS version
-/// prompts on a TTY, and that branch is WP-5's — it cannot be exercised by the
-/// parity harness, which runs every scenario non-interactively. The
-/// non-TTY behaviour (take the first available) is identical here.
-async fn detect_adapter(styles: &Styles) -> String {
+/// Four outcomes: none detected defaults to claude with a note, one is taken
+/// with a note, several are taken silently when not interactive, and several
+/// on a TTY prompt.
+async fn detect_adapter(styles: &Styles, interactive: bool) -> String {
     let mut available: Vec<(String, Option<String>)> = Vec::new();
 
     for adapter in SUPPORTED_ADAPTERS {
@@ -211,22 +214,60 @@ async fn detect_adapter(styles: &Styles) -> String {
             );
             "claude".to_owned()
         }
-        _ => {
+        1 => {
             let (name, version) = &available[0];
-            if available.len() == 1 {
-                let suffix = version
-                    .as_ref()
-                    .map(|v| format!("({v})"))
-                    .unwrap_or_default();
-                println!(
-                    "  {} {}",
-                    styles.dim(&format!("Detected: {name}")),
-                    styles.dim(&suffix)
-                );
-            }
+            let suffix = version
+                .as_ref()
+                .map(|v| format!("({v})"))
+                .unwrap_or_default();
+            println!(
+                "  {} {}",
+                styles.dim(&format!("Detected: {name}")),
+                styles.dim(&suffix)
+            );
             name.clone()
         }
+        _ if !interactive => available[0].0.clone(),
+        _ => {
+            print!("{}", render_adapter_menu(&available));
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
+            let mut answer = String::new();
+            // A closed stdin reads nothing, which falls back to the first
+            // adapter — the same place an out-of-range answer lands.
+            let _ = std::io::stdin().read_line(&mut answer);
+            let chosen = parse_adapter_choice(&answer, available.len());
+            available[chosen].0.clone()
+        }
     }
+}
+
+/// The menu and its prompt, as one block so the layout is assertable.
+fn render_adapter_menu(available: &[(String, Option<String>)]) -> String {
+    let mut out = String::from("\n  Available adapters:\n");
+    for (index, (name, version)) in available.iter().enumerate() {
+        match version {
+            Some(version) => out.push_str(&format!("    {}) {name} {version}\n", index + 1)),
+            None => out.push_str(&format!("    {}) {name} \n", index + 1)),
+        }
+    }
+    out.push_str(&format!(
+        "\n  Choose default adapter [1-{}]: ",
+        available.len()
+    ));
+    out
+}
+
+/// A 1-based answer, where anything out of range or non-numeric falls back to
+/// the **first** adapter.
+fn parse_adapter_choice(answer: &str, len: usize) -> usize {
+    answer
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|choice| *choice >= 1 && *choice <= len)
+        .map_or(0, |choice| choice - 1)
 }
 
 /// `<command> --version`, 5 s timeout, first line of stdout trimmed.
@@ -307,6 +348,40 @@ mod tests {
     use super::*;
     use orch_infra::storage::fs_utils::clear_ensured_dirs;
 
+    #[test]
+    fn the_adapter_menu_numbers_from_one_and_prompts_with_the_range() {
+        let available = vec![
+            (
+                "claude".to_owned(),
+                Some("2.1.296 (Claude Code)".to_owned()),
+            ),
+            ("codex".to_owned(), Some("codex-cli 0.162.1".to_owned())),
+        ];
+        assert_eq!(
+            render_adapter_menu(&available),
+            "\n  Available adapters:\n\
+             \x20   1) claude 2.1.296 (Claude Code)\n\
+             \x20   2) codex codex-cli 0.162.1\n\
+             \n  Choose default adapter [1-2]: "
+        );
+    }
+
+    #[test]
+    fn an_adapter_without_a_version_still_gets_a_line() {
+        let available = vec![("grok".to_owned(), None)];
+        assert!(render_adapter_menu(&available).contains("    1) grok \n"));
+    }
+
+    #[test]
+    fn an_out_of_range_or_junk_choice_falls_back_to_the_first_adapter() {
+        assert_eq!(parse_adapter_choice("1\n", 2), 0);
+        assert_eq!(parse_adapter_choice("2\n", 2), 1);
+        assert_eq!(parse_adapter_choice(" 2 ", 2), 1);
+        for junk in ["", "\n", "0", "3", "-1", "abc", "1.5", "two"] {
+            assert_eq!(parse_adapter_choice(junk, 2), 0, "{junk:?}");
+        }
+    }
+
     async fn init(root: &Path, args: InitArgs) -> InitOutcome {
         clear_ensured_dirs();
         run(&Styles::plain(), root, &args).await.unwrap()
@@ -316,6 +391,7 @@ mod tests {
         InitArgs {
             name: Some("proj".into()),
             adapter: Some("shell".into()),
+            interactive: false,
         }
     }
 
@@ -363,6 +439,7 @@ mod tests {
             InitArgs {
                 name: Some("p".into()),
                 adapter: Some("claude".into()),
+                interactive: false,
             },
         )
         .await;
@@ -378,6 +455,7 @@ mod tests {
             InitArgs {
                 name: Some("p".into()),
                 adapter: Some("claude".into()),
+                interactive: false,
             },
         )
         .await;
@@ -402,6 +480,7 @@ mod tests {
             InitArgs {
                 name: Some("proj".into()),
                 adapter: Some("codex".into()),
+                interactive: false,
             },
         )
         .await;
@@ -423,6 +502,7 @@ mod tests {
             InitArgs {
                 name: None,
                 adapter: Some("shell".into()),
+                interactive: false,
             },
         )
         .await;
@@ -474,6 +554,7 @@ mod tests {
             InitArgs {
                 name: Some("different".into()),
                 adapter: Some("codex".into()),
+                interactive: false,
             },
         )
         .await;

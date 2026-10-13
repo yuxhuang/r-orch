@@ -1,197 +1,111 @@
 //! The clap command tree, output rendering and the single error boundary.
 //!
 //! WP-0b wired the walking-skeleton slice — `init`, `agent add`, `task add`,
-//! `task list` — end to end. WP-5 extends the tree in place.
+//! `task list` — end to end. WP-5 extends the tree in place: [`tree`] now
+//! carries all sixteen commands, and [`routing`] holds the three L0 routing
+//! properties (container-before-parse, the help fast path, Commander's exit
+//! codes) that the parity harness exercises from its first scenario.
 //!
-//! Three routing properties are L0 and are implemented here rather than left
-//! to WP-5, because the parity harness exercises them from its first scenario:
-//!
-//! - **Any command in an uninitialized directory exits `3`**, including
-//!   `orch <sub> --help` and an unknown command: the container is built before
-//!   argument parsing, so `NotInitializedError` wins over help and over usage
-//!   errors. Only `init`, `doctor` and `update` are exempt (PARITY.md §3).
-//! - **A command group with no subcommand** prints its help to **stdout** and
-//!   exits **`1`**.
-//! - Usage errors exit **`1`**, not clap's default `2`.
+//! Commands whose behaviour needs WP-4's services land with those services;
+//! until then they parse (so V1's surface check is honest) and report that
+//! they are not wired rather than pretending to work. [`not_wired`] is the one
+//! place that happens, and `crates/orch-cli/TEST-MAP.md` lists them.
 
 pub mod commands;
 pub mod context;
+pub mod doctor;
 pub mod editor;
+pub mod logs;
 pub mod output;
+pub mod routing;
 pub mod serve;
 pub mod shop_picker;
-pub mod update_check;
+pub mod tree;
+pub mod update;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser};
 use orch_core::error::{Error, Result};
+use orch_core::storage::RunStore;
 use orch_domain::{SUPPORTED_ADAPTERS, TaskStatus};
+use orch_infra::storage::FileRunStore;
 
 use crate::context::{CliContext, EnvFlags};
 use crate::output::{Styles, print_error};
+use crate::routing::ArgvShape;
+use crate::tree::{
+    AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigSub, ContextCmd, GoalCmd, InitCmd, MsgCmd,
+    OrgCmd, RunCmd, ServeCmd, TaskCmd, TaskSub, TeamCmd,
+};
 
-/// The clap program name stays `orchestry` so `--help` matches, whichever of
-/// the three binary names was invoked.
-#[derive(Debug, Parser)]
-#[command(
-    name = "orchestry",
-    about = "Agents Organizations — CLI orchestrator for AI agents",
-    version = "1.0.34",
-    disable_help_subcommand = true
-)]
-pub struct Cli {
-    #[arg(long, global = true, help = "Output as JSON")]
-    pub json: bool,
-    #[arg(long, global = true, help = "Minimal output (IDs only)")]
-    pub quiet: bool,
-    #[arg(long = "no-color", global = true, help = "Disable colors")]
-    pub no_color: bool,
-    #[arg(long, global = true, help = "ASCII-only output (no Unicode)")]
-    pub ascii: bool,
-
-    #[command(subcommand)]
-    pub command: Option<Command>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    /// Initialize .orchestry/ in the current directory
-    Init(InitCmd),
-    /// Manage tasks
-    Task(TaskCmd),
-    /// Manage agents
-    Agent(AgentCmd),
-}
-
-#[derive(Debug, Args)]
-pub struct InitCmd {
-    #[arg(long, help = "Project name")]
-    pub name: Option<String>,
-    #[arg(
-        long,
-        help = "Default agent adapter (claude, opencode, codex, cursor, pi, grok, antigravity, shell)"
-    )]
-    pub adapter: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct TaskCmd {
-    #[command(subcommand)]
-    pub command: Option<TaskSub>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum TaskSub {
-    /// Create a new task
-    ///
-    /// The flags live in their own `Args` struct rather than inline on the
-    /// variant: there are eleven of them, and an inline variant makes the enum
-    /// large enough that every `TaskSub` costs that much to move.
-    Add(Box<TaskAddFlags>),
-    /// List all tasks
-    List {
-        #[arg(long, help = "Filter by status")]
-        status: Option<String>,
-    },
-}
-
-#[derive(Debug, Args)]
-pub struct TaskAddFlags {
-    pub title: String,
-    #[arg(short, long, help = "Task description")]
-    pub description: Option<String>,
-    #[arg(short, long, default_value = "3", help = "Priority (1-4)")]
-    pub priority: String,
-    #[arg(short, long, help = "Comma-separated labels")]
-    pub labels: Option<String>,
-    #[arg(long = "depends-on", help = "Comma-separated dependency task IDs")]
-    pub depends_on: Option<String>,
-    #[arg(long = "max-attempts", help = "Max retry attempts")]
-    pub max_attempts: Option<String>,
-    #[arg(
-        long = "workspace-mode",
-        help = "Workspace mode: shared|worktree|isolated"
-    )]
-    pub workspace_mode: Option<String>,
-    #[arg(long, help = "Assign to agent")]
-    pub assignee: Option<String>,
-    #[arg(
-        long = "review-criteria",
-        help = "Comma-separated auto-review criteria: test_pass,typecheck,lint"
-    )]
-    pub review_criteria: Option<String>,
-    #[arg(long, help = "Comma-separated glob patterns for file scope")]
-    pub scope: Option<String>,
-    #[arg(long = "goal-id", help = "Associate task with a goal")]
-    pub goal_id: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct AgentCmd {
-    #[command(subcommand)]
-    pub command: Option<AgentSub>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AgentSub {
-    /// Add a new agent
-    Add(Box<AgentAddFlags>),
-}
-
-#[derive(Debug, Args)]
-pub struct AgentAddFlags {
-    pub name: String,
-    #[arg(
-        long,
-        required = true,
-        help = "Adapter type: claude, opencode, codex, cursor, pi, grok, antigravity, shell"
-    )]
-    pub adapter: String,
-    #[arg(long, help = "Agent role description")]
-    pub role: Option<String>,
-    #[arg(long, help = "Shell command (for shell adapter)")]
-    pub command: Option<String>,
-    #[arg(long, help = "Model name (for AI adapters)")]
-    pub model: Option<String>,
-    #[arg(long, help = "Reasoning effort: low, medium, high")]
-    pub effort: Option<String>,
-    #[arg(long = "max-turns", help = "Max turns per run")]
-    pub max_turns: Option<String>,
-    #[arg(long, help = "Timeout in ms")]
-    pub timeout: Option<String>,
-    #[arg(long = "approval-policy", help = "suggest|auto|manual")]
-    pub approval_policy: Option<String>,
-    #[arg(long = "workspace-mode", help = "shared|worktree|isolated")]
-    pub workspace_mode: Option<String>,
-    #[arg(long, help = "Comma-separated list of agent skills")]
-    pub skills: Option<String>,
+/// A command that parses but whose service is not wired yet.
+///
+/// Deliberately an error rather than a no-op: a silent success would make a
+/// scenario pass for the wrong reason, and the parity harness has no scenario
+/// for these until they land.
+fn not_wired(command: &str) -> Error {
+    Error::other(format!(
+        "{command} is not wired yet in this build (see crates/orch-cli/TEST-MAP.md)"
+    ))
 }
 
 /// The single entry point behind the `orch`, `orchestry` and `ao` binaries.
 pub fn run() -> ExitCode {
     let env = EnvFlags::from_env();
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let shape = ArgvShape::of(&argv);
 
-    // Parse first so the global flags are available to the error printer, but
-    // map clap's own exit code: a usage error is exit 1 in ORCH, not 2.
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(err) => {
-            let is_help_or_version = matches!(
-                err.kind(),
-                clap::error::ErrorKind::DisplayHelp
-                    | clap::error::ErrorKind::DisplayVersion
-                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-            );
-            let _ = err.print();
-            return if is_help_or_version {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            };
+    // `--help` / `--version` with no real subcommand: answer without touching
+    // the filesystem, so `orch --help` works anywhere.
+    if shape.is_help_fast_path() {
+        return match Cli::try_parse_from(&argv) {
+            // `orch --json` alone parses: fall through to the normal path.
+            Ok(cli) => dispatch_parsed(cli, env, shape),
+            Err(err) => ExitCode::from(routing::report_parse_error(&err)),
+        };
+    }
+
+    // The container is built **before** parsing, so an uninitialized project
+    // beats a usage error, an unknown command and `--help` on a subcommand.
+    if shape.requires_initialized_project() {
+        let styles = Styles {
+            color: env.stdout_is_tty && !env.no_color_env,
+            ascii: env.dumb_term,
+        };
+        match std::env::current_dir() {
+            Ok(cwd) if !is_initialized(&cwd) => {
+                let err = Error::from(orch_domain::DomainError::NotInitialized);
+                print_error(&styles, &err.to_string(), err.hint().as_deref());
+                return ExitCode::from(3);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                print_error(
+                    &styles,
+                    &format!("cannot read the working directory: {err}"),
+                    None,
+                );
+                return ExitCode::from(1);
+            }
         }
-    };
+    }
 
+    match Cli::try_parse_from(&argv) {
+        Ok(cli) => dispatch_parsed(cli, env, shape),
+        Err(err) => ExitCode::from(routing::report_parse_error(&err)),
+    }
+}
+
+/// `findProjectRoot` + `paths.isInitialized()`, synchronously: this runs
+/// before the runtime exists.
+fn is_initialized(cwd: &std::path::Path) -> bool {
+    let root = orch_infra::storage::find_project_root(cwd);
+    root.join(orch_infra::storage::ORCHESTRY_DIR).is_dir()
+}
+
+fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     let styles = styles_for(&cli, env);
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -206,7 +120,7 @@ pub fn run() -> ExitCode {
         }
     };
 
-    match runtime.block_on(dispatch(&cli, env)) {
+    match runtime.block_on(dispatch(&cli, env, &shape)) {
         Ok(code) => code,
         Err(err) => {
             print_error(&styles, &err.to_string(), err.hint().as_deref());
@@ -223,57 +137,32 @@ pub fn run() -> ExitCode {
     }
 }
 
-async fn dispatch(cli: &Cli, env: EnvFlags) -> Result<ExitCode> {
+async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCode> {
     let cwd = std::env::current_dir()
         .map_err(|err| Error::other(format!("cannot read the working directory: {err}")))?;
 
     match &cli.command {
-        // `init` is one of the three commands that work without a container.
-        Some(Command::Init(args)) => {
-            if let Some(adapter) = &args.adapter
-                && !orch_domain::is_adapter_kind(adapter)
-            {
-                let styles = styles_for(cli, env);
-                print_error(
-                    &styles,
-                    &format!("Unknown adapter \"{adapter}\""),
-                    Some(&format!(
-                        "Supported: {}",
-                        SUPPORTED_ADAPTERS
-                            .iter()
-                            .map(|a| a.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
-                );
-                // An explicit `process.exit(2)` guard in the original.
-                return Ok(ExitCode::from(2));
-            }
-
-            let styles = styles_for(cli, env);
-            let outcome = commands::init::run(
-                &styles,
-                &cwd,
-                &commands::init::InitArgs {
-                    name: args.name.clone(),
-                    adapter: args.adapter.clone(),
-                },
-            )
-            .await?;
-            if !outcome.already_initialized {
-                println!(
-                    "  Next: {}",
-                    styles.dim(commands::init::next_hint(&outcome.adapter))
-                );
-                println!();
-            }
+        Some(Command::Init(args)) => run_init(cli, env, &cwd, args).await,
+        Some(Command::Update(args)) => {
+            update::run(&styles_for(cli, env), args.check);
             Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Doctor) => {
+            let styles = styles_for(cli, env);
+            // `doctor` runs in either tier: container-less it probes five
+            // adapters, with a project it probes eight.
+            let project = if is_initialized(&cwd) {
+                let (ctx, _, engine) = build(cli, env, &cwd).await?;
+                Some((ctx, engine))
+            } else {
+                None
+            };
+            doctor::run(&styles, &cwd, cli.json, project.as_ref()).await
         }
 
         Some(Command::Task(TaskCmd { command })) => {
             let Some(sub) = command else {
-                // A group with no subcommand prints help to stdout, exit 1.
-                return Ok(print_group_help("task"));
+                return Ok(print_group_help(&["task"]));
             };
             let (ctx, styles, engine) = build(cli, env, &cwd).await?;
             match sub {
@@ -308,13 +197,22 @@ async fn dispatch(cli: &Cli, env: EnvFlags) -> Result<ExitCode> {
                     let status: Option<TaskStatus> = parse_enum(status.as_deref(), "status")?;
                     commands::task::list(&engine, &ctx, &styles, status).await?;
                 }
+                TaskSub::Assign { task_id, agent_id } => {
+                    commands::task::assign(&engine, &ctx, &styles, task_id, agent_id).await?;
+                }
+                TaskSub::Show { .. } => return Err(not_wired("task show")),
+                TaskSub::Edit { .. } => return Err(not_wired("task edit")),
+                TaskSub::Cancel { .. } => return Err(not_wired("task cancel")),
+                TaskSub::Approve { .. } => return Err(not_wired("task approve")),
+                TaskSub::Reject { .. } => return Err(not_wired("task reject")),
+                TaskSub::Retry { .. } => return Err(not_wired("task retry")),
             }
             Ok(ExitCode::SUCCESS)
         }
 
         Some(Command::Agent(AgentCmd { command })) => {
             let Some(sub) = command else {
-                return Ok(print_group_help("agent"));
+                return Ok(print_group_help(&["agent"]));
             };
             let (ctx, styles, engine) = build(cli, env, &cwd).await?;
             match sub {
@@ -351,14 +249,187 @@ async fn dispatch(cli: &Cli, env: EnvFlags) -> Result<ExitCode> {
                     )
                     .await?;
                 }
+                AgentSub::Shop { list } => {
+                    commands::agent::shop(
+                        &engine,
+                        &styles,
+                        *list,
+                        env.stdout_is_tty,
+                        env.stdin_is_tty,
+                    )
+                    .await?;
+                }
+                AgentSub::List => return Err(not_wired("agent list")),
+                AgentSub::Status { .. } => return Err(not_wired("agent status")),
+                AgentSub::Edit { .. } => return Err(not_wired("agent edit")),
+                AgentSub::Remove { .. } => return Err(not_wired("agent remove")),
+                AgentSub::Disable { .. } => return Err(not_wired("agent disable")),
+                AgentSub::Enable { .. } => return Err(not_wired("agent enable")),
+                AgentSub::Autonomous { .. } => return Err(not_wired("agent autonomous")),
             }
             Ok(ExitCode::SUCCESS)
         }
 
-        // Bare `orch` launches the TUI in the original. WP-6 owns that; until
-        // it lands, print help rather than pretending.
-        None => Ok(print_group_help_root()),
+        Some(Command::Logs(args)) => {
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            let runs: Arc<dyn RunStore> = Arc::new(FileRunStore::new(engine.paths.clone()));
+            logs::run(
+                &logs::LogsDeps {
+                    runs,
+                    events: Arc::clone(&engine.events),
+                },
+                &ctx,
+                &styles,
+                &logs::LogsArgs {
+                    run_id: args.run_id.clone(),
+                    task: args.task.clone(),
+                    agent: args.agent.clone(),
+                    follow: args.follow,
+                    since: args.since.clone(),
+                },
+            )
+            .await
+        }
+
+        Some(Command::Serve(args)) => run_serve(cli, env, &cwd, args).await,
+
+        Some(Command::Status) => Err(not_wired("status")),
+        Some(Command::Config(ConfigCmd { command })) => match command {
+            None => Ok(print_group_help(&["config"])),
+            Some(ConfigSub::Global(global)) if global.command.is_none() => {
+                Ok(print_group_help(&["config", "global"]))
+            }
+            Some(_) => Err(not_wired("config")),
+        },
+        Some(Command::Context(ContextCmd { command })) => match command {
+            None => Ok(print_group_help(&["context"])),
+            Some(_) => Err(not_wired("context")),
+        },
+        Some(Command::Msg(MsgCmd { command })) => match command {
+            None => Ok(print_group_help(&["msg"])),
+            Some(_) => Err(not_wired("msg")),
+        },
+        Some(Command::Goal(GoalCmd { command })) => match command {
+            None => Ok(print_group_help(&["goal"])),
+            Some(_) => Err(not_wired("goal")),
+        },
+        Some(Command::Team(TeamCmd { command })) => match command {
+            None => Ok(print_group_help(&["team"])),
+            Some(_) => Err(not_wired("team")),
+        },
+        Some(Command::Org(OrgCmd { command })) => match command {
+            None => Ok(print_group_help(&["org"])),
+            Some(_) => Err(not_wired("org")),
+        },
+        Some(Command::Run(RunCmd {
+            task_id,
+            all,
+            watch,
+            ..
+        })) => {
+            // The argument check is the command's own, and it exits 2 before
+            // anything else happens (`docs/parity/cli.md` §13.1).
+            if !*watch && !*all && task_id.is_none() {
+                print_error(
+                    &styles_for(cli, env),
+                    "Specify a task ID, --all, or --watch",
+                    None,
+                );
+                return Ok(ExitCode::from(2));
+            }
+            Err(not_wired("run"))
+        }
+        Some(Command::Tui) => Err(not_wired("tui")),
+
+        // Bare `orch` is the first-run experience in the reference: it inits
+        // and launches the TUI. Both halves of that are WP-6's; printing the
+        // root help is the honest interim behaviour.
+        None => {
+            let _ = shape;
+            Ok(print_group_help_root())
+        }
     }
+}
+
+async fn run_init(
+    cli: &Cli,
+    env: EnvFlags,
+    cwd: &std::path::Path,
+    args: &InitCmd,
+) -> Result<ExitCode> {
+    let styles = styles_for(cli, env);
+
+    if let Some(adapter) = &args.adapter
+        && !orch_domain::is_adapter_kind(adapter)
+    {
+        print_error(
+            &styles,
+            &format!("Unknown adapter \"{adapter}\""),
+            Some(&format!(
+                "Supported: {}",
+                SUPPORTED_ADAPTERS
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        );
+        // An explicit `process.exit(2)` guard in the original.
+        return Ok(ExitCode::from(2));
+    }
+
+    let outcome = commands::init::run(
+        &styles,
+        cwd,
+        &commands::init::InitArgs {
+            name: args.name.clone(),
+            adapter: args.adapter.clone(),
+            interactive: env.stdout_is_tty && env.stdin_is_tty,
+        },
+    )
+    .await?;
+    if !outcome.already_initialized {
+        println!(
+            "  Next: {}",
+            styles.dim(commands::init::next_hint(&outcome.adapter))
+        );
+        println!();
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_serve(
+    cli: &Cli,
+    env: EnvFlags,
+    cwd: &std::path::Path,
+    args: &ServeCmd,
+) -> Result<ExitCode> {
+    let styles = styles_for(cli, env);
+
+    let Some(format) = serve::LogFormat::parse(&args.log_format) else {
+        print_error(
+            &styles,
+            &format!(
+                "Unknown --log-format \"{}\". Valid: json, text",
+                args.log_format
+            ),
+            None,
+        );
+        return Ok(ExitCode::from(2));
+    };
+
+    let (_ctx, _styles, engine) = build(cli, env, cwd).await?;
+    serve::run(
+        engine,
+        serve::ServeArgs {
+            once: args.once,
+            tick_interval: args.tick_interval.clone(),
+            log_file: args.log_file.clone(),
+            format,
+            verbose: args.verbose,
+        },
+    )
+    .await
 }
 
 fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {
@@ -369,7 +440,8 @@ fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {
 }
 
 /// Resolve the context and build the light engine. The `require_init` inside
-/// `build_light` is what produces exit 3 for an uninitialized directory.
+/// `build_light` is what produces exit 3 for an uninitialized directory, and
+/// the pre-parse guard in [`run`] is what makes that happen before parsing.
 async fn build(
     cli: &Cli,
     env: EnvFlags,
@@ -382,14 +454,17 @@ async fn build(
 }
 
 /// A command group invoked with no subcommand prints its help to **stdout**
-/// and exits **1**.
-fn print_group_help(group: &str) -> ExitCode {
+/// and exits **1** (`docs/parity/cli.md` §3.6).
+fn print_group_help(path: &[&str]) -> ExitCode {
     let mut command = Cli::command();
-    if let Some(sub) = command.find_subcommand_mut(group) {
-        let mut sub = sub.clone();
-        let _ = sub.print_help();
-        println!();
+    for segment in path {
+        match command.find_subcommand(segment) {
+            Some(sub) => command = sub.clone(),
+            None => return ExitCode::from(1),
+        }
     }
+    let _ = command.print_help();
+    println!();
     ExitCode::from(1)
 }
 
@@ -402,14 +477,14 @@ fn print_group_help_root() -> ExitCode {
 /// `parseInt(value, 10)`. A non-numeric value is `NaN` in the original, which
 /// then fails the domain's own range check — so the message a user sees comes
 /// from the service, not from here.
-fn parse_int(raw: &str, flag: &str) -> Result<i64> {
+pub(crate) fn parse_int(raw: &str, flag: &str) -> Result<i64> {
     raw.trim()
         .parse::<i64>()
         .map_err(|_| Error::invalid_arguments(format!("--{flag} must be an integer")))
 }
 
 /// Parse an enum-valued flag, naming the accepted values on failure.
-fn parse_enum<T>(raw: Option<&str>, flag: &str) -> Result<Option<T>>
+pub(crate) fn parse_enum<T>(raw: Option<&str>, flag: &str) -> Result<Option<T>>
 where
     T: std::str::FromStr<Err = ()>,
 {
@@ -425,92 +500,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_command_tree_parses_the_walking_skeleton_surface() {
-        let cli = Cli::try_parse_from(["orch", "init", "--name", "p", "--adapter", "shell"])
-            .expect("init parses");
-        match cli.command {
-            Some(Command::Init(args)) => {
-                assert_eq!(args.name.as_deref(), Some("p"));
-                assert_eq!(args.adapter.as_deref(), Some("shell"));
-            }
-            other => panic!("{other:?}"),
-        }
-
-        let cli = Cli::try_parse_from([
-            "orch",
-            "task",
-            "add",
-            "Do it",
-            "--priority",
-            "1",
-            "--assignee",
-            "agt_creator",
-        ])
-        .expect("task add parses");
-        assert!(matches!(cli.command, Some(Command::Task(_))));
-
-        let cli = Cli::try_parse_from(["orch", "--json", "task", "list"]).expect("parses");
-        assert!(cli.json);
-
-        // The global flags are accepted after the subcommand too, as
-        // Commander accepts them.
-        let cli = Cli::try_parse_from(["orch", "task", "list", "--json"]).expect("parses");
-        assert!(cli.json);
-    }
-
-    #[test]
-    fn agent_add_requires_the_adapter_flag() {
-        let err = Cli::try_parse_from(["orch", "agent", "add", "shelly"]).expect_err("required");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    #[test]
-    fn task_add_requires_a_title() {
-        let err = Cli::try_parse_from(["orch", "task", "add"]).expect_err("required");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    #[test]
-    fn a_group_with_no_subcommand_parses_so_the_handler_can_print_help() {
-        let cli = Cli::try_parse_from(["orch", "task"]).expect("parses");
-        assert!(matches!(
-            cli.command,
-            Some(Command::Task(TaskCmd { command: None }))
-        ));
-    }
-
-    #[test]
-    fn short_flags_match_the_reference() {
-        let cli = Cli::try_parse_from([
-            "orch", "task", "add", "t", "-d", "body", "-p", "2", "-l", "a,b",
-        ])
-        .expect("parses");
-        match cli.command {
-            Some(Command::Task(TaskCmd {
-                command: Some(TaskSub::Add(flags)),
-            })) => {
-                assert_eq!(flags.description.as_deref(), Some("body"));
-                assert_eq!(flags.priority, "2");
-                assert_eq!(flags.labels.as_deref(), Some("a,b"));
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn priority_defaults_to_three() {
-        let cli = Cli::try_parse_from(["orch", "task", "add", "t"]).expect("parses");
-        match cli.command {
-            Some(Command::Task(TaskCmd {
-                command: Some(TaskSub::Add(flags)),
-            })) => {
-                assert_eq!(flags.priority, "3");
-            }
-            other => panic!("{other:?}"),
-        }
-    }
 
     #[test]
     fn parse_int_rejects_a_non_numeric_value_with_exit_2() {
@@ -530,11 +519,5 @@ mod tests {
         let err = parse_enum::<TaskStatus>(Some("nope"), "status").expect_err("rejected");
         assert_eq!(err.to_string(), "Invalid --status: \"nope\"");
         assert_eq!(err.exit_code(), 2);
-    }
-
-    #[test]
-    fn the_program_name_is_orchestry_whichever_binary_was_invoked() {
-        assert_eq!(Cli::command().get_name(), "orchestry");
-        assert_eq!(Cli::command().get_version(), Some("1.0.34"));
     }
 }

@@ -124,6 +124,28 @@ impl TaskService {
             .ok_or_else(|| Error::Domain(DomainError::TaskNotFound(id.to_owned())))
     }
 
+    /// Assign a task to an agent.
+    ///
+    /// Added by WP-5a because `task assign` is the first command that
+    /// **re-saves** an existing entity, which is what makes the `_index.json`
+    /// last-write order observable to the parity harness (PARITY.md §14.4 —
+    /// the gap `fixtures/scenarios/README.md` lists). The `task:assigned`
+    /// event carries the **requested** `agent_id`, not the resolved one, as
+    /// the reference does.
+    pub async fn assign(&self, task_id: &str, agent_id: &str) -> Result<Task> {
+        let mut task = self.get(task_id).await?;
+        task.assignee = self.resolve_assignee(Some(agent_id)).await?;
+        task.updated_at = self.clock.now_iso();
+        self.tasks.save(&task).await?;
+
+        self.events.emit(OrchestratorEvent::TaskAssigned {
+            task_id: task_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+        });
+
+        Ok(task)
+    }
+
     /// Resolve an assignee to an agent **id**, accepting either an id or an
     /// exact name. The two error messages are contract (PARITY.md §3.1).
     async fn resolve_assignee(&self, assignee: Option<&str>) -> Result<Option<String>> {

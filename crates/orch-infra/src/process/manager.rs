@@ -312,25 +312,37 @@ mod tests {
     #[tokio::test]
     async fn spawn_creates_a_new_process_group_led_by_the_child() {
         let pm = SystemProcessManager::new();
+        // The child blocks until its stdout is read, so it is still alive
+        // when its process group is inspected.
         let mut child = pm
             .spawn(
                 "sh",
-                &sh("printf '%s' \"$$\"; exec ps -o pgid= -p $$"),
+                &sh("printf 'up\\n'; sleep 30"),
                 SpawnOptions::default(),
             )
             .expect("spawn");
 
-        let mut out = String::new();
+        let mut up = [0u8; 3];
         child
             .stdout
-            .take()
+            .as_mut()
             .expect("stdout")
-            .read_to_string(&mut out)
+            .read_exact(&mut up)
             .await
             .expect("read");
-        let (pid, pgid) = out.split_at(out.find(|c: char| c.is_whitespace()).unwrap_or(out.len()));
-        assert_eq!(pid.trim(), pgid.trim(), "the child leads its own group");
-        assert_eq!(pid.trim().parse::<u32>().expect("pid"), child.pid);
+
+        // node's `detached: true`: the child leads a group of its own, which
+        // is what makes `kill(-pid)` reach the whole tree.
+        let pgid = nix::unistd::getpgid(Some(Pid::from_raw(child.pid as i32))).expect("pgid");
+        assert_eq!(pgid.as_raw() as u32, child.pid);
+        assert_ne!(
+            pgid.as_raw() as u32,
+            std::process::id(),
+            "the child must not share our group"
+        );
+
+        pm.kill(child.pid, Signal::Kill);
+        assert!(wait_until_dead(&pm, child.pid).await);
     }
 
     #[tokio::test]

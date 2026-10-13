@@ -1,7 +1,8 @@
 //! `orch task` — ported from `src/cli/commands/task.ts`.
 //!
-//! WP-0b covers `add` and `list`. The remaining subcommands (`show`, `edit`,
-//! `assign`, `cancel`, `approve`, `reject`, `retry`, `delete`) are WP-5's.
+//! WP-0b covers `add` and `list`; WP-5a adds `assign`. The remaining
+//! subcommands (`show`, `edit`, `cancel`, `approve`, `reject`, `retry`) need
+//! WP-4's service methods.
 
 use orch_core::error::Result;
 use orch_core::storage::TaskFilter;
@@ -148,6 +149,35 @@ fn task_row(styles: &Styles, task: &Task) -> Vec<String> {
             .unwrap_or_else(|| styles.dim("—")),
         time,
     ]
+}
+
+/// `task assign <task-id> <agent-id>`.
+///
+/// Prints `Assigned <id> → <resolved assignee>`, falling back to the argument
+/// when the task ended up with no assignee at all. **Not** `--quiet`-aware:
+/// `task assign` is in the ignored half of the matrix
+/// (`docs/parity/cli.md` §21.6).
+pub async fn assign(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let task = engine.task_service.assign(task_id, agent_id).await?;
+
+    if ctx.json {
+        return print_json(&task);
+    }
+    print_success(
+        styles,
+        &format!(
+            "Assigned {} → {}",
+            task.id,
+            task.assignee.as_deref().unwrap_or(agent_id)
+        ),
+    );
+    Ok(())
 }
 
 /// `<n> tasks` — **not pluralized**, and the running/review/done clauses only

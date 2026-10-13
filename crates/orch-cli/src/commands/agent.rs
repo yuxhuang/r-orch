@@ -1,14 +1,17 @@
 //! `orch agent` — ported from `src/cli/commands/agent.ts`.
 //!
-//! WP-0b covers `add`. The remaining subcommands (`list`, `show`, `shop`,
-//! `edit`, `remove`, `disable`, `enable`, `autonomous`) are WP-5's.
+//! WP-0b covers `add`; WP-5a adds `shop`. The remaining subcommands
+//! (`list`, `status`, `edit`, `remove`, `disable`, `enable`, `autonomous`)
+//! need WP-4's service methods.
 
 use orch_core::error::Result;
-use orch_domain::CreateAgentInput;
+use orch_domain::{AGENT_SHOP_TEMPLATES, CreateAgentInput};
 use orch_engine::Engine;
+use orch_engine::agent_factory::template_to_agent_input;
 
 use crate::context::CliContext;
 use crate::output::{Styles, print_json, print_success};
+use crate::shop_picker;
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentAddArgs {
@@ -70,6 +73,46 @@ pub async fn add(
             ),
         );
     }
+    Ok(())
+}
+
+/// `orch agent shop` — browse and install a pre-built template.
+///
+/// The table is printed when `--list` is given **or** stdout is not a TTY;
+/// otherwise the picker runs. A cancelled pick prints `  Cancelled.` and is
+/// still exit 0. No `--json`, and `--quiet` is ignored
+/// (`docs/parity/cli.md` §5.4, §21.6).
+pub async fn shop(
+    engine: &Engine,
+    styles: &Styles,
+    list: bool,
+    stdout_is_tty: bool,
+    stdin_is_tty: bool,
+) -> Result<()> {
+    if list || !stdout_is_tty {
+        print!(
+            "{}",
+            shop_picker::render_list(styles, &AGENT_SHOP_TEMPLATES)
+        );
+        return Ok(());
+    }
+
+    let Some(template) = shop_picker::pick_from_shop(&AGENT_SHOP_TEMPLATES, stdin_is_tty) else {
+        println!("  Cancelled.");
+        return Ok(());
+    };
+
+    let input = template_to_agent_input(template, &engine.config.defaults.agent.adapter)?;
+    let agent = engine.agent_service.create(input).await?;
+    print_success(
+        styles,
+        &format!(
+            "Added agent {} ({}) → {}",
+            styles.agent_name(&agent.name),
+            agent.adapter,
+            agent.id
+        ),
+    );
     Ok(())
 }
 

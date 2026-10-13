@@ -33,11 +33,19 @@ orch-tui.workspace = true
 
 # anyhow is allowed here and in xtask only — never in a library signature.
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
+# Raw mode and key events for the agent shop picker (§21.2). The TUI owns the
+# dashboard; this is one modal list.
+crossterm.workspace = true
 futures.workspace = true
 indexmap.workspace = true
+# `logs` renders event times in the local zone, as `toLocaleTimeString` does.
+jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `$EDITOR` buffers live in a temporary directory, as in the reference.
+tempfile.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
