@@ -41,7 +41,18 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // assemble. Recorded here rather than left as a silent discrepancy — see
     // the note in crates/orch-engine/Cargo.toml.
     ("orch-engine", &["orch-core", "orch-domain", "orch-infra"]),
-    ("orch-tui", &["orch-core", "orch-domain", "orch-engine"]),
+    // **Tighter than ARCHITECTURE §3.1's diagram**, which has the TUI
+    // depending on the engine. WP-6 inverted it: everything the dashboard
+    // needs goes through one trait, `orch_tui::backend::TuiBackend`, so the
+    // TUI names only the domain types that cross it. `orch-cli` implements
+    // that trait over the DI container (`cli/src/tui/backend.rs`) and the
+    // TUI's own tests use an in-crate `FakeBackend`.
+    //
+    // This table entry is what noticed the change: the previous one listed
+    // `orch-core` and `orch-engine`, and the stale-entry check turned
+    // "someone quietly improved the layering" into a failure that had to be
+    // looked at rather than a diff nobody read.
+    ("orch-tui", &["orch-domain"]),
     // The CLI is the top of the stack and may name anything below it.
     (
         "orch-cli",

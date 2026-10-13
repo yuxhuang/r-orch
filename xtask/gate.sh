@@ -93,7 +93,17 @@ summarize() {
   local name="$1" log="$2"
   case "$name" in
     test)
-      awk '/^test result:/ { p += $4; f += $6 } END { printf "%d passed, %d failed", p, f }' "$log"
+      # Name the failures as well as counting them. A cold gate run is the
+      # only place a timing-sensitive test has shown up here, and "1 failed"
+      # with the log already deleted is not enough to chase it.
+      local counts failures
+      counts=$(awk '/^test result:/ { p += $4; f += $6 } END { printf "%d passed, %d failed", p, f }' "$log")
+      failures=$(sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' "$log" | sort -u | paste -sd' ' -)
+      if [ -n "$failures" ]; then
+        printf '%s — %s' "$counts" "$failures"
+      else
+        printf '%s' "$counts"
+      fi
       ;;
     parity)
       # Name the failures, not just the count: this gate runs with a standing
