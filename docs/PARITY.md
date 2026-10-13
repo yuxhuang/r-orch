@@ -2826,7 +2826,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 |---|---|
 | `none` | Observable output is unchanged, or the surface is outside the harness. The row stays verified. |
 | `scenario exclusion required (<named>)` | The harness cannot compare this; the named scenarios must avoid it. The row becomes **unverified** and that is now visible. |
-| `oracle patched` | We patch the vendored oracle to match. Requires an explicit note of what was patched and why. |
+| `oracle patched` | We patch the vendored oracle so the surface is comparable at all. Requires a patch file under `parity/patches/`, applied by `parity/setup.sh`, and an explicit note of what was patched and why. **Reserved for cases where the oracle is too broken to compare against** — not for making it agree with us. In use by §14.21. |
 
 **An entry marked `FIX` without this field is incomplete.** Summary:
 
@@ -2852,6 +2852,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.18 wizard `Esc` discards the wizard | FIX | `none` — TUI |
 | §14.19 wizard cancel leaks attachments | FIX | `none` — TUI |
 | §14.20 `logSelectedIndex` filtered/unfiltered mix | FIX | `none` — TUI |
+| §14.21 worktree-mode `run`/`serve --once` no-op | **FIX** | **`oracle patched`** (`parity/patches/0001-…`) |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3205,6 +3206,66 @@ counter describes a third frame of reference. This is a correctness bug, not a c
 
 **Decision: fix** — `log_selected_index` indexes the **filtered** list everywhere: selection, rendering,
 detail and counter. Clamp on filter change so a narrowing filter cannot leave the index out of range.
+
+### 14.21 TS `run <id>` and `serve --once` dispatch nothing in **worktree** mode — **FIX (oracle patched)**
+
+**Effect on differential comparison: `oracle patched`** — the first entry to use that value. A minimal
+documented patch (`parity/patches/0001-…`) is applied by `parity/setup.sh`: keep the child `ref`'d while it is
+being awaited. Without it, no `run`/`serve --once` scenario can be compared in the **default** workspace mode.
+
+**The reference implementation's primary dispatch commands exit 0 without doing anything, in the mode that
+ships as the default.** Lead-verified matrix:
+
+| Mode | Repo | `run <id>` | `serve --once` |
+|---|---|---|---|
+| `shared` | no git | ✓ dispatches | ✓ |
+| `shared` | git | ✓ dispatches | ✓ |
+| **`worktree`** (default) | git | **✗ no-op, exit 0** | **✗ no-op, exit 0** |
+
+**Mechanism**, confirmed in source:
+
+1. `ProcessManager.spawn` (`process-manager.ts:64-80`) spawns with `stdio: ['ignore', 'pipe', 'pipe']`,
+   `detached: true`, and then calls **`proc.unref()`**. Its own comment states the intent exactly:
+   *"Pipes (stdout/stderr) still hold refs while being read — that's intentional."* The ref exists **only
+   while something is reading**.
+2. `WorkspaceManager.spawnAndWait` (`workspace-manager.ts:171-181`) uses that spawn and awaits a promise
+   resolved by `'close'`/`'error'` — and **never reads `proc.stdout` or `proc.stderr`**.
+3. So nothing holds a `ref` on the event loop: the child is unref'd and its pipes are unread. Node's loop
+   empties, the process exits 0, and the `await` **never resolves**.
+
+The contrast inside the same file is the proof: `spawnAndCapture` (`:184`) attaches
+`proc.stdout?.on('data', …)`, which refs the pipe and keeps the loop alive — so it works, and `spawnAndWait`
+does not. Every `spawnAndWait` call site is affected: `git rev-parse --is-inside-work-tree` (`:57`),
+`git worktree add` (`:146`, `:152`), `git worktree prune` (`:151`), `git worktree remove` (`:79`),
+`git branch -D` (`:83`), `git clone` (`:209`), `rsync` (`:218`).
+
+**Why `shared` escapes it**: `prepare()` guards with `if (mode !== 'shared') await this.requireGitRepo(mode)`
+and returns `{ path: projectRoot }` for `shared` without spawning anything. So the shared path never touches
+`spawnAndWait`. The matrix above falls directly out of that guard — which is strong corroboration that the
+diagnosis is right.
+
+The first unread-pipe spawn in a worktree dispatch is `git rev-parse` (`:57`); the lead observed the exit
+occurring mid-`git worktree add`, which simply means something else still ref'd the loop during `rev-parse`
+and it emptied slightly later. The outcome is identical either way, and the exact exit point is
+environment-dependent — do not encode it in a test.
+
+**Wreckage left behind**, which a scenario must tolerate:
+
+- the task stays `todo` (never transitions, never gets a run record);
+- `.orchestry/orchestry.lock` persists, holding a **dead** PID — so unlike §14.17 it is re-acquirable and does
+  not wedge the project;
+- `state.claimed` retains the task id. `dispatchAll` filters on `!claimed.has(id)`, so the task is
+  **suppressed from `run --all` and `serve`** until a `startWatch` runs `cleanupStaleRunningEntries`, which
+  unconditionally clears `claimed`. A direct `run <id>` still works, because `dispatchOnlyTask` calls
+  `dispatchTask` without consulting the claimed filter.
+
+**Decision: fix** — r-orch dispatches in worktree mode. Keep the child referenced for the duration of the
+await (or read its pipes, which r-orch does anyway for the stderr tail, §14.12). There is no sense in
+replicating a default-mode no-op.
+
+> **Note for anyone reading the captured reference output in §5.4:** that `orch run` transcript was taken
+> after `orch config set defaults.agent.workspace_mode shared`, which is why it shows a real dispatch. The
+> default-mode failure was not visible in it.
 
 ---
 

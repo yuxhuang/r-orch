@@ -916,8 +916,16 @@ cargo xtask crate-graph                      # asserts the whole inter-crate edg
 ```
 
 `cargo xtask parity` is gated on `parity/orch-ts/dist/` existing; `parity/setup.sh` clones the pinned
-commit `c066dc0` and runs `npm ci && npm run build`. The parity job is **required** for merge — the whole
-design rests on it.
+commit `c066dc0`, **applies every patch in `parity/patches/` in order**, then runs `npm ci && npm run build`.
+The parity job is **required** for merge — the whole design rests on it.
+
+**Patching the oracle is a last resort, and the bar is high.** It is for surfaces where the reference is too
+broken to compare against at all, never for making it agree with us. Each patch must be minimal, carry its
+rationale in the patch header, and be referenced from the §14 entry that justifies it
+([PARITY.md §14.0](PARITY.md) `oracle patched`). Today there is exactly one:
+`0001-…`, because the TS `run`/`serve --once` commands dispatch nothing in the **default** workspace mode
+([PARITY.md §14.21](PARITY.md)) — without it, the project's central behaviour has no oracle in its default
+configuration. Reviewers should treat a second patch as a signal to re-examine, not as precedent.
 
 ---
 
