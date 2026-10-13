@@ -20,14 +20,16 @@ use orch_infra::storage::fs_utils::{atomic_write, ensure_dir, path_exists, write
 
 use crate::output::{Styles, print_success, print_warning};
 
-/// `DEFAULT_PROMPT_TEMPLATE` from `src/infrastructure/template/template-engine.ts`,
-/// extracted byte-exact.
+/// The combined default prompt template, from WP-3's
+/// `orch_infra::template`.
 ///
-/// It lives here rather than in `orch-infra` because WP-3 owns that module and
-/// is building in parallel. When WP-3 lands `orch_infra::template`, move the
-/// constant there and have this command reference it — the bytes must stay
-/// identical either way, since the file is a prompt input (PARITY.md §9.1).
-pub const DEFAULT_PROMPT_TEMPLATE: &str = include_str!("../../assets/default-prompt-template.md");
+/// WP-0b carried its own byte-exact copy while WP-3 was building in parallel;
+/// that copy is gone now the real module has landed, because two sources of
+/// truth for a prompt input is exactly the kind of drift PARITY.md §9.1 makes
+/// expensive. Verified byte-identical before the switch.
+fn default_prompt_template() -> String {
+    orch_infra::template::default_prompt_template()
+}
 
 /// `.orchestry/.gitignore` (PARITY.md §6.11).
 const GITIGNORE: &str = "\
@@ -120,7 +122,7 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
     write_yaml(&paths.config_path(), &config).await?;
     atomic_write(&paths.gitignore_path(), GITIGNORE).await?;
     atomic_write(&paths.workspace_exclude_path(), WORKSPACE_EXCLUDE).await?;
-    atomic_write(&paths.default_template_path(), DEFAULT_PROMPT_TEMPLATE).await?;
+    atomic_write(&paths.default_template_path(), &default_prompt_template()).await?;
     for agent in &agents {
         write_yaml(&paths.agent_path(&agent.id)?, agent).await?;
     }
@@ -453,10 +455,10 @@ mod tests {
             tokio::fs::read_to_string(paths.default_template_path())
                 .await
                 .unwrap(),
-            DEFAULT_PROMPT_TEMPLATE
+            default_prompt_template()
         );
         // The prompt template is a prompt input, so its size is pinned.
-        assert_eq!(DEFAULT_PROMPT_TEMPLATE.len(), 4822);
+        assert_eq!(default_prompt_template().len(), 4822);
     }
 
     #[tokio::test]

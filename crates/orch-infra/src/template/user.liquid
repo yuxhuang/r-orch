@@ -1,0 +1,70 @@
+## Task: {{ task.title }}
+{{ task.description }}
+
+Priority: {{ task.priority }}
+{% if attempt %}Attempt: {{ attempt }}{% endif %}
+{% if retry %}
+## Previous attempt failed
+**Error:** {{ retry.previous_error }}
+{% if retry.previous_output != "" %}
+**Last output:**
+```
+{{ retry.previous_output }}
+```
+{% endif %}
+**Important:** The previous approach failed. Analyze the error above and try a different strategy. Do NOT repeat the same steps that led to the failure.
+{% endif %}
+
+## Context
+Project: {{ project.name }}
+Working directory: {{ workspace_path }}
+
+## Team
+You are part of a multi-agent team. Available agents:
+{% for a in agents %}- **{{ a.name }}** ({{ a.adapter }}){% if a.role %} — {{ a.role }}{% endif %} · ID: `{{ a.id }}`
+{% endfor %}
+Use `orch agent list` to check current agent statuses. Find teammates by name/role — do NOT hardcode agent IDs.
+
+{% if feedback %}
+## Review Feedback
+This task was previously completed but **rejected** during review with the following feedback:
+> {{ feedback }}
+
+**Important:** Address the feedback above. Focus on what the reviewer asked to change. Do NOT redo work that was already accepted.
+{% endif %}
+
+{% if shared_context %}
+## Shared Context
+Other agents have shared the following information:
+{% for entry in shared_context %}- **{{ entry[0] }}**: {{ entry[1] }}
+{% endfor %}
+{% endif %}
+
+{% if messages %}
+## Inbox ({{ messages.size }} message{% if messages.size != 1 %}s{% endif %})
+{% for msg in messages %}
+---
+**From:** {{ msg.from }}{% if msg.subject != "" %} · **Subject:** {{ msg.subject }}{% endif %}
+{{ msg.body }}
+{% if msg.reply_to %}*(Reply to: {{ msg.reply_to }})*{% endif %}
+---
+{% endfor %}
+{% endif %}
+
+{% if goal %}
+## Goal: {{ goal.title }}
+**Status:** {{ goal.status }} · **ID:** `{{ goal.id }}`
+{% if goal.description != "" %}
+{{ goal.description }}
+{% endif %}
+{% if goal.task_names.size > 0 %}
+**Linked tasks ({{ goal.task_names.size }}):**
+{% for name in goal.task_names %}- {{ name }}
+{% endfor %}
+Use `orch task list --goal-id {{ goal.id }}` and `orch task show <id>` to inspect details.
+{% endif %}
+{% if goal.progress %}
+**Latest progress report:**
+{{ goal.progress }}
+{% endif %}
+{% endif %}
