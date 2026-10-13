@@ -313,6 +313,19 @@ pub fn format_duration(ms: i64) -> String {
     format!("{hours}h{mins:02}m")
 }
 
+/// `formatDurationSince(iso)` = `formatDuration(Date.now() - t)`.
+///
+/// **Unclamped**, so a future timestamp renders negative — which is how
+/// `context list` shows a live TTL as `-60s` (PARITY.md §22.6).
+pub fn format_duration_since(timestamp: &str) -> String {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let then = timestamp
+        .parse::<jiff::Timestamp>()
+        .map(|ts| ts.as_millisecond())
+        .unwrap_or(now);
+    format_duration(now - then)
+}
+
 /// `1.2k` at or above 1000, the plain integer below.
 pub fn format_tokens(n: u64) -> String {
     if n >= 1000 {

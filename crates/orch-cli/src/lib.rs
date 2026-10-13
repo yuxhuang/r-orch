@@ -36,8 +36,9 @@ use crate::context::{CliContext, EnvFlags};
 use crate::output::{Styles, print_error};
 use crate::routing::ArgvShape;
 use crate::tree::{
-    AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigSub, ContextCmd, GoalCmd, InitCmd, MsgCmd,
-    OrgCmd, RunCmd, ServeCmd, TaskCmd, TaskSub, TeamCmd,
+    AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
+    ContextCmd, ContextSub, GoalCmd, InitCmd, MsgCmd, OrgCmd, RunCmd, ServeCmd, TaskCmd, TaskSub,
+    TeamCmd,
 };
 
 /// A command that parses but whose service is not wired yet.
@@ -309,17 +310,61 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             commands::status::run(&engine, &ctx, &styles).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Config(ConfigCmd { command })) => match command {
-            None => Ok(print_group_help(&["config"])),
-            Some(ConfigSub::Global(global)) if global.command.is_none() => {
-                Ok(print_group_help(&["config", "global"]))
+        Some(Command::Config(ConfigCmd { command })) => {
+            let Some(sub) = command else {
+                return Ok(print_group_help(&["config"]));
+            };
+            if let ConfigSub::Global(ConfigGlobalCmd { command: None }) = sub {
+                return Ok(print_group_help(&["config", "global"]));
             }
-            Some(_) => Err(not_wired("config")),
-        },
-        Some(Command::Context(ContextCmd { command })) => match command {
-            None => Ok(print_group_help(&["context"])),
-            Some(_) => Err(not_wired("context")),
-        },
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            match sub {
+                ConfigSub::Get { key } => {
+                    commands::config::get(&engine, &ctx, &styles, key).await?;
+                }
+                ConfigSub::Set { key, value } => {
+                    commands::config::set(&engine, &ctx, &styles, key, value).await?;
+                }
+                ConfigSub::Edit => commands::config::edit(&engine).await?,
+                ConfigSub::Global(ConfigGlobalCmd { command }) => match command {
+                    Some(ConfigGlobalSub::Get { key }) => {
+                        commands::config::global_get(&engine, &ctx, &styles, key).await?;
+                    }
+                    Some(ConfigGlobalSub::Set { key, value }) => {
+                        commands::config::global_set(&engine, &ctx, &styles, key, value).await?;
+                    }
+                    Some(ConfigGlobalSub::Show) => {
+                        commands::config::global_show(&engine, &ctx, &styles).await?;
+                    }
+                    // Handled above, before the container is built.
+                    None => unreachable!("the empty group prints help"),
+                },
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Context(ContextCmd { command })) => {
+            let Some(sub) = command else {
+                return Ok(print_group_help(&["context"]));
+            };
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            match sub {
+                ContextSub::Set { key, value, ttl } => {
+                    let ttl_ms = match ttl {
+                        Some(raw) => Some(parse_int(raw, "ttl")? as u64),
+                        None => None,
+                    };
+                    commands::context::set(&engine, &ctx, &styles, key, value, ttl_ms).await?;
+                }
+                ContextSub::Get { key } => {
+                    commands::context::get(&engine, &ctx, &styles, key).await?;
+                }
+                ContextSub::List => commands::context::list(&engine, &ctx, &styles).await?,
+                ContextSub::Delete { key } => {
+                    commands::context::delete(&engine, &ctx, &styles, key).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Msg(MsgCmd { command })) => match command {
             None => Ok(print_group_help(&["msg"])),
             Some(_) => Err(not_wired("msg")),

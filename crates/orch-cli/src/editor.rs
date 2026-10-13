@@ -203,6 +203,12 @@ pub async fn open_in_editor(initial_content: &str, extension: &str) -> Result<St
     Ok(edited)
 }
 
+/// Open an **existing** file in `$EDITOR`, which is what `config edit` does:
+/// no temporary buffer, no parsing, and nothing printed.
+pub async fn edit_file(path: &Path) -> Result<()> {
+    run_editor(&editor_command(), path).await
+}
+
 /// `spawn(parts[0], [...parts.slice(1), filePath], { stdio: 'inherit' })`.
 async fn run_editor(editor: &str, path: &Path) -> Result<()> {
     let mut parts = editor.split_whitespace();

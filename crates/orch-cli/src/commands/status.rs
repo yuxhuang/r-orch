@@ -21,7 +21,7 @@ use orch_engine::Engine;
 use serde::Serialize;
 
 use crate::context::CliContext;
-use crate::output::{Color, Styles, format_duration, format_tokens, print_json};
+use crate::output::{Color, Styles, format_duration_since, format_tokens, print_json};
 
 /// `{ tasks, agents, state }`, with `claimed` as an array.
 ///
@@ -114,7 +114,7 @@ fn render(
                 "  {} {assignee}  {:<37}{}  {}\n",
                 styles.status_icon("in_progress"),
                 title,
-                duration_since(&task.updated_at),
+                format_duration_since(&task.updated_at),
                 styles.priority_label(task.priority),
             ));
         }
@@ -154,22 +154,12 @@ fn footer(state: &OrchestratorState) -> Option<String> {
 
     let mut halves: Vec<String> = Vec::new();
     if let Some(started_at) = &state.started_at {
-        halves.push(format!("up {}", duration_since(started_at)));
+        halves.push(format!("up {}", format_duration_since(started_at)));
     }
     if !parts.is_empty() {
         halves.push(parts.join(" "));
     }
     (!halves.is_empty()).then(|| halves.join(" · "))
-}
-
-/// `formatDurationSince(iso)` = `formatDuration(Date.now() - t)`.
-fn duration_since(timestamp: &str) -> String {
-    let now = jiff::Timestamp::now().as_millisecond();
-    let then = timestamp
-        .parse::<jiff::Timestamp>()
-        .map(|ts| ts.as_millisecond())
-        .unwrap_or(now);
-    format_duration(now - then)
 }
 
 #[cfg(test)]
