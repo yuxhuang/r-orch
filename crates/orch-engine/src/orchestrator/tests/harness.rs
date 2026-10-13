@@ -400,7 +400,12 @@ impl Harness {
     /// the test process, not a child. Seeding is **on**, which is the TS
     /// default for `startWatch()` with no options.
     pub(crate) async fn start_watch(&self) -> orch_core::error::Result<()> {
-        self.orchestrator.start_watch(WatchOptions::default()).await
+        self.orchestrator
+            .start_watch(WatchOptions {
+                skip_autonomous_seeding: false,
+                handle_signals: false,
+            })
+            .await
     }
 
     /// `startWatch({ skipAutonomousSeeding: true })` — what `serve --once`
