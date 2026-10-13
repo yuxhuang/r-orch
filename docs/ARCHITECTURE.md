@@ -98,17 +98,39 @@ r-orch/
              orch-core                      (traits only; depends on orch-domain)
                  ▲
         ┌────────┴────────┐
-    orch-infra        orch-engine           (engine depends on core, NOT on infra)
-        ▲                 ▲
+    orch-infra ◄───── orch-engine           (engine → infra: assembly + two faithful
+        ▲                 ▲                  couplings — see below)
         └────────┬────────┘
                  │
         ┌────────┴────────┐
     orch-cli          orch-tui              (both depend on engine; tui never on cli)
 ```
 
+**`orch-engine` does depend on `orch-infra`.** An earlier revision of this diagram said "engine depends on
+core, NOT on infra", which was wrong. The edge is real and comes from three places:
+
+| Site | What it names | Why it is acceptable |
+|---|---|---|
+| `container.rs` | every concrete infra type it assembles — stores, adapters, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `NanoIdGenerator`, `SystemClock` | Assembly has to name implementations somewhere. This is the TS `container.ts` in Rust form. |
+| `orchestrator.rs` | `CachedTaskStore`, `CachedAgentStore`, `CachedGoalStore` | Faithful: `orchestrator.ts` likewise constructs the tick-scoped cache wrappers itself (`new CachedTaskStore(deps.taskStore)`). |
+| `orchestrator/dispatch.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE`, `build_prompt_context`, `BuildPromptOptions` | Faithful: `orchestrator.ts` imports exactly these from `template-engine.ts`. |
+
+**What actually holds is the narrower, more useful property: every *service* takes only `orch-core` traits.**
+Concrete types appear at assembly and in the two orchestrator modules where the TypeScript couples the same
+way. So `orch-engine` remains unit-testable against `test_support` fakes, and `orch-infra` is still swappable
+wholesale — which is what the boundary was for.
+
+If the edge ever needs to be severed, the moves are known: lift `storage::cached` into `orch-core` (it is
+generic over the traits already) and the two template constants into `orch-domain`. Neither is worth doing now
+— both would diverge from the TS layering for no behavioural gain.
+
 **Enforced invariant: `orch-engine` has zero dependency on `orch-cli` or `orch-tui`.** This mirrors the TS
-layering ("the core engine has zero dependencies on CLI/TUI layers") and is checked in CI by a
-`cargo tree`-based test, not by convention.
+layering ("the core engine has zero dependencies on CLI/TUI layers").
+
+`xtask crate-graph` asserts the **whole edge set** against a table, not just that one forbidden edge —
+including build- and dev-dependencies, since a test-only edge still compiles the crate. A single
+forbidden-edge check would pass a workspace in which `orch-infra` had started depending on `orch-engine`,
+inverting the layering while satisfying the letter of the rule.
 
 **Why `orch-core` exists as a separate crate from `orch-domain`.** The TS code puts storage interfaces under
 `src/infrastructure/storage/interfaces.ts` and the adapter interface under
@@ -869,7 +891,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                       # layers 1, 3, 4
 cargo xtask parity                           # layer 2 — needs node + the vendored TS build
-cargo xtask crate-graph                      # asserts orch-engine ∌ {orch-cli, orch-tui}
+cargo xtask crate-graph                      # asserts the whole inter-crate edge set (§3.1)
 ```
 
 `cargo xtask parity` is gated on `parity/orch-ts/dist/` existing; `parity/setup.sh` clones the pinned
