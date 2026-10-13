@@ -15,13 +15,16 @@
 //! Neither is optional and neither has a caller-visible switch, so no caller
 //! can forget.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use orch_core::error::{Error, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Write atomically: temp file in the same directory, then rename.
 ///
@@ -375,6 +378,288 @@ pub fn is_yaml11_timestamp(value: &str) -> bool {
     i == b.len()
 }
 
+// ── JSONL ──────────────────────────────────────────────────────────────────
+
+/// POSIX `PIPE_BUF`. An `O_APPEND` write up to this size is atomic, which is
+/// what stops concurrent writers interleaving mid-line.
+const PIPE_BUF: usize = 4096;
+
+/// Max file size for a full [`read_jsonl`] (50 MB). Larger files read only the
+/// tail.
+const MAX_JSONL_READ_SIZE: u64 = 50 * 1024 * 1024;
+
+/// Records returned when a file exceeds [`MAX_JSONL_READ_SIZE`].
+const OVERSIZE_TAIL_RECORDS: usize = 200;
+
+/// Idle time before a cached append handle is closed.
+const HANDLE_IDLE: Duration = Duration::from_secs(10);
+
+/// Append a record as one compact JSON line through a cached `O_APPEND`
+/// handle.
+///
+/// `JSON.stringify(record) + "\n"` — compact, no spaces (PARITY.md §6.4).
+///
+/// When the line exceeds [`PIPE_BUF`] and the record is an object with a
+/// non-empty string `data`, `data` is re-truncated so the whole line fits:
+///
+/// ```text
+/// budget = PIPE_BUF - byteLen(JSON.stringify({...record, data: ""}) + "\n") - 3
+/// data   = data.slice(0, budget) + "…"
+/// ```
+///
+/// The `- 3` is the UTF-8 width of the `…`, and the slice counts **characters,
+/// not bytes**, so multi-byte data can still push the line past `PIPE_BUF`.
+/// That is a known bug in the original (PARITY.md §14.10) and is replicated:
+/// the truncation is a best-effort interleaving defence, not a guarantee, and
+/// local filesystems hold the inode lock anyway. A `budget <= 0` writes the
+/// line over-length, unchanged.
+pub async fn append_jsonl<T: Serialize>(path: &Path, record: &T) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_dir(dir).await?;
+
+    let value = serde_json::to_value(record)
+        .map_err(|err| Error::serde(format!("serialize {}", path.display()), path, err))?;
+    let line = jsonl_line(&value)
+        .map_err(|err| Error::serde(format!("serialize {}", path.display()), path, err))?;
+
+    let handle = append_handle(path).await?;
+    let mut file = handle.lock().await;
+    file.write_all(line.as_bytes())
+        .await
+        .map_err(|err| Error::io(format!("append to {}", path.display()), path, err))?;
+    file.flush()
+        .await
+        .map_err(|err| Error::io(format!("flush {}", path.display()), path, err))
+}
+
+/// The exact bytes one JSONL line occupies, truncation applied.
+fn jsonl_line(value: &serde_json::Value) -> std::result::Result<String, serde_json::Error> {
+    let mut line = serde_json::to_string(value)?;
+    line.push('\n');
+    if line.len() <= PIPE_BUF {
+        return Ok(line);
+    }
+
+    let Some(map) = value.as_object() else {
+        return Ok(line);
+    };
+    let Some(data) = map.get("data").and_then(serde_json::Value::as_str) else {
+        return Ok(line);
+    };
+    if data.is_empty() {
+        return Ok(line);
+    }
+
+    // Measure the shell without `data` to know how much room `data` gets.
+    // `{...obj, data: ''}` keeps `data` in its original position, and
+    // `preserve_order` makes the Rust map do the same.
+    let mut shell = value.clone();
+    shell["data"] = serde_json::Value::String(String::new());
+    let overhead = serde_json::to_string(&shell)?.len() + 1;
+    let budget = PIPE_BUF as isize - overhead as isize - 3;
+    if budget <= 0 {
+        return Ok(line);
+    }
+
+    let mut truncated = slice_utf16_units(data, budget as usize);
+    truncated.push('…');
+    let mut out = value.clone();
+    out["data"] = serde_json::Value::String(truncated);
+    let mut line = serde_json::to_string(&out)?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// `String.prototype.slice(0, n)`, which counts UTF-16 code units.
+///
+/// A cut that would land between the two halves of a surrogate pair is moved
+/// back to the preceding code point: JavaScript would produce a lone
+/// surrogate, which a Rust `String` cannot hold. Reachable only with an astral
+/// character at exactly the budget boundary.
+fn slice_utf16_units(text: &str, units: usize) -> String {
+    let mut out = String::with_capacity(units);
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = ch.len_utf16();
+        if used + width > units {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out
+}
+
+/// One `O_APPEND` handle per path, so a chatty run does not open and close a
+/// file per event.
+///
+/// The TS version arms a per-path 10 s timer and re-arms it past the midpoint.
+/// Here eviction is a sweep performed on each append plus the explicit
+/// [`close_append_handle`] the run store calls on completion. The observable
+/// property — handles do not accumulate — is the same, and it avoids a
+/// detached timer task per open file; the trade is that a process which
+/// appends nothing further holds one handle until it exits or closes it.
+static APPEND_HANDLES: OnceLock<AsyncMutex<HashMap<PathBuf, HandleEntry>>> = OnceLock::new();
+
+struct HandleEntry {
+    file: Arc<AsyncMutex<tokio::fs::File>>,
+    last_used: Instant,
+}
+
+fn append_handles() -> &'static AsyncMutex<HashMap<PathBuf, HandleEntry>> {
+    APPEND_HANDLES.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+async fn append_handle(path: &Path) -> Result<Arc<AsyncMutex<tokio::fs::File>>> {
+    let mut handles = append_handles().lock().await;
+    let now = Instant::now();
+    handles.retain(|_, entry| now.duration_since(entry.last_used) < HANDLE_IDLE);
+
+    if let Some(entry) = handles.get_mut(path) {
+        entry.last_used = now;
+        return Ok(Arc::clone(&entry.file));
+    }
+
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|err| Error::io(format!("open {} for append", path.display()), path, err))?;
+    let file = Arc::new(AsyncMutex::new(file));
+    handles.insert(
+        path.to_path_buf(),
+        HandleEntry {
+            file: Arc::clone(&file),
+            last_used: now,
+        },
+    );
+    Ok(file)
+}
+
+/// Release the cached append handle for a path, reclaiming the descriptor
+/// immediately. Called when a run completes.
+pub async fn close_append_handle(path: &Path) {
+    append_handles().lock().await.remove(path);
+}
+
+/// Release every cached append handle. Call on shutdown and in test teardown.
+pub async fn close_all_append_handles() {
+    append_handles().lock().await.clear();
+}
+
+/// Every record in a `.jsonl` file. A missing file reads as empty.
+///
+/// A file over 50 MB reads only its last 200 records and warns, so a runaway
+/// event log cannot exhaust memory.
+pub async fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    let size = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(Error::io(format!("stat {}", path.display()), path, err)),
+    };
+
+    if size > MAX_JSONL_READ_SIZE {
+        tracing::warn!(
+            path = %path.display(),
+            megabytes = size / 1024 / 1024,
+            "jsonl file too large, reading tail only"
+        );
+        return read_jsonl_tail(path, OVERSIZE_TAIL_RECORDS).await;
+    }
+
+    let Some(content) = read_to_string_opt(path).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(parse_jsonl_lines(content.lines()))
+}
+
+/// The last `count` records of a `.jsonl` file, without loading the whole
+/// thing.
+///
+/// A file under 32 KB is read whole and sliced. Larger files are read
+/// backwards in chunks of 64 KB — 128 KB past 1 MB, because a single
+/// tool-result event can exceed 8 KB — for at most 4 chunks. A chunk that did
+/// not start at offset 0 may begin mid-line, so its first line is discarded.
+pub async fn read_jsonl_tail<T: DeserializeOwned>(path: &Path, count: usize) -> Result<Vec<T>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let size = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(Error::io(format!("stat {}", path.display()), path, err)),
+    };
+
+    if size < 32_768 {
+        let Some(content) = read_to_string_opt(path).await? else {
+            return Ok(Vec::new());
+        };
+        let all: Vec<T> = parse_jsonl_lines(content.lines());
+        let start = all.len().saturating_sub(count);
+        return Ok(all.into_iter().skip(start).collect());
+    }
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| Error::io(format!("open {}", path.display()), path, err))?;
+
+    let chunk_size = std::cmp::min(size, if size > 1_048_576 { 131_072 } else { 65_536 });
+    let mut position = size.saturating_sub(chunk_size);
+    let mut earliest_read = position;
+    let mut tail = String::new();
+
+    for _ in 0..4 {
+        earliest_read = position;
+        let read_size = std::cmp::min(chunk_size, size - position) as usize;
+        let mut buffer = vec![0u8; read_size];
+        file.seek(std::io::SeekFrom::Start(position))
+            .await
+            .map_err(|err| Error::io(format!("seek {}", path.display()), path, err))?;
+        file.read_exact(&mut buffer)
+            .await
+            .map_err(|err| Error::io(format!("read {}", path.display()), path, err))?;
+
+        // A chunk boundary can split a multi-byte character; the lossy decode
+        // only ever damages the partial first line, which is discarded below.
+        tail = format!("{}{tail}", String::from_utf8_lossy(&buffer));
+
+        let lines = tail.lines().filter(|l| !l.trim().is_empty()).count();
+        // Strictly more than `count`, because the first line may be partial
+        // and is discarded below.
+        if lines > count || position == 0 {
+            break;
+        }
+        position = position.saturating_sub(chunk_size);
+    }
+
+    let mut lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
+    if earliest_read > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let start = lines.len().saturating_sub(count);
+    Ok(parse_jsonl_lines(lines.into_iter().skip(start)))
+}
+
+/// Parse JSONL lines, skipping corrupt ones with a warning rather than
+/// failing the read — a truncated last line must not lose the whole log.
+fn parse_jsonl_lines<'l, T: DeserializeOwned>(lines: impl Iterator<Item = &'l str>) -> Vec<T> {
+    let mut out = Vec::new();
+    for raw in lines {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(record) => out.push(record),
+            Err(_) => {
+                let preview: String = line.chars().take(200).collect();
+                tracing::warn!(line = %preview, "skipping corrupt jsonl line");
+            }
+        }
+    }
+    out
+}
+
 /// Directories already created in this process.
 ///
 /// The TS version keeps the same cache to skip ~50 redundant `mkdir` syscalls
@@ -709,6 +994,330 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // ── JSONL ──────────────────────────────────────────────────────────────
+
+    /// The append-handle cache is process-global, so a test that asserts on
+    /// its contents must not run beside one that mutates it. Cargo runs tests
+    /// in one process on many threads, so the serialization has to be
+    /// explicit.
+    static HANDLE_CACHE_TESTS: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    fn event(data: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": "2026-10-13T16:37:59.169Z",
+            "type": "agent_output",
+            "data": data,
+        })
+    }
+
+    /// Byte and character counts measured by running the TS `appendJsonl`
+    /// arithmetic under node, not derived from reading it.
+    #[test]
+    fn the_pipe_buf_truncation_matches_the_reference_arithmetic() {
+        // A short line is untouched and compact — no spaces.
+        let short = jsonl_line(&serde_json::json!({
+            "timestamp": "t", "type": "agent_output", "data": "hi"
+        }))
+        .unwrap();
+        assert_eq!(
+            short,
+            "{\"timestamp\":\"t\",\"type\":\"agent_output\",\"data\":\"hi\"}\n"
+        );
+
+        // ASCII data is truncated to land exactly on PIPE_BUF.
+        let ascii = jsonl_line(&event(&"x".repeat(8000))).unwrap();
+        assert_eq!(ascii.len(), 4096, "node measures 4096 bytes");
+        assert_eq!(ascii.chars().count(), 4094, "node measures 4094 chars");
+        assert!(ascii.ends_with("…\"}\n"));
+
+        // PARITY.md §14.10: the slice counts characters, so multi-byte data
+        // still overshoots PIPE_BUF. Replicated, including the exact size.
+        let multibyte = jsonl_line(&event(&"é".repeat(8000))).unwrap();
+        assert_eq!(
+            multibyte.len(),
+            8116,
+            "node measures 8116 bytes — the §14.10 overshoot"
+        );
+        assert_eq!(multibyte.chars().count(), 4094);
+        assert!(multibyte.ends_with("…\"}\n"));
+    }
+
+    #[test]
+    fn a_long_line_without_a_string_data_field_is_written_unchanged() {
+        let no_data = serde_json::json!({
+            "timestamp": "t", "type": "x", "other": "y".repeat(8000)
+        });
+        assert_eq!(
+            jsonl_line(&no_data).unwrap().len(),
+            8040,
+            "node measures 8040"
+        );
+
+        let empty_data = serde_json::json!({
+            "timestamp": "t", "type": "x", "data": "", "pad": "z".repeat(8000)
+        });
+        assert_eq!(
+            jsonl_line(&empty_data).unwrap().len(),
+            8048,
+            "node measures 8048"
+        );
+
+        // A non-object record is left alone too.
+        let array = serde_json::json!(["x".repeat(8000)]);
+        assert!(jsonl_line(&array).unwrap().len() > PIPE_BUF);
+    }
+
+    #[test]
+    fn truncation_keeps_the_data_field_in_its_original_position() {
+        // `{...obj, data: ''}` does not move `data`, and neither may we — the
+        // shell's byte length is what the budget is computed from.
+        let line = jsonl_line(&event(&"x".repeat(8000))).unwrap();
+        let keys: Vec<&str> = ["timestamp", "type", "data"].to_vec();
+        let mut last = 0;
+        for key in keys {
+            let at = line.find(&format!("\"{key}\"")).expect(key);
+            assert!(at >= last, "{key} moved");
+            last = at;
+        }
+    }
+
+    #[test]
+    fn slicing_counts_utf16_units_and_never_splits_a_surrogate_pair() {
+        assert_eq!(slice_utf16_units("hello", 3), "hel");
+        assert_eq!(slice_utf16_units("hello", 99), "hello");
+        assert_eq!(slice_utf16_units("", 3), "");
+        // A BMP character is one unit.
+        assert_eq!(slice_utf16_units("éé", 1), "é");
+        // An astral character is two units, so a budget of 1 excludes it
+        // rather than emitting a lone surrogate as JavaScript would.
+        assert_eq!(slice_utf16_units("\u{1F600}", 1), "");
+        assert_eq!(slice_utf16_units("\u{1F600}", 2), "\u{1F600}");
+        assert_eq!(slice_utf16_units("a\u{1F600}", 2), "a");
+    }
+
+    #[tokio::test]
+    async fn append_jsonl_writes_one_compact_line_per_record() {
+        let _serial = HANDLE_CACHE_TESTS.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("run.jsonl");
+
+        for n in 0..3 {
+            append_jsonl(&path, &event(&format!("line {n}")))
+                .await
+                .unwrap();
+        }
+        // Per-path, not `close_all_*`: the cache is process-global and these
+        // tests run in parallel.
+        close_append_handle(&path).await;
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(raw.lines().count(), 3);
+        assert!(raw.ends_with('\n'));
+        assert!(!raw.contains(": "), "not compact: {raw}");
+
+        let records: Vec<serde_json::Value> = read_jsonl(&path).await.unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["data"], "line 0");
+    }
+
+    #[tokio::test]
+    async fn appends_from_a_second_handle_interleave_without_corruption() {
+        let _serial = HANDLE_CACHE_TESTS.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("run.jsonl");
+
+        let mut handles = Vec::new();
+        for n in 0..32 {
+            let path = path.clone();
+            handles.push(tokio::spawn(async move {
+                append_jsonl(&path, &event(&format!("line {n}")))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        close_append_handle(&path).await;
+
+        // Every line is intact, which is what O_APPEND under PIPE_BUF buys.
+        let records: Vec<serde_json::Value> = read_jsonl(&path).await.unwrap();
+        assert_eq!(records.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_skips_a_corrupt_line_rather_than_failing() {
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("run.jsonl");
+        atomic_write(&path, "{\"a\":1}\n{not json\n\n{\"a\":2}\n")
+            .await
+            .unwrap();
+
+        let records: Vec<serde_json::Value> = read_jsonl(&path).await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["a"], 1);
+        assert_eq!(records[1]["a"], 2);
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_on_a_missing_file_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let records: Vec<serde_json::Value> =
+            read_jsonl(&temp.path().join("nope.jsonl")).await.unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_tail_slices_a_small_file() {
+        let _serial = HANDLE_CACHE_TESTS.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("run.jsonl");
+        for n in 0..10 {
+            append_jsonl(&path, &serde_json::json!({ "n": n }))
+                .await
+                .unwrap();
+        }
+        close_append_handle(&path).await;
+
+        let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, 3).await.unwrap();
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0]["n"], 7);
+        assert_eq!(tail[2]["n"], 9);
+
+        // Asking for more than exists returns everything.
+        let all: Vec<serde_json::Value> = read_jsonl_tail(&path, 99).await.unwrap();
+        assert_eq!(all.len(), 10);
+        assert!(
+            read_jsonl_tail::<serde_json::Value>(&path, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_tail_reads_backwards_past_the_32kb_threshold() {
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("big.jsonl");
+
+        // ~500 records of ~1 KB each: comfortably over 32 KB, so the
+        // chunked backwards path runs.
+        let mut content = String::new();
+        for n in 0..500 {
+            content.push_str(
+                &serde_json::to_string(&serde_json::json!({
+                    "n": n, "pad": "x".repeat(1000)
+                }))
+                .unwrap(),
+            );
+            content.push('\n');
+        }
+        atomic_write(&path, &content).await.unwrap();
+        assert!(tokio::fs::metadata(&path).await.unwrap().len() > 32_768);
+
+        let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, 5).await.unwrap();
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail[0]["n"], 495);
+        assert_eq!(tail[4]["n"], 499);
+
+        // A tail larger than one chunk still works, bounded by the 4-chunk cap.
+        let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, 100).await.unwrap();
+        assert_eq!(tail.len(), 100);
+        assert_eq!(tail[99]["n"], 499);
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_tail_discards_a_partial_leading_line() {
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("big.jsonl");
+
+        // One record wide enough that a 64 KB chunk starts mid-record.
+        let mut content = String::new();
+        for n in 0..40 {
+            content.push_str(
+                &serde_json::to_string(&serde_json::json!({
+                    "n": n, "pad": "y".repeat(2000)
+                }))
+                .unwrap(),
+            );
+            content.push('\n');
+        }
+        atomic_write(&path, &content).await.unwrap();
+
+        // Whatever comes back parses — no half-record leaks through.
+        let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, 3).await.unwrap();
+        assert_eq!(tail.len(), 3);
+        for record in &tail {
+            assert!(record["n"].is_number(), "{record}");
+        }
+        assert_eq!(tail[2]["n"], 39);
+    }
+
+    #[tokio::test]
+    async fn close_append_handle_releases_just_that_path() {
+        let _serial = HANDLE_CACHE_TESTS.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let one = temp.path().join("one.jsonl");
+        let two = temp.path().join("two.jsonl");
+        append_jsonl(&one, &serde_json::json!({ "a": 1 }))
+            .await
+            .unwrap();
+        append_jsonl(&two, &serde_json::json!({ "a": 2 }))
+            .await
+            .unwrap();
+
+        // The handle cache is process-global and these tests run in parallel,
+        // so assert only about this test's own paths — never the total.
+        let held = |path: &std::path::Path| {
+            let path = path.to_path_buf();
+            async move { append_handles().lock().await.contains_key(&path) }
+        };
+        assert!(held(&one).await);
+        assert!(held(&two).await);
+
+        close_append_handle(&one).await;
+        assert!(!held(&one).await);
+        assert!(held(&two).await, "closing one path must not close another");
+
+        // Appending again after a close reopens and keeps the earlier data.
+        append_jsonl(&one, &serde_json::json!({ "a": 3 }))
+            .await
+            .unwrap();
+        close_append_handle(&one).await;
+        let records: Vec<serde_json::Value> = read_jsonl(&one).await.unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn close_all_append_handles_is_safe_to_call_at_any_time() {
+        let _serial = HANDLE_CACHE_TESTS.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("run.jsonl");
+        append_jsonl(&path, &serde_json::json!({ "a": 1 }))
+            .await
+            .unwrap();
+
+        // Cannot assert the map is empty afterwards: it is process-global and
+        // other tests append in parallel. What matters is that it is safe and
+        // that appending still works.
+        close_all_append_handles().await;
+        append_jsonl(&path, &serde_json::json!({ "a": 2 }))
+            .await
+            .unwrap();
+        close_append_handle(&path).await;
+
+        let records: Vec<serde_json::Value> = read_jsonl(&path).await.unwrap();
+        assert_eq!(records.len(), 2);
     }
 
     #[test]

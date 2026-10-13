@@ -50,6 +50,9 @@ orch-core = { workspace = true, features = ["test-support"] }
 insta.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+# `test-util` gives `#[tokio::test(start_paused = true)]`, so the stream's 30 s
+# file wait and the lock's staleness window cost no wall-clock time.
+tokio = { workspace = true, features = ["test-util", "macros", "rt", "rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"
