@@ -51,8 +51,9 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
     // Everything the dispatch emitted is already buffered, so this decides
     // correctly whether a run started at all — the `if (!targetRunId)` of the
     // original, which is reached for a terminal or non-dispatchable task.
+    let mut completed = false;
     for event in events.try_drain() {
-        handle_single(styles, &event, task_id, &mut target_run, &mut failed);
+        completed |= handle_single(styles, &event, task_id, &mut target_run, &mut failed);
     }
 
     // The original's closing `console.log()` runs here, right after
@@ -61,17 +62,24 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
     // sits under the header rather than at the end of the stream.
     println!();
 
-    if target_run.is_some() {
+    // `!completed` because the completion can already be in the batch above:
+    // without it this waits for a second one that never comes, and `run <id>`
+    // hangs after printing its result.
+    if target_run.is_some() && !completed {
         while let Some(event) = events.recv().await {
             let completed = handle_single(styles, &event, task_id, &mut target_run, &mut failed);
             if completed {
                 break;
             }
         }
+    }
+    if target_run.is_some() {
         // `agent:completed` is emitted when the *run* is finished, from the
         // middle of the collector — the task's status change, the agent's
         // stats and the workspace cleanup all come after it. Returning here
-        // would drop the runtime mid-collector.
+        // would drop the runtime mid-collector. Outside the branch above
+        // because it is owed whenever a run started, including when its
+        // completion arrived before the wait.
         engine.orchestrator.wait_for_collectors().await;
     }
 
