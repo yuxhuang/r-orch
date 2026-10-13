@@ -226,6 +226,19 @@ impl ProcessManager for ScriptedProcessManager {
     }
 }
 
+/// One recorded adapter session from `fixtures/adapters/<kind>/<name>`.
+///
+/// Sharing WP-2's recordings rather than inlining payloads keeps one source of
+/// truth per adapter: a frame added to a fixture is seen by the adapter's own
+/// parser test and by the orchestrator e2e below at the same time.
+pub fn adapter_fixture(kind: &str, name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/adapters")
+        .join(kind)
+        .join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}
+
 /// A command runner that answers every auto-review criterion as passing, so
 /// no integration test shells out to `npm` (PARITY.md V31).
 pub struct PassingCommandRunner;

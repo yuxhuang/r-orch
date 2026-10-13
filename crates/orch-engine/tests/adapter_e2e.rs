@@ -13,7 +13,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Rig, ScriptedProcessManager};
+use common::{Rig, ScriptedProcessManager, adapter_fixture};
 use orch_core::test_support::{make_agent, make_task};
 use orch_domain::{
     AdapterErrorKind, Agent, AgentStatus, RunEventType, RunStatus, Task, TaskStatus, TokenUsage,
@@ -87,19 +87,13 @@ async fn pi_drives_a_task_from_todo_to_done() {
     assert_eq!(busy.status, AgentStatus::Running);
     assert_eq!(busy.current_task.as_deref(), Some("tsk_pi"));
 
-    // Feed the RPC stream. `text_delta` deltas aggregate; `text_end` flushes
-    // one canonical `output` event.
-    for line in [
-        r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Reading"}}"#,
-        r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" sources…"}}"#,
-        r#"{"type":"message_update","assistantMessageEvent":{"type":"text_end","content":"Reading sources…"}}"#,
-        r#"{"type":"tool_execution_start","toolName":"read","args":{"path":"src/foo.ts"}}"#,
-        r#"{"type":"tool_execution_end","toolName":"bash","args":{"command":"npm test"},"result":{"content":[{"type":"text","text":"passed"}],"details":{"exitCode":0}},"isError":false}"#,
-        r#"{"type":"tool_execution_end","toolName":"write","args":{"path":"src/foo.ts"},"result":{"content":[{"type":"text","text":"written"}]},"isError":false}"#,
-        r#"{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"Implementation complete."}],"usage":{"input":42,"output":17,"reasoning":3,"cache_read":5,"cache_write":0}}]}"#,
-    ] {
-        rig.processes.write_line(line).await;
-    }
+    // Feed the recorded RPC session. `text_delta` frames aggregate and
+    // `text_end` flushes one canonical `output`; the `extension_ui_request`
+    // and `tool_execution_update` frames in the fixture are passive and
+    // produce nothing.
+    rig.processes
+        .write_stdout(adapter_fixture("pi", "session.jsonl"))
+        .await;
 
     rig.wait_for_status("tsk_pi", TaskStatus::Done).await;
 
@@ -245,14 +239,9 @@ async fn grok_drives_a_task_from_todo_to_done() {
         Some("bypassPermissions")
     );
 
-    for line in [
-        r#"{"type":"thought","data":"skip"}"#,
-        r#"{"type":"text","data":"Grok result"}"#,
-        r#"{"type":"tool_call","name":"read","input":{"path":"src/index.ts"}}"#,
-        r#"{"type":"end","stopReason":"EndTurn"}"#,
-    ] {
-        rig.processes.write_line(line).await;
-    }
+    rig.processes
+        .write_stdout(adapter_fixture("grok", "session.jsonl"))
+        .await;
     rig.processes.close_stdout();
     rig.processes.exit(0);
 
@@ -267,15 +256,15 @@ async fn grok_drives_a_task_from_todo_to_done() {
     assert_eq!(freed.stats.tasks_completed, 1);
 
     let run = only_run(&rig);
-    let mut types = run_event_types(&rig, &run.id);
-    assert_eq!(types.last(), Some(&RunEventType::Done));
-    types.sort_by_key(|event_type| event_type.as_str());
+    // The order in `fixtures/adapters/grok/session.expected.json`: the tool
+    // call passes straight through, while the two `text` frames aggregate into
+    // one `output` that only flushes at `end`.
     assert_eq!(
-        types,
+        run_event_types(&rig, &run.id),
         vec![
+            RunEventType::ToolCall,
             RunEventType::AgentOutput,
-            RunEventType::Done,
-            RunEventType::ToolCall
+            RunEventType::Done
         ]
     );
     // The `thought` frame is dropped, not forwarded as output.
@@ -287,7 +276,7 @@ async fn grok_drives_a_task_from_todo_to_done() {
         .expect("an output event");
     assert_eq!(
         output.data,
-        serde_json::Value::String(r#"{"text":"Grok result"}"#.into())
+        serde_json::Value::String(r#"{"text":"ORCH_OK"}"#.into())
     );
 }
 
@@ -317,8 +306,9 @@ async fn antigravity_drives_a_task_from_todo_to_done() {
             .is_some_and(|prompt| prompt.contains("rendered prompt"))
     );
 
-    rig.processes.write_line("Antigravity line one").await;
-    rig.processes.write_line("Antigravity line two").await;
+    rig.processes
+        .write_stdout(adapter_fixture("antigravity", "session.txt"))
+        .await;
     rig.processes.close_stdout();
     rig.processes.exit(0);
 

@@ -27,13 +27,14 @@ pub use container::{
 };
 pub use doctor_service::{CheckStatus, DoctorCheck, DoctorReport, DoctorService};
 pub use events::{EventBus, EventHandler, EventSubscription, Unsubscribe};
-pub use goal_service::GoalService;
+pub use goal_service::{GoalService, UpdateGoalFields};
 pub use lock::{FileLock, InMemoryLock, LockResult, ProjectLock};
 pub use message_service::MessageService;
+pub use orchestrator::{Orchestrator, OrchestratorDeps, WatchOptions};
 pub use review_runner::{
     CommandOutcome, CommandRunner, ProcessCommandRunner, ReviewRunner, ReviewRunnerOptions,
     all_passed, format_report,
 };
-pub use run_service::RunService;
+pub use run_service::{CreateRunInput, RetryContext, RunService};
 pub use task_service::{TaskService, UpdateTaskFields};
 pub use team_service::TeamService;
