@@ -278,6 +278,64 @@ impl Adapter for ShellAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream::StreamExt;
+    use orch_core::process::ExitSignal;
+    use orch_core::test_support::FakeProcessManager;
+
+    /// A stdout that fails on first read. The TS equivalent is
+    /// `proc.stdout.destroy(new Error(...))`, and the test it guards is the
+    /// one that used to hang forever: if the buffer is never closed, the
+    /// consumer waits for an event that will never arrive.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let _ = buf;
+            std::task::Poll::Ready(Err(std::io::Error::other("stream read error")))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_stream_closes_the_buffer_instead_of_hanging() {
+        let io = ChildIo {
+            pid: 9999,
+            stdout: Some(Box::new(FailingReader)),
+            stderr: Some(Box::new(std::io::Cursor::new(b"still readable\n".to_vec()))),
+            stdin: None,
+            exit: ExitSignal::resolved(ExitOutcome {
+                code: Some(1),
+                signal: None,
+            }),
+            stderr_tail: Default::default(),
+        };
+
+        let stream = shell_events(
+            io,
+            Arc::new(FakeProcessManager::new()),
+            system_clock(),
+            CancellationToken::new(),
+        );
+
+        let collected = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+            .await
+            .expect("the stream must finish rather than wait for a buffer that never closes");
+
+        // The readable half still produced its event, and the run then failed
+        // on the exit code.
+        assert_eq!(collected.len(), 2);
+        assert_eq!(
+            collected[0].as_ref().expect("event").data,
+            Value::String("still readable".to_owned())
+        );
+        assert_eq!(
+            collected[1].as_ref().expect_err("the exit failed").message,
+            "Shell command exited with code 1"
+        );
+    }
 
     #[test]
     fn a_clean_exit_is_not_a_failure() {

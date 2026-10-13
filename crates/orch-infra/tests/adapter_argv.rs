@@ -137,3 +137,35 @@ async fn antigravity_argv() {
         AntigravityAdapter::new(pm).with_clock(fixed_clock())
     )));
 }
+
+/// Every adapter returns the child's pid **synchronously**, before a single
+/// event is pulled: the orchestrator writes `state.running` from it.
+#[tokio::test]
+async fn every_adapter_reports_its_pid_synchronously() {
+    type Build = fn(Arc<dyn ProcessManager>) -> Box<dyn Adapter>;
+
+    let builders: Vec<(&str, Build)> = vec![
+        ("claude", |pm| Box::new(ClaudeAdapter::new(pm))),
+        ("codex", |pm| Box::new(CodexAdapter::new(pm))),
+        ("cursor", |pm| Box::new(CursorAdapter::new(pm))),
+        ("shell", |pm| Box::new(ShellAdapter::new(pm))),
+        ("opencode", |pm| Box::new(OpenCodeAdapter::new(pm))),
+        ("pi", |pm| Box::new(PiAdapter::new(pm))),
+        ("grok", |pm| Box::new(GrokAdapter::new(pm))),
+        ("antigravity", |pm| Box::new(AntigravityAdapter::new(pm))),
+    ];
+
+    for (kind, build) in builders {
+        let pm = ScriptedProcessManager::silent();
+        let adapter = build(Arc::clone(&pm) as Arc<dyn ProcessManager>);
+        let mut execute_params = params("the user prompt", "/ws");
+        execute_params.config = AgentConfig {
+            command: Some("npm test".to_owned()),
+            ..Default::default()
+        };
+
+        let handle = adapter.execute(execute_params).expect("execute");
+        assert!(handle.pid > 0, "{kind} reported pid {}", handle.pid);
+        assert!(!pm.spawn_record().args.is_empty(), "{kind}");
+    }
+}
