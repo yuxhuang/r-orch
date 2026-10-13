@@ -2583,7 +2583,9 @@ The handler is **one ordered `if` chain and the order is load-bearing**. Reprodu
    and then also performs its normal action**.
 2. Agent picker open → swallow everything. (The *type* picker does **not** block — a quirk; `q` still quits
    through it. Preserve or fix deliberately — see §14.8.)
-3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard.
+3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard — **refused when the default adapter is
+   `shell`**, since shop templates require an AI adapter (§11.4). The refusal surfaces the same guidance the
+   suggestion path uses: *Agent Shop requires an AI provider. Choose Shell and enter a command instead.*
 4. Any input mode active → text-input branch.
 5. Normal-mode chain, in source order.
 
@@ -2666,9 +2668,12 @@ step types. Validation is **300 ms debounced** for text and textarea, **synchron
       `approval_policy` **always** skipped; `team` skipped when there are fewer than 2 options. `effort`
       **must sit immediately after `model`**. Shell collapses the wizard to `name`/`adapter`/`command` and
       forces `approval_policy = "auto"`, clearing model/effort/role/skills/team.
-- [ ] **EDIT AGENT** — **8 steps**: `name, adapter, command, model, effort, role, role_custom, team`
-      (`getEditAgentWizardSteps`). **It has no `skills` and no `approval_policy` step**, which is what makes
-      it 8 rather than NEW AGENT's 10 — so neither field is editable through the TUI once an agent exists.
+- [ ] **EDIT AGENT** — **8 steps**, `getEditAgentWizardSteps` at
+      `src/tui/wizardConfigs.ts:463-547`: `name` (:473), `adapter` (:485), `command` (:492), `model` (:503),
+      `effort` (:515), `role` (:523), `role_custom` (:531), `team` (:539).
+      **It has no `skills` and no `approval_policy` step**, which is what makes it 8 rather than NEW AGENT's
+      10 — so **neither field is editable through the TUI once an agent exists**, leaving `agent edit` via
+      `$EDITOR` (§2.4) as the only way to change an agent's skills.
       *(An earlier revision said 9; [docs/parity/tui.md §5.2](parity/tui.md) was correct.)*
 - [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) ·
       **NEW TASK** (4) · **EDIT TASK** (4) · **NEW TEAM** (4) · **New Goal** (3) · **Edit Goal** (3) ·
@@ -2696,7 +2701,7 @@ solid text, selection); exact hex values are L2.
 
 ### 12.8 Deliberate divergences in r-orch's TUI
 
-WP-6 is complete: **740 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
+WP-6 is complete: **742 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
 
@@ -3243,7 +3248,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
 | V31 | **Harness hermeticity**: `HOME`/`USERPROFILE` redirected per tmpdir; a fresh `update-check.json` pre-seeded; the oracle spawns **no `npm`** and makes **no network call** | L0 | Scenario asserting the process tree contains no `npm` and no socket; run with the network namespace disabled in CI |
 | V32 | **Generalized YAML cross-parse**: every YAML artifact in **both** trees re-parsed **in the TS process with js-yaml** and deep-compared against the Rust parse | L0 | Harness step (~50 lines of Node glue). **Subsumes V8.** The single highest-value check in the plan |
-| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 740 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
+| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 742 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
 | V34 | **Stall clock semantics**: a run emitting blank lines stalls; a run emitting unparseable non-blank lines does not | L1 | Cross-compat `serve --once` scenario with a fake agent, compared against the oracle |
 | V35 | **`serve --once` killed mid-run** → task recovery, run finalization and `--json` records match the oracle | L1 | Cross-compat scenario with a fake agent and an external kill |
 | V36 | **`max_concurrent_agents` saturation**: N ready tasks, cap 2 — dispatch order, claim/release and final tree match the oracle | L1 | Cross-compat scenario with fake agents |
