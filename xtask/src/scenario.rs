@@ -143,6 +143,21 @@ impl Scenario {
             if argv.is_empty() {
                 bail!("step {step:?} parses to an empty argv");
             }
+            if argv[0] == WRITE_STEP {
+                if argv.len() != 3 {
+                    bail!(
+                        "`{WRITE_STEP} <path> <content>` takes exactly two arguments; \
+                         got {} in {step:?}",
+                        argv.len() - 1
+                    );
+                }
+                let path = std::path::Path::new(&argv[1]);
+                // The content goes into the scenario's tmpdir, so a path that
+                // escapes it would write into the developer's checkout.
+                if path.is_absolute() || path.components().any(|c| c.as_os_str() == "..") {
+                    bail!("`{WRITE_STEP}` needs a relative path inside the project: {step:?}");
+                }
+            }
         }
         match (self.kind, self.split_at) {
             (Kind::TsThenRust | Kind::RustThenTs, None) => {
@@ -335,6 +350,14 @@ impl Directives {
     }
 }
 
+/// A step that writes a file into the project instead of running a binary.
+///
+/// Some states are only reachable by putting bytes on disk: a lock file
+/// holding garbage, for instance, which no command will produce but which
+/// decides whether the orchestrator starts (PARITY.md §14). Written into both
+/// trees identically, so a differential scenario stays differential.
+pub const WRITE_STEP: &str = "@write";
+
 /// Whether the oracle rejected a step before running it.
 ///
 /// Commander writes its own errors as `error: …` on stderr, while every ORCH
@@ -446,6 +469,52 @@ steps = ["init --adapter shell", "task list"]
             scenario.argv(&scenario.steps[0]).unwrap(),
             vec!["serve".to_owned(), "--once".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_write_step_needs_a_safe_relative_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let body =
+            |step: &str| format!("name = \"s\"\nkind = \"differential\"\nsteps = [{step:?}]\n");
+
+        // The content lands in the scenario's tmpdir, so a path that escapes
+        // it would write into the developer's own checkout.
+        for bad in [
+            "@write /etc/passwd oops",
+            "@write ../../escape oops",
+            "@write .orchestry/../../escape oops",
+            "@write .orchestry/orchestry.lock",
+            "@write .orchestry/orchestry.lock one two",
+        ] {
+            let path = write(temp.path(), "s.toml", &body(bad));
+            assert!(Scenario::load(&path).is_err(), "{bad}");
+        }
+
+        let path = write(
+            temp.path(),
+            "s.toml",
+            &body("@write .orchestry/orchestry.lock not-a-pid-at-all"),
+        );
+        let scenario = Scenario::load(&path).unwrap();
+        assert_eq!(
+            scenario.argv(&scenario.steps[0]).unwrap(),
+            vec![
+                "@write".to_owned(),
+                ".orchestry/orchestry.lock".to_owned(),
+                "not-a-pid-at-all".to_owned()
+            ]
+        );
+
+        // An empty content argument is legal — an empty lock file reads the
+        // same way as a garbage one, and the scenario covers both.
+        let path = write(
+            temp.path(),
+            "s.toml",
+            "name = \"s\"\nkind = \"differential\"\n\
+             steps = [\"@write .orchestry/orchestry.lock ''\"]\n",
+        );
+        let scenario = Scenario::load(&path).unwrap();
+        assert_eq!(scenario.argv(&scenario.steps[0]).unwrap()[2], "");
     }
 
     #[test]

@@ -677,6 +677,24 @@ fn execute(
     let argv = ids
         .expand(&scenario.argv(step)?)
         .map_err(|err| anyhow!("step `{step}`: {err}"))?;
+    // `@write` puts bytes on disk rather than invoking a binary, for states
+    // no command produces — a lock file holding garbage, say.
+    if argv[0] == crate::scenario::WRITE_STEP {
+        let path = project.root.join(&argv[1]);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {} for `@write`", parent.display()))?;
+        }
+        std::fs::write(&path, &argv[2]).with_context(|| format!("`@write` {}", path.display()))?;
+        return Ok(StepOutput {
+            step: step.to_owned(),
+            runner: "harness",
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        });
+    }
+
     let (mut command, label) = match runner {
         Runner::Rust | Runner::Both => (Command::new(&bins.rust), "rust"),
         Runner::Ts => {

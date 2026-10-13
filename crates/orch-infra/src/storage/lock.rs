@@ -175,7 +175,7 @@ pub async fn check_lock(lock_path: &Path) -> LockResult {
 pub async fn require_lock(lock_path: &Path) -> Result<()> {
     let result = acquire_lock(lock_path).await?;
     match (result.acquired, result.pid) {
-        (false, Some(pid)) => Err(Error::Domain(DomainError::LockConflict(pid))),
+        (false, Some(pid)) => Err(Error::Domain(DomainError::LockConflict(Some(pid)))),
         _ => Ok(()),
     }
 }
