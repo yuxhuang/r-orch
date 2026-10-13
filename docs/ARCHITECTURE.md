@@ -257,6 +257,30 @@ not open-ended work.
 
 ---
 
+### 4.8 Library-first policy (user directive, 2026-10-13)
+
+**Where a well-supported third-party crate covers a complex feature, use it instead of hand-rolling.**
+Hand-roll only when (a) no maintained crate fits, or (b) a parity requirement in PARITY.md rules the crate
+out — and say which in a code comment. Candidates for areas that would otherwise be hand-written (verify
+version compatibility with `ratatui` 0.30 / rustc 1.94.1 before adopting; record the choice in
+`[workspace.dependencies]`):
+
+| Area | Crate(s) | Note |
+|---|---|---|
+| Process groups / session spawn + group kill (tokio) | `process-wrap` 10 (tokio feature) | Prefer over hand-rolled `setsid` + `kill(-pid)`; keep `nix` for `kill(pid, 0)` liveness if `process-wrap` lacks it |
+| TUI multi-line/single-line text editing (wizards, command bar, undo) | `tui-textarea` / `tui-input` (or a maintained ratatui-0.30-compatible fork) | Parity of key semantics is L1 — wrap the widget, don't rewrite an editor |
+| Grapheme segmentation / display width (`text-cursor` parity) | `unicode-segmentation`, `unicode-width` | Replaces `Intl.Segmenter` + width logic |
+| Clipboard text/image (TUI paste) | `arboard` (with image support) | TS shells out to osascript/xclip/PowerShell; TUI is L2 here, so the mechanism may differ — degrade to "empty" on any failure, as TS does |
+| Diffs in the parity harness / test failures | `similar`, `pretty_assertions` | |
+| Version comparison (update check) | `semver` | |
+| Templates | `liquid` (already chosen) | The ~400-line fallback renderer is a last resort only, after escalation |
+
+Things that **stay hand-written because parity requires it**: the PID lock-file format, `scopesOverlap`'s raw
+string-prefix logic, the line reader's 16 KB cap/empty-line semantics, the retry backoff formula, the
+`--since` duration regex, the table renderer's exact padding, and the TS-compatible atomic-write temp naming.
+
+---
+
 ## 5. Key traits and types
 
 Signatures below are the contract that WP-0 freezes. Illustrative but intended to be close to final.
