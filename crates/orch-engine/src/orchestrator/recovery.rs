@@ -56,10 +56,7 @@ impl Orchestrator {
                 )
                 .await
             {
-                self.emit_error(
-                    err,
-                    format!("startup cleanup: finish run {}", entry.run_id),
-                );
+                self.emit_error(err, format!("startup cleanup: finish run {}", entry.run_id));
             }
         }))
         .await;
@@ -145,10 +142,7 @@ impl Orchestrator {
             {
                 self.emit_error(
                     err,
-                    format!(
-                        "startup cleanup: finish orphaned preparing run {}",
-                        run.id
-                    ),
+                    format!("startup cleanup: finish orphaned preparing run {}", run.id),
                 );
             }
         }))
@@ -218,12 +212,7 @@ impl Orchestrator {
             match self.deps().task_store.get(&task_id).await {
                 Ok(Some(task)) => {
                     let next = resolve_failure_status(&task);
-                    if let Err(err) = self
-                        .deps()
-                        .task_service
-                        .update_status(&task_id, next)
-                        .await
-                    {
+                    if let Err(err) = self.deps().task_service.update_status(&task_id, next).await {
                         self.emit_error(err, format!("stop: set task {task_id} to {next}"));
                     }
                 }

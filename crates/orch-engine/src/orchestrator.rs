@@ -246,7 +246,7 @@ impl Orchestrator {
         }
     }
 
-    fn deps(&self) -> &OrchestratorDeps {
+    pub(crate) fn deps(&self) -> &OrchestratorDeps {
         &self.inner.deps
     }
 
@@ -483,24 +483,37 @@ impl Orchestrator {
         }
         self.cancel_lazy_save().await;
 
-        {
+        // The save is allowed to fail without aborting the rest of the
+        // shutdown. The TS code `await`s it inside the critical section and
+        // lets a rejection propagate, which skips the lock release and wedges
+        // the project for every later invocation — reachable here because the
+        // tick circuit breaker calls `stop()` precisely when the state store
+        // is the thing that is broken. The error is still returned, so a
+        // caller sees it; it just no longer costs the lock.
+        let saved = {
             let mut slot = self.inner.state.lock().await;
-            if let Some(state) = slot.as_mut() {
-                self.shutdown_running_entries(state).await;
-                state.running.clear();
-                state.claimed.clear();
-                state.pid = None;
-                state.started_at = None;
-                self.save_state(state).await?;
+            match slot.as_mut() {
+                Some(state) => {
+                    self.shutdown_running_entries(state).await;
+                    state.running.clear();
+                    state.claimed.clear();
+                    state.pid = None;
+                    state.started_at = None;
+                    self.save_state(state).await
+                }
+                None => Ok(()),
             }
-        }
+        };
 
         if self.inner.lock_acquired.swap(false, Ordering::SeqCst) {
             self.deps().lock.release().await;
         }
 
         let _ = self.inner.stopped.send(true);
-        Ok(())
+        if let Err(err) = &saved {
+            self.emit_error(err, "stop: persist the cleared state");
+        }
+        saved
     }
 
     /// Cancel a running task: abort, kill, finish the run, mark cancelled.

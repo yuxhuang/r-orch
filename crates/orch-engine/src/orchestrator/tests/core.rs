@@ -3,16 +3,14 @@
 use std::sync::Arc;
 
 use orch_core::test_support::{
-    done_event, make_agent, make_run, make_task, output_event, FakeAdapter,
+    FakeAdapter, done_event, make_agent, make_run, make_task, output_event,
 };
 use orch_domain::{
     Agent, AgentStatus, OrchestratorEvent, OrchestratorEventType, OrchestratorState, Run,
     RunStatus, Task, TaskStatus,
 };
 
-use super::harness::{
-    config_with_concurrency, iso_before, state_running, Harness, NOW_ISO,
-};
+use super::harness::{Harness, NOW_ISO, config_with_concurrency, iso_before, state_running};
 
 fn task_at(id: &str, status: TaskStatus) -> Task {
     Task {
@@ -88,13 +86,17 @@ async fn run_task_does_not_reactive_dispatch_the_other_ready_tasks() {
     // A single-task run must not consume the next ready task just because the
     // agent it used became idle.
     let h = Harness::builder()
-        .tasks([task_at("tsk_1", TaskStatus::Todo), task_at("tsk_2", TaskStatus::Todo)])
+        .tasks([
+            task_at("tsk_1", TaskStatus::Todo),
+            task_at("tsk_2", TaskStatus::Todo),
+        ])
         .agents([agent_at("agt_1", AgentStatus::Idle)])
         .adapter(done_adapter())
         .build();
 
     h.orchestrator.run_task("tsk_1").await.unwrap();
-    h.wait_for(|h| h.task("tsk_1").status == TaskStatus::Done).await;
+    h.wait_for(|h| h.task("tsk_1").status == TaskStatus::Done)
+        .await;
 
     // Past the 500 ms debounce a reactive dispatch would have fired by now.
     tokio::time::sleep(std::time::Duration::from_millis(650)).await;
@@ -186,7 +188,11 @@ async fn stop_kills_running_agents_and_leaves_their_tasks_retryable() {
         .tasks([task.clone()])
         .agents([agent])
         .state(state_running(
-            &task.id, "agt_test1", "run_test1", 54321, NOW_ISO,
+            &task.id,
+            "agt_test1",
+            "run_test1",
+            54321,
+            NOW_ISO,
         ))
         .build();
     h.runs.seed(run);
@@ -201,7 +207,10 @@ async fn stop_kills_running_agents_and_leaves_their_tasks_retryable() {
     );
     // attempts (1) < max_attempts (3), so it goes back to `retrying`.
     assert_eq!(h.task("tsk_test1").status, TaskStatus::Retrying);
-    assert_eq!(h.runs.peek("run_test1").unwrap().status, RunStatus::Cancelled);
+    assert_eq!(
+        h.runs.peek("run_test1").unwrap().status,
+        RunStatus::Cancelled
+    );
     assert_eq!(h.agent("agt_test1").status, AgentStatus::Idle);
     assert!(h.persisted_state().running.is_empty());
 }
@@ -272,7 +281,11 @@ async fn reconcile_drops_a_running_entry_whose_task_is_already_terminal() {
         .tasks([task_at("tsk_dead", TaskStatus::Failed)])
         .agents([make_agent()])
         .state(state_running(
-            "tsk_dead", "agt_test1", "run_dead", 88888, NOW_ISO,
+            "tsk_dead",
+            "agt_test1",
+            "run_dead",
+            88888,
+            NOW_ISO,
         ))
         .build();
     h.processes.set_dead(88888);
@@ -291,7 +304,11 @@ async fn reconcile_drops_a_stale_entry_for_a_done_task_without_checking_the_cloc
         .tasks([task_at("tsk_stall", TaskStatus::Done)])
         .agents([make_agent()])
         .state(state_running(
-            "tsk_stall", "agt_test1", "run_stall", 77777, &long_ago,
+            "tsk_stall",
+            "agt_test1",
+            "run_stall",
+            77777,
+            &long_ago,
         ))
         .build();
 
@@ -319,7 +336,11 @@ async fn reconcile_emits_stall_detected_and_kills_a_stalled_run() {
         }])
         .agents([make_agent()])
         .state(state_running(
-            "tsk_stall", "agt_test1", "run_stall", 77777, &long_ago,
+            "tsk_stall",
+            "agt_test1",
+            "run_stall",
+            77777,
+            &long_ago,
         ))
         .build();
     h.runs.seed(Run {
@@ -353,7 +374,11 @@ async fn reconcile_handles_a_dead_pid_through_the_failure_path_without_deadlocki
         }])
         .agents([make_agent()])
         .state(state_running(
-            "tsk_deadpid", "agt_test1", "run_deadpid", 99999, NOW_ISO,
+            "tsk_deadpid",
+            "agt_test1",
+            "run_deadpid",
+            99999,
+            NOW_ISO,
         ))
         .build();
     h.runs.seed(Run {
@@ -432,7 +457,11 @@ async fn the_failure_handler_updates_the_task_and_enqueues_a_retry() {
         }])
         .agents([make_agent()])
         .state(state_running(
-            "tsk_fail", "agt_test1", "run_fail", 77777, NOW_ISO,
+            "tsk_fail",
+            "agt_test1",
+            "run_fail",
+            77777,
+            NOW_ISO,
         ))
         .build();
     h.runs.seed(Run {
@@ -507,9 +536,8 @@ async fn reconcile_drains_a_retry_that_has_come_due() {
 
 #[tokio::test]
 async fn a_retry_that_is_not_yet_due_stays_queued() {
-    let future = orch_core::clock::iso_from_epoch_ms(
-        orch_core::test_support::FIXED_NOW_MS + 60_000,
-    );
+    let future =
+        orch_core::clock::iso_from_epoch_ms(orch_core::test_support::FIXED_NOW_MS + 60_000);
     let h = Harness::builder()
         .tasks([Task {
             id: "tsk_retry".into(),
@@ -562,9 +590,7 @@ async fn dispatch_stops_at_the_concurrency_cap() {
         .agents([make_agent()])
         .config(config_with_concurrency(1))
         .adapter(done_adapter())
-        .state(state_running(
-            "tsk_1", "agt_test1", "run_1", 11111, NOW_ISO,
-        ))
+        .state(state_running("tsk_1", "agt_test1", "run_1", 11111, NOW_ISO))
         .build();
 
     h.load_state().await.unwrap();
@@ -998,10 +1024,7 @@ async fn collecting_events_logs_them_and_forwards_them_to_the_bus() {
     // Three events reached the run log, and the run carries the tokens.
     let run = h.runs.snapshot().into_iter().next().expect("a run");
     assert_eq!(h.runs.peek_events(&run.id).len(), 3);
-    assert_eq!(
-        h.runs.peek(&run.id).unwrap().tokens.unwrap().total,
-        300
-    );
+    assert_eq!(h.runs.peek(&run.id).unwrap().tokens.unwrap().total, 300);
     assert_eq!(
         h.task("tsk_test1").proof.unwrap().agent_summary.as_deref(),
         Some("completed!")
@@ -1023,9 +1046,7 @@ async fn a_failing_tick_emits_orchestrator_error_with_the_tick_context() {
     let errors = h.events_of(OrchestratorEventType::OrchestratorError);
     assert_eq!(errors.len(), 1);
     match &errors[0] {
-        OrchestratorEvent::OrchestratorError {
-            context, fatal, ..
-        } => {
+        OrchestratorEvent::OrchestratorError { context, fatal, .. } => {
             assert_eq!(context, "tick");
             assert!(!fatal);
         }

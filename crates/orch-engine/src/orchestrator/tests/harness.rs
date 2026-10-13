@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use orch_core::adapter::{AdapterRegistry, AgentEvent};
+use orch_core::adapter::AdapterRegistry;
 use orch_core::clock::Clock;
 use orch_core::ids::IdGenerator;
 use orch_core::storage::{
@@ -11,8 +11,8 @@ use orch_core::storage::{
 };
 use orch_core::test_support::{
     FakeAdapter, FakeAgentStore, FakeContextStore, FakeGoalStore, FakeMessageStore,
-    FakeProcessManager, FakeRunStore, FakeSkillLoader, FakeStateStore, FakeTaskStore, FakeTeamStore,
-    FakeTemplateEngine, FakeWorkspaceManager, FixedClock, SeqIdGenerator,
+    FakeProcessManager, FakeRunStore, FakeSkillLoader, FakeStateStore, FakeTaskStore,
+    FakeTeamStore, FakeTemplateEngine, FakeWorkspaceManager, FixedClock, SeqIdGenerator,
 };
 use orch_domain::{
     Agent, Goal, OrchestratorConfig, OrchestratorEvent, OrchestratorEventType, OrchestratorState,
@@ -42,16 +42,8 @@ impl ScriptedCommandRunner {
         }
     }
 
-    /// Make every criterion fail from now on.
-    pub(crate) fn set_outcome(&self, outcome: crate::review_runner::CommandOutcome) {
-        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = outcome;
-    }
-
     pub(crate) fn calls(&self) -> Vec<(String, Vec<String>, std::path::PathBuf)> {
-        self.calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -64,14 +56,11 @@ impl crate::review_runner::CommandRunner for ScriptedCommandRunner {
         cwd: &std::path::Path,
         _timeout: std::time::Duration,
     ) -> crate::review_runner::CommandOutcome {
-        self.calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((
-                command.to_owned(),
-                args.iter().map(|a| (*a).to_owned()).collect(),
-                cwd.to_path_buf(),
-            ));
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).push((
+            command.to_owned(),
+            args.iter().map(|a| (*a).to_owned()).collect(),
+            cwd.to_path_buf(),
+        ));
         self.outcome
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -108,9 +97,7 @@ pub(crate) struct Harness {
     pub agents: Arc<FakeAgentStore>,
     pub runs: Arc<FakeRunStore>,
     pub state: Arc<FakeStateStore>,
-    pub goals: Arc<FakeGoalStore>,
     pub context: Arc<FakeContextStore>,
-    pub messages: Arc<FakeMessageStore>,
     pub processes: Arc<FakeProcessManager>,
     pub workspace: Arc<FakeWorkspaceManager>,
     pub templates: Arc<FakeTemplateEngine>,
@@ -120,7 +107,6 @@ pub(crate) struct Harness {
     pub commands: Arc<ScriptedCommandRunner>,
     pub clock: Arc<FixedClock>,
     pub bus: Arc<EventBus>,
-    pub config: OrchestratorConfig,
     recorded: Arc<Mutex<Vec<OrchestratorEvent>>>,
     /// Keeps the wildcard subscription attached for the harness's lifetime.
     _recorder: Option<crate::events::Unsubscribe>,
@@ -142,8 +128,11 @@ pub(crate) struct HarnessBuilder {
     skills: Arc<FakeSkillLoader>,
     clock: Arc<FixedClock>,
     review_outcome: crate::review_runner::CommandOutcome,
+    adapter_impl: Option<Arc<dyn orch_core::adapter::Adapter>>,
     #[allow(clippy::type_complexity)]
     wrap_tasks: Option<Box<dyn FnOnce(Arc<FakeTaskStore>) -> Arc<dyn TaskStore>>>,
+    #[allow(clippy::type_complexity)]
+    wrap_agents: Option<Box<dyn FnOnce(Arc<FakeAgentStore>) -> Arc<dyn AgentStore>>>,
 }
 
 impl Default for HarnessBuilder {
@@ -169,7 +158,9 @@ impl HarnessBuilder {
             skills: Arc::new(FakeSkillLoader::new()),
             clock: Arc::new(FixedClock::new()),
             review_outcome: review_pass(),
+            adapter_impl: None,
             wrap_tasks: None,
+            wrap_agents: None,
         }
     }
 
@@ -181,6 +172,15 @@ impl HarnessBuilder {
         wrap: impl FnOnce(Arc<FakeTaskStore>) -> Arc<dyn TaskStore> + 'static,
     ) -> Self {
         self.wrap_tasks = Some(Box::new(wrap));
+        self
+    }
+
+    /// The same, for the agent store.
+    pub(crate) fn wrap_agent_store(
+        mut self,
+        wrap: impl FnOnce(Arc<FakeAgentStore>) -> Arc<dyn AgentStore> + 'static,
+    ) -> Self {
+        self.wrap_agents = Some(Box::new(wrap));
         self
     }
 
@@ -216,14 +216,15 @@ impl HarnessBuilder {
         self
     }
 
-    /// Replay these events from the single registered adapter.
-    pub(crate) fn adapter_events(self, events: impl IntoIterator<Item = AgentEvent>) -> Self {
-        self.adapter.set_events(events);
+    pub(crate) fn adapter(mut self, adapter: Arc<FakeAdapter>) -> Self {
+        self.adapter = adapter;
         self
     }
 
-    pub(crate) fn adapter(mut self, adapter: Arc<FakeAdapter>) -> Self {
-        self.adapter = adapter;
+    /// Register an arbitrary adapter implementation rather than the fake —
+    /// for the cases that need a hand-written `execute`.
+    pub(crate) fn adapter_impl(mut self, adapter: Arc<dyn orch_core::adapter::Adapter>) -> Self {
+        self.adapter_impl = Some(adapter);
         self
     }
 
@@ -231,11 +232,6 @@ impl HarnessBuilder {
     /// `buildDeps` hands over a bare `new AdapterRegistry()`.
     pub(crate) fn without_adapter(mut self) -> Self {
         self.register_adapter = false;
-        self
-    }
-
-    pub(crate) fn with_goal_store(mut self) -> Self {
-        self.with_goal_store = true;
         self
     }
 
@@ -290,15 +286,23 @@ impl HarnessBuilder {
             Some(wrap) => wrap(Arc::clone(&tasks)),
             None => Arc::clone(&tasks) as Arc<dyn TaskStore>,
         };
+        let agent_store: Arc<dyn AgentStore> = match self.wrap_agents {
+            Some(wrap) => wrap(Arc::clone(&agents)),
+            None => Arc::clone(&agents) as Arc<dyn AgentStore>,
+        };
 
         let mut registry = AdapterRegistry::new();
-        if self.register_adapter {
-            registry.register(Arc::clone(&self.adapter) as Arc<dyn orch_core::adapter::Adapter>);
+        match self.adapter_impl {
+            Some(adapter) => registry.register(adapter),
+            None if self.register_adapter => {
+                registry.register(Arc::clone(&self.adapter) as Arc<dyn orch_core::adapter::Adapter>)
+            }
+            None => {}
         }
 
         let task_service = Arc::new(TaskService::new(
             Arc::clone(&task_store),
-            Arc::clone(&agents) as Arc<dyn AgentStore>,
+            Arc::clone(&agent_store),
             Arc::clone(&bus),
             self.config.clone(),
             Arc::clone(&clock) as Arc<dyn Clock>,
@@ -306,7 +310,7 @@ impl HarnessBuilder {
             None,
         ));
         let agent_service = Arc::new(AgentService::new(
-            Arc::clone(&agents) as Arc<dyn AgentStore>,
+            Arc::clone(&agent_store),
             Arc::clone(&state) as Arc<dyn StateStore>,
             Arc::clone(&bus),
             self.config.clone(),
@@ -320,7 +324,7 @@ impl HarnessBuilder {
         ));
         let message_service = Arc::new(MessageService::new(
             Arc::clone(&messages) as Arc<dyn MessageStore>,
-            Arc::clone(&agents) as Arc<dyn AgentStore>,
+            Arc::clone(&agent_store),
             teams as Arc<dyn TeamStore>,
             Arc::clone(&bus),
             Arc::clone(&clock) as Arc<dyn Clock>,
@@ -337,7 +341,7 @@ impl HarnessBuilder {
 
         let deps = OrchestratorDeps {
             task_store: Arc::clone(&task_store),
-            agent_store: Arc::clone(&agents) as Arc<dyn AgentStore>,
+            agent_store: Arc::clone(&agent_store),
             run_store: Arc::clone(&runs) as Arc<dyn RunStore>,
             state_store: Arc::clone(&state) as Arc<dyn StateStore>,
             adapters: Arc::new(registry),
@@ -350,8 +354,7 @@ impl HarnessBuilder {
             run_service,
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
             lock: Arc::clone(&lock) as Arc<dyn crate::lock::ProjectLock>,
-            command_runner: Arc::clone(&commands)
-                as Arc<dyn crate::review_runner::CommandRunner>,
+            command_runner: Arc::clone(&commands) as Arc<dyn crate::review_runner::CommandRunner>,
             config: self.config.clone(),
             project_root: std::path::PathBuf::from("/tmp/project"),
             context_store: self
@@ -372,9 +375,7 @@ impl HarnessBuilder {
             agents,
             runs,
             state,
-            goals,
             context,
-            messages,
             processes,
             workspace,
             templates,
@@ -384,7 +385,6 @@ impl HarnessBuilder {
             commands,
             clock,
             bus,
-            config: self.config,
             recorded,
             _recorder: Some(recorder),
         }
@@ -397,17 +397,18 @@ impl Harness {
     }
 
     /// Start watch mode with signal handling off — a real `SIGINT` would hit
-    /// the test process, not a child.
+    /// the test process, not a child. Seeding is **on**, which is the TS
+    /// default for `startWatch()` with no options.
     pub(crate) async fn start_watch(&self) -> orch_core::error::Result<()> {
-        self.orchestrator
-            .start_watch(WatchOptions::default())
-            .await
+        self.orchestrator.start_watch(WatchOptions::default()).await
     }
 
-    pub(crate) async fn start_watch_seeding(&self) -> orch_core::error::Result<()> {
+    /// `startWatch({ skipAutonomousSeeding: true })` — what `serve --once`
+    /// and the skills suite pass.
+    pub(crate) async fn start_watch_skipping_seeding(&self) -> orch_core::error::Result<()> {
         self.orchestrator
             .start_watch(WatchOptions {
-                skip_autonomous_seeding: false,
+                skip_autonomous_seeding: true,
                 handle_signals: false,
             })
             .await
@@ -469,7 +470,9 @@ impl Harness {
     }
 
     pub(crate) fn task(&self, id: &str) -> Task {
-        self.tasks.peek(id).unwrap_or_else(|| panic!("no task {id}"))
+        self.tasks
+            .peek(id)
+            .unwrap_or_else(|| panic!("no task {id}"))
     }
 
     pub(crate) fn agent(&self, id: &str) -> Agent {

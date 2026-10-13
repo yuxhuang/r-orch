@@ -142,7 +142,8 @@ async fn a_clean_merge_reports_success_and_cleans_the_worktree_up() {
         vec![("tsk_1".to_owned(), Some("orch/tsk_1".to_owned()))]
     );
     assert_eq!(
-        h.events_of(OrchestratorEventType::WorkspaceMergeSucceeded).len(),
+        h.events_of(OrchestratorEventType::WorkspaceMergeSucceeded)
+            .len(),
         1
     );
     // Auto-approve applies on the happy path.

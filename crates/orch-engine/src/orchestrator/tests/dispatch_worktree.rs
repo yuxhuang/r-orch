@@ -110,7 +110,9 @@ async fn the_worktree_path_lands_on_the_task() {
     .await;
 
     assert_eq!(
-        branch_save(&h, "tsk_wt1", "orch/tsk_wt1").workspace.as_deref(),
+        branch_save(&h, "tsk_wt1", "orch/tsk_wt1")
+            .workspace
+            .as_deref(),
         Some(path)
     );
 }
@@ -204,10 +206,7 @@ impl TaskStore for VanishingTaskStore {
     }
 
     async fn get(&self, id: &str) -> Result<Option<Task>> {
-        let count = self
-            .gets
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+        let count = self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if count > self.vanish_after && id == self.vanishing_id {
             return Ok(None);
         }

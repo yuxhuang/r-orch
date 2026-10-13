@@ -9,8 +9,10 @@
 //! exactly `n` milliseconds instead of sleeping, and ids are predictable.
 
 mod auto_review_approve;
+mod autonomous;
 mod bugfixes_2026_03;
 mod core;
+mod defensive_validation;
 mod dispatch_worktree;
 mod endurance;
 mod error_kind_propagation;

@@ -125,10 +125,7 @@ impl InMemoryLock {
     /// Report a conflict with `pid` from now on. `None` restores normal
     /// behaviour.
     pub fn set_conflict(&self, pid: Option<u32>) {
-        *self
-            .conflict_with
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = pid;
+        *self.conflict_with.lock().unwrap_or_else(|e| e.into_inner()) = pid;
     }
 
     pub fn is_held(&self) -> bool {
@@ -156,11 +153,7 @@ impl ProjectLock for InMemoryLock {
     async fn acquire(&self) -> LockResult {
         self.acquires
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if let Some(pid) = *self
-            .conflict_with
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-        {
+        if let Some(pid) = *self.conflict_with.lock().unwrap_or_else(|e| e.into_inner()) {
             return LockResult {
                 acquired: false,
                 pid: Some(pid),

@@ -5,19 +5,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
+use orch_core::storage::{AgentStore, GoalStore, TaskStore};
 use orch_core::template::{GoalContext, RetryContext};
 use orch_domain::{
     AgentStatus, DomainError, OrchestratorEvent, OrchestratorState, RetryEntry, RunningEntry,
     ScopeIndex, Task, TaskProof, TaskStatus, calculate_retry_delay, is_blocked, is_dispatchable,
     is_terminal, resolve_failure_status, scopes_overlap,
 };
-use orch_core::storage::{AgentStore, GoalStore, TaskStore};
 use orch_infra::template::{
     BuildPromptOptions, DEFAULT_SYSTEM_TEMPLATE, DEFAULT_USER_TEMPLATE, build_prompt_context,
 };
 
 use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator, RETRY_CONTEXT_EVENTS};
-use crate::orchestrator::tick::epoch_ms_from_iso;
 
 impl Orchestrator {
     /// Invalidate → load → dispatch → save, under the state lock. Shared by
@@ -198,7 +197,13 @@ impl Orchestrator {
                 self.config().scheduling.retry_base_delay_ms,
                 self.config().scheduling.retry_max_delay_ms,
             );
-            self.enqueue_retry(state, &updated.id, updated.attempts, delay, &err.to_string());
+            self.enqueue_retry(
+                state,
+                &updated.id,
+                updated.attempts,
+                delay,
+                &err.to_string(),
+            );
             let _ = self.save_state(state).await;
         }
     }
@@ -209,11 +214,7 @@ impl Orchestrator {
     /// dispatch path cannot opportunistically start it, then the original
     /// claimed set is restored. Without this a one-shot command would behave
     /// like `run --all` whenever more work happened to be ready.
-    async fn dispatch_only_task(
-        &self,
-        state: &mut OrchestratorState,
-        task_id: &str,
-    ) -> Result<()> {
+    async fn dispatch_only_task(&self, state: &mut OrchestratorState, task_id: &str) -> Result<()> {
         let original_claimed = state.claimed.clone();
         let all_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
         self.inner
@@ -467,7 +468,10 @@ impl Orchestrator {
             .update_status(&task_id, TaskStatus::InProgress)
             .await?;
         self.deps().task_service.assign(&task_id, &agent.id).await?;
-        self.deps().task_service.increment_attempts(&task_id).await?;
+        self.deps()
+            .task_service
+            .increment_attempts(&task_id)
+            .await?;
 
         // Persist the branch immediately, re-reading first so the
         // `in_progress` status set above is not overwritten. Without this a
@@ -671,15 +675,5 @@ impl Orchestrator {
         if cascaded_any {
             self.inner.cached_tasks.invalidate_async().await;
         }
-    }
-
-    /// Whether a retry for this task is queued, and when it comes due.
-    /// Used by `status` and by the tests that assert the queue was drained.
-    pub(super) fn retry_due_at(state: &OrchestratorState, task_id: &str) -> Option<i64> {
-        state
-            .retry_queue
-            .iter()
-            .find(|retry| retry.task_id == task_id)
-            .and_then(|retry| epoch_ms_from_iso(&retry.due_at))
     }
 }

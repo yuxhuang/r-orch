@@ -7,11 +7,11 @@
 use std::sync::atomic::Ordering;
 
 use orch_core::error::Result;
+use orch_core::storage::{AgentStore, GoalStore, TaskStore};
 use orch_domain::{
     AgentStatus, OrchestratorEvent, OrchestratorState, RunningEntry, TaskStatus, is_dispatchable,
     is_terminal,
 };
-use orch_core::storage::{AgentStore, GoalStore, TaskStore};
 
 use super::{AUTO_SEED_COOLDOWN_MS, DEBOUNCE, MAX_IMMEDIATE_DISPATCH_RETRIES, Orchestrator};
 
@@ -112,7 +112,11 @@ impl Orchestrator {
         .await;
 
         for (index, (task_id, entry)) in entries.iter().enumerate() {
-            let task = tasks.get(index).and_then(|r| r.as_ref().ok()).cloned().flatten();
+            let task = tasks
+                .get(index)
+                .and_then(|r| r.as_ref().ok())
+                .cloned()
+                .flatten();
 
             // 1. The task is gone or already terminal: the running entry is
             // stale bookkeeping, nothing more.
@@ -147,7 +151,13 @@ impl Orchestrator {
             // 3. PID liveness.
             if !self.deps().processes.is_alive(entry.pid) {
                 if let Err(err) = self
-                    .handle_run_failure_locked(state, task_id, entry, "Process crashed unexpectedly", None)
+                    .handle_run_failure_locked(
+                        state,
+                        task_id,
+                        entry,
+                        "Process crashed unexpectedly",
+                        None,
+                    )
                     .await
                 {
                     // The failure handler itself failed (an invalid
@@ -366,10 +376,9 @@ impl Orchestrator {
 
         for agent in autonomous {
             // An agent with work in flight does not need more.
-            if all_tasks
-                .iter()
-                .any(|task| task.assignee.as_deref() == Some(&agent.id) && !is_terminal(task.status))
-            {
+            if all_tasks.iter().any(|task| {
+                task.assignee.as_deref() == Some(&agent.id) && !is_terminal(task.status)
+            }) {
                 continue;
             }
             // Cooldown, so a failing agent is not handed a new task every tick.
@@ -499,8 +508,9 @@ impl Orchestrator {
         self.fresh_dispatch_all().await
     }
 
-    /// Whether an immediate dispatch is currently scheduled. The TS tests
-    /// assert on `immediateDispatchTimer` being cleared by `stop`.
+    /// Whether an immediate dispatch is currently scheduled. The TS suite
+    /// asserts on `immediateDispatchTimer` being cleared by `stop`.
+    #[cfg(test)]
     pub(super) async fn has_pending_immediate_dispatch(&self) -> bool {
         self.inner.immediate_dispatch.lock().await.is_some()
     }

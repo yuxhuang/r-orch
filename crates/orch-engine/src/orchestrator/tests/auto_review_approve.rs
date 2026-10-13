@@ -42,7 +42,9 @@ fn setup(auto_approve: bool, criteria: Vec<ReviewCriterion>, criteria_pass: bool
     let harness = Harness::builder()
         .tasks([task])
         .agents([agent])
-        .state(state_running("tsk_ar1", "agt_ar1", "run_ar1", 12345, NOW_ISO))
+        .state(state_running(
+            "tsk_ar1", "agt_ar1", "run_ar1", 12345, NOW_ISO,
+        ))
         .review_outcome(if criteria_pass {
             review_pass()
         } else {
@@ -185,7 +187,10 @@ async fn criteria_run_in_the_tasks_own_workspace() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "npx");
     assert_eq!(calls[0].1, vec!["tsc".to_owned(), "--noEmit".to_owned()]);
-    assert_eq!(calls[0].2, std::path::PathBuf::from("/tmp/worktrees/tsk_ar1"));
+    assert_eq!(
+        calls[0].2,
+        std::path::PathBuf::from("/tmp/worktrees/tsk_ar1")
+    );
 }
 
 #[tokio::test]

@@ -22,7 +22,9 @@ pub mod team_service;
 
 pub use agent_factory::{is_mcp_skill, template_to_agent_input};
 pub use agent_service::{AgentService, AgentStatsUpdate, UpdateAgentFields};
-pub use container::{Engine, EngineSeams, build_light, build_light_with};
+pub use container::{
+    Engine, EngineSeams, FullEngine, build_full, build_full_with, build_light, build_light_with,
+};
 pub use doctor_service::{CheckStatus, DoctorCheck, DoctorReport, DoctorService};
 pub use events::{EventBus, EventHandler, EventSubscription, Unsubscribe};
 pub use goal_service::GoalService;

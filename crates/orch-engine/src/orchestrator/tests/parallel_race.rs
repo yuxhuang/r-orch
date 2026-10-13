@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use orch_core::adapter::{AdapterError, AgentEvent, AgentEventKind};
-use orch_core::test_support::{FakeAdapter, done_event, make_agent, make_run, make_task, output_event};
+use orch_core::test_support::{
+    FakeAdapter, done_event, make_agent, make_run, make_task, output_event,
+};
 use orch_domain::{
     Agent, AgentStatus, OrchestratorState, Run, RunStatus, RunningEntry, Task, TaskStatus,
 };
@@ -220,8 +222,5 @@ async fn a_stream_error_with_a_live_entry_goes_through_the_failure_handler() {
     assert_eq!(h.agent("agt_fin").status, AgentStatus::Idle);
     assert_eq!(h.task("tsk_fin").status, TaskStatus::Retrying);
     // The classification came from the thrown error, not from an error event.
-    assert_eq!(
-        h.agent("agt_fin").last_error.unwrap().kind,
-        "spawn_failed"
-    );
+    assert_eq!(h.agent("agt_fin").last_error.unwrap().kind, "spawn_failed");
 }

@@ -12,13 +12,13 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use orch_core::adapter::{AdapterError, AgentEvent, AgentEventKind};
 use orch_core::error::Result;
+use orch_core::storage::TaskStore;
 use orch_domain::{
     AdapterErrorKind, AgentLastError, AgentStatus, OrchestratorEvent, OrchestratorState,
     ReviewCriterion, RunStatus, RunningEntry, Task, TaskProof, TaskStatus, TokenUsage,
     TokenUsageOpts, classify_adapter_error, create_token_usage, resolve_completion_status,
     resolve_failure_status,
 };
-use orch_core::storage::TaskStore;
 
 use super::{
     MAX_AGENT_SUMMARY_LEN, MAX_BUS_DATA_LEN, MAX_EVENT_DATA_LEN, MAX_LAST_ERROR_LEN, Orchestrator,
@@ -146,8 +146,15 @@ impl Orchestrator {
             .clone()
             .or_else(|| collected.last_agent_message.clone());
         let files: Vec<String> = collected.files_changed.iter().cloned().collect();
-        self.handle_run_success(task_id, run_id, agent_id, collected.tokens, final_result, files)
-            .await
+        self.handle_run_success(
+            task_id,
+            run_id,
+            agent_id,
+            collected.tokens,
+            final_result,
+            files,
+        )
+        .await
     }
 
     async fn record_event(
@@ -390,9 +397,12 @@ impl Orchestrator {
         let stats_update = AgentStatsUpdate {
             tasks_completed: Some(previous.as_ref().map_or(0, |s| s.tasks_completed) + 1),
             total_runs: Some(previous.as_ref().map_or(0, |s| s.total_runs) + 1),
-            total_runtime_ms: Some(previous.as_ref().map_or(0, |s| s.total_runtime_ms) + runtime_ms),
-            tokens_used: tokens
-                .map(|tokens| previous.as_ref().and_then(|s| s.tokens_used).unwrap_or(0) + tokens.total),
+            total_runtime_ms: Some(
+                previous.as_ref().map_or(0, |s| s.total_runtime_ms) + runtime_ms,
+            ),
+            tokens_used: tokens.map(|tokens| {
+                previous.as_ref().and_then(|s| s.tokens_used).unwrap_or(0) + tokens.total
+            }),
             ..Default::default()
         };
         if let Err(err) = self
@@ -553,7 +563,12 @@ impl Orchestrator {
 
         self.deps()
             .run_service
-            .finish(&entry.run_id, RunStatus::Failed, None, Some(error.to_owned()))
+            .finish(
+                &entry.run_id,
+                RunStatus::Failed,
+                None,
+                Some(error.to_owned()),
+            )
             .await?;
         self.deps()
             .agent_service
@@ -761,13 +776,7 @@ impl Orchestrator {
     /// not parse, where JS would produce `NaN` and poison the counter.
     fn runtime_ms(&self, entry: &RunningEntry) -> Option<u64> {
         let started_at = epoch_ms_from_iso(&entry.started_at)?;
-        Some(
-            self.deps()
-                .clock
-                .now_ms()
-                .saturating_sub(started_at)
-                .max(0) as u64,
-        )
+        Some(self.deps().clock.now_ms().saturating_sub(started_at).max(0) as u64)
     }
 }
 
