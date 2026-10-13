@@ -63,9 +63,19 @@ skill loading; serve-mode log record *fields*.
 
 ### 1.3 What is L2
 
-TUI pixel layout, colours and glyph choices; `--help` text wording and layout; spinner frames and animation
-timing; colour/ANSI styling of human output; log *text* format in `serve --log-format text`; progress and
-status decoration.
+TUI pixel layout, colours and glyph choices; spinner frames and animation timing; colour/ANSI styling of human
+output; log *text* format in `serve --log-format text`; progress and status decoration.
+
+**`--help` output is L2 — it is clap's, not Commander's.** Wording, wrapping, option ordering and section
+headings all differ, and no attempt is made to reproduce Commander's layout. What *is* L0 around help:
+
+- the **command, subcommand, alias and flag names** themselves (§2.2) — these are what `--help` advertises and
+  what scripts call;
+- the **stream** help goes to: stdout for an explicit `--help`, **stderr** for the bare-command-group path
+  (§3);
+- the **exit code**: 0 for explicit `--help`, 1 for a bare command group, 3 in an uninitialized directory.
+
+So a harness scenario asserts the stream and exit code of a help invocation, never its body.
 
 ### 1.4 Normalization rules for comparison
 
@@ -164,7 +174,7 @@ Positional args: `<x>` required, `[x]` optional. All options take a value unless
 | `add` | `<title>` | `-d, --description <desc>`; `-p, --priority <n>` **default `'3'`**; `-l, --labels <labels>` (comma-separated); `--depends-on <ids>` (comma-separated); `--max-attempts <n>`; `--workspace-mode <mode>` (`shared\|worktree\|isolated`); `--assignee <agent-id>`; `--review-criteria <criteria>` (comma-separated of `test_pass,typecheck,lint`); `--scope <patterns>` (comma-separated globs); `--goal-id <goalId>`; `--attach <paths>` (comma-separated); `-e, --edit` *(bool)* |
 | `list` | — | `--status <status>` |
 | `show` | `<id>` | — |
-| `edit` | `<id>` | — (opens `$EDITOR`) |
+| `edit` | `<id>` | **none** — round-trips via `$EDITOR` only (§2.4) |
 | `assign` | `<task-id> <agent-id>` | — |
 | `cancel` | `<id>` | — |
 | `approve` | `<id>` | — |
@@ -178,7 +188,7 @@ Positional args: `<x>` required, `[x]` optional. All options take a value unless
 | `shop` | — | `--list` *(bool)* — print all templates non-interactively |
 | `list` | — | — |
 | `status` | `<id>` | — |
-| `edit` | `<id>` | — |
+| `edit` | `<id>` | **none** — round-trips via `$EDITOR` only (§2.4) |
 | `remove` | `<id>` | — |
 | `disable` | `<id>` | — |
 | `enable` | `<id>` | — |
@@ -282,6 +292,29 @@ No args, no options.
 2. `orch` with no args in an initialized project → launch the TUI.
 3. `--help`/`-h`/`--version`/`-V` with no real subcommand → print and exit without building a container.
 
+### 2.4 The `$EDITOR` round-trip protocol (L0)
+
+**`task edit <id>` and `agent edit <id>` take no options whatsoever.** They sit beside flag-taking verbs in
+§2.2, which invites the assumption that they accept `--title`/`--description`/`--model`. They do not. Each:
+
+1. serializes the entity into a temp file as **`---`-delimited frontmatter**,
+2. spawns an editor on it — **`$EDITOR`, then `$VISUAL`, then `vi`**,
+3. parses what comes back and writes **only the fields that changed**.
+
+This is an L0 surface that no earlier revision of this document enumerated. Three behaviours are contract:
+
+| Situation | Behaviour |
+|---|---|
+| Editor exits 0 with an unchanged file | prints `No changes.` |
+| Editor exits non-zero | prints `Editor exited with code N` |
+| Editor exits 0 with changes | writes only the changed fields |
+
+The exact frontmatter key set per entity is in [docs/parity/cli.md §4, §5](parity/cli.md). Scenarios reach
+these commands through `fixtures/fake-editors/`; `cargo xtask lint-scenarios` rejects a scenario that passes
+invented flags to them, which is how four originally-written scenarios were found to be asserting nothing.
+
+The same `-e/--edit` flag on `task add` and `agent add` uses the same protocol to author one field.
+
 ---
 
 ## 3. Exit codes (L0)
@@ -303,8 +336,22 @@ Additional exit paths (all L0):
 - **Any command in an uninitialized directory exits `3`** — *including* `orch <sub> --help` and unknown
   commands. The container is built **before** Commander parses, so `NotInitializedError` wins over help and
   over usage errors. Only `init`, `doctor` and `update` are exempt.
-- **A command group invoked with no subcommand** (`orch task`, `orch agent`, …) prints its help to **stdout**
-  and exits **`1`**.
+- **A command group invoked with no subcommand** (`orch task`, `orch agent`, …) prints its help to
+  **stderr** — **0 bytes on stdout** — and exits **`1`**. This is Commander's `help({ error: true })` path,
+  which a subcommand without an `.action()` falls into. Measured against the oracle in a hermetic tmpdir:
+
+  | argv | stdout | stderr | exit |
+  |---|---|---|---|
+  | `orch task` | 0 B | 735 B | 1 |
+  | `orch agent` | 0 B | 654 B | 1 |
+  | `orch config` | 0 B | 407 B | 1 |
+
+  The first stderr line is `Usage: orchestry <group> [options] [command]`. **The stream is contract**; the
+  help body's layout is clap's and is L2 (§1.3). Encoded in
+  `fixtures/scenarios/cmd-exit-codes-groups.toml`.
+
+  > An earlier revision of this document said **stdout**. That was wrong, and a parity scenario would have
+  > failed on it.
 - Commander errors (unknown command, unknown option, missing required option) → **exit 1**, message on stderr
   in Commander's own format (`error: unknown command 'x'`, optionally followed by `(Did you mean y?)`). The
   exact wording is **L2**; the exit code is L0.
@@ -430,8 +477,8 @@ a field whose value is `null` is **emitted as `null`**. The only `null`-valued f
 | `context list` | array of `ContextEntry` |
 | `logs` | array of `Run` objects (metadata, including the full `prompt`) |
 | `status` | `{ tasks, agents, state }` — see §4.3 |
-| `config get` | **compact.** the raw value at the dot path, JSON-encoded. **The `value` key is omitted entirely for a missing key** |
-| `config global get` | **compact** |
+| `config get` | **compact.** the raw value at the dot path, JSON-encoded. **The `value` key is omitted entirely for a missing key**. Dot paths **do** work: `config get defaults.agent.max_turns --json` → `{"key":…,"value":50}` |
+| `config global get` | **compact. Cannot read a nested key** — see below |
 | `config global show` | **compact.** the `GlobalConfig` object |
 | `agent edit` | a single `Agent` object |
 | `agent autonomous` | a single `Agent` object |
@@ -445,6 +492,18 @@ a field whose value is `null` is **emitted as `null`**. The only `null`-valued f
 
 Empty collections are `[]`. A **missing context entry** (`context get <unknown> --json`) prints the literal
 line `null`.
+
+**`config global get` cannot read a nested key, and that asymmetry is L0.** Measured in one tree:
+
+| argv | output | exit |
+|---|---|---|
+| `config global show --json` | `{"tui":{"palette":"amber",…}}` | 0 |
+| `config global get tui.palette --json` | `{"key":"tui.palette"}` — **no `value` at all** | 0 |
+| `config global get tui --json` | likewise empty | 0 |
+| `config get defaults.agent.max_turns --json` | `{"key":"defaults.agent.max_turns","value":50}` | 0 |
+
+So the project-level `config get` walks dot paths and the global one does not. **Replicate; do not "fix" it** —
+the CLI contract is byte parity, not sanity. Encoded in `fixtures/scenarios/cmd-config.toml`.
 
 ### 4.1.1 Commands that do NOT support `--json` (L0 — they print human text even with the flag)
 
@@ -588,7 +647,7 @@ That is a bug, and it is **fixed** in r-orch by user decision (§14.1). The diff
 `state.claimed` in `status --json` comparisons and instead asserts that r-orch's value equals the `claimed` array
 in the resulting `state.json`.
 
-`state` otherwise matches the `state.json` schema in §6.5 exactly.
+`state` otherwise matches the `state.json` schema in **§6.6** exactly (§6.5 is `config.yml`).
 
 ### 4.4 `goal show --json`
 
@@ -604,9 +663,9 @@ Human output is split: **structural text is L0, decoration is L2.**
 **L0 (must match exactly, after stripping ANSI):** every literal word, label, column header, count line,
 success/error message, and the padding of table cells (see §5.1).
 
-**L2 (may differ):** colours, ANSI codes, `--help` layout and wrapping, spinner frames, and the Unicode glyph
-chosen for a status — but the *set* of glyphs and their ASCII fallbacks are L0 because `--ascii` is a
-documented flag.
+**L2 (may differ):** colours, ANSI codes, **the entire `--help` body** (it is clap's layout, not Commander's —
+see §1.3), spinner frames, and the Unicode glyph chosen for a status — but the *set* of glyphs and their ASCII
+fallbacks are L0 because `--ascii` is a documented flag.
 
 ### 5.1 Table rendering (L0)
 
@@ -916,6 +975,13 @@ and `js-yaml.dump` (verified). In Rust, every `Option` field that the TS type ma
 `#[serde(skip_serializing_if = "Option::is_none")]`. The single exception is `Message.to_agent_id`
 (`string | null`), which must serialize as `null` when absent.
 
+> **This rule governs *persisted records and `--json` output only* — it does not extend to `PromptContext`.**
+> The template context requires the **opposite** discipline: every optional variable must be **present** with
+> an explicit `nil`, because the Rust `liquid` crate errors on a missing key where liquidjs renders empty
+> (§9.5, ARCHITECTURE §4.3). The two rules do not conflict — they apply to different types — but the wording
+> above reads as universal, so it is scoped here explicitly. **WP-3: do not "fix" `PromptContext` to use
+> `skip_serializing_if`.**
+
 **⚠ Timestamp quoting — blocking cross-compat hazard.** js-yaml's default schema includes the YAML 1.1
 `timestamp` type, so an **unquoted** `created_at: 2026-10-13T16:37:58.959Z` is parsed by the TypeScript binary
 into a JavaScript **`Date` object**, not a string. Downstream, `MessageStore.list()` calls
@@ -1138,6 +1204,21 @@ non-strings) and truncates to 8192 characters, appending `…` (U+2026) when tru
 is an object with a non-empty string `data`, `data` is re-truncated so the whole line fits:
 `budget = 4096 - byteLen(JSON.stringify({...record, data: ""}) + "\n") - 3`, then
 `data = data.slice(0, budget) + "…"`. If `budget <= 0`, the line is written over-length unchanged.
+
+**`streamEvents(runId, signal?)` reads the file to EOF and ends — it does not tail-follow** (L1). It waits up
+to **30 s** for the file to appear (polling every 100 ms), then opens a plain read stream, yields each parsed
+line, skips corrupt lines with the same stderr warning, and stops at EOF. A caller wanting to follow must
+**re-invoke** it.
+
+> Two things about it are worth knowing before implementing the trait method:
+> - **It has no production caller.** Only tests reference it (`run-store.test.ts`, `error-paths.test.ts`,
+>   plus the fakes in `helpers.ts`). The trait method and its tests still port, because the interface declares
+>   it and 5 test cases pin it — but nothing in the CLI or TUI depends on its behaviour.
+> - **`logs --follow` does not use it.** It calls `followLive()`, which subscribes to the **EventBus**
+>   (`eventBus.onAny`) and blocks until SIGINT/SIGTERM. Since `logs` builds a *Light* container in a one-shot
+>   process, and the orchestrator that emits events runs in a **different** process, that bus is inert: the
+>   command prints its `Following live events...` header and then emits nothing until interrupted. Replicate
+>   this — it is the observable behaviour — and see §15.1, which lists `logs --follow` as outside the harness.
 
 **Read behaviour** (L1): corrupt lines are skipped with a warning on stderr
 (`[readJsonl] skipping corrupt line: <first 200 chars>`). Files over 50 MB read only the last 200 records and
@@ -1630,11 +1711,23 @@ and resolve all `waitForStop()` waiters.
 - `send` validates: non-empty `body`; `0 < ttl_ms <= 604800000` (7 days), defaulting to **86400000** (24 h);
   the sender must exist **unless** it is the literal `cli`.
 - `subject` is truncated to **200** chars and defaults to the literal `(no subject)`; `body` to **4000**.
+  Both counts are **UTF-16 code units** — see §14.14 for the mid-surrogate case.
+- **The body is validated trimmed and stored untrimmed** (L0, measured). `send` rejects on
+  `!input.body.trim()` and then stores `input.body` — the original. So `"   "` is an error while `" padded "`
+  is accepted and **keeps both spaces on disk**. The subject is neither trimmed nor validated; empty becomes
+  the literal `(no subject)`. Trimming before storing passes every rejection test and diverges on every
+  message anyone sends with a trailing newline. `fixtures/scenarios/cmd-msg-body-trimming.toml`.
 - `expires_at = created_at + ttl_ms`.
 - **`direct`** — `to_agent_id` required and must exist. One message.
 - **`broadcast`** — one message per recipient. Recipients are all agents **excluding the sender** and
-  **excluding `status == "disabled"`**; with `team_id`, further restricted to that team's members (a missing
-  team silently degrades to all agents).
+  **excluding `status == "disabled"`**; with `team_id`, further restricted to that team's members.
+
+  **An unknown `team_id` fans out to *every* agent** (L0, measured). `message-service.ts` resolves the team and
+  filters only `if (team)`, with no else branch, so an unresolvable id leaves the recipient list unfiltered —
+  **and `team_id: "<unknown>"` is still persisted on every message**, leaving a dangling reference in the
+  store. Measured in a four-agent tree: a real two-member team → 2 messages; `--team team_nosuch` → 4.
+  **An implementation that validates the team id sends strictly fewer messages than the oracle.** Replicate.
+  `fixtures/scenarios/cmd-msg-broadcast-unknown-team.toml`.
 - **`lead`** — requires `team_id`; resolves to `team.lead_agent_id`. One message.
 - `drainMailbox(agentId, taskId)` — called during dispatch: list pending, mark all delivered, emit
   `message:delivered` per message, return them for prompt injection.
@@ -2652,6 +2745,9 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.11 merge output guard | REPLICATE | `none` |
 | §14.12 grok/antigravity stderr | **FIX (drain-and-discard)** | `none` |
 | §14.13 pi line reader | REPLICATE | `none` |
+| §14.14 msg surrogate truncation | DIVERGENCE (lead ruling) | `scenario exclusion required (cmd-msg-truncation, mid-pair case only)` |
+| §14.15 `stop()` wedges the lock | FIX | `none` |
+| §14.16 DiskObserver straddling line | FIX | `none` |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -2830,6 +2926,77 @@ rather than an oversight in the port.
 
 Also: pi's `waitForSettled` tests **key presence**, not value — an `agent_settled` frame with a falsy value
 still settles. Replicate.
+
+### 14.14 `msg send` can write a message file `serde_json` cannot parse — **DOCUMENTED DIVERGENCE**
+
+**Effect on differential comparison: `scenario exclusion required (cmd-msg-truncation, mid-pair case only)`.**
+The control case one character shorter is still compared normally.
+
+`MessageService.send` truncates with JS `.slice()`, which counts **UTF-16 code units**:
+`subject.slice(0, 200)`, `body.slice(0, 4000)`. A non-BMP character is two code units, so a body of 3999 ASCII
+characters followed by `😀` is cut **between the surrogates** and the stored value ends in a **lone high
+surrogate**. One `msg send` reaches this; it is not a hostile-input hypothetical.
+
+Measured oracle behaviour, which differs per output path:
+
+| Path | Bytes | Valid UTF-8 |
+|---|---|---|
+| `.orchestry/messages/<id>.json` | `…aaa\ud83d` (the 6-byte escape) | yes |
+| `msg list --json` on stdout | `…aaa\ud83d` (same escape) | yes |
+| `msg inbox` human output | `…aaa` + `ef bf bd` (U+FFFD) | yes |
+
+A Rust `String` cannot hold a lone surrogate at all, and **`serde_json` rejects a lone-surrogate escape
+outright** (`from_str(r#"{"body":"aaa\ud83d"}"#)` → `unexpected end of hex escape`), so a naive storage layer
+cannot read back a file the oracle wrote — `msg list` would fail entirely rather than diverge in one field.
+
+**Decision (team lead ruling), in three parts:**
+
+1. **Write side — truncate at the last whole character at or below the UTF-16 limit.** r-orch never emits a
+   lone surrogate. Below the limit this is byte-identical to the oracle; at a mid-pair cut r-orch stores one
+   character fewer. **The field is L2 above the limit**, which is a documented concession of an L0 field and
+   is recorded as such.
+2. **Read side — tolerate lone-surrogate escapes in TS-written files.** Decode them to **U+FFFD** rather than
+   erroring, and **never fail a whole listing** because one message is affected. This is the half that
+   matters: without it, r-orch cannot read a project the TS binary has used.
+3. **Do not rewrite the body on read.** A tolerated message is **not** re-serialized unless the message is
+   being re-saved for an independent reason, so merely running `msg list` does not silently rewrite the file
+   and destroy the oracle's bytes.
+
+Rejected alternatives: modelling the body as UTF-16 (byte-exact, but poisons the domain type for every
+consumer) and replacing lone surrogates with U+FFFD on read *and* re-saving (silently rewrites the file).
+
+Test: `fixtures/scenarios/cmd-msg-truncation.toml`, with the `${repeat:…}` control case. The harness now
+reports a file only one side can parse as a **failure** rather than aborting the run.
+
+### 14.15 `Orchestrator.stop()` can wedge a project by propagating mid-wind-down — **FIX**
+
+**Effect on differential comparison: `none`** — the divergence is reachable only when the state store is
+already broken, which no scenario induces.
+
+`stop()` performs the wind-down (abort, kill, finish run, transition task, release agent) and **then**
+releases the lock. Several of those steps can throw — most realistically the task transition or a state write.
+Because the tick circuit breaker calls `stop()` after 5 consecutive tick failures (§7.3), and those failures
+are frequently *caused* by a failing state store, the original can throw partway through and **leave the lock
+file held by a process that is exiting**. The project is then wedged: every subsequent `run`/`serve` fails with
+`LockConflictError` until the stale lock ages past `LOCK_STALE_MS`.
+
+**Decision: fix.** r-orch **reports** each wind-down failure (an `orchestrator:error` event per failed step)
+and **completes the wind-down regardless**, including the lock release and the signal-handler teardown. Phrased
+as a requirement: `stop()` is infallible from the caller's perspective — it returns after making a best effort
+at every step, never short-circuiting on the first error.
+
+### 14.16 `DiskObserver` loses a JSONL line that straddles a tick — **FIX**
+
+**Effect on differential comparison: `none`** — the disk observer feeds the TUI only, which is outside the
+harness (§15.1).
+
+The serve-mode disk observer polls run JSONL files from a saved byte offset. On reading a chunk whose final
+line is incomplete, the original **rewinds the offset and keeps the remainder**, but the bookkeeping drops
+that remainder on the next tick, so **a line split across two polls is lost**. The effect is a missing
+activity row in the TUI, which is why it went unnoticed.
+
+**Decision: fix.** Carry the partial-line remainder across ticks explicitly and prepend it to the next chunk.
+TUI-only, no on-disk or wire effect.
 
 ---
 
