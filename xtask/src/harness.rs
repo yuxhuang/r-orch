@@ -486,6 +486,15 @@ pub fn run_scenario(
                     }
                     Err(problem) => Some(("status --json", problem)),
                 }
+            } else if toolchain_mask::applies_to(&verify_argv) {
+                let left = toolchain_mask::mask(&norm.text(&rust_out.stdout));
+                let right = toolchain_mask::mask(&norm.text(&ts_out.stdout));
+                (left != right).then(|| {
+                    (
+                        "doctor stdout (toolchain row masked, §13)",
+                        unified_diff(&right, &left),
+                    )
+                })
             } else if let Some((rust_doc, ts_doc)) =
                 json_documents(&rust_out.stdout, &ts_out.stdout)
             {
@@ -632,6 +641,15 @@ pub fn run_scenario(
                     }
                     (Err(problem), _) | (_, Err(problem)) => Some(("status --json", problem)),
                 }
+            } else if toolchain_mask::applies_to(&argv) {
+                let left = toolchain_mask::mask(&rust_norm.text(&rust_out.stdout));
+                let right = toolchain_mask::mask(&ts_norm.text(&ts_out.stdout));
+                (left != right).then(|| {
+                    (
+                        "doctor stdout (toolchain row masked, §13)",
+                        unified_diff(&right, &left),
+                    )
+                })
             } else if let Some((rust_doc, ts_doc)) =
                 json_documents(&rust_out.stdout, &ts_out.stdout)
             {
@@ -1032,6 +1050,76 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
         framing,
         unparseable,
     })
+}
+
+/// PARITY.md §13's named divergence: r-orch's `toolchain` row replaces the
+/// oracle's `node` row in the same position and format, only the label and
+/// value differing. §1.4 says to **mask** it rather than pretend the two
+/// match, so this removes that one row — and nothing else — from a `doctor`
+/// step's output on both sides.
+///
+/// Everything else about `doctor` is still compared byte for byte: the eight
+/// adapter rows, git, the repo check, `.gitignore`, the project line, the
+/// `N of M adapters ready` footer and the two header lines.
+mod toolchain_mask {
+    /// The row's two names, the oracle's first.
+    const NAMES: [&str; 2] = ["node", "toolchain"];
+
+    pub fn applies_to(argv: &[String]) -> bool {
+        argv.first().map(String::as_str) == Some("doctor")
+    }
+
+    /// Replace the row wherever it appears: the human line, and the JSON
+    /// object `doctor --json` prints after its two human lines (which is why
+    /// this is text-based — that stdout is not a JSON document).
+    pub fn mask(stdout: &str) -> String {
+        let mut out = String::with_capacity(stdout.len());
+        let mut inside_object = false;
+        for line in stdout.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("\"name\": \"")
+                && NAMES
+                    .iter()
+                    .any(|name| rest.starts_with(&format!("{name}\"")))
+            {
+                out.push_str("      \"name\": \"<TOOLCHAIN>\",\n");
+                inside_object = true;
+                continue;
+            }
+            if inside_object {
+                if trimmed.starts_with("\"detail\": ") {
+                    out.push_str("      \"detail\": \"<TOOLCHAIN>\"\n");
+                    continue;
+                }
+                if trimmed.starts_with('}') {
+                    inside_object = false;
+                }
+                out.push_str(line);
+                continue;
+            }
+            if is_human_row(trimmed) {
+                out.push_str("  <TOOLCHAIN ROW>\n");
+                continue;
+            }
+            out.push_str(line);
+        }
+        out
+    }
+
+    /// `  <icon>  node         v24.21.0` — the icon is one glyph and the name
+    /// is padded, so the test is "second whitespace-separated word is the
+    /// row's name".
+    fn is_human_row(trimmed: &str) -> bool {
+        let mut words = trimmed.split_whitespace();
+        let Some(icon) = words.next() else {
+            return false;
+        };
+        // One character: `✓`, `✕`, `—`, or their ASCII forms.
+        if icon.chars().count() != 1 {
+            return false;
+        }
+        words.next().is_some_and(|name| NAMES.contains(&name))
+    }
 }
 
 /// A collected `.orchestry/` tree.
@@ -2090,5 +2178,45 @@ mod tests {
         assert!(json_document("  key = 5\n").is_none());
         assert!(json_document("{\"a\":1}\ntrailing\n").is_none());
         assert!(json_document("[]\n").is_some());
+    }
+
+    #[test]
+    fn the_toolchain_row_masks_to_the_same_thing_on_both_sides() {
+        let ts = "  \u{2713}  .gitignore   .orchestry is excluded\n  \u{2713}  node         v24.21.0\n\n  8 of 8 adapters ready\n";
+        let rust = "  \u{2713}  .gitignore   .orchestry is excluded\n  \u{2713}  toolchain    r-orch 0.1.0 (rust 1.94.1)\n\n  8 of 8 adapters ready\n";
+        assert_ne!(ts, rust);
+        assert_eq!(toolchain_mask::mask(ts), toolchain_mask::mask(rust));
+        // Only that row is touched.
+        assert!(toolchain_mask::mask(ts).contains(".orchestry is excluded"));
+        assert!(toolchain_mask::mask(ts).contains("8 of 8 adapters ready"));
+    }
+
+    #[test]
+    fn the_toolchain_row_is_masked_inside_the_json_document_too() {
+        let ts = "{\n  \"checks\": [\n    {\n      \"name\": \"node\",\n      \"status\": \"ok\",\n      \"detail\": \"v24.21.0\"\n    }\n  ]\n}\n";
+        let rust = "{\n  \"checks\": [\n    {\n      \"name\": \"toolchain\",\n      \"status\": \"ok\",\n      \"detail\": \"r-orch 0.1.0 (rust 1.94.1)\"\n    }\n  ]\n}\n";
+        assert_eq!(toolchain_mask::mask(ts), toolchain_mask::mask(rust));
+        // The status is not masked: a failed toolchain row on one side only
+        // must still be a difference.
+        let failed = rust.replace("\"ok\"", "\"fail\"");
+        assert_ne!(toolchain_mask::mask(&failed), toolchain_mask::mask(rust));
+    }
+
+    #[test]
+    fn the_mask_only_applies_to_doctor() {
+        assert!(toolchain_mask::applies_to(&["doctor".to_owned()]));
+        assert!(toolchain_mask::applies_to(&[
+            "doctor".to_owned(),
+            "--json".to_owned()
+        ]));
+        for other in ["status", "logs", "task"] {
+            assert!(!toolchain_mask::applies_to(&[other.to_owned()]), "{other}");
+        }
+        // A row that happens to be named `node` elsewhere is not a doctor
+        // row: `applies_to` gates the whole thing.
+        assert_eq!(
+            toolchain_mask::mask("  \u{2713}  nodes        3\n"),
+            "  \u{2713}  nodes        3\n"
+        );
     }
 }

@@ -10,10 +10,12 @@
 //!   `N of M adapters ready` line changes with it;
 //! - the exit code is **always 0**, however many checks fail.
 //!
-//! The report type and the checks live here rather than in `orch-engine`
-//! because the container-less tier has no service to ask. When WP-4 lands
-//! `DoctorService` it should produce this same [`DoctorReport`] and the
-//! renderer below stays as it is.
+//! The checks themselves are [`orch_engine::DoctorService`]; what lives here
+//! is the rendering, the container-less adapter registry (the tier has no
+//! container, but the service only needs a registry and a cwd) and the
+//! camelCase JSON view — `adaptersReady`/`adaptersTotal` are the printed key
+//! names, and the engine's own struct is snake_case like every other domain
+//! type.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -21,59 +23,16 @@ use std::sync::Arc;
 use orch_core::adapter::AdapterRegistry;
 use orch_core::error::Result;
 use orch_core::process::ProcessManager;
+use orch_engine::{CheckStatus, DoctorCheck, DoctorReport, DoctorService};
 use orch_infra::adapters::{
     AntigravityAdapter, ClaudeAdapter, GrokAdapter, PiAdapter, ShellAdapter,
 };
 use orch_infra::process::SystemProcessManager;
 use orch_infra::storage::Paths;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::context::CliContext;
 use crate::output::{Color, Icon, Styles, print_json};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CheckStatus {
-    Ok,
-    Fail,
-    /// In the type but never produced; the renderer maps it to `dim('—')`.
-    Skip,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DoctorCheck {
-    pub name: String,
-    pub status: CheckStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-impl DoctorCheck {
-    fn ok(name: impl Into<String>, detail: impl Into<String>) -> Self {
-        DoctorCheck {
-            name: name.into(),
-            status: CheckStatus::Ok,
-            detail: Some(detail.into()),
-        }
-    }
-
-    fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
-        DoctorCheck {
-            name: name.into(),
-            status: CheckStatus::Fail,
-            detail: Some(detail.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DoctorReport {
-    pub checks: Vec<DoctorCheck>,
-    #[serde(rename = "adaptersReady")]
-    pub adapters_ready: usize,
-    #[serde(rename = "adaptersTotal")]
-    pub adapters_total: usize,
-}
 
 /// The five adapters the container-less tier probes, in the order it
 /// registers them (§14.1) — note that codex, cursor and opencode are absent.
@@ -87,94 +46,24 @@ pub fn container_less_registry(process_manager: Arc<dyn ProcessManager>) -> Adap
     registry
 }
 
-/// `DoctorService.runAll`: one check per adapter **sequentially**, then git,
-/// the repo check, `.gitignore` and node.
-pub async fn probe(registry: &AdapterRegistry, cwd: &std::path::Path) -> DoctorReport {
-    let mut checks = Vec::new();
-    let mut adapters_ready = 0;
-
-    for adapter in registry.list() {
-        let result = adapter.test().await;
-        if result.ok {
-            adapters_ready += 1;
-            checks.push(DoctorCheck {
-                name: adapter.kind().to_owned(),
-                status: CheckStatus::Ok,
-                detail: result.version,
-            });
-        } else {
-            checks.push(DoctorCheck {
-                name: adapter.kind().to_owned(),
-                status: CheckStatus::Fail,
-                detail: result.error,
-            });
-        }
-    }
-    let adapters_total = registry.len();
-
-    checks.push(match command_version("git", &["--version"], cwd).await {
-        Some(version) => DoctorCheck::ok("git", version),
-        None => DoctorCheck::fail("git", "git: command not found"),
-    });
-
-    checks.push(
-        match command_version("git", &["rev-parse", "--is-inside-work-tree"], cwd).await {
-            Some(_) => DoctorCheck::ok("git repo", "git repository detected"),
-            None => DoctorCheck::fail(
-                "git repo",
-                "not a git repository — worktree/isolated modes will fail. Run: git init",
-            ),
-        },
-    );
-
-    checks.push(gitignore_check(cwd).await);
-
-    checks.push(match command_version("node", &["--version"], cwd).await {
-        Some(version) => DoctorCheck::ok("node", version),
-        None => DoctorCheck::fail("node", "node: command not found"),
-    });
-
-    DoctorReport {
-        checks,
-        adapters_ready,
-        adapters_total,
-    }
+/// The printed shape of a report: the TS interface is camelCase here, unlike
+/// every stored entity, and this is the only place that matters.
+#[derive(Debug, Serialize)]
+struct DoctorJson<'a> {
+    checks: &'a [DoctorCheck],
+    #[serde(rename = "adaptersReady")]
+    adapters_ready: usize,
+    #[serde(rename = "adaptersTotal")]
+    adapters_total: usize,
 }
 
-/// `checkCommand`: ok → trimmed stdout, failure → `None`.
-async fn command_version(command: &str, args: &[&str], cwd: &std::path::Path) -> Option<String> {
-    let output = tokio::process::Command::new(command)
-        .args(args)
-        .current_dir(cwd)
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-/// A line whose trimmed form is exactly `.orchestry` passes; a present file
-/// without one and a missing file have **different** messages.
-async fn gitignore_check(cwd: &std::path::Path) -> DoctorCheck {
-    let path = cwd.join(".gitignore");
-    match tokio::fs::read_to_string(&path).await {
-        Ok(contents) => {
-            if contents.lines().any(|line| line.trim() == ".orchestry") {
-                DoctorCheck::ok(".gitignore", ".orchestry is excluded")
-            } else {
-                DoctorCheck::fail(
-                    ".gitignore",
-                    ".orchestry not in .gitignore — worktrees will copy state recursively. Run: orch init",
-                )
-            }
+impl<'a> From<&'a DoctorReport> for DoctorJson<'a> {
+    fn from(report: &'a DoctorReport) -> Self {
+        DoctorJson {
+            checks: &report.checks,
+            adapters_ready: report.adapters_ready,
+            adapters_total: report.adapters_total,
         }
-        Err(_) => DoctorCheck::fail(
-            ".gitignore",
-            "no .gitignore found — .orchestry may be committed to git. Run: orch init",
-        ),
     }
 }
 
@@ -260,12 +149,14 @@ pub async fn run(
         None => container_less_registry(Arc::clone(&process_manager)),
     };
 
-    let report = probe(&registry, cwd).await;
+    let report = DoctorService::new(Arc::new(registry), cwd.to_path_buf())
+        .run_all()
+        .await;
 
     // JSON mode is gated on a container existing, so a container-less
     // `doctor --json` still prints text.
     if json && project.is_some() {
-        print_json(&report)?;
+        print_json(&DoctorJson::from(&report))?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -304,19 +195,24 @@ mod tests {
     use super::*;
     use orch_core::test_support::FakeProcessManager;
 
+    fn check(name: &str, status: CheckStatus, detail: Option<&str>) -> DoctorCheck {
+        DoctorCheck {
+            name: name.to_owned(),
+            status,
+            detail: detail.map(str::to_owned),
+        }
+    }
+
     fn report() -> DoctorReport {
         DoctorReport {
             checks: vec![
-                DoctorCheck::ok("claude", "2.1.296 (Claude Code)"),
-                DoctorCheck::fail(
+                check("claude", CheckStatus::Ok, Some("2.1.296 (Claude Code)")),
+                check(
                     "pi",
-                    "Pi CLI not found. Install: npm i -g @mariozechner/pi-coding-agent",
+                    CheckStatus::Fail,
+                    Some("Pi CLI not found. Install: npm i -g @mariozechner/pi-coding-agent"),
                 ),
-                DoctorCheck {
-                    name: "skipped".to_owned(),
-                    status: CheckStatus::Skip,
-                    detail: None,
-                },
+                check("skipped", CheckStatus::Skip, None),
             ],
             adapters_ready: 5,
             adapters_total: 8,
@@ -371,7 +267,8 @@ mod tests {
 
     #[test]
     fn the_json_shape_is_the_reference_one() {
-        let json = serde_json::to_value(report()).expect("serialize");
+        let report = report();
+        let json = serde_json::to_value(DoctorJson::from(&report)).expect("serialize");
         assert_eq!(json["adaptersReady"], 5);
         assert_eq!(json["adaptersTotal"], 8);
         assert_eq!(json["checks"][0]["name"], "claude");
@@ -409,8 +306,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_probe_reports_one_check_per_adapter_plus_four() {
-        // A fake process manager makes every version probe fail, which is the
+    async fn the_container_less_tier_reports_five_adapters_plus_four_checks() {
+        // The service is the engine's, but which registry it gets is this
+        // module's decision, and the row count the footer reports depends on
+        // it. A fake process manager fails every version probe, which is the
         // interesting shape: the names and the ready count still have to be
         // right.
         let registry = container_less_registry(Arc::new(FakeProcessManager::new().with_exit(
@@ -419,7 +318,9 @@ mod tests {
                 signal: None,
             },
         )));
-        let report = probe(&registry, std::path::Path::new(".")).await;
+        let report = DoctorService::new(Arc::new(registry), std::path::PathBuf::from("."))
+            .run_all()
+            .await;
 
         let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
@@ -433,61 +334,11 @@ mod tests {
                 "git",
                 "git repo",
                 ".gitignore",
-                "node"
+                // PARITY §13: the `node` row's replacement, same position.
+                "toolchain"
             ]
         );
         assert_eq!(report.adapters_total, 5);
         assert_eq!(report.adapters_ready, 0);
-    }
-
-    #[tokio::test]
-    async fn the_gitignore_check_distinguishes_missing_from_incomplete() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let missing = gitignore_check(dir.path()).await;
-        assert_eq!(missing.status, CheckStatus::Fail);
-        assert_eq!(
-            missing.detail.as_deref(),
-            Some("no .gitignore found — .orchestry may be committed to git. Run: orch init")
-        );
-
-        tokio::fs::write(dir.path().join(".gitignore"), "node_modules\n")
-            .await
-            .expect("write");
-        let incomplete = gitignore_check(dir.path()).await;
-        assert_eq!(incomplete.status, CheckStatus::Fail);
-        assert_eq!(
-            incomplete.detail.as_deref(),
-            Some(
-                ".orchestry not in .gitignore — worktrees will copy state recursively. Run: orch init"
-            )
-        );
-
-        tokio::fs::write(
-            dir.path().join(".gitignore"),
-            "node_modules\n  .orchestry  \n",
-        )
-        .await
-        .expect("write");
-        let excluded = gitignore_check(dir.path()).await;
-        assert_eq!(excluded.status, CheckStatus::Ok);
-        assert_eq!(excluded.detail.as_deref(), Some(".orchestry is excluded"));
-    }
-
-    #[tokio::test]
-    async fn a_missing_command_is_a_failed_check_not_an_error() {
-        assert_eq!(
-            command_version(
-                "orch-definitely-not-a-binary",
-                &[],
-                std::path::Path::new(".")
-            )
-            .await,
-            None
-        );
-        // `git --version` exists in any environment this is developed in; the
-        // check's shape is what matters.
-        let git = command_version("git", &["--version"], std::path::Path::new(".")).await;
-        assert!(git.is_none_or(|version| version.starts_with("git version")));
     }
 }

@@ -38,13 +38,7 @@ scenario is added with each one, not before.
 
 | Command | Needs |
 |---|---|
-| `org *` | org deploy (§18.2) |
-| `task show/edit/cancel/approve/reject/retry` | WP-4 `TaskService` methods; `task cancel` additionally needs the orchestrator for an `in_progress` task |
-| `agent status/edit/remove/autonomous` | WP-4 `AgentService` methods |
-| `run` (`--all`, `--watch`, a single task) | WP-4 orchestrator. The argument check (`exit 2`) is wired already |
-| `serve` (the watch itself) | WP-4 orchestrator. The logger, the `--once` rule, `--log-file`, `--tick-interval` and the disk observer are all built and tested; `serve::run_with` takes an orchestrator through `ServeOrchestrator` |
 | `tui` | WP-6, including the bare-`orch` first-run path |
-| `doctor`'s service | WP-4 may move the checks into `DoctorService`; the report type and renderer here are the target shape |
 
 ## Covered by the parity harness rather than a unit test
 
@@ -60,6 +54,27 @@ a unit test cannot: the exact stdout of `init`, `task add`, `task list`,
 | `cmd-config*`, `cmd-context*` | the config/context stores through the CLI: compact `--json`, the dropped `value` key, `context get`'s exit-0 miss, the unclamped TTL column |
 | `cmd-goal*`, `cmd-team` | the goal state machine's two exit codes out of one subcommand, the team membership rules, `disband` leaving the file readable |
 | `cmd-msg*` | the fan-out shape of `send`/`broadcast`, the unknown-team no-op, the disabled-recipient filter, and body/subject trimming |
+| `cmd-org` | the ten org templates as L0 data, and a deployment's agents/team/goal |
+| `cmd-task-*`, `cmd-agent-*`, `cmd-edit-*` | the task and agent mutations, including the `$EDITOR` round trips |
+
+## Blocked on the oracle
+
+`run` and `serve` are wired and work, but the vendored oracle does not
+dispatch anything in this environment: `run <id>` and `serve --once` both
+print their header and exit 0 having done nothing, leaving `.orchestry/
+orchestry.lock` and a stale `claimed` entry behind. The same invocation under
+a `node -r` preload that holds the event loop open completes the task
+correctly, so it is an event-loop-lifetime bug upstream —
+`ProcessManager.spawn` unrefs every child and `spawnAndWait` then awaits
+`close` with nothing holding a ref — and it is invisible to the oracle's own
+vitest suite, which keeps the loop alive itself.
+
+So `v7-run-single-task` and the nine `o7-*` scenarios cannot be compared
+against it as written. `o7-concurrency-cap` is separately unsound: its six
+tasks end in `review`, which is not terminal in **either** implementation, so
+`serve --once` waits forever by design. Both need a contract ruling; neither
+is r-orch's behaviour. `v7-run-cross-compat` passes, because the oracle only
+*reads* the artifacts r-orch produced.
 | `cmd-logs`, `cmd-init`, `cmd-ascii-and-quiet`, `cmd-exit-codes-uninitialized` | from master's corpus; green as of this work package |
 
 Two notes on the harness as it now stands:
