@@ -1,6 +1,7 @@
 name = "o7-concurrency-cap"
 kind = "differential"
 requires = ["serve", "config set", "status"]
+fake_agents = true
 timeout_secs = 90
 description = """
 Red-team O7 / V36: six ready tasks against max_concurrent_agents = 2. The \

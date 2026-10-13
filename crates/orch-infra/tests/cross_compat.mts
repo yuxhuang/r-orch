@@ -175,6 +175,39 @@ if (mode === 'read') {
 
   await stores.context.set('ts-key', longLine);
   process.stdout.write('ok');
+} else if (mode === 'write-lone-surrogate') {
+  // PARITY.md §14 / TRAITS-FROZEN §11. The TS truncates by UTF-16 code unit,
+  // so a body of 3999 ASCII characters plus a non-BMP emoji (4001 units) is
+  // cut *between* the surrogates and stored with a lone high surrogate, which
+  // JSON.stringify writes as the escape `\ud83d`. The point of doing it
+  // through the real store rather than writing the bytes by hand is that this
+  // proves the oracle actually produces such a file.
+  const emoji = String.fromCodePoint(0x1f600);
+  const body = 'a'.repeat(3999) + emoji;
+  const subject = 'b'.repeat(199) + emoji;
+
+  await stores.message.save({
+    id: 'msg_lonely',
+    channel: 'direct',
+    from_agent_id: 'cli',
+    to_agent_id: 'agt_creator',
+    subject: subject.slice(0, 200),
+    body: body.slice(0, 4000),
+    created_at: '2026-10-13T16:37:58.959Z',
+    expires_at: '2026-10-14T16:37:58.959Z',
+    status: 'pending',
+  });
+
+  // Report what landed on disk, so the Rust side's expectation is pinned to a
+  // measurement rather than to my reading of the spec.
+  const { readFile } = await import('node:fs/promises');
+  const file = join(projectRoot, '.orchestry/messages/msg_lonely.json');
+  const raw = await readFile(file, 'utf-8');
+  process.stdout.write(JSON.stringify({
+    containsLoneEscape: raw.includes('\\ud83d'),
+    bodyUnits: body.slice(0, 4000).length,
+    subjectUnits: subject.slice(0, 200).length,
+  }));
 } else {
   process.stderr.write(`unknown mode: ${mode}\n`);
   process.exit(2);

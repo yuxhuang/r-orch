@@ -2,6 +2,7 @@ name = "o7-killed-mid-run"
 kind = "rust_then_ts"
 split_at = 6
 requires = ["serve", "config set", "status"]
+fake_agents = true
 timeout_secs = 90
 env = { ORCH_FAKE_SCENARIO = "slow", ORCH_FAKE_SLOW_SECONDS = "20" }
 description = """

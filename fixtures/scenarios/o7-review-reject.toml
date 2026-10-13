@@ -1,6 +1,7 @@
 name = "o7-review-reject"
 kind = "differential"
 requires = ["serve", "config set", "task reject", "task show"]
+fake_agents = true
 timeout_secs = 90
 description = """
 Red-team O7: the reject path. A rejected review goes back to todo with \

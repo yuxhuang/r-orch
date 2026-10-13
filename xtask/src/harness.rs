@@ -568,8 +568,9 @@ pub fn run_scenario(
             }
         }
 
-        let rust_tree = collect_tree(&rust.root, &mut rust_norm)?;
-        let ts_tree = collect_tree(&ts.root, &mut ts_norm)?;
+        let mut rust_tree = collect_tree(&rust.root, &mut rust_norm)?;
+        let mut ts_tree = collect_tree(&ts.root, &mut ts_norm)?;
+        failures.extend(exclude_tree_paths(scenario, &mut rust_tree, &mut ts_tree));
         failures.extend(compare_trees(&rust_tree, &ts_tree));
         failures.extend(claimed_matches_state_file(&masked_claimed, &rust_tree));
 
@@ -1028,6 +1029,43 @@ mod claimed_mask {
             .as_object_mut()?
             .shift_remove("claimed")
     }
+}
+
+/// Drop a scenario's named tree exclusions from both sides, reporting one that
+/// matched nothing.
+///
+/// A path that no longer exists means the exclusion is stale, and a stale
+/// exclusion is a comparison nobody is doing any more for a reason nobody
+/// remembers — so it fails rather than passing quietly.
+fn exclude_tree_paths(scenario: &Scenario, rust: &mut Tree, ts: &mut Tree) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    for prefix in &scenario.excluded_tree_paths {
+        let matched: Vec<String> = ts
+            .values
+            .keys()
+            .chain(rust.values.keys())
+            .filter(|path| path.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+
+        if matched.is_empty() {
+            failures.push(format!(
+                "`excluded_tree_paths` lists `{prefix}`, which matches nothing in either tree \
+                 — a stale exclusion silently stops comparing something. Remove it."
+            ));
+            continue;
+        }
+        for path in matched {
+            rust.values.remove(&path);
+            ts.values.remove(&path);
+            rust.framing.remove(&path);
+            ts.framing.remove(&path);
+            rust.unparseable.remove(&path);
+            ts.unparseable.remove(&path);
+        }
+    }
+    failures
 }
 
 /// The second named exclusion: `doctor`'s toolchain row (PARITY.md §13).
@@ -1722,6 +1760,66 @@ mod tests {
         let failures = compare_trees(&rust, &ts);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_named_tree_exclusion_drops_the_path_from_both_sides() {
+        let scenario = scenario_with(
+            "name = \"s\"\nkind = \"differential\"\n\
+             excluded_tree_paths = [\"messages/\"]\nsteps = [\"a\"]\n",
+        );
+        let mut rust = Tree::default();
+        let mut ts = Tree::default();
+        for tree in [&mut rust, &mut ts] {
+            tree.values
+                .insert("tasks/tsk_1.yml".to_owned(), Value::from(1));
+        }
+        // The excluded path differs, which without the exclusion would fail.
+        rust.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("rust"));
+        ts.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("ts"));
+
+        let failures = exclude_tree_paths(&scenario, &mut rust, &mut ts);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(compare_trees(&rust, &ts).is_empty());
+        // Everything outside the exclusion is still there to be compared.
+        assert!(rust.values.contains_key("tasks/tsk_1.yml"));
+        assert!(!rust.values.contains_key("messages/msg_1.json"));
+    }
+
+    #[test]
+    fn a_stale_tree_exclusion_fails_rather_than_passing_quietly() {
+        // An exclusion matching nothing is a comparison nobody is doing any
+        // more for a reason nobody remembers.
+        let scenario = scenario_with(
+            "name = \"s\"\nkind = \"differential\"\n\
+             excluded_tree_paths = [\"runs/\"]\nsteps = [\"a\"]\n",
+        );
+        let mut rust = Tree::default();
+        let mut ts = Tree::default();
+        rust.values
+            .insert("tasks/tsk_1.yml".to_owned(), Value::from(1));
+        ts.values
+            .insert("tasks/tsk_1.yml".to_owned(), Value::from(1));
+
+        let failures = exclude_tree_paths(&scenario, &mut rust, &mut ts);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("matches nothing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_scenario_without_exclusions_compares_everything() {
+        let scenario = scenario_with("name = \"s\"\nkind = \"differential\"\nsteps = [\"a\"]\n");
+        let mut rust = Tree::default();
+        let mut ts = Tree::default();
+        rust.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("rust"));
+        ts.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("ts"));
+
+        assert!(exclude_tree_paths(&scenario, &mut rust, &mut ts).is_empty());
+        assert_eq!(compare_trees(&rust, &ts).len(), 1);
     }
 
     #[test]

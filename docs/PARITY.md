@@ -2666,7 +2666,11 @@ step types. Validation is **300 ms debounced** for text and textarea, **synchron
       `approval_policy` **always** skipped; `team` skipped when there are fewer than 2 options. `effort`
       **must sit immediately after `model`**. Shell collapses the wizard to `name`/`adapter`/`command` and
       forces `approval_policy = "auto"`, clearing model/effort/role/skills/team.
-- [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) · **EDIT AGENT** (9) ·
+- [ ] **EDIT AGENT** — **8 steps**: `name, adapter, command, model, effort, role, role_custom, team`
+      (`getEditAgentWizardSteps`). **It has no `skills` and no `approval_policy` step**, which is what makes
+      it 8 rather than NEW AGENT's 10 — so neither field is editable through the TUI once an agent exists.
+      *(An earlier revision said 9; [docs/parity/tui.md §5.2](parity/tui.md) was correct.)*
+- [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) ·
       **NEW TASK** (4) · **EDIT TASK** (4) · **NEW TEAM** (4) · **New Goal** (3) · **Edit Goal** (3) ·
       **SETTINGS** (5 single-step variants, one per config setting)
 - [ ] Validation messages verbatim: `Title is required`, `Priority must be 1-4`, `Name is required`,
@@ -2720,6 +2724,37 @@ install, no detected version.
 The fields exist so the facade matches the shape of the TS header component and so a future release channel
 could populate them without reshaping the view; nothing currently does. Do not "finish" them, and do not file
 the absent chip as a parity gap.
+
+### 12.10 Pre-dispatch failures must surface synchronously (L1)
+
+The TUI backend facade (`crates/orch-tui/BACKEND.md`) is fire-and-request: `run_task`, `run_all` and
+`start_watch` ask the orchestrator to dispatch and return immediately, with outcomes arriving via
+`poll_events`. **That is correct for outcomes and wrong for pre-dispatch failures**, because of a gap in the
+original:
+
+**Neither the TS TUI nor r-orch renders `orchestrator:error`.** The TS event switch in `App.tsx` handles
+`agent:completed`, `agent:error`, `agent:file_changed`, `agent:output`, `agent:started`,
+`orchestrator:stall_detected`, `orchestrator:tick`, `run:retry`, `task:assigned`, `task:cascade_failed`,
+`task:created` and `task:status_changed` — and **no `orchestrator:error` case** (nor
+`orchestrator:shutdown`).
+
+Dispatch failures are emitted as `orchestrator:error { context: "dispatch task <id>" }` and deliberately do
+**not** stop other dispatches (§7.5). So in the TS TUI, pressing `r` on a task whose dispatch fails — a
+`WorkspaceError` because the project is not a git repo, `NoAgentsError`, an unknown adapter — produces
+**no feedback whatsoever**. The event is emitted, nothing renders it, the task silently stays `todo`.
+
+**Requirement:** `run_task`, `run_all` and `start_watch` must return **`Err(String)` synchronously** for any
+failure detectable before the agent process is spawned — lock conflict, no agents configured, unknown adapter,
+workspace preparation failure, an invalid task id or a non-dispatchable status. The TUI renders
+`Failed: {err}`, so the message *is* the contract: use the same text the CLI would print for that failure
+(§3.1).
+
+Post-dispatch outcomes stay asynchronous and arrive through `poll_events` — that part of the facade is right
+and must not become blocking. The dividing line is **"did the child process start?"**: before it, `Err`;
+after it, events.
+
+This is a **fix** for a usability gap rather than a parity divergence: the original emits the error, so the
+information exists; it simply never reaches the screen.
 
 ---
 

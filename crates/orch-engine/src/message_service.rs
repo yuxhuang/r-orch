@@ -334,6 +334,65 @@ mod tests {
         Agent, OrchestratorEventType, Team, TeamConfig, TeamMember, TeamMemberRole, TeamStatus,
     };
 
+    #[test]
+    fn truncation_stops_at_the_last_whole_character() {
+        // PARITY.md §14 / TRAITS-FROZEN §11, ruled L2 above the limit. JS
+        // slices by UTF-16 code unit and will cut *between* the surrogates of
+        // a non-BMP character, leaving a lone surrogate that a Rust `String`
+        // cannot even hold. We stop at the last whole character instead.
+        let emoji = "\u{1F600}"; // two UTF-16 units, four UTF-8 bytes
+
+        // 3999 units of ASCII plus a 2-unit character is 4001: the emoji does
+        // not fit, so it is dropped whole rather than halved.
+        let body = "a".repeat(3999) + emoji;
+        let truncated = truncate_utf16(&body, BODY_MAX_UNITS);
+        assert_eq!(truncated, "a".repeat(3999));
+        assert!(!truncated.contains(emoji));
+
+        // One character earlier it fits exactly, and must be kept.
+        let fits = "a".repeat(3998) + emoji;
+        assert_eq!(truncate_utf16(&fits, BODY_MAX_UNITS), fits);
+        assert_eq!(utf16_len(&truncate_utf16(&fits, BODY_MAX_UNITS)), 4000);
+
+        // Same arithmetic at the subject's 200-unit cap.
+        assert_eq!(
+            truncate_utf16(&("b".repeat(199) + emoji), SUBJECT_MAX_UNITS),
+            "b".repeat(199)
+        );
+        assert_eq!(
+            truncate_utf16(&("b".repeat(198) + emoji), SUBJECT_MAX_UNITS),
+            "b".repeat(198) + emoji
+        );
+    }
+
+    #[test]
+    fn truncation_never_exceeds_the_cap_for_any_split_point() {
+        // The property, over every alignment of a 2-unit character against
+        // the boundary: the result is always whole characters and always
+        // within the cap. A single hand-picked case would miss an off-by-one.
+        for ascii in 0..12 {
+            for emoji_count in 0..6 {
+                let text = "a".repeat(ascii) + &"\u{1F600}".repeat(emoji_count);
+                for cap in 0..16 {
+                    let truncated = truncate_utf16(&text, cap);
+                    assert!(utf16_len(&truncated) <= cap, "{text:?} cap={cap}");
+                    assert!(text.starts_with(&truncated), "{text:?} cap={cap}");
+                    // Whole characters only — guaranteed by `String`, but the
+                    // point is that nothing was dropped mid-character.
+                    assert!(
+                        truncated.chars().count()
+                            == text.chars().take(truncated.chars().count()).count(),
+                        "{text:?} cap={cap}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn utf16_len(text: &str) -> usize {
+        text.chars().map(char::len_utf16).sum()
+    }
+
     const TIMESTAMP: &str = "2025-01-01T00:00:00Z";
     /// [`FIXED_NOW_ISO`] plus the default 24-hour TTL.
     const FIXED_EXPIRY_ISO: &str = "2025-10-14T16:37:33.426Z";

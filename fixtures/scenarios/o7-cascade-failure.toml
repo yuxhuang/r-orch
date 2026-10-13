@@ -1,6 +1,7 @@
 name = "o7-cascade-failure"
 kind = "differential"
 requires = ["serve", "config set", "status"]
+fake_agents = true
 timeout_secs = 120
 env = { ORCH_FAKE_SCENARIO = "fail" }
 description = """

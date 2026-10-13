@@ -587,11 +587,35 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
       concedes a documented L0 field.
 
     Not a hypothetical about hostile input: it needs one `msg send` with a long
-    body ending in an emoji. `fixtures/scenarios/cmd-msg-truncation.toml` is
-    the test for whichever option is chosen, with a `${repeat:…}` control case
-    one character shorter where the cut falls between characters and no special
-    handling is needed. The harness now reports a file only one side can parse
-    as a failure instead of aborting the run, which it previously did.
+    body ending in an emoji. The harness now reports a file only one side can
+    parse as a failure instead of aborting the run, which it previously did.
+
+    **Ruled 2026-10-13 (option 3, plus a read-side repair).** Write side:
+    truncate at the last whole character within the cap — which WP-4's
+    `truncate_utf16` already did, so no behaviour changed, and it is now
+    covered over every alignment of a two-unit character against both caps.
+    L2 above the limit. Read side: `fs_utils::read_json` repairs unpaired
+    surrogate escapes to U+FFFD for **every** `.json` store, never failing a
+    listing, and leaves the file alone — a re-save for another reason (drain
+    marks delivered) may then write the replacement character, which is
+    accepted. A valid pair is passed through untouched, so no well-formed file
+    changes value.
+
+    Pinned by: `message_service.rs` truncation tests;
+    `fs_utils::repair_lone_surrogates` unit tests, including the adjacency
+    case where a lone surrogate precedes a valid pair and the escaped-backslash
+    case `\\ud83d`, which must not be read as an escape; and
+    `cross_compat.rs::ts_written_lone_surrogate_does_not_break_the_rust_listing`,
+    where the **oracle's own `MessageStore`** writes the record and r-orch
+    lists it. That last one is the real guarantee and was verified to fail
+    without the repair — before it, one such message made `msg list` return
+    nothing at all rather than one mangled body.
+
+    Scenario split accordingly: `cmd-msg-truncation` keeps the cases that cut
+    between characters and is fully compared; `cmd-msg-truncation-mid-pair`
+    carries the licensed divergence, with `@exit-only:parity-14-lone-surrogate`
+    on its steps and `excluded_tree_paths = ["messages/"]`. Both exclusions are
+    named in the file, and a tree exclusion that matches nothing is a failure.
 
 12. **`msg broadcast --team <nonexistent>` fans out to every agent.**
     `message-service.ts` resolves the team and filters only `if (team)`, with

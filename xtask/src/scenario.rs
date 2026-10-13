@@ -77,6 +77,16 @@ pub struct Scenario {
     /// ids and timestamps must agree.
     #[serde(default)]
     pub verify: Vec<String>,
+    /// Paths under `.orchestry/` whose contents the contract licenses this
+    /// scenario not to compare, as prefixes of the normalized tree path.
+    ///
+    /// A **named** exclusion, like the §14.1 and §13 masks: it exists only
+    /// where a clause says the two implementations legitimately differ, and
+    /// the clause belongs in the scenario's description. The harness fails if
+    /// an exclusion matches nothing, so a stale entry cannot sit here quietly
+    /// switching off a comparison that had started working.
+    #[serde(default)]
+    pub excluded_tree_paths: Vec<String>,
     /// Why this scenario exists, printed with the results.
     #[serde(default)]
     pub description: Option<String>,

@@ -1,0 +1,32 @@
+name = "cmd-msg-truncation-mid-pair"
+kind = "differential"
+requires = ["msg send", "msg list"]
+excluded_tree_paths = ["messages/"]
+description = """
+The one licensed divergence in the message path (PARITY.md §14, \
+docs/TRAITS-FROZEN.md §11, ruled 2026-10-13). A body of 3999 ASCII \
+characters plus a non-BMP emoji is 4001 UTF-16 units, so JS `.slice(0, \
+4000)` cuts **between the surrogates** and stores a lone high surrogate — \
+which `JSON.stringify` writes as the escape `\\ud83d` and a Rust `String` \
+cannot hold at all. The ruling: r-orch truncates at the last whole \
+character instead, L2 above the limit, so its stored body is 3999 \
+characters where the oracle's is 3999 plus half a character. Everything \
+comparable about this scenario is therefore excluded **by name**: the \
+steps are `@exit-only` and `messages/` is dropped from the tree walk. What \
+is *not* excluded, and is where the behaviour is actually pinned: - \
+`message_service.rs` unit tests, over every alignment of a two-unit \
+character against both caps; - `fs_utils::repair_lone_surrogates`, which \
+decodes an unpaired escape to U+FFFD on read and leaves the file \
+untouched; - \
+`cross_compat.rs::ts_written_lone_surrogate_does_not_break_the_rust_listing`, \
+where the **oracle's own store** writes the record and r-orch lists it. \
+That is the real guarantee, and it was verified to fail without the repair \
+— which is what made `msg list` return nothing at all rather than one \
+mangled body. The scenario remains because the exit codes are still \
+contract: a 4001-unit body is accepted, not rejected, on both sides."""
+steps = [
+  "init --name proj --adapter claude",
+  "@exit-only:parity-14-lone-surrogate msg send agt_creator '${repeat:a:3999}😀' -s '${repeat:b:199}😀' --json",
+  "@exit-only:parity-14-lone-surrogate msg list --json",
+  "@exit-only:parity-14-lone-surrogate msg inbox agt_creator",
+]
