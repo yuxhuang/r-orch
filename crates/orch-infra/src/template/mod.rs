@@ -8,6 +8,7 @@
 
 mod context;
 mod engine;
+mod lenient;
 
 pub use context::{
     BuildPromptOptions, ContextFilterInput, build_prompt_context, extract_role_keywords,

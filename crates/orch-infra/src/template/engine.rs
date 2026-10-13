@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use orch_core::template::{DEFAULT_RENDER_TIMEOUT_MS, PromptContext, TemplateEngine};
 use orch_core::{Error, Result};
 
+use super::lenient;
+
 /// Liquid-backed [`TemplateEngine`].
 ///
 /// `liquid` is synchronous, so the render runs on the blocking pool and is
@@ -45,7 +47,7 @@ impl Default for LiquidTemplateEngine {
 #[async_trait]
 impl TemplateEngine for LiquidTemplateEngine {
     async fn render(&self, template: &str, context: &PromptContext) -> Result<String> {
-        let mut globals = liquid::to_object(context)
+        let globals = liquid::to_object(context)
             .map_err(|e| Error::other(format!("serializing the prompt context: {e}")))?;
         let parser = Arc::clone(&self.parser);
         let template = template.to_owned();
@@ -53,7 +55,9 @@ impl TemplateEngine for LiquidTemplateEngine {
             let parsed = parser
                 .parse(&template)
                 .map_err(|e| Error::other(e.to_string()))?;
-            render_lenient(&parsed, &mut globals)
+            parsed
+                .render(&lenient::Object::root(&globals))
+                .map_err(|e| Error::other(e.to_string()))
         });
 
         let joined = if self.render_timeout_ms == 0 {
@@ -75,121 +79,5 @@ impl TemplateEngine for LiquidTemplateEngine {
             }
         };
         joined.map_err(|e| Error::other(format!("template render task failed: {e}")))?
-    }
-}
-
-/// Upper bound on distinct undefined names a single template may use.
-const MAX_UNDEFINED_NAMES: usize = 64;
-
-/// liquidjs runs with `strictVariables: false`: an undefined variable renders
-/// as empty. `liquid` errors instead, so on an "unknown variable" or "unknown
-/// index" error bind the offending name to `nil` and render again. This covers
-/// undefined root variables and undefined direct properties of a root
-/// variable; deeper chains in a user template still fail. The default
-/// templates never get here — the context builder defines every variable —
-/// this serves user-supplied `config.prompt.*` templates.
-fn render_lenient(template: &liquid::Template, globals: &mut liquid::Object) -> Result<String> {
-    for _ in 0..=MAX_UNDEFINED_NAMES {
-        let message = match template.render(&*globals) {
-            Ok(out) => return Ok(out),
-            Err(err) => err.to_string(),
-        };
-        if !bind_undefined(&message, globals) {
-            return Err(Error::other(message));
-        }
-    }
-    Err(Error::other(
-        "template references too many undefined variables",
-    ))
-}
-
-/// What a liquid "unknown ..." error complained about.
-#[derive(Debug, PartialEq, Eq)]
-enum Undefined<'a> {
-    Variable(&'a str),
-    Index { variable: &'a str, index: &'a str },
-}
-
-fn field<'a>(message: &'a str, key: &str) -> Option<&'a str> {
-    let (_, rest) = message.split_once(key)?;
-    let value = rest.lines().next()?.trim();
-    (!value.is_empty()).then_some(value)
-}
-
-fn parse_undefined(message: &str) -> Option<Undefined<'_>> {
-    if message.contains("Unknown variable") {
-        let name = field(message, "requested variable=")?;
-        return (name != "nil").then_some(Undefined::Variable(name));
-    }
-    if message.contains("Unknown index") {
-        return Some(Undefined::Index {
-            variable: field(message, "variable=")?,
-            index: field(message, "requested index=")?,
-        });
-    }
-    None
-}
-
-/// Returns whether the error was one we could fix by binding `nil`.
-fn bind_undefined(message: &str, globals: &mut liquid::Object) -> bool {
-    use liquid::model::{Object, Value};
-    match parse_undefined(message) {
-        Some(Undefined::Variable(name)) if !globals.contains_key(name) => {
-            globals.insert(name.to_owned().into(), Value::Nil);
-            true
-        }
-        Some(Undefined::Index { variable, index }) => match globals.get_mut(variable) {
-            Some(Value::Object(obj)) if !obj.contains_key(index) => {
-                obj.insert(index.to_owned().into(), Value::Nil);
-                true
-            }
-            Some(slot @ Value::Nil) => {
-                let mut obj = Object::new();
-                obj.insert(index.to_owned().into(), Value::Nil);
-                *slot = Value::Object(obj);
-                true
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Undefined, parse_undefined};
-
-    fn render_err(template: &str, globals: &liquid::Object) -> String {
-        liquid::ParserBuilder::with_stdlib()
-            .build()
-            .unwrap()
-            .parse(template)
-            .unwrap()
-            .render(globals)
-            .unwrap_err()
-            .to_string()
-    }
-
-    #[test]
-    fn parses_the_liquid_unknown_variable_message() {
-        let err = render_err("{{ nope }}", &liquid::Object::new());
-        assert_eq!(parse_undefined(&err), Some(Undefined::Variable("nope")));
-    }
-
-    #[test]
-    fn parses_the_liquid_unknown_index_message() {
-        let mut globals = liquid::Object::new();
-        globals.insert(
-            "task".into(),
-            liquid::model::Value::Object(liquid::Object::new()),
-        );
-        let err = render_err("{{ task.missing }}", &globals);
-        assert_eq!(
-            parse_undefined(&err),
-            Some(Undefined::Index {
-                variable: "task",
-                index: "missing"
-            })
-        );
     }
 }

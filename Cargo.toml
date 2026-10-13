@@ -88,6 +88,8 @@ unicode-segmentation = "1.13"
 unicode-width = "0.2"
 # Clipboard. Degrade to "empty" on any failure, exactly as the TS does.
 arboard = "3.6"
+# PNG-encodes clipboard images (already in the tree via arboard).
+png = "0.18"
 # Version comparison for the update check.
 semver = "1.0"
 

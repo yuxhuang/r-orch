@@ -175,3 +175,16 @@ async fn a_syntax_error_is_an_error_not_a_panic() {
         .await;
     assert!(res.is_err());
 }
+
+#[tokio::test]
+async fn documented_residual_unknown_property_of_a_loop_variable_errors() {
+    // liquidjs renders this empty; `liquid` copies loop variables out as plain
+    // values, so the lenient layer cannot reach them (see template/lenient.rs).
+    let res = LiquidTemplateEngine::new()
+        .render(
+            "{% for a in agents %}{{ a.nope }}{% endfor %}",
+            &plain_context(),
+        )
+        .await;
+    assert!(res.is_err());
+}

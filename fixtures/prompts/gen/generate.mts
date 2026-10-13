@@ -22,7 +22,8 @@ function toTs(ctx: Json): Json {
 }
 function strip(target: Json, key: string, v: Json) {
   if (v === null) {
-    if (key === 'attempt') target[key] = null;
+    // buildPromptContext assigns `undefined` explicitly, so the key exists (it counts in `.size`).
+    target[key] = key === 'attempt' ? null : undefined;
     return;
   }
   if (Array.isArray(v)) target[key] = v.map((x) => (x && typeof x === 'object' && !Array.isArray(x) ? clean(x) : x));
@@ -31,7 +32,7 @@ function strip(target: Json, key: string, v: Json) {
 }
 function clean(o: Json): Json {
   const r: Json = {};
-  for (const [k, v] of Object.entries(o)) if (v !== null) r[k] = Array.isArray(v) ? v.map((x) => (x && typeof x === 'object' ? clean(x) : x)) : v && typeof v === 'object' ? clean(v) : v;
+  for (const [k, v] of Object.entries(o)) r[k] = v === null ? undefined : Array.isArray(v) ? v.map((x) => (x && typeof x === 'object' ? clean(x) : x)) : v && typeof v === 'object' ? clean(v) : v;
   return r;
 }
 
@@ -107,6 +108,13 @@ custom('attempt-null-if', '{% if attempt %}A{{ attempt }}{% endif %}|{% if retry
 custom('compare-gt', '{% if agents.size > 2 %}many{% endif %}{% if agents.size > 5 %}lots{% endif %}');
 custom('empty-template', '');
 custom('crlf', 'a\r\n{{ agent.name }}\r\n');
+custom('nested-missing', '[{{ task.foo.bar }}|{{ goal.x.y }}|{{ nope.a.b.c }}|{{ task.foo.bar.baz.qux }}]');
+custom('nested-missing-guarded', '{% if goal %}G{% endif %}[{{ goal.a.b }}]{% if goal.a.b %}Y{% else %}N{% endif %}{% if task.foo.bar == "" %}eq{% endif %}');
+custom('nested-missing-for', '{% for a in goal.items.list %}x{% endfor %}done{% for b in nope.x %}y{% endfor %}');
+custom('nested-missing-index', '[{{ agents[5].name }}|{{ agents[0].nope.deeper }}|{{ task.labels[9] }}|{{ agents[-1].id }}|{{ agents.first.id }}|{{ agents.last.nope.x }}]');
+custom('nested-missing-default', '{{ goal.a.b | default: "dflt" }}|{{ task.foo.bar | default: "d2" }}|{% if feedback.x.y != "" %}ne{% endif %}');
+custom('nested-missing-present-goal', '{{ goal.title }}|{{ goal.nope.x }}|{{ goal.task_names.size }}|{{ goal.task_names[0] }}', with_((c) => { c.goal = goal(); }));
+custom('object-size', '{{ task.size }}|{{ agent.size }}', base());
 cases.push({
   name: 'legacy.default-prompt-template', template: 'inline:' + DEFAULT_PROMPT_TEMPLATE,
   context: with_((c) => { c.attempt = 2; c.retry = { previous_error: 'boom', previous_output: 'out' }; c.feedback = 'f'; }), description: 'DEFAULT_PROMPT_TEMPLATE',

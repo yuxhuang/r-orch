@@ -11,7 +11,7 @@ repository.workspace = true
 orch-domain.workspace = true
 orch-core.workspace = true
 
-arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+arboard.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
 futures.workspace = true
@@ -21,7 +21,7 @@ liquid.workspace = true
 # Pinned for the toolchain MSRV — see the root manifest.
 kstring.workspace = true
 nanoid.workspace = true
-png = "0.18"
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
