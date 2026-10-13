@@ -142,3 +142,16 @@ Enable the Kitty keyboard protocol at startup
 (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) so `Ctrl+Enter` is
 distinguishable from `Enter` in the wizard textarea; the `Tab` confirm fallback
 stays for terminals that refuse it.
+
+## Entry point
+
+`orch_tui::run(backend)` owns the whole terminal lifecycle — raw mode, the
+alternate screen, the Kitty enhancement flags (popped on exit), the
+poll/tick/draw loop at one animation tick, and restoring the terminal on every
+exit path including a panic. `orch tui` should be:
+
+```rust
+let backend = EngineBackend::new(container, handle);
+orch_tui::run(backend)?;
+// then: stop watch mode or the disk observer, and clear the event bus.
+```
