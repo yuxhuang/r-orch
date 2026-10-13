@@ -455,10 +455,7 @@ impl Wizard {
             }
             StepKind::Select => {
                 let options = step.options.resolve(&self.values);
-                self.select_index = options
-                    .iter()
-                    .position(|o| o.value == default)
-                    .unwrap_or(0);
+                self.select_index = options.iter().position(|o| o.value == default).unwrap_or(0);
             }
             StepKind::Multiselect => {
                 self.multi_selected = default
@@ -629,8 +626,8 @@ impl Wizard {
     pub fn handle_key(&mut self, key: KeyEvent, now_ms: i64) -> WizardOutcome {
         self.poll(now_ms);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let meta =
-            key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SUPER);
+        let meta = key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER);
         let kind = self.step().kind;
 
         // Paste image: Ctrl+V / Cmd+V / Ctrl+I, text and textarea only.
@@ -990,7 +987,10 @@ mod tests {
     fn text_steps_confirm_with_enter_and_tab_and_trim() {
         let mut wizard = Wizard::new(WizardKind::Task, "T", two_text_steps());
         type_text(&mut wizard, "  hello  ", 0);
-        assert_eq!(wizard.handle_key(key(KeyCode::Enter), 0), WizardOutcome::Consumed);
+        assert_eq!(
+            wizard.handle_key(key(KeyCode::Enter), 0),
+            WizardOutcome::Consumed
+        );
         assert_eq!(wizard.step_id(), "b");
         type_text(&mut wizard, "world", 0);
         let outcome = wizard.handle_key(key(KeyCode::Tab), 0);
@@ -1006,7 +1006,10 @@ mod tests {
     #[test]
     fn a_required_empty_step_blocks_with_the_fix_hint() {
         let mut wizard = Wizard::new(WizardKind::Task, "T", two_text_steps());
-        assert_eq!(wizard.handle_key(key(KeyCode::Enter), 0), WizardOutcome::Consumed);
+        assert_eq!(
+            wizard.handle_key(key(KeyCode::Enter), 0),
+            WizardOutcome::Consumed
+        );
         assert_eq!(wizard.step_id(), "a");
         assert!(wizard.enter_block_hint());
         wizard.poll(ENTER_BLOCK_HINT_MS);
@@ -1059,7 +1062,10 @@ mod tests {
         type_text(&mut wizard, "a", 0);
         wizard.handle_key(key(KeyCode::Enter), 0);
         assert_eq!(wizard.step_id(), "b");
-        assert_eq!(wizard.handle_key(key(KeyCode::Esc), 0), WizardOutcome::Consumed);
+        assert_eq!(
+            wizard.handle_key(key(KeyCode::Esc), 0),
+            WizardOutcome::Consumed
+        );
         assert_eq!(wizard.step_id(), "a");
         assert_eq!(wizard.text_value(), "a", "the stored answer is restored");
         assert_eq!(
@@ -1092,7 +1098,8 @@ mod tests {
     fn skipped_steps_are_invisible_to_sequencing_and_counting() {
         let steps = vec![
             WizardStep::new("one", "One", StepKind::Text),
-            WizardStep::new("two", "Two", StepKind::Text).skip(|v| v.get("one").map(String::as_str) == Some("skip")),
+            WizardStep::new("two", "Two", StepKind::Text)
+                .skip(|v| v.get("one").map(String::as_str) == Some("skip")),
             WizardStep::new("three", "Three", StepKind::Text),
         ];
         let mut wizard = Wizard::new(WizardKind::Task, "T", steps);
@@ -1128,7 +1135,10 @@ mod tests {
         wizard.handle_key(key(KeyCode::Down), 0);
         assert_eq!(wizard.select_index(), 2);
         // Synchronous validation blocks immediately, with no poll().
-        assert_eq!(wizard.handle_key(key(KeyCode::Enter), 0), WizardOutcome::Consumed);
+        assert_eq!(
+            wizard.handle_key(key(KeyCode::Enter), 0),
+            WizardOutcome::Consumed
+        );
         assert_eq!(wizard.visible_error(), Some("not three"));
         wizard.handle_key(key(KeyCode::Up), 0);
         match wizard.handle_key(key(KeyCode::Enter), 0) {
@@ -1141,7 +1151,10 @@ mod tests {
     fn select_number_keys_jump_and_bypass_validation() {
         let steps = vec![
             WizardStep::new("pick", "Pick", StepKind::Select)
-                .options(vec![Choice::new("1", "One", ""), Choice::new("3", "Three", "")])
+                .options(vec![
+                    Choice::new("1", "One", ""),
+                    Choice::new("3", "Three", ""),
+                ])
                 .validate(|_| Some("always invalid".into())),
         ];
         let mut wizard = Wizard::new(WizardKind::Config, "C", steps);
@@ -1171,10 +1184,8 @@ mod tests {
     #[test]
     fn multiselect_toggles_with_space_and_submits_a_comma_joined_string() {
         let steps = vec![
-            WizardStep::new("members", "Members", StepKind::Multiselect).options(vec![
-                Choice::new("a1", "A", ""),
-                Choice::new("a2", "B", ""),
-            ]),
+            WizardStep::new("members", "Members", StepKind::Multiselect)
+                .options(vec![Choice::new("a1", "A", ""), Choice::new("a2", "B", "")]),
         ];
         let mut wizard = Wizard::new(WizardKind::Team, "T", steps);
         wizard.handle_key(key(KeyCode::Char(' ')), 0);
@@ -1325,9 +1336,13 @@ mod tests {
 
     #[test]
     fn callback_suggestions_report_the_selection_to_the_host() {
-        let steps = vec![WizardStep::new("name", "Name", StepKind::Text).suggestions(vec![
-            Choice::new("backend-dev", "Backend Developer", "builds APIs"),
-        ])];
+        let steps = vec![
+            WizardStep::new("name", "Name", StepKind::Text).suggestions(vec![Choice::new(
+                "backend-dev",
+                "Backend Developer",
+                "builds APIs",
+            )]),
+        ];
         let mut wizard = Wizard::new(WizardKind::Agent, "A", steps);
         wizard.handle_key(key(KeyCode::Down), 0);
         assert_eq!(
@@ -1338,8 +1353,10 @@ mod tests {
 
     #[test]
     fn up_at_the_first_suggestion_leaves_browse_mode() {
-        let steps = vec![WizardStep::new("name", "Name", StepKind::Text)
-            .suggestions(vec![Choice::new("a", "A", ""), Choice::new("b", "B", "")])];
+        let steps = vec![
+            WizardStep::new("name", "Name", StepKind::Text)
+                .suggestions(vec![Choice::new("a", "A", ""), Choice::new("b", "B", "")]),
+        ];
         let mut wizard = Wizard::new(WizardKind::Agent, "A", steps);
         wizard.handle_key(key(KeyCode::Down), 0);
         wizard.handle_key(key(KeyCode::Down), 0);
@@ -1353,9 +1370,8 @@ mod tests {
     #[test]
     fn typing_exits_browse_mode() {
         let steps = vec![
-            WizardStep::new("name", "Name", StepKind::Text).suggestions(vec![Choice::new(
-                "alpha", "Alpha", "",
-            )]),
+            WizardStep::new("name", "Name", StepKind::Text)
+                .suggestions(vec![Choice::new("alpha", "Alpha", "")]),
         ];
         let mut wizard = Wizard::new(WizardKind::Agent, "A", steps);
         wizard.handle_key(key(KeyCode::Down), 0);

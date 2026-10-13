@@ -190,7 +190,10 @@ mod tests {
             parse_timestamp_ms("2026-10-13T16:37:33.426Z"),
             Some(1_791_909_453_426)
         );
-        assert_eq!(parse_timestamp_ms("2026-10-13T16:37:33Z"), Some(1_791_909_453_000));
+        assert_eq!(
+            parse_timestamp_ms("2026-10-13T16:37:33Z"),
+            Some(1_791_909_453_000)
+        );
         assert_eq!(parse_timestamp_ms("nope"), None);
         assert_eq!(parse_timestamp_ms(""), None);
     }

@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn initial_welcome_with_no_tasks() {
-        assert_eq!(OnboardingStep::initial(&state(), 0), OnboardingStep::Welcome);
+        assert_eq!(
+            OnboardingStep::initial(&state(), 0),
+            OnboardingStep::Welcome
+        );
     }
 
     #[test]
@@ -203,10 +206,7 @@ mod tests {
                 last_event_at: "x".into(),
             },
         );
-        assert_eq!(
-            OnboardingStep::initial(&s, 1),
-            OnboardingStep::RunStarted
-        );
+        assert_eq!(OnboardingStep::initial(&s, 1), OnboardingStep::RunStarted);
     }
 
     #[test]

@@ -548,7 +548,11 @@ mod tests {
     fn run_maps_prune_oldest_first_at_500() {
         let mut runs = RunMaps::default();
         for i in 0..600 {
-            runs.record(&format!("run_{i}"), &format!("agt_{i}"), &format!("tsk_{i}"));
+            runs.record(
+                &format!("run_{i}"),
+                &format!("agt_{i}"),
+                &format!("tsk_{i}"),
+            );
         }
         assert_eq!(runs.agent_of_run.len(), MAX_RUN_MAP_SIZE);
         assert_eq!(runs.task_of_run.len(), MAX_RUN_MAP_SIZE);
@@ -562,8 +566,8 @@ mod tests {
     #[test]
     fn details_are_capped_at_2kb() {
         let long = "x".repeat(5_000);
-        let msg = Message::new(1, 0, "t", Token::White, MsgType::Output)
-            .with_detail(Some(long.clone()));
+        let msg =
+            Message::new(1, 0, "t", Token::White, MsgType::Output).with_detail(Some(long.clone()));
         let detail = msg.detail.unwrap();
         assert!(detail.ends_with("…[truncated]"));
         assert_eq!(detail.chars().count(), format::MAX_DETAIL_LEN + 12);

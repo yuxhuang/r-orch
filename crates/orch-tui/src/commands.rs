@@ -3,12 +3,12 @@
 //! The verb and subcommand set is contract (PARITY.md §12.4), as are the
 //! confirmation and refusal strings, which the TS tests assert as substrings.
 
-use orch_domain::{AgentStatus, GOAL_STATUSES, GoalStatus, TaskStatus, TUI_PALETTE_NAMES};
+use orch_domain::{AgentStatus, GOAL_STATUSES, GoalStatus, TUI_PALETTE_NAMES, TaskStatus};
 
 use crate::app::{App, parse_palette};
 use crate::backend::TuiBackend;
 use crate::clock::Clock;
-use crate::command_bar::{CONFIG_SETTINGS, COMMAND_REGISTRY, is_config_setting};
+use crate::command_bar::{COMMAND_REGISTRY, CONFIG_SETTINGS, is_config_setting};
 use crate::format::cap_line;
 use crate::messages::MsgType;
 use crate::state::is_runnable;
@@ -70,10 +70,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     pub fn execute_command(&mut self, raw: &str) {
         let stripped = raw.trim().trim_start_matches('/');
-        let parts: Vec<String> = stripped
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let parts: Vec<String> = stripped.split_whitespace().map(str::to_string).collect();
         let Some(verb) = parts.first().map(|v| v.to_lowercase()) else {
             return;
         };
@@ -253,12 +250,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     .iter()
                     .map(|i| {
                         let task = &self.state.tasks[*i];
-                        format!(
-                            "  {}  {:<11} {}",
-                            task.id,
-                            task.status.as_str(),
-                            task.title
-                        )
+                        format!("  {}  {:<11} {}", task.id, task.status.as_str(), task.title)
                     })
                     .collect();
                 for line in lines {
@@ -363,9 +355,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 Some(id) => self.delete_task_by_id(&id),
                 None => self.refuse(NO_TASK_OR_ID),
             },
-            _ => self.refuse(
-                "Usage: /task add|list|show|cancel|retry|assign|approve|reject|delete",
-            ),
+            _ => {
+                self.refuse("Usage: /task add|list|show|cancel|retry|assign|approve|reject|delete")
+            }
         }
     }
 
@@ -591,7 +583,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
             }
             Some("set-lead") => {
-                let (Some(team_id), Some(agent_id)) = (parts.get(2).cloned(), parts.get(3).cloned())
+                let (Some(team_id), Some(agent_id)) =
+                    (parts.get(2).cloned(), parts.get(3).cloned())
                 else {
                     self.refuse("Usage: /team set-lead <teamId> <agentId>");
                     return;
@@ -648,12 +641,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     .iter()
                     .map(|i| {
                         let goal = &self.state.goals[*i];
-                        format!(
-                            "  {}  {:<8} {}",
-                            goal.id,
-                            goal.status.as_str(),
-                            goal.title
-                        )
+                        format!("  {}  {:<8} {}", goal.id, goal.status.as_str(), goal.title)
                     })
                     .collect();
                 for line in lines {

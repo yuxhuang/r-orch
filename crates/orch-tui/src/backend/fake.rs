@@ -5,9 +5,9 @@
 //! views to render and every call recorded for assertions.
 
 use orch_domain::{
-    Agent, AgentConfig, AgentStats, AgentStatus, CreateGoalInput, CreateTeamInput, Goal, GoalStatus,
-    NotificationPreferences, OrchestratorEvent, OrchestratorState, Task, TaskStatus, Team,
-    TeamConfig, TeamMember, TeamMemberRole, TeamStatus, TuiPaletteName, default_state,
+    Agent, AgentConfig, AgentStats, AgentStatus, CreateGoalInput, CreateTeamInput, Goal,
+    GoalStatus, NotificationPreferences, OrchestratorEvent, OrchestratorState, Task, TaskStatus,
+    Team, TeamConfig, TeamMember, TeamMemberRole, TeamStatus, TuiPaletteName, default_state,
 };
 
 use super::{

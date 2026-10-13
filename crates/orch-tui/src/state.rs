@@ -212,7 +212,7 @@ impl TabFlash {
     /// Bright on even tick pairs, dim on odd ones.
     pub fn is_bright(&self, tick: u64) -> bool {
         let elapsed = tick.saturating_sub(self.started_tick);
-        (elapsed / 2) % 2 == 0
+        (elapsed / 2).is_multiple_of(2)
     }
 
     pub fn is_done(&self, tick: u64) -> bool {
@@ -737,10 +737,7 @@ impl AppState {
                     }
                     None => {
                         // Only once, on the transition into the unassigned block.
-                        let count = order
-                            .iter()
-                            .filter(|i| self.team_of(**i).is_none())
-                            .count();
+                        let count = order.iter().filter(|i| self.team_of(**i).is_none()).count();
                         rows.push(AgentRow::UnassignedSection { count });
                     }
                 }
@@ -788,7 +785,7 @@ impl AppState {
     }
 
     /// `listItemCount` — feeds the layout's 50 % list cap.
-    pub fn list_item_count(&self, can_create: bool) -> usize {
+    pub fn list_item_count(&self, _can_create: bool) -> usize {
         match self.view {
             ViewId::Goals => self.sorted_goals().len() + 1,
             ViewId::Tasks => {
@@ -800,7 +797,6 @@ impl AppState {
             ViewId::Agents => self.agents.len() + 1 + self.agent_section_rows(),
             ViewId::Logs => 0,
         }
-        .max(usize::from(can_create) * 0)
     }
 
     pub fn regions(&self, can_create: bool) -> crate::layout::Regions {
@@ -995,8 +991,10 @@ impl AppState {
             self.detail_maximized = false;
             self.split_offset = -((content_h as i32) / 2);
         } else {
-            self.split_offset =
-                crate::layout::clamp_split_offset(self.split_offset - crate::layout::SPLIT_STEP, content_h);
+            self.split_offset = crate::layout::clamp_split_offset(
+                self.split_offset - crate::layout::SPLIT_STEP,
+                content_h,
+            );
         }
     }
 
@@ -1007,8 +1005,10 @@ impl AppState {
             self.detail_maximized = false;
             self.split_offset = (content_h as i32) / 2;
         } else {
-            self.split_offset =
-                crate::layout::clamp_split_offset(self.split_offset + crate::layout::SPLIT_STEP, content_h);
+            self.split_offset = crate::layout::clamp_split_offset(
+                self.split_offset + crate::layout::SPLIT_STEP,
+                content_h,
+            );
         }
     }
 
@@ -1016,7 +1016,9 @@ impl AppState {
     pub fn clamp_all(&mut self, can_create: bool) {
         self.goal_selected = self.goal_selected.min(self.goal_selection_max(can_create));
         self.task_selected = self.task_selected.min(self.task_selection_max(can_create));
-        self.agent_selected = self.agent_selected.min(self.agent_selection_max(can_create));
+        self.agent_selected = self
+            .agent_selected
+            .min(self.agent_selection_max(can_create));
         let regions = self.regions(can_create);
         let main_h = regions.main_h as usize;
         let clamp = |len: usize| len.saturating_sub(main_h);
@@ -1044,6 +1046,9 @@ impl AppState {
 }
 
 #[cfg(test)]
+// Fixtures build an `AppState` field by field; struct-update syntax would bury
+// what each test is actually setting.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::backend::{make_agent, make_goal, make_task, make_team};
@@ -1214,7 +1219,10 @@ mod tests {
             }
             other => panic!("expected a goal section, got {other:?}"),
         }
-        assert!(matches!(sections[1], TaskRow::UngroupedSection { total: 2 }));
+        assert!(matches!(
+            sections[1],
+            TaskRow::UngroupedSection { total: 2 }
+        ));
 
         // Selection indices are contiguous across the headers.
         let selections: Vec<usize> = rows
@@ -1245,7 +1253,9 @@ mod tests {
         ];
         state.teams = vec![make_team("t1", "core", "a1", &["a1"])];
         let rows = state.agent_rows(true);
-        assert!(matches!(rows[0], AgentRow::TeamSection { ref name, count: 1, .. } if name == "core"));
+        assert!(
+            matches!(rows[0], AgentRow::TeamSection { ref name, count: 1, .. } if name == "core")
+        );
         assert!(matches!(rows[1], AgentRow::Agent { selection: 0, .. }));
         assert!(matches!(rows[2], AgentRow::UnassignedSection { count: 1 }));
         assert!(matches!(rows[3], AgentRow::Agent { selection: 1, .. }));
@@ -1281,7 +1291,10 @@ mod tests {
                 crate::messages::MESSAGE_BATCH_MS,
             );
         }
-        assert!(state.messages.is_empty(), "nothing visible before the flush");
+        assert!(
+            state.messages.is_empty(),
+            "nothing visible before the flush"
+        );
         assert_eq!(state.message_flush_at, Some(80));
         state.flush_messages(80);
         assert_eq!(state.messages.len(), 100);

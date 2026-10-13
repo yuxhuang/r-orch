@@ -316,6 +316,10 @@ impl CommandHistory {
     }
 
     /// `↓` — the next entry, or `None` past the end (meaning "clear the input").
+    ///
+    /// Named after the TS `CommandHistory.next()` it ports; it is not an
+    /// iterator.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<String> {
         if !self.entries.is_empty() && self.cursor + 1 < self.entries.len() {
             self.cursor += 1;
@@ -399,7 +403,8 @@ mod tests {
     #[test]
     fn bare_slash_is_category_grouped_with_three_separators() {
         let suggestions = resolve_suggestions("/");
-        let separators: Vec<&Suggestion> = suggestions.iter().filter(|s| s.is_separator()).collect();
+        let separators: Vec<&Suggestion> =
+            suggestions.iter().filter(|s| s.is_separator()).collect();
         assert_eq!(separators.len(), 3);
         assert_eq!(separators[0].desc, "── MANAGEMENT ──");
         assert_eq!(separators[1].desc, "── MONITORING ──");

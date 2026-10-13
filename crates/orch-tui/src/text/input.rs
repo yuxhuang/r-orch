@@ -147,8 +147,8 @@ impl TextInput {
         self.poll(now_ms);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Option (ALT) and Cmd (SUPER) are both `key.meta` in Ink.
-        let meta =
-            key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SUPER);
+        let meta = key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER);
 
         if ctrl {
             let Some(ch) = char_of(key.code) else {

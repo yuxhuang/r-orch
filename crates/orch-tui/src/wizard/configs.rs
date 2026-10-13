@@ -71,11 +71,27 @@ pub fn priority_options() -> Vec<Choice> {
 pub fn role_presets() -> Vec<Choice> {
     choices(&[
         ("", "Skip", "no role description"),
-        ("Full-stack developer", "Full-stack developer", "general purpose"),
+        (
+            "Full-stack developer",
+            "Full-stack developer",
+            "general purpose",
+        ),
         ("Frontend developer", "Frontend developer", "React, CSS, UI"),
-        ("Backend developer", "Backend developer", "APIs, databases, services"),
-        ("DevOps engineer", "DevOps engineer", "CI/CD, infra, deploys"),
-        ("QA / Test engineer", "QA / Test engineer", "testing, quality"),
+        (
+            "Backend developer",
+            "Backend developer",
+            "APIs, databases, services",
+        ),
+        (
+            "DevOps engineer",
+            "DevOps engineer",
+            "CI/CD, infra, deploys",
+        ),
+        (
+            "QA / Test engineer",
+            "QA / Test engineer",
+            "testing, quality",
+        ),
         ("Code reviewer", "Code reviewer", "review PRs, find bugs"),
         ("Technical writer", "Technical writer", "docs, READMEs"),
         (CUSTOM_ROLE, "Custom...", "type your own"),
@@ -126,7 +142,11 @@ pub fn palette_options() -> Vec<Choice> {
         ("ocean", "Ocean", "cool blue control room"),
         ("forest", "Forest", "calm green operations"),
         ("violet", "Violet", "high-contrast purple"),
-        ("light", "Light", "high-contrast palette for light terminals"),
+        (
+            "light",
+            "Light",
+            "high-contrast palette for light terminals",
+        ),
     ])
 }
 
@@ -283,7 +303,11 @@ pub fn validate_priority(value: &str) -> Option<String> {
     }
 }
 
-pub fn validate_agent_name(value: &str, agents: &[Agent], exclude_id: Option<&str>) -> Option<String> {
+pub fn validate_agent_name(
+    value: &str,
+    agents: &[Agent],
+    exclude_id: Option<&str>,
+) -> Option<String> {
     if value.trim().is_empty() {
         return Some(NAME_REQUIRED.into());
     }
@@ -648,13 +672,7 @@ pub fn edit_agent_wizard_steps(
             .skip(move |v| a4(v) == "shell"),
         WizardStep::new("effort", "Reasoning effort", StepKind::Select)
             .options(effort_options())
-            .default_value(
-                agent
-                    .config
-                    .effort
-                    .map(|e| e.as_str())
-                    .unwrap_or(""),
-            )
+            .default_value(agent.config.effort.map(|e| e.as_str()).unwrap_or(""))
             .skip(move |v| !EFFORT_ADAPTERS.contains(&a5(v).as_str())),
         WizardStep::new("role", "Role / specialization", StepKind::Select)
             .options(role_presets())
@@ -719,11 +737,8 @@ pub fn edit_agent_wizard_to_fields(values: &Values) -> (AgentFields, Option<Stri
 
 /// `getTaskWizardSteps(agents)`.
 pub fn task_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
-    let options = agent_options_with_sentinel(
-        agents,
-        "Auto-assign",
-        "orchestrator picks the best agent",
-    );
+    let options =
+        agent_options_with_sentinel(agents, "Auto-assign", "orchestrator picks the best agent");
     let options_len = options.len();
     vec![
         WizardStep::new("title", "Task title", StepKind::Text)
@@ -931,9 +946,13 @@ pub fn config_wizard_steps(
                 .default_value(palette),
         ],
         "activity-filter" => vec![
-            WizardStep::new("activity_filter", "Activity filter preset", StepKind::Select)
-                .options(activity_filter_options())
-                .default_value(filter),
+            WizardStep::new(
+                "activity_filter",
+                "Activity filter preset",
+                StepKind::Select,
+            )
+            .options(activity_filter_options())
+            .default_value(filter),
         ],
         "max-concurrent" => vec![
             WizardStep::new("max_concurrent", "Max concurrent agents", StepKind::Select)
@@ -941,9 +960,13 @@ pub fn config_wizard_steps(
                 .default_value(&max_concurrent.to_string()),
         ],
         "notifications-toast" => vec![
-            WizardStep::new("notifications_toast", "Toast notifications", StepKind::Select)
-                .options(toggle_options())
-                .default_value(if notifications.toast { "true" } else { "false" }),
+            WizardStep::new(
+                "notifications_toast",
+                "Toast notifications",
+                StepKind::Select,
+            )
+            .options(toggle_options())
+            .default_value(if notifications.toast { "true" } else { "false" }),
         ],
         "notifications-bell" => vec![
             WizardStep::new("notifications_bell", "Bell on completion", StepKind::Select)

@@ -40,10 +40,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         //    dismisses the overlay *and* performs its normal action.
         if self.state.show_help {
             self.state.show_help = false;
-            if matches!(
-                key.code,
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1)
-            ) {
+            if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1)) {
                 return;
             }
         }
@@ -446,8 +443,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     // From tail: jump to the last message.
                     let last = filtered.len() as i64 - 1;
                     self.state.log_selected_index = last;
-                    self.state.log_scroll_offset =
-                        (last - main_h as i64 + 2).max(0) as usize;
+                    self.state.log_scroll_offset = (last - main_h as i64 + 2).max(0) as usize;
                 } else {
                     self.state.log_selected_index = (self.state.log_selected_index - 1).max(0);
                     if (self.state.log_selected_index as usize) < self.state.log_scroll_offset {
@@ -537,10 +533,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     // A verb with subcommands fills the buffer instead of
                     // executing.
                     if selected.subs.is_some() && !cmd_part.contains(' ') {
-                        self.state
-                            .command_bar
-                            .input
-                            .reset(&format!("{cmd_part} "));
+                        self.state.command_bar.input.reset(&format!("{cmd_part} "));
                         self.state.command_bar.suggestion_index = 0;
                         return;
                     }
@@ -553,8 +546,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             }
             KeyCode::Tab => {
                 if !suggestions.is_empty() {
-                    if let Some(selected) =
-                        suggestions.get(self.state.command_bar.suggestion_index)
+                    if let Some(selected) = suggestions.get(self.state.command_bar.suggestion_index)
                     {
                         let cmd_part = strip_args_hint(&selected.cmd);
                         let filled = if selected.subs.is_some() {

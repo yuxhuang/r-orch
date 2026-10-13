@@ -5,9 +5,7 @@
 //! [`crate::keys`] and command execution in [`crate::commands`], both as
 //! `impl` blocks on this type.
 
-use orch_domain::{
-    Agent, Goal, GoalStatus, OrchestratorEvent, Task, TaskStatus, TuiPaletteName,
-};
+use orch_domain::{Agent, Goal, GoalStatus, OrchestratorEvent, Task, TaskStatus, TuiPaletteName};
 
 use crate::backend::{ClipboardPaste, HistoryEntry, ModelCatalog, TuiBackend};
 use crate::clock::{Clock, SystemClock};
@@ -374,9 +372,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         {
             self.state.goals = goals;
         }
-        if include_teams
-            && let Ok(teams) = self.backend.list_teams()
-        {
+        if include_teams && let Ok(teams) = self.backend.list_teams() {
             self.state.teams = teams;
         }
         // State is always committed.
@@ -766,10 +762,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     fn submit_shop(&mut self, values: &Values) {
-        let key = values
-            .get("shop_template")
-            .cloned()
-            .unwrap_or_default();
+        let key = values.get("shop_template").cloned().unwrap_or_default();
         match orch_domain::get_shop_template_by_key(&key) {
             Some(template) => {
                 let wizard = configs::agent_from_shop_wizard(
@@ -1031,9 +1024,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             return;
         }
         let now = self.now();
-        let message = self
-            .state
-            .schedule_deletion(EntityType::Task, &task.id, &task.title, false, now);
+        let message =
+            self.state
+                .schedule_deletion(EntityType::Task, &task.id, &task.title, false, now);
         self.emit(&message, Token::Yellow, MsgType::System);
     }
 
@@ -1057,13 +1050,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             return;
         }
         let now = self.now();
-        let message = self.state.schedule_deletion(
-            EntityType::Agent,
-            &agent.id,
-            &agent.name,
-            running,
-            now,
-        );
+        let message =
+            self.state
+                .schedule_deletion(EntityType::Agent, &agent.id, &agent.name, running, now);
         self.emit(&message, Token::Yellow, MsgType::System);
     }
 
@@ -1303,7 +1292,10 @@ mod tests {
         });
         assert_eq!(app.state.toasts.len(), 1);
         assert_eq!(app.state.toasts[0].title, "Ship it");
-        assert!(!app.backend.called(|c| matches!(c, crate::backend::Call::Bell)));
+        assert!(
+            !app.backend
+                .called(|c| matches!(c, crate::backend::Call::Bell))
+        );
     }
 
     #[test]
@@ -1462,9 +1454,12 @@ mod tests {
         app.delete_agent_by_id("agt_1");
         assert!(app.state.pending_deletions.is_empty());
         app.state.flush_messages(0);
-        assert!(app.state.messages.iter().any(|m| m
-            .text
-            .contains("is running. Press S to stop first.")));
+        assert!(
+            app.state
+                .messages
+                .iter()
+                .any(|m| m.text.contains("is running. Press S to stop first."))
+        );
     }
 
     #[test]

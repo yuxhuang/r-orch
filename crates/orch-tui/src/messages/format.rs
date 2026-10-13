@@ -304,10 +304,10 @@ fn dispatch(parsed: &Value, raw: &str) -> Formatted {
     }
 
     // ── Legacy flat Codex item shapes, persisted before adapter normalization.
-    if ty == Some("agent_message") {
-        if let Some(text) = str_field(parsed, "text") {
-            return with_detail(first_line_trunc(text, 200), raw);
-        }
+    if ty == Some("agent_message")
+        && let Some(text) = str_field(parsed, "text")
+    {
+        return with_detail(first_line_trunc(text, 200), raw);
     }
     if ty == Some("reasoning") {
         return Formatted {
@@ -315,16 +315,16 @@ fn dispatch(parsed: &Value, raw: &str) -> Formatted {
             detail: String::new(),
         };
     }
-    if ty == Some("command_execution") {
-        if let Some(command) = str_field(parsed, "command") {
-            let result = str_field(parsed, "aggregated_output")
-                .or_else(|| str_field(parsed, "result"))
-                .filter(|s| !s.is_empty());
-            let tail = result.map_or_else(String::new, |r| {
-                format!(" \u{2192} {}", first_line_trunc(r, 80))
-            });
-            return with_detail(format!("$ {}{tail}", slice_chars(command, 120)), raw);
-        }
+    if ty == Some("command_execution")
+        && let Some(command) = str_field(parsed, "command")
+    {
+        let result = str_field(parsed, "aggregated_output")
+            .or_else(|| str_field(parsed, "result"))
+            .filter(|s| !s.is_empty());
+        let tail = result.map_or_else(String::new, |r| {
+            format!(" \u{2192} {}", first_line_trunc(r, 80))
+        });
+        return with_detail(format!("$ {}{tail}", slice_chars(command, 120)), raw);
     }
     if ty == Some("web_search") {
         let query = str_field(parsed, "query").or_else(|| {
@@ -339,38 +339,43 @@ fn dispatch(parsed: &Value, raw: &str) -> Formatted {
     }
 
     // ── Canonical AgentEvent data shapes — see adapters/interface.ts.
-    if let Some(text) = str_field(parsed, "text") {
-        if !text.is_empty() && !has_type && !has_role {
-            return with_detail(first_line_trunc(text, 200), raw);
-        }
+    if let Some(text) = str_field(parsed, "text")
+        && !text.is_empty()
+        && !has_type
+        && !has_role
+    {
+        return with_detail(first_line_trunc(text, 200), raw);
     }
-    if let Some(command) = str_field(parsed, "command") {
-        if !has_type {
-            let tail = str_field(parsed, "result")
-                .filter(|s| !s.is_empty())
-                .map_or_else(String::new, |r| {
-                    format!(" \u{2192} {}", first_line_trunc(r, 80))
-                });
-            return with_detail(format!("$ {}{tail}", slice_chars(command, 120)), raw);
-        }
+    if let Some(command) = str_field(parsed, "command")
+        && !has_type
+    {
+        let tail = str_field(parsed, "result")
+            .filter(|s| !s.is_empty())
+            .map_or_else(String::new, |r| {
+                format!(" \u{2192} {}", first_line_trunc(r, 80))
+            });
+        return with_detail(format!("$ {}{tail}", slice_chars(command, 120)), raw);
     }
-    if let Some(paths) = field(parsed, "paths").as_array() {
-        if !paths.is_empty() && !has_type {
-            // MSG_ICONS.file
-            let joined = js_join(paths, ", ");
-            return with_detail(format!("\u{270E} {}", slice_chars(&joined, 180)), raw);
-        }
+    if let Some(paths) = field(parsed, "paths").as_array()
+        && !paths.is_empty()
+        && !has_type
+    {
+        // MSG_ICONS.file
+        let joined = js_join(paths, ", ");
+        return with_detail(format!("\u{270E} {}", slice_chars(&joined, 180)), raw);
     }
-    if let Some(message) = str_field(parsed, "message") {
-        if !has_role && !truthy(field(parsed, "content")) && !truthy(field(parsed, "subtype")) {
-            // MSG_ICONS.error
-            return with_detail(format!("\u{2715} {}", first_line_trunc(message, 200)), raw);
-        }
+    if let Some(message) = str_field(parsed, "message")
+        && !has_role
+        && !truthy(field(parsed, "content"))
+        && !truthy(field(parsed, "subtype"))
+    {
+        // MSG_ICONS.error
+        return with_detail(format!("\u{2715} {}", first_line_trunc(message, 200)), raw);
     }
-    if let Some(result) = str_field(parsed, "result") {
-        if !has_type {
-            return with_detail(format!("\u{2713} {}", first_line_trunc(result, 200)), raw);
-        }
+    if let Some(result) = str_field(parsed, "result")
+        && !has_type
+    {
+        return with_detail(format!("\u{2713} {}", first_line_trunc(result, 200)), raw);
     }
 
     // ── Claude API message: {"type":"message","role":"assistant","content":[…]}
@@ -435,10 +440,10 @@ fn dispatch(parsed: &Value, raw: &str) -> Formatted {
     }
 
     // ── Generic: try the content field.
-    if truthy(field(parsed, "content")) {
-        if let Some(text) = renderable(field(parsed, "content")) {
-            return with_detail(slice_chars(&text, 200), raw);
-        }
+    if truthy(field(parsed, "content"))
+        && let Some(text) = renderable(field(parsed, "content"))
+    {
+        return with_detail(slice_chars(&text, 200), raw);
     }
 
     // ── Fallback: show the type, or truncate the payload.
@@ -1267,10 +1272,11 @@ mod tests {
             out.summary.as_deref(),
             Some("The 'gpt-5.6' model is not supported for this account.")
         );
-        assert!(!out
-            .summary
-            .unwrap_or_default()
-            .contains("invalid_request_error"));
+        assert!(
+            !out.summary
+                .unwrap_or_default()
+                .contains("invalid_request_error")
+        );
         assert_eq!(out.detail, raw);
     }
 
