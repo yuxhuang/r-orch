@@ -413,25 +413,21 @@ impl TuiBackend for EngineBackend {
     /// Spawned, not awaited: dispatching takes a lock, prepares a workspace and
     /// starts a child. A lock conflict therefore arrives as an
     /// `orchestrator:error`, not as this call's return value.
+    /// Awaited, not spawned. Both of these dispatch and return — they never
+    /// wait on an agent, because collection happens on a later tick — so the
+    /// frame cost is bounded, and awaiting is the only way the dashboard can
+    /// see a pre-dispatch failure: it has no renderer for
+    /// `orchestrator:error`, so an error delivered through the event stream
+    /// alone is invisible (BACKEND.md §3). A lock conflict naming the holder's
+    /// PID is exactly such a failure.
     fn run_task(&mut self, id: &str) -> BackendResult<()> {
-        let engine = Arc::clone(&self.engine);
-        let id = id.to_owned();
-        self.handle.spawn(async move {
-            if let Err(err) = engine.orchestrator.run_task(&id).await {
-                EngineBackend::report(&engine, err, &format!("tui run task {id}"));
-            }
-        });
-        Ok(())
+        self.block_on(self.engine.orchestrator.run_task(id))
+            .map_err(to_message)
     }
 
     fn run_all(&mut self) -> BackendResult<()> {
-        let engine = Arc::clone(&self.engine);
-        self.handle.spawn(async move {
-            if let Err(err) = engine.orchestrator.run_all().await {
-                EngineBackend::report(&engine, err, "tui run all");
-            }
-        });
-        Ok(())
+        self.block_on(self.engine.orchestrator.run_all())
+            .map_err(to_message)
     }
 
     /// Awaited: cancelling is bounded by the 3 s kill grace, and the dashboard
@@ -589,18 +585,18 @@ impl TuiBackend for EngineBackend {
 
     // ── Watch mode ───────────────────────────────────────────────────────
 
-    /// Spawned: `start_watch` performs startup recovery and one full tick.
+    /// Awaited for the same reason as [`EngineBackend::run_task`]: it acquires
+    /// the lock, recovers stale state and runs one tick, then returns with the
+    /// loop running. The failure that matters — another process holding the
+    /// lock — is knowable before any agent starts, and `/watch` is the one
+    /// command whose whole purpose is to report it.
     fn start_watch(&mut self) -> BackendResult<()> {
-        let engine = Arc::clone(&self.engine);
-        self.handle.spawn(async move {
-            if let Err(err) = engine
+        self.block_on(
+            self.engine
                 .orchestrator
-                .start_watch(WatchOptions::watching())
-                .await
-            {
-                EngineBackend::report(&engine, err, "tui start watch");
-            }
-        });
+                .start_watch(WatchOptions::watching()),
+        )
+        .map_err(to_message)?;
         self.watch_active = true;
         Ok(())
     }

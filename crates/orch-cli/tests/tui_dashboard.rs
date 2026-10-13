@@ -15,6 +15,7 @@ use orch_core::storage::ConfigStore;
 use orch_domain::{CreateAgentInput, CreateTaskInput, TaskStatus, WorkspaceMode, default_config};
 use orch_engine::{FullEngine, build_full};
 use orch_infra::storage::{FileConfigStore, Paths};
+use orch_tui::backend::TuiBackend;
 use orch_tui::clock::TestClock;
 use orch_tui::state::ViewId;
 use orch_tui::{App, views};
@@ -178,4 +179,34 @@ async fn quitting_sets_the_exit_flag_the_runner_loops_on() {
 
     assert!(should_exit, "`q` must end `orch_tui::run`'s loop");
     engine.orchestrator.stop().await.expect("stop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_conflict_is_rendered_to_the_user_not_swallowed() {
+    let (_temp, engine) = project("contested").await;
+    // Another process owns the orchestrator, so the dashboard launches as an
+    // observer and `/watch` cannot take the lock.
+    let held = orch_engine::FileLock::new(engine.paths.lock_path());
+    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
+
+    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9").await;
+    assert!(backend.context().observer_mode);
+
+    let rendered = on_dashboard(backend, |app, terminal| {
+        // `0` flushes the message batch synchronously.
+        app.batch_ms = 0;
+        app.execute_command("/watch");
+        frame(app, terminal)
+    })
+    .await;
+
+    // The whole point of returning `Err` synchronously: the dashboard has no
+    // renderer for `orchestrator:error`, so this text is the only way the user
+    // learns which process holds the lock (BACKEND.md §3).
+    assert!(
+        rendered.contains("Failed: Orchestrator already running (PID:"),
+        "{rendered}"
+    );
+
+    orch_engine::ProjectLock::release(&held).await;
 }

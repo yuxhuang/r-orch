@@ -859,47 +859,40 @@ async fn stop_watch_returns_at_once_and_the_shutdown_arrives_on_the_bus() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dispatch_that_cannot_take_the_lock_reports_on_the_bus_not_to_the_caller() {
+async fn a_dispatch_that_cannot_take_the_lock_fails_the_call_with_the_holders_pid() {
     let (temp, engine) = project().await;
-    // Launch in observer mode, so the orchestrator owns no lock.
+    // Another process owns the orchestrator, so this one launches as observer.
     let held = orch_engine::FileLock::new(engine.paths.lock_path());
     assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
 
     let backend = launch(Arc::clone(&engine)).await;
     assert!(backend.context().observer_mode);
 
-    // Fire-and-forget: the call itself succeeds.
-    let (backend, result) = on_draw_thread(backend, |backend| {
-        backend.poll_events();
-        backend.run_all()
+    // A lock conflict is knowable before any agent starts, so it must come
+    // back to the caller: the dashboard has no renderer for
+    // `orchestrator:error`, and an error delivered only on the event stream
+    // would be invisible (BACKEND.md §3).
+    let (backend, results) = on_draw_thread(backend, |backend| {
+        [
+            ("run_all", backend.run_all()),
+            ("run_task", backend.run_task("tsk_missing")),
+            ("start_watch", backend.start_watch()),
+        ]
+        .map(|(name, result)| (name, result.err()))
     })
     .await;
-    assert_eq!(result, Ok(()));
 
-    // The lock conflict arrives as an event instead.
-    let mut backend = backend;
-    let mut reported = None;
-    for _ in 0..400 {
-        let (returned, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
-        backend = returned;
-        reported = events.into_iter().find_map(|event| match event {
-            orch_domain::OrchestratorEvent::OrchestratorError { error, context, .. }
-                if context == "tui run all" =>
-            {
-                Some(error)
-            }
-            _ => None,
-        });
-        if reported.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    for (name, error) in &results {
+        let error = error
+            .as_deref()
+            .unwrap_or_else(|| panic!("{name} returned Ok while the lock was held"));
+        assert!(
+            error.starts_with("Orchestrator already running (PID:"),
+            "{name} reported {error:?}"
+        );
     }
-    let error = reported.expect("the lock conflict was never reported");
-    assert!(
-        error.starts_with("Orchestrator already running (PID:"),
-        "error was {error:?}"
-    );
+    // A refused `start_watch` must not leave the dashboard claiming otherwise.
+    assert!(!backend.is_watch_active());
 
     orch_engine::ProjectLock::release(&held).await;
     drop(temp);
