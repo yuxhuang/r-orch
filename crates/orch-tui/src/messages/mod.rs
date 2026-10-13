@@ -36,6 +36,10 @@ pub const ANIM_TICK_MS: i64 = 120;
 pub const NOW_TICK_MS: i64 = 5_000;
 /// Same-agent gap that starts a new visual session in the logs view.
 pub const LOG_SESSION_GAP_MS: i64 = 30_000;
+/// Periodic disk poll in observer mode.
+pub const OBSERVER_POLL_MS: i64 = 3_000;
+/// Periodic disk poll in watch mode.
+pub const WATCH_POLL_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MsgType {

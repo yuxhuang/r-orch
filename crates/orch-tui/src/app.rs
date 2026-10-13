@@ -11,8 +11,8 @@ use crate::backend::{ClipboardPaste, HistoryEntry, ModelCatalog, TuiBackend};
 use crate::clock::{Clock, SystemClock};
 use crate::format::parse_timestamp_ms;
 use crate::messages::{
-    ANIM_TICK_MS, MESSAGE_BATCH_MS, MsgType, PendingMessage, REFRESH_DEBOUNCE_MS, format,
-    format_event,
+    ANIM_TICK_MS, MESSAGE_BATCH_MS, MsgType, OBSERVER_POLL_MS, PendingMessage, REFRESH_DEBOUNCE_MS,
+    WATCH_POLL_MS, format, format_event,
 };
 use crate::onboarding::{COMPLETED_DISMISS_MS, OnboardingStep};
 use crate::state::{
@@ -30,6 +30,7 @@ pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     /// `messageBatchMs`; `0` flushes synchronously.
     pub batch_ms: i64,
     last_anim_at: i64,
+    last_refresh_at: i64,
 }
 
 impl<B: TuiBackend, C: Clock> App<B, C> {
@@ -66,6 +67,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             model_catalog: ModelCatalog::new(),
             batch_ms: MESSAGE_BATCH_MS,
             last_anim_at: now,
+            last_refresh_at: now,
         };
 
         // Launch banner (docs/parity/tui.md §8.6).
@@ -151,6 +153,18 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             && now >= deadline
         {
             self.state.refresh_at = None;
+            self.refresh_all(false);
+        }
+
+        // Periodic disk poll — 3 s in observer mode (where no events arrive at
+        // all), 5 s otherwise, skipped while a refresh is already recent
+        // (docs/parity/tui.md §7).
+        let poll_interval = if self.state.observer_mode {
+            OBSERVER_POLL_MS
+        } else {
+            WATCH_POLL_MS
+        };
+        if now - self.last_refresh_at >= poll_interval {
             self.refresh_all(false);
         }
 
@@ -357,6 +371,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     /// `refreshAll({ includeTeams })` — commit only what actually changed.
     pub fn refresh_all(&mut self, include_teams: bool) {
+        self.last_refresh_at = self.now();
         if let Ok(tasks) = self.backend.refresh_tasks()
             && tasks_changed(&self.state.tasks, &tasks)
         {
