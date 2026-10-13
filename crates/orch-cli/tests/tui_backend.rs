@@ -9,9 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use orch_cli::tui::{
-    AgentFields, AgentOpts, CreateTaskOpts, EngineBackend, GoalFields, TaskFields,
-};
+use orch_cli::tui::EngineBackend;
 use orch_core::storage::ConfigStore;
 use orch_domain::{
     AgentStatus, ApprovalPolicy, CreateGoalInput, CreateTeamInput, GoalStatus,
@@ -20,6 +18,9 @@ use orch_domain::{
 };
 use orch_engine::{FullEngine, build_full};
 use orch_infra::storage::{FileConfigStore, Paths};
+use orch_tui::backend::{
+    AgentFields, AgentOpts, CreateTaskOpts, GoalFields, HistoryEntry, TaskFields, TuiBackend,
+};
 
 /// A project with a written `config.yml`, which is what `require_init` wants.
 async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
@@ -755,7 +756,7 @@ async fn poll_history_delivers_the_two_batches_newest_runs_first() {
     let backend = launch(Arc::clone(&engine)).await;
 
     // The load is spawned at launch; poll until both batches have landed.
-    let mut batches: Vec<Vec<orch_cli::tui::HistoryEntry>> = Vec::new();
+    let mut batches: Vec<Vec<HistoryEntry>> = Vec::new();
     let mut backend = backend;
     for _ in 0..200 {
         let (returned, polled) = on_draw_thread(backend, |backend| backend.poll_history()).await;

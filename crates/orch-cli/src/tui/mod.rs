@@ -37,22 +37,16 @@
 //!
 //! # What is not here yet
 //!
-//! Two pieces wait on branches that have not reached `master`:
-//!
-//! - `impl TuiBackend for EngineBackend` — the trait is on the WP-6 branch. The
-//!   methods below are deliberately named and typed to match it, so the `impl`
-//!   is a mechanical delegation rather than a rewrite.
-//! - the **observer fallback**. When `start_watch` fails because another
-//!   process holds the lock, the TS switches `onSubscribeEvents` to a
-//!   `DiskObserver` that polls `state.json` and the run JSONLs. WP-5a built
-//!   that observer (`serve::disk_observer`) but it is not on `master` either.
-//!   [`backend::EngineBackend`] already records the mode and routes every
-//!   event through one queue, so attaching the observer is one call —
-//!   see [`backend::EngineBackend::push_observed_event`].
+//! The **observer fallback**. When `start_watch` fails because another process
+//! holds the lock, the TS switches `onSubscribeEvents` to a `DiskObserver` that
+//! polls `state.json` and the run JSONLs. WP-5a built that observer
+//! (`serve::disk_observer`) and it has not reached `master` yet.
+//! [`backend::EngineBackend`] already records the mode and routes every event
+//! through one queue, so attaching it is one call — see
+//! [`backend::EngineBackend::observer_sink`] and the TODO in [`command`].
 
 pub mod backend;
+pub mod command;
 
-pub use backend::{
-    AgentFields, AgentOpts, ClipboardPaste, CreateTaskOpts, EngineBackend, GoalFields,
-    HistoryEntry, LaunchContext, ModelCatalog, ModelOption, TaskFields,
-};
+pub use backend::EngineBackend;
+pub use command::run;

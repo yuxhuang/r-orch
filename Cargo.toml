@@ -63,6 +63,7 @@ crossterm = "0.29"
 # maintained ratatui-0.30 continuation and also adds the soft-wrap/visual-row
 # cursor support the wizard needs (docs/parity/tui.md §5.1).
 tui-textarea-2 = "0.13"
+# Replaces Intl.Segmenter + width logic for `text-cursor` parity.
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 unicode-normalization = "0.1"
@@ -103,9 +104,6 @@ toml = "1.1"
 process-wrap = { version = "10", features = ["tokio1"] }
 # Single-line text editing for the TUI command bar and `text` wizard steps.
 tui-input = "0.15"
-# Replaces Intl.Segmenter + width logic for `text-cursor` parity.
-unicode-segmentation = "1.13"
-unicode-width = "0.2"
 # Clipboard. Degrade to "empty" on any failure, exactly as the TS does.
 arboard = "3.6"
 # PNG-encodes clipboard images (already in the tree via arboard).
