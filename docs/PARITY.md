@@ -2663,6 +2663,18 @@ Five palettes (`amber`, `ocean`, `forest`, `violet`, `light`) persisted in `~/.o
 **semantic roles** must exist (brand/amber, success/green, error/red, info/blue, warning/yellow, dim, ghost,
 solid text, selection); exact hex values are L2.
 
+### 12.8 The update facade is intentionally inert
+
+The TS header renders a **version chip** when an update is available, driven by the post-command update check.
+Since self-update and all network access are **out of scope on security grounds** (§11.5, §13), r-orch's TUI
+facade keeps `poll_update`, `background_install` and `installed_version` **at their defaults** — no polling, no
+install, no detected version.
+
+**Consequence: the header version chip never appears in r-orch.** That is **intended, not a missing feature.**
+The fields exist so the facade matches the shape of the TS header component and so a future release channel
+could populate them without reshaping the view; nothing currently does. Do not "finish" them, and do not file
+the absent chip as a parity gap.
+
 ---
 
 ## 13. Out of parity scope
@@ -2682,6 +2694,7 @@ solid text, selection); exact hex values are L2.
 | **`TeamConfig.auto_claim` / `max_concurrent_tasks` behaviour** | Stored and surfaced by the CLI but never read by the orchestrator. Data model and CLI are preserved; the (absent) behaviour is not invented. |
 | **`.orchestry/logs/`** | A path exists in `Paths`; nothing writes it. Kept in the path API, unused. |
 | **npm self-update, and the post-command background update check** | **OUT OF SCOPE — security.** Not "reimplemented". A Rust CLI overwriting its own executable as a side effect of an unrelated command is a supply-chain and integrity surface with no channel, no signing story and no atomic-replace story, and it is unverifiable by the harness. `orch update [--check]` keeps its name, flag and exit 0, and prints the current version plus install instructions. No network access. See §11.5. |
+| **The TUI header's update/version chip** | Follows from the row above. The TUI facade's `poll_update`, `background_install` and `installed_version` stay **at their defaults**, so the chip **never renders**. Intended, not a gap — see §12.8. |
 | **`doctor`'s `node` check** | Replaced by a check of the r-orch build/toolchain identity. The row keeps its **position and format**; only its label and value change. Because that is a divergence in L0 human output, the harness **masks the toolchain row** (§1.4) rather than pretending it matches. |
 | **`readJsonl`'s 50 MB fallback stderr warning wording** | L1 behaviour (tail-read) is kept; the exact warning string is not contract. |
 
