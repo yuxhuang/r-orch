@@ -171,6 +171,43 @@ at parse time unless it is marked `@exit-only`. Commander writes `error: …` on
 stderr while every ORCH domain error is rendered with `✕`, which makes the
 prefix an unambiguous discriminator.
 
+## The one named exclusion: `state.claimed` (§14.1)
+
+PARITY.md §14.1 was decided **FIX**, so there is exactly one path the harness
+does not compare. TS `status --json` serializes the in-memory state object, and
+`JSON.stringify` of a JS `Set` is `{}` whatever it holds — so the oracle's
+`state.claimed` is always empty while `state.json` on disk correctly holds an
+array. r-orch emits the array, and §14.1 grants a **named** exclusion for that
+path in `status --json` comparisons.
+
+A masked value is an unasserted value, so the mask is paired with a replacement
+assertion instead of being left as a hole: **r-orch's array must equal the
+`claimed` array in the `state.json` it wrote.** The cross-implementation check
+on the same data still happens too — `state.json` is an ordinary file in the
+tree walk, where both sides agree on the array — so the mask drops a duplicate
+comparison in a format that legitimately differs, not the only one.
+
+It is scoped as narrowly as it can be, and the scope is tested:
+
+- `status` with `--json`, and nothing else. `state.running` has the same JS-Map
+  problem but §14.1 does not cover it, so it stays compared.
+- Masking a path that is **absent** would assert nothing, so a `status --json`
+  with no `state.claimed` is a failure on either side. If the *oracle* stops
+  emitting it, the message says to re-read the contract rather than to adjust
+  the mask.
+- Comparing parsed documents could have lost the JSON framing the raw-text
+  comparison was covering, so indent and trailing newline (§6.4) are compared
+  separately. Key order survives because `serde_json` is built with
+  `preserve_order`.
+- Two mutation probes assert the hole is exactly its intended size: widening
+  the mask to every command is caught, and deepening it to swallow the whole
+  `state` object is caught. The second is `probe_pending` until `orch status`
+  exists, since nothing exercises it before then.
+
+If a second named exclusion is ever needed, it needs the same four things, and
+a line in PARITY.md naming it. An unnamed exclusion is just a field nobody
+compares any more.
+
 ## What is compared
 
 Per step: stdout, stderr and the exit code. At the end: a recursive walk of
@@ -211,13 +248,27 @@ The tmpdir must also have **no `.orchestry` ancestor**, because
 somewhere outside any ORCH project.
 
 Finally, the harness **builds `orch-cli` from this tree and runs a private copy
-of the binary**, rather than reading `target/debug/orch`. The parallel work
-packages live in separate git worktrees sharing one `CARGO_TARGET_DIR`, so
-`target/debug/orch` is whichever tree built last. This was observed, not
-anticipated: a run reported eleven scenarios failing with rich, plausible diffs
-because it was grading a worktree with the full command surface while this tree
-had three commands. Building makes the binary ours; the snapshot means a
-rebuild elsewhere cannot swap it out mid-run.
+of the binary**, rather than reading `target/debug/orch`.
+
+This was observed, not anticipated. The work packages originally shared one
+`CARGO_TARGET_DIR` across git worktrees, and artifacts from two trees hash
+identically, so `target/debug/orch` was simply whichever tree built last: a run
+reported eleven scenarios failing with rich, plausible diffs because it was
+grading a worktree that had the full command surface while this tree had three
+commands. The worktrees now have their own target directories, but the build
+and the snapshot stay — building is what makes the binary *this source*, and
+the snapshot is what stops a concurrent rebuild swapping it out mid-run.
+
+Nothing in the harness hard-codes a target path: the binary comes from cargo's
+own `--message-format=json` output, and `concurrent_index.rs` derives its from
+`CARGO_TARGET_DIR` with a `<repo>/target` fallback.
+
+One non-obvious thing the snapshot depends on: `resolve_library_dir()` probes
+the executable's directory and its ancestors for `skills/library` and *then*
+falls back to the repository the crate was built from. From a tempdir the probe
+finds nothing, so the snapshot works only because of that fallback — removing
+it would break every skill-dependent scenario in a way that looks like a parity
+failure.
 
 Where a scenario needs a program to exist, it gets a fixture rather than the
 machine's own:
