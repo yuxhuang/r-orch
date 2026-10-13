@@ -209,20 +209,6 @@ impl Scenario {
                 && !argv.iter().any(|arg| arg == "--log-format"))
     }
 
-    /// Whether a step is a `status --json`, whose `state.claimed` is a
-    /// **named exclusion** (PARITY.md §14.1).
-    ///
-    /// The oracle serializes an in-memory JS `Set` there and emits `{}` for
-    /// any contents; r-orch emits the array of ids, by user decision. So the
-    /// field is masked on both sides and checked against `state.json`
-    /// instead — the one divergence in the corpus that is deliberate.
-    pub fn masks_claimed(&self, step: &str) -> bool {
-        let Ok(argv) = self.argv(step) else {
-            return false;
-        };
-        argv.first().map(String::as_str) == Some("status") && argv.iter().any(|arg| arg == "--json")
-    }
-
     /// Which binary runs each step, as a list the runner can walk.
     pub fn plan(&self) -> Vec<Runner> {
         match self.kind {

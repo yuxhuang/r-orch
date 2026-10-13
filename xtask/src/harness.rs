@@ -214,107 +214,21 @@ fn git(cwd: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Normalize a `status --json` document with `state.claimed` masked out,
-/// returning the normalized value of what was masked.
-///
-/// PARITY.md §14.1 is the corpus's only deliberate `--json` divergence: the
-/// oracle emits `{}` (it stringifies a JS `Set`) and r-orch emits the array of
-/// claimed task ids. Comparing the field would fail by design, and dropping
-/// the whole step would stop checking `tasks`, `agents` and the rest of
-/// `state` — so the field alone is masked, and
-/// [`claimed_matches_state_json`] then asserts r-orch's value against the
-/// `state.json` it wrote.
-///
-/// Parsed **first**, normalized second, exactly as the tree comparison is: a
-/// `status --json` document carries a numeric `pid` and `total_runtime_ms`,
-/// and `Normalizer::text` replaces those with bare placeholders, which would
-/// leave the text unparseable.
-fn masked_status_json(raw: &str, norm: &mut Normalizer) -> (String, Option<serde_json::Value>) {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        // Not JSON: a failed command, or human output. Nothing to mask.
-        return (norm.text(raw), None);
-    };
-    let claimed = value
-        .get_mut("state")
-        .and_then(|state| state.as_object_mut())
-        .and_then(|state| {
-            state.insert(
-                "claimed".to_owned(),
-                serde_json::Value::String("<CLAIMED masked: PARITY §14.1>".to_owned()),
-            )
-        })
-        .map(|claimed| norm.value(&claimed));
-
-    let normalized = norm.value(&value);
-    let text = serde_json::to_string_pretty(&normalized).unwrap_or_else(|_| raw.to_owned());
-    (text, claimed)
-}
-
-/// The replacement for the masked comparison: what `status --json` reported
-/// must be exactly what `state.json` holds.
-fn claimed_matches_state_json(
-    project: &Project,
-    norm: &mut Normalizer,
-    reported: &serde_json::Value,
-) -> Option<String> {
-    let path = project.root.join(".orchestry/state.json");
-    // `init` does not write `state.json`; the orchestrator creates it on its
-    // first write, and until then `StateStore::read` returns the defaults —
-    // whose `claimed` is empty.
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return (*reported != serde_json::json!([])).then(|| {
-                format!(
-                    "`status --json` claimed {reported} but there is no state.json, \
-                     so the default empty set is what it should have reported"
-                )
-            });
-        }
-        Err(err) => {
-            return Some(format!(
-                "`status --json` reported claimed {reported} but {} is unreadable: {err}",
-                path.display()
-            ));
-        }
-    };
-    let Ok(on_disk) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return Some(format!("{} is not JSON", path.display()));
-    };
-    let on_disk = norm
-        .value(&on_disk)
-        .get("claimed")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-
-    (*reported != on_disk).then(|| {
-        format!(
-            "`status --json` claimed {reported} but state.json holds {on_disk} \
-             — PARITY §14.1 requires the two to be identical"
-        )
-    })
-}
-
 /// Which subcommands the Rust binary has **wired**, as opposed to declared.
 ///
-/// `<cmd> --help` is no longer a sufficient probe. WP-5a declares the whole
-/// command tree so that V1's surface check is honest — every command,
-/// subcommand, alias and flag of PARITY.md §2.2 exists and parses — and a
-/// command whose service is not wired yet fails at *run* time with
-/// `… is not wired yet`. `--help` therefore exits 0 for all of them, and
-/// probing it alone made a scenario run against an unimplemented command:
-/// that is not a skip and not a real failure, and a `${goal.0}` placeholder in
-/// such a scenario aborts the whole suite because no goal was ever created.
+/// `<cmd> --help` is no longer a sufficient probe on its own. WP-5a declares
+/// the whole command tree so that V1's surface check is honest — every
+/// command, subcommand, alias and flag of PARITY.md §2.2 exists and parses —
+/// and a command whose service is not wired yet fails at *run* time with
+/// `… is not wired yet`. `--help` therefore exits 0 for all sixteen, and
+/// probing it alone made scenarios run against unimplemented commands: that
+/// is neither a skip nor a real failure, and a `${goal.0}` placeholder in such
+/// a scenario aborts the whole suite because no goal was ever created.
 ///
 /// So the probe is an explicit list, intersected with the `--help` check (so a
 /// misspelled requirement still skips rather than silently passing). The list
-/// is the one thing to update when a command lands — and the scenario that was
-/// being skipped starts running in the same commit, which is the ratchet.
-#[derive(Debug, Default)]
-pub struct Capabilities {
-    probed: std::cell::RefCell<BTreeMap<String, bool>>,
-}
-
+/// is the one thing to update when a command lands — and the scenarios that
+/// were being skipped go live in the same commit, which is the ratchet.
 /// Commands whose handler actually does the work.
 ///
 /// Keep sorted, and keep it in step with `crates/orch-cli/TEST-MAP.md`, which
@@ -335,6 +249,11 @@ const WIRED_COMMANDS: &[&str] = &[
     "update",
 ];
 
+#[derive(Debug, Default)]
+pub struct Capabilities {
+    probed: std::cell::RefCell<BTreeMap<String, bool>>,
+}
+
 impl Capabilities {
     pub fn new() -> Self {
         Capabilities::default()
@@ -353,7 +272,6 @@ impl Capabilities {
         if let Some(known) = self.probed.borrow().get(command) {
             return *known;
         }
-
         // Declared *and* wired. The `--help` half catches a requirement that
         // names a command the tree does not have at all — a typo in a
         // scenario, or one written against a renamed verb.
@@ -368,7 +286,6 @@ impl Capabilities {
             .map(|status| status.success())
             .unwrap_or(false);
         let supported = declared && WIRED_COMMANDS.contains(&command);
-
         self.probed
             .borrow_mut()
             .insert(command.to_owned(), supported);
@@ -490,19 +407,8 @@ pub fn run_scenario(
                 ("stdout", &rust_out.stdout, &ts_out.stdout),
                 ("stderr", &rust_out.stderr, &ts_out.stderr),
             ] {
-                let (left, right) = if channel == "stdout" && scenario.masks_claimed(step) {
-                    let (left, reported) = masked_status_json(rust_text, &mut norm);
-                    let (right, _) = masked_status_json(ts_text, &mut norm);
-                    if let Some(reported) = reported
-                        && let Some(failure) =
-                            claimed_matches_state_json(&project, &mut norm, &reported)
-                    {
-                        failures.push(format!("verify `{step}`: {failure}"));
-                    }
-                    (left, right)
-                } else {
-                    (norm.text(rust_text), norm.text(ts_text))
-                };
+                let left = norm.text(rust_text);
+                let right = norm.text(ts_text);
                 if left != right {
                     failures.push(format!(
                         "verify `{step}`: {channel} differs over the shared tree — one binary \
@@ -529,6 +435,9 @@ pub fn run_scenario(
         let mut rust_norm = Normalizer::new().with_root(&rust.root, "<ROOT>");
         let mut ts_norm = Normalizer::new().with_root(&ts.root, "<ROOT>");
         let (mut rust_ids, mut ts_ids) = (IdRegistry::new(), IdRegistry::new());
+        // r-orch's `state.claimed`, kept from the last `status --json` so it
+        // can be checked against the `state.json` the run left behind.
+        let mut masked_claimed: Option<Value> = None;
 
         for step in &scenario.steps {
             let rust_out = execute(bins, &rust, scenario, step, Runner::Rust, &rust_ids)?;
@@ -557,19 +466,24 @@ pub fn run_scenario(
             if Scenario::exit_only(step) {
                 continue;
             }
-            // `serve --log-format json` emits records, not prose: the record
-            // *fields* are L0 and the text format is L2 (PARITY.md §11.1), so
-            // compare those parsed and normalized, and everything else as text.
-            let stdout_diff = if scenario.masks_claimed(step) {
-                let (left, reported) = masked_status_json(&rust_out.stdout, &mut rust_norm);
-                let (right, _) = masked_status_json(&ts_out.stdout, &mut ts_norm);
-                if let Some(reported) = reported
-                    && let Some(failure) =
-                        claimed_matches_state_json(&rust, &mut rust_norm, &reported)
-                {
-                    failures.push(format!("step `{step}`: {failure}"));
+            // `status --json` carries the one named exclusion in the
+            // contract (PARITY.md §14.1); everything else about the document
+            // is still compared, and the masked value is re-asserted against
+            // `state.json` after the tree is collected.
+            let argv = scenario.argv(step)?;
+            let stdout_diff = if claimed_mask::applies_to(&argv) {
+                match mask_claimed_and_compare(
+                    &rust_out.stdout,
+                    &ts_out.stdout,
+                    &mut rust_norm,
+                    &mut ts_norm,
+                ) {
+                    Ok((claimed, diff)) => {
+                        masked_claimed = Some(claimed);
+                        diff
+                    }
+                    Err(problem) => Some(("status --json", problem)),
                 }
-                (left != right).then(|| ("stdout", unified_diff(&right, &left)))
             } else if scenario.stdout_is_json_records(step) {
                 let left = json_records(&rust_out.stdout, &mut rust_norm);
                 let right = json_records(&ts_out.stdout, &mut ts_norm);
@@ -601,6 +515,7 @@ pub fn run_scenario(
         let rust_tree = collect_tree(&rust.root, &mut rust_norm)?;
         let ts_tree = collect_tree(&ts.root, &mut ts_norm)?;
         failures.extend(compare_trees(&rust_tree, &ts_tree));
+        failures.extend(claimed_matches_state_file(&masked_claimed, &rust_tree));
 
         failures.extend(cross_parse_failures(bins, &rust)?);
 
@@ -1001,6 +916,172 @@ fn parse_by_extension(relative: &Path, text: &str) -> Result<Value> {
         // the lock file) compares as a string, so byte differences show.
         _ => Ok(Value::String(text.to_owned())),
     }
+}
+
+/// The one named exclusion the parity contract grants, and the machinery that
+/// keeps it from spreading.
+///
+/// PARITY.md §14.1 was decided **FIX**: TS `status --json` serializes the
+/// in-memory state object directly, and `JSON.stringify` of a JS `Set` is `{}`
+/// whatever it holds, so the oracle's `state.claimed` is always an empty
+/// object while `state.json` on disk correctly holds an array. r-orch emits
+/// the array. The two therefore cannot be compared at that one path, and §14.1
+/// grants a *named* exclusion for it.
+///
+/// A masked value is an unasserted value, so the mask is paired with a
+/// replacement assertion rather than left as a hole: r-orch's array must equal
+/// the `claimed` array in the `state.json` it wrote. The cross-implementation
+/// check on the same data still happens too — `state.json` is an ordinary file
+/// in the tree walk, where both implementations agree on the array — so the
+/// mask removes a duplicate comparison in a format that legitimately differs,
+/// not the only one.
+mod claimed_mask {
+    use super::*;
+
+    /// The masked path, as it appears in `status --json`.
+    pub const PATH: &str = "state.claimed";
+
+    /// Whether the §14.1 mask applies to this step.
+    ///
+    /// Deliberately narrow: `status` with `--json` and nothing else. The mask
+    /// exists for one documented divergence, and a mask that drifted onto
+    /// another command would silently stop comparing a field nobody agreed to
+    /// stop comparing. `probe-harness.sh` asserts that breaking `claimed`
+    /// anywhere *else* is still caught.
+    pub fn applies_to(argv: &[String]) -> bool {
+        // The subcommand is the first non-flag argument, because the global
+        // flags are accepted on either side of it (`--ascii status --json`
+        // and `status --json --ascii` are both valid — measured). This is the
+        // same rule the oracle's own `cli.ts` uses to pick the subcommand,
+        // limitations included: it would be fooled by a value-taking global
+        // flag, and neither has one.
+        let subcommand = argv.iter().find(|arg| !arg.starts_with('-'));
+        subcommand.map(String::as_str) == Some("status") && argv.iter().any(|arg| arg == "--json")
+    }
+
+    /// Remove `state.claimed` from a parsed `status --json` document, handing
+    /// back whatever was there.
+    ///
+    /// `None` for the value means the document had no such path, which is
+    /// itself worth reporting: a `status --json` that stopped emitting
+    /// `state.claimed` would otherwise pass by having nothing to mask.
+    pub fn take(document: &mut Value) -> Option<Value> {
+        document
+            .get_mut("state")?
+            .as_object_mut()?
+            .shift_remove("claimed")
+    }
+}
+
+/// Compare a `status --json` document with `state.claimed` masked, returning
+/// r-orch's masked value and any difference in the rest.
+///
+/// The documents are compared parsed rather than as text, which is what lets
+/// one path be removed. Two things keep that from weakening the check:
+/// `serde_json` is built with `preserve_order`, so re-serializing preserves
+/// key order, and the raw framing (2-space indent, trailing newline — §6.4) is
+/// compared separately below.
+/// What differed about a step's output: a label for the message, and the diff.
+type StepDiff = Option<(&'static str, String)>;
+
+fn mask_claimed_and_compare(
+    rust_stdout: &str,
+    ts_stdout: &str,
+    rust_norm: &mut Normalizer,
+    ts_norm: &mut Normalizer,
+) -> std::result::Result<(Value, StepDiff), String> {
+    let mut rust_doc: Value = serde_json::from_str(rust_stdout)
+        .map_err(|err| format!("r-orch's `status --json` is not valid JSON: {err}"))?;
+    let mut ts_doc: Value = serde_json::from_str(ts_stdout)
+        .map_err(|err| format!("the oracle's `status --json` is not valid JSON: {err}"))?;
+
+    // A document with nothing to mask would pass vacuously, so the absence of
+    // the path is a failure rather than a no-op.
+    let rust_claimed = claimed_mask::take(&mut rust_doc).ok_or_else(|| {
+        format!(
+            "r-orch's `status --json` has no `{}` to mask — the field is contract (§6.6), \
+             and masking a path that is missing would assert nothing",
+            claimed_mask::PATH
+        )
+    })?;
+    claimed_mask::take(&mut ts_doc).ok_or_else(|| {
+        format!(
+            "the oracle's `status --json` has no `{}`, so the §14.1 exclusion no longer \
+             describes the oracle — re-read the contract before touching the mask",
+            claimed_mask::PATH
+        )
+    })?;
+
+    let framing = (JsonFraming::of(rust_stdout), JsonFraming::of(ts_stdout));
+    if framing.0 != framing.1 {
+        return Ok((
+            rust_claimed,
+            Some((
+                "status --json framing",
+                format!(
+                    "2-space indent plus a trailing newline is contract (§6.4)\n    ts:   \
+                     {:?}\n    rust: {:?}",
+                    framing.1, framing.0
+                ),
+            )),
+        ));
+    }
+
+    let left = rust_norm.value(&rust_doc);
+    let right = ts_norm.value(&ts_doc);
+    let diff = (left != right).then(|| {
+        (
+            "status --json (state.claimed masked, §14.1)",
+            unified_diff(&pretty(&right), &pretty(&left)),
+        )
+    });
+    Ok((rust_claimed, diff))
+}
+
+/// The replacement assertion for the §14.1 mask: r-orch's `state.claimed` must
+/// equal the `claimed` array in the `state.json` it wrote.
+///
+/// Without this the mask would be a hole. With it, the field is still pinned —
+/// just against r-orch's own on-disk state, which the tree walk has already
+/// compared against the oracle's, rather than against a `status --json`
+/// document that is empty by construction on the other side.
+fn claimed_matches_state_file(masked: &Option<Value>, rust_tree: &Tree) -> Vec<String> {
+    let Some(claimed) = masked else {
+        return Vec::new();
+    };
+
+    // `init` does not write `state.json` — the orchestrator creates it on its
+    // first write, and until then `StateStore::read` returns the defaults.
+    // So its absence is not a hole: it means the only correct report is the
+    // empty set, and that is still asserted.
+    let Some(state) = rust_tree.values.get("state.json") else {
+        if *claimed == serde_json::json!([]) {
+            return Vec::new();
+        }
+        return vec![format!(
+            "`{}` in `status --json` is {claimed}, but the run left no \
+             `.orchestry/state.json`, so the default empty set is what it should have \
+             reported (PARITY.md §14.1)",
+            claimed_mask::PATH
+        )];
+    };
+    let on_disk = &state["claimed"];
+
+    if !claimed.is_array() {
+        return vec![format!(
+            "`status --json` must emit `{}` as an array (PARITY.md §14.1, decided FIX), \
+             got {claimed}",
+            claimed_mask::PATH
+        )];
+    }
+    if claimed != on_disk {
+        return vec![format!(
+            "`{}` in `status --json` is {claimed}, but `.orchestry/state.json` holds \
+             {on_disk} — the fix must report the same ids the state file does (§14.1)",
+            claimed_mask::PATH
+        )];
+    }
+    Vec::new()
 }
 
 /// Fail a step the oracle rejected at parse time, unless the scenario says it
@@ -1524,6 +1605,128 @@ mod tests {
         let failures = compare_trees(&rust, &ts);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn the_claimed_mask_applies_only_to_status_json() {
+        let yes = [
+            "status --json",
+            "status --json --ascii",
+            "--ascii status --json",
+        ];
+        let no = [
+            // No `--json`: the human renderer never prints the raw Set.
+            "status",
+            // Other commands also carry `state`-shaped output; the exclusion
+            // §14.1 grants is for `status --json` and nothing else.
+            "task list --json",
+            "agent list --json",
+            "config get scheduling --json",
+            "doctor --json",
+            "serve --once --log-format json",
+        ];
+        for step in yes {
+            let argv = shell_words::split(step).unwrap();
+            assert!(claimed_mask::applies_to(&argv), "{step}");
+        }
+        for step in no {
+            let argv = shell_words::split(step).unwrap();
+            assert!(!claimed_mask::applies_to(&argv), "{step}");
+        }
+    }
+
+    #[test]
+    fn the_mask_removes_exactly_one_path() {
+        let mut doc: Value = serde_json::from_str(
+            r#"{"tasks":[],"agents":[],"state":{"version":1,"claimed":["tsk_a"],"running":{}}}"#,
+        )
+        .unwrap();
+
+        let taken = claimed_mask::take(&mut doc).expect("claimed present");
+        assert_eq!(taken, serde_json::json!(["tsk_a"]));
+        // Everything else survives, `running` included — it has the same JS
+        // Map problem but §14.1 does not cover it, so it stays compared.
+        assert_eq!(doc["state"]["version"], 1);
+        assert_eq!(doc["state"]["running"], serde_json::json!({}));
+        assert!(doc["state"].get("claimed").is_none());
+        assert!(doc.get("tasks").is_some());
+
+        // A second take finds nothing, which is how a `status --json` that
+        // stopped emitting the field is caught instead of passing vacuously.
+        assert!(claimed_mask::take(&mut doc).is_none());
+    }
+
+    #[test]
+    fn masking_lets_the_set_and_the_array_through_but_nothing_else() {
+        let ts = "{\n  \"state\": {\n    \"claimed\": {},\n    \"version\": 1\n  }\n}\n";
+        let rust = "{\n  \"state\": {\n    \"claimed\": [\n      \"tsk_a\"\n    ],\n    \"version\": 1\n  }\n}\n";
+        let (mut rn, mut tn) = (Normalizer::new(), Normalizer::new());
+
+        let (claimed, diff) = mask_claimed_and_compare(rust, ts, &mut rn, &mut tn).unwrap();
+        assert_eq!(claimed, serde_json::json!(["tsk_a"]));
+        assert!(diff.is_none(), "{diff:?}");
+
+        // A difference anywhere else in the same document still fails.
+        let changed = rust.replace("\"version\": 1", "\"version\": 2");
+        let (_, diff) = mask_claimed_and_compare(&changed, ts, &mut rn, &mut tn).unwrap();
+        assert!(
+            diff.is_some(),
+            "a non-masked field diverged and was not reported"
+        );
+    }
+
+    #[test]
+    fn a_status_json_without_claimed_is_a_failure_not_a_free_pass() {
+        let (mut rn, mut tn) = (Normalizer::new(), Normalizer::new());
+        let ts = "{\n  \"state\": {\n    \"claimed\": {}\n  }\n}\n";
+        let no_claimed = "{\n  \"state\": {\n    \"version\": 1\n  }\n}\n";
+
+        let err = mask_claimed_and_compare(no_claimed, ts, &mut rn, &mut tn)
+            .expect_err("a missing field must not mask silently");
+        assert!(err.contains("no `state.claimed` to mask"), "{err}");
+    }
+
+    #[test]
+    fn the_masked_value_is_re_asserted_against_state_json() {
+        let mut tree = Tree::default();
+        tree.values.insert(
+            "state.json".to_owned(),
+            serde_json::json!({ "claimed": ["tsk_a", "tsk_b"] }),
+        );
+
+        // Agreeing with the state file is the pass.
+        let ok = Some(serde_json::json!(["tsk_a", "tsk_b"]));
+        assert!(claimed_matches_state_file(&ok, &tree).is_empty());
+
+        // Disagreeing is caught — this is the whole point of the replacement
+        // assertion, since the oracle's own value is empty by construction.
+        let wrong = Some(serde_json::json!(["tsk_a"]));
+        let failures = claimed_matches_state_file(&wrong, &tree);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("state.json"), "{}", failures[0]);
+
+        // Still an object, i.e. the fix was never applied.
+        let unfixed = Some(serde_json::json!({}));
+        let failures = claimed_matches_state_file(&unfixed, &tree);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("must emit"), "{}", failures[0]);
+
+        // Masked with no state.json to check against. `init` does not write
+        // one, so this is the common case rather than a hole: the only correct
+        // report is the empty set, and that is still asserted.
+        assert!(
+            claimed_matches_state_file(&Some(serde_json::json!([])), &Tree::default()).is_empty()
+        );
+        let failures = claimed_matches_state_file(&ok, &Tree::default());
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("left no `.orchestry/state.json`"),
+            "{}",
+            failures[0]
+        );
+
+        // No `status --json` in the scenario means nothing to re-assert.
+        assert!(claimed_matches_state_file(&None, &tree).is_empty());
     }
 
     #[test]

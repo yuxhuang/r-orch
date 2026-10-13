@@ -54,12 +54,13 @@ PY
     return
   fi
 
-  if ! cargo build -p orch-cli >/dev/null 2>&1; then
-    # A mutation that does not compile proves nothing about the harness.
+  # Probes mutate orch-cli, the domain/infra crates, or the harness itself,
+  # so build both: a mutation that does not compile proves nothing.
+  if ! cargo build -p orch-cli -p xtask >/dev/null 2>&1; then
     printf '  BUILD BROKE   %s\n' "$label"
     missed=$((missed + 1))
     git checkout -- "$file"
-    cargo build -p orch-cli >/dev/null 2>&1
+    cargo build -p orch-cli -p xtask >/dev/null 2>&1
     return
   fi
 
@@ -70,6 +71,13 @@ PY
   # this suite the very thing it exists to prevent: a gate that cannot fail.
   local now newly
   now=$(failing_scenarios)
+  if ! parity_ran; then
+    printf '  HARNESS BROKE %s\n' "$label"
+    missed=$((missed + 1))
+    git checkout -- "$file"
+    cargo build -p orch-cli -p xtask >/dev/null 2>&1
+    return
+  fi
   newly=$(comm -13 <(printf '%s\n' "$baseline") <(printf '%s\n' "$now"))
 
   if [ -n "$newly" ]; then
@@ -81,16 +89,28 @@ PY
   fi
 
   git checkout -- "$file"
-  cargo build -p orch-cli >/dev/null 2>&1
+  cargo build -p orch-cli -p xtask >/dev/null 2>&1
 }
 
 # The sorted names of every scenario the harness currently reports as failing.
+#
+# Writes the raw run to $last_parity_output so the caller can tell "every
+# scenario passed" from "the harness never got as far as reporting", which
+# would otherwise look identical — an empty list — and read as a missed probe.
+last_parity_output=""
 failing_scenarios() {
-  cargo xtask parity 2>&1 | sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' | sort
+  last_parity_output=$(cargo xtask parity 2>&1)
+  printf '%s' "$last_parity_output" \
+    | sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' | sort
+}
+
+# Whether the harness actually ran to completion.
+parity_ran() {
+  printf '%s' "$last_parity_output" | grep -q 'scenario(s):'
 }
 
 echo "building the baseline"
-cargo build -p orch-cli >/dev/null 2>&1
+cargo build -p orch-cli -p xtask >/dev/null 2>&1
 baseline=$(failing_scenarios)
 if [ -n "$baseline" ]; then
   # Expected while the corpus runs ahead of the CLI: these are the red bar
@@ -143,6 +163,30 @@ probe 'table padding changed (§5.1)' \
   '        &rows,
         3,
     );'
+
+# ── The §14.1 named exclusion ────────────────────────────────────────────
+#
+# `state.claimed` is masked in `status --json` comparisons, which means the
+# harness deliberately stops comparing one path. A mask is a hole in the gate,
+# so these two probes assert the hole is exactly the size it is supposed to be:
+# widening it must be caught, and it must not have blinded the harness to
+# `claimed` anywhere else.
+
+probe 'the claimed mask spreads to every command (§14.1 scope)' \
+  xtask/src/harness.rs \
+  '        let subcommand = argv.iter().find(|arg| !arg.starts_with('"'"'-'"'"'));
+        subcommand.map(String::as_str) == Some("status")
+            && argv.iter().any(|arg| arg == "--json")' \
+  '        let _ = argv;
+        true'
+
+probe 'the claimed mask swallows the whole state object (§14.1 depth)' \
+  xtask/src/harness.rs \
+  '        document
+            .get_mut("state")?
+            .as_object_mut()?
+            .shift_remove("claimed")' \
+  '        document.as_object_mut()?.shift_remove("state")'
 
 echo
 echo "$detected detected, $missed missed"

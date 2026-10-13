@@ -69,7 +69,7 @@ Two notes on the harness as it now stands:
   there in the same commit that wires it, and the scenarios waiting on it go
   live.
 - **`state.claimed` in `status --json` is the corpus's one masked field**
-  (§14.1). `xtask/src/harness.rs::masked_status_json` removes it from the
-  comparison and `claimed_matches_state_json` asserts r-orch's array against
-  the `state.json` on disk — including the case where no `state.json` exists
-  yet, where the default empty set is the right answer.
+  (§14.1). `xtask/src/harness.rs`'s `claimed_mask` removes it from the
+  comparison and `claimed_matches_state_file` asserts r-orch's array against
+  the `state.json` the run wrote — or, when `init` left none, against the
+  default empty set, which is the only correct report in that case.
