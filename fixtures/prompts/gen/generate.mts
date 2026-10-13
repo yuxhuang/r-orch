@@ -154,4 +154,15 @@ F('empty-agent-name', [['a', 'b']], { agentName: '' });
 F('short-first-word', [['a-x', 'v']], { agentName: 'A B' });
 const filterOut = filterCases.map((c) => ({ ...c, expected: Object.entries(filterRelevantContext(Object.fromEntries(c.entries), c.filter)) }));
 writeFileSync(join(outDir, '_filter.json'), JSON.stringify(filterOut, null, 2) + '\n');
+// Skill block (V17): the real TS SkillLoader against the shipped library.
+const { SkillLoader } = await import(pathToFileURL(join(tsRoot, 'src/infrastructure/skills/skill-loader.ts')).href);
+const skillCases = [
+  ['careful'],
+  ['review', 'feature-dev:code-explorer', 'qa-only', 'nonexistent', '../etc/passwd', 'Review'],
+  ['unfreeze', 'freeze', 'unfreeze'],
+  ['only:mcp'],
+];
+const skillOut = [];
+for (const names of skillCases) skillOut.push({ names, expected: await new SkillLoader(join(tsRoot, 'skills', 'library')).loadSkills(names) });
+writeFileSync(join(outDir, '_skills.json'), JSON.stringify(skillOut, null, 2) + '\n');
 console.log(`wrote ${cases.length} render cases, ${filterOut.length} filter cases`);

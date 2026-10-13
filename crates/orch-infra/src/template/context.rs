@@ -117,9 +117,9 @@ pub fn filter_relevant_context(
                 score += 6;
             }
             if role_keywords.iter().any(|kw| {
-                key_lower.strip_prefix(kw.as_str()).is_some_and(|rest| {
-                    rest.starts_with('-') || rest.starts_with('_')
-                })
+                key_lower
+                    .strip_prefix(kw.as_str())
+                    .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
             }) {
                 score += 4;
             }
@@ -189,20 +189,17 @@ pub fn build_prompt_context(
             .collect()
     });
 
-    let shared_context = options
-        .shared_context
-        .filter(|c| !c.is_empty())
-        .map(|c| {
-            filter_relevant_context(
-                c,
-                &ContextFilterInput {
-                    agent_name: &agent.name,
-                    agent_role: agent.role.as_deref(),
-                    goal_id: task.goal_id.as_deref(),
-                    task_scope: task.scope.as_deref(),
-                },
-            )
-        });
+    let shared_context = options.shared_context.filter(|c| !c.is_empty()).map(|c| {
+        filter_relevant_context(
+            c,
+            &ContextFilterInput {
+                agent_name: &agent.name,
+                agent_role: agent.role.as_deref(),
+                goal_id: task.goal_id.as_deref(),
+                task_scope: task.scope.as_deref(),
+            },
+        )
+    });
 
     PromptContext {
         project: ProjectContext {
@@ -230,13 +227,21 @@ pub fn build_prompt_context(
             .map(|a| AgentInfo {
                 id: a.id.clone(),
                 name: a.name.clone(),
-                role: if a.id == agent.id { None } else { a.role.clone() },
+                role: if a.id == agent.id {
+                    None
+                } else {
+                    a.role.clone()
+                },
                 adapter: a.adapter.clone(),
             })
             .collect(),
         attempt: (attempt > 1).then_some(i64::from(attempt)),
         workspace_path: workspace_path.to_owned(),
-        retry: if attempt > 1 { options.retry_context } else { None },
+        retry: if attempt > 1 {
+            options.retry_context
+        } else {
+            None
+        },
         feedback: options.feedback,
         shared_context,
         messages,
@@ -453,7 +458,8 @@ mod tests {
 
     #[test]
     fn filter_caps_at_fifteen_and_pads_with_unscored_entries() {
-        let pairs: Vec<(String, String)> = (0..30).map(|i| (format!("k{i:02}"), "v".into())).collect();
+        let pairs: Vec<(String, String)> =
+            (0..30).map(|i| (format!("k{i:02}"), "v".into())).collect();
         let all: IndexMap<_, _> = pairs.into_iter().collect();
         let got = filter_relevant_context(&all, &filter("Zed"));
         assert_eq!(got.len(), MAX_CONTEXT_ENTRIES);
@@ -478,6 +484,9 @@ mod tests {
             extract_role_keywords("cmo", Some("Marketing lead")),
             ["cmo", "marketer", "marketing", "cmo"]
         );
-        assert_eq!(extract_role_keywords("a b", Some("qa")), Vec::<String>::new());
+        assert_eq!(
+            extract_role_keywords("a b", Some("qa")),
+            Vec::<String>::new()
+        );
     }
 }

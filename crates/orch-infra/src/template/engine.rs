@@ -63,7 +63,10 @@ impl TemplateEngine for LiquidTemplateEngine {
             match tokio::time::timeout(limit, job).await {
                 Ok(joined) => joined,
                 Err(_) => {
-                    tracing::warn!(timeout_ms = self.render_timeout_ms, "template render timed out");
+                    tracing::warn!(
+                        timeout_ms = self.render_timeout_ms,
+                        "template render timed out"
+                    );
                     return Err(Error::other(format!(
                         "Template render timed out after {}ms",
                         self.render_timeout_ms
@@ -95,7 +98,9 @@ fn render_lenient(template: &liquid::Template, globals: &mut liquid::Object) -> 
             return Err(Error::other(message));
         }
     }
-    Err(Error::other("template references too many undefined variables"))
+    Err(Error::other(
+        "template references too many undefined variables",
+    ))
 }
 
 /// What a liquid "unknown ..." error complained about.
@@ -174,11 +179,17 @@ mod tests {
     #[test]
     fn parses_the_liquid_unknown_index_message() {
         let mut globals = liquid::Object::new();
-        globals.insert("task".into(), liquid::model::Value::Object(liquid::Object::new()));
+        globals.insert(
+            "task".into(),
+            liquid::model::Value::Object(liquid::Object::new()),
+        );
         let err = render_err("{{ task.missing }}", &globals);
         assert_eq!(
             parse_undefined(&err),
-            Some(Undefined::Index { variable: "task", index: "missing" })
+            Some(Undefined::Index {
+                variable: "task",
+                index: "missing"
+            })
         );
     }
 }

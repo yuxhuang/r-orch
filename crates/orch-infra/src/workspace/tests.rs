@@ -29,7 +29,11 @@ fn failing(commands: &'static [&'static str]) -> Arc<TestProcessManager> {
     // Fail any invocation whose "cmd sub" prefix is listed.
     Arc::new(TestProcessManager::with(move |cmd, args| {
         let key = format!("{cmd} {}", args.first().map(String::as_str).unwrap_or(""));
-        let code = if commands.contains(&key.as_str()) { 1 } else { 0 };
+        let code = if commands.contains(&key.as_str()) {
+            1
+        } else {
+            0
+        };
         Behavior::Script {
             stdout: "",
             stderr: "",
@@ -78,11 +82,20 @@ fn workspace_error(err: &Error) -> (&str, Option<&str>) {
 
 fn merge_pm(stdout: &'static str, stderr: &'static str, code: i32) -> Arc<TestProcessManager> {
     Arc::new(TestProcessManager::with(move |_, args| {
-        if args.first().is_some_and(|a| a == "--abort") || args.get(1).is_some_and(|a| a == "--abort")
+        if args.first().is_some_and(|a| a == "--abort")
+            || args.get(1).is_some_and(|a| a == "--abort")
         {
-            Behavior::Script { stdout: "", stderr: "", code: 0 }
+            Behavior::Script {
+                stdout: "",
+                stderr: "",
+                code: 0,
+            }
         } else {
-            Behavior::Script { stdout, stderr, code }
+            Behavior::Script {
+                stdout,
+                stderr,
+                code,
+            }
         }
     }))
 }
@@ -94,8 +107,14 @@ fn strategy(pm: &Arc<TestProcessManager>) -> MergeStrategy {
 #[tokio::test]
 async fn clean_merge_succeeds_with_one_spawn_and_exact_argv() {
     let pm = merge_pm("Merge made by the 'ort' strategy.", "", 0);
-    assert_eq!(strategy(&pm).merge_back("orchestry/t1/x").await, MergeResult::Success);
-    assert_eq!(pm.lines(), ["git merge --no-ff orchestry/t1/x -m Merge orchestry/t1/x"]);
+    assert_eq!(
+        strategy(&pm).merge_back("orchestry/t1/x").await,
+        MergeResult::Success
+    );
+    assert_eq!(
+        pm.lines(),
+        ["git merge --no-ff orchestry/t1/x -m Merge orchestry/t1/x"]
+    );
     assert_eq!(pm.calls()[0].args[4], "Merge orchestry/t1/x");
     assert_eq!(pm.calls()[0].cwd, Path::new(ROOT));
 }
@@ -104,8 +123,14 @@ async fn clean_merge_succeeds_with_one_spawn_and_exact_argv() {
 async fn conflict_on_stdout_aborts_the_merge() {
     let pm = merge_pm("CONFLICT (content): Merge conflict in a.ts", "", 1);
     let result = strategy(&pm).merge_back("b").await;
-    assert_eq!(result.conflict_info(), Some("CONFLICT (content): Merge conflict in a.ts"));
-    assert_eq!(pm.lines(), ["git merge --no-ff b -m Merge b", "git merge --abort"]);
+    assert_eq!(
+        result.conflict_info(),
+        Some("CONFLICT (content): Merge conflict in a.ts")
+    );
+    assert_eq!(
+        pm.lines(),
+        ["git merge --no-ff b -m Merge b", "git merge --abort"]
+    );
 }
 
 #[tokio::test]
@@ -126,7 +151,9 @@ async fn non_conflict_failure_does_not_abort() {
 
 #[tokio::test]
 async fn spawn_error_reports_its_message() {
-    let pm = Arc::new(TestProcessManager::with(|_, _| Behavior::SpawnError("spawn git ENOENT")));
+    let pm = Arc::new(TestProcessManager::with(|_, _| {
+        Behavior::SpawnError("spawn git ENOENT")
+    }));
     let result = strategy(&pm).merge_back("b").await;
     assert_eq!(result.conflict_info(), Some("spawn git ENOENT"));
 }
@@ -145,7 +172,11 @@ async fn a_failing_abort_still_resolves() {
         if args[1] == "--abort" {
             Behavior::SpawnError("abort failed")
         } else {
-            Behavior::Script { stdout: "CONFLICT x", stderr: "", code: 1 }
+            Behavior::Script {
+                stdout: "CONFLICT x",
+                stderr: "",
+                code: 1,
+            }
         }
     }));
     let result = strategy(&pm).merge_back("b").await;
@@ -157,9 +188,13 @@ async fn a_failing_abort_still_resolves() {
 #[tokio::test]
 async fn shared_mode_returns_the_project_root_without_any_git_call() {
     let pm = ok_pm();
-    let r = prepare(&manager(&pm), &task_with(Some(WorkspaceMode::Shared)), &agent_with(None))
-        .await
-        .unwrap();
+    let r = prepare(
+        &manager(&pm),
+        &task_with(Some(WorkspaceMode::Shared)),
+        &agent_with(None),
+    )
+    .await
+    .unwrap();
     assert_eq!(r.path, ROOT);
     assert_eq!(r.branch, None);
     assert!(pm.calls().is_empty());
@@ -170,19 +205,30 @@ async fn task_mode_beats_agent_mode_beats_config_default() {
     let pm = ok_pm();
     let m = manager(&pm);
     // task override: shared wins over the agent's isolated.
-    let r = prepare(&m, &task_with(Some(WorkspaceMode::Shared)), &agent_with(Some(WorkspaceMode::Isolated)))
-        .await
-        .unwrap();
+    let r = prepare(
+        &m,
+        &task_with(Some(WorkspaceMode::Shared)),
+        &agent_with(Some(WorkspaceMode::Isolated)),
+    )
+    .await
+    .unwrap();
     assert_eq!(r.path, ROOT);
     // agent override: shared wins over the default worktree.
-    let r = prepare(&m, &task_with(None), &agent_with(Some(WorkspaceMode::Shared)))
-        .await
-        .unwrap();
+    let r = prepare(
+        &m,
+        &task_with(None),
+        &agent_with(Some(WorkspaceMode::Shared)),
+    )
+    .await
+    .unwrap();
     assert_eq!(r.path, ROOT);
     // config default.
     let mut config = default_config();
     config.defaults.agent.workspace_mode = WorkspaceMode::Shared;
-    let r = m.prepare(&task_with(None), &agent_with(None), &config).await.unwrap();
+    let r = m
+        .prepare(&task_with(None), &agent_with(None), &config)
+        .await
+        .unwrap();
     assert_eq!(r.path, ROOT);
     assert!(pm.calls().is_empty());
 }
@@ -194,17 +240,27 @@ async fn worktree_add_uses_the_exact_argv_and_branch_name() {
     let dir = tempfile::tempdir().unwrap();
     let pm = ok_pm();
     let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join(".orchestry"), pm.clone());
-    let r = prepare(&m, &task_with(Some(WorkspaceMode::Worktree)), &agent_with(None))
-        .await
-        .unwrap();
+    let r = prepare(
+        &m,
+        &task_with(Some(WorkspaceMode::Worktree)),
+        &agent_with(None),
+    )
+    .await
+    .unwrap();
     let path = dir.path().join(".orchestry/workspaces/tsk_abc1234");
     assert_eq!(r.path, path.to_string_lossy());
-    assert_eq!(r.branch.as_deref(), Some("orchestry/tsk_abc1234/fix-login-bug"));
+    assert_eq!(
+        r.branch.as_deref(),
+        Some("orchestry/tsk_abc1234/fix-login-bug")
+    );
     assert_eq!(
         pm.lines(),
         [
             "git rev-parse --is-inside-work-tree".to_owned(),
-            format!("git worktree add {} -b orchestry/tsk_abc1234/fix-login-bug", path.display()),
+            format!(
+                "git worktree add {} -b orchestry/tsk_abc1234/fix-login-bug",
+                path.display()
+            ),
         ]
     );
 }
@@ -214,7 +270,11 @@ async fn titles_without_ascii_alphanumerics_fall_back_to_the_task_id() {
     for (id, title) in [("tsk_cjk1", "修复数据库连接"), ("tsk_emo1", "🚀🎉✨")] {
         let dir = tempfile::tempdir().unwrap();
         let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join("o"), ok_pm());
-        let task = Task { id: id.into(), title: title.into(), ..task_with(None) };
+        let task = Task {
+            id: id.into(),
+            title: title.into(),
+            ..task_with(None)
+        };
         let r = prepare(&m, &task, &agent_with(None)).await.unwrap();
         assert_eq!(r.branch, Some(format!("orchestry/{id}/{id}")));
     }
@@ -233,12 +293,20 @@ async fn failed_worktree_add_prunes_then_reuses_the_branch() {
     let dir = tempfile::tempdir().unwrap();
     let pm = Arc::new(TestProcessManager::with(move |_, args| {
         let is_new_branch_add = args.iter().any(|a| a == "-b");
-        Behavior::Script { stdout: "", stderr: "", code: i32::from(is_new_branch_add) }
+        Behavior::Script {
+            stdout: "",
+            stderr: "",
+            code: i32::from(is_new_branch_add),
+        }
     }));
     let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join("o"), pm.clone());
-    let r = prepare(&m, &task_with(Some(WorkspaceMode::Worktree)), &agent_with(None))
-        .await
-        .unwrap();
+    let r = prepare(
+        &m,
+        &task_with(Some(WorkspaceMode::Worktree)),
+        &agent_with(None),
+    )
+    .await
+    .unwrap();
     let path = r.path.clone();
     assert_eq!(
         pm.lines(),
@@ -256,7 +324,9 @@ async fn worktree_add_failing_twice_is_a_workspace_error_with_a_hint() {
     let dir = tempfile::tempdir().unwrap();
     let pm = failing(&["git worktree"]);
     let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join("o"), pm);
-    let err = prepare(&m, &task_with(None), &agent_with(None)).await.unwrap_err();
+    let err = prepare(&m, &task_with(None), &agent_with(None))
+        .await
+        .unwrap_err();
     assert_eq!(err.exit_code(), 6);
     let (message, hint) = workspace_error(&err);
     assert_eq!(message, "git worktree add failed with code 1");
@@ -273,7 +343,9 @@ async fn an_existing_workspace_directory_is_reused_without_touching_git_worktree
     fs::create_dir_all(&existing).unwrap();
     let pm = ok_pm();
     let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join("o"), pm.clone());
-    let r = prepare(&m, &task_with(None), &agent_with(None)).await.unwrap();
+    let r = prepare(&m, &task_with(None), &agent_with(None))
+        .await
+        .unwrap();
     assert_eq!(r.path, existing.to_string_lossy());
     assert_eq!(pm.lines(), ["git rev-parse --is-inside-work-tree"]);
 }
@@ -285,9 +357,13 @@ async fn isolated_mode_clones_locally_without_hardlinks() {
     let dir = tempfile::tempdir().unwrap();
     let pm = ok_pm();
     let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join("o"), pm.clone());
-    let r = prepare(&m, &task_with(Some(WorkspaceMode::Isolated)), &agent_with(None))
-        .await
-        .unwrap();
+    let r = prepare(
+        &m,
+        &task_with(Some(WorkspaceMode::Isolated)),
+        &agent_with(None),
+    )
+    .await
+    .unwrap();
     assert_eq!(r.branch, None);
     assert_eq!(
         pm.lines()[1],
@@ -302,12 +378,20 @@ async fn failed_clone_falls_back_to_rsync_with_the_exclude_file() {
     let pm = failing(&["git clone"]);
     let orchestry = dir.path().join("o");
     let m = GitWorkspaceManager::new(ROOT.into(), orchestry.clone(), pm.clone());
-    let r = prepare(&m, &task_with(Some(WorkspaceMode::Isolated)), &agent_with(None))
-        .await
-        .unwrap();
+    let r = prepare(
+        &m,
+        &task_with(Some(WorkspaceMode::Isolated)),
+        &agent_with(None),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         pm.lines()[2],
-        format!("rsync -a --exclude-from={}/workspace-exclude ./ {}/", orchestry.display(), r.path)
+        format!(
+            "rsync -a --exclude-from={}/workspace-exclude ./ {}/",
+            orchestry.display(),
+            r.path
+        )
     );
 }
 
@@ -316,9 +400,13 @@ async fn rsync_failure_is_a_plain_error() {
     let dir = tempfile::tempdir().unwrap();
     let pm = failing(&["git clone", "rsync -a"]);
     let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join("o"), pm);
-    let err = prepare(&m, &task_with(Some(WorkspaceMode::Isolated)), &agent_with(None))
-        .await
-        .unwrap_err();
+    let err = prepare(
+        &m,
+        &task_with(Some(WorkspaceMode::Isolated)),
+        &agent_with(None),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.to_string(), "rsync failed with code 1");
     assert_eq!(err.exit_code(), 1);
 }
@@ -334,10 +422,15 @@ async fn non_git_projects_reject_worktree_and_isolated_with_the_hint() {
             .unwrap_err();
         assert_eq!(err.exit_code(), 6);
         let (message, hint) = workspace_error(&err);
-        assert_eq!(message, format!("workspace_mode \"{mode}\" requires a git repository"));
+        assert_eq!(
+            message,
+            format!("workspace_mode \"{mode}\" requires a git repository")
+        );
         assert_eq!(
             hint,
-            Some("Run: git init && git add -A && git commit -m \"Initial commit\"\n         Or set workspace_mode: shared in .orchestry/config.yml")
+            Some(
+                "Run: git init && git add -A && git commit -m \"Initial commit\"\n         Or set workspace_mode: shared in .orchestry/config.yml"
+            )
         );
     }
 }
@@ -348,16 +441,25 @@ async fn a_positive_repo_probe_is_cached_but_a_negative_is_reprobed() {
     let ok = ok_pm();
     let m = GitWorkspaceManager::new(ROOT.into(), dir.path().join("o"), ok.clone());
     for id in ["tsk_a", "tsk_b"] {
-        let task = Task { id: id.into(), ..task_with(None) };
+        let task = Task {
+            id: id.into(),
+            ..task_with(None)
+        };
         prepare(&m, &task, &agent_with(None)).await.unwrap();
     }
-    let probes = ok.lines().iter().filter(|l| l.contains("rev-parse")).count();
+    let probes = ok
+        .lines()
+        .iter()
+        .filter(|l| l.contains("rev-parse"))
+        .count();
     assert_eq!(probes, 1);
 
     let bad = failing(&["git rev-parse"]);
     let m = manager(&bad);
     for _ in 0..2 {
-        prepare(&m, &task_with(None), &agent_with(None)).await.unwrap_err();
+        prepare(&m, &task_with(None), &agent_with(None))
+            .await
+            .unwrap_err();
     }
     assert_eq!(bad.calls().len(), 2);
 }
@@ -430,7 +532,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -465,7 +571,10 @@ async fn real_git_worktree_lifecycle() {
     assert!(git(repo.path(), &["branch", "--list", &branch]).contains(&branch));
 
     // Idempotent re-prepare.
-    assert_eq!(prepare(&m, &task, &agent_with(None)).await.unwrap().path, r.path);
+    assert_eq!(
+        prepare(&m, &task, &agent_with(None)).await.unwrap().path,
+        r.path
+    );
 
     // No changes yet.
     assert!(m.get_changed_files(&branch).await.unwrap().is_empty());
@@ -475,17 +584,26 @@ async fn real_git_worktree_lifecycle() {
     fs::write(ws.join("src/c.txt"), "new\n").unwrap();
     git(ws, &["add", "."]);
     git(ws, &["commit", "-qm", "work"]);
-    assert_eq!(m.get_changed_files(&branch).await.unwrap(), ["b.txt", "src/c.txt"]);
+    assert_eq!(
+        m.get_changed_files(&branch).await.unwrap(),
+        ["b.txt", "src/c.txt"]
+    );
 
     // Merge needs identity; supply it through the environment git reads.
     set_identity(repo.path());
     assert!(m.merge_back(&branch).await.unwrap().success());
     assert!(repo.path().join("b.txt").exists());
-    assert!(git(repo.path(), &["log", "-1", "--format=%s"]).starts_with(&format!("Merge {branch}")));
+    assert!(
+        git(repo.path(), &["log", "-1", "--format=%s"]).starts_with(&format!("Merge {branch}"))
+    );
 
     m.cleanup(&task.id, Some(&branch)).await.unwrap();
     assert!(!ws.exists());
-    assert!(git(repo.path(), &["branch", "--list", &branch]).trim().is_empty());
+    assert!(
+        git(repo.path(), &["branch", "--list", &branch])
+            .trim()
+            .is_empty()
+    );
 }
 
 fn set_identity(repo: &Path) {
@@ -504,9 +622,16 @@ async fn real_git_conflict_is_aborted_and_the_tree_is_left_clean() {
     fs::write(repo.path().join("a.txt"), "main\n").unwrap();
     git(repo.path(), &["commit", "-qam", "main"]);
 
-    let result = real_manager(repo.path()).merge_back("feature").await.unwrap();
+    let result = real_manager(repo.path())
+        .merge_back("feature")
+        .await
+        .unwrap();
     assert!(result.conflict_info().unwrap().contains("CONFLICT"));
-    assert!(git(repo.path(), &["status", "--porcelain"]).trim().is_empty());
+    assert!(
+        git(repo.path(), &["status", "--porcelain"])
+            .trim()
+            .is_empty()
+    );
     assert!(!repo.path().join(".git/MERGE_HEAD").exists());
 }
 
@@ -535,14 +660,24 @@ async fn real_git_clone_isolated_workspace() {
 #[tokio::test]
 async fn real_git_outside_a_repo_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let err = prepare(&real_manager(dir.path()), &task_with(None), &agent_with(None))
-        .await
-        .unwrap_err();
+    let err = prepare(
+        &real_manager(dir.path()),
+        &task_with(None),
+        &agent_with(None),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.exit_code(), 6);
 }
 
 #[tokio::test]
 async fn changed_files_is_empty_for_unknown_branches() {
     let repo = init_repo();
-    assert!(real_manager(repo.path()).get_changed_files("nope").await.unwrap().is_empty());
+    assert!(
+        real_manager(repo.path())
+            .get_changed_files("nope")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

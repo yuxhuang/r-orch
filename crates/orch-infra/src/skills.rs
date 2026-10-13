@@ -46,10 +46,7 @@ pub fn resolve_library_dir() -> PathBuf {
             }
         }
     }
-    exe_dir
-        .unwrap_or_default()
-        .join("skills")
-        .join("library")
+    exe_dir.unwrap_or_default().join("skills").join("library")
 }
 
 pub struct FileSkillLoader {
@@ -120,7 +117,10 @@ impl FileSkillLoader {
                     "[orch] skill library: \"{name}\" not found in {}\n",
                     dir.display()
                 ));
-                self.cache.lock().unwrap().insert(name.to_owned(), String::new());
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_owned(), String::new());
                 None
             }
         }
@@ -145,9 +145,7 @@ impl SkillLoader for FileSkillLoader {
             .into_iter()
             .zip(loaded)
             .filter_map(|(name, content)| {
-                content
-                    .filter(|c| !c.is_empty())
-                    .map(|c| (name.clone(), c))
+                content.filter(|c| !c.is_empty()).map(|c| (name.clone(), c))
             })
             .collect();
         Ok(format_skills_block(&resolved))
@@ -174,11 +172,7 @@ impl SkillLoader for FileSkillLoader {
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                return Err(Error::io(
-                    "reading the skill library",
-                    dir,
-                    e,
-                ));
+                return Err(Error::io("reading the skill library", dir, e));
             }
         };
         names.sort();
@@ -219,7 +213,10 @@ mod tests {
             ("investigate.md", "# Investigate\nDebug stuff."),
         ]);
         let (l, _) = loader(dir.path());
-        let out = l.load_skills(&names(&["review", "investigate"])).await.unwrap();
+        let out = l
+            .load_skills(&names(&["review", "investigate"]))
+            .await
+            .unwrap();
         assert_eq!(
             out,
             "## Skills\n\n### review\n\n# Review\nDo a review.\n\n### investigate\n\n# Investigate\nDebug stuff."
@@ -256,7 +253,10 @@ mod tests {
     async fn unknown_skill_warns_once_with_the_exact_line() {
         let dir = lib(&[("review.md", "Review content")]);
         let (l, warnings) = loader(dir.path());
-        let out = l.load_skills(&names(&["review", "nonexistent"])).await.unwrap();
+        let out = l
+            .load_skills(&names(&["review", "nonexistent"]))
+            .await
+            .unwrap();
         assert!(out.contains("### review") && !out.contains("nonexistent"));
         l.load_skills(&names(&["nonexistent"])).await.unwrap();
         assert_eq!(
@@ -305,7 +305,10 @@ mod tests {
             ("not-a-skill.txt", "x"),
         ]);
         let (l, _) = loader(dir.path());
-        assert_eq!(l.list_available().await.unwrap(), ["careful", "qa", "review"]);
+        assert_eq!(
+            l.list_available().await.unwrap(),
+            ["careful", "qa", "review"]
+        );
     }
 
     #[tokio::test]

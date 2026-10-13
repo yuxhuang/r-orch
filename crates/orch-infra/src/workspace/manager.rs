@@ -63,7 +63,11 @@ impl GitWorkspaceManager {
         if self.git_repo_confirmed.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if self.code("git", &["rev-parse", "--is-inside-work-tree"]).await == 0 {
+        if self
+            .code("git", &["rev-parse", "--is-inside-work-tree"])
+            .await
+            == 0
+        {
             self.git_repo_confirmed.store(true, Ordering::Relaxed);
             return Ok(());
         }
@@ -124,7 +128,10 @@ impl GitWorkspaceManager {
         let root = self.project_root.to_string_lossy().into_owned();
 
         let cloned = self
-            .code("git", &["clone", "--local", "--no-hardlinks", &root, &target])
+            .code(
+                "git",
+                &["clone", "--local", "--no-hardlinks", &root, &target],
+            )
             .await
             == 0;
         if !cloned {
@@ -217,8 +224,18 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 
     async fn get_changed_files(&self, branch: &str) -> Result<Vec<String>> {
-        let base_args = ["merge-base".to_owned(), "HEAD".to_owned(), branch.to_owned()];
-        let Ok(base) = run(&*self.process_manager, &self.project_root, "git", &base_args).await
+        let base_args = [
+            "merge-base".to_owned(),
+            "HEAD".to_owned(),
+            branch.to_owned(),
+        ];
+        let Ok(base) = run(
+            &*self.process_manager,
+            &self.project_root,
+            "git",
+            &base_args,
+        )
+        .await
         else {
             return Ok(Vec::new());
         };
@@ -231,7 +248,13 @@ impl WorkspaceManager for GitWorkspaceManager {
             "--name-only".to_owned(),
             format!("{merge_base}...{branch}"),
         ];
-        let Ok(diff) = run(&*self.process_manager, &self.project_root, "git", &diff_args).await
+        let Ok(diff) = run(
+            &*self.process_manager,
+            &self.project_root,
+            "git",
+            &diff_args,
+        )
+        .await
         else {
             return Ok(Vec::new());
         };

@@ -59,7 +59,11 @@ impl MergeStrategy {
         let info = truncate_utf16(&merged.combined, CONFLICT_INFO_LEN);
         let is_conflict = info.contains("CONFLICT") || info.contains("Merge conflict");
         if !is_conflict {
-            tracing::warn!(branch, code = merged.code, "git merge failed without a conflict");
+            tracing::warn!(
+                branch,
+                code = merged.code,
+                "git merge failed without a conflict"
+            );
             return MergeResult::Conflict {
                 conflict_info: info,
             };
