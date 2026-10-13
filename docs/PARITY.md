@@ -1,0 +1,2496 @@
+# ORCH → r-orch Parity Contract
+
+**Reference implementation:** `oxgeneral/ORCH` @ `c066dc0` (npm `@oxgeneral/orch` v1.0.34), vendored read-only at
+`parity/orch-ts/` (gitignored; re-created by `parity/setup.sh`).
+
+**Baseline:** `CI=1 npx vitest run` → **2085 passing / 0 failing / 8 skipped**, exit 0. ~26.2k LOC under
+`src/`. Running without `CI=1` produces 5–6 *flaky* failures that differ run to run — see
+[§14.9](#149-the-1-failing-baseline-test-is-actually-suite-flakiness--do-not-replicate). Always use `CI=1`
+when invoking the reference suite.
+
+This document is the **authoritative specification** for the Rust rewrite. Where this document and the TypeScript
+source disagree, the TypeScript source wins and this document is a bug — except for the items in
+[§14 Known bugs](#14-known-bugs-in-the-original), which record deliberate divergences.
+
+---
+
+## 1. Parity levels
+
+Every requirement in this document carries a level. Engineers must know which one applies before choosing how
+much effort to spend.
+
+| Level | Name | Meaning | Verified by |
+|---|---|---|---|
+| **L0** | **Wire contract** | Byte- or value-exact. A third party (script, CI job, the other binary) depends on it. Changing it is a breaking change. | Differential harness, exact assertions |
+| **L1** | **Behavioural** | Same observable behaviour and semantics; incidental representation may differ. | Ported unit/integration tests |
+| **L2** | **Best effort** | Same feature and intent; presentation may differ. | Manual checklist, smoke tests |
+
+### 1.1 What is L0
+
+1. **`.orchestry/` on-disk format** — every file's path, name, format (YAML/JSON/JSONL) and the *parsed value* of
+   every field. Both binaries must operate on the same project directory interchangeably, in either order.
+2. **CLI command and flag surface** — command names, subcommand names, aliases, positional arity, long and short
+   option names, and option-argument arity.
+3. **Exit codes.**
+4. **`--json` output** — the parsed JSON value: key names, nesting, types, array-vs-object, and how empty results
+   are represented.
+5. **Prompt text produced by the default templates** — byte-exact, including blank-line runs. Agents are sensitive
+   to prompt text and it is also the input to prompt caching.
+6. **ID formats** — prefix and character set.
+7. **Adapter argv** — the exact command line handed to each external AI CLI.
+
+### 1.2 What is L1
+
+Task state machine and all transitions; retry/backoff arithmetic; tick phase ordering; stall/zombie detection;
+lock acquisition and staleness; concurrency limiting; dispatch candidate ordering; scope-overlap blocking;
+cascade failure; auto-review; goal/team/message/context semantics; event emission (the set of events and their
+payload fields); adapter stdout parsing and error classification; workspace/worktree git command sequences;
+skill loading; serve-mode log record *fields*.
+
+### 1.3 What is L2
+
+TUI pixel layout, colours and glyph choices; `--help` text wording and layout; spinner frames and animation
+timing; colour/ANSI styling of human output; log *text* format in `serve --log-format text`; progress and
+status decoration.
+
+### 1.4 Normalization rules for comparison
+
+The differential harness ([ARCHITECTURE.md §8.2](ARCHITECTURE.md)) compares after applying these:
+
+| Aspect | Rule | Why |
+|---|---|---|
+| JSON object key order | **Not contract.** Compare parsed values. | TS key order is JS *insertion* order (e.g. `Run` emits `pid` and `finished_at` after `prompt` because they are assigned later; `Message` emits `id`/`to_agent_id` last after an object spread). Rust `serde` emits struct declaration order. RFC 8259 objects are unordered. |
+| YAML emitted bytes | **Not contract.** Compare parsed values. | js-yaml folds long single-line scalars with `>-` at `lineWidth: 120`; Rust emitters use `|-`/plain. Both round-trip to the same string. |
+| YAML mapping key order | **Not contract**, but SHOULD match the TS interface field order for human diff friendliness. | `writeYaml` uses `sortKeys: false`. |
+| IDs | Replace `/(tsk|agt|run|goal|team|msg)_[A-Za-z0-9_-]{7}/` with `<\1_ID>`, consistently per-run. | nanoid is random. |
+| Timestamps | Replace ISO-8601 instants with `<TS>`; preserve ordering relations separately where asserted. | Wall clock. |
+| Absolute paths | Replace the temp project root with `<ROOT>`. | Temp dirs. |
+| PIDs | Replace with `<PID>`. | OS-assigned. |
+| Durations / `*_ms` measured values | Replace with `<MS>`. | Timing. |
+| ANSI escapes | Strip from human stdout before comparing. | L2 styling. |
+| Trailing whitespace on human table rows | Significant — do **not** strip. See §5.1. | The TS table writer pads every cell including the last. |
+
+---
+
+## 2. CLI surface
+
+### 2.1 Binaries and global surface
+
+Three binaries, **all the same program**: `orch`, `orchestry`, `ao` (npm `bin` map → `dist/cli.js`).
+
+- Commander program name: `orchestry`. `--help` output begins `Usage: orchestry [options] [command]`.
+- Description: `Agents Organizations — CLI orchestrator for AI agents`
+- `--version` / `-V` → `1.0.34` (L0 that a version is printed; the value tracks the Rust crate version — see §13).
+
+**Global options** (declared on the root program; L0):
+
+| Flag | Effect |
+|---|---|
+| `--json` | Machine output. Per-command shapes in §4. |
+| `--quiet` | Minimal output (IDs only). |
+| `--no-color` | Disable colour. Also implied by the `NO_COLOR` env var being *present* (any value, including empty). |
+| `--ascii` | ASCII-only glyphs. Also implied by `TERM=dumb`. |
+| `-h, --help` | Help. |
+
+`--json`, `--quiet`, `--no-color`, `--ascii` are parsed as global options and are accepted **before** the
+subcommand. Commander also accepts them after; preserve that.
+
+**Environment variables read** (L0):
+
+| Var | Read by | Effect |
+|---|---|---|
+| `NO_COLOR` | `createContext` | Presence (not value) disables colour |
+| `TERM` | `createContext` | `dumb` ⇒ ASCII mode |
+| `ORCHESTRY_GLOBAL_CONFIG_PATH` | `GlobalConfigStore` | Overrides `~/.orchestry/global.yml` (trimmed, then `path.resolve`d). **Critical for tests.** |
+| `ORCHESTRY_DEBUG` | root error boundary | Also dump the error object to stderr |
+| `EDITOR` | `cli/editor.ts` | Interactive editor for `-e/--edit`, `task edit`, `agent edit`, `config edit` |
+| `ORCHESTRY_TASK_PROMPT` | **written** by the shell adapter | Full prompt passed to the child |
+| `ORCH_AGENT_ID`, `ORCH_AGENT_NAME`, `ORCH_TASK_ID` | **written** by the orchestrator into every adapter child env | |
+
+**Project root resolution** (L0): walk up from `cwd` looking for a `.orchestry` entry (`accessSync`); the first
+directory containing one is the project root. If none is found, the resolved start directory is used (so `init`
+works). Results are cached per start-dir for the process lifetime.
+
+**Container tiering** (L1, performance only — no observable difference except startup latency):
+
+- *Light* (stores + services): `task`, `agent`, `status`, `logs`, `config`, `context`, `msg`, `goal`, `team`, `org`
+- *Full* (+ orchestrator, adapters, process manager, template engine, skill loader, workspace manager, doctor):
+  `run`, `doctor`, `tui`, `serve`
+- *No container*: `init`, `update`
+
+### 2.2 Command table
+
+Positional args: `<x>` required, `[x]` optional. All options take a value unless marked *(bool)*.
+
+#### `init`
+| | |
+|---|---|
+| Args | — |
+| Options | `--name <name>` (project name), `--adapter <adapter>` (default agent adapter: `claude\|opencode\|codex\|cursor\|pi\|grok\|antigravity\|shell`) |
+| Exits | `0` always on success |
+
+#### `task` — *Manage tasks*
+| Subcommand | Args | Options |
+|---|---|---|
+| `add` | `<title>` | `-d, --description <desc>`; `-p, --priority <n>` **default `'3'`**; `-l, --labels <labels>` (comma-separated); `--depends-on <ids>` (comma-separated); `--max-attempts <n>`; `--workspace-mode <mode>` (`shared\|worktree\|isolated`); `--assignee <agent-id>`; `--review-criteria <criteria>` (comma-separated of `test_pass,typecheck,lint`); `--scope <patterns>` (comma-separated globs); `--goal-id <goalId>`; `--attach <paths>` (comma-separated); `-e, --edit` *(bool)* |
+| `list` | — | `--status <status>` |
+| `show` | `<id>` | — |
+| `edit` | `<id>` | — (opens `$EDITOR`) |
+| `assign` | `<task-id> <agent-id>` | — |
+| `cancel` | `<id>` | — |
+| `approve` | `<id>` | — |
+| `reject` | `<id>` | `-r, --reason <reason>` |
+| `retry` | `<id>` | — |
+
+#### `agent` — *Manage agents*
+| Subcommand | Args | Options |
+|---|---|---|
+| `add` | `<name>` | **`--adapter <adapter>` (REQUIRED)**; `--role <role>`; `--command <cmd>`; `--model <model>`; `--effort <level>` (`low\|medium\|high`); `--max-turns <n>`; `--timeout <ms>`; `--approval-policy <policy>` (`suggest\|auto\|manual`); `--workspace-mode <mode>`; `--skills <skills>` (comma-separated); `-e, --edit` *(bool)* |
+| `shop` | — | `--list` *(bool)* — print all templates non-interactively |
+| `list` | — | — |
+| `status` | `<id>` | — |
+| `edit` | `<id>` | — |
+| `remove` | `<id>` | — |
+| `disable` | `<id>` | — |
+| `enable` | `<id>` | — |
+| `autonomous` | `<id>` | `--on` *(bool)*, `--off` *(bool)* |
+
+> `--adapter` is a Commander `requiredOption`: omitting it is a usage error (exit 1), **not** an
+> `InvalidArgumentsError`. There is no `agent show` — `agent status <id>` is the detail view. Commander's
+> did-you-mean suggests `shop` for `show`.
+
+#### `status` — *Show orchestrator status*
+No args, no options.
+
+#### `logs` — *View run logs*
+| Args | Options |
+|---|---|
+| `[run-id]` | `--agent <agent-id>`; `--task <task-id>`; `--follow` *(bool)*; `--since <duration>` (e.g. `5m`, `1h`) |
+
+Requires at least one of: positional `run-id`, `--task`, `--agent`, `--since`. Otherwise:
+`Specify a run ID, --task, --agent, or --since <duration>` with **exit 2**.
+
+#### `config` — *Manage configuration*
+| Subcommand | Args |
+|---|---|
+| `get` | `<key>` (dot path) |
+| `set` | `<key> <value>` |
+| `edit` | — (opens `$EDITOR` on `.orchestry/config.yml`) |
+| `global get` | `<key>` |
+| `global set` | `<key> <value>` |
+| `global show` | — |
+
+#### `context` — *Shared context store for inter-agent data exchange*
+| Subcommand | Args | Options |
+|---|---|---|
+| `set` | `<key> <value>` | `--ttl <ms>` |
+| `get` | `<key>` | — |
+| `list` | — | — |
+| `delete` | `<key>` | — |
+
+#### `msg` — *Inter-agent messaging*
+| Subcommand | Args | Options |
+|---|---|---|
+| `send` | `<to-agent-id> <body>` | `-s, --subject <subject>`; `--from <agent-id>` (default `cli`); `--ttl <ms>`; `--reply-to <msg-id>` |
+| `broadcast` | `<body>` | `-s, --subject <subject>`; `--from <agent-id>` (default `cli`); `--team <team-id>`; `--ttl <ms>` |
+| `inbox` | `<agent-id>` | — |
+| `list` | — | `--agent <agent-id>` |
+
+#### `goal` — *Manage goals*
+| Subcommand | Alias | Args | Options |
+|---|---|---|---|
+| `add` | | `<title>` | `--description <desc>`; `--assignee <agentId>` |
+| `list` | `ls` | — | `--status <status>` |
+| `show` | | `<id>` | — |
+| `status` | | `<id> <status>` | `--force` *(bool)* |
+| `update` | | `<id>` | `--title <title>`; `--description <desc>`; `--assignee <agentId>` (empty string unassigns) |
+| `delete` | `rm` | `<id>` | — |
+
+#### `team` — *Manage teams*
+| Subcommand | Args | Options |
+|---|---|---|
+| `create` | `<name>` | **`--lead <agent-id>` (REQUIRED)**; `--members <ids>` (comma-separated); `-d, --description <desc>`; `--no-auto-claim` *(bool)* |
+| `list` | — | — |
+| `show` | `<id>` | — |
+| `join` | `<team-id> <agent-id>` | — |
+| `leave` | `<team-id> <agent-id>` | — |
+| `add-task` | `<team-id> <task-id>` | — |
+| `set-lead` | `<team-id> <agent-id>` | — |
+| `disband` | `<id>` | — |
+
+#### `org` — *Pre-built AI companies*
+| Subcommand | Alias | Args | Options |
+|---|---|---|---|
+| `list` | `ls` | — | — |
+| `deploy` | | `<template>` | `--goal <goal>` |
+
+#### `run` — *Run tasks*
+| Args | Options |
+|---|---|
+| `[task-id]` | `--all` *(bool)*; `--watch` *(bool)*; `--verbose` *(bool)* |
+
+#### `doctor` — *Check adapters and dependencies*
+No args, no options. Runs **without** an initialized project.
+
+#### `tui` — *Launch TUI dashboard*
+No args, no options.
+
+#### `serve` — *Headless daemon mode with structured logs*
+| Options |
+|---|
+| `--once` *(bool)*; `--tick-interval <ms>`; `--log-file <path>`; `--log-format <format>` **default `'json'`** (`json\|text`); `--verbose` *(bool)* |
+
+#### `update` — *Check for updates*
+| Options |
+|---|
+| `--check` *(bool)* — only check, do not install |
+
+### 2.3 Default behaviour with no subcommand (L0)
+
+1. `orch` with no args **in a directory that has no `.orchestry/`** → run `init` (non-interactive), then launch
+   the TUI rooted at `cwd`. This is the first-run experience. The `init` must happen **before** project-root
+   resolution so an ancestor project is not adopted.
+2. `orch` with no args in an initialized project → launch the TUI.
+3. `--help`/`-h`/`--version`/`-V` with no real subcommand → print and exit without building a container.
+
+---
+
+## 3. Exit codes (L0)
+
+Source of truth: `src/domain/errors.ts`.
+
+| Code | Meaning | Error class |
+|---|---|---|
+| `0` | Success | — |
+| `1` | General error | `OrchestryError` base, `NoAgentsError`, `TaskNotFoundError`, `AgentNotFoundError`, `TaskAlreadyRunningError`, `InvalidTransitionError`, `GoalNotFoundError`, `GoalHasPendingTasksError`, `TeamNotFoundError`, `MessageNotFoundError`, any non-`OrchestryError` throw, **and all Commander usage errors** |
+| `2` | Invalid arguments | `InvalidArgumentsError` |
+| `3` | Not initialized | `NotInitializedError` |
+| `4` | Lock conflict | `LockConflictError` |
+| `5` | Agent adapter unavailable | `AgentAdapterError` |
+| `6` | Workspace error | `WorkspaceError` |
+
+Additional exit paths:
+
+- `serve --once` → `1` if any task reached a failed terminal status, else `0`.
+- Commander errors (unknown command, unknown option, missing required option) → **exit 1**, message on stderr
+  in Commander's own format (`error: unknown command 'x'`, optionally followed by `(Did you mean y?)`). The exact
+  wording is **L2**; the exit code is L0.
+
+### 3.1 Error message format (L0 for the message and hint text, L2 for colour)
+
+```
+  ✕ <message>
+    <hint>
+```
+
+Both lines go to **stderr**. Two spaces before the glyph, one space after; the hint line is indented four
+spaces and is omitted when there is no hint. In `--ascii` mode the glyph is `x`.
+
+**Exact message and hint strings** (L0):
+
+| Error | Message | Hint |
+|---|---|---|
+| `NotInitializedError` | `Not initialized` | `Run: orch init` |
+| `LockConflictError` | `Orchestrator already running (PID: <pid>)` | `Use: orch status` |
+| `AgentAdapterError` | `Agent adapter "<adapter>" not available` | *(detail passed in)* |
+| `NoAgentsError` | `No agents configured` | `Run: orch agent add <name> --adapter <adapter>` |
+| `TaskNotFoundError` | `Task not found: <id>` | — |
+| `AgentNotFoundError` | `Agent not found: <id>` | — |
+| `TaskAlreadyRunningError` | `Task <id> is already running (run: <runId>, agent: <agentName>)` | `Use: orch logs --task <id> --follow` |
+| `InvalidTransitionError` | `Invalid transition for <id>: <from> → <to>` | — |
+| `GoalNotFoundError` | `Goal not found: <id>` | — |
+| `GoalHasPendingTasksError` | `Cannot mark goal <id> as achieved: <n> task(s) still pending — <summary>` | `Use --force to cancel pending tasks and mark achieved` |
+| `TeamNotFoundError` | `Team not found: <id>` | — |
+| `MessageNotFoundError` | `Message not found: <id>` | — |
+| `WorkspaceError` | *(varies)* | *(varies)* |
+
+Note the `→` in `InvalidTransitionError` is U+2192 and is **not** ASCII-folded (it is produced in the domain
+layer, which has no knowledge of `--ascii`).
+
+Validation messages (all `InvalidArgumentsError`, exit 2) — exact text is L0:
+
+- `Task title is required` / `Task title cannot be empty`
+- `Priority must be an integer between 1 and 4`
+- `Unknown depends_on task ID(s): <id>, <id>`
+- `Unknown agent ID: "<v>". No agent with this ID exists.`
+- `Unknown agent: "<v>". Use an agent ID (agt_xxx) or an exact agent name.`
+- `Cannot delete a running task. Cancel it first.`
+- `Agent name is required` / `Agent name cannot be empty` / `Agent adapter cannot be empty`
+- `Shell agents require a command`
+- `Agent "<name>" already exists`
+- `Cannot remove a running agent. Stop it first.`
+- `Goal title is required` / `Goal title cannot be empty`
+- `Cannot transition goal from '<from>' to '<to>'`
+- `Team name is required` / `Team "<name>" already exists`
+- `Lead agent not found: <id>` / `Member agent not found: <id>` / `Agent not found: <id>`
+- `Agent <id> is already a member of team <id>`
+- `Lead cannot leave team. Disband the team or transfer lead first.`
+- `Agent <id> is not a member of team <id>`
+- `Task not found: <id>` *(from `team add-task`)*
+- `Message body is required`
+- `TTL must be between 1ms and 604800000ms`
+- `to_agent_id is required for direct messages` / `team_id is required for lead channel`
+- `Recipient agent not found: <id>` / `Sender agent not found: <id>` / `Team not found: <id>`
+- `Specify a run ID, --task, --agent, or --since <duration>`
+- `TTL must be a positive number up to 2592000000ms (30 days)` *(context store; a plain `Error`, so exit 1)*
+- `Agent Shop templates require an AI adapter; create shell agents with --command`
+- `Paths not configured`
+- `Attachment file not found: <path>`
+
+---
+
+## 4. `--json` output shapes (L0)
+
+`--json` is a **global** flag; each command decides whether to honour it. Where a command does not implement
+`--json`, it prints its normal human output — do not add JSON where the original has none.
+
+All JSON goes to **stdout**, pretty-printed with **2-space indent and a trailing newline**
+(`JSON.stringify(value, null, 2)` then `console.log`, which appends `\n`).
+
+**Key order is not contract** (§1.4). Field *presence* is: a field whose TS value is `undefined` is **omitted**;
+a field whose value is `null` is **emitted as `null`**. The only `null`-valued field in the domain is
+`Message.to_agent_id` (typed `string | null`) and `PromptContext.attempt`.
+
+### 4.1 Commands that support `--json`
+
+| Command | Shape |
+|---|---|
+| `task add` | a single `Task` object |
+| `task list` | array of `Task` (possibly `[]`) |
+| `task show` | a single `Task` object |
+| `agent add` | a single `Agent` object |
+| `agent list` | array of `Agent` |
+| `agent status` | a single `Agent` object |
+| `goal add` | a single `Goal` object |
+| `goal list` | array of `Goal` |
+| `goal show` | `Goal` plus linked tasks — see §4.4 |
+| `team create` | a single `Team` object |
+| `team list` | array of `Team` |
+| `team show` | a single `Team` object |
+| `msg send` | array of `Message` (one element for direct/lead) |
+| `msg broadcast` | array of `Message` (one per recipient) |
+| `msg list` | array of `Message` |
+| `msg inbox` | array of `Message` |
+| `context get` | a single `ContextEntry` object |
+| `context list` | array of `ContextEntry` |
+| `logs` | array of `Run` objects (metadata, including the full `prompt`) |
+| `status` | `{ tasks, agents, state }` — see §4.3 |
+| `config get` | the raw value at the dot path, JSON-encoded |
+| `config global show` | the `GlobalConfig` object |
+| `doctor` | adapter/dependency check results |
+
+### 4.2 Entity shapes
+
+These are the same shapes as the on-disk records (§6), with the same omit-on-`undefined` rule. A worked
+example of each, captured from the reference binary:
+
+`Task` (minimal, as created):
+```json
+{
+  "id": "tsk_k3GVRqg",
+  "title": "Second task",
+  "description": "",
+  "status": "todo",
+  "priority": 3,
+  "labels": [],
+  "depends_on": [],
+  "created_at": "2026-10-13T16:37:33.426Z",
+  "updated_at": "2026-10-13T16:37:33.426Z",
+  "attempts": 0,
+  "max_attempts": 3
+}
+```
+Note: `assignee`, `workspace_mode`, `workspace`, `proof`, `review_criteria`, `review_results`, `scope`,
+`feedback`, `goalId`, `attachments` are all absent when unset.
+
+`Agent` (shell):
+```json
+{
+  "id": "agt_veWG_kK",
+  "name": "shelly",
+  "adapter": "shell",
+  "config": {
+    "command": "echo hello",
+    "approval_policy": "auto",
+    "max_turns": 50,
+    "timeout_ms": 3600000,
+    "stall_timeout_ms": 600000
+  },
+  "status": "idle",
+  "stats": {
+    "tasks_completed": 0,
+    "tasks_failed": 0,
+    "total_runs": 0,
+    "total_runtime_ms": 0
+  }
+}
+```
+Note `config.model` and `config.effort` are **forced to absent** for `adapter: "shell"`, and
+`approval_policy` defaults to `auto` for shell rather than the configured default.
+
+`Run`:
+```json
+{
+  "id": "run_rKQA8ah",
+  "task_id": "tsk_i4hkLPH",
+  "agent_id": "agt_veWG_kK",
+  "attempt": 1,
+  "status": "succeeded",
+  "started_at": "2026-10-13T16:37:59.145Z",
+  "workspace_path": "/abs/path",
+  "prompt": "...full rendered user prompt...",
+  "pid": 360135,
+  "finished_at": "2026-10-13T16:37:59.175Z"
+}
+```
+
+`Message`:
+```json
+{
+  "channel": "direct",
+  "from_agent_id": "cli",
+  "subject": "Hi",
+  "body": "hello there",
+  "created_at": "2026-10-13T16:42:10.904Z",
+  "expires_at": "2026-10-14T16:42:10.904Z",
+  "status": "pending",
+  "id": "msg_zMOeUPn",
+  "to_agent_id": "agt_creator"
+}
+```
+
+`Goal`:
+```json
+{
+  "id": "goal_717sF1B",
+  "title": "Ship v2",
+  "description": "Get it out",
+  "status": "active",
+  "created_at": "2026-10-13T16:42:02.793Z",
+  "updated_at": "2026-10-13T16:42:02.793Z"
+}
+```
+
+`Team`:
+```json
+{
+  "id": "team_tmmAHja",
+  "name": "squad",
+  "status": "active",
+  "members": [
+    { "agent_id": "agt_creator", "role": "lead", "joined_at": "2026-10-13T16:42:11.108Z" }
+  ],
+  "task_pool": [],
+  "lead_agent_id": "agt_creator",
+  "created_at": "2026-10-13T16:42:11.108Z",
+  "updated_at": "2026-10-13T16:42:11.108Z",
+  "config": { "auto_claim": true, "message_ttl_ms": 86400000 }
+}
+```
+
+`ContextEntry`:
+```json
+{
+  "key": "mykey",
+  "value": "myvalue",
+  "created_at": "2026-10-13T16:42:10.630Z",
+  "updated_at": "2026-10-13T16:42:10.630Z"
+}
+```
+`ttl_ms` and `expires_at` are omitted when no TTL was given.
+
+### 4.3 `status --json`
+
+```json
+{ "tasks": [ ...Task ], "agents": [ ...Agent ], "state": { ...OrchestratorState } }
+```
+
+**The `state.claimed` field is emitted as `{}`, never as an array.** The in-memory `OrchestratorState.claimed`
+is a JS `Set`, and `JSON.stringify` of a `Set` yields `{}` regardless of its contents. This is a bug in the
+original (§14.1) that is **replicated**, because `--json` is a declared machine contract.
+
+`state` otherwise matches the `state.json` schema in §6.5, *except* that `claimed` on disk is a JSON array.
+
+### 4.4 `goal show --json`
+
+`Goal` fields plus the linked tasks and progress report. Read
+`parity/orch-ts/src/cli/commands/goal.ts:86-135` for the exact assembly before implementing.
+
+---
+
+## 5. Human-readable output contract
+
+Human output is split: **structural text is L0, decoration is L2.**
+
+**L0 (must match exactly, after stripping ANSI):** every literal word, label, column header, count line,
+success/error message, and the padding of table cells (see §5.1).
+
+**L2 (may differ):** colours, ANSI codes, `--help` layout and wrapping, spinner frames, and the Unicode glyph
+chosen for a status — but the *set* of glyphs and their ASCII fallbacks are L0 because `--ascii` is a
+documented flag.
+
+### 5.1 Table rendering (L0)
+
+`printTable(headers, rows, padding = 2)` in `src/cli/output.ts`:
+
+- Column width = `max(header.length, max(ansi-stripped cell length))`.
+- Every cell — **including the last in a row** — is padded to `width + padding`. Rows therefore carry
+  **trailing spaces**. Do not trim them.
+- Each line is prefixed with exactly two spaces.
+- The header line is dimmed (L2) but its text and padding are L0.
+- Output is written with `process.stdout.write(lines.join('\n') + '\n')` — one trailing newline, no blank line
+  between header and rows.
+
+`printKeyValue(pairs)`: `  ` + key padded to `maxKeyLen + 2` + value, joined by `\n`, one trailing newline.
+
+### 5.2 Glyphs (L0 — both sets)
+
+| Role | Unicode | `--ascii` |
+|---|---|---|
+| running / in_progress | `●` | `*` |
+| todo / cancelled / idle | `○` | `o` |
+| review | `◈` | `#` |
+| done | `✓` | `+` |
+| failed / error | `✕` | `x` |
+| retrying | `↻` | `~` |
+| disabled | `─` | `-` |
+| agent action | `▸` | `>` |
+| orchestrator event | `→` | `->` |
+| warning | `⚠` | `!!` |
+
+`printSuccess` → `  ✓ <msg>` on stdout. `printWarning` → `  ⚠ <msg>` on stdout.
+`printError` → `  ✕ <msg>` on stderr (+ indented hint).
+
+### 5.3 Formatters (L0)
+
+```
+formatDuration(ms):
+  < 60s        → "<n>s"
+  < 60min      → "<m>:<ss>"      (seconds zero-padded to 2)
+  otherwise    → "<h>h<mm>m"     (minutes zero-padded to 2)
+formatTokens(n):
+  n >= 1000    → "<n/1000 to 1 decimal>k"
+  otherwise    → "<n>"
+priorityLabel(p): "P1".."P4", else "P<p>"
+```
+
+### 5.4 Captured reference output
+
+Exact reference output for the common commands (ANSI stripped). Trailing spaces are significant.
+
+`orch init` (stdout):
+```
+
+  ✓ initialized
+
+  Created .orchestry/
+  ├── config.yml
+  ├── tasks/
+  ├── agents/
+  │   └── agt_creator.yml (Agent Creator)
+  ├── templates/default.md
+  └── .gitignore
+
+  Next: orch task add "Create backend agent" --assignee agt_creator
+
+```
+
+`orch task add "First task"`:
+```
+  ✓ Created tsk_O5WBXtX "First task"
+```
+
+`orch task list`:
+```
+
+  STATUS  PRI  TASK         AGENT  TIME  
+  ○ todo  P3   Second task  —      —     
+  ○ todo  P2   First task   —      —     
+
+  2 tasks
+
+```
+
+`orch agent list`:
+```
+
+  STATUS  AGENT          ADAPTER  TASK  TIME  
+  ○ idle  Agent Creator  claude   —     —     
+  ○ idle  shelly         shell    —     —     
+
+  2 agents · 0 running · 0 tokens total
+
+```
+
+`orch status`:
+```
+
+orch · proj · idle
+
+  todo        2
+
+```
+
+`orch task show <id>`:
+```
+
+  Shell task
+  ══════════════════════════════════════════
+
+  Status    ✓ done · attempt 1/3
+  Priority  P3
+  Agent     agt_veWG_kK
+  Created   2026-10-13T16:37:58.959Z
+
+  Result
+  ──────────────────────────────────────────
+
+```
+
+`orch run <id>` (shell agent printing `hello`):
+```
+
+  orch · running tsk_i4hkLPH "Shell task"
+
+  12:37:59  ▸ hello
+  ✓ Done
+```
+The timestamp is **local time**, `HH:MM:SS`.
+
+`orch logs --task <id>`:
+```
+
+  Run run_rKQA8ah · attempt 1 · succeeded
+  12:37:59  ▸ hello
+
+```
+
+`orch goal list`:
+```
+     ID            Title    Status  Assignee  
+  ●  goal_717sF1B  Ship v2  active  any       
+```
+An unassigned goal renders its assignee as the literal `any`.
+
+`orch goal show <id>`:
+```
+  ID           goal_717sF1B
+  Title        Ship v2
+  Status       active
+  Assignee     any
+  Description  Get it out
+  Created      2026-10-13T16:42:02.793Z
+  Updated      2026-10-13T16:42:02.793Z
+
+  No tasks linked to this goal yet.
+
+```
+
+`orch context list`:
+```
+
+  KEY    VALUE    UPDATED  TTL  
+  mykey  myvalue  0s       —    
+
+  1 entries
+
+```
+Note `1 entries` — not pluralized. Replicate.
+
+`orch context get <key>`:
+```
+
+  mykey = myvalue
+
+```
+
+`orch context set <key> <value>` → `  ✓ Set context "mykey"`
+
+`orch msg send <to> <body>` → `  ✓ Message sent: msg_zMOeUPn → agt_creator`
+
+`orch msg inbox <agent>`:
+```
+
+  msg_zMOeUPn from cli — Hi
+  hello there
+
+```
+
+`orch config set <key> <value>` → `  ✓ defaults.agent.workspace_mode = "shared"`
+(the value is JSON-encoded in the echo).
+
+`orch doctor`:
+```
+
+  orch doctor · checking adapters and dependencies
+
+  ✓  claude       2.1.296 (Claude Code)
+  ✓  codex        codex-cli 0.162.1
+  ✓  cursor       2026.03.11-6dfa30c
+  ✓  shell        GNU bash, version 5.2.37(1)-release (x86_64-pc-linux-gnu)
+  ✓  opencode     1.18.21
+  ✕  pi           Pi CLI not found. Install: npm i -g @mariozechner/pi-coding-agent
+  ✕  grok         Grok CLI not found. Install and authenticate the grok CLI, then ensure `grok` is on PATH.
+  ✕  antigravity  Antigravity CLI not found. Install Google Antigravity CLI and ensure `agy` is on PATH.
+  ✓  git          git version 2.47.3
+  ✓  git repo     git repository detected
+  ✓  .gitignore   .orchestry is excluded
+  ✓  node         v24.21.0
+
+  ✓  .orchestry/   exists · 2 agents · 3 tasks
+
+  5 of 8 adapters ready
+
+```
+Adapter probe order is L0: `claude, codex, cursor, shell, opencode, pi, grok, antigravity` — it is the
+registration order in `buildFullContainer`. The `node` check is replaced in r-orch; see §13.
+
+---
+
+## 6. On-disk format — `.orchestry/` (L0)
+
+Directory constant: `ORCHESTRY_DIR = ".orchestry"`, at the project root.
+
+### 6.1 File map
+
+| Path | Format | Written by | Notes |
+|---|---|---|---|
+| `.orchestry/config.yml` | YAML | `ConfigStore` | Project config, deep-merged over defaults on read |
+| `.orchestry/state.json` | JSON | `StateStore` | Orchestrator runtime state. gitignored |
+| `.orchestry/orchestry.lock` | plain text | `lock.ts` | Decimal PID, no trailing newline |
+| `.orchestry/.gitignore` | plain text | `init` | See §6.11 |
+| `.orchestry/workspace-exclude` | plain text | `init` | rsync exclude list for `isolated` mode |
+| `.orchestry/templates/default.md` | Markdown | `init` | |
+| `.orchestry/tasks/<task-id>.yml` | YAML | `TaskStore` | One file per task |
+| `.orchestry/tasks/_index.json` | JSON | `IndexManager` | Array of full `Task` objects |
+| `.orchestry/agents/<agent-id>.yml` | YAML | `AgentStore` | |
+| `.orchestry/agents/_index.json` | JSON | `IndexManager` | Array of full `Agent` objects |
+| `.orchestry/goals/<goal-id>.yml` | YAML | `GoalStore` | |
+| `.orchestry/goals/_index.json` | JSON | `IndexManager` | Array of full `Goal` objects |
+| `.orchestry/teams/<team-id>.yml` | YAML | `TeamStore` | **No index file** — `TeamStore` scans the directory |
+| `.orchestry/messages/<msg-id>.json` | JSON | `MessageStore` | |
+| `.orchestry/messages/_index.json` | JSON | `IndexManager` | Array of full `Message` objects |
+| `.orchestry/context/<key>.json` | JSON | `ContextStore` | |
+| `.orchestry/context/_index.json` | JSON | `IndexManager` | Array of full `ContextEntry` objects |
+| `.orchestry/runs/<run-id>.json` | JSON | `RunStore` | Run metadata. **No index file** |
+| `.orchestry/runs/<run-id>.jsonl` | JSONL | `RunStore` | Append-only event log |
+| `.orchestry/attachments/<task-id>/<basename>` | copied bytes | `TaskService` | Task attachments |
+| `.orchestry/workspaces/<task-id>/` | directory | `WorkspaceManager` | Worktree or clone. gitignored |
+| `.orchestry/logs/` | — | reserved | Path exists in `Paths`; nothing writes it. gitignored |
+| `~/.orchestry/global.yml` | YAML | `GlobalConfigStore` | Global, cross-project. Overridable via `ORCHESTRY_GLOBAL_CONFIG_PATH` |
+
+`init` creates **only**: `config.yml`, `agents/agt_creator.yml`, `templates/default.md`, `.gitignore`,
+`workspace-exclude`. It does **not** create `tasks/`, `runs/`, `logs/`, or any `_index.json`. Everything else
+is created lazily on first write. A first `task list` on a fresh project therefore rebuilds the index from an
+empty directory.
+
+### 6.2 ID formats (L0)
+
+`<prefix>_<nanoid(7)>` where the alphabet is the 64-character URL-safe set `A–Z a–z 0–9 _ -`.
+
+| Entity | Prefix | Example |
+|---|---|---|
+| Task | `tsk_` | `tsk_O5WBXtX` |
+| Agent | `agt_` | `agt_veWG_kK` |
+| Run | `run_` | `run_rKQA8ah` |
+| Goal | `goal_` | `goal_717sF1B` |
+| Team | `team_` | `team_tmmAHja` |
+| Message | `msg_` | `msg_zMOeUPn` |
+
+The JS `nanoid` default alphabet (`urlAlphabet`) and the Rust `nanoid::alphabet::SAFE` constant contain the
+**same 64 characters** (verified), so no custom alphabet is needed — only the length (7) and the prefix.
+
+Exception: `init` writes a **fixed** agent id `agt_creator` (not a nanoid).
+
+**Filename safety** (L0): every id used in a path passes `sanitizeId`, which enforces `^[A-Za-z0-9._-]+$` and
+throws `Invalid identifier: "<id>"` otherwise. Context keys go through the same function, so a key containing
+`/`, `..`, or any other character outside that class is rejected rather than sanitized. This is the path
+traversal defence and must be preserved exactly.
+
+### 6.3 Timestamps (L0)
+
+Every timestamp is an **ISO-8601 instant in UTC with exactly 3 fractional digits and a `Z` suffix** —
+`new Date().toISOString()`, e.g. `2026-10-13T16:37:33.426Z`.
+
+### 6.4 Serialization rules (L0 — these are the cross-compat crux)
+
+**JSON writes** (`writeJson`): `JSON.stringify(data, null, 2) + "\n"` — 2-space indent, **trailing newline**.
+Rust: `serde_json::to_string_pretty` produces the same indentation but **no trailing newline** — append one.
+
+**JSONL appends** (`appendJsonl`): `JSON.stringify(record) + "\n"` — compact, no spaces. Opened with `O_APPEND`
+so writes interleave atomically up to `PIPE_BUF`. See §6.9 for the truncation rule.
+
+**YAML writes** (`writeYaml`): `js-yaml.dump(data, { indent: 2, lineWidth: 120, noRefs: true, sortKeys: false })`.
+
+**Optional fields:** a TS `undefined` value is **omitted from the mapping entirely** by both `JSON.stringify`
+and `js-yaml.dump` (verified). In Rust, every `Option` field that the TS type marks `?` MUST carry
+`#[serde(skip_serializing_if = "Option::is_none")]`. The single exception is `Message.to_agent_id`
+(`string | null`), which must serialize as `null` when absent.
+
+**⚠ Timestamp quoting — blocking cross-compat hazard.** js-yaml's default schema includes the YAML 1.1
+`timestamp` type, so an **unquoted** `created_at: 2026-10-13T16:37:58.959Z` is parsed by the TypeScript binary
+into a JavaScript **`Date` object**, not a string. Downstream, `MessageStore.list()` calls
+`a.created_at.localeCompare(...)` — which **throws** on a `Date`. js-yaml emits these values single-quoted;
+both `serde_yaml_ng` and `serde_norway` emit them **unquoted** (verified). The Rust YAML writer MUST therefore
+force quoting on any scalar that would re-parse as a YAML 1.1 timestamp or date. See
+[ARCHITECTURE.md §5.3](ARCHITECTURE.md) for the implementation and its mandatory round-trip test.
+
+Scalars that js-yaml quotes and a YAML-1.2 emitter may not: anything matching the 1.1 timestamp/date grammar.
+Scalars safe either way (verified): `yes`, `no`, `on`, `off` are plain strings under js-yaml's core schema;
+`null`, `true`, `false`, and numeric-looking strings are quoted by both.
+
+### 6.5 `config.yml`
+
+Read with a recursive deep-merge over `DEFAULT_CONFIG` (objects merge; arrays and scalars replace). A file
+missing entirely yields the defaults. `config get`/`set` use `.`-separated dot paths; `set` creates missing
+intermediate objects.
+
+As written by `init`:
+```yaml
+project:
+  name: proj
+defaults:
+  agent:
+    adapter: claude
+    approval_policy: auto
+    max_turns: 50
+    timeout_ms: 3600000
+    stall_timeout_ms: 600000
+    workspace_mode: worktree
+  task:
+    max_attempts: 3
+    priority: 3
+scheduling:
+  poll_interval_ms: 10000
+  max_concurrent_agents: 6
+  retry_base_delay_ms: 10000
+  retry_max_delay_ms: 300000
+```
+
+Full schema, with defaults (L0):
+
+| Path | Type | Default |
+|---|---|---|
+| `project.name` | string | `my-project` (`init` substitutes the directory name) |
+| `project.description` | string? | — |
+| `defaults.agent.adapter` | string | `claude` |
+| `defaults.agent.approval_policy` | `suggest\|auto\|manual` | `auto` |
+| `defaults.agent.max_turns` | int | `50` |
+| `defaults.agent.timeout_ms` | int | `3600000` |
+| `defaults.agent.stall_timeout_ms` | int | `600000` |
+| `defaults.agent.workspace_mode` | `shared\|worktree\|isolated` | `worktree` |
+| `defaults.task.max_attempts` | int | `3` |
+| `defaults.task.priority` | int | `3` |
+| `scheduling.poll_interval_ms` | int | `10000` |
+| `scheduling.max_concurrent_agents` | int | `6` |
+| `scheduling.retry_base_delay_ms` | int | `10000` |
+| `scheduling.retry_max_delay_ms` | int | `300000` |
+| `prompt.template` | string? | — (legacy single combined template) |
+| `prompt.system_template` | string? | — |
+| `prompt.user_template` | string? | — |
+
+### 6.6 `state.json`
+
+```json
+{
+  "version": 1,
+  "onboardingCompleted": false,
+  "running": {},
+  "claimed": [],
+  "retry_queue": [],
+  "stats": {
+    "total_runs": 1,
+    "total_tasks_completed": 1,
+    "total_tasks_failed": 0,
+    "total_tokens": {
+      "input": 0, "output": 0, "reasoning": 0,
+      "total": 0, "cache_read": 0, "cache_write": 0
+    },
+    "total_runtime_ms": 15
+  }
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `version` | `1` | Literal |
+| `pid` | int? | PID of the watch-mode orchestrator; cleared on stop |
+| `started_at` | ts? | Cleared on stop |
+| `onboardingCompleted` | bool | Coerced to `false` unless strictly a boolean on read |
+| `running` | map taskId → `RunningEntry` | `{}` when empty |
+| `claimed` | **array of task ids** on disk | In memory a `Set`. Non-array on read ⇒ empty set |
+| `retry_queue` | array of `RetryEntry` | Non-array on read ⇒ `[]` |
+| `stats.total_runs` | int | |
+| `stats.total_tasks_completed` | int | |
+| `stats.total_tasks_failed` | int | |
+| `stats.total_tokens` | `TokenUsage` | Merged field-wise over the zero default on read |
+| `stats.total_runtime_ms` | int | |
+
+`RunningEntry`: `{ run_id, agent_id, task_id, pid, started_at, last_event_at }` — all required.
+`RetryEntry`: `{ task_id, attempt, due_at, error }` — all required.
+
+Read is **tolerant**: missing or wrong-typed fields fall back to defaults field by field rather than failing.
+Rust must mirror this (`#[serde(default)]` plus explicit coercion for `onboardingCompleted`, `running`,
+`claimed`, `retry_queue`).
+
+### 6.7 `orchestry.lock`
+
+Content: the holder's PID as a decimal string, written with `O_CREAT|O_EXCL` (`fs.open(path, 'wx')`), **no
+trailing newline**. Semantics in §8.5.
+
+### 6.8 Task / Agent / Goal / Team YAML
+
+Field order as emitted (= TS interface declaration order; L2 but recommended):
+
+**Task** — `id, title, description, status, priority, assignee?, labels, depends_on, created_at, updated_at,
+attempts, max_attempts, workspace_mode?, workspace?, proof?, review_criteria?, review_results?, scope?,
+feedback?, goalId?, attachments?`
+
+> `goalId` is **camelCase** while every other field is snake_case. This is an inconsistency in the original
+> and is **preserved** — it is the on-disk key name.
+
+`proof`: `{ branch?, pr_url?, files_changed: string[], test_results?, agent_summary? }` — `files_changed` is
+required, so a task that succeeded with no file changes still writes `proof: { files_changed: [] }`.
+
+`review_criteria`: array of `test_pass | typecheck | lint`.
+`review_results`: array of `{ criterion, passed, output }`.
+
+**Agent** — `id, name, adapter, role?, config, status, current_task?, autonomous?, stats, last_error?`
+
+`config`: `{ command?, model?, effort?, approval_policy?, max_turns?, timeout_ms?, stall_timeout_ms?, env?,
+system_prompt?, workspace_mode?, skills? }`
+`stats`: `{ tasks_completed, tasks_failed, total_runs, total_runtime_ms, tokens_used? }`
+`last_error`: `{ message, kind, timestamp }` — `message` truncated to 500 chars; `kind` is an
+`AdapterErrorKind` string value.
+`status`: `idle | running | error | disabled`.
+
+**Goal** — `id, title, description, status, assignee?, created_at, updated_at?`
+`status`: `active | paused | achieved | abandoned`.
+
+**Team** — `id, name, description?, status, members, task_pool, lead_agent_id, created_at, updated_at, config`
+`members`: array of `{ agent_id, role: "lead"|"member", joined_at }`
+`config`: `{ max_concurrent_tasks?, auto_claim: bool, message_ttl_ms? }` — defaults
+`{ auto_claim: true, message_ttl_ms: 86400000 }`
+`status`: `active | paused | disbanded`.
+
+### 6.9 Runs
+
+**`<run-id>.json`** — `Run`: `id, task_id, agent_id, attempt, status, started_at, finished_at?,
+workspace_path, prompt, pid?, error?, tokens?`
+`status`: `preparing | running | succeeded | failed | timed_out | cancelled`.
+`tokens`: `TokenUsage` = `{ input, output, reasoning, total, cache_read, cache_write }` where
+**`total == input + output + reasoning`** — cache counters are informational and are *not* added to the total.
+
+**`<run-id>.jsonl`** — one `RunEvent` per line, exactly:
+```json
+{"timestamp":"2026-10-13T16:37:59.169Z","type":"agent_output","data":"hello"}
+```
+Keys in that order (L2 for order, L0 for names). `type` is one of `agent_output | file_changed | command_run |
+tool_call | error | done`. **`data` is always a string** — the orchestrator pre-serializes it (JSON-encoding
+non-strings) and truncates to 8192 characters, appending `…` (U+2026) when truncated.
+
+**Atomic-append truncation rule** (L1): if the serialized line exceeds `PIPE_BUF` (4096 bytes) and the record
+is an object with a non-empty string `data`, `data` is re-truncated so the whole line fits:
+`budget = 4096 - byteLen(JSON.stringify({...record, data: ""}) + "\n") - 3`, then
+`data = data.slice(0, budget) + "…"`. If `budget <= 0`, the line is written over-length unchanged.
+
+**Read behaviour** (L1): corrupt lines are skipped with a warning on stderr
+(`[readJsonl] skipping corrupt line: <first 200 chars>`). Files over 50 MB read only the last 200 records and
+warn (`[readJsonl] file too large (<n> MB), reading tail only: <path>`). `readJsonlTail(path, n)` reads whole
+files under 32 KB, otherwise reads backwards in chunks (65536, or 131072 when over 1 MB) for up to 4 chunks,
+discarding the first (possibly partial) line when it did not read from offset 0.
+
+### 6.10 `_index.json`
+
+A JSON **array of the complete entity objects** — not a summary. Maintained by `IndexManager`:
+
+- `readIndex()` → parse `_index.json`; if missing, not an array, or corrupt → **rebuild** from the individual
+  files and write it back.
+- `rebuildIndex()` → list the directory for the store's extension, apply `fileFilter`, strip the extension to
+  recover the id, read each file in parallel, drop nulls, write the index.
+- `updateIndex(fn)` → read-modify-write under a mutex that serializes all index mutations within the process.
+- `save(entity)` appends/replaces by id — **the entity moves to the end of the array**, so index order is
+  last-write order, not creation order. All consumers sort explicitly, so index order is **not contract**.
+- `.json`-backed stores (context, messages) set `fileFilter` to exclude `_index.json` from the rebuild scan.
+  `.yml`-backed stores do not need it.
+
+`IndexManager` is used by task, agent, goal, context and message stores. **`TeamStore` and `RunStore` have no
+index** and scan their directories.
+
+### 6.11 `init` file contents (L0)
+
+`.orchestry/.gitignore`:
+```
+# Runtime state
+state.json
+*.lock
+
+# Logs and runs
+runs/
+logs/
+
+# Agent workspaces
+workspaces/
+```
+
+`.orchestry/workspace-exclude`:
+```
+.orchestry
+node_modules
+.env
+.env.*
+dist
+build
+.next
+__pycache__
+*.pyc
+.venv
+```
+
+`.orchestry/agents/agt_creator.yml` — the "Agent Creator" bootstrap agent. Its `role` is a ~3 KB Markdown
+document that must be reproduced **byte for byte** (it is injected into prompts). Source:
+`parity/orch-ts/src/domain/default-agents.ts`. Its config is
+`{ model: claude-sonnet-4-6, approval_policy: suggest, max_turns: 50, timeout_ms: 3600000,
+stall_timeout_ms: 300000, skills: [document-skills:skill-creator] }` — note `stall_timeout_ms` is 300000 here,
+**not** the 600000 project default.
+
+`.orchestry/templates/default.md` — see `src/cli/commands/init.ts`.
+
+**Idempotency** (L1): re-running `init` in an initialized project must not destroy existing tasks, agents or
+config. Verify against the reference binary before implementing; the behaviour is asserted in
+`test/unit/cli/commands-init.test.ts`.
+
+### 6.12 `~/.orchestry/global.yml`
+
+```yaml
+tui:
+  palette: amber
+  activity_filter: all
+  notifications:
+    toast: true
+    bell: false
+```
+
+| Field | Type | Default | Validation on read |
+|---|---|---|---|
+| `tui.palette` | `amber\|ocean\|forest\|violet\|light` | `amber` | Invalid ⇒ fall back to `amber` |
+| `tui.activity_filter` | `all\|text\|tools\|errors\|events` | `all` | **Not validated** — any value passes through |
+| `tui.notifications.toast` | bool | `true` | Non-boolean ⇒ default |
+| `tui.notifications.bell` | bool | `false` | Non-boolean ⇒ default |
+
+The parent directory is created on write. Path override: `ORCHESTRY_GLOBAL_CONFIG_PATH` (trimmed, resolved).
+
+---
+
+## 7. Domain semantics
+
+### 7.1 Task state machine (L0 — the transition table is contract)
+
+Source: `src/domain/transitions.ts`.
+
+```
+            ┌──────────────────────────────┐
+            ▼                              │
+  ┌──────┐                                 │
+  │ todo │──────────► in_progress ─────────┼──► review ───► done
+  └──────┘                 │               │      │
+      ▲ │                  ├──► retrying ──┘      ├──► todo        (rejected)
+      │ │                  │       │              └──► cancelled
+      │ │                  ├───────┴──► failed ──► todo | retrying
+      │ └──────────────────┴──────────► cancelled ──► todo
+      └───────────────────────────────────────────────┘
+```
+
+| From | Allowed `to` |
+|---|---|
+| `todo` | `in_progress`, `cancelled` |
+| `in_progress` | `review`, `retrying`, `failed`, `cancelled` |
+| `retrying` | `in_progress`, `failed`, `cancelled` |
+| `review` | `done`, `todo`, `cancelled` |
+| `done` | *(none)* |
+| `failed` | `todo`, `retrying` |
+| `cancelled` | `todo` |
+
+Any other transition requested through `TaskService.updateStatus` raises
+`InvalidTransitionError` (exit 1). **The orchestrator deliberately bypasses this check in recovery paths** by
+writing the task through the store directly — see §7.4.
+
+Derived predicates (L0):
+
+- `isTerminal(s)` → `s ∈ {done, failed, cancelled}`
+- `isDispatchable(s)` → `s ∈ {todo, retrying}`
+- `isBlocked(task, all)` → `task.depends_on` is non-empty and **any** dependency has `status != "done"`.
+  A dependency id that is **missing from the store is treated as resolved** (deleted = done), never as blocking.
+- `resolveFailureStatus(task)` → `retrying` if `task.attempts < task.max_attempts`, else `failed`
+- `resolveCompletionStatus(task, success, _autoApprove)` → `review` on success (always — auto-approve is applied
+  afterwards by the orchestrator as a separate `review → done` transition), else `resolveFailureStatus(task)`
+- `calculateRetryDelay(attempt, base, max)` → `min(base * 2^attempt, max)`
+
+> Note the exponent is `attempt`, **not** `attempt - 1`. Callers pass `task.attempts - 1`, so the first retry
+> delay is `base * 2^0 = base`. With the defaults (`base = 10000`, `max = 300000`) the sequence is
+> 10 s, 20 s, 40 s, 80 s, 160 s, 300 s, 300 s, …
+
+### 7.2 Goal state machine (L0)
+
+| From | Allowed `to` |
+|---|---|
+| `active` | `paused`, `achieved`, `abandoned` |
+| `paused` | `active`, `achieved`, `abandoned` |
+| `achieved` | *(none)* |
+| `abandoned` | *(none)* |
+
+Invalid transition ⇒ `InvalidArgumentsError` (exit **2**), message
+`Cannot transition goal from '<from>' to '<to>'`. Terminal set: `{achieved, abandoned}`.
+Canonical sort order: `active(0) < paused(1) < achieved(2) < abandoned(3)`.
+
+**Achieved guard** (L1): transitioning to `achieved` fails with `GoalHasPendingTasksError` if any linked task is
+non-terminal, **excluding** tasks labelled `autonomous`. With `--force`, tasks that are not `in_progress` are
+cancelled first; if any `in_progress` task remains, the error is still raised, with summary
+`<id> (in_progress), …`. Without `--force` the summary is `<id> (<status>), …`.
+
+**Autonomous side effects** (L1):
+- Creating a goal with an `assignee` → `agent.autonomous = true`.
+- `active → paused` → disable autonomous *if the agent has no other active goal*, **and** cancel that agent's
+  dispatchable (`todo`/`retrying`) tasks labelled `autonomous`.
+- `paused → active` → re-enable autonomous.
+- → terminal → disable autonomous if no other active goal remains.
+- `goal update` changing the assignee → enable on the new agent, maybe-disable on the old (in parallel).
+- `goal delete` → maybe-disable on the former assignee.
+- All of these swallow "agent not found" silently.
+
+### 7.3 Tick loop (L1 — phase order is contract)
+
+`startWatch()`:
+1. `acquireLock(lockPath)` — on failure throw `LockConflictError(pid)` (exit 4).
+2. `loadState()`.
+3. `cleanupStaleRunningEntries()` (§7.6).
+4. Set `state.pid = <own pid>`, `state.started_at = now`, `saveState()`.
+5. Register `SIGINT`/`SIGTERM` handlers.
+6. Subscribe to `task:created` for reactive dispatch.
+7. Run one `tick()` immediately.
+8. `setInterval(tick, config.scheduling.poll_interval_ms)`.
+
+Each `tick()` runs **under the state mutex**, and in this order:
+1. Invalidate the tick-scoped task/agent/goal caches.
+2. `loadState()`.
+3. `reconcile()`.
+4. `seedAutonomousTasks()` — unless `skipAutonomousSeeding`.
+5. `dispatchAll()`.
+6. Emit `orchestrator:tick { running, queued }` where `queued` counts tasks with a dispatchable status.
+7. *(outside the mutex)* `touchLock(lockPath)` — update mtime to prove liveness.
+
+> "Collect" is **not** a synchronous phase. Event collection runs as a detached background task per run
+> (`collectEvents`), and completion is handled by `handleRunSuccess`/`handleRunFailure`, each of which takes
+> the state mutex. The CLAUDE.md phrase "Reconcile → Dispatch → Collect" describes the conceptual model, not
+> the call order.
+
+**Tick failure circuit breaker** (L1): consecutive tick rejections increment a counter; each emits
+`orchestrator:error { context: "tick", fatal: <count >= 5> }`. On the 5th, emit
+`orchestrator:shutdown { reason: "<count> consecutive tick failures" }` and call `stop()`. Any successful tick
+resets the counter to 0.
+
+**Reactive dispatch** (L1): `task:created` schedules an immediate dispatch with a **500 ms debounce**. If a tick
+is in progress when the timer fires, it reschedules, up to **10 retries** (≈5 s) then gives up. The immediate
+dispatch is a mini-tick: invalidate caches → `loadState` → `dispatchAll` → `saveState` — **no reconcile**. It is
+skipped entirely while any `runTask` single-task run is in flight. `handleRunSuccess`/`handleRunFailure` also
+schedule one, unless the finishing task was a single-task run.
+
+### 7.4 Reconcile (L1)
+
+For each entry in `state.running`, in insertion order:
+
+1. **Stale terminal task** — if the task is missing or `isTerminal`, drop the running entry and set the agent
+   `idle`. Continue.
+2. **Active collector guard** — if `activeCollectors` contains the task id, **skip both the PID and stall
+   checks**. This prevents a race where the child exited cleanly but the success handler has not yet taken the
+   mutex, which would otherwise be misread as a crash.
+3. **PID liveness** — `!isAlive(pid)` ⇒ `_handleRunFailure(taskId, entry, "Process crashed unexpectedly")`.
+   If that itself throws, force-drop the running entry and set the agent idle.
+4. **Stall** — `now - entry.last_event_at > (agent.config.stall_timeout_ms ?? config.defaults.agent.stall_timeout_ms)`
+   (strictly greater) ⇒ emit `orchestrator:stall_detected { runId }`, abort the controller,
+   `killWithGrace(pid, 5000)`, then `_handleRunFailure(taskId, entry, "Agent stalled (no events)")`.
+
+Then, project-wide:
+
+5. **Stale agents** — agents with `status == "running"` and no running entry → set `idle` (in parallel).
+6. **Orphaned tasks** — tasks with `status == "in_progress"` and no running entry → `failed` (force-written
+   through the store if the transition is rejected), each emitting `task:orphaned { taskId }`.
+7. **Retry queue** — entries whose `due_at <= now` are removed from the queue and dispatched, but only after
+   re-reading the task and confirming it is still dispatchable.
+8. `saveState()`.
+
+### 7.5 Dispatch (L1)
+
+`dispatchAll()`:
+1. `availableSlots = config.scheduling.max_concurrent_agents - |state.running|`. Return if `<= 0`.
+2. Candidates = tasks that are dispatchable **and** not blocked by dependencies **and** not in `state.running`
+   **and** not in `state.claimed`.
+3. **Sort** (L0 — this is the scheduling contract):
+   1. `priority` ascending (lower number = more urgent; P1 before P4; missing ⇒ 3)
+   2. goal-linked first (`goalId` present beats absent)
+   3. `updated_at` **descending** (most recently updated first)
+4. Truncate to `availableSlots`.
+5. **Scope overlap** — build a `ScopeIndex` from the scopes of all `in_progress` tasks. For each candidate with
+   a non-empty `scope`: if it overlaps the index, emit
+   `task:scope_overlap { taskId, overlappingTaskId, patterns }` and skip it; otherwise add its scope to the
+   index so later candidates in the same pass are checked against it too.
+6. Dispatch each surviving candidate. A `WorkspaceError` during dispatch increments `attempts` and applies
+   `resolveFailureStatus`: `retrying` enqueues a retry with the backoff delay; `failed` cascade-fails
+   dependents. Any dispatch error emits `orchestrator:error { context: "dispatch task <id>" }` and **does not**
+   stop the remaining dispatches.
+
+`dispatchTask(taskId)`:
+1. Already in `state.running` ⇒ `TaskAlreadyRunningError`.
+2. Re-read the task; return silently if no longer dispatchable.
+3. Add to `state.claimed` and **persist state before spawning** (crash safety).
+4. `findBestAgent(task)` (§7.7). No agent and zero agents configured ⇒ `NoAgentsError`. No *idle* agent ⇒
+   unclaim, persist, return.
+5. `workspaceManager.prepare(task, agent, config)` → `{ path, branch? }`.
+6. Build the prompt (§9).
+7. `attempt = task.attempts + 1`. If `attempt > 1`, fetch the last failed run's error and last 50
+   `agent_output`/`error` events as retry context.
+8. In parallel: read all shared context, **drain the agent's mailbox** (marks messages delivered), load the goal.
+9. `runService.create(...)` → a `Run` in status `preparing`.
+10. If the task was `failed`/`cancelled`, call `taskService.retry` first (resets to `todo`, `attempts = 0`).
+11. `updateStatus(in_progress)` → `assign(agent.id)` → `incrementAttempts()`.
+12. If a worktree branch was created, re-read the task and persist `proof.branch` and `workspace` **immediately**
+    so the branch survives a later failure.
+13. Agent → `running`, set `current_task`, **clear `last_error`**.
+14. `adapterRegistry.require(agent.adapter)` — unknown adapter throws
+    `Unknown adapter: "<kind>". Available: <comma-joined kinds>` (a plain `Error`, exit 1).
+15. `adapter.execute({ prompt, systemPrompt, workspace, env, config, signal })` where `env` is
+    `{ ...agent.config.env, ORCH_AGENT_ID, ORCH_AGENT_NAME, ORCH_TASK_ID }`.
+16. `runService.start(run.id, pid)` → run status `running`, emits `agent:started`.
+17. Move the task from `claimed` to `running` with `started_at = last_event_at = now`; persist.
+18. Register the task in `activeCollectors` and start `collectEvents` detached.
+
+On any throw before step 18: delete the abort controller, unclaim, persist, rethrow.
+
+`dispatchOnlyTask(taskId)` (used by `orch run <id>`): temporarily adds **every other** dispatchable task to
+`state.claimed` so the shared dispatch path cannot opportunistically start them, dispatches the one task, then
+restores the original claimed set.
+
+### 7.6 Startup recovery (L1)
+
+`cleanupStaleRunningEntries()`:
+1. Running entries whose PID is dead → drop the entry, set the agent `idle`, **force the task to `cancelled`**
+   (not `failed` — so a restart does not make agents redo already-committed work), and finish the run as
+   `cancelled` with error `Orchestrator restarted`.
+2. **Always** clear `state.claimed` — any surviving claim is by definition stale.
+3. Only if dead PIDs were found: cancel tasks still `in_progress` with no running entry, and drop their retry
+   queue entries.
+4. `cleanupOrphanedPreparingRuns()` — runs still in status `preparing` that are not referenced by
+   `state.running` are finished as `cancelled` with error
+   `Orphaned preparing run (orchestrator restarted)`.
+
+### 7.7 Agent selection (L1)
+
+`findBestAgent(task)`:
+- Candidate pool = agents with `status == "idle"`. Empty pool ⇒ `null`.
+- **Explicit assignee is a hard constraint**: match by id **or** name across *all* agents; return it only if it
+  is `idle`, else return `null` (the task waits — it is never given to another agent).
+- Otherwise score each idle agent:
+  - **+50 per** task label that case-insensitively equals one of the agent's `config.skills`
+  - **+30** if any task label is a case-insensitive **substring** of `agent.role`
+  - **+20** for being idle (always applies to the pool)
+  - **+0..10** success rate: `round(tasks_completed / (tasks_completed + tasks_failed) * 10)`, only when the
+    denominator is non-zero
+- Sort by score **descending** and take the first. Ties resolve to the earlier element of the pool, i.e. the
+  `agentStore.list()` order, which is `_index.json` order — **last-write order**. This makes ties
+  non-deterministic across implementations; see §14.4.
+
+### 7.8 Completion handling (L1)
+
+`handleRunSuccess` (under the mutex):
+1. Flush any debounced state write; drop the abort controller.
+2. Return immediately if the task is no longer in `state.running` (already cancelled) or no longer exists.
+3. If the adapter reported no changed files **and** the task has `proof.branch`, derive them via
+   `getChangedFiles(branch)`.
+4. Write `proof.agent_summary` = result text truncated to **2000** chars, `proof.files_changed`; **delete
+   `task.feedback`**.
+5. `autoApprove = task.labels.includes("autonomous") || agent.config.approval_policy == "auto"`.
+6. `newStatus = resolveCompletionStatus(task, true, autoApprove)` → always `review`.
+7. `runService.finish(runId, "succeeded", tokens)` → emits `agent:completed { success: true }`.
+8. Accumulate `state.stats.total_runtime_ms += now - entry.started_at`; drop the running entry **before** any
+   fallible work so a later throw cannot re-enter the failure path.
+9. Agent stats: `tasks_completed += 1`, `total_runs += 1`, `total_runtime_ms += runtime`,
+   and `tokens_used += tokens.total` when tokens are present.
+10. Global stats: `total_tasks_completed += 1`, `total_runs += 1`, and token counters accumulated field-wise
+    with `total` recomputed as `input + output + reasoning`.
+11. **Merge-back** if `proof.branch` is set (§10.3). On conflict or error, force the task to `review` with the
+    summary prefixed `MERGE CONFLICT: <info>` / `MERGE ERROR: <msg>` and **return** — auto-approve is skipped.
+12. `updateStatus(review)`; on validation failure, emit `orchestrator:error` and force-write through the store.
+13. Agent → `idle`, `current_task` cleared.
+14. If the task has `review_criteria`, run auto-review (§7.9). Else if `autoApprove`, transition
+    `review → done` immediately.
+15. `saveState()`; schedule a reactive dispatch unless this was a single-task run.
+
+`handleRunFailure` (under the mutex):
+1. Flush; drop the abort controller; return if the running entry is gone or the task is missing.
+2. `runService.finish(runId, "failed", undefined, error)`; agent → `idle`.
+3. Clear `current_task`; set `last_error = { message: error.slice(0, 500), kind: errorKind ??
+   classifyAdapterError(error), timestamp: now }`.
+4. Agent stats: `tasks_failed += 1`, `total_runs += 1`, `total_runtime_ms += runtime`.
+5. `failureStatus = resolveFailureStatus(task)`; `updateStatus(failureStatus)`.
+6. If `retrying`: enqueue a retry with `calculateRetryDelay(task.attempts - 1, base, max)` and emit
+   `run:retry { runId, attempt: task.attempts + 1, delay_ms }`.
+   Else: `state.stats.total_tasks_failed += 1` and **cascade-fail dependents** (§7.10).
+7. `state.stats.total_runtime_ms += runtime`.
+8. Clean up the worktree and branch if `proof.branch` is set.
+9. Drop the running entry, `total_runs += 1`, `saveState()`, schedule a reactive dispatch.
+
+**Retry queue** is deduplicated by `task_id` and bounded to **100** entries; on overflow the oldest is shifted
+off.
+
+### 7.9 Auto-review (L1)
+
+`ReviewRunner` runs criteria as child processes in `cwd = task.workspace ?? projectRoot`:
+
+| Criterion | Command | argv |
+|---|---|---|
+| `typecheck` | `npx` | `["tsc", "--noEmit"]` |
+| `lint` | `npm` | `["run", "lint"]` |
+| `test_pass` | `npm` | `["test"]` |
+
+- **Execution order is fixed**: `typecheck`, `lint`, `test_pass` — fastest first, regardless of the order in
+  `review_criteria`. Unknown criteria sort last.
+- **Fail-fast by default**: stop at the first failure.
+- Per-criterion timeout **120000 ms**, `maxBuffer` 1 MiB.
+- `passed = (no error)`; `output = (stdout + "\n" + stderr).trim().slice(0, 2000)`.
+- `allPassed(results)` = `results.length > 0 && every(passed)` — an empty result set is **not** "all passed".
+- `formatReport(results)`: per result `"<✓|✗> <criterion>: <PASSED|FAILED>\n  <output>"`, joined by `"\n\n"`.
+
+Results are written to `task.review_results` and `task.proof.test_results`, then
+`task:auto_reviewed { taskId, passed, results }` is emitted. If all passed **or** `autoApprove` is set, the
+task goes to `done` (force-written if the transition is rejected). When `autoApprove` forced a failing review
+through, an `orchestrator:error` is emitted with context `auto-review-with-auto-approve`.
+
+> These commands are hard-coded and Node-centric. They are **preserved as-is** for parity — r-orch does not
+> substitute `cargo` equivalents (see §14.5).
+
+### 7.10 Cascade failure (L1)
+
+When a task permanently fails, every task that depends on it — directly or transitively — is set to `failed`
+via a breadth-first walk over a reverse-dependency index. Already-terminal and already-visited tasks are
+skipped. Each cascaded task emits **both** `task:status_changed { from, to: "failed" }` and
+`task:cascade_failed { taskId, failedDependencyId, reason }`, where `reason` is
+`dependency <failedTaskId> failed: <error>`. Writes are batched in parallel per BFS level.
+
+### 7.11 Scope overlap (L1)
+
+A scope is an array of glob patterns. Two scopes overlap if **any** pattern pair overlaps. A task with no scope
+never overlaps anything.
+
+`patternsOverlap(a, b)`:
+1. Identical strings ⇒ overlap.
+2. Reduce each pattern to its **base** = the prefix before the first `*` (whole pattern if none).
+3. If either base is a string prefix of the other ⇒ overlap.
+4. Otherwise, if **neither** base ends with `/` (both "file-like"), overlap iff
+   `dirname(aBase) == dirname(bBase)` and that dirname is not `.` — sibling files in the same directory
+   conflict.
+
+This is deliberately **conservative**: false positives are acceptable, false negatives are not. It is
+**prefix matching on raw strings, not glob semantics** — `src/a*` and `src/ab` overlap because `src/a` is a
+prefix of `src/ab`.
+
+`ScopeIndex` is the batch form: a compressed radix trie of bases plus a set of directories containing
+file-like bases. `overlapsAny(scope)` returns true if any pattern's base has a prefix relationship with an
+indexed base, or if the pattern is file-like and its directory (≠ `.`) already holds an indexed file-like
+pattern. `add(scope)` mutates the index. The trie compares **UTF-16 code units**, matching JS `startsWith`;
+in Rust, compare by `char`/byte consistently and cover the surrogate-pair cases with tests — the observable
+contract is only that it agrees with the pairwise `patternsOverlap` function.
+
+### 7.12 Autonomous task seeding (L1)
+
+Each tick (unless suppressed), for every agent with `autonomous == true` **and** `status == "idle"`:
+- Skip if the agent already has any non-terminal task assigned.
+- Skip if seeded within the last **30000 ms** (per-agent cooldown, in-memory).
+- Pick a goal: first an `active` goal assigned to this agent and not yet claimed this pass, else an `active`
+  unassigned goal not yet claimed this pass. Claimed goal ids are tracked within the pass so two agents do not
+  take the same goal.
+- `role = agent.role ?? "general assistant"`.
+- Create a task:
+  - title: `[auto] <agent.name>: <goal.title sliced to 60>` or `[auto] <agent.name>: <role sliced to 60>`
+  - description: with a goal —
+    `## GOAL (highest priority)\n\n<goal.description || goal.title>\n\n---\nAgent role: <role>`;
+    without — `Autonomous work cycle. Agent role: <role>`
+  - `assignee = agent.id`, `labels = ["autonomous"]`, `priority = 3`, `goalId = goal?.id`
+- Failures emit `orchestrator:error { context: "autonomous task for agent <id>" }` and do not abort the pass.
+
+### 7.13 Locking (L1)
+
+| Operation | Behaviour |
+|---|---|
+| `acquireLock(path)` | Serialized in-process. If a lock file exists and its PID is alive **and** the file's mtime is newer than `LOCK_STALE_MS = 60000`, fail with `{ acquired: false, pid }`. Otherwise unlink the stale lock and create a new one with `O_CREAT\|O_EXCL`. An `EEXIST` race re-reads the PID and reports failure. |
+| `releaseLock(path)` | Unlink, errors ignored. |
+| `touchLock(path)` | `utimes(now, now)`, errors ignored. Called once per tick. |
+| `checkLock(path)` | `{ locked, pid? }` — `locked` is false for a missing file or a dead PID. **Does not consider mtime.** |
+| `requireLock(path)` | Acquire or throw `LockConflictError(pid)`. |
+
+**PID liveness** = `kill(pid, 0)` succeeds, **or** fails with `EPERM` (process exists, not ours). Any other
+error ⇒ dead.
+
+The mtime check defends against PID recycling: a lock whose holder died and whose PID was reused by an
+unrelated process looks "alive" but will not have been touched within 60 s.
+
+Who takes the lock:
+- `run --watch`, `serve` → hold for the process lifetime (`startWatch`).
+- `run <id>`, `run --all`, `cancelTask`, `forceStopAgent` → acquire a **temporary** lock for the duration, then
+  release; if the lock is already held by this instance, run inline instead.
+- All read-only commands → **no lock**.
+
+`isOwner` is true only while this instance holds the lock; state mutation paths check it.
+
+### 7.14 Shutdown (L1)
+
+`stop()` is idempotent. It: clears the interval; unsubscribes `task:created` and clears the debounce timer;
+flushes the debounced state write; then **under the mutex**, for every running entry — abort the controller,
+`killWithGrace(pid)` (default **10000 ms** grace), finish the run as `cancelled`, set the task to
+`resolveFailureStatus(task)` (so it retries if budget remains), and set the agent `idle`. Then clear
+`running`, clear `claimed`, clear `pid`/`started_at`, persist, release the lock, remove the signal handlers,
+and resolve all `waitForStop()` waiters.
+
+`SIGINT`/`SIGTERM` each emit `orchestrator:shutdown { reason: "Received <SIGNAL>" }` and then `stop()`.
+
+### 7.15 Concurrency control (L1)
+
+- **Global cap**: `scheduling.max_concurrent_agents` (default 6) bounds `|state.running|`.
+- **One run per task**: enforced by `state.running` keyed on task id.
+- **One run per agent**: enforced by the agent `status` field (only `idle` agents are candidates).
+- **One orchestrator per project**: the PID lock.
+- **State serialization**: a promise-chain mutex (`withStateLock`) wraps `tick`, `stop`, `cancelTask`,
+  `forceStopAgent`, `freshDispatch`, `handleRunSuccess` and `handleRunFailure`. `IndexManager` has its own
+  independent mutex per store instance.
+- **Debounced state writes**: `saveStateLazy()` coalesces `last_event_at` updates on a **500 ms** timer;
+  `flushStateLazy()` forces it before any critical transition.
+
+### 7.16 Messages (L1)
+
+- `send` validates: non-empty `body`; `0 < ttl_ms <= 604800000` (7 days), defaulting to **86400000** (24 h);
+  the sender must exist **unless** it is the literal `cli`.
+- `subject` is truncated to **200** chars and defaults to the literal `(no subject)`; `body` to **4000**.
+- `expires_at = created_at + ttl_ms`.
+- **`direct`** — `to_agent_id` required and must exist. One message.
+- **`broadcast`** — one message per recipient. Recipients are all agents **excluding the sender** and
+  **excluding `status == "disabled"`**; with `team_id`, further restricted to that team's members (a missing
+  team silently degrades to all agents).
+- **`lead`** — requires `team_id`; resolves to `team.lead_agent_id`. One message.
+- `drainMailbox(agentId, taskId)` — called during dispatch: list pending, mark all delivered, emit
+  `message:delivered` per message, return them for prompt injection.
+- `listPending(agentId)` — `status == "pending"`, not expired, `to_agent_id == agentId`.
+- `purgeExpired()` — deletes messages that are expired **or** were delivered more than **3600000 ms** ago;
+  returns the count. One batched index update.
+- `list()` sorts by `created_at` ascending via `localeCompare` — see the timestamp hazard in §6.4.
+
+### 7.17 Context (L1)
+
+- `set(key, value, ttlMs?)` — `ttlMs`, when given, must be finite, `> 0` and `<= 2592000000` (30 days), else a
+  plain `Error` (exit 1): `TTL must be a positive number up to 2592000000ms (30 days)`.
+- `created_at` is preserved across overwrites; `updated_at` is always refreshed.
+- `expires_at = now + ttl_ms` when a TTL is given, else omitted.
+- `get` lazily deletes an expired entry and returns `null`.
+- `list` lazily deletes all expired entries (batched, with a single index rewrite) and returns the rest sorted
+  by `key` ascending (`localeCompare`).
+- `getAll()` → `{ key: value }` map built from `list()`.
+- Keys go through `sanitizeId` (§6.2) — invalid keys throw.
+
+### 7.18 Teams (L1)
+
+- `create` — name required and unique; the lead agent must exist; members are validated and de-duplicated
+  against the lead. Emits `team:created`, then `team:member_joined` per additional member.
+- `join` — rejects an existing member; the agent must exist. Emits `team:member_joined`.
+- `leave` — **the lead cannot leave** (`Lead cannot leave team. Disband the team or transfer lead first.`).
+  Emits `team:member_left`.
+- `add-task` — the task must exist; appending is idempotent; emits `team:task_added` only on an actual append.
+- `set-lead` — the agent must already be a member; demotes the previous lead to `member`.
+- `disband` — sets `status = "disbanded"` (does **not** delete the file); emits `team:disbanded`.
+- `findTeamForAgent` — first `active` team containing the agent.
+
+> `team:task_claimed` is declared in the event union but is **never emitted** by any code path, and
+> `TeamConfig.auto_claim` / `max_concurrent_tasks` are stored but never read by the orchestrator. Team task
+> pools do not currently affect dispatch. Preserve the data model and the CLI; do not invent the behaviour.
+
+### 7.19 Event types (L1 — the names and payload fields are contract)
+
+Emitted synchronously; handler exceptions are caught and logged, never propagated. Subscribers can register
+per-type (`on`, `once`, `off`) or wildcard (`onAny`). A listener count above `maxListeners` (default 10) logs a
+one-time warning per type.
+
+| Event | Payload |
+|---|---|
+| `task:created` | `task: Task` |
+| `task:assigned` | `taskId, agentId` |
+| `task:status_changed` | `taskId, from, to` |
+| `task:auto_reviewed` | `taskId, passed, results` |
+| `task:scope_overlap` | `taskId, overlappingTaskId, patterns` |
+| `task:cascade_failed` | `taskId, failedDependencyId, reason` |
+| `task:orphaned` | `taskId` |
+| `agent:started` | `agentId, taskId, runId` |
+| `agent:output` | `runId, agentId, data` |
+| `agent:file_changed` | `runId, agentId, path` |
+| `agent:completed` | `runId, agentId, success` |
+| `agent:error` | `runId, agentId, error, errorKind?` |
+| `agent:autonomous_toggled` | `agentId, autonomous` |
+| `run:retry` | `runId, attempt, delay_ms` |
+| `orchestrator:tick` | `running, queued` |
+| `orchestrator:stall_detected` | `runId` |
+| `orchestrator:error` | `error, context, fatal` |
+| `orchestrator:shutdown` | `reason` |
+| `workspace:merge_succeeded` | `taskId, branch` |
+| `workspace:merge_conflict` | `taskId, branch, conflictInfo` |
+| `message:sent` | `messageId, fromAgentId, toAgentId, channel` |
+| `message:delivered` | `messageId, toAgentId, taskId` |
+| `team:created` | `teamId, name, leadAgentId` |
+| `team:member_joined` | `teamId, agentId` |
+| `team:member_left` | `teamId, agentId` |
+| `team:task_claimed` | `teamId, taskId, agentId` *(never emitted)* |
+| `team:disbanded` | `teamId` |
+| `team:task_added` | `teamId, taskId` |
+| `goal:created` | `goalId, title` |
+| `goal:status_changed` | `goalId, from, to` |
+| `goal:updated` | `goalId` |
+| `goal:deleted` | `goalId` |
+
+### 7.20 Event data caps (L1)
+
+Three layers, applied in order:
+
+1. `readLines` caps each stdout line at **16384** characters (truncated, not split). A truncated JSON line
+   becomes unparseable and falls through the adapter's parse-failure path.
+2. `serializeEventData(data, 8192)` before the JSONL write — stringify if not already a string, then truncate
+   with a trailing `…`.
+3. `serializeEventData(serialized, 4096)` before the event-bus emit, for TUI consumption.
+
+Additionally `appendJsonl` may truncate further to fit `PIPE_BUF` (§6.9), and `proof.agent_summary` is capped
+at 2000 characters.
+
+---
+
+## 8. Adapters
+
+Eight adapters. Registration order (which is also the `doctor` probe order and `listKinds()` order) is L0:
+**`claude, codex, cursor, shell, opencode, pi, grok, antigravity`**.
+
+`AdapterRegistry.require(kind)` on an unknown kind throws a plain `Error`:
+`Unknown adapter: "<kind>". Available: <kinds joined by ", ">`.
+
+### 8.1 The adapter contract (L1)
+
+```rust
+pub struct ExecuteParams {
+    pub prompt: String,
+    pub system_prompt: Option<String>,
+    pub workspace: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub config: AgentConfig,
+    // cancellation: see ARCHITECTURE.md §6
+}
+
+pub enum AgentEventKind { Output, FileChange, Command, ToolCall, Error, Done }
+
+pub struct AgentEvent {
+    pub kind: AgentEventKind,
+    pub timestamp: String,        // ISO-8601, generated at parse time
+    pub data: serde_json::Value,
+    pub tokens: Option<TokenUsage>,
+    pub error_kind: Option<AdapterErrorKind>,
+}
+
+pub struct AdapterTestResult {
+    pub ok: bool,
+    pub version: Option<String>,
+    pub error: Option<String>,
+    pub error_kind: Option<AdapterErrorKind>,
+    pub details: Option<serde_json::Value>,
+}
+```
+
+The TS `execute()` returns `{ pid, events: AsyncGenerator<AgentEvent> }` **synchronously** — the PID is
+available before the first event is pulled. The Rust equivalent must preserve this: `execute` returns the PID
+and a stream, not a future of both. The generator body must not be required to run for the process lifecycle
+listeners to attach (the TS code attaches `close`/`error`/stderr listeners eagerly for exactly this reason —
+a fast-failing child must not be missed).
+
+`AgentEvent.type → RunEvent.type` mapping (L0):
+`output → agent_output`, `file_change → file_changed`, `command → command_run`, `tool_call → tool_call`,
+`error → error`, anything else → `done`.
+
+### 8.2 argv per adapter (L0)
+
+Every argv below is exact and ordered. Conditional arguments are marked. No adapter does shell quoting (the
+shell adapter delegates to `bash`), none sets a per-process timeout, and **none has any resume/session/continue
+flag**.
+
+| Adapter | Binary | argv |
+|---|---|---|
+| `claude` | `claude` | `--print`, `--output-format stream-json`, `--max-turns <config.max_turns ?? 50>`, `--verbose`, `--dangerously-skip-permissions`, [`--model <m>`], [`--effort <e>`], [`--system-prompt <sp>`], then **`<prompt>` as the last positional** |
+| `codex` | `codex` | `exec`, `--json`, `--sandbox danger-full-access`, [`--model <m>`], `-` — **prompt goes on stdin** (write + `end()`) |
+| `cursor` | `cursor-agent`, falling back to `agent` | `-p`, `--output-format stream-json`, `--workspace <workspace>`, `--yolo`, `--trust`, [`--model <m>`], then `<fullPrompt>` last |
+| `opencode` | `opencode` | `run`, `--format json`, [`--model <m>`], then `<fullPrompt>` last |
+| `pi` | `pi` | `--mode rpc`, [`--model <m>`], [`--thinking <effort>`], [`--append-system-prompt <sp>`] — **prompt sent as a JSONL RPC command on stdin, which stays open** |
+| `grok` | `grok` | `-p <prompt>` (**prompt is argv[1], raw**), `--output-format streaming-json`, `--permission-mode bypassPermissions`, `--always-approve`, `--cwd <workspace>`, [`--model <m>`], [`--effort <e>`], [`--max-turns <n>`], [`--system-prompt-override <sp>`] |
+| `antigravity` | `agy` | `-p`, `<fullPrompt>` (**argv[2], not last**), `--dangerously-skip-permissions`, [`--model <m>`] |
+| `shell` | `bash` | `-lc`, `<config.command>` — **prompt passed via the `ORCHESTRY_TASK_PROMPT` env var** |
+
+Notes that are easy to get wrong:
+
+- `claude` always passes `--max-turns`, defaulting to **50** (`?? 50`). `grok` passes `--max-turns` only when
+  `config.max_turns` is **truthy**, so `0` omits it.
+- `pi` uses **`--thinking`** for effort and **`--append-system-prompt`** (never `--system-prompt`). It
+  deliberately does **not** pass `--no-session`.
+- `grok` passes `--cwd <workspace>` *in addition to* setting the spawn cwd.
+- `cursor` resolves its binary only inside `test()`; if `test()` never ran, `execute()` spawns `cursor-agent`.
+- `antigravity` puts the prompt at argv index 2, before `--dangerously-skip-permissions`.
+- System prompt handling differs: `claude`/`pi`/`grok`/`antigravity` use
+  `params.systemPrompt ?? config.system_prompt`; `codex`/`cursor`/`opencode`/`shell` use `params.systemPrompt`
+  **only** and ignore `config.system_prompt`.
+- `buildFullPrompt(system, user)` = `system ? system + "\n\n" + user : user`.
+
+### 8.3 Spawn environment (L0)
+
+Every adapter spawns with `{ ...process.env, ...params.env }` — the parent environment is **inherited** and
+then overlaid. `params.env` is assembled by the orchestrator as
+`{ ...agent.config.env, ORCH_AGENT_ID, ORCH_AGENT_NAME, ORCH_TASK_ID }` — so the three `ORCH_*` variables
+**override** any same-named key in the agent's configured env.
+
+The shell adapter additionally sets `ORCHESTRY_TASK_PROMPT` to the full combined prompt.
+
+### 8.4 Process spawning (L0/L1)
+
+`ProcessManager.spawn`:
+- `stdio: ['ignore', 'pipe', 'pipe']` by default — **stdin is ignored**, which is why every adapter passes a
+  permission-bypass flag (an interactive prompt would hang forever). `codex` and `pi` override stdin to `pipe`.
+- `detached: true` — **a new process group**, so killing `-pid` reaps the whole tree (vitest, playwright, …).
+- `proc.unref()` — the parent may exit without waiting; the stdout/stderr pipes keep their own refs while being
+  read.
+- No PID ⇒ throw `Failed to spawn process: <command>`.
+
+`isAlive(pid)` = `kill(pid, 0)` succeeds, or fails with `EPERM`.
+
+`kill(pid, signal = SIGTERM)` — try `kill(-pid, signal)` (the group) **first**; on failure fall back to
+`kill(pid, signal)`; swallow all errors.
+
+`killWithGrace(pid, graceMs = 10000)` — return if already dead; send `SIGTERM`; poll `isAlive` every **200 ms**
+until the deadline; then send `SIGKILL`. Call sites use different grace periods:
+`cancelTask`/`forceStopAgent` → **3000 ms**, stall detection and adapter abort → **5000 ms**,
+`stop()` and `adapter.stop()` → the **10000 ms** default.
+
+There is **no registry of spawned processes** — the PID in `state.running` is the only handle.
+
+### 8.5 Line reading (L1)
+
+`readLines(stream)` is a byte-level newline splitter, not a text-mode reader:
+- Splits on `0x0A` only; a `\r` is retained as part of the line.
+- **Empty lines are skipped** (`if (newlineIdx > offset)`).
+- A trailing fragment with no final newline **is** yielded.
+- Each line is capped at **16384** characters.
+- Decoded as UTF-8 per line.
+
+`pi` does its own framing and does not use `readLines`.
+
+### 8.6 stdout parsing and `done` sources (L1)
+
+| Adapter | Format | `done` from | Synthesises `done`? |
+|---|---|---|---|
+| `claude` | JSONL | `{"type":"result"}` | no |
+| `codex` | JSONL | `{"type":"turn.completed"}` | no |
+| `cursor` | JSONL | `{"type":"result"}` | no |
+| `opencode` | JSONL | `step_finish` whose `reason` is anything other than `"error"`/`"tool-calls"` (including absent) | no |
+| `pi` | JSONL RPC | `agent_end` (possibly promoted by `agent_settled`) with no failure | no |
+| `grok` | JSONL | `{"type":"end"}` | **yes** — on a clean exit 0 with no `end` record |
+| `antigravity` | plain text lines | — | **yes** — always, after exit 0 or `null`, when not aborted |
+| `shell` | plain text lines | — | **never** |
+
+`claude` line dispatch (L1):
+
+| `parsed.type` | Emitted |
+|---|---|
+| `assistant` | `output`, data = `parsed.message ?? parsed` |
+| `tool_use` | `tool_call`, data = whole `parsed` |
+| `tool_result` | `output`, data = whole `parsed` |
+| `error` | `error`, data = `parsed.error ?? parsed`, `errorKind = classifyAdapterError(stringified)` |
+| `result` | `done`, data = whole `parsed`, `tokens = extractTokens(parsed, { statsFallback: true })` |
+| anything else | `output`, data = whole `parsed` |
+| unparseable line | `output`, data = the raw line **string** |
+
+`data` shapes are **not uniform across adapters** — the `interface.ts` docstring declares a canonical shape
+(`output: { text, raw }` etc.) but acknowledges that claude/cursor emit `parsed.message`, codex emits
+`{ text, raw }`, opencode emits bare strings, and shell emits bare line strings. Consumers must be
+**defensive**, exactly like the TS TUI's `formatAgentOutput`. Reproduce the per-adapter shapes as they are;
+do not normalize them.
+
+### 8.7 Token extraction (L1)
+
+`extractTokens(parsed, { statsFallback })`:
+1. `usage = parsed.usage`; if absent and `statsFallback` (claude only), `usage = parsed.stats?.usage`.
+2. No `usage` ⇒ `None`.
+3. `input` = `usage.input_tokens` else `usage.inputTokens`; **if neither is a number, return `None`**.
+4. `output` = `output_tokens` / `outputTokens` else 0.
+5. `reasoning` = `reasoning_tokens` / `reasoningTokens` else 0.
+6. `cache_read` = `cache_read_input_tokens` / `cacheReadTokens` else 0.
+7. `cache_write` = `cache_creation_input_tokens` / `cacheWriteTokens` else 0.
+8. `total = input + output + reasoning` — **cache counters excluded**.
+
+### 8.8 Error classification (L0)
+
+`classifyAdapterError(error, exitCode?)` lowercases the message and tests **in this order**; the first match
+wins, so **string matches always beat the exit code**:
+
+| # | Condition (substring of the lowercased message) | Result |
+|---|---|---|
+| 1 | `enoent` or `spawn failed` | `spawn_failed` |
+| 2 | `not found` or `command not found` or `no such file` | `adapter_not_found` |
+| 3 | `auth` or `unauthorized` or `401` or `invalid api key` or `authentication` | `auth_failed` |
+| 4 | `timeout` or `timed out` or `etimedout` | `timeout` |
+| 5 | `rate limit` or `429` or `too many requests` | `rate_limit` |
+| 6 | `exitCode` is present and non-zero | `process_crash` |
+| 7 | otherwise | `unknown` |
+
+Exactly **7** enum values, all matching `^[a-z_]+$`:
+`adapter_not_found, auth_failed, timeout, rate_limit, process_crash, spawn_failed, unknown`.
+
+Quirks to preserve: `auth` is a bare substring, so `"author"` classifies as `auth_failed`; `401`/`429` are
+bare substrings, not status-code parsing. The stderr tail is appended to the message **before** classification,
+so stderr content can change the class of an exit-code failure.
+
+Conformance vectors (port these as a table test):
+
+```
+'spawn ENOENT'                  → spawn_failed        'Rate limit exceeded'           → rate_limit
+'Spawn failed: /usr/bin/foo'    → spawn_failed        'HTTP 429 Too Many Requests'    → rate_limit
+'claude: command not found'     → adapter_not_found   'Too many requests, slow down'  → rate_limit
+'CLI not found on PATH'         → adapter_not_found   ('Segmentation fault', 139)     → process_crash
+'Authentication failed'         → auth_failed         ('Unknown error occurred', 1)   → process_crash
+'Request unauthorized'          → auth_failed         ('Something weird', 0)          → unknown
+'HTTP 401 error'                → auth_failed         'Something else'                → unknown
+'Invalid API key provided'      → auth_failed         ('ENOENT /bin/claude', 127)     → spawn_failed
+'Request timeout after 60s'     → timeout             ('Unauthorized access', 1)      → auth_failed
+'Connection timed out'          → timeout
+'connect ETIMEDOUT 1.2.3.4:443' → timeout
+```
+
+### 8.9 `ERROR_HINTS` (L0)
+
+| Kind | `message` | `fix` | `doctorHint` |
+|---|---|---|---|
+| `adapter_not_found` | `CLI is not installed.` | `Install it with: npm i -g @anthropic-ai/claude-code` | `true` |
+| `auth_failed` | `API key is invalid.` | `Check it with: claude auth status` | — |
+| `timeout` | `Agent timed out.` | `Increase the timeout with: orch config set agent_timeout <ms>` | — |
+| `rate_limit` | `API rate limit reached.` | `Wait and retry with: orch task retry <id>` | — |
+| `process_crash` | `Agent process crashed.` | `Try again with: orch task retry <id>` | — |
+| `spawn_failed` | `Failed to start the process.` | `Check PATH and file permissions` | — |
+| `unknown` | `Unknown error.` | `Run: orch doctor` | `true` |
+
+> The `timeout` fix references `orch config set agent_timeout <ms>`, which is **not a real config key** (the
+> real path is `defaults.agent.timeout_ms`). Replicated as-is — see §14.3.
+
+### 8.10 Exit handling (L1)
+
+`createStreamingEvents` (used by claude, codex, cursor, opencode):
+- Attaches `close`, `error` and the stderr tail capture **eagerly**, before the generator is first polled.
+- Keeps a bounded **4096-byte tail** of stderr (an exactly-sized copy, not a view).
+- Reads stdout to EOF, then **destroys the stdout stream** in a `finally` to release the FD immediately.
+- Then awaits exit, and throws only when **not aborted and no `done` event was seen**:
+  - spawn error ⇒ `appendStderrTail(err.message, <AdapterName>, tail)`
+  - non-zero, non-null exit ⇒ `appendStderrTail("<AdapterName> process exited with code <n>", …)`
+  - in both cases the thrown error carries `errorKind = classifyAdapterError(message, exitCode)`
+
+`appendStderrTail(msg, name, tail)` = `msg` when the tail is empty, else
+`"<msg>\n--- <name> stderr (tail) ---\n<tail>"`.
+
+The `gotDoneEvent` suppression matters: an adapter that emitted `done` and *then* exited non-zero is treated as
+a **success**.
+
+Shell adapter exit messages (L0): `Shell command exited with code <n>`, or
+`Shell command terminated by signal <sig|unknown>` when the exit code is null. A missing `config.command`
+yields a handle with `pid: 0` whose stream emits a single `error` event with data
+`Shell adapter requires a command in agent config` and `errorKind = spawn_failed`.
+
+### 8.11 Backpressure (L1)
+
+`EventBuffer` is a ring buffer with capacity **1024**. `push()` returns a future that resolves when space is
+available; the consumer dequeues in O(1) with event-driven wakeup (no polling). The shell adapter reads stdout
+and stderr **concurrently** into one buffer and closes it when both drain — reading them sequentially would
+deadlock on a full pipe. Reproduce the concurrency, not the data structure.
+
+### 8.12 Model discovery (L1)
+
+`src/infrastructure/models/model-discovery.ts` probes installed CLIs to list available models, with
+per-adapter regex parsers, a process-lifetime cache, and hard-coded fallback option lists used when the probe
+fails. It feeds the TUI model picker only; nothing in the engine depends on it. Port the fallback lists and the
+probe table verbatim from the source — they are data, and `test/unit/infrastructure/model-discovery.test.ts`
+pins the parsers.
+
+### 8.13 Model tiers (L0 — this is data)
+
+`resolveModel(adapter, tier)`; unknown adapter ⇒ `""`. `defaultModelForAdapter(a)` = the `balanced` entry.
+
+| Adapter | `capable` | `balanced` | `fast` |
+|---|---|---|---|
+| `claude` | `claude-opus-4-6` | `claude-sonnet-4-6` | `claude-haiku-4-6` |
+| `opencode` | `openrouter/anthropic/claude-opus-4.6` | `""` | `openrouter/google/gemini-2.5-flash` |
+| `codex` | `gpt-5.4` | `gpt-5.3-codex` | `gpt-5-mini` |
+| `cursor` | `auto` | `auto` | `auto` |
+| `pi` | `openai-codex/gpt-5.5` | `openai-codex/gpt-5.5` | `openai-codex/gpt-5.5` |
+| `grok` | `grok-build` | `grok-composer-2.5-fast` | `grok-composer-2.5-fast` |
+| `antigravity` | `gemini-3-pro` | `""` | `gemini-3-flash` |
+| `shell` | `""` | `""` | `""` |
+
+`SUPPORTED_ADAPTERS` display order (L0):
+`claude, opencode, codex, cursor, pi, grok, antigravity, shell` — note this differs from the registration
+order in §8.
+
+---
+
+## 9. Prompts, templates and skills
+
+### 9.1 Prompt assembly (L0 — the rendered text is contract)
+
+1. `systemTemplate = config.prompt.system_template ?? DEFAULT_SYSTEM_TEMPLATE`
+2. `userTemplate = config.prompt.user_template ?? DEFAULT_USER_TEMPLATE`
+3. If `config.prompt.template` is set (**legacy single-template mode**), render **only** that one into `prompt`
+   and leave `systemPrompt` unset.
+4. Otherwise render both: `systemPrompt` from the system template, `prompt` from the user template.
+5. If the agent has `config.skills`, load library skills and append the block:
+   - split mode → `systemPrompt = systemPrompt + "\n\n" + skillBlock`
+   - legacy mode → `prompt = prompt + "\n\n" + skillBlock`
+6. `run.prompt` persists the **user** prompt only — the system prompt is not stored.
+
+Render timeout: **5000 ms** by default, implemented by the caller, not the template engine. On timeout:
+`Template render timed out after <ms>ms`.
+
+The two default templates are inline constants in `src/infrastructure/template/template-engine.ts`
+(`DEFAULT_SYSTEM_TEMPLATE` lines 317-360, `DEFAULT_USER_TEMPLATE` lines 366-436). **Copy them byte for byte**
+into the Rust source. `DEFAULT_PROMPT_TEMPLATE = DEFAULT_SYSTEM_TEMPLATE + "\n" + DEFAULT_USER_TEMPLATE`
+(deprecated, but asserted by a test).
+
+### 9.2 Template context (L0 — variable names and nesting)
+
+```
+project.name                string
+project.description         string?
+task.id                     string
+task.title                  string
+task.description            string
+task.priority               number
+task.labels                 string[]
+task.scope                  string[]?
+task.is_autonomous          bool        (labels includes "autonomous")
+task.goal_id                string?     (from Task.goalId)
+agent.id, agent.name        string
+agent.role                  string?
+agents[]                    { id, name, role?, adapter }
+attempt                     number | null   ← null when attempt <= 1, NEVER 0
+workspace_path              string
+retry.previous_error        string       (only when attempt > 1)
+retry.previous_output       string
+feedback                    string?
+shared_context              { key: value }?   (absent when empty)
+messages[]                  { id, from, subject, body, sent_at, reply_to? }?  (absent when empty)
+goal                        { id, title, description, status, task_names[], progress? }?
+```
+
+Construction rules that matter:
+- `attempt` is `null` for the first attempt, not `0` — because `0` is **truthy** in Liquid.
+- `retry` is only populated when `attempt > 1`, even if a retry context is supplied.
+- In `agents[]`, the **current agent's own `role` is set to `undefined`** (it is already in the system prompt).
+- `shared_context` is `undefined` (not `{}`) when empty, and otherwise passes through
+  `filterRelevantContext` (§9.3).
+- `messages` is `undefined` (not `[]`) when empty. `messages[].from` is the sender's **name** when resolvable,
+  falling back to the raw agent id.
+- `goal.task_names` entries are formatted `[<status>] <title>`.
+- `goal.progress` comes from the context key `<goalId>-progress`.
+
+### 9.3 `filterRelevantContext` (L1)
+
+Scores each shared-context entry, keeps at most **15**:
+
+| Points | Rule |
+|---|---|
+| +10 | key (lowercased) starts with the task's `goalId` (lowercased) |
+| +8 | key **or value** (lowercased) contains the agent name (lowercased) |
+| +6 | any task scope pattern, stripped of `*` and trailing `/`, appears in the key or value (first match only) |
+| +4 | key starts with `<roleKeyword>-` or `<roleKeyword>_` (first match only) |
+| +1 | key matches `^(bug|perf|stability|docs|arch|spec)-` (case-insensitive) |
+
+Sort by score descending (stable). Take all entries with score > 0 up to 15, then pad with score-0 entries up
+to 15. Values are **never truncated**.
+
+Role keywords: the first word of the lowercased agent name (if longer than 1 char); plus
+`front-end, frontend, tui` if the name contains `front` or `tui`; plus `marketer, marketing, cmo` if it
+contains `market` or `cmo`; plus the first word of the lowercased role (if longer than 2 chars and not already
+present).
+
+### 9.4 Liquid surface actually used (L0)
+
+**No custom filters or tags are registered.** Everything is built-in liquidjs, configured with
+`strictFilters: false, strictVariables: false`.
+
+| Construct | Occurrences |
+|---|---|
+| `{{ … }}` | all interpolations |
+| `{% if %}` / `{% endif %}` | 17 distinct conditions |
+| `{% for x in y %}` / `{% endfor %}` | `agents`, `shared_context`, `messages`, `goal.task_names` |
+| `default:` filter | 3 occurrences, all on `task.goal_id` |
+| `.size` | `messages.size` ×2, `goal.task_names.size` ×2 |
+| object iteration with `entry[0]`/`entry[1]` | `shared_context` |
+| operators | `!=`, `>`, bare truthiness |
+
+**Not used anywhere:** whitespace control (`{%- -%}`), `assign`, `capture`, `unless`, `case/when`, `include`,
+`render`, `raw`, `comment`, `cycle`, `tablerow`, `increment`, `else`/`elsif`, `forloop`, and every date,
+number and string filter.
+
+### 9.5 liquidjs vs the Rust `liquid` crate — measured differences
+
+Measured against `liquid` 0.26.11 and `liquidjs` 10.27.2 with the actual constructs above:
+
+**Identical (verified):** `.size` on arrays; `!=` and `>`; Shopify truthiness (`nil`/`false` falsy; `0`, `""`
+and `[]` **truthy**); `default:` on an explicit `null`; inline `{% if %}` within a line; `for` over an array of
+objects; **and, critically, all whitespace handling** — including the `\n\n\n` runs that the real prompts
+produce. `A\n{% if t %}\nB\n{% endif %}\nC` renders to `"A\n\nB\n\nC"` in both.
+
+**Differs — must be mitigated:**
+
+| # | Difference | Mitigation (mandatory) |
+|---|---|---|
+| 1 | **Missing key or variable** — liquidjs renders `""`; the Rust crate raises `Unknown index` / `Unknown variable`. | Always build the globals object with **every** documented variable present, using explicit `nil` for absent optionals. Never omit a key. Verified: `{"task":{"goal_id":null}}` renders identically in both. |
+| 2 | **Object iteration order** — liquidjs iterates insertion order; the Rust crate's `Object` does not. | Pass `shared_context` as an **ordered array of `[key, value]` pairs**. Verified to render identically through `entry[0]`/`entry[1]` while preserving order. Keep it `nil` (not `[]`) when empty, matching the TS `undefined`. |
+| 3 | **Unknown filter** — liquidjs passes the value through (`strictFilters: false`); the Rust crate fails at **parse** time. | Affects only user-supplied templates in `config.prompt.*`. Documented divergence (§14.6); surface the parse error as a clear message rather than a panic. |
+| 4 | Nested access through a `nil` parent (`retry.previous_error` when `retry` is `nil`) errors in the Rust crate. | Harmless for the shipped templates, since every such access is inside an `{% if parent %}` guard which short-circuits. Keep `retry`/`goal`/`messages` as `nil` rather than empty objects — an **empty object is truthy** in Liquid and would wrongly enter the block. |
+| 5 | `liquid` 0.26.11 pulls `kstring` 2.0.5, whose MSRV (1.96.0) exceeds the pinned toolchain (1.94.1). | Pin `kstring = "2.0.2"` in the workspace, or raise the toolchain. Noted in `Cargo.toml`. |
+
+**The acceptance gate for this subsystem** is a golden-fixture suite: render both default templates through
+the TS binary across the full matrix of branch combinations, store the outputs, and assert the Rust renderer
+reproduces them byte for byte. See [ARCHITECTURE.md §8.3](ARCHITECTURE.md).
+
+### 9.6 Skill loading (L1)
+
+- **Library directory resolution**: walk up from the executable's own directory up to 5 levels looking for
+  `skills/library/`; fall back to `<dir>/../../../skills/library`. In r-orch this becomes: the directory
+  containing the binary, then `$CARGO_MANIFEST_DIR` in debug builds, then an installed share path. The
+  **library content is shipped with the binary** and must be byte-identical to `parity/orch-ts/skills/library/`.
+- **Name validity**: `^[a-z0-9-]+$`. A name failing this returns `None` **without touching the filesystem** —
+  this is the path-traversal defence.
+- **Library vs MCP**: a skill name **containing `:`** is an MCP skill, handled natively by the Claude CLI, and
+  is **silently skipped** by the loader.
+- **Missing skill**: logs `[orch] skill library: "<name>" not found in <dir>` to **stderr**, caches the empty
+  result, and continues. Never throws.
+- **Caching**: per-loader-instance, process lifetime, including negative results.
+- **Output format** (L0): `## Skills\n\n` followed by, per resolved skill, `### <name>\n\n<file content>`,
+  joined by `\n\n`. Returns `""` when no library skills resolve (and the caller then appends nothing).
+- Skill order follows the order of `agent.config.skills`, not the directory order.
+- `listAvailable()` → `.md` basenames, **sorted**, cached.
+
+---
+
+## 10. Workspaces
+
+### 10.1 Mode resolution (L0)
+
+`task.workspace_mode ?? agent.config.workspace_mode ?? config.defaults.agent.workspace_mode ?? "worktree"`.
+
+Modes: `shared` (use the project root as-is), `worktree` (git worktree on a dedicated branch),
+`isolated` (a full local clone, falling back to rsync).
+
+Any mode other than `shared` first requires a git repository: `git rev-parse --is-inside-work-tree`. A
+**positive** result is cached for the process; a negative result is **re-probed every time** (the user may run
+`git init` meanwhile). Failure ⇒ `WorkspaceError` (exit 6):
+
+```
+workspace_mode "<mode>" requires a git repository
+```
+hint:
+```
+Run: git init && git add -A && git commit -m "Initial commit"
+         Or set workspace_mode: shared in .orchestry/config.yml
+```
+(the hint contains a literal newline followed by 9 spaces).
+
+### 10.2 Worktree preparation (L0 — paths, branch names and command sequence)
+
+- **Directory**: `<projectRoot>/.orchestry/workspaces/<taskId>` (the task id through `sanitizeId`).
+- **Branch**: `orchestry/<taskId>/<titleSlug>` where
+  ```
+  titleSlug = title.toLowerCase()
+                   .replace(/[^a-z0-9]+/g, '-')
+                   .replace(/^-|-$/g, '')
+                   .slice(0, 40)
+  ```
+  **Dash-trimming happens before the 40-char slice**, so a truncated slug may end with `-`. A title with no
+  `[a-z0-9]` characters slugs to `""` and the branch falls back to `orchestry/<taskId>/<taskId>` — tests pin
+  `orchestry/tsk_cjk1/tsk_cjk1` for `修复数据库连接` and `orchestry/tsk_emo1/tsk_emo1` for `🚀🎉✨`.
+- **Idempotent**: if the directory already exists, return `{ path, branch }` without touching git.
+- **Command sequence**:
+  1. `git worktree add <path> -b <branch>`
+  2. on failure → `git worktree prune`
+  3. then `git worktree add <path> <branch>` (reuse the existing branch; **no `-b`**)
+  4. still failing ⇒ `WorkspaceError`: `git worktree add failed with code <n>`, hint
+     `Run: git worktree prune && git branch | grep orchestry | xargs -r git branch -D`
+  5. on success, recursively remove `<path>/.orchestry` so worktrees do not nest state.
+
+### 10.3 Isolated preparation (L1)
+
+1. `git clone --local --no-hardlinks <projectRoot> <path>`; a non-zero exit falls through to:
+2. `rsync -a --exclude-from=<orchestryDir>/workspace-exclude ./ <path>/` with `cwd = projectRoot`; a non-zero
+   exit throws a **plain** `Error` (`rsync failed with code <n>`), not a `WorkspaceError` — so it surfaces as
+   exit 1, not 6.
+3. Recursively remove `<path>/.orchestry`.
+
+### 10.4 Merge-back (L0 for the git commands, L1 for classification)
+
+There is exactly **one** merge strategy and no strategy option:
+
+```
+git merge --no-ff <branch> -m "Merge <branch>"      cwd = projectRoot
+```
+
+- stdout and stderr are appended into **one** buffer, guarded at **2000** chars (the guard is checked *before*
+  appending, so the buffer can overshoot by one chunk).
+- exit 0 ⇒ `{ success: true }`.
+- otherwise `trimmed = output.slice(0, 1000)`;
+  `isConflict = trimmed.includes("CONFLICT") || trimmed.includes("Merge conflict")`.
+  - conflict ⇒ run `git merge --abort` (cwd = projectRoot), then `{ success: false, conflictInfo: trimmed }`
+  - **not** a conflict (e.g. `fatal: branch not found`) ⇒ `{ success: false, conflictInfo: trimmed }` with
+    **no abort**
+- a spawn `error` event ⇒ `{ success: false, conflictInfo: err.message }`
+- `mergeBack` **never rejects**.
+
+Orchestrator integration: success ⇒ emit `workspace:merge_succeeded` then `cleanup(taskId, branch)`.
+Failure ⇒ emit `workspace:merge_conflict` and force the task to `review` with summary prefix
+`MERGE CONFLICT: <info>`, **returning early so auto-approve is skipped**. A thrown error ⇒ summary prefix
+`MERGE ERROR: <msg>`, same early return.
+
+### 10.5 Cleanup (L1)
+
+```
+git worktree remove --force <path>        awaited first, exit code ignored
+then concurrently:
+  git branch -D <branch>                  only when a branch is given
+  rm -rf <path>                           errors swallowed
+```
+Never throws; cleaning a non-existent workspace succeeds. Called after a successful merge and on permanent
+task failure, both wrapped to emit `orchestrator:error { context: "workspace cleanup for <taskId>" }`.
+
+### 10.6 `getChangedFiles(branch)` (L1)
+
+```
+git merge-base HEAD <branch>                  → mergeBase (trimmed); empty ⇒ []
+git diff --name-only <mergeBase>...<branch>   → non-zero or empty stdout ⇒ []
+                                              → else split on '\n', drop empties
+```
+Any throw ⇒ `[]`. Called only when the adapter reported no changed files.
+
+### 10.7 Path validation (L0)
+
+`validateWorkspacePath(p, root)` resolves both and throws
+`Workspace path "<p>" is outside project root` unless the resolved path equals the root or starts with
+`root + separator`.
+
+---
+
+## 11. Serve mode, doctor, init, org, update
+
+### 11.1 `serve` (L0 for the log record fields, L2 for the text format)
+
+`serve` starts the full orchestrator in watch mode and streams structured logs. It **does not** run the update
+check.
+
+Flags: `--once`, `--tick-interval <ms>` (overrides `scheduling.poll_interval_ms`), `--log-file <path>`
+(append mode, in addition to stdout), `--log-format json|text` (default `json`), `--verbose`.
+
+**JSON record** (`--log-format json`, the default): one compact JSON object per line, `JSON.stringify(entry) + "\n"`.
+Every record has:
+
+| Field | Type |
+|---|---|
+| `ts` | ISO-8601 instant, generated at transform time (**not** the originating event's timestamp) |
+| `level` | `debug \| info \| warn \| error` |
+| `event` | the `OrchestratorEvent` type string, or a serve-local event name |
+
+plus the per-event fields below. **Events not listed are suppressed entirely** (the transform returns null).
+
+| `event` | `level` | Extra fields |
+|---|---|---|
+| `orchestrator:tick` | `info` | `running`, `queued`, `heap_mb` *(heap bytes / 1048576, 1 decimal)* |
+| `orchestrator:shutdown` | `info` | `reason` |
+| `orchestrator:error` | `error` if `fatal` else `warn` | `error`, `context`, `fatal` |
+| `orchestrator:stall_detected` | `warn` | `runId` |
+| `agent:started` | `info` | `agentId`, `taskId`, `runId` |
+| `agent:completed` | `info` if `success` else `warn` | `runId`, `agentId`, `success` |
+| `agent:error` | `error` | `runId`, `agentId`, `error`, `errorKind` |
+| `agent:output` | `debug` | `runId`, `agentId`, `data` **truncated to 200 chars** — **only when `--verbose`** |
+| `agent:file_changed` | `info` | `runId`, `agentId`, `path` |
+| `run:retry` | `warn` | `runId`, `attempt`, `delay_ms` |
+| `task:created` | `info` | `taskId`, `title` |
+| `task:status_changed` | `info` | `taskId`, `from`, `to` |
+| `task:auto_reviewed` | `info` | `taskId`, `passed` *(the `results` array is **not** logged)* |
+| `task:orphaned` | `warn` | `taskId` |
+| `task:scope_overlap` | `warn` | `taskId`, `overlappingTaskId`, `patterns` |
+| `task:cascade_failed` | `warn` | `taskId`, `failedDependencyId`, `reason` |
+| `workspace:merge_succeeded` | `info` | `taskId`, `branch` |
+| `workspace:merge_conflict` | `warn` | `taskId`, `branch`, `conflictInfo` |
+
+Suppressed (no record at all): `task:assigned`, all `message:*`, all `team:*`, all `goal:*`,
+`agent:autonomous_toggled`, and `agent:output` without `--verbose`.
+
+**Idle-tick throttling** (L1): a tick is "idle" when `running == 0 && queued == 0`. In non-verbose mode an idle
+tick is logged only when `tickCounter % idleLogInterval == 0`. The counter increments on **every** tick
+(including non-idle ones) and is never reset. `idleLogInterval` is **6**
+(`IDLE_LOG_EVERY_N_TICKS = 6` in `src/cli/commands/serve.ts:16` — verified). With `--verbose`, every tick is
+logged.
+
+**Text format** (L2): `"<HH:MM:SS.mmm> <LEVEL padded to 5> <event>  <k=v ...>\n"` — the time is
+`ts.slice(11, 23)`, the level is uppercased and right-padded to 5, there are **two** spaces before the field
+list, and values are raw for strings, JSON-encoded otherwise.
+
+**`--once`** (L0 for the exit code): start watch mode with `skipAutonomousSeeding: true`, then poll
+`taskStore.list()` every **2000 ms** until either the task list is **empty**, or **every** task is terminal,
+or an `orchestrator:shutdown` event was observed. Then `stop()`. Exit **1** if any task ended `failed`,
+else **0**. Note the check is `status === "failed"` specifically — a `cancelled` task does **not** cause a
+non-zero exit.
+
+**Flush on exit** (L1): all non-stdout/stderr streams are `end()`ed and awaited before the process exits, so a
+`--log-file` is never truncated.
+
+### 11.2 `doctor` (L1)
+
+Runs **without** an initialized project (the CLI registers it specially on `NotInitializedError`).
+
+Checks, in order: each adapter's `test()` in registration order
+(`claude, codex, cursor, shell, opencode, pi, grok, antigravity`), then `git` version, then whether the cwd is
+a git repository, then whether `.orchestry` is git-ignored, then the Node version, then the `.orchestry/`
+summary line (`exists · N agents · M tasks`), then the tally `<n> of 8 adapters ready`.
+
+Each adapter check shells out to `<bin> --version` (`cursor` tries `cursor-agent` then `agent`; `shell` runs
+`bash --version` and takes the first line). Pass shows the version string, failure shows the adapter's own
+not-found message (quoted in §5.4).
+
+**Exit code is 0 even when adapters are missing** — `doctor` reports, it does not gate.
+
+See §13 for the `node` check's replacement in r-orch.
+
+### 11.3 `init` (L0 for the created files, L1 for idempotency)
+
+- `--name <name>` overrides the project name; the default is the **basename of the current directory**.
+- `--adapter <adapter>` overrides `defaults.agent.adapter`.
+- Creates exactly the files in §6.11 and prints the tree shown in §5.4.
+- Writes `agents/agt_creator.yml` **directly**, not through `AgentStore`, so **no `_index.json` is created**.
+- Exit 0.
+
+### 11.4 `org` (L1 — the catalogue is L0 data)
+
+`org list` prints the available pre-built organization templates; `org deploy <template> [--goal <goal>]`
+instantiates one — creating the agent set, a team, and optionally a goal. The template catalogue
+(`src/domain/org-shop.ts`) and the agent-shop catalogue (`src/domain/agent-shop.ts`, **15 templates**) are
+**data that must be reproduced verbatim**, including every long role description, because those strings are
+injected into prompts. See [docs/parity/infra.md §5–§7](parity/infra.md).
+
+Agent-shop templates reference a semantic `tier` (`capable|balanced|fast`) rather than a model string;
+`templateToAgentInput(template, adapter)` resolves it via §8.13 and **filters out MCP skills (names containing
+`:`) for every adapter except `claude`**. Passing `adapter: "shell"` throws
+`Agent Shop templates require an AI adapter; create shell agents with --command`.
+
+### 11.5 `update` / update check (L1)
+
+- `update` checks npm for a newer version and installs it; `--check` only reports.
+- A **background, cache-only** check runs after every command **except** `tui`, `update` and `serve`. It is
+  stale-while-revalidate: it never blocks the CLI, and prints a notification after the command completes. When
+  an update is available it also kicks off a detached background install.
+- Cache location and TTL: see `src/cli/update-check.ts`.
+
+**r-orch divergence:** npm is not the distribution channel for a Rust binary. The `update` command and the
+background check are **reimplemented against the r-orch release channel**, keeping the command, its `--check`
+flag, and its exit codes. The notification text may differ (L2). Flagged in §13.
+
+---
+
+## 12. TUI feature checklist (L2 overall; the keymap is L1)
+
+The TUI is reimplemented with `ratatui` + `crossterm`. **Views, keybindings, command-bar verbs and wizard
+steps are behavioural parity (L1); layout, colour and glyphs are L2.** The exhaustive inventory —
+every key, every wizard field, every validation message, every layout constant — is in
+[docs/parity/tui.md](parity/tui.md); this section is the acceptance checklist.
+
+### 12.1 Views
+
+Four tabs, in `Tab`-cycle order: `goals` (`G`), `tasks` (`T`, **default at startup**), `agents` (`A`),
+`logs` (`L`). The logs tab's **rendered label is `ACTIONS`**, not `LOGS`.
+
+- [ ] Goals list + goal detail panel, with linked-task display
+- [ ] Tasks list + task detail panel (status, priority, agent, attempts, proof, review results, error hint)
+- [ ] Agents list + agent detail panel (adapter, model, status, stats, `last_error` with hint)
+- [ ] Logs/activity feed with per-agent and per-event-type filtering
+- [ ] Tasks tab badge `" (N)"`, shown **only when tasks are hidden** by the viewport
+- [ ] `Tab` / `→` cycle forward with wrap; `←` cycles backward; **all view switching is blocked while a detail
+      panel is open**
+
+### 12.2 Keybindings
+
+The handler is **one ordered `if` chain and the order is load-bearing**. Reproduce this dispatch order:
+
+1. Help overlay open → close. If the key was `?`, `Esc` or F1, swallow it; **any other key closes the overlay
+   and then also performs its normal action**.
+2. Agent picker open → swallow everything. (The *type* picker does **not** block — a quirk; `q` still quits
+   through it. Preserve or fix deliberately — see §14.8.)
+3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard.
+4. Any input mode active → text-input branch.
+5. Normal-mode chain, in source order.
+
+Normal mode highlights (full table in [docs/parity/tui.md §2](parity/tui.md)):
+
+- [ ] `q`/`Q` quit — **tested first, so `q` can never be typed in normal mode**
+- [ ] `Esc` closes the detail panel, else returns the log view to tail; **`Esc` never quits**
+- [ ] `+`/`=` and `-` resize the split by 3 rows; interact with the maximized state
+- [ ] `j`/`k`/`↑`/`↓` navigate; `Enter` opens detail; `?` opens help; `:` or `/` opens the command bar
+- [ ] `N` opens the task wizard; the unreachable `'new_task'` input mode is **not** ported (§14.8)
+
+### 12.3 Overlays and modes
+
+- [ ] Command bar with ghost completion, suggestion panel and history
+- [ ] Help overlay
+- [ ] Logs agent-filter picker; logs event-type-filter picker
+- [ ] Onboarding box (first run)
+- [ ] Toast banner, optional terminal bell, tab flash
+- [ ] Form wizard
+- [ ] Confirmation prompts
+- [ ] Undo banner (soft delete)
+- [ ] `LogsSearchBar` is **not** ported — it is implemented and unit-tested in the original but never mounted
+      (§13)
+
+### 12.4 Command bar verbs (L1 — the verb and subcommand set is contract)
+
+Registry order determines suggestion order:
+
+| Verb | Subcommands |
+|---|---|
+| `task` | `add, list, show, cancel, retry, assign, approve, reject, delete` |
+| `agent` | `add, list, disable, enable, delete, autonomous, shop` |
+| `team` | `create, list, join, leave, disband, set-lead` |
+| `goal` | `add, list, show, status, delete` |
+| `run` | *(arg `[id]`)* |
+| `run-all` | — |
+| `watch` | — |
+| `pause` | — |
+| `status` | — |
+| `config` | `palette, activity-filter, max-concurrent, notifications-toast, notifications-bell` |
+| `help` | — |
+| `quit` | — |
+
+- [ ] `resolveCompletion` returns only the ghost **suffix**; input must start with `/`; an exact match yields
+      `null`. Pinned vectors: `'task'`→`null`, `'/'`→`null`, `'/ta'`→`'sk'`, `'/task'`→`null`,
+      `'/task c'`→`'ancel'`, `'/config pal'`→`'ette'`, `'/xyz'`→`null`
+
+### 12.5 Wizards
+
+- [ ] **NEW AGENT** — 11 steps (`name, adapter, command, model, effort, role, role_custom, skills,
+      approval_policy, team`), with conditional skips: `command` only for `shell`; `model`/`role`/`skills`/
+      `team` skipped for `shell`; `effort` only for `{claude, pi, grok}`; `approval_policy` **always** skipped;
+      `team` skipped when there are fewer than 2 options. `effort` **must sit immediately after `model`**.
+      Shell forces `approval_policy = "auto"` and clears model/effort/role/skills/team.
+- [ ] **NEW TASK**, **NEW GOAL**, **NEW TEAM**, **AGENT SHOP** wizards — see
+      [docs/parity/tui.md §5.2](parity/tui.md)
+- [ ] Complete validation-message catalogue reproduced verbatim (e.g. `Name is required`,
+      `Agent with this name already exists`, `Command is required for Shell`)
+
+### 12.6 Live-update mechanics (L1 — these are OOM defences, not cosmetics)
+
+- [ ] Batched message queue with an **80 ms** flush interval
+- [ ] Detail strings capped at **2 KB**
+- [ ] RunId-keyed maps capped at **500** entries (LRU)
+- [ ] Animation tick for spinners
+- [ ] Defensive `formatAgentOutput` that accepts both the canonical and every legacy adapter `data` shape
+
+### 12.7 Theme
+
+Five palettes (`amber`, `ocean`, `forest`, `violet`, `light`) persisted in `~/.orchestry/global.yml`. The
+**semantic roles** must exist (brand/amber, success/green, error/red, info/blue, warning/yellow, dim, ghost,
+solid text, selection); exact hex values are L2.
+
+---
+
+## 13. Out of parity scope
+
+| Item | Reason |
+|---|---|
+| **npm `postinstall` script** (`scripts/postinstall.cjs`) | Node packaging artifact. r-orch ships a binary; installation is cargo/release-archive. |
+| **Landing page** (`landing/index.html`) | Marketing asset, not product behaviour. |
+| **`scripts/release.sh`, `.github/workflows/publish.yml`** | Node/npm release plumbing. Replaced by a Rust release pipeline. |
+| **JS programmatic API** (`src/index.ts`) | Replaced by the Rust library crates — see §13.1. |
+| **`tsup`/`tsc`/`vitest` configuration** | Toolchain. |
+| **`components/Footer.tsx`, `components/TabBar.tsx` (the component), `components/LogsSearchBar.tsx`, the four unused `*StatsRibbon` components, `Header`'s `sparklineData` prop** | **Dead code** in the original — implemented and in some cases unit-tested, but never mounted. Not ported. Their tests are not ported either. |
+| **`InputMode` value `'new_task'`** | Unreachable — nothing sets it. Not ported. |
+| **The `W` key hint** | `onboarding-config.ts` advertises `W start orchestrator` but **no handler exists**. The hint is dropped (watch mode stays reachable via `/watch`). |
+| **`team:task_claimed` emission** | Declared in the event union, never emitted. The variant is kept in the type for forward compatibility; nothing emits it. |
+| **`TeamConfig.auto_claim` / `max_concurrent_tasks` behaviour** | Stored and surfaced by the CLI but never read by the orchestrator. Data model and CLI are preserved; the (absent) behaviour is not invented. |
+| **`.orchestry/logs/`** | A path exists in `Paths`; nothing writes it. Kept in the path API, unused. |
+| **npm-based `update`** | Reimplemented against the r-orch release channel (same command, flags and exit codes; different mechanism and message text). |
+| **`doctor`'s `node` check** | Replaced by a check of the r-orch build/toolchain identity. The row keeps its position in the output so the shape of the report is unchanged. |
+| **`readJsonl`'s 50 MB fallback stderr warning wording** | L1 behaviour (tail-read) is kept; the exact warning string is not contract. |
+
+### 13.1 Rust library surface replacing the JS API
+
+`src/index.ts` exports domain types, the state machine, errors, model tiers, the agent shop, `EventBus`,
+`TaskService`/`AgentService`/`RunService`/`Orchestrator`, the adapter interface and registry, the skill
+loader, the clipboard helpers, and the container builders. The equivalent Rust surface:
+
+| TS export group | Rust equivalent |
+|---|---|
+| Domain types, `TaskStatus`, `canTransition`, `isTerminal`, `isDispatchable`, `isBlocked`, `resolveFailureStatus` | `orch-domain` — public structs, enums and free functions |
+| `OrchestryError`, `AdapterErrorKind`, `ERROR_HINTS`, `classifyAdapterError` | `orch_domain::error` |
+| `MODEL_TIER_MAP`, `resolveModel`, `defaultModelForAdapter`, `SUPPORTED_ADAPTERS` | `orch_domain::model_tiers` |
+| `AGENT_SHOP_TEMPLATES`, `getShopTemplateByKey`, `templateToAgentInput`, `isMcpSkill` | `orch_domain::shop`, `orch_engine::agent_factory` |
+| `EventBus`, `OrchestratorEvent` | `orch_engine::events` — a broadcast channel plus the event enum |
+| `TaskService`, `AgentService`, `RunService`, `Orchestrator` | `orch-engine` — same names |
+| `IAgentAdapter`, `AgentEvent`, `ExecuteParams`, `AdapterRegistry` | `orch_core::adapter` traits (in `orch-core` so `orch-engine` and `orch-infra` can both see them) |
+| `ISkillLoader`, `SkillLoader` | `orch_infra::skills` |
+| clipboard helpers | `orch_infra::clipboard` |
+| `buildLightContainer`, `buildFullContainer` | `orch_engine::container::{build_light, build_full}` |
+
+Public-API stability is **not** a parity requirement — no external Rust consumer exists yet. The requirement is
+that the *same capabilities* are reachable from a library consumer without going through the CLI, and that
+`orch-engine` has **zero dependency** on `orch-cli` or `orch-tui`.
+
+---
+
+## 14. Known bugs in the original
+
+Default policy: **fix**, and document. Exceptions are called out.
+
+### 14.1 `status --json` emits `"claimed": {}` — **REPLICATE**
+
+`OrchestratorState.claimed` is a JS `Set`. `status --json` serializes the in-memory state object directly, and
+`JSON.stringify(new Set([...]))` is `{}` for any contents. So `state.claimed` in `status --json` is **always**
+an empty object, while `state.json` on disk correctly holds an array.
+
+**Decision: replicate.** `--json` is a declared machine contract (§1.1); a consumer may have a schema that
+expects an object there, and emitting `[]` would be the breaking change. The on-disk array is unaffected.
+Recorded here so the choice is visible and reversible. *(Flagged for review — this is the one place where
+"replicate the bug" and "fix by default" genuinely conflict.)*
+
+### 14.2 `goalId` is camelCase among snake_case fields — **REPLICATE**
+
+Every other `Task` field is snake_case. `goalId` is the on-disk key name and the `--json` key name, so it is
+L0 and cannot be renamed.
+
+### 14.3 `ERROR_HINTS[timeout].fix` names a non-existent config key — **REPLICATE**
+
+It suggests `orch config set agent_timeout <ms>`; the real path is `defaults.agent.timeout_ms`. The hint text
+is user-visible output asserted by tests. **Replicate**, and open a follow-up issue to fix it in both
+implementations together.
+
+### 14.4 `findBestAgent` ties are resolved by `_index.json` order — **FIX (make deterministic)**
+
+Equal-scoring agents are resolved by position in `agentStore.list()`, which is `_index.json` order, which is
+**last-write order**. Two implementations will legitimately disagree, and so will two runs of the same
+implementation.
+
+**Decision: fix** by adding a final deterministic tiebreaker — sort by `(score desc, agent.id asc)`. This
+changes which agent is picked in a tie, which is unobservable to any correctness property, and makes the
+differential harness able to assert agent selection at all. Document in the changelog.
+
+### 14.5 `ReviewRunner` commands are hard-coded to npm/npx — **REPLICATE**
+
+`test_pass` → `npm test`, `typecheck` → `npx tsc --noEmit`, `lint` → `npm run lint`. These are wrong for a
+non-Node project, but they are the documented meaning of the `review_criteria` values and are asserted by
+tests. **Replicate.** Making them configurable is a feature, not parity.
+
+### 14.6 `strictFilters: false` cannot be reproduced — **DOCUMENTED DIVERGENCE**
+
+A user-supplied template in `config.prompt.*` that references an unknown filter renders in TS (the value
+passes through) and **fails to parse** in Rust. Shipped templates are unaffected. Surface a clear error naming
+the unknown filter; do not panic.
+
+### 14.7 `context list` prints `1 entries` — **REPLICATE**
+
+Not pluralized. It is asserted human output. Replicate.
+
+### 14.8 TUI: the type picker does not block global keys — **FIX**
+
+While the logs *agent* picker is open, all App keys are blocked; while the *type* picker is open they are not,
+so `q` quits out of it. **Decision: fix** — block global keys for both pickers. The inconsistency is clearly
+unintended and the TUI is L2.
+
+Related, and **not ported** (see §13): the unreachable `'new_task'` input mode, the advertised-but-unhandled
+`W` key, and the never-mounted `LogsSearchBar`.
+
+### 14.9 The "1 failing baseline test" is actually suite flakiness — **DO NOT REPLICATE**
+
+Measured, not assumed. Four runs of the reference suite at `c066dc0`:
+
+| Run | Config | Result |
+|---|---|---|
+| 1 | default (`maxWorkers = availableParallelism()`) | **6 failed** / 2085 passed / 2 skipped — exit 1 |
+| 2 | default, re-run | **5 failed** / 2086 passed / 2 skipped — exit 1, **a different failure set** |
+| 3 | `--maxWorkers=1`, only the 4 failing files | **210 / 210 passed** |
+| 4 | `CI=1` (⇒ `maxWorkers=2`), full suite | **0 failed** / 2085 passed / 8 skipped — **exit 0** |
+
+There is **no deterministic failing test**. Every failure is in an Ink `.tsx` test that writes to stdin, waits
+a *fixed* delay, then asserts on `lastFrame()`; under thread contention the React re-render misses the window
+and the assertion reads the previous frame. `vitest.config.ts` caps `maxWorkers` at 2 when `CI` is set, which
+is the only reason CI is green.
+
+**Consequences, all mandatory:**
+
+1. **The canonical baseline is `CI=1 npx vitest run` → 2085 passed, 8 skipped, exit 0.** Every comparison
+   against the TS suite uses this invocation. The "2090 / 1 / 2" figure in the project brief is superseded.
+2. **The differential harness must invoke the TS oracle with `CI=1`** (or an explicit `--maxWorkers=2`), or it
+   will inherit the flakiness as spurious parity failures.
+3. **Do not port the sleep-and-assert pattern.** Against `ratatui`'s `TestBackend`, drive frames
+   synchronously: push the key event, call `terminal.draw()`, assert on the buffer. ~20 TUI files and ~500
+   cases depend on timing that Rust can make deterministic. This is the single largest quality win available
+   in the port.
+4. The **2 unconditionally skipped tests** are both in `help-overlay.test.tsx` and are skipped only because
+   `ink-testing-library` cannot deliver an F1 escape sequence (`\x1bOP`) through its fake stdin. In ratatui
+   they are trivial (`KeyCode::F(1)`) — **port them as passing tests.** 6 further tests skip under `CI=1`
+   (`process-endurance.test.ts`, which spawns real `sleep`/`bash`); in Rust these should run everywhere.
+
+### 14.10 `appendJsonl` truncation can still exceed `PIPE_BUF`
+
+The truncation budget is computed in characters but checked in bytes, so a multi-byte `data` payload can still
+produce an over-`PIPE_BUF` line (the source acknowledges this: "acceptable on local filesystems"). **Replicate**
+the arithmetic exactly — changing it changes where the `…` lands, which is observable in the JSONL.
+
+### 14.11 `MergeStrategy` output guard overshoots 2000 chars
+
+The length check happens before appending, so the buffer can exceed 2000 by one chunk. `conflictInfo` is
+always sliced to 1000, so this is unobservable. **Replicate** the simple form.
+
+---
+
+## 15. Verification matrix
+
+Every row must be satisfiable by an automated check. Full harness design in
+[ARCHITECTURE.md §8](ARCHITECTURE.md).
+
+| # | Requirement | Level | How it is verified |
+|---|---|---|---|
+| V1 | Every command, subcommand, alias, positional and flag in §2.2 exists with the same arity | L0 | Generated test walking the clap command tree against a checked-in table extracted from `bin/cli.ts` |
+| V2 | Exit codes per §3 | L0 | Differential harness: run the same argv against both binaries, compare exit codes |
+| V3 | `--json` parsed values match for every command in §4.1 | L0 | Differential harness with the §1.4 normalizers |
+| V4 | Human stdout matches for the commands in §5.4 | L0 (structure) | Differential harness, ANSI-stripped, trailing spaces preserved |
+| V5 | Error messages and hints per §3.1 | L0 | Table test + differential on stderr |
+| V6 | `.orchestry/` artifacts parse-equal after the same scenario | L0 | Differential harness compares every file, parsed, with normalizers |
+| V7 | **Rust writes → TS reads** without error, and vice versa | L0 | Cross-compat scenarios: each binary performs the first half of a scenario and the other the second half |
+| V8 | YAML timestamps survive a Rust-write → TS-read round trip **as strings** | L0 | Dedicated test asserting `typeof === 'string'` in the TS process (§6.4) |
+| V9 | Task state machine transition table | L0 | Exhaustive 7×7 table test |
+| V10 | Retry delay arithmetic | L0 | Table test over `(attempt, base, max)` |
+| V11 | Dispatch candidate ordering | L1 | Property test with fixed fixtures |
+| V12 | Scope overlap agrees with the pairwise function, including the trie batch form | L1 | Property test: `ScopeIndex::overlaps_any` ≡ any `patterns_overlap` |
+| V13 | `classifyAdapterError` conformance vectors (§8.8) | L0 | Table test |
+| V14 | Adapter argv per §8.2 | L0 | Snapshot test per adapter over the config matrix |
+| V15 | Adapter stdout parsing | L1 | Fixture test: recorded stdout lines → expected `AgentEvent` sequence |
+| V16 | Default prompt text, all branch combinations | L0 | Golden fixtures generated from the TS binary, byte-compared |
+| V17 | Skill block format and resolution rules | L1 | Unit tests + a golden prompt with skills |
+| V18 | Worktree branch naming, including CJK/emoji fallback | L0 | Table test |
+| V19 | Git command sequences for prepare/cleanup/merge | L1 | Fake-git test double recording argv |
+| V20 | `serve --json` log record fields per §11.1 | L0 | Differential harness on a scenario with a fake agent |
+| V21 | `serve --once` exit code semantics | L0 | Scenario tests: all-pass → 0; one failed → 1; one cancelled → 0; empty → 0 |
+| V22 | Lock acquisition, staleness and PID-recycling defence | L1 | Integration test with a real second process |
+| V23 | Concurrency cap is never exceeded | L1 | Integration test with N fake agents and `max_concurrent_agents = 2` |
+| V24 | Stall detection fires at the configured timeout | L1 | Integration test with a fake agent that sleeps |
+| V25 | Crash recovery: dead PID → task `cancelled`, claims cleared, `preparing` runs finalized | L1 | Integration test that kills the orchestrator mid-run |
+| V26 | Cascade failure graph walk | L1 | Unit test with a diamond dependency graph |
+| V27 | TUI keymap and command-bar verbs | L1 | `ratatui::TestBackend` tests driving key sequences |
+| V28 | Agent-shop / org-shop / default-agent catalogue data | L0 | Byte comparison against strings extracted from the TS source |
+| V29 | ID format: prefix + 7 chars from the 64-char URL-safe alphabet | L0 | Property test |
+| V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
