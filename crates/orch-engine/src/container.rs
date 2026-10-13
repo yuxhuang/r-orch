@@ -96,9 +96,12 @@ pub async fn build_light_with(
         config.clone(),
         Arc::clone(&seams.clock),
         Arc::clone(&seams.ids),
+        Some(paths.clone()),
     ));
     let agent_service = Arc::new(AgentService::new(
         Arc::clone(&agents),
+        Arc::clone(&state),
+        Arc::clone(&events),
         config.clone(),
         Arc::clone(&seams.ids),
     ));
