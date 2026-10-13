@@ -10,7 +10,7 @@ use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_json, print_success};
+use crate::output::{Styles, format_tokens, print_json, print_success, print_table};
 use crate::shop_picker;
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +72,93 @@ pub async fn add(
                 agent.id
             ),
         );
+    }
+    Ok(())
+}
+
+/// `orch agent list`.
+///
+/// The TIME column is **hard-coded** to a dim em dash: the reference never
+/// computes it (`docs/parity/cli.md` §22.7).
+pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
+    let agents = engine.agent_service.list().await?;
+
+    if ctx.json {
+        return print_json(&agents);
+    }
+    if ctx.quiet {
+        for agent in &agents {
+            println!("{}", agent.id);
+        }
+        return Ok(());
+    }
+    if agents.is_empty() {
+        println!(
+            "\n  No agents. Add one: {}\n",
+            styles.dim("orch agent add <name> --adapter <adapter>")
+        );
+        return Ok(());
+    }
+
+    println!();
+    let rows: Vec<Vec<String>> = agents
+        .iter()
+        .map(|agent| agent_row(styles, agent))
+        .collect();
+    print_table(
+        styles,
+        &["STATUS", "AGENT", "ADAPTER", "TASK", "TIME"],
+        &rows,
+        2,
+    );
+    println!("\n  {}\n", summary_line(styles, &agents));
+    Ok(())
+}
+
+fn agent_row(styles: &Styles, agent: &orch_domain::Agent) -> Vec<String> {
+    vec![
+        format!(
+            "{} {}",
+            styles.status_icon(agent.status.as_str()),
+            agent.status
+        ),
+        styles.agent_name(&agent.name),
+        agent.adapter.clone(),
+        agent
+            .current_task
+            .clone()
+            .unwrap_or_else(|| styles.dim("—")),
+        // Never computed.
+        styles.dim("—"),
+    ]
+}
+
+/// `<n> agents · <r> running · <t> tokens total` — every clause always
+/// present, unlike `task list`'s.
+fn summary_line(_styles: &Styles, agents: &[orch_domain::Agent]) -> String {
+    let running = agents
+        .iter()
+        .filter(|agent| agent.status == orch_domain::AgentStatus::Running)
+        .count();
+    let tokens: u64 = agents
+        .iter()
+        .map(|agent| agent.stats.tokens_used.unwrap_or(0))
+        .sum();
+    format!(
+        "{} agents · {running} running · {} tokens total",
+        agents.len(),
+        format_tokens(tokens)
+    )
+}
+
+/// `orch agent disable` / `orch agent enable`. Neither honours `--quiet`.
+pub async fn set_enabled(engine: &Engine, styles: &Styles, id: &str, enabled: bool) -> Result<()> {
+    if enabled {
+        engine.agent_service.enable(id).await?;
+        print_success(styles, &format!("Enabled agent {id}"));
+    } else {
+        engine.agent_service.disable(id).await?;
+        print_success(styles, &format!("Disabled agent {id}"));
     }
     Ok(())
 }

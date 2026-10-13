@@ -39,6 +39,20 @@ fn main() -> Result<()> {
 }
 
 fn repo_root() -> Result<PathBuf> {
+    // The working directory's repo wins over the compile-time path.
+    //
+    // `CARGO_MANIFEST_DIR` is baked in at build time, and every worktree here
+    // shares one `CARGO_TARGET_DIR` — so `cargo xtask parity` run from a
+    // worktree gets a binary compiled in *another* checkout and would load
+    // that checkout's scenarios. Measured, not hypothetical.
+    if let Ok(cwd) = std::env::current_dir() {
+        for dir in cwd.ancestors() {
+            if dir.join("fixtures/scenarios").is_dir() && dir.join("xtask/Cargo.toml").is_file() {
+                return Ok(dir.to_path_buf());
+            }
+        }
+    }
+
     // `CARGO_MANIFEST_DIR` is `<repo>/xtask`.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest

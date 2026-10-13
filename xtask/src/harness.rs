@@ -39,7 +39,12 @@ pub struct Binaries {
 
 impl Binaries {
     pub fn discover(repo_root: &Path) -> Result<Binaries> {
-        let rust = repo_root.join("target/debug/orch");
+        // `CARGO_TARGET_DIR` is shared between worktrees here, so the binary
+        // is not necessarily under this repo's own `target/`.
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_root.join("target"));
+        let rust = target.join("debug/orch");
         if !rust.exists() {
             bail!(
                 "{} is missing — run `cargo build -p orch-cli` first",

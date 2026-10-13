@@ -111,10 +111,17 @@ harness.
 Honest limits of the current scenario set, to be closed as WP-5 lands more
 commands:
 
-- **Index tie order under a re-save** is unit-tested but not oracle-verified:
-  the four walking-skeleton commands never re-save an entity, so push-to-end
-  and in-place update produce the same `_index.json`. A `task assign` or
-  `agent edit` step closes this.
+- ~~**Index tie order under a re-save**~~ — **closed** by
+  `index-tie-order.toml` and its `rust_then_ts` pair: `agent disable
+  agt_creator` re-saves an entity with a deterministic id, so push-to-end and
+  in-place update now produce different trees.
+- **A step cannot name a generated id.** Steps are literal argv lines, so any
+  command whose target is a `tsk_`/`agt_`/`run_` id can only be exercised
+  against one the project creates deterministically — in practice
+  `agt_creator`, written by `init`. That is why `task assign`, which re-saves
+  a task exactly as `agent disable` re-saves an agent, has unit coverage but no
+  scenario. Capturing ids from a step's output into later steps would close
+  this for every id-taking command at once.
 - **Stable-sort ties** in `task list` need two tasks sharing a status *and* an
   `updated_at`, which the clock makes unreliable to produce from the CLI.
 - **Multi-entity index rebuild** is deliberately not exercised:

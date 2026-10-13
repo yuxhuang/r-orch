@@ -57,8 +57,15 @@ pub fn run() -> ExitCode {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let shape = ArgvShape::of(&argv);
 
-    // `--help` / `--version` with no real subcommand: answer without touching
-    // the filesystem, so `orch --help` works anywhere.
+    // `--version` prints the bare version string, where clap would prefix it
+    // with the program name.
+    if shape.is_help_fast_path() && shape.wants_version {
+        println!("{}", update::VERSION);
+        return ExitCode::SUCCESS;
+    }
+
+    // `--help` with no real subcommand: answer without touching the
+    // filesystem, so `orch --help` works anywhere.
     if shape.is_help_fast_path() {
         return match Cli::try_parse_from(&argv) {
             // `orch --json` alone parses: fall through to the normal path.
@@ -259,12 +266,16 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     )
                     .await?;
                 }
-                AgentSub::List => return Err(not_wired("agent list")),
+                AgentSub::List => commands::agent::list(&engine, &ctx, &styles).await?,
                 AgentSub::Status { .. } => return Err(not_wired("agent status")),
                 AgentSub::Edit { .. } => return Err(not_wired("agent edit")),
                 AgentSub::Remove { .. } => return Err(not_wired("agent remove")),
-                AgentSub::Disable { .. } => return Err(not_wired("agent disable")),
-                AgentSub::Enable { .. } => return Err(not_wired("agent enable")),
+                AgentSub::Disable { id } => {
+                    commands::agent::set_enabled(&engine, &styles, id, false).await?;
+                }
+                AgentSub::Enable { id } => {
+                    commands::agent::set_enabled(&engine, &styles, id, true).await?;
+                }
                 AgentSub::Autonomous { .. } => return Err(not_wired("agent autonomous")),
             }
             Ok(ExitCode::SUCCESS)

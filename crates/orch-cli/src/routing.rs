@@ -26,6 +26,12 @@ pub struct ArgvShape {
     pub sub: Option<String>,
     /// `--help`, `-h`, `--version` or `-V` appears anywhere.
     pub is_help_or_version: bool,
+    /// `--version` or `-V` specifically: Commander prints the bare version
+    /// string, where clap prefixes it with the program name.
+    pub wants_version: bool,
+    /// `process.argv.length <= 2` — no arguments at all, which is the
+    /// first-run path rather than a guarded command.
+    pub is_bare: bool,
 }
 
 impl ArgvShape {
@@ -36,12 +42,18 @@ impl ArgvShape {
     {
         let mut sub = None;
         let mut is_help_or_version = false;
+        let mut wants_version = false;
+        let mut count = 0;
 
         // Skip argv[0]: the binary name is `orch`, `orchestry` or `ao`.
         for arg in args.into_iter().skip(1) {
+            count += 1;
             let arg = arg.as_ref().to_string_lossy().into_owned();
             if matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V") {
                 is_help_or_version = true;
+            }
+            if matches!(arg.as_str(), "--version" | "-V") {
+                wants_version = true;
             }
             if sub.is_none() && !arg.starts_with('-') {
                 sub = Some(arg);
@@ -51,6 +63,8 @@ impl ArgvShape {
         ArgvShape {
             sub,
             is_help_or_version,
+            wants_version,
+            is_bare: count == 0,
         }
     }
 
@@ -68,14 +82,18 @@ impl ArgvShape {
 
     /// Whether an uninitialized project is fatal for this invocation.
     ///
-    /// `init`, `doctor` and `update` are the exemptions. A bare `orch` is
-    /// **not** fatal: the reference treats it as the first-run experience
+    /// `init`, `doctor` and `update` are the exemptions. A **bare** `orch` is
+    /// also not fatal: the reference treats it as the first-run experience
     /// (init, then the TUI), which is WP-6's surface — until that lands the
-    /// root help is printed instead, which is also what an uninitialized
-    /// bare `orch` does here rather than exiting 3.
+    /// root help is printed instead. `orch --nope`, though, is *not* bare:
+    /// it has no subcommand, so the reference builds the full container and
+    /// reports `Not initialized` before the usage error (verified in §3.5).
     pub fn requires_initialized_project(&self) -> bool {
+        if self.is_bare {
+            return false;
+        }
         match self.sub.as_deref() {
-            None => false,
+            None => true,
             Some(sub) => !CONTAINER_LESS_COMMANDS.contains(&sub),
         }
     }
@@ -182,6 +200,26 @@ mod tests {
         assert!(!shape(&["orch", "task", "list"]).is_help_fast_path());
         // An unknown command is not a real subcommand.
         assert!(shape(&["orch", "frobnicate", "--help"]).is_help_fast_path());
+    }
+
+    #[test]
+    fn a_bare_orch_is_the_first_run_path_but_a_stray_flag_is_not() {
+        assert!(shape(&["orch"]).is_bare);
+        assert!(!shape(&["orch"]).requires_initialized_project());
+
+        // `orch --nope` has no subcommand but is not bare: the reference
+        // builds the container and reports `Not initialized` (verified).
+        assert!(!shape(&["orch", "--nope"]).is_bare);
+        assert!(shape(&["orch", "--nope"]).requires_initialized_project());
+        assert!(shape(&["orch", "--json"]).requires_initialized_project());
+    }
+
+    #[test]
+    fn the_version_flags_are_distinguished_from_help() {
+        assert!(shape(&["orch", "--version"]).wants_version);
+        assert!(shape(&["orch", "-V"]).wants_version);
+        assert!(!shape(&["orch", "--help"]).wants_version);
+        assert!(shape(&["orch", "--help"]).is_help_or_version);
     }
 
     #[test]

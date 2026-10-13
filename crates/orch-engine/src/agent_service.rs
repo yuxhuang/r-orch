@@ -115,6 +115,28 @@ impl AgentService {
         self.agents.list().await
     }
 
+    /// `agent disable` — status only, no event.
+    ///
+    /// Added by WP-5a: with `task assign` it gives the parity harness a
+    /// non-interactive mutation on a **deterministic** id (`agt_creator`),
+    /// which is what makes the `_index.json` last-write order oracle-checkable
+    /// (PARITY.md §14.4).
+    pub async fn disable(&self, id: &str) -> Result<Agent> {
+        self.set_status(id, AgentStatus::Disabled).await
+    }
+
+    /// `agent enable` — back to `idle`, not to whatever it was before.
+    pub async fn enable(&self, id: &str) -> Result<Agent> {
+        self.set_status(id, AgentStatus::Idle).await
+    }
+
+    pub async fn set_status(&self, id: &str, status: AgentStatus) -> Result<Agent> {
+        let mut agent = self.get(id).await?;
+        agent.status = status;
+        self.agents.save(&agent).await?;
+        Ok(agent)
+    }
+
     pub async fn get(&self, id: &str) -> Result<Agent> {
         self.agents
             .get(id)
