@@ -17,8 +17,8 @@ use orch_domain::{TokenUsage, TokenUsageOpts, create_token_usage};
 use serde_json::{Map, Value};
 
 use super::util::{
-    build_full_prompt, copy_present, error_event, probe_version, streaming_events, stringify,
-    system_clock, version_probe_failure,
+    build_full_prompt, copy_present, error_event, number_field, probe_version, streaming_events,
+    stringify, system_clock, version_probe_failure,
 };
 use crate::process::spawn::{StderrPolicy, spawn_child};
 
@@ -69,12 +69,12 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
 /// this one has no camelCase aliases and no cache counters.
 fn extract_opencode_tokens(part: &Value) -> Option<TokenUsage> {
     let tokens = part.get("tokens")?;
-    let input = tokens.get("input").and_then(Value::as_u64)?;
+    let input = number_field(tokens, "input")?;
     Some(create_token_usage(
         input,
-        tokens.get("output").and_then(Value::as_u64).unwrap_or(0),
+        number_field(tokens, "output").unwrap_or(0),
         Some(TokenUsageOpts {
-            reasoning: Some(tokens.get("reasoning").and_then(Value::as_u64).unwrap_or(0)),
+            reasoning: Some(number_field(tokens, "reasoning").unwrap_or(0)),
             ..Default::default()
         }),
     ))
@@ -180,7 +180,7 @@ impl Adapter for OpenCodeAdapter {
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
         let args = build_args(&params);
         let io = spawn_child(
-            self.process_manager.as_ref(),
+            &self.process_manager,
             "opencode",
             &args,
             SpawnOptions {
@@ -189,6 +189,7 @@ impl Adapter for OpenCodeAdapter {
                 stdin: StdioMode::Ignore,
             },
             StderrPolicy::Tail,
+            &params.cancel,
         )?;
 
         let pid = io.pid;

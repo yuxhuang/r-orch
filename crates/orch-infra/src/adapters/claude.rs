@@ -99,7 +99,7 @@ impl Adapter for ClaudeAdapter {
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
         let args = build_args(&params);
         let io = spawn_child(
-            self.process_manager.as_ref(),
+            &self.process_manager,
             "claude",
             &args,
             SpawnOptions {
@@ -108,6 +108,7 @@ impl Adapter for ClaudeAdapter {
                 stdin: StdioMode::Ignore,
             },
             StderrPolicy::Tail,
+            &params.cancel,
         )?;
 
         let pid = io.pid;

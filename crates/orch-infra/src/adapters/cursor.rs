@@ -115,7 +115,7 @@ impl Adapter for CursorAdapter {
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
         let args = build_args(&params);
         let io = spawn_child(
-            self.process_manager.as_ref(),
+            &self.process_manager,
             self.command(),
             &args,
             SpawnOptions {
@@ -124,6 +124,7 @@ impl Adapter for CursorAdapter {
                 stdin: StdioMode::Ignore,
             },
             StderrPolicy::Tail,
+            &params.cancel,
         )?;
 
         let pid = io.pid;

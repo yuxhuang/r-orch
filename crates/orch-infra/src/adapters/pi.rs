@@ -34,8 +34,8 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use super::util::{
-    append_stderr_tail, classify, copy_present, error_event, probe_version, stringify,
-    system_clock, version_probe_failure,
+    append_stderr_tail, classify, copy_present, error_event, number_field, probe_version,
+    stringify, system_clock, version_probe_failure,
 };
 use crate::process::line_reader::read_pi_lines;
 use crate::process::spawn::{ChildIo, ChildWriter, StderrPolicy, spawn_child};
@@ -599,11 +599,8 @@ fn extract_tokens_from_message(parsed: &Value) -> Option<TokenUsage> {
             .map(|(_, aliases)| *aliases)
             .unwrap_or(&[]);
         for key in aliases {
-            if let Some(Value::Number(number)) = usage.get(*key) {
-                return number
-                    .as_u64()
-                    .or_else(|| number.as_f64().map(|value| value.max(0.0) as u64))
-                    .unwrap_or(0);
+            if let Some(found) = number_field(usage, key) {
+                return found;
             }
         }
         0
@@ -787,7 +784,7 @@ impl Adapter for PiAdapter {
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
         let args = build_args(&params);
         let mut child = spawn_child(
-            self.process_manager.as_ref(),
+            &self.process_manager,
             "pi",
             &args,
             SpawnOptions {
@@ -798,6 +795,7 @@ impl Adapter for PiAdapter {
             // The tail surfaces auth and extension-load failures on a non-zero
             // exit instead of silently discarding them.
             StderrPolicy::Tail,
+            &params.cancel,
         )?;
 
         let stdin: SharedStdin = Arc::new(tokio::sync::Mutex::new(child.stdin.take()));

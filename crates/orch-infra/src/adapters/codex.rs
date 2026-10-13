@@ -355,7 +355,7 @@ impl Adapter for CodexAdapter {
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
         let args = build_args(&params);
         let mut io = spawn_child(
-            self.process_manager.as_ref(),
+            &self.process_manager,
             "codex",
             &args,
             SpawnOptions {
@@ -365,6 +365,7 @@ impl Adapter for CodexAdapter {
                 stdin: StdioMode::Pipe,
             },
             StderrPolicy::Tail,
+            &params.cancel,
         )?;
 
         // Codex has no native `--system-prompt`, so it is prepended.

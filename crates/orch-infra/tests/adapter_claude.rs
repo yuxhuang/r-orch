@@ -364,6 +364,29 @@ async fn a_cancelled_run_ends_without_an_exit_error() {
 }
 
 #[tokio::test]
+async fn cancelling_a_run_signals_the_child() {
+    // The TS passes `signal: params.signal` to `spawn`, so node signals the
+    // child on abort. The shared spawn path reproduces that, for every
+    // adapter, rather than relying on the orchestrator to remember.
+    let pm = ScriptedProcessManager::new(Script::new().sleep_ms(30_000));
+    let execute_params = run_params();
+    let cancel = execute_params.cancel.clone();
+    let handle = adapter(&pm).execute(execute_params).expect("execute");
+    let pid = handle.pid;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+
+    // The run ends because the child was signalled, not because it finished.
+    collect(handle).await.expect_ok();
+    assert_eq!(
+        pm.killed(),
+        [(pid, orch_core::process::Signal::Term)],
+        "cancelling must reach the child"
+    );
+}
+
+#[tokio::test]
 async fn the_version_probe_reports_the_version() {
     let pm = ScriptedProcessManager::new(Script::new().stdout("claude/1.0.0\n"));
     let result = adapter(&pm).test().await;

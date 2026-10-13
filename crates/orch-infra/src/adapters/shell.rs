@@ -245,7 +245,7 @@ impl Adapter for ShellAdapter {
         );
 
         let io = spawn_child(
-            self.process_manager.as_ref(),
+            &self.process_manager,
             "bash",
             &["-lc".to_owned(), command],
             SpawnOptions {
@@ -254,6 +254,7 @@ impl Adapter for ShellAdapter {
                 stdin: StdioMode::Ignore,
             },
             StderrPolicy::Stream,
+            &params.cancel,
         )?;
 
         let pid = io.pid;

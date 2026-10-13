@@ -54,29 +54,29 @@ pub fn append_stderr_tail(message: &str, adapter_name: &str, tail: &str) -> Stri
     format!("{message}\n--- {adapter_name} stderr (tail) ---\n{tail}")
 }
 
-/// `typeof usage[key] === 'number'` for the first key that is present.
+/// The first of the two keys whose value is a number.
+fn usage_number(usage: &Value, primary: &str, fallback: &str) -> Option<u64> {
+    number_field(usage, primary).or_else(|| number_field(usage, fallback))
+}
+
+/// `typeof value[key] === 'number'`, as a `u64`.
 ///
 /// JSON numbers are arbitrary; [`TokenUsage`] counts are `u64`, so a negative
 /// or fractional count is clamped at zero and truncated. No provider emits
 /// either, and the alternative is a panic.
-fn usage_number(usage: &Value, primary: &str, fallback: &str) -> Option<u64> {
-    for key in [primary, fallback] {
-        match usage.get(key) {
-            Some(Value::Number(number)) => {
-                if let Some(exact) = number.as_u64() {
-                    return Some(exact);
-                }
-                let approx = number.as_f64().unwrap_or(0.0);
-                return Some(if approx.is_finite() && approx > 0.0 {
-                    approx as u64
-                } else {
-                    0
-                });
-            }
-            _ => continue,
-        }
+pub fn number_field(value: &Value, key: &str) -> Option<u64> {
+    let Some(Value::Number(number)) = value.get(key) else {
+        return None;
+    };
+    if let Some(exact) = number.as_u64() {
+        return Some(exact);
     }
-    None
+    let approx = number.as_f64().unwrap_or(0.0);
+    Some(if approx.is_finite() && approx > 0.0 {
+        approx as u64
+    } else {
+        0
+    })
 }
 
 /// Extract token usage from a parsed JSON event.

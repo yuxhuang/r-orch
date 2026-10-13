@@ -24,8 +24,9 @@
 use std::sync::{Arc, Mutex};
 
 use orch_core::adapter::AdapterError;
-use orch_core::process::{ExitSignal, ProcessManager, SpawnOptions};
+use orch_core::process::{ExitSignal, ProcessManager, Signal, SpawnOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio_util::sync::CancellationToken;
 
 /// Bounded stderr retained for diagnostics (`utils.ts:15`).
 const STDERR_TAIL_BYTES: usize = 4096;
@@ -103,18 +104,20 @@ impl std::fmt::Debug for ChildIo {
     }
 }
 
-/// Spawn through the process manager and install the stderr policy.
+/// Spawn through the process manager, install the stderr policy, and arrange
+/// for the child to be signalled if the run is cancelled.
 ///
 /// A spawn failure becomes an [`AdapterError`] carrying the TS message
 /// (`Failed to spawn process: <command>`) and its classification, because the
 /// TS `ProcessManager.spawn` throws synchronously out of `execute()` when node
 /// reports a child with no pid.
 pub fn spawn_child(
-    process_manager: &dyn ProcessManager,
+    process_manager: &Arc<dyn ProcessManager>,
     command: &str,
     args: &[String],
     opts: SpawnOptions,
     policy: StderrPolicy,
+    cancel: &CancellationToken,
 ) -> std::result::Result<ChildIo, AdapterError> {
     let child = process_manager
         .spawn(command, args, opts)
@@ -131,7 +134,41 @@ pub fn spawn_child(
 
     let stderr = child.stderr.map(|err| Box::new(err) as ChildReader);
     apply_stderr_policy(&mut io, stderr, policy);
+    kill_on_cancel(Arc::clone(process_manager), io.pid, io.exit.clone(), cancel);
     Ok(io)
+}
+
+/// Every TS adapter passes `signal: params.signal` to `spawn`, which makes
+/// **node** signal the child when the `AbortController` fires — so cancelling
+/// a run reaps the agent process whether or not the orchestrator also calls
+/// `killWithGrace`. Nothing in a `CancellationToken` does that, so the shared
+/// spawn path does it here, and every adapter inherits it.
+///
+/// The signal goes through [`ProcessManager::kill`], which tries the process
+/// group before the bare pid. node kills only the pid; the group is what the
+/// orchestrator's own `kill_with_grace` would reach a moment later anyway, and
+/// using the contract's kill rather than a weaker one keeps a cancelled run
+/// from leaving a subtree behind.
+fn kill_on_cancel(
+    process_manager: Arc<dyn ProcessManager>,
+    pid: u32,
+    exit: ExitSignal,
+    cancel: &CancellationToken,
+) {
+    let cancel = cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            // Already-cancelled resolves immediately, as node's
+            // already-aborted signal does.
+            _ = cancel.cancelled() => {
+                tracing::debug!(pid, "run cancelled; signalling the child");
+                process_manager.kill(pid, Signal::Term);
+            }
+            // The child got there first: nothing to do, and the watcher must
+            // not outlive it.
+            _ = exit.wait() => {}
+        }
+    });
 }
 
 /// The policy half of [`spawn_child`], split out so the adapter tests can
@@ -276,13 +313,14 @@ mod tests {
         use crate::process::SystemProcessManager;
         use orch_domain::AdapterErrorKind;
 
-        let pm = SystemProcessManager::new();
+        let pm: Arc<dyn ProcessManager> = Arc::new(SystemProcessManager::new());
         let err = spawn_child(
             &pm,
             "orch-definitely-not-a-binary",
             &[],
             SpawnOptions::default(),
             StderrPolicy::Tail,
+            &CancellationToken::new(),
         )
         .expect_err("spawn should fail");
 

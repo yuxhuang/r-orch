@@ -288,7 +288,7 @@ impl Adapter for GrokAdapter {
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
         let args = build_args(&params);
         let io = spawn_child(
-            self.process_manager.as_ref(),
+            &self.process_manager,
             "grok",
             &args,
             SpawnOptions {
@@ -297,6 +297,7 @@ impl Adapter for GrokAdapter {
                 stdin: StdioMode::Ignore,
             },
             StderrPolicy::Discard,
+            &params.cancel,
         )?;
 
         let pid = io.pid;
