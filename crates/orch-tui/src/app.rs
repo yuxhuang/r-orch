@@ -1150,7 +1150,13 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         };
         self.state.detail = DetailPanel::Entity;
         self.state.goal_detail_scroll = 0;
-        self.state.goal_progress_report = self.backend.goal_progress(&goal.id).ok();
+        // An empty report means "nothing recorded yet", not a failure, and
+        // renders no `progress` section (BACKEND.md).
+        self.state.goal_progress_report = self
+            .backend
+            .goal_progress(&goal.id)
+            .ok()
+            .filter(|report| !report.trim().is_empty());
     }
 }
 

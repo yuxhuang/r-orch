@@ -2690,7 +2690,26 @@ Five palettes (`amber`, `ocean`, `forest`, `violet`, `light`) persisted in `~/.o
 **semantic roles** must exist (brand/amber, success/green, error/red, info/blue, warning/yellow, dim, ghost,
 solid text, selection); exact hex values are L2.
 
-### 12.8 The update facade is intentionally inert
+### 12.8 Deliberate divergences in r-orch's TUI
+
+WP-6 is complete: **740 tests, 100 % of this section's checklist.** Seven divergences from the Ink original
+were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
+each is justified on its own merits rather than by the gate.
+
+| # | Divergence | Level | Rationale | Recorded |
+|---|---|---|---|---|
+| a | Both logs pickers block global keys | L1 | The agent picker blocks, the type picker does not; `q` quits out of the latter. Unintended asymmetry. | §14.8 |
+| b | Minimum-terminal-size guard added | L2 | The original has no breakpoints and no guard; below ~9 rows the layout arithmetic goes negative. **Addition, not parity.** | §12 layout note |
+| c | Wizard `Esc` = back one step; `Esc` on step 0 cancels | **L1 (keymap)** | This is **FormWizard's own intended behaviour**, defeated in Ink by a second handler. | §14.18 |
+| d | Cancelling a wizard clears pending attachments | L1 | The original leaks them on the `Esc`-above-step-0 path. | §14.19 |
+| e | The `W` hint is dropped | L2 | Advertised by `onboarding-config.ts`, **no handler exists**. | §13 |
+| f | Toast and undo rows come from the elastic bottom panel | **L2** | Pure layout. The rows exist and carry the same text; where the space is taken from differs. | here |
+| g | `log_selected_index` consistently indexes the **filtered** list | L1 | The original mixes filtered and unfiltered indexing, so the highlighted row and the detail shown disagree whenever a filter is active. | §14.20 |
+
+Items (b) and (f) are recorded only here, because they are additions/layout rather than behaviours of the
+original. The other five have §13 or §14 entries.
+
+### 12.9 The update facade is intentionally inert
 
 The TS header renders a **version chip** when an update is available, driven by the post-command update check.
 Since self-update and all network access are **out of scope on security grounds** (§11.5, §13), r-orch's TUI
@@ -2721,7 +2740,7 @@ the absent chip as a parity gap.
 | **`TeamConfig.auto_claim` / `max_concurrent_tasks` behaviour** | Stored and surfaced by the CLI but never read by the orchestrator. Data model and CLI are preserved; the (absent) behaviour is not invented. |
 | **`.orchestry/logs/`** | A path exists in `Paths`; nothing writes it. Kept in the path API, unused. |
 | **npm self-update, and the post-command background update check** | **OUT OF SCOPE — security.** Not "reimplemented". A Rust CLI overwriting its own executable as a side effect of an unrelated command is a supply-chain and integrity surface with no channel, no signing story and no atomic-replace story, and it is unverifiable by the harness. `orch update [--check]` keeps its name, flag and exit 0, and prints the current version plus install instructions. No network access. See §11.5. |
-| **The TUI header's update/version chip** | Follows from the row above. The TUI facade's `poll_update`, `background_install` and `installed_version` stay **at their defaults**, so the chip **never renders**. Intended, not a gap — see §12.8. |
+| **The TUI header's update/version chip** | Follows from the row above. The TUI facade's `poll_update`, `background_install` and `installed_version` stay **at their defaults**, so the chip **never renders**. Intended, not a gap — see §12.9. |
 | **`doctor`'s `node` check** | Replaced by a check of the r-orch build/toolchain identity. The row keeps its **position and format**; only its label and value change. Because that is a divergence in L0 human output, the harness **masks the toolchain row** (§1.4) rather than pretending it matches. |
 | **`readJsonl`'s 50 MB fallback stderr warning wording** | L1 behaviour (tail-read) is kept; the exact warning string is not contract. |
 
@@ -2789,6 +2808,9 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.15 `stop()` wedges the lock | FIX | `none` |
 | §14.16 DiskObserver straddling line | FIX | `none` |
 | §14.17 corrupt lock wedges, `PID: undefined` | REPLICATE | `none` |
+| §14.18 wizard `Esc` discards the wizard | FIX | `none` — TUI |
+| §14.19 wizard cancel leaks attachments | FIX | `none` — TUI |
+| §14.20 `logSelectedIndex` filtered/unfiltered mix | FIX | `none` — TUI |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -2876,9 +2898,13 @@ Not pluralized. It is asserted human output. Replicate.
 
 ### 14.8 TUI: the type picker does not block global keys — **FIX**
 
-While the logs *agent* picker is open, all App keys are blocked; while the *type* picker is open they are not,
-so `q` quits out of it. **Decision: fix** — block global keys for both pickers. The inconsistency is clearly
-unintended and the TUI is L2.
+**Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1).
+
+While the logs *agent* picker is open, all App keys are blocked (`if (showAgentPicker) return;`); while the
+*type* picker is open they are not, so `q` quits out of it. **Decision: fix** — block global keys for
+**both** pickers. The inconsistency is clearly unintended.
+
+**Implemented as specified** — WP-6 confirms both pickers now block global keys.
 
 Related, and **not ported** (see §13): the unreachable `'new_task'` input mode, the advertised-but-unhandled
 `W` key, and the never-mounted `LogsSearchBar`.
@@ -3067,6 +3093,78 @@ Related, same measurement run: **`serve:started` is logged before the lock is ac
 fail with exit 4 still emits one `serve:started` record first. Replicate the ordering — it is part of the
 §11.1 log contract.
 
+### 14.18 Wizard `Esc` closes the whole wizard, defeating `FormWizard`'s own logic — **FIX**
+
+**Effect on differential comparison: `none`** — TUI, outside the harness.
+
+`FormWizard.tsx:397-404` already implements the sensible behaviour:
+
+```ts
+if (key.escape) {
+  if (currentStep === 0) { onCancel(); } else { goToPrevStep(); }
+  return;
+}
+```
+
+But `App.tsx:1954-1960` handles `Esc` first for **any** active input mode, and `wizard` is one of them:
+
+```ts
+if (inputMode !== 'none') {
+  if (key.escape) { setInputMode('none'); inputHook.reset(''); cmdHistory.reset(); return; }
+```
+
+Ink mounts both components, so **both `useInput` handlers fire**. `setInputMode('none')` unmounts the wizard,
+so `goToPrevStep()` is applied to a component that is going away and the step change is never seen.
+**Observable behaviour: `Esc` anywhere in a wizard discards the whole thing**, and `FormWizard`'s
+back-one-step branch is dead code reachable only in an impossible state.
+
+**Decision: fix** — implement `FormWizard`'s stated intent: `Esc` goes back one step, and `Esc` on step 0
+cancels. Note what this is *not*: it is not a new design, it is the original component's documented behaviour
+with the framework quirk that masks it removed. The keymap is **L1**, so this divergence is recorded
+explicitly rather than waved through as presentation. The Ink double-`useInput` mechanism is described in
+[docs/parity/tui.md §10](parity/tui.md).
+
+Consequence to keep in mind: a user who wants to abandon a half-filled wizard now presses `Esc` once per step
+(or `Ctrl+C`). That is the cost of the fix and it is accepted.
+
+### 14.19 Cancelling a wizard leaks pending attachments — **FIX**
+
+**Effect on differential comparison: `none`** — TUI, outside the harness.
+
+`handleWizardCancel` (`App.tsx:1313-1317`) does the right thing:
+
+```ts
+setInputMode('none'); setWizardConfig(null); setPendingAttachments([]);
+```
+
+It is wired to `FormWizard`'s `onCancel`, which only fires on `Esc` **at step 0**. On any later step
+`FormWizard` takes the `goToPrevStep()` branch instead, while App's handler (§14.18) tears the wizard down
+with **`setInputMode('none')` alone** — clearing neither `pendingAttachments` **nor `wizardConfig`**. So
+clipboard-pasted images survive a cancelled wizard and `wizardConfig` is left stale.
+
+**Decision: fix** — clear pending attachments (and the wizard config) on **every** cancel path, not just
+`onCancel`. Strictly an improvement: a cancelled wizard should not contribute files to whatever is created
+next.
+
+### 14.20 `logSelectedIndex` mixes filtered and unfiltered indexing — **FIX**
+
+**Effect on differential comparison: `none`** — TUI, outside the harness.
+
+In the logs/`ACTIONS` view, `logSelectedIndex` is used against **two different arrays**:
+
+| Site | Array | Use |
+|---|---|---|
+| `App.tsx:2485` | `messages` — **unfiltered** | `selectedLog`, i.e. what the detail panel renders |
+| `App.tsx:3406-3407` | `filteredMessages` | the rows actually drawn |
+| `App.tsx:3441` | `filteredMessages.length` | the `n/N` position counter |
+
+So with **any** filter active, the highlighted row and the detail shown are **different events**, and the
+counter describes a third frame of reference. This is a correctness bug, not a cosmetic one — selecting the
+3rd visible row shows the 3rd event of the *unfiltered* stream.
+
+**Decision: fix** — `log_selected_index` indexes the **filtered** list everywhere: selection, rendering,
+detail and counter. Clamp on filter change so a narrowing filter cannot leave the index out of range.
+
 ---
 
 ## 15. Verification matrix
@@ -3109,7 +3207,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
 | V31 | **Harness hermeticity**: `HOME`/`USERPROFILE` redirected per tmpdir; a fresh `update-check.json` pre-seeded; the oracle spawns **no `npm`** and makes **no network call** | L0 | Scenario asserting the process tree contains no `npm` and no socket; run with the network namespace disabled in CI |
 | V32 | **Generalized YAML cross-parse**: every YAML artifact in **both** trees re-parsed **in the TS process with js-yaml** and deep-compared against the Rust parse | L0 | Harness step (~50 lines of Node glue). **Subsumes V8.** The single highest-value check in the plan |
-| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
+| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 740 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
 | V34 | **Stall clock semantics**: a run emitting blank lines stalls; a run emitting unparseable non-blank lines does not | L1 | Cross-compat `serve --once` scenario with a fake agent, compared against the oracle |
 | V35 | **`serve --once` killed mid-run** → task recovery, run finalization and `--json` records match the oracle | L1 | Cross-compat scenario with a fake agent and an external kill |
 | V36 | **`max_concurrent_agents` saturation**: N ready tasks, cap 2 — dispatch order, claim/release and final tree match the oracle | L1 | Cross-compat scenario with fake agents |

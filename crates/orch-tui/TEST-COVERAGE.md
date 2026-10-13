@@ -12,15 +12,15 @@ Run everything with `cargo test -p orch-tui`.
 
 | Suite | Cases | What it enumerates |
 |---|---:|---|
-| `tests/keymap.rs` (`k001..k092`) | 92 | The five-stage dispatch chain and every per-view binding |
+| `tests/keymap.rs` (`k001..k093`) | 93 | The five-stage dispatch chain and every per-view binding |
 | `tests/wizards.rs` (`w001..w093`) | 93 | All 11 wizards: fields, defaults, skip predicates, mappers, validation |
 | `tests/command_surface.rs` (`c001..c109`) | 109 | Every verb, subcommand, alias, usage and confirmation string |
-| `tests/views_render.rs` (`v001..v093`) | 93 | Sort orders, glyphs, caps, badges, detail panels, header, onboarding, overlays |
+| `tests/views_render.rs` (`v001..v094`) | 94 | Sort orders, glyphs, caps, badges, detail panels, header, onboarding, overlays |
 | `tests/filters.rs` (`f001..f044`) | 44 | Both filter pickers and every filter predicate |
 | `tests/live_updates.rs` (`l001..l048`) | 48 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history, endurance |
-| **Integration total** | **479** | |
+| **Integration total** | **481** | |
 | In-module unit tests | 261 | Pure logic: see the table below |
-| **Grand total** | **740** | |
+| **Grand total** | **742** | |
 
 In-module unit tests, by file:
 
