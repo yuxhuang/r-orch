@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Rewrite one value in the file $EDITOR was handed. `config edit` hands over
+# `.orchestry/config.yml` **itself** — no temp file, no frontmatter — so the
+# edit has to survive in place, and both readers have to agree on the result.
+set -euo pipefail
+sed -i 's/^  max_concurrent_agents: .*/  max_concurrent_agents: 2/' "$1"
