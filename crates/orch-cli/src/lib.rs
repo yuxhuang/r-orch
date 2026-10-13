@@ -182,7 +182,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                         commands::task::TaskAddArgs {
                             title: flags.title.clone(),
                             description: flags.description.clone(),
-                            priority: parse_int(&flags.priority, "priority")?,
+                            priority: parse_priority(&flags.priority),
                             labels: flags.labels.clone(),
                             depends_on: flags.depends_on.clone(),
                             max_attempts: match &flags.max_attempts {
@@ -208,12 +208,14 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                 TaskSub::Assign { task_id, agent_id } => {
                     commands::task::assign(&engine, &ctx, &styles, task_id, agent_id).await?;
                 }
-                TaskSub::Show { .. } => return Err(not_wired("task show")),
-                TaskSub::Edit { .. } => return Err(not_wired("task edit")),
-                TaskSub::Cancel { .. } => return Err(not_wired("task cancel")),
-                TaskSub::Approve { .. } => return Err(not_wired("task approve")),
-                TaskSub::Reject { .. } => return Err(not_wired("task reject")),
-                TaskSub::Retry { .. } => return Err(not_wired("task retry")),
+                TaskSub::Show { id } => commands::task::show(&engine, &ctx, &styles, id).await?,
+                TaskSub::Edit { id } => commands::task::edit(&engine, &styles, id).await?,
+                TaskSub::Cancel { id } => commands::task::cancel(&engine, &styles, id).await?,
+                TaskSub::Approve { id } => commands::task::approve(&engine, &styles, id).await?,
+                TaskSub::Reject { id, reason } => {
+                    commands::task::reject(&engine, &styles, id, reason.as_deref()).await?;
+                }
+                TaskSub::Retry { id } => commands::task::retry(&engine, &styles, id).await?,
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -268,16 +270,22 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     .await?;
                 }
                 AgentSub::List => commands::agent::list(&engine, &ctx, &styles).await?,
-                AgentSub::Status { .. } => return Err(not_wired("agent status")),
-                AgentSub::Edit { .. } => return Err(not_wired("agent edit")),
-                AgentSub::Remove { .. } => return Err(not_wired("agent remove")),
+                AgentSub::Status { id } => {
+                    commands::agent::status(&engine, &ctx, &styles, id).await?;
+                }
+                AgentSub::Edit { id } => {
+                    commands::agent::edit(&engine, &ctx, &styles, id).await?;
+                }
+                AgentSub::Remove { id } => commands::agent::remove(&engine, &styles, id).await?,
                 AgentSub::Disable { id } => {
                     commands::agent::set_enabled(&engine, &styles, id, false).await?;
                 }
                 AgentSub::Enable { id } => {
                     commands::agent::set_enabled(&engine, &styles, id, true).await?;
                 }
-                AgentSub::Autonomous { .. } => return Err(not_wired("agent autonomous")),
+                AgentSub::Autonomous { id, on, off } => {
+                    commands::agent::autonomous(&engine, &ctx, &styles, id, *on, *off).await?;
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -683,13 +691,48 @@ fn print_group_help_root() -> ExitCode {
     ExitCode::from(1)
 }
 
-/// `parseInt(value, 10)`. A non-numeric value is `NaN` in the original, which
-/// then fails the domain's own range check — so the message a user sees comes
-/// from the service, not from here.
+/// `parseInt(value, 10)`: leading whitespace, an optional sign, then as many
+/// digits as there are — `"3abc"` is `3` and `"abc"` is `NaN`, which is `None`
+/// here.
+pub(crate) fn js_parse_int(raw: &str) -> Option<i64> {
+    let text = raw.trim_start();
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        None => (1, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    digits[..end].parse::<i64>().ok().map(|value| sign * value)
+}
+
+/// `parseInt(value, 10)` where the resulting `NaN` would be **stored** rather
+/// than validated.
+///
+/// The original writes `NaN` straight into the entity (and then into YAML as
+/// `.nan`) for `--max-attempts`, `--max-turns`, or kills the command with
+/// `Invalid time value` for `--ttl`. Neither is worth reproducing, so a
+/// non-numeric value is rejected here instead — a recorded divergence, and the
+/// only one in this file. `--priority`, which the contract *does* measure, is
+/// [`parse_priority`].
 pub(crate) fn parse_int(raw: &str, flag: &str) -> Result<i64> {
-    raw.trim()
-        .parse::<i64>()
-        .map_err(|_| Error::invalid_arguments(format!("--{flag} must be an integer")))
+    js_parse_int(raw)
+        .ok_or_else(|| Error::invalid_arguments(format!("--{flag} must be an integer")))
+}
+
+/// A `NaN` priority stands in as an out-of-range number.
+///
+/// `--priority notanumber` must reach the service and be rejected *there*,
+/// with the service's own message and in the service's own order: an empty
+/// title is reported before a bad priority, so rejecting it here would print
+/// the wrong error for `task add '' --priority nope`. Every value outside
+/// `1..=4` fails that check identically, so any one of them reproduces `NaN`
+/// exactly.
+pub(crate) fn parse_priority(raw: &str) -> i64 {
+    js_parse_int(raw).unwrap_or(i64::MIN)
 }
 
 /// `opts.ttl ? parseInt(opts.ttl, 10) : undefined` — a TTL of `0` is a real
@@ -722,10 +765,30 @@ mod tests {
 
     #[test]
     fn parse_int_rejects_a_non_numeric_value_with_exit_2() {
-        let err = parse_int("abc", "priority").expect_err("rejected");
+        let err = parse_int("abc", "max-attempts").expect_err("rejected");
         assert_eq!(err.exit_code(), 2);
-        assert_eq!(parse_int(" 4 ", "priority").unwrap(), 4);
-        assert_eq!(parse_int("-1", "priority").unwrap(), -1);
+        assert_eq!(parse_int(" 4 ", "max-attempts").unwrap(), 4);
+        assert_eq!(parse_int("-1", "max-attempts").unwrap(), -1);
+    }
+
+    #[test]
+    fn js_parse_int_takes_the_leading_digits_and_nothing_else() {
+        assert_eq!(js_parse_int("3abc"), Some(3));
+        assert_eq!(js_parse_int("  -12 "), Some(-12));
+        assert_eq!(js_parse_int("+7"), Some(7));
+        // `parseInt` with radix 10 stops at the `x`.
+        assert_eq!(js_parse_int("0x10"), Some(0));
+        for nan in ["abc", "", "   ", "-", "+", ".5"] {
+            assert_eq!(js_parse_int(nan), None, "{nan:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_priority_reaches_the_service_as_out_of_range() {
+        assert_eq!(parse_priority("2"), 2);
+        assert_eq!(parse_priority("2abc"), 2);
+        // Not 1..=4, so the service rejects it exactly as it rejects `NaN`.
+        assert!(!(1..=4).contains(&parse_priority("notanumber")));
     }
 
     #[test]

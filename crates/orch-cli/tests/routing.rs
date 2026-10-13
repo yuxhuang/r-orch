@@ -418,11 +418,7 @@ fn a_commands_not_wired_yet_is_an_error_rather_than_a_silent_success() {
     // succeeding with nothing done. Keep this pointed at a command that is
     // still waiting on WP-4 — see crates/orch-cli/TEST-MAP.md.
     let dir = initialized_project();
-    for argv in [
-        vec!["org", "list"],
-        vec!["task", "show", "tsk_nosuch"],
-        vec!["agent", "status", "agt_nosuch"],
-    ] {
+    for argv in [vec!["org", "list"], vec!["run", "--all"], vec!["tui"]] {
         let output = orch(dir.path()).args(&argv).output().expect("run");
         assert_eq!(
             output.status.code(),

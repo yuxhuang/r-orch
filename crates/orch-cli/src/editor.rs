@@ -450,13 +450,18 @@ mod tests {
         let script = dir.path().join("record-editor");
         tokio::fs::write(
             &script,
-            format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", recorded.display()),
+            format!("printf '%s' \"$1\" > '{}'\n", recorded.display()),
         )
         .await
         .expect("write the script");
-        set_executable(&script).await;
 
-        let returned = open_in_editor_with(&script.to_string_lossy(), "contents", ".yml")
+        // Run through `sh` rather than marking the script executable: exec'ing
+        // a file this process has only just written races with any other test
+        // thread that forks in between, and Linux answers `ETXTBSY`. The
+        // editor command is split on whitespace, so this also covers the
+        // multi-word `$EDITOR` path.
+        let editor = format!("sh {}", script.display());
+        let returned = open_in_editor_with(&editor, "contents", ".yml")
             .await
             .expect("the edit succeeds");
         assert_eq!(returned, "contents");
@@ -474,18 +479,6 @@ mod tests {
             !handed_to_editor.parent().expect("a parent").exists(),
             "the temporary directory outlived the call"
         );
-    }
-
-    async fn set_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = tokio::fs::metadata(path)
-            .await
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        tokio::fs::set_permissions(path, permissions)
-            .await
-            .expect("chmod");
     }
 
     /// `open_in_editor` with the editor command injected, so the tests do not
