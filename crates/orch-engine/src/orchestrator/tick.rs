@@ -112,15 +112,15 @@ impl Orchestrator {
         .await;
 
         for (index, (task_id, entry)) in entries.iter().enumerate() {
-            let task = tasks
+            let live = tasks
                 .get(index)
-                .and_then(|r| r.as_ref().ok())
-                .cloned()
-                .flatten();
+                .and_then(|result| result.as_ref().ok())
+                .and_then(Option::as_ref)
+                .is_some_and(|task| !is_terminal(task.status));
 
             // 1. The task is gone or already terminal: the running entry is
             // stale bookkeeping, nothing more.
-            let Some(task) = task.filter(|task| !is_terminal(task.status)) else {
+            if !live {
                 self.drop_cancel(task_id).await;
                 state.running.shift_remove(task_id);
                 if let Err(err) = self
@@ -138,8 +138,7 @@ impl Orchestrator {
                     );
                 }
                 continue;
-            };
-            let _ = &task;
+            }
 
             // 2. A live collector means the child may have exited cleanly with
             // the success handler still queued for the state lock. Checking
@@ -150,7 +149,11 @@ impl Orchestrator {
 
             // 3. PID liveness.
             if !self.deps().processes.is_alive(entry.pid) {
-                if let Err(err) = self
+                // A failure *inside* the failure handler — an invalid
+                // transition, say — must still free the slot, or the entry
+                // leaks and the agent stays busy forever. The handler has
+                // already reported whatever went wrong.
+                if self
                     .handle_run_failure_locked(
                         state,
                         task_id,
@@ -159,11 +162,8 @@ impl Orchestrator {
                         None,
                     )
                     .await
+                    .is_err()
                 {
-                    // The failure handler itself failed (an invalid
-                    // transition, say). Force the entry out regardless, or the
-                    // slot leaks and the agent stays busy forever.
-                    let _ = &err;
                     state.running.shift_remove(task_id);
                     if let Err(err) = self
                         .deps()
@@ -210,11 +210,12 @@ impl Orchestrator {
                 .processes
                 .kill_with_grace(entry.pid, super::STALL_KILL_GRACE)
                 .await;
-            if let Err(err) = self
+            // Same fallback as the crash path above.
+            if self
                 .handle_run_failure_locked(state, task_id, entry, "Agent stalled (no events)", None)
                 .await
+                .is_err()
             {
-                let _ = &err;
                 state.running.shift_remove(task_id);
                 if let Err(err) = self
                     .deps()

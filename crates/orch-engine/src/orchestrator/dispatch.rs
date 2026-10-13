@@ -16,7 +16,7 @@ use orch_infra::template::{
     BuildPromptOptions, DEFAULT_SYSTEM_TEMPLATE, DEFAULT_USER_TEMPLATE, build_prompt_context,
 };
 
-use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator, RETRY_CONTEXT_EVENTS};
+use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator};
 
 impl Orchestrator {
     /// Invalidate → load → dispatch → save, under the state lock. Shared by
@@ -318,7 +318,6 @@ impl Orchestrator {
         } else {
             None
         };
-        let _ = RETRY_CONTEXT_EVENTS;
 
         // Shared context, the mailbox drain and the goal are independent reads.
         let (shared_context, pending_messages, goal) = futures::future::join3(

@@ -93,8 +93,6 @@ const STALL_KILL_GRACE: Duration = Duration::from_millis(5_000);
 const MAX_AGENT_SUMMARY_LEN: usize = 2000;
 /// `last_error.message` cap.
 const MAX_LAST_ERROR_LEN: usize = 500;
-/// How many trailing run events a retry prompt quotes back.
-const RETRY_CONTEXT_EVENTS: usize = 50;
 
 /// Everything the orchestrator needs. Mirrors the TS `OrchestratorDeps`, with
 /// `lockPath: string` replaced by an injected [`ProjectLock`] and the two
