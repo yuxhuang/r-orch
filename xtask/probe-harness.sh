@@ -22,11 +22,20 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "refusing to run: the working tree has uncommitted changes, and probes" >&2
-  echo "revert with \`git checkout\`. Commit or stash first." >&2
-  exit 1
-fi
+# Each probe reverts **its own file** with `git checkout`, so that file is all
+# that has to be clean. Demanding a clean tree globally made the suite
+# unusable whenever anyone had unrelated work in flight in the shared main
+# checkout — which is the normal state of this repo — and the pressure then is
+# to commit someone else's edit to get the probes to run. Checked per probe,
+# just before mutating.
+require_clean() {
+  if ! git diff --quiet -- "$1" || ! git diff --cached --quiet -- "$1"; then
+    printf '  DIRTY FILE    %s\n' "$2"
+    printf '                %s has uncommitted changes; a probe would revert them\n' "$1"
+    missed=$((missed + 1))
+    return 1
+  fi
+}
 
 export TMPDIR="${TMPDIR:-/tmp}"
 detected=0
@@ -57,6 +66,8 @@ probe_pending() {
 # that no longer matches is a hard error, not a silent pass.
 probe() {
   local label="$1" file="$2" old="$3" new="$4"
+
+  require_clean "$file" "$label" || return
 
   if ! python3 - "$file" "$old" "$new" <<'PY'
 import sys, pathlib

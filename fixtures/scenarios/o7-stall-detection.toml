@@ -1,6 +1,7 @@
 name = "o7-stall-detection"
 kind = "differential"
 requires = ["serve", "config set", "status"]
+fake_agents = true
 timeout_secs = 90
 env = { ORCH_FAKE_SCENARIO = "slow", ORCH_FAKE_SLOW_SECONDS = "25" }
 description = """

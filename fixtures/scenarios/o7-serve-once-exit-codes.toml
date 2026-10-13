@@ -1,6 +1,7 @@
 name = "o7-serve-once-exit-codes"
 kind = "differential"
 requires = ["serve", "config set"]
+fake_agents = true
 timeout_secs = 120
 description = """
 V21: `serve --once` exits 1 if and only if a task ended failed. An empty \

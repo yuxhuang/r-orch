@@ -24,8 +24,15 @@ pub enum DomainError {
     #[error("{0}")]
     InvalidArguments(String),
 
-    #[error("Orchestrator already running (PID: {0})")]
-    LockConflict(u32),
+    /// `None` renders as the literal `undefined`, which is what the TS
+    /// prints: `withTemporaryLock` and `startWatch` throw
+    /// `LockConflictError(lockResult.pid!)` on **any** failed acquisition, and
+    /// a lock file holding garbage yields no PID — so the template
+    /// interpolates `undefined`. Measured against the oracle: a garbage or
+    /// empty lock file makes `serve --once` and `run <id>` exit 4 with
+    /// `Orchestrator already running (PID: undefined)` (PARITY.md §14).
+    #[error("Orchestrator already running (PID: {})", DomainError::render_pid(*_0))]
+    LockConflict(Option<u32>),
 
     #[error("Agent adapter \"{adapter}\" not available")]
     AgentAdapter { adapter: String, detail: String },
@@ -85,6 +92,15 @@ pub enum DomainError {
 }
 
 impl DomainError {
+    /// A lock holder's PID as the TS renders it — the number, or the literal
+    /// `undefined` when the lock file held nothing parseable.
+    fn render_pid(pid: Option<u32>) -> String {
+        match pid {
+            Some(pid) => pid.to_string(),
+            None => "undefined".to_owned(),
+        }
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             DomainError::InvalidArguments(_) => 2,
@@ -467,9 +483,26 @@ mod tests {
 
     #[test]
     fn lock_conflict_includes_the_pid_and_has_exit_code_4() {
-        let err = DomainError::LockConflict(12345);
+        let err = DomainError::LockConflict(Some(12345));
         assert_eq!(err.exit_code(), 4);
         assert_eq!(err.to_string(), "Orchestrator already running (PID: 12345)");
+        assert_eq!(err.hint().as_deref(), Some("Use: orch status"));
+        assert_eq!(err.name(), "LockConflictError");
+    }
+
+    #[test]
+    fn a_lock_conflict_without_a_pid_renders_the_literal_undefined() {
+        // Measured against the oracle: a garbage or empty lock file makes
+        // `serve --once` and `run <id>` exit 4 with this exact text, because
+        // the TS throws `LockConflictError(lockResult.pid!)` on **any** failed
+        // acquisition and the template interpolates `undefined`. Collapsing it
+        // to 0 was a silent L0 divergence (PARITY.md §14).
+        let err = DomainError::LockConflict(None);
+        assert_eq!(
+            err.to_string(),
+            "Orchestrator already running (PID: undefined)"
+        );
+        assert_eq!(err.exit_code(), 4);
         assert_eq!(err.hint().as_deref(), Some("Use: orch status"));
         assert_eq!(err.name(), "LockConflictError");
     }

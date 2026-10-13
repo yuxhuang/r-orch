@@ -2583,7 +2583,9 @@ The handler is **one ordered `if` chain and the order is load-bearing**. Reprodu
    and then also performs its normal action**.
 2. Agent picker open → swallow everything. (The *type* picker does **not** block — a quirk; `q` still quits
    through it. Preserve or fix deliberately — see §14.8.)
-3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard.
+3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard — **refused when the default adapter is
+   `shell`**, since shop templates require an AI adapter (§11.4). The refusal surfaces the same guidance the
+   suggestion path uses: *Agent Shop requires an AI provider. Choose Shell and enter a command instead.*
 4. Any input mode active → text-input branch.
 5. Normal-mode chain, in source order.
 
@@ -2666,7 +2668,14 @@ step types. Validation is **300 ms debounced** for text and textarea, **synchron
       `approval_policy` **always** skipped; `team` skipped when there are fewer than 2 options. `effort`
       **must sit immediately after `model`**. Shell collapses the wizard to `name`/`adapter`/`command` and
       forces `approval_policy = "auto"`, clearing model/effort/role/skills/team.
-- [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) · **EDIT AGENT** (9) ·
+- [ ] **EDIT AGENT** — **8 steps**, `getEditAgentWizardSteps` at
+      `src/tui/wizardConfigs.ts:463-547`: `name` (:473), `adapter` (:485), `command` (:492), `model` (:503),
+      `effort` (:515), `role` (:523), `role_custom` (:531), `team` (:539).
+      **It has no `skills` and no `approval_policy` step**, which is what makes it 8 rather than NEW AGENT's
+      10 — so **neither field is editable through the TUI once an agent exists**, leaving `agent edit` via
+      `$EDITOR` (§2.4) as the only way to change an agent's skills.
+      *(An earlier revision said 9; [docs/parity/tui.md §5.2](parity/tui.md) was correct.)*
+- [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) ·
       **NEW TASK** (4) · **EDIT TASK** (4) · **NEW TEAM** (4) · **New Goal** (3) · **Edit Goal** (3) ·
       **SETTINGS** (5 single-step variants, one per config setting)
 - [ ] Validation messages verbatim: `Title is required`, `Priority must be 1-4`, `Name is required`,
@@ -2692,7 +2701,7 @@ solid text, selection); exact hex values are L2.
 
 ### 12.8 Deliberate divergences in r-orch's TUI
 
-WP-6 is complete: **740 tests, 100 % of this section's checklist.** Seven divergences from the Ink original
+WP-6 is complete: **742 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
 
@@ -2705,6 +2714,7 @@ each is justified on its own merits rather than by the gate.
 | e | The `W` hint is dropped | L2 | Advertised by `onboarding-config.ts`, **no handler exists**. | §13 |
 | f | Toast and undo rows come from the elastic bottom panel | **L2** | Pure layout. The rows exist and carry the same text; where the space is taken from differs. | here |
 | g | `log_selected_index` consistently indexes the **filtered** list | L1 | The original mixes filtered and unfiltered indexing, so the highlighted row and the detail shown disagree whenever a filter is active. | §14.20 |
+| h | Pre-dispatch failures reported synchronously as `Err` | L1 | The TUI renders no `orchestrator:error` case, so a stream-only dispatch error is **invisible**. | §12.10 |
 
 Items (b) and (f) are recorded only here, because they are additions/layout rather than behaviours of the
 original. The other five have §13 or §14 entries.
@@ -2720,6 +2730,37 @@ install, no detected version.
 The fields exist so the facade matches the shape of the TS header component and so a future release channel
 could populate them without reshaping the view; nothing currently does. Do not "finish" them, and do not file
 the absent chip as a parity gap.
+
+### 12.10 Pre-dispatch failures must surface synchronously (L1)
+
+The TUI backend facade (`crates/orch-tui/BACKEND.md`) is fire-and-request: `run_task`, `run_all` and
+`start_watch` ask the orchestrator to dispatch and return immediately, with outcomes arriving via
+`poll_events`. **That is correct for outcomes and wrong for pre-dispatch failures**, because of a gap in the
+original:
+
+**Neither the TS TUI nor r-orch renders `orchestrator:error`.** The TS event switch in `App.tsx` handles
+`agent:completed`, `agent:error`, `agent:file_changed`, `agent:output`, `agent:started`,
+`orchestrator:stall_detected`, `orchestrator:tick`, `run:retry`, `task:assigned`, `task:cascade_failed`,
+`task:created` and `task:status_changed` — and **no `orchestrator:error` case** (nor
+`orchestrator:shutdown`).
+
+Dispatch failures are emitted as `orchestrator:error { context: "dispatch task <id>" }` and deliberately do
+**not** stop other dispatches (§7.5). So in the TS TUI, pressing `r` on a task whose dispatch fails — a
+`WorkspaceError` because the project is not a git repo, `NoAgentsError`, an unknown adapter — produces
+**no feedback whatsoever**. The event is emitted, nothing renders it, the task silently stays `todo`.
+
+**Requirement:** `run_task`, `run_all` and `start_watch` must return **`Err(String)` synchronously** for any
+failure detectable before the agent process is spawned — lock conflict, no agents configured, unknown adapter,
+workspace preparation failure, an invalid task id or a non-dispatchable status. The TUI renders
+`Failed: {err}`, so the message *is* the contract: use the same text the CLI would print for that failure
+(§3.1).
+
+Post-dispatch outcomes stay asynchronous and arrive through `poll_events` — that part of the facade is right
+and must not become blocking. The dividing line is **"did the child process start?"**: before it, `Err`;
+after it, events.
+
+This is a **fix** for a usability gap rather than a parity divergence: the original emits the error, so the
+information exists; it simply never reaches the screen.
 
 ---
 
@@ -3207,7 +3248,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
 | V31 | **Harness hermeticity**: `HOME`/`USERPROFILE` redirected per tmpdir; a fresh `update-check.json` pre-seeded; the oracle spawns **no `npm`** and makes **no network call** | L0 | Scenario asserting the process tree contains no `npm` and no socket; run with the network namespace disabled in CI |
 | V32 | **Generalized YAML cross-parse**: every YAML artifact in **both** trees re-parsed **in the TS process with js-yaml** and deep-compared against the Rust parse | L0 | Harness step (~50 lines of Node glue). **Subsumes V8.** The single highest-value check in the plan |
-| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 740 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
+| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 742 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
 | V34 | **Stall clock semantics**: a run emitting blank lines stalls; a run emitting unparseable non-blank lines does not | L1 | Cross-compat `serve --once` scenario with a fake agent, compared against the oracle |
 | V35 | **`serve --once` killed mid-run** → task recovery, run finalization and `--json` records match the oracle | L1 | Cross-compat scenario with a fake agent and an external kill |
 | V36 | **`max_concurrent_agents` saturation**: N ready tasks, cap 2 — dispatch order, claim/release and final tree match the oracle | L1 | Cross-compat scenario with fake agents |

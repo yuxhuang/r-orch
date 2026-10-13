@@ -289,9 +289,7 @@ impl Orchestrator {
     {
         let outcome = self.deps().lock.acquire().await;
         if !outcome.acquired {
-            return Err(Error::Domain(DomainError::LockConflict(
-                outcome.pid.unwrap_or(0),
-            )));
+            return Err(Error::Domain(DomainError::LockConflict(outcome.pid)));
         }
         self.inner.lock_acquired.store(true, Ordering::SeqCst);
         let result = body().await;
@@ -403,9 +401,7 @@ impl Orchestrator {
 
         let outcome = self.deps().lock.acquire().await;
         if !outcome.acquired {
-            return Err(Error::Domain(DomainError::LockConflict(
-                outcome.pid.unwrap_or(0),
-            )));
+            return Err(Error::Domain(DomainError::LockConflict(outcome.pid)));
         }
         self.inner.lock_acquired.store(true, Ordering::SeqCst);
 

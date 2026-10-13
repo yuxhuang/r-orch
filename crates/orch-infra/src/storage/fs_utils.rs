@@ -15,6 +15,7 @@
 //! Neither is optional and neither has a caller-visible switch, so no caller
 //! can forget.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -86,9 +87,98 @@ pub async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let Some(content) = read_to_string_opt(path).await? else {
         return Ok(None);
     };
-    serde_json::from_str(&content)
+    serde_json::from_str(&repair_lone_surrogates(&content))
         .map(Some)
         .map_err(|err| Error::serde(format!("parse {}", path.display()), path, err))
+}
+/// Replace unpaired surrogate escapes with `U+FFFD`, so a TS-written file
+/// stays readable (PARITY.md §14, docs/TRAITS-FROZEN.md §11).
+///
+/// `JSON.stringify` will happily emit a lone surrogate as the six-character
+/// escape `\ud83d`, and `serde_json` rejects that outright — "unexpected end
+/// of hex escape", whatever follows it. One `msg send` with a 4001-code-unit
+/// body ending in a non-BMP character is enough to produce such a file,
+/// because JS truncates by UTF-16 code unit and cuts between the surrogates.
+/// Without this repair that single message makes `msg list` fail **entirely**
+/// rather than show one slightly mangled body.
+///
+/// Per the ruling: decode to U+FFFD, never fail the listing, and leave the
+/// file alone. This is read-side only, so the bytes on disk stay as the oracle
+/// wrote them until something re-saves the record for its own reasons — at
+/// which point the replacement character is what gets written, which is
+/// accepted.
+///
+/// A valid surrogate *pair* is passed through untouched, so this cannot change
+/// the value of any well-formed file, and the return is `Borrowed` whenever
+/// there is nothing to repair — which is every file r-orch writes itself.
+fn repair_lone_surrogates(content: &str) -> Cow<'_, str> {
+    // Cheap reject: no `\u` escape at all means nothing to do.
+    if !content.contains("\\u") {
+        return Cow::Borrowed(content);
+    }
+
+    let bytes = content.as_bytes();
+    let mut out: Option<String> = None;
+    // Everything before this index is already in `out`.
+    let mut copied_to = 0usize;
+    let mut at = 0usize;
+
+    while at < bytes.len() {
+        match escape_at(bytes, at) {
+            // A high surrogate followed by a low one is a real character.
+            Some((high, next))
+                if (0xD800..=0xDBFF).contains(&high)
+                    && escape_at(bytes, next)
+                        .is_some_and(|(low, _)| (0xDC00..=0xDFFF).contains(&low)) =>
+            {
+                at = next + 6;
+            }
+            // Any other escape in the surrogate range is unpaired.
+            Some((lone, next)) if (0xD800..=0xDFFF).contains(&lone) => {
+                let buffer = out.get_or_insert_with(String::new);
+                buffer.push_str(&content[copied_to..at]);
+                buffer.push_str("\\ufffd");
+                copied_to = next;
+                at = next;
+            }
+            Some((_, next)) => at = next,
+            // Only ASCII `\` starts an escape, so a byte step stays on a
+            // char boundary for anything we slice.
+            None => at += 1,
+        }
+    }
+
+    match out {
+        Some(mut buffer) => {
+            buffer.push_str(&content[copied_to..]);
+            Cow::Owned(buffer)
+        }
+        None => Cow::Borrowed(content),
+    }
+}
+
+/// The code unit of a `\uXXXX` escape at `at`, and the index just past it —
+/// but only when the backslash is itself unescaped.
+fn escape_at(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
+    if bytes.get(at) != Some(&b'\\') || bytes.get(at + 1) != Some(&b'u') {
+        return None;
+    }
+    // `\\uD83D` is a literal backslash followed by the text `uD83D`, not an
+    // escape, so the run of backslashes ending here must be of even length.
+    let preceding = bytes[..at]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    if preceding % 2 != 0 {
+        return None;
+    }
+    let hex = bytes.get(at + 2..at + 6)?;
+    let mut code = 0u32;
+    for digit in hex {
+        code = code * 16 + (*digit as char).to_digit(16)?;
+    }
+    Some((code, at + 6))
 }
 
 /// Write data as YAML atomically, with the timestamp guard applied.
@@ -1147,6 +1237,112 @@ mod tests {
         // Every line is intact, which is what O_APPEND under PIPE_BUF buys.
         let records: Vec<serde_json::Value> = read_jsonl(&path).await.unwrap();
         assert_eq!(records.len(), 32);
+    }
+
+    #[test]
+    fn a_lone_surrogate_escape_becomes_the_replacement_character() {
+        // The exact shape the oracle writes when `.slice(0, 4000)` cuts
+        // between the surrogates of an emoji — measured, not constructed.
+        let written = r#"{"body":"aaa\ud83d","subject":"bbb\ud83d"}"#;
+        let repaired = repair_lone_surrogates(written);
+        assert!(
+            matches!(repaired, Cow::Owned(_)),
+            "must have been rewritten"
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&repaired).expect("the repaired text must parse");
+        assert_eq!(value["body"], "aaa\u{FFFD}");
+        assert_eq!(value["subject"], "bbb\u{FFFD}");
+
+        // And the unrepaired original really is unparseable, so the repair is
+        // load-bearing rather than belt-and-braces.
+        assert!(serde_json::from_str::<serde_json::Value>(written).is_err());
+    }
+
+    #[test]
+    fn a_valid_surrogate_pair_is_left_exactly_alone() {
+        // The common case: nothing may change the value of a well-formed file.
+        let pair = r#"{"body":"hi 😀 there"}"#;
+        assert!(matches!(repair_lone_surrogates(pair), Cow::Borrowed(_)));
+        let value: serde_json::Value = serde_json::from_str(pair).unwrap();
+        assert_eq!(value["body"], "hi \u{1F600} there");
+
+        // An *escaped* pair is the case that actually exercises the pairing
+        // check, and the hex may be in any case — JSON.stringify emits
+        // lowercase, but a hand-edited file or another writer need not.
+        for escaped in [
+            "\"\\ud83d\\ude00\"",
+            "\"\\uD83D\\uDE00\"",
+            "\"\\ud83D\\uDe00\"",
+        ] {
+            assert!(
+                matches!(repair_lone_surrogates(escaped), Cow::Borrowed(_)),
+                "{escaped}"
+            );
+            let value: serde_json::Value = serde_json::from_str(escaped).unwrap();
+            assert_eq!(value, "\u{1F600}", "{escaped}");
+        }
+    }
+
+    #[test]
+    fn a_lone_low_surrogate_and_a_half_pair_are_both_repaired() {
+        // A trailing low surrogate with no high one, and a high surrogate
+        // followed by an ordinary escape rather than its partner.
+        for (written, expected) in [
+            (r#""\ude00""#, "\u{FFFD}"),
+            (r#""\ud83dA""#, "\u{FFFD}A"),
+            ("\"\\ud83d\\ud83d\\ude00\"", "\u{FFFD}\u{1F600}"),
+        ] {
+            let repaired = repair_lone_surrogates(written);
+            let value: serde_json::Value =
+                serde_json::from_str(&repaired).unwrap_or_else(|e| panic!("{written}: {e}"));
+            assert_eq!(value, expected, "{written}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_backslash_does_not_start_an_escape() {
+        // `\\uD83D` is a literal backslash then the text `uD83D`. Treating it
+        // as an escape would corrupt a body that merely talks about one.
+        let written = r#"{"body":"literal \\ud83d stays"}"#;
+        assert!(matches!(repair_lone_surrogates(written), Cow::Borrowed(_)));
+        let value: serde_json::Value = serde_json::from_str(written).unwrap();
+        assert_eq!(value["body"], r"literal \ud83d stays");
+    }
+
+    #[test]
+    fn content_without_escapes_is_borrowed_untouched() {
+        for plain in [
+            "{}",
+            r#"{"body":"nothing to see"}"#,
+            r#"{"body":"an emoji é and a 😀 straight through"}"#,
+        ] {
+            assert!(
+                matches!(repair_lone_surrogates(plain), Cow::Borrowed(_)),
+                "{plain}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_json_tolerates_a_ts_written_lone_surrogate() {
+        // The end-to-end guarantee from the ruling: a file the oracle wrote
+        // must not fail the read.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("msg_lonely.json");
+        std::fs::write(&path, "{\"id\":\"msg_abc1234\",\"body\":\"aaa\\ud83d\"}\n").unwrap();
+
+        let value: serde_json::Value = read_json(&path)
+            .await
+            .expect("a lone surrogate must not fail the read")
+            .expect("the file exists");
+        assert_eq!(value["id"], "msg_abc1234");
+        assert_eq!(value["body"], "aaa\u{FFFD}");
+
+        // Read-side only: the bytes on disk are untouched.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains(r"\ud83d"), "the file was rewritten: {after}");
     }
 
     #[tokio::test]

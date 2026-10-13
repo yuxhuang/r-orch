@@ -2,6 +2,7 @@ name = "v7-run-cross-compat"
 kind = "rust_then_ts"
 split_at = 4
 requires = ["run", "logs"]
+fake_agents = true
 timeout_secs = 90
 description = """
 V7 cross-compat over run artifacts: r-orch runs a task, then the \
