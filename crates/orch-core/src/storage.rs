@@ -7,6 +7,32 @@
 //! Every method takes `&self`, not `&mut self`: stores are shared as
 //! `Arc<dyn …>` and own their interior mutability (the index mutex), exactly
 //! like the TS classes, which are shared instances.
+//!
+//! # Three rules every implementation owes the contract
+//!
+//! These are not implementation taste. Each is observable, each is invisible
+//! in review, and the test fakes in [`crate::test_support`] already replicate
+//! all three — so a fake-backed test will not catch a store that skips one.
+//!
+//! 1. **`save` pushes to the end of `_index.json`.** Remove the entity by id,
+//!    then append (PARITY.md §6.10). Index order is therefore *last-write*
+//!    order, not creation order, and it is observable: `findBestAgent`
+//!    resolves equal-scoring agents by position in [`AgentStore::list`], and
+//!    r-orch **replicates** that rather than fixing it (PARITY.md §14.4).
+//!    An in-place update that preserves position silently changes which agent
+//!    runs a task.
+//!
+//! 2. **Sorts over index order must be stable.** ECMAScript mandates a stable
+//!    `Array.prototype.sort`; Rust's `sort_unstable*` family is not. The
+//!    workspace `clippy.toml` denies those three methods for this reason —
+//!    see rule 1 for what breaks.
+//!
+//! 3. **Every YAML read must apply merge keys.** js-yaml's default schema
+//!    resolves `<<` and `serde_yaml_ng` leaves it as a literal `"<<"` key, so
+//!    a reader that forgets `Value::apply_merge()` silently falls back to
+//!    `DEFAULT_CONFIG` for everything a hand-authored `config.yml` supplied
+//!    through a merge — while both trees still compare equal under the Rust
+//!    parser (PARITY.md §6.4.2, V38).
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -129,7 +155,9 @@ pub trait ConfigStore: Send + Sync {
     /// Implementations must round-trip through the **raw merged value**, not
     /// through [`OrchestratorConfig`]: the TS store deep-merges plain objects,
     /// so unknown keys in `config.yml` survive a `config set`
-    /// ([`orch_domain::deep_merge`]).
+    /// ([`orch_domain::deep_merge`]). `config.yml` is also the one file a user
+    /// hand-authors, so it is the one place YAML merge keys are reachable —
+    /// rule 3 in the module docs applies to `read` here specifically.
     async fn set(&self, key_path: &str, value: serde_json::Value) -> Result<()>;
 }
 

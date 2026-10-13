@@ -66,6 +66,31 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = { version = "2.14", features = ["serde"] }
 toml = "1.1"
 
+# ── Library-first candidates (ARCHITECTURE §4.8) ───────────────────────────
+# All verified on 2026-10-13 to resolve on rustc 1.94.1 *and* alongside
+# ratatui 0.30.2 with a single ratatui in the graph. None is used yet; they are
+# declared here so the owning package does not have to touch this manifest.
+#
+# `tui-textarea` is deliberately ABSENT: 0.7.0 (its latest) hard-depends on
+# ratatui 0.29.0 and crossterm 0.28.1, so a `TextArea` cannot be rendered into
+# a ratatui 0.30 `Frame` and adding it puts two ratatui versions in the graph.
+# WP-6 therefore gets `tui-input` for single-line fields and must either wrap
+# it for the multi-line wizard steps or hand-roll those — see §4.8 and record
+# the choice.
+#
+# Process groups: prefer this over a hand-rolled setsid + kill(-pid); keep
+# `nix` for kill(pid, 0) liveness (ARCHITECTURE §4.8, §5.5).
+process-wrap = { version = "10", features = ["tokio1"] }
+# Single-line text editing for the TUI command bar and `text` wizard steps.
+tui-input = "0.15"
+# Replaces Intl.Segmenter + width logic for `text-cursor` parity.
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+# Clipboard. Degrade to "empty" on any failure, exactly as the TS does.
+arboard = "3.6"
+# Version comparison for the update check.
+semver = "1.0"
+
 # ── Dev (ARCHITECTURE §4.6) ────────────────────────────────────────────────
 insta = "1.49"
 assert_cmd = "2.2"
@@ -73,6 +98,9 @@ predicates = "3.1"
 # Not used yet. Declared so WP-2/WP-5 can reach for it without touching the
 # root manifest (ARCHITECTURE §4.6).
 proptest = "1.12"
+# Diffs in the parity harness and in test failures (ARCHITECTURE §4.8).
+similar = "3.2"
+pretty_assertions = "1.4"
 
 # Disk is tight and debuginfo is the bulk of a dev build's target/ size.
 [profile.dev]
