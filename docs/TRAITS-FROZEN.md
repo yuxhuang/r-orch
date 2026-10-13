@@ -550,3 +550,63 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
     L0 surface nobody had enumerated: the frontmatter keys per entity, the
     "No changes." path when nothing is edited, and `Editor exited with code N`
     on a non-zero editor exit — all four are now scenarios.
+
+11. **One `msg send` can write a message file that `serde_json` cannot parse —
+    this needs an architect decision.** Measured, and reachable from the CLI
+    with a single command.
+
+    `MessageService.send` truncates with JS `.slice()`, which counts **UTF-16
+    code units**: `subject.slice(0, 200)` and `body.slice(0, 4000)`. A non-BMP
+    character is two code units, so a body of 3999 ASCII characters followed by
+    `😀` (4001 code units) is cut **between the surrogates**, and the stored
+    value ends in a **lone high surrogate**. What the oracle then does with it
+    differs by output path:
+
+    | path | bytes | valid UTF-8 |
+    |---|---|---|
+    | `.orchestry/messages/<id>.json` | `…aaa\ud83d` (the 6-byte escape) | yes |
+    | `msg list --json` on stdout | `…aaa\ud83d` (same escape) | yes |
+    | `msg inbox` human output | `…aaa` + `ef bf bd` (U+FFFD) | yes |
+
+    Both renderings are byte-reproducible from Rust only deliberately, because
+    a Rust `String` cannot hold a lone surrogate at all. The **read** path is
+    the harder half: `serde_json` rejects a lone surrogate escape outright —
+    `from_str(r#"{"body":"aaa\ud83d"}"#)` fails with `unexpected end of hex
+    escape`, whatever follows it — so our storage layer cannot read back a
+    file the oracle wrote. `msg list` would fail entirely rather than diverge
+    in one field.
+
+    Three options, none free, hence the escalation:
+
+    - **Model the body as UTF-16.** Byte-exact in every path, and poisons the
+      domain type for every consumer.
+    - **Replace lone surrogates with U+FFFD on read.** Keeps `String`, matches
+      the human path, and breaks byte parity on re-save (the escape becomes
+      `ef bf bd`), so a round-trip through r-orch silently rewrites the file.
+    - **Declare it L2 above the limit** and record the deviation. Honest, and
+      concedes a documented L0 field.
+
+    Not a hypothetical about hostile input: it needs one `msg send` with a long
+    body ending in an emoji. `fixtures/scenarios/cmd-msg-truncation.toml` is
+    the test for whichever option is chosen, with a `${repeat:…}` control case
+    one character shorter where the cut falls between characters and no special
+    handling is needed. The harness now reports a file only one side can parse
+    as a failure instead of aborting the run, which it previously did.
+
+12. **`msg broadcast --team <nonexistent>` fans out to every agent.**
+    `message-service.ts` resolves the team and filters only `if (team)`, with
+    no else branch, so an unknown team id leaves the recipient list unfiltered.
+    Measured in a four-agent tree: `--team <real two-member team>` → 2
+    messages, `--team team_nosuch` → 4, and `team_id: "team_nosuch"` is
+    persisted on all four, leaving a dangling reference in the store. An
+    implementation that validates the team id sends strictly fewer messages
+    than the oracle. Replicated in `cmd-msg-broadcast-unknown-team.toml`.
+
+13. **A message body is validated trimmed and stored untrimmed.**
+    `send` rejects on `!input.body.trim()` and then stores
+    `input.body.slice(0, 4000)` — the original. So `'   '` is an error while
+    `' padded '` is accepted and keeps both spaces on disk. The subject is
+    neither trimmed nor validated: empty becomes the literal `(no subject)`.
+    Trimming before storing passes every rejection test and diverges on every
+    message anyone sends with a trailing newline.
+    Covered by `cmd-msg-body-trimming.toml`.

@@ -64,6 +64,16 @@ pass-through of the literal text.
 as a fixed string, so masking it would hide a divergence rather than tolerate
 one (PARITY.md §6.2).
 
+### `${repeat:<text>:<count>}` — long arguments
+
+`${repeat:a:3999}😀` expands at parse time to 3999 `a`s followed by the emoji.
+The truncation limits are 200 characters for a subject and 4000 for a body, so
+testing them needs arguments of that size; written out literally they would
+make the scenario unreadable and bury the one character that matters — the
+multi-byte one sitting astride the cut. Unlike `${task.N}` this depends on
+nothing the tree produced, so the loader and the lint both see the real
+argument. Expansions over 64 KiB are rejected as typos.
+
 ### Step directives
 
 A step may carry leading `@directive` tokens:
@@ -243,6 +253,14 @@ The scenarios encode the measured behaviour; the doc is the architect's to fix.
 Separately, `task edit` and `agent edit` take **no options**; §2.2's listing of
 them alongside flag-taking verbs invites exactly the mistake four of these
 scenarios originally made.
+
+And one that needs an architect decision rather than a scenario: **a single
+`msg send` can write a file `serde_json` cannot parse.** Bodies are truncated
+by JS `.slice()`, which counts UTF-16 code units, so a 4001-code-unit body
+ending in a non-BMP emoji is cut between the surrogates and stored as a lone
+high surrogate — written as the escape `\ud83d`, which serde_json rejects
+outright. `cmd-msg-truncation.toml` is the test for whichever way it is
+resolved; the detail and the three options are in docs/TRAITS-FROZEN.md §11.
 
 ## Known coverage gaps
 

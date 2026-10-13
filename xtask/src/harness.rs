@@ -773,6 +773,7 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
     files.sort();
 
     let mut framing = BTreeMap::new();
+    let mut unparseable = BTreeMap::new();
     let mut tree = BTreeMap::new();
     for relative in files {
         let path = root.join(&relative);
@@ -780,10 +781,21 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         // Parse first, normalize second: substituting placeholders into the
         // raw text would make `"pid": 360135` invalid JSON.
-        let parsed = parse_by_extension(&relative, &raw)
-            .with_context(|| format!("parse {}", path.display()))?;
-        let value = norm.value(&parsed);
+        //
+        // A file that will not parse is a *finding*, not a harness error. The
+        // oracle can legitimately write JSON that serde_json rejects — a
+        // message body truncated mid-surrogate-pair comes out as the escape
+        // `\ud83d`, and serde_json refuses a lone surrogate outright — and
+        // that divergence is exactly what a scenario would be testing. So
+        // fall back to comparing the raw text and record why.
         let key = norm.path(&relative.to_string_lossy());
+        let value = match parse_by_extension(&relative, &raw) {
+            Ok(parsed) => norm.value(&parsed),
+            Err(err) => {
+                unparseable.insert(key.clone(), format!("{err}"));
+                norm.value(&Value::String(raw.clone()))
+            }
+        };
         if relative.extension().is_some_and(|e| e == "json") {
             framing.insert(key.clone(), JsonFraming::of(&raw));
         }
@@ -798,14 +810,19 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
     Ok(Tree {
         values: tree,
         framing,
+        unparseable,
     })
 }
 
 /// A collected `.orchestry/` tree.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Tree {
     values: BTreeMap<String, Value>,
     framing: BTreeMap<String, JsonFraming>,
+    /// Files whose own extension's parser rejected them, and why. Compared
+    /// between trees, so "one binary wrote something the other's parser
+    /// cannot read" is reported rather than crashing the run.
+    unparseable: BTreeMap<String, String>,
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -869,6 +886,26 @@ fn usage_error_failure(_scenario: &Scenario, step: &str, ts_stderr: &str) -> Opt
 
 fn compare_trees(rust: &Tree, ts: &Tree) -> Vec<String> {
     let mut failures = compare_values(&rust.values, &ts.values);
+
+    // A file only one side could parse is the sharpest possible signal: the
+    // two implementations do not even agree that it is well-formed.
+    for (path, why) in &ts.unparseable {
+        if !rust.unparseable.contains_key(path) {
+            failures.push(format!(
+                "`.orchestry/{path}`: the oracle wrote a file our parser rejects ({why}) \
+                 while r-orch's own file parses — the two are not interchangeable, whatever \
+                 the values compare as"
+            ));
+        }
+    }
+    for (path, why) in &rust.unparseable {
+        if !ts.unparseable.contains_key(path) {
+            failures.push(format!(
+                "`.orchestry/{path}`: r-orch wrote a file our parser rejects ({why}) while \
+                 the oracle's parses"
+            ));
+        }
+    }
 
     for (path, ts_framing) in &ts.framing {
         if let Some(rust_framing) = rust.framing.get(path)
@@ -1349,6 +1386,49 @@ mod tests {
         let failures = compare_trees(&rust, &ts);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_file_only_one_side_can_parse_is_reported_not_crashed_on() {
+        // The real case: a message body truncated mid-surrogate-pair is
+        // written by the oracle as the escape `\ud83d`, which serde_json
+        // rejects outright. Aborting the run would turn the divergence under
+        // test into a harness error.
+        let mut rust = Tree::default();
+        rust.values
+            .insert("messages/m.json".to_owned(), Value::Null);
+        let mut ts = Tree::default();
+        ts.values.insert("messages/m.json".to_owned(), Value::Null);
+        ts.unparseable.insert(
+            "messages/m.json".to_owned(),
+            "unexpected end of hex escape at line 1 column 19".to_owned(),
+        );
+
+        let failures = compare_trees(&rust, &ts);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("our parser rejects"),
+            "{}",
+            failures[0]
+        );
+        assert!(failures[0].contains("hex escape"), "{}", failures[0]);
+
+        // Both sides unparseable in the same way is not a divergence; the raw
+        // text comparison still covers the content.
+        let mut both = rust.clone();
+        both.unparseable = ts.unparseable.clone();
+        assert!(compare_trees(&both, &ts).is_empty());
+    }
+
+    #[test]
+    fn parse_by_extension_reports_a_lone_surrogate_rather_than_accepting_it() {
+        let err = parse_by_extension(Path::new("m.json"), r#"{"body":"aaa\ud83d"}"#)
+            .expect_err("serde_json must reject a lone surrogate escape");
+        assert!(format!("{err}").contains("hex escape"), "{err}");
+
+        // A whole pair is fine, so the rejection is specific to the split.
+        let ok = parse_by_extension(Path::new("m.json"), "{\"body\":\"\u{1F600}\"}").unwrap();
+        assert_eq!(ok["body"], Value::String("\u{1F600}".to_owned()));
     }
 
     #[test]

@@ -154,10 +154,15 @@ impl Scenario {
         }
     }
 
-    /// A step's argv, with any leading directives stripped.
+    /// A step's argv, with any leading directives stripped and `${repeat:…}`
+    /// expanded.
     pub fn argv(&self, step: &str) -> Result<Vec<String>> {
-        shell_words::split(Directives::parse(step).1)
-            .with_context(|| format!("split step {step:?}"))
+        let argv = shell_words::split(Directives::parse(step).1)
+            .with_context(|| format!("split step {step:?}"))?;
+        argv.iter()
+            .map(|arg| expand_repeats(arg))
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("expand step {step:?}"))
     }
 
     /// `@kill-after:<ms> <argv…>` runs the step and kills it after `<ms>`.
@@ -225,6 +230,45 @@ impl Scenario {
                 .collect(),
         }
     }
+}
+
+/// Expand `${repeat:<text>:<count>}` in one argument.
+///
+/// The truncation limits are 200 characters for a subject and 4000 for a body,
+/// so testing them needs arguments of that length. Written out literally they
+/// would make the scenario unreadable and hide the one character that matters
+/// — the multi-byte one sitting astride the cut.
+///
+/// This is deliberately separate from `${task.N}`: a repeat depends on nothing
+/// the tree produced, so it expands at parse time and the loader and the lint
+/// both see the real argument.
+fn expand_repeats(arg: &str) -> Result<String> {
+    const MARKER: &str = "${repeat:";
+    let mut out = String::new();
+    let mut rest = arg;
+
+    while let Some(start) = rest.find(MARKER) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + MARKER.len()..];
+        let Some(end) = after.find('}') else {
+            bail!("unterminated `{MARKER}` in {arg:?}");
+        };
+        let (text, count) = after[..end]
+            .rsplit_once(':')
+            .with_context(|| format!("`{MARKER}` needs `<text>:<count>` in {arg:?}"))?;
+        let count: usize = count
+            .parse()
+            .with_context(|| format!("`{MARKER}` count must be a number in {arg:?}"))?;
+        // A scenario that asks for a megabyte is a typo, not an intention:
+        // argv has an OS limit and the diff would be unreadable either way.
+        if count * text.len() > 64 * 1024 {
+            bail!("`{MARKER}{text}:{count}}}` would expand past 64 KiB in {arg:?}");
+        }
+        out.push_str(&text.repeat(count));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Leading `@name[:arg]` tokens on a step, which modify how it is run and
@@ -414,6 +458,40 @@ steps = ["init --adapter shell", "task list"]
             scenario.argv(&scenario.steps[0]).unwrap(),
             vec!["task".to_owned(), "nosuchsub".to_owned()]
         );
+    }
+
+    #[test]
+    fn repeat_expands_at_parse_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            temp.path(),
+            "s.toml",
+            "name = \"s\"\nkind = \"differential\"\n\
+             steps = [\"msg send a '${repeat:x:5}\u{1F600}' -s '${repeat:y:3}'\"]\n",
+        );
+        let scenario = Scenario::load(&path).unwrap();
+        let argv = scenario.argv(&scenario.steps[0]).unwrap();
+        assert_eq!(argv[3], "xxxxx\u{1F600}");
+        assert_eq!(argv[5], "yyy");
+    }
+
+    #[test]
+    fn a_malformed_repeat_is_an_error_not_a_literal() {
+        for arg in [
+            "${repeat:x}",
+            "${repeat:x:notanumber}",
+            "${repeat:x:5",
+            // 64 KiB guard: a count this large is a typo, not an intention.
+            "${repeat:x:99999}",
+        ] {
+            assert!(expand_repeats(arg).is_err(), "{arg}");
+        }
+        assert_eq!(
+            expand_repeats("no markers here").unwrap(),
+            "no markers here"
+        );
+        // A zero count is legal and expands to nothing.
+        assert_eq!(expand_repeats("a${repeat:x:0}b").unwrap(), "ab");
     }
 
     #[test]
