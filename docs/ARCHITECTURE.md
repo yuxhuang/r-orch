@@ -63,9 +63,13 @@ binary, so serialization is unachievable while interchangeable operation is a go
 **document the behaviour and verify that it is what we documented** (V37), not to claim a guarantee we cannot
 provide. Two consequences:
 
-- The `--allow-foreign-project` valve (§11, Rollback) stays **default-on** until V32 is green, not merely V8.
+- **There is no `--allow-foreign-project` valve.** An earlier revision had one staying default-on until V32
+  went green; it is **retired** — a default-on refusal would break the interchangeable-operation promise it
+  was meant to protect, and V7/V8/V32 cover the failure mode on every commit instead. Reasoning in §11,
+  Rollback.
 - Concurrent mutation while an orchestrator is running is a **known, documented hazard inherited from the
-  original**, and belongs in user-facing docs — not only here.
+  original**. It is written up for operators, with the one-command recovery, in
+  [docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update).
 
 ---
 
@@ -387,7 +391,12 @@ Notes:
 ```rust
 // orch-infra/src/storage/fs_utils.rs
 
-/// temp file + fsync + rename. Temp name: `.{basename}.{8 hex}.tmp` in the same directory.
+/// Durable atomic write. Temp name: `.{basename}.{8 hex}.tmp` in the same directory.
+/// Order: write temp -> **fsync the temp file** -> rename over the target ->
+/// **fsync the parent directory**. Both fsyncs are required: without the first,
+/// a power loss can make the rename durable while the data is not; without the
+/// second, the rename itself may not survive. rename() alone is only safe
+/// against *process* crashes, not machine crashes (sre C5).
 pub async fn atomic_write(path: &Path, content: &str) -> Result<()>;
 
 /// `serde_json::to_string_pretty` + '\n'. 2-space indent, trailing newline — matches
@@ -857,7 +866,8 @@ Rules:
   the Rust parse (V32). This is a harness *step*, not a hand-written test. Without it, both trees are verified
   by a single parser that shares the writer's assumptions, and **every bug of the form "js-yaml reads r-orch's
   bytes differently" is invisible by construction** — which is precisely the failure class R1 and the
-  `--allow-foreign-project` valve exist to prevent. It is ~50 lines of Node glue, it subsumes V8's timestamp
+  cross-compat tests exist to prevent (§11 records why no opt-in valve accompanies them). It is ~50 lines of
+Node glue, it subsumes V8's timestamp
   assertion as a special case, and it catches the schema deltas in [PARITY.md §6.4.2](PARITY.md) (merge keys,
   `!!binary`, `!!timestamp` tags, complex keys) without anyone having to enumerate them correctly in advance.
 - **Cross-compat scenarios** are a separate scenario kind, and they are the part that actually proves the
@@ -1243,9 +1253,29 @@ quoting pass — buys one of those two.
 
 There is nothing to roll back *to* — this is a greenfield reimplementation, and the TS binary continues to
 exist and work. The meaningful failure mode is shipping something that corrupts a project a user also opens
-with the TS binary, which is what R1/V7/V8 exist to prevent. Until the parity harness is green across the
-cross-compat scenarios, r-orch should refuse to write to a `.orchestry/` directory it did not create, behind a
-`--allow-foreign-project` flag. That is the only real safety valve and it costs almost nothing.
+with the TS binary, which is what R1/V7/V8/V32 exist to prevent.
+
+**`--allow-foreign-project` is retired, not deferred. It was never built, and it should not be.** Earlier
+revisions of this document specified it as default-on until V32 went green, and called it "the only real
+safety valve". Both the code and SRE gate reviews found zero implementation (code M2, sre F6). The team lead's
+ruling, which I agree with:
+
+- **A default-on refusal contradicts the product's central promise.** [PARITY.md §1.1](PARITY.md) states that
+  both binaries must operate on the same project directory interchangeably, in either order, and the
+  [README](../README.md) tells users exactly that. A flag that refuses to write to a `.orchestry/` r-orch did
+  not create would make the common case — pointing r-orch at a project the npm package created — fail by
+  default. The valve would break the thing it was meant to protect.
+- **Its job is done, and done better, by the cross-compat tests.** V7 (`ts_then_rust` / `rust_then_ts` /
+  interleaved), V8 (Rust-written YAML re-read in the TS process with string timestamps asserted) and V32
+  (every YAML artifact re-parsed in Node with js-yaml and deep-compared) all exercise the real failure mode
+  on every commit, rather than asking the user to opt in to safety at the point of use. V32's machinery is
+  implemented and green.
+- **The one hole is being closed.** `cross_compat.rs` passed green when the oracle was absent (code M5), which
+  would have let the guarantee lapse silently. WP-0 is making a missing oracle a **hard failure**. The valve's
+  retirement depends on that, and on nothing else.
+
+What remains is documentation, not a flag: the concurrent-index hazard (§2.1) and the recovery for it are in
+[docs/RUNBOOK.md](RUNBOOK.md), which is where an operator will look.
 
 ---
 
