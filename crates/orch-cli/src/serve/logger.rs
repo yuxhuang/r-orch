@@ -155,10 +155,12 @@ impl StructuredLogger {
                     vec![
                         ("running", Value::from(*running)),
                         ("queued", Value::from(*queued)),
-                        // The reference reports V8's heap; there is no
-                        // equivalent number here, and reporting a made-up one
-                        // would be worse than reporting the real RSS-free
-                        // zero. Kept as a field so the record shape holds.
+                        // The reference reports V8's heap, which a Rust
+                        // process has no counterpart for; reporting RSS under
+                        // the same name would be a different metric wearing
+                        // this one's label. The field stays, so the record
+                        // shape holds, and the harness masks the value the
+                        // way it masks pids and durations (PARITY.md §1.4).
                         ("heap_mb", Value::from(0.0)),
                     ],
                 )

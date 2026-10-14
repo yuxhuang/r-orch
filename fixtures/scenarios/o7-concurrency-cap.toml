@@ -9,7 +9,12 @@ cap must never be exceeded, and the dispatch order, the claim/release \
 sequence and the final tree must match the oracle. The priorities are \
 deliberately tied in pairs so the tie-break order is exercised too — §14.4 \
 is REPLICATE, so ties resolve by _index.json last-write order rather than \
-by anything intrinsic to the agent."""
+by anything intrinsic to the agent. `agt_creator` is disabled first: it has
+no auto approval policy, so a task it claimed would stop in `review` and
+`serve --once` would never return. The run's log records are not compared:
+which tasks are running when a tick fires is timing, not contract.
+What is compared is every other record, the resulting tree, the dispatch
+order in it, and the `status --json` summary."""
 steps = [
   "init --name proj --adapter claude",
   "config set scheduling.max_concurrent_agents 2",
@@ -17,13 +22,24 @@ steps = [
   "agent add a1 --adapter claude --quiet",
   "agent add a2 --adapter claude --quiet",
   "agent add a3 --adapter claude --quiet",
+  # `agt_creator` has no auto approval policy, so anything it claims stops in
+  # `review` — which is not terminal, so `serve --once` would then poll
+  # forever in both implementations. Disabling it leaves the three
+  # auto-policy agents, whose tasks reach `done`, which is what lets this
+  # scenario end at all.
+  "agent disable agt_creator",
   "task add one --priority 1 --quiet",
   "task add two --priority 1 --quiet",
   "task add three --priority 2 --quiet",
   "task add four --priority 2 --quiet",
   "task add five --priority 3 --quiet",
   "task add six --priority 4 --quiet",
-  "serve --once --log-format json",
+  # Which tasks happen to be running when a tick fires is timing, not
+  # contract — measured as a `running: 2` tick here against `running: 1`
+  # there — so the heartbeat is dropped and every other record still
+  # compared, along with the dispatch order and the final tree. The cap
+  # itself is `dispatch_stops_at_the_concurrency_cap` in orch-engine.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "task list --json",
   "status --json",
 ]

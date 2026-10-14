@@ -673,10 +673,17 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
     Invisible to the orchestrator's own tests, which is why it survived: with
     the in-memory fakes nothing inside `stop()` ever pends, so the task runs
     to completion even while cancelled, and `tests/resilience.rs` drives
-    `handle_signal` from the *test* task rather than from the loop. Fixed with
-    a `IN_WATCH_LOOP` task-local that `stop()` checks before aborting —
-    `shutdown.cancel()` already breaks the loop cooperatively, so the abort
-    was never needed from inside it. Covered end to end by
-    `crates/orch-cli/tests/watch_shutdown.rs`, at the only level where it is
-    real: SIGINT to `run --watch`, SIGTERM to `serve`, both asserting the
-    process exits and the lock file is gone.
+    `handle_signal` from the *test* task rather than from the loop.
+
+    Fixed by not aborting the watch task at all: `shutdown.cancel()` already
+    stops future ticks, which is exactly what `clearInterval(this.timer)`
+    does in the reference, and the arm that called `stop()` breaks
+    immediately after. The abort was cancelling the *tick* as well, and a
+    tick cancelled between `atomic_write`'s temp file and its rename left
+    `.orchestry/.state.json.<hash>.tmp` behind — litter the reference cannot
+    produce, since `clearInterval` cannot interrupt a running callback. That
+    one surfaced as a flaky tree difference in `o7-serve-once-exit-codes`.
+
+    Covered end to end by `crates/orch-cli/tests/watch_shutdown.rs`, at the
+    only level where it is real: SIGINT to `run --watch`, SIGTERM to `serve`,
+    both asserting the process exits and the lock file is gone.

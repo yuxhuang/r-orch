@@ -472,20 +472,23 @@ impl Orchestrator {
             return Ok(());
         }
 
+        // `clearInterval(this.timer)`: stop *future* ticks and let the one in
+        // flight finish. The handle is dropped rather than aborted, for two
+        // reasons found the hard way.
+        //
+        // Aborting it cancels the caller: both the signal arms and the tick
+        // circuit breaker call `stop()` **from inside the watch task**, so
+        // the abort would land at the next await that pends — the state save,
+        // before the lock release and before `stopped.send(true)` — leaving
+        // `wait_for_stop` waiting forever, which is `serve` ignoring SIGTERM.
+        //
+        // Aborting it also cancels whatever the *tick* is doing, and a tick
+        // cancelled between `atomic_write`'s temp file and its rename leaves
+        // `.orchestry/.state.json.<hash>.tmp` behind — litter the reference
+        // cannot produce, because `clearInterval` cannot interrupt a running
+        // callback.
         self.inner.shutdown.cancel();
-        // Taken either way, so the loop is detached; aborted **only** from
-        // outside it. Both the signal arms and the tick circuit breaker call
-        // `stop()` from inside the watch task, where `abort()` would cancel
-        // the caller at its next pending await — the state save — leaving the
-        // lock held and `stopped` unsignalled, so `wait_for_stop` would never
-        // return and `serve`/`run --watch` would ignore Ctrl+C. The loop does
-        // not need aborting from there anyway: `shutdown.cancel()` above
-        // breaks it, and the arm that called us breaks immediately after.
-        if let Some(task) = self.inner.watch_task.lock().await.take()
-            && !in_watch_loop()
-        {
-            task.abort();
-        }
+        let _ = self.inner.watch_task.lock().await.take();
         if let Some(timer) = self.inner.immediate_dispatch.lock().await.take() {
             timer.abort();
         }
@@ -669,7 +672,7 @@ impl Orchestrator {
         let interval_ms = self.config().scheduling.poll_interval_ms.max(1);
         let shutdown = self.inner.shutdown.clone();
 
-        let task = tokio::spawn(IN_WATCH_LOOP.scope((), async move {
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
             // `setInterval` does not catch up on missed ticks; tokio's default
             // `Burst` would fire several back-to-back after a slow tick and
@@ -706,7 +709,7 @@ impl Orchestrator {
                 }
             }
             unsubscribe.unsubscribe();
-        }));
+        });
 
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
@@ -738,18 +741,6 @@ impl Orchestrator {
             }
         }
     }
-}
-
-tokio::task_local! {
-    /// Set for the lifetime of the watch-loop task, so [`Orchestrator::stop`]
-    /// can tell "called from the loop" apart from "called by the CLI" and not
-    /// abort the task it is running in. See the comment in `stop`.
-    static IN_WATCH_LOOP: ();
-}
-
-/// Whether this is the watch-loop task.
-fn in_watch_loop() -> bool {
-    IN_WATCH_LOOP.try_with(|()| ()).is_ok()
 }
 
 /// The `SIGINT`/`SIGTERM` arms of the watch loop, replacing the TS

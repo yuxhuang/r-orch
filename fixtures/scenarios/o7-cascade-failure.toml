@@ -21,7 +21,11 @@ steps = [
   "task add right --depends-on ${task.0} --quiet",
   "task add leaf --depends-on ${task.1},${task.2} --quiet",
   "task list --json",
-  "serve --once --log-format json",
+  # The tick stream is a wall-clock heartbeat: how many ticks fire before
+  # a run finishes, and which tasks are running when one does, differ
+  # between two independently-timed processes. Every other record is
+  # compared.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "task list --json",
   "status --json",
 ]

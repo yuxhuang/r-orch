@@ -17,7 +17,11 @@ steps = [
   "config set scheduling.poll_interval_ms 200",
   "agent add flaky --adapter claude --quiet",
   "task add 'A task that always fails' --assignee ${agent.0} --max-attempts 3 --quiet",
-  "serve --once --log-format json",
+  # The tick stream is a wall-clock heartbeat: how many ticks fire before
+  # a run finishes, and which tasks are running when one does, differ
+  # between two independently-timed processes. Every other record is
+  # compared.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "task list --json",
   "logs --task ${task.0} --json",
   "status --json",

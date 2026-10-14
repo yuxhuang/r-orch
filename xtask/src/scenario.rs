@@ -210,6 +210,17 @@ impl Scenario {
         Directives::parse(step).0.exit_only_reason
     }
 
+    /// Whether `orchestrator:tick` records are dropped from this step's
+    /// comparison (`@ticks-vary:<why>`).
+    pub fn ticks_vary(step: &str) -> bool {
+        Directives::parse(step).0.ticks_vary
+    }
+
+    /// The `@stop-after:<ms>` budget, after which the step is SIGTERMed.
+    pub fn stop_after(step: &str) -> Option<std::time::Duration> {
+        Directives::parse(step).0.stop_after
+    }
+
     /// Whether this step's JSON array is compared as a multiset
     /// (`@unordered:<why>`).
     pub fn unordered(step: &str) -> bool {
@@ -336,6 +347,30 @@ pub struct Directives {
     /// A bare `@unordered` is not accepted: the reason is the whole point, so
     /// it falls through as an unknown token and breaks the step loudly.
     pub unordered: bool,
+    /// `@stop-after:<ms>` — run it, then **SIGTERM** it and wait for it to
+    /// shut down.
+    ///
+    /// The graceful counterpart of `@kill-after`, for the scenarios whose
+    /// subject is a watch-mode orchestrator: `serve` without `--once` never
+    /// returns, and `serve --once` never returns either when a task lands in
+    /// `review`, which is not terminal. A SIGTERM leaves the tree exactly as
+    /// a real operator's Ctrl+C would — agents cleaned up, lock released —
+    /// so the steps after it compare something meaningful, which a SIGKILL
+    /// mid-write does not.
+    pub stop_after: Option<std::time::Duration>,
+    /// `@ticks-vary:<reason>` — drop `orchestrator:tick` records from this
+    /// step's comparison.
+    ///
+    /// The tick stream is a heartbeat on a wall clock: how many ticks fire
+    /// before a run completes, and which tasks are running when one does,
+    /// differ between two independently-timed processes (measured: a
+    /// `running: 2` tick on one side against `running: 1` on the other, and
+    /// one extra tick before a stall is detected). Every *other* record in
+    /// the stream is deterministic, so this drops exactly the heartbeat and
+    /// keeps the lifecycle: dispatch, completion, retries, stalls, shutdown.
+    /// The tick record's own shape is covered by the structured logger's unit
+    /// tests.
+    pub ticks_vary: bool,
 }
 
 impl Directives {
@@ -358,6 +393,15 @@ impl Directives {
                     directives.exit_only_reason = true;
                 }
                 _ if token.starts_with("@unordered:") => directives.unordered = true,
+                _ if token.starts_with("@ticks-vary:") => directives.ticks_vary = true,
+                _ if token.starts_with("@stop-after:") => {
+                    match token["@stop-after:".len()..].parse::<u64>() {
+                        Ok(millis) => {
+                            directives.stop_after = Some(std::time::Duration::from_millis(millis));
+                        }
+                        Err(_) => return (directives, rest),
+                    }
+                }
                 _ => match token.strip_prefix("@kill-after:") {
                     Some(millis) => match millis.parse::<u64>() {
                         Ok(millis) => {

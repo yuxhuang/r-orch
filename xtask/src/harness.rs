@@ -422,7 +422,13 @@ pub fn run_scenario(
             if output.runner == "ts" {
                 failures.extend(usage_error_failure(scenario, step, &output.stderr));
             }
-            if output.exit_code != 0 {
+            // A `@kill-after` step is killed on purpose, so its exit code is
+            // whatever the signal produced — the scenario's subject is the
+            // tree the *next* step finds, not this step's status.
+            if output.exit_code != 0
+                && Scenario::kill_after(step).is_none()
+                && Scenario::stop_after(step).is_none()
+            {
                 failures.push(format!(
                     "step `{step}` ({}) exited {} — cross-compat steps must all succeed\n\
                      stdout: {}\nstderr: {}",
@@ -665,8 +671,9 @@ pub fn run_scenario(
                     })
                 })
             } else if scenario.stdout_is_json_records(step) {
-                let left = json_records(&rust_out.stdout, &mut rust_norm);
-                let right = json_records(&ts_out.stdout, &mut ts_norm);
+                let drop_ticks = Scenario::ticks_vary(step);
+                let left = json_records(&rust_out.stdout, &mut rust_norm, drop_ticks);
+                let right = json_records(&ts_out.stdout, &mut ts_norm, drop_ticks);
                 (left != right).then(|| {
                     (
                         "log records",
@@ -846,9 +853,10 @@ fn execute(
         .env_remove("ORCHESTRY_DEBUG")
         .stdin(std::process::Stdio::null());
 
-    let (output, timed_out) = match Scenario::kill_after(step) {
-        Some(after) => (run_and_kill(command, after, label, step)?, false),
-        None => run_with_timeout(command, scenario.timeout(), label, step)?,
+    let (output, timed_out) = match (Scenario::kill_after(step), Scenario::stop_after(step)) {
+        (Some(after), _) => (run_and_kill(command, after, label, step)?, false),
+        (None, Some(after)) => (run_and_stop(command, after, label, step)?, false),
+        (None, None) => run_with_timeout(command, scenario.timeout(), label, step)?,
     };
 
     Ok(StepOutput {
@@ -860,6 +868,65 @@ fn execute(
         timed_out,
     })
 }
+
+/// Run a step, `SIGTERM` it after `after`, and wait for it to shut down.
+///
+/// For a watch-mode orchestrator, which does not return on its own: this is
+/// what a real operator's Ctrl+C does, so the tree the next step reads is a
+/// cleanly shut-down one — agents reaped, lock released. A `SIGKILL` would
+/// leave the lock file behind with a different pid per tree, and the steps
+/// after it would be comparing wreckage.
+fn run_and_stop(
+    mut command: Command,
+    after: std::time::Duration,
+    label: &str,
+    step: &str,
+) -> Result<std::process::Output> {
+    let scratch = tempfile::tempdir().context("create stdio scratch dir")?;
+    let (out_path, err_path) = (scratch.path().join("stdout"), scratch.path().join("stderr"));
+    command
+        .stdout(std::fs::File::create(&out_path).context("create stdout file")?)
+        .stderr(std::fs::File::create(&err_path).context("create stderr file")?);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn {label} step `{step}`"))?;
+
+    std::thread::sleep(after);
+    let status = match child.try_wait().context("poll child")? {
+        // It finished on its own, which is fine: the point is that it did not
+        // outlive the budget.
+        Some(status) => status,
+        None => {
+            // `kill(1)` rather than `Child::kill`, which is SIGKILL.
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+            loop {
+                match child.try_wait().context("poll child")? {
+                    Some(status) => break status,
+                    None if std::time::Instant::now() >= deadline => {
+                        // A shutdown that needs SIGKILL is a finding in
+                        // itself; the scenario then sees the exit code.
+                        let _ = child.kill();
+                        break child.wait().context("reap the killed child")?;
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: std::fs::read(&out_path).context("read captured stdout")?,
+        stderr: std::fs::read(&err_path).context("read captured stderr")?,
+    })
+}
+
+/// How long a `@stop-after` step gets to shut down before it is killed.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Run a step and `SIGKILL` it after `after`, for the crash-recovery
 /// scenarios. The exit code is whatever the kill produced, which the scenario
@@ -1659,15 +1726,35 @@ fn json_framing_diff(rust_stdout: &str, ts_stdout: &str) -> Option<(&'static str
     })
 }
 
-fn json_records(stdout: &str, norm: &mut Normalizer) -> Vec<Value> {
+fn json_records(stdout: &str, norm: &mut Normalizer, drop_ticks: bool) -> Vec<Value> {
     stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| match serde_json::from_str::<Value>(line) {
-            Ok(value) => norm.value(&value),
+            Ok(value) => mask_heap_mb(norm.value(&value)),
             Err(_) => Value::String(norm.text(line)),
         })
+        .filter(|record| !(drop_ticks && is_tick(record)))
         .collect()
+}
+
+fn is_tick(record: &Value) -> bool {
+    record.get("event").and_then(Value::as_str) == Some("orchestrator:tick")
+}
+
+/// `orchestrator:tick`'s `heap_mb` is a memory measurement of the runtime that
+/// produced it — `process.memoryUsage().heapUsed / 1 MiB` in the oracle, which
+/// has no counterpart in a Rust process at all. Masked like `<PID>` and `<MS>`
+/// are (§1.4): the field's presence and position are contract, its value is a
+/// property of V8.
+fn mask_heap_mb(mut record: Value) -> Value {
+    if let Some(object) = record.as_object_mut()
+        && let Some(heap) = object.get_mut("heap_mb")
+        && heap.is_number()
+    {
+        *heap = Value::String("<HEAP_MB>".to_owned());
+    }
+    record
 }
 
 fn records_text(records: &[Value]) -> String {
