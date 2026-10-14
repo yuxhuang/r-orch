@@ -69,7 +69,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     pub fn execute_command(&mut self, raw: &str) {
-        let stripped = raw.trim().trim_start_matches('/');
+        // `replace(/^\//, '')` — exactly one leading slash, so `//task` keeps
+        // its second one and lands in the unknown-verb branch.
+        let trimmed = raw.trim();
+        let stripped = trimmed.strip_prefix('/').unwrap_or(trimmed);
         let parts: Vec<String> = stripped.split_whitespace().map(str::to_string).collect();
         let Some(verb) = parts.first().map(|v| v.to_lowercase()) else {
             return;

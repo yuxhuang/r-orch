@@ -539,6 +539,18 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// A `callback`-mode suggestion was chosen on the agent-name step: open the
     /// pre-filled shop wizard for that template.
     pub fn apply_name_suggestion(&mut self, template_key: &str) {
+        // The guard precedes the template lookup, as in TS, so an unknown key
+        // still refuses rather than silently doing nothing. The wording differs
+        // from the `/agent shop` refusal — both strings are verbatim from
+        // `App.tsx` (`handleSuggestionSelected` vs `launchShopWizard`).
+        if self.state.default_adapter == "shell" {
+            self.emit(
+                "Agent Shop requires an AI provider. Choose Shell and enter a command instead.",
+                Token::Yellow,
+                MsgType::System,
+            );
+            return;
+        }
         let Some(template) = orch_domain::get_shop_template_by_key(template_key) else {
             return;
         };

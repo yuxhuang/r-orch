@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Span;
 
 use crate::format::cap_line;
+use crate::text::cursor::{Cursor, display_width, text_display_width};
 use crate::theme::{BLOCK, CHECK, CIRCLE, CIRCLE_FILLED, CURSOR, Token, light_rule};
 use crate::views::{RenderCtx, put_line};
 use crate::wizard::engine::{StepKind, Wizard};
@@ -158,10 +159,15 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
             ctx.style(Token::Ghost),
         ));
     } else {
+        // A display-width-aware sliding viewport that keeps the cursor visible
+        // (docs/parity/tui.md §5.1); CJK and emoji count as two cells, so the
+        // window is measured in cells, not characters.
         let cursor = wizard.text_input().cursor();
-        spans.push(Span::styled(cursor.before(), ctx.style(Token::White)));
+        let field_w = max_w.saturating_sub(4).max(1);
+        let (before, after) = slide_viewport(cursor, field_w);
+        spans.push(Span::styled(before, ctx.style(Token::White)));
         spans.push(Span::styled(BLOCK, ctx.style(Token::Amber)));
-        spans.push(Span::styled(cursor.after(), ctx.style(Token::White)));
+        spans.push(Span::styled(after, ctx.style(Token::White)));
     }
     put_line(frame, area, area.y, spans);
     let mut used = 1;
@@ -336,4 +342,82 @@ fn render_multiselect_field(
         used += 1;
     }
     used
+}
+
+/// The text field's sliding viewport: drop whole graphemes from the left until
+/// the text before the cursor fits in `width` cells, then fill the remainder
+/// with what follows. Widths come from [`text_display_width`], so a CJK
+/// character or an emoji costs two cells.
+///
+/// `width` is the cell budget for the value itself; the block cursor sits in
+/// the last cell, so the text before it gets `width - 1`.
+fn slide_viewport(cursor: &Cursor, width: usize) -> (String, String) {
+    let budget = width.saturating_sub(1).max(1);
+    let before_segs = cursor.before_segs();
+    let mut start = 0;
+    while start < before_segs.len() && text_display_width(&before_segs[start..].concat()) > budget {
+        start += 1;
+    }
+    let before = before_segs[start..].concat();
+
+    let remaining = budget.saturating_sub(text_display_width(&before));
+    let mut after = String::new();
+    for segment in cursor.after_segs() {
+        if text_display_width(&after) + display_width(segment) > remaining {
+            break;
+        }
+        after.push_str(segment);
+    }
+    (before, after)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_value_is_shown_whole() {
+        let cursor = Cursor::new("hello");
+        assert_eq!(slide_viewport(&cursor, 20), ("hello".into(), String::new()));
+    }
+
+    #[test]
+    fn the_window_slides_to_keep_the_cursor_visible() {
+        let cursor = Cursor::new("abcdefghij");
+        let (before, after) = slide_viewport(&cursor, 5);
+        assert_eq!(before, "ghij");
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn text_after_the_cursor_fills_the_remaining_cells() {
+        let cursor = Cursor::at("abcdefghij", 2);
+        let (before, after) = slide_viewport(&cursor, 5);
+        assert_eq!(before, "ab");
+        assert_eq!(after, "cd");
+    }
+
+    #[test]
+    fn wide_clusters_cost_two_cells_each() {
+        // Four CJK characters are eight cells; a five-cell field keeps two.
+        let cursor = Cursor::new("你好世界");
+        let (before, after) = slide_viewport(&cursor, 5);
+        assert_eq!(before, "世界");
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn a_wide_cluster_is_never_split_in_half() {
+        let cursor = Cursor::at("你好世界", 0);
+        let (before, after) = slide_viewport(&cursor, 4);
+        assert!(before.is_empty());
+        // Three cells of budget fit one two-cell character, not one and a half.
+        assert_eq!(after, "你");
+    }
+
+    #[test]
+    fn an_empty_value_yields_empty_halves() {
+        let cursor = Cursor::new("");
+        assert_eq!(slide_viewport(&cursor, 10), (String::new(), String::new()));
+    }
 }

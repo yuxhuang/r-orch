@@ -65,6 +65,10 @@ fi
 
 declare -a NAMES=() RESULTS=() DETAILS=()
 FAILED=0
+# Logs of failing steps land here. Inside target/, so it is gitignored and a
+# cold run's cleanup does not take it: the point is to survive the run.
+LOG_KEEP="$REPO/target/gate-logs"
+rm -rf "$LOG_KEEP"
 
 # step <name> <command…> — run it, record pass/fail and a one-line detail.
 #
@@ -82,11 +86,19 @@ step() {
   DETAILS+=("$(summarize "$name" "$log")")
   if [ "$rc" -eq 0 ]; then
     RESULTS+=("pass")
+    rm -f "$log"
   else
     RESULTS+=("FAIL ($rc)")
     FAILED=$((FAILED + 1))
+    # Keep the log. A failing step's output is the only evidence of *why*, and
+    # deleting it has already cost two investigations: an intermittent test
+    # failed under the cold gate's I/O load, and by the time anyone looked
+    # there was nothing but "1 failed" to go on. Cheap insurance.
+    mkdir -p "$LOG_KEEP"
+    cp "$log" "$LOG_KEEP/$name.log"
+    rm -f "$log"
+    printf '  (log kept at %s/%s.log)\n' "$LOG_KEEP" "$name"
   fi
-  rm -f "$log"
 }
 
 summarize() {

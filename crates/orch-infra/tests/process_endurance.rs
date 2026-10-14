@@ -129,7 +129,13 @@ async fn the_group_kill_cleans_up_the_children_of_the_child() {
             "sh",
             &[
                 "-c".to_owned(),
-                "sleep 30 & sleep 30 & sleep 30 & printf 'up\\n'; sleep 30".to_owned(),
+                // All four forked before `up`, then `wait` (a builtin). See
+                // the twin in `process::manager`'s unit tests for why the
+                // trailing foreground `sleep` was a race: a child forked
+                // between the SIGTERM and the shell's death joins the group
+                // unsignalled, and `kill_with_grace` returns without ever
+                // sending SIGKILL — faithfully to the TS.
+                "sleep 30 & sleep 30 & sleep 30 & sleep 30 & printf 'up\\n'; wait".to_owned(),
             ],
             SpawnOptions::default(),
         )

@@ -1268,6 +1268,55 @@ A JSON **array of the complete entity objects** — not a summary. Maintained by
 `IndexManager` is used by task, agent, goal, context and message stores. **`TeamStore` and `RunStore` have no
 index** and scan their directories.
 
+#### 6.10.1 Index order leaks into tied listings — position is not contract
+
+Stated once here; the §14 entries that hit it cross-reference this section rather than repeating it.
+
+**The mechanism, in three steps:**
+
+1. **Concurrent saves land in nondeterministic order.** Several code paths write a batch of entities with
+   `Promise.all` (`join_all` in Rust). Completion order within the batch is not specified, and `save()`
+   pushes each entity to the **end** of the index, so the resulting `_index.json` order varies run to run.
+2. **`updated_at` has only millisecond precision** (`new Date().toISOString()`, §6.3). A batch written in the
+   same millisecond produces entities whose timestamps are **exactly equal**.
+3. **The listing comparators return `0` on an exact tie**, and both JS `Array.prototype.sort` (ES2019+) and
+   Rust `slice::sort_by` are **stable** — so a tie preserves input order, which is index order, which is
+   nondeterministic by step 1.
+
+```
+task-store.ts:42  /  goal-store.ts:39   return bTime < aTime ? -1 : bTime > aTime ? 1 : 0;   // 0 on tie
+message-store.ts:46                     a.created_at.localeCompare(b.created_at)              // 0 on tie
+```
+
+**Therefore: the position of an entity within any listing whose sort key ties is NOT contract.** This applies
+to `task list`, `goal list`, `msg list`, their `--json` forms, and the `_index.json` files themselves.
+
+**Known concurrent-save sites** (all verified in source):
+
+| Site | Store written |
+|---|---|
+| `message-service.ts` broadcast fan-out | messages |
+| `goal-service.ts:99` — `goal status --force` cancelling pending tasks | tasks |
+| `goal-service.ts:211` — `cancelPendingAutonomousTasks` on goal pause | tasks |
+| `orchestrator.ts:940` — `cascadeFailDependents` per BFS level | tasks |
+| `orchestrator.ts:620` — `reconcile` resetting stale agents to `idle` | **agents** |
+
+**How scenarios declare it.** Per step, not globally:
+
+- **`@unordered:<reason>`** — arrays are sorted at **every depth** before comparison. The `<reason>` is
+  required, so a reader can tell a real nondeterminism from a masked bug.
+- **`unordered_files`** — the same, for a set of files whose relative order is not meaningful.
+
+Everything else on the step is still compared in full. Declaring it per step keeps the blast radius visible:
+a step without the marker is order-sensitive, and that is the default.
+
+> **Interaction with §14.4.** That entry replicates TS tie-breaking in `findBestAgent`, on the stated
+> precondition that index order is "deterministic for a given operation sequence". The agent row above is the
+> exception: `reconcile`'s stale-agent batch writes the **agent** index concurrently, so an operation sequence
+> that includes a stale-agent reset can itself produce a nondeterministic agent order — and with it a
+> nondeterministic tie. Scenarios asserting agent selection must avoid both a multi-entity index rebuild
+> (§14.4) **and** a concurrent stale-agent reset.
+
 ### 6.11 `init` file contents (L0)
 
 `.orchestry/.gitignore`:
@@ -1641,7 +1690,8 @@ When a task permanently fails, every task that depends on it — directly or tra
 via a breadth-first walk over a reverse-dependency index. Already-terminal and already-visited tasks are
 skipped. Each cascaded task emits **both** `task:status_changed { from, to: "failed" }` and
 `task:cascade_failed { taskId, failedDependencyId, reason }`, where `reason` is
-`dependency <failedTaskId> failed: <error>`. Writes are batched in parallel per BFS level.
+`dependency <failedTaskId> failed: <error>`. Writes are batched in parallel per BFS level, so the cascaded
+tasks' order in a tied listing is not contract (§6.10.1).
 
 ### 7.11 Scope overlap (L1)
 
@@ -1757,7 +1807,8 @@ and resolve all `waitForStop()` waiters.
   **and `team_id: "<unknown>"` is still persisted on every message**, leaving a dangling reference in the
   store. Measured in a four-agent tree: a real two-member team → 2 messages; `--team team_nosuch` → 4.
   **An implementation that validates the team id sends strictly fewer messages than the oracle.** Replicate.
-  `fixtures/scenarios/cmd-msg-broadcast-unknown-team.toml`.
+  `fixtures/scenarios/cmd-msg-broadcast-unknown-team.toml`. The fan-out is a concurrent batch, so the
+  recipients' order in `msg list` is not contract — see §6.10.1.
 - **`lead`** — requires `team_id`; resolves to `team.lead_agent_id`. One message.
 - `drainMailbox(agentId, taskId)` — called during dispatch: list pending, mark all delivered, emit
   `message:delivered` per message, return them for prompt injection.
@@ -2614,8 +2665,19 @@ The handler is **one ordered `if` chain and the order is load-bearing**. Reprodu
 2. Agent picker open → swallow everything. (The *type* picker does **not** block — a quirk; `q` still quits
    through it. Preserve or fix deliberately — see §14.8.)
 3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard — **refused when the default adapter is
-   `shell`**, since shop templates require an AI adapter (§11.4). The refusal surfaces the same guidance the
-   suggestion path uses: *Agent Shop requires an AI provider. Choose Shell and enter a command instead.*
+   `shell`**, since shop templates require an AI adapter (§11.4).
+
+   **There are two different refusal strings, both `yellow` toasts. They are L0 and must not be unified:**
+
+   | Call site | Reached by | Exact string |
+   |---|---|---|
+   | `launchShopWizard` — `App.tsx:1012` | **`Ctrl+S`** and **`/agent shop`** | `Agent Shop requires an AI provider. Press N to create a Shell agent.` |
+   | `handleSuggestionSelected` — `App.tsx:1321` | selecting a template from the inline suggestion list on the agent wizard's **name** step | `Agent Shop requires an AI provider. Choose Shell and enter a command instead.` |
+
+   They share a first sentence and differ in the advice, which fits each entry point: from `Ctrl+S` you are
+   not yet in a wizard, so you are told to press `N`; from the suggestion list you already are, so you are
+   told what to pick. *(An earlier revision of this document claimed both paths printed the same string. They
+   do not.)*
 4. Any input mode active → text-input branch.
 5. Normal-mode chain, in source order.
 
@@ -2708,6 +2770,30 @@ step types. Validation is **300 ms debounced** for text and textarea, **synchron
 - [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) ·
       **NEW TASK** (4) · **EDIT TASK** (4) · **NEW TEAM** (4) · **New Goal** (3) · **Edit Goal** (3) ·
       **SETTINGS** (5 single-step variants, one per config setting)
+- [ ] **Display-width-aware sliding viewport** on `text`/`textarea` fields (`TextInput.tsx`): fill `before`
+      from the right while `width + 1` fits (one column reserved for the cursor block), then fill `after`
+      with the remainder, measuring **per grapheme**. Required for parity — without it a cursor in a long
+      value drifts out of view. r-orch measures with `unicode-width` rather than the TS range table, so the
+      algorithm matches while the widths differ (§12.8.1).
+- [ ] **Clipboard paste** on `text`/`textarea` steps. The TS guard is
+      `(key.ctrl || key.meta) && (input === 'v' || input === 'i')`, and in Ink `key.meta` means
+      **Alt/Option**, so the reachable bindings are **`Ctrl+V`, `Ctrl+I`, `Alt`/`Option`+`V`,
+      `Alt`/`Option`+`I`**. Only active when a paste handler is wired and the step is `text` or `textarea`.
+
+      **Cmd (U+2318) is not one of them, and cannot be.** Verified in Ink 6.8.0 `parse-keypress.js`: on the
+      legacy path `key.meta` is set from an **ESC-prefixed** sequence (`key.meta = s.charAt(0) === '\x1b'`,
+      and `metaKeyCodeRe = /^(?:\x1b)([a-zA-Z0-9])$/`), which is exactly how terminals encode
+      Option-as-Meta; on the xterm path it is `!!(modifier & 10)`, i.e. the Alt/Meta bits. Under the Kitty
+      protocol `meta` is a **distinct bit from `super`** — `kittyModifiers = { shift: 1, alt: 2, ctrl: 4,
+      super: 8, hyper: 16, meta: 32 }` — and Cmd arrives as `super`, which Ink never maps to `key.meta`. On
+      other terminals Cmd combinations are consumed by the emulator and never reach the application.
+
+      Bind `Ctrl` and `Alt`/`Option`; do **not** add a Cmd binding expecting it to fire.
+
+      **In crossterm terms**, since that is the vocabulary the port is written in: match
+      **`KeyModifiers::ALT`**, plus **`KeyModifiers::META`** where the terminal reports it — and
+      **never `KeyModifiers::SUPER`**. `SUPER` is where Cmd arrives when it arrives at all, so treating it
+      as meta re-creates exactly the binding that cannot fire.
 - [ ] Validation messages verbatim: `Title is required`, `Priority must be 1-4`, `Name is required`,
       `Agent with this name already exists`, `Team with this name already exists`,
       `Command is required for Shell`, `Fix the error above`
@@ -2731,7 +2817,9 @@ solid text, selection); exact hex values are L2.
 
 ### 12.8 Deliberate divergences in r-orch's TUI
 
-WP-6 is complete: **742 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
+WP-6 is complete: **100 % of this section’s checklist**, with the case count and its per-area breakdown in
+`crates/orch-tui/TEST-COVERAGE.md` (**authoritative** — deliberately not restated here; see V33). Nine
+divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
 
@@ -2745,9 +2833,36 @@ each is justified on its own merits rather than by the gate.
 | f | Toast and undo rows come from the elastic bottom panel | **L2** | Pure layout. The rows exist and carry the same text; where the space is taken from differs. | here |
 | g | `log_selected_index` consistently indexes the **filtered** list | L1 | The original mixes filtered and unfiltered indexing, so the highlighted row and the detail shown disagree whenever a filter is active. | §14.20 |
 | h | Pre-dispatch failures reported synchronously as `Err` | L1 | The TUI renders no `orchestrator:error` case, so a stream-only dispatch error is **invisible**. | §12.10 |
+| i | Grapheme display width from `unicode-width`, not the TS range table | **L2** | The TS table under-measures several emoji classes; r-orch matches what terminals actually render. | §12.8.1 |
 
-Items (b) and (f) are recorded only here, because they are additions/layout rather than behaviours of the
-original. The other five have §13 or §14 entries.
+Items (b), (f) and (i) are recorded only here, because they are additions, layout or presentation rather
+than behaviours of the original. The others have §13, §14 or §12.10 entries.
+
+#### 12.8.1 Display width (L2)
+
+`text-cursor.ts:31` classifies a grapheme by **its first codepoint alone**, against a hand-written range
+table whose emoji entry is only `0x1F300–0x1FAFF`. Grapheme *clustering* is correct (it uses
+`Intl.Segmenter`); only the width classification is wrong. Measured consequences:
+
+| Input | First codepoint | TS width | Terminal / `unicode-width` |
+|---|---|---|---|
+| `⌚` `⏰` `✅` — BMP pictographs | U+231A, U+23F0, U+2705 — all below the `0x2E80` CJK floor | **1** | **2** |
+| `❤️` — VS16 sequence | U+2764 (the VS16 is in the same cluster but never inspected) | **1** | **2** |
+| `🇺🇸` — regional-indicator pair | U+1F1FA, below the `0x1F300` emoji floor | **1** | **2** |
+| `😀` | U+1F600, inside the range | 2 | 2 |
+| CJK, Hangul, fullwidth forms | — | 2 | 2 |
+
+r-orch uses **`unicode-width`**, so these measure 2 and the cursor, truncation and padding land where the
+terminal actually draws. **L2 and effect `none`** — it is presentation, and the TUI is outside the harness —
+but it is a visible improvement rather than a cosmetic shuffle: under the TS table an `⌚` in a task title
+drifts every column to its right by one.
+
+All on-screen measurement in r-orch goes through **ratatui**; the standalone width helpers are being
+annotated or removed by WP-6 so there is one source of truth rather than two that can disagree.
+
+**Related, same class:** the command bar truncates by **`char` count** in r-orch where the TS slices by
+**UTF-16 code units** (`commandBar.ts`). Each astral character is 2 code units but 1 `char`, so a command
+containing one drifts by a column between the two implementations. Also **L2**.
 
 ### 12.9 The update facade is intentionally inert
 
@@ -2788,6 +2903,14 @@ workspace preparation failure, an invalid task id or a non-dispatchable status. 
 Post-dispatch outcomes stay asynchronous and arrive through `poll_events` — that part of the facade is right
 and must not become blocking. The dividing line is **"did the child process start?"**: before it, `Err`;
 after it, events.
+
+**One exception on the other side of that line: `stop_watch` awaits the wind-down.** It is the one facade
+method that legitimately blocks, because the wind-down must complete every step and release the lock before
+the call returns (§14.15), and an in-flight tick is allowed to finish rather than be aborted (§14.24).
+**This matches the TypeScript and is therefore not a divergence** — it is deliberately absent from §12.8's
+table, which is for divergences only. Recorded here because "the facade never blocks" would otherwise read
+as absolute and invite someone to make `stop_watch` fire-and-forget, which would let the TUI exit while the
+lock was still held.
 
 This is a **fix** for a usability gap rather than a parity divergence: the original emits the error, so the
 information exists; it simply never reaches the screen.
@@ -2945,7 +3068,14 @@ It depends on three properties, all of which are now requirements:
 
    **Scenario rule:** do not construct a differential scenario that triggers a multi-entity index rebuild.
    Single-entity rebuilds are safe (trivially ordered), which covers the common `init` → first `agent add`
-   path. This is the one tie-order case that stays unverifiable, and it is recorded rather than hidden.
+   path.
+
+4. **A second hole, from §6.10.1:** `reconcile` resets stale agents with a **concurrent batch**
+   (`orchestrator.ts:620`), which writes the agent index in nondeterministic order. So even a *fixed*
+   operation sequence can yield a nondeterministic agent order if it includes a stale-agent reset. Scenarios
+   asserting agent selection must avoid that too.
+
+Both holes are recorded rather than hidden. Everything outside them is oracle-verifiable.
 
 ### 14.5 `ReviewRunner` commands are hard-coded to npm/npx — **REPLICATE**
 
@@ -3394,7 +3524,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
 | V31 | **Harness hermeticity**: `HOME`/`USERPROFILE` redirected per tmpdir; a fresh `update-check.json` pre-seeded; the oracle spawns **no `npm`** and makes **no network call** | L0 | Scenario asserting the process tree contains no `npm` and no socket; run with the network namespace disabled in CI |
 | V32 | **Generalized YAML cross-parse**: every YAML artifact in **both** trees re-parsed **in the TS process with js-yaml** and deep-compared against the Rust parse | L0 | Harness step (~50 lines of Node glue). **Subsumes V8.** The single highest-value check in the plan |
-| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 742 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
+| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: `crates/orch-tui/TEST-COVERAGE.md`, which carries the count and its per-area breakdown and is the authoritative figure. No count is restated in this document** — it was hand-bumped four times (740 → 742 → 747 → 754) before being removed, which is the drift this rule exists to stop. | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
 | V34 | **Stall clock semantics**: a run emitting blank lines stalls; a run emitting unparseable non-blank lines does not | L1 | Cross-compat `serve --once` scenario with a fake agent, compared against the oracle |
 | V35 | **`serve --once` killed mid-run** → task recovery, run finalization and `--json` records match the oracle | L1 | Cross-compat scenario with a fake agent and an external kill |
 | V36 | **`max_concurrent_agents` saturation**: N ready tasks, cap 2 — dispatch order, claim/release and final tree match the oracle | L1 | Cross-compat scenario with fake agents |
