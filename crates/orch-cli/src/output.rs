@@ -210,7 +210,7 @@ pub fn render_table(
         .map(|(i, header)| {
             rows.iter()
                 .map(|row| row.get(i).map(|c| display_width(c)).unwrap_or(0))
-                .chain(std::iter::once(header.chars().count()))
+                .chain(std::iter::once(utf16_len(header)))
                 .max()
                 .unwrap_or(0)
         })
@@ -247,11 +247,7 @@ pub fn print_table(styles: &Styles, headers: &[&str], rows: &[Vec<String>], padd
 
 /// `  ` + key padded to `maxKeyLen + 2` + value, one trailing newline.
 pub fn render_key_value(styles: &Styles, pairs: &[(String, String)]) -> String {
-    let max_key = pairs
-        .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(0);
+    let max_key = pairs.iter().map(|(k, _)| utf16_len(k)).max().unwrap_or(0);
     let lines: Vec<String> = pairs
         .iter()
         .map(|(key, value)| format!("  {}{value}", styles.dim(&pad_end(key, max_key + 2))))
@@ -263,10 +259,17 @@ pub fn print_key_value(styles: &Styles, pairs: &[(String, String)]) {
     print!("{}", render_key_value(styles, pairs));
 }
 
-/// `String.prototype.padEnd`, which counts UTF-16 code units. For the ASCII
-/// headers and labels in this module that is the same as counting characters.
+/// `String.prototype.length`: UTF-16 code units, so an astral character (an
+/// emoji, say) counts 2. Every width and pad in this module is a `.length` in
+/// the TS, and a cell can hold a user-supplied title or agent name, so the
+/// count has to be the UTF-16 one to pad identically (PARITY.md §5.1).
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// `String.prototype.padEnd`, which counts UTF-16 code units.
 fn pad_end(text: &str, width: usize) -> String {
-    let len = text.chars().count();
+    let len = utf16_len(text);
     if len >= width {
         text.to_owned()
     } else {
@@ -276,7 +279,7 @@ fn pad_end(text: &str, width: usize) -> String {
 
 /// Cell width as the TS computes it: ANSI stripped, then `.length`.
 fn display_width(cell: &str) -> usize {
-    strip_ansi(cell).chars().count()
+    utf16_len(&strip_ansi(cell))
 }
 
 /// The TS `stripAnsi` is `/\x1b\[[0-9;]*m/g` — SGR sequences only.
@@ -504,6 +507,25 @@ mod tests {
         let coloured = format!("\x1b[38;5;72m{}\x1b[39m", "ab");
         let rendered = render_table(&Styles::plain(), &["H"], &[vec![coloured]], 2);
         assert_eq!(strip_ansi(&rendered), "  H   \n  ab  \n");
+    }
+
+    #[test]
+    fn an_astral_character_in_a_cell_counts_two_columns_like_string_length() {
+        // The TS widths and pads are `.length`, i.e. UTF-16 code units, so a
+        // rocket counts 2 and the TITLE column is 7 + 2 wide — not 6 + 2.
+        // Measured against node: see PARITY.md §5.1.
+        assert_eq!(
+            render_table(
+                &Styles::plain(),
+                &["TITLE", "PRI"],
+                &rows_of(&[&["ship \u{1F680}", "P3"], &["x", "P1"]]),
+                2
+            ),
+            "  TITLE    PRI  \n  ship \u{1F680}  P3   \n  x        P1   \n"
+        );
+        assert_eq!(utf16_len("ship \u{1F680}"), 7);
+        // A BMP glyph is one unit, which is why the icon columns line up.
+        assert_eq!(utf16_len("○ todo"), 6);
     }
 
     #[test]

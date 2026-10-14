@@ -72,7 +72,6 @@ jiff = "0.2"
 nix = { version = "0.31", default-features = false }
 tempfile = "3.27"
 dirs = "7.0"
-which = "8.0"
 shell-words = "1.1"
 globset = "0.4"
 # Model-discovery parsers (PARITY.md §8.12). `fancy-regex` is pinned to the
@@ -88,8 +87,14 @@ toml = "1.1"
 
 # ── Library-first candidates (ARCHITECTURE §4.8) ───────────────────────────
 # All verified on 2026-10-13 to resolve on rustc 1.94.1 *and* alongside
-# ratatui 0.30.2 with a single ratatui in the graph. None is used yet; they are
-# declared here so the owning package does not have to touch this manifest.
+# ratatui 0.30.2 with a single ratatui in the graph. `unicode-segmentation`,
+# `unicode-width`, `arboard` and `png` are in use; the rest are declared here
+# so the owning package does not have to touch this manifest.
+#
+# `process-wrap` is declared but NOT adopted: the parity contract needs a
+# pid-keyed kill/is_alive API with no child handle, and its group `wait()`
+# would delay `ExitSignal` past node's `close`. The full reason is at the head
+# of orch-infra/src/process/manager.rs (ARCHITECTURE §4.8 exemption (b)).
 #
 # `tui-textarea` is deliberately ABSENT: 0.7.0 (its latest) hard-depends on
 # ratatui 0.29.0 and crossterm 0.28.1, so a `TextArea` cannot be rendered into
@@ -113,13 +118,10 @@ unicode-width = "0.2"
 arboard = "3.6"
 # PNG-encodes clipboard images (already in the tree via arboard).
 png = "0.18"
-# Version comparison for the update check.
-semver = "1.0"
 
 # ── Dev (ARCHITECTURE §4.6) ────────────────────────────────────────────────
 insta = "1.49"
 assert_cmd = "2.2"
-predicates = "3.1"
 # Not used yet. Declared so WP-2/WP-5 can reach for it without touching the
 # root manifest (ARCHITECTURE §4.6).
 proptest = "1.12"

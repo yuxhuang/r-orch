@@ -1,0 +1,47 @@
+name = "cmd-astral-column-widths"
+kind = "differential"
+requires = [
+  "task add", "task list", "task show",
+  "agent add", "agent list",
+  "goal add", "goal list",
+  "context set", "context list",
+]
+description = """
+Column widths and cell padding are `String.prototype.length` — UTF-16 code \
+units — not characters and not display columns (PARITY.md §5.1). Every \
+table here carries one cell with an astral character beside a plain one, so \
+the padding of the *whole column* records the count: a rocket \
+(U+1F680) is 2 units, and the family (U+1F468 ZWJ U+1F469 ZWJ U+1F467) is \
+8, though both occupy two terminal columns. An implementation that counts \
+`char`s pads these columns one short per astral character, and one that \
+counts display width pads the family six short; both look right on every \
+ASCII fixture and wrong the first time anyone names a task with an emoji. \
+The key/value renderings (`task show`) pad only the key, so they pin the \
+label column while the astral text sits in the value."""
+steps = [
+  "init --name proj --adapter claude",
+  # U+1F680 ROCKET: 2 UTF-16 units, 2 terminal columns.
+  "task add 'ship \U0001F680 it' --description 'body \U0001F680' --priority 1 --quiet",
+  # U+1F468 U+200D U+1F469 U+200D U+1F467: 8 UTF-16 units, 2 terminal columns.
+  "task add 'pair \U0001F468\u200D\U0001F469\u200D\U0001F467 up' --priority 2 --quiet",
+  "task add 'plain ascii title' --priority 3 --quiet",
+  "task list",
+  "task list --json",
+  "task show ${task.0}",
+  "task show ${task.0} --json",
+  "agent add 'nav \U0001F680' --adapter shell --command 'echo hi' --quiet",
+  "agent add plain --adapter shell --command 'echo hi' --quiet",
+  "agent list",
+  "agent list --json",
+  "goal add 'launch \U0001F680' --description 'and \U0001F468\u200D\U0001F469\u200D\U0001F467' --quiet",
+  "goal add 'plain goal' --quiet",
+  "goal list",
+  "goal list --json",
+  # A context *key* is `[A-Za-z0-9._-]` (paths.ts `sanitizeId`), so the astral
+  # character can only reach a table through the VALUE column — where it has
+  # to be the widest cell to drive the column.
+  "context set alpha 'ship \U0001F680 the thing'",
+  "context set beta ascii",
+  "context list",
+  "context list --json",
+]
