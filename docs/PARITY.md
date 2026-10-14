@@ -2789,6 +2789,11 @@ step types. Validation is **300 ms debounced** for text and textarea, **synchron
       other terminals Cmd combinations are consumed by the emulator and never reach the application.
 
       Bind `Ctrl` and `Alt`/`Option`; do **not** add a Cmd binding expecting it to fire.
+
+      **In crossterm terms**, since that is the vocabulary the port is written in: match
+      **`KeyModifiers::ALT`**, plus **`KeyModifiers::META`** where the terminal reports it — and
+      **never `KeyModifiers::SUPER`**. `SUPER` is where Cmd arrives when it arrives at all, so treating it
+      as meta re-creates exactly the binding that cannot fire.
 - [ ] Validation messages verbatim: `Title is required`, `Priority must be 1-4`, `Name is required`,
       `Agent with this name already exists`, `Team with this name already exists`,
       `Command is required for Shell`, `Fix the error above`
