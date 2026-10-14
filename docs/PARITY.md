@@ -3642,6 +3642,8 @@ contain them.
 
 **Effect on differential comparison: `none` in the corpus** — no scenario produces a document near any bound.
 
+> **⚠ Not currently true for nested aliases.** A third bomb shape defeats all four guards together — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0. An exact expanded-size pre-pass is pending; this section will be rewritten against it.
+
 js-yaml has no limits of any kind. r-orch refuses a document that trips **any of four guards**:
 
 | Guard | Bound |
@@ -3734,6 +3736,8 @@ platform has no modes, and the write proceeds unrestricted.
 `state.json` keep umask modes, matching TS. They are not credential-bearing by design, and tightening
 everything would be a larger divergence for no security gain — a secret pasted into a task *description* is
 a user error that 0600 would hide rather than fix.
+
+> **⚠ Not a mitigation for the YAML DoS (C0).** A hostile `config.yml` arrives through the repository, not through local write access, so `0600` does not bound it — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0 and §14.31.
 
 **This does not make secrets in `env:` safe.** `.orchestry/agents/` is **not** covered by `init`'s
 `.gitignore`, so an API key there still reaches your repository on the next `git add`. 0600 closes local

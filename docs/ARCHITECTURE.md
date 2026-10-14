@@ -232,6 +232,10 @@ Three maintained options:
 **Decision: `serde_yaml_ng = "0.10"`.** Re-confirmed at the gate against measured alternatives rather than
 left as a first-pass choice:
 
+> **⚠ The ~0.2–0.3 ms refusal does not hold for nested aliases.** A third bomb shape defeats all four guards together — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0; an exact expanded-size pre-pass is pending and this reasoning will be rewritten against it.
+
+
+
 | Candidate | DoS behaviour on the C0 bombs | Why not |
 |---|---|---|
 | **`serde_yaml_ng` 0.10** — chosen | 5 s / 65 s *unguarded*; **~0.2–0.3 ms refusal** with the §14.31 expansion estimate in front of it | — |
@@ -965,7 +969,7 @@ transitive with no alternative:
 
 | Advisory | Crate | Via | Why accepted |
 |---|---|---|---|
-| RUSTSEC-2024-0449 | `unsafe-libyaml` | `serde_yaml_ng` | The §14.31 read guards refuse the DoS shapes in ~0.2–0.3 ms before the parser sees them. Revisit if `serde-saphyr` gains a `Value` API (§4.2) |
+| RUSTSEC-2024-0449 | `unsafe-libyaml` | `serde_yaml_ng` | **⚠ Mitigation incomplete — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0; an exact expanded-size pre-pass is pending.** The §14.31 read guards refuse the two known DoS shapes in ~0.2–0.3 ms before the parser sees them, but not a nested-alias shape. Revisit if `serde-saphyr` gains a `Value` API (§4.2) |
 | RUSTSEC-2026-0319 | `anymap2` | `liquid-core` | No alternative; `liquid` is the only maintained Liquid implementation for Rust (§4.3) and prompt rendering is byte-contract |
 
 Each accepted advisory must name its mitigation and its revisit condition. An advisory accepted with neither
