@@ -90,6 +90,9 @@ The differential harness ([ARCHITECTURE.md §8.2](ARCHITECTURE.md)) compares aft
 | YAML mapping key order | **Not contract**, but SHOULD match the TS interface field order for human diff friendliness. | `writeYaml` uses `sortKeys: false`. |
 | IDs | Replace `/(tsk|agt|run|goal|team|msg)_[A-Za-z0-9_-]{7}/` with `<\1_ID>`, consistently per-run. | nanoid is random. |
 | Timestamps | Replace ISO-8601 instants with `<TS>`; preserve ordering relations separately where asserted. | Wall clock. |
+| **Local clock times** in human output — `HH:MM:SS` from `toLocaleTimeString('en-US', { hour12: false })` in `orch run`, `orch logs` and the TUI activity feed | Replace with `<TIME>`. | The two binaries run seconds apart, so the values differ legitimately; and the TS form is **local time**, not UTC (§5.4). The *presence and position* of the field stays contract. |
+| `heap_mb` in `serve` tick records | **Masked.** | V8 heap vs process RSS — no faithful counterpart (§11.1). The field name is contract, the value is not. |
+| `orchestrator:tick` records in `serve` output | **Dropped** on steps marked `@ticks-vary`. | Tick count is a function of wall-clock duration vs `poll_interval_ms`. Every other record type on those steps is still compared. |
 | Absolute paths | Replace the temp project root with `<ROOT>`. | Temp dirs. |
 | PIDs | Replace with `<PID>`. | OS-assigned. |
 | Durations / `*_ms` measured values | Replace with `<MS>`. | Timing. |
@@ -2407,7 +2410,7 @@ plus the per-event fields below. **Events not listed are suppressed entirely** (
 
 | `event` | `level` | Extra fields |
 |---|---|---|
-| `orchestrator:tick` | `info` | `running`, `queued`, `heap_mb` *(heap bytes / 1048576, 1 decimal)* |
+| `orchestrator:tick` | `info` | `running`, `queued`, `heap_mb` — see below |
 | `orchestrator:shutdown` | `info` | `reason` |
 | `orchestrator:error` | `error` if `fatal` else `warn` | `error`, `context`, `fatal` |
 | `orchestrator:stall_detected` | `warn` | `runId` |
@@ -2429,6 +2432,20 @@ plus the per-event fields below. **Events not listed are suppressed entirely** (
 Suppressed (no record at all): `task:assigned`, all `message:*`, all `team:*`, all `goal:*`,
 `agent:autonomous_toggled`, and `agent:output` without `--verbose`.
 
+#### `heap_mb` and the tick heartbeat
+
+**`heap_mb` has no faithful Rust counterpart.** In TS it is `process.memoryUsage().heapUsed / 1048576` to one
+decimal — a **V8 heap** measurement. Rust has no V8 heap. **Decision (team lead): r-orch reports process
+**RSS in MiB** under the same field name**, to one decimal. The *field* is contract (a log consumer's schema
+keeps working); the *value* is not comparable, so **the harness masks it**.
+
+**`orchestrator:tick` records are a wall-clock heartbeat and are excluded from comparison.** The number of
+ticks a run emits depends on how long the run took versus `poll_interval_ms`, so two binaries started seconds
+apart legitimately emit different counts. Scenario steps that run `serve` carry **`@ticks-vary`**, which drops
+`event == "orchestrator:tick"` records from the comparison. **Every other record is still compared in full** —
+the exclusion is per-record-type, not per-step, so dropping ticks does not weaken the §11.1 contract for
+anything else.
+
 **Idle-tick throttling** (L1): a tick is "idle" when `running == 0 && queued == 0`. In non-verbose mode an idle
 tick is logged only when `tickCounter % idleLogInterval == 0`. The counter increments on **every** tick
 (including non-idle ones) and is never reset. `idleLogInterval` is **6**
@@ -2444,6 +2461,19 @@ list, and values are raw for strings, JSON-encoded otherwise.
 or an `orchestrator:shutdown` event was observed. Then `stop()`. Exit **1** if any task ended `failed`,
 else **0**. Note the check is `status === "failed"` specifically — a `cancelled` task does **not** cause a
 non-zero exit.
+
+> **Usage trap — `serve --once` never returns while any task sits in `review`.** `review` is **not** a
+> terminal status (terminal is `{done, failed, cancelled}`, §7.1), so the poll loop waits for it forever.
+> A task lands in `review` and stays there whenever its agent's `approval_policy` is **`suggest`** or
+> **`manual`** and the task has no `review_criteria` — nothing auto-approves it, and `--once` has no
+> timeout.
+>
+> **This is reachable out of the box**: the `agt_creator` agent that `orch init` creates ships with
+> `approval_policy: suggest` (§6.11), so a `serve --once` over a task assigned to the default agent hangs.
+> It applies **equally to both binaries** — it is inherited behaviour, not a divergence, and is replicated.
+> Document it for users (use `approval_policy: auto`, set `review_criteria`, or approve out of band) and
+> **keep it out of unattended scenarios**: a `--once` scenario must drive tasks to a terminal status or it
+> will hang the harness rather than fail it.
 
 **Flush on exit** (L1): all non-stdout/stderr streams are `end()`ed and awaited before the process exits, so a
 `--log-file` is never truncated.
@@ -2853,6 +2883,9 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.19 wizard cancel leaks attachments | FIX | `none` — TUI |
 | §14.20 `logSelectedIndex` filtered/unfiltered mix | FIX | `none` — TUI |
 | §14.21 worktree-mode `run`/`serve --once` no-op | **FIX** | **`oracle patched`** (`parity/patches/0001-…`) |
+| §14.22 `kill(0)` hits our own process group | **FIX** | `none` |
+| §14.23 `run <id>` awaits the collector | equivalent behaviour | `none` |
+| §14.24 `stop()` lets an in-flight tick finish | REPLICATE | `none` |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3266,6 +3299,58 @@ replicating a default-mode no-op.
 > **Note for anyone reading the captured reference output in §5.4:** that `orch run` transcript was taken
 > after `orch config set defaults.agent.workspace_mode shared`, which is why it shows a real dispatch. The
 > default-mode failure was not visible in it.
+
+### 14.22 `kill(pid)` with a stale `pid: 0` signals the orchestrator's own process group — **FIX**
+
+**Effect on differential comparison: `none`.**
+
+`ProcessManager.kill` tries the process **group** first: `process.kill(-pid, signal)`. For `pid === 0` that is
+`process.kill(-0, …)`, and since `-0 === 0`, the target is **process group 0 — the caller's own group.** So a
+stale `pid: 0` makes the orchestrator **SIGTERM itself** (and every sibling in its group). `isAlive(0)` does
+not save you: `process.kill(0, 0)` signals the caller's own group, succeeds, and reports the phantom process
+as alive, so `killWithGrace(0)` proceeds straight to the `SIGTERM`.
+
+**This is reachable, not theoretical.** The shell adapter returns `{ pid: 0, events: errorGen() }` when the
+agent has no `config.command` (`shell.ts:47`, §8.10). If such a handle's `pid` reaches `state.running` — or
+survives in a hand-edited or partially-written `state.json` — the next reconcile, stall kill, `cancelTask`,
+`forceStopAgent` or `stop()` turns into self-termination.
+
+**Decision: fix.** The process manager **refuses to signal pid 0** (and, for the same reason, any
+non-positive pid), logging the refusal rather than silently ignoring it. There is no legitimate call: ORCH
+never means "my own group". Also treat `is_alive(0)` as **false**, so a stale zero is reaped as a dead entry
+instead of being believed.
+
+### 14.23 `run <id>` must wait for the event collector to finish — **implementation of equivalent behaviour**
+
+**Effect on differential comparison: `none`.**
+
+`agent:completed` is emitted by `runService.finish`, which runs **inside** `collectEvents` — so the event
+fires while the collector is still draining and persisting. The TS process nonetheless stays alive to the end
+of the run, because the adapter's stdout pipe is **actively being read**, and that holds a `ref` on node's
+event loop until EOF.
+
+That is the same mechanism as §14.21 seen from the other side: **read pipes keep the process alive; unread
+pipes let it exit.** `run <id>` works by accident of the first; worktree-mode dispatch breaks by accident of
+the second.
+
+r-orch has no equivalent implicit keep-alive, so `run <id>` must **explicitly await the collector task** —
+not merely the `agent:completed` event — before returning. Returning on the event would truncate the JSONL
+event log, skip the proof/stats writes, and exit before the task reaches its terminal status. This is not a
+divergence: it is what the original does, made explicit.
+
+### 14.24 `stop()` does not interrupt an in-flight tick — **REPLICATE**
+
+**Effect on differential comparison: `none`.**
+
+`stop()` calls `clearInterval`, which prevents **future** ticks but cannot interrupt a callback already
+running. So a `stop()` issued mid-tick waits for that tick to finish (the state mutex serializes them anyway,
+§7.15).
+
+**Decision: replicate.** Aborting a tick in flight would be worse, not better: `atomicWrite` writes
+`.state.json.<random>.tmp` and renames, so cancelling between write and rename **litters the `.orchestry/`
+directory with temp files** that nothing ever cleans up. A tick is bounded work; letting it complete is
+correct. Pair this with §14.15 — the wind-down must still complete every step and release the lock even when
+steps fail.
 
 ---
 
