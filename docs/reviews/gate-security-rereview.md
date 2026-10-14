@@ -335,8 +335,13 @@ Fix C0, correct the `RUSTSEC-2024-0449` reason string, and route `init`'s two wr
 > `git diff f5d5abf be7df28` = **+21 / −2 lines in `fs_utils.rs`, all comments** — specifically the
 > "sole load-bearing defence" warning the lead required as a condition of accepting the deadline
 > removal. **No logic differs**, so these results apply to both commits, and the required comment is
-> satisfied by the amendment itself. Whatever lands on master should be checked to be this tree:
-> `git diff be7df28 <master> -- crates/orch-infra/src/storage/fs_utils.rs` should be empty.
+> satisfied by the amendment itself.
+>
+> **Master confirmed (`239e881`).** `be7df28` is a true ancestor of master
+> (`git merge-base --is-ancestor` passes), and `git diff be7df28 239e881` touches
+> **documentation only** — `docs/ARCHITECTURE.md`, `docs/PARITY.md`, `docs/RUNBOOK.md`. No `.rs`,
+> `Cargo.toml`/`Cargo.lock`, `deny.toml` or `.sh` file differs, and `fs_utils.rs` is byte-identical.
+> **Master therefore carries exactly the code this verdict is based on.**
 
 ## 11.1 Ruling on the deviation (deadline removed, no boundary-exit backstop)
 
