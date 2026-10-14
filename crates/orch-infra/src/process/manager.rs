@@ -427,7 +427,25 @@ mod tests {
         let child = pm
             .spawn(
                 "sh",
-                &sh("sleep 30 & sleep 30 & printf 'up\\n'; sleep 30"),
+                // Every child is forked **before** `up`, and the shell then
+                // `wait`s — a builtin, so it forks nothing more. That ordering
+                // is the whole point.
+                //
+                // With a trailing foreground `sleep 30` instead, the shell was
+                // still forking when the kill arrived, and a child created
+                // between `kill(-pgid, SIGTERM)` and the shell's death inherits
+                // the group *without* having been signalled: `kill_with_grace`
+                // returns as soon as the direct child is gone and never sends
+                // the SIGKILL. That is faithful to the TS (`killWithGrace` has
+                // the same early return), so the implementation is right and
+                // the test's premise was wrong — it asserted a stronger
+                // property than a group kill actually provides.
+                //
+                // Measured, from a preserved gate log: `pid … state S ppid 1
+                // pgid <target>` — a live, reparented, never-signalled
+                // grandchild. Load-dependent, which is why it only ever
+                // appeared in a cold gate.
+                &sh("sleep 30 & sleep 30 & sleep 30 & printf 'up\\n'; wait"),
                 SpawnOptions::default(),
             )
             .expect("spawn");
