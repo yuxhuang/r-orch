@@ -3092,7 +3092,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.35 `config.yml` / `agents/*.yml` written 0600 | FIX | `none` — **modes are not compared**, hence the row |
 | §14.36 three favourable divergences (sandboxed Liquid, negative-PID reject, in-process clipboard) | DIVERGENCE (favourable) | `none`, except Liquid partials: `scenario exclusion required (custom-template-*)` |
 | §14.37 malformed YAML/JSON error text is parser-specific | DIVERGENCE | `scenario exclusion required (malformed-input-*)` — all stderr after `  ✕ ` masked |
-| §14.38 `serve --once` hangs on an unreadable task, then reports `all_done` exit 0 | REPLICATE (**FIX candidate**, user decision) | `none` |
+| §14.38 `serve --once` reports success after interruption | **FIX** (user decision) | `none` today; a scenario covering it needs a named exclusion |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3971,18 +3971,19 @@ diverge here:
 produce **byte-identical stderr** and both exit 1. The excerpt, the caret and the absent path are the same in
 each.
 
-### 14.38 `serve --once` never terminates on an unreadable task, then reports success — **REPLICATE (FIX candidate)**
+### 14.38 `serve --once` reports success after being interrupted — **FIX (user decision, 2026-10-14)**
 
-**Effect on differential comparison: `none`** — no scenario plants an unreadable entity file.
+**Effect on differential comparison: `none` today** — no existing scenario interrupts `serve --once`.
+**A scenario that does will need an exclusion**; see the scenario note below.
 
-With an entity file the store cannot read, `serve --once` **never finishes**:
+#### The bug
 
-- every tick logs `orchestrator:error` and the task stays counted — `queued: 1`, indefinitely;
-- the task never reaches a terminal status, so the `--once` poll loop (§11.1) has nothing to wait for;
-- on `SIGTERM` it reports **`serve:finished result="all_done" exit_code=0`**.
+With an entity file the store cannot read, `serve --once` never finishes: every tick logs
+`orchestrator:error`, the task stays counted at `queued: 1` indefinitely, and it never reaches a terminal
+status so the poll loop (§11.1) has nothing to wait for. On `SIGTERM` the original reports
+**`serve:finished result="all_done" exit_code=0`**.
 
-**That last line is the bad part: it claims success.** The mechanism, which is worth stating because it is
-not obvious that a shutdown produces a *success* verdict:
+The mechanism, because a shutdown producing a *success* verdict is not obvious:
 
 ```ts
 if (isStopped()) return tasks;                                     // once-runner.ts
@@ -3990,21 +3991,54 @@ const hasFailed = finalTasks.some((t) => t.status === 'failed');
 return hasFailed ? 'has_failed' : 'all_done';
 ```
 
-`SIGTERM` sets the shutdown flag, so `waitForAllTerminal` returns the **current, non-terminal** task list.
-The verdict then asks only whether anything is `failed` — and the stuck task is still `todo`, never `failed`.
-So `all_done` and exit 0. **A CI job that times out and kills the daemon gets a success exit code.**
+`SIGTERM` sets the shutdown flag, `waitForAllTerminal` returns the **current, non-terminal** task list, and
+the verdict asks only whether anything is `failed`. The stuck task is still `todo`, never `failed` — so
+`all_done`, exit 0. **A CI job that times out and kills the daemon gets a success exit code**, which is the
+failure mode a pipeline is least able to notice.
 
-**Decision: REPLICATE — TS does exactly the same** (measured). It is a parity divergence to fix it, and this
-is the `serve --once` exit-code contract (§11.1), which is L0.
+#### The fix
 
-**Flagged as a FIX candidate pending a user decision**, because unlike the other replicated bugs this one
-reports success for a run that accomplished nothing — the failure mode a CI pipeline is least able to notice.
-The obvious fix is to distinguish "every task terminal" from "we were interrupted" and exit non-zero for the
-latter; that changes an L0 exit code, which is why it is escalated rather than taken.
+> **Decided by the user**, 2026-10-14, overriding an earlier REPLICATE recommendation from the architect and
+> team lead. Recorded the way §14.1 is: the call was escalated because it trades an L0 exit code against a
+> silent-success failure, and the user took the trade.
 
-Related and already documented: the `review` trap (§11.1) hangs `--once` the same way but for a legitimate
-reason, and the runbook covers both under
-[`serve --once` hangs](RUNBOOK.md#serve---once-hangs-on-a-task-in-review).
+| Stop condition | `result` | Exit |
+|---|---|---|
+| Every task terminal, none failed | `all_done` | **0** — unchanged |
+| Every task terminal, ≥1 failed | `has_failed` | **1** — unchanged |
+| **Interrupted by a signal before every task is terminal** | **`interrupted`** | **1** |
+
+A stop *after* all tasks are terminal keeps today's verdict exactly: the fix only distinguishes the
+interrupted case, so a clean `--once` run is byte-identical to the original.
+
+#### Why exit 1, and not a new code
+
+§3's exit-code table allocates **0–6 by error class** — invalid arguments, not initialized, lock conflict,
+adapter, workspace. "Interrupted" is not a new error class: there is no `OrchestryError` for it, and nothing
+else in the table describes an outcome rather than a fault. Minting a **7** would extend an **L0** table that
+every consumer's `case` statement predates, to encode a distinction that is **already carried losslessly by
+the `result` field** in the structured log (§11.1, also L0).
+
+It also matches what the caller actually needs: `if ! orch serve --once; then` cannot tell 1 from 7, and
+**0 from non-zero is the whole question**. Reusing 1 preserves the simpler invariant — **every non-success
+`--once` outcome exits 1** — and keeps `interrupted` beside `has_failed` where a log consumer already looks.
+
+#### Scenario note
+
+No existing scenario reaches this. `@stop-after` appears only on `run --watch`
+(`v7-run-watch.toml`, itself `@exit-only`), and `o7-serve-once-exit-codes.toml` runs `--once` to completion
+four times for V21. So nothing goes red today.
+
+**A new scenario covering the interrupted case cannot be a plain differential scenario**: TS reports
+`all_done`/0 where r-orch reports `interrupted`/1, by design. It needs either a named exclusion masking the
+exit code *and* the `serve:finished` line, or to be a Rust-side-only test asserting the new contract. **The
+exclusion must not mask the whole `serve` log**, or it would void V20's record-field coverage on the same
+step.
+
+#### Still to settle with wp0
+
+The exact `result` string (`interrupted` as above) and the exit code are specified here but **wp0
+implements them** — confirm both match before this row is treated as describing shipped behaviour.
 
 ---
 
