@@ -45,6 +45,7 @@ use crate::tree::{
 
 /// The single entry point behind the `orch`, `orchestry` and `ao` binaries.
 pub fn run() -> ExitCode {
+    init_tracing();
     let env = EnvFlags::from_env();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let shape = ArgvShape::of(&argv);
@@ -689,6 +690,44 @@ async fn run_serve(
 /// The version the dashboard reports, which is the one `--version` prints.
 fn version() -> &'static str {
     tree::VERSION
+}
+
+/// Send `tracing` output to **stderr**, and only when asked for.
+///
+/// Until now nothing installed a subscriber, so every `tracing::warn!` in the
+/// engine, the adapters and the stores went nowhere: the swallowed-error paths
+/// that are deliberate parity decisions (a corrupt lock, an unreadable entity
+/// file, a dropped event) left no trace at all, and the first question in any
+/// incident — "what did it decide to ignore?" — had no answer.
+///
+/// Three rules, in this order of importance:
+///
+/// 1. **stderr, never stdout.** Stdout is the contract: the differential
+///    harness compares it byte for byte and `--json` output has to stay
+///    parseable, so a diagnostic there would corrupt both.
+/// 2. **Silent by default**, so no invocation's output changes.
+/// 3. `RUST_LOG` takes an `EnvFilter` for anyone who knows what they want;
+///    `ORCHESTRY_DEBUG` — which already exists, as the flag that prints an
+///    error's cause chain — turns on `debug` without one.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(spec) if !spec.trim().is_empty() => EnvFilter::new(spec),
+        _ if std::env::var_os("ORCHESTRY_DEBUG").is_some() => EnvFilter::new("debug"),
+        // No targets enabled: the subscriber is installed but records nothing,
+        // which costs a filter check per call site and nothing else.
+        _ => EnvFilter::new("off"),
+    };
+
+    // `try_init` rather than `init`: a test binary may install its own, and a
+    // second attempt must not abort the process over logging.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .without_time()
+        .try_init();
 }
 
 fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {

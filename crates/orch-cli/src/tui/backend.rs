@@ -147,11 +147,18 @@ impl EngineBackend {
             Err(err) => {
                 // Another process holds the lock. The dashboard becomes a
                 // read-only observer of *their* orchestrator, and the message
-                // is **suppressed**: the TS passes
+                // is **suppressed** in the UI: the TS passes
                 // `observerMode ? undefined : watchError` (`tui.ts:314`), so
-                // the header shows the observer badge instead of an error. It
-                // is logged rather than dropped, since otherwise nothing tells
-                // the user which PID holds the lock.
+                // the header shows the observer badge rather than an error,
+                // and matching that is the reason this is not rendered.
+                //
+                // The holder's pid therefore survives only in this record,
+                // which reaches a terminal only when diagnostics are on
+                // (`RUST_LOG`, or `ORCHESTRY_DEBUG`) — an earlier version of
+                // this comment claimed it was how the user learns the pid,
+                // which was wrong twice over: nothing installed a subscriber
+                // at all until the CLI grew one, and even now the default is
+                // silent. `orch status` is where a user looks.
                 tracing::info!(%err, "watch mode refused; entering observer mode");
                 context.observer_mode = true;
                 false
