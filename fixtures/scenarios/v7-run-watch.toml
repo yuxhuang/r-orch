@@ -1,0 +1,20 @@
+name = "v7-run-watch"
+kind = "differential"
+requires = ["run", "task list", "status"]
+fake_agents = true
+timeout_secs = 90
+description = """
+`run --watch`, the only command besides `serve` that never returns on its \
+own: a SIGTERM after four seconds is what an operator's Ctrl+C does, and \
+the tree it leaves behind — tasks done, agent idle again, state cleared, \
+lock released — is what is compared. Its stdout is not: the status line \
+is rewritten in place with a carriage return and carries a running/queued \
+count that depends on when each tick fired."""
+steps = [
+  "init --name proj --adapter claude",
+  "agent add worker --adapter claude --quiet",
+  "task add 'Watched' --assignee ${agent.0} --quiet",
+  "@exit-only:status-line-is-rewritten-and-tick-timed @stop-after:4000 run --watch",
+  "task list --json",
+  "status --json",
+]

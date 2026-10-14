@@ -56,25 +56,26 @@ a unit test cannot: the exact stdout of `init`, `task add`, `task list`,
 | `cmd-msg*` | the fan-out shape of `send`/`broadcast`, the unknown-team no-op, the disabled-recipient filter, and body/subject trimming |
 | `cmd-org` | the ten org templates as L0 data, and a deployment's agents/team/goal |
 | `cmd-task-*`, `cmd-agent-*`, `cmd-edit-*` | the task and agent mutations, including the `$EDITOR` round trips |
+| `v7-run-*` | `run <id>` (the collector wait), `run --all` (the queue drain) and `run --watch` (SIGTERM, then the tree it left) |
+| `o7-*` | the orchestrator end to end through `serve`: cascade failure, child crash, the concurrency cap, a killed orchestrator, retry backoff, review approve/reject, `--once` exit codes, stall detection |
 
-## Blocked on the oracle
+## What is not compared, and why
 
-`run` and `serve` are wired and work, but the vendored oracle does not
-dispatch anything in this environment: `run <id>` and `serve --once` both
-print their header and exit 0 having done nothing, leaving `.orchestry/
-orchestry.lock` and a stale `claimed` entry behind. The same invocation under
-a `node -r` preload that holds the event loop open completes the task
-correctly, so it is an event-loop-lifetime bug upstream —
-`ProcessManager.spawn` unrefs every child and `spawnAndWait` then awaits
-`close` with nothing holding a ref — and it is invisible to the oracle's own
-vitest suite, which keeps the loop alive itself.
+Three things in a `serve`/`run` stream are properties of the runtime rather
+than of the contract, so the harness masks or drops them (all recorded in
+docs/TRAITS-FROZEN.md, spec issues 17-18):
 
-So `v7-run-single-task` and the nine `o7-*` scenarios cannot be compared
-against it as written. `o7-concurrency-cap` is separately unsound: its six
-tasks end in `review`, which is not terminal in **either** implementation, so
-`serve --once` waits forever by design. Both need a contract ruling; neither
-is r-orch's behaviour. `v7-run-cross-compat` passes, because the oracle only
-*reads* the artifacts r-orch produced.
+- `heap_mb`, which is V8's heap and has no Rust counterpart — the field is
+  emitted (the record shape is contract) and its value masked;
+- `orchestrator:tick` records on the steps marked `@ticks-vary`, because how
+  many ticks fire before a run finishes, and what is running when one does,
+  is wall-clock timing — every other record is still compared;
+- local clock times from `toLocaleTimeString`, normalized to `<TIME>`: the
+  two binaries start seconds apart.
+
+`run --watch` and `serve` never return, so their scenarios stop them with
+`@stop-after:<ms>` (SIGTERM, then wait) and compare the tree they left —
+which is also the regression test for a shutdown that hangs.
 | `cmd-logs`, `cmd-init`, `cmd-ascii-and-quiet`, `cmd-exit-codes-uninitialized` | from master's corpus; green as of this work package |
 
 Two notes on the harness as it now stands:
