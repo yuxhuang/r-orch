@@ -43,6 +43,24 @@ pub async fn first_run(
     run(find_project_root(cwd), version).await
 }
 
+/// Start a [`DiskObserver`](crate::serve::disk_observer::DiskObserver) feeding
+/// `sink`, which is what observer mode reads its live events from.
+///
+/// Public so the test can wire it the way [`run`] does rather than the way it
+/// imagines [`run`] does; dropping the handle stops the poll loop.
+pub fn attach_observer(
+    engine: &orch_engine::FullEngine,
+    sink: Arc<dyn Fn(orch_domain::OrchestratorEvent) + Send + Sync>,
+) -> crate::serve::disk_observer::ObserverHandle {
+    crate::serve::disk_observer::DiskObserver::new(
+        engine.paths.clone(),
+        Arc::clone(&engine.state),
+        Arc::clone(&engine.runs),
+        Arc::clone(&engine.clock),
+    )
+    .observe(move |event| sink(event))
+}
+
 /// Launch the dashboard and block until the user quits.
 ///
 /// Must be called from the runtime — `dispatch` already is.
@@ -53,20 +71,25 @@ pub async fn run(project_root: PathBuf, version: &str) -> Result<ExitCode> {
     // Read before the move: `orch_tui::run` consumes the backend, and the
     // cleanup below needs to know whether *this* process started watch mode.
     let watch_active = backend.is_watch_active();
-    // TODO(wp5): in observer mode, attach `serve::disk_observer` to
-    // `backend.observer_sink()` here and stop it in the cleanup below. The
-    // observer is on the WP-5a branch; until it lands, an observer-mode
-    // dashboard renders from the stores on every refresh but sees no live
-    // events.
+
+    // Observer mode: another process holds the lock, so there is no in-process
+    // bus traffic to subscribe to and the live events have to come off disk.
+    // The TS does the same thing at the same point —
+    // `onSubscribeEvents = handler => diskObserver.subscribe(handler)`
+    // (`tui.ts:261-267`) — and constructs the observer with no interval, so
+    // both poll at the default 1 s.
     //
-    // Expect exactly three visible differences in observer mode once it is
-    // attached, all of them TS-faithful: the `● OBSERVING` header chip, a 3 s
-    // poll instead of 5 s, and **stale teams** — the periodic refresh passes
-    // `include_teams = false` (`App.tsx:826`), so a team another process
-    // creates or disbands does not appear until something team-related
-    // happens locally. Not a bug in either half; changing it needs a
-    // PARITY §14 entry, since which collections the poll re-reads is
+    // Dropped in the cleanup below, which is the `unsubscribe` the TS
+    // `subscribe` returns.
+    //
+    // Three visible differences remain in observer mode, all TS-faithful: the
+    // `● OBSERVING` header chip, a 3 s dashboard refresh instead of 5 s, and
+    // **stale teams** — the periodic refresh passes `include_teams = false`
+    // (`App.tsx:826`), so a team another process creates or disbands does not
+    // appear until something team-related happens locally. Changing that would
+    // need a PARITY §14 entry: which collections the poll re-reads is
     // observable.
+    let observer = (!watch_active).then(|| attach_observer(&engine, backend.observer_sink()));
 
     // The draw loop must not run on a runtime thread: `TuiBackend` is
     // synchronous and its methods call `Handle::block_on`, which panics inside
@@ -85,7 +108,9 @@ pub async fn run(project_root: PathBuf, version: &str) -> Result<ExitCode> {
         .map_err(|err| Error::other(format!("the dashboard thread was cancelled: {err}")))?;
 
     // Cleanup runs whether the dashboard exited cleanly or panicked — a panic
-    // there must not leave the lock held or an agent running.
+    // there must not leave the lock held, an agent running or a poll loop
+    // reading the project after the window is gone.
+    drop(observer);
     if watch_active {
         // `stop()` already reports its own failures on the bus; the TS
         // swallows this rejection outright (`.catch(() => {})`).

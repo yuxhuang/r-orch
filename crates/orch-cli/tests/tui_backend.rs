@@ -957,3 +957,74 @@ async fn in_observer_mode_a_refresh_sees_another_process_writing_state() {
     orch_engine::ProjectLock::release(&held).await;
     drop(temp);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_observer_mode_the_disk_observer_feeds_the_event_queue() {
+    // The wiring `tui::command::run` does when watch mode is refused. Without
+    // it an observer-mode dashboard re-reads the stores on every refresh but
+    // never sees a live event, which is the half the TS gets from
+    // `onSubscribeEvents = handler => diskObserver.subscribe(handler)`.
+    let (temp, engine) = project().await;
+    let held = orch_engine::FileLock::new(engine.paths.lock_path());
+    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
+
+    let backend = launch(Arc::clone(&engine)).await;
+    assert!(backend.context().observer_mode, "expected observer mode");
+    let observer = orch_cli::tui::command::attach_observer(&engine, backend.observer_sink());
+
+    // Another process starts a run: a `running` entry appears in state.json,
+    // which is all the observer needs to announce it.
+    let external = build_isolated(temp.path()).await.expect("second engine");
+    let mut state = external.state.read().await.expect("read state");
+    state.running.insert(
+        "tsk_watched".to_owned(),
+        orch_domain::RunningEntry {
+            run_id: "run_watched".to_owned(),
+            agent_id: "agt_watched".to_owned(),
+            task_id: "tsk_watched".to_owned(),
+            pid: 4242,
+            started_at: "2026-10-13T16:00:00.000Z".to_owned(),
+            last_event_at: "2026-10-13T16:00:00.000Z".to_owned(),
+        },
+    );
+    external.state.write(&state).await.expect("write state");
+
+    // The observer polls on its own interval, so this waits rather than
+    // assuming the first poll has already happened.
+    let mut backend = backend;
+    let mut started = None;
+    for _ in 0..80 {
+        let (returned, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
+        backend = returned;
+        started = events.into_iter().find(|event| {
+            matches!(
+                event,
+                orch_domain::OrchestratorEvent::AgentStarted { run_id, .. }
+                    if run_id == "run_watched"
+            )
+        });
+        if started.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        started.is_some(),
+        "the observer never reported the external run"
+    );
+
+    // Dropping the handle is the `unsubscribe`: nothing more arrives.
+    drop(observer);
+    let mut state = external.state.read().await.expect("read state");
+    state.running.clear();
+    external.state.write(&state).await.expect("write state");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_backend, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
+    assert!(
+        events.is_empty(),
+        "the observer kept polling after its handle was dropped: {events:?}"
+    );
+
+    orch_engine::ProjectLock::release(&held).await;
+    drop(temp);
+}
