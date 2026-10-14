@@ -19,8 +19,8 @@ Run everything with `cargo test -p orch-tui`.
 | `tests/filters.rs` (`f001..f044`) | 44 | Both filter pickers and every filter predicate |
 | `tests/live_updates.rs` (`l001..l048`) | 48 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history, endurance |
 | **Integration total** | **486** | |
-| In-module unit tests | 261 | Pure logic: see the table below |
-| **Grand total** | **747** | |
+| In-module unit tests | 268 | Pure logic: see the table below |
+| **Grand total** | **754** | |
 
 In-module unit tests, by file:
 
@@ -29,7 +29,7 @@ In-module unit tests, by file:
 | `messages/format.rs` | 84 | `formatAgentOutput` and friends — every legacy adapter shape |
 | `text/cursor.rs` | 27 | `text-cursor.test.ts` (grapheme, width, navigation, kills) |
 | `state.rs` | 27 | Sort orders, selection spaces, rows, batching, deletions, toasts |
-| `wizard/engine.rs` | 25 | `form-wizard.test.tsx`, `form-wizard-validation.test.tsx` |
+| `wizard/engine.rs` | 26 | `form-wizard.test.tsx`, `form-wizard-validation.test.tsx` |
 | `app.rs` | 21 | Event ingestion, `entityListChanged`, notifications, soft delete |
 | `text/input.rs` | 14 | `text-input.test.tsx` (kill ring, undo, debounce) |
 | `messages/mod.rs` | 14 | `formatEvent`, message types, activity presets |
@@ -38,6 +38,7 @@ In-module unit tests, by file:
 | `theme.rs` | 8 | `colors.test.ts` (palettes, remap, WCAG contrast) |
 | `layout.rs` | 8 | The region arithmetic and the clamp tests |
 | `format.rs` | 7 | `capLine`/`capText`/`formatDuration`/`relativeTime` |
+| `widgets/wizard.rs` | 6 | The text field's display-width sliding viewport |
 | `views/mod.rs` | 2 | Frame composition and the minimum-size guard |
 | `clock.rs` | 2 | The injected clock |
 

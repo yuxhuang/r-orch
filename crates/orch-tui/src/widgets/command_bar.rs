@@ -34,7 +34,10 @@ fn render_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     };
     let completion = resolve_completion(&value).unwrap_or_default();
 
-    // The value truncates **from the left** with a leading `…`.
+    // The value truncates **from the left** with a leading `…`. Counted in
+    // `char`s where TS counts UTF-16 code units, so an astral character (an
+    // emoji, say) costs one here and two there; the window differs by at most
+    // a character on such input, which is L2 cosmetic (PARITY §12).
     let max_len = (area.width as usize)
         .saturating_sub(6 + hint.chars().count() + completion.chars().count() + 1)
         .max(4);

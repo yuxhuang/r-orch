@@ -630,19 +630,15 @@ impl Wizard {
             || key.modifiers.contains(KeyModifiers::SUPER);
         let kind = self.step().kind;
 
-        // Paste image: Ctrl+V / Cmd+V / Ctrl+I, text and textarea only.
+        // Paste image, text and textarea steps only. One condition, as in TS:
+        // `(key.ctrl || key.meta) && (input === 'v' || input === 'i')` — the
+        // `i` arm takes the modifier set the `v` arm does, so Cmd/Option+I
+        // pastes too.
         if (ctrl || meta)
-            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
-            && matches!(kind, StepKind::Text | StepKind::Textarea)
-        {
-            return if self.paste_capable {
-                WizardOutcome::PasteImage
-            } else {
-                WizardOutcome::Consumed
-            };
-        }
-        if ctrl
-            && matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
+            && matches!(
+                key.code,
+                KeyCode::Char('v') | KeyCode::Char('V') | KeyCode::Char('i') | KeyCode::Char('I')
+            )
             && matches!(kind, StepKind::Text | StepKind::Textarea)
         {
             return if self.paste_capable {
@@ -1311,6 +1307,43 @@ mod tests {
             wizard.handle_key(ctrl(KeyCode::Char('v')), 0),
             WizardOutcome::Consumed
         );
+    }
+
+    #[test]
+    fn paste_takes_the_same_modifier_set_for_v_and_i() {
+        // TS is one condition — `(key.ctrl || key.meta) && (input === 'v' || input
+        // === 'i')` — so Cmd/Option+I pastes just like Cmd/Option+V.
+        let steps = vec![
+            WizardStep::new("t", "T", StepKind::Text),
+            WizardStep::new("body", "Body", StepKind::Textarea),
+        ];
+        for code in [
+            KeyCode::Char('v'),
+            KeyCode::Char('V'),
+            KeyCode::Char('i'),
+            KeyCode::Char('I'),
+        ] {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::SUPER,
+            ] {
+                let mut wizard = Wizard::new(WizardKind::Task, "T", steps.clone()).with_paste(true);
+                assert_eq!(
+                    wizard.handle_key(KeyEvent::new(code, modifiers), 0),
+                    WizardOutcome::PasteImage,
+                    "text step: {code:?} + {modifiers:?}"
+                );
+                // And again on the textarea step.
+                wizard.handle_key(key(KeyCode::Enter), 0);
+                assert_eq!(wizard.step_id(), "body");
+                assert_eq!(
+                    wizard.handle_key(KeyEvent::new(code, modifiers), 0),
+                    WizardOutcome::PasteImage,
+                    "textarea step: {code:?} + {modifiers:?}"
+                );
+            }
+        }
     }
 
     #[test]
