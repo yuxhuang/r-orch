@@ -309,6 +309,56 @@ instantly, and three O7 scenarios were quietly wrong. `lint-scenarios` catches
 it as a per-step timeout, which is why its budget is a scenario-level setting
 rather than something to raise when a step is slow.
 
+## Agent selection on a tie: avoid a stale-agent reset too
+
+PARITY.md §14.4 replicates the oracle's `findBestAgent` tie-breaking, on the
+stated precondition that the agent index order is deterministic for a given
+operation sequence. §6.10.1 names the exception: **`reconcile`'s stale-agent
+reset to `idle` writes the agent index as a concurrent batch**
+(`orchestrator.ts:620`), so an operation sequence containing one can itself
+produce a nondeterministic agent order — and with it a nondeterministic tie.
+
+So a scenario that asserts **agent selection** must avoid *both*:
+
+- a multi-entity index rebuild (deleting `_index.json` with ≥2 entities —
+  `rebuildIndex` derives order from `fs.readdir`); and
+- a concurrent stale-agent reset *before* the selection — which means any
+  crash, stall, or killed run, because each leaves a dead PID for `reconcile`
+  to clean up.
+
+**The cheap way to stay clear of it: assign tasks explicitly.** `--assignee`
+means no selection happens, so no tie can be observed, and the scenario is
+free to crash and stall as much as it likes. Every scenario here that triggers
+a stale-agent reset does exactly that.
+
+Current state, audited — nothing violates the rule:
+
+| scenario | candidate agents | unassigned tasks | stale reset? |
+|---|---|---|---|
+| `o7-stall-detection` | 2 | 0 | yes |
+| `o7-child-crash` | 2 | 0 | yes |
+| `o7-killed-mid-run` | 2 | 0 | yes |
+| `o7-retry-backoff` | 2 | 0 | no |
+| `o7-serve-once-exit-codes` | 2 | 0 | no |
+| `o7-concurrency-cap` | 4 | 0 | no |
+| `o7-cascade-failure` | 2 | 3 | no |
+| `index-tie-order`, `index-tie-order-rust-then-ts` | 3-4 | — | no |
+
+Two notes on reading that table:
+
+- **"Candidate agents" counts `agt_creator`**, which `init` writes into every
+  tree. A scenario that adds one agent still has two candidates, so one
+  unassigned task is enough to make selection observable.
+- **`o7-cascade-failure` has three unassigned tasks and is safe only
+  incidentally**: they are cascade-failed before they ever become
+  dispatchable, so no selection happens. If that scenario is ever changed so a
+  dependent *does* get dispatched, it needs explicit assignees.
+
+`index-tie-order*` assert index order directly rather than selection, and they
+reach it through sequential CLI saves (`agent add`, `agent disable`,
+`agent enable`) with no orchestrator run — so no concurrent batch is involved.
+That is the right way to test push-to-end ordering.
+
 ## Contract findings from writing this corpus
 
 Two things measured against the oracle that **contradict `docs/PARITY.md`**.
