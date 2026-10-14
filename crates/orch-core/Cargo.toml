@@ -3,6 +3,7 @@ name = "orch-core"
 description = "Port traits for r-orch: storage, adapters, process, workspace, templates, clock, ids."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

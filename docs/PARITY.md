@@ -3018,16 +3018,17 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.22 `kill(0)` hits our own process group | **FIX** | `none` |
 | §14.23 `run <id>` awaits the collector | equivalent behaviour | `none` |
 | §14.24 `stop()` lets an in-flight tick finish | REPLICATE | `none` |
-| §14.25 index rebuild swallowed a parse error | PORT DEFECT → TS | `none` |
+| §14.25 index rebuild swallowed a parse error | PORT DEFECT → TS (convergence) | `none` |
 | §14.26 signal handlers after the first tick | PORT DEFECT → TS | `none` |
 | §14.27 orphaned `running` runs never swept | FIX | `none` |
 | §14.28 `start_watch` leaks the lock on error | FIX | `none` |
 | §14.29 lock PID `0` / `> i32::MAX` treated dead | FIX (differs from TS for `0`) | `none` expected |
 | §14.30 `.`/`..` accepted as an id | FIX (additive) | `none` |
-| §14.31 YAML > 1 MiB or > 64 aliases rejected | DIVERGENCE | `none` in harness |
-| §14.32 no size guard on run-events reads | FIX | `none` |
+| §14.31 four YAML read guards reject what js-yaml accepts | DIVERGENCE | `none` in corpus |
+| §14.32 run-events > 50 MiB tail-read (last 1 MiB) | FIX | `none` — unreachable in corpus |
 | §14.33 token totals can overflow | FIX | `none` |
 | §14.34 tracing to stderr under `ORCHESTRY_DEBUG` | FIX | `none` |
+| §14.35 `config.yml` / `agents/*.yml` written 0600 | FIX | `none` — **modes are not compared**, hence the row |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3511,9 +3512,16 @@ the read loudly. The port's `scan_items` dropped the unreadable file and then **
 writing the index without it — turning a recoverable corrupt file into a silently deleted entity, which is a
 divergence in the unsafe direction (gate code review B1).
 
-**Decision: restore propagation**, matching TS. A corrupt `.yml` makes the listing fail with an error naming
-the file, rather than quietly shrinking the result set. The recovery is in
-[docs/RUNBOOK.md](RUNBOOK.md) — fix or remove the file, then rebuild.
+**Decision: restore propagation**, matching TS — so this entry records a **convergence**, not a divergence.
+`rebuild_index` now propagates parse errors: a corrupt `.yml` makes the listing fail with an error naming the
+file, rather than quietly shrinking the result set. The recovery is in
+[docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update) — fix or remove the file, then rebuild.
+
+Worth recording *why* the defect survived review: the old code carried a comment asserting that "TS drops
+nulls the same way." That was **true of nulls and false of errors** — `rebuildIndex` does filter out a
+`readYaml` that returned `null` for a *missing* file, but a **parse failure throws** and propagates. A
+half-true comment is harder to spot than a wrong one, which is the same failure mode as the `key.meta`
+comment in §12.5.
 
 ### 14.26 Signal handlers installed after the first tick — **PORT DEFECT, corrected toward TS**
 
@@ -3572,34 +3580,57 @@ odd filename), but an id used as a **bare path segment** — the workspace direc
 `.orchestry/workspaces/<taskId>` — would resolve to the parent directory.
 
 **Decision: fix** — reject `.` and `..` outright. Additive hardening: no legitimate id is affected, and the
-generated form is `<prefix>_<nanoid(7)>`, which cannot produce either.
+generated form is `<prefix>_<nanoid(7)>`, which cannot produce either. **Reachable only by hand-editing** an
+entity file or `state.json` to contain such an id — no CLI path and no adapter can produce one — which is why
+it is hardening rather than a live bug.
 
-### 14.31 YAML documents over 1 MiB or with more than 64 aliases — **DOCUMENTED DIVERGENCE**
+### 14.31 YAML read guards reject documents js-yaml accepts — **DOCUMENTED DIVERGENCE**
 
-**Effect on differential comparison: `none` in the harness** — no scenario produces a document near either
-bound.
+**Effect on differential comparison: `none` in the corpus** — no scenario produces a document near any bound.
 
-TS accepts arbitrarily large YAML and arbitrarily many aliases; js-yaml has no limits. r-orch **rejects** a
-document over **1 MiB** or containing more than **64 aliases**.
+js-yaml has no limits of any kind. r-orch refuses a document that trips **any of four guards**:
 
-**Decision: diverge, deliberately.** Both are denial-of-service bounds on a file that may be checked into a
-shared repository: alias expansion is the classic "billion laughs" amplification, and an unbounded document
-is an unbounded allocation. Neither bound is reachable by anything r-orch writes — the largest artifact is an
-agent file holding a few kilobytes of role prompt. A hand-authored config.yml that legitimately exceeded
-either would be pathological.
+| Guard | Bound |
+|---|---|
+| Document size | **> 1 MiB** |
+| Alias count | **> 64** |
+| Estimated expansion — `len × (1 + aliases)` | **> 8 MiB** |
+| Parse wall-clock | **> 2 s** |
 
-Recorded as a divergence rather than a fix because TS genuinely accepts such files: a project r-orch refuses
-may still open in the original.
+The expansion estimate is the one that matters: size and alias count are each individually cheap to stay
+under while still amplifying, so the product is what actually bounds a "billion laughs". The time bound is
+the backstop for anything the first three miss.
 
-### 14.32 No size guard on reading a run's events — **FIX**
+**This is not a workaround for the YAML crate.** `serde_norway` was measured on the same inputs and behaves
+**identically** to `serde_yaml_ng`, so the guards are r-orch's own hardening rather than compensation for a
+parser deficiency — and swapping the crate would not remove the need for them.
 
-**Effect on differential comparison: `none`.**
+**Decision: diverge, deliberately.** These files can be checked into a shared repository, so a hostile or
+accidental one is reachable by anyone with commit access. No bound is reachable by anything r-orch *writes* —
+the largest artifact is an agent file holding a few kilobytes of role prompt — so the guards only ever fire
+on hand-authored or externally-supplied input.
 
-`readJsonl` has a 50 MB ceiling above which it tail-reads instead (§6.9), but the per-read path the CLI and
-TUI use had no guard in the port, so a pathological `.jsonl` could be read whole into memory.
+Recorded as a divergence rather than a fix because TS genuinely accepts such files: **a project r-orch
+refuses may still open in the original**, which is the asymmetry an operator would hit.
 
-**Decision: fix** — apply the documented ceiling consistently on every run-events read path. This matches the
-TS intent; the original simply has the check in one place and not the other.
+### 14.32 Run-events files over 50 MiB are tail-read, not read whole — **FIX**
+
+**Effect on differential comparison: `none`** — unreachable in the corpus; no scenario generates an events
+file of that size.
+
+A run's `.jsonl` event log is append-only and unbounded (§6.9). **TS reads it in full** on the per-read path
+the CLI and TUI use, so a pathological run can exhaust memory.
+
+**Decision: fix.** Above **50 MiB**, r-orch reads only the **last 1 MiB** and **drops the partial first
+line**, since a mid-record boundary cannot be parsed. Two consequences to be aware of rather than surprised
+by:
+
+- the result is the **tail**, not the whole log — `orch logs` on such a run shows recent events only;
+- the oldest event in that window is dropped even if it happened to be complete, because the reader cannot
+  distinguish "started at a record boundary" from "started mid-record" without scanning backwards.
+
+The raw file is never truncated, so `.orchestry/runs/<run-id>.jsonl` remains the complete record for anything
+that wants to read it directly.
 
 ### 14.33 Token totals can overflow — **FIX**
 
@@ -3625,6 +3656,35 @@ distinguishing "another process holds the lock" from "I could not read the lock 
 mandatory, not stylistic: stdout carries the `--json` contract (§4) and the `serve` log stream (§11.1), and a
 diagnostic line on stdout would corrupt both. Documented for operators in
 [docs/RUNBOOK.md](RUNBOOK.md#debugging).
+
+### 14.35 `config.yml` and `agents/*.yml` are written owner-only (0600) — **FIX**
+
+**Effect on differential comparison: `none` — and that is precisely why this row exists.** The harness
+compares file *contents*, never file *modes*, so this divergence is invisible to every scenario. Without a
+§14 row it would be an undocumented behavioural difference that nothing could catch.
+
+TS writes every artifact at the process umask — typically **0644**, world-readable. r-orch writes the two
+files that can hold credentials at **0600**:
+
+| File | Why |
+|---|---|
+| `.orchestry/agents/<id>.yml` | an agent's `config.env` map is written verbatim and passed to every child it spawns, so it is the natural place an API key ends up |
+| `.orchestry/config.yml` | project configuration, hand-edited and able to carry per-project settings |
+
+**The mode is set on the temp file at creation** (`OpenOptions::mode()`), not applied after the write, so the
+file is **never briefly world-readable** — there is no umask window to race. A test asserts exactly that
+(`an_owner_only_write_is_never_briefly_world_readable`). Unix only: `owner_only()` yields `None` where the
+platform has no modes, and the write proceeds unrestricted.
+
+**Scope is deliberately narrow.** `tasks/`, `goals/`, `teams/`, `messages/`, `context/`, `runs/` and
+`state.json` keep umask modes, matching TS. They are not credential-bearing by design, and tightening
+everything would be a larger divergence for no security gain — a secret pasted into a task *description* is
+a user error that 0600 would hide rather than fix.
+
+**This does not make secrets in `env:` safe.** `.orchestry/agents/` is **not** covered by `init`'s
+`.gitignore`, so an API key there still reaches your repository on the next `git add`. 0600 closes local
+read access, not disclosure through version control. See
+[docs/RUNBOOK.md](RUNBOOK.md#secrets-in-agent-config).
 
 ---
 

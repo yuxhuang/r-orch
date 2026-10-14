@@ -275,13 +275,22 @@ config:
     ANTHROPIC_API_KEY: sk-ant-...      # ← don't
 ```
 
-Two things make that worse than it looks:
+**r-orch protects the file locally.** `.orchestry/agents/<id>.yml` and `.orchestry/config.yml` are written
+**`0600`**, owner-only — and the mode is set when the temp file is created, so the file is never even briefly
+world-readable. The TypeScript original writes them at the process umask (typically `0644`), so this is one
+of the few places r-orch is deliberately stricter ([PARITY.md §14.35](PARITY.md)).
 
-1. **The files are world-readable.** Writes use the process umask, so entity files land at **`0644`** under a
-   typical `umask 022`. Any local user can read them.
-2. **`orch init`'s `.gitignore` does not cover them.** It ignores `state.json`, `*.lock`, `runs/`, `logs/`
+**That is local read access only, and it is not the main risk.** The exposure that remains:
+
+1. **`orch init`'s `.gitignore` does not cover them.** It ignores `state.json`, `*.lock`, `runs/`, `logs/`
    and `workspaces/` — **`agents/`, `tasks/`, `goals/`, `teams/`, `messages/` and `context/` are all
-   committed.** An API key in `env:` goes into your repository history on the next `git add`.
+   committed.** An API key in `env:` goes into your repository history on the next `git add`, where `0600`
+   protects nothing: git does not preserve modes beyond the executable bit, and anyone who can read the repo
+   can read the key.
+2. **Only those two files are owner-only.** `tasks/`, `goals/`, `teams/`, `messages/` and `context/` keep
+   umask modes, so a credential pasted into a task description or a context value **is** world-readable.
+3. **The child process still receives it.** `env:` is passed to every agent the entry spawns, so anything
+   that agent logs or echoes can leak it onward.
 
 **Do this instead.** Leave the key out of the agent and let it inherit from the environment — children
 receive the parent environment, overlaid with `env:` and the three `ORCH_*` variables:

@@ -229,9 +229,23 @@ Three maintained options:
 | `serde_norway` | `0.9.42` | Also a maintained `serde_yaml` fork, same API. Verified to read and emit identically to `serde_yaml_ng` on our data. A drop-in fallback if `_ng` stalls. |
 | `saphyr` / `yaml-rust2` | `0.2.1` / `0.13.0` | Full YAML 1.2 engines, but **no serde integration** — we would hand-write (de)serialization for 7 entity types. Rejected as a default; see §5.3 for where a raw emitter would be needed anyway. |
 
-**Decision: `serde_yaml_ng = "0.10"`**, with `serde_norway` named as the pre-vetted escape hatch. Both were
-tested against real TS-written YAML (including the folded-scalar `>-` 3 KB `agt_creator` role) and read it
-correctly.
+**Decision: `serde_yaml_ng = "0.10"`.** Re-confirmed at the gate against measured alternatives rather than
+left as a first-pass choice:
+
+| Candidate | DoS behaviour on the C0 bombs | Why not |
+|---|---|---|
+| **`serde_yaml_ng` 0.10** — chosen | 5 s / 65 s *unguarded*; **~0.2–0.3 ms refusal** with the §14.31 expansion estimate in front of it | — |
+| `serde-saphyr` | **excellent — ~80 ms refusal** unaided | **No dynamic `Value` model and no `apply_merge`.** Adopting it would mean hand-writing merge-key resolution ([PARITY.md §6.4.2](PARITY.md)), the timestamp quoting guard (§5.3) and surrogate repair ([PARITY.md §14.14](PARITY.md)) — three wire-contract behaviours — on top of a parser that cannot express them. Rejected on **API fit**, not performance |
+| `serde_norway` 0.9 | 5 s / 65 s — same libyaml design | No advantage; retained only as a drop-in if `_ng` stalls |
+
+Both chosen and fallback were tested against real TS-written YAML (including the folded-scalar `>-` 3 KB
+`agt_creator` role) and read it correctly.
+
+**`unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is accepted**, because the §14.31 guards refuse the
+bombs in **~0.2–0.3 ms** — before the parser is reached — which is a better outcome than `serde-saphyr`'s
+unaided 80 ms, and the guards are needed regardless ([PARITY.md §14.31](PARITY.md): `serde_norway` measures
+identically, so this is not a crate-specific weakness). **Revisit if `serde-saphyr` gains a `Value` API**, at
+which point the API-fit objection disappears and it becomes the better choice on both axes.
 
 ### 4.3 Templates — the highest-risk dependency
 
@@ -880,7 +894,24 @@ Node glue, it subsumes V8's timestamp
 - Scenario failures print a unified diff of the normalized artifacts, not a boolean.
 
 **Run the TS oracle with `CI=1`** (⇒ `maxWorkers=2`) whenever the reference *suite* is invoked, per
-[PARITY.md §14.9](PARITY.md). The oracle *binary* is unaffected, but the habit should be in the tooling.
+[PARITY.md §14.9](PARITY.md).
+
+**Every scenario needs a timeout, and this is not hypothetical.** A `serve --once` step in our own probe
+script **hung for three hours** before anyone noticed, on the `review` trap: `review` is not terminal, so the
+poll loop waits forever and there is no built-in timeout
+([PARITY.md §11.1](PARITY.md), [docs/RUNBOOK.md](RUNBOOK.md#serve---once-hangs-on-a-task-in-review)). It
+burned a slot and produced no signal — strictly worse than a red test, because nothing failed.
+
+Two requirements follow:
+
+1. **The harness imposes a per-step wall-clock timeout** and reports a timeout as a **failure**, naming the
+   step. A hung step must never be able to look like a slow one.
+2. **A `--once` scenario must drive every task it creates to a terminal status** — `approval_policy: auto`,
+   or `review_criteria`, or an explicit `task approve` step. A scenario that can reach `review` and stop is
+   malformed, and `cargo xtask lint-scenarios` is the right place to reject it.
+
+This is also the concrete evidence behind the runbook entry: the trap caught the people who wrote the spec
+for it, which is about as strong a case as a runbook entry gets. The oracle *binary* is unaffected, but the habit should be in the tooling.
 
 ### 8.3 Layer 3 — fixtures
 
@@ -921,9 +952,28 @@ sequencing, skip predicates and validation messages; command-bar completion vect
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                       # layers 1, 3, 4
-cargo xtask parity                           # layer 2 — needs node + the vendored TS build
+cargo deny check                             # supply chain — advisories, licences, bans
 cargo xtask crate-graph                      # asserts the whole inter-crate edge set (§3.1)
+cargo xtask parity                           # layer 2 — needs node + the vendored TS build
 ```
+
+**`cargo deny` runs before the parity job**, deliberately: it is fast and needs no oracle, so a supply-chain
+regression should not wait behind a job that requires node and a vendored build.
+
+`deny.toml` carries **two accepted advisories**, both *unmaintained* rather than vulnerable, and both
+transitive with no alternative:
+
+| Advisory | Crate | Via | Why accepted |
+|---|---|---|---|
+| RUSTSEC-2024-0449 | `unsafe-libyaml` | `serde_yaml_ng` | The §14.31 read guards refuse the DoS shapes in ~0.2–0.3 ms before the parser sees them. Revisit if `serde-saphyr` gains a `Value` API (§4.2) |
+| RUSTSEC-2026-0319 | `anymap2` | `liquid-core` | No alternative; `liquid` is the only maintained Liquid implementation for Rust (§4.3) and prompt rendering is byte-contract |
+
+Each accepted advisory must name its mitigation and its revisit condition. An advisory accepted with neither
+is a silent waiver, which is the failure mode an allowlist invites.
+
+**Licences:** `MPL-2.0` is allowed for **`option-ext`** (transitive via `dirs`). MPL's copyleft is
+**per-file** and the crate is used **unmodified**, so it imposes no obligation on our sources. Every
+workspace member is `publish = false`, so none of this is a distribution question for the crates themselves.
 
 `cargo xtask parity` is gated on `parity/orch-ts/dist/` existing; `parity/setup.sh` clones the pinned
 commit `c066dc0`, **applies every patch in `parity/patches/` in order**, then runs `npm ci && npm run build`.

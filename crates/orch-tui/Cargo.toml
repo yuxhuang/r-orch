@@ -3,6 +3,7 @@ name = "orch-tui"
 description = "ratatui dashboard for r-orch."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

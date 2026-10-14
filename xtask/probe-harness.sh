@@ -59,12 +59,18 @@ dirty=0
 # it instead would mean nobody writes it later.
 probe_pending() {
   local subcommand="$1"; shift
-  if ! has_subcommand "$subcommand"; then
-    printf '  pending       %s  (no `orch %s` yet)\n' "$1" "$subcommand"
-    pending=$((pending + 1))
-    return
-  fi
-  probe "$@"
+  has_subcommand "$subcommand"
+  case $? in
+    0) probe "$@" ;;
+    1)
+      printf '  pending       %s  (no `orch %s` yet)\n' "$1" "$subcommand"
+      pending=$((pending + 1))
+      ;;
+    *)
+      printf '  FAILED        %s  (probe harness could not find the orch binary)\n' "$1"
+      missed=$((missed + 1))
+      ;;
+  esac
 }
 
 # has_subcommand <subcommand>
@@ -74,15 +80,36 @@ probe_pending() {
 # has to happen inside one, or every subcommand looks absent and every probe
 # above it looks pending — the same trap the harness's own capability probe
 # fell into.
+#
+# The binary is wherever cargo put it, which is **not** `<repo>/target/debug`
+# under `gate.sh` — that sets `CARGO_TARGET_DIR` to `target/gate` for a cold
+# run. This was hard-coded, and the failure it caused is worth keeping in mind:
+# the cold gate found no binary, so both §14.1/§13 mask probes reported
+# `pending` ("no `orch status` yet") on a tree where `status` plainly exists,
+# and the gate still passed because pending is not a failure. Before that it was
+# worse than wrong — it was passing by running whatever stale `target/debug/orch`
+# a previous warm build had left behind, i.e. grading one tree's masks with
+# another tree's binary.
+#
+# Exit status is three-valued on purpose: 0 present, 1 absent, **2 no binary at
+# all**. A missing binary is an infrastructure fault, and reporting it as
+# "absent" would turn every probe below into a pending — a green gate that
+# tested nothing, which is the failure mode this whole script exists to catch.
 has_subcommand() {
-  local root="$PWD" dir
+  local root="$PWD" dir orch
+  orch="${CARGO_TARGET_DIR:-$root/target}/debug/orch"
+  if [ ! -x "$orch" ]; then
+    printf 'probe harness: no orch binary at %s\n' "$orch" >&2
+    printf '  (CARGO_TARGET_DIR=%s)\n' "${CARGO_TARGET_DIR:-<unset>}" >&2
+    return 2
+  fi
   dir=$(mktemp -d)
   (
     cd "$dir" || exit 1
     mkdir -p home
     export HOME="$dir/home" USERPROFILE="$dir/home"
-    "$root/target/debug/orch" init --name probe --adapter claude >/dev/null 2>&1 || exit 1
-    eval "\"$root/target/debug/orch\" $1 --help" >/dev/null 2>&1
+    "$orch" init --name probe --adapter claude >/dev/null 2>&1 || exit 1
+    eval "\"$orch\" $1 --help" >/dev/null 2>&1
   )
   local ok=$?
   rm -rf "$dir"

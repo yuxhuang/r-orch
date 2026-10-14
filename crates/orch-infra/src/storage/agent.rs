@@ -6,7 +6,7 @@ use orch_core::error::{Error, Result};
 use orch_core::storage::AgentStore;
 use orch_domain::Agent;
 
-use super::fs_utils::{ensure_dir, read_yaml, write_yaml};
+use super::fs_utils::{ensure_dir, owner_only, read_yaml, write_yaml_with_mode};
 use super::index::{IndexManager, ItemFormat, replace_at_end};
 use super::paths::Paths;
 
@@ -42,7 +42,9 @@ impl AgentStore for FileAgentStore {
 
     async fn save(&self, agent: &Agent) -> Result<()> {
         ensure_dir(&self.paths.agents_dir()).await?;
-        write_yaml(&self.paths.agent_path(&agent.id)?, agent).await?;
+        // Owner-only: an agent file is the role prompt the agent is run
+        // with, i.e. instructions to an AI CLI (security review C3).
+        write_yaml_with_mode(&self.paths.agent_path(&agent.id)?, agent, owner_only()).await?;
         let agent = agent.clone();
         self.index
             .update_index(move |items| replace_at_end(items, agent, |a| &a.id))
@@ -75,6 +77,28 @@ mod tests {
     fn store(root: &std::path::Path) -> FileAgentStore {
         clear_ensured_dirs();
         FileAgentStore::new(Paths::new(root))
+    }
+
+    /// Security review C3: an agent file is the role prompt an AI CLI is run
+    /// with, so it is instructions as much as data.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_saved_agent_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path());
+        let saved = agent("agt_1", "nav");
+        store.save(&saved).await.unwrap();
+
+        let path = store.paths.agent_path("agt_1").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} is {mode:o}, not owner-only",
+            path.display()
+        );
     }
 
     fn agent(id: &str, name: &str) -> Agent {

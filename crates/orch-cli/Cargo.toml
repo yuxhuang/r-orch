@@ -3,6 +3,7 @@ name = "orch-cli"
 description = "clap command tree, output rendering and serve mode for r-orch. Hosts the three binaries."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

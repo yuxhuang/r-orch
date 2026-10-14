@@ -104,6 +104,19 @@ step() {
 summarize() {
   local name="$1" log="$2"
   case "$name" in
+    advisories)
+      if grep -q "skipping" "$log"; then
+        echo "cargo-deny not installed (step skipped)"
+      else
+        # cargo-deny prints all four verdicts on one line
+        # ("advisories ok, bans ok, licenses ok, sources ok"), so count the
+        # verdicts in it rather than the lines — `grep -c` would say 1 of 4
+        # and read like three checks had silently vanished.
+        local verdicts
+        verdicts=$(grep -oE "(advisories|licenses|bans|sources) (ok|FAILED)" "$log" | sort -u)
+        printf '%s' "$(printf '%s' "$verdicts" | tr '\n' ' ')"
+      fi
+      ;;
     test)
       # Name the failures as well as counting them. A cold gate run is the
       # only place a timing-sensitive test has shown up here, and "1 failed"
@@ -300,10 +313,27 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   printf 'WARNING: the working tree is dirty; this gates the tree, not the commit\n'
 fi
 
+# cargo-deny over advisories, licences, bans and sources (deny.toml).
+#
+# Skipped with a clear line rather than failing when cargo-deny is absent: it
+# is an extra tool the developer installs, and a gate that cannot run on a
+# fresh clone teaches people to bypass it. The CI story is to install it.
+advisories_check() {
+  local deny
+  deny=$(command -v cargo-deny || echo "$HOME/.cargo/bin/cargo-deny")
+  if [ ! -x "$deny" ]; then
+    echo "cargo-deny not installed; skipping (cargo install cargo-deny --locked)"
+    return 0
+  fi
+  "$deny" --version
+  "$deny" --manifest-path "$REPO/Cargo.toml" check advisories licenses bans sources
+}
+
 step build          cargo build --workspace --all-targets
 step test           cargo test --workspace --no-fail-fast
 step clippy         cargo clippy --workspace --all-targets -- -D warnings
 step fmt            cargo fmt --all --check
+step advisories     advisories_check
 step crate-graph    cargo xtask crate-graph
 step lint-scenarios cargo xtask lint-scenarios
 step parity         cargo xtask parity

@@ -288,6 +288,25 @@ Nothing in the harness hard-codes a target path: the binary comes from cargo's
 own `--message-format=json` output, and `concurrent_index.rs` derives its from
 `CARGO_TARGET_DIR` with a `<repo>/target` fallback.
 
+`probe-harness.sh` did hard-code one, and the way it surfaced is the reason the
+rule is absolute rather than a preference. Its `has_subcommand` ran
+`<repo>/target/debug/orch` to decide whether a command exists yet, so under
+`gate.sh` — which points `CARGO_TARGET_DIR` at `target/gate` for a cold run —
+it was reading a path cargo had never written. While a warm `target/debug/orch`
+happened to be lying around it worked, by asking **one tree's binary** whether
+**another tree's** commands existed. When that stale binary was finally deleted,
+the two mask probes (§14.1 depth, §13 scope) reported `pending` — "no `orch
+status` yet" — on a tree where `status` plainly exists, and **the gate still
+passed**, because a pending probe is deliberately not a failure. Two probes
+stopped testing and the summary moved from `11 detected` to `9 detected, 2
+pending`, which is exactly the erosion this script exists to detect, happening
+to the script itself.
+
+So `has_subcommand` is now three-valued: present, absent, or **no binary at
+all**, and the third is a hard failure rather than a pending. An infrastructure
+fault and an unimplemented command must never render the same, or the gate
+reports green for having tested nothing.
+
 One non-obvious thing the snapshot depends on: `resolve_library_dir()` probes
 the executable's directory and its ancestors for `skills/library` and *then*
 falls back to the repository the crate was built from. From a tempdir the probe
