@@ -3092,6 +3092,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.35 `config.yml` / `agents/*.yml` written 0600 | FIX | `none` — **modes are not compared**, hence the row |
 | §14.36 three favourable divergences (sandboxed Liquid, negative-PID reject, in-process clipboard) | DIVERGENCE (favourable) | `none`, except Liquid partials: `scenario exclusion required (custom-template-*)` |
 | §14.37 malformed YAML/JSON error text is parser-specific | DIVERGENCE | `scenario exclusion required (malformed-input-*)` — all stderr after `  ✕ ` masked |
+| §14.38 `serve --once` hangs on an unreadable task, then reports `all_done` exit 0 | REPLICATE (**FIX candidate**, user decision) | `none` |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3934,6 +3935,31 @@ path is the single most useful thing an error here can do.
 | stdout | **empty** |
 | The offending file | **left untouched** — verified by checksum after a failure on both read paths |
 
+#### A corrupt `_index.json` is **not** a divergence — it is a faithful recovery path
+
+Both implementations **silently rebuild it and exit 0**. `readIndex` treats a missing, non-array or
+unparseable index as a cache miss and reconstructs it from the entity files
+(`index-manager.ts:79-87`; r-orch's `read_index` does the same, §6.10). Measured with valid entity files:
+`task list` printed the normal table, **nothing on stderr**, exit **0**, and the index was rewritten as a
+valid array.
+
+So the index is genuinely a cache: corrupting it costs one rebuild and no data. **Do not add a §14 row or an
+exclusion for it** — the only surprise is that there is no surprise.
+
+> **The two faults compound, though.** A corrupt index *forces* the rebuild, and the rebuild opens every
+> entity file — so a corrupt index **plus** a corrupt entity file surfaces the §14.37 YAML error, where
+> either alone would be silent (a bad index rebuilds cleanly; a bad entity file is invisible to a listing,
+> §6.10). Observed while testing: the same command that recovers one fault is what reveals the other. This
+> is the mechanism behind the runbook's advice that a forced rebuild is the **diagnostic** as well as the
+> repair.
+
+#### Scope: YAML and `context/<key>.json`
+
+This row covers both malformed **YAML** (entity files, `config.yml`) and malformed **JSON** in
+`context/<key>.json`, whose TS shape is given above. **r-orch's text for the JSON case is being measured by
+wp0**; expect it to name the path as the YAML case does, and reconcile this row against that measurement
+when it lands.
+
 #### Both read paths behave identically
 
 Worth stating because §6.10 and §14.25 establish them as *different* paths, so a reader might expect them to
@@ -3944,6 +3970,41 @@ diverge here:
 
 produce **byte-identical stderr** and both exit 1. The excerpt, the caret and the absent path are the same in
 each.
+
+### 14.38 `serve --once` never terminates on an unreadable task, then reports success — **REPLICATE (FIX candidate)**
+
+**Effect on differential comparison: `none`** — no scenario plants an unreadable entity file.
+
+With an entity file the store cannot read, `serve --once` **never finishes**:
+
+- every tick logs `orchestrator:error` and the task stays counted — `queued: 1`, indefinitely;
+- the task never reaches a terminal status, so the `--once` poll loop (§11.1) has nothing to wait for;
+- on `SIGTERM` it reports **`serve:finished result="all_done" exit_code=0`**.
+
+**That last line is the bad part: it claims success.** The mechanism, which is worth stating because it is
+not obvious that a shutdown produces a *success* verdict:
+
+```ts
+if (isStopped()) return tasks;                                     // once-runner.ts
+const hasFailed = finalTasks.some((t) => t.status === 'failed');
+return hasFailed ? 'has_failed' : 'all_done';
+```
+
+`SIGTERM` sets the shutdown flag, so `waitForAllTerminal` returns the **current, non-terminal** task list.
+The verdict then asks only whether anything is `failed` — and the stuck task is still `todo`, never `failed`.
+So `all_done` and exit 0. **A CI job that times out and kills the daemon gets a success exit code.**
+
+**Decision: REPLICATE — TS does exactly the same** (measured). It is a parity divergence to fix it, and this
+is the `serve --once` exit-code contract (§11.1), which is L0.
+
+**Flagged as a FIX candidate pending a user decision**, because unlike the other replicated bugs this one
+reports success for a run that accomplished nothing — the failure mode a CI pipeline is least able to notice.
+The obvious fix is to distinguish "every task terminal" from "we were interrupted" and exit non-zero for the
+latter; that changes an L0 exit code, which is why it is escalated rather than taken.
+
+Related and already documented: the `review` trap (§11.1) hangs `--once` the same way but for a legitimate
+reason, and the runbook covers both under
+[`serve --once` hangs](RUNBOOK.md#serve---once-hangs-on-a-task-in-review).
 
 ---
 
