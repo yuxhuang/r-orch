@@ -3028,6 +3028,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.32 run-events > 50 MiB tail-read (last 1 MiB) | FIX | `none` — unreachable in corpus |
 | §14.33 token totals can overflow | FIX | `none` |
 | §14.34 tracing to stderr under `ORCHESTRY_DEBUG` | FIX | `none` |
+| §14.35 `config.yml` / `agents/*.yml` written 0600 | FIX | `none` — **modes are not compared**, hence the row |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3655,6 +3656,35 @@ distinguishing "another process holds the lock" from "I could not read the lock 
 mandatory, not stylistic: stdout carries the `--json` contract (§4) and the `serve` log stream (§11.1), and a
 diagnostic line on stdout would corrupt both. Documented for operators in
 [docs/RUNBOOK.md](RUNBOOK.md#debugging).
+
+### 14.35 `config.yml` and `agents/*.yml` are written owner-only (0600) — **FIX**
+
+**Effect on differential comparison: `none` — and that is precisely why this row exists.** The harness
+compares file *contents*, never file *modes*, so this divergence is invisible to every scenario. Without a
+§14 row it would be an undocumented behavioural difference that nothing could catch.
+
+TS writes every artifact at the process umask — typically **0644**, world-readable. r-orch writes the two
+files that can hold credentials at **0600**:
+
+| File | Why |
+|---|---|
+| `.orchestry/agents/<id>.yml` | an agent's `config.env` map is written verbatim and passed to every child it spawns, so it is the natural place an API key ends up |
+| `.orchestry/config.yml` | project configuration, hand-edited and able to carry per-project settings |
+
+**The mode is set on the temp file at creation** (`OpenOptions::mode()`), not applied after the write, so the
+file is **never briefly world-readable** — there is no umask window to race. A test asserts exactly that
+(`an_owner_only_write_is_never_briefly_world_readable`). Unix only: `owner_only()` yields `None` where the
+platform has no modes, and the write proceeds unrestricted.
+
+**Scope is deliberately narrow.** `tasks/`, `goals/`, `teams/`, `messages/`, `context/`, `runs/` and
+`state.json` keep umask modes, matching TS. They are not credential-bearing by design, and tightening
+everything would be a larger divergence for no security gain — a secret pasted into a task *description* is
+a user error that 0600 would hide rather than fix.
+
+**This does not make secrets in `env:` safe.** `.orchestry/agents/` is **not** covered by `init`'s
+`.gitignore`, so an API key there still reaches your repository on the next `git add`. 0600 closes local
+read access, not disclosure through version control. See
+[docs/RUNBOOK.md](RUNBOOK.md#secrets-in-agent-config).
 
 ---
 
