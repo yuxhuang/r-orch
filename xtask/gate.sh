@@ -70,6 +70,58 @@ FAILED=0
 LOG_KEEP="$REPO/target/gate-logs"
 rm -rf "$LOG_KEEP"
 
+# The durable verdict. Also inside target/ and outside `target/gate`, so a cold
+# run's cleanup leaves it behind.
+RESULT_FILE="$REPO/target/gate-result.txt"
+
+# write_result <verdict> — stamp the result file.
+#
+# Called once at startup with IN PROGRESS and again at the end with the real
+# verdict, so the file distinguishes three states a reader otherwise cannot
+# tell apart: never run (no file), running or died mid-run (IN PROGRESS, with
+# a start time to compare against the clock), and finished (PASSED/FAILED with
+# the table). The commit is recorded because a verdict without the hash it
+# applies to is close to useless — history gets rewritten, branches move, and
+# "the gate passed" then means nothing in particular.
+write_result() {
+  local verdict="$1" now_commit
+  now_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+  mkdir -p "$(dirname "$RESULT_FILE")"
+  {
+    printf 'verdict:   %s\n' "$verdict"
+    printf 'commit:    %s\n' "$START_COMMIT"
+    printf 'tree:      %s\n' "$START_TREE"
+    printf 'dirty:     %s\n' \
+      "$(if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null | grep -v '^??')" ]; then
+           echo "yes — tracked files differ from the commit above"
+         else echo no; fi)"
+    # HEAD can move while a 40-minute gate runs — another session landing a
+    # commit, or a history rewrite. Observed: the architect committed docs
+    # mid-run. Recording HEAD at *completion* would then file the verdict
+    # against a commit most of the run never saw, so the commit above is the
+    # one the run started on and any move is called out rather than hidden.
+    if [ "$now_commit" != "$START_COMMIT" ]; then
+      printf 'moved:     HEAD moved to %s during the run; the verdict applies to the commit above\n' \
+        "$now_commit"
+    fi
+    printf 'mode:      %s\n' "$MODE"
+    printf 'started:   %s\n' "$STARTED_AT"
+    printf 'finished:  %s\n' \
+      "$(if [ "$verdict" = "IN PROGRESS" ]; then echo "-"; else date -Is; fi)"
+    if [ "${#NAMES[@]}" -gt 0 ]; then
+      printf '\n'
+      for i in "${!NAMES[@]}"; do
+        printf '%-9s %-16s %s\n' "${RESULTS[$i]}" "${NAMES[$i]}" "${DETAILS[$i]}"
+      done
+    fi
+  } > "$RESULT_FILE"
+}
+
+STARTED_AT=$(date -Is)
+START_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+START_TREE=$(git -C "$REPO" rev-parse HEAD^{tree} 2>/dev/null || echo unknown)
+write_result "IN PROGRESS"
+
 # step <name> <command…> — run it, record pass/fail and a one-line detail.
 #
 # The detail is pulled out of the step's own output by `summarize`, so the
@@ -356,8 +408,19 @@ for i in "${!NAMES[@]}"; do
 done
 printf '════════════════════════════════════════════════════════════════════\n'
 
+# Record the verdict where it outlives the run. A cold gate deletes its own
+# `target/gate` on the way out, so a finished run leaves no process and no
+# build directory — meaning "passed forty minutes ago" and "never started"
+# look identical to anyone checking afterwards. That ambiguity cost three
+# rounds of "is a gate actually running?" on one release candidate, so the
+# answer now lives in a file: `target/gate-result.txt` is stamped IN PROGRESS
+# at the start of the run and overwritten with the table at the end.
+write_result "$(if [ "$FAILED" -gt 0 ]; then echo "FAILED"; else echo "PASSED"; fi)"
+
 if [ "$FAILED" -gt 0 ]; then
   printf ' %d of %d step(s) FAILED\n' "$FAILED" "${#NAMES[@]}"
+  printf ' verdict recorded in %s\n' "${RESULT_FILE#"$REPO"/}"
   exit 1
 fi
 printf ' all %d step(s) passed\n' "${#NAMES[@]}"
+printf ' verdict recorded in %s\n' "${RESULT_FILE#"$REPO"/}"
