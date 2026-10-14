@@ -43,12 +43,34 @@ pending=0
 # it instead would mean nobody writes it later.
 probe_pending() {
   local subcommand="$1"; shift
-  if ! eval "./target/debug/orch $subcommand --help" >/dev/null 2>&1; then
+  if ! has_subcommand "$subcommand"; then
     printf '  pending       %s  (no `orch %s` yet)\n' "$1" "$subcommand"
     pending=$((pending + 1))
     return
   fi
   probe "$@"
+}
+
+# has_subcommand <subcommand>
+#
+# `<cmd> --help` exits **3** outside a project, because everything but init,
+# update and doctor builds the container before Commander parses. So the probe
+# has to happen inside one, or every subcommand looks absent and every probe
+# above it looks pending — the same trap the harness's own capability probe
+# fell into.
+has_subcommand() {
+  local root="$PWD" dir
+  dir=$(mktemp -d)
+  (
+    cd "$dir" || exit 1
+    mkdir -p home
+    export HOME="$dir/home" USERPROFILE="$dir/home"
+    "$root/target/debug/orch" init --name probe --adapter claude >/dev/null 2>&1 || exit 1
+    eval "\"$root/target/debug/orch\" $1 --help" >/dev/null 2>&1
+  )
+  local ok=$?
+  rm -rf "$dir"
+  return $ok
 }
 
 # probe <label> <file> <python-replacement-expression>

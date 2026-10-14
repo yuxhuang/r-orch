@@ -687,3 +687,33 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
     Covered end to end by `crates/orch-cli/tests/watch_shutdown.rs`, at the
     only level where it is real: SIGINT to `run --watch`, SIGTERM to `serve`,
     both asserting the process exits and the lock file is gone.
+
+17. **`heap_mb` has no Rust counterpart.** The `orchestrator:tick` log record
+    carries `heap_mb = +(process.memoryUsage().heapUsed / 1_048_576)
+    .toFixed(1)` (PARITY §16.4). A Rust process has no V8 heap, and reporting
+    RSS under that name would be a different metric wearing this one's label,
+    so r-orch emits `0.0` — the field stays, because the record *shape* is
+    contract — and the harness masks the value the way it masks pids and
+    durations (§1.4). Decide in §14 whether the honest zero or an RSS figure
+    is wanted; nothing downstream reads it.
+
+18. **The tick stream is a wall-clock heartbeat, not a sequence.** How many
+    `orchestrator:tick` records appear before a run finishes, and which tasks
+    are running when one fires, differ between two independently-timed
+    processes: measured as a `running: 2` tick on one side against
+    `running: 1` on the other (`o7-concurrency-cap`), and one extra tick
+    before a stall was detected (`o7-stall-detection`). The scenarios that
+    compare records therefore carry `@ticks-vary:<reason>`, which drops tick
+    records and keeps every other one — dispatch, completion, retries,
+    stalls, shutdown. Separately, human output stamped with
+    `toLocaleTimeString` (`run`, `run --watch`, `logs`) normalizes to
+    `<TIME>`: the two binaries start seconds apart.
+
+19. **`kill(pid 0)` signals the caller's own process group.** Both
+    `kill(-0)` and `kill(0)` do, in C and in node, so a stale or absent pid
+    in `state.json` would have had the orchestrator SIGTERM itself along with
+    every agent it started. `SystemProcessManager::kill` refuses pid 0 and
+    `is_alive(0)` is false. Not replicated from the reference, which has the
+    same hazard: a process that kills itself because a pid field was missing
+    is not behaviour, and nothing observable depends on it. The test can only
+    fail by killing the test runner.
