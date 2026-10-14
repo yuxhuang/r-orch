@@ -26,7 +26,7 @@ use orch_core::storage::{
 use orch_core::template::TemplateEngine;
 use orch_core::workspace::WorkspaceManager;
 use orch_domain::{GlobalConfig, OrchestratorConfig};
-use orch_infra::adapters::build_registry;
+use orch_infra::adapters::build_registry_with_clock;
 use orch_infra::storage::{
     FileAgentStore, FileConfigStore, FileContextStore, FileGlobalConfigStore, FileGoalStore,
     FileMessageStore, FileRunStore, FileStateStore, FileTaskStore, FileTeamStore, Paths,
@@ -121,6 +121,22 @@ impl std::ops::Deref for FullEngine {
 pub struct EngineSeams {
     pub clock: Arc<dyn Clock>,
     pub ids: Arc<dyn IdGenerator>,
+    /// Where `global.yml` lives, for a test that must not touch the real one.
+    ///
+    /// `None` keeps the production resolution: `ORCHESTRY_GLOBAL_CONFIG_PATH`,
+    /// else `~/.orchestry/global.yml`. That default is machine-global, so a
+    /// test using it writes the developer's own preferences — which is not
+    /// hypothetical. Two tests in `orch-cli` did exactly that, and the user's
+    /// `~/.orchestry/global.yml` was found holding `activity_filter:
+    /// nonsense`, a literal from one of them.
+    ///
+    /// An env var is **not** a sufficient fix: it was first set through
+    /// `[env]` in `.cargo/config.toml`, which cargo only loads when the
+    /// working directory is inside the workspace — so the writer came straight
+    /// back for any invocation from elsewhere. Verified by running the suite
+    /// with a cwd outside the repo, which reproduced the file byte for byte.
+    /// A seam the test passes explicitly cannot be bypassed that way.
+    pub global_config_path: Option<PathBuf>,
 }
 
 impl Default for EngineSeams {
@@ -128,6 +144,7 @@ impl Default for EngineSeams {
         EngineSeams {
             clock: Arc::new(SystemClock::new()),
             ids: Arc::new(NanoIdGenerator::new()),
+            global_config_path: None,
         }
     }
 }
@@ -147,7 +164,10 @@ pub async fn build_light_with(
     paths.require_init().await?;
 
     let config_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(paths.clone()));
-    let global_config_store: Arc<dyn GlobalConfigStore> = Arc::new(FileGlobalConfigStore::new());
+    let global_config_store: Arc<dyn GlobalConfigStore> = match &seams.global_config_path {
+        Some(path) => Arc::new(FileGlobalConfigStore::at(path.clone())),
+        None => Arc::new(FileGlobalConfigStore::new()),
+    };
     let config = config_store.read().await?;
     // The light tier does not read `global.yml`: the TS container leaves
     // `globalConfig` at its default until the full tier loads it, and no
@@ -259,7 +279,13 @@ pub async fn build_full_with(
     engine.global_config = engine.global_config_store.read().await?;
 
     let processes: Arc<dyn ProcessManager> = Arc::new(orch_infra::process::SystemProcessManager);
-    let adapters = Arc::new(build_registry(Arc::clone(&processes)));
+    // Adapters stamp the events they parse out of a child's stdout, so they
+    // get the injected clock too — otherwise the seam would reach every
+    // timestamp except the ones a differential scenario actually reads.
+    let adapters = Arc::new(build_registry_with_clock(
+        Arc::clone(&processes),
+        Arc::clone(&engine.clock),
+    ));
     let workspace: Arc<dyn WorkspaceManager> = Arc::new(GitWorkspaceManager::new(
         project_root.clone(),
         engine.paths.root(),
@@ -311,6 +337,25 @@ pub async fn build_full_with(
     })
 }
 
+/// Both tiers, and the orchestrator, must be movable and shareable across
+/// threads.
+///
+/// This is load-bearing rather than hygiene: the TUI's facade is
+/// **synchronous** while every service here is `async`, and `orch-cli` already
+/// runs `dispatch` inside `Runtime::block_on`. So the draw loop has to live on
+/// a thread that is *not* driving the runtime — `Handle::block_on` panics on
+/// one that is — which means the engine gets moved onto a plain
+/// `std::thread`. A stray `Rc` or `RefCell` anywhere in the container would
+/// make that impossible, and the error would land on whoever wires the TUI
+/// rather than on whoever introduced it. Hence a static assertion here.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync + 'static>() {}
+    assert_send_sync::<Engine>();
+    assert_send_sync::<FullEngine>();
+    assert_send_sync::<Orchestrator>();
+    assert_send_sync::<EngineSeams>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +375,10 @@ mod tests {
         EngineSeams {
             clock: Arc::new(orch_core::test_support::FixedClock::at(0)),
             ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
+            // Left at the default here because these cases only build the
+            // light tier, which does not construct the global-config store.
+            // Anything reading or writing `global.yml` must set it.
+            global_config_path: None,
         }
     }
 

@@ -413,6 +413,8 @@ mod tests {
             EngineSeams {
                 clock: Arc::new(orch_core::test_support::FixedClock::new()),
                 ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
+                // Light tier only, so no global-config store is built.
+                global_config_path: None,
             },
         )
         .await

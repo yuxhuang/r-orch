@@ -21,7 +21,9 @@ pub mod routing;
 pub mod serve;
 pub mod shop_picker;
 pub mod tree;
+pub mod tui;
 pub mod update;
+pub mod update_check;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -40,17 +42,6 @@ use crate::tree::{
     ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, OrgCmd, OrgSub, RunCmd,
     ServeCmd, TaskCmd, TaskSub, TeamCmd, TeamSub,
 };
-
-/// A command that parses but whose service is not wired yet.
-///
-/// Deliberately an error rather than a no-op: a silent success would make a
-/// scenario pass for the wrong reason, and the parity harness has no scenario
-/// for these until they land.
-fn not_wired(command: &str) -> Error {
-    Error::other(format!(
-        "{command} is not wired yet in this build (see crates/orch-cli/TEST-MAP.md)"
-    ))
-}
 
 /// The single entry point behind the `orch`, `orchestry` and `ao` binaries.
 pub fn run() -> ExitCode {
@@ -581,15 +572,35 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     .await
             }
         }
-        Some(Command::Tui) => Err(not_wired("tui")),
-
-        // Bare `orch` is the first-run experience in the reference: it inits
-        // and launches the TUI. Both halves of that are WP-6's; printing the
-        // root help is the honest interim behaviour.
-        None => {
-            let _ = shape;
-            Ok(print_group_help_root())
+        Some(Command::Tui) => {
+            let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+            // The dashboard needs the orchestrator, so this is the one command
+            // that builds the full container up front.
+            tui::run(ctx.project_root, version()).await
         }
+
+        // Bare `orch` is the first-run experience (PARITY.md §2.3): it inits
+        // if needed and launches the dashboard. `is_bare` is the routing
+        // guard's own answer to "no arguments at all", which is what the
+        // reference tests before appending `tui` (`cli.ts:206`) — the arm that
+        // landed on master guessed it from `args_os().count()` pending this.
+        None if shape.is_bare => {
+            tui::first_run(
+                &styles_for(cli, env),
+                &cwd,
+                &commands::init::InitArgs {
+                    name: None,
+                    adapter: None,
+                    interactive: env.stdout_is_tty && env.stdin_is_tty,
+                },
+                version(),
+            )
+            .await
+        }
+
+        // Flags but no subcommand (`orch --json`): the reference appends `tui`
+        // only for a bare argv, so this prints the root help instead.
+        None => Ok(print_group_help_root()),
     }
 }
 
@@ -673,6 +684,11 @@ async fn run_serve(
         },
     )
     .await
+}
+
+/// The version the dashboard reports, which is the one `--version` prints.
+fn version() -> &'static str {
+    tree::VERSION
 }
 
 fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {

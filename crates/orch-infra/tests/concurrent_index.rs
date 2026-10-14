@@ -87,6 +87,7 @@ impl Harness {
             .prefix("r-orch-a2-")
             .tempdir()
             .expect("tempdir");
+        orch_core::test_support::assert_hermetic(project.path());
         let home = project.path().join(".harness-home");
         std::fs::create_dir_all(home.join(".orchestry")).expect("harness home");
         // A warm update-check cache, so the oracle makes no network call.

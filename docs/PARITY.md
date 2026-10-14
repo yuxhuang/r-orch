@@ -63,9 +63,19 @@ skill loading; serve-mode log record *fields*.
 
 ### 1.3 What is L2
 
-TUI pixel layout, colours and glyph choices; `--help` text wording and layout; spinner frames and animation
-timing; colour/ANSI styling of human output; log *text* format in `serve --log-format text`; progress and
-status decoration.
+TUI pixel layout, colours and glyph choices; spinner frames and animation timing; colour/ANSI styling of human
+output; log *text* format in `serve --log-format text`; progress and status decoration.
+
+**`--help` output is L2 — it is clap's, not Commander's.** Wording, wrapping, option ordering and section
+headings all differ, and no attempt is made to reproduce Commander's layout. What *is* L0 around help:
+
+- the **command, subcommand, alias and flag names** themselves (§2.2) — these are what `--help` advertises and
+  what scripts call;
+- the **stream** help goes to: stdout for an explicit `--help`, **stderr** for the bare-command-group path
+  (§3);
+- the **exit code**: 0 for explicit `--help`, 1 for a bare command group, 3 in an uninitialized directory.
+
+So a harness scenario asserts the stream and exit code of a help invocation, never its body.
 
 ### 1.4 Normalization rules for comparison
 
@@ -80,6 +90,9 @@ The differential harness ([ARCHITECTURE.md §8.2](ARCHITECTURE.md)) compares aft
 | YAML mapping key order | **Not contract**, but SHOULD match the TS interface field order for human diff friendliness. | `writeYaml` uses `sortKeys: false`. |
 | IDs | Replace `/(tsk|agt|run|goal|team|msg)_[A-Za-z0-9_-]{7}/` with `<\1_ID>`, consistently per-run. | nanoid is random. |
 | Timestamps | Replace ISO-8601 instants with `<TS>`; preserve ordering relations separately where asserted. | Wall clock. |
+| **Local clock times** in human output — `HH:MM:SS` from `toLocaleTimeString('en-US', { hour12: false })` in `orch run`, `orch logs` and the TUI activity feed | Replace with `<TIME>`. | The two binaries run seconds apart, so the values differ legitimately; and the TS form is **local time**, not UTC (§5.4). The *presence and position* of the field stays contract. |
+| `heap_mb` in `serve` tick records | **Masked.** | V8 heap vs process RSS — no faithful counterpart (§11.1). The field name is contract, the value is not. |
+| `orchestrator:tick` records in `serve` output | **Dropped** on steps marked `@ticks-vary`. | Tick count is a function of wall-clock duration vs `poll_interval_ms`. Every other record type on those steps is still compared. |
 | Absolute paths | Replace the temp project root with `<ROOT>`. | Temp dirs. |
 | PIDs | Replace with `<PID>`. | OS-assigned. |
 | Durations / `*_ms` measured values | Replace with `<MS>`. | Timing. |
@@ -164,7 +177,7 @@ Positional args: `<x>` required, `[x]` optional. All options take a value unless
 | `add` | `<title>` | `-d, --description <desc>`; `-p, --priority <n>` **default `'3'`**; `-l, --labels <labels>` (comma-separated); `--depends-on <ids>` (comma-separated); `--max-attempts <n>`; `--workspace-mode <mode>` (`shared\|worktree\|isolated`); `--assignee <agent-id>`; `--review-criteria <criteria>` (comma-separated of `test_pass,typecheck,lint`); `--scope <patterns>` (comma-separated globs); `--goal-id <goalId>`; `--attach <paths>` (comma-separated); `-e, --edit` *(bool)* |
 | `list` | — | `--status <status>` |
 | `show` | `<id>` | — |
-| `edit` | `<id>` | — (opens `$EDITOR`) |
+| `edit` | `<id>` | **none** — round-trips via `$EDITOR` only (§2.4) |
 | `assign` | `<task-id> <agent-id>` | — |
 | `cancel` | `<id>` | — |
 | `approve` | `<id>` | — |
@@ -178,7 +191,7 @@ Positional args: `<x>` required, `[x]` optional. All options take a value unless
 | `shop` | — | `--list` *(bool)* — print all templates non-interactively |
 | `list` | — | — |
 | `status` | `<id>` | — |
-| `edit` | `<id>` | — |
+| `edit` | `<id>` | **none** — round-trips via `$EDITOR` only (§2.4) |
 | `remove` | `<id>` | — |
 | `disable` | `<id>` | — |
 | `enable` | `<id>` | — |
@@ -282,6 +295,29 @@ No args, no options.
 2. `orch` with no args in an initialized project → launch the TUI.
 3. `--help`/`-h`/`--version`/`-V` with no real subcommand → print and exit without building a container.
 
+### 2.4 The `$EDITOR` round-trip protocol (L0)
+
+**`task edit <id>` and `agent edit <id>` take no options whatsoever.** They sit beside flag-taking verbs in
+§2.2, which invites the assumption that they accept `--title`/`--description`/`--model`. They do not. Each:
+
+1. serializes the entity into a temp file as **`---`-delimited frontmatter**,
+2. spawns an editor on it — **`$EDITOR`, then `$VISUAL`, then `vi`**,
+3. parses what comes back and writes **only the fields that changed**.
+
+This is an L0 surface that no earlier revision of this document enumerated. Three behaviours are contract:
+
+| Situation | Behaviour |
+|---|---|
+| Editor exits 0 with an unchanged file | prints `No changes.` |
+| Editor exits non-zero | prints `Editor exited with code N` |
+| Editor exits 0 with changes | writes only the changed fields |
+
+The exact frontmatter key set per entity is in [docs/parity/cli.md §4, §5](parity/cli.md). Scenarios reach
+these commands through `fixtures/fake-editors/`; `cargo xtask lint-scenarios` rejects a scenario that passes
+invented flags to them, which is how four originally-written scenarios were found to be asserting nothing.
+
+The same `-e/--edit` flag on `task add` and `agent add` uses the same protocol to author one field.
+
 ---
 
 ## 3. Exit codes (L0)
@@ -303,8 +339,22 @@ Additional exit paths (all L0):
 - **Any command in an uninitialized directory exits `3`** — *including* `orch <sub> --help` and unknown
   commands. The container is built **before** Commander parses, so `NotInitializedError` wins over help and
   over usage errors. Only `init`, `doctor` and `update` are exempt.
-- **A command group invoked with no subcommand** (`orch task`, `orch agent`, …) prints its help to **stdout**
-  and exits **`1`**.
+- **A command group invoked with no subcommand** (`orch task`, `orch agent`, …) prints its help to
+  **stderr** — **0 bytes on stdout** — and exits **`1`**. This is Commander's `help({ error: true })` path,
+  which a subcommand without an `.action()` falls into. Measured against the oracle in a hermetic tmpdir:
+
+  | argv | stdout | stderr | exit |
+  |---|---|---|---|
+  | `orch task` | 0 B | 735 B | 1 |
+  | `orch agent` | 0 B | 654 B | 1 |
+  | `orch config` | 0 B | 407 B | 1 |
+
+  The first stderr line is `Usage: orchestry <group> [options] [command]`. **The stream is contract**; the
+  help body's layout is clap's and is L2 (§1.3). Encoded in
+  `fixtures/scenarios/cmd-exit-codes-groups.toml`.
+
+  > An earlier revision of this document said **stdout**. That was wrong, and a parity scenario would have
+  > failed on it.
 - Commander errors (unknown command, unknown option, missing required option) → **exit 1**, message on stderr
   in Commander's own format (`error: unknown command 'x'`, optionally followed by `(Did you mean y?)`). The
   exact wording is **L2**; the exit code is L0.
@@ -430,8 +480,8 @@ a field whose value is `null` is **emitted as `null`**. The only `null`-valued f
 | `context list` | array of `ContextEntry` |
 | `logs` | array of `Run` objects (metadata, including the full `prompt`) |
 | `status` | `{ tasks, agents, state }` — see §4.3 |
-| `config get` | **compact.** the raw value at the dot path, JSON-encoded. **The `value` key is omitted entirely for a missing key** |
-| `config global get` | **compact** |
+| `config get` | **compact.** the raw value at the dot path, JSON-encoded. **The `value` key is omitted entirely for a missing key**. Dot paths **do** work: `config get defaults.agent.max_turns --json` → `{"key":…,"value":50}` |
+| `config global get` | **compact. Cannot read a nested key** — see below |
 | `config global show` | **compact.** the `GlobalConfig` object |
 | `agent edit` | a single `Agent` object |
 | `agent autonomous` | a single `Agent` object |
@@ -445,6 +495,18 @@ a field whose value is `null` is **emitted as `null`**. The only `null`-valued f
 
 Empty collections are `[]`. A **missing context entry** (`context get <unknown> --json`) prints the literal
 line `null`.
+
+**`config global get` cannot read a nested key, and that asymmetry is L0.** Measured in one tree:
+
+| argv | output | exit |
+|---|---|---|
+| `config global show --json` | `{"tui":{"palette":"amber",…}}` | 0 |
+| `config global get tui.palette --json` | `{"key":"tui.palette"}` — **no `value` at all** | 0 |
+| `config global get tui --json` | likewise empty | 0 |
+| `config get defaults.agent.max_turns --json` | `{"key":"defaults.agent.max_turns","value":50}` | 0 |
+
+So the project-level `config get` walks dot paths and the global one does not. **Replicate; do not "fix" it** —
+the CLI contract is byte parity, not sanity. Encoded in `fixtures/scenarios/cmd-config.toml`.
 
 ### 4.1.1 Commands that do NOT support `--json` (L0 — they print human text even with the flag)
 
@@ -588,7 +650,7 @@ That is a bug, and it is **fixed** in r-orch by user decision (§14.1). The diff
 `state.claimed` in `status --json` comparisons and instead asserts that r-orch's value equals the `claimed` array
 in the resulting `state.json`.
 
-`state` otherwise matches the `state.json` schema in §6.5 exactly.
+`state` otherwise matches the `state.json` schema in **§6.6** exactly (§6.5 is `config.yml`).
 
 ### 4.4 `goal show --json`
 
@@ -604,9 +666,9 @@ Human output is split: **structural text is L0, decoration is L2.**
 **L0 (must match exactly, after stripping ANSI):** every literal word, label, column header, count line,
 success/error message, and the padding of table cells (see §5.1).
 
-**L2 (may differ):** colours, ANSI codes, `--help` layout and wrapping, spinner frames, and the Unicode glyph
-chosen for a status — but the *set* of glyphs and their ASCII fallbacks are L0 because `--ascii` is a
-documented flag.
+**L2 (may differ):** colours, ANSI codes, **the entire `--help` body** (it is clap's layout, not Commander's —
+see §1.3), spinner frames, and the Unicode glyph chosen for a status — but the *set* of glyphs and their ASCII
+fallbacks are L0 because `--ascii` is a documented flag.
 
 ### 5.1 Table rendering (L0)
 
@@ -916,6 +978,13 @@ and `js-yaml.dump` (verified). In Rust, every `Option` field that the TS type ma
 `#[serde(skip_serializing_if = "Option::is_none")]`. The single exception is `Message.to_agent_id`
 (`string | null`), which must serialize as `null` when absent.
 
+> **This rule governs *persisted records and `--json` output only* — it does not extend to `PromptContext`.**
+> The template context requires the **opposite** discipline: every optional variable must be **present** with
+> an explicit `nil`, because the Rust `liquid` crate errors on a missing key where liquidjs renders empty
+> (§9.5, ARCHITECTURE §4.3). The two rules do not conflict — they apply to different types — but the wording
+> above reads as universal, so it is scoped here explicitly. **WP-3: do not "fix" `PromptContext` to use
+> `skip_serializing_if`.**
+
 **⚠ Timestamp quoting — blocking cross-compat hazard.** js-yaml's default schema includes the YAML 1.1
 `timestamp` type, so an **unquoted** `created_at: 2026-10-13T16:37:58.959Z` is parsed by the TypeScript binary
 into a JavaScript **`Date` object**, not a string. Downstream, `MessageStore.list()` calls
@@ -1081,7 +1150,29 @@ Rust must mirror this (`#[serde(default)]` plus explicit coercion for `onboardin
 ### 6.7 `orchestry.lock`
 
 Content: the holder's PID as a decimal string, written with `O_CREAT|O_EXCL` (`fs.open(path, 'wx')`), **no
-trailing newline**. Semantics in §8.5.
+trailing newline**. Acquisition semantics in §7.13.
+
+**Parsing (L0).** `parseInt(content.trim(), 10)`, then `isNaN ? null : pid`. A read error is also `null`. So
+an **unparseable or empty lock file is indistinguishable from a missing PID** — and that is *not* treated as
+"no lock":
+
+| Lock file contents | Outcome | Lock file afterwards |
+|---|---|---|
+| absent | **acquired** | created with our PID |
+| decimal PID, process **alive**, mtime fresh | **refused**, `pid` reported | untouched |
+| decimal PID, process **alive**, mtime older than `LOCK_STALE_MS` (60 s) | **acquired** (PID-recycling defence) | replaced |
+| decimal PID, process **dead** | **acquired** | replaced |
+| **garbage** (e.g. `xyz`) | **REFUSED** | **untouched** |
+| **empty** | **REFUSED** | **untouched** |
+
+Measured against the oracle with `serve --once` and `run <id>` (fake agent). The garbage and empty cases
+**refuse with exit 4** and the message **`Orchestrator already running (PID: undefined)`** — the literal
+string `undefined`. See §14.17; this is **L0 and replicated verbatim**.
+
+Why: `readLockPid` returns `null` for garbage, which makes the `existing !== null` guard in `doAcquire` false,
+so the entire stale-handling branch — including the `unlink` — is **skipped**. The subsequent
+`fs.open(path, 'wx')` then fails `EEXIST` because the file does exist, and the error path re-reads the PID,
+gets `null` again, and returns `{ acquired: false, pid: undefined }`.
 
 ### 6.8 Task / Agent / Goal / Team YAML
 
@@ -1138,6 +1229,21 @@ non-strings) and truncates to 8192 characters, appending `…` (U+2026) when tru
 is an object with a non-empty string `data`, `data` is re-truncated so the whole line fits:
 `budget = 4096 - byteLen(JSON.stringify({...record, data: ""}) + "\n") - 3`, then
 `data = data.slice(0, budget) + "…"`. If `budget <= 0`, the line is written over-length unchanged.
+
+**`streamEvents(runId, signal?)` reads the file to EOF and ends — it does not tail-follow** (L1). It waits up
+to **30 s** for the file to appear (polling every 100 ms), then opens a plain read stream, yields each parsed
+line, skips corrupt lines with the same stderr warning, and stops at EOF. A caller wanting to follow must
+**re-invoke** it.
+
+> Two things about it are worth knowing before implementing the trait method:
+> - **It has no production caller.** Only tests reference it (`run-store.test.ts`, `error-paths.test.ts`,
+>   plus the fakes in `helpers.ts`). The trait method and its tests still port, because the interface declares
+>   it and 5 test cases pin it — but nothing in the CLI or TUI depends on its behaviour.
+> - **`logs --follow` does not use it.** It calls `followLive()`, which subscribes to the **EventBus**
+>   (`eventBus.onAny`) and blocks until SIGINT/SIGTERM. Since `logs` builds a *Light* container in a one-shot
+>   process, and the orchestrator that emits events runs in a **different** process, that bus is inert: the
+>   command prints its `Following live events...` header and then emits nothing until interrupted. Replicate
+>   this — it is the observable behaviour — and see §15.1, which lists `logs --follow` as outside the harness.
 
 **Read behaviour** (L1): corrupt lines are skipped with a warning on stderr
 (`[readJsonl] skipping corrupt line: <first 200 chars>`). Files over 50 MB read only the last 200 records and
@@ -1582,11 +1688,16 @@ Each tick (unless suppressed), for every agent with `autonomous == true` **and**
 
 | Operation | Behaviour |
 |---|---|
-| `acquireLock(path)` | Serialized in-process. If a lock file exists and its PID is alive **and** the file's mtime is newer than `LOCK_STALE_MS = 60000`, fail with `{ acquired: false, pid }`. Otherwise unlink the stale lock and create a new one with `O_CREAT\|O_EXCL`. An `EEXIST` race re-reads the PID and reports failure. |
+| `acquireLock(path)` | Serialized in-process. Reads the PID first. **If the PID parses**: a live PID with a fresh mtime fails with `{ acquired: false, pid }`; otherwise the stale lock is unlinked and a new one created with `O_CREAT\|O_EXCL`. **If the PID does not parse** (garbage, empty, unreadable) the whole stale-handling branch is **skipped — nothing is unlinked** — and the `O_CREAT\|O_EXCL` create then fails `EEXIST`, returning `{ acquired: false, pid: undefined }`. See §6.7 for the full table. |
 | `releaseLock(path)` | Unlink, errors ignored. |
 | `touchLock(path)` | `utimes(now, now)`, errors ignored. Called once per tick. |
-| `checkLock(path)` | `{ locked, pid? }` — `locked` is false for a missing file or a dead PID. **Does not consider mtime.** |
-| `requireLock(path)` | Acquire or throw `LockConflictError(pid)`. |
+| `checkLock(path)` | `{ locked, pid? }` — `locked` is false for a missing file **or a dead PID or a garbage PID**. **Does not consider mtime.** So `checkLock` reports "not locked" for a garbage lock that `acquireLock` will refuse — the two disagree. |
+| `requireLock(path)` | **Dead code — no caller.** Its single occurrence is its own definition. Note it would also be *wrong* if used: `if (!result.acquired && result.pid)` is falsy when `pid` is `undefined`, so it would silently **succeed** on a garbage lock. Port it only if the ported tests require it; nothing else does. |
+
+**The live acquisition path** is `withTemporaryLock` / `startWatch`, both of which do
+`if (!lockResult.acquired) throw new LockConflictError(lockResult.pid!)` — unconditionally, with the non-null
+assertion. That is why an `undefined` pid still throws (and prints `PID: undefined`) rather than being
+swallowed the way `requireLock` would swallow it.
 
 **PID liveness** = `kill(pid, 0)` succeeds, **or** fails with `EPERM` (process exists, not ours). Any other
 error ⇒ dead.
@@ -1630,11 +1741,23 @@ and resolve all `waitForStop()` waiters.
 - `send` validates: non-empty `body`; `0 < ttl_ms <= 604800000` (7 days), defaulting to **86400000** (24 h);
   the sender must exist **unless** it is the literal `cli`.
 - `subject` is truncated to **200** chars and defaults to the literal `(no subject)`; `body` to **4000**.
+  Both counts are **UTF-16 code units** — see §14.14 for the mid-surrogate case.
+- **The body is validated trimmed and stored untrimmed** (L0, measured). `send` rejects on
+  `!input.body.trim()` and then stores `input.body` — the original. So `"   "` is an error while `" padded "`
+  is accepted and **keeps both spaces on disk**. The subject is neither trimmed nor validated; empty becomes
+  the literal `(no subject)`. Trimming before storing passes every rejection test and diverges on every
+  message anyone sends with a trailing newline. `fixtures/scenarios/cmd-msg-body-trimming.toml`.
 - `expires_at = created_at + ttl_ms`.
 - **`direct`** — `to_agent_id` required and must exist. One message.
 - **`broadcast`** — one message per recipient. Recipients are all agents **excluding the sender** and
-  **excluding `status == "disabled"`**; with `team_id`, further restricted to that team's members (a missing
-  team silently degrades to all agents).
+  **excluding `status == "disabled"`**; with `team_id`, further restricted to that team's members.
+
+  **An unknown `team_id` fans out to *every* agent** (L0, measured). `message-service.ts` resolves the team and
+  filters only `if (team)`, with no else branch, so an unresolvable id leaves the recipient list unfiltered —
+  **and `team_id: "<unknown>"` is still persisted on every message**, leaving a dangling reference in the
+  store. Measured in a four-agent tree: a real two-member team → 2 messages; `--team team_nosuch` → 4.
+  **An implementation that validates the team id sends strictly fewer messages than the oracle.** Replicate.
+  `fixtures/scenarios/cmd-msg-broadcast-unknown-team.toml`.
 - **`lead`** — requires `team_id`; resolves to `team.lead_agent_id`. One message.
 - `drainMailbox(agentId, taskId)` — called during dispatch: list pending, mark all delivered, emit
   `message:delivered` per message, return them for prompt injection.
@@ -2287,7 +2410,7 @@ plus the per-event fields below. **Events not listed are suppressed entirely** (
 
 | `event` | `level` | Extra fields |
 |---|---|---|
-| `orchestrator:tick` | `info` | `running`, `queued`, `heap_mb` *(heap bytes / 1048576, 1 decimal)* |
+| `orchestrator:tick` | `info` | `running`, `queued`, `heap_mb` — see below |
 | `orchestrator:shutdown` | `info` | `reason` |
 | `orchestrator:error` | `error` if `fatal` else `warn` | `error`, `context`, `fatal` |
 | `orchestrator:stall_detected` | `warn` | `runId` |
@@ -2309,6 +2432,20 @@ plus the per-event fields below. **Events not listed are suppressed entirely** (
 Suppressed (no record at all): `task:assigned`, all `message:*`, all `team:*`, all `goal:*`,
 `agent:autonomous_toggled`, and `agent:output` without `--verbose`.
 
+#### `heap_mb` and the tick heartbeat
+
+**`heap_mb` has no faithful Rust counterpart.** In TS it is `process.memoryUsage().heapUsed / 1048576` to one
+decimal — a **V8 heap** measurement. Rust has no V8 heap. **Decision (team lead): r-orch reports process
+**RSS in MiB** under the same field name**, to one decimal. The *field* is contract (a log consumer's schema
+keeps working); the *value* is not comparable, so **the harness masks it**.
+
+**`orchestrator:tick` records are a wall-clock heartbeat and are excluded from comparison.** The number of
+ticks a run emits depends on how long the run took versus `poll_interval_ms`, so two binaries started seconds
+apart legitimately emit different counts. Scenario steps that run `serve` carry **`@ticks-vary`**, which drops
+`event == "orchestrator:tick"` records from the comparison. **Every other record is still compared in full** —
+the exclusion is per-record-type, not per-step, so dropping ticks does not weaken the §11.1 contract for
+anything else.
+
 **Idle-tick throttling** (L1): a tick is "idle" when `running == 0 && queued == 0`. In non-verbose mode an idle
 tick is logged only when `tickCounter % idleLogInterval == 0`. The counter increments on **every** tick
 (including non-idle ones) and is never reset. `idleLogInterval` is **6**
@@ -2324,6 +2461,19 @@ list, and values are raw for strings, JSON-encoded otherwise.
 or an `orchestrator:shutdown` event was observed. Then `stop()`. Exit **1** if any task ended `failed`,
 else **0**. Note the check is `status === "failed"` specifically — a `cancelled` task does **not** cause a
 non-zero exit.
+
+> **Usage trap — `serve --once` never returns while any task sits in `review`.** `review` is **not** a
+> terminal status (terminal is `{done, failed, cancelled}`, §7.1), so the poll loop waits for it forever.
+> A task lands in `review` and stays there whenever its agent's `approval_policy` is **`suggest`** or
+> **`manual`** and the task has no `review_criteria` — nothing auto-approves it, and `--once` has no
+> timeout.
+>
+> **This is reachable out of the box**: the `agt_creator` agent that `orch init` creates ships with
+> `approval_policy: suggest` (§6.11), so a `serve --once` over a task assigned to the default agent hangs.
+> It applies **equally to both binaries** — it is inherited behaviour, not a divergence, and is replicated.
+> Document it for users (use `approval_policy: auto`, set `review_criteria`, or approve out of band) and
+> **keep it out of unattended scenarios**: a `--once` scenario must drive tasks to a terminal status or it
+> will hang the harness rather than fail it.
 
 **Flush on exit** (L1): all non-stdout/stderr streams are `end()`ed and awaited before the process exits, so a
 `--log-file` is never truncated.
@@ -2463,7 +2613,9 @@ The handler is **one ordered `if` chain and the order is load-bearing**. Reprodu
    and then also performs its normal action**.
 2. Agent picker open → swallow everything. (The *type* picker does **not** block — a quirk; `q` still quits
    through it. Preserve or fix deliberately — see §14.8.)
-3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard.
+3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard — **refused when the default adapter is
+   `shell`**, since shop templates require an AI adapter (§11.4). The refusal surfaces the same guidance the
+   suggestion path uses: *Agent Shop requires an AI provider. Choose Shell and enter a command instead.*
 4. Any input mode active → text-input branch.
 5. Normal-mode chain, in source order.
 
@@ -2546,7 +2698,14 @@ step types. Validation is **300 ms debounced** for text and textarea, **synchron
       `approval_policy` **always** skipped; `team` skipped when there are fewer than 2 options. `effort`
       **must sit immediately after `model`**. Shell collapses the wizard to `name`/`adapter`/`command` and
       forces `approval_policy = "auto"`, clearing model/effort/role/skills/team.
-- [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) · **EDIT AGENT** (9) ·
+- [ ] **EDIT AGENT** — **8 steps**, `getEditAgentWizardSteps` at
+      `src/tui/wizardConfigs.ts:463-547`: `name` (:473), `adapter` (:485), `command` (:492), `model` (:503),
+      `effort` (:515), `role` (:523), `role_custom` (:531), `team` (:539).
+      **It has no `skills` and no `approval_policy` step**, which is what makes it 8 rather than NEW AGENT's
+      10 — so **neither field is editable through the TUI once an agent exists**, leaving `agent edit` via
+      `$EDITOR` (§2.4) as the only way to change an agent's skills.
+      *(An earlier revision said 9; [docs/parity/tui.md §5.2](parity/tui.md) was correct.)*
+- [ ] **AGENT SHOP** (1 step, 15 templates) · **NEW AGENT — {template}** (prefilled) ·
       **NEW TASK** (4) · **EDIT TASK** (4) · **NEW TEAM** (4) · **New Goal** (3) · **Edit Goal** (3) ·
       **SETTINGS** (5 single-step variants, one per config setting)
 - [ ] Validation messages verbatim: `Title is required`, `Priority must be 1-4`, `Name is required`,
@@ -2570,6 +2729,69 @@ Five palettes (`amber`, `ocean`, `forest`, `violet`, `light`) persisted in `~/.o
 **semantic roles** must exist (brand/amber, success/green, error/red, info/blue, warning/yellow, dim, ghost,
 solid text, selection); exact hex values are L2.
 
+### 12.8 Deliberate divergences in r-orch's TUI
+
+WP-6 is complete: **742 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
+were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
+each is justified on its own merits rather than by the gate.
+
+| # | Divergence | Level | Rationale | Recorded |
+|---|---|---|---|---|
+| a | Both logs pickers block global keys | L1 | The agent picker blocks, the type picker does not; `q` quits out of the latter. Unintended asymmetry. | §14.8 |
+| b | Minimum-terminal-size guard added | L2 | The original has no breakpoints and no guard; below ~9 rows the layout arithmetic goes negative. **Addition, not parity.** | §12 layout note |
+| c | Wizard `Esc` = back one step; `Esc` on step 0 cancels | **L1 (keymap)** | This is **FormWizard's own intended behaviour**, defeated in Ink by a second handler. | §14.18 |
+| d | Cancelling a wizard clears pending attachments | L1 | The original leaks them on the `Esc`-above-step-0 path. | §14.19 |
+| e | The `W` hint is dropped | L2 | Advertised by `onboarding-config.ts`, **no handler exists**. | §13 |
+| f | Toast and undo rows come from the elastic bottom panel | **L2** | Pure layout. The rows exist and carry the same text; where the space is taken from differs. | here |
+| g | `log_selected_index` consistently indexes the **filtered** list | L1 | The original mixes filtered and unfiltered indexing, so the highlighted row and the detail shown disagree whenever a filter is active. | §14.20 |
+| h | Pre-dispatch failures reported synchronously as `Err` | L1 | The TUI renders no `orchestrator:error` case, so a stream-only dispatch error is **invisible**. | §12.10 |
+
+Items (b) and (f) are recorded only here, because they are additions/layout rather than behaviours of the
+original. The other five have §13 or §14 entries.
+
+### 12.9 The update facade is intentionally inert
+
+The TS header renders a **version chip** when an update is available, driven by the post-command update check.
+Since self-update and all network access are **out of scope on security grounds** (§11.5, §13), r-orch's TUI
+facade keeps `poll_update`, `background_install` and `installed_version` **at their defaults** — no polling, no
+install, no detected version.
+
+**Consequence: the header version chip never appears in r-orch.** That is **intended, not a missing feature.**
+The fields exist so the facade matches the shape of the TS header component and so a future release channel
+could populate them without reshaping the view; nothing currently does. Do not "finish" them, and do not file
+the absent chip as a parity gap.
+
+### 12.10 Pre-dispatch failures must surface synchronously (L1)
+
+The TUI backend facade (`crates/orch-tui/BACKEND.md`) is fire-and-request: `run_task`, `run_all` and
+`start_watch` ask the orchestrator to dispatch and return immediately, with outcomes arriving via
+`poll_events`. **That is correct for outcomes and wrong for pre-dispatch failures**, because of a gap in the
+original:
+
+**Neither the TS TUI nor r-orch renders `orchestrator:error`.** The TS event switch in `App.tsx` handles
+`agent:completed`, `agent:error`, `agent:file_changed`, `agent:output`, `agent:started`,
+`orchestrator:stall_detected`, `orchestrator:tick`, `run:retry`, `task:assigned`, `task:cascade_failed`,
+`task:created` and `task:status_changed` — and **no `orchestrator:error` case** (nor
+`orchestrator:shutdown`).
+
+Dispatch failures are emitted as `orchestrator:error { context: "dispatch task <id>" }` and deliberately do
+**not** stop other dispatches (§7.5). So in the TS TUI, pressing `r` on a task whose dispatch fails — a
+`WorkspaceError` because the project is not a git repo, `NoAgentsError`, an unknown adapter — produces
+**no feedback whatsoever**. The event is emitted, nothing renders it, the task silently stays `todo`.
+
+**Requirement:** `run_task`, `run_all` and `start_watch` must return **`Err(String)` synchronously** for any
+failure detectable before the agent process is spawned — lock conflict, no agents configured, unknown adapter,
+workspace preparation failure, an invalid task id or a non-dispatchable status. The TUI renders
+`Failed: {err}`, so the message *is* the contract: use the same text the CLI would print for that failure
+(§3.1).
+
+Post-dispatch outcomes stay asynchronous and arrive through `poll_events` — that part of the facade is right
+and must not become blocking. The dividing line is **"did the child process start?"**: before it, `Err`;
+after it, events.
+
+This is a **fix** for a usability gap rather than a parity divergence: the original emits the error, so the
+information exists; it simply never reaches the screen.
+
 ---
 
 ## 13. Out of parity scope
@@ -2589,6 +2811,7 @@ solid text, selection); exact hex values are L2.
 | **`TeamConfig.auto_claim` / `max_concurrent_tasks` behaviour** | Stored and surfaced by the CLI but never read by the orchestrator. Data model and CLI are preserved; the (absent) behaviour is not invented. |
 | **`.orchestry/logs/`** | A path exists in `Paths`; nothing writes it. Kept in the path API, unused. |
 | **npm self-update, and the post-command background update check** | **OUT OF SCOPE — security.** Not "reimplemented". A Rust CLI overwriting its own executable as a side effect of an unrelated command is a supply-chain and integrity surface with no channel, no signing story and no atomic-replace story, and it is unverifiable by the harness. `orch update [--check]` keeps its name, flag and exit 0, and prints the current version plus install instructions. No network access. See §11.5. |
+| **The TUI header's update/version chip** | Follows from the row above. The TUI facade's `poll_update`, `background_install` and `installed_version` stay **at their defaults**, so the chip **never renders**. Intended, not a gap — see §12.9. |
 | **`doctor`'s `node` check** | Replaced by a check of the r-orch build/toolchain identity. The row keeps its **position and format**; only its label and value change. Because that is a divergence in L0 human output, the harness **masks the toolchain row** (§1.4) rather than pretending it matches. |
 | **`readJsonl`'s 50 MB fallback stderr warning wording** | L1 behaviour (tail-read) is kept; the exact warning string is not contract. |
 
@@ -2633,7 +2856,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 |---|---|
 | `none` | Observable output is unchanged, or the surface is outside the harness. The row stays verified. |
 | `scenario exclusion required (<named>)` | The harness cannot compare this; the named scenarios must avoid it. The row becomes **unverified** and that is now visible. |
-| `oracle patched` | We patch the vendored oracle to match. Requires an explicit note of what was patched and why. |
+| `oracle patched` | We patch the vendored oracle so the surface is comparable at all. Requires a patch file under `parity/patches/`, applied by `parity/setup.sh`, and an explicit note of what was patched and why. **Reserved for cases where the oracle is too broken to compare against** — not for making it agree with us. In use by §14.21. |
 
 **An entry marked `FIX` without this field is incomplete.** Summary:
 
@@ -2652,6 +2875,17 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.11 merge output guard | REPLICATE | `none` |
 | §14.12 grok/antigravity stderr | **FIX (drain-and-discard)** | `none` |
 | §14.13 pi line reader | REPLICATE | `none` |
+| §14.14 msg surrogate truncation | DIVERGENCE (lead ruling) | `scenario exclusion required (cmd-msg-truncation, mid-pair case only)` |
+| §14.15 `stop()` wedges the lock | FIX | `none` |
+| §14.16 DiskObserver straddling line | FIX | `none` |
+| §14.17 corrupt lock wedges, `PID: undefined` | REPLICATE | `none` |
+| §14.18 wizard `Esc` discards the wizard | FIX | `none` — TUI |
+| §14.19 wizard cancel leaks attachments | FIX | `none` — TUI |
+| §14.20 `logSelectedIndex` filtered/unfiltered mix | FIX | `none` — TUI |
+| §14.21 worktree-mode `run`/`serve --once` no-op | **FIX** | **`oracle patched`** (`parity/patches/0001-…`) |
+| §14.22 `kill(0)` hits our own process group | **FIX** | `none` |
+| §14.23 `run <id>` awaits the collector | equivalent behaviour | `none` |
+| §14.24 `stop()` lets an in-flight tick finish | REPLICATE | `none` |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -2739,9 +2973,13 @@ Not pluralized. It is asserted human output. Replicate.
 
 ### 14.8 TUI: the type picker does not block global keys — **FIX**
 
-While the logs *agent* picker is open, all App keys are blocked; while the *type* picker is open they are not,
-so `q` quits out of it. **Decision: fix** — block global keys for both pickers. The inconsistency is clearly
-unintended and the TUI is L2.
+**Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1).
+
+While the logs *agent* picker is open, all App keys are blocked (`if (showAgentPicker) return;`); while the
+*type* picker is open they are not, so `q` quits out of it. **Decision: fix** — block global keys for
+**both** pickers. The inconsistency is clearly unintended.
+
+**Implemented as specified** — WP-6 confirms both pickers now block global keys.
 
 Related, and **not ported** (see §13): the unreachable `'new_task'` input mode, the advertised-but-unhandled
 `W` key, and the never-mounted `LogsSearchBar`.
@@ -2831,6 +3069,289 @@ rather than an oversight in the port.
 Also: pi's `waitForSettled` tests **key presence**, not value — an `agent_settled` frame with a falsy value
 still settles. Replicate.
 
+### 14.14 `msg send` can write a message file `serde_json` cannot parse — **DOCUMENTED DIVERGENCE**
+
+**Effect on differential comparison: `scenario exclusion required (cmd-msg-truncation, mid-pair case only)`.**
+The control case one character shorter is still compared normally.
+
+`MessageService.send` truncates with JS `.slice()`, which counts **UTF-16 code units**:
+`subject.slice(0, 200)`, `body.slice(0, 4000)`. A non-BMP character is two code units, so a body of 3999 ASCII
+characters followed by `😀` is cut **between the surrogates** and the stored value ends in a **lone high
+surrogate**. One `msg send` reaches this; it is not a hostile-input hypothetical.
+
+Measured oracle behaviour, which differs per output path:
+
+| Path | Bytes | Valid UTF-8 |
+|---|---|---|
+| `.orchestry/messages/<id>.json` | `…aaa\ud83d` (the 6-byte escape) | yes |
+| `msg list --json` on stdout | `…aaa\ud83d` (same escape) | yes |
+| `msg inbox` human output | `…aaa` + `ef bf bd` (U+FFFD) | yes |
+
+A Rust `String` cannot hold a lone surrogate at all, and **`serde_json` rejects a lone-surrogate escape
+outright** (`from_str(r#"{"body":"aaa\ud83d"}"#)` → `unexpected end of hex escape`), so a naive storage layer
+cannot read back a file the oracle wrote — `msg list` would fail entirely rather than diverge in one field.
+
+**Decision (team lead ruling), in three parts:**
+
+1. **Write side — truncate at the last whole character at or below the UTF-16 limit.** r-orch never emits a
+   lone surrogate. Below the limit this is byte-identical to the oracle; at a mid-pair cut r-orch stores one
+   character fewer. **The field is L2 above the limit**, which is a documented concession of an L0 field and
+   is recorded as such.
+2. **Read side — tolerate lone-surrogate escapes in TS-written files.** Decode them to **U+FFFD** rather than
+   erroring, and **never fail a whole listing** because one message is affected. This is the half that
+   matters: without it, r-orch cannot read a project the TS binary has used.
+3. **Do not rewrite the body on read.** A tolerated message is **not** re-serialized unless the message is
+   being re-saved for an independent reason, so merely running `msg list` does not silently rewrite the file
+   and destroy the oracle's bytes.
+
+Rejected alternatives: modelling the body as UTF-16 (byte-exact, but poisons the domain type for every
+consumer) and replacing lone surrogates with U+FFFD on read *and* re-saving (silently rewrites the file).
+
+Test: `fixtures/scenarios/cmd-msg-truncation.toml`, with the `${repeat:…}` control case. The harness now
+reports a file only one side can parse as a **failure** rather than aborting the run.
+
+### 14.15 `Orchestrator.stop()` can wedge a project by propagating mid-wind-down — **FIX**
+
+**Effect on differential comparison: `none`** — the divergence is reachable only when the state store is
+already broken, which no scenario induces.
+
+`stop()` performs the wind-down (abort, kill, finish run, transition task, release agent) and **then**
+releases the lock. Several of those steps can throw — most realistically the task transition or a state write.
+Because the tick circuit breaker calls `stop()` after 5 consecutive tick failures (§7.3), and those failures
+are frequently *caused* by a failing state store, the original can throw partway through and **leave the lock
+file held by a process that is exiting**. The project is then wedged: every subsequent `run`/`serve` fails with
+`LockConflictError` until the stale lock ages past `LOCK_STALE_MS`.
+
+**Decision: fix.** r-orch **reports** each wind-down failure (an `orchestrator:error` event per failed step)
+and **completes the wind-down regardless**, including the lock release and the signal-handler teardown. Phrased
+as a requirement: `stop()` is infallible from the caller's perspective — it returns after making a best effort
+at every step, never short-circuiting on the first error.
+
+### 14.16 `DiskObserver` loses a JSONL line that straddles a tick — **FIX**
+
+**Effect on differential comparison: `none`** — the disk observer feeds the TUI only, which is outside the
+harness (§15.1).
+
+The serve-mode disk observer polls run JSONL files from a saved byte offset. On reading a chunk whose final
+line is incomplete, the original **rewinds the offset and keeps the remainder**, but the bookkeeping drops
+that remainder on the next tick, so **a line split across two polls is lost**. The effect is a missing
+activity row in the TUI, which is why it went unnoticed.
+
+**Decision: fix.** Carry the partial-line remainder across ticks explicitly and prepend it to the next chunk.
+TUI-only, no on-disk or wire effect.
+
+### 14.17 A corrupt lock file wedges the project, and reports `PID: undefined` — **REPLICATE**
+
+**Effect on differential comparison: `none`.**
+
+Three defects compound here. All three are **replicated**, including the literal `undefined`.
+
+1. **A garbage or empty `orchestry.lock` refuses acquisition** (exit 4) instead of being treated as stale.
+   `readLockPid` returns `null`, the `existing !== null` guard short-circuits the stale-handling branch, and
+   the `O_CREAT|O_EXCL` create then fails `EEXIST` (§6.7).
+2. **The error message interpolates `undefined`**: `Orchestrator already running (PID: undefined)`. The live
+   path throws `LockConflictError(lockResult.pid!)` unconditionally, and `pid` is `undefined` for an
+   unparseable lock. **This exact string is L0** — it appears on stderr and a user may well be grepping for
+   it.
+3. **Nothing ever clears it.** The garbage lock is never unlinked, no command repairs it, and `orch status`
+   does not clear it either (`checkLock` even reports the project *unlocked*, disagreeing with
+   `acquireLock`). **The project is wedged until the file is deleted by hand** — the 60 s `LOCK_STALE_MS`
+   escape hatch does not apply, because that path is only reached when the PID parses.
+
+**Decision: replicate all three.** This is the inherited behaviour at the pinned commit, the message is
+user-visible output, and "fixing" it changes an exit code and a stderr line that the harness compares. The
+remedy belongs in user-facing documentation — *delete `.orchestry/orchestry.lock` if you see
+`PID: undefined`* — not in a silent behavioural divergence.
+
+Related, same measurement run: **`serve:started` is logged before the lock is acquired**
+(`serve.ts:84` vs the `runOnce`/`startWatch` calls at `:113`/`:131`), so a `serve` invocation that is about to
+fail with exit 4 still emits one `serve:started` record first. Replicate the ordering — it is part of the
+§11.1 log contract.
+
+### 14.18 Wizard `Esc` closes the whole wizard, defeating `FormWizard`'s own logic — **FIX**
+
+**Effect on differential comparison: `none`** — TUI, outside the harness.
+
+`FormWizard.tsx:397-404` already implements the sensible behaviour:
+
+```ts
+if (key.escape) {
+  if (currentStep === 0) { onCancel(); } else { goToPrevStep(); }
+  return;
+}
+```
+
+But `App.tsx:1954-1960` handles `Esc` first for **any** active input mode, and `wizard` is one of them:
+
+```ts
+if (inputMode !== 'none') {
+  if (key.escape) { setInputMode('none'); inputHook.reset(''); cmdHistory.reset(); return; }
+```
+
+Ink mounts both components, so **both `useInput` handlers fire**. `setInputMode('none')` unmounts the wizard,
+so `goToPrevStep()` is applied to a component that is going away and the step change is never seen.
+**Observable behaviour: `Esc` anywhere in a wizard discards the whole thing**, and `FormWizard`'s
+back-one-step branch is dead code reachable only in an impossible state.
+
+**Decision: fix** — implement `FormWizard`'s stated intent: `Esc` goes back one step, and `Esc` on step 0
+cancels. Note what this is *not*: it is not a new design, it is the original component's documented behaviour
+with the framework quirk that masks it removed. The keymap is **L1**, so this divergence is recorded
+explicitly rather than waved through as presentation. The Ink double-`useInput` mechanism is described in
+[docs/parity/tui.md §10](parity/tui.md).
+
+Consequence to keep in mind: a user who wants to abandon a half-filled wizard now presses `Esc` once per step
+(or `Ctrl+C`). That is the cost of the fix and it is accepted.
+
+### 14.19 Cancelling a wizard leaks pending attachments — **FIX**
+
+**Effect on differential comparison: `none`** — TUI, outside the harness.
+
+`handleWizardCancel` (`App.tsx:1313-1317`) does the right thing:
+
+```ts
+setInputMode('none'); setWizardConfig(null); setPendingAttachments([]);
+```
+
+It is wired to `FormWizard`'s `onCancel`, which only fires on `Esc` **at step 0**. On any later step
+`FormWizard` takes the `goToPrevStep()` branch instead, while App's handler (§14.18) tears the wizard down
+with **`setInputMode('none')` alone** — clearing neither `pendingAttachments` **nor `wizardConfig`**. So
+clipboard-pasted images survive a cancelled wizard and `wizardConfig` is left stale.
+
+**Decision: fix** — clear pending attachments (and the wizard config) on **every** cancel path, not just
+`onCancel`. Strictly an improvement: a cancelled wizard should not contribute files to whatever is created
+next.
+
+### 14.20 `logSelectedIndex` mixes filtered and unfiltered indexing — **FIX**
+
+**Effect on differential comparison: `none`** — TUI, outside the harness.
+
+In the logs/`ACTIONS` view, `logSelectedIndex` is used against **two different arrays**:
+
+| Site | Array | Use |
+|---|---|---|
+| `App.tsx:2485` | `messages` — **unfiltered** | `selectedLog`, i.e. what the detail panel renders |
+| `App.tsx:3406-3407` | `filteredMessages` | the rows actually drawn |
+| `App.tsx:3441` | `filteredMessages.length` | the `n/N` position counter |
+
+So with **any** filter active, the highlighted row and the detail shown are **different events**, and the
+counter describes a third frame of reference. This is a correctness bug, not a cosmetic one — selecting the
+3rd visible row shows the 3rd event of the *unfiltered* stream.
+
+**Decision: fix** — `log_selected_index` indexes the **filtered** list everywhere: selection, rendering,
+detail and counter. Clamp on filter change so a narrowing filter cannot leave the index out of range.
+
+### 14.21 TS `run <id>` and `serve --once` dispatch nothing in **worktree** mode — **FIX (oracle patched)**
+
+**Effect on differential comparison: `oracle patched`** — the first entry to use that value. A minimal
+documented patch (`parity/patches/0001-…`) is applied by `parity/setup.sh`: keep the child `ref`'d while it is
+being awaited. Without it, no `run`/`serve --once` scenario can be compared in the **default** workspace mode.
+
+**The reference implementation's primary dispatch commands exit 0 without doing anything, in the mode that
+ships as the default.** Lead-verified matrix:
+
+| Mode | Repo | `run <id>` | `serve --once` |
+|---|---|---|---|
+| `shared` | no git | ✓ dispatches | ✓ |
+| `shared` | git | ✓ dispatches | ✓ |
+| **`worktree`** (default) | git | **✗ no-op, exit 0** | **✗ no-op, exit 0** |
+
+**Mechanism**, confirmed in source:
+
+1. `ProcessManager.spawn` (`process-manager.ts:64-80`) spawns with `stdio: ['ignore', 'pipe', 'pipe']`,
+   `detached: true`, and then calls **`proc.unref()`**. Its own comment states the intent exactly:
+   *"Pipes (stdout/stderr) still hold refs while being read — that's intentional."* The ref exists **only
+   while something is reading**.
+2. `WorkspaceManager.spawnAndWait` (`workspace-manager.ts:171-181`) uses that spawn and awaits a promise
+   resolved by `'close'`/`'error'` — and **never reads `proc.stdout` or `proc.stderr`**.
+3. So nothing holds a `ref` on the event loop: the child is unref'd and its pipes are unread. Node's loop
+   empties, the process exits 0, and the `await` **never resolves**.
+
+The contrast inside the same file is the proof: `spawnAndCapture` (`:184`) attaches
+`proc.stdout?.on('data', …)`, which refs the pipe and keeps the loop alive — so it works, and `spawnAndWait`
+does not. Every `spawnAndWait` call site is affected: `git rev-parse --is-inside-work-tree` (`:57`),
+`git worktree add` (`:146`, `:152`), `git worktree prune` (`:151`), `git worktree remove` (`:79`),
+`git branch -D` (`:83`), `git clone` (`:209`), `rsync` (`:218`).
+
+**Why `shared` escapes it**: `prepare()` guards with `if (mode !== 'shared') await this.requireGitRepo(mode)`
+and returns `{ path: projectRoot }` for `shared` without spawning anything. So the shared path never touches
+`spawnAndWait`. The matrix above falls directly out of that guard — which is strong corroboration that the
+diagnosis is right.
+
+The first unread-pipe spawn in a worktree dispatch is `git rev-parse` (`:57`); the lead observed the exit
+occurring mid-`git worktree add`, which simply means something else still ref'd the loop during `rev-parse`
+and it emptied slightly later. The outcome is identical either way, and the exact exit point is
+environment-dependent — do not encode it in a test.
+
+**Wreckage left behind**, which a scenario must tolerate:
+
+- the task stays `todo` (never transitions, never gets a run record);
+- `.orchestry/orchestry.lock` persists, holding a **dead** PID — so unlike §14.17 it is re-acquirable and does
+  not wedge the project;
+- `state.claimed` retains the task id. `dispatchAll` filters on `!claimed.has(id)`, so the task is
+  **suppressed from `run --all` and `serve`** until a `startWatch` runs `cleanupStaleRunningEntries`, which
+  unconditionally clears `claimed`. A direct `run <id>` still works, because `dispatchOnlyTask` calls
+  `dispatchTask` without consulting the claimed filter.
+
+**Decision: fix** — r-orch dispatches in worktree mode. Keep the child referenced for the duration of the
+await (or read its pipes, which r-orch does anyway for the stderr tail, §14.12). There is no sense in
+replicating a default-mode no-op.
+
+> **Note for anyone reading the captured reference output in §5.4:** that `orch run` transcript was taken
+> after `orch config set defaults.agent.workspace_mode shared`, which is why it shows a real dispatch. The
+> default-mode failure was not visible in it.
+
+### 14.22 `kill(pid)` with a stale `pid: 0` signals the orchestrator's own process group — **FIX**
+
+**Effect on differential comparison: `none`.**
+
+`ProcessManager.kill` tries the process **group** first: `process.kill(-pid, signal)`. For `pid === 0` that is
+`process.kill(-0, …)`, and since `-0 === 0`, the target is **process group 0 — the caller's own group.** So a
+stale `pid: 0` makes the orchestrator **SIGTERM itself** (and every sibling in its group). `isAlive(0)` does
+not save you: `process.kill(0, 0)` signals the caller's own group, succeeds, and reports the phantom process
+as alive, so `killWithGrace(0)` proceeds straight to the `SIGTERM`.
+
+**This is reachable, not theoretical.** The shell adapter returns `{ pid: 0, events: errorGen() }` when the
+agent has no `config.command` (`shell.ts:47`, §8.10). If such a handle's `pid` reaches `state.running` — or
+survives in a hand-edited or partially-written `state.json` — the next reconcile, stall kill, `cancelTask`,
+`forceStopAgent` or `stop()` turns into self-termination.
+
+**Decision: fix.** The process manager **refuses to signal pid 0** (and, for the same reason, any
+non-positive pid), logging the refusal rather than silently ignoring it. There is no legitimate call: ORCH
+never means "my own group". Also treat `is_alive(0)` as **false**, so a stale zero is reaped as a dead entry
+instead of being believed.
+
+### 14.23 `run <id>` must wait for the event collector to finish — **implementation of equivalent behaviour**
+
+**Effect on differential comparison: `none`.**
+
+`agent:completed` is emitted by `runService.finish`, which runs **inside** `collectEvents` — so the event
+fires while the collector is still draining and persisting. The TS process nonetheless stays alive to the end
+of the run, because the adapter's stdout pipe is **actively being read**, and that holds a `ref` on node's
+event loop until EOF.
+
+That is the same mechanism as §14.21 seen from the other side: **read pipes keep the process alive; unread
+pipes let it exit.** `run <id>` works by accident of the first; worktree-mode dispatch breaks by accident of
+the second.
+
+r-orch has no equivalent implicit keep-alive, so `run <id>` must **explicitly await the collector task** —
+not merely the `agent:completed` event — before returning. Returning on the event would truncate the JSONL
+event log, skip the proof/stats writes, and exit before the task reaches its terminal status. This is not a
+divergence: it is what the original does, made explicit.
+
+### 14.24 `stop()` does not interrupt an in-flight tick — **REPLICATE**
+
+**Effect on differential comparison: `none`.**
+
+`stop()` calls `clearInterval`, which prevents **future** ticks but cannot interrupt a callback already
+running. So a `stop()` issued mid-tick waits for that tick to finish (the state mutex serializes them anyway,
+§7.15).
+
+**Decision: replicate.** Aborting a tick in flight would be worse, not better: `atomicWrite` writes
+`.state.json.<random>.tmp` and renames, so cancelling between write and rename **litters the `.orchestry/`
+directory with temp files** that nothing ever cleans up. A tick is bounded work; letting it complete is
+correct. Pair this with §14.15 — the wind-down must still complete every step and release the lock even when
+steps fail.
+
 ---
 
 ## 15. Verification matrix
@@ -2862,6 +3383,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V20 | `serve --json` log record fields per §11.1 | L0 | Differential harness on a scenario with a fake agent |
 | V21 | `serve --once` exit code semantics | L0 | Scenario tests: all-pass → 0; one failed → 1; one cancelled → 0; empty → 0 |
 | V22 | Lock acquisition, staleness and PID-recycling defence | L1 | Integration test with a real second process |
+| V22b | **Corrupt-lock matrix** (§6.7): absent / live+fresh / live+stale / dead / garbage / empty — each yields the measured outcome, exit code and post-state of the lock file, including `PID: undefined` on stderr for the garbage and empty cases | L0 | Oracle-compared scenarios with a fake agent, one per row |
 | V23 | Concurrency cap is never exceeded | L1 | Integration test with N fake agents and `max_concurrent_agents = 2` |
 | V24 | Stall detection fires at the configured timeout | L1 | Integration test with a fake agent that sleeps |
 | V25 | Crash recovery: dead PID → task `cancelled`, claims cleared, `preparing` runs finalized | L1 | Integration test that kills the orchestrator mid-run |
@@ -2872,7 +3394,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
 | V31 | **Harness hermeticity**: `HOME`/`USERPROFILE` redirected per tmpdir; a fresh `update-check.json` pre-seeded; the oracle spawns **no `npm`** and makes **no network call** | L0 | Scenario asserting the process tree contains no `npm` and no socket; run with the network namespace disabled in CI |
 | V32 | **Generalized YAML cross-parse**: every YAML artifact in **both** trees re-parsed **in the TS process with js-yaml** and deep-compared against the Rust parse | L0 | Harness step (~50 lines of Node glue). **Subsumes V8.** The single highest-value check in the plan |
-| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
+| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 742 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
 | V34 | **Stall clock semantics**: a run emitting blank lines stalls; a run emitting unparseable non-blank lines does not | L1 | Cross-compat `serve --once` scenario with a fake agent, compared against the oracle |
 | V35 | **`serve --once` killed mid-run** → task recovery, run finalization and `--json` records match the oracle | L1 | Cross-compat scenario with a fake agent and an external kill |
 | V36 | **`max_concurrent_agents` saturation**: N ready tasks, cap 2 — dispatch order, claim/release and final tree match the oracle | L1 | Cross-compat scenario with fake agents |

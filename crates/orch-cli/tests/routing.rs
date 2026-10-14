@@ -412,19 +412,21 @@ fn doctor_json_prints_the_two_header_lines_before_the_json() {
 }
 
 #[test]
-fn a_commands_not_wired_yet_is_an_error_rather_than_a_silent_success() {
-    // The honest interim behaviour for a command another work package owns:
-    // it parses, so V1's surface check is real, and it fails loudly rather
-    // than succeeding with nothing done. `tui` is the last one left — see
-    // crates/orch-cli/TEST-MAP.md.
+fn every_declared_command_is_wired() {
+    // The ratchet that replaced `… is not wired yet`: there is no such
+    // command any more, so the assertion is that no command *claims* to be
+    // unwired. `orch tui` was the last one, and it needs a TTY, so it is
+    // checked for the message rather than for success.
     let dir = initialized_project();
-    let output = orch(dir.path()).arg("tui").output().expect("run");
-    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
-    assert!(
-        stderr_of(&output).contains("not wired yet"),
-        "{}",
-        stderr_of(&output)
-    );
+    for argv in [vec!["tui"], vec!["run", "--all"], vec!["org", "list"]] {
+        let output = orch(dir.path()).args(&argv).output().expect("run");
+        let stderr = stderr_of(&output);
+        assert!(
+            !stderr.contains("not wired yet"),
+            "orch {}: {stderr}",
+            argv.join(" ")
+        );
+    }
 }
 
 #[test]

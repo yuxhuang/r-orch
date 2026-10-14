@@ -305,6 +305,7 @@ impl EventBus {
     pub fn subscribe(&self) -> EventSubscription {
         EventSubscription {
             rx: self.tx.subscribe(),
+            skipped: 0,
         }
     }
 
@@ -379,20 +380,19 @@ impl Unsubscribe {
 #[derive(Debug)]
 pub struct EventSubscription {
     rx: broadcast::Receiver<Arc<OrchestratorEvent>>,
+    skipped: u64,
 }
 
 impl EventSubscription {
     /// The next event, or `None` once the bus is dropped.
     ///
-    /// A lag is logged and the stream continues from the oldest retained
-    /// event, which is what a lossy fan-out means in practice.
+    /// A lag is logged and counted, and the stream continues from the oldest
+    /// retained event, which is what a lossy fan-out means in practice.
     pub async fn recv(&mut self) -> Option<Arc<OrchestratorEvent>> {
         loop {
             match self.rx.recv().await {
                 Ok(event) => return Some(event),
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "event bus subscriber lagged; events were dropped");
-                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => self.note_lag(skipped),
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
@@ -405,12 +405,33 @@ impl EventSubscription {
         loop {
             match self.rx.try_recv() {
                 Ok(event) => events.push(event),
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "event bus subscriber lagged; events were dropped");
-                }
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => self.note_lag(skipped),
                 Err(_) => return events,
             }
         }
+    }
+
+    /// How many events this subscriber has missed, in total.
+    ///
+    /// A lossy fan-out is fine for a dashboard feed, but a caller that waits
+    /// for *one specific* event — `run <id>` waiting for its own
+    /// `agent:completed` — would wait forever if that event were among the
+    /// dropped ones. The TS cannot hit this, because its handlers are
+    /// synchronous and a handler cannot lag; in Rust it is a real hazard, so
+    /// the count is exposed rather than only logged. A caller that must not
+    /// miss an event compares this across calls and falls back to the store
+    /// when it grows.
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    fn note_lag(&mut self, skipped: u64) {
+        self.skipped = self.skipped.saturating_add(skipped);
+        tracing::warn!(
+            skipped,
+            total = self.skipped,
+            "event bus subscriber lagged; events were dropped"
+        );
     }
 }
 
@@ -851,6 +872,29 @@ mod tests {
         assert_eq!(drained.len(), 2);
         bus.emit(status_changed("tsk_after"));
         assert_eq!(sub.try_drain().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lagging_subscriber_can_tell_how_much_it_missed() {
+        let bus = EventBus::with_capacity(2);
+        let mut sub = bus.subscribe();
+        assert_eq!(sub.skipped(), 0);
+
+        for n in 0..5 {
+            bus.emit(status_changed(&format!("tsk_{n}")));
+        }
+        // Dropping events silently is right for a dashboard feed and wrong for
+        // a caller waiting on one specific event, so the loss is countable.
+        assert_eq!(sub.try_drain().len(), 2);
+        assert_eq!(sub.skipped(), 3);
+
+        // It accumulates rather than resetting, so a caller can compare it
+        // across calls, and `recv` counts the same way `try_drain` does.
+        for n in 0..5 {
+            bus.emit(status_changed(&format!("tsk_second_{n}")));
+        }
+        assert!(sub.recv().await.is_some());
+        assert_eq!(sub.skipped(), 6);
     }
 
     #[tokio::test]

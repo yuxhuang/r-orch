@@ -14,7 +14,7 @@
 //! `findProjectRoot` walks up and would otherwise find the developer's own
 //! project. That is asserted, not assumed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -72,6 +72,8 @@ impl Binaries {
                 oracle_entry.display()
             );
         }
+        verify_oracle_is_patched(repo_root)?;
+
         Ok(Binaries {
             rust,
             oracle_entry,
@@ -80,6 +82,110 @@ impl Binaries {
             _snapshot: Some(snapshot),
         })
     }
+}
+
+/// Refuse to run against an oracle that is not the patched, freshly built one.
+///
+/// `parity/patches/` holds the minimal patches that make some behaviour
+/// observable at all (see that README). Those patches are the difference
+/// between a scenario being differential and being vacuous, and the failure is
+/// silent: the unpatched oracle exits 0 and simply does nothing. A harness that
+/// kept going would report ten green scenarios about a binary that never
+/// dispatched.
+///
+/// Three things have to line up, and the stamp is written only after a
+/// successful build:
+///
+/// 1. the stamp exists at all — `parity/setup.sh` has been run since the
+///    patches were introduced;
+/// 2. it lists every patch currently in `parity/patches/` — a patch added
+///    later is not silently skipped;
+/// 3. its recorded hash matches the built `dist/` — someone rebuilding with a
+///    plain `npm run build` after a bare `git checkout` invalidates it rather
+///    than leaving a stamp that lies.
+fn verify_oracle_is_patched(repo_root: &Path) -> Result<()> {
+    let stamp_path = repo_root.join("parity/orch-ts/.parity-stamp");
+    let rerun = "run `./parity/setup.sh` to apply the patches and rebuild";
+
+    let stamp = std::fs::read_to_string(&stamp_path).with_context(|| {
+        format!(
+            "{} is missing — the oracle may be unpatched, and an unpatched oracle fails \
+             *silently* (it exits 0 without dispatching, so scenarios pass while asserting \
+             nothing). {rerun}",
+            stamp_path.display()
+        )
+    })?;
+
+    let stamped: BTreeSet<&str> = stamp
+        .lines()
+        .filter_map(|line| line.strip_prefix("patch "))
+        .map(str::trim)
+        .collect();
+
+    let patch_dir = repo_root.join("parity/patches");
+    let mut expected: Vec<String> = Vec::new();
+    if patch_dir.is_dir() {
+        for entry in std::fs::read_dir(&patch_dir)
+            .with_context(|| format!("read {}", patch_dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "patch") {
+                expected.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    expected.sort();
+
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|name| !stamped.contains(name.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        bail!("the built oracle does not include {missing:?} from parity/patches/ — {rerun}");
+    }
+
+    let recorded = stamp
+        .lines()
+        .find_map(|line| line.strip_prefix("dist-sha256 "))
+        .map(str::trim)
+        .context("the parity stamp has no dist-sha256 line — {rerun}")?;
+    let actual = dist_hash(&repo_root.join("parity/orch-ts"))?;
+    if recorded != actual {
+        bail!(
+            "the oracle's dist/ does not match the stamp, so it was rebuilt without the \
+             patches (stamp {}…, built {}…) — {rerun}",
+            &recorded[..recorded.len().min(12)],
+            &actual[..actual.len().min(12)]
+        );
+    }
+    Ok(())
+}
+
+/// The oracle's `dist/` hash, computed by running the **same shell pipeline**
+/// `setup.sh` records.
+///
+/// Shelling out rather than hashing in Rust on purpose: a second
+/// implementation could disagree with the stamp over file order or line
+/// endings and fail the gate for a reason that has nothing to do with the
+/// oracle. Running the identical command makes that impossible, and xtask
+/// already shells out to cargo and node.
+fn dist_hash(oracle_root: &Path) -> Result<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "find dist -maxdepth 1 -name '*.js' -exec sha256sum {} + \
+             | LC_ALL=C sort -k 2 | sha256sum | cut -d' ' -f1",
+        )
+        .current_dir(oracle_root)
+        .output()
+        .context("hash the oracle's dist/")?;
+    if !output.status.success() {
+        bail!(
+            "could not hash the oracle's dist/: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// `cargo build -p orch-cli` against *this* tree's manifest, returning the
@@ -225,20 +331,16 @@ fn git(cwd: &Path, args: &[&str]) -> Result<()> {
 /// `<cmd> --help` is no longer a sufficient probe on its own. WP-5a declares
 /// the whole command tree so that V1's surface check is honest — every
 /// command, subcommand, alias and flag of PARITY.md §2.2 exists and parses —
-/// and a command whose service is not wired yet fails at *run* time with
-/// `… is not wired yet`. `--help` therefore exits 0 for all sixteen, and
-/// probing it alone made scenarios run against unimplemented commands: that
-/// is neither a skip nor a real failure, and a `${goal.0}` placeholder in such
-/// a scenario aborts the whole suite because no goal was ever created.
+/// so `--help` answered yes for commands whose service was not wired yet, and
+/// scenarios ran against them: neither a skip nor a real failure, and a
+/// `${goal.0}` placeholder in such a scenario aborted the whole suite because
+/// no goal was ever created.
 ///
 /// So the probe is an explicit list, intersected with the `--help` check (so a
-/// misspelled requirement still skips rather than silently passing). The list
-/// is the one thing to update when a command lands — and the scenarios that
-/// were being skipped go live in the same commit, which is the ratchet.
-/// Commands whose handler actually does the work.
-///
-/// Keep sorted, and keep it in step with `crates/orch-cli/TEST-MAP.md`, which
-/// explains what each *absent* command is waiting on.
+/// misspelled requirement still skips rather than silently passing). Every
+/// declared command is wired now, which makes the list a ratchet rather than a
+/// gate: a command removed from it stops its scenarios instead of letting
+/// them fail.
 const WIRED_COMMANDS: &[&str] = &[
     "agent add",
     "agent autonomous",
@@ -294,27 +396,45 @@ const WIRED_COMMANDS: &[&str] = &[
     "team list",
     "team set-lead",
     "team show",
+    "tui",
     "update",
 ];
 
-#[derive(Default)]
+/// Which subcommands the Rust binary has wired, probed once per run.
+///
+/// The probe runs inside an **initialized project of its own**, and this is
+/// not a detail: `<cmd> --help` builds the container before Commander parses
+/// (PARITY.md §3), so in a directory that is not a project it exits **3**
+/// (`Not initialized`) and every command looks absent — silently skipping the
+/// entire corpus, since a skip is not a failure. Found by a mutation probe
+/// that came back "detected" by two scenarios instead of twenty-nine.
+///
+/// The project also carries its own `HOME`. Without one the container
+/// resolves its root by **walking up**, so once `~/.orchestry` existed every
+/// probe latched onto the developer's own home as the project and could
+/// create directories in it — fifteen probes per run, every run.
 pub struct Capabilities {
     probed: std::cell::RefCell<BTreeMap<String, bool>>,
-    /// A throwaway initialized project to probe **inside**.
-    ///
-    /// `<cmd> --help` is not cwd-independent: every command but `init`,
-    /// `update` and `doctor` builds the container before Commander parses, so
-    /// in a directory that is not a project the help exits **3**
-    /// (`Not initialized`). Probing from wherever the harness happens to run
-    /// therefore reported every command missing and skipped the entire
-    /// corpus — silently, since a skip is not a failure. Found by a mutation
-    /// probe that was "detected" by two scenarios instead of twenty-nine.
     project: std::cell::OnceCell<Project>,
 }
 
 impl Capabilities {
     pub fn new() -> Self {
-        Capabilities::default()
+        Capabilities {
+            probed: std::cell::RefCell::new(BTreeMap::new()),
+            project: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Why probing is not isolated, if it is not.
+    ///
+    /// Always `None` now: the probe project is created eagerly on first use
+    /// and a failure to create it is fatal, so there is no un-isolated
+    /// fallback left to warn about. Kept because the caller prints it, and
+    /// because a future probe that cannot be sandboxed should say so here
+    /// rather than quietly inheriting the developer's environment.
+    pub fn isolation_note(&self) -> Option<&'static str> {
+        None
     }
 
     /// The initialized project every probe runs in, created on first use.
@@ -327,6 +447,10 @@ impl Capabilities {
                 .current_dir(&project.root)
                 .env("HOME", &project.home)
                 .env("USERPROFILE", &project.home)
+                .env(
+                    "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                    project.home.join(".orchestry/global.yml"),
+                )
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -364,6 +488,10 @@ impl Capabilities {
             .current_dir(&project.root)
             .env("HOME", &project.home)
             .env("USERPROFILE", &project.home)
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                project.home.join(".orchestry/global.yml"),
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -530,14 +658,44 @@ pub fn run_scenario(
                     Err(problem) => Some(("status --json", problem)),
                 }
             } else if toolchain_mask::applies_to(&verify_argv) {
-                let left = toolchain_mask::mask(&norm.text(&rust_out.stdout));
-                let right = toolchain_mask::mask(&norm.text(&ts_out.stdout));
-                (left != right).then(|| {
-                    (
-                        "doctor stdout (toolchain row masked, §13)",
-                        unified_diff(&right, &left),
-                    )
-                })
+                // §13, over one shared tree: the row's position is still
+                // contract, and a missing row on either side is a failure
+                // rather than a free pass.
+                match (
+                    toolchain_mask::mask(&rust_out.stdout),
+                    toolchain_mask::mask(&ts_out.stdout),
+                ) {
+                    (Some((rust_masked, rust_row)), Some((ts_masked, ts_row))) => {
+                        if rust_row != ts_row {
+                            Some((
+                                "doctor toolchain row position",
+                                format!(
+                                    "§13 keeps the row's position; it moved\n    ts:   line \
+                                     {ts_row}\n    rust: line {rust_row}"
+                                ),
+                            ))
+                        } else {
+                            let left = norm.text(&rust_masked);
+                            let right = norm.text(&ts_masked);
+                            (left != right).then(|| {
+                                (
+                                    "doctor output (toolchain row masked, §13)",
+                                    unified_diff(&right, &left),
+                                )
+                            })
+                        }
+                    }
+                    (rust_row, ts_row) => Some((
+                        "doctor output",
+                        format!(
+                            "no toolchain row to mask, so the comparison would assert nothing \
+                             — §13 says the row keeps its position and format (present in \
+                             rust: {}, in ts: {})",
+                            rust_row.is_some(),
+                            ts_row.is_some()
+                        ),
+                    )),
+                }
             } else if let Some((rust_doc, ts_doc)) =
                 json_documents(&rust_out.stdout, &ts_out.stdout)
             {
@@ -685,14 +843,43 @@ pub fn run_scenario(
                     (Err(problem), _) | (_, Err(problem)) => Some(("status --json", problem)),
                 }
             } else if toolchain_mask::applies_to(&argv) {
-                let left = toolchain_mask::mask(&rust_norm.text(&rust_out.stdout));
-                let right = toolchain_mask::mask(&ts_norm.text(&ts_out.stdout));
-                (left != right).then(|| {
-                    (
-                        "doctor stdout (toolchain row masked, §13)",
-                        unified_diff(&right, &left),
-                    )
-                })
+                // §13: the toolchain row's label and value legitimately
+                // differ; its position does not.
+                match (
+                    toolchain_mask::mask(&rust_out.stdout),
+                    toolchain_mask::mask(&ts_out.stdout),
+                ) {
+                    (Some((rust_masked, rust_row)), Some((ts_masked, ts_row))) => {
+                        if rust_row != ts_row {
+                            Some((
+                                "doctor toolchain row position",
+                                format!(
+                                    "§13 keeps the row's position; it moved\n    ts:   line \
+                                     {ts_row}\n    rust: line {rust_row}"
+                                ),
+                            ))
+                        } else {
+                            let left = rust_norm.text(&rust_masked);
+                            let right = ts_norm.text(&ts_masked);
+                            (left != right).then(|| {
+                                (
+                                    "doctor output (toolchain row masked, §13)",
+                                    unified_diff(&right, &left),
+                                )
+                            })
+                        }
+                    }
+                    (rust_row, ts_row) => Some((
+                        "doctor output",
+                        format!(
+                            "no toolchain row to mask, so the comparison would assert nothing \
+                             — §13 says the row keeps its position and format (present in \
+                             rust: {}, in ts: {})",
+                            rust_row.is_some(),
+                            ts_row.is_some()
+                        ),
+                    )),
+                }
             } else if let Some((rust_doc, ts_doc)) =
                 json_documents(&rust_out.stdout, &ts_out.stdout)
             {
@@ -736,8 +923,9 @@ pub fn run_scenario(
             }
         }
 
-        let rust_tree = collect_tree(&rust.root, &mut rust_norm)?;
-        let ts_tree = collect_tree(&ts.root, &mut ts_norm)?;
+        let mut rust_tree = collect_tree(&rust.root, &mut rust_norm)?;
+        let mut ts_tree = collect_tree(&ts.root, &mut ts_norm)?;
+        failures.extend(exclude_tree_paths(scenario, &mut rust_tree, &mut ts_tree));
         failures.extend(compare_trees(
             &rust_tree,
             &ts_tree,
@@ -848,6 +1036,25 @@ fn execute(
     let argv = ids
         .expand(&scenario.argv(step)?)
         .map_err(|err| anyhow!("step `{step}`: {err}"))?;
+    // `@write` puts bytes on disk rather than invoking a binary, for states
+    // no command produces — a lock file holding garbage, say.
+    if argv[0] == crate::scenario::WRITE_STEP {
+        let path = project.root.join(&argv[1]);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {} for `@write`", parent.display()))?;
+        }
+        std::fs::write(&path, &argv[2]).with_context(|| format!("`@write` {}", path.display()))?;
+        return Ok(StepOutput {
+            step: step.to_owned(),
+            runner: "harness",
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        });
+    }
+
     let (mut command, label) = match runner {
         Runner::Rust | Runner::Both => (Command::new(&bins.rust), "rust"),
         Runner::Ts => {
@@ -857,9 +1064,7 @@ fn execute(
         }
     };
 
-    if scenario.fake_agents || scenario.fake_editor.is_some() {
-        command.env("PATH", stand_in_path(bins, scenario)?);
-    }
+    command.env("PATH", stand_in_path(bins, scenario)?);
     if let Some(editor) = &scenario.fake_editor {
         // `VISUAL` wins over `EDITOR` in some editors but not in the oracle,
         // which checks `EDITOR` first — so set both to the same script and
@@ -1008,10 +1213,13 @@ fn run_and_kill(
 /// both binaries spawn the fixtures rather than whatever the machine has
 /// installed.
 fn stand_in_path(bins: &Binaries, scenario: &Scenario) -> Result<String> {
-    let mut dirs = Vec::new();
-    if scenario.fake_agents {
-        dirs.push("fixtures/fake-agents");
-    }
+    // Always, for every scenario. `doctor` probes whatever is on `PATH`, and
+    // the adapters spawn from it, so a scenario that inherited the developer's
+    // `PATH` would compare two runs against whatever that machine happens to
+    // have installed — green here, red on the next machine, and silently
+    // testing the real `claude` CLI rather than the fixture. It was opt-in
+    // once; an opt-in that every scenario should set is just a trap.
+    let mut dirs = vec!["fixtures/fake-agents"];
     if scenario.fake_editor.is_some() {
         dirs.push("fixtures/fake-editors");
     }
@@ -1156,76 +1364,6 @@ fn collect_tree(project_root: &Path, norm: &mut Normalizer) -> Result<Tree> {
     })
 }
 
-/// PARITY.md §13's named divergence: r-orch's `toolchain` row replaces the
-/// oracle's `node` row in the same position and format, only the label and
-/// value differing. §1.4 says to **mask** it rather than pretend the two
-/// match, so this removes that one row — and nothing else — from a `doctor`
-/// step's output on both sides.
-///
-/// Everything else about `doctor` is still compared byte for byte: the eight
-/// adapter rows, git, the repo check, `.gitignore`, the project line, the
-/// `N of M adapters ready` footer and the two header lines.
-mod toolchain_mask {
-    /// The row's two names, the oracle's first.
-    const NAMES: [&str; 2] = ["node", "toolchain"];
-
-    pub fn applies_to(argv: &[String]) -> bool {
-        argv.first().map(String::as_str) == Some("doctor")
-    }
-
-    /// Replace the row wherever it appears: the human line, and the JSON
-    /// object `doctor --json` prints after its two human lines (which is why
-    /// this is text-based — that stdout is not a JSON document).
-    pub fn mask(stdout: &str) -> String {
-        let mut out = String::with_capacity(stdout.len());
-        let mut inside_object = false;
-        for line in stdout.split_inclusive('\n') {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("\"name\": \"")
-                && NAMES
-                    .iter()
-                    .any(|name| rest.starts_with(&format!("{name}\"")))
-            {
-                out.push_str("      \"name\": \"<TOOLCHAIN>\",\n");
-                inside_object = true;
-                continue;
-            }
-            if inside_object {
-                if trimmed.starts_with("\"detail\": ") {
-                    out.push_str("      \"detail\": \"<TOOLCHAIN>\"\n");
-                    continue;
-                }
-                if trimmed.starts_with('}') {
-                    inside_object = false;
-                }
-                out.push_str(line);
-                continue;
-            }
-            if is_human_row(trimmed) {
-                out.push_str("  <TOOLCHAIN ROW>\n");
-                continue;
-            }
-            out.push_str(line);
-        }
-        out
-    }
-
-    /// `  <icon>  node         v24.21.0` — the icon is one glyph and the name
-    /// is padded, so the test is "second whitespace-separated word is the
-    /// row's name".
-    fn is_human_row(trimmed: &str) -> bool {
-        let mut words = trimmed.split_whitespace();
-        let Some(icon) = words.next() else {
-            return false;
-        };
-        // One character: `✓`, `✕`, `—`, or their ASCII forms.
-        if icon.chars().count() != 1 {
-            return false;
-        }
-        words.next().is_some_and(|name| NAMES.contains(&name))
-    }
-}
-
 /// A collected `.orchestry/` tree.
 #[derive(Debug, Default, Clone)]
 struct Tree {
@@ -1329,6 +1467,135 @@ mod claimed_mask {
             .get_mut("state")?
             .as_object_mut()?
             .shift_remove("claimed")
+    }
+}
+
+/// Drop a scenario's named tree exclusions from both sides, reporting one that
+/// matched nothing.
+///
+/// A path that no longer exists means the exclusion is stale, and a stale
+/// exclusion is a comparison nobody is doing any more for a reason nobody
+/// remembers — so it fails rather than passing quietly.
+fn exclude_tree_paths(scenario: &Scenario, rust: &mut Tree, ts: &mut Tree) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    for prefix in &scenario.excluded_tree_paths {
+        let matched: Vec<String> = ts
+            .values
+            .keys()
+            .chain(rust.values.keys())
+            .filter(|path| path.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+
+        if matched.is_empty() {
+            failures.push(format!(
+                "`excluded_tree_paths` lists `{prefix}`, which matches nothing in either tree \
+                 — a stale exclusion silently stops comparing something. Remove it."
+            ));
+            continue;
+        }
+        for path in matched {
+            rust.values.remove(&path);
+            ts.values.remove(&path);
+            rust.framing.remove(&path);
+            ts.framing.remove(&path);
+            rust.unparseable.remove(&path);
+            ts.unparseable.remove(&path);
+        }
+    }
+    failures
+}
+
+/// The second named exclusion: `doctor`'s toolchain row (PARITY.md §13).
+///
+/// §13 replaces the `node` version check with the r-orch build identity. The
+/// row keeps its **position and format**; only its label and value change. So
+/// the harness masks that one row rather than pretending the two match — and,
+/// because position is the part §13 actually promises, checks that the row sits
+/// at the same index on both sides.
+///
+/// Like the §14.1 mask, this is a hole in the gate, so it is as narrow as it
+/// can be: `doctor` steps only, one row, and a missing row is a failure rather
+/// than a free pass.
+mod toolchain_mask {
+    /// The TS label and the r-orch label, which are the only two this may hit.
+    const LABELS: [&str; 2] = ["node", "toolchain"];
+
+    /// Whether the §13 mask applies to this step.
+    pub fn applies_to(argv: &[String]) -> bool {
+        argv.iter()
+            .find(|arg| !arg.starts_with('-'))
+            .map(String::as_str)
+            == Some("doctor")
+    }
+
+    /// Replace the toolchain row with a placeholder, reporting which line it
+    /// was on so the two sides' positions can be compared.
+    ///
+    /// `None` when there is no such row: masking a row that is not there would
+    /// assert nothing, and a `doctor` that stopped printing a toolchain row
+    /// would otherwise pass by having nothing to mask.
+    pub fn mask(stdout: &str) -> Option<(String, usize)> {
+        let mut index = None;
+        let mut masking_detail = false;
+        let mut out = Vec::new();
+
+        for (line_number, line) in stdout.lines().enumerate() {
+            match (index, label_of(line)) {
+                // Only the first match is masked; a second row with the same
+                // label would be a real difference worth seeing.
+                (None, Some(_)) => {
+                    index = Some(line_number);
+                    out.push("  <TOOLCHAIN ROW>".to_owned());
+                    // In the `--json` shape the value is a line of its own,
+                    // and `r-orch 0.1.0 (rust 1.94.1)` against `v24.21.0` is
+                    // the other half of the same divergence. The human row
+                    // carries both on the line just masked, so this only ever
+                    // consumes a `"detail"` that follows.
+                    masking_detail = true;
+                }
+                _ if masking_detail && line.trim_start().starts_with("\"detail\": ") => {
+                    masking_detail = false;
+                    out.push("      \"detail\": \"<TOOLCHAIN>\"".to_owned());
+                }
+                _ => {
+                    if line.trim_start().starts_with('}') {
+                        masking_detail = false;
+                    }
+                    out.push(line.to_owned());
+                }
+            }
+        }
+
+        let index = index?;
+        let mut masked = out.join("\n");
+        if stdout.ends_with('\n') {
+            masked.push('\n');
+        }
+        Some((masked, index))
+    }
+
+    /// The row's label, if the line carries one.
+    ///
+    /// Two shapes, because `doctor` prints the row twice over: the human
+    /// `<glyph> <label> <value>` line, and — after the two header lines, which
+    /// is why this is text and not a parsed document (§22.2) — the
+    /// `"name": "<label>"` line of the `--json` object.
+    fn label_of(line: &str) -> Option<&'static str> {
+        let rest = line.trim_start();
+        if let Some(name) = rest.strip_prefix("\"name\": \"") {
+            let label = name
+                .strip_suffix("\",")
+                .or_else(|| name.strip_suffix('"'))?;
+            return LABELS.into_iter().find(|known| *known == label);
+        }
+        // The glyph is ✓/✕ normally and +/x under --ascii; take whatever the
+        // first whitespace-delimited token is and look at the one after it.
+        let mut tokens = rest.split_whitespace();
+        let _glyph = tokens.next()?;
+        let label = tokens.next()?;
+        LABELS.into_iter().find(|known| *known == label)
     }
 }
 
@@ -1861,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn stand_in_directories_go_on_the_path_only_when_asked_for() {
+    fn the_fake_agents_are_always_on_the_path_and_editors_on_request() {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1874,13 +2141,16 @@ mod tests {
             _snapshot: None,
         };
 
+        // Unconditional: `doctor` probes PATH and the adapters spawn from it,
+        // so inheriting the developer's PATH would compare two runs against
+        // whatever that machine has installed.
         let plain = scenario_with("name = \"s\"\nkind = \"differential\"\nsteps = [\"a\"]\n");
         let path = stand_in_path(&bins, &plain).unwrap();
-        assert!(!path.contains("fake-agents"), "{path}");
+        assert!(path.contains("fake-agents"), "{path}");
         assert!(!path.contains("fake-editors"), "{path}");
 
         let both = scenario_with(
-            "name = \"s\"\nkind = \"differential\"\nfake_agents = true\n\
+            "name = \"s\"\nkind = \"differential\"\n\
              fake_editor = \"orch-edit-title\"\nsteps = [\"a\"]\n",
         );
         let path = stand_in_path(&bins, &both).unwrap();
@@ -2073,6 +2343,138 @@ mod tests {
         let failures = compare_trees(&rust, &ts, &[]);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_named_tree_exclusion_drops_the_path_from_both_sides() {
+        let scenario = scenario_with(
+            "name = \"s\"\nkind = \"differential\"\n\
+             excluded_tree_paths = [\"messages/\"]\nsteps = [\"a\"]\n",
+        );
+        let mut rust = Tree::default();
+        let mut ts = Tree::default();
+        for tree in [&mut rust, &mut ts] {
+            tree.values
+                .insert("tasks/tsk_1.yml".to_owned(), Value::from(1));
+        }
+        // The excluded path differs, which without the exclusion would fail.
+        rust.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("rust"));
+        ts.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("ts"));
+
+        let failures = exclude_tree_paths(&scenario, &mut rust, &mut ts);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(compare_trees(&rust, &ts, &[]).is_empty());
+        // Everything outside the exclusion is still there to be compared.
+        assert!(rust.values.contains_key("tasks/tsk_1.yml"));
+        assert!(!rust.values.contains_key("messages/msg_1.json"));
+    }
+
+    #[test]
+    fn a_stale_tree_exclusion_fails_rather_than_passing_quietly() {
+        // An exclusion matching nothing is a comparison nobody is doing any
+        // more for a reason nobody remembers.
+        let scenario = scenario_with(
+            "name = \"s\"\nkind = \"differential\"\n\
+             excluded_tree_paths = [\"runs/\"]\nsteps = [\"a\"]\n",
+        );
+        let mut rust = Tree::default();
+        let mut ts = Tree::default();
+        rust.values
+            .insert("tasks/tsk_1.yml".to_owned(), Value::from(1));
+        ts.values
+            .insert("tasks/tsk_1.yml".to_owned(), Value::from(1));
+
+        let failures = exclude_tree_paths(&scenario, &mut rust, &mut ts);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("matches nothing"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_scenario_without_exclusions_compares_everything() {
+        let scenario = scenario_with("name = \"s\"\nkind = \"differential\"\nsteps = [\"a\"]\n");
+        let mut rust = Tree::default();
+        let mut ts = Tree::default();
+        rust.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("rust"));
+        ts.values
+            .insert("messages/msg_1.json".to_owned(), Value::from("ts"));
+
+        assert!(exclude_tree_paths(&scenario, &mut rust, &mut ts).is_empty());
+        assert_eq!(compare_trees(&rust, &ts, &[]).len(), 1);
+    }
+
+    #[test]
+    fn the_toolchain_mask_applies_only_to_doctor() {
+        for step in ["doctor", "doctor --json", "--ascii doctor"] {
+            let argv = shell_words::split(step).unwrap();
+            assert!(toolchain_mask::applies_to(&argv), "{step}");
+        }
+        for step in [
+            "status --json",
+            "task list",
+            "agent list --json",
+            "serve --once",
+        ] {
+            let argv = shell_words::split(step).unwrap();
+            assert!(!toolchain_mask::applies_to(&argv), "{step}");
+        }
+    }
+
+    #[test]
+    fn the_toolchain_row_is_masked_in_place_and_nothing_else_is() {
+        // Shaped like the real output, measured from the oracle.
+        let ts = concat!(
+            "\n  orch doctor · checking adapters and dependencies\n\n",
+            "  ✓  claude       2.1.296 (Claude Code)\n",
+            "  ✓  git          git version 2.47.3\n",
+            "  ✓  node         v24.21.0\n",
+            "\n  8 of 8 adapters ready\n"
+        );
+        let rust = ts.replace(
+            "  ✓  node         v24.21.0",
+            "  ✓  toolchain    rustc 1.94.1",
+        );
+
+        let (ts_masked, ts_row) = toolchain_mask::mask(ts).expect("ts row");
+        let (rust_masked, rust_row) = toolchain_mask::mask(&rust).expect("rust row");
+
+        // Same position, and the differing row is gone from both.
+        assert_eq!(ts_row, rust_row);
+        assert_eq!(ts_masked, rust_masked);
+        assert!(ts_masked.contains("<TOOLCHAIN ROW>"));
+        // Everything around it survives, so a real divergence still shows.
+        assert!(ts_masked.contains("git version 2.47.3"));
+        assert!(ts_masked.contains("8 of 8 adapters ready"));
+        assert!(!ts_masked.contains("v24.21.0"));
+        assert!(!rust_masked.contains("rustc 1.94.1"));
+    }
+
+    #[test]
+    fn a_doctor_output_with_no_toolchain_row_masks_nothing() {
+        // Would otherwise pass vacuously; the caller turns this into a failure.
+        assert!(toolchain_mask::mask("  ✓  git  git version 2.47.3\n").is_none());
+        assert!(toolchain_mask::mask("").is_none());
+    }
+
+    #[test]
+    fn the_toolchain_mask_survives_the_ascii_glyphs() {
+        // --ascii swaps ✓ for +, so matching on the glyph itself would make
+        // the mask silently stop applying under one flag.
+        let (masked, row) = toolchain_mask::mask("  +  node         v24.21.0\n").expect("row");
+        assert_eq!(row, 0);
+        assert!(masked.contains("<TOOLCHAIN ROW>"));
+    }
+
+    #[test]
+    fn only_the_first_toolchain_row_is_masked() {
+        // A second row with the same label is a real difference, not another
+        // licensed exclusion.
+        let two = "  ✓  node  v1\n  ✓  node  v2\n";
+        let (masked, _) = toolchain_mask::mask(two).expect("row");
+        assert!(masked.contains("<TOOLCHAIN ROW>"));
+        assert!(masked.contains("v2"), "{masked}");
     }
 
     #[test]
@@ -2302,45 +2704,5 @@ mod tests {
         assert!(json_document("  key = 5\n").is_none());
         assert!(json_document("{\"a\":1}\ntrailing\n").is_none());
         assert!(json_document("[]\n").is_some());
-    }
-
-    #[test]
-    fn the_toolchain_row_masks_to_the_same_thing_on_both_sides() {
-        let ts = "  \u{2713}  .gitignore   .orchestry is excluded\n  \u{2713}  node         v24.21.0\n\n  8 of 8 adapters ready\n";
-        let rust = "  \u{2713}  .gitignore   .orchestry is excluded\n  \u{2713}  toolchain    r-orch 0.1.0 (rust 1.94.1)\n\n  8 of 8 adapters ready\n";
-        assert_ne!(ts, rust);
-        assert_eq!(toolchain_mask::mask(ts), toolchain_mask::mask(rust));
-        // Only that row is touched.
-        assert!(toolchain_mask::mask(ts).contains(".orchestry is excluded"));
-        assert!(toolchain_mask::mask(ts).contains("8 of 8 adapters ready"));
-    }
-
-    #[test]
-    fn the_toolchain_row_is_masked_inside_the_json_document_too() {
-        let ts = "{\n  \"checks\": [\n    {\n      \"name\": \"node\",\n      \"status\": \"ok\",\n      \"detail\": \"v24.21.0\"\n    }\n  ]\n}\n";
-        let rust = "{\n  \"checks\": [\n    {\n      \"name\": \"toolchain\",\n      \"status\": \"ok\",\n      \"detail\": \"r-orch 0.1.0 (rust 1.94.1)\"\n    }\n  ]\n}\n";
-        assert_eq!(toolchain_mask::mask(ts), toolchain_mask::mask(rust));
-        // The status is not masked: a failed toolchain row on one side only
-        // must still be a difference.
-        let failed = rust.replace("\"ok\"", "\"fail\"");
-        assert_ne!(toolchain_mask::mask(&failed), toolchain_mask::mask(rust));
-    }
-
-    #[test]
-    fn the_mask_only_applies_to_doctor() {
-        assert!(toolchain_mask::applies_to(&["doctor".to_owned()]));
-        assert!(toolchain_mask::applies_to(&[
-            "doctor".to_owned(),
-            "--json".to_owned()
-        ]));
-        for other in ["status", "logs", "task"] {
-            assert!(!toolchain_mask::applies_to(&[other.to_owned()]), "{other}");
-        }
-        // A row that happens to be named `node` elsewhere is not a doctor
-        // row: `applies_to` gates the whole thing.
-        assert_eq!(
-            toolchain_mask::mask("  \u{2713}  nodes        3\n"),
-            "  \u{2713}  nodes        3\n"
-        );
     }
 }

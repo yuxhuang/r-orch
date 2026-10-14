@@ -125,7 +125,12 @@ pub struct OrchestratorDeps {
     pub skill_loader: Option<Arc<dyn SkillLoader>>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Deliberately **not** `Default`: `handle_signals` would default to `false`,
+/// so a caller writing `..Default::default()` would get a watch loop that
+/// ignores `SIGTERM` — a daemon that cannot be shut down by its supervisor,
+/// with nothing at the call site to hint at it. Use the named constructors;
+/// a caller that wants something else spells both fields out.
+#[derive(Debug, Clone)]
 pub struct WatchOptions {
     /// `tick()` skips `seed_autonomous_tasks` — `serve --once` sets it.
     pub skip_autonomous_seeding: bool,
@@ -136,10 +141,20 @@ pub struct WatchOptions {
 }
 
 impl WatchOptions {
-    /// The production default: signals handled, seeding on.
+    /// Long-running watch mode (`orch serve`, `orch run --watch`, the TUI):
+    /// TS `startWatch()` with no options.
     pub fn watching() -> Self {
         WatchOptions {
             skip_autonomous_seeding: false,
+            handle_signals: true,
+        }
+    }
+
+    /// `serve --once`: drain the queue and exit, seeding nothing new.
+    /// TS `startWatch({ skipAutonomousSeeding: true })`.
+    pub fn once() -> Self {
+        WatchOptions {
+            skip_autonomous_seeding: true,
             handle_signals: true,
         }
     }
@@ -289,9 +304,7 @@ impl Orchestrator {
     {
         let outcome = self.deps().lock.acquire().await;
         if !outcome.acquired {
-            return Err(Error::Domain(DomainError::LockConflict(
-                outcome.pid.unwrap_or(0),
-            )));
+            return Err(Error::Domain(DomainError::LockConflict(outcome.pid)));
         }
         self.inner.lock_acquired.store(true, Ordering::SeqCst);
         let result = body().await;
@@ -403,9 +416,7 @@ impl Orchestrator {
 
         let outcome = self.deps().lock.acquire().await;
         if !outcome.acquired {
-            return Err(Error::Domain(DomainError::LockConflict(
-                outcome.pid.unwrap_or(0),
-            )));
+            return Err(Error::Domain(DomainError::LockConflict(outcome.pid)));
         }
         self.inner.lock_acquired.store(true, Ordering::SeqCst);
 

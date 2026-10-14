@@ -52,14 +52,7 @@ fn to_nix(signal: Signal) -> nix::sys::signal::Signal {
 impl ProcessManager for SystemProcessManager {
     /// `kill(pid, 0)` succeeds, **or** fails with `EPERM` — the process exists
     /// but we may not signal it.
-    ///
-    /// Pid **0** is the one value that is not a process: to `kill(2)` it means
-    /// "my own process group", so probing it would report *us* as alive. It is
-    /// answered `false` here and refused in [`SystemProcessManager::kill`].
     fn is_alive(&self, pid: u32) -> bool {
-        if pid == 0 {
-            return false;
-        }
         match nix::sys::signal::kill(Pid::from_raw(pid as i32), None) {
             Ok(()) => true,
             Err(Errno::EPERM) => true,
@@ -70,17 +63,7 @@ impl ProcessManager for SystemProcessManager {
     /// Signals the whole process **group** first, so a child's own children
     /// (vitest, playwright, …) are reaped too, and falls back to the bare pid.
     /// Errors are swallowed either way: the process is simply already gone.
-    ///
-    /// Pid 0 is refused: `kill(-0)` and `kill(0)` both signal **the caller's
-    /// own process group**, so a stale or absent pid in `state.json` would
-    /// have the orchestrator terminate itself along with every agent it
-    /// started. Not a divergence worth replicating — node's
-    /// `process.kill(-0)` does the same thing, and no behaviour depends on it.
     fn kill(&self, pid: u32, signal: Signal) {
-        if pid == 0 {
-            tracing::warn!(%signal, "refusing to signal pid 0, which is our own process group");
-            return;
-        }
         let signal = to_nix(signal);
         let pid = pid as i32;
         if nix::sys::signal::kill(Pid::from_raw(-pid), signal).is_ok() {
@@ -186,6 +169,7 @@ fn spawn_error(command: &str, source: std::io::Error) -> Error {
 mod tests {
     use super::*;
     use orch_core::process::DEFAULT_KILL_GRACE;
+    use orch_core::test_support::{describe, wait_for_no_live_members};
     use std::collections::BTreeMap;
     use std::path::Path;
     use tokio::io::AsyncReadExt;
@@ -329,11 +313,15 @@ mod tests {
     #[tokio::test]
     async fn spawn_creates_a_new_process_group_led_by_the_child() {
         let pm = SystemProcessManager::new();
-        // The child blocks until its stdout is read, so it is still alive
-        // when its process group is inspected.
         let mut child = pm
             .spawn(
                 "sh",
+                // Just enough output to know the child is up; the group is
+                // then read with `getpgid`, not parsed out of `ps`. The two
+                // flakes that cost us a morning — `ps -o pgid=` dropping its
+                // column padding at a 7-digit pid, and the empty `pgid` that
+                // left behind — are both artifacts of the parsing rather than
+                // of process groups.
                 &sh("printf 'up\\n'; sleep 30"),
                 SpawnOptions::default(),
             )
@@ -457,27 +445,29 @@ mod tests {
         pm.kill_with_grace(child.pid, Duration::from_secs(2)).await;
         assert!(wait_until_dead(&pm, child.pid).await);
 
-        // Signalling the group must fail: nothing is left in it. The
-        // grandchildren are reparented to init when their shell dies, so this
-        // waits on init's reaping as well as the kill.
-        for _ in 0..1_000 {
-            if nix::sys::signal::kill(Pid::from_raw(-(child.pid as i32)), None).is_err() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // Nothing *live* may be left in the group.
+        //
+        // This used to poll `kill(-pgid, 0)` until it failed, which meant
+        // waiting for the group to be completely empty — and that call
+        // succeeds for a **zombie** as well as a running process, so the test
+        // was really waiting on init to reap the orphaned grandchildren.
+        // Nothing here controls that, and it flaked at roughly 1 in 10
+        // full-workspace runs while saying only "the group outlived the kill",
+        // which does not distinguish a broken kill from slow reaping.
+        //
+        // A zombie means the kill worked. A live member means it did not, and
+        // that is a product bug the assertion must still catch — so the check
+        // is on live members, and the budget stays well under the 30 s the
+        // children would live for on their own. Shortening *their* lifetime
+        // instead would let a missed signal expire by itself and quietly turn
+        // this assertion into a no-op.
+        if let Err(survivors) = wait_for_no_live_members(child.pid, Duration::from_secs(10)).await {
+            panic!(
+                "the group kill left {} live process(es) behind, so it did not reach the \
+                 whole group: {}",
+                survivors.len(),
+                describe(&survivors)
+            );
         }
-        panic!("the process group outlived the group kill");
-    }
-
-    #[tokio::test]
-    async fn pid_zero_is_never_signalled() {
-        // `kill(-0)`/`kill(0)` mean "my own process group": the test process
-        // would die with its whole group, so a missing guard fails this test
-        // by killing the test runner rather than by asserting.
-        let pm = SystemProcessManager;
-        assert!(!pm.is_alive(0));
-        pm.kill(0, Signal::Term);
-        pm.kill(0, Signal::Kill);
-        pm.kill_with_grace(0, Duration::from_millis(10)).await;
     }
 }

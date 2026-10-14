@@ -98,17 +98,60 @@ r-orch/
              orch-core                      (traits only; depends on orch-domain)
                  ▲
         ┌────────┴────────┐
-    orch-infra        orch-engine           (engine depends on core, NOT on infra)
+    orch-infra ◄───── orch-engine           (engine → infra: 5 sites, see below)
         ▲                 ▲
         └────────┬────────┘
                  │
-        ┌────────┴────────┐
-    orch-cli          orch-tui              (both depend on engine; tui never on cli)
+             orch-cli                       (top of the stack; may name anything below)
+                 │
+                 ▼  implements TuiBackend
+             orch-tui                       (depends on orch-domain ONLY)
 ```
 
+Two things in this diagram were wrong in earlier revisions, and both are now enforced rather than described.
+
+**1. `orch-engine` does depend on `orch-infra`.** An earlier revision said "engine depends on core, NOT on
+infra". The edge is real, and it is **five** non-test sites:
+
+| Site | What it names | Why it is acceptable |
+|---|---|---|
+| `container.rs` | every concrete infra type it assembles — stores, adapters, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `FileSkillLoader`, `NanoIdGenerator`, `SystemClock`, `REGISTRATION_ORDER` | Assembly has to name implementations somewhere. The TS `container.ts` in Rust form. |
+| `orchestrator.rs` | `CachedTaskStore`, `CachedAgentStore`, `CachedGoalStore` | Faithful: `orchestrator.ts` likewise constructs the tick-scoped cache wrappers itself (`new CachedTaskStore(deps.taskStore)`). |
+| `orchestrator/dispatch.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE`, `build_prompt_context`, `BuildPromptOptions` | Faithful: `orchestrator.ts` imports exactly these from `template-engine.ts`. |
+| `task_service.rs` | `Paths`, `fs_utils` — for attachment paths | Faithful: `task-service.ts` imports `paths.ts` for the same reason. |
+| `lock.rs` | `storage::lock`, re-exporting `LOCK_STALE` and `LockResult` | The lock *mechanism* is infra; `ProjectLock` is a thin wrapper over it. |
+
+**What actually holds is the narrower, more useful property: every *service* takes only `orch-core` traits.**
+Concrete types appear at assembly and in the four modules where the TypeScript couples the same way. So
+`orch-engine` remains unit-testable against `test_support` fakes, and `orch-infra` is still swappable
+wholesale — which is what the boundary was for.
+
+If the edge ever needs severing, the moves are known: lift `storage::cached` into `orch-core` (already
+generic over the traits) and the two template constants into `orch-domain`. Neither is worth doing — both
+would diverge from the TS layering for no behavioural gain.
+
+**2. `orch-tui` depends on `orch-domain` alone — not on the engine.** An earlier revision of this diagram had
+the TUI depending on `orch-engine`. WP-6 **inverted** it: everything the dashboard needs crosses a single
+trait, `orch_tui::backend::TuiBackend` (§12 of PARITY.md, `crates/orch-tui/BACKEND.md`), so the TUI names only
+the domain types that pass through it. `orch-cli` implements that trait over the DI container
+(`crates/orch-cli/src/tui/backend.rs`), and the TUI's own tests use an in-crate `FakeBackend`. **The real
+layering is tighter than this document originally specified** — a genuine improvement, recorded rather than
+quietly absorbed.
+
+**The authoritative enumeration lives in the check, not in this prose.** `ENGINE_INFRA_SITES` in
+`xtask/src/crate_graph.rs` lists each permitted site with its justification, and it is bidirectional: **a new
+engine file naming `orch_infra` fails the build until it is justified, and a stale entry fails too.** The
+stale-entry half is what caught the TUI inversion above — it turned "someone quietly improved the layering"
+into a failure somebody had to look at, rather than a diff nobody read. The table above keeps the *rationale*;
+the check keeps the *list*. If they disagree, the check is right.
+
 **Enforced invariant: `orch-engine` has zero dependency on `orch-cli` or `orch-tui`.** This mirrors the TS
-layering ("the core engine has zero dependencies on CLI/TUI layers") and is checked in CI by a
-`cargo tree`-based test, not by convention.
+layering ("the core engine has zero dependencies on CLI/TUI layers").
+
+`xtask crate-graph` asserts the **whole edge set** against a table, not just that one forbidden edge —
+including build- and dev-dependencies, since a test-only edge still compiles the crate. A single
+forbidden-edge check would pass a workspace in which `orch-infra` had started depending on `orch-engine`,
+inverting the layering while satisfying the letter of the rule.
 
 **Why `orch-core` exists as a separate crate from `orch-domain`.** The TS code puts storage interfaces under
 `src/infrastructure/storage/interfaces.ts` and the adapter interface under
@@ -148,7 +191,7 @@ All three names are the same program, matching the npm `bin` map:
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output`, `context`, `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
-| `orch-tui` | `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
+| `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
 
 ---
 
@@ -319,7 +362,9 @@ pub trait RunStore: Send + Sync {
     async fn append_event(&self, run_id: &str, event: &RunEvent) -> Result<()>;
     async fn read_events(&self, run_id: &str) -> Result<Vec<RunEvent>>;
     async fn read_events_tail(&self, run_id: &str, count: usize) -> Result<Vec<RunEvent>>;
-    /// Tail-follow for `logs --follow`. Ends when `token` is cancelled.
+    /// Reads the JSONL file to EOF and ends — **not** a tail-follow. Waits up to 30 s
+    /// for the file to appear. Cancellable. Has no production caller (tests only);
+    /// `logs --follow` subscribes to the EventBus instead. See PARITY.md §6.9.
     fn stream_events(&self, run_id: &str, token: CancellationToken)
         -> BoxStream<'static, Result<RunEvent>>;
     /// Release the cached O_APPEND handle for this run.
@@ -867,12 +912,20 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                       # layers 1, 3, 4
 cargo xtask parity                           # layer 2 — needs node + the vendored TS build
-cargo xtask crate-graph                      # asserts orch-engine ∌ {orch-cli, orch-tui}
+cargo xtask crate-graph                      # asserts the whole inter-crate edge set (§3.1)
 ```
 
 `cargo xtask parity` is gated on `parity/orch-ts/dist/` existing; `parity/setup.sh` clones the pinned
-commit `c066dc0` and runs `npm ci && npm run build`. The parity job is **required** for merge — the whole
-design rests on it.
+commit `c066dc0`, **applies every patch in `parity/patches/` in order**, then runs `npm ci && npm run build`.
+The parity job is **required** for merge — the whole design rests on it.
+
+**Patching the oracle is a last resort, and the bar is high.** It is for surfaces where the reference is too
+broken to compare against at all, never for making it agree with us. Each patch must be minimal, carry its
+rationale in the patch header, and be referenced from the §14 entry that justifies it
+([PARITY.md §14.0](PARITY.md) `oracle patched`). Today there is exactly one:
+`0001-…`, because the TS `run`/`serve --once` commands dispatch nothing in the **default** workspace mode
+([PARITY.md §14.21](PARITY.md)) — without it, the project's central behaviour has no oracle in its default
+configuration. Reviewers should treat a second patch as a signal to re-examine, not as precedent.
 
 ---
 
@@ -1101,7 +1154,8 @@ WP-0b walking skeleton + harness  ◄── HARD GATE (V39)
                              │
                              ├──► WP-4 engine ──► WP-5 CLI
                              │
-                             └──► WP-6 wires to the real engine
+                             └──► WP-5 implements TuiBackend over the container,
+                                  replacing WP-6's FakeBackend (§3.1)
 ```
 
 - **WP-0b is a hard gate**: WP-4 and WP-5 may not begin until V39 is green. WP-1/2/3/6 may begin in parallel

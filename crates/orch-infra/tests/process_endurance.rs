@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use orch_core::process::{DEFAULT_KILL_GRACE, ProcessManager, Signal, SpawnOptions};
+use orch_core::test_support::{describe, wait_for_no_live_members};
 use orch_infra::process::SystemProcessManager;
 
 /// Pids well past `/proc/sys/kernel/pid_max`, so they cannot exist.
@@ -143,15 +144,19 @@ async fn the_group_kill_cleans_up_the_children_of_the_child() {
     pm.kill_with_grace(child.pid, Duration::from_secs(2)).await;
     assert!(wait_until_dead(&pm, child.pid).await);
 
-    // Nothing is left in the group.
-    let group = nix::unistd::Pid::from_raw(-(child.pid as i32));
-    for _ in 0..1_000 {
-        if nix::sys::signal::kill(group, None).is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // Nothing *live* is left in the group. See the twin of this test in
+    // `process::manager`'s unit tests for why this counts live members rather
+    // than polling `kill(-pgid, 0)` until the group is empty: that call also
+    // succeeds for a zombie, so the old form waited on init's reaping and
+    // flaked without being able to say which half had failed.
+    if let Err(survivors) = wait_for_no_live_members(child.pid, Duration::from_secs(10)).await {
+        panic!(
+            "the group kill left {} live process(es) behind, so it did not reach the whole \
+             group: {}",
+            survivors.len(),
+            describe(&survivors)
+        );
     }
-    panic!("the process group outlived the group kill");
 }
 
 #[tokio::test]

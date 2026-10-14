@@ -22,16 +22,32 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "refusing to run: the working tree has uncommitted changes, and probes" >&2
-  echo "revert with \`git checkout\`. Commit or stash first." >&2
-  exit 1
-fi
+# Each probe reverts **its own file** with `git checkout`, so that file is all
+# that has to be clean. Demanding a clean tree globally made the suite
+# unusable whenever anyone had unrelated work in flight in the shared main
+# checkout — which is the normal state of this repo — and the pressure then is
+# to commit someone else's edit to get the probes to run. Checked per probe,
+# just before mutating.
+require_clean() {
+  if ! git diff --quiet -- "$1" || ! git diff --cached --quiet -- "$1"; then
+    printf '  DIRTY FILE    %s\n' "$2"
+    printf '                %s has uncommitted changes; a probe would revert them\n' "$1"
+    # Counted separately from `missed`. A missed probe means the harness has a
+    # blind spot and the gate should stop; a dirty target file means the
+    # operator has work in progress, which is a different conversation and
+    # must not be reported as the first one. (It was, briefly: the gate said
+    # "8 detected, 1 missed" when the only problem was my own uncommitted
+    # edit to the file a probe mutates.)
+    dirty=$((dirty + 1))
+    return 1
+  fi
+}
 
 export TMPDIR="${TMPDIR:-/tmp}"
 detected=0
 missed=0
 pending=0
+dirty=0
 
 # probe_pending <subcommand> <label> <file> <old> <new>
 #
@@ -79,6 +95,8 @@ has_subcommand() {
 # that no longer matches is a hard error, not a silent pass.
 probe() {
   local label="$1" file="$2" old="$3" new="$4"
+
+  require_clean "$file" "$label" || return
 
   if ! python3 - "$file" "$old" "$new" <<'PY'
 import sys, pathlib
@@ -244,14 +262,30 @@ probe_pending status \
             .shift_remove("claimed")' \
   '        document.as_object_mut()?.shift_remove("state")'
 
+# The §13 toolchain-row exclusion. Same reasoning as §14.1 above: masking one
+# `doctor` row must not blind the harness to the rest of the command's output.
+probe_pending doctor \
+  'the toolchain mask spreads to every command (§13 scope)' \
+  xtask/src/harness.rs \
+  '        argv.iter()
+            .find(|arg| !arg.starts_with('"'"'-'"'"'))
+            .map(String::as_str)
+            == Some("doctor")' \
+  '        let _ = argv;
+        true'
+
 echo
-if [ "$pending" -gt 0 ]; then
-  echo "$detected detected, $missed missed, $pending pending on commands that do not exist yet"
-else
-  echo "$detected detected, $missed missed"
-fi
+summary="$detected detected, $missed missed"
+[ "$pending" -gt 0 ] && summary="$summary, $pending pending on commands that do not exist yet"
+[ "$dirty" -gt 0 ] && summary="$summary, $dirty skipped on an uncommitted target file"
+echo "$summary"
 if [ "$missed" -gt 0 ]; then
   echo "a missed probe means the harness has a blind spot — fix the harness, not the probe" >&2
+  exit 1
+fi
+if [ "$dirty" -gt 0 ]; then
+  echo "$dirty probe(s) could not run because their target file has uncommitted changes;" >&2
+  echo "commit or stash that work and re-run — this is not a harness blind spot" >&2
   exit 1
 fi
 echo "every probe was detected"

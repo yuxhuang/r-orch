@@ -34,13 +34,17 @@ pub const ALL_KNOWN_COMMANDS: [&str; 16] = [
 /// tier, which is why it is here *and* takes a container when one exists.
 pub const CONTAINER_LESS_COMMANDS: [&str; 3] = ["init", "update", "doctor"];
 
+/// The version `--version` prints and the dashboard reports. Pinned to the
+/// reference's own (PARITY.md §13), not this crate's.
+pub const VERSION: &str = "1.0.34";
+
 /// The clap program name stays `orchestry` so `--help` matches, whichever of
 /// the three binary names was invoked.
 #[derive(Debug, Parser)]
 #[command(
     name = "orchestry",
     about = "Agents Organizations — CLI orchestrator for AI agents",
-    version = "1.0.34",
+    version = VERSION,
     // Commander renders usage errors and exits 1; clap's default is 2, and the
     // mapping lives in `run()`.
     disable_help_flag = false

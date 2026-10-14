@@ -1,2 +1,22 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Point the *global* config at the build directory for every cargo-run command
+# in this workspace.
+#
+# `FileGlobalConfigStore` resolves `~/.orchestry/global.yml` unless this is
+# set, and three integration tests in orch-cli read and write it — in parallel,
+# in one test binary. That is two bugs at once: they race each other (observed:
+# `palette: Ocean` vs `Forest`, ~1 in 20 full-workspace runs), and they do it in
+# the **developer's real config**. Mine came out of a test run holding
+# `activity_filter: nonsense`, which is a literal from tui_backend.rs.
+#
+# Set here rather than per test because `std::env::set_var` is process-global
+# and racy — exactly the problem being fixed — so a per-test override cannot
+# work in a parallel binary. One line here covers every test binary, present
+# and future, and `cargo run` too.
+[env]
+# The basename stays `global.yml`: `the_real_path_ends_at_the_expected_file_name`
+# asserts that the name is fixed whatever the ambient environment says, and it
+# is right to — pointing this at some other name broke it deterministically.
+ORCHESTRY_GLOBAL_CONFIG_PATH = { value = "target/test-global/global.yml", relative = true }

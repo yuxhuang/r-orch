@@ -60,10 +60,12 @@ impl Fixture {
             );
             return None;
         }
-        Some(Fixture {
+        let fixture = Fixture {
             project: tempfile::tempdir().expect("tempdir"),
             ts_root,
-        })
+        };
+        orch_core::test_support::assert_hermetic(fixture.project.path());
+        Some(fixture)
     }
 
     fn paths(&self) -> Paths {
@@ -81,6 +83,17 @@ impl Fixture {
             // tsx resolves its own dependencies from the package directory.
             .current_dir(&self.ts_root)
             .env("CI", "1")
+            // HOME inside the fixture, because the cwd above is the vendored
+            // package *inside this repository* — so anything in the TS that
+            // resolves `~/.orchestry` directly would otherwise touch the
+            // developer's own home. Nothing in these modes should, but the
+            // cost of being sure is one line.
+            .env("HOME", self.project.path())
+            .env("USERPROFILE", self.project.path())
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                self.project.path().join("global.yml"),
+            )
             .output()
             .expect("run the oracle script");
 
@@ -516,5 +529,77 @@ fn the_timestamp_walker_finds_nested_fields() {
     assert_eq!(
         paths,
         vec!["created_at", "list[0].joined_at", "nested.updated_at"]
+    );
+}
+
+/// PARITY.md §14 / TRAITS-FROZEN §11: a message the oracle truncated
+/// mid-surrogate-pair must not break the Rust side's listing.
+///
+/// This is the read half of the ruling. The oracle writes the message through
+/// its own `MessageStore`, so the file really is what ORCH produces — a body
+/// ending in the lone-surrogate escape `\ud83d`, which `serde_json` rejects
+/// outright. Before the repair in `fs_utils::read_json`, this one record made
+/// `MessageStore::list()` fail **entirely**: not a mangled body, no messages
+/// at all.
+#[tokio::test]
+async fn ts_written_lone_surrogate_does_not_break_the_rust_listing() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let reported: Value = serde_json::from_str(&fixture.oracle("write-lone-surrogate"))
+        .expect("the oracle reports what it wrote");
+
+    // The premise, measured rather than assumed: the oracle really does leave
+    // a lone-surrogate escape in the file, and really does cut at 4000/200
+    // UTF-16 units.
+    assert_eq!(
+        reported["containsLoneEscape"],
+        Value::Bool(true),
+        "the oracle no longer writes a lone surrogate — re-read §14 before \
+         trusting the repair this test guards"
+    );
+    assert_eq!(reported["bodyUnits"], 4000);
+    assert_eq!(reported["subjectUnits"], 200);
+
+    let store = FileMessageStore::new(fixture.paths(), clock());
+
+    // `list()` is what `msg list` and `msg inbox` are built on, and it is the
+    // call that used to fail.
+    let messages = store.list().await.expect("listing must survive the record");
+    assert_eq!(messages.len(), 1);
+
+    let message = &messages[0];
+    assert_eq!(message.id, "msg_lonely");
+    assert_eq!(message.to_agent_id.as_deref(), Some("agt_creator"));
+
+    // The lone surrogate decoded to U+FFFD, and nothing else moved: 3999 'a's
+    // then the replacement character.
+    assert_eq!(message.body.chars().count(), 4000);
+    assert!(message.body.starts_with(&"a".repeat(3999)));
+    assert_eq!(message.body.chars().next_back(), Some('\u{FFFD}'));
+    assert_eq!(message.subject.chars().count(), 200);
+    assert_eq!(message.subject.chars().next_back(), Some('\u{FFFD}'));
+
+    // Fetching it by id goes through the same reader.
+    let fetched = store
+        .get("msg_lonely")
+        .await
+        .expect("get must survive it too")
+        .expect("the message exists");
+    assert_eq!(fetched.body, message.body);
+
+    // Read-side only: the file still holds the oracle's bytes, so a tree that
+    // r-orch merely *read* is byte-identical afterwards.
+    let raw = std::fs::read_to_string(
+        fixture
+            .project
+            .path()
+            .join(".orchestry/messages/msg_lonely.json"),
+    )
+    .expect("read the file back");
+    assert!(
+        raw.contains("\\ud83d"),
+        "reading the record rewrote the file: {}",
+        &raw[raw.len().saturating_sub(120)..]
     );
 }

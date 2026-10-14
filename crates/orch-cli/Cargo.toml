@@ -44,8 +44,6 @@ indexmap.workspace = true
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# `$EDITOR` buffers live in a temporary directory, as in the reference.
-tempfile.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
@@ -57,6 +55,11 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 tokio-util.workspace = true
+# `$EDITOR` buffers live in a temporary directory, as in the reference, and
+# the TUI's clipboard-paste directory needs a real `mkdtemp` (docs/parity/
+# tui.md §8.2): atomic, 0700 and collision-free, which a hand-built name is
+# not. Already a production dependency of orch-infra.
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -64,6 +67,9 @@ tracing-subscriber.workspace = true
 orch-core = { workspace = true, features = ["test-support"] }
 assert_cmd.workspace = true
 insta.workspace = true
+# `TestBackend` for the end-to-end dashboard test (tests/tui_dashboard.rs):
+# the real `orch-tui` App over the real engine, rendered into a buffer.
+ratatui.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
 

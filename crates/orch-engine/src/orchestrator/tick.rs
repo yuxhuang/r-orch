@@ -15,17 +15,9 @@ use orch_domain::{
 
 use super::{AUTO_SEED_COOLDOWN_MS, DEBOUNCE, MAX_IMMEDIATE_DISPATCH_RETRIES, Orchestrator};
 
-/// `new Date(value).getTime()`, as an `Option` because JS yields `NaN` for an
-/// unparseable string and every `NaN` comparison is false.
-///
-/// This belongs beside [`orch_core::clock::iso_from_epoch_ms`]; `orch-core` has
-/// the formatter but no parser yet, so it lives here until one lands.
-pub(super) fn epoch_ms_from_iso(value: &str) -> Option<i64> {
-    value
-        .parse::<jiff::Timestamp>()
-        .ok()
-        .map(|timestamp| timestamp.as_millisecond())
-}
+/// `new Date(value).getTime()`. Now lives beside the formatter it inverts,
+/// in `orch-core`, so both share one node-verified test vector.
+pub(super) use orch_core::clock::epoch_ms_from_iso;
 
 impl Orchestrator {
     /// One tick, under the state lock, in contract order: invalidate the
@@ -74,9 +66,7 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// `invalidate()` on the cached stores is **sync and blocking** — it calls
-    /// `blocking_lock`, which panics inside a runtime — so the async form is
-    /// the only one usable from here.
+    /// Drop every tick-scoped memoized read.
     pub(super) async fn invalidate_caches(&self) {
         self.inner.cached_tasks.invalidate_async().await;
         self.inner.cached_agents.invalidate_async().await;

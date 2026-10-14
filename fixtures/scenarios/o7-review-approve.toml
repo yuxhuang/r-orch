@@ -1,6 +1,6 @@
 name = "o7-review-approve"
 kind = "differential"
-requires = ["serve", "config set", "task approve", "task show"]
+requires = ["run", "config set", "task approve", "task show"]
 fake_agents = true
 timeout_secs = 90
 description = """
@@ -16,14 +16,7 @@ steps = [
   "config set scheduling.poll_interval_ms 200",
   "agent add reviewer --adapter claude --approval-policy manual --quiet",
   "task add 'Needs review' --assignee ${agent.0} --quiet",
-  # `serve --once` cannot return here: the task lands in `review`, which
-  # is not terminal, so `waitForAllTerminal` polls forever in **both**
-  # implementations. A watch-mode serve stopped with SIGTERM is what an
-  # operator would do, and it leaves a cleanly shut-down tree for the
-  # steps below. Its own output is timing-dependent (the idle-tick count
-  # differs between two independently-timed runs), so only the exit code
-  # is compared.
-  "@exit-only:idle-tick-count-is-timing-dependent @stop-after:4000 serve --log-format json",
+  "run ${task.0}",
   "task list --json",
   "task show ${task.0} --json",
   "task approve ${task.0}",

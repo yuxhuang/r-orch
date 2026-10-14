@@ -312,6 +312,28 @@ catches it, and reverts — one probe per numbered PARITY requirement. It found
 two real blind spots when it was first written, so run it after changing the
 harness.
 
+## `serve --once` needs every task to reach a *terminal* status
+
+`once-runner` polls until `tasks.every(isTerminal)`, and **`review` is not
+terminal**. So a scenario that drives `serve --once` hangs forever — not fails,
+hangs — if any task can end up parked in review. Two ways that happens, both
+measured:
+
+- an agent whose `approval_policy` is `manual` or `suggest` leaves a successful
+  run in `review`;
+- an **unassigned** task can be matched to `agt_creator`, which every tree has
+  and whose policy is `suggest`.
+
+So: assign tasks explicitly in any `serve --once` scenario, and use `run <id>`
+when the *point* is to reach review — `run` returns when that single run
+finishes and leaves the task where it landed.
+
+This was invisible until the oracle patch (see `parity/patches/README.md`) made
+`serve --once` actually dispatch; before that it was a no-op that returned
+instantly, and three O7 scenarios were quietly wrong. `lint-scenarios` catches
+it as a per-step timeout, which is why its budget is a scenario-level setting
+rather than something to raise when a step is slow.
+
 ## Contract findings from writing this corpus
 
 Two things measured against the oracle that **contradict `docs/PARITY.md`**.

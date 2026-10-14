@@ -61,9 +61,11 @@ impl ProjectLock for FileLock {
         match lock::acquire_lock(&self.path).await {
             Ok(result) => result,
             // An I/O failure is not "someone else holds it", but the caller's
-            // only move is the same either way, and reporting no PID yields
-            // `LockConflictError(0)` — the same thing the TS code produces
-            // when the holder's PID cannot be read.
+            // only move is the same either way. Reporting no PID yields
+            // `Orchestrator already running (PID: undefined)`, which is
+            // exactly what the TS prints when the lock file holds no readable
+            // PID — measured, and the reason `LockConflict` carries an
+            // `Option` rather than collapsing to 0 (PARITY.md §14).
             Err(err) => {
                 tracing::warn!(path = %self.path.display(), %err, "could not acquire the project lock");
                 LockResult {

@@ -9,25 +9,18 @@ repository.workspace = true
 
 [dependencies]
 orch-domain.workspace = true
-orch-core.workspace = true
-orch-engine.workspace = true
 
-futures.workspace = true
 indexmap.workspace = true
 # Use ratatui's crossterm re-export in code to avoid a version clash; this
 # entry exists for the few places that need the crate path directly.
 crossterm.workspace = true
 ratatui.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-util.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-orch-core = { workspace = true, features = ["test-support"] }
-insta.workspace = true
+tui-textarea-2.workspace = true
+unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

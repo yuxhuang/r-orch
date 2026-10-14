@@ -1,0 +1,237 @@
+# `TuiBackend` — the engine facade the dashboard needs
+
+`orch-tui` does **not** depend on `orch-engine`. Everything the dashboard needs
+from the rest of the system goes through one trait, `orch_tui::backend::TuiBackend`
+(`src/backend/mod.rs`), implemented in the TS original by the ~45 callbacks that
+`src/cli/commands/tui.ts` passes to `App`. The CLI (WP-5) implements this trait
+over the DI container; the tests use the in-crate `FakeBackend`.
+
+Everything below is the contract. If you need a shape changed, say so rather than
+widening it locally — the TUI's parity tests are written against this surface.
+
+## Two shape changes from the TS callbacks
+
+1. **Synchronous.** Every method returns a value, not a future. A call is a
+   *request*: an implementation must not block on long-running work. `run_task`
+   asks the orchestrator to dispatch and returns; the outcome arrives through
+   `poll_events`. Use `tokio::runtime::Handle::block_on` for the short
+   store reads/writes (`refresh_*`, `create_task`, …) and `spawn` for anything
+   that waits on an agent.
+2. **Polled streams.** `onSubscribeEvents`, `onLoadHistory`,
+   `onLoadModelCatalog` and `onCheckUpdate` were callback registrations. Here
+   they are `poll_*` methods that the TUI drains **once per frame**:
+
+   | TS callback | Facade method | Contract |
+   |---|---|---|
+   | `onSubscribeEvents(handler)` | `poll_events() -> Vec<OrchestratorEvent>` | Events since the last poll, oldest first. Drain a `broadcast::Receiver` without blocking; drop nothing silently — the feed's caps are the TUI's job. |
+   | `onLoadHistory(onBatch)` | `poll_history() -> Vec<Vec<HistoryEntry>>` | Zero or more batches since the last poll. The TS host delivers two (the 3 newest runs, then the next 7, 30 tail events each, sliced to the last 200). |
+   | `onLoadModelCatalog(onUpdate)` | `poll_model_catalog() -> Option<ModelCatalog>` | The newest catalog, if one arrived. The TUI rebuilds an open agent wizard in place when it does. |
+   | `onCheckUpdate` | `poll_update() -> Option<String>` | A newer version, once known. The TUI starts `background_install` exactly once and then reads `installed_version()`. |
+
+   This is what makes the TUI tests synchronous: push a key, `tick()`, draw,
+   assert (ARCHITECTURE §8.4).
+
+## Errors
+
+`BackendResult<T> = Result<T, String>`. The TUI only ever renders
+`Failed: {err}`, so the message is the whole contract — use the same text the
+CLI would print for that failure.
+
+## Capability flags
+
+The TS App keys several bindings off "was this callback passed?"
+(`onCreateTask && …`). Those predicates are the `can_*` methods, all defaulting
+to `true`:
+
+| Method | Gates |
+|---|---|
+| `can_create_task` | `n`/`N` and the `+ add task...` row on the tasks view, `/task add` |
+| `can_add_agent` | `n`/`N` and `+ add agent...`, `/agent add` |
+| `can_create_goal` | `n`/`N` and `+ add goal...`, `/goal add` |
+| `can_force_stop_agent` | whether a *running* agent can be soft-deleted at all (otherwise the TUI refuses with `Cannot delete — agent "{name}" is running. Press S to stop first.`) |
+| `can_paste_image` | the `⌘+V paste image` hint in the task wizards |
+
+## Launch context
+
+`context() -> LaunchContext` carries the non-callback props of the TS `App`:
+project name, version, default adapter, the persisted palette / activity filter
+/ notification preferences / max-concurrent value, and the watch-mode outcome
+(`initial_watch_active`, `observer_mode`, `watch_error`). The TUI emits the
+observer-mode banner or the watch-failure banner from these on launch, exactly
+as `App.tsx` does.
+
+## Operations
+
+Grouped as in the trait; names map 1:1 onto the TS callbacks.
+
+* **Refresh** — `refresh_tasks`, `refresh_agents`, `refresh_goals`,
+  `refresh_state`, `list_teams`. Called on launch and after every mutation, plus
+  on the 150 ms debounced event refresh. The TUI commits a list only when
+  `entityListChanged` says so, so returning fresh-but-equal `Vec`s is cheap and
+  safe.
+* **Tasks** — `create_task(title, CreateTaskOpts)`, `update_task(id, TaskFields)`,
+  `delete_task`, `run_task`, `run_all`, `cancel_task`, `retry_task`,
+  `assign_task(task, agent)`, `approve_task`, `reject_task(id, feedback)`.
+* **Agents** — `add_agent(name, adapter, AgentOpts)`,
+  `update_agent(id, AgentFields)`, `delete_agent`, `force_stop_agent`,
+  `toggle_autonomous(id, enabled)`, `disable_agent`, `enable_agent`.
+* **Teams** — `create_team(CreateTeamInput)`, `join_team`, `leave_team`,
+  `disband_team`, `set_team_lead`.
+* **Goals** — `create_goal(CreateGoalInput)`, `update_goal(id, GoalFields)`,
+  `update_goal_status(id, status, force)`, `delete_goal`, `goal_progress(id)`.
+* **Watch mode** — `start_watch`, `stop_watch` (reachable only through `/watch`
+  and `/pause`).
+* **Settings persistence** — `save_palette`, `save_activity_filter`,
+  `save_notifications`, `save_max_concurrent`, `complete_onboarding`. All write
+  `~/.orchestry/global.yml` or `.orchestry/config.yml`; the TUI treats a failure
+  as non-fatal.
+* **Side channels** — `paste_image() -> ClipboardPaste` (the TUI writes nothing
+  itself; the implementation puts the image in a temp file and returns its path
+  plus its size) and `bell()`, a direct terminal write outside the draw loop.
+
+### Field semantics worth preserving
+
+* `AgentFields::command` / `effort`: `Some(String::new())` means **clear the
+  field**, `None` means **leave it unchanged**. The edit-agent wizard relies on
+  this (docs/parity/tui.md §5.2) — switching an agent away from `shell` sends
+  `command: Some("")`.
+* `TaskFields::description`: always sent by the edit-task wizard (`?? ''`), so
+  an emptied description clears it.
+* `update_goal_status(.., force = true)` is only used by `C` on the goals view
+  (achieve, cancelling cancellable tasks).
+* `CreateTaskOpts::attachments` / `TaskFields::attachments` carry the pasted
+  image paths; the TUI clears its pending list once the call returns.
+
+## Wiring sketch (for WP-5)
+
+```rust
+struct EngineBackend {
+    container: Container,
+    runtime: tokio::runtime::Handle,
+    events: broadcast::Receiver<OrchestratorEvent>,
+    history: mpsc::Receiver<Vec<HistoryEntry>>,
+    catalog: mpsc::Receiver<ModelCatalog>,
+}
+
+impl TuiBackend for EngineBackend {
+    fn refresh_tasks(&mut self) -> BackendResult<Vec<Task>> {
+        self.runtime
+            .block_on(self.container.task_service.list())
+            .map_err(|e| e.to_string())
+    }
+
+    fn poll_events(&mut self) -> Vec<OrchestratorEvent> {
+        let mut out = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+    // …
+}
+```
+
+The event loop lives in the CLI: read a crossterm event (with a poll timeout no
+longer than the 120 ms animation tick), call `app.handle_key(key)` or
+`app.state.width/height = …` on a resize, then `app.tick()` and
+`terminal.draw(|f| orch_tui::views::draw(f, &app))`. Exit when
+`app.state.should_exit` is set, then stop watch mode / the disk observer and
+clear the event bus, as `tui.ts` does.
+
+Enable the Kitty keyboard protocol at startup
+(`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) so `Ctrl+Enter` is
+distinguishable from `Enter` in the wizard textarea; the `Tab` confirm fallback
+stays for terminals that refuse it.
+
+## Entry point
+
+`orch_tui::run(backend)` owns the whole terminal lifecycle — raw mode, the
+alternate screen, the Kitty enhancement flags (popped on exit), the
+poll/tick/draw loop at one animation tick, and restoring the terminal on every
+exit path including a panic. `orch tui` should be:
+
+```rust
+let backend = EngineBackend::new(container, handle);
+orch_tui::run(backend)?;
+// then: stop watch mode or the disk observer, and clear the event bus.
+```
+
+## Implementer answers (asked by WP-4, settled here)
+
+1. **`goal_progress` with no report.** Map "absent" to `Ok(String::new())`, not
+   `Err` — `Err` renders `Failed: …` and "nothing recorded yet" is not a
+   failure. The TUI treats an empty-or-whitespace report as absent and renders
+   no `progress` section (case `v094`).
+2. **Stringly-typed enums.** Parse `AgentOpts::{effort, approval_policy}` and
+   `AgentFields::effort` with `FromStr`; an unparseable value is
+   `Err("Unknown effort: \"{v}\"")` — the TUI shows it verbatim. On clearing:
+   `Some(String::new())` means *clear* and `None` means *unchanged* for
+   `command`, `effort` and `model`. The TUI never sends `Some("")` for `role`:
+   choosing the `Skip` preset maps to `None`, so a role cannot be cleared from
+   the UI — that is TS behaviour (`vals.role || undefined`), not an oversight.
+   The engine accepts a clear for all four, so **`role` is the one place where
+   the backend is more capable than the UI on purpose.** Do not "fix" the
+   mapper: the wizard → entity field mapping is **L0** (PARITY §12), so making
+   `Skip` clear a stored role would write different data than the TS binary for
+   the same keystrokes. If we ever want that behaviour it goes through a
+   PARITY §14 entry first; `edit_agent_wizard_to_fields` carries the same note.
+
+   `approval_policy` is deliberately absent from `AgentFields`: the TS prop type
+   declares it but the edit-agent wizard never passes it (`App.tsx:1242`), and
+   its step is `skip: () => true`, so no edit path can produce one.
+3. **Fire-and-forget is about *dispatch*, not validation.** `run_task`,
+   `run_all` and `start_watch` must return `Err` for anything knowable before an
+   agent starts — a lock conflict, an unknown id, no eligible agent — because
+   that is the TS behaviour (the promise rejected and the TUI printed
+   `Failed: {err}`), and because **the TUI does not render
+   `orchestrator:error`**: `formatEvent` has no case for it in the TS original
+   and none here, so an error delivered only through the event stream is
+   invisible. Everything that happens *after* the run starts belongs in
+   `poll_events`.
+4. **`stop_watch`** may spawn and return `Ok(())` — the TUI only needs the
+   request accepted. It sets `watch_active = false` and prints
+   `✓ Watch mode paused` on `Ok`; the header chip follows that flag.
+5. **The update facade is intentionally inert.** Leave `poll_update`,
+   `background_install` and `installed_version` at their trait defaults
+   (PARITY §13: no self-update, no network). No test requires a real version —
+   case `v070` scripts one through `FakeBackend`. The header update chip then
+   simply never appears.
+6. **`refresh_state`** re-reads `state.json` on every call; no caching. The TUI
+   calls it on launch, after each mutation, on the 150 ms event-driven refresh
+   and on the periodic poll (3 s observer / 5 s watch), and always commits the
+   result — unlike the entity lists, which it commits only when
+   `entityListChanged`.
+7. **`poll_history` — the exact two batches** (`src/cli/commands/tui.ts`,
+   `onLoadHistory`):
+   * list **all** runs once (not per task), sort by `started_at` **descending**,
+     keep only `succeeded` and `failed`;
+   * batch 1 = runs `[0..3)`, batch 2 = runs `[3..10)`;
+   * per run, read the **last 30** events (`readEventsTail(run.id, 30)`) and map
+     each to `HistoryEntry { timestamp: event.timestamp, run_id: run.id,
+     agent_id: run.agent_id, task_id: run.task_id, event_type: event.type,
+     data: event.data }`;
+   * flatten each batch, sort **ascending** by timestamp, keep the **last 200**;
+   * deliver batch 1 as soon as it is ready and batch 2 afterwards (the TS host
+     loads it in the background). Failures go to stderr and must never bubble
+     into the UI.
+   The TUI prepends each batch and re-truncates to 500 messages, de-duplicates
+   repeated nested provider errors per `run_id`, and skips entries whose
+   formatter yields no summary.
+8. **`save_max_concurrent`** writing `scheduling.max_concurrent_agents` with
+   silent-until-restart semantics is correct — it is what the TS does. The TUI
+   prints `Settings saved` and shows the new value in the wizard default.
+9. **Capability flags in observer mode** all stay `true`; let
+   `run_task`/`run_all`/`start_watch` fail with the lock holder's PID (see #3).
+   The flags mean "this build supports the operation", not "it will succeed now".
+10. **`bell()`** is yours: write `\x07` to stdout directly, outside the draw
+    loop. The TUI calls it only for `failed` and `review` transitions and only
+    when `notifications.bell` is set — never for `done`.
+
+Two notes back:
+
+* **A lossy `poll_events` is fine.** The TUI's 80 ms batching, 500-message ring
+  and 2 KB detail caps already assume `agent:output` can be dropped under load
+  (ARCHITECTURE §6.5). Log the lag; never fail the call.
+* **Feeding `DiskObserver` into the same queue is exactly right.** The TUI has
+  no way to tell the sources apart and must not: `observer_mode` in
+  `LaunchContext` only drives the header chip and the 3 s poll interval.
