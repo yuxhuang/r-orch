@@ -830,8 +830,9 @@ pub fn run_scenario(
                                 ),
                             ))
                         } else {
-                            let left = rust_norm.value(&rust_doc);
-                            let right = ts_norm.value(&ts_doc);
+                            let unordered = Scenario::unordered(step);
+                            let left = as_compared(&rust_norm.value(&rust_doc), unordered);
+                            let right = as_compared(&ts_norm.value(&ts_doc), unordered);
                             (left != right).then(|| {
                                 (
                                     "status --json (state.claimed masked, §14.1)",
@@ -1957,15 +1958,27 @@ struct JsYamlResult {
 /// first — ids are placeholders assigned per entity, in the same order on both
 /// sides — so equal multisets sort to equal sequences.
 fn as_compared(value: &Value, unordered: bool) -> Value {
+    if !unordered {
+        return value.clone();
+    }
     match value {
-        Value::Array(items) if unordered => {
-            let mut sorted = items.clone();
+        Value::Array(items) => {
+            let mut sorted: Vec<Value> = items.iter().map(|item| as_compared(item, true)).collect();
             // Keyed on a *key-sorted* rendering: two sides that agree on the
             // pairs but not their order must sort to the same sequence, or
             // this would invent a difference instead of ignoring one.
             sorted.sort_by_cached_key(|item| pretty(&with_sorted_keys(item)));
             Value::Array(sorted)
         }
+        // Recursive, because the array in question is not always the whole
+        // document: `status --json` carries its tasks and agents under
+        // `tasks`/`agents`, and those are the arrays whose order a tie in the
+        // store's sort leaves undefined.
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), as_compared(value, true)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }

@@ -4,13 +4,23 @@ requires = ["serve", "config set", "status"]
 fake_agents = true
 timeout_secs = 120
 env = { ORCH_FAKE_SCENARIO = "fail" }
+unordered_files = ["tasks/_index.json"]
 description = """
 Red-team O7 / V26: a diamond dependency graph whose root fails. Both \
 branches and the shared leaf must be cascade-failed with the same reason \
 text, and the leaf exactly once even though two paths reach it. The \
 ${task.N} placeholders resolve per tree, since the two binaries mint \
 different ids — without them a dependency graph is not expressible in a \
-differential scenario at all."""
+differential scenario at all.
+
+The cascade saves its dependents with `Promise.all` — `join_all` on our
+side — so `left` and `right` reach `tasks/_index.json` in whichever order
+the writes land, and they share an `updated_at` to the millisecond, which
+makes `TaskStore.list`'s (status, updated_at) sort a tie that falls back to
+that index order. PARITY.md §6.10 says index order is not contract, so the
+two listings *after* the run and the index file are compared as multisets;
+the listing before it is still compared in order, and every field, count
+and cascade reason is compared either way."""
 steps = [
   "init --name proj --adapter claude",
   "config set scheduling.poll_interval_ms 200",
@@ -26,6 +36,6 @@ steps = [
   # between two independently-timed processes. Every other record is
   # compared.
   "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
-  "task list --json",
-  "status --json",
+  "@unordered:cascaded-in-the-same-millisecond-§6.10 task list --json",
+  "@unordered:cascaded-in-the-same-millisecond-§6.10 status --json",
 ]
