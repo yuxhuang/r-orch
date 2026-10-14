@@ -834,19 +834,13 @@ async fn poll_history_is_empty_for_a_project_with_no_finished_runs() {
     drop(temp);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_model_catalog_is_not_probed_until_it_is_first_polled() {
-    let (temp, engine) = project().await;
-    let backend = launch(Arc::clone(&engine)).await;
-
-    // The first poll starts the probe and reports nothing, which is what
-    // keeps eight adapter spawns off the startup path.
-    let (_backend, first) = on_draw_thread(backend, |backend| backend.poll_model_catalog()).await;
-    assert!(first.is_none());
-
-    engine.orchestrator.stop().await.expect("stop");
-    drop(temp);
-}
+// `poll_model_catalog` has no test here on purpose: the first poll starts a
+// real probe, which execs `claude --help`, `cursor-agent --list-models` and six
+// more, and reads the developer's `~/.codex`. No test may touch the real HOME,
+// and the property an earlier version of this test asserted — "not probed until
+// polled" — is not a contract: the reference loads the catalog in a mount
+// effect (`App.tsx:984`), and `App::tick` polls on the very first tick, so the
+// deferral only spares a facade consumer that never polls at all.
 
 // ── watch mode ───────────────────────────────────────────────────────────
 
