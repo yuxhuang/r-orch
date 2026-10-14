@@ -17,6 +17,25 @@ fn orch(dir: &Path) -> Command {
     // in the alternate screen; without one, `orch_tui::run` fails at
     // `enable_raw_mode` and the FTUE's init half is still observable on disk.
     command.env("TERM", "dumb");
+
+    // The FTUE opens the dashboard, and the dashboard probes every supported
+    // adapter for its model catalogue — so without this these tests exec
+    // whichever of `claude`, `codex`, `cursor-agent`, `opencode`, `pi`,
+    // `grok` and `agy` happen to be installed, and those write their own
+    // config into `$HOME`. Measured: 14 real CLI executions from this file
+    // alone. Pointing PATH at the fixtures makes the probe hermetic *and*
+    // deterministic, which is what the gate's `no-real-cli` step checks.
+    let fakes = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/fake-agents");
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    command.env("PATH", format!("{}:{inherited}", fakes.display()));
+
+    // Keep `global.yml` and the update-check cache out of the real home.
+    let home = dir.join(".first-run-home");
+    std::fs::create_dir_all(home.join(".orchestry")).expect("create test home");
+    command.env("HOME", &home).env("USERPROFILE", &home).env(
+        "ORCHESTRY_GLOBAL_CONFIG_PATH",
+        home.join(".orchestry/global.yml"),
+    );
     command
 }
 
