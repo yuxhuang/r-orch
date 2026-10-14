@@ -127,8 +127,14 @@ summarize() {
       # reads as that rather than as a blind spot.
       grep -oE '[0-9]+ detected, [0-9]+ missed.*' "$log" | tail -1
       ;;
+    no-real-cli)
+      grep -oE "no test exec'd an agent CLI|a test exec'd a real agent CLI:" "$log" | tail -1
+      ;;
+    real-home)
+      grep -oE 'still does not exist|existed before this run.*|was created during this gate run.*' "$log" | tail -1
+      ;;
     home-hygiene)
-      grep -oE 'nothing ORCH-shaped.*|a test created an ORCH project.*' "$log" | tail -1
+      grep -oE 'a sentinel HOME is still empty.*|the suite wrote into a sentinel HOME:' "$log" | tail -1
       ;;
     crate-graph)
       grep -oE 'layering matches [^ ]+ .*|[0-9]+ layering problem\(s\)' "$log" | tail -1
@@ -147,64 +153,133 @@ summarize() {
   esac
 }
 
-# Run the suite with HOME pointed at an empty directory and fail if anything
-# ORCH-shaped appears in it.
+# Run the suite with HOME pointed at an empty directory and fail if **anything**
+# appears in it.
 #
-# The project root is resolved by walking **up**, and `cargo test` runs with
-# its cwd inside $HOME — so once `~/.orchestry` exists, a test that resolves a
-# project without an explicit path finds the developer's own home and writes
-# into it. That is not hypothetical: `~/.orchestry` on this machine collected
-# `tasks/_index.json`, `agents/_index.json`, `runs/` and `state.json` from our
-# own runs before this check existed.
+# Originally this only looked for `.orchestry`, which let the rest through: the
+# adapter and FTUE tests spawned the real `cursor` and `opencode`, which wrote
+# `.cursor/cli-config.json`, `.cache/opencode`, `.config/opencode` and
+# `.local/share/opencode`. Same standard as ORCH data — no test may write into
+# a developer's home — so the check is now "the directory is still empty".
 #
-# Only `.orchestry` is checked, not the whole directory: cargo and rustup
-# legitimately recreate their caches under a moved HOME, and the adapter tests
-# spawn real `cursor`/`opencode` binaries that write their own config there.
-# Those are noise; a project directory is the finding.
+# `.cargo` and `.rustup` are the one exception, and only because *cargo itself*
+# recreates them when HOME moves: they are the build tool's own state, created
+# before any test code runs. Everything else is a finding.
+#
+# Runs from **outside** the workspace. An earlier version ran with the cwd in
+# the repo and passed while a bug was live, because cargo only loads
+# `.cargo/config.toml` — and its `[env]` — from inside the workspace, so the
+# redirect that was hiding the writer was still in effect. CARGO_HOME and
+# RUSTUP_HOME are set explicitly because a moved HOME otherwise hides the
+# toolchain, and the suite then runs **zero tests** while this reports clean.
 sentinel_home_check() {
-  local sentinel cwd
+  local sentinel cwd unexpected status
   sentinel=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-home-XXXXXX")
   cwd=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-cwd-XXXXXX")
 
-  # Run from **outside** the workspace, which is the whole point.
-  #
-  # The first version of this check ran with the cwd in the repo and passed
-  # while the bug was still live: cargo only loads `.cargo/config.toml` — and
-  # therefore its `[env]` — when the working directory is inside the
-  # workspace, so the redirect that was hiding the writer was still in effect.
-  # Running from elsewhere removes that cover. `rust-toolchain.toml` is also
-  # found via the cwd, hence the explicit RUSTUP_TOOLCHAIN.
   (
     cd "$cwd" || exit 1
     HOME="$sentinel" \
+    CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" \
     RUSTUP_TOOLCHAIN="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")" \
     CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}" \
       cargo test --manifest-path "$REPO/Cargo.toml" --workspace --no-fail-fast
   ) >/dev/null 2>&1
 
-  local status=0
-  if [ -e "$sentinel/.orchestry" ]; then
-    echo "a test created an ORCH project under a sentinel HOME:"
-    find "$sentinel/.orchestry" 2>/dev/null | head -20
+  unexpected=$(find "$sentinel" -mindepth 1 -maxdepth 1 2>/dev/null \
+               | grep -vE '/\.(cargo|rustup)$' || true)
+  status=0
+  if [ -n "$unexpected" ]; then
+    echo "the suite wrote into a sentinel HOME:"
+    printf '%s\n' "$unexpected" | sed "s|$sentinel|<HOME>|" | head -12
     status=1
   else
-    echo "nothing ORCH-shaped created under a sentinel HOME"
+    echo "a sentinel HOME is still empty after the suite"
   fi
-
-  # Reported, not failed: the adapter tests spawn the real `cursor` and
-  # `opencode` binaries, which write their own config and caches into HOME.
-  # Not ORCH data, but still this suite touching a developer's home, and it
-  # means those tests depend on whichever versions are installed.
-  local others
-  others=$(find "$sentinel" -maxdepth 2 -mindepth 1 2>/dev/null \
-           | grep -vE '/\.(cargo|rustup)' | head -8)
-  if [ -n "$others" ]; then
-    echo "note: third-party CLIs spawned by the adapter tests also wrote to HOME:"
-    printf '%s\n' "$others" | sed "s|$sentinel|<HOME>|"
-  fi
-
   rm -rf "$sentinel" "$cwd"
   return "$status"
+}
+
+# Run the suite with the AI CLIs replaced by shims that record being called,
+# and report anything that execs one.
+#
+# `cargo test` should never exec a real agent CLI: the adapter tests drive a
+# scripted `FakeProcessManager`, and the fixtures under fixtures/fake-agents
+# are for `cargo xtask parity`. One test did anyway — it ran `claude --help`,
+# `cursor-agent --list-models` and read the real `~/.codex` — which is both a
+# hermeticity hole (results depend on what is installed) and a privacy one.
+#
+# A shim rather than an empty PATH, because an absent binary is indistinguishable
+# from one that was never wanted: the shim names the caller. The suite's own
+# result is ignored here — a test that expected a working CLI may now fail, and
+# that is not what this step is asking. Pass/fail of the suite is the `test`
+# step's job.
+no_real_cli_check() {
+  # `name` is declared local here on purpose: bash scopes dynamically, so the
+  # loop below would otherwise overwrite `step`'s own `local name` and the
+  # summary table would label this row `agy` — which it did.
+  local shims log name status others sentinel cwd
+  shims=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-shims-XXXXXX")
+  log="$shims/calls.log"
+  : > "$log"
+
+  for name in claude codex cursor cursor-agent agent opencode pi grok agy; do
+    cat > "$shims/$name" <<SHIM
+#!/bin/sh
+printf '%s %s\n' "$name" "\$*" >> "$log"
+exit 127
+SHIM
+    chmod +x "$shims/$name"
+  done
+
+  sentinel=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-shim-home-XXXXXX")
+  cwd=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-shim-cwd-XXXXXX")
+  (
+    cd "$cwd" || exit 1
+    HOME="$sentinel" \
+    PATH="$shims:$PATH" \
+    CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" \
+    RUSTUP_TOOLCHAIN="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")" \
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}" \
+      cargo test --manifest-path "$REPO/Cargo.toml" --workspace --no-fail-fast
+  ) >/dev/null 2>&1
+
+  status=0
+  if [ -s "$log" ]; then
+    echo "a test exec'd a real agent CLI:"
+    sort "$log" | uniq -c | sort -rn | head -10
+    status=1
+  else
+    echo "no test exec'd an agent CLI"
+  fi
+  rm -rf "$shims" "$sentinel" "$cwd"
+  return "$status"
+}
+
+# The real home must be exactly as we found it.
+#
+# The sentinel checks above prove the suite is hermetic under a *moved* HOME;
+# this proves nothing slipped past them into the actual one. Cheap, and it is
+# the property the user actually cares about.
+# Captured before anything moves HOME.
+REAL_HOME="${HOME:-/nonexistent}"
+REAL_ORCHESTRY="$REAL_HOME/.orchestry"
+REAL_ORCHESTRY_EXISTED=0
+[ -e "$REAL_ORCHESTRY" ] && REAL_ORCHESTRY_EXISTED=1
+
+real_home_untouched_check() {
+  if [ "$REAL_ORCHESTRY_EXISTED" -eq 0 ] && [ -e "$REAL_ORCHESTRY" ]; then
+    echo "$REAL_ORCHESTRY was created during this gate run:"
+    find "$REAL_ORCHESTRY" 2>/dev/null | head -20
+    return 1
+  fi
+  if [ "$REAL_ORCHESTRY_EXISTED" -eq 1 ]; then
+    echo "$REAL_ORCHESTRY existed before this run; left alone"
+    return 0
+  fi
+  echo "$REAL_ORCHESTRY still does not exist"
 }
 
 printf 'r-orch gate — %s\n' "$MODE"
@@ -224,7 +299,11 @@ step parity         cargo xtask parity
 # so it goes last: on a cold gate it is by far the slowest step, and anything
 # it would catch is worth knowing about after the cheaper checks have run.
 step home-hygiene   sentinel_home_check
+step no-real-cli    no_real_cli_check
 step probes         ./xtask/probe-harness.sh
+# Last, so it covers every step above it — including the probe suite, which
+# rebuilds and re-runs the CLI repeatedly.
+step real-home      real_home_untouched_check
 
 printf '\n'
 printf '════════════════════════════════════════════════════════════════════\n'

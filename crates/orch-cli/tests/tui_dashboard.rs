@@ -106,7 +106,14 @@ async fn the_dashboard_renders_what_the_engine_has_on_disk() {
         .agent_service
         .create(CreateAgentInput {
             name: "builder".into(),
-            adapter: "claude".into(),
+            // A **shell** agent, not `claude`: this test dispatches, and with
+            // a stream adapter the real `claude` CLI gets exec'd — with
+            // `--dangerously-skip-permissions` and a rendered prompt — on any
+            // machine that has it installed. Nothing here asserts the adapter;
+            // it only needs an agent to exist and be dispatchable. Caught by
+            // the gate's `no-real-cli` step.
+            adapter: "shell".into(),
+            command: Some("echo dashboard-fixture".into()),
             ..Default::default()
         })
         .await
