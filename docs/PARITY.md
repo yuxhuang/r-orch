@@ -2665,8 +2665,19 @@ The handler is **one ordered `if` chain and the order is load-bearing**. Reprodu
 2. Agent picker open → swallow everything. (The *type* picker does **not** block — a quirk; `q` still quits
    through it. Preserve or fix deliberately — see §14.8.)
 3. `Ctrl+S` in the agent wizard → open the Agent Shop wizard — **refused when the default adapter is
-   `shell`**, since shop templates require an AI adapter (§11.4). The refusal surfaces the same guidance the
-   suggestion path uses: *Agent Shop requires an AI provider. Choose Shell and enter a command instead.*
+   `shell`**, since shop templates require an AI adapter (§11.4).
+
+   **There are two different refusal strings, both `yellow` toasts. They are L0 and must not be unified:**
+
+   | Call site | Reached by | Exact string |
+   |---|---|---|
+   | `launchShopWizard` — `App.tsx:1012` | **`Ctrl+S`** and **`/agent shop`** | `Agent Shop requires an AI provider. Press N to create a Shell agent.` |
+   | `handleSuggestionSelected` — `App.tsx:1321` | selecting a template from the inline suggestion list on the agent wizard's **name** step | `Agent Shop requires an AI provider. Choose Shell and enter a command instead.` |
+
+   They share a first sentence and differ in the advice, which fits each entry point: from `Ctrl+S` you are
+   not yet in a wizard, so you are told to press `N`; from the suggestion list you already are, so you are
+   told what to pick. *(An earlier revision of this document claimed both paths printed the same string. They
+   do not.)*
 4. Any input mode active → text-input branch.
 5. Normal-mode chain, in source order.
 
@@ -2839,6 +2850,14 @@ workspace preparation failure, an invalid task id or a non-dispatchable status. 
 Post-dispatch outcomes stay asynchronous and arrive through `poll_events` — that part of the facade is right
 and must not become blocking. The dividing line is **"did the child process start?"**: before it, `Err`;
 after it, events.
+
+**One exception on the other side of that line: `stop_watch` awaits the wind-down.** It is the one facade
+method that legitimately blocks, because the wind-down must complete every step and release the lock before
+the call returns (§14.15), and an in-flight tick is allowed to finish rather than be aborted (§14.24).
+**This matches the TypeScript and is therefore not a divergence** — it is deliberately absent from §12.8's
+table, which is for divergences only. Recorded here because "the facade never blocks" would otherwise read
+as absolute and invite someone to make `stop_watch` fire-and-forget, which would let the TUI exit while the
+lock was still held.
 
 This is a **fix** for a usability gap rather than a parity divergence: the original emits the error, so the
 information exists; it simply never reaches the screen.
