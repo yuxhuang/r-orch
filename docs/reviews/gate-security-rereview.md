@@ -7,7 +7,19 @@
 
 ---
 
-## Verdict
+## Verdict — Round 2 (`f5d5abf`, branch `c0-exact-count`): **PASS**
+
+> **All conditions met. C0 is closed, and the deviation (removing the deadline) is accepted on
+> evidence.** Details in §11, which supersedes the Round 1 verdict below.
+>
+> Headline: every bomb I could construct is now refused in **21–28 ms** with exit 1, including the
+> `shapeD` shape that caused the block. The fix also closed a **second DoS neither of us had
+> found** — 300 KB of non-alias nesting took `ed05007` **58 seconds**; it now takes **23 ms**.
+> Worst legitimate 1,033,805-byte config parses in **0.099 s**.
+
+---
+
+## Verdict — Round 1 (`ed05007`): BLOCK *(superseded by §11)*
 
 > **BLOCK — on C0 alone.**
 >
@@ -308,3 +320,157 @@ code's own repeated assertion that nothing ORCH writes uses aliases.
 
 Fix C0, correct the `RUSTSEC-2024-0449` reason string, and route `init`'s two writes through
 `OWNER_ONLY`. I will re-run `shapeD_6000_30` and clear this on the next pass.
+
+---
+
+# 11. Round 2 — verification of the C0 fix (`f5d5abf`)
+
+**Candidate as tested:** branch `c0-exact-count` @ **`be7df28`** (worktree
+`../r-orch-wt/gfix-storage`), off master `c88d3ed`.
+**Verdict: PASS — all conditions met.** This supersedes the Round 1 BLOCK.
+
+> **Commit note.** I was asked to verify `f5d5abf`; by the time I read the worktree, wp0 had
+> **amended** it to `be7df28` (same subject, same parent `c88d3ed`, not an ancestor —
+> `git merge-base --is-ancestor f5d5abf HEAD` is false). I verified `be7df28`. The delta is
+> `git diff f5d5abf be7df28` = **+21 / −2 lines in `fs_utils.rs`, all comments** — specifically the
+> "sole load-bearing defence" warning the lead required as a condition of accepting the deadline
+> removal. **No logic differs**, so these results apply to both commits, and the required comment is
+> satisfied by the amendment itself. Whatever lands on master should be checked to be this tree:
+> `git diff be7df28 <master> -- crates/orch-infra/src/storage/fs_utils.rs` should be empty.
+
+## 11.1 Ruling on the deviation (deadline removed, no boundary-exit backstop)
+
+wp0 removed the 2 s deadline instead of building the lock-safe boundary exit I asked for. In Round 1
+I named the condition that would change my mind: *"evidence that the deadline cannot fire while the
+lock is held or the TUI is up — e.g. if the exact pre-pass makes the deadline formally unreachable
+and you delete it rather than keeping it as a guard."* **That condition is satisfied. I accept the
+deviation.**
+
+The reason is that the three independent ways to make a YAML parse expensive are each bounded by a
+*different* mechanism, so there is no residual class for a clock to catch:
+
+| Cost source | Bound | Measured |
+|---|---|---|
+| Alias expansion | exact memoised node count, 200,000 budget | every bomb refused in 21–28 ms |
+| Nesting depth | `saphyr-parser`'s own recursion limit | 150,000-deep refused in 23 ms |
+| Scalar/key size | 1 MiB document cap | 1 MiB scalar parses in 0.092 s |
+
+Two further structural points, both of which I verified rather than took on trust:
+
+- **The u64 overflow trap is unreachable, not merely handled.** With the alias cap at 64, the
+  maximum achievable expansion is ~4.3 × 10⁹ (64 aliases arranged as 2-per-level × 32 levels), which
+  is nine orders of magnitude below `u64::MAX`. My overflow probe (3× fan-out × 45 levels, 3⁴⁵ ≈
+  2.9 × 10²¹) was rejected by the **alias cap at 135 aliases** before the arithmetic mattered. The
+  `checked_add` calls are correct belt-and-braces; the cap is what makes overflow impossible.
+- **The pre-pass is iterative, not recursive** — one frame per open collection in a `Vec`
+  (`fs_utils.rs:353`), so the pre-pass cannot itself be stack-overflowed by deep nesting. This was
+  my main worry about making it the sole defence.
+
+The margin is also large in the direction that matters for a *false* positive: the worst legitimate
+file (1,033,805 bytes, no aliases) parses in 0.099 s, two orders of magnitude inside any deadline
+anyone would have set.
+
+**And the premise of my Round 1 dissent turned out not to apply at all.** I planted a bomb in a task
+file and ran `serve --once`: the orchestrator logs `orchestrator:error` with the budget message and
+**keeps ticking** — the failure is an ordinary per-tick error, not a process-fatal one. There is no
+hard exit from `orch-infra` to strand anything. On SIGTERM it wound down cleanly and the lock was
+gone afterwards (verified live, and by `refusing_a_bomb_leaves_no_lock_behind`).
+
+## 11.2 Measurements
+
+Release build of `f5d5abf`, compiled into an isolated target dir, `orch status` end-to-end, bomb as
+`.orchestry/config.yml` unless noted.
+
+| probe | bytes | rc | elapsed | outcome |
+|---|---|---|---|---|
+| **shapeD_6000_30** (the Round 1 bypass) | 84,661 | 1 | **0.026 s** | "expands to at least … nodes" |
+| shapeA (nested, seq leaf, W=1200) | 46,854 | 1 | 0.024 s | refused, 6000 aliases |
+| shapeB (flat anchor ×2000) | 322,901 | 1 | 0.021 s | refused, 2000 aliases |
+| overflow probe (3⁴⁵) | 1,269 | 1 | 0.025 s | refused, 135 aliases |
+| merge-key bomb (`<<: *base` ×60) | 37,803 | 1 | 0.025 s | "expands to at least …" — merge keys counted |
+| deep non-alias nesting (150,000 deep) | 300,008 | 1 | **0.023 s** | "recursion limit exceeded" |
+| 1 MiB single scalar | 1,000,009 | 0 | 0.092 s | parses |
+| 900 KB single key | 900,006 | 1 | 0.030 s | clean "not valid YAML" |
+| bomb planted in `tasks/<id>.yml` | 84,661 | 1 | 0.028 s | refused via `task show` |
+| bomb planted in `agents/agt_creator.yml` | 84,661 | 1 | 0.028 s | refused via `agent list` |
+
+**The second DoS, found by comparing against the old binary.** Deep non-alias nesting on `ed05007`:
+**58.143 s**, exit 1. On `f5d5abf`: **0.023 s**, exit 1. Neither of us had found this; the lead
+hypothesised it as something worth probing and it was real. Note the shape of the old failure — it
+returned exit 1 *after 58 s*, i.e. the 2 s deadline fired and the process still could not exit until
+the parse finished. That is the containment failure of Round 1, reproduced independently on an input
+with no aliases in it at all.
+
+**Positives — all `rc=0`:** `init`, `status`, `task add`, `agent add`, `config set`, `task list`,
+`agent list`, `doctor`; a hand-authored merge-key `config.yml` using `&defaults` + `<<:` (the js-yaml
+parity case the alias budget exists to preserve); and the 1,033,805-byte legitimate config in 0.099 s.
+
+**wp0's own suite:** `cargo test --release -p orch-cli --test yaml_bomb` → **4 passed**, 0 failed, in
+0.09 s. It covers config, task and agent plants, asserts process exit and a peak-RSS ceiling via
+`run_sampling_rss`, and asserts lock removal — the RSS ceiling is the check I asked for in Round 1
+so that a slow-wind-down regression cannot pass on a large CI box and OOM on a laptop.
+
+## 11.3 Design review of the pre-pass
+
+`expanded_node_count` (`crates/orch-infra/src/storage/fs_utils.rs:338`) walks `saphyr-parser`
+events, never resolving an alias, memoising expanded counts in a `HashMap<usize, u64>` keyed by the
+parser's **numeric anchor id** rather than by name — which is what makes anchor redefinition safe,
+since a redefinition gets a fresh id (trap 4). An `Alias` whose id is absent from the map means the
+anchor is not yet closed, i.e. a cycle, and is refused (`fs_utils.rs:414-421`). Merge keys arrive as
+ordinary `Alias` events and so carry their full expanded cost (trap 3) — confirmed empirically by
+the merge-key bomb. All five traps from Round 1 are addressed, four structurally.
+
+## 11.4 Remaining condition items — all met
+
+- **C5 deny.toml reason: corrected.** Now reads "…no API-compatible replacement (serde-saphyr has no
+  `Value` model), and the amplification class is closed by the exact expanded-node pre-pass in
+  `read_yaml_value`" (`deny.toml:54`). That is accurate as of this commit, and it names the actual
+  blocker to replacement rather than asserting a bound that did not hold.
+- **0600 on `config.yml` / `agents/*.yml`: met.** Fresh `orch init` now yields `600` for both
+  (was `664`). Verified on a real project, umask 002.
+- **"Sole load-bearing defence" comment: present** (`fs_utils.rs:281` and `:303`, "This is the sole
+  DoS defence for YAML reads, and it is load-bearing alone").
+
+## 11.5 New observations (none blocking, none a regression)
+
+1. **`tasks/*.yml` is written 0664**, while `config.yml` and `agents/*.yml` are now 0600. Task files
+   hold descriptions and prompts, not credentials, so the exposure is materially lower — but the
+   inconsistency will read as an oversight later. Suggest routing the task store through
+   `OWNER_ONLY` too, or recording why task files are deliberately different.
+2. **A corrupt/planted task file makes `serve --once` never terminate.** The task can never be read,
+   so it stays `queued` and `--once` never reaches "all done"; it held the lock for the full 120 s of
+   my run and only ended on SIGTERM. It then reported `serve:finished result="all_done"
+   exit_code=0`, which is the wrong result string for "I was killed while stuck". Same family as the
+   known open resilience item (c). **Not a regression** — pre-fix this was worse (seconds of CPU per
+   tick plus a leaked thread) — but the `all_done` / exit 0 on a SIGTERM-after-wedge is worth
+   handing to SRE.
+3. **Error wording for malformed YAML changed.** `ed05007` printed `parse <path>`; `f5d5abf` prints
+   `is not valid YAML: <saphyr detail>`. Exit code is 1 in both, so §3 is intact, but if any harness
+   scenario asserts that text it will have moved. The 58/58 parity run presumably covers this;
+   flagging it so nobody is surprised.
+4. **Operational, not about the code:** the shared box is at **97 % disk (15 GB free)**. A cold gate
+   that starts with `cargo clean` has limited headroom. My own build wiped itself mid-run once
+   because wp0's cold gate cleaned the shared `gfix-storage/target` underneath it; I moved to an
+   isolated target dir, which is also why my numbers are from a clean build rather than theirs.
+
+## 11.6 A correction to my own probing
+
+My `surrogate_only.yml` probe (`s: "\ud800"`) is refused by `f5d5abf`, and I initially read that as
+the fix breaking the §14.14 lone-surrogate tolerance. **It is not a regression:** I ran the same file
+against the `ed05007` binary and it is refused there too. `repair_lone_surrogates` is called only
+from the **JSON** read path (`fs_utils.rs:158`); `read_yaml_value` never invoked it, so lone-surrogate
+tolerance was never a property of the YAML path and my probe asserted something that never held.
+Checked before reporting rather than after.
+
+## 11.7 Scope
+
+Read-only review of `f5d5abf`. Built `--release --bin orch` and the `yaml_bomb` test target into
+`$TMPDIR/vtarget` (isolated, deleted afterwards) so as not to collide
+with wp0's concurrent cold gate. Probe projects and bomb files under
+`$TMPDIR/v3/` — outside every repo — deleted afterwards. No file in any
+candidate worktree modified; no commits; no state-changing git commands. Timings are single runs on a
+shared, loaded machine; every margin reported here is at least two orders of magnitude, far outside
+any noise band.
+
+Positive-case exit codes were re-verified by direct per-command capture after an initial shell loop
+reported spurious `rc=1` values — the loop was clobbering `$?`, not the binary failing.
