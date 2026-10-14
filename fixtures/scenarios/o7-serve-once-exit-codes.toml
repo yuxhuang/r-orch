@@ -12,14 +12,30 @@ steps = [
   "init --name proj --adapter claude",
   "config set scheduling.poll_interval_ms 200",
   "config set defaults.task.max_attempts 1",
-  "serve --once --log-format json",
+  # The tick stream is a wall-clock heartbeat: how many ticks fire before
+  # a run finishes, and which tasks are running when one does, differ
+  # between two independently-timed processes. Every other record is
+  # compared.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "agent add worker --adapter claude --quiet",
   "task add 'passes' --assignee ${agent.0} --quiet",
-  "serve --once --log-format json",
+  # The tick stream is a wall-clock heartbeat: how many ticks fire before
+  # a run finishes, and which tasks are running when one does, differ
+  # between two independently-timed processes. Every other record is
+  # compared.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "task add 'cancel me' --assignee ${agent.0} --quiet",
   "task cancel ${task.1}",
-  "serve --once --log-format json",
+  # The tick stream is a wall-clock heartbeat: how many ticks fire before
+  # a run finishes, and which tasks are running when one does, differ
+  # between two independently-timed processes. Every other record is
+  # compared.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "task add 'fails ORCH_FAKE_FAIL' --assignee ${agent.0} --quiet",
-  "serve --once --log-format json",
+  # The tick stream is a wall-clock heartbeat: how many ticks fire before
+  # a run finishes, and which tasks are running when one does, differ
+  # between two independently-timed processes. Every other record is
+  # compared.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "task list --json",
 ]

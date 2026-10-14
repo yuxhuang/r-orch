@@ -646,15 +646,26 @@ impl Orchestrator {
             let now = self.deps().clock.now_iso();
             // Written through the store, not the service: a dependent in
             // `todo` has no legal transition to `failed`.
-            futures::future::join_all(to_fail.iter().map(|(task, _)| {
+            //
+            // **Sequential, where the reference uses `Promise.all`.** Each
+            // save appends to `_index.json`, whose entry order is observable
+            // (PARITY.md §14.4) and is the order the saves *complete* in.
+            // Concurrent saves therefore race on a value the differential
+            // harness compares byte for byte: node's `Promise.all` over fs
+            // writes settles in map order in practice, so the oracle is
+            // stable, while `join_all` on a multi-threaded runtime genuinely
+            // interleaves — observed as `o7-cascade-failure` failing about one
+            // run in seven with `left` and `right` transposed. Awaiting in
+            // order reproduces the order the oracle prints. The cost is
+            // nothing: a cascade is a handful of tasks.
+            for (task, _) in &to_fail {
                 let failed = Task {
                     status: TaskStatus::Failed,
                     updated_at: now.clone(),
                     ..task.clone()
                 };
-                async move { self.deps().task_store.save(&failed).await }
-            }))
-            .await;
+                let _ = self.deps().task_store.save(&failed).await;
+            }
 
             for (task, previous_status) in &to_fail {
                 self.emit(OrchestratorEvent::TaskStatusChanged {

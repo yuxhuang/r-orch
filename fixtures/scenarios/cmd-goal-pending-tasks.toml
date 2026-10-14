@@ -6,7 +6,19 @@ The achieved guard: a goal with a non-terminal linked task cannot be \
 achieved. Measured exit 1, with the count and a task summary in the \
 message (`1 task(s) still pending — <id> (todo)`) and a hint line pointing \
 at --force; --force then cancels the pending tasks and marks the goal \
-achieved."""
+achieved.
+
+`--force` cancels with `Promise.all`, so which cancel reaches
+`tasks/_index.json` last is a libuv scheduling artifact (measured: usually
+the reverse of the task order). PARITY.md §6.10 says index order is not
+contract — every consumer sorts explicitly, and both `task list --json`
+steps here are still compared element by element — so the index file is
+compared as a multiset — and so is the listing *after* `--force`, where both
+tasks are `cancelled` with the same `updated_at` and `TaskStore.list`'s
+(status, updated_at) sort is therefore a tie that falls back to that same
+index order. The listing before `--force` is still compared in order: those
+two tasks have distinct timestamps."""
+unordered_files = ["tasks/_index.json"]
 steps = [
   "init --name proj --adapter claude",
   "goal add 'Blocked goal' --quiet",
@@ -15,6 +27,6 @@ steps = [
   "goal status ${goal.0} achieved",
   "task list --json",
   "goal status ${goal.0} achieved --force --json",
-  "task list --json",
+  "@unordered:cancelled-in-the-same-millisecond-§6.10 task list --json",
   "goal list --json",
 ]

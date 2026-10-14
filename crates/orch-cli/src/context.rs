@@ -27,6 +27,11 @@ pub struct EnvFlags {
     /// stdout is a terminal. `chalk` emits no colour otherwise, and matching
     /// that keeps piped output identical between the two binaries.
     pub stdout_is_tty: bool,
+    /// stdin is a terminal. The interactive surfaces — `init`'s adapter
+    /// prompt and the agent shop picker — require **both** to be a TTY and
+    /// silently take the non-interactive path otherwise
+    /// (`docs/parity/cli.md` §21.2, §21.3).
+    pub stdin_is_tty: bool,
 }
 
 impl EnvFlags {
@@ -35,6 +40,7 @@ impl EnvFlags {
             no_color_env: std::env::var_os("NO_COLOR").is_some(),
             dumb_term: std::env::var("TERM").is_ok_and(|term| term == "dumb"),
             stdout_is_tty: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            stdin_is_tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
         }
     }
 }
@@ -93,6 +99,7 @@ mod tests {
             no_color_env: no_color,
             dumb_term: dumb,
             stdout_is_tty: tty,
+            stdin_is_tty: tty,
         }
     }
 

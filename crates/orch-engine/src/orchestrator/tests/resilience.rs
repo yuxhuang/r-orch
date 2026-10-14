@@ -295,6 +295,25 @@ async fn sigterm_reports_the_reason_and_stops() {
     .expect("wait_for_stop should resolve after a signal");
 }
 
+#[tokio::test]
+async fn wait_for_stop_resolves_when_the_breaker_stops_us_from_inside_the_loop() {
+    // The circuit breaker calls `stop()` *from the watch task*, and `stop()`
+    // aborts whatever `JoinHandle` it finds — which is that very task. If it
+    // aborts itself before signalling `stopped`, `wait_for_stop` never
+    // resolves and `orch serve`/`orch run --watch` hang on Ctrl+C instead of
+    // shutting down.
+    let h = Harness::builder().config(fast_poll(15)).build();
+    h.start_watch().await.unwrap();
+    h.state.faults.fail_always("persistent-error");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        h.orchestrator.wait_for_stop(),
+    )
+    .await
+    .expect("wait_for_stop must resolve after the breaker fires");
+}
+
 // ── Fix 4: structured error events ───────────────────────────────────────
 
 #[tokio::test]

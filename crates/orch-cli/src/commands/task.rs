@@ -1,7 +1,16 @@
 //! `orch task` — ported from `src/cli/commands/task.ts`.
 //!
-//! WP-0b covers `add` and `list`. The remaining subcommands (`show`, `edit`,
-//! `assign`, `cancel`, `approve`, `reject`, `retry`, `delete`) are WP-5's.
+//! Four details that are easy to lose:
+//!
+//! - `show` is a long cascade of optional sections, each printed only when
+//!   its field is non-empty, and `--json` prints the task and nothing else;
+//! - `edit` compares the edited buffer against the existing task and prints
+//!   `  No changes.` when nothing differs, without touching the store;
+//! - `cancel` builds the **full** container only when the task is
+//!   `in_progress`, because only then is there a process to kill;
+//! - none of `cancel`/`approve`/`reject`/`retry` honours `--json` or
+//!   `--quiet`: they always print their success line
+//!   (`docs/parity/cli.md` §21.6).
 
 use orch_core::error::Result;
 use orch_core::storage::TaskFilter;
@@ -9,7 +18,8 @@ use orch_domain::{CreateTaskInput, Task, TaskStatus};
 use orch_engine::Engine;
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_json, print_success, print_table};
+use crate::editor;
+use crate::output::{Styles, print_json, print_key_value, print_success, print_table};
 
 /// Comma-separated list option: split, trim, keep empties out of the way the
 /// TS does **not** — `"a,,b".split(',').map(trim)` yields `["a", "", "b"]`, so
@@ -148,6 +158,268 @@ fn task_row(styles: &Styles, task: &Task) -> Vec<String> {
             .unwrap_or_else(|| styles.dim("—")),
         time,
     ]
+}
+
+/// `task assign <task-id> <agent-id>`.
+///
+/// Prints `Assigned <id> → <resolved assignee>`, falling back to the argument
+/// when the task ended up with no assignee at all. **Not** `--quiet`-aware:
+/// `task assign` is in the ignored half of the matrix
+/// (`docs/parity/cli.md` §21.6).
+pub async fn assign(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let task = engine.task_service.assign(task_id, agent_id).await?;
+
+    if ctx.json {
+        return print_json(&task);
+    }
+    print_success(
+        styles,
+        &format!(
+            "Assigned {} → {}",
+            task.id,
+            task.assignee.as_deref().unwrap_or(agent_id)
+        ),
+    );
+    Ok(())
+}
+
+pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
+    let task = engine.task_service.get(id).await?;
+
+    if ctx.json {
+        return print_json(&task);
+    }
+
+    println!("\n  {}", task.title);
+    println!("  {}", "═".repeat(42));
+    println!();
+
+    let mut pairs = vec![
+        (
+            "Status".to_owned(),
+            format!(
+                "{} {} · attempt {}/{}",
+                styles.status_icon(task.status.as_str()),
+                task.status,
+                task.attempts,
+                task.max_attempts
+            ),
+        ),
+        ("Priority".to_owned(), styles.priority_label(task.priority)),
+    ];
+    if let Some(assignee) = &task.assignee {
+        pairs.push(("Agent".to_owned(), styles.agent_name(assignee)));
+    }
+    if !task.labels.is_empty() {
+        pairs.push(("Labels".to_owned(), task.labels.join(", ")));
+    }
+    if let Some(scope) = task.scope.as_ref().filter(|scope| !scope.is_empty()) {
+        pairs.push(("Scope".to_owned(), scope.join(", ")));
+    }
+    if let Some(mode) = &task.workspace_mode {
+        pairs.push(("Workspace".to_owned(), mode.as_str().to_owned()));
+    }
+    if let Some(workspace) = &task.workspace {
+        pairs.push(("Path".to_owned(), styles.file_path(workspace)));
+    }
+    if let Some(criteria) = task
+        .review_criteria
+        .as_ref()
+        .filter(|criteria| !criteria.is_empty())
+    {
+        pairs.push((
+            "Review".to_owned(),
+            criteria
+                .iter()
+                .map(|criterion| criterion.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if let Some(feedback) = &task.feedback {
+        pairs.push(("Feedback".to_owned(), feedback.clone()));
+    }
+    pairs.push(("Created".to_owned(), task.created_at.clone()));
+    print_key_value(styles, &pairs);
+
+    if let Some(attachments) = task
+        .attachments
+        .as_ref()
+        .filter(|attachments| !attachments.is_empty())
+    {
+        println!(
+            "\n  Attachments ({})\n  {}",
+            attachments.len(),
+            "─".repeat(42)
+        );
+        for attachment in attachments {
+            println!("    {}", styles.file_path(attachment));
+        }
+    }
+
+    if !task.description.is_empty() {
+        println!("\n  Description\n  {}", "─".repeat(42));
+        for line in task.description.split('\n') {
+            println!("  {line}");
+        }
+    }
+
+    if let Some(proof) = &task.proof {
+        println!("\n  Result\n  {}", "─".repeat(42));
+        if let Some(branch) = &proof.branch {
+            println!("  Branch:        {branch}");
+        }
+        if let Some(pr_url) = &proof.pr_url {
+            println!("  PR:            {pr_url}");
+        }
+        if !proof.files_changed.is_empty() {
+            println!("  Files changed:");
+            for file in &proof.files_changed {
+                println!("    • {file}");
+            }
+        }
+        if let Some(results) = &proof.test_results {
+            println!("  Test results:");
+            for line in results.split('\n') {
+                println!("    {line}");
+            }
+        }
+        if let Some(summary) = &proof.agent_summary {
+            println!("  Agent summary:");
+            for line in summary.split('\n') {
+                println!("    {line}");
+            }
+        }
+    }
+
+    if let Some(results) = task
+        .review_results
+        .as_ref()
+        .filter(|results| !results.is_empty())
+    {
+        println!("\n  Review Results\n  {}", "─".repeat(42));
+        for result in results {
+            // Hard-coded glyphs, unlike `statusIcon` — no ASCII fallback.
+            let icon = if result.passed { "✓" } else { "✗" };
+            let outcome = if result.passed { "passed" } else { "failed" };
+            println!("  {icon} {}: {outcome}", result.criterion.as_str());
+            if !result.output.is_empty() {
+                for line in result.output.split('\n') {
+                    println!("    {line}");
+                }
+            }
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+/// `task edit` — round-trip the task through `$EDITOR` and write back only
+/// what changed.
+pub async fn edit(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
+    let existing = engine.task_service.get(id).await?;
+
+    // Informational only: the note is a comment line, so it comes back as
+    // part of the description unless the user deletes it — which is what the
+    // original does too.
+    let attachment_note = match existing
+        .attachments
+        .as_ref()
+        .filter(|attachments| !attachments.is_empty())
+    {
+        Some(attachments) => format!("\n# Attachments: {}", attachments.join(", ")),
+        None => String::new(),
+    };
+    let initial = format!(
+        "{}{attachment_note}",
+        editor::task_buffer(&existing.title, existing.priority, &existing.description)
+    );
+
+    let edited = editor::open_in_editor(&initial, ".yml").await?;
+    let parsed = editor::parse_task_content(&edited);
+
+    let mut fields = orch_engine::task_service::UpdateTaskFields::default();
+    if let Some(title) = parsed.title.filter(|title| *title != existing.title) {
+        fields.title = Some(title);
+    }
+    if let Some(priority) = parsed.priority.filter(|p| *p != existing.priority) {
+        fields.priority = Some(priority);
+    }
+    if let Some(description) = parsed
+        .description
+        .filter(|description| *description != existing.description)
+    {
+        fields.description = Some(description);
+    }
+
+    if fields == orch_engine::task_service::UpdateTaskFields::default() {
+        println!("  No changes.");
+        return Ok(());
+    }
+
+    let updated = engine.task_service.update(id, fields).await?;
+    print_success(
+        styles,
+        &format!("Updated {} \"{}\"", updated.id, updated.title),
+    );
+    Ok(())
+}
+
+/// `task cancel` — the one command that upgrades to the full container
+/// mid-flight, and only for an `in_progress` task: cancelling that one has to
+/// kill the agent process, release the claim and finish the run, which lives
+/// on the orchestrator.
+pub async fn cancel(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
+    let task = engine.task_service.get(id).await?;
+
+    if task.status == TaskStatus::InProgress {
+        let full = orch_engine::build_full(engine.paths.project_root().to_path_buf()).await?;
+        full.orchestrator.cancel_task(id).await?;
+    } else {
+        engine.task_service.cancel(id).await?;
+    }
+    print_success(styles, &format!("Cancelled {id}"));
+    Ok(())
+}
+
+pub async fn approve(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
+    engine
+        .task_service
+        .update_status(id, TaskStatus::Done)
+        .await?;
+    print_success(styles, &format!("Approved {id}"));
+    Ok(())
+}
+
+pub async fn reject(
+    engine: &Engine,
+    styles: &Styles,
+    id: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    engine
+        .task_service
+        .reject(id, reason.map(str::to_owned))
+        .await?;
+    let suffix = match reason {
+        Some(reason) => format!(" (reason: {reason})"),
+        None => String::new(),
+    };
+    print_success(styles, &format!("Rejected {id} → todo{suffix}"));
+    Ok(())
+}
+
+pub async fn retry(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
+    engine.task_service.retry(id).await?;
+    print_success(styles, &format!("Reset {id} to todo"));
+    Ok(())
 }
 
 /// `<n> tasks` — **not pluralized**, and the running/review/done clauses only

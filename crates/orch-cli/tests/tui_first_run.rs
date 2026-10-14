@@ -108,16 +108,35 @@ fn bare_orch_in_an_initialized_project_does_not_re_init() {
 }
 
 #[test]
-fn flags_without_a_subcommand_print_help_rather_than_initializing() {
+fn flags_without_a_subcommand_do_not_initialize() {
+    // `cli.ts:206` appends `tui` only for a *bare* argv, so `orch --json` is
+    // not the first-run path. What it *is* depends on the directory, and both
+    // halves are measured against the oracle:
+    //
+    //   - uninitialized: the container is built before Commander parses, so
+    //     this is `Not initialized`, exit **3** — not the root help. Measured:
+    //     `node dist/cli.js --json` in an empty directory exits 3 and prints
+    //     `✕ Not initialized`.
+    //   - initialized: no subcommand to run, so the root help and exit 1.
     let temp = tempfile::tempdir().expect("tempdir");
     let output = orch(temp.path()).arg("--json").output().expect("run orch");
-
-    // `cli.ts:206` appends `tui` only for a *bare* argv, so this is the
-    // "group with no subcommand" path: help on stdout, exit 1.
     assert!(
         !initialized(temp.path()),
         "`orch --json` must not run the first-run init"
     );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let ready = tempfile::tempdir().expect("tempdir");
+    orch(ready.path())
+        .args(["init", "--name", "proj", "--adapter", "claude"])
+        .output()
+        .expect("init");
+    let output = orch(ready.path()).arg("--json").output().expect("run orch");
     assert_eq!(output.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("Usage:"),

@@ -77,6 +77,21 @@ pub struct Scenario {
     /// ids and timestamps must agree.
     #[serde(default)]
     pub verify: Vec<String>,
+    /// Files under `.orchestry/` whose top-level JSON **array** order is not
+    /// contract, relative to that directory (`messages/_index.json`).
+    ///
+    /// The same exemption as the `@unordered:<reason>` step directive, for the
+    /// file the step reads: `_index.json` is maintained in last-write order,
+    /// which PARITY.md §6.10 states is not contract. Keep this list to the
+    /// files a scenario genuinely cannot order — every other `_index.json`
+    /// stays compared element by element, which is what catches an
+    /// implementation that appends on update instead of moving to the end.
+    ///
+    /// Narrower than [`Self::excluded_tree_paths`], which drops a path from
+    /// the comparison entirely: this one still compares every element, count
+    /// and field.
+    #[serde(default)]
+    pub unordered_files: Vec<String>,
     /// Paths under `.orchestry/` whose contents the contract licenses this
     /// scenario not to compare, as prefixes of the normalized tree path.
     ///
@@ -143,6 +158,15 @@ impl Scenario {
             if argv.is_empty() {
                 bail!("step {step:?} parses to an empty argv");
             }
+            // `@unordered` only means anything for a JSON document, and
+            // without `--json` the output is a table whose row order *is*
+            // contract — so a marker there would silence a real difference.
+            if Scenario::unordered(step) && !argv.iter().any(|arg| arg == "--json") {
+                bail!(
+                    "step {step:?} is marked `@unordered` but does not pass `--json`; \
+                     only a JSON array is compared as a multiset"
+                );
+            }
             if argv[0] == WRITE_STEP {
                 if argv.len() != 3 {
                     bail!(
@@ -157,6 +181,11 @@ impl Scenario {
                 if path.is_absolute() || path.components().any(|c| c.as_os_str() == "..") {
                     bail!("`{WRITE_STEP}` needs a relative path inside the project: {step:?}");
                 }
+            }
+        }
+        for path in &self.unordered_files {
+            if path.is_empty() || path.starts_with('/') || path.contains("..") {
+                bail!("`unordered_files` entry {path:?} must be a plain path under .orchestry/");
             }
         }
         match (self.kind, self.split_at) {
@@ -205,6 +234,23 @@ impl Scenario {
     /// Whether the author gave a reason for `@exit-only` (`@exit-only:<why>`).
     pub fn exit_only_reason(step: &str) -> bool {
         Directives::parse(step).0.exit_only_reason
+    }
+
+    /// Whether `orchestrator:tick` records are dropped from this step's
+    /// comparison (`@ticks-vary:<why>`).
+    pub fn ticks_vary(step: &str) -> bool {
+        Directives::parse(step).0.ticks_vary
+    }
+
+    /// The `@stop-after:<ms>` budget, after which the step is SIGTERMed.
+    pub fn stop_after(step: &str) -> Option<std::time::Duration> {
+        Directives::parse(step).0.stop_after
+    }
+
+    /// Whether this step's JSON array is compared as a multiset
+    /// (`@unordered:<why>`).
+    pub fn unordered(step: &str) -> bool {
+        Directives::parse(step).0.unordered
     }
 
     /// The per-step budget, defaulting to 30 s — enough for a fake agent to
@@ -314,6 +360,45 @@ pub struct Directives {
     /// output genuinely is L2", which the lint then accepts. It is also the
     /// one place a reader of the scenario finds out which L2 clause applies.
     pub exit_only_reason: bool,
+    /// `@unordered:<reason>` — the JSON arrays in this step's output hold the
+    /// same elements on both sides but not necessarily in the same order, so
+    /// they are compared as multisets. Applies at every depth: `status
+    /// --json` carries its arrays under `tasks` and `agents`.
+    ///
+    /// The one case that needs it today is a `broadcast` fan-out: the oracle
+    /// saves the messages with `Promise.all`, so the order they reach
+    /// `_index.json` is a libuv scheduling artifact, and `MessageStore.list`
+    /// sorts only by `created_at` — identical for every message in one
+    /// fan-out — leaving `_index.json` order as the stable-sort tie-break.
+    /// PARITY.md §6.10 states that index order is not contract.
+    ///
+    /// A bare `@unordered` is not accepted: the reason is the whole point, so
+    /// it falls through as an unknown token and breaks the step loudly.
+    pub unordered: bool,
+    /// `@stop-after:<ms>` — run it, then **SIGTERM** it and wait for it to
+    /// shut down.
+    ///
+    /// The graceful counterpart of `@kill-after`, for the scenarios whose
+    /// subject is a watch-mode orchestrator: `serve` without `--once` never
+    /// returns, and `serve --once` never returns either when a task lands in
+    /// `review`, which is not terminal. A SIGTERM leaves the tree exactly as
+    /// a real operator's Ctrl+C would — agents cleaned up, lock released —
+    /// so the steps after it compare something meaningful, which a SIGKILL
+    /// mid-write does not.
+    pub stop_after: Option<std::time::Duration>,
+    /// `@ticks-vary:<reason>` — drop `orchestrator:tick` records from this
+    /// step's comparison.
+    ///
+    /// The tick stream is a heartbeat on a wall clock: how many ticks fire
+    /// before a run completes, and which tasks are running when one does,
+    /// differ between two independently-timed processes (measured: a
+    /// `running: 2` tick on one side against `running: 1` on the other, and
+    /// one extra tick before a stall is detected). Every *other* record in
+    /// the stream is deterministic, so this drops exactly the heartbeat and
+    /// keeps the lifecycle: dispatch, completion, retries, stalls, shutdown.
+    /// The tick record's own shape is covered by the structured logger's unit
+    /// tests.
+    pub ticks_vary: bool,
 }
 
 impl Directives {
@@ -334,6 +419,16 @@ impl Directives {
                 _ if token.starts_with("@exit-only:") => {
                     directives.exit_only = true;
                     directives.exit_only_reason = true;
+                }
+                _ if token.starts_with("@unordered:") => directives.unordered = true,
+                _ if token.starts_with("@ticks-vary:") => directives.ticks_vary = true,
+                _ if token.starts_with("@stop-after:") => {
+                    match token["@stop-after:".len()..].parse::<u64>() {
+                        Ok(millis) => {
+                            directives.stop_after = Some(std::time::Duration::from_millis(millis));
+                        }
+                        Err(_) => return (directives, rest),
+                    }
                 }
                 _ => match token.strip_prefix("@kill-after:") {
                     Some(millis) => match millis.parse::<u64>() {

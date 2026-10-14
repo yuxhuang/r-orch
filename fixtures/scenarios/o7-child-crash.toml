@@ -16,7 +16,11 @@ steps = [
   "config set defaults.task.max_attempts 1",
   "agent add crasher --adapter claude --quiet",
   "task add 'A task whose agent dies' --assignee ${agent.0} --quiet",
-  "serve --once --log-format json",
+  # The tick stream is a wall-clock heartbeat: how many ticks fire before
+  # a run finishes, and which tasks are running when one does, differ
+  # between two independently-timed processes. Every other record is
+  # compared.
+  "@ticks-vary:heartbeat-is-timing serve --once --log-format json",
   "task list --json",
   "status --json",
 ]

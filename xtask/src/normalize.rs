@@ -82,6 +82,7 @@ impl Normalizer {
         let text = self.replace_roots(&text);
         let text = self.replace_ids(&text);
         let text = replace_timestamps(&text);
+        let text = replace_clock_times(&text);
         replace_pids_and_durations(&text)
     }
 
@@ -347,6 +348,59 @@ fn timestamp_end(b: &[u8], i: usize) -> Option<usize> {
 }
 
 /// `"pid": <n>` → `<PID>`, and the measured-duration fields of §1.4.
+/// Wall-clock times in human output → `<TIME>`.
+///
+/// `run <id>`, `run --watch` and `logs` stamp each line with
+/// `toLocaleTimeString`, i.e. local `HH:MM:SS` (or `HH:MM` in watch mode).
+/// The two binaries run seconds apart, so those differ for the same reason
+/// an ISO instant does — §1.4 normalizes timestamps, and this is one in a
+/// different coat.
+///
+/// Deliberately anchored: both halves must be exactly two digits and the
+/// match must not start or end inside a longer run of digits, so an id or a
+/// number with a colon in it is left alone.
+fn replace_clock_times(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if let Some(end) = clock_time_end(bytes, i) {
+            out.push_str("<TIME>");
+            i = end;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// End offset of an `HH:MM[:SS]` starting at `i`, if there is one.
+fn clock_time_end(b: &[u8], i: usize) -> Option<usize> {
+    let digit = |at: usize| b.get(at).is_some_and(u8::is_ascii_digit);
+    // Not in the middle of a longer number, nor the tail of a longer
+    // colon-separated run — `01:02:03:04` is not two times.
+    if i > 0 && (b[i - 1].is_ascii_digit() || b[i - 1] == b':') {
+        return None;
+    }
+    if !(digit(i) && digit(i + 1) && b.get(i + 2) == Some(&b':') && digit(i + 3) && digit(i + 4)) {
+        return None;
+    }
+    let mut end = i + 5;
+    if b.get(end) == Some(&b':') && digit(end + 1) && digit(end + 2) {
+        end += 3;
+    }
+    // …and not followed by more digits or another `:` group.
+    if b.get(end)
+        .is_some_and(|next| next.is_ascii_digit() || *next == b':')
+    {
+        return None;
+    }
+    Some(end)
+}
+
 fn replace_pids_and_durations(text: &str) -> String {
     let mut out = text.to_owned();
     for key in ["pid", "total_runtime_ms"] {
@@ -673,5 +727,20 @@ mod tests {
             n.mapping().get("tsk_AAAAAAA").map(String::as_str),
             Some("<tsk_1>")
         );
+    }
+
+    #[test]
+    fn a_clock_time_is_masked_but_a_number_with_a_colon_is_not() {
+        let mut norm = Normalizer::new();
+        assert_eq!(
+            norm.text("  20:33:09  \u{25b8} output\n"),
+            "  <TIME>  \u{25b8} output\n"
+        );
+        // Watch mode's minute precision.
+        assert_eq!(norm.text("19:24  \u{2713} DONE"), "<TIME>  \u{2713} DONE");
+        // Not a time: three groups, or digits either side.
+        for untouched in ["01:02:03:04", "123:45", "12:345", "1:02:03"] {
+            assert_eq!(norm.text(untouched), untouched, "{untouched}");
+        }
     }
 }

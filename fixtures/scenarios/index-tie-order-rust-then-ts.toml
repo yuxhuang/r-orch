@@ -1,0 +1,24 @@
+name = "index-tie-order-rust-then-ts"
+kind = "rust_then_ts"
+split_at = 5
+description = """
+The cross-compat half of index-tie-order: r-orch creates the project and \
+re-saves `agt_creator`, moving it to the end of `_index.json`; the TypeScript \
+binary then reads that index, adds its own agent and lists. If our index \
+writer reordered wrongly — or wrote a shape js-yaml reads differently — the \
+verify steps diverge, because both binaries list the same directory."""
+verify = [
+  "agent list",
+  "agent list --quiet",
+  "task list --json",
+]
+steps = [
+  "init --name proj --adapter claude",
+  "agent add shelly --adapter shell --command 'echo hello'",
+  "agent add tess --adapter shell --command 'echo tess'",
+  "agent disable agt_creator",
+  "task add 'Written by rust'",
+  "agent add ts-added --adapter shell --command 'echo ts'",
+  "agent enable agt_creator",
+  "task add 'Written by ts'",
+]

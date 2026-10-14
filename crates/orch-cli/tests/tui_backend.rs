@@ -866,7 +866,7 @@ async fn poll_history_is_empty_for_a_project_with_no_finished_runs() {
 // ── watch mode ───────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stop_watch_returns_at_once_and_the_shutdown_arrives_on_the_bus() {
+async fn stop_watch_waits_for_the_stop_and_releases_the_lock() {
     let (temp, engine) = project().await;
     let backend = launch(Arc::clone(&engine)).await;
     assert!(engine.orchestrator.is_owner());
@@ -876,16 +876,47 @@ async fn stop_watch_returns_at_once_and_the_shutdown_arrives_on_the_bus() {
         backend.stop_watch().expect("stop watch");
     })
     .await;
+
+    // Awaited, not spawned: by the time the call returns the orchestrator has
+    // stopped and the lock is gone. The reference `await`s `onStopWatch` too,
+    // and spawning would mean a failed stop could only be reported as
+    // `orchestrator:error`, which nothing renders — so `/pause` would claim to
+    // have paused a loop that is still running.
+    assert!(
+        !engine.orchestrator.is_owner(),
+        "stop_watch returned before the lock was released"
+    );
     assert!(!backend.is_watch_active());
 
-    // Spawned, so the lock release happens after the call returned.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while engine.orchestrator.is_owner() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("watch mode never stopped");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_stop_watch_reports_the_error_and_keeps_the_watch_flag() {
+    let (temp, engine) = project().await;
+    let backend = launch(Arc::clone(&engine)).await;
+    assert!(backend.is_watch_active());
+
+    // `stop()` persists the cleared state, so a state file that cannot be
+    // written is the one way it fails. A *directory* in its place is the
+    // cheapest unwritable file: the running orchestrator would simply
+    // recreate a deleted one.
+    let state_path = engine.paths.state_path();
+    let _ = tokio::fs::remove_file(&state_path).await;
+    tokio::fs::create_dir_all(&state_path)
+        .await
+        .expect("block state.json");
+
+    let (backend, result) = on_draw_thread(backend, |backend| backend.stop_watch()).await;
+
+    let err = result.expect_err("a failed stop must reach the caller");
+    assert!(!err.is_empty(), "the message is the whole contract");
+    // The flag describes the watch loop, so it must not claim a pause that
+    // did not happen.
+    assert!(
+        backend.is_watch_active(),
+        "watch_active was cleared despite the failure"
+    );
 
     drop(temp);
 }
@@ -953,6 +984,77 @@ async fn in_observer_mode_a_refresh_sees_another_process_writing_state() {
     // in observer mode the periodic poll is the only thing moving, so a cached
     // read would freeze the dashboard at launch for as long as it is open.
     assert_eq!(observed.pid, Some(4242));
+
+    orch_engine::ProjectLock::release(&held).await;
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_observer_mode_the_disk_observer_feeds_the_event_queue() {
+    // The wiring `tui::command::run` does when watch mode is refused. Without
+    // it an observer-mode dashboard re-reads the stores on every refresh but
+    // never sees a live event, which is the half the TS gets from
+    // `onSubscribeEvents = handler => diskObserver.subscribe(handler)`.
+    let (temp, engine) = project().await;
+    let held = orch_engine::FileLock::new(engine.paths.lock_path());
+    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
+
+    let backend = launch(Arc::clone(&engine)).await;
+    assert!(backend.context().observer_mode, "expected observer mode");
+    let observer = orch_cli::tui::command::attach_observer(&engine, backend.observer_sink());
+
+    // Another process starts a run: a `running` entry appears in state.json,
+    // which is all the observer needs to announce it.
+    let external = build_isolated(temp.path()).await.expect("second engine");
+    let mut state = external.state.read().await.expect("read state");
+    state.running.insert(
+        "tsk_watched".to_owned(),
+        orch_domain::RunningEntry {
+            run_id: "run_watched".to_owned(),
+            agent_id: "agt_watched".to_owned(),
+            task_id: "tsk_watched".to_owned(),
+            pid: 4242,
+            started_at: "2026-10-13T16:00:00.000Z".to_owned(),
+            last_event_at: "2026-10-13T16:00:00.000Z".to_owned(),
+        },
+    );
+    external.state.write(&state).await.expect("write state");
+
+    // The observer polls on its own interval, so this waits rather than
+    // assuming the first poll has already happened.
+    let mut backend = backend;
+    let mut started = None;
+    for _ in 0..80 {
+        let (returned, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
+        backend = returned;
+        started = events.into_iter().find(|event| {
+            matches!(
+                event,
+                orch_domain::OrchestratorEvent::AgentStarted { run_id, .. }
+                    if run_id == "run_watched"
+            )
+        });
+        if started.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        started.is_some(),
+        "the observer never reported the external run"
+    );
+
+    // Dropping the handle is the `unsubscribe`: nothing more arrives.
+    drop(observer);
+    let mut state = external.state.read().await.expect("read state");
+    state.running.clear();
+    external.state.write(&state).await.expect("write state");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_backend, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
+    assert!(
+        events.is_empty(),
+        "the observer kept polling after its handle was dropped: {events:?}"
+    );
 
     orch_engine::ProjectLock::release(&held).await;
     drop(temp);

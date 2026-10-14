@@ -634,3 +634,110 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
     Trimming before storing passes every rejection test and diverges on every
     message anyone sends with a trailing newline.
     Covered by `cmd-msg-body-trimming.toml`.
+
+14. **The oracle's `run` and `serve --once` do not dispatch anything from the
+    CLI — the process exits first.** `orch run <id>` and
+    `orch serve --once` print their header and exit **0** having done nothing:
+    the task stays `todo`, no run record is written, and
+    `.orchestry/orchestry.lock` plus a stale `claimed` entry are left behind.
+    Reproduced outside the harness, inside a git repo and outside one, in
+    `worktree` and `shared` workspace modes, on node 24.21.0. The same
+    invocation under a `node -r <preload>` that holds the event loop open with
+    an interval timer completes the task correctly, so every await does
+    resolve — the process simply exits before they do.
+
+    The mechanism is `ProcessManager.spawn` (`process-manager.ts:63-77`),
+    which `unref()`s every child on the stated assumption that "pipes
+    (stdout/stderr) still hold refs while being read", plus the callers that
+    never read them —`WorkspaceManager.spawnAndWait`
+    (`workspace-manager.ts:171-181`) awaits `close` with no `data` listener.
+    Seven lines reproduce it with no ORCH code at all:
+
+    ```js
+    const p = spawn('sh', ['-c', 'sleep 1'],
+      { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    p.unref();
+    new Promise((r) => p.on('close', r)).then((c) => console.log('close', c));
+    // → node exits 0 immediately; `close` never fires
+    ```
+
+    The oracle's own vitest suite cannot see this: it drives the orchestrator
+    in-process, where vitest keeps the loop alive. `unref()` has these
+    semantics on every supported node, so an older runtime is unlikely to
+    change it.
+
+    Consequence for the corpus: `v7-run-single-task` and all nine `o7-*`
+    scenarios cannot be compared against the oracle as written —
+    r-orch does the work and the oracle does nothing, so every artifact
+    differs. `v7-run-cross-compat` is unaffected, because there the oracle
+    only *reads* what r-orch wrote. Needs a decision: patch the vendored
+    oracle (recorded as such), convert those ten to rust-only snapshots, or
+    leave them red. Not something r-orch can or should reproduce.
+
+15. **`review` is not terminal, so `serve --once` waits forever for a task
+    that lands there.** Both implementations' `waitForAllTerminal` poll until
+    every task `isTerminal`, and `review` is not — by design, since a task
+    without `review_criteria` is auto-approved only when its agent's
+    `approval_policy` is `auto`. `o7-concurrency-cap` dispatches six tasks to
+    agents that mostly lack that policy, so it cannot terminate in either
+    implementation; it needs `task approve` steps or auto-policy agents. The
+    harness now reports a timed-out step as a scenario failure rather than
+    aborting the whole run.
+
+16. **`Orchestrator::stop()` aborted the task it was running in, so `serve`
+    and `run --watch` ignored Ctrl+C.** `stop()` takes the stored watch-loop
+    `JoinHandle` and aborts it — but both the signal arms and the tick circuit
+    breaker call `stop()` **from inside that very task**, so it cancelled
+    itself at the next await that actually pends. In the real binary that is
+    the state save, which happens *before* the lock release and before
+    `stopped.send(true)`, so `wait_for_stop()` never returned: `orch run
+    --watch` and `orch serve` printed `Shutting down…` and then sat there
+    until something killed them, leaving `.orchestry/orchestry.lock` behind.
+
+    Invisible to the orchestrator's own tests, which is why it survived: with
+    the in-memory fakes nothing inside `stop()` ever pends, so the task runs
+    to completion even while cancelled, and `tests/resilience.rs` drives
+    `handle_signal` from the *test* task rather than from the loop.
+
+    Fixed by not aborting the watch task at all: `shutdown.cancel()` already
+    stops future ticks, which is exactly what `clearInterval(this.timer)`
+    does in the reference, and the arm that called `stop()` breaks
+    immediately after. The abort was cancelling the *tick* as well, and a
+    tick cancelled between `atomic_write`'s temp file and its rename left
+    `.orchestry/.state.json.<hash>.tmp` behind — litter the reference cannot
+    produce, since `clearInterval` cannot interrupt a running callback. That
+    one surfaced as a flaky tree difference in `o7-serve-once-exit-codes`.
+
+    Covered end to end by `crates/orch-cli/tests/watch_shutdown.rs`, at the
+    only level where it is real: SIGINT to `run --watch`, SIGTERM to `serve`,
+    both asserting the process exits and the lock file is gone.
+
+17. **`heap_mb` has no Rust counterpart.** The `orchestrator:tick` log record
+    carries `heap_mb = +(process.memoryUsage().heapUsed / 1_048_576)
+    .toFixed(1)` (PARITY §16.4). A Rust process has no V8 heap, and reporting
+    RSS under that name would be a different metric wearing this one's label,
+    so r-orch emits `0.0` — the field stays, because the record *shape* is
+    contract — and the harness masks the value the way it masks pids and
+    durations (§1.4). Decide in §14 whether the honest zero or an RSS figure
+    is wanted; nothing downstream reads it.
+
+18. **The tick stream is a wall-clock heartbeat, not a sequence.** How many
+    `orchestrator:tick` records appear before a run finishes, and which tasks
+    are running when one fires, differ between two independently-timed
+    processes: measured as a `running: 2` tick on one side against
+    `running: 1` on the other (`o7-concurrency-cap`), and one extra tick
+    before a stall was detected (`o7-stall-detection`). The scenarios that
+    compare records therefore carry `@ticks-vary:<reason>`, which drops tick
+    records and keeps every other one — dispatch, completion, retries,
+    stalls, shutdown. Separately, human output stamped with
+    `toLocaleTimeString` (`run`, `run --watch`, `logs`) normalizes to
+    `<TIME>`: the two binaries start seconds apart.
+
+19. **`kill(pid 0)` signals the caller's own process group.** Both
+    `kill(-0)` and `kill(0)` do, in C and in node, so a stale or absent pid
+    in `state.json` would have had the orchestrator SIGTERM itself along with
+    every agent it started. `SystemProcessManager::kill` refuses pid 0 and
+    `is_alive(0)` is false. Not replicated from the reference, which has the
+    same hazard: a process that kills itself because a pid field was missing
+    is not behaviour, and nothing observable depends on it. The test can only
+    fail by killing the test runner.

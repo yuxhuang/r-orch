@@ -205,16 +205,11 @@ impl EngineBackend {
         self.handle.block_on(future)
     }
 
-    /// Report a background failure the way the dashboard can see it: the TS
-    /// callbacks `await` and surface a rejection, but a spawned call has no
-    /// caller left to reject to, so it goes on the bus instead.
-    fn report(engine: &FullEngine, err: impl std::fmt::Display, context: &str) {
-        engine.events.emit(OrchestratorEvent::OrchestratorError {
-            error: err.to_string(),
-            context: context.to_owned(),
-            fatal: false,
-        });
-    }
+    // There was a `report` helper here that put a background failure on the
+    // bus as `orchestrator:error`. Nothing is left to call it, which is the
+    // point: every method that can fail is awaited now, because the dashboard
+    // has no renderer for that event (docs/parity/tui.md §12.10) and a failure
+    // reported only there is a failure nobody sees.
 
     /// Read-modify-write: the engine's `GlobalConfigStore` is whole-document,
     /// where the TS store has a per-key `set`.
@@ -603,16 +598,17 @@ impl TuiBackend for EngineBackend {
         Ok(())
     }
 
-    /// Spawned: `stop` kills every running agent with a 10 s grace, which must
-    /// not hold a frame. The dashboard learns it finished from
-    /// `orchestrator:shutdown`.
+    /// Awaited, like its siblings. `stop` can take up to the kill grace, so
+    /// this holds a frame for that long — which is what the reference does
+    /// too (`await onStopWatch()`), and the alternative is worse: spawned, a
+    /// failure could only be reported as `orchestrator:error`, which the
+    /// dashboard has no renderer for, so `/pause` would claim to have paused a
+    /// watch loop that is still running.
+    ///
+    /// `watch_active` therefore flips **only on success**.
     fn stop_watch(&mut self) -> BackendResult<()> {
-        let engine = Arc::clone(&self.engine);
-        self.handle.spawn(async move {
-            if let Err(err) = engine.orchestrator.stop().await {
-                EngineBackend::report(&engine, err, "tui stop watch");
-            }
-        });
+        self.block_on(self.engine.orchestrator.stop())
+            .map_err(to_message)?;
         self.watch_active = false;
         Ok(())
     }

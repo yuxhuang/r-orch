@@ -133,6 +133,11 @@ impl Styles {
         self.paint(Color::Green, name)
     }
 
+    /// A workspace or attachment path, purple as `filePath` paints it.
+    pub fn file_path(&self, path: &str) -> String {
+        self.paint(Color::Purple, path)
+    }
+
     /// The coloured glyph for a task or agent status.
     pub fn status_icon(&self, status: &str) -> String {
         let (icon, color) = match status {
@@ -311,6 +316,19 @@ pub fn format_duration(ms: i64) -> String {
     let hours = minutes.div_euclid(60);
     let mins = minutes.rem_euclid(60);
     format!("{hours}h{mins:02}m")
+}
+
+/// `formatDurationSince(iso)` = `formatDuration(Date.now() - t)`.
+///
+/// **Unclamped**, so a future timestamp renders negative — which is how
+/// `context list` shows a live TTL as `-60s` (PARITY.md §22.6).
+pub fn format_duration_since(timestamp: &str) -> String {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let then = timestamp
+        .parse::<jiff::Timestamp>()
+        .map(|ts| ts.as_millisecond())
+        .unwrap_or(now);
+    format_duration(now - then)
 }
 
 /// `1.2k` at or above 1000, the plain integer below.

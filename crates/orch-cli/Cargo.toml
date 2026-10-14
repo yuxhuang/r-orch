@@ -33,9 +33,15 @@ orch-tui.workspace = true
 
 # anyhow is allowed here and in xtask only — never in a library signature.
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
+# Raw mode and key events for the agent shop picker (§21.2). The TUI owns the
+# dashboard; this is one modal list.
+crossterm.workspace = true
 futures.workspace = true
 indexmap.workspace = true
+# `logs` renders event times in the local zone, as `toLocaleTimeString` does.
+jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = [
@@ -49,9 +55,10 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 tokio-util.workspace = true
-# Real `mkdtemp` for the TUI's clipboard-paste directory (docs/parity/tui.md
-# §8.2): atomic, 0700 and collision-free, which a hand-built name is not.
-# Already a production dependency of orch-infra.
+# `$EDITOR` buffers live in a temporary directory, as in the reference, and
+# the TUI's clipboard-paste directory needs a real `mkdtemp` (docs/parity/
+# tui.md §8.2): atomic, 0700 and collision-free, which a hand-built name is
+# not. Already a production dependency of orch-infra.
 tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

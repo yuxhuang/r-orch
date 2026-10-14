@@ -233,6 +233,12 @@ pub struct StepOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    /// The step outlived the scenario's budget and was killed.
+    ///
+    /// A **scenario failure**, not a harness error: one non-terminating step
+    /// must not abort the whole corpus, or a single hang hides every other
+    /// result. The partial output is kept and reported with it.
+    pub timed_out: bool,
 }
 
 /// A prepared, hermetic project directory.
@@ -320,54 +326,142 @@ fn git(cwd: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Which subcommands the Rust binary actually has.
+/// Which subcommands the Rust binary has **wired**, as opposed to declared.
 ///
-/// Probed with `<cmd> --help`, which clap answers during parsing: exit 0 for a
-/// command it knows, non-zero (`unrecognized subcommand`) for one it does not.
-/// That happens before the container is built, so an uninitialized directory
-/// does not confuse it.
+/// `<cmd> --help` is no longer a sufficient probe on its own. WP-5a declares
+/// the whole command tree so that V1's surface check is honest — every
+/// command, subcommand, alias and flag of PARITY.md §2.2 exists and parses —
+/// so `--help` answered yes for commands whose service was not wired yet, and
+/// scenarios ran against them: neither a skip nor a real failure, and a
+/// `${goal.0}` placeholder in such a scenario aborted the whole suite because
+/// no goal was ever created.
 ///
-/// No `Default`: a `Capabilities` without its sandbox would probe with the
-/// inherited cwd and HOME, which is the bug this type was fixed for. Use
-/// [`Capabilities::new`].
-#[derive(Debug)]
+/// So the probe is an explicit list, intersected with the `--help` check (so a
+/// misspelled requirement still skips rather than silently passing). Every
+/// declared command is wired now, which makes the list a ratchet rather than a
+/// gate: a command removed from it stops its scenarios instead of letting
+/// them fail.
+const WIRED_COMMANDS: &[&str] = &[
+    "agent add",
+    "agent autonomous",
+    "agent disable",
+    "agent edit",
+    "agent enable",
+    "agent list",
+    "agent remove",
+    "agent shop",
+    "agent status",
+    "config edit",
+    "config get",
+    "config global get",
+    "config global set",
+    "config global show",
+    "config set",
+    "context delete",
+    "context get",
+    "context list",
+    "context set",
+    "doctor",
+    "goal add",
+    "goal delete",
+    "goal list",
+    "goal show",
+    "goal status",
+    "goal update",
+    "init",
+    "logs",
+    "msg broadcast",
+    "msg inbox",
+    "msg list",
+    "msg send",
+    "org deploy",
+    "org list",
+    "run",
+    "serve",
+    "status",
+    "task add",
+    "task approve",
+    "task assign",
+    "task cancel",
+    "task edit",
+    "task list",
+    "task reject",
+    "task retry",
+    "task show",
+    "team add-task",
+    "team create",
+    "team disband",
+    "team join",
+    "team leave",
+    "team list",
+    "team set-lead",
+    "team show",
+    "tui",
+    "update",
+];
+
+/// Which subcommands the Rust binary has wired, probed once per run.
+///
+/// The probe runs inside an **initialized project of its own**, and this is
+/// not a detail: `<cmd> --help` builds the container before Commander parses
+/// (PARITY.md §3), so in a directory that is not a project it exits **3**
+/// (`Not initialized`) and every command looks absent — silently skipping the
+/// entire corpus, since a skip is not a failure. Found by a mutation probe
+/// that came back "detected" by two scenarios instead of twenty-nine.
+///
+/// The project also carries its own `HOME`. Without one the container
+/// resolves its root by **walking up**, so once `~/.orchestry` existed every
+/// probe latched onto the developer's own home as the project and could
+/// create directories in it — fifteen probes per run, every run.
 pub struct Capabilities {
     probed: std::cell::RefCell<BTreeMap<String, bool>>,
-    /// An empty directory with its own `HOME`, for the probes to run in.
-    ///
-    /// The probe used to inherit the harness's cwd and `HOME`, which meant
-    /// running `orch <cmd> --help` from inside the repository with the
-    /// developer's real home. `--help` in an uninitialized directory still
-    /// builds the container first (PARITY.md §3), and the container resolves
-    /// its project root by **walking up** — so once `~/.orchestry` existed,
-    /// every probe latched onto the developer's own home as the project and
-    /// could create directories in it. Fifteen probes per run, every run.
-    ///
-    /// `None` only if a tempdir cannot be made, in which case the probe falls
-    /// back to the inherited environment rather than failing the harness —
-    /// reported by `probe_isolation_note`.
-    sandbox: Option<tempfile::TempDir>,
+    project: std::cell::OnceCell<Project>,
 }
 
 impl Capabilities {
     pub fn new() -> Self {
         Capabilities {
             probed: std::cell::RefCell::new(BTreeMap::new()),
-            sandbox: tempfile::Builder::new()
-                .prefix("r-orch-probe-home-")
-                .tempdir()
-                .ok(),
+            project: std::cell::OnceCell::new(),
         }
     }
 
     /// Why probing is not isolated, if it is not.
+    ///
+    /// Always `None` now: the probe project is created eagerly on first use
+    /// and a failure to create it is fatal, so there is no un-isolated
+    /// fallback left to warn about. Kept because the caller prints it, and
+    /// because a future probe that cannot be sandboxed should say so here
+    /// rather than quietly inheriting the developer's environment.
     pub fn isolation_note(&self) -> Option<&'static str> {
-        self.sandbox.as_ref().map_or(
-            Some(
-                "could not create a tempdir for capability probing, so probes run with the                  inherited cwd and HOME — a probe may then resolve the developer's own                  ~/.orchestry as its project",
-            ),
-            |_| None,
-        )
+        None
+    }
+
+    /// The initialized project every probe runs in, created on first use.
+    fn probe_project(&self, bins: &Binaries) -> &Project {
+        self.project.get_or_init(|| {
+            let project =
+                Project::create("capability-probe").expect("create the capability-probe project");
+            let status = Command::new(&bins.rust)
+                .args(["init", "--name", "probe", "--adapter", "claude"])
+                .current_dir(&project.root)
+                .env("HOME", &project.home)
+                .env("USERPROFILE", &project.home)
+                .env(
+                    "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                    project.home.join(".orchestry/global.yml"),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run init in the capability-probe project");
+            assert!(
+                status.success(),
+                "init failed in the capability-probe project; every `requires` would skip"
+            );
+            project
+        })
     }
 
     /// Every requirement this scenario declares that the Rust binary lacks.
@@ -383,30 +477,28 @@ impl Capabilities {
         if let Some(known) = self.probed.borrow().get(command) {
             return *known;
         }
+        // Declared *and* wired. The `--help` half catches a requirement that
+        // names a command the tree does not have at all — a typo in a
+        // scenario, or one written against a renamed verb.
         let argv = shell_words::split(command).unwrap_or_default();
-        let mut probe = Command::new(&bins.rust);
-        probe
+        let project = self.probe_project(bins);
+        let declared = Command::new(&bins.rust)
             .args(&argv)
             .arg("--help")
+            .current_dir(&project.root)
+            .env("HOME", &project.home)
+            .env("USERPROFILE", &project.home)
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                project.home.join(".orchestry/global.yml"),
+            )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // An empty directory with nothing above it: no project to walk up to,
-        // and a HOME that is not the developer's.
-        if let Some(sandbox) = self.sandbox.as_ref() {
-            probe
-                .current_dir(sandbox.path())
-                .env("HOME", sandbox.path())
-                .env("USERPROFILE", sandbox.path())
-                .env(
-                    "ORCHESTRY_GLOBAL_CONFIG_PATH",
-                    sandbox.path().join("global.yml"),
-                );
-        }
-        let supported = probe
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
+        let supported = declared && WIRED_COMMANDS.contains(&command);
         self.probed
             .borrow_mut()
             .insert(command.to_owned(), supported);
@@ -495,7 +587,13 @@ pub fn run_scenario(
             if output.runner == "ts" {
                 failures.extend(usage_error_failure(scenario, step, &output.stderr));
             }
-            if output.exit_code != 0 {
+            // A `@kill-after` step is killed on purpose, so its exit code is
+            // whatever the signal produced — the scenario's subject is the
+            // tree the *next* step finds, not this step's status.
+            if output.exit_code != 0
+                && Scenario::kill_after(step).is_none()
+                && Scenario::stop_after(step).is_none()
+            {
                 failures.push(format!(
                     "step `{step}` ({}) exited {} — cross-compat steps must all succeed\n\
                      stdout: {}\nstderr: {}",
@@ -503,6 +601,15 @@ pub fn run_scenario(
                     output.exit_code,
                     output.stdout.trim(),
                     output.stderr.trim()
+                ));
+            }
+            if output.timed_out {
+                failures.push(format!(
+                    "step `{step}`: the {} binary did not finish within {:?} and was \
+                     killed — the shared tree is left mid-flight, so nothing after this \
+                     step is comparable",
+                    output.runner,
+                    scenario.timeout()
                 ));
             }
             outputs.push(output);
@@ -519,6 +626,13 @@ pub fn run_scenario(
             let rust_out = execute(bins, &project, scenario, step, Runner::Rust, &ids)?;
             let ts_out = execute(bins, &project, scenario, step, Runner::Ts, &ids)?;
 
+            if rust_out.timed_out || ts_out.timed_out {
+                failures.push(format!(
+                    "verify `{step}`: a binary did not finish within {:?} and was killed",
+                    scenario.timeout()
+                ));
+                continue;
+            }
             if rust_out.exit_code != ts_out.exit_code {
                 failures.push(format!(
                     "verify `{step}`: exit code {} (rust) vs {} (ts) over the shared tree",
@@ -543,6 +657,59 @@ pub fn run_scenario(
                     }
                     Err(problem) => Some(("status --json", problem)),
                 }
+            } else if toolchain_mask::applies_to(&verify_argv) {
+                // §13, over one shared tree: the row's position is still
+                // contract, and a missing row on either side is a failure
+                // rather than a free pass.
+                match (
+                    toolchain_mask::mask(&rust_out.stdout),
+                    toolchain_mask::mask(&ts_out.stdout),
+                ) {
+                    (Some((rust_masked, rust_row)), Some((ts_masked, ts_row))) => {
+                        if rust_row != ts_row {
+                            Some((
+                                "doctor toolchain row position",
+                                format!(
+                                    "§13 keeps the row's position; it moved\n    ts:   line \
+                                     {ts_row}\n    rust: line {rust_row}"
+                                ),
+                            ))
+                        } else {
+                            let left = norm.text(&rust_masked);
+                            let right = norm.text(&ts_masked);
+                            (left != right).then(|| {
+                                (
+                                    "doctor output (toolchain row masked, §13)",
+                                    unified_diff(&right, &left),
+                                )
+                            })
+                        }
+                    }
+                    (rust_row, ts_row) => Some((
+                        "doctor output",
+                        format!(
+                            "no toolchain row to mask, so the comparison would assert nothing \
+                             — §13 says the row keeps its position and format (present in \
+                             rust: {}, in ts: {})",
+                            rust_row.is_some(),
+                            ts_row.is_some()
+                        ),
+                    )),
+                }
+            } else if let Some((rust_doc, ts_doc)) =
+                json_documents(&rust_out.stdout, &ts_out.stdout)
+            {
+                json_framing_diff(&rust_out.stdout, &ts_out.stdout).or_else(|| {
+                    let unordered = Scenario::unordered(step);
+                    let left = as_compared(&norm.value(&rust_doc), unordered);
+                    let right = as_compared(&norm.value(&ts_doc), unordered);
+                    (left != right).then(|| {
+                        (
+                            "json document",
+                            unified_diff(&pretty(&right), &pretty(&left)),
+                        )
+                    })
+                })
             } else {
                 let left = norm.text(&rust_out.stdout);
                 let right = norm.text(&ts_out.stdout);
@@ -606,6 +773,25 @@ pub fn run_scenario(
 
             failures.extend(usage_error_failure(scenario, step, &ts_out.stderr));
 
+            // A step that had to be killed says nothing about parity, and its
+            // partial output would produce a misleading diff — so it is
+            // reported on its own and the rest of the step is skipped.
+            let timed_out: Vec<&str> = [(&rust_out, "rust"), (&ts_out, "ts")]
+                .into_iter()
+                .filter(|(out, _)| out.timed_out)
+                .map(|(_, label)| label)
+                .collect();
+            if !timed_out.is_empty() {
+                failures.push(format!(
+                    "step `{step}`: {} did not finish within {:?} and was killed — \
+                     either the command does not terminate (`run --watch`, `serve` without \
+                     `--once`) or the scenario waits for a status the tasks never reach \
+                     (`review` is not terminal)",
+                    timed_out.join(" and "),
+                    scenario.timeout()
+                ));
+                continue;
+            }
             if rust_out.exit_code != ts_out.exit_code {
                 failures.push(format!(
                     "step `{step}`: exit code {} (rust) vs {} (ts)",
@@ -644,8 +830,9 @@ pub fn run_scenario(
                                 ),
                             ))
                         } else {
-                            let left = rust_norm.value(&rust_doc);
-                            let right = ts_norm.value(&ts_doc);
+                            let unordered = Scenario::unordered(step);
+                            let left = as_compared(&rust_norm.value(&rust_doc), unordered);
+                            let right = as_compared(&ts_norm.value(&ts_doc), unordered);
                             (left != right).then(|| {
                                 (
                                     "status --json (state.claimed masked, §14.1)",
@@ -694,9 +881,24 @@ pub fn run_scenario(
                         ),
                     )),
                 }
+            } else if let Some((rust_doc, ts_doc)) =
+                json_documents(&rust_out.stdout, &ts_out.stdout)
+            {
+                json_framing_diff(&rust_out.stdout, &ts_out.stdout).or_else(|| {
+                    let unordered = Scenario::unordered(step);
+                    let left = as_compared(&rust_norm.value(&rust_doc), unordered);
+                    let right = as_compared(&ts_norm.value(&ts_doc), unordered);
+                    (left != right).then(|| {
+                        (
+                            "json document",
+                            unified_diff(&pretty(&right), &pretty(&left)),
+                        )
+                    })
+                })
             } else if scenario.stdout_is_json_records(step) {
-                let left = json_records(&rust_out.stdout, &mut rust_norm);
-                let right = json_records(&ts_out.stdout, &mut ts_norm);
+                let drop_ticks = Scenario::ticks_vary(step);
+                let left = json_records(&rust_out.stdout, &mut rust_norm, drop_ticks);
+                let right = json_records(&ts_out.stdout, &mut ts_norm, drop_ticks);
                 (left != right).then(|| {
                     (
                         "log records",
@@ -725,7 +927,11 @@ pub fn run_scenario(
         let mut rust_tree = collect_tree(&rust.root, &mut rust_norm)?;
         let mut ts_tree = collect_tree(&ts.root, &mut ts_norm)?;
         failures.extend(exclude_tree_paths(scenario, &mut rust_tree, &mut ts_tree));
-        failures.extend(compare_trees(&rust_tree, &ts_tree));
+        failures.extend(compare_trees(
+            &rust_tree,
+            &ts_tree,
+            &scenario.unordered_files,
+        ));
         failures.extend(claimed_matches_state_file(&masked_claimed, &rust_tree));
 
         failures.extend(cross_parse_failures(bins, &rust)?);
@@ -846,6 +1052,7 @@ fn execute(
             stdout: String::new(),
             stderr: String::new(),
             exit_code: 0,
+            timed_out: false,
         });
     }
 
@@ -889,9 +1096,10 @@ fn execute(
         .env_remove("ORCHESTRY_DEBUG")
         .stdin(std::process::Stdio::null());
 
-    let output = match Scenario::kill_after(step) {
-        Some(after) => run_and_kill(command, after, label, step)?,
-        None => run_with_timeout(command, scenario.timeout(), label, step)?,
+    let (output, timed_out) = match (Scenario::kill_after(step), Scenario::stop_after(step)) {
+        (Some(after), _) => (run_and_kill(command, after, label, step)?, false),
+        (None, Some(after)) => (run_and_stop(command, after, label, step)?, false),
+        (None, None) => run_with_timeout(command, scenario.timeout(), label, step)?,
     };
 
     Ok(StepOutput {
@@ -900,8 +1108,68 @@ fn execute(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(-1),
+        timed_out,
     })
 }
+
+/// Run a step, `SIGTERM` it after `after`, and wait for it to shut down.
+///
+/// For a watch-mode orchestrator, which does not return on its own: this is
+/// what a real operator's Ctrl+C does, so the tree the next step reads is a
+/// cleanly shut-down one — agents reaped, lock released. A `SIGKILL` would
+/// leave the lock file behind with a different pid per tree, and the steps
+/// after it would be comparing wreckage.
+fn run_and_stop(
+    mut command: Command,
+    after: std::time::Duration,
+    label: &str,
+    step: &str,
+) -> Result<std::process::Output> {
+    let scratch = tempfile::tempdir().context("create stdio scratch dir")?;
+    let (out_path, err_path) = (scratch.path().join("stdout"), scratch.path().join("stderr"));
+    command
+        .stdout(std::fs::File::create(&out_path).context("create stdout file")?)
+        .stderr(std::fs::File::create(&err_path).context("create stderr file")?);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn {label} step `{step}`"))?;
+
+    std::thread::sleep(after);
+    let status = match child.try_wait().context("poll child")? {
+        // It finished on its own, which is fine: the point is that it did not
+        // outlive the budget.
+        Some(status) => status,
+        None => {
+            // `kill(1)` rather than `Child::kill`, which is SIGKILL.
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+            loop {
+                match child.try_wait().context("poll child")? {
+                    Some(status) => break status,
+                    None if std::time::Instant::now() >= deadline => {
+                        // A shutdown that needs SIGKILL is a finding in
+                        // itself; the scenario then sees the exit code.
+                        let _ = child.kill();
+                        break child.wait().context("reap the killed child")?;
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        }
+    };
+
+    Ok(std::process::Output {
+        status,
+        stdout: std::fs::read(&out_path).context("read captured stdout")?,
+        stderr: std::fs::read(&err_path).context("read captured stderr")?,
+    })
+}
+
+/// How long a `@stop-after` step gets to shut down before it is killed.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Run a step and `SIGKILL` it after `after`, for the crash-recovery
 /// scenarios. The exit code is whatever the kill produced, which the scenario
@@ -983,7 +1251,7 @@ fn run_with_timeout(
     timeout: std::time::Duration,
     label: &str,
     step: &str,
-) -> Result<std::process::Output> {
+) -> Result<(std::process::Output, bool)> {
     let scratch = tempfile::tempdir().context("create stdio scratch dir")?;
     let (out_path, err_path) = (scratch.path().join("stdout"), scratch.path().join("stderr"));
     command
@@ -995,27 +1263,27 @@ fn run_with_timeout(
         .with_context(|| format!("spawn {label} step `{step}`"))?;
 
     let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
     let status = loop {
         match child.try_wait().context("poll child")? {
             Some(status) => break status,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
-                bail!(
-                    "{label} step `{step}` did not finish within {timeout:?} — a \
-                     non-terminating command (`run --watch`, `serve` without `--once`) \
-                     cannot be a scenario step"
-                );
+                timed_out = true;
+                break child.wait().context("reap the timed-out child")?;
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     };
 
-    Ok(std::process::Output {
-        status,
-        stdout: std::fs::read(&out_path).context("read captured stdout")?,
-        stderr: std::fs::read(&err_path).context("read captured stderr")?,
-    })
+    Ok((
+        std::process::Output {
+            status,
+            stdout: std::fs::read(&out_path).context("read captured stdout")?,
+            stderr: std::fs::read(&err_path).context("read captured stderr")?,
+        },
+        timed_out,
+    ))
 }
 
 /// The byte-level properties of a JSON artifact that **are** contract even
@@ -1271,6 +1539,7 @@ mod toolchain_mask {
     /// would otherwise pass by having nothing to mask.
     pub fn mask(stdout: &str) -> Option<(String, usize)> {
         let mut index = None;
+        let mut masking_detail = false;
         let mut out = Vec::new();
 
         for (line_number, line) in stdout.lines().enumerate() {
@@ -1280,8 +1549,23 @@ mod toolchain_mask {
                 (None, Some(_)) => {
                     index = Some(line_number);
                     out.push("  <TOOLCHAIN ROW>".to_owned());
+                    // In the `--json` shape the value is a line of its own,
+                    // and `r-orch 0.1.0 (rust 1.94.1)` against `v24.21.0` is
+                    // the other half of the same divergence. The human row
+                    // carries both on the line just masked, so this only ever
+                    // consumes a `"detail"` that follows.
+                    masking_detail = true;
                 }
-                _ => out.push(line.to_owned()),
+                _ if masking_detail && line.trim_start().starts_with("\"detail\": ") => {
+                    masking_detail = false;
+                    out.push("      \"detail\": \"<TOOLCHAIN>\"".to_owned());
+                }
+                _ => {
+                    if line.trim_start().starts_with('}') {
+                        masking_detail = false;
+                    }
+                    out.push(line.to_owned());
+                }
             }
         }
 
@@ -1293,9 +1577,20 @@ mod toolchain_mask {
         Some((masked, index))
     }
 
-    /// The row's label, if the line is `<glyph> <label> <value>`.
+    /// The row's label, if the line carries one.
+    ///
+    /// Two shapes, because `doctor` prints the row twice over: the human
+    /// `<glyph> <label> <value>` line, and — after the two header lines, which
+    /// is why this is text and not a parsed document (§22.2) — the
+    /// `"name": "<label>"` line of the `--json` object.
     fn label_of(line: &str) -> Option<&'static str> {
         let rest = line.trim_start();
+        if let Some(name) = rest.strip_prefix("\"name\": \"") {
+            let label = name
+                .strip_suffix("\",")
+                .or_else(|| name.strip_suffix('"'))?;
+            return LABELS.into_iter().find(|known| *known == label);
+        }
         // The glyph is ✓/✕ normally and +/x under --ascii; take whatever the
         // first whitespace-delimited token is and look at the one after it.
         let mut tokens = rest.split_whitespace();
@@ -1382,10 +1677,18 @@ fn claimed_matches_state_file(masked: &Option<Value>, rust_tree: &Tree) -> Vec<S
         return Vec::new();
     };
 
+    // `init` does not write `state.json` — the orchestrator creates it on its
+    // first write, and until then `StateStore::read` returns the defaults.
+    // So its absence is not a hole: it means the only correct report is the
+    // empty set, and that is still asserted.
     let Some(state) = rust_tree.values.get("state.json") else {
+        if *claimed == serde_json::json!([]) {
+            return Vec::new();
+        }
         return vec![format!(
-            "`{}` was masked in `status --json` but the run left no `.orchestry/state.json` \
-             to check it against, so the value went unasserted (PARITY.md §14.1)",
+            "`{}` in `status --json` is {claimed}, but the run left no \
+             `.orchestry/state.json`, so the default empty set is what it should have \
+             reported (PARITY.md §14.1)",
             claimed_mask::PATH
         )];
     };
@@ -1427,8 +1730,8 @@ fn usage_error_failure(_scenario: &Scenario, step: &str, ts_stderr: &str) -> Opt
     ))
 }
 
-fn compare_trees(rust: &Tree, ts: &Tree) -> Vec<String> {
-    let mut failures = compare_values(&rust.values, &ts.values);
+fn compare_trees(rust: &Tree, ts: &Tree, unordered_files: &[String]) -> Vec<String> {
+    let mut failures = compare_values(&rust.values, &ts.values, unordered_files);
 
     // A file only one side could parse is the sharpest possible signal: the
     // two implementations do not even agree that it is well-formed.
@@ -1464,7 +1767,11 @@ fn compare_trees(rust: &Tree, ts: &Tree) -> Vec<String> {
     failures
 }
 
-fn compare_values(rust: &BTreeMap<String, Value>, ts: &BTreeMap<String, Value>) -> Vec<String> {
+fn compare_values(
+    rust: &BTreeMap<String, Value>,
+    ts: &BTreeMap<String, Value>,
+    unordered_files: &[String],
+) -> Vec<String> {
     let mut failures = Vec::new();
 
     for path in ts.keys() {
@@ -1482,9 +1789,12 @@ fn compare_values(rust: &BTreeMap<String, Value>, ts: &BTreeMap<String, Value>) 
         }
     }
     for (path, ts_value) in ts {
-        if let Some(rust_value) = rust.get(path)
-            && rust_value != ts_value
+        let unordered = unordered_files.iter().any(|named| named == path);
+        if let Some(rust_value) = rust.get(path).map(|value| as_compared(value, unordered))
+            && rust_value != as_compared(ts_value, unordered)
         {
+            let ts_value = &as_compared(ts_value, unordered);
+            let rust_value = &rust_value;
             failures.push(format!(
                 "`.orchestry/{path}` differs\n{}",
                 unified_diff(&pretty(ts_value), &pretty(rust_value))
@@ -1640,15 +1950,128 @@ struct JsYamlResult {
 /// Parse JSONL stdout into normalized records. A line that is not JSON is
 /// kept as a string record, so a stray human line still shows in the diff
 /// rather than vanishing.
-fn json_records(stdout: &str, norm: &mut Normalizer) -> Vec<Value> {
+/// A value as it is compared: identical, unless the caller declared its
+/// top-level array order non-contract, in which case the elements are sorted
+/// canonically so the two sides are compared as multisets.
+///
+/// Sorting by the rendered element is safe because both sides are normalized
+/// first — ids are placeholders assigned per entity, in the same order on both
+/// sides — so equal multisets sort to equal sequences.
+fn as_compared(value: &Value, unordered: bool) -> Value {
+    if !unordered {
+        return value.clone();
+    }
+    match value {
+        Value::Array(items) => {
+            let mut sorted: Vec<Value> = items.iter().map(|item| as_compared(item, true)).collect();
+            // Keyed on a *key-sorted* rendering: two sides that agree on the
+            // pairs but not their order must sort to the same sequence, or
+            // this would invent a difference instead of ignoring one.
+            sorted.sort_by_cached_key(|item| pretty(&with_sorted_keys(item)));
+            Value::Array(sorted)
+        }
+        // Recursive, because the array in question is not always the whole
+        // document: `status --json` carries its tasks and agents under
+        // `tasks`/`agents`, and those are the arrays whose order a tie in the
+        // store's sort leaves undefined.
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), as_compared(value, true)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The same document with every object's keys in sorted order, so it renders
+/// identically whatever insertion order produced it.
+fn with_sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut pairs: Vec<_> = map.iter().collect();
+            pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+            Value::Object(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), with_sorted_keys(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(with_sorted_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Both stdouts parsed, when **both** are exactly one JSON object or array —
+/// which is what every `--json` command prints.
+///
+/// PARITY.md §1.4: JSON object key order is **not** contract. TS emits JS
+/// insertion order, which depends on when a field was first assigned — a goal
+/// that gains an `assignee` after creation emits it last, after `updated_at`,
+/// and `Message` emits `id`/`to_agent_id` last after an object spread — while
+/// serde emits declaration order. So these are compared as parsed values
+/// (`serde_json::Map` is an `IndexMap` under `preserve_order`, whose `Eq`
+/// ignores order) plus the framing that *is* contract, and never as text.
+///
+/// A scalar (`null`, a bare number) and anything with surrounding human text
+/// fall through to the text comparison: key order only exists inside a
+/// container, and text is the stricter test.
+fn json_documents(rust_stdout: &str, ts_stdout: &str) -> Option<(Value, Value)> {
+    Some((json_document(rust_stdout)?, json_document(ts_stdout)?))
+}
+
+fn json_document(stdout: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => Some(value),
+        _ => None,
+    }
+}
+
+/// The byte-level framing both sides must share even where key order is free
+/// (§6.4): 2-space indent and a trailing newline, or neither for a compact
+/// document.
+fn json_framing_diff(rust_stdout: &str, ts_stdout: &str) -> Option<(&'static str, String)> {
+    let (rust_framing, ts_framing) = (JsonFraming::of(rust_stdout), JsonFraming::of(ts_stdout));
+    (rust_framing != ts_framing).then(|| {
+        (
+            "json framing",
+            format!(
+                "indent and trailing newline are contract (§6.4)\n    ts:   \
+                 {ts_framing:?}\n    rust: {rust_framing:?}"
+            ),
+        )
+    })
+}
+
+fn json_records(stdout: &str, norm: &mut Normalizer, drop_ticks: bool) -> Vec<Value> {
     stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| match serde_json::from_str::<Value>(line) {
-            Ok(value) => norm.value(&value),
+            Ok(value) => mask_heap_mb(norm.value(&value)),
             Err(_) => Value::String(norm.text(line)),
         })
+        .filter(|record| !(drop_ticks && is_tick(record)))
         .collect()
+}
+
+fn is_tick(record: &Value) -> bool {
+    record.get("event").and_then(Value::as_str) == Some("orchestrator:tick")
+}
+
+/// `orchestrator:tick`'s `heap_mb` is a memory measurement of the runtime that
+/// produced it — `process.memoryUsage().heapUsed / 1 MiB` in the oracle, which
+/// has no counterpart in a Rust process at all. Masked like `<PID>` and `<MS>`
+/// are (§1.4): the field's presence and position are contract, its value is a
+/// property of V8.
+fn mask_heap_mb(mut record: Value) -> Value {
+    if let Some(object) = record.as_object_mut()
+        && let Some(heap) = object.get_mut("heap_mb")
+        && heap.is_number()
+    {
+        *heap = Value::String("<HEAP_MB>".to_owned());
+    }
+    record
 }
 
 fn records_text(records: &[Value]) -> String {
@@ -1763,6 +2186,7 @@ mod tests {
             stdout: String::new(),
             stderr: "Usage: orchestry task [options] [command]\n".into(),
             exit_code: 1,
+            timed_out: false,
         };
         assert!(is_group_help(&output));
 
@@ -1853,7 +2277,7 @@ mod tests {
         ts.insert("a.json".to_owned(), serde_json::json!({ "v": 2 }));
         ts.insert("only-ts.json".to_owned(), Value::Null);
 
-        let failures = compare_values(&rust, &ts);
+        let failures = compare_values(&rust, &ts, &[]);
         assert_eq!(failures.len(), 3);
         assert!(
             failures
@@ -1876,7 +2300,7 @@ mod tests {
     fn identical_trees_produce_no_failures() {
         let mut tree = BTreeMap::new();
         tree.insert("a.json".to_owned(), serde_json::json!({ "v": 1 }));
-        assert!(compare_values(&tree, &tree).is_empty());
+        assert!(compare_values(&tree, &tree, &[]).is_empty());
     }
 
     #[test]
@@ -1929,7 +2353,7 @@ mod tests {
             },
         );
 
-        let failures = compare_trees(&rust, &ts);
+        let failures = compare_trees(&rust, &ts, &[]);
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("JSON framing"), "{}", failures[0]);
     }
@@ -1954,7 +2378,7 @@ mod tests {
 
         let failures = exclude_tree_paths(&scenario, &mut rust, &mut ts);
         assert!(failures.is_empty(), "{failures:?}");
-        assert!(compare_trees(&rust, &ts).is_empty());
+        assert!(compare_trees(&rust, &ts, &[]).is_empty());
         // Everything outside the exclusion is still there to be compared.
         assert!(rust.values.contains_key("tasks/tsk_1.yml"));
         assert!(!rust.values.contains_key("messages/msg_1.json"));
@@ -1991,7 +2415,7 @@ mod tests {
             .insert("messages/msg_1.json".to_owned(), Value::from("ts"));
 
         assert!(exclude_tree_paths(&scenario, &mut rust, &mut ts).is_empty());
-        assert_eq!(compare_trees(&rust, &ts).len(), 1);
+        assert_eq!(compare_trees(&rust, &ts, &[]).len(), 1);
     }
 
     #[test]
@@ -2075,6 +2499,10 @@ mod tests {
         ];
         let no = [
             // No `--json`: the human renderer never prints the raw Set.
+            "org deploy",
+            "org list",
+            "run",
+            "serve",
             "status",
             // Other commands also carry `state`-shaped output; the exclusion
             // §14.1 grants is for `status --json` and nothing else.
@@ -2187,11 +2615,19 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("must emit"), "{}", failures[0]);
 
-        // Masked but no state.json to check against: the value would go
-        // unasserted, so say so rather than passing.
+        // Masked with no state.json to check against. `init` does not write
+        // one, so this is the common case rather than a hole: the only correct
+        // report is the empty set, and that is still asserted.
+        assert!(
+            claimed_matches_state_file(&Some(serde_json::json!([])), &Tree::default()).is_empty()
+        );
         let failures = claimed_matches_state_file(&ok, &Tree::default());
         assert_eq!(failures.len(), 1);
-        assert!(failures[0].contains("went unasserted"), "{}", failures[0]);
+        assert!(
+            failures[0].contains("left no `.orchestry/state.json`"),
+            "{}",
+            failures[0]
+        );
 
         // No `status --json` in the scenario means nothing to re-assert.
         assert!(claimed_matches_state_file(&None, &tree).is_empty());
@@ -2213,7 +2649,7 @@ mod tests {
             "unexpected end of hex escape at line 1 column 19".to_owned(),
         );
 
-        let failures = compare_trees(&rust, &ts);
+        let failures = compare_trees(&rust, &ts, &[]);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(
             failures[0].contains("our parser rejects"),
@@ -2226,7 +2662,7 @@ mod tests {
         // text comparison still covers the content.
         let mut both = rust.clone();
         both.unparseable = ts.unparseable.clone();
-        assert!(compare_trees(&both, &ts).is_empty());
+        assert!(compare_trees(&both, &ts, &[]).is_empty());
     }
 
     #[test]
@@ -2247,5 +2683,39 @@ mod tests {
         assert!(diff.contains("+++ rust"));
         assert!(diff.contains("-expected"));
         assert!(diff.contains("+actual"));
+    }
+
+    #[test]
+    fn a_json_document_compares_regardless_of_key_order() {
+        let rust = "{\n  \"assignee\": \"agt_1\",\n  \"updated_at\": \"x\"\n}\n";
+        let ts = "{\n  \"updated_at\": \"x\",\n  \"assignee\": \"agt_1\"\n}\n";
+        // §1.4: the same pairs in a different order are the same document.
+        assert_eq!(json_document(rust), json_document(ts));
+        // …and the framing both sides must still share is unchanged by it.
+        assert_eq!(JsonFraming::of(rust), JsonFraming::of(ts));
+    }
+
+    #[test]
+    fn a_json_document_still_notices_a_changed_value_or_framing() {
+        let base = "{\n  \"a\": 1,\n  \"b\": 2\n}\n";
+        assert_ne!(
+            json_document(base),
+            json_document("{\n  \"b\": 2,\n  \"a\": 9\n}\n")
+        );
+        assert_ne!(json_document(base), json_document("{\n  \"a\": 1\n}\n"));
+        // A compact document has no indent, so the framing check catches it
+        // even though the parsed values match.
+        let compact = "{\"a\":1,\"b\":2}\n";
+        assert_eq!(json_document(base), json_document(compact));
+        assert_ne!(JsonFraming::of(base), JsonFraming::of(compact));
+    }
+
+    #[test]
+    fn only_a_container_takes_the_json_path() {
+        assert!(json_document("null\n").is_none());
+        assert!(json_document("5\n").is_none());
+        assert!(json_document("  key = 5\n").is_none());
+        assert!(json_document("{\"a\":1}\ntrailing\n").is_none());
+        assert!(json_document("[]\n").is_some());
     }
 }

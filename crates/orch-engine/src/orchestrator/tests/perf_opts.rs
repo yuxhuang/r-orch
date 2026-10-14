@@ -208,3 +208,149 @@ async fn reconcile_issues_all_of_its_pre_fetches_before_processing_any_of_them()
     // All three pre-fetches overlapped — one round trip, not three.
     assert_eq!(probe.max_in_flight.load(Ordering::SeqCst), 3);
 }
+
+// ── cascade writes are ordered, not concurrent ───────────────────────────
+
+/// Records save order, holding up one task's save.
+///
+/// `_index.json` keeps entries in the order their saves complete
+/// (PARITY.md §14.4), so the delay is what turns "are these writes
+/// concurrent?" into a deterministic assertion: awaited in order, the slow one
+/// still lands first; issued together, it lands last.
+struct OrderedSaveProbe {
+    inner: Arc<FakeTaskStore>,
+    saved: std::sync::Mutex<Vec<String>>,
+    slow: &'static str,
+}
+
+#[async_trait]
+impl TaskStore for OrderedSaveProbe {
+    async fn list(&self, filter: &TaskFilter) -> Result<Vec<Task>> {
+        self.inner.list(filter).await
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<Task>> {
+        self.inner.get(id).await
+    }
+
+    async fn save(&self, task: &Task) -> Result<()> {
+        if task.id == self.slow {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        self.inner.save(task).await?;
+        self.saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(task.id.clone());
+        Ok(())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        self.inner.delete(id).await
+    }
+}
+
+/// A cascade must write its dependents in order, because the order they land
+/// in `_index.json` is compared byte for byte against the oracle.
+///
+/// The reference uses `Promise.all` here, and node settles those writes in map
+/// order in practice; `join_all` on a multi-threaded runtime does not, which
+/// showed up as `o7-cascade-failure` transposing two tasks about one run in
+/// seven.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cascade_saves_its_dependents_in_order() {
+    let probe: Arc<std::sync::Mutex<Option<Arc<OrderedSaveProbe>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let captured = Arc::clone(&probe);
+
+    let mut config = super::harness::test_config();
+    // One attempt, so the root fails outright instead of being retried.
+    config.defaults.task.max_attempts = 1;
+
+    let h = Harness::builder()
+        .tasks([
+            Task {
+                id: "tsk_root".into(),
+                status: TaskStatus::InProgress,
+                assignee: Some("agt_test1".into()),
+                // Out of attempts, so the failure is final and cascades
+                // instead of queueing a retry.
+                attempts: 1,
+                max_attempts: 1,
+                ..make_task()
+            },
+            Task {
+                id: "tsk_left".into(),
+                title: "left".into(),
+                depends_on: vec!["tsk_root".into()],
+                ..make_task()
+            },
+            Task {
+                id: "tsk_right".into(),
+                title: "right".into(),
+                depends_on: vec!["tsk_root".into()],
+                ..make_task()
+            },
+        ])
+        .agents([Agent {
+            id: "agt_test1".into(),
+            status: AgentStatus::Running,
+            current_task: Some("tsk_root".into()),
+            ..make_agent()
+        }])
+        .config(config)
+        .state(super::harness::state_running(
+            "tsk_root",
+            "agt_test1",
+            "run_1",
+            11111,
+            NOW_ISO,
+        ))
+        .wrap_task_store(move |inner| {
+            let wrapped = Arc::new(OrderedSaveProbe {
+                inner,
+                saved: std::sync::Mutex::new(Vec::new()),
+                // The first dependent the cascade visits.
+                slow: "tsk_left",
+            });
+            *captured.lock().unwrap() = Some(Arc::clone(&wrapped));
+            wrapped
+        })
+        .build();
+    h.runs.seed(orch_domain::Run {
+        id: "run_1".into(),
+        task_id: "tsk_root".into(),
+        agent_id: "agt_test1".into(),
+        status: orch_domain::RunStatus::Running,
+        ..orch_core::test_support::make_run()
+    });
+
+    h.load_state().await.unwrap();
+
+    // The failure path directly: the root's run errors, which fails the task
+    // and cascades to both dependents.
+    h.orchestrator
+        .collect_events(
+            Box::pin(futures::stream::iter(vec![Err(
+                orch_core::adapter::AdapterError::new("boom", None),
+            )])),
+            "run_1",
+            "tsk_root",
+            "agt_test1",
+        )
+        .await
+        .unwrap();
+
+    let probe = probe.lock().unwrap().clone().expect("probe installed");
+    let saved = probe.saved.lock().unwrap().clone();
+    let cascaded: Vec<&str> = saved
+        .iter()
+        .map(String::as_str)
+        .filter(|id| *id == "tsk_left" || *id == "tsk_right")
+        .collect();
+    assert_eq!(
+        cascaded,
+        vec!["tsk_left", "tsk_right"],
+        "the cascade transposed its dependents: {saved:?}"
+    );
+}

@@ -448,6 +448,28 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Resolve once every dispatched run's collector has finished.
+    ///
+    /// The CLI's replacement for node's handle accounting. `run_task` and
+    /// `run_all` return as soon as the dispatch is done, and the collector
+    /// that follows a run — the task's status change, the agent's stats, the
+    /// workspace merge and cleanup — is a detached task. Node keeps the
+    /// process alive for it because the agent's pipes and the fs operations
+    /// are open handles; a Rust `main` that returned there would drop the
+    /// runtime and leave the task `in_progress` with its worktree still on
+    /// disk, which is exactly what `v7-run-single-task` measured.
+    ///
+    /// Polled rather than awaited: the collectors are detached, and a 25 ms
+    /// poll on a set that is almost always empty costs nothing next to a run.
+    pub async fn wait_for_collectors(&self) {
+        loop {
+            if self.inner.active_collectors.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Resolves once [`Orchestrator::stop`] has completed. Returns immediately
     /// when shutdown has already begun, matching the TS `waitForStop`.
     pub async fn wait_for_stop(&self) {
@@ -483,10 +505,23 @@ impl Orchestrator {
             return Ok(());
         }
 
+        // `clearInterval(this.timer)`: stop *future* ticks and let the one in
+        // flight finish. The handle is dropped rather than aborted, for two
+        // reasons found the hard way.
+        //
+        // Aborting it cancels the caller: both the signal arms and the tick
+        // circuit breaker call `stop()` **from inside the watch task**, so
+        // the abort would land at the next await that pends — the state save,
+        // before the lock release and before `stopped.send(true)` — leaving
+        // `wait_for_stop` waiting forever, which is `serve` ignoring SIGTERM.
+        //
+        // Aborting it also cancels whatever the *tick* is doing, and a tick
+        // cancelled between `atomic_write`'s temp file and its rename leaves
+        // `.orchestry/.state.json.<hash>.tmp` behind — litter the reference
+        // cannot produce, because `clearInterval` cannot interrupt a running
+        // callback.
         self.inner.shutdown.cancel();
-        if let Some(task) = self.inner.watch_task.lock().await.take() {
-            task.abort();
-        }
+        let _ = self.inner.watch_task.lock().await.take();
         if let Some(timer) = self.inner.immediate_dispatch.lock().await.take() {
             timer.abort();
         }

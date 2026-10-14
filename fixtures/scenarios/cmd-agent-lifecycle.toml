@@ -5,7 +5,9 @@ description = """
 The agent subcommands: add, list, status, edit, disable, enable, \
 autonomous, remove, and `agent shop --list`, which prints the catalogue \
 table non-interactively instead of opening the picker. The read verb is \
-`agent status <id>`, not `agent show`."""
+`agent status <id>`, not `agent show`. The tail covers `autonomous`'s \
+three forms: `--on`, `--off`, neither (**toggle**) and both (`--on` \
+wins)."""
 steps = [
   "init --name proj --adapter claude",
   "agent add shelly --adapter shell --command 'echo hello' --quiet",
@@ -26,4 +28,12 @@ steps = [
   "agent status ${agent.1} --json",
   "agent remove ${agent.0}",
   "agent list --json",
+  # `autonomous` with neither flag **toggles**, and with both `--on` wins —
+  # the `opts.on ? true : opts.off ? false : !current.autonomous` chain.
+  "agent autonomous ${agent.1}",
+  "agent status ${agent.1} --json",
+  "agent autonomous ${agent.1}",
+  "agent status ${agent.1} --json",
+  "agent autonomous ${agent.1} --on --off",
+  "agent status ${agent.1} --json",
 ]
