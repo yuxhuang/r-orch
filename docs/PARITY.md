@@ -3091,6 +3091,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.34 tracing to stderr under `ORCHESTRY_DEBUG` | FIX | `none` |
 | §14.35 `config.yml` / `agents/*.yml` written 0600 | FIX | `none` — **modes are not compared**, hence the row |
 | §14.36 three favourable divergences (sandboxed Liquid, negative-PID reject, in-process clipboard) | DIVERGENCE (favourable) | `none`, except Liquid partials: `scenario exclusion required (custom-template-*)` |
+| §14.37 malformed YAML/JSON error text is parser-specific | DIVERGENCE | `scenario exclusion required (malformed-input-*)` — all stderr after `  ✕ ` masked |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3869,6 +3870,80 @@ it.
 PowerShell — one fewer subprocess surface, and no shell quoting to get wrong. The cost is a larger in-process
 image-decoder dependency stack, which is the trade the security review accepted. TUI-only, outside the
 harness.
+
+### 14.37 Malformed YAML and JSON produce parser-specific error text — **DOCUMENTED DIVERGENCE**
+
+**Effect on differential comparison: `scenario exclusion required (malformed-input-*)`** — the exclusion
+masks **all of stderr after the leading `  ✕ ` prefix**. wp0 is adding the scenario; nothing covered this
+before, which is why an L0 divergence went undocumented.
+
+#### What TS prints
+
+Measured against the oracle. A `tasks/<id>.yml` with an unterminated quoted scalar:
+
+```
+  ✕ unexpected end of the stream within a double quoted scalar (4:1)
+
+ 1 | id: tsk_Tqk05N3
+ 2 | title: "unterminated
+ 3 | status: todo
+ 4 | 
+-----^
+```
+
+- the js-yaml reason, then `(line:col)`;
+- a blank line, then a **source excerpt** with ` N | ` line numbering and a `-----^` caret;
+- **no path** — the file that failed is not named;
+- empty stdout, exit **1**.
+
+**The excerpt length is variable — roughly 1 to 5 lines.** It is js-yaml's own windowing of context either
+side of the fault, so it depends on where in the file the error falls and how long the file is. Do not encode
+a fixed line count.
+
+**Malformed JSON is a different shape entirely**, not a variant of the same format. A corrupt
+`context/<key>.json`:
+
+```
+  ✕ Unexpected end of JSON input
+```
+
+No path, no `line:col`, **no excerpt at all** — it is the JavaScript engine's own `JSON.parse` message, passed through unchanged. (Not to be confused with **V8** the verification row in §15; the collision of names is unfortunate.)
+
+#### What r-orch prints
+
+`  ✕ <path> is not valid YAML: <saphyr detail>` — exit 1, empty stdout. It **names the failing file**, which
+TS does not, and carries `saphyr`'s diagnostic rather than js-yaml's.
+
+*(Before the C0 work this read `  ✕ parse <path>`, which named the file but said nothing about the fault. The
+current form is strictly more useful; it is recorded here only so a reader of an older build is not
+confused.)*
+
+#### Decision: do not replicate
+
+The reason text is **parser-specific**. Reproducing js-yaml's wording, its `(line:col)` convention, its
+excerpt windowing and its caret placement would mean reimplementing one parser's diagnostics on top of
+another's — a large amount of fragile work to make our errors *less* informative, since naming the failing
+path is the single most useful thing an error here can do.
+
+**What remains L0, and is asserted:**
+
+| Invariant | Value |
+|---|---|
+| Exit code | **1** |
+| stderr prefix | `  ✕ ` — two spaces, the glyph, one space (§3.1) |
+| stdout | **empty** |
+| The offending file | **left untouched** — verified by checksum after a failure on both read paths |
+
+#### Both read paths behave identically
+
+Worth stating because §6.10 and §14.25 establish them as *different* paths, so a reader might expect them to
+diverge here:
+
+- `task show <id>`, which opens the entity file directly, and
+- a forced rebuild (`rm _index.json && task list`), which opens every file,
+
+produce **byte-identical stderr** and both exit 1. The excerpt, the caret and the absent path are the same in
+each.
 
 ---
 
