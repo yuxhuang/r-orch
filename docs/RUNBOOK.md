@@ -234,14 +234,31 @@ session, say — and dispatch a task to an agent whose adapter is `claude`, r-or
 process inside the session you are already in. Nested sessions compete for the same credentials and rate
 limits, produce interleaved output, and are hard to attribute.
 
-**Nothing prevents this.** r-orch sets exactly three environment variables on every child —
+**r-orch itself does not prevent it.** It sets exactly three environment variables on every child —
 `ORCH_AGENT_ID`, `ORCH_AGENT_NAME`, `ORCH_TASK_ID` — and inspects **no** session marker. There is no
-`CLAUDECODE` check, in r-orch or in the TypeScript original; a guard was discussed and is not implemented in
-either. Do not rely on one.
+`CLAUDECODE` check in r-orch or in the TypeScript original, and no guard is planned in either. Do not expect
+one.
 
-**What to do instead:** run `orch serve` or `orch run` from a plain shell, not from inside an agent session.
-If you must drive r-orch from an agent, use `shell`-adapter agents, which spawn `bash -lc <command>` and
-start no AI CLI.
+**In practice the `claude` CLI usually stops it for you — by failing.** Recent Claude Code versions set
+`CLAUDECODE=1` in the session environment, and the `claude` CLI refuses to start a *nested* session when it
+sees it. Adapters inherit the parent environment and only overlay their own keys — verified: nothing in
+r-orch calls `env_clear`, so every variable in your shell reaches the child — so `CLAUDECODE` arrives with
+it. The visible result is that **every `claude`-adapter agent exits immediately**, the task fails, and
+`orch logs` shows a near-instant non-zero exit rather than any useful agent output. If you see that pattern
+inside an agent session, this is why; it is the outer CLI declining, not an r-orch fault.
+
+**What to do:**
+
+- **Preferred — run from a plain shell.** `orch serve` and `orch run` belong outside any agent session.
+- **If you must drive r-orch from inside one**, use `shell`-adapter agents: they spawn `bash -lc <command>`
+  and start no AI CLI, so the guard is irrelevant.
+- **To force it anyway**, strip the variable for r-orch and everything it spawns:
+  ```bash
+  env -u CLAUDECODE orch serve
+  ```
+  Understand what this does: it removes the guard rather than satisfying it, so you get genuinely nested
+  sessions competing for the same credentials and rate limits, with interleaved output that is hard to
+  attribute. Use it knowingly, not as the default fix.
 
 ---
 
