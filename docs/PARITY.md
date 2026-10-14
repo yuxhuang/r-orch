@@ -3074,7 +3074,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.28 `start_watch` leaks the lock on error | FIX | `none` |
 | §14.29 lock PID `0` / `> i32::MAX` treated dead | FIX (differs from TS for `0`) | `none` expected |
 | §14.30 `.`/`..` reach two extension-less builders | FIX (additive, **two builders only**) | `none` |
-| §14.31 four YAML read guards reject what js-yaml accepts | DIVERGENCE | `none` in corpus |
+| §14.31 exact expanded-node pre-pass bounds every YAML read | DIVERGENCE | `none` in corpus |
 | §14.32 run-events > 50 MiB tail-read (last 1 MiB) | FIX | `none` — unreachable in corpus |
 | §14.33 token totals can overflow | FIX | `none` |
 | §14.34 tracing to stderr under `ORCHESTRY_DEBUG` | FIX | `none` |
@@ -3652,36 +3652,80 @@ contain them.
 > every store, diverging from the reference character class on an L0 surface — which is why the remediation
 > is scoped to the two sinks that actually need it.
 
-### 14.31 YAML read guards reject documents js-yaml accepts — **DOCUMENTED DIVERGENCE**
+### 14.31 YAML reads are bounded by an exact expanded-node count — **DOCUMENTED DIVERGENCE**
 
-**Effect on differential comparison: `none` in the corpus** — no scenario produces a document near any bound.
+**Effect on differential comparison: `none` in the corpus** — no scenario produces a document that trips it.
 
-> **⚠ Not currently true for nested aliases.** A third bomb shape defeats all four guards together — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0. An exact expanded-size pre-pass is pending; this section will be rewritten against it.
+js-yaml has no limits of any kind. r-orch bounds **every** YAML read.
 
-js-yaml has no limits of any kind. r-orch refuses a document that trips **any of four guards**:
+#### The defence is one layer, and it is load-bearing
+
+An **exact expanded-node-count pre-pass** runs before `serde_yaml_ng` ever sees the document:
+
+| Property | Detail |
+|---|---|
+| Mechanism | `saphyr-parser` event walk — streams events and **never resolves an alias** |
+| Budget | **200 000** expanded nodes (`MAX_YAML_EXPANDED_NODES`) |
+| Memoisation | by the parser's **numeric anchor id**, not by name — so redefining an anchor yields a fresh id and is counted afresh |
+| Merge keys | counted **as aliases**; `<<` is not exempt |
+| Cycles | **refused** |
+| Arithmetic | checked at **every** accumulation; overflow is treated as over budget, never as a value |
+| Cost | O(input) time, O(depth + anchors) memory, however large the expansion would be |
+
+**It counts what the document *expands to*, not what it looks like.** That is the whole point, and it is why
+the previous guard set failed: see §14.31.1.
+
+#### Size and alias caps remain, as defence in depth
 
 | Guard | Bound |
 |---|---|
-| Document size | **> 1 MiB** |
-| Alias count | **> 64** |
-| Estimated expansion — `len × (1 + aliases)` | **> 8 MiB** |
-| Parse wall-clock | **> 2 s** |
+| Document size | > 1 MiB |
+| Alias count | > 64 |
 
-The expansion estimate is the one that matters: size and alias count are each individually cheap to stay
-under while still amplifying, so the product is what actually bounds a "billion laughs". The time bound is
-the backstop for anything the first three miss.
+They are cheap, they reject obvious junk before the walk, and neither is load-bearing any more.
 
-**This is not a workaround for the YAML crate.** `serde_norway` was measured on the same inputs and behaves
-**identically** to `serde_yaml_ng`, so the guards are r-orch's own hardening rather than compensation for a
-parser deficiency — and swapping the crate would not remove the need for them.
+#### There is no timeout, deliberately
 
-**Decision: diverge, deliberately.** These files can be checked into a shared repository, so a hostile or
-accidental one is reachable by anyone with commit access. No bound is reachable by anything r-orch *writes* —
-the largest artifact is an agent file holding a few kilobytes of role prompt — so the guards only ever fire
-on hand-authored or externally-supplied input.
+An earlier design had a 2 s parse deadline. **It was removed, not demoted to a backstop**, and the reasoning
+is worth keeping: `spawn_blocking` work **cannot be cancelled**. The deadline fired correctly, printed the
+right error — and the parse carried on allocating on its blocking thread. Measured at ~0.55 GiB/s, reaching
+19.3 GiB RSS in 28 s and 180 GiB at 3 min 14 s, still climbing. A clock that fires on work it cannot stop is
+**worse than nothing**: it reports the incident and contains none of it, while reading as though the case
+were handled. Do not reintroduce one.
 
-Recorded as a divergence rather than a fix because TS genuinely accepts such files: **a project r-orch
-refuses may still open in the original**, which is the asymmetry an operator would hit.
+#### Measured
+
+| Case | Result |
+|---|---|
+| `shapeD_6000_30` — 84 KB, 60 aliases, the shape that defeated the old guards | **refused in 18 ms**, exit 1 |
+| Worst *legitimate* 1 MiB document | parses in **161 ms** |
+| Pre-pass overhead | ~**55 %** of the parse it protects |
+
+#### Scope and failure mode
+
+The pre-pass sits at the **`read_yaml_value` chokepoint**, so it covers **every** YAML read — `config.yml`,
+`agents/`, `tasks/`, `goals/`, `teams/` — not just hand-authored config. One guard, one place.
+
+Rejection exits **1**, the same code as the size and alias caps and as any other general error (§3); the
+*message* is what distinguishes them, not the code.
+
+**Decision: diverge, deliberately.** Nothing r-orch writes approaches the budget — the largest artifact is an
+agent file holding a few kilobytes of role prompt — so it only ever fires on hand-authored or
+externally-supplied input. Recorded as a divergence rather than a fix because TS genuinely accepts such
+files: **a project r-orch refuses may still open in the original**, which is the asymmetry an operator hits.
+
+#### 14.31.1 Why the previous guard set failed
+
+Kept because the failure is instructive and the fix is only obviously right once you have seen it.
+
+The old bound was an *estimate*: `len × (1 + aliases) > 8 MiB`. It assumed an alias expands to at most the
+whole document. **That is wildly wrong for nested aliases** — doubling needs only two aliases per level, so
+30 levels is **60 aliases**, under any sane cap, for 2³⁰ expansion while *both* factors stay small.
+`shapeD_6000_30` was 84 KB with 60 aliases and an estimate of 4.93 MiB: it passed every cap, and took
+`orch status` to 19.3 GiB RSS in 28 s.
+
+The lesson generalises: **a bound on the input cannot bound an output that amplifies.** Only counting the
+expansion works, which is what the pre-pass does.
 
 ### 14.32 Run-events files over 50 MiB are tail-read, not read whole — **FIX**
 
@@ -3751,7 +3795,7 @@ platform has no modes, and the write proceeds unrestricted.
 everything would be a larger divergence for no security gain — a secret pasted into a task *description* is
 a user error that 0600 would hide rather than fix.
 
-> **⚠ Not a mitigation for the YAML DoS (C0).** Every YAML read goes through one chokepoint, so **any** entity file — not just `config.yml` — is a vector, and none of them arrives through local write access; `0600` does not bound it. See [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0 and §14.31.
+> **Not a mitigation for the YAML expansion class.** Every YAML read goes through one chokepoint, so **any** entity file — not just `config.yml` — is a vector, and none of them arrives through local write access. That class is bounded by the pre-pass in §14.31, not by file modes; `0600` is about local *read* access and nothing else.
 
 **Version control is not the hole I previously claimed it was.** An earlier revision of this entry said
 `.orchestry/agents/` is not covered by `init`'s `.gitignore` and that a key there reaches the repository on

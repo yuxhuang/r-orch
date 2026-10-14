@@ -226,30 +226,37 @@ Three maintained options:
 | Candidate | Version | Assessment |
 |---|---|---|
 | **`serde_yaml_ng`** | `0.10.0` | A direct, actively maintained continuation of `serde_yaml` with the same API. **Chosen.** |
+| **`saphyr-parser`** | `0.2` | **Also adopted**, for a different job: the event-streaming parser behind the §14.31 expanded-node pre-pass. Not a `serde_yaml_ng` replacement — see below. |
 | `serde_norway` | `0.9.42` | Also a maintained `serde_yaml` fork, same API. Verified to read and emit identically to `serde_yaml_ng` on our data. A drop-in fallback if `_ng` stalls. |
 | `saphyr` / `yaml-rust2` | `0.2.1` / `0.13.0` | Full YAML 1.2 engines, but **no serde integration** — we would hand-write (de)serialization for 7 entity types. Rejected as a default; see §5.3 for where a raw emitter would be needed anyway. |
 
 **Decision: `serde_yaml_ng = "0.10"`.** Re-confirmed at the gate against measured alternatives rather than
 left as a first-pass choice:
 
-> **⚠ The ~0.2–0.3 ms refusal does not hold for nested aliases.** A third bomb shape defeats all four guards together — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0; an exact expanded-size pre-pass is pending and this reasoning will be rewritten against it.
-
 
 
 | Candidate | DoS behaviour on the C0 bombs | Why not |
 |---|---|---|
-| **`serde_yaml_ng` 0.10** — chosen | 5 s / 65 s *unguarded*; **~0.2–0.3 ms refusal** with the §14.31 expansion estimate in front of it | — |
+| **`serde_yaml_ng` 0.10** — chosen | 5 s / 65 s *unguarded*; **refused in 18 ms** with the §14.31 expanded-node pre-pass in front of it | — |
 | `serde-saphyr` | **excellent — ~80 ms refusal** unaided | **No dynamic `Value` model and no `apply_merge`.** Adopting it would mean hand-writing merge-key resolution ([PARITY.md §6.4.2](PARITY.md)), the timestamp quoting guard (§5.3) and surrogate repair ([PARITY.md §14.14](PARITY.md)) — three wire-contract behaviours — on top of a parser that cannot express them. Rejected on **API fit**, not performance |
 | `serde_norway` 0.9 | 5 s / 65 s — same libyaml design | No advantage; retained only as a drop-in if `_ng` stalls |
 
 Both chosen and fallback were tested against real TS-written YAML (including the folded-scalar `>-` 3 KB
 `agt_creator` role) and read it correctly.
 
-**`unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is accepted**, because the §14.31 guards refuse the
-bombs in **~0.2–0.3 ms** — before the parser is reached — which is a better outcome than `serde-saphyr`'s
-unaided 80 ms, and the guards are needed regardless ([PARITY.md §14.31](PARITY.md): `serde_norway` measures
-identically, so this is not a crate-specific weakness). **Revisit if `serde-saphyr` gains a `Value` API**, at
-which point the API-fit objection disappears and it becomes the better choice on both axes.
+**`saphyr-parser` 0.2 is a direct dependency** — and note which half of the saphyr family we took.
+`serde-saphyr` was rejected above for having no `Value` model, but `saphyr-parser`, the **event-streaming
+parser underneath it**, is exactly the right tool for the §14.31 pre-pass: it streams events without
+resolving aliases, which is what makes an exact expansion count O(input) instead of O(expansion). So the
+family is split by job — `serde_yaml_ng` for serde deserialisation, `saphyr-parser` for the guard in front of
+it.
+
+**`unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is accepted**, because the §14.31 pre-pass closes the
+amplification class **before the parser is reached** — refusing the shape that defeated every prior guard in
+**18 ms**, while the worst legitimate 1 MiB document still parses in 161 ms. The guard is needed regardless
+of crate: `serde_norway` measures identically on the same inputs, so this is not a crate-specific weakness.
+**Revisit if `serde-saphyr` gains a `Value` API**, at which point the API-fit objection disappears and it
+becomes the better choice on both axes.
 
 ### 4.3 Templates — the highest-risk dependency
 
@@ -969,7 +976,7 @@ transitive with no alternative:
 
 | Advisory | Crate | Via | Why accepted |
 |---|---|---|---|
-| RUSTSEC-2024-0449 | `unsafe-libyaml` | `serde_yaml_ng` | **⚠ Mitigation incomplete — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0; an exact expanded-size pre-pass is pending.** The §14.31 read guards refuse the two known DoS shapes in ~0.2–0.3 ms before the parser sees them, but not a nested-alias shape. Revisit if `serde-saphyr` gains a `Value` API (§4.2) |
+| RUSTSEC-2024-0449 | `unsafe-libyaml` | `serde_yaml_ng` | No API-compatible replacement (`serde-saphyr` has no `Value` model), and the amplification class is closed by the exact expanded-node pre-pass at the `read_yaml_value` chokepoint — §14.31, measured refusing the worst known shape in 18 ms. Revisit if `serde-saphyr` gains a `Value` API (§4.2) |
 | RUSTSEC-2026-0319 | `anymap2` | `liquid-core` | No alternative; `liquid` is the only maintained Liquid implementation for Rust (§4.3) and prompt rendering is byte-contract |
 
 Each accepted advisory must name its mitigation and its revisit condition. An advisory accepted with neither
