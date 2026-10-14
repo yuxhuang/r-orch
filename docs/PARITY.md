@@ -1097,7 +1097,7 @@ Full schema, with defaults (L0):
 | `defaults.agent.adapter` | string | `claude` |
 | `defaults.agent.approval_policy` | `suggest\|auto\|manual` | `auto` |
 | `defaults.agent.max_turns` | int | `50` |
-| `defaults.agent.timeout_ms` | int | `3600000` |
+| `defaults.agent.timeout_ms` | int | `3600000` | **Stored, never enforced — see below** |
 | `defaults.agent.stall_timeout_ms` | int | `600000` |
 | `defaults.agent.workspace_mode` | `shared\|worktree\|isolated` | `worktree` |
 | `defaults.task.max_attempts` | int | `3` |
@@ -1109,6 +1109,27 @@ Full schema, with defaults (L0):
 | `prompt.template` | string? | — (legacy single combined template) |
 | `prompt.system_template` | string? | — |
 | `prompt.user_template` | string? | — |
+
+> **`timeout_ms` is inert in both implementations — do not treat it as a safety net.** Neither
+> `defaults.agent.timeout_ms` nor an agent's own `config.timeout_ms` is read by any dispatch or adapter
+> path: it is accepted by `agent add --timeout`, defaulted, stored in the entity file, surfaced in
+> `--json`, and **never enforced**. No adapter sets a per-process timeout (§8.2).
+>
+> **`stall_timeout_ms` is the only bound on a run**, and it only fires from `reconcile`, which runs **only
+> in the watch loop**. Two consequences:
+>
+> - an agent that keeps emitting events but never finishes runs **forever**, since each event refreshes the
+>   stall clock (§7.4);
+> - `orch run <id>` and `orch run --all` have **no stall detection at all** — they wait on completion, so a
+>   hung agent wedges the CLI indefinitely.
+>
+> A field that reads as a timeout and is not one is worse than no field, which is why it is called out here
+> rather than only in the appendix. It is **replicated**: the name and shape are L0, and removing it would
+> break `--json` consumers. Operator guidance in
+> [docs/RUNBOOK.md](RUNBOOK.md#timeout_ms-is-not-a-timeout).
+>
+> Not to be confused with `ReviewRunner`'s **own** `timeout_ms` (§7.9), which *is* enforced — 120 000 ms per
+> review criterion. Same field name, different type, different code path.
 
 ### 6.6 `state.json`
 
@@ -2025,6 +2046,14 @@ The shell adapter additionally sets `ORCHESTRY_TASK_PROMPT` to the full combined
 
 `kill(pid, signal = SIGTERM)` — try `kill(-pid, signal)` (the group) **first**; on failure fall back to
 `kill(pid, signal)`; swallow all errors.
+
+> **A grandchild forked during the kill window can survive unsignalled.** `killWithGrace` returns as soon as
+> the **direct child** is gone, so the final `SIGKILL` to the group is never sent. A process forked between
+> the `SIGTERM` to the group and the child's death inherits the process group **without having been
+> signalled**, and is then reparented to init. Observed in a cold gate run as a live `state S ppid 1
+> pgid <target>` process. **Faithful — TS's `killWithGrace` has the same early return** — so it is
+> replicated, and the cleanup procedure is in
+> [docs/RUNBOOK.md](RUNBOOK.md#stray-agent-subprocesses-after-a-cancel).
 
 `killWithGrace(pid, graceMs = 10000)` — return if already dead; send `SIGTERM`; poll `isAlive` every **200 ms**
 until the deadline; then send `SIGKILL`. Call sites use different grace periods:

@@ -19,6 +19,8 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `.state.json.*.tmp` files piling up | [Temp-file litter](#state-file-temp-litter) |
 | `serve:started` logged but the daemon is not up | [serve:started ordering](#servestarted-precedes-the-lock-check) |
 | Need to see what r-orch is doing internally | [Debugging](#debugging) |
+| Agent processes still running after a cancel | [Stray agent subprocesses](#stray-agent-subprocesses-after-a-cancel) |
+| An agent has run for hours and nothing stopped it | [`timeout_ms` is not a timeout](#timeout_ms-is-not-a-timeout) |
 | Running r-orch from inside a Claude Code session | [Nested agent sessions](#nested-agent-sessions) |
 | Worried about API keys in agent config | [Secrets in agent config](#secrets-in-agent-config) |
 
@@ -224,6 +226,85 @@ orch doctor                           # adapter availability — note it checks 
 
 `orch doctor` reports whether the AI CLIs are installed and whether you are in a git repository. It does
 **not** check the lock, the state file, index consistency, or disk space, and it **always exits 0**.
+
+---
+
+## Stray agent subprocesses after a cancel
+
+**Symptom.** You cancelled a task, force-stopped an agent, or shut the orchestrator down, and a process the
+agent started is still running — often reparented to init (`ppid 1`).
+
+**Cause.** Stopping an agent sends `SIGTERM` to the whole **process group**, then waits for the **direct
+child** to exit and returns. The final `SIGKILL` sweep of the group never happens. A process forked in the
+window between the group signal and the child's death **inherits the group without having been signalled**,
+survives, and is reparented. Load-dependent, so it shows up under contention rather than reliably.
+Faithful to the original — its `killWithGrace` returns the same way ([PARITY.md §8.4](PARITY.md)).
+
+**Spotting it.** Agents are spawned into their own process group whose **group id is the child's pid**, and
+that pid is in the run record:
+
+```bash
+# the pid for a task's most recent run
+orch logs --task <task-id> --json | grep -o '"pid":[0-9]*'
+# or straight from disk
+grep -h '"pid"' .orchestry/runs/*.json
+
+# anything still alive in that group
+ps -eo pid,ppid,pgid,stat,etime,args | awk -v g=<pid> 'NR==1 || $3==g'
+```
+
+A row with `ppid 1` and an `etime` older than your cancel is a survivor.
+
+**Cleanup.** Signal the group explicitly, which is the step that was skipped:
+
+```bash
+kill -TERM -<pid>      # note the leading minus: the GROUP, not the process
+sleep 2
+kill -KILL -<pid>      # if anything remains
+```
+
+Check before you do: confirm the group id is the one from the run record, and that no *current* run is using
+it. A recycled pid would make you kill an unrelated group.
+
+**Prevention.** None available at the operator level — it is inherent to the cancel path. If stray processes
+are a recurring problem in your deployment (long-running builds, test runners that fork), prefer
+`workspace_mode: worktree` so survivors at least operate on a throwaway checkout rather than your working
+tree.
+
+---
+
+## `timeout_ms` is not a timeout
+
+**It is accepted, stored, displayed — and never enforced.** `orch agent add --timeout <ms>` and
+`defaults.agent.timeout_ms` (default `3600000`) write a field that **no code reads**. The same is true in the
+TypeScript original. If you set it expecting a run to be killed after an hour, nothing will kill it.
+
+**What actually bounds a run** is `stall_timeout_ms` (default `600000`), and only partly:
+
+| Situation | Bounded? |
+|---|---|
+| Agent emits no events for `stall_timeout_ms`, under `run --watch` or `serve` | **Yes** — the run is killed and the task fails or retries |
+| Agent keeps emitting events but never finishes | **No** — every event refreshes the stall clock, so it runs forever |
+| `orch run <task-id>` or `orch run --all` | **No stall detection at all** — these wait for completion, so a hung agent wedges the command indefinitely |
+
+The last row is the one that catches people: stall detection lives in the watch loop's reconcile phase, so
+the one-shot commands have none of it.
+
+**What to do.**
+
+- **Don't rely on `timeout_ms`.** Leave it at the default; changing it has no effect.
+- **Bound it outside r-orch.** For one-shot runs, wrap the command:
+  ```bash
+  timeout 3600 orch run <task-id>
+  ```
+  In CI, set a job-level timeout — that is your real backstop.
+- **Prefer `serve` or `run --watch` for unattended work**, so `stall_timeout_ms` is at least active, and tune
+  it per agent (`stall_timeout_ms` in the agent's config) rather than reaching for `timeout_ms`.
+- **To stop a wedged run by hand:** `orch task cancel <task-id>`, then check for survivors as
+  [above](#stray-agent-subprocesses-after-a-cancel).
+
+Both the inert field and the one-shot gap are replicated from the original rather than fixed, because the
+field name and shape are part of the `--json` contract ([PARITY.md §6.5](PARITY.md)).
 
 ---
 
