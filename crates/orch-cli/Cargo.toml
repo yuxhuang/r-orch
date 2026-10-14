@@ -71,7 +71,6 @@ insta.workspace = true
 # `TestBackend` for the end-to-end dashboard test (tests/tui_dashboard.rs):
 # the real `orch-tui` App over the real engine, rendered into a buffer.
 ratatui.workspace = true
-predicates.workspace = true
 tempfile.workspace = true
 
 [lints.rust]

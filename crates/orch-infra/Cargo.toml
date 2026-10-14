@@ -29,7 +29,6 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
-shell-words.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [
@@ -44,7 +43,6 @@ tokio = { workspace = true, features = [
 ] }
 tokio-util.workspace = true
 tracing.workspace = true
-which.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
@@ -52,7 +50,6 @@ nix = { workspace = true, features = ["signal", "process"] }
 [dev-dependencies]
 orch-core = { workspace = true, features = ["test-support"] }
 insta.workspace = true
-predicates.workspace = true
 tempfile.workspace = true
 # `test-util` gives `#[tokio::test(start_paused = true)]`, so the stream's 30 s
 # file wait and the lock's staleness window cost no wall-clock time.

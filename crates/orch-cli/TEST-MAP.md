@@ -56,6 +56,7 @@ a unit test cannot: the exact stdout of `init`, `task add`, `task list`,
 | `cmd-msg*` | the fan-out shape of `send`/`broadcast`, the unknown-team no-op, the disabled-recipient filter, and body/subject trimming |
 | `cmd-org` | the ten org templates as L0 data, and a deployment's agents/team/goal |
 | `cmd-task-*`, `cmd-agent-*`, `cmd-edit-*` | the task and agent mutations, including the `$EDITOR` round trips |
+| `cmd-astral-column-widths` | that column widths and padding are `String.prototype.length` (UTF-16 code units), not `char`s and not display columns — one astral cell per table through `task list`, `agent list`, `goal list`, `context list` |
 | `v7-run-*` | `run <id>` (the collector wait), `run --all` (the queue drain) and `run --watch` (SIGTERM, then the tree it left) |
 | `o7-*` | the orchestrator end to end through `serve`: cascade failure, child crash, the concurrency cap, a killed orchestrator, retry backoff, review approve/reject, `--once` exit codes, stall detection |
 
