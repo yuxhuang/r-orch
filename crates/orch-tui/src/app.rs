@@ -103,6 +103,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 agent_id: None,
                 task_id: None,
                 detail: None,
+                ts_ms: None,
             },
             now,
             batch,
@@ -281,6 +282,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut messages = Vec::new();
         for entry in batch {
+            // The entry's own instant, so a backfilled run reads its real age.
+            let ts_ms = parse_timestamp_ms(&entry.timestamp);
             let pending = match entry.event_type.as_str() {
                 "error" => {
                     let formatted = format::format_agent_error(&entry.data);
@@ -298,6 +301,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                             agent_id: Some(entry.agent_id.clone()),
                             task_id: Some(entry.task_id.clone()),
                             detail: Some(formatted.detail),
+                            ts_ms,
                         }
                     } else {
                         PendingMessage {
@@ -307,6 +311,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                             agent_id: Some(entry.agent_id.clone()),
                             task_id: Some(entry.task_id.clone()),
                             detail: Some(formatted.detail),
+                            ts_ms,
                         }
                     }
                 }
@@ -317,6 +322,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     agent_id: Some(entry.agent_id.clone()),
                     task_id: Some(entry.task_id.clone()),
                     detail: None,
+                    ts_ms,
                 },
                 "done" => PendingMessage {
                     text: "Completed".into(),
@@ -325,14 +331,19 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     agent_id: Some(entry.agent_id.clone()),
                     task_id: Some(entry.task_id.clone()),
                     detail: None,
+                    ts_ms,
                 },
                 "tool_call" => PendingMessage {
-                    text: format!("⚙ {}()", entry.data),
+                    // `⚙ ${d?.name ?? 'tool'}()` — the payload is a JSON
+                    // object for every adapter that records one, and a bare
+                    // name only for the ones that do not.
+                    text: format!("⚙ {}()", tool_call_name(&entry.data)),
                     color: Token::Cyan,
                     msg_type: MsgType::Tool,
                     agent_id: Some(entry.agent_id.clone()),
                     task_id: Some(entry.task_id.clone()),
                     detail: None,
+                    ts_ms,
                 },
                 _ => {
                     let formatted = format::format_agent_output(&entry.data);
@@ -348,23 +359,15 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                         agent_id: Some(entry.agent_id.clone()),
                         task_id: Some(entry.task_id.clone()),
                         detail: Some(formatted.detail),
+                        ts_ms,
                     }
                 }
             };
-            messages.push((entry.timestamp, pending));
+            messages.push(pending);
         }
+        // `now` only stamps entries whose own timestamp did not parse.
         let now = self.now();
-        let mapped: Vec<PendingMessage> = messages
-            .into_iter()
-            .map(|(timestamp, mut pending)| {
-                // History timestamps are preserved where parseable; the
-                // relative clock reads them.
-                let _ = parse_timestamp_ms(&timestamp);
-                pending.detail = pending.detail.take();
-                pending
-            })
-            .collect();
-        self.state.prepend_messages(mapped, now);
+        self.state.prepend_messages(messages, now);
     }
 
     // ── Refresh ────────────────────────────────────────────────────────────
@@ -1170,6 +1173,22 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             .ok()
             .filter(|report| !report.trim().is_empty());
     }
+}
+
+/// The tool name from a `tool_call` history payload: the `name` field when the
+/// payload is a JSON object, the raw string when it is a bare name, and `tool`
+/// when neither (`d?.name ?? 'tool'`).
+fn tool_call_name(data: &str) -> String {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(data) {
+        return match map.get("name").and_then(|v| v.as_str()) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => "tool".to_string(),
+        };
+    }
+    if data.trim().is_empty() {
+        return "tool".to_string();
+    }
+    data.to_string()
 }
 
 fn classification_tokens(classification: format::Classification) -> (MsgType, Token) {

@@ -122,10 +122,9 @@ pub fn classify_agent_summary(summary: &str) -> Classification {
 /// Format a tool input into a concise hint (`Read` → file basename, `Bash` →
 /// command snippet).
 ///
-/// `name` is accepted for signature parity with the TS helper, which also
+/// `_name` is accepted for signature parity with the TS helper, which also
 /// ignores it: the hint is derived entirely from the input shape.
-pub fn format_tool_input(name: &str, input: &Value) -> String {
-    let _ = name;
+pub fn format_tool_input(_name: &str, input: &Value) -> String {
     // `!input || typeof input !== 'object'` — arrays are objects in JS and
     // fall through to the generic JSON branch below.
     if !matches!(input, Value::Object(_) | Value::Array(_)) {

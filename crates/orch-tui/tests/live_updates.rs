@@ -723,3 +723,88 @@ fn l048_a_recent_refresh_postpones_the_periodic_poll() {
     harness.advance(3_500);
     assert_eq!(harness.app.state.tasks.len(), 2);
 }
+
+// ── History timestamps ─────────────────────────────────────────────────────
+
+#[test]
+fn l049_a_backfilled_entry_keeps_its_own_instant() {
+    // `historyEntryToMsg` sets `ts: new Date(entry.timestamp).getTime()`, so a
+    // run recorded hours ago must not read as `now`.
+    let mut backend = FakeBackend::new();
+    let mut entry = history("done", "");
+    // Two hours before the harness clock (which starts at 1_000_000 ms).
+    entry.timestamp = "1970-01-01T00:00:00.000Z".into();
+    backend.pending_history = vec![vec![entry]];
+    let mut harness = Harness::with(backend);
+    harness.app.tick();
+    let message = &harness.app.state.messages[0];
+    assert_eq!(
+        message.ts_ms, 0,
+        "the entry's own instant, not the flush time"
+    );
+    assert_ne!(message.ts_ms, harness.now());
+}
+
+#[test]
+fn l050_a_backfilled_entry_renders_its_original_relative_time() {
+    let mut backend =
+        FakeBackend::new().with_agents(vec![make_agent("agt_1", "alpha", AgentStatus::Idle)]);
+    let mut entry = history("done", "");
+    // 1970 against a 1_000_000 ms clock is ~16 minutes of age.
+    entry.timestamp = "1970-01-01T00:00:00.000Z".into();
+    backend.pending_history = vec![vec![entry]];
+    let mut harness = Harness::with(backend);
+    harness.app.state.view = ViewId::Logs;
+    harness.app.tick();
+    harness.assert_text("16m");
+    harness.refute_text(" now ");
+}
+
+#[test]
+fn l051_an_unparseable_history_timestamp_falls_back_to_the_flush_time() {
+    let mut backend = FakeBackend::new();
+    let mut entry = history("done", "");
+    entry.timestamp = "not a date".into();
+    backend.pending_history = vec![vec![entry]];
+    let mut harness = Harness::with(backend);
+    let now = harness.now();
+    harness.app.tick();
+    assert_eq!(harness.app.state.messages[0].ts_ms, now);
+}
+
+#[test]
+fn l052_a_live_event_is_stamped_with_the_flush_time() {
+    let mut harness = event_harness();
+    harness.advance(500);
+    let now = harness.now();
+    harness.app.handle_event(&output_event("live line"));
+    harness.app.state.flush_messages(now);
+    assert_eq!(harness.app.state.messages.last().unwrap().ts_ms, now);
+}
+
+#[test]
+fn l053_a_tool_call_payload_object_renders_its_name() {
+    let mut backend = FakeBackend::new();
+    backend.pending_history = vec![vec![history("tool_call", r#"{"name":"Bash","input":{}}"#)]];
+    let mut harness = Harness::with(backend);
+    harness.app.tick();
+    harness.assert_message("⚙ Bash()");
+}
+
+#[test]
+fn l054_a_bare_tool_call_name_still_renders() {
+    let mut backend = FakeBackend::new();
+    backend.pending_history = vec![vec![history("tool_call", "Read")]];
+    let mut harness = Harness::with(backend);
+    harness.app.tick();
+    harness.assert_message("⚙ Read()");
+}
+
+#[test]
+fn l055_a_nameless_tool_call_payload_falls_back_to_tool() {
+    let mut backend = FakeBackend::new();
+    backend.pending_history = vec![vec![history("tool_call", r#"{"input":{}}"#)]];
+    let mut harness = Harness::with(backend);
+    harness.app.tick();
+    harness.assert_message("⚙ tool()");
+}

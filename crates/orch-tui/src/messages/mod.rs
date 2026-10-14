@@ -270,6 +270,12 @@ pub struct PendingMessage {
     pub agent_id: Option<String>,
     pub task_id: Option<String>,
     pub detail: Option<String>,
+    /// The message's own instant, when it has one: history entries carry the
+    /// time the event was recorded (`ts: new Date(entry.timestamp).getTime()`
+    /// in `historyEntryToMsg`), so a backfilled run keeps reading `2h` rather
+    /// than `now`. `None` means "stamp it with the flush time", which is what
+    /// every live event wants.
+    pub ts_ms: Option<i64>,
 }
 
 fn pending(text: String, color: Token, msg_type: MsgType) -> PendingMessage {
@@ -280,6 +286,7 @@ fn pending(text: String, color: Token, msg_type: MsgType) -> PendingMessage {
         agent_id: None,
         task_id: None,
         detail: None,
+        ts_ms: None,
     }
 }
 

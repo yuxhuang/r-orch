@@ -17,10 +17,10 @@ Run everything with `cargo test -p orch-tui`.
 | `tests/command_surface.rs` (`c001..c112`) | 112 | Every verb, subcommand, alias, usage and confirmation string |
 | `tests/views_render.rs` (`v001..v094`) | 94 | Sort orders, glyphs, caps, badges, detail panels, header, onboarding, overlays |
 | `tests/filters.rs` (`f001..f044`) | 44 | Both filter pickers and every filter predicate |
-| `tests/live_updates.rs` (`l001..l048`) | 48 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history, endurance |
-| **Integration total** | **487** | |
+| `tests/live_updates.rs` (`l001..l055`) | 55 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history and its timestamps, endurance |
+| **Integration total** | **494** | |
 | In-module unit tests | 271 | Pure logic: see the table below |
-| **Grand total** | **758** | |
+| **Grand total** | **765** | |
 
 In-module unit tests, by file:
 
@@ -79,7 +79,7 @@ In-module unit tests, by file:
 | §6 Layout arithmetic, resize, minimum-size guard | `layout.rs` (8), `k007`–`k017`, `v060`–`v062`, `v090`, `v091` |
 | §6 Header contents | `v063`–`v072` |
 | §7 Live updates: batching, debounce, caps, LRU, formatters | `l001`–`l021`, `l044`–`l048`, `messages/format.rs` (84) |
-| §7 History loading | `l037`–`l043` |
+| §7 History loading, incl. per-entry timestamps | `l037`–`l043`, `l049`–`l055` |
 | §8.1 Soft delete with undo | `l022`–`l026`, `k046`–`k049`, `k061`, `k062`, `k068` |
 | §8.2 Paste image / attachments | `app.rs` paste cases, `w0xx` paste cases, `v020`, `v044` |
 | §8.3 Onboarding | `onboarding.rs` (12), `v073`–`v079` |

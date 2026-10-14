@@ -848,7 +848,9 @@ impl AppState {
             .map(|p| {
                 let id = self.next_message_id;
                 self.next_message_id += 1;
-                Message::new(id, now_ms, &p.text, p.color, p.msg_type)
+                // A message with its own instant (a history entry) keeps it;
+                // everything else is stamped with the flush time.
+                Message::new(id, p.ts_ms.unwrap_or(now_ms), &p.text, p.color, p.msg_type)
                     .with_agent(p.agent_id)
                     .with_task(p.task_id)
                     .with_detail(p.detail)
@@ -875,7 +877,9 @@ impl AppState {
             .map(|p| {
                 let id = self.next_message_id;
                 self.next_message_id += 1;
-                Message::new(id, now_ms, &p.text, p.color, p.msg_type)
+                // A message with its own instant (a history entry) keeps it;
+                // everything else is stamped with the flush time.
+                Message::new(id, p.ts_ms.unwrap_or(now_ms), &p.text, p.color, p.msg_type)
                     .with_agent(p.agent_id)
                     .with_task(p.task_id)
                     .with_detail(p.detail)
@@ -1295,6 +1299,7 @@ mod tests {
                     agent_id: None,
                     task_id: None,
                     detail: None,
+                    ts_ms: None,
                 },
                 0,
                 crate::messages::MESSAGE_BATCH_MS,
@@ -1321,6 +1326,7 @@ mod tests {
                 agent_id: None,
                 task_id: None,
                 detail: None,
+                ts_ms: None,
             },
             0,
             0,
@@ -1340,6 +1346,7 @@ mod tests {
                     agent_id: None,
                     task_id: None,
                     detail: None,
+                    ts_ms: None,
                 },
                 0,
                 0,
@@ -1361,6 +1368,7 @@ mod tests {
                 agent_id: None,
                 task_id: None,
                 detail: None,
+                ts_ms: None,
             },
             0,
             0,
@@ -1373,6 +1381,7 @@ mod tests {
                 agent_id: None,
                 task_id: None,
                 detail: None,
+                ts_ms: None,
             }],
             0,
         );
