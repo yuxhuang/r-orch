@@ -2793,7 +2793,7 @@ solid text, selection); exact hex values are L2.
 
 ### 12.8 Deliberate divergences in r-orch's TUI
 
-WP-6 is complete: **747 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
+WP-6 is complete: **747 tests, 100 % of this section’s checklist.** Nine divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
 
@@ -2807,9 +2807,36 @@ each is justified on its own merits rather than by the gate.
 | f | Toast and undo rows come from the elastic bottom panel | **L2** | Pure layout. The rows exist and carry the same text; where the space is taken from differs. | here |
 | g | `log_selected_index` consistently indexes the **filtered** list | L1 | The original mixes filtered and unfiltered indexing, so the highlighted row and the detail shown disagree whenever a filter is active. | §14.20 |
 | h | Pre-dispatch failures reported synchronously as `Err` | L1 | The TUI renders no `orchestrator:error` case, so a stream-only dispatch error is **invisible**. | §12.10 |
+| i | Grapheme display width from `unicode-width`, not the TS range table | **L2** | The TS table under-measures several emoji classes; r-orch matches what terminals actually render. | §12.8.1 |
 
-Items (b) and (f) are recorded only here, because they are additions/layout rather than behaviours of the
-original. The other five have §13 or §14 entries.
+Items (b), (f) and (i) are recorded only here, because they are additions, layout or presentation rather
+than behaviours of the original. The others have §13, §14 or §12.10 entries.
+
+#### 12.8.1 Display width (L2)
+
+`text-cursor.ts:31` classifies a grapheme by **its first codepoint alone**, against a hand-written range
+table whose emoji entry is only `0x1F300–0x1FAFF`. Grapheme *clustering* is correct (it uses
+`Intl.Segmenter`); only the width classification is wrong. Measured consequences:
+
+| Input | First codepoint | TS width | Terminal / `unicode-width` |
+|---|---|---|---|
+| `⌚` `⏰` `✅` — BMP pictographs | U+231A, U+23F0, U+2705 — all below the `0x2E80` CJK floor | **1** | **2** |
+| `❤️` — VS16 sequence | U+2764 (the VS16 is in the same cluster but never inspected) | **1** | **2** |
+| `🇺🇸` — regional-indicator pair | U+1F1FA, below the `0x1F300` emoji floor | **1** | **2** |
+| `😀` | U+1F600, inside the range | 2 | 2 |
+| CJK, Hangul, fullwidth forms | — | 2 | 2 |
+
+r-orch uses **`unicode-width`**, so these measure 2 and the cursor, truncation and padding land where the
+terminal actually draws. **L2 and effect `none`** — it is presentation, and the TUI is outside the harness —
+but it is a visible improvement rather than a cosmetic shuffle: under the TS table an `⌚` in a task title
+drifts every column to its right by one.
+
+All on-screen measurement in r-orch goes through **ratatui**; the standalone width helpers are being
+annotated or removed by WP-6 so there is one source of truth rather than two that can disagree.
+
+**Related, same class:** the command bar truncates by **`char` count** in r-orch where the TS slices by
+**UTF-16 code units** (`commandBar.ts`). Each astral character is 2 code units but 1 `char`, so a command
+containing one drifts by a column between the two implementations. Also **L2**.
 
 ### 12.9 The update facade is intentionally inert
 
