@@ -29,6 +29,13 @@ use orch_infra::adapters::{
 use orch_infra::process::SystemProcessManager;
 use support::{collect, fixed_clock, params};
 
+/// Commands this suite spawns on purpose that are **not** agent CLIs.
+///
+/// `bash` is the shell adapter's launcher (`bash -lc <command>`); it has no
+/// fixture and should not have one. Everything else without a fixture is a
+/// mistake — see the panic in `spawn`.
+const SPAWNED_BY_DESIGN: &[&str] = &["bash"];
+
 fn fake_agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/fake-agents")
 }
@@ -70,8 +77,21 @@ impl ProcessManager for FakeAgentProcessManager {
         let fake = fake_agents_dir().join(command);
         let command = if fake.is_file() {
             fake.to_string_lossy().into_owned()
-        } else {
+        } else if SPAWNED_BY_DESIGN.contains(&command) {
             command.to_owned()
+        } else {
+            // No fixture, and not a system tool this suite means to run — so
+            // the inherited `PATH` would decide, and on a developer's machine
+            // that resolves to the real agent CLI. The old code fell through
+            // silently, which is one missing fixture away from executing the
+            // real `claude` with a rendered prompt. Fail loudly instead and
+            // name what to add.
+            panic!(
+                "no fixture for `{command}` in {} — add one, or list the command in \
+                 SPAWNED_BY_DESIGN if it is a system tool. Falling through to the inherited \
+                 PATH would run the real agent CLI.",
+                fake_agents_dir().display()
+            )
         };
         // The scripts run anywhere; the adapters' workspaces do not exist here.
         let opts = SpawnOptions {
