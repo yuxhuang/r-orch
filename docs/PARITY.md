@@ -3874,8 +3874,9 @@ harness.
 
 ### 14.37 Malformed YAML and JSON produce parser-specific error text — **DOCUMENTED DIVERGENCE**
 
-**Effect on differential comparison: `scenario exclusion required (malformed-input-*)`** — the exclusion
-masks **all of stderr after the leading `  ✕ ` prefix**. wp0 is adding the scenario; nothing covered this
+**Effect on differential comparison: `scenario exclusion required`** — pinned by wp0's
+`cmd-malformed-input` scenario using the **`@stderr-prefix-only:<reason>`** directive, which compares only
+the `  ✕ ` marker while keeping **exit code, stdout and the file's bytes exact**. Nothing covered this
 before, which is why an L0 divergence went undocumented.
 
 #### What TS prints
@@ -3946,6 +3947,18 @@ valid array.
 So the index is genuinely a cache: corrupting it costs one rebuild and no data. **Do not add a §14 row or an
 exclusion for it** — the only surprise is that there is no surprise.
 
+> **The trap here, and it is a real one.** r-orch's `read_index` swallows the error and falls through to
+> `rebuild_index` — an `if let Ok(Some(..))` of **exactly the same shape** as the §14.25 port defect, where
+> `scan_items` swallowed a parse error and persisted the loss. **The difference is which function does it.**
+> Swallowing in `read_index` is **correct and faithful**: the index is a cache, a cache miss is not an error,
+> and TS does the same (`index-manager.ts:79-87`). Swallowing in `scan_items` was a **defect**: the entity
+> files are the source of truth, so dropping one deletes data.
+>
+> Anyone auditing for the §14.25 pattern will find this and be tempted to "fix" it. **Do not** — it would
+> turn a silent recovery into a hard failure on a corrupt cache, diverging from TS and breaking a project for
+> no gain. (wp0 flagged this; it is the kind of thing that gets fixed wrongly a year later by someone
+> grepping for a shape rather than reading the call site.)
+
 > **The two faults compound, though.** A corrupt index *forces* the rebuild, and the rebuild opens every
 > entity file — so a corrupt index **plus** a corrupt entity file surfaces the §14.37 YAML error, where
 > either alone would be silent (a bad index rebuilds cleanly; a bad entity file is invisible to a listing,
@@ -3956,9 +3969,16 @@ exclusion for it** — the only surprise is that there is no surprise.
 #### Scope: YAML and `context/<key>.json`
 
 This row covers both malformed **YAML** (entity files, `config.yml`) and malformed **JSON** in
-`context/<key>.json`, whose TS shape is given above. **r-orch's text for the JSON case is being measured by
-wp0**; expect it to name the path as the YAML case does, and reconcile this row against that measurement
-when it lands.
+`context/<key>.json`. Both measured against the oracle:
+
+| Input | Command | TS stderr | r-orch stderr |
+|---|---|---|---|
+| malformed `config.yml` | `status` | reason + `(l:c)` + excerpt + caret, **no path** | `  ✕ <path> is not valid YAML: <saphyr reason>` |
+| malformed task `.yml` | `task show <id>` | same shape | same shape |
+| corrupt `context/<key>.json` | `context get <key>` | `  ✕ Unexpected end of JSON input` — **no path, no excerpt** | **path + `serde_json`'s reason** |
+
+So r-orch names the failing file in **both** formats, where TS names it in neither. Exit 1, empty stdout and
+the file left byte-identical in every case.
 
 #### Both read paths behave identically
 
