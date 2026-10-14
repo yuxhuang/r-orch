@@ -955,8 +955,15 @@ Exception: `init` writes a **fixed** agent id `agt_creator` (not a nanoid).
 
 **Filename safety** (L0): every id used in a path passes `sanitizeId`, which enforces `^[A-Za-z0-9._-]+$` and
 throws `Invalid identifier: "<id>"` otherwise. Context keys go through the same function, so a key containing
-`/`, `..`, or any other character outside that class is rejected rather than sanitized. This is the path
-traversal defence and must be preserved exactly.
+`/`, a path separator, or any other character outside that class is rejected rather than sanitized. This is
+the path traversal defence and must be preserved exactly.
+
+> **`sanitizeId` accepts `.` and `..`, and that is correct — do not "harden" it.** Both consist only of
+> permitted characters (`.` is in the class), so the regex admits them. An earlier revision of this paragraph
+> claimed `..` was rejected; it is not, in either implementation. The character class is **L0** and changing
+> it would diverge on every id. The `..` traversal risk is closed in the **two path builders that append no
+> extension**, not in `sanitizeId` — see §14.30. Every other builder appends `.yml`/`.json`, where `..`
+> yields the ordinary filename `...yml`.
 
 ### 6.3 Timestamps (L0)
 
@@ -3023,12 +3030,13 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.27 orphaned `running` runs never swept | FIX | `none` |
 | §14.28 `start_watch` leaks the lock on error | FIX | `none` |
 | §14.29 lock PID `0` / `> i32::MAX` treated dead | FIX (differs from TS for `0`) | `none` expected |
-| §14.30 `.`/`..` accepted as an id | FIX (additive) | `none` |
+| §14.30 `.`/`..` reach two extension-less builders | FIX (additive, **two builders only**) | `none` |
 | §14.31 four YAML read guards reject what js-yaml accepts | DIVERGENCE | `none` in corpus |
 | §14.32 run-events > 50 MiB tail-read (last 1 MiB) | FIX | `none` — unreachable in corpus |
 | §14.33 token totals can overflow | FIX | `none` |
 | §14.34 tracing to stderr under `ORCHESTRY_DEBUG` | FIX | `none` |
 | §14.35 `config.yml` / `agents/*.yml` written 0600 | FIX | `none` — **modes are not compared**, hence the row |
+| §14.36 three favourable divergences (sandboxed Liquid, negative-PID reject, in-process clipboard) | DIVERGENCE (favourable) | `none`, except Liquid partials: `scenario exclusion required (custom-template-*)` |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3570,19 +3578,36 @@ A PID that parses as a number but cannot name a live process is treated as **dea
   is the same root cause as §14.22 and the same decision.
 - **`> i32::MAX`** — cannot be a PID on any supported platform.
 
-### 14.30 `.` and `..` accepted in extension-less id paths — **FIX (additive)**
+### 14.30 `.` and `..` reach two extension-less path builders — **FIX (additive, scoped to two builders)**
 
 **Effect on differential comparison: `none`.**
 
-`sanitize_id`'s character class `^[A-Za-z0-9._-]+$` (§6.2) admits the strings `.` and `..`, because both
-consist only of permitted characters. For ids used with an extension this is harmless (`./..yml` is just an
-odd filename), but an id used as a **bare path segment** — the workspace directory
-`.orchestry/workspaces/<taskId>` — would resolve to the parent directory.
+`sanitize_id`'s character class `^[A-Za-z0-9._-]+$` (§6.2) admits `.` and `..`, because both consist only of
+permitted characters. That is **deliberate and stays that way** — the class is L0 (§6.2). In every builder
+that appends an extension it is harmless: `..` + `.yml` is the ordinary filename `...yml`.
 
-**Decision: fix** — reject `.` and `..` outright. Additive hardening: no legitimate id is affected, and the
-generated form is `<prefix>_<nanoid(7)>`, which cannot produce either. **Reachable only by hand-editing** an
-entity file or `state.json` to contain such an id — no CLI path and no adapter can produce one — which is why
-it is hardening rather than a live bug.
+**Two builders append nothing**, and that is where the risk lives:
+
+| Builder | `".."` yields |
+|---|---|
+| `task_attachments_dir` (`storage/paths.rs:166`) | `.orchestry/attachments/..` |
+| `workspace_path` (`workspace/manager.rs:49`) | `.orchestry/workspaces/..` = **`.orchestry` itself** |
+
+The second is the dangerous one: `cleanup` hands that path to a recursive remove
+(`workspace/manager.rs:200`), so a task id of `..` would delete the entire project state directory.
+**Identical in the oracle** — `workspace-manager.ts:76` is the same
+`path.join(orchestryDir, 'workspaces', sanitizeId(taskId))` followed by
+`fs.rm(..., { recursive: true, force: true })` — so this is a pre-existing hazard, not a port regression. It
+is reachable only by hand-editing an entity file or `state.json`; ids are nanoid-generated and no CLI path or
+adapter can produce one. The destructive sink is what makes it worth closing regardless.
+
+**Decision: fix — reject exactly `.` and `..` in those two builders only.** `sanitize_id` itself is
+**unchanged and byte-compatible**, so no on-disk or CLI contract moves. Purely additive: real ids never
+contain them.
+
+> Do not "simplify" this by moving the check into `sanitize_id`. That would reject `.`/`..` for every id in
+> every store, diverging from the reference character class on an L0 surface — which is why the remediation
+> is scoped to the two sinks that actually need it.
 
 ### 14.31 YAML read guards reject documents js-yaml accepts — **DOCUMENTED DIVERGENCE**
 
@@ -3685,6 +3710,40 @@ a user error that 0600 would hide rather than fix.
 `.gitignore`, so an API key there still reaches your repository on the next `git add`. 0600 closes local
 read access, not disclosure through version control. See
 [docs/RUNBOOK.md](RUNBOOK.md#secrets-in-agent-config).
+
+### 14.36 Three places r-orch is materially safer than the original — **DIVERGENCE (favourable)**
+
+**Effect on differential comparison: `none`** for (2) and (3). **(1) needs a named scenario exclusion** — see
+below.
+
+Recorded at the security reviewer's request, because these are **wins, not divergences to apologise for**,
+and because an undocumented favourable divergence is still a divergence somebody will later "fix" back.
+
+**1. Liquid templates cannot read the filesystem.** `template/engine.rs:31` builds the parser as
+`ParserBuilder::with_stdlib().build()` with **no partials source**, so `{% include %}`, `{% render %}` and
+any `../` traversal fail with `Partial does not exist`. The oracle's liquidjs defaults to `root: ['.']` with
+a filesystem loader, and **was measured rendering real file contents** — `package.json`, `tsconfig.json`,
+`src/index.ts` — into agent prompts.
+
+This matters because `config.prompt.*` templates are **user- and agent-supplied**: an agent that can write
+the config can exfiltrate arbitrary readable files into the next agent's prompt. r-orch closes a real
+file-disclosure path that the original has.
+
+**Effect on comparison: `scenario exclusion required (custom-template-*)`.** A scenario whose custom
+template uses `{% include %}` renders file contents in TS and an error in r-orch. The existing
+`custom-template-*` exclusion for unknown filters (§14.6) covers the same scenario family; add
+partial-bearing templates to it rather than creating a second one.
+
+**2. Negative PIDs in the lock file are rejected.** `lock.rs:186` parses with `parse::<u32>()`, which refuses
+`-1`. The oracle's `parseInt` accepts it and then probes **every process the user can signal** — `kill(-1, 0)`
+is "all processes", so a lock file containing `-1` makes TS report the project locked by a phantom. The other
+half of this cast is §14.29. **No comparison effect:** nothing writes a negative PID, so no scenario reaches
+it.
+
+**3. Clipboard access is in-process.** `arboard` replaces shelling out to `osascript` / `xclip` /
+PowerShell — one fewer subprocess surface, and no shell quoting to get wrong. The cost is a larger in-process
+image-decoder dependency stack, which is the trade the security review accepted. TUI-only, outside the
+harness.
 
 ---
 
