@@ -360,8 +360,10 @@ pub struct Directives {
     /// output genuinely is L2", which the lint then accepts. It is also the
     /// one place a reader of the scenario finds out which L2 clause applies.
     pub exit_only_reason: bool,
-    /// `@unordered:<reason>` — this step prints a JSON **array** whose element
-    /// order is not contract, so the two sides are compared as multisets.
+    /// `@unordered:<reason>` — the JSON arrays in this step's output hold the
+    /// same elements on both sides but not necessarily in the same order, so
+    /// they are compared as multisets. Applies at every depth: `status
+    /// --json` carries its arrays under `tasks` and `agents`.
     ///
     /// The one case that needs it today is a `broadcast` fan-out: the oracle
     /// saves the messages with `Promise.all`, so the order they reach
