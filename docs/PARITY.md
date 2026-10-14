@@ -2775,9 +2775,20 @@ step types. Validation is **300 ms debounced** for text and textarea, **synchron
       with the remainder, measuring **per grapheme**. Required for parity — without it a cursor in a long
       value drifts out of view. r-orch measures with `unicode-width` rather than the TS range table, so the
       algorithm matches while the widths differ (§12.8.1).
-- [ ] **Clipboard paste** on `text`/`textarea` steps: **`Ctrl+V`, `Cmd+V`, `Ctrl+I`, `Cmd+I`** — the guard is
-      `(key.ctrl || key.meta) && (input === 'v' || input === 'i')`, so it is Ctrl-or-Cmd, **not** Option/Alt.
-      Only active when a paste handler is wired and the step is `text` or `textarea`.
+- [ ] **Clipboard paste** on `text`/`textarea` steps. The TS guard is
+      `(key.ctrl || key.meta) && (input === 'v' || input === 'i')`, and in Ink `key.meta` means
+      **Alt/Option**, so the reachable bindings are **`Ctrl+V`, `Ctrl+I`, `Alt`/`Option`+`V`,
+      `Alt`/`Option`+`I`**. Only active when a paste handler is wired and the step is `text` or `textarea`.
+
+      **Cmd (U+2318) is not one of them, and cannot be.** Verified in Ink 6.8.0 `parse-keypress.js`: on the
+      legacy path `key.meta` is set from an **ESC-prefixed** sequence (`key.meta = s.charAt(0) === '\x1b'`,
+      and `metaKeyCodeRe = /^(?:\x1b)([a-zA-Z0-9])$/`), which is exactly how terminals encode
+      Option-as-Meta; on the xterm path it is `!!(modifier & 10)`, i.e. the Alt/Meta bits. Under the Kitty
+      protocol `meta` is a **distinct bit from `super`** — `kittyModifiers = { shift: 1, alt: 2, ctrl: 4,
+      super: 8, hyper: 16, meta: 32 }` — and Cmd arrives as `super`, which Ink never maps to `key.meta`. On
+      other terminals Cmd combinations are consumed by the emulator and never reach the application.
+
+      Bind `Ctrl` and `Alt`/`Option`; do **not** add a Cmd binding expecting it to fire.
 - [ ] Validation messages verbatim: `Title is required`, `Priority must be 1-4`, `Name is required`,
       `Agent with this name already exists`, `Team with this name already exists`,
       `Command is required for Shell`, `Fix the error above`
