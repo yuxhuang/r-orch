@@ -52,7 +52,7 @@ impl SystemProcessManager {
 ///
 /// `kill` negates this value itself to signal the group first, so the result
 /// is always strictly positive.
-fn signal_target(pid: u32) -> Option<i32> {
+pub(crate) fn signal_target(pid: u32) -> Option<i32> {
     match i32::try_from(pid) {
         Ok(pid) if pid > 0 => Some(pid),
         _ => {

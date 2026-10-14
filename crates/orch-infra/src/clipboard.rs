@@ -260,10 +260,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_system_clipboard_never_errors_even_when_headless() {
-        // Whatever this machine has, the calls must return a value.
-        let _ = detect_clipboard_type().await;
-        let _ = get_clipboard_image().await;
-        let _ = is_clipboard_available();
+    async fn the_system_clipboard_degrades_rather_than_erroring_when_headless() {
+        // This used to bind every result to `_`, which asserts nothing at all
+        // (code m6): the calls could have returned anything, or panicked only
+        // on some machines, and the test would still have passed. The real
+        // contract is that each one *degrades* — no clipboard is a `None`/
+        // `false`, never an error and never a panic.
+        //
+        // CI and this sandbox are headless, so that is the branch under test;
+        // a developer running it on a desktop may legitimately see a
+        // clipboard, which is why the assertions name both outcomes rather
+        // than pinning one.
+        let kind = detect_clipboard_type().await;
+        let image = get_clipboard_image().await;
+        let available = is_clipboard_available();
+
+        if available {
+            // With a clipboard present, the type is whatever is on it and the
+            // image is `Some` only if it really holds an image.
+            assert!(
+                image.is_none() || kind == ClipboardContentType::Image,
+                "an image was returned but the type says {kind:?}"
+            );
+        } else {
+            assert_eq!(
+                kind,
+                ClipboardContentType::Empty,
+                "no clipboard must read as Empty, not as text or an image"
+            );
+            assert!(image.is_none(), "no clipboard cannot yield an image");
+        }
     }
 }

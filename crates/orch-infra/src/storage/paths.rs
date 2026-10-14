@@ -139,7 +139,7 @@ impl Paths {
     }
 
     pub fn task_attachments_dir(&self, task_id: &str) -> Result<PathBuf> {
-        Ok(self.attachments_dir().join(sanitize_id(task_id)?))
+        Ok(self.attachments_dir().join(sanitize_path_segment(task_id)?))
     }
 
     pub async fn is_initialized(&self) -> bool {
@@ -171,6 +171,27 @@ pub fn sanitize_id(id: &str) -> Result<&str> {
     } else {
         Err(Error::other(format!("Invalid identifier: \"{id}\"")))
     }
+}
+
+/// `sanitize_id`, additionally rejecting `.` and `..` (security C2).
+///
+/// For the builders that append an **extension**, `sanitize_id` is enough: an
+/// id of `..` yields `tasks/...yml`, an odd file name and nothing more.
+/// `task_attachments_dir` appends no extension, so `..` would resolve to the
+/// *parent* directory — and `attachments/..` is `.orchestry/`.
+///
+/// Unreachable today, because every id is generated: the regex
+/// `^[A-Za-z0-9._-]+$` accepts `..` but nanoid never produces it. That makes
+/// this a guard against a future caller passing a user-supplied id, which is
+/// exactly the kind of assumption that stops holding quietly.
+fn sanitize_path_segment(id: &str) -> Result<&str> {
+    let id = sanitize_id(id)?;
+    if id == "." || id == ".." {
+        return Err(Error::other(format!(
+            "Invalid identifier: \"{id}\" would escape its directory"
+        )));
+    }
+    Ok(id)
 }
 
 /// Reject a workspace path outside the project root (PARITY.md §10.7).
@@ -241,6 +262,25 @@ mod tests {
 
     fn paths() -> Paths {
         Paths::new("/tmp/project")
+    }
+
+    #[test]
+    fn the_extension_less_builders_reject_dot_and_dotdot() {
+        // `sanitize_id` accepts both, because `.` is a legal id character —
+        // harmless where an extension follows (`tasks/...yml`), a traversal
+        // where none does: `attachments/..` is `.orchestry/` itself.
+        let paths = Paths::new(Path::new("/tmp/project"));
+        for id in [".", ".."] {
+            assert!(
+                paths.task_attachments_dir(id).is_err(),
+                "attachments/{id} must be refused"
+            );
+            // Still fine for the builders that append an extension.
+            assert!(sanitize_id(id).is_ok(), "{id} is a valid id generally");
+        }
+        assert!(paths.task_attachments_dir("tsk_abc1234").is_ok());
+        // And a nested traversal was already impossible: `/` is not allowed.
+        assert!(paths.task_attachments_dir("../etc").is_err());
     }
 
     #[test]
@@ -370,11 +410,13 @@ mod tests {
             paths.context_path("..").unwrap(),
             Path::new("/tmp/project/.orchestry/context/...json")
         );
-        // The one builder with no extension to absorb it.
-        assert_eq!(
-            paths.task_attachments_dir("..").unwrap(),
-            Path::new("/tmp/project/.orchestry/attachments/..")
-        );
+        // The one builder with no extension to absorb it **used** to return
+        // `attachments/..`, i.e. `.orchestry/` itself. The id-level
+        // acceptance above is still faithful to the reference regex — that is
+        // what this test exists to record — but the extension-less builder
+        // now refuses it (security C2). The parity fact and the guard are
+        // different things, and both are asserted.
+        assert!(paths.task_attachments_dir("..").is_err());
     }
 
     #[test]
@@ -421,7 +463,11 @@ mod tests {
         let orphan = temp.path().join("orphan");
         std::fs::create_dir_all(&orphan).unwrap();
         let found = find_project_root(&orphan);
-        assert!(found == lexically_resolve(&orphan) || found == lexically_resolve(temp.path()));
+        // One expected value, not a disjunction: an assertion that accepts
+        // either answer cannot fail if the fallback changes (code m4). With
+        // no `.orchestry` anywhere above it, `find_project_root` falls back
+        // to the directory it started from.
+        assert_eq!(found, lexically_resolve(&orphan));
     }
 
     #[tokio::test]

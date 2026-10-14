@@ -38,17 +38,35 @@ pub async fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let basename = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp_path = dir.join(format!(".{basename}.{}.tmp", random_hex8()));
 
-    match tokio::fs::write(&tmp_path, content).await {
-        Ok(()) => {}
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(Error::io(
-                format!("write {}", tmp_path.display()),
-                &tmp_path,
-                err,
-            ));
-        }
+    // `create_new` so the open fails rather than following a symlink or
+    // truncating something that is already there. The name has 8 random hex
+    // characters, so a collision means another writer is mid-flight on the
+    // same path and failing is the right answer (sre C5, security).
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await?;
+        file.write_all(content.as_bytes()).await?;
+        // Without this the rename can be durable while the *contents* are
+        // not: a crash between the two leaves a correctly named file full of
+        // zeroes. `atomic_write` is what every store writes through, so this
+        // is the one place it has to be right.
+        file.sync_all().await?;
+        Ok::<(), std::io::Error>(())
     }
+    .await;
+
+    if let Err(err) = write_result {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(Error::io(
+            format!("write {}", tmp_path.display()),
+            &tmp_path,
+            err,
+        ));
+    }
+
     if let Err(err) = tokio::fs::rename(&tmp_path, path).await {
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(Error::io(
@@ -57,6 +75,16 @@ pub async fn atomic_write(path: &Path, content: &str) -> Result<()> {
             err,
         ));
     }
+
+    // And fsync the directory, or the rename itself can be lost: the entry is
+    // only durable once the directory's own metadata is. Best-effort — a
+    // filesystem that refuses to open a directory for sync is not a reason to
+    // fail a write that already succeeded.
+    #[cfg(unix)]
+    if let Ok(dir_handle) = tokio::fs::File::open(dir).await {
+        let _ = dir_handle.sync_all().await;
+    }
+
     Ok(())
 }
 
@@ -193,6 +221,120 @@ pub async fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write(path, &quote_ambiguous_scalars(&raw)).await
 }
 
+/// Largest YAML document `read_yaml_value` will hand to the parser.
+///
+/// Every file ORCH writes is orders of magnitude smaller; the cap exists so a
+/// hand-placed file cannot make the parser the expensive part.
+const MAX_YAML_READ_SIZE: usize = 1024 * 1024;
+
+/// Ceiling on a document's *expanded* size, estimated as
+/// `length × (1 + aliases)`.
+///
+/// This is the check that actually stops flat amplification, and it stops it
+/// in microseconds rather than at the deadline. The estimate is deliberately
+/// crude — it assumes the worst case, that every alias refers to the whole
+/// document — because the real figure needs the anchor spans, and anything
+/// that walks structure is the parse we are trying to avoid.
+///
+/// The two populations are nowhere near each other, which is what makes a
+/// crude estimate workable:
+///
+/// - a 974 KB document aliased 64 times estimates at **62 MB** and parses in
+///   7.5 s;
+/// - the largest plausible real file — a 20 KB agent with a long role — with
+///   64 aliases estimates at 1.3 MB, and in practice ORCH's own files contain
+///   **no** aliases at all, so they estimate at their own length.
+///
+/// It does not catch *nested* amplification, where the product is small but
+/// expansion is exponential (5 KB × 30 ≈ 150 KB, yet 7 s to parse). That is
+/// what [`YAML_PARSE_TIMEOUT`] is for. Neither check subsumes the other.
+const MAX_YAML_EXPANDED_SIZE: usize = 8 * 1024 * 1024;
+
+/// How long `read_yaml_value` will spend parsing one document.
+///
+/// Generous: the largest file ORCH writes parses in single-digit milliseconds,
+/// and the worst *legitimate* document allowed by [`MAX_YAML_READ_SIZE`] is
+/// well under this. It is the backstop for amplification that
+/// [`MAX_YAML_EXPANDED_SIZE`]'s estimate does not model — chiefly *nested*
+/// aliases, where the product of length and count stays small but expansion is
+/// exponential (5 KB × 30 aliases, 7 s to reject).
+///
+/// **Caveat worth knowing:** `spawn_blocking` work cannot be cancelled, so the
+/// parse keeps running on its blocking thread after the timeout fires. The
+/// caller gets a prompt error, but the thread is occupied until the parse
+/// finishes — bounded, because the document is already capped at 1 MiB, which
+/// is about 8 s in the worst measured case. Returning promptly while one
+/// thread finishes its work is strictly better than blocking the caller for
+/// the same duration.
+const YAML_PARSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Most YAML aliases a document may contain.
+///
+/// Defence in depth. A count alone cannot be the defence, because the cost of
+/// an alias depends entirely on what it points at:
+///
+/// **The amplifying shape is one large *collection* anchor aliased many
+/// times**, and each alias deep-copies every node in it. Measured on this
+/// crate, 64 aliases of a map anchor:
+///
+/// | document | parse time |
+/// |----------|------------|
+/// | 27 KB    | 272 ms     |
+/// | 71 KB    | 628 ms     |
+/// | 211 KB   | 1.69 s     |
+/// | 974 KB   | **7.51 s** |
+///
+/// Every one of those **parses successfully**, and the last is inside both
+/// this cap and [`MAX_YAML_READ_SIZE`] — so size and count together are not
+/// enough. [`MAX_YAML_EXPANDED_SIZE`] is what rejects this shape, by combining
+/// them into an estimate rather than checking each alone. (A *scalar* anchor
+/// of the same size is cheap: 316 KB aliased 64 times parses in 31 ms. The
+/// cost is in copying structure, not bytes.)
+///
+/// Nested aliases are a different and lesser problem: `serde_yaml_ng`'s own
+/// repetition limit rejects them, though it spends seconds doing so.
+const MAX_YAML_ALIASES: usize = 64;
+
+/// Count `*alias` tokens outside quotes and comments.
+///
+/// Deliberately a scanner rather than a parse: the whole point is to decide
+/// before the parser gets the document. It does not need to be exact — a
+/// false positive on a document with 17+ aliases is acceptable, because
+/// nothing ORCH writes has any.
+fn count_yaml_aliases(content: &str) -> usize {
+    let bytes = content.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    let (mut in_single, mut in_double, mut in_comment) = (false, false, false);
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match byte {
+            b'\n' => {
+                in_comment = false;
+                // A newline also ends a single-quoted scalar only in the sense
+                // that we stop tracking it; YAML allows multi-line quotes, and
+                // over-counting is the safe direction.
+            }
+            b'#' if !in_single && !in_double => in_comment = true,
+            b'\'' if !in_double && !in_comment => in_single = !in_single,
+            b'"' if !in_single && !in_comment => in_double = !in_double,
+            b'*' if !in_single && !in_double && !in_comment => {
+                // An alias is `*` followed by a name character. `a * b` is
+                // multiplication in a plain scalar, not an alias.
+                if bytes.get(i + 1).is_some_and(|next| {
+                    next.is_ascii_alphanumeric() || *next == b'_' || *next == b'-'
+                }) {
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    count
+}
+
 /// Read and parse a YAML file, resolving merge keys. `None` when absent.
 pub async fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let Some(value) = read_yaml_value(path).await? else {
@@ -212,8 +354,72 @@ pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>
     let Some(content) = read_to_string_opt(path).await? else {
         return Ok(None);
     };
-    let mut value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content)
-        .map_err(|err| Error::serde(format!("parse {}", path.display()), path, err))?;
+    // Three checks, all *before* the parser sees the document, because the cost
+    // being avoided is the parse itself. See the constants for what each one
+    // catches; none of them subsumes another.
+    if content.len() > MAX_YAML_READ_SIZE {
+        return Err(Error::other(format!(
+            "{} is {} bytes, over the {MAX_YAML_READ_SIZE}-byte YAML limit",
+            path.display(),
+            content.len()
+        )));
+    }
+    let aliases = count_yaml_aliases(&content);
+    // Estimated expanded size, before the count cap: a document can be inside
+    // both the size and alias caps and still expand to tens of megabytes.
+    let expanded = content.len().saturating_mul(aliases.saturating_add(1));
+    if expanded > MAX_YAML_EXPANDED_SIZE {
+        return Err(Error::other(format!(
+            "{} is {} bytes with {aliases} aliases, which could expand to ~{} MiB: \
+             over the {} MiB limit. Nothing ORCH writes uses aliases at all.",
+            path.display(),
+            content.len(),
+            expanded / 1024 / 1024,
+            MAX_YAML_EXPANDED_SIZE / 1024 / 1024
+        )));
+    }
+    if aliases > MAX_YAML_ALIASES {
+        return Err(Error::other(format!(
+            "{} contains {aliases} YAML aliases, over the limit of \
+             {MAX_YAML_ALIASES}: nested aliases amplify, and the parser spends \
+             seconds on a few kilobytes of them. Nothing ORCH writes uses aliases \
+             at all.",
+            path.display()
+        )));
+    }
+    // Parsed on a blocking thread under a hard deadline. Alias expansion is
+    // CPU-bound and unbounded in the input's *expanded* size rather than its
+    // length, so neither the size cap nor the alias count can bound it — only
+    // a clock can. On the async thread this would also stall every other task
+    // on the runtime.
+    let owned_path = path.to_path_buf();
+    let parsed = tokio::time::timeout(
+        YAML_PARSE_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content).map_err(|err| {
+                Error::serde(format!("parse {}", owned_path.display()), &owned_path, err)
+            })
+        }),
+    )
+    .await;
+
+    let mut value: serde_yaml_ng::Value = match parsed {
+        Ok(Ok(result)) => result?,
+        Ok(Err(join_err)) => {
+            return Err(Error::other(format!(
+                "parsing {} panicked: {join_err}",
+                path.display()
+            )));
+        }
+        Err(_elapsed) => {
+            return Err(Error::other(format!(
+                "parsing {} exceeded {:?}: a YAML document whose aliases expand to far more \
+                 than its own size. Nothing ORCH writes uses aliases at all.",
+                path.display(),
+                YAML_PARSE_TIMEOUT
+            )));
+        }
+    };
     // js-yaml's default schema resolves `<<`; serde_yaml_ng does not until
     // asked (PARITY.md §6.4.2). Unconditional: it is a no-op on every document
     // ORCH itself writes.
@@ -833,6 +1039,293 @@ mod tests {
     }
 
     // ── atomic_write / json ────────────────────────────────────────────────
+
+    /// Any `.tmp` siblings left behind in `dir`.
+    ///
+    /// The whole point of writing through a temp file is that a failure leaves
+    /// the destination untouched; leaving litter behind instead breaks the
+    /// other half of that promise (code m3).
+    fn stray_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.ends_with(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The measured amplification bomb: 14 nesting levels of `<<: [*p, *p]`
+    /// over a 4 KB anchor, in ~5 KB of YAML.
+    fn alias_bomb() -> String {
+        let mut doc = String::from("base: &b\n");
+        for i in 0..100 {
+            doc.push_str(&format!("  k{i}: {}\n", "v".repeat(40)));
+        }
+        let mut previous = "b".to_owned();
+        for level in 1..=14 {
+            doc.push_str(&format!(
+                "m{level}: &m{level}\n  <<: [*{previous}, *{previous}]\n  e{level}: 1\n"
+            ));
+            previous = format!("m{level}");
+        }
+        doc.push_str(&format!("top:\n  <<: [*{previous}, *{previous}]\n"));
+        doc
+    }
+
+    /// The shape that actually amplifies: one large **collection** anchor,
+    /// aliased many times, so every alias deep-copies every node.
+    ///
+    /// Sized to sit inside both the size cap and the alias cap, because that
+    /// is the point — neither of those can stop it.
+    fn flat_anchor_bomb() -> String {
+        let mut doc = String::from("a: &a\n");
+        for i in 0..60_000 {
+            doc.push_str(&format!("  k{i}: v{i}\n"));
+        }
+        doc.push_str("list:\n");
+        for _ in 0..64 {
+            doc.push_str("  - *a\n");
+        }
+        doc
+    }
+
+    #[tokio::test]
+    async fn a_flat_anchor_bomb_is_refused_promptly() {
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("flat.yml");
+        let bomb = flat_anchor_bomb();
+        // Inside both cheap caps, which is what makes the timeout necessary.
+        assert!(bomb.len() < MAX_YAML_READ_SIZE, "inside the size cap");
+        assert!(
+            count_yaml_aliases(&bomb) <= MAX_YAML_ALIASES,
+            "inside the alias cap"
+        );
+        std::fs::write(&path, &bomb).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = read_yaml_value(&path)
+            .await
+            .expect_err("an amplifying document must be refused");
+        let elapsed = started.elapsed();
+
+        // Refused by the expanded-size estimate, so in microseconds — not at
+        // the deadline. 7.5 s unguarded, and the deadline alone would still
+        // have made the caller wait two seconds.
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "rejection took {elapsed:?}; the estimate should refuse this without parsing"
+        );
+        let message = format!("{err}");
+        assert!(
+            message.contains("flat.yml"),
+            "must name the file: {message}"
+        );
+        assert!(message.contains("expand"), "must say why: {message}");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_document_is_nowhere_near_the_deadline() {
+        // The deadline must not be anywhere near a real file's cost. This is
+        // larger than anything ORCH writes.
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("big-but-honest.yml");
+        let mut doc = String::new();
+        for i in 0..20_000 {
+            doc.push_str(&format!("k{i}: value number {i}\n"));
+        }
+        std::fs::write(&path, &doc).unwrap();
+
+        let started = std::time::Instant::now();
+        let value = read_yaml_value(&path).await.unwrap().expect("present");
+        let elapsed = started.elapsed();
+
+        assert_eq!(value["k19999"].as_str(), Some("value number 19999"));
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "an alias-free 20k-key document took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nested_alias_bomb_is_refused_by_the_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("bomb.yml");
+        let bomb = alias_bomb();
+        std::fs::write(&path, &bomb).unwrap();
+
+        // 28 aliases — inside the count cap, so the deadline is what stops
+        // it. `serde_yaml_ng` would reject it eventually, through its own
+        // repetition limit, but only after about seven seconds.
+        assert!(count_yaml_aliases(&bomb) <= MAX_YAML_ALIASES);
+
+        let started = std::time::Instant::now();
+        let err = read_yaml_value(&path)
+            .await
+            .expect_err("an alias bomb must be refused");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < YAML_PARSE_TIMEOUT + std::time::Duration::from_millis(500),
+            "the caller waited {elapsed:?}, past the deadline"
+        );
+        let message = format!("{err}");
+        assert!(
+            message.contains("bomb.yml"),
+            "must name the file: {message}"
+        );
+        assert!(message.contains("exceeded"), "must say why: {message}");
+    }
+
+    #[tokio::test]
+    async fn too_many_aliases_is_refused_without_parsing_at_all() {
+        // The count cap's own test, now that both bombs are caught by the
+        // deadline. This document is cheap to parse, so only the count can be
+        // what rejects it — and it must do so without a parse.
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("many.yml");
+        let mut doc = String::from("a: &a 1\nlist:\n");
+        for _ in 0..(MAX_YAML_ALIASES + 1) {
+            doc.push_str("  - *a\n");
+        }
+        std::fs::write(&path, &doc).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = read_yaml_value(&path).await.expect_err("over the cap");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "the count cap must not involve a parse"
+        );
+        let message = format!("{err}");
+        assert!(
+            message.contains("many.yml"),
+            "must name the file: {message}"
+        );
+        assert!(message.contains("aliases"), "must say why: {message}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_yaml_document_is_rejected_by_size() {
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("huge.yml");
+        // Just over the cap, with no aliases at all, so the size check is
+        // unambiguously the one that fires.
+        std::fs::write(&path, format!("key: {}\n", "x".repeat(MAX_YAML_READ_SIZE))).unwrap();
+
+        let err = read_yaml_value(&path).await.expect_err("over the size cap");
+        let message = format!("{err}");
+        assert!(
+            message.contains("huge.yml"),
+            "must name the file: {message}"
+        );
+        assert!(message.contains("YAML limit"), "must say why: {message}");
+    }
+
+    #[tokio::test]
+    async fn a_document_with_a_few_merge_keys_still_reads() {
+        // The guard must not break the thing it exists to allow: a
+        // hand-written config using merge keys (§6.4.2).
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("merged.yml");
+        std::fs::write(
+            &path,
+            "defaults: &d\n  a: 1\n  b: 2\none:\n  <<: *d\n  b: 3\ntwo:\n  <<: *d\n",
+        )
+        .unwrap();
+
+        let value = read_yaml_value(&path).await.unwrap().expect("present");
+        assert_eq!(value["one"]["a"].as_u64(), Some(1));
+        assert_eq!(value["one"]["b"].as_u64(), Some(3), "the override wins");
+        assert_eq!(value["two"]["b"].as_u64(), Some(2), "the merged value");
+    }
+
+    #[test]
+    fn the_alias_scanner_ignores_quotes_comments_and_multiplication() {
+        // Over-counting is safe; under-counting is not. These are the cases
+        // where a naive `content.matches('*')` would over-count so badly that
+        // an ordinary file would be refused.
+        assert_eq!(count_yaml_aliases("a: *anchor\n"), 1);
+        assert_eq!(count_yaml_aliases("a: [*x, *y, *z]\n"), 3);
+        assert_eq!(count_yaml_aliases("a: '*not an alias'\n"), 0);
+        assert_eq!(count_yaml_aliases("a: \"*also not\"\n"), 0);
+        assert_eq!(count_yaml_aliases("# *commented out\n"), 0);
+        assert_eq!(count_yaml_aliases("a: 3 * 4\n"), 0, "multiplication");
+        assert_eq!(count_yaml_aliases("a: **\n"), 0, "no name after the star");
+        assert_eq!(count_yaml_aliases(""), 0);
+        // The scanner counts; it does not judge. The nested bomb sits
+        // *under* the cap and is caught by the deadline instead.
+        assert_eq!(
+            count_yaml_aliases(&alias_bomb()),
+            30,
+            "14 levels of two, plus the two in `top`"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_leaves_no_temp_file_and_no_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let dir = temp.path().join("ro");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-create so `ensure_dir`'s cache does not try to mkdir it later.
+        let target = dir.join("thing.yml");
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let result = atomic_write(&target, "payload\n").await;
+
+        // Restore first, so an assertion failure cannot leave an undeletable
+        // tempdir behind.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        assert!(result.is_err(), "a read-only directory must fail the write");
+        assert!(!target.exists(), "the destination must not be created");
+        assert_eq!(stray_temp_files(&dir), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_leaves_no_temp_file() {
+        // The destination is a non-empty *directory*, so the rename fails
+        // after the temp file was written — the second error branch.
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let target = temp.path().join("occupied");
+        std::fs::create_dir_all(target.join("inner")).unwrap();
+
+        let result = atomic_write(&target, "payload\n").await;
+
+        assert!(result.is_err(), "renaming onto a non-empty dir must fail");
+        assert!(target.is_dir(), "the destination is untouched");
+        assert_eq!(stray_temp_files(temp.path()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn the_temp_file_is_created_exclusively_but_the_target_is_replaced() {
+        // `create_new` stops the temp path being a planted symlink or an
+        // existing file that gets truncated. It applies to the temp name
+        // only — replacing the destination must still work.
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let target = temp.path().join("thing.yml");
+        atomic_write(&target, "first\n").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first\n");
+        atomic_write(&target, "second\n").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second\n");
+        assert_eq!(stray_temp_files(temp.path()), Vec::<String>::new());
+    }
 
     #[tokio::test]
     async fn atomic_write_creates_parents_and_leaves_no_temp_file() {
