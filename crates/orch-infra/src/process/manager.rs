@@ -169,6 +169,7 @@ fn spawn_error(command: &str, source: std::io::Error) -> Error {
 mod tests {
     use super::*;
     use orch_core::process::DEFAULT_KILL_GRACE;
+    use orch_core::test_support::{describe, wait_for_no_live_members};
     use std::collections::BTreeMap;
     use std::path::Path;
     use tokio::io::AsyncReadExt;
@@ -439,15 +440,29 @@ mod tests {
         pm.kill_with_grace(child.pid, Duration::from_secs(2)).await;
         assert!(wait_until_dead(&pm, child.pid).await);
 
-        // Signalling the group must fail: nothing is left in it. The
-        // grandchildren are reparented to init when their shell dies, so this
-        // waits on init's reaping as well as the kill.
-        for _ in 0..1_000 {
-            if nix::sys::signal::kill(Pid::from_raw(-(child.pid as i32)), None).is_err() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // Nothing *live* may be left in the group.
+        //
+        // This used to poll `kill(-pgid, 0)` until it failed, which meant
+        // waiting for the group to be completely empty — and that call
+        // succeeds for a **zombie** as well as a running process, so the test
+        // was really waiting on init to reap the orphaned grandchildren.
+        // Nothing here controls that, and it flaked at roughly 1 in 10
+        // full-workspace runs while saying only "the group outlived the kill",
+        // which does not distinguish a broken kill from slow reaping.
+        //
+        // A zombie means the kill worked. A live member means it did not, and
+        // that is a product bug the assertion must still catch — so the check
+        // is on live members, and the budget stays well under the 30 s the
+        // children would live for on their own. Shortening *their* lifetime
+        // instead would let a missed signal expire by itself and quietly turn
+        // this assertion into a no-op.
+        if let Err(survivors) = wait_for_no_live_members(child.pid, Duration::from_secs(10)).await {
+            panic!(
+                "the group kill left {} live process(es) behind, so it did not reach the \
+                 whole group: {}",
+                survivors.len(),
+                describe(&survivors)
+            );
         }
-        panic!("the process group outlived the group kill");
     }
 }

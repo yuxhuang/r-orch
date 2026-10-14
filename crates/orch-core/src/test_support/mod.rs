@@ -25,6 +25,7 @@ pub mod factories;
 pub mod faults;
 pub mod ids;
 pub mod process;
+pub mod process_group;
 pub mod recorder;
 pub mod skills;
 pub mod stores;
@@ -37,6 +38,9 @@ pub use factories::{FACTORY_TIMESTAMP, make_agent, make_run, make_task};
 pub use faults::Faults;
 pub use ids::SeqIdGenerator;
 pub use process::{FAKE_PID, FakeProcessManager, FakeProcessManagerCall};
+pub use process_group::{
+    GroupMember, describe, live_group_members, process_group_members, wait_for_no_live_members,
+};
 pub use recorder::Recorder;
 pub use skills::FakeSkillLoader;
 pub use stores::{

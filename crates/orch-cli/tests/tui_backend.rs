@@ -22,6 +22,21 @@ use orch_tui::backend::{
     AgentFields, AgentOpts, CreateTaskOpts, GoalFields, HistoryEntry, TaskFields, TuiBackend,
 };
 
+/// Serializes the two cases that touch the **global** config.
+///
+/// Everything else here is isolated by its own tempdir, but `global.yml` is a
+/// single file per machine — `~/.orchestry/global.yml`, or wherever
+/// `ORCHESTRY_GLOBAL_CONFIG_PATH` points. Two `multi_thread` tests in this
+/// binary write it, so they raced: observed as `palette: Ocean` where `Forest`
+/// was expected, about 1 in 20 full-workspace runs.
+///
+/// A mutex rather than per-test isolation because `std::env::set_var` is
+/// process-global and racy — the same class of bug. The *path* is redirected
+/// into `target/` for the whole workspace by `[env]` in `.cargo/config.toml`,
+/// which is what stops these tests from rewriting the developer's own
+/// preferences; this only stops them from fighting each other.
+static GLOBAL_CONFIG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A project with a written `config.yml`, which is what `require_init` wants.
 async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -119,6 +134,7 @@ async fn launch_falls_back_to_observer_mode_when_the_lock_is_held() {
 #[tokio::test(flavor = "multi_thread")]
 async fn launch_reads_the_tui_preferences_out_of_the_global_config() {
     let (temp, engine) = project().await;
+    let _serial = GLOBAL_CONFIG_TESTS.lock().await;
     let mut global = engine
         .global_config_store
         .read()
@@ -569,6 +585,7 @@ async fn teams_and_goals_round_trip() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_settings_writes_persist_where_the_next_launch_will_read_them() {
     let (temp, engine) = project().await;
+    let _serial = GLOBAL_CONFIG_TESTS.lock().await;
     let backend = launch(Arc::clone(&engine)).await;
 
     let (backend, _) = on_draw_thread(backend, |backend| {
