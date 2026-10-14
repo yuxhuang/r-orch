@@ -146,9 +146,7 @@ impl TextInput {
     pub fn handle_key(&mut self, key: KeyEvent, now_ms: i64) -> bool {
         self.poll(now_ms);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        // Option (ALT) and Cmd (SUPER) are both `key.meta` in Ink.
-        let meta = key.modifiers.contains(KeyModifiers::ALT)
-            || key.modifiers.contains(KeyModifiers::SUPER);
+        let meta = is_meta(key);
 
         if ctrl {
             let Some(ch) = char_of(key.code) else {
@@ -250,6 +248,21 @@ impl TextInput {
         self.snapshot_debounced(now_ms);
         self.cursor.insert(text);
     }
+}
+
+/// Ink's `key.meta`, which is **Alt/Option — never Cmd**.
+///
+/// Verified in Ink 6.8.0 `parse-keypress.js` (PARITY §12.5): on the legacy path
+/// `key.meta` comes from an ESC-prefixed sequence, which is how terminals
+/// encode Option-as-Meta; on the xterm path it is the Alt/Meta modifier bits;
+/// and under the Kitty protocol `meta` (bit 32) is a *distinct* bit from
+/// `super` (bit 8), where Cmd arrives. Ink never maps `super` to `key.meta`,
+/// and on terminals without the protocol the emulator swallows Cmd before the
+/// application sees it. So `SUPER` must not satisfy a meta binding: the keymap
+/// is L1, and treating Cmd as Meta would make bindings fire here that cannot
+/// fire in the original.
+pub fn is_meta(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::META)
 }
 
 fn char_of(code: KeyCode) -> Option<char> {
@@ -451,6 +464,29 @@ mod tests {
             assert!(!input.handle_key(key(code), 0), "{code:?} must not consume");
         }
         assert_eq!(input.value(), "x");
+    }
+
+    #[test]
+    fn cmd_is_not_meta_so_super_bindings_do_not_fire() {
+        // `key.meta` in Ink is Alt/Option or the Kitty `meta` bit, never Cmd
+        // (PARITY §12.5). Cmd+A must not jump to the start the way Alt+A does;
+        // it falls through and inserts the character.
+        let mut alt = TextInput::new("hello");
+        alt.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT), 0);
+        assert_eq!(alt.cursor().pos(), 0);
+        assert_eq!(alt.value(), "hello");
+
+        let mut sup = TextInput::new("hello");
+        sup.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER), 0);
+        assert_eq!(sup.cursor().pos(), 6);
+        assert_eq!(sup.value(), "helloa");
+    }
+
+    #[test]
+    fn the_kitty_meta_bit_counts_as_meta() {
+        let mut input = TextInput::new("hello world");
+        input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::META), 0);
+        assert_eq!(input.cursor().pos(), 6, "word back");
     }
 
     #[test]

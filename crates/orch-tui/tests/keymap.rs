@@ -962,3 +962,19 @@ fn k095_a_name_step_template_suggestion_opens_the_prefilled_wizard_otherwise() {
     harness.assert_text("NEW AGENT — Backend Developer");
     harness.refute_message("Agent Shop requires an AI provider");
 }
+
+#[test]
+fn k096_cmd_s_does_not_open_the_agent_shop_but_alt_s_does() {
+    // `(key.ctrl || key.meta) && input === 's'`, and Ink's `key.meta` is
+    // Alt/Option — Cmd arrives as the Kitty `super` bit, which Ink never maps
+    // to meta, so it cannot reach this binding (PARITY §12.5).
+    let mut harness = agents_harness();
+    harness.key('n');
+    harness.press_mod(KeyCode::Char('s'), KeyModifiers::SUPER);
+    harness.refute_text("AGENT SHOP");
+
+    let mut harness = agents_harness();
+    harness.key('n');
+    harness.press_mod(KeyCode::Char('s'), KeyModifiers::ALT);
+    harness.assert_text("AGENT SHOP");
+}

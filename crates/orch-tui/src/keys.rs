@@ -16,6 +16,7 @@ use crate::clock::Clock;
 use crate::command_bar::{resolve_completion, resolve_suggestions};
 use crate::messages::{MsgType, cycle_preset, preset_types};
 use crate::state::{DetailPanel, InputMode, ViewId, is_runnable};
+use crate::text::is_meta;
 use crate::theme::Token;
 use crate::wizard::engine::{WizardKind, WizardOutcome};
 
@@ -55,9 +56,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             return;
         }
 
-        // 3. Ctrl+S / Cmd+S inside the NEW AGENT wizard opens the Agent Shop.
-        if (key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::SUPER))
+        // 3. Ctrl+S / Alt+S inside the NEW AGENT wizard opens the Agent Shop.
+        // TS is `(key.ctrl || key.meta) && input === 's'`; see [`is_meta`] for
+        // why `key.meta` excludes Cmd.
+        if (key.modifiers.contains(KeyModifiers::CONTROL) || is_meta(key))
             && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
             && self.state.input_mode == InputMode::Wizard
             && self
