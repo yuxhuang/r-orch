@@ -928,3 +928,37 @@ fn k093_ctrl_s_is_refused_when_the_default_adapter_is_shell() {
     harness.refute_text("AGENT SHOP");
     harness.assert_message("Agent Shop requires an AI provider. Press N to create a Shell agent.");
 }
+
+#[test]
+fn k094_a_name_step_template_suggestion_is_refused_for_a_shell_default() {
+    // `handleSuggestionSelected` guards before resolving the template, with a
+    // different string from the `/agent shop` refusal (App.tsx:1320-1323).
+    let mut backend = FakeBackend::new();
+    backend.context.default_adapter = "shell".into();
+    let mut harness = Harness::with(backend);
+    harness.app.state.view = ViewId::Agents;
+    harness.key('n');
+    // Browse the shop templates offered on the name step and pick the first.
+    harness.press(KeyCode::Down);
+    harness.press(KeyCode::Enter);
+    harness.assert_message(
+        "Agent Shop requires an AI provider. Choose Shell and enter a command instead.",
+    );
+    harness.refute_text("NEW AGENT — Backend Developer");
+    assert_eq!(
+        harness.app.state.wizard.as_ref().unwrap().kind,
+        orch_tui::wizard::WizardKind::Agent,
+        "the open wizard is untouched"
+    );
+}
+
+#[test]
+fn k095_a_name_step_template_suggestion_opens_the_prefilled_wizard_otherwise() {
+    let mut harness = Harness::with(FakeBackend::new());
+    harness.app.state.view = ViewId::Agents;
+    harness.key('n');
+    harness.press(KeyCode::Down);
+    harness.press(KeyCode::Enter);
+    harness.assert_text("NEW AGENT — Backend Developer");
+    harness.refute_message("Agent Shop requires an AI provider");
+}

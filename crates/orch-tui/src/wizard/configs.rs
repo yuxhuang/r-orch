@@ -575,7 +575,10 @@ pub fn apply_shop_template(
 
 // ── EDIT AGENT ─────────────────────────────────────────────────────────────
 
-/// `getEditAgentWizardSteps(agent, agents, teams, modelCatalog)` — nine steps.
+/// `getEditAgentWizardSteps(agent, agents, teams, modelCatalog)` — eight steps
+/// (`wizardConfigs.ts:463`: the NEW AGENT ids minus `skills` and
+/// `approval_policy`).
+///
 /// Every skip predicate falls back to `agent.adapter` when the user has not
 /// (yet) chosen one.
 pub fn edit_agent_wizard_steps(

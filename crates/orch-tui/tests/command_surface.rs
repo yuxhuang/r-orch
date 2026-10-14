@@ -1013,3 +1013,26 @@ fn c109_a_failing_backend_call_reports_failed_with_the_error() {
     harness.run_command("/run-all");
     harness.assert_message("Failed: boom");
 }
+
+#[test]
+fn c110_only_one_leading_slash_is_stripped() {
+    // `replace(/^\//, '')` — `//task` keeps its second slash and is unknown.
+    let mut harness = Harness::new();
+    harness.run_command("//task");
+    harness.assert_message("Unknown: /task. Type /help for commands");
+    harness.refute_message("Usage: /task add|list");
+}
+
+#[test]
+fn c111_a_single_leading_slash_still_resolves_the_verb() {
+    let mut harness = Harness::new();
+    harness.run_command("/task");
+    harness.assert_message("Usage: /task add|list|show|cancel|retry|assign|approve|reject|delete");
+}
+
+#[test]
+fn c112_a_bare_verb_without_a_slash_still_resolves() {
+    let mut harness = Harness::new();
+    harness.run_command("status");
+    harness.assert_message("0 running");
+}
