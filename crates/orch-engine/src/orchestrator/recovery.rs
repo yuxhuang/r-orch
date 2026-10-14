@@ -149,10 +149,77 @@ impl Orchestrator {
         .await;
     }
 
+    /// Finalize runs that were started but whose running entry never reached
+    /// disk — a crash between `adapter.execute` and `save_state`.
+    ///
+    /// The window is four statements wide in `dispatch_claimed`, and nothing
+    /// else closes it: `dead` is computed from `state.running`, so it is
+    /// empty; the orphaned-task sweep is gated on `dead` being non-empty;
+    /// `reconcile` iterates `state.running`; and the `preparing` sweep filters
+    /// that status only. So the *task* self-heals through
+    /// `reconcile_orphaned_tasks`, but the run record stays `running` forever
+    /// and the agent's child keeps working in a workspace whose task has been
+    /// failed — writing, committing, burning tokens, parented to nothing.
+    ///
+    /// The pid is the only handle (PARITY.md §8.4), and it is on the run
+    /// record, so this kills first and then finalizes.
+    pub(super) async fn cleanup_orphaned_running_runs(
+        &self,
+        state: &OrchestratorState,
+    ) -> Result<()> {
+        let all_runs = match self.deps().run_store.list_all().await {
+            Ok(runs) => runs,
+            Err(err) => {
+                self.emit_error(err, "startup cleanup: cleanupOrphanedRunningRuns");
+                return Ok(());
+            }
+        };
+
+        let active: std::collections::HashSet<&str> = state
+            .running
+            .values()
+            .map(|entry| entry.run_id.as_str())
+            .collect();
+        let orphaned: Vec<&orch_domain::Run> = all_runs
+            .iter()
+            .filter(|run| run.status == RunStatus::Running && !active.contains(run.id.as_str()))
+            .collect();
+
+        for run in orphaned {
+            // Sequential, not `join_all`: each of these may spend the full
+            // kill grace, and a crashed daemon's leftovers are a handful.
+            if let Some(pid) = run.pid
+                && self.deps().processes.is_alive(pid)
+            {
+                self.deps()
+                    .processes
+                    .kill_with_grace(pid, orch_core::process::DEFAULT_KILL_GRACE)
+                    .await;
+            }
+            if let Err(err) = self
+                .deps()
+                .run_service
+                .finish(
+                    &run.id,
+                    RunStatus::Cancelled,
+                    None,
+                    Some("Orchestrator restarted".to_owned()),
+                )
+                .await
+            {
+                self.emit_error(
+                    err,
+                    format!("startup cleanup: finish orphaned running run {}", run.id),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Cancel a task, falling back to a direct store write when the
     /// transition is rejected. One of the recovery paths that deliberately
     /// bypasses the state machine (PARITY.md §7.1).
-    async fn force_task_cancelled(&self, task_id: &str) {
+    pub(super) async fn force_task_cancelled(&self, task_id: &str) {
         if self
             .deps()
             .task_service
@@ -162,8 +229,19 @@ impl Orchestrator {
         {
             return;
         }
-        let Ok(Some(mut task)) = self.deps().task_store.get(task_id).await else {
-            return;
+        let mut task = match self.deps().task_store.get(task_id).await {
+            Ok(Some(task)) => task,
+            // Gone: there is nothing left to cancel.
+            Ok(None) => return,
+            // Unreadable is not the same as absent, and since WP-0's YAML
+            // hardening it is not even the same as corrupt: a read can now
+            // fail on an alias-expansion cap or a parse deadline, where the
+            // file is intact and the next attempt would succeed. Returning
+            // silently would leave the task non-terminal with nothing said.
+            Err(err) => {
+                self.emit_error(err, format!("startup cleanup: read task {task_id}"));
+                return;
+            }
         };
         if is_terminal(task.status) {
             return;

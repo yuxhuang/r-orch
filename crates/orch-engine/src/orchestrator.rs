@@ -420,6 +420,58 @@ impl Orchestrator {
         }
         self.inner.lock_acquired.store(true, Ordering::SeqCst);
 
+        // **Installed before the first tick**, which is the whole point: until
+        // these exist, `SIGTERM` and `SIGINT` keep their default disposition —
+        // immediate death, with no `stop()`, no state save and no lock
+        // release, leaving the children orphaned with live pids in
+        // `state.running` so the next startup's staleness filter skips them.
+        // The first tick reconciles and dispatches everything ready (worktree
+        // creation, agent spawns), so that window is seconds to minutes, and
+        // `systemctl restart` during startup walks straight into it. The
+        // reference registers both handlers before `await this.tick()`
+        // (`orchestrator.ts:224` vs `:232`); this now does the same.
+        //
+        // Creating the arm is what replaces the disposition — a signal that
+        // arrives during the first tick is held by tokio's signal driver and
+        // handled as soon as the loop polls, rather than killing the process.
+        let signals = if options.handle_signals {
+            SignalArms::install()
+        } else {
+            SignalArms::disabled()
+        };
+
+        // Everything from here can fail, and failing with the lock still held
+        // is worse than not starting: `serve` and `run --watch` exit, so their
+        // dead pid makes the file stealable, but the TUI stays up in observer
+        // mode holding a lock stamped with its own *live* pid, which nothing
+        // will reclaim for the full staleness window.
+        // Reactive dispatch: a task created by any process in this binary
+        // should not wait for the next poll.
+        let reactive = self.clone();
+        let unsubscribe = self.deps().events.on(
+            orch_domain::OrchestratorEventType::TaskCreated,
+            move |_event| {
+                reactive.schedule_immediate_dispatch(0);
+            },
+        );
+
+        match self.start_watch_prepared(signals, unsubscribe).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.inner.lock_acquired.store(false, Ordering::SeqCst);
+                self.deps().lock.release().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// The fallible half of [`Orchestrator::start_watch`], split out so one
+    /// `match` can release the lock on every error path.
+    async fn start_watch_prepared(
+        &self,
+        signals: SignalArms,
+        unsubscribe: crate::events::Unsubscribe,
+    ) -> Result<()> {
         {
             let mut slot = self.inner.state.lock().await;
             self.load_state(&mut slot).await?;
@@ -428,23 +480,17 @@ impl Orchestrator {
             // entries and cancel the work rather than retrying it, so agents
             // do not redo already-committed work (PARITY.md §7.6).
             self.cleanup_stale_running_entries(state).await?;
+            // A crash between `adapter.execute` and `save_state` leaves a run
+            // `running` with no entry here and an unparented child; nothing
+            // else sweeps those.
+            self.cleanup_orphaned_running_runs(state).await?;
             state.pid = Some(std::process::id());
             state.started_at = Some(self.deps().clock.now_iso());
             self.save_state(state).await?;
         }
 
-        // Reactive dispatch: a task created by any process in this binary
-        // should not wait for the next poll.
-        let reactive = self.clone();
-        let _unsub = self.deps().events.on(
-            orch_domain::OrchestratorEventType::TaskCreated,
-            move |_event| {
-                reactive.schedule_immediate_dispatch(0);
-            },
-        );
-
         self.tick_once().await?;
-        self.spawn_watch_loop(options.handle_signals, _unsub);
+        self.spawn_watch_loop(signals, unsubscribe);
         Ok(())
     }
 
@@ -700,7 +746,7 @@ impl Orchestrator {
 
     // ── watch loop ───────────────────────────────────────────────────────
 
-    fn spawn_watch_loop(&self, handle_signals: bool, unsubscribe: crate::events::Unsubscribe) {
+    fn spawn_watch_loop(&self, signals: SignalArms, unsubscribe: crate::events::Unsubscribe) {
         let orchestrator = self.clone();
         let interval_ms = self.config().scheduling.poll_interval_ms.max(1);
         let shutdown = self.inner.shutdown.clone();
@@ -715,11 +761,9 @@ impl Orchestrator {
             // `start_watch` has already run one tick, so discard it.
             ticker.tick().await;
 
-            let mut signals = if handle_signals {
-                SignalArms::install()
-            } else {
-                SignalArms::disabled()
-            };
+            // Installed by `start_watch` *before* the first tick, so a signal
+            // that arrived during it is already queued here.
+            let mut signals = signals;
 
             loop {
                 tokio::select! {

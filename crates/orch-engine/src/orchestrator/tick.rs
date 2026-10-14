@@ -248,6 +248,15 @@ impl Orchestrator {
         if stale.is_empty() {
             return Ok(());
         }
+        // One failure fails the whole reconcile, where the orphaned-task sweep
+        // below swallows per item. That asymmetry looks like an oversight and
+        // is not: the reference wraps these in a bare
+        // `await Promise.all(staleAgents.map(...))`
+        // (`orchestrator.ts:618-622`), so a rejection propagates out of
+        // reconcile and fails the tick, while the orphaned-task map has its
+        // own `try`/`catch` (`:630-637`). Reproduced rather than tidied, and
+        // `a_stale_agent_write_failure_fails_the_tick_but_an_orphaned_task_one_does_not`
+        // pins both halves.
         futures::future::join_all(stale.iter().map(|agent| {
             self.deps()
                 .agent_service

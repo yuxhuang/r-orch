@@ -50,7 +50,7 @@ impl GitWorkspaceManager {
         Ok(self
             .orchestry_dir
             .join("workspaces")
-            .join(sanitize_id(task_id)?))
+            .join(sanitize_path_segment(task_id)?))
     }
 
     async fn code(&self, command: &str, args: &[&str]) -> i32 {
@@ -275,6 +275,22 @@ fn workspace_error(message: String, hint: &str) -> Error {
         message,
         hint: Some(hint.to_owned()),
     })
+}
+
+/// `sanitize_id`, additionally rejecting `.` and `..` (security C2).
+///
+/// No extension is appended here, so `..` would resolve to the parent of
+/// `workspaces/` — and this path is handed to `git worktree add` and to
+/// `remove_dir_all`. Unreachable today because ids are generated, which is
+/// precisely why it is worth pinning.
+fn sanitize_path_segment(id: &str) -> Result<&str> {
+    let id = sanitize_id(id)?;
+    if id == "." || id == ".." {
+        return Err(Error::other(format!(
+            "Invalid identifier: \"{id}\" would escape its directory"
+        )));
+    }
+    Ok(id)
 }
 
 /// `^[A-Za-z0-9._-]+$` — keeps ids from escaping `.orchestry/workspaces/`.

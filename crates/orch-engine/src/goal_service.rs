@@ -1013,35 +1013,62 @@ mod tests {
     #[tokio::test]
     async fn create_without_an_agent_service_is_a_no_op() {
         let h = Harness::bare();
-        assert!(
-            h.service
-                .create(CreateGoalInput {
-                    title: "Goal X".into(),
-                    assignee: Some("agt_x".into()),
-                    ..Default::default()
-                })
-                .await
-                .is_ok()
-        );
+        let mut sub = h.bus.subscribe();
+        let goal = h
+            .service
+            .create(CreateGoalInput {
+                title: "Goal X".into(),
+                assignee: Some("agt_x".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("create");
+
+        // "No-op" is about the *agent* half only: the goal itself is still
+        // created, stored and announced with its assignee intact. `is_ok()`
+        // alone would also pass if this silently created nothing.
+        assert_eq!(goal.assignee.as_deref(), Some("agt_x"));
+        assert_eq!(h.goals.peek(&goal.id).expect("stored").title, "Goal X");
+        assert_eq!(h.goals.saved().len(), 1);
+        let events = sub.try_drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type(), OrchestratorEventType::GoalCreated);
+        // And nothing was written to the agent store, there being no service.
+        assert_eq!(h.agents.saved().len(), 0);
     }
 
     #[tokio::test]
     async fn delete_without_an_agent_service_is_a_no_op() {
         let h = Harness::bare();
         h.goals.seed(assigned_goal("goal_noop1", "agt_y"));
-        assert!(h.service.delete("goal_noop1").await.is_ok());
+
+        h.service.delete("goal_noop1").await.expect("delete");
+
+        assert!(
+            h.goals.peek("goal_noop1").is_none(),
+            "the goal survived its own deletion"
+        );
+        assert_eq!(h.agents.saved().len(), 0);
     }
 
     #[tokio::test]
     async fn update_status_without_an_agent_service_is_a_no_op() {
         let h = Harness::bare();
         h.goals.seed(assigned_goal("goal_noop2", "agt_z"));
-        assert!(
-            h.service
-                .update_status("goal_noop2", GoalStatus::Achieved, false)
-                .await
-                .is_ok()
+
+        let goal = h
+            .service
+            .update_status("goal_noop2", GoalStatus::Achieved, false)
+            .await
+            .expect("update status");
+
+        assert_eq!(goal.status, GoalStatus::Achieved);
+        assert_eq!(
+            h.goals.peek("goal_noop2").expect("stored").status,
+            GoalStatus::Achieved,
+            "the new status never reached the store"
         );
+        assert_eq!(h.agents.saved().len(), 0);
     }
 
     // ── set_autonomous failures are swallowed ──────────────────────────────
@@ -1051,34 +1078,49 @@ mod tests {
         let h = Harness::with_agent_service();
         // No `agt_missing` in the store, so `set_autonomous` raises
         // `AgentNotFoundError` — the exact TS scenario.
-        assert!(
-            h.service
-                .create(CreateGoalInput {
-                    title: "Goal err".into(),
-                    assignee: Some("agt_missing".into()),
-                    ..Default::default()
-                })
-                .await
-                .is_ok()
-        );
+        let goal = h
+            .service
+            .create(CreateGoalInput {
+                title: "Goal err".into(),
+                assignee: Some("agt_missing".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("create");
+
+        // Swallowed means the goal lands anyway, with the assignee it asked
+        // for — not that the call returns `Ok` having abandoned the write.
+        assert_eq!(goal.assignee.as_deref(), Some("agt_missing"));
+        assert_eq!(h.goals.peek(&goal.id).expect("stored").title, "Goal err");
     }
 
     #[tokio::test]
     async fn delete_swallows_a_set_autonomous_failure() {
         let h = Harness::with_agent_service();
         h.goals.seed(assigned_goal("goal_err1", "agt_missing"));
-        assert!(h.service.delete("goal_err1").await.is_ok());
+
+        h.service.delete("goal_err1").await.expect("delete");
+
+        assert!(
+            h.goals.peek("goal_err1").is_none(),
+            "the agent failure took the deletion with it"
+        );
     }
 
     #[tokio::test]
     async fn update_status_swallows_a_set_autonomous_failure() {
         let h = Harness::with_agent_service();
         h.goals.seed(assigned_goal("goal_err2", "agt_missing"));
-        assert!(
-            h.service
-                .update_status("goal_err2", GoalStatus::Achieved, false)
-                .await
-                .is_ok()
+
+        h.service
+            .update_status("goal_err2", GoalStatus::Achieved, false)
+            .await
+            .expect("update status");
+
+        assert_eq!(
+            h.goals.peek("goal_err2").expect("stored").status,
+            GoalStatus::Achieved,
+            "the agent failure took the status change with it"
         );
     }
 
