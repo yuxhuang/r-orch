@@ -76,13 +76,20 @@ pub async fn run_with(
 
     // Subscribed **before** `startWatch`, so nothing emitted during startup is
     // lost.
-    let mut subscription = engine.events.subscribe();
+    let subscription = engine.events.subscribe();
+    // Ended by a token rather than `abort()`, and drained afterwards: the
+    // wind-down inside `stop()` emits a run, task and agent event per running
+    // entry, plus an `orchestrator:error` record per sub-failure, and aborting
+    // the pump discards whatever it has not logged yet. The reference's logger
+    // is synchronous and cannot lose a record, and `serve --json`'s record
+    // stream is compared byte for byte.
+    let done = tokio_util::sync::CancellationToken::new();
     let pump = tokio::spawn({
         let logger = Arc::clone(&logger);
+        let done = done.clone();
         async move {
-            while let Some(event) = subscription.recv().await {
-                logger.handle(&event);
-            }
+            crate::logs::pump_until_cancelled(subscription, done, |event| logger.handle(event))
+                .await;
         }
     });
 
@@ -122,7 +129,10 @@ pub async fn run_with(
         ExitCode::SUCCESS
     };
 
-    pump.abort();
+    // Drain, *then* flush: the final records have to reach the sinks before
+    // the file is closed.
+    done.cancel();
+    let _ = pump.await;
     logger.flush();
     Ok(code)
 }
@@ -163,6 +173,93 @@ pub async fn run(engine: orch_engine::FullEngine, args: ServeArgs) -> Result<Exi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orch_domain::OrchestratorEvent;
+    use std::sync::Mutex;
+
+    /// Emits the shutdown burst from `wait_for_stop`, the way the real
+    /// orchestrator emits it from inside `stop()`.
+    struct BurstingOrchestrator {
+        events: Arc<orch_engine::EventBus>,
+        stops: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ServeOrchestrator for BurstingOrchestrator {
+        async fn start_watch(&self, _skip_autonomous_seeding: bool) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            *self.stops.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn wait_for_stop(&self) {
+            // Synchronous and with no await afterwards, so the pump has had no
+            // chance to run when `run_with` reaches its shutdown: exactly the
+            // window `pump.abort()` used to discard.
+            for n in 0..5 {
+                self.events.emit(OrchestratorEvent::OrchestratorError {
+                    error: format!("wind-down {n}"),
+                    context: "stop".to_owned(),
+                    fatal: false,
+                });
+            }
+            self.events.emit(OrchestratorEvent::OrchestratorShutdown {
+                reason: "Received SIGTERM".to_owned(),
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shutdown_burst_reaches_the_log_before_the_sinks_close() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        orch_infra::storage::fs_utils::clear_ensured_dirs();
+        std::fs::create_dir_all(orch_infra::storage::Paths::new(temp.path()).root())
+            .expect("create .orchestry");
+        let engine = orch_engine::build_light_with(
+            temp.path(),
+            orch_engine::EngineSeams {
+                clock: Arc::new(orch_core::test_support::FixedClock::new()),
+                ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
+                global_config_path: None,
+            },
+        )
+        .await
+        .expect("build_light");
+
+        let log_path = temp.path().join("serve.log");
+        let orchestrator = BurstingOrchestrator {
+            events: Arc::clone(&engine.events),
+            stops: Mutex::new(0),
+        };
+
+        run_with(
+            &orchestrator,
+            &engine,
+            ServeArgs {
+                once: false,
+                tick_interval: None,
+                log_file: Some(log_path.to_string_lossy().into_owned()),
+                format: LogFormat::Json,
+                verbose: false,
+            },
+        )
+        .await
+        .expect("serve");
+
+        let written = std::fs::read_to_string(&log_path).expect("read log");
+        // The reference's logger is synchronous, so none of these can be lost;
+        // aborting the pump instead of draining it loses all six.
+        for n in 0..5 {
+            assert!(
+                written.contains(&format!("wind-down {n}")),
+                "lost wind-down record {n}:\n{written}"
+            );
+        }
+        assert!(
+            written.contains("Received SIGTERM"),
+            "lost the shutdown record:\n{written}"
+        );
+    }
 
     #[test]
     fn a_positive_tick_interval_overrides_the_configured_one() {

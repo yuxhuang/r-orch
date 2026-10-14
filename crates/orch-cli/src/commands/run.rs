@@ -31,6 +31,14 @@ use crate::output::{Color, Icon, Styles, print_error, print_success};
 /// Only `--all` waits it out; see the module docs.
 const REACTIVE_DISPATCH_WINDOW: Duration = Duration::from_millis(1_500);
 
+/// How long `run <id>` sits on a silent bus before asking the run record
+/// whether it missed the completion.
+///
+/// Deliberately far longer than any agent's gap between events: the check is a
+/// backstop for a *lost* completion, not a poll loop, and ending the wait
+/// early would truncate the stream the reference prints in full.
+const LOST_COMPLETION_POLL: Duration = Duration::from_secs(60);
+
 /// `run <task-id>` — dispatch one task and stream its events.
 pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Result<ExitCode> {
     let task = engine.task_service.get(task_id).await?;
@@ -66,10 +74,33 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
     // without it this waits for a second one that never comes, and `run <id>`
     // hangs after printing its result.
     if target_run.is_some() && !completed {
-        while let Some(event) = events.recv().await {
-            let completed = handle_single(styles, &event, task_id, &mut target_run, &mut failed);
-            if completed {
-                break;
+        let mut dropped = 0;
+        loop {
+            match tokio::time::timeout(LOST_COMPLETION_POLL, events.recv()).await {
+                Ok(Some(event)) => {
+                    let ended =
+                        handle_single(styles, &event, task_id, &mut target_run, &mut failed);
+                    let lost = crate::logs::report_dropped_events(&mut dropped, &events);
+                    // Only the completion ends the wait — and a dropped event
+                    // may *be* the completion, so check the record too.
+                    if ended
+                        || (lost
+                            && finish_from_record(engine, styles, &target_run, &mut failed).await)
+                    {
+                        break;
+                    }
+                }
+                // The bus outlives this call, so `None` means shutdown.
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    // Long silence. An agent can be quiet for minutes, so this
+                    // ends the wait only if the run is already finished on
+                    // disk — in which case its `agent:completed` is never
+                    // coming and waiting is waiting forever.
+                    if finish_from_record(engine, styles, &target_run, &mut failed).await {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -88,6 +119,37 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Finish the wait from the run record when its `agent:completed` never
+/// arrived, printing the same `Done`/`Failed` the event handler would.
+///
+/// Returns whether the run is over. `false` keeps the caller waiting, which is
+/// the right answer while the run is still in flight.
+async fn finish_from_record(
+    engine: &FullEngine,
+    styles: &Styles,
+    target_run: &Option<String>,
+    failed: &mut bool,
+) -> bool {
+    let Some(run_id) = target_run.as_deref() else {
+        return false;
+    };
+    let Ok(Some(run)) = engine.run_service.get(run_id).await else {
+        // A record we cannot read is not evidence the run ended.
+        return false;
+    };
+    use orch_domain::RunStatus;
+    match run.status {
+        RunStatus::Succeeded => print_success(styles, "Done"),
+        RunStatus::Failed | RunStatus::Cancelled | RunStatus::TimedOut => {
+            print_error(styles, "Failed", None);
+            *failed = true;
+        }
+        // Still in flight; keep waiting for the event.
+        RunStatus::Preparing | RunStatus::Running => return false,
+    }
+    true
 }
 
 /// Print what this event shows and report whether it ended the target run.
@@ -214,13 +276,22 @@ pub async fn watch(engine: &FullEngine, styles: &Styles, verbose: bool) -> Resul
     println!("{}", "━".repeat(43));
     println!();
 
-    let mut events = engine.events.subscribe();
+    let events = engine.events.subscribe();
+    // Ended by a token rather than `abort()`, and drained afterwards. The
+    // shutdown emits a burst — `orchestrator:shutdown`, then a run, task and
+    // agent event per entry the wind-down finishes — and aborting the pump
+    // discards whatever it has not printed yet, including the reference's last
+    // line (`Shutting down...`). The original's handler is synchronous and
+    // cannot lose any of it.
+    let done = tokio_util::sync::CancellationToken::new();
     let pump = tokio::spawn({
         let styles = *styles;
+        let done = done.clone();
         async move {
-            while let Some(event) = events.recv().await {
-                print_watch_event(&styles, &event, verbose);
-            }
+            crate::logs::pump_until_cancelled(events, done, |event| {
+                print_watch_event(&styles, event, verbose);
+            })
+            .await;
         }
     });
 
@@ -230,7 +301,8 @@ pub async fn watch(engine: &FullEngine, styles: &Styles, verbose: bool) -> Resul
         .await?;
     engine.orchestrator.wait_for_stop().await;
 
-    pump.abort();
+    done.cancel();
+    let _ = pump.await;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -315,6 +387,98 @@ fn slice_utf16(data: &str, max_units: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A project with one finished run, so the backstop has a record to read.
+    async fn engine_with_run(
+        status: orch_domain::RunStatus,
+    ) -> (tempfile::TempDir, FullEngine, String) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        orch_infra::storage::fs_utils::clear_ensured_dirs();
+        let paths = orch_infra::storage::Paths::new(temp.path());
+        std::fs::create_dir_all(paths.root()).expect("create .orchestry");
+        orch_core::storage::ConfigStore::write(
+            &orch_infra::storage::FileConfigStore::new(paths.clone()),
+            &orch_domain::default_config(),
+        )
+        .await
+        .expect("write config");
+
+        let engine = orch_engine::build_full_with(
+            temp.path(),
+            orch_engine::EngineSeams {
+                global_config_path: Some(paths.root().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("build_full");
+
+        let run = engine
+            .run_service
+            .create(orch_engine::CreateRunInput {
+                task_id: "tsk_1".to_owned(),
+                agent_id: "agt_1".to_owned(),
+                attempt: 1,
+                prompt: "p".to_owned(),
+                workspace_path: "/ws".to_owned(),
+            })
+            .await
+            .expect("create run");
+        if status != orch_domain::RunStatus::Preparing {
+            engine
+                .run_service
+                .finish(&run.id, status, None, None)
+                .await
+                .expect("finish run");
+        }
+        (temp, engine, run.id)
+    }
+
+    /// The backstop for an `agent:completed` that never arrives — dropped by a
+    /// lagging bus, or lost outright. Without it, `run <id>` waits forever on
+    /// an event that is not coming.
+    #[tokio::test]
+    async fn a_finished_run_record_ends_the_wait_and_sets_the_exit_code() {
+        use orch_domain::RunStatus;
+        let styles = Styles::plain();
+
+        for (status, expect_failed) in [
+            (RunStatus::Succeeded, false),
+            (RunStatus::Failed, true),
+            (RunStatus::Cancelled, true),
+            (RunStatus::TimedOut, true),
+        ] {
+            let (_temp, engine, run_id) = engine_with_run(status).await;
+            let mut failed = false;
+            assert!(
+                finish_from_record(&engine, &styles, &Some(run_id), &mut failed).await,
+                "{status:?} is terminal and must end the wait"
+            );
+            assert_eq!(failed, expect_failed, "{status:?} exit code");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_run_keeps_the_wait_open() {
+        let styles = Styles::plain();
+        let (_temp, engine, run_id) = engine_with_run(orch_domain::RunStatus::Preparing).await;
+        let mut failed = false;
+        // Still in flight: ending here would truncate the stream the
+        // reference prints in full.
+        assert!(!finish_from_record(&engine, &styles, &Some(run_id), &mut failed).await);
+        // And an id with no record at all is not evidence of anything.
+        assert!(
+            !finish_from_record(
+                &engine,
+                &styles,
+                &Some("run_missing".to_owned()),
+                &mut failed
+            )
+            .await
+        );
+        assert!(!finish_from_record(&engine, &styles, &None, &mut failed).await);
+        assert!(!failed);
+    }
 
     fn started(run_id: &str, task_id: &str) -> OrchestratorEvent {
         OrchestratorEvent::AgentStarted {

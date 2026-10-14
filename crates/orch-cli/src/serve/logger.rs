@@ -25,6 +25,27 @@ use serde_json::{Map, Value};
 /// One in six idle ticks is logged (`IDLE_LOG_EVERY_N_TICKS`).
 pub const IDLE_LOG_EVERY_N_TICKS: u64 = 6;
 
+/// This process's resident set in MiB, to one decimal — the `heap_mb` field of
+/// an `orchestrator:tick` record.
+///
+/// `VmRSS` is reported in kB already, which avoids the page-size arithmetic
+/// `/proc/self/statm` would need (pages are not 4 KiB everywhere). On a system
+/// without `/proc` the field reads `0.0`, which is also what it did before
+/// this was measured at all.
+fn resident_mb() -> f64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0.0;
+    };
+    let kb = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|number| number.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    // `toFixed(1)`, which rounds half away from zero — as `f64::round` does.
+    (kb / 1024.0 * 10.0).round() / 10.0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     Json,
@@ -155,13 +176,18 @@ impl StructuredLogger {
                     vec![
                         ("running", Value::from(*running)),
                         ("queued", Value::from(*queued)),
-                        // The reference reports V8's heap, which a Rust
-                        // process has no counterpart for; reporting RSS under
-                        // the same name would be a different metric wearing
-                        // this one's label. The field stays, so the record
-                        // shape holds, and the harness masks the value the
-                        // way it masks pids and durations (PARITY.md §1.4).
-                        ("heap_mb", Value::from(0.0)),
+                        // The reference reports V8's heap
+                        // (`+(heapUsed / 1_048_576).toFixed(1)`), which has no
+                        // Rust counterpart, so this is the closest honest
+                        // equivalent: the process's own resident set, in MiB,
+                        // to one decimal. It is a *different* metric under the
+                        // same name — but the field has to be a real number,
+                        // because an operator watching `heap_mb` for a leak is
+                        // the reason it exists, and a hard 0.0 would quietly
+                        // tell them everything is fine forever. The harness
+                        // masks the value the way it masks pids and durations
+                        // (PARITY.md §1.4), so the difference costs no parity.
+                        ("heap_mb", Value::from(resident_mb())),
                     ],
                 )
             }
@@ -562,6 +588,37 @@ mod tests {
         assert_eq!(
             recorder.lines(),
             [r#"16:37:33.426 WARN  task:scope_overlap  patterns=["a/**","b/**"]"#]
+        );
+    }
+
+    #[test]
+    fn heap_mb_is_the_resident_set_in_mib_to_one_decimal() {
+        let mb = resident_mb();
+        // This process is linked against tokio and serde; it is not using a
+        // kilobyte, and a hard 0.0 is what this field used to report.
+        assert!(mb > 0.5, "implausible RSS: {mb}");
+        assert!(mb < 100_000.0, "implausible RSS: {mb}");
+        // `toFixed(1)`: at most one decimal place survives.
+        assert_eq!(mb, (mb * 10.0).round() / 10.0, "more than one decimal");
+
+        // And it reaches the record, rather than only existing as a helper.
+        let recorder = Recorder::default();
+        let logger = StructuredLogger::new(
+            LogFormat::Json,
+            false,
+            Arc::new(FixedClock::new()),
+            vec![LogSink::Writer(Box::new(recorder.clone()))],
+        );
+        logger.handle(&OrchestratorEvent::OrchestratorTick {
+            running: 1,
+            queued: 0,
+        });
+        let line = recorder.lines().join("");
+        let record: serde_json::Value = serde_json::from_str(line.trim()).expect("json");
+        let logged = record["heap_mb"].as_f64().expect("heap_mb is a number");
+        assert!(
+            logged > 0.5,
+            "the record still carries a placeholder: {line}"
         );
     }
 

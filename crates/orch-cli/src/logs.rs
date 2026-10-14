@@ -19,7 +19,7 @@ use std::sync::Arc;
 use orch_core::error::{Error, Result};
 use orch_core::storage::RunStore;
 use orch_domain::{OrchestratorEvent, Run, RunEvent, RunEventType};
-use orch_engine::EventBus;
+use orch_engine::{EventBus, EventSubscription};
 
 use crate::context::CliContext;
 use crate::output::{Icon, Styles, print_json};
@@ -282,10 +282,14 @@ async fn follow_live(deps: &LogsDeps, styles: &Styles, args: &LogsArgs) -> Resul
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|err| Error::other(format!("cannot listen for SIGTERM: {err}")))?;
 
+    let mut dropped = 0;
     loop {
         tokio::select! {
             event = subscription.recv() => {
                 let Some(event) = event else { break };
+                // Nothing here waits on a particular event, so a loss costs
+                // lines rather than termination — but the operator is told.
+                report_dropped_events(&mut dropped, &subscription);
                 if has_filter && !matches_filter(&event, &run_ids, &agent_ids) {
                     continue;
                 }
@@ -491,6 +495,64 @@ pub(crate) fn now_time() -> String {
     format_zoned(jiff::Timestamp::now())
 }
 
+/// Hand every event to `handle` until `done` is cancelled or the bus closes,
+/// then drain whatever was emitted before the cancel.
+///
+/// The drain is the point. A caller that `abort()`s its pump instead discards
+/// everything the pump has not processed yet, and the burst it is most likely
+/// to lose is the one emitted *during* shutdown — `orchestrator:shutdown`,
+/// then a run, task and agent event for each entry the wind-down finishes.
+/// The reference's handlers are synchronous and cannot lose any of it, and
+/// both callers' output is compared record by record.
+pub(crate) async fn pump_until_cancelled(
+    mut subscription: EventSubscription,
+    done: tokio_util::sync::CancellationToken,
+    mut handle: impl FnMut(&OrchestratorEvent),
+) {
+    let mut dropped = 0;
+    loop {
+        tokio::select! {
+            // Biased so a ready event is always taken before the cancel arm;
+            // without it the last events are a coin toss.
+            biased;
+            event = subscription.recv() => {
+                let Some(event) = event else { break };
+                report_dropped_events(&mut dropped, &subscription);
+                handle(&event);
+            }
+            () = done.cancelled() => break,
+        }
+    }
+    for event in subscription.try_drain() {
+        handle(&event);
+    }
+    report_dropped_events(&mut dropped, &subscription);
+}
+
+/// Report any events the bus dropped for this reader, and say whether it
+/// dropped some since the last call.
+///
+/// The fan-out is lossy under load: a reader that falls behind by a whole
+/// channel's worth loses the oldest events, silently. The reference cannot do
+/// this — its handlers are synchronous, and a handler cannot lag — so there is
+/// no reference output to match and no honest way to pretend nothing happened.
+/// Two rules follow: it goes to **stderr**, because stdout carries the record
+/// and log streams the differential harness compares byte for byte, and a
+/// reader that was waiting for one specific event must treat `true` as "that
+/// event may be the one I lost".
+pub(crate) fn report_dropped_events(seen: &mut u64, subscription: &EventSubscription) -> bool {
+    let total = subscription.skipped();
+    if total <= *seen {
+        return false;
+    }
+    eprintln!(
+        "warning: {} event(s) dropped — this reader fell behind the event bus",
+        total - *seen
+    );
+    *seen = total;
+    true
+}
+
 /// The same clock at minute precision, which is what `run --watch` prints —
 /// `toLocaleTimeString` there omits `second`.
 pub(crate) fn now_time_minutes() -> String {
@@ -513,6 +575,77 @@ mod tests {
     use super::*;
     use orch_domain::RunStatus;
     use serde_json::json;
+
+    fn shutdown(reason: &str) -> OrchestratorEvent {
+        OrchestratorEvent::OrchestratorShutdown {
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// The property `serve` and `run --watch` both depend on: the events
+    /// emitted in the instant before the pump is told to stop are still
+    /// handled. Cancelling and `abort()`ing differ exactly here, and this is
+    /// the only coverage `run --watch`'s pump can get — its handler writes
+    /// straight to stdout, which a test cannot read back.
+    #[tokio::test]
+    async fn the_pump_handles_everything_emitted_before_the_cancel() {
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe();
+        let done = tokio_util::sync::CancellationToken::new();
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pump = tokio::spawn({
+            let seen = Arc::clone(&seen);
+            let done = done.clone();
+            async move {
+                pump_until_cancelled(subscription, done, |event| {
+                    if let OrchestratorEvent::OrchestratorShutdown { reason } = event {
+                        seen.lock().unwrap().push(reason.clone());
+                    }
+                })
+                .await;
+            }
+        });
+
+        // Emitted with no await in between, so the pump has not been polled
+        // once when the cancel lands — the window that loses records.
+        for n in 0..5 {
+            bus.emit(shutdown(&format!("burst {n}")));
+        }
+        done.cancel();
+        pump.await.expect("pump");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            (0..5).map(|n| format!("burst {n}")).collect::<Vec<_>>(),
+            "the pump dropped events it was given before the cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pump_stops_when_the_bus_is_gone_without_a_cancel() {
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe();
+        bus.emit(shutdown("last"));
+        drop(bus);
+
+        let seen = Arc::new(std::sync::Mutex::new(0_usize));
+        let counted = Arc::clone(&seen);
+        // Never cancelled: a closed bus has to end the pump on its own, or
+        // `serve` would hang on `pump.await` instead of exiting.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_until_cancelled(
+                subscription,
+                tokio_util::sync::CancellationToken::new(),
+                move |_| *counted.lock().unwrap() += 1,
+            ),
+        )
+        .await
+        .expect("the pump never finished after the bus closed");
+        assert_eq!(*seen.lock().unwrap(), 1);
+    }
 
     fn event(timestamp: &str, event_type: RunEventType, data: serde_json::Value) -> RunEvent {
         RunEvent {

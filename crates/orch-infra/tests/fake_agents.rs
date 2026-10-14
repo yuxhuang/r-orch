@@ -68,10 +68,23 @@ impl ProcessManager for FakeAgentProcessManager {
         opts: SpawnOptions,
     ) -> orch_core::Result<SpawnedChild> {
         let fake = fake_agents_dir().join(command);
+        // Default deny: no silent fallback to `PATH`. A renamed or deleted
+        // fixture would otherwise send these tests at the developer's *real*
+        // agent CLI — network, credentials, and a suite that passes while
+        // testing the wrong binary.
+        //
+        // `bash` is the one real command allowed through, because the shell
+        // adapter's whole purpose is to run one (`bash -lc`), so there is no
+        // fixture to rename and nothing to mistake it for.
         let command = if fake.is_file() {
             fake.to_string_lossy().into_owned()
-        } else {
+        } else if command == "bash" {
             command.to_owned()
+        } else {
+            return Err(orch_core::error::Error::other(format!(
+                "no fake agent fixture for {command:?}: expected {}",
+                fake.display()
+            )));
         };
         // The scripts run anywhere; the adapters' workspaces do not exist here.
         let opts = SpawnOptions {
@@ -236,4 +249,38 @@ async fn the_prompt_can_select_a_scenario_on_its_own() {
     let handle = adapter.execute(execute_params).expect("execute");
     let collected = collect(handle).await;
     assert!(collected.error.is_some(), "{:?}", collected.kinds());
+}
+
+#[test]
+fn a_command_with_no_fixture_is_refused_rather_than_resolved_on_path() {
+    let pm = FakeAgentProcessManager::new();
+    // `cat` exists on every PATH this suite could run on, has no fixture and
+    // is not the shell adapter's `bash`, so it distinguishes the two
+    // behaviours: refused here, spawned for real if the fallback came back.
+    let err = pm
+        .spawn("cat", &[], SpawnOptions::default())
+        .expect_err("a command with no fixture must not spawn");
+    let message = err.to_string();
+    assert!(
+        message.contains("no fake agent fixture for \"cat\""),
+        "{message}"
+    );
+
+    // The fixtures these tests rely on really are present, so the guard
+    // cannot be masking a broken checkout. These are the file names, which is
+    // what the adapters spawn — `cursor-agent`, not `cursor`.
+    for adapter in [
+        "claude",
+        "codex",
+        "cursor-agent",
+        "opencode",
+        "pi",
+        "grok",
+        "agy",
+    ] {
+        assert!(
+            fake_agents_dir().join(adapter).is_file(),
+            "missing fixture for {adapter}"
+        );
+    }
 }

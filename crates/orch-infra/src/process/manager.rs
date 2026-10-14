@@ -38,6 +38,30 @@ impl SystemProcessManager {
     }
 }
 
+/// The pid as something safe to hand to `kill(2)`, or `None` if it is not a
+/// single real process.
+///
+/// Two values must never reach `kill`, and `state.running` is populated from
+/// JSON on disk, so both are reachable from a stale or hand-edited file:
+///
+/// - **0** means "every process in the caller's own group" — the orchestrator
+///   would SIGTERM itself and every agent it started;
+/// - anything above [`i32::MAX`] wraps to a negative `i32`, and a negative
+///   target is a *process group*; `u32::MAX` in particular wraps to `-1`,
+///   which signals **every process the user can signal**.
+///
+/// `kill` negates this value itself to signal the group first, so the result
+/// is always strictly positive.
+fn signal_target(pid: u32) -> Option<i32> {
+    match i32::try_from(pid) {
+        Ok(pid) if pid > 0 => Some(pid),
+        _ => {
+            tracing::warn!(pid, "refusing to signal: not a single process id");
+            None
+        }
+    }
+}
+
 fn to_nix(signal: Signal) -> nix::sys::signal::Signal {
     use nix::sys::signal::Signal as S;
     match signal {
@@ -53,7 +77,13 @@ impl ProcessManager for SystemProcessManager {
     /// `kill(pid, 0)` succeeds, **or** fails with `EPERM` — the process exists
     /// but we may not signal it.
     fn is_alive(&self, pid: u32) -> bool {
-        match nix::sys::signal::kill(Pid::from_raw(pid as i32), None) {
+        let Some(pid) = signal_target(pid) else {
+            // Not a process, so not alive. Reporting `true` here — which
+            // `kill(0, 0)` does, because the caller's own group exists — would
+            // have reconcile keep waiting on a running entry forever.
+            return false;
+        };
+        match nix::sys::signal::kill(Pid::from_raw(pid), None) {
             Ok(()) => true,
             Err(Errno::EPERM) => true,
             Err(_) => false,
@@ -65,7 +95,9 @@ impl ProcessManager for SystemProcessManager {
     /// Errors are swallowed either way: the process is simply already gone.
     fn kill(&self, pid: u32, signal: Signal) {
         let signal = to_nix(signal);
-        let pid = pid as i32;
+        let Some(pid) = signal_target(pid) else {
+            return;
+        };
         if nix::sys::signal::kill(Pid::from_raw(-pid), signal).is_ok() {
             return;
         }
@@ -367,6 +399,45 @@ mod tests {
         let pm = SystemProcessManager::new();
         assert!(pm.is_alive(std::process::id()));
         assert!(!pm.is_alive(999_000_001));
+    }
+
+    #[test]
+    fn only_a_single_positive_process_id_is_signalable() {
+        assert_eq!(signal_target(1), Some(1));
+        assert_eq!(signal_target(i32::MAX as u32), Some(i32::MAX));
+        // `kill(0, …)` means the caller's own process group.
+        assert_eq!(signal_target(0), None);
+        // These wrap to a negative `i32`, which `kill(2)` reads as a process
+        // group — `u32::MAX` becomes `-1`, "every process we may signal".
+        assert_eq!(signal_target(u32::MAX), None);
+        assert_eq!(signal_target(i32::MAX as u32 + 1), None);
+    }
+
+    #[test]
+    fn a_pid_that_is_not_a_process_is_never_alive() {
+        let pm = SystemProcessManager::new();
+        // `kill(0, 0)` *succeeds* — our own group exists — so without the
+        // guard this reports `true` and reconcile waits on the running entry
+        // forever. Both values are reachable: `state.running` is JSON on disk.
+        assert!(!pm.is_alive(0));
+        assert!(!pm.is_alive(u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn signalling_a_non_process_pid_does_not_signal_us() {
+        let pm = SystemProcessManager::new();
+        // Without the guard, each of these sends the signal to a process
+        // *group*: pid 0 is our own, and `u32::MAX` wraps to -1. This test
+        // then does not fail — it terminates the test runner, which is the
+        // only way a mistake of this shape can announce itself.
+        pm.kill(0, Signal::Term);
+        pm.kill(u32::MAX, Signal::Term);
+        pm.kill_with_grace(0, Duration::from_millis(50)).await;
+
+        assert!(
+            pm.is_alive(std::process::id()),
+            "we signalled our own process group"
+        );
     }
 
     #[test]
