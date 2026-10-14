@@ -1307,6 +1307,9 @@ to `task list`, `goal list`, `msg list`, their `--json` forms, and the `_index.j
   required, so a reader can tell a real nondeterminism from a masked bug.
 - **`unordered_files`** — the same, for a set of files whose relative order is not meaningful.
 
+The operator-facing half — how to recover when a concurrent write has *dropped* an index entry rather than
+reordered it — is in [docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update).
+
 Everything else on the step is still compared in full. Declaring it per step keeps the blast radius visible:
 a step without the marker is order-sensitive, and that is the default.
 
@@ -2522,9 +2525,10 @@ non-zero exit.
 > **This is reachable out of the box**: the `agt_creator` agent that `orch init` creates ships with
 > `approval_policy: suggest` (§6.11), so a `serve --once` over a task assigned to the default agent hangs.
 > It applies **equally to both binaries** — it is inherited behaviour, not a divergence, and is replicated.
-> Document it for users (use `approval_policy: auto`, set `review_criteria`, or approve out of band) and
-> **keep it out of unattended scenarios**: a `--once` scenario must drive tasks to a terminal status or it
-> will hang the harness rather than fail it.
+> Documented for users, with all three escapes, in
+> [docs/RUNBOOK.md](RUNBOOK.md#serve---once-hangs-on-a-task-in-review). **Keep it out of unattended
+> scenarios**: a `--once` scenario must drive tasks to a terminal status or it will hang the harness
+> rather than fail it.
 
 **Flush on exit** (L1): all non-stdout/stderr streams are `end()`ed and awaited before the process exits, so a
 `--log-file` is never truncated.
@@ -2963,9 +2967,14 @@ that the *same capabilities* are reachable from a library consumer without going
 
 ---
 
-## 14. Known bugs in the original
+## 14. Known bugs, divergences and port defects
 
 Default policy: **fix**, and document. Exceptions are called out.
+
+Most entries are bugs in the **reference implementation**. A few (§14.25, §14.26) are **port defects** —
+places where r-orch had drifted from the original and was corrected *toward* it. They live here because the
+effect-on-comparison accounting in §14.0 applies identically, and because a reader asking "why does r-orch do
+X" deserves one list, not two. Each entry's heading states its kind.
 
 ### 14.0 Every entry must state its effect on the differential comparison
 
@@ -3009,6 +3018,16 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.22 `kill(0)` hits our own process group | **FIX** | `none` |
 | §14.23 `run <id>` awaits the collector | equivalent behaviour | `none` |
 | §14.24 `stop()` lets an in-flight tick finish | REPLICATE | `none` |
+| §14.25 index rebuild swallowed a parse error | PORT DEFECT → TS | `none` |
+| §14.26 signal handlers after the first tick | PORT DEFECT → TS | `none` |
+| §14.27 orphaned `running` runs never swept | FIX | `none` |
+| §14.28 `start_watch` leaks the lock on error | FIX | `none` |
+| §14.29 lock PID `0` / `> i32::MAX` treated dead | FIX (differs from TS for `0`) | `none` expected |
+| §14.30 `.`/`..` accepted as an id | FIX (additive) | `none` |
+| §14.31 YAML > 1 MiB or > 64 aliases rejected | DIVERGENCE | `none` in harness |
+| §14.32 no size guard on run-events reads | FIX | `none` |
+| §14.33 token totals can overflow | FIX | `none` |
+| §14.34 tracing to stderr under `ORCHESTRY_DEBUG` | FIX | `none` |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3290,8 +3309,9 @@ Three defects compound here. All three are **replicated**, including the literal
 
 **Decision: replicate all three.** This is the inherited behaviour at the pinned commit, the message is
 user-visible output, and "fixing" it changes an exit code and a stderr line that the harness compares. The
-remedy belongs in user-facing documentation — *delete `.orchestry/orchestry.lock` if you see
-`PID: undefined`* — not in a silent behavioural divergence.
+remedy belongs in user-facing documentation — **now written up, with the confirm-first procedure and the
+reasons `orch status` and the TUI both mislead here, in
+[docs/RUNBOOK.md](RUNBOOK.md#corrupt-lock-file)** — not in a silent behavioural divergence.
 
 Related, same measurement run: **`serve:started` is logged before the lock is acquired**
 (`serve.ts:84` vs the `runOnce`/`startWatch` calls at `:113`/`:131`), so a `serve` invocation that is about to
@@ -3481,6 +3501,130 @@ running. So a `stop()` issued mid-tick waits for that tick to finish (the state 
 directory with temp files** that nothing ever cleans up. A tick is bounded work; letting it complete is
 correct. Pair this with §14.15 — the wind-down must still complete every step and release the lock even when
 steps fail.
+
+### 14.25 Index rebuild silently discarded an unreadable entity file — **PORT DEFECT, corrected toward TS**
+
+**Effect on differential comparison: `none`** — the correction *removes* a divergence.
+
+Not a bug in the original. The TS `rebuildIndex` lets a parse error propagate, so a corrupt entity file fails
+the read loudly. The port's `scan_items` dropped the unreadable file and then **persisted the loss** by
+writing the index without it — turning a recoverable corrupt file into a silently deleted entity, which is a
+divergence in the unsafe direction (gate code review B1).
+
+**Decision: restore propagation**, matching TS. A corrupt `.yml` makes the listing fail with an error naming
+the file, rather than quietly shrinking the result set. The recovery is in
+[docs/RUNBOOK.md](RUNBOOK.md) — fix or remove the file, then rebuild.
+
+### 14.26 Signal handlers installed after the first tick — **PORT DEFECT, corrected toward TS**
+
+**Effect on differential comparison: `none`.**
+
+TS registers `SIGINT`/`SIGTERM` handlers **before** the initial tick (§7.3 step 5, then step 7). The port
+installed them after, leaving a window in which Ctrl-C kills the process mid-dispatch with no graceful
+shutdown — no lock release, no run finalisation, so the exact wreckage of §14.21 and §14.17 by a different
+route.
+
+**Decision: install before the first tick**, matching the documented order.
+
+### 14.27 No startup sweep of orphaned `running` runs — **FIX**
+
+**Effect on differential comparison: `none`.**
+
+A crash between `runService.create` and the state write leaves a `Run` in status `running` that no
+`state.running` entry references, so reconcile never sees it and it stays `running` forever. TS sweeps
+`preparing` runs at startup (§7.6 phase 4) but **not** `running` ones.
+
+**Decision: fix** — extend the startup sweep to finalise orphaned `running` runs as well as `preparing` ones,
+using the same `cancelled` status and a message naming the restart. Strictly additive: it only touches runs
+that are unreachable from state, which TS leaves stranded.
+
+### 14.28 `start_watch` leaks the lock file on any error after acquisition — **FIX**
+
+**Effect on differential comparison: `none`.**
+
+`start_watch` acquires the lock and then does several fallible things — state load, stale-entry cleanup, the
+state write, the first tick. An error in any of them returns without releasing the lock, leaving a file whose
+PID belongs to a process that has exited. Dead PIDs are re-acquirable, so this is a nuisance rather than the
+§14.17 wedge — but it is avoidable.
+
+**Decision: fix** — release the lock on every error path out of `start_watch`. Pairs with §14.15: the
+wind-down completes and releases even when its steps fail.
+
+### 14.29 Lock PIDs of `0` or above `i32::MAX` — **FIX (differs from TS for `0`)**
+
+**Effect on differential comparison: `none` expected** — reaching it requires a lock file that neither
+implementation writes.
+
+A PID that parses as a number but cannot name a live process is treated as **dead**, so the lock is replaced:
+
+- **`0`** — TS's `isProcessAlive(0)` calls `process.kill(0, 0)`, which signals the **caller's own process
+  group**, succeeds, and reports it alive — so TS refuses the lock forever. r-orch treats `0` as dead. This
+  is the same root cause as §14.22 and the same decision.
+- **`> i32::MAX`** — cannot be a PID on any supported platform.
+
+### 14.30 `.` and `..` accepted in extension-less id paths — **FIX (additive)**
+
+**Effect on differential comparison: `none`.**
+
+`sanitize_id`'s character class `^[A-Za-z0-9._-]+$` (§6.2) admits the strings `.` and `..`, because both
+consist only of permitted characters. For ids used with an extension this is harmless (`./..yml` is just an
+odd filename), but an id used as a **bare path segment** — the workspace directory
+`.orchestry/workspaces/<taskId>` — would resolve to the parent directory.
+
+**Decision: fix** — reject `.` and `..` outright. Additive hardening: no legitimate id is affected, and the
+generated form is `<prefix>_<nanoid(7)>`, which cannot produce either.
+
+### 14.31 YAML documents over 1 MiB or with more than 64 aliases — **DOCUMENTED DIVERGENCE**
+
+**Effect on differential comparison: `none` in the harness** — no scenario produces a document near either
+bound.
+
+TS accepts arbitrarily large YAML and arbitrarily many aliases; js-yaml has no limits. r-orch **rejects** a
+document over **1 MiB** or containing more than **64 aliases**.
+
+**Decision: diverge, deliberately.** Both are denial-of-service bounds on a file that may be checked into a
+shared repository: alias expansion is the classic "billion laughs" amplification, and an unbounded document
+is an unbounded allocation. Neither bound is reachable by anything r-orch writes — the largest artifact is an
+agent file holding a few kilobytes of role prompt. A hand-authored config.yml that legitimately exceeded
+either would be pathological.
+
+Recorded as a divergence rather than a fix because TS genuinely accepts such files: a project r-orch refuses
+may still open in the original.
+
+### 14.32 No size guard on reading a run's events — **FIX**
+
+**Effect on differential comparison: `none`.**
+
+`readJsonl` has a 50 MB ceiling above which it tail-reads instead (§6.9), but the per-read path the CLI and
+TUI use had no guard in the port, so a pathological `.jsonl` could be read whole into memory.
+
+**Decision: fix** — apply the documented ceiling consistently on every run-events read path. This matches the
+TS intent; the original simply has the check in one place and not the other.
+
+### 14.33 Token totals can overflow — **FIX**
+
+**Effect on differential comparison: `none`.**
+
+Cumulative token counters in `state.json` (`stats.total_tokens`) are summed without bound. In TS they are
+JS numbers, which lose precision rather than wrap. In Rust an integer accumulator would **overflow** —
+panicking in debug, wrapping in release, which would corrupt the stats file.
+
+**Decision: fix** — saturating addition. A pinned maximum is wrong but monotonic and inert; a wrapped total
+is wrong and actively misleading. The totals are informational and no control flow depends on them.
+
+### 14.34 `tracing` output goes to stderr only, and only under `ORCHESTRY_DEBUG` — **FIX**
+
+**Effect on differential comparison: `none`** — the harness never sets the variable, so no record is emitted.
+
+`tracing-subscriber` was a declared dependency with **no subscriber ever installed**, so all `tracing::`
+call sites wrote nowhere (gate code review M4, sre C4). What was lost mattered: the only signal
+distinguishing "another process holds the lock" from "I could not read the lock file" — both of which print
+`PID: undefined` (§14.17) — plus failed-reap and refused-signal diagnostics.
+
+**Decision: fix** — install a subscriber gated on `ORCHESTRY_DEBUG`, writing to **stderr only**. Stderr is
+mandatory, not stylistic: stdout carries the `--json` contract (§4) and the `serve` log stream (§11.1), and a
+diagnostic line on stdout would corrupt both. Documented for operators in
+[docs/RUNBOOK.md](RUNBOOK.md#debugging).
 
 ---
 

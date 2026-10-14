@@ -174,6 +174,43 @@ async fn read_events_after_wait(
     read_events_file(&path).await
 }
 
+/// Largest run-events file read whole, matching `read_jsonl`'s threshold.
+const MAX_EVENTS_READ_SIZE: u64 = 50 * 1024 * 1024;
+
+/// Bytes read from the end of an oversize events file.
+const EVENTS_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// The last [`EVENTS_TAIL_BYTES`] of `path`, starting at a line boundary.
+///
+/// The first line of the window is dropped: seeking to a byte offset almost
+/// always lands mid-line, and half a JSON object is not a record.
+async fn read_events_tail_bytes(path: &Path, size: u64) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|err| Error::io(format!("open {}", path.display()), path, err))?;
+    let offset = size.saturating_sub(EVENTS_TAIL_BYTES);
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|err| Error::io(format!("seek {}", path.display()), path, err))?;
+
+    let mut buffer = Vec::with_capacity(EVENTS_TAIL_BYTES as usize);
+    file.read_to_end(&mut buffer)
+        .await
+        .map_err(|err| Error::io(format!("read {}", path.display()), path, err))?;
+
+    if offset > 0 {
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(first_newline) => buffer.drain(..=first_newline),
+            // No newline in a megabyte: one enormous line, and there is no
+            // record boundary to trust.
+            None => buffer.drain(..),
+        };
+    }
+    Ok(buffer)
+}
+
 /// Parse the events file with the shared line-reading semantics
 /// (PARITY.md §8.5): split on `0x0A` only — `\r` is retained — skip empty
 /// lines, and cap each line at 16384 characters.
@@ -182,9 +219,33 @@ async fn read_events_after_wait(
 /// must keep the same cap and empty-line rule; this one reads a file, so it
 /// cannot simply call that one.
 async fn read_events_file(path: &Path) -> Result<Vec<RunEvent>> {
-    let content = tokio::fs::read(path)
-        .await
-        .map_err(|err| Error::io(format!("read {}", path.display()), path, err))?;
+    // Bounded like `read_jsonl`: an event log is append-only and unbounded in
+    // principle, so reading it whole makes its size the memory ceiling. A
+    // runaway agent, or a hand-placed file, should not be able to choose how
+    // much we allocate.
+    //
+    // This cannot delegate to `read_jsonl`, whose `lines()` strips `\r`;
+    // §8.5 requires splitting on `0x0A` only and retaining `\r`. So the cap
+    // is applied here with the same threshold, and the oversize path reads a
+    // bounded tail rather than the whole file.
+    let size = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(Error::io(format!("stat {}", path.display()), path, err)),
+    };
+
+    let content = if size > MAX_EVENTS_READ_SIZE {
+        tracing::warn!(
+            path = %path.display(),
+            megabytes = size / 1024 / 1024,
+            "run events file too large, reading the tail only"
+        );
+        read_events_tail_bytes(path, size).await?
+    } else {
+        tokio::fs::read(path)
+            .await
+            .map_err(|err| Error::io(format!("read {}", path.display()), path, err))?
+    };
 
     let mut events = Vec::new();
     for raw in content.split(|byte| *byte == b'\n') {
@@ -241,6 +302,44 @@ mod tests {
 
     fn ids(runs: &[Run]) -> Vec<&str> {
         runs.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn an_oversize_events_file_reads_a_bounded_tail() {
+        // Reading an append-only log whole makes its size the memory ceiling.
+        // The file here is deliberately just over the cap, and built from
+        // records so the tail is parseable.
+        let temp = tempfile::tempdir().unwrap();
+        clear_ensured_dirs();
+        let path = temp.path().join("run_big.jsonl");
+
+        let line = format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": "2026-10-13T16:37:33.426Z",
+                "type": "agent_output",
+                "data": "x".repeat(900)
+            })
+        );
+        let mut file = std::fs::File::create(&path).unwrap();
+        use std::io::Write;
+        let mut written = 0u64;
+        while written <= MAX_EVENTS_READ_SIZE {
+            file.write_all(line.as_bytes()).unwrap();
+            written += line.len() as u64;
+        }
+        file.flush().unwrap();
+        drop(file);
+
+        let events = read_events_file(&path).await.unwrap();
+        assert!(!events.is_empty(), "the tail must still parse");
+        // Bounded by the tail window, not by the file: the whole file holds
+        // ~52k records.
+        assert!(
+            events.len() < 2_000,
+            "read {} records, so the cap did not apply",
+            events.len()
+        );
     }
 
     #[tokio::test]

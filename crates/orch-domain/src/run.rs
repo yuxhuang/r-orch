@@ -105,7 +105,13 @@ pub fn create_token_usage(input: u64, output: u64, opts: Option<TokenUsageOpts>)
         input,
         output,
         reasoning,
-        total: input + output + reasoning,
+        // Saturating: these three come from an adapter's own usage report,
+        // which is attacker-adjacent (a hostile or buggy agent CLI prints
+        // whatever it likes) and is also re-read from `state.json`, which can
+        // be hand-edited. A debug build would panic and a release build would
+        // wrap, and a wrapped total is worse than a clamped one — it reads as
+        // a plausible small number.
+        total: input.saturating_add(output).saturating_add(reasoning),
         cache_read: opts.cache_read.unwrap_or(0),
         cache_write: opts.cache_write.unwrap_or(0),
     }

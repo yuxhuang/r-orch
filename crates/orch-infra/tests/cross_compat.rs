@@ -49,17 +49,28 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// `None` when the vendored oracle has not been built.
+    /// `None` only when the caller has explicitly opted out.
+    ///
+    /// A missing oracle used to `return None` with an `eprintln`, which cargo
+    /// hides for a passing test — so this whole file reported green while
+    /// asserting nothing, and the cross-compat crux (§6.4) is exactly the
+    /// thing that cannot afford to be quietly skipped. Mirrors
+    /// `concurrent_index.rs`: fail loudly, with `ORCH_SKIP_CROSS_BINARY` as
+    /// the only way to skip (code M5).
     fn new() -> Option<Fixture> {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let ts_root = repo_root.join("parity/orch-ts");
-        if !ts_root.join("node_modules/.bin/tsx").exists() {
-            eprintln!(
-                "skipping: {} is missing — run parity/setup.sh to build the oracle",
-                ts_root.join("node_modules/.bin/tsx").display()
-            );
+
+        if std::env::var_os("ORCH_SKIP_CROSS_BINARY").is_some() {
+            eprintln!("skipping: ORCH_SKIP_CROSS_BINARY is set");
             return None;
         }
+        assert!(
+            ts_root.join("node_modules/.bin/tsx").exists(),
+            "{} is missing — run parity/setup.sh to build the vendored oracle (or set \
+             ORCH_SKIP_CROSS_BINARY=1 to skip the cross-binary tests)",
+            ts_root.join("node_modules/.bin/tsx").display()
+        );
         let fixture = Fixture {
             project: tempfile::tempdir().expect("tempdir"),
             ts_root,

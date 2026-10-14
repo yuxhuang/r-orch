@@ -271,10 +271,17 @@ mod tests {
     #[tokio::test]
     async fn rejects_traversal_and_invalid_names_silently() {
         let dir = lib(&[("review.md", "Review content")]);
-        std::fs::write(dir.path().join("..").join("secret.md"), "x").ok();
+        // The decoy goes in a sibling *inside* the tempdir, not in
+        // `dir/..` — which is the tempdir's own parent, i.e. `/tmp` (code
+        // m5). A test that writes outside its tempdir leaves litter on the
+        // machine and, worse, would be writing somewhere it has no business
+        // writing if `..` ever resolved somewhere sensitive.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), "x").unwrap();
         let (l, warnings) = loader(dir.path());
         let out = l
-            .load_skills(&names(&["../etc/passwd", "../../secret", "review"]))
+            .load_skills(&names(&["../etc/passwd", "../outside/secret", "review"]))
             .await
             .unwrap();
         assert!(out.contains("### review") && !out.contains("passwd") && !out.contains("secret"));

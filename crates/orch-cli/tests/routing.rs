@@ -34,6 +34,15 @@ fn orch(cwd: &Path) -> Command {
     command
         .current_dir(cwd)
         .env("NO_COLOR", "1")
+        // A `PATH` with no agent CLIs on it. `doctor` probes all eight by
+        // exec'ing them, and on a developer's machine several resolve — which
+        // made these tests spawn the real `claude`, `cursor-agent` and
+        // `opencode` (they then wrote into `$HOME`, which is how the gate
+        // caught it). The assertions here are about counts and headers, never
+        // about an adapter being present, so an empty probe set is both
+        // sufficient and machine-independent. `git` and `bash` stay reachable
+        // because `doctor` reports on those too.
+        .env("PATH", "/usr/bin:/bin")
         .env_remove("ORCHESTRY_DEBUG");
     command
 }

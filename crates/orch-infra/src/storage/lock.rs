@@ -207,7 +207,21 @@ pub fn is_process_alive(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
-    match kill(Pid::from_raw(pid as i32), None) {
+    // Through the shared guard rather than `pid as i32` (security).
+    //
+    // A `u32` above `i32::MAX` wraps to a *negative* number, and a negative
+    // argument to `kill(2)` addresses a process **group** — so the probe
+    // would report "alive" because some unrelated group exists. Pid 0 is the
+    // same hazard: it means the caller's own group, which is always alive.
+    //
+    // Treating both as dead is a deliberate, narrow divergence: the TS does
+    // `process.kill(0, 0)`, which succeeds, so a lock file containing `0`
+    // makes the oracle report a conflict while r-orch treats the lock as
+    // stale. Needs a §14 entry; reachable only by hand-editing the lock file.
+    let Some(target) = crate::process::manager::signal_target(pid) else {
+        return false;
+    };
+    match kill(Pid::from_raw(target), None) {
         Ok(()) => true,
         Err(Errno::EPERM) => true,
         Err(_) => false,
@@ -237,6 +251,24 @@ mod tests {
     fn lock_path(root: &Path) -> std::path::PathBuf {
         clear_ensured_dirs();
         root.join(".orchestry/orchestry.lock")
+    }
+
+    #[test]
+    fn a_pid_that_cannot_be_a_single_process_is_reported_dead() {
+        // `pid as i32` wrapped these into negatives, and a negative argument
+        // to `kill(2)` addresses a process *group* — so the probe reported
+        // "alive" on the strength of some unrelated group existing.
+        assert!(!is_process_alive(0), "pid 0 is the caller's own group");
+        assert!(
+            !is_process_alive(u32::MAX),
+            "u32::MAX wraps to -1, which means every process"
+        );
+        assert!(
+            !is_process_alive(i32::MAX as u32 + 1),
+            "the first value that wraps negative"
+        );
+        // A real, live process is still reported alive.
+        assert!(is_process_alive(std::process::id()));
     }
 
     #[tokio::test]

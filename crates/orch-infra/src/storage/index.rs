@@ -113,10 +113,20 @@ where
                 ItemFormat::Yaml => read_yaml::<T>(&path).await,
                 ItemFormat::Json => read_json::<T>(&path).await,
             };
-            // A single unreadable entity file must not lose the whole index;
-            // the TS version drops nulls the same way.
-            if let Ok(Some(item)) = item {
-                items.push(item);
+            // Only a **missing** file is skipped. A parse error propagates.
+            //
+            // This used to be `if let Ok(Some(item))`, which swallowed `Err`
+            // as well — so one corrupt entity file produced a *shortened*
+            // index that `rebuild_index`'s caller then persisted, silently
+            // dropping every entity in that file from `list()` with nothing
+            // logged. The comment claimed the TS "drops nulls the same way",
+            // which is true of nulls and untrue of errors: `readYaml` returns
+            // `null` **only** on ENOENT and rethrows everything else, and
+            // `rebuildIndex`'s `Promise.all` then rejects the whole rebuild.
+            // Propagating is both safer and the faithful behaviour.
+            match item? {
+                Some(item) => items.push(item),
+                None => continue,
             }
         }
         Ok(items)
@@ -314,7 +324,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_entity_file_is_skipped_not_fatal() {
+    async fn an_unreadable_entity_file_fails_the_rebuild_rather_than_shortening_it() {
+        // Inverted deliberately (sre B1). Skipping the bad file produced an
+        // index missing that entity, and `rebuild_index`'s callers *persist*
+        // what it returns — so a single corrupt file silently removed an
+        // entity from every `list()` thereafter, with nothing logged. The TS
+        // propagates here: `readYaml` returns null only on ENOENT and
+        // rethrows a parse error, which rejects `rebuildIndex`'s `Promise.all`.
         let temp = tempfile::tempdir().unwrap();
         let index = manager(temp.path());
         write_yaml(&temp.path().join("a.yml"), &item("a", 1))
@@ -324,6 +340,26 @@ mod tests {
             .await
             .unwrap();
 
+        let err = index
+            .rebuild_index()
+            .await
+            .expect_err("a corrupt entity file must not be silently dropped");
+        assert!(
+            format!("{err}").contains("bad.yml"),
+            "the error must name the file: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_entity_file_is_still_skipped() {
+        // The other half of B1: `Ok(None)` — a file listed but gone by the
+        // time it is read — stays non-fatal, which is what the TS `null`
+        // branch does.
+        let temp = tempfile::tempdir().unwrap();
+        let index = manager(temp.path());
+        write_yaml(&temp.path().join("a.yml"), &item("a", 1))
+            .await
+            .unwrap();
         assert_eq!(index.rebuild_index().await.unwrap(), vec![item("a", 1)]);
     }
 
