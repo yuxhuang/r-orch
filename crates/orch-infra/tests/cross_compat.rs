@@ -60,10 +60,12 @@ impl Fixture {
             );
             return None;
         }
-        Some(Fixture {
+        let fixture = Fixture {
             project: tempfile::tempdir().expect("tempdir"),
             ts_root,
-        })
+        };
+        orch_core::test_support::assert_hermetic(fixture.project.path());
+        Some(fixture)
     }
 
     fn paths(&self) -> Paths {
@@ -81,6 +83,17 @@ impl Fixture {
             // tsx resolves its own dependencies from the package directory.
             .current_dir(&self.ts_root)
             .env("CI", "1")
+            // HOME inside the fixture, because the cwd above is the vendored
+            // package *inside this repository* — so anything in the TS that
+            // resolves `~/.orchestry` directly would otherwise touch the
+            // developer's own home. Nothing in these modes should, but the
+            // cost of being sure is one line.
+            .env("HOME", self.project.path())
+            .env("USERPROFILE", self.project.path())
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                self.project.path().join("global.yml"),
+            )
             .output()
             .expect("run the oracle script");
 

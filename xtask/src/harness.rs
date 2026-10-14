@@ -326,14 +326,48 @@ fn git(cwd: &Path, args: &[&str]) -> Result<()> {
 /// command it knows, non-zero (`unrecognized subcommand`) for one it does not.
 /// That happens before the container is built, so an uninitialized directory
 /// does not confuse it.
-#[derive(Debug, Default)]
+///
+/// No `Default`: a `Capabilities` without its sandbox would probe with the
+/// inherited cwd and HOME, which is the bug this type was fixed for. Use
+/// [`Capabilities::new`].
+#[derive(Debug)]
 pub struct Capabilities {
     probed: std::cell::RefCell<BTreeMap<String, bool>>,
+    /// An empty directory with its own `HOME`, for the probes to run in.
+    ///
+    /// The probe used to inherit the harness's cwd and `HOME`, which meant
+    /// running `orch <cmd> --help` from inside the repository with the
+    /// developer's real home. `--help` in an uninitialized directory still
+    /// builds the container first (PARITY.md §3), and the container resolves
+    /// its project root by **walking up** — so once `~/.orchestry` existed,
+    /// every probe latched onto the developer's own home as the project and
+    /// could create directories in it. Fifteen probes per run, every run.
+    ///
+    /// `None` only if a tempdir cannot be made, in which case the probe falls
+    /// back to the inherited environment rather than failing the harness —
+    /// reported by `probe_isolation_note`.
+    sandbox: Option<tempfile::TempDir>,
 }
 
 impl Capabilities {
     pub fn new() -> Self {
-        Capabilities::default()
+        Capabilities {
+            probed: std::cell::RefCell::new(BTreeMap::new()),
+            sandbox: tempfile::Builder::new()
+                .prefix("r-orch-probe-home-")
+                .tempdir()
+                .ok(),
+        }
+    }
+
+    /// Why probing is not isolated, if it is not.
+    pub fn isolation_note(&self) -> Option<&'static str> {
+        self.sandbox.as_ref().map_or(
+            Some(
+                "could not create a tempdir for capability probing, so probes run with the                  inherited cwd and HOME — a probe may then resolve the developer's own                  ~/.orchestry as its project",
+            ),
+            |_| None,
+        )
     }
 
     /// Every requirement this scenario declares that the Rust binary lacks.
@@ -350,12 +384,26 @@ impl Capabilities {
             return *known;
         }
         let argv = shell_words::split(command).unwrap_or_default();
-        let supported = Command::new(&bins.rust)
+        let mut probe = Command::new(&bins.rust);
+        probe
             .args(&argv)
             .arg("--help")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // An empty directory with nothing above it: no project to walk up to,
+        // and a HOME that is not the developer's.
+        if let Some(sandbox) = self.sandbox.as_ref() {
+            probe
+                .current_dir(sandbox.path())
+                .env("HOME", sandbox.path())
+                .env("USERPROFILE", sandbox.path())
+                .env(
+                    "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                    sandbox.path().join("global.yml"),
+                );
+        }
+        let supported = probe
             .status()
             .map(|status| status.success())
             .unwrap_or(false);

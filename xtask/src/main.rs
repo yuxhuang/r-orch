@@ -131,6 +131,11 @@ fn parity(repo_root: &Path, filter: Option<&str>, verbose: bool) -> Result<()> {
     println!("running {} parity scenario(s)\n", selected.len());
 
     let capabilities = harness::Capabilities::new();
+    if let Some(note) = capabilities.isolation_note() {
+        // Loud, because the consequence is writing into the developer's own
+        // home rather than a failure anyone would notice.
+        println!("WARNING: {note}\n");
+    }
     let (mut failed, mut skipped) = (0usize, 0usize);
     let mut skipped_names: Vec<(String, String)> = Vec::new();
 

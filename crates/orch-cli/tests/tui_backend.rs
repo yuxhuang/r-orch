@@ -40,6 +40,7 @@ static GLOBAL_CONFIG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 /// A project with a written `config.yml`, which is what `require_init` wants.
 async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
     let temp = tempfile::tempdir().expect("tempdir");
+    orch_core::test_support::assert_hermetic(temp.path());
     orch_infra::storage::fs_utils::clear_ensured_dirs();
     let paths = Paths::new(temp.path());
     tokio::fs::create_dir_all(paths.root())

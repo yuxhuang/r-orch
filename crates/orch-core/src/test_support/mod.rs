@@ -23,6 +23,7 @@ pub mod adapter;
 pub mod clock;
 pub mod factories;
 pub mod faults;
+pub mod hermetic;
 pub mod ids;
 pub mod process;
 pub mod process_group;
@@ -36,6 +37,7 @@ pub use adapter::{FakeAdapter, FakeExecuteCall, done_event, error_event, output_
 pub use clock::{FIXED_NOW_ISO, FIXED_NOW_MS, FixedClock};
 pub use factories::{FACTORY_TIMESTAMP, make_agent, make_run, make_task};
 pub use faults::Faults;
+pub use hermetic::assert_hermetic;
 pub use ids::SeqIdGenerator;
 pub use process::{FAKE_PID, FakeProcessManager, FakeProcessManagerCall};
 pub use process_group::{

@@ -127,6 +127,9 @@ summarize() {
       # reads as that rather than as a blind spot.
       grep -oE '[0-9]+ detected, [0-9]+ missed.*' "$log" | tail -1
       ;;
+    home-hygiene)
+      grep -oE 'nothing ORCH-shaped.*|a test created an ORCH project.*' "$log" | tail -1
+      ;;
     crate-graph)
       grep -oE 'layering matches [^ ]+ .*|[0-9]+ layering problem\(s\)' "$log" | tail -1
       ;;
@@ -142,6 +145,36 @@ summarize() {
       ;;
     *) printf -- '-' ;;
   esac
+}
+
+# Run the suite with HOME pointed at an empty directory and fail if anything
+# ORCH-shaped appears in it.
+#
+# The project root is resolved by walking **up**, and `cargo test` runs with
+# its cwd inside $HOME — so once `~/.orchestry` exists, a test that resolves a
+# project without an explicit path finds the developer's own home and writes
+# into it. That is not hypothetical: `~/.orchestry` on this machine collected
+# `tasks/_index.json`, `agents/_index.json`, `runs/` and `state.json` from our
+# own runs before this check existed.
+#
+# Only `.orchestry` is checked, not the whole directory: cargo and rustup
+# legitimately recreate their caches under a moved HOME, and the adapter tests
+# spawn real `cursor`/`opencode` binaries that write their own config there.
+# Those are noise; a project directory is the finding.
+sentinel_home_check() {
+  local sentinel
+  sentinel=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-home-XXXXXX")
+  HOME="$sentinel" cargo test --workspace --no-fail-fast >/dev/null 2>&1
+  local found
+  found=$(find "$sentinel" -maxdepth 2 -name '.orchestry' 2>/dev/null)
+  if [ -n "$found" ]; then
+    echo "a test created an ORCH project under a sentinel HOME:"
+    find "$sentinel/.orchestry" 2>/dev/null | head -20
+    rm -rf "$sentinel"
+    return 1
+  fi
+  rm -rf "$sentinel"
+  echo "nothing ORCH-shaped created under a sentinel HOME"
 }
 
 printf 'r-orch gate — %s\n' "$MODE"
@@ -160,6 +193,7 @@ step parity         cargo xtask parity
 # The probe suite rebuilds the CLI repeatedly as it mutates and reverts source,
 # so it goes last: on a cold gate it is by far the slowest step, and anything
 # it would catch is worth knowing about after the cheaper checks have run.
+step home-hygiene   sentinel_home_check
 step probes         ./xtask/probe-harness.sh
 
 printf '\n'

@@ -27,6 +27,7 @@ fn initialized(dir: &Path) -> bool {
 #[test]
 fn bare_orch_initializes_the_current_directory_and_opens_the_dashboard() {
     let temp = tempfile::tempdir().expect("tempdir");
+    orch_core::test_support::assert_hermetic(temp.path());
     let output = orch(temp.path()).output().expect("run orch");
 
     assert!(
