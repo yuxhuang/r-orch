@@ -63,26 +63,64 @@ fn stdout_is_byte_identical_whether_or_not_tracing_is_on() {
     );
     serde_json::from_slice::<serde_json::Value>(&loud.stdout).expect("stdout is still JSON");
     // And it did go somewhere, so this is not passing because tracing is
-    // simply broken.
+    // simply broken. Note this says nothing about *our* records: at `trace`
+    // the first line on that command comes from `mio`. It is still a real
+    // check — no subscriber means no output at all — but
+    // `nothing_is_logged_by_default_but_orchestry_debug_turns_it_on` is the
+    // one that proves our own warnings flow.
     assert!(
         !loud.stderr.is_empty(),
         "RUST_LOG=trace produced no diagnostics at all"
     );
 }
 
+/// Silence by default is a *choice*, so the test has to tell it apart from a
+/// subscriber that was never installed — which an earlier version of this test
+/// could not: asserting an empty stderr passes identically whether the
+/// subscriber is silent or absent, and the name claimed more than the body
+/// established.
+///
+/// It is driven through a *warning we own*, for a reason worth recording:
+/// `task list --json` logs nothing of ours at any level, and what
+/// `RUST_LOG=trace` produces for it comes from `mio`. A test that turned
+/// logging up on that command and asserted "something appeared" would be
+/// measuring a dependency. So this uses the unreadable global config — one of
+/// the deliberate degradations — and asserts that *its* warning is absent by
+/// default and present with `ORCHESTRY_DEBUG`, which is also the only coverage
+/// that path has.
 #[test]
-fn nothing_is_logged_by_default() {
+fn nothing_is_logged_by_default_but_orchestry_debug_turns_it_on() {
     let dir = project();
+    let broken = dir.path().join("broken-global.yml");
+    std::fs::write(&broken, b"\x00\x01 not: [valid").expect("write a broken global config");
 
-    let output = orch(dir.path())
-        .args(["task", "list", "--json"])
+    // Stderr is not empty here — the dashboard still fails to open a terminal,
+    // and that error is reported — so the assertion is about the *warning*,
+    // which is the thing logging controls.
+    let quiet = orch(dir.path())
+        .arg("tui")
+        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", &broken)
         .output()
         .expect("run");
-
     assert!(
-        output.stderr.is_empty(),
-        "an ordinary invocation logged to stderr:\n{}",
-        show(&output.stderr)
+        !show(&quiet.stderr).contains("unreadable global config"),
+        "an ordinary invocation logged a warning:\n{}",
+        show(&quiet.stderr)
+    );
+
+    // Same command, same tree, one environment variable. `ORCHESTRY_DEBUG`
+    // takes no filter spec — it means `debug`.
+    let debug = orch(dir.path())
+        .arg("tui")
+        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", &broken)
+        .env("ORCHESTRY_DEBUG", "1")
+        .output()
+        .expect("run");
+    assert!(
+        show(&debug.stderr).contains("unreadable global config"),
+        "ORCHESTRY_DEBUG logged nothing, so the silence above proves nothing \
+         about the subscriber:\n{}",
+        show(&debug.stderr)
     );
 }
 
