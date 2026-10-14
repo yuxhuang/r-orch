@@ -47,6 +47,7 @@ export TMPDIR="${TMPDIR:-/tmp}"
 detected=0
 missed=0
 pending=0
+stale=0
 dirty=0
 
 # probe_pending <subcommand> <label> <file> <old> <new>
@@ -136,7 +137,7 @@ p.write_text(s.replace(old, new, 1))
 PY
   then
     printf '  ANCHOR STALE  %s\n' "$label"
-    missed=$((missed + 1))
+    stale=$((stale + 1))
     return
   fi
 
@@ -223,8 +224,8 @@ echo "running mutation probes"
 
 probe 'YAML timestamp guard off (R1, V8, V32)' \
   crates/orch-infra/src/storage/fs_utils.rs \
-  'atomic_write(path, &quote_ambiguous_scalars(&raw)).await' \
-  'atomic_write(path, &raw).await'
+  'atomic_write_with_mode(path, &quote_ambiguous_scalars(&raw), mode).await' \
+  'atomic_write_with_mode(path, &raw, mode).await'
 
 probe 'JSON trailing newline dropped (§6.4)' \
   crates/orch-infra/src/storage/fs_utils.rs \
@@ -303,11 +304,28 @@ probe_pending doctor \
 
 echo
 summary="$detected detected, $missed missed"
+# A stale anchor and a blind spot both make the gate red, and both used to
+# report as "missed" — which sends the reader hunting for a corpus gap when the
+# actual fix is a one-line probe update. They need different responses, so they
+# get different words. This one cost exactly that confusion: a refactor renamed
+# `atomic_write` to `atomic_write_with_mode` for the 0600 work, the YAML
+# timestamp probe stopped matching, and the table said "1 missed".
+[ "$stale" -gt 0 ] && summary="$summary, $stale with a stale anchor (the probe needs updating, not the corpus)"
 [ "$pending" -gt 0 ] && summary="$summary, $pending pending on commands that do not exist yet"
 [ "$dirty" -gt 0 ] && summary="$summary, $dirty skipped on an uncommitted target file"
 echo "$summary"
 if [ "$missed" -gt 0 ]; then
   echo "a missed probe means the harness has a blind spot — fix the harness, not the probe" >&2
+  exit 1
+fi
+# Separating `stale` from `missed` above made the wording clearer and would
+# have made the gate unable to fail on a stale anchor, had this been left out.
+# A probe that cannot apply its mutation is not testing anything, which is the
+# same end state as a blind spot even though the fix is different.
+if [ "$stale" -gt 0 ]; then
+  echo "$stale probe(s) no longer match the source they mutate. The code moved and the" >&2
+  echo "probe did not: update the anchor to the current call site. Until then those" >&2
+  echo "probes assert nothing, so this is red for the same reason a miss is." >&2
   exit 1
 fi
 if [ "$dirty" -gt 0 ]; then
