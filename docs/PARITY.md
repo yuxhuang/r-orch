@@ -2793,7 +2793,7 @@ solid text, selection); exact hex values are L2.
 
 ### 12.8 Deliberate divergences in r-orch's TUI
 
-WP-6 is complete: **742 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
+WP-6 is complete: **747 tests, 100 % of this section’s checklist.** Eight divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
 
@@ -3471,7 +3471,7 @@ Every row must be satisfiable by an automated check. Full harness design in
 | V30 | `sanitizeId` rejects path traversal | L0 | Table test with `../`, `/`, `a/b`, empty, unicode |
 | V31 | **Harness hermeticity**: `HOME`/`USERPROFILE` redirected per tmpdir; a fresh `update-check.json` pre-seeded; the oracle spawns **no `npm`** and makes **no network call** | L0 | Scenario asserting the process tree contains no `npm` and no socket; run with the network namespace disabled in CI |
 | V32 | **Generalized YAML cross-parse**: every YAML artifact in **both** trees re-parsed **in the TS process with js-yaml** and deep-compared against the Rust parse | L0 | Harness step (~50 lines of Node glue). **Subsumes V8.** The single highest-value check in the plan |
-| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 742 tests, 100 % of the §12 checklist (WP-6).** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
+| V33 | **TUI counted-case enumeration**: every wizard field, validation message, command-bar verb and filter predicate has a named `TestBackend` case; the total is tracked and must not regress. **Baseline: 747 tests, 100 % of the §12 checklist (WP-6), enumerated in `crates/orch-tui/TEST-COVERAGE.md` — that file is authoritative, not this number.** | L0/L1 | Counted test inventory, asserted like V1's generated command-tree test |
 | V34 | **Stall clock semantics**: a run emitting blank lines stalls; a run emitting unparseable non-blank lines does not | L1 | Cross-compat `serve --once` scenario with a fake agent, compared against the oracle |
 | V35 | **`serve --once` killed mid-run** → task recovery, run finalization and `--json` records match the oracle | L1 | Cross-compat scenario with a fake agent and an external kill |
 | V36 | **`max_concurrent_agents` saturation**: N ready tasks, cap 2 — dispatch order, claim/release and final tree match the oracle | L1 | Cross-compat scenario with fake agents |
