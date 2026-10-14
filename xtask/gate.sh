@@ -123,6 +123,8 @@ summarize() {
       grep -oE 'all [0-9]+ scenario\(s\) well-formed|[0-9]+ of [0-9]+ scenario\(s\) are malformed' "$log" | tail -1
       ;;
     probes)
+      # The whole summary line, so "skipped on an uncommitted target file"
+      # reads as that rather than as a blind spot.
       grep -oE '[0-9]+ detected, [0-9]+ missed.*' "$log" | tail -1
       ;;
     crate-graph)

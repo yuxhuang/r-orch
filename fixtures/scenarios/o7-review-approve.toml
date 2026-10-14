@@ -1,6 +1,6 @@
 name = "o7-review-approve"
 kind = "differential"
-requires = ["serve", "config set", "task approve", "task show"]
+requires = ["run", "config set", "task approve", "task show"]
 fake_agents = true
 timeout_secs = 90
 description = """
@@ -16,7 +16,7 @@ steps = [
   "config set scheduling.poll_interval_ms 200",
   "agent add reviewer --adapter claude --approval-policy manual --quiet",
   "task add 'Needs review' --assignee ${agent.0} --quiet",
-  "serve --once --log-format json",
+  "run ${task.0}",
   "task list --json",
   "task show ${task.0} --json",
   "task approve ${task.0}",

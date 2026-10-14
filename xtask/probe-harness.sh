@@ -32,7 +32,13 @@ require_clean() {
   if ! git diff --quiet -- "$1" || ! git diff --cached --quiet -- "$1"; then
     printf '  DIRTY FILE    %s\n' "$2"
     printf '                %s has uncommitted changes; a probe would revert them\n' "$1"
-    missed=$((missed + 1))
+    # Counted separately from `missed`. A missed probe means the harness has a
+    # blind spot and the gate should stop; a dirty target file means the
+    # operator has work in progress, which is a different conversation and
+    # must not be reported as the first one. (It was, briefly: the gate said
+    # "8 detected, 1 missed" when the only problem was my own uncommitted
+    # edit to the file a probe mutates.)
+    dirty=$((dirty + 1))
     return 1
   fi
 }
@@ -41,6 +47,7 @@ export TMPDIR="${TMPDIR:-/tmp}"
 detected=0
 missed=0
 pending=0
+dirty=0
 
 # probe_pending <subcommand> <label> <file> <old> <new>
 #
@@ -242,13 +249,17 @@ probe_pending doctor \
         true'
 
 echo
-if [ "$pending" -gt 0 ]; then
-  echo "$detected detected, $missed missed, $pending pending on commands that do not exist yet"
-else
-  echo "$detected detected, $missed missed"
-fi
+summary="$detected detected, $missed missed"
+[ "$pending" -gt 0 ] && summary="$summary, $pending pending on commands that do not exist yet"
+[ "$dirty" -gt 0 ] && summary="$summary, $dirty skipped on an uncommitted target file"
+echo "$summary"
 if [ "$missed" -gt 0 ]; then
   echo "a missed probe means the harness has a blind spot — fix the harness, not the probe" >&2
+  exit 1
+fi
+if [ "$dirty" -gt 0 ]; then
+  echo "$dirty probe(s) could not run because their target file has uncommitted changes;" >&2
+  echo "commit or stash that work and re-run — this is not a harness blind spot" >&2
   exit 1
 fi
 echo "every probe was detected"

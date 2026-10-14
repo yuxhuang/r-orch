@@ -14,7 +14,7 @@
 //! `findProjectRoot` walks up and would otherwise find the developer's own
 //! project. That is asserted, not assumed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -72,6 +72,8 @@ impl Binaries {
                 oracle_entry.display()
             );
         }
+        verify_oracle_is_patched(repo_root)?;
+
         Ok(Binaries {
             rust,
             oracle_entry,
@@ -80,6 +82,110 @@ impl Binaries {
             _snapshot: Some(snapshot),
         })
     }
+}
+
+/// Refuse to run against an oracle that is not the patched, freshly built one.
+///
+/// `parity/patches/` holds the minimal patches that make some behaviour
+/// observable at all (see that README). Those patches are the difference
+/// between a scenario being differential and being vacuous, and the failure is
+/// silent: the unpatched oracle exits 0 and simply does nothing. A harness that
+/// kept going would report ten green scenarios about a binary that never
+/// dispatched.
+///
+/// Three things have to line up, and the stamp is written only after a
+/// successful build:
+///
+/// 1. the stamp exists at all — `parity/setup.sh` has been run since the
+///    patches were introduced;
+/// 2. it lists every patch currently in `parity/patches/` — a patch added
+///    later is not silently skipped;
+/// 3. its recorded hash matches the built `dist/` — someone rebuilding with a
+///    plain `npm run build` after a bare `git checkout` invalidates it rather
+///    than leaving a stamp that lies.
+fn verify_oracle_is_patched(repo_root: &Path) -> Result<()> {
+    let stamp_path = repo_root.join("parity/orch-ts/.parity-stamp");
+    let rerun = "run `./parity/setup.sh` to apply the patches and rebuild";
+
+    let stamp = std::fs::read_to_string(&stamp_path).with_context(|| {
+        format!(
+            "{} is missing — the oracle may be unpatched, and an unpatched oracle fails \
+             *silently* (it exits 0 without dispatching, so scenarios pass while asserting \
+             nothing). {rerun}",
+            stamp_path.display()
+        )
+    })?;
+
+    let stamped: BTreeSet<&str> = stamp
+        .lines()
+        .filter_map(|line| line.strip_prefix("patch "))
+        .map(str::trim)
+        .collect();
+
+    let patch_dir = repo_root.join("parity/patches");
+    let mut expected: Vec<String> = Vec::new();
+    if patch_dir.is_dir() {
+        for entry in std::fs::read_dir(&patch_dir)
+            .with_context(|| format!("read {}", patch_dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "patch") {
+                expected.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    expected.sort();
+
+    let missing: Vec<&String> = expected
+        .iter()
+        .filter(|name| !stamped.contains(name.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        bail!("the built oracle does not include {missing:?} from parity/patches/ — {rerun}");
+    }
+
+    let recorded = stamp
+        .lines()
+        .find_map(|line| line.strip_prefix("dist-sha256 "))
+        .map(str::trim)
+        .context("the parity stamp has no dist-sha256 line — {rerun}")?;
+    let actual = dist_hash(&repo_root.join("parity/orch-ts"))?;
+    if recorded != actual {
+        bail!(
+            "the oracle's dist/ does not match the stamp, so it was rebuilt without the \
+             patches (stamp {}…, built {}…) — {rerun}",
+            &recorded[..recorded.len().min(12)],
+            &actual[..actual.len().min(12)]
+        );
+    }
+    Ok(())
+}
+
+/// The oracle's `dist/` hash, computed by running the **same shell pipeline**
+/// `setup.sh` records.
+///
+/// Shelling out rather than hashing in Rust on purpose: a second
+/// implementation could disagree with the stamp over file order or line
+/// endings and fail the gate for a reason that has nothing to do with the
+/// oracle. Running the identical command makes that impossible, and xtask
+/// already shells out to cargo and node.
+fn dist_hash(oracle_root: &Path) -> Result<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "find dist -maxdepth 1 -name '*.js' -exec sha256sum {} + \
+             | LC_ALL=C sort -k 2 | sha256sum | cut -d' ' -f1",
+        )
+        .current_dir(oracle_root)
+        .output()
+        .context("hash the oracle's dist/")?;
+    if !output.status.success() {
+        bail!(
+            "could not hash the oracle's dist/: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// `cargo build -p orch-cli` against *this* tree's manifest, returning the
