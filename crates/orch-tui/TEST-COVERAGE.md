@@ -12,15 +12,15 @@ Run everything with `cargo test -p orch-tui`.
 
 | Suite | Cases | What it enumerates |
 |---|---:|---|
-| `tests/keymap.rs` (`k001..k095`) | 95 | The five-stage dispatch chain and every per-view binding |
+| `tests/keymap.rs` (`k001..k096`) | 96 | The five-stage dispatch chain and every per-view binding |
 | `tests/wizards.rs` (`w001..w093`) | 93 | All 11 wizards: fields, defaults, skip predicates, mappers, validation |
 | `tests/command_surface.rs` (`c001..c112`) | 112 | Every verb, subcommand, alias, usage and confirmation string |
 | `tests/views_render.rs` (`v001..v094`) | 94 | Sort orders, glyphs, caps, badges, detail panels, header, onboarding, overlays |
 | `tests/filters.rs` (`f001..f044`) | 44 | Both filter pickers and every filter predicate |
 | `tests/live_updates.rs` (`l001..l048`) | 48 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history, endurance |
-| **Integration total** | **486** | |
-| In-module unit tests | 268 | Pure logic: see the table below |
-| **Grand total** | **754** | |
+| **Integration total** | **487** | |
+| In-module unit tests | 271 | Pure logic: see the table below |
+| **Grand total** | **758** | |
 
 In-module unit tests, by file:
 
@@ -29,9 +29,9 @@ In-module unit tests, by file:
 | `messages/format.rs` | 84 | `formatAgentOutput` and friends — every legacy adapter shape |
 | `text/cursor.rs` | 27 | `text-cursor.test.ts` (grapheme, width, navigation, kills) |
 | `state.rs` | 27 | Sort orders, selection spaces, rows, batching, deletions, toasts |
-| `wizard/engine.rs` | 26 | `form-wizard.test.tsx`, `form-wizard-validation.test.tsx` |
+| `wizard/engine.rs` | 27 | `form-wizard.test.tsx`, `form-wizard-validation.test.tsx` |
 | `app.rs` | 21 | Event ingestion, `entityListChanged`, notifications, soft delete |
-| `text/input.rs` | 14 | `text-input.test.tsx` (kill ring, undo, debounce) |
+| `text/input.rs` | 16 | `text-input.test.tsx` (kill ring, undo, debounce) |
 | `messages/mod.rs` | 14 | `formatEvent`, message types, activity presets |
 | `onboarding.rs` | 12 | `onboarding.test.tsx`, `onboarding-agents.test.ts` |
 | `command_bar.rs` | 10 | `help-overlay.test.tsx` (completion, suggestions, history) |
@@ -61,7 +61,7 @@ In-module unit tests, by file:
 | §2.1 Dispatch order (overlay, pickers, Ctrl+S, input modes) | `k018`–`k023`, `k080`, `k081`, `k089`–`k091` |
 | §2.2 Normal-mode chain, every binding and overload | `k001`–`k088` |
 | §2.3 Command-mode keys | `c0xx` command-bar key cases, `k092` |
-| §2.4 Text editing (kill ring, undo, both undo flavours) | `text/input.rs` (14) |
+| §2.4 Text editing (kill ring, undo, both undo flavours) | `text/input.rs` (16), and `is_meta` — Cmd is not Meta |
 | §2.5 Agent filter picker | `f001`–`f012` |
 | §2.6 Type filter picker | `f013`–`f027` |
 | §3.1 Command bar hints and navigate bar | `c0xx` frame cases |

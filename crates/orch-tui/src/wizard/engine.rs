@@ -22,7 +22,7 @@ use indexmap::{IndexMap, IndexSet};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::{CursorMove, TextArea, WrapMode};
 
-use crate::text::TextInput;
+use crate::text::{TextInput, is_meta};
 
 /// Collected wizard answers, keyed by step id, in step order.
 pub type Values = IndexMap<String, String>;
@@ -626,14 +626,13 @@ impl Wizard {
     pub fn handle_key(&mut self, key: KeyEvent, now_ms: i64) -> WizardOutcome {
         self.poll(now_ms);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let meta = key.modifiers.contains(KeyModifiers::ALT)
-            || key.modifiers.contains(KeyModifiers::SUPER);
+        let meta = is_meta(key);
         let kind = self.step().kind;
 
         // Paste image, text and textarea steps only. One condition, as in TS:
         // `(key.ctrl || key.meta) && (input === 'v' || input === 'i')` — the
-        // `i` arm takes the modifier set the `v` arm does, so Cmd/Option+I
-        // pastes too.
+        // `i` arm takes the modifier set the `v` arm does, so Alt/Option+I
+        // pastes too. `key.meta` is Alt, never Cmd — see `text::is_meta`.
         if (ctrl || meta)
             && matches!(
                 key.code,
@@ -1311,8 +1310,10 @@ mod tests {
 
     #[test]
     fn paste_takes_the_same_modifier_set_for_v_and_i() {
-        // TS is one condition — `(key.ctrl || key.meta) && (input === 'v' || input
-        // === 'i')` — so Cmd/Option+I pastes just like Cmd/Option+V.
+        // TS is one condition — `(key.ctrl || key.meta) && (input === 'v' ||
+        // input === 'i')` — so the `i` arm takes exactly the modifiers the `v`
+        // arm does. `key.meta` is Alt/Option (or the Kitty `meta` bit), never
+        // Cmd (PARITY §12.5).
         let steps = vec![
             WizardStep::new("t", "T", StepKind::Text),
             WizardStep::new("body", "Body", StepKind::Textarea),
@@ -1323,11 +1324,7 @@ mod tests {
             KeyCode::Char('i'),
             KeyCode::Char('I'),
         ] {
-            for modifiers in [
-                KeyModifiers::CONTROL,
-                KeyModifiers::ALT,
-                KeyModifiers::SUPER,
-            ] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT, KeyModifiers::META] {
                 let mut wizard = Wizard::new(WizardKind::Task, "T", steps.clone()).with_paste(true);
                 assert_eq!(
                     wizard.handle_key(KeyEvent::new(code, modifiers), 0),
@@ -1343,6 +1340,27 @@ mod tests {
                     "textarea step: {code:?} + {modifiers:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cmd_is_not_meta_so_super_never_pastes() {
+        // Ink never maps the Kitty `super` bit to `key.meta`, so Cmd+V/Cmd+I
+        // cannot reach the paste handler in the original and must not here.
+        let steps = vec![WizardStep::new("t", "T", StepKind::Text)];
+        for code in [KeyCode::Char('v'), KeyCode::Char('i')] {
+            let mut wizard = Wizard::new(WizardKind::Task, "T", steps.clone()).with_paste(true);
+            let outcome = wizard.handle_key(KeyEvent::new(code, KeyModifiers::SUPER), 0);
+            assert_ne!(outcome, WizardOutcome::PasteImage, "{code:?} + SUPER");
+            // It falls through to the editor as ordinary input.
+            assert_eq!(wizard.text_value(), code_char(code).to_string());
+        }
+    }
+
+    fn code_char(code: KeyCode) -> char {
+        match code {
+            KeyCode::Char(c) => c,
+            other => panic!("not a character key: {other:?}"),
         }
     }
 
