@@ -880,7 +880,24 @@ Node glue, it subsumes V8's timestamp
 - Scenario failures print a unified diff of the normalized artifacts, not a boolean.
 
 **Run the TS oracle with `CI=1`** (⇒ `maxWorkers=2`) whenever the reference *suite* is invoked, per
-[PARITY.md §14.9](PARITY.md). The oracle *binary* is unaffected, but the habit should be in the tooling.
+[PARITY.md §14.9](PARITY.md).
+
+**Every scenario needs a timeout, and this is not hypothetical.** A `serve --once` step in our own probe
+script **hung for three hours** before anyone noticed, on the `review` trap: `review` is not terminal, so the
+poll loop waits forever and there is no built-in timeout
+([PARITY.md §11.1](PARITY.md), [docs/RUNBOOK.md](RUNBOOK.md#serve---once-hangs-on-a-task-in-review)). It
+burned a slot and produced no signal — strictly worse than a red test, because nothing failed.
+
+Two requirements follow:
+
+1. **The harness imposes a per-step wall-clock timeout** and reports a timeout as a **failure**, naming the
+   step. A hung step must never be able to look like a slow one.
+2. **A `--once` scenario must drive every task it creates to a terminal status** — `approval_policy: auto`,
+   or `review_criteria`, or an explicit `task approve` step. A scenario that can reach `review` and stop is
+   malformed, and `cargo xtask lint-scenarios` is the right place to reject it.
+
+This is also the concrete evidence behind the runbook entry: the trap caught the people who wrote the spec
+for it, which is about as strong a case as a runbook entry gets. The oracle *binary* is unaffected, but the habit should be in the tooling.
 
 ### 8.3 Layer 3 — fixtures
 
