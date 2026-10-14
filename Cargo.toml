@@ -51,6 +51,13 @@ nanoid = "0.5"
 # serde_yaml is archived; _ng is the maintained continuation with the same API.
 # serde_norway 0.9 is the pre-vetted escape hatch.
 serde_yaml_ng = "0.10"
+# Event-based YAML scanner, used only to *count* a document's expanded size
+# before `serde_yaml_ng` is allowed to build it (security review C0). Chosen
+# over hand-rolling a scanner because alias and anchor bookkeeping is the whole
+# problem: it reports anchor ids on nodes and on aliases, and assigns a fresh
+# id when an anchor is redefined, so a redefinition is correct without special
+# handling. Safe Rust, no libyaml.
+saphyr-parser = "0.2"
 
 # ── Templates (ARCHITECTURE §4.3) ──────────────────────────────────────────
 liquid = "0.26.11"

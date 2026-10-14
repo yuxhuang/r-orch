@@ -16,7 +16,9 @@ use std::time::Duration;
 use orch_core::error::{Error, Result};
 use orch_domain::{SUPPORTED_ADAPTERS, WorkspaceMode, default_agents, default_config};
 use orch_infra::storage::Paths;
-use orch_infra::storage::fs_utils::{atomic_write, ensure_dir, path_exists, write_yaml};
+use orch_infra::storage::fs_utils::{
+    atomic_write, ensure_dir, owner_only, path_exists, write_yaml_with_mode,
+};
 
 use crate::output::{Styles, print_success, print_warning};
 
@@ -123,12 +125,19 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
 
     let agents = default_agents(&adapter);
 
-    write_yaml(&paths.config_path(), &config).await?;
+    // Owner-only, like every later write of these two files: `config.yml`
+    // carries adapter commands and API-key environment names, and an agent
+    // file is the role prompt an AI CLI is run with (security review C3).
+    // `init` had its own write path, so routing the stores through
+    // `OWNER_ONLY` left the files `init` created at the umask's 0664 — the
+    // mode of the file as *first written* is the one that matters, because
+    // nothing rewrites them until they are edited.
+    write_yaml_with_mode(&paths.config_path(), &config, owner_only()).await?;
     atomic_write(&paths.gitignore_path(), GITIGNORE).await?;
     atomic_write(&paths.workspace_exclude_path(), WORKSPACE_EXCLUDE).await?;
     atomic_write(&paths.default_template_path(), &default_prompt_template()).await?;
     for agent in &agents {
-        write_yaml(&paths.agent_path(&agent.id)?, agent).await?;
+        write_yaml_with_mode(&paths.agent_path(&agent.id)?, agent, owner_only()).await?;
     }
 
     // Keep `.orchestry` out of the repo so worktrees do not nest recursively.
@@ -448,6 +457,27 @@ mod tests {
         .await;
         let paths = Paths::new(temp.path());
         assert!(path_exists(&paths.agent_path("agt_creator").unwrap()).await);
+
+        // Security review C3 / §14: the *first* write is the one that matters.
+        // These two files are created by `init`'s own path, not by the stores,
+        // so routing the stores through OWNER_ONLY was not enough — the review
+        // found both at 0664 after a fresh init.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [
+                paths.config_path(),
+                paths.agent_path("agt_creator").unwrap(),
+            ] {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "{} is {mode:o}, not owner-only",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[tokio::test]

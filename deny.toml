@@ -28,18 +28,30 @@ yanked = "deny"
 unmaintained = "all"
 unsound = "all"
 ignore = [
-  # serde_yaml_ng -> unsafe-libyaml. An accepted risk, with the reasoning in
-  # `fs_utils.rs` beside the guards: the library is the only maintained YAML
-  # crate offering a dynamic `Value` model plus `apply_merge()`, and js-yaml
-  # merge-key parity (PARITY.md §6.4.2) is a wire-contract requirement rather
-  # than a convenience. serde-saphyr was evaluated as the advisory's suggested
-  # replacement and rejected on API fit: it deserializes into typed structs
-  # only, with no document model, so adopting it would mean hand-writing merge
-  # resolution, the timestamp guard and surrogate repair — more unsafe surface
-  # of our own making, not less. The DoS exposure that *would* have justified
-  # the cost is handled directly, by the size/alias/expansion caps and the
-  # parse deadline in `read_yaml_value`.
-  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml_ng; no API-compatible replacement, DoS bounded by read_yaml_value's caps" },
+  # serde_yaml_ng -> unsafe-libyaml. An accepted risk, and the reasoning has
+  # changed since the first version of this file, which said the DoS exposure
+  # was "bounded by read_yaml_value's caps". It was not: the security review
+  # (C0) showed the caps were bypassable by nested aliases, and that the 2 s
+  # deadline could not stop the parse it was timing.
+  #
+  # What the acceptance now rests on, in order:
+  #   1. No API-compatible replacement. serde_yaml_ng is the only maintained
+  #      crate offering a dynamic `Value` model plus `apply_merge()`, and
+  #      js-yaml merge-key parity (PARITY.md §6.4.2) is a wire contract, not a
+  #      convenience. serde-saphyr was evaluated as the advisory's suggested
+  #      replacement and deserializes into typed structs only — adopting it
+  #      means hand-writing merge resolution, the timestamp guard and surrogate
+  #      repair, which is more unsafe-equivalent surface of our own making.
+  #   2. An exact expansion pre-pass. `expanded_node_count` walks the document's
+  #      parse events once and computes the expanded node count exactly, before
+  #      serde_yaml_ng sees the input, rejecting over 200,000 nodes. That closes
+  #      the amplification class at the source rather than bounding its inputs.
+  #   3. Size and alias caps in front of it, as cheap filters.
+  #
+  # The deadline is gone, not improved: a clock that fires on work it cannot
+  # cancel is a diagnostic, not a control, and documenting one as what makes
+  # the caps safe is what let C0 through.
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml_ng; no API-compatible replacement (serde-saphyr has no Value model), and the amplification class is closed by the exact expanded-node pre-pass in read_yaml_value" },
 
   # liquid-core -> anymap2. Unmaintained with no successor. Reached only by the
   # skill/prompt template renderer, over template text we ship ourselves.
