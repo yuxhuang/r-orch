@@ -273,7 +273,13 @@ fn every_fixture_these_tests_resolve_is_present() {
     // So the guard above cannot be masking a broken checkout: these are the
     // file names the adapters spawn — `cursor-agent`, not `cursor`.
     for adapter in [
-        "claude", "codex", "cursor-agent", "opencode", "pi", "grok", "agy",
+        "claude",
+        "codex",
+        "cursor-agent",
+        "opencode",
+        "pi",
+        "grok",
+        "agy",
     ] {
         assert!(
             fake_agents_dir().join(adapter).is_file(),

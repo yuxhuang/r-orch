@@ -866,7 +866,7 @@ async fn poll_history_is_empty_for_a_project_with_no_finished_runs() {
 // ── watch mode ───────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stop_watch_returns_at_once_and_the_shutdown_arrives_on_the_bus() {
+async fn stop_watch_waits_for_the_stop_and_releases_the_lock() {
     let (temp, engine) = project().await;
     let backend = launch(Arc::clone(&engine)).await;
     assert!(engine.orchestrator.is_owner());
@@ -876,16 +876,47 @@ async fn stop_watch_returns_at_once_and_the_shutdown_arrives_on_the_bus() {
         backend.stop_watch().expect("stop watch");
     })
     .await;
+
+    // Awaited, not spawned: by the time the call returns the orchestrator has
+    // stopped and the lock is gone. The reference `await`s `onStopWatch` too,
+    // and spawning would mean a failed stop could only be reported as
+    // `orchestrator:error`, which nothing renders — so `/pause` would claim to
+    // have paused a loop that is still running.
+    assert!(
+        !engine.orchestrator.is_owner(),
+        "stop_watch returned before the lock was released"
+    );
     assert!(!backend.is_watch_active());
 
-    // Spawned, so the lock release happens after the call returned.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while engine.orchestrator.is_owner() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("watch mode never stopped");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_stop_watch_reports_the_error_and_keeps_the_watch_flag() {
+    let (temp, engine) = project().await;
+    let backend = launch(Arc::clone(&engine)).await;
+    assert!(backend.is_watch_active());
+
+    // `stop()` persists the cleared state, so a state file that cannot be
+    // written is the one way it fails. A *directory* in its place is the
+    // cheapest unwritable file: the running orchestrator would simply
+    // recreate a deleted one.
+    let state_path = engine.paths.state_path();
+    let _ = tokio::fs::remove_file(&state_path).await;
+    tokio::fs::create_dir_all(&state_path)
+        .await
+        .expect("block state.json");
+
+    let (backend, result) = on_draw_thread(backend, |backend| backend.stop_watch()).await;
+
+    let err = result.expect_err("a failed stop must reach the caller");
+    assert!(!err.is_empty(), "the message is the whole contract");
+    // The flag describes the watch loop, so it must not claim a pause that
+    // did not happen.
+    assert!(
+        backend.is_watch_active(),
+        "watch_active was cleared despite the failure"
+    );
 
     drop(temp);
 }
