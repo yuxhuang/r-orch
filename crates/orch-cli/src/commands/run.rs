@@ -55,6 +55,12 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
         handle_single(styles, &event, task_id, &mut target_run, &mut failed);
     }
 
+    // The original's closing `console.log()` runs here, right after
+    // `await runTask(...)` — *before* the agent's output arrives, since the
+    // dispatch returns as soon as the child is spawned. So the blank line
+    // sits under the header rather than at the end of the stream.
+    println!();
+
     if target_run.is_some() {
         while let Some(event) = events.recv().await {
             let completed = handle_single(styles, &event, task_id, &mut target_run, &mut failed);
@@ -62,9 +68,13 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
                 break;
             }
         }
+        // `agent:completed` is emitted when the *run* is finished, from the
+        // middle of the collector — the task's status change, the agent's
+        // stats and the workspace cleanup all come after it. Returning here
+        // would drop the runtime mid-collector.
+        engine.orchestrator.wait_for_collectors().await;
     }
 
-    println!();
     Ok(if failed {
         ExitCode::from(1)
     } else {
@@ -139,6 +149,9 @@ pub async fn all(engine: &FullEngine, styles: &Styles) -> Result<ExitCode> {
     let mut events = engine.events.subscribe();
     engine.orchestrator.run_all().await?;
     drain_runs(&mut events).await;
+    // The last completion event arrives from inside a collector; this waits
+    // for the work that follows it.
+    engine.orchestrator.wait_for_collectors().await;
     Ok(ExitCode::SUCCESS)
 }
 
