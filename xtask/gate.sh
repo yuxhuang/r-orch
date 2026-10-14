@@ -162,19 +162,49 @@ summarize() {
 # spawn real `cursor`/`opencode` binaries that write their own config there.
 # Those are noise; a project directory is the finding.
 sentinel_home_check() {
-  local sentinel
+  local sentinel cwd
   sentinel=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-home-XXXXXX")
-  HOME="$sentinel" cargo test --workspace --no-fail-fast >/dev/null 2>&1
-  local found
-  found=$(find "$sentinel" -maxdepth 2 -name '.orchestry' 2>/dev/null)
-  if [ -n "$found" ]; then
+  cwd=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-cwd-XXXXXX")
+
+  # Run from **outside** the workspace, which is the whole point.
+  #
+  # The first version of this check ran with the cwd in the repo and passed
+  # while the bug was still live: cargo only loads `.cargo/config.toml` — and
+  # therefore its `[env]` — when the working directory is inside the
+  # workspace, so the redirect that was hiding the writer was still in effect.
+  # Running from elsewhere removes that cover. `rust-toolchain.toml` is also
+  # found via the cwd, hence the explicit RUSTUP_TOOLCHAIN.
+  (
+    cd "$cwd" || exit 1
+    HOME="$sentinel" \
+    RUSTUP_TOOLCHAIN="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")" \
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}" \
+      cargo test --manifest-path "$REPO/Cargo.toml" --workspace --no-fail-fast
+  ) >/dev/null 2>&1
+
+  local status=0
+  if [ -e "$sentinel/.orchestry" ]; then
     echo "a test created an ORCH project under a sentinel HOME:"
     find "$sentinel/.orchestry" 2>/dev/null | head -20
-    rm -rf "$sentinel"
-    return 1
+    status=1
+  else
+    echo "nothing ORCH-shaped created under a sentinel HOME"
   fi
-  rm -rf "$sentinel"
-  echo "nothing ORCH-shaped created under a sentinel HOME"
+
+  # Reported, not failed: the adapter tests spawn the real `cursor` and
+  # `opencode` binaries, which write their own config and caches into HOME.
+  # Not ORCH data, but still this suite touching a developer's home, and it
+  # means those tests depend on whichever versions are installed.
+  local others
+  others=$(find "$sentinel" -maxdepth 2 -mindepth 1 2>/dev/null \
+           | grep -vE '/\.(cargo|rustup)' | head -8)
+  if [ -n "$others" ]; then
+    echo "note: third-party CLIs spawned by the adapter tests also wrote to HOME:"
+    printf '%s\n' "$others" | sed "s|$sentinel|<HOME>|"
+  fi
+
+  rm -rf "$sentinel" "$cwd"
+  return "$status"
 }
 
 printf 'r-orch gate — %s\n' "$MODE"

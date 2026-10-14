@@ -16,7 +16,7 @@ use orch_domain::{
     NotificationPreferences, OrchestratorEventType, ReasoningEffort, Run, RunEvent, RunEventType,
     RunStatus, TaskStatus, TuiPaletteName, WorkspaceMode, default_config,
 };
-use orch_engine::{FullEngine, build_full};
+use orch_engine::{EngineSeams, FullEngine, build_full_with};
 use orch_infra::storage::{FileConfigStore, Paths};
 use orch_tui::backend::{
     AgentFields, AgentOpts, CreateTaskOpts, GoalFields, HistoryEntry, TaskFields, TuiBackend,
@@ -56,8 +56,28 @@ async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
         .await
         .expect("write config.yml");
 
-    let engine = Arc::new(build_full(temp.path()).await.expect("build_full"));
+    let engine = Arc::new(build_isolated(temp.path()).await.expect("build_full"));
     (temp, engine)
+}
+
+/// `build_full`, with `global.yml` kept inside the project directory.
+///
+/// Every build in this file goes through here. The default resolution is
+/// `~/.orchestry/global.yml` — one file per machine — and two tests below
+/// write it, so using `build_full` directly meant rewriting the developer's
+/// own preferences. An env var does not fix it: set through `[env]` in
+/// `.cargo/config.toml` it only applies when cargo is run from inside the
+/// workspace, and the writer came straight back for any other cwd (verified).
+/// A seam passed explicitly cannot be bypassed.
+async fn build_isolated(root: &std::path::Path) -> orch_core::error::Result<FullEngine> {
+    build_full_with(
+        root,
+        EngineSeams {
+            global_config_path: Some(root.join(".orchestry/global.yml")),
+            ..EngineSeams::default()
+        },
+    )
+    .await
 }
 
 /// Run `body` on a thread that is not driving the runtime, as the draw loop
@@ -155,7 +175,7 @@ async fn launch_reads_the_tui_preferences_out_of_the_global_config() {
 
     // `build_full` reads `global.yml`, so a fresh engine is what the dashboard
     // would see on its next launch.
-    let engine = Arc::new(build_full(temp.path()).await.expect("rebuild"));
+    let engine = Arc::new(build_isolated(temp.path()).await.expect("rebuild"));
     let backend = launch(Arc::clone(&engine)).await;
 
     let context = backend.context();
@@ -638,7 +658,7 @@ async fn the_settings_writes_persist_where_the_next_launch_will_read_them() {
     );
     assert_eq!(backend.context().initial_max_concurrent, 6);
 
-    let reopened = Arc::new(build_full(temp.path()).await.expect("rebuild"));
+    let reopened = Arc::new(build_isolated(temp.path()).await.expect("rebuild"));
     assert_eq!(reopened.config.scheduling.max_concurrent_agents, 3);
 
     // An unrecognized preset is *stored*, not refused: the field is a plain
@@ -927,7 +947,7 @@ async fn in_observer_mode_a_refresh_sees_another_process_writing_state() {
     assert!(backend.context().observer_mode);
 
     // A second engine on the same tree stands in for that other process.
-    let external = build_full(temp.path()).await.expect("second engine");
+    let external = build_isolated(temp.path()).await.expect("second engine");
     let mut state = external.state.read().await.expect("read state");
     state.pid = Some(4242);
     external.state.write(&state).await.expect("write state");

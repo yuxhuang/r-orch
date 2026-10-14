@@ -121,6 +121,22 @@ impl std::ops::Deref for FullEngine {
 pub struct EngineSeams {
     pub clock: Arc<dyn Clock>,
     pub ids: Arc<dyn IdGenerator>,
+    /// Where `global.yml` lives, for a test that must not touch the real one.
+    ///
+    /// `None` keeps the production resolution: `ORCHESTRY_GLOBAL_CONFIG_PATH`,
+    /// else `~/.orchestry/global.yml`. That default is machine-global, so a
+    /// test using it writes the developer's own preferences — which is not
+    /// hypothetical. Two tests in `orch-cli` did exactly that, and the user's
+    /// `~/.orchestry/global.yml` was found holding `activity_filter:
+    /// nonsense`, a literal from one of them.
+    ///
+    /// An env var is **not** a sufficient fix: it was first set through
+    /// `[env]` in `.cargo/config.toml`, which cargo only loads when the
+    /// working directory is inside the workspace — so the writer came straight
+    /// back for any invocation from elsewhere. Verified by running the suite
+    /// with a cwd outside the repo, which reproduced the file byte for byte.
+    /// A seam the test passes explicitly cannot be bypassed that way.
+    pub global_config_path: Option<PathBuf>,
 }
 
 impl Default for EngineSeams {
@@ -128,6 +144,7 @@ impl Default for EngineSeams {
         EngineSeams {
             clock: Arc::new(SystemClock::new()),
             ids: Arc::new(NanoIdGenerator::new()),
+            global_config_path: None,
         }
     }
 }
@@ -147,7 +164,10 @@ pub async fn build_light_with(
     paths.require_init().await?;
 
     let config_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(paths.clone()));
-    let global_config_store: Arc<dyn GlobalConfigStore> = Arc::new(FileGlobalConfigStore::new());
+    let global_config_store: Arc<dyn GlobalConfigStore> = match &seams.global_config_path {
+        Some(path) => Arc::new(FileGlobalConfigStore::at(path.clone())),
+        None => Arc::new(FileGlobalConfigStore::new()),
+    };
     let config = config_store.read().await?;
     // The light tier does not read `global.yml`: the TS container leaves
     // `globalConfig` at its default until the full tier loads it, and no
@@ -355,6 +375,10 @@ mod tests {
         EngineSeams {
             clock: Arc::new(orch_core::test_support::FixedClock::at(0)),
             ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
+            // Left at the default here because these cases only build the
+            // light tier, which does not construct the global-config store.
+            // Anything reading or writing `global.yml` must set it.
+            global_config_path: None,
         }
     }
 
