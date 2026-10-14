@@ -3,6 +3,7 @@ name = "orch-engine"
 description = "Services, orchestrator, event bus and container for r-orch."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
