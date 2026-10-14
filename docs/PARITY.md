@@ -3688,6 +3688,7 @@ An **exact expanded-node-count pre-pass** runs before `serde_yaml_ng` ever sees 
 | Cycles | **refused** |
 | Arithmetic | checked at **every** accumulation; overflow is treated as over budget, never as a value |
 | Cost | O(input) time, O(depth + anchors) memory, however large the expansion would be |
+| Deep nesting | bounded by **`saphyr-parser`'s recursion limit** — and the pre-pass walk is **iterative**, so it does not overflow the stack while counting |
 
 **It counts what the document *expands to*, not what it looks like.** That is the whole point, and it is why
 the previous guard set failed: see §14.31.1.
@@ -3715,8 +3716,19 @@ were handled. Do not reintroduce one.
 | Case | Result |
 |---|---|
 | `shapeD_6000_30` — 84 KB, 60 aliases, the shape that defeated the old guards | **refused in 18 ms**, exit 1 |
-| Worst *legitimate* 1 MiB document | parses in **161 ms** |
+| Shapes A/B — the two bombs from the first security review | refused in **21–24 ms** |
+| Worst *legitimate* 1 MiB document | parses in **99–161 ms** |
+| **150 000-deep non-alias nesting** (`[[[[…`) | **refused in 23 ms** by the recursion limit |
 | Pre-pass overhead | ~**55 %** of the parse it protects |
+
+Figures are **measured, not guaranteed** — wp0 and gate-security measured independently, on different
+machines, and agreed to within about 1.6×; the ranges above span both. Treat the order of magnitude as the
+contract, not the millisecond.
+
+**Deep nesting was a second DoS, and the fix closed it too.** It is a distinct class from alias
+amplification — no anchors, no aliases, just depth — and the previous build took **58 s on 300 KB of
+`[[[[…`**. It is now bounded by `saphyr-parser`'s recursion limit rather than by anything we wrote, which is
+part of why the parser choice (§4.2) matters beyond the alias walk.
 
 #### Scope and failure mode
 
