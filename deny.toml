@@ -1,0 +1,92 @@
+# cargo-deny: supply-chain gate (ARCHITECTURE §4.8, gate-security-review C5).
+#
+# Run by `xtask/gate.sh`'s `advisories` step. Checked in rather than left to a
+# developer's habits, because an advisory nobody runs is not a control.
+
+[graph]
+# Only what we actually ship. Without this, advisories for other platforms'
+# crates (winapi, redox, wasm) count against a Linux build that never links
+# them, and the signal drowns.
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+version = 2
+# A vulnerability or a yanked release fails the gate. `unmaintained` and
+# `unsound` take a *scope* rather than a severity in cargo-deny 0.20 — every
+# selected advisory is an error unless explicitly ignored below.
+#
+# Scope is "all", not "workspace". Both advisories we actually carry are
+# against *transitive* crates — `unsafe-libyaml` under serde_yaml_ng and
+# `anymap2` under liquid-core — so "workspace" scope reports neither, and
+# cargo-deny then warns that both `ignore` entries were never encountered.
+# That is the trap worth naming: the narrower scope looks tidier and quietly
+# removes the control, leaving a green check that inspects nothing. "all"
+# keeps them visible as recorded decisions. The cost is that a new transitive
+# advisory can redden the gate; that is the point of having it.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = [
+  # serde_yaml_ng -> unsafe-libyaml. An accepted risk, with the reasoning in
+  # `fs_utils.rs` beside the guards: the library is the only maintained YAML
+  # crate offering a dynamic `Value` model plus `apply_merge()`, and js-yaml
+  # merge-key parity (PARITY.md §6.4.2) is a wire-contract requirement rather
+  # than a convenience. serde-saphyr was evaluated as the advisory's suggested
+  # replacement and rejected on API fit: it deserializes into typed structs
+  # only, with no document model, so adopting it would mean hand-writing merge
+  # resolution, the timestamp guard and surrogate repair — more unsafe surface
+  # of our own making, not less. The DoS exposure that *would* have justified
+  # the cost is handled directly, by the size/alias/expansion caps and the
+  # parse deadline in `read_yaml_value`.
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml_ng; no API-compatible replacement, DoS bounded by read_yaml_value's caps" },
+
+  # liquid-core -> anymap2. Unmaintained with no successor. Reached only by the
+  # skill/prompt template renderer, over template text we ship ourselves.
+  { id = "RUSTSEC-2026-0319", reason = "anymap2 via liquid-core; no alternative exists, and input is first-party template text" },
+]
+
+[licenses]
+version = 2
+# Everything the tree resolves to today, all permissive. Deliberately not a
+# wildcard: a new dependency arriving under an unexpected licence should stop
+# the gate and get a decision, which is the whole point of the list.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "Zlib",
+  "0BSD",
+  "Unlicense",
+  "Unicode-3.0",
+  # `option-ext`, reached through `dirs` -> `dirs-sys`, is MPL-2.0 with no dual
+  # option. MPL's copyleft is per-file and triggers on modifying *its* files,
+  # which we do not do — linking it into our binary carries no obligation over
+  # our own source. Flagged rather than buried: it is the one dependency in the
+  # tree whose licence is not permissive, and if policy forbids weak copyleft
+  # at all then `dirs` has to go, not this line.
+  "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicates warn rather than fail. We already carry two `r-efi` majors through
+# std's own platform crates, and resolving a duplicate is sometimes impossible
+# without pinning a transitive dependency we do not control. The warning is
+# still worth having: the duplicate unicode-segmentation/unicode-width pair was
+# a real merge hazard that left the manifest able to resolve to neither copy.
+multiple-versions = "warn"
+# A `*` version requirement on a published crate is a supply-chain hole: any
+# future release satisfies it. `orch-domain.workspace = true` and friends
+# resolve to `*` too, so without this exemption the check fires six times on
+# our own path dependencies and nothing else.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

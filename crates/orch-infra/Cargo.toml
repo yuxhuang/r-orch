@@ -3,6 +3,7 @@ name = "orch-infra"
 description = "Implementations of the orch-core port traits: storage, adapters, process, workspace, templates, skills."
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true

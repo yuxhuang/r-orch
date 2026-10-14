@@ -27,11 +27,45 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 
+/// Owner-only, for files that carry credentials or agent instructions.
+///
+/// `config.yml` holds adapter commands and API-key environment names, and
+/// `agents/*.yml` hold the role prompts an agent is run with. Both are worth
+/// keeping out of a group- or world-readable project directory on a shared
+/// machine. Everything else keeps the process umask: changing the mode of
+/// `state.json` or the indexes would be churn without a secret to protect.
+#[cfg(unix)]
+pub const OWNER_ONLY: u32 = 0o600;
+
+/// [`OWNER_ONLY`] where the platform has modes, `None` where it does not, so a
+/// caller can ask for owner-only without repeating the `cfg` itself.
+pub fn owner_only() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(OWNER_ONLY)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Write atomically: temp file in the same directory, then rename.
 ///
 /// Temp name is `.{basename}.{8 hex}.tmp`, matching the TS layout so a crashed
 /// write leaves a file the other binary also recognizes as debris.
 pub async fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    atomic_write_with_mode(path, content, None).await
+}
+
+/// `atomic_write`, with an explicit unix mode for the created file.
+///
+/// The mode is applied to the **temp file as it is created**, not to the final
+/// path afterwards. Doing it after the rename would publish the file at the
+/// umask's mode first and tighten it a moment later, which is a window another
+/// user on the machine can read through. `mode` is ignored on non-unix, where
+/// there is no equivalent and the directory ACL is the control.
+pub async fn atomic_write_with_mode(path: &Path, content: &str, mode: Option<u32>) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     ensure_dir(dir).await?;
 
@@ -43,11 +77,17 @@ pub async fn atomic_write(path: &Path, content: &str) -> Result<()> {
     // characters, so a collision means another writer is mid-flight on the
     // same path and failing is the right answer (sre C5, security).
     let write_result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // `tokio::fs::OpenOptions::mode` on unix; the mode lands on the
+        // temp file at creation, so the rename publishes it already tight.
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut file = options.open(&tmp_path).await?;
         file.write_all(content.as_bytes()).await?;
         // Without this the rename can be durable while the *contents* are
         // not: a crash between the two leaves a correctly named file full of
@@ -216,9 +256,18 @@ fn escape_at(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
 /// (§1.4) — js-yaml folds long scalars with `>-` where `serde_yaml_ng` picks
 /// `|-` or a quoted style, and both round-trip to the same value (§6.4.1).
 pub async fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_yaml_with_mode(path, value, None).await
+}
+
+/// `write_yaml`, with an explicit unix mode — see [`atomic_write_with_mode`].
+pub async fn write_yaml_with_mode<T: Serialize>(
+    path: &Path,
+    value: &T,
+    mode: Option<u32>,
+) -> Result<()> {
     let raw = serde_yaml_ng::to_string(value)
         .map_err(|err| Error::serde(format!("serialize {}", path.display()), path, err))?;
-    atomic_write(path, &quote_ambiguous_scalars(&raw)).await
+    atomic_write_with_mode(path, &quote_ambiguous_scalars(&raw), mode).await
 }
 
 /// Largest YAML document `read_yaml_value` will hand to the parser.
@@ -1080,6 +1129,33 @@ mod tests {
     ///
     /// Sized to sit inside both the size cap and the alias cap, because that
     /// is the point — neither of those can stop it.
+    /// gate-security-review C0: a flat anchor, then five levels each aliasing
+    /// the previous one `w` times, so the node count is `w^6` while the text
+    /// stays a few kilobytes. This is the shape the security review measured
+    /// at **7 s (w=300)** and **104 s (w=1200)** unguarded, parsing to a real
+    /// error (`repetition limit exceeded`) rather than being refused.
+    fn c0_bomb(w: usize) -> String {
+        let mut s = String::from("a0: &a0 [");
+        for i in 0..w {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("\"xxxxxxxx\"");
+        }
+        s.push_str("]\n");
+        for level in 1..=5 {
+            s.push_str(&format!("a{level}: &a{level} ["));
+            for i in 0..w {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("*a{}", level - 1));
+            }
+            s.push_str("]\n");
+        }
+        s
+    }
+
     fn flat_anchor_bomb() -> String {
         let mut doc = String::from("a: &a\n");
         for i in 0..60_000 {
@@ -1125,6 +1201,70 @@ mod tests {
             "must name the file: {message}"
         );
         assert!(message.contains("expand"), "must say why: {message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_owner_only_write_is_never_briefly_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.yml");
+        atomic_write_with_mode(&path, "k: v\n", owner_only())
+            .await
+            .unwrap();
+
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
+
+        // And the default path is left to the umask rather than quietly
+        // tightened: a reader checking `state.json`'s mode should see the
+        // ordinary thing, or this change is wider than it claims to be.
+        let open = dir.path().join("ordinary.yml");
+        atomic_write(&open, "k: v\n").await.unwrap();
+        let open_mode = tokio::fs::metadata(&open)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_ne!(
+            open_mode, 0o600,
+            "atomic_write should not be setting an owner-only mode of its own accord"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_c0_nested_alias_shape_is_refused_in_microseconds() {
+        for w in [300usize, 1200] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("c0.yml");
+            let doc = c0_bomb(w);
+            tokio::fs::write(&path, &doc).await.unwrap();
+
+            let started = std::time::Instant::now();
+            let err = read_yaml_value(&path).await.expect_err("must be refused");
+            let elapsed = started.elapsed();
+
+            // The expanded-size estimate is what catches this: 9 KB x 1501 is
+            // ~13 MiB and 37 KB x 6001 is ~213 MiB, both over the 8 MiB bound,
+            // so it never reaches the parser or the deadline. Measured at
+            // 195 us and 326 us against 7 s and 104 s unguarded.
+            assert!(
+                elapsed < std::time::Duration::from_millis(200),
+                "w={w} took {elapsed:?}"
+            );
+            let message = format!("{err}");
+            assert!(
+                message.contains("expand"),
+                "w={w} must be refused by the expansion estimate, not something else: {message}"
+            );
+        }
     }
 
     #[tokio::test]

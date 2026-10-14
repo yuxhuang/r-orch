@@ -13,7 +13,7 @@ use orch_core::storage::ConfigStore;
 use orch_domain::{OrchestratorConfig, deep_merge, default_config, get_by_path, set_by_path};
 use serde_json::Value;
 
-use super::fs_utils::{read_yaml_value, write_yaml};
+use super::fs_utils::{owner_only, read_yaml_value, write_yaml_with_mode};
 use super::paths::Paths;
 
 #[derive(Debug)]
@@ -50,7 +50,9 @@ impl FileConfigStore {
     }
 
     async fn write_merged(&self, value: &Value) -> Result<()> {
-        write_yaml(&self.paths.config_path(), value).await
+        // Owner-only: this file carries adapter commands and the names of the
+        // environment variables holding API keys (security review C3).
+        write_yaml_with_mode(&self.paths.config_path(), value, owner_only()).await
     }
 }
 
@@ -92,6 +94,26 @@ mod tests {
         let paths = Paths::new(root);
         ensure_dir(&paths.root()).await.unwrap();
         FileConfigStore::new(paths)
+    }
+
+    /// Security review C3: the file carries adapter commands and the names of
+    /// the environment variables holding API keys, so it must not be readable
+    /// by other users of a shared machine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_written_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        store.write(&default_config()).await.unwrap();
+
+        let mode = std::fs::metadata(store.paths.config_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "config.yml is {mode:o}, not owner-only");
     }
 
     #[tokio::test]
