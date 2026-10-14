@@ -297,14 +297,47 @@ const WIRED_COMMANDS: &[&str] = &[
     "update",
 ];
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Capabilities {
     probed: std::cell::RefCell<BTreeMap<String, bool>>,
+    /// A throwaway initialized project to probe **inside**.
+    ///
+    /// `<cmd> --help` is not cwd-independent: every command but `init`,
+    /// `update` and `doctor` builds the container before Commander parses, so
+    /// in a directory that is not a project the help exits **3**
+    /// (`Not initialized`). Probing from wherever the harness happens to run
+    /// therefore reported every command missing and skipped the entire
+    /// corpus — silently, since a skip is not a failure. Found by a mutation
+    /// probe that was "detected" by two scenarios instead of twenty-nine.
+    project: std::cell::OnceCell<Project>,
 }
 
 impl Capabilities {
     pub fn new() -> Self {
         Capabilities::default()
+    }
+
+    /// The initialized project every probe runs in, created on first use.
+    fn probe_project(&self, bins: &Binaries) -> &Project {
+        self.project.get_or_init(|| {
+            let project =
+                Project::create("capability-probe").expect("create the capability-probe project");
+            let status = Command::new(&bins.rust)
+                .args(["init", "--name", "probe", "--adapter", "claude"])
+                .current_dir(&project.root)
+                .env("HOME", &project.home)
+                .env("USERPROFILE", &project.home)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run init in the capability-probe project");
+            assert!(
+                status.success(),
+                "init failed in the capability-probe project; every `requires` would skip"
+            );
+            project
+        })
     }
 
     /// Every requirement this scenario declares that the Rust binary lacks.
@@ -324,9 +357,13 @@ impl Capabilities {
         // names a command the tree does not have at all — a typo in a
         // scenario, or one written against a renamed verb.
         let argv = shell_words::split(command).unwrap_or_default();
+        let project = self.probe_project(bins);
         let declared = Command::new(&bins.rust)
             .args(&argv)
             .arg("--help")
+            .current_dir(&project.root)
+            .env("HOME", &project.home)
+            .env("USERPROFILE", &project.home)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
