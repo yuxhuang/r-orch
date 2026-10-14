@@ -1268,6 +1268,55 @@ A JSON **array of the complete entity objects** — not a summary. Maintained by
 `IndexManager` is used by task, agent, goal, context and message stores. **`TeamStore` and `RunStore` have no
 index** and scan their directories.
 
+#### 6.10.1 Index order leaks into tied listings — position is not contract
+
+Stated once here; the §14 entries that hit it cross-reference this section rather than repeating it.
+
+**The mechanism, in three steps:**
+
+1. **Concurrent saves land in nondeterministic order.** Several code paths write a batch of entities with
+   `Promise.all` (`join_all` in Rust). Completion order within the batch is not specified, and `save()`
+   pushes each entity to the **end** of the index, so the resulting `_index.json` order varies run to run.
+2. **`updated_at` has only millisecond precision** (`new Date().toISOString()`, §6.3). A batch written in the
+   same millisecond produces entities whose timestamps are **exactly equal**.
+3. **The listing comparators return `0` on an exact tie**, and both JS `Array.prototype.sort` (ES2019+) and
+   Rust `slice::sort_by` are **stable** — so a tie preserves input order, which is index order, which is
+   nondeterministic by step 1.
+
+```
+task-store.ts:42  /  goal-store.ts:39   return bTime < aTime ? -1 : bTime > aTime ? 1 : 0;   // 0 on tie
+message-store.ts:46                     a.created_at.localeCompare(b.created_at)              // 0 on tie
+```
+
+**Therefore: the position of an entity within any listing whose sort key ties is NOT contract.** This applies
+to `task list`, `goal list`, `msg list`, their `--json` forms, and the `_index.json` files themselves.
+
+**Known concurrent-save sites** (all verified in source):
+
+| Site | Store written |
+|---|---|
+| `message-service.ts` broadcast fan-out | messages |
+| `goal-service.ts:99` — `goal status --force` cancelling pending tasks | tasks |
+| `goal-service.ts:211` — `cancelPendingAutonomousTasks` on goal pause | tasks |
+| `orchestrator.ts:940` — `cascadeFailDependents` per BFS level | tasks |
+| `orchestrator.ts:620` — `reconcile` resetting stale agents to `idle` | **agents** |
+
+**How scenarios declare it.** Per step, not globally:
+
+- **`@unordered:<reason>`** — arrays are sorted at **every depth** before comparison. The `<reason>` is
+  required, so a reader can tell a real nondeterminism from a masked bug.
+- **`unordered_files`** — the same, for a set of files whose relative order is not meaningful.
+
+Everything else on the step is still compared in full. Declaring it per step keeps the blast radius visible:
+a step without the marker is order-sensitive, and that is the default.
+
+> **Interaction with §14.4.** That entry replicates TS tie-breaking in `findBestAgent`, on the stated
+> precondition that index order is "deterministic for a given operation sequence". The agent row above is the
+> exception: `reconcile`'s stale-agent batch writes the **agent** index concurrently, so an operation sequence
+> that includes a stale-agent reset can itself produce a nondeterministic agent order — and with it a
+> nondeterministic tie. Scenarios asserting agent selection must avoid both a multi-entity index rebuild
+> (§14.4) **and** a concurrent stale-agent reset.
+
 ### 6.11 `init` file contents (L0)
 
 `.orchestry/.gitignore`:
@@ -1641,7 +1690,8 @@ When a task permanently fails, every task that depends on it — directly or tra
 via a breadth-first walk over a reverse-dependency index. Already-terminal and already-visited tasks are
 skipped. Each cascaded task emits **both** `task:status_changed { from, to: "failed" }` and
 `task:cascade_failed { taskId, failedDependencyId, reason }`, where `reason` is
-`dependency <failedTaskId> failed: <error>`. Writes are batched in parallel per BFS level.
+`dependency <failedTaskId> failed: <error>`. Writes are batched in parallel per BFS level, so the cascaded
+tasks' order in a tied listing is not contract (§6.10.1).
 
 ### 7.11 Scope overlap (L1)
 
@@ -1757,7 +1807,8 @@ and resolve all `waitForStop()` waiters.
   **and `team_id: "<unknown>"` is still persisted on every message**, leaving a dangling reference in the
   store. Measured in a four-agent tree: a real two-member team → 2 messages; `--team team_nosuch` → 4.
   **An implementation that validates the team id sends strictly fewer messages than the oracle.** Replicate.
-  `fixtures/scenarios/cmd-msg-broadcast-unknown-team.toml`.
+  `fixtures/scenarios/cmd-msg-broadcast-unknown-team.toml`. The fan-out is a concurrent batch, so the
+  recipients' order in `msg list` is not contract — see §6.10.1.
 - **`lead`** — requires `team_id`; resolves to `team.lead_agent_id`. One message.
 - `drainMailbox(agentId, taskId)` — called during dispatch: list pending, mark all delivered, emit
   `message:delivered` per message, return them for prompt injection.
@@ -2945,7 +2996,14 @@ It depends on three properties, all of which are now requirements:
 
    **Scenario rule:** do not construct a differential scenario that triggers a multi-entity index rebuild.
    Single-entity rebuilds are safe (trivially ordered), which covers the common `init` → first `agent add`
-   path. This is the one tie-order case that stays unverifiable, and it is recorded rather than hidden.
+   path.
+
+4. **A second hole, from §6.10.1:** `reconcile` resets stale agents with a **concurrent batch**
+   (`orchestrator.ts:620`), which writes the agent index in nondeterministic order. So even a *fixed*
+   operation sequence can yield a nondeterministic agent order if it includes a stale-agent reset. Scenarios
+   asserting agent selection must avoid that too.
+
+Both holes are recorded rather than hidden. Everything outside them is oracle-verifiable.
 
 ### 14.5 `ReviewRunner` commands are hard-coded to npm/npx — **REPLICATE**
 
