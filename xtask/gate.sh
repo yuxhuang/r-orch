@@ -134,7 +134,7 @@ summarize() {
       grep -oE 'still does not exist|existed before this run.*|was created during this gate run.*' "$log" | tail -1
       ;;
     home-hygiene)
-      grep -oE 'nothing ORCH-shaped.*|a test created an ORCH project.*' "$log" | tail -1
+      grep -oE 'a sentinel HOME is still empty.*|the suite wrote into a sentinel HOME:' "$log" | tail -1
       ;;
     crate-graph)
       grep -oE 'layering matches [^ ]+ .*|[0-9]+ layering problem\(s\)' "$log" | tail -1
@@ -153,33 +153,30 @@ summarize() {
   esac
 }
 
-# Run the suite with HOME pointed at an empty directory and fail if anything
-# ORCH-shaped appears in it.
+# Run the suite with HOME pointed at an empty directory and fail if **anything**
+# appears in it.
 #
-# The project root is resolved by walking **up**, and `cargo test` runs with
-# its cwd inside $HOME — so once `~/.orchestry` exists, a test that resolves a
-# project without an explicit path finds the developer's own home and writes
-# into it. That is not hypothetical: `~/.orchestry` on this machine collected
-# `tasks/_index.json`, `agents/_index.json`, `runs/` and `state.json` from our
-# own runs before this check existed.
+# Originally this only looked for `.orchestry`, which let the rest through: the
+# adapter and FTUE tests spawned the real `cursor` and `opencode`, which wrote
+# `.cursor/cli-config.json`, `.cache/opencode`, `.config/opencode` and
+# `.local/share/opencode`. Same standard as ORCH data — no test may write into
+# a developer's home — so the check is now "the directory is still empty".
 #
-# Only `.orchestry` is checked, not the whole directory: cargo and rustup
-# legitimately recreate their caches under a moved HOME, and the adapter tests
-# spawn real `cursor`/`opencode` binaries that write their own config there.
-# Those are noise; a project directory is the finding.
+# `.cargo` and `.rustup` are the one exception, and only because *cargo itself*
+# recreates them when HOME moves: they are the build tool's own state, created
+# before any test code runs. Everything else is a finding.
+#
+# Runs from **outside** the workspace. An earlier version ran with the cwd in
+# the repo and passed while a bug was live, because cargo only loads
+# `.cargo/config.toml` — and its `[env]` — from inside the workspace, so the
+# redirect that was hiding the writer was still in effect. CARGO_HOME and
+# RUSTUP_HOME are set explicitly because a moved HOME otherwise hides the
+# toolchain, and the suite then runs **zero tests** while this reports clean.
 sentinel_home_check() {
-  local sentinel cwd
+  local sentinel cwd unexpected status
   sentinel=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-home-XXXXXX")
   cwd=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-cwd-XXXXXX")
 
-  # Run from **outside** the workspace, which is the whole point.
-  #
-  # The first version of this check ran with the cwd in the repo and passed
-  # while the bug was still live: cargo only loads `.cargo/config.toml` — and
-  # therefore its `[env]` — when the working directory is inside the
-  # workspace, so the redirect that was hiding the writer was still in effect.
-  # Running from elsewhere removes that cover. `rust-toolchain.toml` is also
-  # found via the cwd, hence the explicit RUSTUP_TOOLCHAIN.
   (
     cd "$cwd" || exit 1
     HOME="$sentinel" \
@@ -190,26 +187,16 @@ sentinel_home_check() {
       cargo test --manifest-path "$REPO/Cargo.toml" --workspace --no-fail-fast
   ) >/dev/null 2>&1
 
-  local status=0
-  if [ -e "$sentinel/.orchestry" ]; then
-    echo "a test created an ORCH project under a sentinel HOME:"
-    find "$sentinel/.orchestry" 2>/dev/null | head -20
+  unexpected=$(find "$sentinel" -mindepth 1 -maxdepth 1 2>/dev/null \
+               | grep -vE '/\.(cargo|rustup)$' || true)
+  status=0
+  if [ -n "$unexpected" ]; then
+    echo "the suite wrote into a sentinel HOME:"
+    printf '%s\n' "$unexpected" | sed "s|$sentinel|<HOME>|" | head -12
     status=1
   else
-    echo "nothing ORCH-shaped created under a sentinel HOME"
+    echo "a sentinel HOME is still empty after the suite"
   fi
-
-  # Reported, not failed: the adapter tests spawn the real `cursor` and
-  # `opencode` binaries, which write their own config and caches into HOME.
-  # Not ORCH data, but still this suite touching a developer's home, and it
-  # means those tests depend on whichever versions are installed.
-  others=$(find "$sentinel" -maxdepth 2 -mindepth 1 2>/dev/null \
-           | grep -vE '/\.(cargo|rustup)' | head -8)
-  if [ -n "$others" ]; then
-    echo "note: third-party CLIs spawned by the adapter tests also wrote to HOME:"
-    printf '%s\n' "$others" | sed "s|$sentinel|<HOME>|"
-  fi
-
   rm -rf "$sentinel" "$cwd"
   return "$status"
 }
