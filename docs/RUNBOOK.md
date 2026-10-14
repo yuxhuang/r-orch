@@ -135,6 +135,19 @@ the only symptom is the disagreement above.
 **Prevention.** Avoid running mutating commands (`task add`, `agent add`, `goal add`) concurrently with a
 `serve` or `run --watch`, and avoid two of them at once. `teams/` and `runs/` have no index and are immune.
 
+**The inverse case, worth knowing while you are here.** A listing reads only the index — it never opens the
+entity files — so the failure can run the other way too: a **corrupt or truncated** `tasks/<id>.yml` is
+**invisible** to `task list`, which keeps serving the stale-but-valid index entry. It surfaces on
+`task show <id>`, or once the index is rebuilt. So a healthy-looking `task list` is **not** evidence that
+your entity files are intact. If you suspect corruption, force the read:
+
+```bash
+rm .orchestry/tasks/_index.json && orch task list
+```
+
+A rebuild reads every file and **fails loudly, naming the offending one** — which is what you want when
+diagnosing, and is why the rebuild is the diagnostic as well as the repair.
+
 ---
 
 ## `state.json` parse failure

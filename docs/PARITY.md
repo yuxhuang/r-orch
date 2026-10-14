@@ -1296,6 +1296,17 @@ A JSON **array of the complete entity objects** — not a summary. Maintained by
 `IndexManager` is used by task, agent, goal, context and message stores. **`TeamStore` and `RunStore` have no
 index** and scan their directories.
 
+> **A listing reads only the index, so a corrupt entity file is invisible until something forces a rebuild.**
+> `list()` returns `readIndex()` filtered — it never opens the entity files
+> (`task-store.ts:28`, verified against the oracle; the Rust `list()` is the same `read_index()` call). So a
+> truncated or malformed `tasks/<id>.yml` does **not** make `task list` fail: the stale-but-valid index entry
+> is served instead, and the damage surfaces only on `task show <id>` (which reads the file) or once the
+> index is deleted or corrupted into a rebuild. Identical in both implementations, so **faithful — not a
+> §14 row.**
+>
+> Two practical consequences: a listing agreeing with reality is not evidence that the files are intact, and
+> the loud failure §14.25 restored applies to the **rebuild** path, not to every read.
+
 #### 6.10.1 Index order leaks into tied listings — position is not contract
 
 Stated once here; the §14 entries that hit it cross-reference this section rather than repeating it.
@@ -3564,8 +3575,14 @@ writing the index without it — turning a recoverable corrupt file into a silen
 divergence in the unsafe direction (gate code review B1).
 
 **Decision: restore propagation**, matching TS — so this entry records a **convergence**, not a divergence.
-`rebuild_index` now propagates parse errors: a corrupt `.yml` makes the listing fail with an error naming the
-file, rather than quietly shrinking the result set. The recovery is in
+`rebuild_index` now propagates parse errors: a corrupt `.yml` fails the read with an error naming the file,
+rather than quietly shrinking the result set.
+
+**Scope that claim carefully: this fires on the rebuild path only.** A listing reads the index and never
+opens the entity files (§6.10), so while a valid index exists, a corrupt file is served from the cached entry
+and goes unnoticed. The loud failure appears when the index is absent or corrupt and a rebuild is forced —
+which is also exactly when the old behaviour would have **persisted** the loss, so the fix lands where it
+matters. The recovery is in
 [docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update) — fix or remove the file, then rebuild.
 
 Worth recording *why* the defect survived review: the old code carried a comment asserting that "TS drops
