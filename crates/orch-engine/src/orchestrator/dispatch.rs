@@ -150,8 +150,21 @@ impl Orchestrator {
         all_tasks: &[Task],
         err: &Error,
     ) {
-        let Ok(Some(task)) = self.deps().task_store.get(task_id).await else {
-            return;
+        let task = match self.deps().task_store.get(task_id).await {
+            Ok(Some(task)) => task,
+            // Gone: no attempt to account for.
+            Ok(None) => return,
+            // An unreadable task is not an absent one — see the same
+            // distinction in `force_task_cancelled`. Silently skipping the
+            // failure accounting would lose an attempt and leave the task
+            // dispatchable again with no record of why.
+            Err(err) => {
+                self.emit_error(
+                    err,
+                    format!("read task {task_id} after a workspace failure"),
+                );
+                return;
+            }
         };
         if is_terminal(task.status) {
             return;

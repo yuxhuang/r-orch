@@ -219,7 +219,7 @@ impl Orchestrator {
     /// Cancel a task, falling back to a direct store write when the
     /// transition is rejected. One of the recovery paths that deliberately
     /// bypasses the state machine (PARITY.md §7.1).
-    async fn force_task_cancelled(&self, task_id: &str) {
+    pub(super) async fn force_task_cancelled(&self, task_id: &str) {
         if self
             .deps()
             .task_service
@@ -229,8 +229,19 @@ impl Orchestrator {
         {
             return;
         }
-        let Ok(Some(mut task)) = self.deps().task_store.get(task_id).await else {
-            return;
+        let mut task = match self.deps().task_store.get(task_id).await {
+            Ok(Some(task)) => task,
+            // Gone: there is nothing left to cancel.
+            Ok(None) => return,
+            // Unreadable is not the same as absent, and since WP-0's YAML
+            // hardening it is not even the same as corrupt: a read can now
+            // fail on an alias-expansion cap or a parse deadline, where the
+            // file is intact and the next attempt would succeed. Returning
+            // silently would leave the task non-terminal with nothing said.
+            Err(err) => {
+                self.emit_error(err, format!("startup cleanup: read task {task_id}"));
+                return;
+            }
         };
         if is_terminal(task.status) {
             return;

@@ -805,3 +805,58 @@ async fn a_signal_during_the_first_tick_shuts_down_instead_of_killing_us() {
     assert!(!h.lock.is_held(), "the lock survived the signal");
     assert_eq!(h.state.peek().pid, None, "the state was not cleared");
 }
+
+/// A task file that cannot be *read* is not a task that is gone.
+///
+/// Both recovery paths used to fold the two together with a `let Ok(Some(..))
+/// else { return }`, which was tolerable while a read could only fail on a
+/// missing or malformed file. Since WP-0's YAML hardening it can also fail on
+/// an alias-expansion cap or a parse deadline — the file is intact and a retry
+/// would work — so a silent return there hides a transient and leaves the task
+/// non-terminal with nothing said.
+///
+/// Driven through `force_task_cancelled` directly: reaching it from
+/// `start_watch` needs a store that fails one specific read and serves every
+/// other, and a test tuned to a call count would pass for the wrong reason the
+/// first time recovery reads one more task.
+#[tokio::test]
+async fn an_unreadable_task_is_reported_rather_than_treated_as_absent() {
+    let h = Harness::builder()
+        .tasks([Task {
+            id: "tsk_unreadable".into(),
+            // `cancelled` is not a legal transition from `todo`, so the
+            // service refuses and the force-write path reads the task back.
+            status: TaskStatus::Todo,
+            ..make_task()
+        }])
+        .agents([make_agent()])
+        .build();
+    // As a parse deadline would: the file is there, the read is not.
+    h.tasks.faults.fail_always("yaml-deadline-boom");
+
+    h.orchestrator.force_task_cancelled("tsk_unreadable").await;
+
+    let reported = errors_matching(&h, "startup cleanup: read task");
+    assert_eq!(
+        reported.len(),
+        1,
+        "an unreadable task passed without a word: {:?}",
+        h.events_of(OrchestratorEventType::OrchestratorError)
+    );
+    assert!(reported[0].0.contains("yaml-deadline-boom"), "{reported:?}");
+}
+
+#[tokio::test]
+async fn a_task_that_is_simply_gone_is_cancelled_in_silence() {
+    let h = Harness::builder().agents([make_agent()]).build();
+
+    // Nothing seeded: an absent task is a legitimate no-op, and must not be
+    // reported as a failure now that an unreadable one is.
+    h.orchestrator.force_task_cancelled("tsk_missing").await;
+
+    assert!(
+        h.events_of(OrchestratorEventType::OrchestratorError)
+            .is_empty(),
+        "an absent task was reported as an error"
+    );
+}
