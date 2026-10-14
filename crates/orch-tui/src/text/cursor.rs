@@ -2,11 +2,20 @@
 //!
 //! ARCHITECTURE §4.8: `unicode-segmentation` replaces `Intl.Segmenter`,
 //! `unicode-normalization` replaces `String.normalize('NFC')` and
-//! `unicode-width` replaces the hand-written CJK/emoji width table. The TS
-//! table only ever answers 1 or 2, and a terminal cell grid cannot render a
-//! cluster wider than 2, so [`display_width`] clamps the library answer to
-//! `1..=2` — that reproduces every asserted vector while leaving the
-//! classification itself to the Unicode tables.
+//! `unicode-width` replaces the hand-written CJK/emoji width table.
+//!
+//! **[`display_width`] is not byte-equivalent to the TS table, deliberately.**
+//! The TS version tests a handful of explicit ranges (CJK, Hangul, CJK
+//! compatibility, fullwidth forms, `U+1F300..=U+1FAFF`) and answers 1 for
+//! everything else, so it reports 1 for BMP pictographs like `☀` and `✈`, for
+//! an emoji presentation sequence (`base + U+FE0F`), and for a regional-
+//! indicator flag pair — all of which real terminals render two cells wide.
+//! `unicode-width` gets those right, and this module keeps that answer: the
+//! width feeds our own truncation and viewport arithmetic, where being right
+//! about the terminal beats matching a table TS got wrong. Every vector
+//! `text-cursor.test.ts` asserts still matches (the tests below cover them),
+//! and the affected inputs are presentation only — L2 (PARITY §12). The clamp
+//! to `1..=2` stays, because a cell grid cannot render a cluster wider than 2.
 //!
 //! Unlike the TS class this is *not* immutable-with-shared-segments: the
 //! `_withPos` identity trick exists to avoid re-segmenting in React render, and

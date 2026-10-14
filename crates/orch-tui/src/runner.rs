@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::crossterm::{execute, queue};
 use ratatui::prelude::CrosstermBackend;
@@ -62,7 +63,8 @@ pub fn run<B: TuiBackend>(backend: B) -> io::Result<()> {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    /// Whether the terminal accepted the Kitty disambiguation flags.
+    /// Whether the terminal reported support for the keyboard enhancement
+    /// protocol, i.e. whether flags were actually pushed and must be popped.
     enhanced_keys: bool,
 }
 
@@ -73,13 +75,20 @@ impl TerminalGuard {
         execute!(stdout, EnterAlternateScreen)?;
         // `Ctrl+Enter` is only distinguishable from `Enter` under the Kitty
         // keyboard protocol; the wizard keeps its `Tab` confirm fallback for
-        // terminals that refuse these flags (docs/parity/tui.md §2.7).
-        let enhanced_keys = queue!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )
-        .and_then(|()| stdout.flush())
-        .is_ok();
+        // terminals without it (docs/parity/tui.md §2.7).
+        //
+        // Ask the terminal rather than inferring support from a successful
+        // write: the push is just bytes on a pipe, so it "succeeds" against a
+        // terminal that ignores it, and we would then pop flags we never set.
+        // The query blocks briefly, so it runs here and never in the loop.
+        let enhanced_keys = supports_keyboard_enhancement().unwrap_or(false);
+        if enhanced_keys {
+            queue!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            stdout.flush()?;
+        }
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(TerminalGuard {
             terminal,
