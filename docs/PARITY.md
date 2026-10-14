@@ -1350,6 +1350,20 @@ a step without the marker is order-sensitive, and that is the default.
 
 ### 6.11 `init` file contents (L0)
 
+**`init` also writes outside `.orchestry/`** (L0, and previously undocumented here): it appends to — or
+creates — the **project's root `.gitignore`**, so the whole state directory is ignored:
+
+```
+# Orchestry state
+.orchestry
+```
+
+Appended with a blank-line separator if the file exists, created outright if not
+(`init.ts:233-247`, `init.rs:327-329`). Verified on a fresh init: `git check-ignore -v` attributes every
+`.orchestry/**` path to this rule, and `git add -A` after `init` stages **only `.gitignore` itself**.
+Its stated purpose is preventing recursive worktrees; the side effect is that no entity file is committed by
+default.
+
 `.orchestry/.gitignore`:
 ```
 # Runtime state
@@ -3737,12 +3751,17 @@ platform has no modes, and the write proceeds unrestricted.
 everything would be a larger divergence for no security gain — a secret pasted into a task *description* is
 a user error that 0600 would hide rather than fix.
 
-> **⚠ Not a mitigation for the YAML DoS (C0).** A hostile `config.yml` arrives through the repository, not through local write access, so `0600` does not bound it — see [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0 and §14.31.
+> **⚠ Not a mitigation for the YAML DoS (C0).** Every YAML read goes through one chokepoint, so **any** entity file — not just `config.yml` — is a vector, and none of them arrives through local write access; `0600` does not bound it. See [`gate-security-rereview.md`](reviews/gate-security-rereview.md) C0 and §14.31.
 
-**This does not make secrets in `env:` safe.** `.orchestry/agents/` is **not** covered by `init`'s
-`.gitignore`, so an API key there still reaches your repository on the next `git add`. 0600 closes local
-read access, not disclosure through version control. See
-[docs/RUNBOOK.md](RUNBOOK.md#secrets-in-agent-config).
+**Version control is not the hole I previously claimed it was.** An earlier revision of this entry said
+`.orchestry/agents/` is not covered by `init`'s `.gitignore` and that a key there reaches the repository on
+the next `git add`. **That is false** — `init` appends `.orchestry` to the project's **root** `.gitignore`
+(§6.11), so the whole directory is ignored by default; verified with `git check-ignore -v` on a fresh init.
+
+What remains, and is the real vector: a repository that **force-adds** the directory (`git add -f`), a user
+who **un-ignores** it deliberately to share agent definitions across a team, or any file an attacker can
+**drop into the tree** by another route. 0600 closes local read access; it does not help once the file is in
+a repository by any of those paths. See [docs/RUNBOOK.md](RUNBOOK.md#secrets-in-agent-config).
 
 ### 14.36 Three places r-orch is materially safer than the original — **DIVERGENCE (favourable)**
 

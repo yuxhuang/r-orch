@@ -345,7 +345,7 @@ inside an agent session, this is why; it is the outer CLI declining, not an r-or
 
 ## Secrets in agent config
 
-**Agent configuration can hold credentials, and those files are not protected.**
+**Agent configuration can hold credentials. r-orch protects those files better than you might expect — and not well enough to put a key in one.**
 
 An agent's `env:` map is written verbatim into `.orchestry/agents/<agent-id>.yml` and passed to every child
 process it spawns. So this puts a live key on disk in plain text:
@@ -361,17 +361,28 @@ config:
 world-readable. The TypeScript original writes them at the process umask (typically `0644`), so this is one
 of the few places r-orch is deliberately stricter ([PARITY.md §14.35](PARITY.md)).
 
-**That is local read access only, and it is not the main risk.** The exposure that remains:
+**And git ignores the whole directory by default.** `orch init` appends `.orchestry` to your project's
+**root** `.gitignore` (creating it if absent), so no entity file is committed unless you go out of your way.
+Verify on your own project:
 
-1. **`orch init`'s `.gitignore` does not cover them.** It ignores `state.json`, `*.lock`, `runs/`, `logs/`
-   and `workspaces/` — **`agents/`, `tasks/`, `goals/`, `teams/`, `messages/` and `context/` are all
-   committed.** An API key in `env:` goes into your repository history on the next `git add`, where `0600`
-   protects nothing: git does not preserve modes beyond the executable bit, and anyone who can read the repo
-   can read the key.
+```bash
+git check-ignore -v .orchestry/agents/*.yml     # should name the root .gitignore rule
+git status --short | grep orchestry             # should be empty
+```
+
+**So the exposure is narrower than it looks — but it is not zero.** What remains:
+
+1. **Someone force-adds or un-ignores the directory.** `git add -f .orchestry` works, and teams sometimes
+   un-ignore it deliberately to share agent definitions. Once a key is in a repository, **`0600` protects
+   nothing** — git preserves no mode beyond the executable bit, and anyone who can read the repo can read
+   the key.
 2. **Only those two files are owner-only.** `tasks/`, `goals/`, `teams/`, `messages/` and `context/` keep
-   umask modes, so a credential pasted into a task description or a context value **is** world-readable.
+   umask modes, so a credential pasted into a task description or a context value **is** world-readable to
+   other local users.
 3. **The child process still receives it.** `env:` is passed to every agent the entry spawns, so anything
-   that agent logs or echoes can leak it onward.
+   that agent logs, echoes or sends onward can leak it.
+4. **Backups and sync tools do not read `.gitignore`.** Dropbox, Time Machine, `rsync` without
+   `--exclude` and most backup agents copy `.orchestry/` verbatim.
 
 **Do this instead.** Leave the key out of the agent and let it inherit from the environment — children
 receive the parent environment, overlaid with `env:` and the three `ORCH_*` variables:
@@ -383,15 +394,18 @@ orch serve
 
 Use `env:` only for non-secret, per-agent settings.
 
-**If a key has already been committed**, treat it as disclosed: rotate it, then purge it from history. And
-consider adding the entity directories to your own `.gitignore` if you do not intend to version your task
-and agent definitions:
+**If a key has already reached a repository**, treat it as disclosed: rotate it first, then purge it from
+history. Rotation is the step that matters — a purge alone leaves the key live in every existing clone.
 
-```
+**If you deliberately un-ignore `.orchestry/` to share agent definitions across a team** — a reasonable thing
+to want, since those files *are* your agent and task definitions — then re-ignore the parts that can hold
+credentials, and keep versioning the rest:
+
+```gitignore
+!.orchestry/
 .orchestry/agents/
-.orchestry/context/
-.orchestry/messages/
+.orchestry/config.yml
 ```
 
-Note the trade-off — those files *are* your project's agent and task definitions, and versioning them is
-often the point. Keep them versioned and keep secrets in the environment.
+The guidance is the same either way: **version the definitions if you want to, keep secrets in the
+environment.**
