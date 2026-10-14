@@ -170,10 +170,12 @@ impl EngineBackend {
             watch_active,
         };
         // History is loaded eagerly because the dashboard's activity view
-        // wants it on the first frame. The model catalog is **not**: probing
-        // eight adapter CLIs costs eight process spawns, and the TS only pays
-        // that when a wizard with a model step opens — so it starts on the
-        // first `poll_model_catalog`.
+        // wants it on the first frame. The model catalog starts on the first
+        // `poll_model_catalog` instead — which, since `App::tick` polls every
+        // tick, is the first frame anyway. That matches the reference, which
+        // loads it in a mount effect (`App.tsx:984`); the deferral is not a
+        // behavioural difference, it only spares a facade consumer that never
+        // polls the eight adapter spawns a probe costs.
         backend.spawn_history_load();
         backend
     }
