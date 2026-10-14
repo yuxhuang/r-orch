@@ -105,7 +105,22 @@ async fn check(kind: &str, case: &str, stream: &str, exit: i32) {
             format!("{}\n", serde_json::to_string_pretty(&actual).expect("json")),
         )
         .expect("write fixture");
-        return;
+        // Write, then **fail** (code m8).
+        //
+        // This used to `return`, so a blessing run reported every fixture
+        // test as passing — which means the variable being set anywhere, in
+        // CI or a stray shell export, would silently disarm the entire wire
+        // contract *and* overwrite the expectations with whatever the code
+        // currently produces. The one thing a fixture suite must never do is
+        // pass without comparing.
+        //
+        // Each case is its own `#[tokio::test]`, so every fixture is still
+        // regenerated in one run; they simply all report failure.
+        panic!(
+            "blessed {kind}/{case} — fixtures regenerated, not verified. Review the diff \
+             (a change here is a change to the wire contract), then re-run without \
+             ORCH_BLESS_FIXTURES to actually compare."
+        );
     }
 
     let expected: Value = serde_json::from_str(
