@@ -408,6 +408,10 @@ render(..., { incrementalRendering: true,
 - **Enter:** `/` from any view while the detail panel is closed; the buffer is pre-seeded with `"/"`.
 - **Exit:** `Esc`, or `Enter` which executes.
 - **Renders:** a bottom line `/ {value}{ghostCompletion}█  {hint}`; the hint is `  ↑↓ select  Tab fill  Esc ✕` when suggestions are visible, otherwise `  Enter exec  ↑↓ history  Tab complete  Esc ✕`. The value truncates **from the left** with a leading `…` when longer than `maxLen = max(4, width - 6 - hint.length - (completion?.length ?? 0) - 1)`. Above the bar: a `COMMANDS` section label plus the `SuggestionsPanel`.
+- **r-orch additions** (PARITY §12.8 row (l)), all three affecting every command rather than only `/msg`:
+  - The `█` is the **real cursor**, drawn at `cursor().pos()`, and the left-truncation window is anchored on the cursor rather than on the end. With the cursor at the end — the common case — the line is unchanged, and the window keeps master's `maxLen` columns including the leading `…`. The window is computed by walking out from the cursor until the budget is spent, so its cost is the columns drawn, not the length of the value. With the cursor **mid-value** it holds a third of the budget back for the text after the cursor, and the ghost completion — which belongs at the end of the value — is dropped while that text is clipped, rather than drawn against a truncation.
+  - A kept newline in the value (only reachable by paste) draws as a dim `⏎`. Display only: the value and the body sent keep the `\n`. One paste inserts at most **64 KiB** (`keys::MAX_PASTE_BYTES`), cut on a character boundary with `Pasted text cut at 64 KiB — paste the rest separately` in the feed **and drawn above the bar** (the feed is not rendered in command mode), cleared by the next keystroke. A paste larger than roughly 4 KB may also not arrive at all (a bracketed paste is all-or-nothing); nothing is inserted and no keystroke leaks when it does not.
+  - For `/msg` with a complete recipient token, a **recipient chip** `→ {name} │ ` is pinned between the `/ ` prefix and the value, measured in display columns, and the value's budget is reduced by its width so the body truncates and the recipient never does. States: `→ {name}` (green), `→ {name} (disabled)` / `→ all agents ({n})` (amber), `⚠ ambiguous: {n} agents` / `⚠ no match — did you mean "{name}"?` / `⚠ no match: "{text}"` (red). While a chip is shown the bar takes the widest hint that still leaves the value window 28 columns — the full hint, else `  Esc ✕`, else nothing — because the full hint at 80 columns left the body 8 columns and dropping it outright took the only *clickable* exit from the bar with it; without a chip the hint goes only below 6, so no other verb's bar moves. Below that the chip is shortened; it is never dropped while a recipient is resolved.
 - **Navigate-mode bar** (the default footer) renders, conditionally: `↑↓`, `Tab`/`←→`, `/ cmd`, `N new` (canNew), `R run` (canRun), `C cancel` (amber), `A approve` (green), `X reject` (red), `E edit` (cyan), `S stop` (red), `P pause`/`P resume` (amber), `U auto on`/`U auto off` (cyan), `S show all`/`S collapse`, `D delete` (only when `canDelete && !canApprove`), `Z undo` (yellow), `Esc close` when a detail panel is open, `Enter detail` when no detail panel and the view is tasks/agents/goals, `Q quit`, `? help`. On the right: `{itemCount} {itemLabel}` when the count is > 0 (labels `goals` / `tasks` / `agents` / `events`). `? help` is amber while `onboardingCompleted === false`, gray otherwise.
 
 ### 3.2 Help overlay
@@ -415,9 +419,9 @@ render(..., { incrementalRendering: true,
 - **Exit:** `?`, `Esc`, F1 (all swallowed), or **any other key — which also executes its normal action**.
 - **Renders:** replaces both the content area and the bottom panel. Rendered with `width = W, height = H - 7`. A centred amber rounded box: inner width 80 (`COL_W*3 + 3 + 3 + 2`), outer 82; horizontal centring via `paddingX = max(0, floor((W - 82)/2))`; vertical via `marginTop = max(0, floor(((H-7) - (maxRows + 10)) / 2))` with `maxRows = 10`. Layout: top border `╭─…╮`, blank, centred title `KEYBOARD SHORTCUTS`, blank, three centred dividers `NAVIGATION` / `ACTIONS` / `COMMANDS`, blank, 10 shortcut rows (key padded to 10 columns, label padded to 12, column width 22, `│` separators), blank, centred footer `Press any key to dismiss`, blank, bottom border.
 - **Content:**
-  - NAVIGATION: `↑↓/j/k Navigate`, `Tab/←→ Switch tabs`, `Enter Detail view`, `G Goals tab`, `T Tasks tab`, `A Agents tab`, `L Logs tab`
+  - NAVIGATION: `↑↓/j/k Navigate`, `Tab/←→ Switch tabs`, `Enter Detail view`, `G Goals tab`, `T Tasks tab`, `A Agents tab`, `L Logs tab`, plus the two r-orch additions `F2 Mouse on/off` and `m Message agent` — nine rows against `maxRows = 10`, which is why they go in this column rather than `ACTIONS`
   - ACTIONS: `N New item`, `E Edit`, `D Delete`, `R Run task`, `S Show / Stop`, `C Cancel`, `A Approve`, `X Reject`, `U Autonomous`, `Z Undo delete`
-  - COMMANDS: `/ Command mode`, `/task add Create task`, `/run Execute`, `/watch Auto-dispatch`, `/config Settings`, `/help Help`, `/quit Exit`
+  - COMMANDS: `/ Command mode`, `/task add Create task`, `/msg Message agent` (r-orch addition), `/run Execute`, `/watch Auto-dispatch`, `/config Settings`, `/help Help`, `/quit Exit`
 
 ### 3.3 Logs agent filter picker
 - **Enter:** `a` / `A` in the logs view (detail closed, no other picker open).
@@ -472,7 +476,12 @@ Rendered above the command bar whenever `pendingDeletions.length > 0`; one row p
 | `status` | — | — | `Show orchestrator status` | MONITORING |
 | `config` | `palette, activity-filter, max-concurrent, notifications-toast, notifications-bell` | — | `TUI settings` | SETTINGS |
 | `help` | — | — | `List all commands` | SETTINGS |
+| `mouse` | `on, off, status` | — | `Mouse capture on/off` | SETTINGS |
+| `msg` | — | `[agent] [message]` | `Message an agent` | MANAGEMENT |
 | `quit` | — | — | `Exit the TUI` | SETTINGS |
+
+`mouse` and `msg` are r-orch additions (PARITY §12.8 rows (j) and (l)); `msg` is registered **after**
+`mouse` so `resolveCompletion('/m')` still yields `ouse`.
 
 ### 4.2 `resolveCompletion(input) → string | null`
 Returns only the ghost **suffix**. Must start with `/`. No space yet → the first registry key with that prefix excluding an exact match, minus the prefix. With a space → the first matching subcommand minus the sub-prefix.
@@ -487,6 +496,24 @@ Asserted: `'task'`→`null`, `'/'`→`null`, `'/ta'`→`'sk'`, `'/task'`→`null
 
 ### 4.4 `SuggestionsPanel` rendering
 Visible rows = `min(suggestions.length, feedH)`; scrolls so the selected index stays visible (`scrollStart = selectedIndex - maxVisible + 1`). Each row: `  ▸ ` (amber) or `    ` (ghost); the command padded to `cmdPad = min(32, max(14, ...all cmd lengths + 1))` (white bold when selected, else silver); the description truncated to `max(4, width - cmdPad - subsText.length - 9)` with `…` (dim); then `  {subs}` (ghost).
+
+**Argument rows (r-orch, `/msg` only).** After `/msg ` the panel lists agents instead of `&'static`
+subcommands, while the input is still inside or at the end of the recipient token — it closes once the body
+starts, so Enter cannot be hijacked mid-body. Groups, concatenated, each in `sorted_agents()` order: name
+prefixes, id prefixes, name substrings, then the broadcast row **last**. Row text is `/msg {unescaped name}`
+capped to 32 **display columns**, with description `{adapter} · {status} · {id}`; the broadcast row is
+`/msg all` with `broadcast · {n} enabled agent(s)`. Two rows that would display the same name are both
+prefixed `!`. Capped at 40 agent rows plus an inert `… {n} more — keep typing to filter`. Accepting a row
+**fills** the bar with the *quoted* form computed from the agent record (never re-derived from the row text,
+which the legacy ` [...]` trim would mangle); its click identity is the agent id. Separator rows are inert
+for `Tab` and `Enter` — previously `Tab` on one cleared the input.
+
+**The retained refusal (r-orch, `/msg` only).** When the suggestion list is empty and a `/msg` refusal (or the
+broadcast confirm) is keeping the bar open, those rows carry that refusal's lines instead,
+**bottom-aligned** so they sit directly above the command they are about, `⚠`-marked on the first line and
+capped in display columns. Necessary because the activity feed — where the same lines also land — is **not
+rendered while the bar is open**, so the one thing the user needs to read would otherwise be the one thing
+off screen. Cleared by the next keystroke, a send, `Esc` or leaving command mode.
 
 ### 4.5 `CommandHistory`
 `push` ignores empty strings, dedupes **consecutive** duplicates, caps at 100 entries (FIFO `shift`), and resets the cursor to the end. `prev()` returns `null` on an empty history, otherwise decrements (clamped at 0) and returns that entry. `next()` increments while below the last index; at or past the end it resets the cursor to `length` and returns `null` (meaning "clear the input"). `reset()` moves the cursor to the end.
@@ -546,6 +573,53 @@ The leading `/` is stripped, the verb lowercased, arguments split on whitespace.
 - `help` → one silver line per registry entry: `  /{verb}{ subs joined by '|' | ' '+args}  — {help}`.
 - `quit` → `exit()`.
 - Unknown verb → `Unknown: {cmd}. Type /help for commands`.
+
+**`/msg` (r-orch addition, PARITY §12.8 row (l))** — `/msg <agent|all> <message>`. The **only** verb that
+does not use `split_whitespace`: it takes the raw tail, because an agent name may contain spaces.
+- **Grammar.** One recipient token — bare, `"…"` (with `\"` and `\\`) or `'…'` — then exactly the whitespace
+  run that follows it, then the body **verbatim** (its own quotes, `#`, backslashes and whitespace runs are
+  untouched). Autocomplete and `m` insert the quoted form; a name is written bare only when it has no
+  whitespace, no `"`, no `'`, no `\`, no leading `@` and is not `all`.
+- **Resolution** commits only on an exact id, an NFC-exact name, or a *unique* case-insensitive name, and
+  never falls back to the selection. Ambiguity lists ids and stops. A **prefix never commits**: it is a
+  did-you-mean refusal. An unquoted exact match shadowed by a longer name is refused with both quoted
+  readings — both when the body carries the whole of that longer name (`Code` and `Code Reviewer`,
+  `/msg Code Reviewer please look`) and when it only *starts* it on whole-word boundaries
+  (`/msg Code Rev hi`, which otherwise sent "Rev hi" to `Code`); the second reading's body is the body
+  with those words removed. One leading `@` is stripped and retried only if nothing matched as typed.
+- **Autocomplete order** is: the NFC-**exact** name, then name prefixes, then id prefixes, then name
+  substrings, then the broadcast row. The exact group exists because accepting a row *fills* the bar, so a
+  row sorting above the name the user typed would rewrite the recipient (`alice` and `Alice`: `/msg Alice`
+  + Tab filled `/msg alice `).
+- **Broadcast** is the exact unquoted lowercase `all` only — `ALL`, `All`, `@all` and `"all"` are read as
+  **names**, so they reach an agent genuinely called that (`@all` literally, or case-insensitively unique)
+  and are otherwise refused by name resolution with `No agent matches "ALL"`. It needs a confirming second
+  Enter against byte-identical input **in the same edit state**: the arm is keyed to the bar's
+  `TextInput::generation` as well as its text, and is dropped by any non-Enter key, any paste, and every
+  exit from command mode (`Esc`, the `✕` zone, re-entering with `/`, running any other verb) — so a
+  retype, an `↑` recall or a mouse cancel all have to arm again. A broadcast with nobody to send to is
+  refused outright with `No enabled agents to message`.
+- **Refusals**: `Usage: /msg <agent|all> <message>`, `Missing message for "{name}"`, `Unclosed quote in
+  recipient — write /msg "Code Reviewer" <message>`, `Expected a space after the quoted name`,
+  `Recipient is empty`, `Ambiguous recipient "{text}" — {n} agents match: {id} {name}, … (use the id)`,
+  `No agent named "{text}" — did you mean "{name}"? …`, `No agent named "{text}" — {n} agents start with
+  it: …`, `No agent matches "{text}" — /agent list to see names`, `Messaging not available`. Every refusal
+  **keeps the bar open with the text exactly as typed** — trailing space included, which is what keeps the
+  suggestion panel closed over a `Missing message` refusal — and so do the broadcast arm and a failed
+  `send_message`, which no other verb does. The retained lines own the suggestion rows while they are
+  shown: the next keystroke clears them and the list comes back. `/msg` + Enter runs the verb instead of filling from its own
+  row — the fill would add only the trailing space — so the Usage line is shown instead of nothing;
+  `Tab` still fills, and a recipient row always fills, a finished name included.
+- **Success**: `Sending to {name}...` then `✓ Queued for {name} ({msgId}) — delivered on its next run`, or
+  `✓ Queued for {n} agents — delivered on their next run`; ` — nothing is dispatching right now; /watch to
+  start` is appended when neither watch nor observer mode is active. Advisories: `{name} is disabled — the
+  message waits in its inbox`, `Body truncated to 4000 characters` (the engine's cut, reported without
+  pre-truncating). No refresh — nothing in `AppState` derives from messages.
+
+**`m` on the Agents tab (r-orch addition)** — with a selection and `can_send_message()`, opens the command
+bar prefilled `/msg "{name}" `. Lowercase only; `M` keeps meaning *maximize*. Advertised as `m msg` in the
+Agents footer, clickable like its neighbours, and as `m Message agent` in the help overlay's NAVIGATION
+column — the footer alone is cut off below ~75 columns.
 
 ---
 

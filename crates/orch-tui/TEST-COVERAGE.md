@@ -20,9 +20,10 @@ Run everything with `cargo test -p orch-tui`.
 | `tests/mouse.rs` (`m001..m111`) | 111 | Every clickable target, every unclickable surface, and the identity/reflow/wheel hazards |
 | `tests/hitmap.rs` (`h001..h021`) | 21 | The per-frame hit map: row↔frame agreement, every clickable target, clipping, invalidation |
 | `tests/live_updates.rs` (`l001..l062`) | 62 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history and its timestamps, endurance, repeated-line collapse |
-| **Integration total** | **636** | |
-| In-module unit tests | 314 | Pure logic: see the table below |
-| **Grand total** | **950** | |
+| `tests/msg.rs` (`msg001..msg068`) | 73 | Bracketed paste and its per-stage routing (including the 64 KiB cap), `/msg`'s grammar and every refusal, broadcast confirm/disarm on every exit, autocomplete and its fills, the `m` binding, the recipient chip, the cursor and its window budget, the retained refusal **as drawn**, and the frame cost of a 64k value |
+| **Integration total** | **709** | |
+| In-module unit tests | 358 | Pure logic: see the table below |
+| **Grand total** | **1067** | |
 
 In-module unit tests, by file:
 
@@ -34,18 +35,21 @@ In-module unit tests, by file:
 | `wizard/engine.rs` | 27 | `form-wizard.test.tsx`, `form-wizard-validation.test.tsx` |
 | `keys.rs` | 24 | New: every named action leaves the state its key leaves |
 | `app.rs` | 23 | Event ingestion, `entityListChanged`, notifications, soft delete |
-| `text/input.rs` | 16 | `text-input.test.tsx` (kill ring, undo, debounce) |
+| `text/input.rs` | 17 | `text-input.test.tsx` (kill ring, undo, debounce), plus the edit generation (new) |
 | `messages/mod.rs` | 14 | `formatEvent`, message types, activity presets |
 | `onboarding.rs` | 12 | `onboarding.test.tsx`, `onboarding-agents.test.ts` |
-| `command_bar.rs` | 10 | `help-overlay.test.tsx` (completion, suggestions, history) |
+| `command_bar.rs` | 21 | `help-overlay.test.tsx` (completion, suggestions, history), plus the `/msg` rows (new) |
 | `theme.rs` | 8 | `colors.test.ts` (palettes, remap, WCAG contrast) |
 | `hit.rs` | 8 | New: z-order, clipping, scroll vs click, invalidation, identity |
 | `layout.rs` | 8 | The region arithmetic and the clamp tests |
-| `format.rs` | 7 | `capLine`/`capText`/`formatDuration`/`relativeTime` |
+| `format.rs` | 8 | `capLine`/`capText`/`formatDuration`/`relativeTime`, plus `cap_display` (new) |
 | `widgets/wizard.rs` | 6 | The text field's display-width sliding viewport |
+| `widgets/command_bar.rs` | 5 | New: the cursor-anchored value window — its budget, both clips, wide graphemes, and that its cost is the columns drawn |
 | `tty.rs` | 5 | New: hang-up beats pending input, the poll timeout, no controlling tty, which fd is polled |
 | `views/mod.rs` | 2 | Frame composition and the minimum-size guard |
 | `clock.rs` | 2 | The injected clock |
+| `backend/fake.rs` | 5 | New: `send_message` recording, fan-out, a disabled recipient, injected failure, refusals |
+| `msg.rs` | 21 | New: the recipient grammar, its quoter's round trip over 35 awkward names, commit resolution, prefix-never-commits, the unquoted-prefix shadow (whole and partial), the broadcast keyword, suggestions and their exact-first order, the chip |
 | `runner.rs` | 3 | New: the DEC mode set, its reverse order, and the env switch |
 
 ## Spec item → case map
@@ -76,7 +80,8 @@ In-module unit tests, by file:
 | §3.7/§8.4 Toasts, bell, tab flash | `l027`–`l036`, `v080`–`v082` |
 | §3.9 No confirmation prompts — soft delete instead | `k046`–`k049`, `l022`–`l026` |
 | §3.10 Undo banner | `v083`, `v084` |
-| §4.1–§4.5 Registry, completion, suggestions, history | `command_bar.rs` (10), `c0xx` |
+| §4.1–§4.5 Registry, completion, suggestions, history | `command_bar.rs` (21), `c0xx` |
+| PARITY §12.8 (l) `/msg`, autocomplete, the chip, `m`, bracketed paste | `msg.rs` (21), `command_bar.rs` `/msg` rows, `widgets/command_bar.rs` (5, the window), `msg001`–`msg068` |
 | §4.6 Command semantics, every verb and refusal | `tests/command_surface.rs` (109) |
 | §5.1 FormWizard engine, validation gating, keys | `wizard/engine.rs` (25), `w0xx` |
 | §5.2 All 11 wizards, fields, skips, mappers | `tests/wizards.rs` (93) |
@@ -104,6 +109,10 @@ In-module unit tests, by file:
 | Cancelling a wizard clears pending attachments | The TS `Esc` path leaked them into the next wizard (§8.2) | `app.rs` `cancelling_a_wizard_clears_pending_attachments` |
 | The `W start orchestrator` onboarding hint is dropped | PARITY §13 — advertised but never handled | `v079`, `onboarding.rs` `the_dropped_w_hint_is_not_advertised` |
 | `'new_task'` input mode, `LogsSearchBar`, `Footer`, `TabBar`, the stats ribbons and `sparklineData` are not ported | PARITY §13 dead code | no cases, by design |
+| `Tab` on a separator row is inert | It called `reset("")` and wiped the input — pre-existing, hit by the category headers | `msg043` |
+| The command bar renders a real cursor and anchors its window on it | PARITY §12.8 (l) — the `TextInput` cursor API was present but unused | `msg038`–`msg040` |
+| A retained `/msg` refusal is drawn in the suggestion rows, which it owns while shown | PARITY §12.8 (l) — the feed is not rendered in command mode, so the refusal was the one thing off screen; a reopened agent list covered it | `msg052`–`msg059` |
+| Bracketed paste is enabled; a paste in normal mode is dropped | PARITY §12.8 (l) — a pasted body submitted line 1 and ran lines 2+ as keys | `msg001`–`msg007` |
 
 ## Not covered, and why
 

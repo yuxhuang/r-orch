@@ -84,6 +84,51 @@ clicks reach the dashboard at all.
 
 To start with the mouse off: `ORCH_TUI_MOUSE=0 orch`. `/mouse status` says which it is.
 
+**Messaging an agent from the dashboard.** On the Agents tab, select an agent and press **`m`**: the
+command bar opens prefilled `/msg "Code Reviewer" `, ready for the body. Or type `/msg ` and pick from
+the agent list — Tab or a double-click fills the name, already quoted. The message is queued exactly as
+`orch msg send` queues it; the recipient reads it on its **next run**, so start `/watch` if nothing is
+dispatching.
+
+```
+/msg reviewer the signup test is flaky on CI      # bare name
+/msg "Code Reviewer" please look at #12           # a name with spaces
+/msg agt_7fK2mQ1 ping                             # by id, always unambiguous
+/msg all standup in five                          # broadcast — asks for a second Enter
+```
+
+Names are quoted the way a shell quotes them, because agent names may contain anything but whitespace
+alone:
+
+| Name | Write it as |
+|---|---|
+| `reviewer`, `名前` | `reviewer`, `名前` |
+| `Code Reviewer`, `🚀 deploy` | `"Code Reviewer"`, `"🚀 deploy"` |
+| `say "hi"` | `"say \"hi\""` |
+| `C:\path` | `"C:\\path"` |
+| `don't` | `"don't"` |
+| `all` (an agent actually named that) | `"all"`, or its id |
+
+The body is everything after the name, verbatim — its own quotes, `#` and `/` are not interpreted, so
+`/msg reviewer /quit now` sends that text and does not quit.
+
+Autocomplete offers prefix matches, but **sending never guesses**: a prefix, an ambiguous name or an
+unquoted name that could be read two ways (`Code` when `Code Reviewer` also exists, including
+`/msg Code Rev hi`) is refused with the exact form to use. `all` broadcasts only as the bare lowercase
+word and only after a confirming second Enter, pressed straight after the first — any edit, any other
+key and leaving the bar all make it ask again. `/msg ALL …` is **not** a broadcast: `ALL`, `All` and
+`@all` are read as names, so they reach an agent actually called that and are otherwise refused with
+`No agent matches`. The chip in the command bar names the recipient while you type.
+
+A queued message **expires after 24 hours** if the recipient never runs; nothing reports that it did,
+so for anything time-sensitive check that something is dispatching (`/watch`, or `● WATCHING` in the
+header). Long bodies: paste is bracketed, so newlines are kept and shown as `⏎` rather than submitting
+the message early — but one paste is capped at **64 KiB** (with a line in the feed when it is cut), and
+the engine cuts the body itself at **4000 characters**, which the TUI reports as an advisory. In a
+terminal or multiplexer *without* bracketed paste (Windows legacy console, tmux with the mode off) a
+pasted body still arrives as raw keystrokes: the first newline submits and the rest is typed into the
+dashboard. Paste one line, or paste into `orch msg send` instead.
+
 Two things that will bite you on first use, both covered in the [runbook](docs/RUNBOOK.md):
 
 - **`approval_policy: auto`** above is deliberate. The default `agt_creator` agent uses `suggest`, which

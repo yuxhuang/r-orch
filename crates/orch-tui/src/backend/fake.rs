@@ -12,7 +12,7 @@ use orch_domain::{
 
 use super::{
     AgentFields, AgentOpts, BackendResult, ClipboardPaste, CreateTaskOpts, GoalFields,
-    HistoryEntry, LaunchContext, ModelCatalog, TaskFields, TuiBackend,
+    HistoryEntry, LaunchContext, MessageTarget, ModelCatalog, TaskFields, TuiBackend,
 };
 
 /// A recorded facade call. Tests assert on this log rather than on side effects.
@@ -83,6 +83,10 @@ pub enum Call {
     },
     DeleteGoal(String),
     GoalProgress(String),
+    SendMessage {
+        target: MessageTarget,
+        body: String,
+    },
     StartWatch,
     StopWatch,
     SavePalette(TuiPaletteName),
@@ -119,6 +123,7 @@ pub struct FakeBackend {
     pub can_create_goal: bool,
     pub can_force_stop_agent: bool,
     pub can_paste_image: bool,
+    pub can_send_message: bool,
     next_id: usize,
 }
 
@@ -145,6 +150,7 @@ impl FakeBackend {
             can_create_goal: true,
             can_force_stop_agent: true,
             can_paste_image: true,
+            can_send_message: true,
             next_id: 1,
         }
     }
@@ -306,6 +312,9 @@ impl TuiBackend for FakeBackend {
     }
     fn can_paste_image(&self) -> bool {
         self.can_paste_image
+    }
+    fn can_send_message(&self) -> bool {
+        self.can_send_message
     }
 
     fn refresh_tasks(&mut self) -> BackendResult<Vec<Task>> {
@@ -653,6 +662,38 @@ impl TuiBackend for FakeBackend {
         Ok(self.goal_progress_report.clone())
     }
 
+    /// Mirrors the two refusals the real service can produce before it writes
+    /// anything — an empty body and an unknown recipient — with the same text,
+    /// because the message *is* the contract the TUI renders.
+    fn send_message(&mut self, target: MessageTarget, body: &str) -> BackendResult<Vec<String>> {
+        self.calls.push(Call::SendMessage {
+            target: target.clone(),
+            body: body.into(),
+        });
+        self.check_failure()?;
+        if body.trim().is_empty() {
+            return Err("Message body is required".to_owned());
+        }
+        let recipients = match &target {
+            MessageTarget::Agent(agent_id) => {
+                if !self.agents.iter().any(|a| &a.id == agent_id) {
+                    return Err(format!("Recipient agent not found: {agent_id}"));
+                }
+                // A *direct* send to a disabled agent is allowed — only the
+                // broadcast fan-out skips them.
+                1
+            }
+            // One per enabled agent. `cli` is not an agent, so unlike an
+            // agent-to-agent broadcast nothing is dropped as the sender.
+            MessageTarget::Broadcast => self
+                .agents
+                .iter()
+                .filter(|a| a.status != AgentStatus::Disabled)
+                .count(),
+        };
+        Ok((0..recipients).map(|_| self.fresh_id("msg")).collect())
+    }
+
     fn start_watch(&mut self) -> BackendResult<()> {
         self.calls.push(Call::StartWatch);
         self.check_failure()
@@ -721,5 +762,110 @@ impl TuiBackend for FakeBackend {
 
     fn bell(&mut self) {
         self.calls.push(Call::Bell);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_agents() -> FakeBackend {
+        FakeBackend::new().with_agents(vec![
+            make_agent("agt_1", "one", AgentStatus::Idle),
+            make_agent("agt_2", "two", AgentStatus::Running),
+            make_agent("agt_off", "off", AgentStatus::Disabled),
+        ])
+    }
+
+    #[test]
+    fn a_direct_send_is_recorded_and_yields_one_id() {
+        let mut backend = with_agents();
+        let ids = backend
+            .send_message(MessageTarget::Agent("agt_1".into()), "ping")
+            .expect("sent");
+
+        assert_eq!(ids, vec!["msg_001"]);
+        assert_eq!(
+            backend.calls,
+            vec![Call::SendMessage {
+                target: MessageTarget::Agent("agt_1".into()),
+                body: "ping".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_direct_send_to_a_disabled_agent_is_allowed() {
+        // Only the broadcast fan-out skips a disabled agent; naming one
+        // directly leaves the message waiting in its inbox.
+        let mut backend = with_agents();
+        assert_eq!(
+            backend
+                .send_message(MessageTarget::Agent("agt_off".into()), "wake up")
+                .expect("sent")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_broadcast_yields_one_id_per_enabled_agent() {
+        let mut backend = with_agents();
+        let ids = backend
+            .send_message(MessageTarget::Broadcast, "all hands")
+            .expect("sent");
+        // agt_off is disabled, so it is not a recipient.
+        assert_eq!(ids, vec!["msg_001", "msg_002"]);
+
+        // Nobody to tell is a success with no ids, not a failure — the real
+        // service and `orch msg broadcast` both exit 0 here.
+        let mut empty = FakeBackend::new();
+        assert!(
+            empty
+                .send_message(MessageTarget::Broadcast, "hello?")
+                .expect("sent")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_injected_failure_is_returned_and_the_call_still_recorded() {
+        let mut backend = with_agents();
+        backend.fail_next = Some("Disk is on fire".into());
+
+        let err = backend
+            .send_message(MessageTarget::Agent("agt_1".into()), "ping")
+            .expect_err("failed");
+        assert_eq!(err, "Disk is on fire");
+        assert!(backend.called(|call| matches!(call, Call::SendMessage { .. })));
+
+        // `fail_next` is one-shot, like everywhere else in the fake.
+        assert!(
+            backend
+                .send_message(MessageTarget::Agent("agt_1".into()), "ping")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_empty_body_and_an_unknown_recipient_are_refused() {
+        let mut backend = with_agents();
+        assert_eq!(
+            backend.send_message(MessageTarget::Agent("agt_1".into()), "   "),
+            Err("Message body is required".to_owned())
+        );
+        assert_eq!(
+            backend.send_message(MessageTarget::Broadcast, ""),
+            Err("Message body is required".to_owned())
+        );
+        assert_eq!(
+            backend.send_message(MessageTarget::Agent("agt_ghost".into()), "ping"),
+            Err("Recipient agent not found: agt_ghost".to_owned())
+        );
+        // Refused, but recorded: the TUI's call is what a test asserts on.
+        assert_eq!(
+            backend.count(|call| matches!(call, Call::SendMessage { .. })),
+            3
+        );
     }
 }

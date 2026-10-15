@@ -2,7 +2,26 @@
 //! (`src/tui/commandBar.ts`).
 //!
 //! Registry **insertion order** is contract: it drives suggestion order and the
-//! first-match semantics of [`resolve_completion`] (PARITY.md §12.4).
+//! first-match semantics of [`resolve_completion`] (PARITY.md §12.4). `msg` is
+//! registered **after** `mouse` for exactly that reason: `/m` + Tab must keep
+//! ghost-completing `mouse`, the text-selection escape hatch users reach for
+//! when clicks stop working (design-v2 §3.5.2, C8).
+
+use orch_domain::Agent;
+
+use crate::format::cap_display;
+use crate::msg::{
+    BROADCAST_KEYWORD, Candidate, enabled_count, parse_partial, quote_recipient, suggest_recipients,
+};
+
+/// The one verb whose arguments are agent names rather than `&'static` words.
+pub const MSG_VERB: &str = "msg";
+
+/// Agent rows per panel, past which an inert row says how many were hidden.
+const MAX_AGENT_ROWS: usize = 40;
+
+/// Display columns for a row's command text, matching the panel's own pad.
+const ROW_COLUMNS: usize = 32;
 
 /// `CONFIG_SETTINGS`.
 pub const CONFIG_SETTINGS: [&str; 5] = [
@@ -30,10 +49,17 @@ pub struct CommandSpec {
     pub args: Option<&'static str>,
     pub help: &'static str,
     pub category: &'static str,
+    /// The verb's own suggestion row **fills** the bar with `/{verb} ` instead
+    /// of executing, because the verb alone does nothing useful.
+    ///
+    /// `true` only for `msg`: giving it to the other argument-taking verbs
+    /// would change what Enter does on rows that have always executed, and
+    /// those are **L1** (`/run` with no id runs the selected task).
+    pub insert_trailing_space: bool,
 }
 
 /// `COMMAND_REGISTRY`, in insertion order.
-pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
+pub const COMMAND_REGISTRY: [CommandSpec; 14] = [
     CommandSpec {
         verb: "task",
         sub: &[
@@ -42,6 +68,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Manage tasks",
         category: CAT_MANAGE,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "agent",
@@ -57,6 +84,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Manage agents",
         category: CAT_MANAGE,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "team",
@@ -64,6 +92,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Manage teams",
         category: CAT_MANAGE,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "goal",
@@ -71,6 +100,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Manage goals",
         category: CAT_MANAGE,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "run",
@@ -78,6 +108,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: Some("[id]"),
         help: "Run task (or selected)",
         category: CAT_MONITOR,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "run-all",
@@ -85,6 +116,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Run all todo tasks",
         category: CAT_MONITOR,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "watch",
@@ -92,6 +124,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Start watch mode (auto-dispatch)",
         category: CAT_MONITOR,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "pause",
@@ -99,6 +132,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Pause watch mode",
         category: CAT_MONITOR,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "status",
@@ -106,6 +140,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Show orchestrator status",
         category: CAT_MONITOR,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "config",
@@ -113,6 +148,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "TUI settings",
         category: CAT_SETTINGS,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "help",
@@ -120,6 +156,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "List all commands",
         category: CAT_SETTINGS,
+        insert_trailing_space: false,
     },
     CommandSpec {
         verb: "mouse",
@@ -127,6 +164,18 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Mouse capture on/off",
         category: CAT_SETTINGS,
+        insert_trailing_space: false,
+    },
+    // After `mouse`, so `resolve_completion("/m")` still yields `ouse`.
+    // `/msg` is an addition to this **L1** verb set, recorded in PARITY.md
+    // §12.8 row (l): the Ink original cannot message an agent at all.
+    CommandSpec {
+        verb: "msg",
+        sub: &[],
+        args: Some("[agent] [message]"),
+        help: "Message an agent",
+        category: CAT_MANAGE,
+        insert_trailing_space: true,
     },
     CommandSpec {
         verb: "quit",
@@ -134,6 +183,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
         args: None,
         help: "Exit the TUI",
         category: CAT_SETTINGS,
+        insert_trailing_space: false,
     },
 ];
 
@@ -142,16 +192,48 @@ pub fn spec_for(verb: &str) -> Option<&'static CommandSpec> {
 }
 
 /// One suggestion row. A separator row has an empty `cmd`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Suggestion {
     pub cmd: String,
     pub desc: String,
     pub subs: Option<String>,
+    /// The exact text to place in the bar when this row is accepted, replacing
+    /// the whole input. `Some(_)` also means **fill, never execute**.
+    ///
+    /// This is what stops a row being reconstructed from its own display text:
+    /// an agent row shows the *unescaped* name (`/msg say "hi"`) and inserts
+    /// the quoted form (`/msg "say \"hi\"" `), computed from the agent record.
+    /// The legacy accept path trims a trailing ` [...]`, which would mangle a
+    /// name like `foo [bar]`.
+    pub insert: Option<String>,
+    /// Click identity, falling back to `cmd`. The agent id, so two agents with
+    /// the same display name still get distinct press/release identities —
+    /// mouse release is matched on `ZoneId`, not position.
+    pub zone_key: Option<String>,
 }
 
 impl Suggestion {
     pub fn is_separator(&self) -> bool {
         self.cmd.is_empty()
+    }
+
+    /// What a click on this row identifies: its `zone_key`, else its text.
+    pub fn zone_key(&self) -> &str {
+        self.zone_key.as_deref().unwrap_or(&self.cmd)
+    }
+}
+
+/// A verb's own row. `insert` is set only where the verb alone does nothing,
+/// which makes Enter fill rather than execute.
+fn verb_row(spec: &CommandSpec) -> Suggestion {
+    Suggestion {
+        cmd: format!("/{}{}", spec.verb, args_hint(spec)),
+        desc: spec.help.to_string(),
+        subs: subs_hint(spec),
+        insert: spec
+            .insert_trailing_space
+            .then(|| format!("/{} ", spec.verb)),
+        zone_key: None,
     }
 }
 
@@ -201,8 +283,33 @@ pub fn resolve_completion(input: &str) -> Option<String> {
     }
 }
 
-/// `resolveSuggestions(input)`.
+/// What the suggestion list needs from app state: the agents `/msg` can name,
+/// and the order the Agents tab shows them in.
+///
+/// Everything else in the registry is `&'static`, which is why this is the
+/// only state the list has ever needed.
+#[derive(Debug, Clone, Copy)]
+pub struct SuggestionCtx<'a> {
+    pub agents: &'a [Agent],
+    /// Indices into `agents` — `AppState::sorted_agents`.
+    pub order: &'a [usize],
+}
+
+impl SuggestionCtx<'_> {
+    pub const EMPTY: SuggestionCtx<'static> = SuggestionCtx {
+        agents: &[],
+        order: &[],
+    };
+}
+
+/// `resolveSuggestions(input)` — for every verb but `msg`, which needs the
+/// agent list ([`resolve_suggestions_in`]).
 pub fn resolve_suggestions(input: &str) -> Vec<Suggestion> {
+    resolve_suggestions_in(input, &SuggestionCtx::EMPTY)
+}
+
+/// `resolveSuggestions(input)`, with the state `/msg` needs.
+pub fn resolve_suggestions_in(input: &str, ctx: &SuggestionCtx<'_>) -> Vec<Suggestion> {
     let Some(body) = input.strip_prefix('/') else {
         return Vec::new();
     };
@@ -217,14 +324,10 @@ pub fn resolve_suggestions(input: &str) -> Vec<Suggestion> {
                     results.push(Suggestion {
                         cmd: String::new(),
                         desc: format!("── {cat} ──"),
-                        subs: None,
+                        ..Suggestion::default()
                     });
                     for spec in COMMAND_REGISTRY.iter().filter(|s| s.category == cat) {
-                        results.push(Suggestion {
-                            cmd: format!("/{}{}", spec.verb, args_hint(spec)),
-                            desc: spec.help.to_string(),
-                            subs: subs_hint(spec),
-                        });
+                        results.push(verb_row(spec));
                     }
                 }
                 return results;
@@ -232,17 +335,13 @@ pub fn resolve_suggestions(input: &str) -> Vec<Suggestion> {
 
             for spec in COMMAND_REGISTRY.iter() {
                 if spec.verb.starts_with(&prefix) {
-                    results.push(Suggestion {
-                        cmd: format!("/{}{}", spec.verb, args_hint(spec)),
-                        desc: spec.help.to_string(),
-                        subs: subs_hint(spec),
-                    });
+                    results.push(verb_row(spec));
                     if spec.verb == prefix && !spec.sub.is_empty() {
                         for sub in spec.sub {
                             results.push(Suggestion {
                                 cmd: format!("/{} {}", spec.verb, sub),
                                 desc: format!("{}: {}", spec.help, sub),
-                                subs: None,
+                                ..Suggestion::default()
                             });
                         }
                     }
@@ -255,6 +354,9 @@ pub fn resolve_suggestions(input: &str) -> Vec<Suggestion> {
             let Some(spec) = spec_for(verb) else {
                 return Vec::new();
             };
+            if spec.verb == MSG_VERB {
+                return msg_suggestions(&body[space_idx + 1..], ctx);
+            }
             if spec.sub.is_empty() {
                 return Vec::new();
             }
@@ -265,11 +367,94 @@ pub fn resolve_suggestions(input: &str) -> Vec<Suggestion> {
                 .map(|sub| Suggestion {
                     cmd: format!("/{verb} {sub}"),
                     desc: format!("{}: {}", spec.help, sub),
-                    subs: None,
+                    ..Suggestion::default()
                 })
                 .collect()
         }
     }
+}
+
+/// The rows offered after `/msg `, in panel order.
+///
+/// Shown **only** while the input is still inside or at the end of the
+/// recipient token. One rule, three jobs: the panel closes once the body
+/// starts, Enter cannot be hijacked mid-body, and the bottom panel stays out
+/// of the way while a long body is typed.
+fn msg_suggestions(tail: &str, ctx: &SuggestionCtx<'_>) -> Vec<Suggestion> {
+    let (partial, body_started) = if tail.trim().is_empty() {
+        // `/msg ` — nothing typed yet, so every agent is a candidate.
+        (String::new(), false)
+    } else {
+        match parse_partial(tail) {
+            Some(token) => (token.text, token.body_started),
+            // Junk after a closing quote (`"Alice"x`): malformed, so offer
+            // nothing rather than the whole fleet.
+            None => return Vec::new(),
+        }
+    };
+    if body_started {
+        return Vec::new();
+    }
+
+    let candidates = suggest_recipients(ctx.agents, ctx.order, &partial);
+    let agents: Vec<usize> = candidates
+        .iter()
+        .filter_map(|candidate| match candidate {
+            Candidate::Agent(index) => Some(*index),
+            Candidate::Broadcast => None,
+        })
+        .collect();
+    let shown = agents.len().min(MAX_AGENT_ROWS);
+
+    let mut rows: Vec<Suggestion> = Vec::with_capacity(shown + 2);
+    for index in &agents[..shown] {
+        let agent = &ctx.agents[*index];
+        // Two rows that read the same are marked, so the user knows to look at
+        // the id — which the description carries.
+        //
+        // **Byte equality only**, which is exactly the set of rows resolution
+        // cannot tell apart either: a byte-duplicate name is an `Ambiguous`
+        // refusal (§3.4.2), and an NFC/NFD twin folds to one and is refused
+        // too. A homoglyph pair (Cyrillic `а` against Latin `a`) is *not*
+        // marked and does resolve, because the two names are different names;
+        // picking the wrong row needs an attacker who can already write the
+        // agent config, and NFKC/confusable folding was rejected with reasons
+        // (dissent C9). Not a protection this comment should claim.
+        let twin = agents[..shown]
+            .iter()
+            .any(|other| *other != *index && ctx.agents[*other].name == agent.name);
+        let display = if twin {
+            format!("!{}", agent.name)
+        } else {
+            agent.name.clone()
+        };
+        rows.push(Suggestion {
+            cmd: cap_display(&format!("/msg {display}"), ROW_COLUMNS),
+            desc: format!("{} · {} · {}", agent.adapter, agent.status, agent.id),
+            subs: None,
+            // The quoted form, from the record — never re-derived from `cmd`.
+            insert: Some(format!("/msg {} ", quote_recipient(&agent.name))),
+            zone_key: Some(agent.id.clone()),
+        });
+    }
+    if agents.len() > shown {
+        rows.push(Suggestion {
+            desc: format!("… {} more — keep typing to filter", agents.len() - shown),
+            ..Suggestion::default()
+        });
+    }
+    // Last, always: broadcast is the one irreversible action here, so
+    // `suggestion_index = 0` must be an agent row whenever any agent matches.
+    if candidates.contains(&Candidate::Broadcast) {
+        rows.push(Suggestion {
+            cmd: format!("/msg {BROADCAST_KEYWORD}"),
+            desc: format!("broadcast · {} enabled agent(s)", enabled_count(ctx.agents)),
+            subs: None,
+            insert: Some(format!("/msg {BROADCAST_KEYWORD} ")),
+            zone_key: Some(BROADCAST_KEYWORD.to_owned()),
+        });
+    }
+    rows
 }
 
 /// `CommandHistory` — 100 entries, consecutive duplicates collapsed.
@@ -357,9 +542,18 @@ mod tests {
             // outside the differential harness (§15.1).
             [
                 "task", "agent", "team", "goal", "run", "run-all", "watch", "pause", "status",
-                "config", "help", "mouse", "quit"
+                "config", "help", "mouse", "msg", "quit"
             ]
         );
+        // `msg` sits **after** `mouse` so `/m` keeps completing `mouse`
+        // (design-v2 §3.5.2). Its position is the contract, not an accident.
+        let verbs: Vec<&str> = COMMAND_REGISTRY.iter().map(|s| s.verb).collect();
+        assert_eq!(
+            verbs.iter().position(|v| *v == "msg"),
+            verbs.iter().position(|v| *v == "mouse").map(|i| i + 1)
+        );
+        assert_eq!(spec_for("msg").unwrap().args, Some("[agent] [message]"));
+        assert!(spec_for("msg").unwrap().sub.is_empty());
         assert_eq!(
             spec_for("task").unwrap().sub,
             [
@@ -405,6 +599,16 @@ mod tests {
     }
 
     #[test]
+    fn msg_does_not_steal_the_mouse_completion() {
+        // The text-selection escape hatch keeps its habit (C8).
+        assert_eq!(resolve_completion("/m").as_deref(), Some("ouse"));
+        assert_eq!(resolve_completion("/ms").as_deref(), Some("g"));
+        assert_eq!(resolve_completion("/mo").as_deref(), Some("use"));
+        assert_eq!(resolve_completion("/msg"), None);
+        assert_eq!(resolve_completion("/msg x"), None);
+    }
+
+    #[test]
     fn resolve_completion_extra_vectors() {
         assert_eq!(resolve_completion("/he").as_deref(), Some("lp"));
         assert_eq!(resolve_completion("/run").as_deref(), Some("-all"));
@@ -421,8 +625,20 @@ mod tests {
         assert_eq!(separators[0].desc, "── MANAGEMENT ──");
         assert_eq!(separators[1].desc, "── MONITORING ──");
         assert_eq!(separators[2].desc, "── SETTINGS ──");
-        // 13 verbs + 3 separators.
-        assert_eq!(suggestions.len(), 16);
+        // 14 verbs + 3 separators.
+        assert_eq!(suggestions.len(), 17);
+        // `msg` is in MANAGEMENT, so it lists with the other management verbs
+        // rather than where its registry index would put it.
+        let management: Vec<&str> = suggestions
+            .iter()
+            .skip(1)
+            .take_while(|s| !s.is_separator())
+            .map(|s| s.cmd.as_str())
+            .collect();
+        assert!(
+            management.contains(&"/msg [agent] [message]"),
+            "{management:?}"
+        );
         // The `[id]` args hint is baked into the command text.
         assert!(suggestions.iter().any(|s| s.cmd == "/run [id]"));
         assert_eq!(
@@ -471,6 +687,211 @@ mod tests {
     fn non_slash_input_yields_no_suggestions() {
         assert!(resolve_suggestions("").is_empty());
         assert!(resolve_suggestions("task").is_empty());
+    }
+
+    // ── `/msg` rows (design-v2 §3.5.3) ────────────────────────────────────
+
+    fn fleet() -> Vec<Agent> {
+        use orch_domain::AgentStatus;
+        vec![
+            crate::backend::make_agent("agt_rev", "Code Reviewer", AgentStatus::Idle),
+            crate::backend::make_agent("agt_al", "alice", AgentStatus::Idle),
+            crate::backend::make_agent("agt_off", "say \"hi\"", AgentStatus::Disabled),
+        ]
+    }
+
+    fn rows(input: &str, agents: &[Agent]) -> Vec<Suggestion> {
+        let order: Vec<usize> = (0..agents.len()).collect();
+        resolve_suggestions_in(
+            input,
+            &SuggestionCtx {
+                agents,
+                order: &order,
+            },
+        )
+    }
+
+    fn texts(rows: &[Suggestion]) -> Vec<String> {
+        rows.iter().map(|r| r.cmd.clone()).collect()
+    }
+
+    #[test]
+    fn the_empty_context_is_byte_identical_to_the_old_behaviour() {
+        // The shim keeps every pinned vector above meaningful: with no agents
+        // the only `/msg` rows are the verb row and the broadcast row.
+        for input in [
+            "/", "/ta", "/goal", "/task ", "/task a", "", "task", "/nope ",
+        ] {
+            assert_eq!(
+                resolve_suggestions(input),
+                resolve_suggestions_in(input, &SuggestionCtx::EMPTY),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            texts(&resolve_suggestions("/msg ")),
+            ["/msg all"],
+            "a backend with no agents still offers the keyword"
+        );
+        assert_eq!(
+            resolve_suggestions("/msg ")[0].desc,
+            "broadcast · 0 enabled agent(s)"
+        );
+    }
+
+    #[test]
+    fn the_verb_row_fills_and_the_agent_rows_follow_the_given_order() {
+        let fleet = fleet();
+        // `/ms` and `/msg` are still the verb row, which fills `/msg `.
+        for input in ["/ms", "/msg"] {
+            let rows = rows(input, &fleet);
+            assert_eq!(texts(&rows), ["/msg [agent] [message]"], "{input:?}");
+            assert_eq!(rows[0].insert.as_deref(), Some("/msg "));
+        }
+        // `/msg ` lists every agent in order, then the broadcast row.
+        assert_eq!(
+            texts(&rows("/msg ", &fleet)),
+            [
+                "/msg Code Reviewer",
+                "/msg alice",
+                "/msg say \"hi\"",
+                "/msg all"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_row_displays_the_name_and_inserts_the_quoted_form() {
+        let fleet = fleet();
+        let rows = rows("/msg say", &fleet);
+        assert_eq!(rows[0].cmd, "/msg say \"hi\"", "the row reads naturally");
+        assert_eq!(
+            rows[0].insert.as_deref(),
+            Some("/msg \"say \\\"hi\\\"\" "),
+            "the inserted text is what parses back"
+        );
+        // Click identity is the id, not the display text.
+        assert_eq!(rows[0].zone_key(), "agt_off");
+        assert_eq!(rows[0].desc, "claude · disabled · agt_off");
+    }
+
+    #[test]
+    fn a_name_with_an_args_hint_shape_is_not_mangled() {
+        // `strip_args_hint` trims a trailing ` [...]`; `insert` bypasses it.
+        use orch_domain::AgentStatus;
+        let fleet = vec![crate::backend::make_agent(
+            "agt_odd",
+            "foo [bar]",
+            AgentStatus::Idle,
+        )];
+        let rows = rows("/msg foo", &fleet);
+        assert_eq!(rows[0].cmd, "/msg foo [bar]");
+        assert_eq!(rows[0].insert.as_deref(), Some("/msg \"foo [bar]\" "));
+    }
+
+    #[test]
+    fn the_broadcast_row_is_last_and_only_when_it_could_still_match() {
+        let fleet = fleet();
+        // `a` is a prefix of every id, so every agent lists — `all` last.
+        let listed = rows("/msg a", &fleet);
+        assert_eq!(listed.last().unwrap().cmd, "/msg all");
+        assert_ne!(listed[0].cmd, "/msg all", "index 0 must be an agent row");
+        // `al` is a prefix of both, and the agent still comes first.
+        assert_eq!(texts(&rows("/msg al", &fleet)), ["/msg alice", "/msg all"]);
+        // `alice` cannot become `all` any more, so the keyword drops out.
+        assert_eq!(texts(&rows("/msg alice", &fleet)), ["/msg alice"]);
+        // …and `all` matches only the keyword.
+        assert_eq!(texts(&rows("/msg all", &fleet)), ["/msg all"]);
+    }
+
+    #[test]
+    fn the_panel_closes_once_the_body_starts_and_on_malformed_input() {
+        let fleet = fleet();
+        assert!(rows("/msg alice ", &fleet).is_empty());
+        assert!(rows("/msg alice hello", &fleet).is_empty());
+        assert!(rows("/msg \"Code Reviewer\" hi", &fleet).is_empty());
+        // Junk after a closing quote offers nothing rather than everything.
+        assert!(rows("/msg \"alice\"x", &fleet).is_empty());
+        // A partial quoted name still filters.
+        assert_eq!(
+            texts(&rows("/msg \"Code R", &fleet)),
+            ["/msg Code Reviewer"]
+        );
+        // A complete quoted name keeps its row, so Tab adds the space.
+        assert_eq!(texts(&rows("/msg \"alice\"", &fleet)), ["/msg alice"]);
+    }
+
+    #[test]
+    fn identically_displayed_rows_are_marked_and_kept_distinct() {
+        use orch_domain::AgentStatus;
+        let fleet = vec![
+            crate::backend::make_agent("agt_1", "dup", AgentStatus::Idle),
+            crate::backend::make_agent("agt_2", "dup", AgentStatus::Idle),
+        ];
+        let rows = rows("/msg dup", &fleet);
+        assert_eq!(texts(&rows), ["/msg !dup", "/msg !dup"]);
+        assert_ne!(rows[0].zone_key(), rows[1].zone_key());
+        assert!(rows[0].desc.ends_with("agt_1"));
+        assert!(rows[1].desc.ends_with("agt_2"));
+    }
+
+    #[test]
+    fn the_agent_rows_are_capped_with_an_inert_row_naming_the_remainder() {
+        use orch_domain::AgentStatus;
+        let fleet: Vec<Agent> = (0..41)
+            .map(|i| {
+                crate::backend::make_agent(
+                    &format!("agt_{i:02}"),
+                    &format!("agent-{i:02}"),
+                    AgentStatus::Idle,
+                )
+            })
+            .collect();
+        let rows = rows("/msg agent", &fleet);
+        assert_eq!(rows.len(), 41, "40 agents plus the overflow row");
+        assert_eq!(rows[40].desc, "… 1 more — keep typing to filter");
+        assert!(rows[40].is_separator(), "the overflow row must be inert");
+    }
+
+    #[test]
+    fn a_wide_name_is_capped_in_display_columns() {
+        use orch_domain::AgentStatus;
+        let fleet = vec![crate::backend::make_agent(
+            "agt_cjk",
+            &"名".repeat(30),
+            AgentStatus::Idle,
+        )];
+        let row = &rows("/msg 名", &fleet)[0];
+        assert!(
+            crate::text::text_display_width(&row.cmd) <= ROW_COLUMNS,
+            "{:?} is {} columns",
+            row.cmd,
+            crate::text::text_display_width(&row.cmd)
+        );
+        // The insert is never capped — it has to parse back.
+        assert_eq!(
+            row.insert.as_deref(),
+            Some(format!("/msg {} ", "名".repeat(30)).as_str())
+        );
+    }
+
+    #[test]
+    fn only_msg_rows_carry_an_insert() {
+        // The fill-vs-execute rule, over the whole registry: a row with
+        // `insert` fills, and giving it to the other argument-taking verbs
+        // would change what Enter has always done on their rows (`/run` with
+        // no id runs the selection). `subs` keeps driving the legacy fill.
+        for spec in COMMAND_REGISTRY.iter() {
+            let row = verb_row(spec);
+            assert_eq!(
+                row.insert.is_some(),
+                spec.verb == MSG_VERB,
+                "/{} must {} fill",
+                spec.verb,
+                if spec.verb == MSG_VERB { "" } else { "not" }
+            );
+            assert_eq!(row.insert.is_some(), spec.insert_trailing_space);
+        }
     }
 
     #[test]

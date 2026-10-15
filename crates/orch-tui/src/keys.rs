@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::app::App;
 use crate::backend::TuiBackend;
 use crate::clock::Clock;
-use crate::command_bar::{resolve_completion, resolve_suggestions};
+use crate::command_bar::{SuggestionCtx, resolve_completion, resolve_suggestions_in};
 use crate::messages::{MsgType, cycle_preset, preset_types};
 use crate::state::{DetailPanel, InputMode, ViewId, is_runnable};
 use crate::text::is_meta;
@@ -28,6 +28,21 @@ fn clamp_step(cursor: usize, delta: i32, total: usize) -> usize {
     } else {
         (cursor + 1).min(last)
     }
+}
+
+/// The most a single bracketed paste may insert.
+///
+/// A terminal hands over whatever was on the clipboard — a log file, a whole
+/// source tree listing — in one `Event::Paste`, and every frame after that
+/// re-measures the value. 64 KiB is sixteen times the engine's own body cap
+/// (4000 UTF-16 units), so nothing a user can actually *send* is lost.
+pub const MAX_PASTE_BYTES: usize = 64 * 1024;
+
+/// A registered verb and nothing else — `/msg`, not `/msg alice`.
+fn is_bare_verb(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix('/')
+        .is_some_and(|verb| crate::command_bar::spec_for(verb).is_some())
 }
 
 /// Strip a trailing ` [...]` args hint from a suggestion's command text.
@@ -314,6 +329,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.toggle_autonomous_by_id(&agent.id);
                     return;
                 }
+                // Lowercase only: `M` keeps meaning *maximize*, and `m` was
+                // unbound, so no existing binding moves. Inert without a
+                // selection or on a backend that cannot send.
+                (KeyCode::Char('m'), Some(agent)) if self.backend.can_send_message() => {
+                    let name = agent.name.clone();
+                    self.compose_message_to(&name);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -382,6 +405,70 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
     }
 
+    /// A bracketed paste, routed by the same stage order [`App::handle_key`]
+    /// uses (design-v2 §3.9.2).
+    ///
+    /// Inserted through the text APIs rather than replayed as key events: a
+    /// synthesised `Enter` is exactly the bug bracketed paste exists to fix.
+    /// In **normal mode it is dropped** — that is the dangerous half, where a
+    /// pasted `q` quits and a pasted `d` deletes an agent. Both pickers drop
+    /// it explicitly because they are reachable *from* an input mode; the help
+    /// overlay needs no guard, being reachable only from normal mode, where
+    /// the match below drops the paste anyway.
+    ///
+    /// `\r\n` and a lone `\r` normalise to `\n`, and the newlines are *kept*:
+    /// the dominant paste into a message body is a stack trace or multi-line
+    /// instructions, and flattening would corrupt the data at the moment the
+    /// user is trying to hand an agent something precise. The command bar
+    /// renders each one as a dim `⏎` (`widgets/command_bar.rs`).
+    ///
+    /// Capped at [`MAX_PASTE_BYTES`], with a line in the feed when the cut
+    /// happens: a terminal will hand over a pasted file of any size, and
+    /// nothing downstream of here wants it (`MessageService` cuts a body at
+    /// 4000 UTF-16 units, and a wizard field is one line).
+    pub fn handle_paste(&mut self, text: &str) {
+        if text.is_empty() || self.state.show_agent_picker || self.state.show_type_picker {
+            return;
+        }
+        let now = self.now();
+        let mut normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut advisory = None;
+        if normalized.len() > MAX_PASTE_BYTES {
+            let mut cut = MAX_PASTE_BYTES;
+            while !normalized.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            normalized.truncate(cut);
+            let text = format!(
+                "Pasted text cut at {} KiB — paste the rest separately",
+                MAX_PASTE_BYTES / 1024
+            );
+            self.emit(&text, Token::Amber, MsgType::System);
+            advisory = Some(text);
+        }
+        match self.state.input_mode {
+            InputMode::Command => {
+                self.state.command_bar.input.insert_str(&normalized, now);
+                self.state.command_bar.suggestion_index = 0;
+                // The activity feed is not drawn while the bar is open, so an
+                // advisory about the text that just landed *in* the bar goes
+                // above it, where the refusals go (design-v2 §3.6.3). Cleared
+                // by the next keystroke, like them. `retain_command_bar` is
+                // **not** set: only `/msg` keeps the bar open.
+                self.state.command_bar.retained_refusal = advisory.into_iter().collect();
+                // A paste is an edit like any other, so it cannot stand in for
+                // the confirming Enter of a broadcast (gate S2).
+                self.disarm_broadcast();
+            }
+            InputMode::Wizard => {
+                if let Some(wizard) = self.state.wizard.as_mut() {
+                    wizard.insert_paste(&normalized, now);
+                }
+            }
+            InputMode::None => {}
+        }
+    }
+
     /// `M` — maximize the detail panel, or restore the split.
     pub(crate) fn toggle_detail_maximized(&mut self) {
         self.state.detail_maximized = !self.state.detail_maximized;
@@ -392,11 +479,65 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.state.show_help = true;
     }
 
+    /// `m` on the Agents tab: the command bar, prefilled with the recipient
+    /// already chosen and the cursor ready for the body.
+    ///
+    /// The name is quoted here rather than by the caller, so an awkward one
+    /// (`say "hi"`, `🚀 deploy`) round-trips through the grammar.
+    pub(crate) fn compose_message_to(&mut self, name: &str) {
+        self.enter_command_mode();
+        let prefill = format!("/msg {} ", crate::msg::quote_recipient(name));
+        self.state.command_bar.input.reset(&prefill);
+        self.state.command_bar.suggestion_index = 0;
+    }
+
+    /// The suggestion rows for an input, with the agent list `/msg` needs.
+    ///
+    /// The borrow is a statement-scoped temporary, so `&mut self.state` uses
+    /// after it still compile.
+    pub(crate) fn suggestions(&self, value: &str) -> Vec<crate::command_bar::Suggestion> {
+        let order = self.state.sorted_agents();
+        resolve_suggestions_in(
+            value,
+            &SuggestionCtx {
+                agents: &self.state.agents,
+                order: &order,
+            },
+        )
+    }
+
     /// `/` — the command bar, pre-filled with its own prefix.
     pub(crate) fn enter_command_mode(&mut self) {
         self.state.input_mode = InputMode::Command;
         self.state.command_bar.input.reset("/");
         self.state.command_bar.suggestion_index = 0;
+        self.state.command_bar.retained_refusal.clear();
+        // A fresh bar inherits nothing from the last one.
+        self.disarm_broadcast();
+    }
+
+    /// Leave command mode, dropping everything that belonged to that bar: its
+    /// text, its history cursor, the refusal drawn above it and any pending
+    /// broadcast confirmation.
+    ///
+    /// **Every** exit goes through here. An arm that outlives the bar is one
+    /// Enter away from an unconfirmed broadcast, and the `✕` zone in the hint
+    /// row used to leave one behind (gate S2 / code F2).
+    pub(crate) fn leave_command_mode(&mut self) {
+        self.state.input_mode = InputMode::None;
+        self.state.command_bar.input.reset("");
+        self.state.command_bar.history.reset();
+        self.state.command_bar.retained_refusal.clear();
+        self.disarm_broadcast();
+    }
+
+    /// Drop a pending broadcast confirmation and the bar retention that goes
+    /// with it. `retain_command_bar` is consumed by a `mem::take` in the Enter
+    /// handler, so a leaked `true` would send the *next*, unrelated command
+    /// down the retaining branch — the branch that keeps the arm alive.
+    pub(crate) fn disarm_broadcast(&mut self) {
+        self.armed_broadcast = None;
+        self.retain_command_bar = false;
     }
 
     /// Logs `a` — the agent filter picker, drafting the live filter.
@@ -599,14 +740,23 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     fn handle_command_key(&mut self, key: KeyEvent, now: i64) {
         let value = self.state.command_bar.input.value().to_string();
-        let suggestions = resolve_suggestions(&value);
+        let suggestions = self.suggestions(&value);
+        // Any key but Enter means the user has moved on from the refusal —
+        // editing, history, Tab or Esc. Enter is excluded because it is what
+        // sets these lines, and `cmd_msg` clears them itself on every run.
+        //
+        // The broadcast arm goes with it: the confirm prompt *is* that
+        // refusal, so leaving the arm behind would hide an armed broadcast
+        // behind a bar that says nothing — one Enter from sending (gate S2,
+        // frontend F2). Only the Enter that immediately follows the arming
+        // Enter can confirm.
+        if key.code != KeyCode::Enter {
+            self.state.command_bar.retained_refusal.clear();
+            self.disarm_broadcast();
+        }
 
         match key.code {
-            KeyCode::Esc => {
-                self.state.input_mode = InputMode::None;
-                self.state.command_bar.input.reset("");
-                self.state.command_bar.history.reset();
-            }
+            KeyCode::Esc => self.leave_command_mode(),
             KeyCode::Enter => {
                 let trimmed = value.trim().to_string();
                 if trimmed.is_empty() {
@@ -614,28 +764,101 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
                 let mut cmd_to_run = trimmed.clone();
                 if let Some(selected) = suggestions.get(self.state.command_bar.suggestion_index) {
-                    let cmd_part = strip_args_hint(&selected.cmd).to_string();
-                    if cmd_part.starts_with(&trimmed) || trimmed == "/" {
-                        cmd_to_run = cmd_part.clone();
+                    // A separator row carries no command. Inert for Enter and
+                    // Tab alike — and above all it must not clear the input,
+                    // which is what the category headers did.
+                    if selected.is_separator() {
+                        return;
                     }
-                    // A verb with subcommands fills the buffer instead of
-                    // executing.
-                    if selected.subs.is_some() && !cmd_part.contains(' ') {
-                        self.state.command_bar.input.reset(&format!("{cmd_part} "));
+                    // A row that knows its own text fills with it verbatim.
+                    // Before the legacy path, because that path derives the
+                    // command from the *displayed* text, which for an agent
+                    // row is the unescaped name.
+                    //
+                    // Unless the fill would only add the trailing space the
+                    // user is already past: on a **bare verb** whose own row
+                    // is selected the fill adds only the trailing space and
+                    // says nothing about what is missing, where executing it
+                    // shows the verb's Usage line (§3.2, QA note). A recipient
+                    // row always fills — including a finished name, whose
+                    // space is the one the body goes after.
+                    if let Some(insert) = selected.insert.clone()
+                        && !(is_bare_verb(&trimmed) && insert.trim() == trimmed)
+                    {
+                        self.state.command_bar.input.reset(&insert);
                         self.state.command_bar.suggestion_index = 0;
                         return;
                     }
+                    if selected.insert.is_none() {
+                        let cmd_part = strip_args_hint(&selected.cmd).to_string();
+                        if cmd_part.starts_with(&trimmed) || trimmed == "/" {
+                            cmd_to_run = cmd_part.clone();
+                        }
+                        // A verb with subcommands fills the buffer instead of
+                        // executing.
+                        if selected.subs.is_some() && !cmd_part.contains(' ') {
+                            self.state.command_bar.input.reset(&format!("{cmd_part} "));
+                            self.state.command_bar.suggestion_index = 0;
+                            return;
+                        }
+                    }
                 }
                 self.state.input_mode = InputMode::None;
+                // The bar's edit state as the user submitted it, for the
+                // verbs that run against it — `cmd_msg`'s broadcast arm.
+                // Read before the clear below, which is a mutation like any
+                // other.
+                self.submitted_generation = self.state.command_bar.input.generation();
                 self.state.command_bar.input.reset("");
                 self.state.command_bar.suggestion_index = 0;
                 self.state.command_bar.history.push(&cmd_to_run);
                 self.execute_command(&cmd_to_run);
+                // `/msg` refusals and the broadcast arm keep the bar open with
+                // their text, so a recipient the user just chose — or an
+                // ambiguity error asking for an id — does not have to be
+                // retyped. History was pushed above either way, so `↑` works
+                // too. Only `cmd_msg` sets this.
+                if std::mem::take(&mut self.retain_command_bar) {
+                    self.state.input_mode = InputMode::Command;
+                    // The text **as typed**, not the trimmed command: `/msg
+                    // Alice ` with no body is a refusal whose trailing space
+                    // is what keeps the suggestion panel closed, and a
+                    // reopened panel covers the refusal (QA repro B).
+                    let retained = if trimmed == cmd_to_run {
+                        &value
+                    } else {
+                        &cmd_to_run
+                    };
+                    self.state.command_bar.input.reset(retained);
+                    // Putting the bar back is not an edit of it, so the
+                    // generation goes back too: the arm this run may have just
+                    // created was stamped with it, and anything the user now
+                    // does to the bar moves past it.
+                    self.state
+                        .command_bar
+                        .input
+                        .restore_generation(self.submitted_generation);
+                } else {
+                    // Command mode was left, so any pending broadcast is
+                    // disarmed — otherwise running some other verb in between
+                    // would leave an arm that fires on the *first* Enter the
+                    // next time that same text is typed.
+                    self.disarm_broadcast();
+                    self.state.command_bar.retained_refusal.clear();
+                }
             }
             KeyCode::Tab => {
                 if !suggestions.is_empty() {
                     if let Some(selected) = suggestions.get(self.state.command_bar.suggestion_index)
                     {
+                        if selected.is_separator() {
+                            return;
+                        }
+                        if let Some(insert) = selected.insert.clone() {
+                            self.state.command_bar.input.reset(&insert);
+                            self.state.command_bar.suggestion_index = 0;
+                            return;
+                        }
                         let cmd_part = strip_args_hint(&selected.cmd);
                         let filled = if selected.subs.is_some() {
                             format!("{cmd_part} ")

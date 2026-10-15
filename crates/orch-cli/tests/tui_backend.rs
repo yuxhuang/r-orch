@@ -9,17 +9,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use orch_cli::context::{CliContext, EnvFlags};
+use orch_cli::output::Styles;
 use orch_cli::tui::EngineBackend;
+use orch_core::clock::epoch_ms_from_iso;
 use orch_core::storage::ConfigStore;
 use orch_domain::{
-    AgentStatus, ApprovalPolicy, CreateGoalInput, CreateTeamInput, GoalStatus,
-    NotificationPreferences, OrchestratorEventType, ReasoningEffort, Run, RunEvent, RunEventType,
-    RunStatus, TaskStatus, TuiPaletteName, WorkspaceMode, default_config,
+    AgentStatus, ApprovalPolicy, CreateGoalInput, CreateTeamInput, DEFAULT_MESSAGE_TTL_MS,
+    GoalStatus, MessageChannel, MessageStatus, NotificationPreferences, OrchestratorEventType,
+    ReasoningEffort, Run, RunEvent, RunEventType, RunStatus, TaskStatus, TuiPaletteName,
+    WorkspaceMode, default_config,
 };
 use orch_engine::{EngineSeams, FullEngine, build_full_with};
 use orch_infra::storage::{FileConfigStore, Paths};
 use orch_tui::backend::{
-    AgentFields, AgentOpts, CreateTaskOpts, GoalFields, HistoryEntry, TaskFields, TuiBackend,
+    AgentFields, AgentOpts, CreateTaskOpts, GoalFields, HistoryEntry, MessageTarget, TaskFields,
+    TuiBackend,
 };
 
 /// Serializes the two cases that touch the **global** config.
@@ -598,6 +603,357 @@ async fn teams_and_goals_round_trip() {
     );
 
     engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+// ── messaging ────────────────────────────────────────────────────────────
+
+/// A `shell` agent that never execs anything real.
+async fn shell_agent(engine: &FullEngine, name: &str) -> orch_domain::Agent {
+    engine
+        .agent_service
+        .create(orch_domain::CreateAgentInput {
+            name: name.into(),
+            adapter: "shell".into(),
+            command: Some("true".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("create agent")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_message_lands_in_the_recipients_inbox_with_the_cli_defaults() {
+    let (temp, engine) = project().await;
+    let one = shell_agent(&engine, "one").await;
+    let two = shell_agent(&engine, "two").await;
+    let backend = launch(Arc::clone(&engine)).await;
+
+    let to = one.id.clone();
+    let (_backend, ids) = on_draw_thread(backend, move |backend| {
+        backend
+            .send_message(MessageTarget::Agent(to), "ship it")
+            .expect("send")
+    })
+    .await;
+    assert_eq!(ids.len(), 1, "a direct send is always one message");
+
+    let inbox = engine
+        .message_service
+        .list_pending_for_agent(&one.id)
+        .await
+        .expect("inbox");
+    assert_eq!(inbox.len(), 1);
+    let message = &inbox[0];
+    // The id handed back is the id stored.
+    assert_eq!(message.id, ids[0]);
+    assert_eq!(message.channel, MessageChannel::Direct);
+    assert_eq!(message.body, "ship it");
+    assert_eq!(message.status, MessageStatus::Pending);
+    // The three `orch msg send` defaults, mirrored: sender `cli`, no subject
+    // (which the service renders as `(no subject)`) and the 24-hour TTL.
+    assert_eq!(message.from_agent_id, "cli");
+    assert_eq!(message.subject, "(no subject)");
+    let created = epoch_ms_from_iso(&message.created_at).expect("created_at");
+    let expires = epoch_ms_from_iso(message.expires_at.as_deref().expect("expires_at"))
+        .expect("expires_at parses");
+    assert_eq!(expires - created, DEFAULT_MESSAGE_TTL_MS as i64);
+
+    // Addressed to `one` only.
+    assert!(
+        engine
+            .message_service
+            .list_pending_for_agent(&two.id)
+            .await
+            .expect("inbox")
+            .is_empty()
+    );
+
+    engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broadcast_fans_out_to_every_enabled_agent() {
+    let (temp, engine) = project().await;
+    let one = shell_agent(&engine, "one").await;
+    let two = shell_agent(&engine, "two").await;
+    let off = shell_agent(&engine, "off").await;
+    engine
+        .agent_service
+        .disable(&off.id)
+        .await
+        .expect("disable");
+    let backend = launch(Arc::clone(&engine)).await;
+
+    let (backend, ids) = on_draw_thread(backend, |backend| {
+        backend
+            .send_message(MessageTarget::Broadcast, "all hands")
+            .expect("broadcast")
+    })
+    .await;
+    // One id per recipient, and a disabled agent is not one. `cli` is not an
+    // agent, so nothing is dropped as the sender either.
+    assert_eq!(ids.len(), 2);
+    // Fan-out follows `AgentStore::list` order, which is observable (§6.10).
+    let stored = engine.message_service.list_all().await.expect("list");
+    let addressed: Vec<&str> = ids
+        .iter()
+        .map(|id| {
+            stored
+                .iter()
+                .find(|m| &m.id == id)
+                .and_then(|m| m.to_agent_id.as_deref())
+                .expect("every returned id is stored and addressed")
+        })
+        .collect();
+    assert_eq!(addressed, vec![one.id.as_str(), two.id.as_str()]);
+
+    for agent in [&one, &two] {
+        let inbox = engine
+            .message_service
+            .list_pending_for_agent(&agent.id)
+            .await
+            .expect("inbox");
+        assert_eq!(inbox.len(), 1, "{} got {inbox:?}", agent.name);
+        assert_eq!(inbox[0].channel, MessageChannel::Broadcast);
+        assert_eq!(inbox[0].body, "all hands");
+        assert!(ids.contains(&inbox[0].id));
+    }
+    assert!(
+        engine
+            .message_service
+            .list_pending_for_agent(&off.id)
+            .await
+            .expect("inbox")
+            .is_empty()
+    );
+
+    // Naming a disabled agent *directly*, on the other hand, delivers: only
+    // the fan-out skips them, and the message waits in the inbox.
+    let to = off.id.clone();
+    let (_backend, ids) = on_draw_thread(backend, move |backend| {
+        backend
+            .send_message(MessageTarget::Agent(to), "wake up")
+            .expect("a disabled agent can still be messaged directly")
+    })
+    .await;
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        engine
+            .message_service
+            .list_pending_for_agent(&off.id)
+            .await
+            .expect("inbox")
+            .len(),
+        1
+    );
+
+    engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+/// The CLI and the on-disk format must not change: the same body sent through
+/// the dashboard and through `orch msg send` has to produce the same record.
+///
+/// This drives `commands::msg::send` rather than the `orch` binary on purpose
+/// — it is the code path that builds the CLI's `CreateMessageInput`, so this
+/// compares the two inputs where they differ, with no process to spawn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tui_sent_message_is_byte_identical_on_disk_to_a_cli_sent_one() {
+    let (temp, engine) = project().await;
+    let one = shell_agent(&engine, "one").await;
+    let backend = launch(Arc::clone(&engine)).await;
+
+    let to = one.id.clone();
+    let (_backend, ids) = on_draw_thread(backend, move |backend| {
+        backend
+            .send_message(MessageTarget::Agent(to), "same body, same record")
+            .expect("send")
+    })
+    .await;
+
+    orch_cli::commands::msg::send(
+        &engine,
+        &CliContext::new(
+            temp.path().to_path_buf(),
+            false,
+            true,
+            true,
+            false,
+            EnvFlags::default(),
+        ),
+        &Styles::plain(),
+        orch_cli::commands::msg::MsgSendArgs {
+            to_agent_id: &one.id,
+            body: "same body, same record",
+            subject: None,
+            from: None,
+            ttl_ms: None,
+            reply_to: None,
+        },
+    )
+    .await
+    .expect("cli send");
+
+    let stored = engine.message_service.list_all().await.expect("list");
+    assert_eq!(stored.len(), 2, "one from each path");
+    let cli_sent = stored
+        .iter()
+        .find(|m| m.id != ids[0])
+        .expect("the CLI's record");
+
+    // Read the files, not the structs: the claim is about the format on disk.
+    let (from_tui, from_cli) = (
+        read_message_json(&engine, &ids[0]).await,
+        read_message_json(&engine, &cli_sent.id).await,
+    );
+    // Everything but the id and the two timestamps, which cannot match.
+    for volatile in ["id", "created_at", "expires_at"] {
+        assert!(
+            from_tui.get(volatile).is_some(),
+            "{volatile} is missing, so excluding it proves nothing"
+        );
+    }
+    assert_eq!(without_volatile(from_tui), without_volatile(from_cli));
+
+    engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+async fn read_message_json(engine: &FullEngine, id: &str) -> serde_json::Value {
+    let path = engine.paths.message_path(id).expect("message path");
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    serde_json::from_str(&raw).expect("a message file is JSON")
+}
+
+fn without_volatile(mut message: serde_json::Value) -> serde_json::Value {
+    let object = message.as_object_mut().expect("a JSON object");
+    for volatile in ["id", "created_at", "expires_at"] {
+        object.remove(volatile);
+    }
+    message
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_over_the_cap_is_cut_by_the_service_and_not_by_the_backend() {
+    let (temp, engine) = project().await;
+    let one = shell_agent(&engine, "one").await;
+    let backend = launch(Arc::clone(&engine)).await;
+
+    let to = one.id.clone();
+    let (_backend, ids) = on_draw_thread(backend, move |backend| {
+        backend
+            .send_message(MessageTarget::Agent(to), &"b".repeat(5_000))
+            .expect("send")
+    })
+    .await;
+
+    // 4000 UTF-16 units, applied by the service's `truncate_utf16` — the
+    // backend hands it the raw 5000 and never cuts anything itself.
+    let inbox = engine
+        .message_service
+        .list_pending_for_agent(&one.id)
+        .await
+        .expect("inbox");
+    assert_eq!(inbox[0].id, ids[0]);
+    let utf16_len: usize = inbox[0].body.chars().map(char::len_utf16).sum();
+    assert_eq!(utf16_len, 4_000);
+
+    engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_message_reports_the_services_own_text_and_writes_nothing() {
+    let (temp, engine) = project().await;
+    let one = shell_agent(&engine, "one").await;
+    let backend = launch(Arc::clone(&engine)).await;
+
+    let to = one.id.clone();
+    let (backend, errors) = on_draw_thread(backend, move |backend| {
+        [
+            backend
+                .send_message(MessageTarget::Agent(to), "   ")
+                .expect_err("empty body"),
+            backend
+                .send_message(MessageTarget::Broadcast, "")
+                .expect_err("empty body"),
+            backend
+                .send_message(MessageTarget::Agent("agt_ghost".into()), "hello?")
+                .expect_err("unknown recipient"),
+        ]
+    })
+    .await;
+    assert_eq!(
+        errors,
+        [
+            "Message body is required",
+            "Message body is required",
+            "Recipient agent not found: agt_ghost",
+        ]
+    );
+    assert!(
+        engine
+            .message_service
+            .list_all()
+            .await
+            .expect("list")
+            .is_empty()
+    );
+
+    // Nobody to tell, on the other hand, is a success: `orch msg broadcast`
+    // prints `0 agent(s)` and exits 0 rather than failing.
+    engine.agent_service.remove(&one.id).await.expect("remove");
+    let (_backend, ids) = on_draw_thread(backend, |backend| {
+        backend
+            .send_message(MessageTarget::Broadcast, "anyone?")
+            .expect("an empty fan-out is not a failure")
+    })
+    .await;
+    assert!(ids.is_empty());
+
+    engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_observer_mode_a_message_still_reaches_the_other_processs_tree() {
+    // Messaging is the one mutation that needs no orchestrator: `send` writes
+    // files and takes no project lock, so an observer-mode dashboard can post
+    // to a mailbox the *other* process will drain.
+    let (temp, engine) = project().await;
+    let one = shell_agent(&engine, "one").await;
+    let held = orch_engine::FileLock::new(engine.paths.lock_path());
+    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
+
+    let backend = launch(Arc::clone(&engine)).await;
+    assert!(backend.context().observer_mode, "expected observer mode");
+
+    let to = one.id.clone();
+    let (_backend, ids) = on_draw_thread(backend, move |backend| {
+        backend
+            .send_message(MessageTarget::Agent(to), "from the observer")
+            .expect("observer mode must still send")
+    })
+    .await;
+
+    // Read back through a second engine on the same tree — the stand-in for
+    // the process that owns the orchestrator. The message is on disk, not just
+    // in this process's memory.
+    let external = build_isolated(temp.path()).await.expect("second engine");
+    let inbox = external
+        .message_service
+        .list_pending_for_agent(&one.id)
+        .await
+        .expect("inbox");
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].id, ids[0]);
+    assert_eq!(inbox[0].body, "from the observer");
+
+    orch_engine::ProjectLock::release(&held).await;
     drop(temp);
 }
 

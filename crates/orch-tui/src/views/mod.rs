@@ -40,6 +40,7 @@ pub struct Caps {
     pub can_add_agent: bool,
     pub can_create_goal: bool,
     pub can_force_stop_agent: bool,
+    pub can_send_message: bool,
 }
 
 impl Caps {
@@ -121,6 +122,7 @@ pub fn draw<B: TuiBackend, C: Clock>(frame: &mut Frame, app: &App<B, C>) -> HitM
         can_add_agent: app.backend.can_add_agent(),
         can_create_goal: app.backend.can_create_goal(),
         can_force_stop_agent: app.backend.can_force_stop_agent(),
+        can_send_message: app.backend.can_send_message(),
     };
     let ctx = RenderCtx::new(&app.state, caps, app.now(), frame.area());
     render(frame, frame.area(), &ctx);

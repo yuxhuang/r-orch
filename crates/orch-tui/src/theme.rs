@@ -301,6 +301,9 @@ pub const PLUS_CIRCLE: &str = "⊕";
 pub const WARN: &str = "⚠";
 pub const HOURGLASS: &str = "⏳";
 pub const EM_DASH: &str = "—";
+/// A newline inside a command-bar value — pasted bodies keep their line
+/// structure, and the bar is a single *visual* line (design-v2 §3.9.3).
+pub const RETURN_GLYPH: &str = "⏎";
 pub const ELLIPSIS: char = '…';
 pub const PAPERCLIP: &str = "📎";
 pub const BRAIN: &str = "🧠";

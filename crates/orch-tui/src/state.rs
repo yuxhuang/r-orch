@@ -293,6 +293,16 @@ pub struct CommandBarState {
     pub input: TextInput,
     pub suggestion_index: usize,
     pub history: CommandHistory,
+    /// The lines of the `/msg` refusal (or broadcast confirm) the bar is being
+    /// kept open for, drawn in the otherwise-empty suggestion rows just above
+    /// it.
+    ///
+    /// They are also in the activity feed, but the feed is **not rendered
+    /// while the bar is open** — the bottom panel belongs to the suggestion
+    /// list — so without this the one thing the user needs to read is the one
+    /// thing off screen (design-v2 §3.6.3 × §3.5, found in the live check).
+    /// Cleared by the next keystroke, a send, `Esc` or leaving command mode.
+    pub retained_refusal: Vec<String>,
 }
 
 /// Which detail panel is open, if any.

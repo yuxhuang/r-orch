@@ -393,21 +393,22 @@ not a fault.
 
 ---
 
-## A leaked mouse mode after an abnormal exit
+## A leaked mouse or paste mode after an abnormal exit
 
 **Symptom.** `orch tui` is gone, but clicking in that terminal prints gibberish like `[<0;44;8M`, or
-the shell receives it as input.
+the shell receives it as input. Or a paste into that terminal arrives wrapped in `^[[200~` … `^[[201~`
+(often shown as `[200~`), with the markers landing in your shell command instead of the text.
 
-**Why.** Mouse reporting is a terminal mode the application turns on and is responsible for turning
-off. Every normal exit does: `q`, a signal, a panic, and a terminal that hangs up all run the same
-restore (PARITY.md §14.39), and the disable is written *first*, before leaving the alternate screen.
-`SIGKILL` and an abort cannot be covered — nothing runs on the way out.
+**Why.** Mouse reporting and bracketed paste are terminal modes the application turns on and is
+responsible for turning off. Every normal exit does: `q`, a signal, a panic, and a terminal that hangs
+up all run the same restore (PARITY.md §14.39), and the disables are written *first*, before leaving
+the alternate screen. `SIGKILL` and an abort cannot be covered — nothing runs on the way out.
 
 **Fix.**
 
 ```bash
-printf '\033[?1006l\033[?1000l'   # turn the two modes back off
-reset                               # or just reset the terminal wholesale
+printf '\033[?1006l\033[?1000l\033[?2004l'   # mouse SGR, mouse, bracketed paste
+reset                                         # or just reset the terminal wholesale
 ```
 
 ---

@@ -81,6 +81,8 @@ pub enum FooterAction {
     Edit,
     StopAgent,
     ToggleAutonomous,
+    /// `m` on the Agents tab: compose a message to the selection.
+    Message,
     PauseGoal,
     ShowAllTasks,
     Delete,

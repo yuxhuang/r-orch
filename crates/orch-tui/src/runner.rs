@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -206,6 +206,10 @@ pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exi
             // rather than a gap left open by accident.
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                // Only reaches us with bracketed paste on. Without it the
+                // paste arrives as keys, where its first newline submits and
+                // the rest lands in normal mode — see `TerminalGuard::enter`.
+                Event::Paste(text) => app.handle_paste(&text),
                 Event::Mouse(mouse) => {
                     app.handle_mouse(mouse);
                     // An action that changed the layout retires the geometry,
@@ -270,6 +274,10 @@ struct TerminalGuard {
     /// Whether the terminal reported support for the keyboard enhancement
     /// protocol, i.e. whether flags were actually pushed and must be popped.
     enhanced_keys: bool,
+    /// Whether bracketed paste was enabled, so `Drop` disables exactly what
+    /// was turned on. Best-effort like the mouse: a terminal that ignores the
+    /// mode must not fail launch.
+    bracketed_paste: bool,
     /// Whether mouse capture is on **right now**. The guard's flag always
     /// matches what the terminal was told, so `Drop` never writes a disable
     /// for a mode that is already off, and the toggle is one-way data flow:
@@ -299,6 +307,7 @@ impl TerminalGuard {
         let mut guard = TerminalGuard {
             terminal: None,
             enhanced_keys: false,
+            bracketed_paste: false,
             mouse: false,
         };
         let mut stdout = io::stdout();
@@ -320,6 +329,14 @@ impl TerminalGuard {
             // Recorded only once the push actually went out, so `Drop` never
             // pops flags that were never set.
             guard.enhanced_keys = true;
+        }
+        // Bracketed paste, so a pasted body arrives as one `Event::Paste`
+        // rather than as keys. Without it the first pasted newline is an
+        // `Enter` — which submits a real message — and the remaining
+        // characters land in normal mode, where `q` quits and `d` on the
+        // Agents tab deletes an agent (design-v2 §3.9).
+        if execute!(stdout, EnableBracketedPaste).is_ok() {
+            guard.bracketed_paste = true;
         }
         if mouse_env_allows() {
             set_mouse_capture(&mut stdout, true)?;
@@ -352,6 +369,9 @@ impl Drop for TerminalGuard {
         // terminal cannot abort the rest of the sequence.
         if self.mouse {
             let _ = set_mouse_capture(&mut stdout, false);
+        }
+        if self.bracketed_paste {
+            let _ = execute!(stdout, DisableBracketedPaste);
         }
         if self.enhanced_keys {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);

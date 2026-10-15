@@ -22,6 +22,22 @@ use crate::theme::{Palette, Token};
 use crate::wizard::engine::{Values, WizardKind};
 use crate::wizard::{Wizard, configs};
 
+/// A broadcast waiting for its confirming second Enter (design-v2 §3.4.4).
+///
+/// Keyed to the command-bar text **and** to the bar's edit generation, so the
+/// arm belongs to one edit state rather than to a string: a backspace and
+/// retype, an `↑` recall of the identical command, or any other path that
+/// rewrites the bar all land on a new generation and have to arm again. The
+/// text alone was not enough — the arm outlived the bar itself through the
+/// mouse `✕` (gate S2, frontend F2, QA info 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastArm {
+    /// The `/msg` tail the arm was created for, byte for byte.
+    pub tail: String,
+    /// `TextInput::generation` at the moment of arming.
+    pub generation: u64,
+}
+
 pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     pub state: AppState,
     pub backend: B,
@@ -29,6 +45,17 @@ pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     pub model_catalog: ModelCatalog,
     /// `messageBatchMs`; `0` flushes synchronously.
     pub batch_ms: i64,
+    /// Set by `cmd_msg` on a refusal or when a broadcast arms: the Enter
+    /// handler then restores command mode with the text intact instead of
+    /// clearing it. Cleared unconditionally once honoured.
+    pub retain_command_bar: bool,
+    /// The pending broadcast confirmation, if any.
+    pub armed_broadcast: Option<BroadcastArm>,
+    /// `TextInput::generation` of the command bar as the running command was
+    /// submitted — the stamp [`BroadcastArm`] is keyed to. `0` for a command
+    /// that did not come from the bar at all (`execute_command` directly,
+    /// which no interactive path uses).
+    pub(crate) submitted_generation: u64,
     last_anim_at: i64,
     last_refresh_at: i64,
 }
@@ -66,6 +93,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             clock,
             model_catalog: ModelCatalog::new(),
             batch_ms: MESSAGE_BATCH_MS,
+            retain_command_bar: false,
+            armed_broadcast: None,
+            submitted_generation: 0,
             last_anim_at: now,
             last_refresh_at: now,
         };

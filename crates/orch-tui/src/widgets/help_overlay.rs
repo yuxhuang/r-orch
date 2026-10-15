@@ -18,9 +18,12 @@ const INNER_W: usize = COL_W * 3 + 3 + 3 + 2;
 const OUTER_W: usize = INNER_W + 2;
 const MAX_ROWS: usize = 10;
 
-// Eight entries against `MAX_ROWS = 10`, so adding `F2` does not change the
-// overlay's layout.
-pub const NAVIGATION: [(&str, &str); 8] = [
+// Nine entries against `MAX_ROWS = 10`, so the two r-orch additions (`F2` and
+// `m`) do not change the overlay's layout. They sit in this column because
+// `ACTIONS` is already *at* `MAX_ROWS` and growing it would move the box;
+// `m` belongs with the keys rather than with the `/msg` verb, which `COMMANDS`
+// already lists.
+pub const NAVIGATION: [(&str, &str); 9] = [
     ("↑↓/j/k", "Navigate"),
     ("Tab/←→", "Switch tabs"),
     ("Enter", "Detail view"),
@@ -29,6 +32,7 @@ pub const NAVIGATION: [(&str, &str); 8] = [
     ("A", "Agents tab"),
     ("L", "Logs tab"),
     ("F2", "Mouse on/off"),
+    ("m", "Message agent"),
 ];
 
 pub const ACTIONS: [(&str, &str); 10] = [
@@ -44,9 +48,10 @@ pub const ACTIONS: [(&str, &str); 10] = [
     ("Z", "Undo delete"),
 ];
 
-pub const COMMANDS: [(&str, &str); 7] = [
+pub const COMMANDS: [(&str, &str); 8] = [
     ("/", "Command mode"),
     ("/task add", "Create task"),
+    ("/msg", "Message agent"),
     ("/run", "Execute"),
     ("/watch", "Auto-dispatch"),
     ("/config", "Settings"),
