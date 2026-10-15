@@ -878,6 +878,21 @@ Rules:
      no registry query happens,
   4. **asserts the oracle spawned no `npm` and opened no socket** (V31). CI runs the parity job with
      networking disabled.
+  **The `HOME` override belongs on the `node .../dist/cli.js` invocation and nowhere else.** This is a real
+  trap and it has already cost 670 MB: `RUSTUP_HOME` and `CARGO_HOME` default to paths **under `HOME`**, so
+  exporting a sandbox `HOME` around a `cargo` command makes rustup re-download the entire toolchain into the
+  tmpdir — and the same shape of mistake once produced a run that passed by executing **zero tests**. So:
+
+  - **do** sandbox `HOME` for each direct oracle invocation (`node .../dist/cli.js …`, with `CI=1`);
+  - **do not** sandbox `HOME` for `cargo`, `cargo run -p xtask -- parity`, or anything that shells out to
+    cargo. The harness sandboxes per project *internally*; wrapping it from outside breaks the toolchain
+    without making anything more hermetic.
+
+  **And there is no read-only oracle invocation to exempt.** Measured: the oracle writes
+  `~/.orchestry/update-check.json` on an ordinary `orch task list`, not only on an update path. So the
+  natural shortcut — *"it's only a list, it can't write anything"* — is false. Every `node` invocation of the
+  oracle gets the sandbox, without exception.
+
   Without step 3 the gate is green in an offline container and red on a laptop — or the reverse — with no code
   change, and a parity run can leave the developer's real TUI claiming a restart is needed.
 - **No real AI CLI is ever needed.** Agents use the `shell` adapter, or a **fake agent script** — a small
