@@ -1427,4 +1427,6 @@ mod tests {
                 .is_some()
         );
     }
+
+    include!("worker_hardening_tests.rs");
 }

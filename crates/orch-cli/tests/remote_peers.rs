@@ -1159,3 +1159,180 @@ fn s13_registry_metadata_change_preserves_inflight_execution_and_exactly_one_eff
     assert_eq!(worker.tasks().len(), 1);
     assert_eq!(text(worker.path("effect")), "effect\n");
 }
+
+#[test]
+fn s14_two_remotes_route_each_os_and_offline_capability_does_not_block_other_worker() {
+    let mut mac = Peer::new("mac-worker");
+    mac.os = "macos".into();
+    let mut linux = Peer::new("linux-worker");
+    linux.os = "linux".into();
+    let mut controller = Peer::new("controller");
+    controller.os = "controller-test".into();
+    let mac_agent = mac.add_agent("mac", "echo mac", "shared");
+    let linux_agent = linux.add_agent("linux", "echo linux", "shared");
+    let mac_addr = port();
+    let linux_addr = port();
+    controller.ok(&["remote", "add", "mac", &mac_addr.to_string()]);
+    controller.ok(&["remote", "add", "linux", &linux_addr.to_string()]);
+    mac.start(Some(mac_addr));
+    linux.start(Some(linux_addr));
+    controller.start(None);
+    let peers = [&controller, &mac, &linux];
+    controller.online("mac", &peers);
+    controller.online("linux", &peers);
+    for (cap, agent) in [
+        ("macos", remote_id(&mac_agent, "mac")),
+        ("linux", remote_id(&linux_agent, "linux")),
+    ] {
+        let task = controller.task(
+            "route while both online",
+            None,
+            &["--labels", &format!("cap:{cap}")],
+        );
+        let done = controller.wait_task(&task, "done", &peers);
+        assert_eq!(done["assignee"], agent);
+    }
+    mac.stop(Signal::SIGKILL);
+    wait("mac offline", &peers, || {
+        controller.status("mac")["online"] == false
+    });
+    let waiting = controller.task(
+        "mac waits",
+        None,
+        &["--labels", "cap:macos", "--priority", "1"],
+    );
+    let available = controller.task(
+        "linux still dispatches",
+        None,
+        &["--labels", "cap:linux", "--priority", "2"],
+    );
+    let done = controller.wait_task(&available, "done", &peers);
+    assert_eq!(done["assignee"], remote_id(&linux_agent, "linux"));
+    assert_eq!(done["proof"]["remote"], "linux");
+    assert_eq!(controller.task_value(&waiting)["status"], "todo");
+    assert!(controller.runs(&waiting).is_empty());
+    assert!(
+        controller
+            .ok(&["task", "show", &waiting])
+            .contains("no online agent with cap macos")
+    );
+    mac.start(Some(mac_addr));
+    controller.online("mac", &peers);
+    let done = controller.wait_task(&waiting, "done", &peers);
+    assert_eq!(done["assignee"], remote_id(&mac_agent, "mac"));
+    assert_eq!(done["proof"]["remote"], "mac");
+    assert_eq!(mac.tasks().len(), 2);
+    assert_eq!(linux.tasks().len(), 2);
+}
+
+#[test]
+fn s15_offline_message_survives_controller_restart_and_delivers_after_worker_reconnect() {
+    let worker = Peer::new("worker");
+    let controller = Peer::new("controller");
+    let agent = worker.add_agent("recipient", "echo unused", "shared");
+    let addr = port();
+    connect(&controller, &worker, "w1", addr);
+    worker.stop(Signal::SIGKILL);
+    wait(
+        "worker offline before send",
+        &[&controller, &worker],
+        || controller.status("w1")["online"] == false,
+    );
+    let sent = controller.json(&[
+        "msg",
+        "send",
+        &remote_id(&agent, "w1"),
+        "offline-message",
+        "--subject",
+        "queued",
+    ]);
+    let id = sent[0]["id"].as_str().unwrap();
+    assert_eq!(controller.message(id)["status"], "pending");
+    assert!(worker.message(id).is_null());
+    controller.stop(Signal::SIGTERM);
+    controller.start(None);
+    assert_eq!(controller.message(id)["status"], "pending");
+    worker.start(Some(addr));
+    controller.online("w1", &[&controller, &worker]);
+    wait(
+        "offline message acknowledged after reconnect",
+        &[&controller, &worker],
+        || {
+            controller.message(id)["status"] == "delivered"
+                && worker.message(id)["body"] == "offline-message"
+        },
+    );
+    assert_eq!(worker.message(id)["to_agent_id"], agent);
+    assert_eq!(worker.message(id)["from_agent_id"], "cli@controller");
+    let messages = worker.json(&["msg", "inbox", &agent]);
+    assert_eq!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["id"] == id)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn s16_removing_remote_with_pending_message_preserves_outbox_without_delivering_to_other_peer() {
+    let removed = Peer::new("removed-worker");
+    let survivor = Peer::new("surviving-worker");
+    let controller = Peer::new("controller");
+    let recipient = removed.add_agent("recipient", "echo unused", "shared");
+    let other = survivor.add_agent("other", "echo unused", "shared");
+    let removed_addr = port();
+    let survivor_addr = port();
+    controller.ok(&["remote", "add", "removed", &removed_addr.to_string()]);
+    controller.ok(&["remote", "add", "survivor", &survivor_addr.to_string()]);
+    removed.start(Some(removed_addr));
+    survivor.start(Some(survivor_addr));
+    controller.start(None);
+    let peers = [&controller, &removed, &survivor];
+    controller.online("removed", &peers);
+    controller.online("survivor", &peers);
+    removed.stop(Signal::SIGKILL);
+    wait("removed worker offline", &peers, || {
+        controller.status("removed")["online"] == false
+    });
+    let sent = controller.json(&[
+        "msg",
+        "send",
+        &remote_id(&recipient, "removed"),
+        "pending-removal",
+    ]);
+    let id = sent[0]["id"].as_str().unwrap();
+    assert_eq!(controller.message(id)["status"], "pending");
+    controller.ok(&["remote", "remove", "removed"]);
+    controller.stop(Signal::SIGTERM);
+    removed.start(Some(removed_addr));
+    controller.start(None);
+    controller.online("survivor", &peers);
+    // An acknowledged message on the surviving link is a polling barrier.
+    let barrier = controller.json(&["msg", "send", &remote_id(&other, "survivor"), "barrier"]);
+    let barrier_id = barrier[0]["id"].as_str().unwrap();
+    wait("surviving link still forwards messages", &peers, || {
+        controller.message(barrier_id)["status"] == "delivered"
+    });
+    assert_eq!(
+        controller
+            .json(&["remote", "list"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(controller.message(id)["status"], "pending");
+    assert_eq!(
+        controller.message(id)["to_agent_id"],
+        remote_id(&recipient, "removed")
+    );
+    assert!(removed.message(id).is_null());
+    assert!(survivor.message(id).is_null());
+    assert!(
+        read_json(removed.path(".orchestry/remotes/_listener.json"))["controller_name"].is_null()
+    );
+    assert!(!controller.path(".orchestry/remotes/removed.json").exists());
+}
