@@ -19,10 +19,6 @@
 
 use crate::output::{Color, Styles};
 
-/// The npm package the reference installs itself from, kept because it is what
-/// a user has to type.
-pub const PACKAGE_NAME: &str = "@oxgeneral/orch";
-
 /// The version reported by `--version`, and the one this command prints.
 pub const VERSION: &str = "1.0.34";
 
@@ -40,8 +36,11 @@ pub fn render(styles: &Styles, check: bool) -> String {
         "  {}\n",
         styles.dim("This build does not update itself.")
     ));
-    out.push_str("  To install the latest version:\n");
-    out.push_str(&format!("    npm install -g {PACKAGE_NAME}\n"));
+    // r-orch is built from source; the reference's `npm install -g` line does
+    // not apply to it.
+    out.push_str("  To install the latest version, from your r-orch checkout:\n");
+    out.push_str("    git pull\n");
+    out.push_str("    cargo install --path crates/orch-cli\n");
     out.push('\n');
     // `--check` is part of the surface; saying so beats pretending the flag
     // changed something.
@@ -69,10 +68,24 @@ mod tests {
             out,
             "\n  orch update · version 1.0.34\n\
              \n  This build does not update itself.\n\
-             \x20 To install the latest version:\n\
-             \x20   npm install -g @oxgeneral/orch\n\
+             \x20 To install the latest version, from your r-orch checkout:\n\
+             \x20   git pull\n\
+             \x20   cargo install --path crates/orch-cli\n\
              \n"
         );
+    }
+
+    #[test]
+    fn never_tells_the_user_to_use_npm() {
+        // r-orch is not an npm package; the reference's install line would
+        // install the TypeScript original instead.
+        for check in [false, true] {
+            let out = render(&Styles::plain(), check);
+            assert!(
+                !out.contains("npm"),
+                "npm is back in the update text:\n{out}"
+            );
+        }
     }
 
     #[test]

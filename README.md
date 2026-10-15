@@ -148,7 +148,7 @@ cargo xtask crate-graph           # asserts the inter-crate dependency edges
 The differential harness needs the reference implementation built once:
 
 ```bash
-./parity/setup.sh                 # clones the pinned commit, applies parity/patches/, npm ci && npm run build
+./parity/setup.sh                 # clones the pinned TS reference, applies parity/patches/, builds it (needs Node and npm)
 cargo xtask parity                # runs every scenario against both binaries
 ```
 

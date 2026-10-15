@@ -2667,7 +2667,7 @@ Verified in source, because this decides the r-orch behaviour:
 
 | Aspect | Decision |
 |---|---|
-| `orch update` / `orch update --check` | Command, flag and **exit 0** preserved. Prints the current version and **how to install** an update. |
+| `orch update` / `orch update --check` | Command, flag and **exit 0** preserved. Prints the current version and **how to install** an update: `git pull` then `cargo install --path crates/orch-cli`, run from the r-orch checkout. It never prints the original's `npm install -g @oxgeneral/orch`, which would install the TypeScript package rather than r-orch. No scenario runs `update` (fixtures/scenarios/README.md), so this has no effect on the differential comparison. |
 | Network access | **None.** No registry query, no release-channel query. |
 | Self-replacement | **None.** The binary never downloads or overwrites itself. |
 | Post-command background check | **Removed entirely.** |
