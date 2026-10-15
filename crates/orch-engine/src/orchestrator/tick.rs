@@ -102,11 +102,11 @@ impl Orchestrator {
         .await;
 
         for (index, (task_id, entry)) in entries.iter().enumerate() {
-            let live = tasks
+            let task = tasks
                 .get(index)
                 .and_then(|result| result.as_ref().ok())
-                .and_then(Option::as_ref)
-                .is_some_and(|task| !is_terminal(task.status));
+                .and_then(Option::as_ref);
+            let live = task.is_some_and(|task| !is_terminal(task.status));
 
             // 1. The task is gone or already terminal: the running entry is
             // stale bookkeeping, nothing more.
@@ -161,6 +161,41 @@ impl Orchestrator {
             // the success handler still queued for the state lock. Checking
             // the PID or the stall clock here would misread that as a crash.
             if self.inner.active_collectors.lock().await.contains(task_id) {
+                continue;
+            }
+
+            // A worker mirror can outlive its engine's result collector. PID
+            // disappearance then proves only that it stopped, not whether its
+            // effects succeeded. Never export this as a retryable failure.
+            // Keep the agent reserved while it lives, and do not stall-kill a
+            // stored PID: telemetry was lost and the PID may have been reused.
+            if task.is_some_and(|task| {
+                task.labels
+                    .iter()
+                    .any(|label| label.starts_with("remote-ctl:"))
+            }) {
+                if self.deps().processes.is_alive(entry.pid) {
+                    continue;
+                }
+                self.deps()
+                    .run_service
+                    .finish(
+                        &entry.run_id,
+                        orch_domain::RunStatus::Cancelled,
+                        None,
+                        Some("Worker execution collector lost; outcome unknown".into()),
+                    )
+                    .await?;
+                self.deps()
+                    .task_service
+                    .update_status(task_id, TaskStatus::Cancelled)
+                    .await?;
+                self.deps()
+                    .agent_service
+                    .set_status(&entry.agent_id, AgentStatus::Idle)
+                    .await?;
+                state.running.shift_remove(task_id);
+                state.retry_queue.retain(|retry| retry.task_id != *task_id);
                 continue;
             }
 

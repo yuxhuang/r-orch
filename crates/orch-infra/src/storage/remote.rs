@@ -2,6 +2,11 @@
 
 use orch_core::error::{Error, Result};
 use orch_domain::{Agent, AgentStatus, InboundStatus, RemoteConfig, RemoteRef, RemoteStatus};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    sync::{Arc, Mutex},
+};
 
 use super::fs_utils::{atomic_write, ensure_dir, read_json, read_yaml, write_json, write_yaml};
 use super::lock::{check_lock, is_stale_by_age};
@@ -63,14 +68,60 @@ pub fn validate_snapshot(agents: &[Agent]) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct FileRemoteStore {
     paths: Paths,
+    // Locks belong to the publisher's lifetime, never to a cached snapshot.
+    health: Arc<Mutex<BTreeMap<String, File>>>,
 }
-
-// Like the other file stores, serialize read-modify-write within this process.
-static REGISTRY_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl FileRemoteStore {
     pub fn new(paths: Paths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            health: Arc::default(),
+        }
+    }
+
+    /// Withdraw live health without any filesystem mutation. This also works
+    /// when the status directory is read-only or its filesystem is full.
+    pub fn mark_link_offline(&self, alias: &str) {
+        self.health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(alias);
+    }
+
+    fn health_path(&self, alias: &str) -> std::path::PathBuf {
+        self.paths.remotes_dir().join(format!("{alias}.health"))
+    }
+
+    fn link_is_live(&self, alias: &str) -> bool {
+        let Ok(file) = File::open(self.health_path(alias)) else {
+            return false;
+        };
+        // A separate open file description observes the exclusive publisher
+        // lock even in this process. Missing/unreadable/unlocked means offline.
+        matches!(
+            file.try_lock_shared(),
+            Err(std::fs::TryLockError::WouldBlock)
+        )
+    }
+
+    fn mark_link_online(&self, alias: &str) -> Result<()> {
+        let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if !health.contains_key(alias) {
+            let path = self.health_path(alias);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| Error::io("Open peer health lease", &path, e))?;
+            file.try_lock().map_err(|e| {
+                Error::other(format!("Lock peer health lease {}: {e}", path.display()))
+            })?;
+            health.insert(alias.into(), file);
+        }
+        Ok(())
     }
 
     pub async fn list(&self) -> Result<Vec<RemoteConfig>> {
@@ -90,12 +141,34 @@ impl FileRemoteStore {
         Ok(entries)
     }
 
+    async fn lock_registry(&self) -> Result<File> {
+        ensure_dir(&self.paths.root()).await?;
+        let path = self.paths.remotes_path().with_extension("lock");
+        // Lock a stable inode, not the registry that atomic_write replaces or
+        // the engine's owner lock. Never unlink this file: the OS releases the
+        // lock on close/process death, including an interrupted writer.
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| Error::io("Open remote registry lock", &path, e))?;
+            file.lock()
+                .map_err(|e| Error::io("Lock remote registry", &path, e))?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| Error::other(format!("Acquire remote registry lock: {e}")))?
+    }
+
     pub async fn add(&self, config: RemoteConfig) -> Result<()> {
         validate_alias(&config.alias)?;
         if config.addr.trim().is_empty() {
             return Err(Error::invalid_arguments("Remote address must not be empty"));
         }
-        let _guard = REGISTRY_MUTEX.lock().await;
+        let _guard = self.lock_registry().await?;
         let mut entries = self.list().await?;
         if entries.iter().any(|entry| entry.alias == config.alias) {
             return Err(Error::other(format!(
@@ -109,7 +182,7 @@ impl FileRemoteStore {
 
     pub async fn remove(&self, alias: &str) -> Result<()> {
         validate_alias(alias)?;
-        let _guard = REGISTRY_MUTEX.lock().await;
+        let _guard = self.lock_registry().await?;
         let mut entries = self.list().await?;
         if !entries.iter().any(|entry| entry.alias == alias) {
             return Err(Error::other(format!("Remote {alias} not found")));
@@ -140,22 +213,41 @@ impl FileRemoteStore {
             validate_snapshot(&status.agents)?;
             if !self.owner_is_live().await {
                 status.online = false;
+            } else if status.online && !self.link_is_live(alias) {
+                status.online = false;
+                status.last_error = Some("Live peer link unavailable; cached online status is not authoritative. Check peer connection and status persistence errors.".into());
             }
         }
         Ok(status)
     }
 
+    /// Publish health only after the snapshot is durable. Retain this store
+    /// for the link's lifetime; dropping its last clone withdraws all leases.
     pub async fn write_status(&self, status: &RemoteStatus) -> Result<()> {
         validate_alias(&status.alias)?;
         validate_snapshot(&status.agents)?;
-        write_json(
+        if !status.online {
+            self.mark_link_offline(&status.alias);
+        }
+        let result = write_json(
             &self
                 .paths
                 .remotes_dir()
                 .join(format!("{}.json", status.alias)),
             status,
         )
-        .await
+        .await;
+        let result = result.and_then(|()| {
+            if status.online {
+                self.mark_link_online(&status.alias)
+            } else {
+                Ok(())
+            }
+        });
+        if result.is_err() {
+            self.mark_link_offline(&status.alias);
+        }
+        result
     }
 
     pub async fn read_inbound(&self) -> Result<Option<InboundStatus>> {
@@ -407,6 +499,27 @@ mod tests {
             directory.resolve("agt_test1@w1", vec![]).await.unwrap(),
             Some(remote.clone())
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_status_publisher_makes_cached_online_snapshot_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        let store = FileRemoteStore::new(paths.clone());
+        store.add(config("w1")).await.unwrap();
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        store.write_status(&status("w1")).await.unwrap();
+        let reader = FileRemoteStore::new(paths.clone());
+        assert!(reader.read_status("w1").await.unwrap().unwrap().online);
+        drop(store);
+        let cached: RemoteStatus = read_json(&paths.remotes_dir().join("w1.json"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cached.online);
+        let observed = reader.read_status("w1").await.unwrap().unwrap();
+        assert!(!observed.online);
+        assert!(observed.last_error.is_some());
     }
 
     #[tokio::test]

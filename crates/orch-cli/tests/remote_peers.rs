@@ -196,6 +196,7 @@ impl Peer {
             .env("GIT_COMMITTER_NAME", "Remote peers test")
             .env("GIT_COMMITTER_EMAIL", "peer-test@example.invalid")
             .env("NO_COLOR", "1")
+            .env_remove("RUST_LOG")
             .env("TERM", "dumb");
         command
     }
@@ -748,6 +749,281 @@ fn s05_worker_outage_marks_offline_and_queued_task_dispatches_after_restart() {
     assert_eq!(controller.runs(&task).len(), 1);
 }
 
+struct HealthLeaseFixture {
+    _dir: tempfile::TempDir,
+    paths: orch_infra::storage::paths::Paths,
+    publisher: orch_infra::storage::remote::FileRemoteStore,
+    status: orch_domain::RemoteStatus,
+}
+
+impl HealthLeaseFixture {
+    async fn new() -> Self {
+        use orch_infra::storage::{lock::acquire_lock, paths::Paths, remote::FileRemoteStore};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        let publisher = FileRemoteStore::new(paths.clone());
+        let status = orch_domain::RemoteStatus {
+            alias: "w1".into(),
+            addr: "127.0.0.1:1".into(),
+            online: true,
+            last_seen: None,
+            last_error: None,
+            peer_name: None,
+            instance_id: None,
+            os: None,
+            agents: vec![],
+        };
+        publisher.write_status(&status).await.unwrap();
+        Self {
+            _dir: dir,
+            paths,
+            publisher,
+            status,
+        }
+    }
+
+    fn reader(&self) -> orch_infra::storage::remote::FileRemoteStore {
+        orch_infra::storage::remote::FileRemoteStore::new(self.paths.clone())
+    }
+
+    fn deny_status_writes(&self) -> StatusWriteFault {
+        let dir = self.paths.remotes_dir();
+        let fault = StatusWriteFault(dir.clone(), fs::metadata(&dir).unwrap().permissions());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(File::create(dir.join("write-probe")).is_err());
+        fault
+    }
+}
+
+struct StatusWriteFault(PathBuf, fs::Permissions);
+
+impl Drop for StatusWriteFault {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, self.1.clone());
+    }
+}
+
+#[tokio::test]
+async fn s20_health_lease_missing_sidecar_makes_cached_online_status_offline() {
+    let fixture = HealthLeaseFixture::new().await;
+    fs::remove_file(fixture.paths.remotes_dir().join("w1.health")).unwrap();
+    assert!(
+        !fixture
+            .reader()
+            .read_status("w1")
+            .await
+            .unwrap()
+            .unwrap()
+            .online
+    );
+}
+
+#[tokio::test]
+async fn s20_health_lease_surviving_clone_keeps_published_status_online() {
+    let fixture = HealthLeaseFixture::new().await;
+    let reader = fixture.reader();
+    let clone = fixture.publisher.clone();
+    drop(fixture.publisher);
+    let observed = reader.read_status("w1").await.unwrap().unwrap();
+    drop(clone);
+    assert!(observed.online);
+}
+
+#[tokio::test]
+async fn s20_health_lease_last_clone_drop_makes_cached_online_status_offline() {
+    let fixture = HealthLeaseFixture::new().await;
+    let reader = fixture.reader();
+    let clone = fixture.publisher.clone();
+    drop(fixture.publisher);
+    drop(clone);
+    assert!(!reader.read_status("w1").await.unwrap().unwrap().online);
+}
+
+#[tokio::test]
+async fn s20_health_lease_failed_online_save_withdraws_existing_publication() {
+    let fixture = HealthLeaseFixture::new().await;
+    let _fault = fixture.deny_status_writes();
+    assert!(
+        fixture
+            .publisher
+            .write_status(&fixture.status)
+            .await
+            .is_err()
+    );
+    assert!(
+        !fixture
+            .reader()
+            .read_status("w1")
+            .await
+            .unwrap()
+            .unwrap()
+            .online
+    );
+}
+
+#[tokio::test]
+async fn s20_health_lease_failed_offline_save_withdraws_existing_publication() {
+    let mut fixture = HealthLeaseFixture::new().await;
+    let _fault = fixture.deny_status_writes();
+    fixture.status.online = false;
+    assert!(
+        fixture
+            .publisher
+            .write_status(&fixture.status)
+            .await
+            .is_err()
+    );
+    assert!(
+        !fixture
+            .reader()
+            .read_status("w1")
+            .await
+            .unwrap()
+            .unwrap()
+            .online
+    );
+}
+
+#[test]
+fn s21_removing_link_releases_health_lease_while_controller_owner_stays_live() {
+    let worker = Peer::new("worker-lease-lifetime");
+    let controller = Peer::new("controller-lease-lifetime");
+    worker.add_agent("executor", "echo healthy", "shared");
+    connect(&controller, &worker, "w1", port());
+    let snapshot = controller.path(".orchestry/remotes/w1.json");
+    let cached = fs::read(&snapshot).unwrap();
+    let health = controller.path(".orchestry/remotes/w1.health");
+    controller.ok(&["remote", "remove", "w1"]);
+    wait(
+        "removed link releases its kernel lease",
+        &[&controller, &worker],
+        || File::open(&health).unwrap().try_lock_shared().is_ok(),
+    );
+    assert!(
+        controller
+            .owner
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none(),
+        "controller owner must remain live after removing a link"
+    );
+    // Retained JSON has no authority once the per-link task is gone, even
+    // though the manager and engine still own their shared runtime stores.
+    fs::write(&snapshot, cached).unwrap();
+    assert_eq!(read_json(&snapshot)["online"], true);
+    let reader = orch_infra::storage::remote::FileRemoteStore::new(
+        orch_infra::storage::paths::Paths::new(controller.dir.path()),
+    );
+    let observed = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(reader.read_status("w1"))
+        .unwrap()
+        .unwrap();
+    assert!(!observed.online);
+}
+
+#[test]
+fn s19_failed_status_save_and_socket_loss_block_new_dispatch_until_recovery() {
+    let worker = Peer::new("worker-status-failure");
+    let controller = Peer::new("controller-status-failure");
+    let agent = worker.add_agent("executor", "echo recovered", "shared");
+    let local = controller.add_agent("local", "echo local-unaffected", "shared");
+    let addr = port();
+    connect(&controller, &worker, "w1", addr);
+
+    struct RestorePermissions(PathBuf, fs::Permissions);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let dir = controller.path(".orchestry/remotes");
+    let permissions = RestorePermissions(dir.clone(), fs::metadata(&dir).unwrap().permissions());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(
+        File::create(dir.join("write-probe")).is_err(),
+        "fault injection must deny writes"
+    );
+    wait(
+        "status persistence failure visible without RUST_LOG",
+        &[&controller, &worker],
+        || {
+            let owner = controller.owner.borrow();
+            let owner = owner.as_ref().unwrap();
+            format!("{}{}", text(&owner.stdout), text(&owner.stderr)).contains("Write peer status")
+        },
+    );
+    assert_eq!(
+        controller.status("w1")["online"],
+        true,
+        "fault must retain the stale snapshot"
+    );
+    let status = controller.json(&["remote", "status"]);
+    assert_eq!(status["remotes"][0]["online"], false);
+    assert!(status["remotes"][0]["last_error"].is_string());
+    worker.stop(Signal::SIGKILL);
+    wait(
+        "socket loss visible without RUST_LOG",
+        &[&controller, &worker],
+        || {
+            let owner = controller.owner.borrow();
+            let owner = owner.as_ref().unwrap();
+            format!("{}{}", text(&owner.stdout), text(&owner.stderr))
+                .contains("Peer w1 disconnected")
+        },
+    );
+    let task = controller.task("wait for healthy link", Some(&remote_id(&agent, "w1")), &[]);
+    let local_task = controller.task("local dispatch unaffected", Some(&local), &[]);
+    controller.wait_task(&local_task, "done", &[&controller, &worker]);
+    remains(
+        "no remote attempt or reservation while status is unwritable",
+        Duration::from_millis(500),
+        || {
+            let state = read_json(controller.path(".orchestry/state.json"));
+            let valid = controller.task_value(&task)["status"] == "todo"
+                && controller.task_value(&task)["attempts"] == 0
+                && controller.runs(&task).is_empty()
+                && state["running"].get(&task).is_none();
+            assert!(valid, "{}", controller.diagnostics());
+            valid
+        },
+    );
+    assert!(
+        controller
+            .ok(&["task", "show", &task])
+            .contains("remote w1 offline")
+    );
+    assert!(
+        worker.tasks().is_empty(),
+        "no submit may create a worker mirror"
+    );
+
+    controller.stop(Signal::SIGKILL);
+    controller.start(None);
+    let another_local = controller.task("local dispatch after restart", Some(&local), &[]);
+    controller.wait_task(&another_local, "done", &[&controller, &worker]);
+    assert_eq!(controller.task_value(&task)["status"], "todo");
+    assert_eq!(controller.task_value(&task)["attempts"], 0);
+    assert!(controller.runs(&task).is_empty());
+
+    drop(permissions);
+    worker.start(Some(addr));
+    controller.online("w1", &[&controller, &worker]);
+    controller.wait_task(&task, "done", &[&controller, &worker]);
+    assert_eq!(controller.task_value(&task)["attempts"], 1);
+    assert_eq!(controller.runs(&task).len(), 1);
+    assert_eq!(worker.tasks().len(), 1);
+    assert_eq!(
+        controller.json(&["remote", "status"])["remotes"][0]["last_error"],
+        Value::Null
+    );
+}
+
 #[test]
 fn s06_inflight_link_outage_beyond_stall_timeout_never_retries_or_duplicates_effect() {
     let worker = Peer::new("worker-one");
@@ -841,6 +1117,382 @@ fn s07_controller_restart_cancels_without_retry_and_sync_cancels_worker_mirror()
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["status"], "cancelled");
     assert!(!worker.path("effect").exists());
+}
+
+#[test]
+fn s22_sigterm_serve_drains_connected_remote_cancellation_before_owner_exit() {
+    connected_shutdown_cancels_before_exit(false);
+}
+
+#[test]
+fn s22b_sigterm_run_watch_drains_connected_remote_cancellation_before_owner_exit() {
+    connected_shutdown_cancels_before_exit(true);
+}
+
+#[test]
+fn s22c_sigterm_tui_drains_connected_remote_cancellation_before_owner_exit() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    struct Dashboard {
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    }
+    impl Drop for Dashboard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.master.take();
+        }
+    }
+
+    let worker = Peer::new("shutdown-worker");
+    let controller = Peer::new("shutdown-controller");
+    let agent = worker.add_agent("executor", &shutdown_gated_body(&worker), "shared");
+    let worker_addr = port();
+    let controller_addr = port();
+    controller.ok(&["remote", "add", "w1", &worker_addr.to_string()]);
+    worker.start(Some(worker_addr));
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let fixture = controller.command(env!("CARGO_BIN_EXE_orch"));
+    let mut command = CommandBuilder::new(fixture.get_program());
+    for (key, value) in fixture.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    command.env("TERM", "xterm-256color");
+    command.cwd(controller.dir.path());
+    command.args(["tui", "--listen", &controller_addr.to_string()]);
+    let mut dashboard = Dashboard {
+        child: pair.slave.spawn_command(command).unwrap(),
+        master: Some(pair.master),
+    };
+    drop(pair.slave);
+    let mut reader = dashboard
+        .master
+        .as_ref()
+        .unwrap()
+        .try_clone_reader()
+        .unwrap();
+    let capture = controller.path("tui-capture");
+    let mut log = File::create(&capture).unwrap();
+    let reading = thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut log);
+    });
+    let peers = [&controller, &worker];
+    controller.online("w1", &peers);
+    let task = controller.task(
+        "TUI cancellation before exit",
+        Some(&remote_id(&agent, "w1")),
+        &[],
+    );
+    wait("running remote shell under TUI", &peers, || {
+        worker.path("started").exists()
+    });
+    let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+    let owner = dashboard.child.process_id().unwrap();
+    kill(Pid::from_raw(owner as i32), Signal::SIGTERM).unwrap();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = dashboard.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "TUI SIGTERM timed out: {}",
+            text(&capture)
+        );
+        thread::sleep(POLL);
+    };
+    eprintln!("TUI SIGTERM exit in {:?}", started.elapsed());
+    assert!(status.success(), "TUI exit {status:?}: {}", text(&capture));
+    assert!(!controller.path(".orchestry/orchestry.lock").exists());
+    assert!(
+        kill(Pid::from_raw(pid), None).is_err(),
+        "shell survived TUI exit"
+    );
+    assert_eq!(worker.tasks()[0]["status"], "cancelled");
+    assert_eq!(controller.task_value(&task)["status"], "cancelled");
+    release(&worker);
+    remains(
+        "no effect after TUI shutdown",
+        Duration::from_millis(500),
+        || !worker.path("effect").exists(),
+    );
+    drop(TcpListener::bind(controller_addr).expect("TUI listener released"));
+    dashboard.master.take();
+    reading.join().unwrap();
+    let captured = text(&capture);
+    assert!(
+        captured.contains("\x1b[?1049l"),
+        "TUI did not restore alternate screen"
+    );
+    sigterm_owner(&worker);
+    drop(TcpListener::bind(worker_addr).expect("worker listener released"));
+}
+
+fn shutdown_gated_body(peer: &Peer) -> String {
+    // Keep stdout silent while gated: a closed event pipe must not mask a
+    // surviving adapter's side effect after the controller has exited.
+    format!(
+        "echo $$ > {}\nwhile [ ! -f {} ]; do sleep 0.04; done\necho effect >> {}",
+        quote(&peer.path("started")),
+        quote(&peer.path("release")),
+        quote(&peer.path("effect")),
+    )
+}
+
+fn sigterm_owner(peer: &Peer) -> Output {
+    let process = peer.owner.borrow_mut().take().expect("running owner");
+    // Signal the controller itself, matching a service manager's SIGTERM.
+    kill(Pid::from_raw(process.child.id() as i32), Signal::SIGTERM).unwrap();
+    let started = Instant::now();
+    let output = process.output(Duration::from_secs(5));
+    eprintln!("{} SIGTERM exit in {:?}", peer.name, started.elapsed());
+    assert!(
+        output.status.success(),
+        "SIGTERM was not graceful: {:?}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!peer.path(".orchestry/orchestry.lock").exists());
+    output
+}
+
+fn connected_shutdown_cancels_before_exit(watch: bool) {
+    let worker = Peer::new("shutdown-worker");
+    let controller = Peer::new("shutdown-controller");
+    let agent = worker.add_agent("executor", &shutdown_gated_body(&worker), "shared");
+    let worker_addr = port();
+    let controller_addr = port();
+    controller.ok(&["remote", "add", "w1", &worker_addr.to_string()]);
+    worker.start(Some(worker_addr));
+    let mut command = controller.command(env!("CARGO_BIN_EXE_orch"));
+    if watch {
+        command.args(["run", "--watch", "--verbose"]);
+    } else {
+        command.args(["serve", "--verbose"]);
+    }
+    command.args(["--listen", &controller_addr.to_string()]);
+    *controller.owner.borrow_mut() = Some(controller.spawn(command, "shutdown-owner"));
+    let peers = [&controller, &worker];
+    controller.online("w1", &peers);
+    let task = controller.task(
+        "cancel before owner exits",
+        Some(&remote_id(&agent, "w1")),
+        &[],
+    );
+    wait("running remote shell", &peers, || {
+        worker.path("started").exists()
+    });
+    let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+
+    let output = sigterm_owner(&controller);
+    let worker_at_exit = worker.tasks();
+    let shell_alive_at_exit = kill(Pid::from_raw(pid), None).is_ok();
+    release(&worker);
+    remains(
+        "no effect after controller shutdown",
+        Duration::from_millis(500),
+        || !worker.path("effect").exists(),
+    );
+    assert!(
+        !shell_alive_at_exit,
+        "remote shell survived controller exit"
+    );
+    assert_eq!(
+        worker_at_exit[0]["status"],
+        "cancelled",
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(controller.task_value(&task)["status"], "cancelled");
+    assert!(
+        read_json(worker.path(".orchestry/state.json"))["running"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    drop(TcpListener::bind(controller_addr).expect("controller listener released"));
+    sigterm_owner(&worker);
+    drop(TcpListener::bind(worker_addr).expect("worker listener released"));
+}
+
+#[test]
+fn s23_sigterm_offline_cancellation_is_bounded_reports_pending_and_sync_cancels() {
+    let worker = Peer::new("shutdown-worker");
+    let controller = Peer::new("shutdown-controller");
+    let agent = worker.add_agent("executor", &shutdown_gated_body(&worker), "shared");
+    connect(&controller, &worker, "w1", port());
+    let peers = [&controller, &worker];
+    let task = controller.task(
+        "cancel while disconnected",
+        Some(&remote_id(&agent, "w1")),
+        &[],
+    );
+    wait("running remote shell", &peers, || {
+        worker.path("started").exists()
+    });
+    let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+    fs::write(controller.path("peer-block"), "blocked").unwrap();
+    wait("worker link offline", &peers, || {
+        controller.status("w1")["online"] == false
+    });
+
+    let exec_key = controller.runs(&task)[0]["id"].as_str().unwrap().to_owned();
+    let output = sigterm_owner(&controller);
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        log.contains("w1")
+            && log.contains(&exec_key)
+            && log.contains("outcome unknown")
+            && log.contains("next Sync"),
+        "offline shutdown must disclose the unacknowledged cancellation: {log}",
+    );
+    assert_eq!(controller.task_value(&task)["status"], "cancelled");
+    assert!(
+        kill(Pid::from_raw(pid), None).is_ok(),
+        "disconnected worker should remain gated until Sync"
+    );
+    fs::remove_file(controller.path("peer-block")).unwrap();
+    controller.start(None);
+    controller.online("w1", &peers);
+    wait("Sync cancels disconnected mirror", &peers, || {
+        worker.tasks()[0]["status"] == "cancelled"
+    });
+    assert!(kill(Pid::from_raw(pid), None).is_err());
+    release(&worker);
+    remains(
+        "no effect after reconnect cancellation",
+        Duration::from_millis(500),
+        || !worker.path("effect").exists(),
+    );
+}
+
+#[test]
+fn s17_worker_restart_loses_collector_without_repeating_surviving_shell_effect() {
+    worker_restart_does_not_repeat(false);
+}
+
+#[test]
+fn s17b_worker_restart_after_child_exit_does_not_repeat_effect() {
+    worker_restart_does_not_repeat(true);
+}
+
+fn worker_restart_does_not_repeat(exit_before_restart: bool) {
+    let worker = Peer::new("worker");
+    let controller = Peer::new("controller");
+    // No stdout after the owner dies: a broken pipe must not prevent the
+    // original shell's side effect and hide the lost-collector regression.
+    let body = format!(
+        "echo $$ > {}\nwhile [ ! -f {} ]; do sleep 0.04; done\necho \"$ORCH_TASK_ID\" >> {}",
+        quote(&worker.path("started")),
+        quote(&worker.path("release")),
+        quote(&worker.path("effect")),
+    );
+    let agent = worker.add_agent("executor", &body, "shared");
+    let addr = port();
+    connect(&controller, &worker, "w1", addr);
+    let task = controller.task("uncertain worker exit", Some(&remote_id(&agent, "w1")), &[]);
+    let peers = [&controller, &worker];
+    wait("durable running shell", &peers, || {
+        worker.path("started").exists()
+            && read_json(worker.path(".orchestry/state.json"))["running"]
+                .as_object()
+                .is_some_and(|entries| entries.len() == 1)
+    });
+    let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+    let mirror = worker.tasks()[0]["id"].as_str().unwrap().to_owned();
+    worker.stop(Signal::SIGKILL);
+    assert!(
+        kill(Pid::from_raw(pid), None).is_ok(),
+        "shell did not survive owner kill"
+    );
+    if exit_before_restart {
+        release(&worker);
+        wait("original shell exits before restart", &peers, || {
+            kill(Pid::from_raw(pid), None).is_err()
+        });
+    }
+    worker.start(Some(addr));
+    controller.online("w1", &peers);
+    if !exit_before_restart {
+        remains(
+            "surviving shell remains reserved",
+            Duration::from_millis(400),
+            || {
+                worker.task_value(&mirror)["status"] == "in_progress"
+                    && controller.task_value(&task)["attempts"] == 1
+            },
+        );
+        release(&worker);
+    }
+    let value = controller.wait_task(&task, "cancelled", &peers);
+    assert_eq!(value["attempts"], 1);
+    assert_eq!(controller.runs(&task).len(), 1);
+    assert_eq!(controller.runs(&task)[0]["status"], "cancelled");
+    assert_eq!(worker.tasks().len(), 1);
+    assert_eq!(worker.task_value(&mirror)["status"], "cancelled");
+    assert_eq!(text(worker.path("effect")), format!("{mirror}\n"));
+    assert!(
+        read_json(worker.path(".orchestry/state.json"))["running"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    if !exit_before_restart {
+        assert!(
+            controller.runs(&task)[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("outcome unknown")
+        );
+    }
+    // A second owner restart and a new successful task are barriers proving
+    // both durable cancellation and release of the original reservation.
+    worker.stop(Signal::SIGKILL);
+    worker.start(Some(addr));
+    controller.online("w1", &peers);
+    let next = controller.task("worker reusable", Some(&remote_id(&agent, "w1")), &[]);
+    controller.wait_task(&next, "done", &peers);
+    assert_eq!(controller.task_value(&task)["status"], "cancelled");
+    assert_eq!(controller.runs(&task).len(), 1);
+    let effects = text(worker.path("effect"));
+    assert_eq!(effects.lines().filter(|line| *line == mirror).count(), 1);
+    assert_eq!(effects.lines().count(), 2);
+}
+
+#[test]
+fn s18_known_worker_application_failure_still_retries_on_controller() {
+    let worker = Peer::new("worker");
+    let controller = Peer::new("controller");
+    let agent = worker.add_agent("executor", "echo known-failure >&2\nexit 7", "shared");
+    connect(&controller, &worker, "w1", port());
+    let task = controller.task("known failure", Some(&remote_id(&agent, "w1")), &[]);
+    let value = controller.wait_task(&task, "failed", &[&controller, &worker]);
+    assert_eq!(value["attempts"], 3);
+    assert_eq!(controller.runs(&task).len(), 3);
+    assert_eq!(worker.tasks().len(), 3);
+    assert!(
+        controller
+            .runs(&task)
+            .iter()
+            .all(|run| run["status"] == "failed")
+    );
 }
 
 #[test]
@@ -1561,4 +2213,199 @@ fn s2_partial_handshake_flood_is_bounded_and_controller_takeover_recovers() {
 #[test]
 fn s2_transient_descriptor_exhaustion_retries_and_listener_recovers_without_restart() {
     s2_resource_probe("emfile");
+}
+
+fn registry_binary(peer: &Peer) -> PathBuf {
+    let binary = peer.bin.join("registry-orch");
+    fs::copy(env!("CARGO_BIN_EXE_orch"), &binary).expect("copy registry test binary");
+    binary
+}
+
+fn registry_command(peer: &Peer, binary: &Path, args: &[&str]) -> Process {
+    let mut command = peer.command(binary);
+    command.args(args);
+    peer.spawn(command, "registry")
+}
+
+fn registry_success(process: Process) -> String {
+    let output = process.output(Duration::from_secs(15));
+    assert!(
+        output.status.success(),
+        "registry command failed: {:?}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn registry_aliases(peer: &Peer, binary: &Path) -> HashSet<String> {
+    let output = registry_success(registry_command(
+        peer,
+        binary,
+        &["remote", "list", "--json"],
+    ));
+    serde_json::from_str::<Vec<Value>>(&output)
+        .unwrap()
+        .iter()
+        .map(|entry| entry["alias"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn registry_concurrent_mutations_preserve_successful_adds_and_unrelated_records_with_live_owner() {
+    let peer = Peer::new("registry-concurrency");
+    let binary = registry_binary(&peer);
+    peer.start(None);
+    let aliases: Vec<_> = (0..32).map(|n| format!("worker-{n}")).collect();
+    let adds: Vec<_> = aliases
+        .iter()
+        .map(|alias| registry_command(&peer, &binary, &["remote", "add", alias, "127.0.0.1:9"]))
+        .collect();
+    for add in adds {
+        registry_success(add);
+    }
+    assert_eq!(
+        registry_aliases(&peer, &binary),
+        aliases.iter().cloned().collect()
+    );
+
+    let mut changes = Vec::new();
+    for alias in &aliases[..16] {
+        changes.push(registry_command(
+            &peer,
+            &binary,
+            &["remote", "remove", alias],
+        ));
+        changes.push(registry_command(
+            &peer,
+            &binary,
+            &["remote", "add", &format!("new-{alias}"), "127.0.0.1:9"],
+        ));
+    }
+    for change in changes {
+        registry_success(change);
+    }
+    let expected = aliases[16..]
+        .iter()
+        .cloned()
+        .chain(aliases[..16].iter().map(|alias| format!("new-{alias}")))
+        .collect();
+    assert_eq!(registry_aliases(&peer, &binary), expected);
+}
+
+#[test]
+fn registry_killed_writer_releases_lock_without_stale_file_cleanup() {
+    let peer = Peer::new("registry-crash");
+    let binary = registry_binary(&peer);
+    let registry = peer.path(".orchestry/remotes.yml");
+    // Pause a real mutation after it acquires the lock, inside its read. No
+    // timing window or production-only test hook is needed to kill the holder.
+    let mut mkfifo = peer.command("mkfifo");
+    mkfifo.arg(&registry);
+    assert!(peer.spawn(mkfifo, "mkfifo").output(WAIT).status.success());
+    let lock_path = peer.path(".orchestry/remotes.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    let mut writer = registry_command(
+        &peer,
+        &binary,
+        &["remote", "add", "interrupted", "127.0.0.1:9"],
+    );
+    wait_for(
+        "writer holds registry lock",
+        Duration::from_secs(5),
+        &[&peer],
+        || {
+            assert!(writer.running(), "writer exited before acquiring the lock");
+            match lock.try_lock() {
+                Ok(()) => {
+                    lock.unlock().unwrap();
+                    false
+                }
+                Err(std::fs::TryLockError::WouldBlock) => true,
+                Err(err) => panic!("observe registry lock: {err}"),
+            }
+        },
+    );
+    writer.terminate(Signal::SIGKILL);
+    lock.try_lock()
+        .expect("kernel releases killed writer's lock");
+    lock.unlock().unwrap();
+    assert!(lock_path.exists(), "lock file must remain a stable inode");
+    fs::remove_file(&registry).unwrap();
+    registry_success(registry_command(
+        &peer,
+        &binary,
+        &["remote", "add", "after-crash", "127.0.0.1:9"],
+    ));
+    assert_eq!(
+        registry_aliases(&peer, &binary),
+        HashSet::from(["after-crash".into()])
+    );
+}
+
+#[test]
+fn registry_malformed_input_fails_loudly_without_overwrite_and_releases_lock() {
+    let peer = Peer::new("registry-malformed");
+    let binary = registry_binary(&peer);
+    let registry = peer.path(".orchestry/remotes.yml");
+    for malformed in [
+        "[broken YAML",
+        r#"[{"alias":"../bad","addr":"127.0.0.1:9","added_at":"now"}]"#,
+        r#"[{"alias":"same","addr":"127.0.0.1:9","added_at":"now"},{"alias":"same","addr":"127.0.0.1:9","added_at":"now"}]"#,
+    ] {
+        fs::write(&registry, malformed).unwrap();
+        for args in [
+            vec!["remote", "add", "new", "127.0.0.1:9"],
+            vec!["remote", "remove", "same"],
+        ] {
+            let output = registry_command(&peer, &binary, &args).output(WAIT);
+            assert!(!output.status.success(), "accepted malformed registry");
+            assert!(!output.stderr.is_empty(), "registry error must be visible");
+            assert_eq!(fs::read(&registry).unwrap(), malformed.as_bytes());
+        }
+    }
+    fs::write(&registry, "[]").unwrap();
+    registry_success(registry_command(
+        &peer,
+        &binary,
+        &["remote", "add", "repaired", "127.0.0.1:9"],
+    ));
+    assert_eq!(
+        registry_aliases(&peer, &binary),
+        HashSet::from(["repaired".into()])
+    );
+}
+
+#[test]
+fn registry_lock_open_failure_is_visible_and_preserves_existing_records() {
+    let peer = Peer::new("registry-lock-error");
+    let binary = registry_binary(&peer);
+    registry_success(registry_command(
+        &peer,
+        &binary,
+        &["remote", "add", "existing", "127.0.0.1:9"],
+    ));
+    let lock_path = peer.path(".orchestry/remotes.lock");
+    if lock_path.exists() {
+        fs::remove_file(&lock_path).unwrap();
+    }
+    fs::create_dir(&lock_path).unwrap();
+    let registry = peer.path(".orchestry/remotes.yml");
+    let before = fs::read(&registry).unwrap();
+    for args in [
+        vec!["remote", "add", "new", "127.0.0.1:9"],
+        vec!["remote", "remove", "existing"],
+    ] {
+        let output = registry_command(&peer, &binary, &args).output(WAIT);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("registry lock"));
+        assert_eq!(fs::read(&registry).unwrap(), before);
+    }
 }

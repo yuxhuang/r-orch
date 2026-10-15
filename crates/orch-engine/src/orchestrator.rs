@@ -168,6 +168,16 @@ struct LazySave {
     timer: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Release waiters even if shutdown is cancelled or unwinds before cleanup ends.
+struct StopNotification<'a>(&'a watch::Sender<bool>);
+
+impl Drop for StopNotification<'_> {
+    fn drop(&mut self) {
+        // Retain the value even when no waiter has subscribed yet.
+        self.0.send_replace(true);
+    }
+}
+
 struct Inner {
     deps: OrchestratorDeps,
 
@@ -200,7 +210,7 @@ struct Inner {
 
     /// Cancels the watch loop.
     shutdown: CancellationToken,
-    /// Flips to `true` once `stop` has finished, releasing `wait_for_stop`.
+    /// Flips to `true` once `stop` completes or is aborted, releasing waiters.
     stopped: watch::Sender<bool>,
 
     /// Tick-scoped memoized reads. Invalidated at the top of every tick and of
@@ -561,12 +571,10 @@ impl Orchestrator {
         }
     }
 
-    /// Resolves once [`Orchestrator::stop`] has completed. Returns immediately
-    /// when shutdown has already begun, matching the TS `waitForStop`.
+    /// Resolves once stop has completed (or the orchestrator is dropped).
+    /// Cancellation or panic in [`Orchestrator::stop`] also releases waiters;
+    /// in that case cleanup may be incomplete.
     pub async fn wait_for_stop(&self) {
-        if self.is_shutting_down() {
-            return;
-        }
         let mut stopped = self.inner.stopped.subscribe();
         while !*stopped.borrow_and_update() {
             if stopped.changed().await.is_err() {
@@ -595,6 +603,7 @@ impl Orchestrator {
         if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        let _stopped = StopNotification(&self.inner.stopped);
 
         // `clearInterval(this.timer)`: stop *future* ticks and let the one in
         // flight finish. The handle is dropped rather than aborted, for two
@@ -603,8 +612,8 @@ impl Orchestrator {
         // Aborting it cancels the caller: both the signal arms and the tick
         // circuit breaker call `stop()` **from inside the watch task**, so
         // the abort would land at the next await that pends — the state save,
-        // before the lock release and before `stopped.send(true)` — leaving
-        // `wait_for_stop` waiting forever, which is `serve` ignoring SIGTERM.
+        // before the lock release — releasing `wait_for_stop` with cleanup
+        // still incomplete.
         //
         // Aborting it also cancels whatever the *tick* is doing, and a tick
         // cancelled between `atomic_write`'s temp file and its rename leaves
@@ -640,11 +649,12 @@ impl Orchestrator {
             }
         };
 
+        self.drain_remote_cancellations().await;
+
         if self.inner.lock_acquired.swap(false, Ordering::SeqCst) {
             self.deps().lock.release().await;
         }
 
-        let _ = self.inner.stopped.send(true);
         if let Err(err) = &saved {
             self.emit_error(err, "stop: persist the cleared state");
         }

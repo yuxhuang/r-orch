@@ -316,6 +316,116 @@ async fn wait_for_stop_resolves_when_the_breaker_stops_us_from_inside_the_loop()
     .expect("wait_for_stop must resolve after the breaker fires");
 }
 
+#[tokio::test]
+async fn wait_for_stop_waits_for_in_progress_cleanup_before_releasing_all_waiters() {
+    let h = Harness::builder().build();
+    h.start_watch().await.unwrap();
+    let slot = h.orchestrator.inner.state.lock().await;
+    let mut waiting = Box::pin(h.orchestrator.wait_for_stop());
+    assert!(futures::poll!(&mut waiting).is_pending());
+
+    let mut stopping = Box::pin(h.orchestrator.stop());
+    assert!(futures::poll!(&mut stopping).is_pending());
+    assert!(h.orchestrator.is_shutting_down());
+    let mut late_waiter = Box::pin(h.orchestrator.wait_for_stop());
+    assert!(
+        futures::poll!(&mut late_waiter).is_pending(),
+        "a waiter arriving during stop must wait for cleanup"
+    );
+    assert!(futures::poll!(&mut waiting).is_pending());
+
+    drop(slot);
+    tokio::time::timeout(std::time::Duration::from_secs(2), stopping)
+        .await
+        .expect("stop completes after the state lock is released")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        tokio::join!(waiting, late_waiter);
+    })
+    .await
+    .expect("both waiters resolve after stop completes");
+    assert!(!h.lock.is_held());
+    assert_eq!(h.state.peek().pid, None);
+}
+
+#[tokio::test]
+async fn wait_for_stop_after_completed_stop_needs_no_prior_subscriber() {
+    let h = Harness::builder().build();
+    h.orchestrator.stop().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        h.orchestrator.wait_for_stop(),
+    )
+    .await
+    .expect("stop notification persists without subscribers");
+}
+
+#[tokio::test]
+async fn wait_for_stop_is_released_when_in_progress_stop_is_cancelled() {
+    let h = Harness::builder().build();
+    let slot = h.orchestrator.inner.state.lock().await;
+    let mut stopping = Box::pin(h.orchestrator.stop());
+    assert!(futures::poll!(&mut stopping).is_pending());
+    let mut waiting = Box::pin(h.orchestrator.wait_for_stop());
+    assert!(futures::poll!(&mut waiting).is_pending());
+
+    drop(stopping);
+    tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        waiting.await;
+        h.orchestrator.wait_for_stop().await;
+    })
+    .await
+    .expect("cancelling stop releases existing and later waiters");
+    drop(slot);
+}
+
+struct PanickingDrainBridge;
+
+#[async_trait::async_trait]
+impl orch_core::remote::RemoteBridge for PanickingDrainBridge {
+    fn submit(
+        &self,
+        request: orch_core::remote::RemoteSubmit,
+    ) -> orch_core::error::Result<orch_core::remote::RemoteExecuteHandle> {
+        orch_core::remote::NoopRemoteBridge.submit(request)
+    }
+
+    async fn cancel(&self, _alias: &str, _exec_key: &str) -> orch_core::error::Result<()> {
+        Ok(())
+    }
+
+    async fn drain_cancellations(
+        &self,
+        _deadline: std::time::Duration,
+    ) -> orch_core::error::Result<Vec<orch_core::remote::PendingRemoteCancellation>> {
+        panic!("shutdown drain panic");
+    }
+
+    async fn send_msg(
+        &self,
+        _peer: &str,
+        _message: &orch_domain::Message,
+    ) -> orch_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn wait_for_stop_is_released_when_stop_panics() {
+    let h = Harness::builder().build();
+    h.orchestrator
+        .set_remote_bridge(Arc::new(PanickingDrainBridge));
+    let orchestrator = h.orchestrator.clone();
+    let stopped = tokio::spawn(async move { orchestrator.stop().await });
+    assert!(stopped.await.expect_err("drain panics").is_panic());
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        h.orchestrator.wait_for_stop(),
+    )
+    .await
+    .expect("panic during stop does not wedge later waiters");
+}
+
 // ── Fix 4: structured error events ───────────────────────────────────────
 
 #[tokio::test]

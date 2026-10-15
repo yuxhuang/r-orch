@@ -238,6 +238,52 @@ async fn reservation_allows_only_one_submit_for_two_tasks_and_one_remote_agent()
 }
 
 #[tokio::test]
+async fn worker_mirror_without_collector_waits_for_exit_then_cancels_without_retry() {
+    let h = Harness::builder()
+        .tasks([Task {
+            id: "tsk_mirror".into(),
+            status: TaskStatus::InProgress,
+            attempts: 1,
+            max_attempts: 1,
+            labels: vec!["remote-ctl:controller".into(), "exec:run_controller".into()],
+            ..make_task()
+        }])
+        .agents([make_agent()])
+        .state(state_running(
+            "tsk_mirror",
+            "agt_test1",
+            "run_mirror",
+            4321,
+            &iso_before(86_400_000),
+        ))
+        .build();
+    h.runs.seed(Run {
+        id: "run_mirror".into(),
+        task_id: "tsk_mirror".into(),
+        status: RunStatus::Running,
+        ..make_run()
+    });
+    h.processes.set_alive(4321);
+    h.reconcile().await.unwrap();
+    assert_eq!(h.task("tsk_mirror").status, TaskStatus::InProgress);
+    assert_eq!(h.in_memory_state().await.running.len(), 1);
+    assert!(
+        h.processes.killed_with_grace().is_empty(),
+        "lost telemetry is not a stall"
+    );
+    h.processes.set_dead(4321);
+    h.orchestrator.invalidate_caches().await;
+    h.reconcile().await.unwrap();
+    assert_eq!(h.task("tsk_mirror").status, TaskStatus::Cancelled);
+    let run = h.runs.peek("run_mirror").unwrap();
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert!(run.error.unwrap().contains("outcome unknown"));
+    assert!(h.persisted_state().running.is_empty());
+    assert!(h.persisted_state().retry_queue.is_empty());
+    assert_eq!(h.agent("agt_test1").status, orch_domain::AgentStatus::Idle);
+}
+
+#[tokio::test]
 async fn startup_cleanup_cancels_remote_without_pid_check_or_retry() {
     let fixture = PeerFixture::new(true).await;
     let (h, _) = running(&fixture).await;

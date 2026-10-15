@@ -127,7 +127,15 @@ impl PeerRuntime {
         for config in store.list().await? {
             if let Some(mut status) = store.read_status(&config.alias).await? {
                 status.online = false;
-                store.write_status(&status).await?;
+                if let Err(error) = store.write_status(&status).await {
+                    // Old snapshots cannot grant health without a live lease.
+                    // Keep local dispatch and reconnect alive during a disk fault.
+                    engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                        error: error.to_string(),
+                        context: format!("Reset peer status for {}; remote dispatch unavailable. Check permissions and free space in {}", config.alias, engine.paths.remotes_dir().display()),
+                        fatal: false,
+                    });
+                }
             }
         }
         let listener_status = engine.paths.remotes_dir().join("_listener.json");

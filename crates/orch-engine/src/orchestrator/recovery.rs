@@ -8,6 +8,9 @@ use orch_domain::{
 
 use super::Orchestrator;
 
+// Leave room inside the TUI's five-second dead-terminal wind-down budget.
+const REMOTE_CANCEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl Orchestrator {
     /// Clean up after a crashed or restarted process.
     ///
@@ -257,6 +260,26 @@ impl Orchestrator {
         task.updated_at = self.deps().clock.now_iso();
         if let Err(err) = self.deps().task_store.save(&task).await {
             self.emit_error(err, format!("startup cleanup: force-cancel task {task_id}"));
+        }
+    }
+
+    /// Called once after shutdown has enqueued all cancels and released the
+    /// state mutex, while the owner lock and peer transport are still alive.
+    pub(super) async fn drain_remote_cancellations(&self) {
+        match self
+            .remote_bridge()
+            .drain_cancellations(REMOTE_CANCEL_DRAIN_DEADLINE)
+            .await
+        {
+            Ok(pending) => {
+                for cancel in pending {
+                    self.emit_error(
+                        orch_core::error::Error::other("Remote cancel outcome unknown; cancellation will be re-sent on the next Sync"),
+                        format!("stop: cancel remote {}:{}", cancel.alias, cancel.exec_key),
+                    );
+                }
+            }
+            Err(error) => self.emit_error(error, "stop: drain remote cancellations"),
         }
     }
 

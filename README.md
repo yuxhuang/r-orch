@@ -139,6 +139,15 @@ Cancelling the task or removing the remote ends that wait. A controller restart 
 remote tasks; reconnecting reconciles and cancels their worker mirrors. Messages queue while offline
 and deduplicate when delivered. Broadcast messages stay local.
 
+A remote counts as online only while its link is live **and** the controller can record that state in
+`.orchestry/remotes/`. If that directory is unwritable or the disk is full, or the socket drops, the
+remote reports `offline` in `orch remote status`, the TUI and `orch agent list`, even if a cached
+snapshot file still says online, and `orch task show` reports `remote w1 offline` for tasks waiting on
+it. Nothing new is dispatched to it until the status can be saved again. The engine prints a
+non-fatal `Write peer status for w1 … Check permissions and free space` (or `Peer w1 disconnected`)
+error without `RUST_LOG`. Fix the permissions or free space; once the link reconnects and saves its status, the remote is online
+again and waiting tasks dispatch. Local agents keep running throughout, including after an engine restart.
+
 **Remote agents are leaf executors using worker-local resources.** There is no repository, input,
 file, or artifact synchronization. Paths refer to the worker, which runs its own agent command, role,
 skills, workspace integration and review criteria. Prepare required resources there before assigning

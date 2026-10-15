@@ -8,17 +8,25 @@ use async_trait::async_trait;
 use futures::stream;
 use orch_core::{
     error::{Error, Result},
-    remote::{RemoteBridge, RemoteExecuteHandle, RemoteOutcome, RemoteRunEvent, RemoteSubmit},
+    remote::{
+        PendingRemoteCancellation, RemoteBridge, RemoteExecuteHandle, RemoteOutcome,
+        RemoteRunEvent, RemoteSubmit,
+    },
     storage::MessageStore,
 };
 use orch_domain::{Message, MessageStatus, RemoteConfig, RemoteStatus};
 use orch_infra::storage::remote::validate_snapshot;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{io::BufReader, net::TcpStream, sync::mpsc, time::Instant};
+use tokio::{
+    io::BufReader,
+    net::TcpStream,
+    sync::{Notify, mpsc},
+    time::Instant,
+};
 
 struct Execution {
     submit: Frame,
@@ -33,21 +41,62 @@ struct Execution {
 struct Queue {
     executions: BTreeMap<String, Execution>,
     commands: VecDeque<Frame>,
+    cancellations: BTreeSet<String>,
+    online: bool,
+    wake: Arc<Notify>,
 }
 
 pub(crate) struct LinkHub {
     queues: Mutex<BTreeMap<String, Queue>>,
     messages: Arc<dyn MessageStore>,
+    changed: Notify,
 }
 impl LinkHub {
     pub fn new(messages: Arc<dyn MessageStore>) -> Self {
         Self {
             queues: Mutex::new(BTreeMap::new()),
             messages,
+            changed: Notify::new(),
         }
     }
     fn queues(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Queue>> {
         self.queues.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn connected(&self, alias: &str) -> Connected<'_> {
+        let mut queues = self.queues();
+        let q = queues.entry(alias.into()).or_default();
+        q.online = true;
+        // Commands may have been consumed by a failed write. Keep cancellation
+        // keys independently until CancelAck, including explicit task cancels.
+        q.commands
+            .retain(|frame| !matches!(frame, Frame::Cancel { .. }));
+        for key in &q.cancellations {
+            q.commands.push_back(Frame::Cancel {
+                exec_key: key.clone(),
+            });
+        }
+        Connected {
+            hub: self,
+            alias: alias.into(),
+            wake: q.wake.clone(),
+        }
+    }
+    fn cancel_ack(&self, alias: &str, key: &str) {
+        if let Some(q) = self.queues().get_mut(alias) {
+            q.cancellations.remove(key);
+        }
+        self.changed.notify_one();
+    }
+    fn pending(&self) -> Vec<PendingRemoteCancellation> {
+        self.queues()
+            .iter()
+            .flat_map(|(alias, q)| {
+                q.cancellations.iter().map(|key| PendingRemoteCancellation {
+                    alias: alias.clone(),
+                    exec_key: key.clone(),
+                })
+            })
+            .collect()
     }
     fn active(&self, alias: &str) -> Vec<String> {
         self.queues()
@@ -185,6 +234,20 @@ impl LinkHub {
     }
 }
 
+struct Connected<'a> {
+    hub: &'a LinkHub,
+    alias: String,
+    wake: Arc<Notify>,
+}
+impl Drop for Connected<'_> {
+    fn drop(&mut self) {
+        if let Some(q) = self.hub.queues().get_mut(&self.alias) {
+            q.online = false;
+        }
+        self.hub.changed.notify_one();
+    }
+}
+
 #[async_trait]
 impl RemoteBridge for LinkHub {
     fn submit(&self, request: RemoteSubmit) -> Result<RemoteExecuteHandle> {
@@ -226,10 +289,44 @@ impl RemoteBridge for LinkHub {
         let mut queues = self.queues();
         let q = queues.entry(alias.into()).or_default();
         q.executions.remove(exec_key);
-        q.commands.push_back(Frame::Cancel {
-            exec_key: exec_key.into(),
-        });
+        if q.cancellations.insert(exec_key.into()) {
+            q.commands.push_back(Frame::Cancel {
+                exec_key: exec_key.into(),
+            });
+        }
+        q.wake.notify_one();
         Ok(())
+    }
+    async fn drain_cancellations(
+        &self,
+        deadline: Duration,
+    ) -> Result<Vec<PendingRemoteCancellation>> {
+        let until = Instant::now() + deadline;
+        {
+            let queues = self.queues();
+            for q in queues
+                .values()
+                .filter(|q| q.online && !q.cancellations.is_empty())
+            {
+                // Wake the writer now; do not race the periodic tick at exit.
+                q.wake.notify_one();
+            }
+        }
+        let wait = async {
+            loop {
+                let changed = self.changed.notified();
+                if !self
+                    .queues()
+                    .values()
+                    .any(|q| q.online && !q.cancellations.is_empty())
+                {
+                    break;
+                }
+                changed.await;
+            }
+        };
+        let _ = tokio::time::timeout_at(until, wait).await;
+        Ok(self.pending())
     }
     async fn ack_finished(&self, alias: &str, exec_key: &str) -> Result<()> {
         let mut queues = self.queues();
@@ -327,7 +424,10 @@ async fn blocked() -> bool {
     }
 }
 
-async fn run_link(ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
+async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
+    // No other runtime task may keep this link's health lease alive after it
+    // is aborted, panics, or is replaced by registry reconciliation.
+    ctx.store = orch_infra::storage::remote::FileRemoteStore::new(ctx.engine.paths.clone());
     let mut status = ctx
         .store
         .read_status(&config.alias)
@@ -358,12 +458,23 @@ async fn run_link(ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
         let result = session(&ctx, &hub, &config, &mut status).await;
         let connected = status.online;
         status.online = false;
+        ctx.store.mark_link_offline(&config.alias);
         status.last_error = Some(
             result
                 .err()
                 .map_or_else(|| "Peer disconnected".into(), |e| e.to_string()),
         );
         persist_status(&ctx, &status).await;
+        ctx.engine
+            .events
+            .emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                error: status.last_error.clone().unwrap_or_default(),
+                context: format!(
+                    "Peer {} disconnected; dispatch unavailable, reconnecting",
+                    config.alias
+                ),
+                fatal: false,
+            });
         if connected {
             backoff = Backoff::default();
         }
@@ -382,7 +493,11 @@ async fn persist_status(ctx: &Context, status: &RemoteStatus) {
         .is_ok_and(|configs| configs.iter().any(|c| c.alias == status.alias))
         && let Err(error) = ctx.store.write_status(status).await
     {
-        tracing::error!(%error,alias=%status.alias,"Write peer status");
+        ctx.engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
+            error: error.to_string(),
+            context: format!("Write peer status for {}; remote dispatch unavailable. Check permissions and free space in {}", status.alias, ctx.engine.paths.remotes_dir().display()),
+            fatal: false,
+        });
     }
 }
 
@@ -474,6 +589,7 @@ async fn session(
             }
         }
     }));
+    let connected = hub.connected(&config.alias);
     let mut synced = false;
     let mut last_frame = Instant::now();
     let mut last_ping = Instant::now();
@@ -490,7 +606,12 @@ async fn session(
                 status.last_seen = Some(ctx.engine.clock.now_iso());
                 handle_frame(ctx, hub, config, status, frame, &mut writer, &mut synced).await?;
             }
-            _ = tick.tick() => {
+            _ = async {
+                tokio::select! {
+                    _ = tick.tick() => {},
+                    _ = connected.wake.notified() => {},
+                }
+            } => {
                 if blocked().await {
                     return Err(Error::other("Peer link blocked by test hook"));
                 }
@@ -545,6 +666,9 @@ async fn handle_frame(
         }
         Frame::SyncState { items } => {
             *synced = true;
+            if let Some(q) = hub.queues().get(&config.alias) {
+                q.wake.notify_one();
+            }
             for item in items {
                 match item.state.as_str() {
                     "finished" => {
@@ -611,7 +735,8 @@ async fn handle_frame(
         Frame::State { exec_key, state } => {
             hub.hint(&config.alias, &exec_key, &state, ctx.engine.clock.now_iso())
         }
-        Frame::Submitted { .. } | Frame::CancelAck { .. } | Frame::Gap { .. } => {}
+        Frame::CancelAck { exec_key } => hub.cancel_ack(&config.alias, &exec_key),
+        Frame::Submitted { .. } | Frame::Gap { .. } => {}
         Frame::Error { msg } => return Err(Error::other(msg)),
         _ => return Err(Error::other("Unexpected worker frame")),
     }
@@ -707,6 +832,111 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_keys_survive_failed_writes_and_reconnect_without_streams() {
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let _stream = hub.submit(request()).unwrap();
+        hub.cancel("w1", "run1").await.unwrap();
+        assert!(hub.active("w1").is_empty());
+        assert_eq!(hub.commands("w1").len(), 1);
+        // The write failed after consuming the command; reconnect must resend.
+        let connection = hub.connected("w1");
+        assert!(matches!(&hub.commands("w1")[0], Frame::Cancel { exec_key } if exec_key == "run1"));
+        drop(connection);
+        let pending = hub
+            .drain_cancellations(Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending,
+            vec![PendingRemoteCancellation {
+                alias: "w1".into(),
+                exec_key: "run1".into()
+            }]
+        );
+        hub.cancel_ack("w1", "run1");
+        assert!(hub.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_wakes_writer_and_waits_for_cancel_ack_for_prior_explicit_cancel() {
+        let hub = Arc::new(LinkHub::new(Arc::new(FakeMessageStore::new())));
+        let connection = hub.connected("w1");
+        hub.cancel("w1", "run1").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), connection.wake.notified())
+            .await
+            .unwrap();
+        hub.commands("w1");
+        let drain = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.drain_cancellations(Duration::from_secs(3))
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), connection.wake.notified())
+            .await
+            .unwrap();
+        assert!(
+            !drain.is_finished(),
+            "socket write is not proof of cancellation"
+        );
+        hub.cancel_ack("w1", "run1");
+        assert!(drain.await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_uses_one_global_deadline_for_all_connected_peers_and_keys() {
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let _one = hub.connected("w1");
+        let _two = hub.connected("w2");
+        for alias in ["w1", "w2", "offline"] {
+            for key in ["run1", "run2"] {
+                hub.cancel(alias, key).await.unwrap();
+            }
+        }
+        let started = Instant::now();
+        let pending = hub
+            .drain_cancellations(Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        assert_eq!(pending.len(), 6);
+        assert_eq!(
+            hub.pending(),
+            pending,
+            "deadline must retain cancellation keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_returns_pending_immediately_when_connected_peer_drops() {
+        let hub = Arc::new(LinkHub::new(Arc::new(FakeMessageStore::new())));
+        let connection = hub.connected("w1");
+        hub.cancel("w1", "run1").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), connection.wake.notified())
+            .await
+            .unwrap();
+        let drain = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.drain_cancellations(Duration::from_secs(3))
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), connection.wake.notified())
+            .await
+            .unwrap();
+        drop(connection);
+        let pending = tokio::time::timeout(Duration::from_millis(100), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
