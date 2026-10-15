@@ -117,7 +117,7 @@ Three binaries, **all the same program**: `orch`, `orchestry`, `ao` (npm `bin` m
 
 - Commander program name: `orchestry`. `--help` output begins `Usage: orchestry [options] [command]`.
 - Description: `Agents Organizations — CLI orchestrator for AI agents`
-- `--version` / `-V` → `1.0.34` (L0 that a version is printed; the value tracks the Rust crate version — see §13).
+- `--version` / `-V` → the reference prints `1.0.34`; r-orch prints its own crate version (e.g. `0.1.2`). L0 is that a version is printed and exits 0; the value is not compared (`@exit-only:version-value-is-ours`).
 
 **Global options** (declared on the root program; L0):
 

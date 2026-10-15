@@ -178,10 +178,10 @@ fn help_and_version_work_without_a_project() {
 
     let output = orch(dir.path()).arg("--version").output().expect("run");
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(stdout_of(&output).trim(), "1.0.34");
+    assert_eq!(stdout_of(&output).trim(), env!("CARGO_PKG_VERSION"));
 
     let output = orch(dir.path()).arg("-V").output().expect("run");
-    assert_eq!(stdout_of(&output).trim(), "1.0.34");
+    assert_eq!(stdout_of(&output).trim(), env!("CARGO_PKG_VERSION"));
 }
 
 // ── Initialized: Commander's own failures ──────────────────────────────────
@@ -476,6 +476,10 @@ fn the_three_binary_names_are_the_same_program() {
             .arg("--version")
             .output()
             .expect("run");
-        assert_eq!(stdout_of(&output).trim(), "1.0.34", "{binary}");
+        assert_eq!(
+            stdout_of(&output).trim(),
+            env!("CARGO_PKG_VERSION"),
+            "{binary}"
+        );
     }
 }

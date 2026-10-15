@@ -20,7 +20,7 @@
 use crate::output::{Color, Styles};
 
 /// The version reported by `--version`, and the one this command prints.
-pub const VERSION: &str = "1.0.34";
+pub const VERSION: &str = crate::tree::VERSION;
 
 /// Render the report. `check` is accepted and makes no difference: with no
 /// network there is nothing to check and nothing to install, so both forms
@@ -66,12 +66,14 @@ mod tests {
         let out = render(&Styles::plain(), false);
         assert_eq!(
             out,
-            "\n  orch update · version 1.0.34\n\
+            format!(
+                "\n  orch update · version {VERSION}\n\
              \n  This build does not update itself.\n\
              \x20 To install the latest version:\n\
              \x20   Homebrew:  brew upgrade r-orch\n\
              \x20   Source:    git pull && cargo install --path crates/orch-cli\n\
              \n"
+            )
         );
     }
 

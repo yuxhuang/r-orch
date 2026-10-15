@@ -34,9 +34,10 @@ pub const ALL_KNOWN_COMMANDS: [&str; 16] = [
 /// tier, which is why it is here *and* takes a container when one exists.
 pub const CONTAINER_LESS_COMMANDS: [&str; 3] = ["init", "update", "doctor"];
 
-/// The version `--version` prints and the dashboard reports. Pinned to the
-/// reference's own (PARITY.md §13), not this crate's.
-pub const VERSION: &str = "1.0.34";
+/// The version `--version` prints and the dashboard reports: this crate's own
+/// release version (PARITY.md §2 — the harness checks that a version is
+/// printed, not its value).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The clap program name stays `orchestry` so `--help` matches, whichever of
 /// the three binary names was invoked.
@@ -1091,7 +1092,10 @@ mod tests {
     #[test]
     fn the_program_name_and_version_are_the_reference_ones() {
         assert_eq!(Cli::command().get_name(), "orchestry");
-        assert_eq!(Cli::command().get_version(), Some("1.0.34"));
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(
             Cli::command().get_about().map(|about| about.to_string()),
             Some("Agents Organizations — CLI orchestrator for AI agents".to_owned())
