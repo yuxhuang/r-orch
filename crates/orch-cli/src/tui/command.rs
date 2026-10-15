@@ -120,6 +120,10 @@ pub async fn run_with_peer(
     // Read before the move: `orch_tui::run` consumes the backend, and the
     // cleanup below needs to know whether *this* process started watch mode.
     let watch_active = backend.is_watch_active();
+    let peer_runtime = backend.peer_runtime_guard();
+    if let Some(error) = backend.startup_error() {
+        return Err(Error::other(format!("cannot start the engine: {error}")));
+    }
     if explicit_listen && !watch_active {
         return Err(Error::invalid_arguments(
             "--listen requires the engine owner; another orchestrator holds the lock",
@@ -171,7 +175,7 @@ pub async fn run_with_peer(
     // there must not leave the lock held, an agent running or a poll loop
     // reading the project after the window is gone.
     drop(observer);
-    if watch_active {
+    if engine.orchestrator.is_owner() {
         // `stop()` already reports its own failures on the bus; the TS
         // swallows this rejection outright (`.catch(() => {})`).
         let stopping = engine.orchestrator.stop();
@@ -193,6 +197,10 @@ pub async fn run_with_peer(
             let _ = stopping.await;
         }
     }
+    peer_runtime
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     engine.events.clear();
 
     match outcome {

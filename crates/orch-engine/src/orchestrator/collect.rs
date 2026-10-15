@@ -377,6 +377,10 @@ impl Orchestrator {
 
         let agent = self.deps().agent_store.get(agent_id).await?;
         let auto_approve = task.is_autonomous()
+            || task
+                .labels
+                .iter()
+                .any(|label| label.starts_with("remote-ctl:"))
             || agent
                 .as_ref()
                 .and_then(|agent| agent.config.approval_policy)

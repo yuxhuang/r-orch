@@ -96,6 +96,7 @@ pub struct EngineBackend {
     history: Arc<Mutex<VecDeque<Vec<HistoryEntry>>>>,
     catalog: Arc<Mutex<CatalogState>>,
     watch_active: bool,
+    peer_runtime: Arc<Mutex<Option<orch_peer::PeerRuntime>>>,
 }
 
 impl std::fmt::Debug for EngineBackend {
@@ -155,14 +156,16 @@ impl EngineBackend {
         let started = if observe {
             Err(None)
         } else {
-            engine
-                .orchestrator
-                .start_watch(WatchOptions::watching())
+            crate::serve::peer::start_watch(Arc::clone(&engine), WatchOptions::watching())
                 .await
                 .map_err(Some)
         };
+        let peer_runtime = Arc::new(Mutex::new(None));
         let watch_active = match started {
-            Ok(()) => true,
+            Ok(runtime) => {
+                *peer_runtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(runtime);
+                true
+            }
             Err(None) => {
                 tracing::info!("--observe: not starting watch mode; entering observer mode");
                 context.observer_mode = true;
@@ -184,6 +187,12 @@ impl EngineBackend {
                 // at all until the CLI grew one, and even now the default is
                 // silent. `orch status` is where a user looks.
                 tracing::info!(%err, "watch mode refused; entering observer mode");
+                if !matches!(
+                    err,
+                    orch_core::Error::Domain(orch_domain::DomainError::LockConflict(_))
+                ) {
+                    context.watch_error = Some(err.to_string());
+                }
                 context.observer_mode = true;
                 false
             }
@@ -199,6 +208,7 @@ impl EngineBackend {
             history: Arc::new(Mutex::new(VecDeque::new())),
             catalog: Arc::new(Mutex::new(CatalogState::NotStarted)),
             watch_active,
+            peer_runtime,
         };
         // History is loaded eagerly because the dashboard's activity view
         // wants it on the first frame. The model catalog starts on the first
@@ -213,6 +223,14 @@ impl EngineBackend {
 
     pub fn is_watch_active(&self) -> bool {
         self.watch_active
+    }
+
+    pub(crate) fn startup_error(&self) -> Option<&str> {
+        self.context.watch_error.as_deref()
+    }
+
+    pub(crate) fn peer_runtime_guard(&self) -> Arc<Mutex<Option<orch_peer::PeerRuntime>>> {
+        Arc::clone(&self.peer_runtime)
     }
 
     /// Hand an event from an external source — the `DiskObserver` — to the
@@ -344,18 +362,30 @@ impl TuiBackend for EngineBackend {
 
     fn peer_status(&mut self) -> BackendResult<String> {
         self.block_on(async {
-            let inbound =
-                orch_infra::storage::remote::FileRemoteStore::new(self.engine.paths.clone())
-                    .read_inbound()
-                    .await?;
-            Ok::<_, orch_core::Error>(format!(
+            let store =
+                orch_infra::storage::remote::FileRemoteStore::new(self.engine.paths.clone());
+            let (listen, controller) = crate::commands::remote::listener_status(
+                &self.engine.paths,
+                self.engine.config.peer.listen.as_deref(),
+            )
+            .await?;
+            let mut status = format!(
                 "listen {} · controller {}",
-                self.engine.config.peer.listen.as_deref().unwrap_or("off"),
-                inbound
-                    .as_ref()
-                    .map(|i| i.controller_name.as_str())
-                    .unwrap_or("none")
-            ))
+                listen.as_deref().unwrap_or("off"),
+                controller.as_deref().unwrap_or("none"),
+            );
+            for remote in store.list().await? {
+                let online = store
+                    .read_status(&remote.alias)
+                    .await?
+                    .is_some_and(|s| s.online);
+                status.push_str(&format!(
+                    " · {} {}",
+                    remote.alias,
+                    if online { "online" } else { "offline" },
+                ));
+            }
+            Ok::<_, orch_core::Error>(status)
         })
         .map_err(to_message)
     }
@@ -642,12 +672,13 @@ impl TuiBackend for EngineBackend {
     /// lock — is knowable before any agent starts, and `/watch` is the one
     /// command whose whole purpose is to report it.
     fn start_watch(&mut self) -> BackendResult<()> {
-        self.block_on(
-            self.engine
-                .orchestrator
-                .start_watch(WatchOptions::watching()),
-        )
-        .map_err(to_message)?;
+        let runtime = self
+            .block_on(crate::serve::peer::start_watch(
+                Arc::clone(&self.engine),
+                WatchOptions::watching(),
+            ))
+            .map_err(to_message)?;
+        *self.peer_runtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(runtime);
         self.watch_active = true;
         Ok(())
     }
@@ -663,6 +694,10 @@ impl TuiBackend for EngineBackend {
     fn stop_watch(&mut self) -> BackendResult<()> {
         self.block_on(self.engine.orchestrator.stop())
             .map_err(to_message)?;
+        self.peer_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         self.watch_active = false;
         Ok(())
     }

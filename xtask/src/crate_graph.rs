@@ -39,6 +39,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // then as a table naming three of the five non-test sites — so
     // `ENGINE_INFRA_SITES` below checks it instead of prose describing it.
     ("orch-engine", &["orch-core", "orch-domain", "orch-infra"]),
+    // Transport composes the engine and concrete peer persistence; the engine
+    // reaches it only through the network-independent bridge in orch-core.
+    (
+        "orch-peer",
+        &["orch-core", "orch-domain", "orch-engine", "orch-infra"],
+    ),
     // **Tighter than ARCHITECTURE §3.1's diagram**, which has the TUI
     // depending on the engine. WP-6 inverted it: everything the dashboard
     // needs goes through one trait, `orch_tui::backend::TuiBackend`, so the
@@ -59,6 +65,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "orch-domain",
             "orch-engine",
             "orch-infra",
+            "orch-peer",
             "orch-tui",
         ],
     ),

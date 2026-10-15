@@ -266,7 +266,11 @@ fn track(event: &OrchestratorEvent, in_flight: &mut HashSet<String>) {
 }
 
 /// `run --watch` — the continuous orchestration loop, with a live log stream.
-pub async fn watch(engine: &FullEngine, styles: &Styles, verbose: bool) -> Result<ExitCode> {
+pub async fn watch(
+    engine: std::sync::Arc<FullEngine>,
+    styles: &Styles,
+    verbose: bool,
+) -> Result<ExitCode> {
     println!(
         "{} · watching · poll interval {}s",
         styles.paint(Color::Amber, "orch"),
@@ -295,11 +299,13 @@ pub async fn watch(engine: &FullEngine, styles: &Styles, verbose: bool) -> Resul
         }
     });
 
-    engine
-        .orchestrator
-        .start_watch(orch_engine::WatchOptions::watching())
-        .await?;
+    let peer_runtime = crate::serve::peer::start_watch(
+        std::sync::Arc::clone(&engine),
+        orch_engine::WatchOptions::watching(),
+    )
+    .await?;
     engine.orchestrator.wait_for_stop().await;
+    drop(peer_runtime);
 
     done.cancel();
     let _ = pump.await;

@@ -583,7 +583,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             // `--watch` wins over `--all`, which wins over a task id, as the
             // original's if/else chain does.
             if *watch {
-                commands::run::watch(&engine, &styles, *verbose).await
+                commands::run::watch(std::sync::Arc::new(engine), &styles, *verbose).await
             } else if *all {
                 commands::run::all(&engine, &styles).await
             } else {

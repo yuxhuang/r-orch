@@ -433,6 +433,16 @@ impl Orchestrator {
     /// Returns once the loop is running — like the TS method, which sets an
     /// interval and resolves. Use [`Orchestrator::wait_for_stop`] to block.
     pub async fn start_watch(&self, options: WatchOptions) -> Result<()> {
+        self.start_watch_with(options, || async { Ok(()) }).await
+    }
+
+    /// Install owner-only runtime services after recovery and before the first
+    /// dispatch. A failed setup releases the owner lock like any startup error.
+    pub async fn start_watch_with<F, Fut>(&self, options: WatchOptions, prepare: F) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         self.inner
             .skip_autonomous_seeding
             .store(options.skip_autonomous_seeding, Ordering::SeqCst);
@@ -471,16 +481,22 @@ impl Orchestrator {
         // Reactive dispatch: a task created by any process in this binary
         // should not wait for the next poll.
         let reactive = self.clone();
-        let unsubscribe = self.deps().events.on(
+        let mut unsubscribe = Some(self.deps().events.on(
             orch_domain::OrchestratorEventType::TaskCreated,
             move |_event| {
                 reactive.schedule_immediate_dispatch(0);
             },
-        );
+        ));
 
-        match self.start_watch_prepared(signals, unsubscribe).await {
+        match self
+            .start_watch_prepared(signals, &mut unsubscribe, prepare)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(err) => {
+                if let Some(unsubscribe) = unsubscribe.take() {
+                    unsubscribe.unsubscribe();
+                }
                 self.inner.lock_acquired.store(false, Ordering::SeqCst);
                 self.deps().lock.release().await;
                 Err(err)
@@ -490,11 +506,16 @@ impl Orchestrator {
 
     /// The fallible half of [`Orchestrator::start_watch`], split out so one
     /// `match` can release the lock on every error path.
-    async fn start_watch_prepared(
+    async fn start_watch_prepared<F, Fut>(
         &self,
         signals: SignalArms,
-        unsubscribe: crate::events::Unsubscribe,
-    ) -> Result<()> {
+        unsubscribe: &mut Option<crate::events::Unsubscribe>,
+        prepare: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         {
             let mut slot = self.inner.state.lock().await;
             self.load_state(&mut slot).await?;
@@ -512,8 +533,9 @@ impl Orchestrator {
             self.save_state(state).await?;
         }
 
+        prepare().await?;
         self.tick_once().await?;
-        self.spawn_watch_loop(signals, unsubscribe);
+        self.spawn_watch_loop(signals, unsubscribe.take().expect("startup subscription"));
         Ok(())
     }
 

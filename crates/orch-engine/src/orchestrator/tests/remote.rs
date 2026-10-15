@@ -982,3 +982,97 @@ async fn reassignment_to_local_does_not_merge_a_previous_worker_branch() {
     assert!(proof.branch.is_none());
     assert!(h.workspace.merged().is_empty());
 }
+
+#[tokio::test]
+async fn unknown_outcome_retries_run_task_and_state_errors_without_losing_the_collector() {
+    for target in ["run", "task", "state"] {
+        let fixture = PeerFixture::new(true).await;
+        let (h, _) = running(&fixture).await;
+        let cancel = CancellationToken::new();
+        h.orchestrator
+            .inner
+            .cancels
+            .lock()
+            .await
+            .insert("tsk_remote".into(), cancel.clone());
+        match target {
+            "run" => h.runs.faults.fail_once("transient unknown run write"),
+            "task" => h.tasks.faults.fail_once("transient unknown task write"),
+            _ => h.state.faults.fail_once("transient unknown state write"),
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            h.orchestrator.collect_remote_events(
+                Box::pin(futures::stream::iter([RemoteRunEvent::Unknown])),
+                "run_remote",
+                "tsk_remote",
+                "agt_peer@worker",
+                true,
+                cancel,
+            ),
+        )
+        .await
+        .expect("unknown outcome retry must finish")
+        .unwrap();
+        let persisted = h.persisted_state();
+        assert!(
+            persisted.running.is_empty(),
+            "{target} error left a running entry"
+        );
+        assert!(persisted.retry_queue.is_empty());
+        assert_eq!(persisted.stats.total_runs, 1);
+        assert_eq!(h.task("tsk_remote").status, TaskStatus::Failed);
+        assert_eq!(
+            h.runs.peek("run_remote").unwrap().error.as_deref(),
+            Some("remote lost execution record")
+        );
+    }
+}
+
+#[tokio::test]
+async fn worker_mirror_without_criteria_autoapproves_under_suggest_policy() {
+    let mut agent = make_agent();
+    agent.config.approval_policy = Some(ApprovalPolicy::Suggest);
+    let h = Harness::builder()
+        .agents([agent])
+        .tasks([Task {
+            id: "tsk_mirror".into(),
+            status: TaskStatus::InProgress,
+            assignee: Some("agt_test1".into()),
+            labels: vec!["remote-ctl:controller".into()],
+            ..make_task()
+        }])
+        .state(state_running(
+            "tsk_mirror",
+            "agt_test1",
+            "run_mirror",
+            42,
+            NOW_ISO,
+        ))
+        .build();
+    h.set_state(state_running(
+        "tsk_mirror",
+        "agt_test1",
+        "run_mirror",
+        42,
+        NOW_ISO,
+    ))
+    .await;
+    h.runs.seed(Run {
+        id: "run_mirror".into(),
+        task_id: "tsk_mirror".into(),
+        ..make_run()
+    });
+    h.orchestrator
+        .handle_run_success(
+            "tsk_mirror",
+            "run_mirror",
+            "agt_test1",
+            None,
+            Some("finished".into()),
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.task("tsk_mirror").status, TaskStatus::Done);
+}

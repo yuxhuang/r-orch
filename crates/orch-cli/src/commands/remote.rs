@@ -69,6 +69,8 @@ pub async fn run(
         RemoteSub::Status => {
             let config = engine.config_store.read().await?;
             let inbound = store.read_inbound().await?;
+            let (listen, controller) =
+                listener_status(&engine.paths, config.peer.listen.as_deref()).await?;
             let mut remotes = Vec::new();
             for entry in store.list().await? {
                 remotes.push(
@@ -90,20 +92,11 @@ pub async fn run(
             }
             if ctx.json {
                 return print_json(
-                    &serde_json::json!({"listen": config.peer.listen, "inbound": inbound, "remotes": remotes}),
+                    &serde_json::json!({"listen": listen, "controller": controller, "inbound": inbound, "remotes": remotes}),
                 );
             }
-            println!(
-                "  Listen: {}",
-                config.peer.listen.as_deref().unwrap_or("off")
-            );
-            println!(
-                "  Controller: {}",
-                inbound
-                    .as_ref()
-                    .map(|i| i.controller_name.as_str())
-                    .unwrap_or("none")
-            );
+            println!("  Listen: {}", listen.as_deref().unwrap_or("off"));
+            println!("  Controller: {}", controller.as_deref().unwrap_or("none"));
             for status in remotes {
                 println!(
                     "  {}: {}{}",
@@ -138,6 +131,38 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Prefer the live owner's effective address (including an ephemeral port or
+/// flag override). Cached listener files never imply a live connection.
+pub(crate) async fn listener_status(
+    paths: &orch_infra::storage::Paths,
+    configured: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct Listener {
+        listen_addr: String,
+        controller_name: Option<String>,
+    }
+
+    let recent = tokio::fs::metadata(paths.lock_path())
+        .await
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .is_some_and(|modified| {
+            std::time::SystemTime::now()
+                .duration_since(modified)
+                .map_or(true, |age| age <= lock::LOCK_STALE)
+        });
+    if recent && lock::check_lock(&paths.lock_path()).await.acquired {
+        let listener: Option<Listener> =
+            orch_infra::storage::fs_utils::read_json(&paths.remotes_dir().join("_listener.json"))
+                .await?;
+        if let Some(listener) = listener {
+            return Ok((Some(listener.listen_addr), listener.controller_name));
+        }
+    }
+    Ok((configured.map(str::to_owned), None))
 }
 
 pub fn normalize_listen(addr: &str) -> Result<String> {
@@ -230,6 +255,49 @@ mod tests {
             crate::context::EnvFlags::default(),
         );
         (temp, engine, ctx)
+    }
+
+    #[tokio::test]
+    async fn listener_status_uses_live_owner_address_and_hides_stale_connections() {
+        let (_temp, engine, _ctx) = fixture().await;
+        orch_infra::storage::fs_utils::write_json(
+            &engine.paths.remotes_dir().join("_listener.json"),
+            &serde_json::json!({
+                "listen_addr": "127.0.0.1:41234",
+                "controller_name": "controller-a"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listener_status(&engine.paths, Some("0.0.0.0:7690"))
+                .await
+                .unwrap(),
+            (Some("0.0.0.0:7690".into()), None),
+        );
+        let acquired = lock::acquire_lock(&engine.paths.lock_path()).await.unwrap();
+        assert!(acquired.acquired);
+        assert_eq!(
+            listener_status(&engine.paths, None).await.unwrap(),
+            (Some("127.0.0.1:41234".into()), Some("controller-a".into())),
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(engine.paths.lock_path())
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - lock::LOCK_STALE - std::time::Duration::from_secs(1),
+            ))
+            .unwrap();
+        assert_eq!(
+            listener_status(&engine.paths, None).await.unwrap(),
+            (None, None),
+        );
+        lock::release_lock(&engine.paths.lock_path()).await;
+        assert_eq!(
+            listener_status(&engine.paths, None).await.unwrap(),
+            (None, None)
+        );
     }
 
     #[tokio::test]

@@ -31,6 +31,15 @@ impl Orchestrator {
             .unwrap_or_else(|e| e.into_inner()) = Some(tap);
     }
 
+    /// Release the owner's in-process tap when its peer runtime stops.
+    pub fn clear_run_event_tap(&self) {
+        *self
+            .inner
+            .event_tap
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     pub(super) fn remote_bridge(&self) -> Arc<dyn RemoteBridge> {
         Arc::clone(
             &self
@@ -60,10 +69,20 @@ impl Orchestrator {
         task_id: &str,
         error: &str,
     ) -> Result<()> {
-        let Some(entry) = state.running.get(task_id).cloned() else {
-            return Ok(());
-        };
         self.take_cancel(task_id).await;
+        self.persist_remote_unknown_locked(state, task_id, error)
+            .await
+    }
+
+    async fn persist_remote_unknown_locked(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        error: &str,
+    ) -> Result<()> {
+        let Some(entry) = state.running.get(task_id).cloned() else {
+            return self.save_remote_state(state).await;
+        };
         self.deps()
             .run_service
             .finish(
@@ -146,15 +165,35 @@ impl Orchestrator {
                     break;
                 }
                 Some(RemoteRunEvent::Unknown) => {
-                    let mut slot = self.inner.state.lock().await;
-                    if let Some(state) = slot.as_mut() {
-                        self.fail_remote_unknown_locked(
-                            state,
-                            task_id,
-                            "remote lost execution record",
-                        )
-                        .await?;
+                    // Sync is authoritative, but applying it still requires
+                    // durable writes, exactly like a finished envelope.
+                    loop {
+                        let result = {
+                            let mut slot = self.inner.state.lock().await;
+                            if let Some(state) = slot.as_mut() {
+                                self.persist_remote_unknown_locked(
+                                    state,
+                                    task_id,
+                                    "remote lost execution record",
+                                )
+                                .await
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        match result {
+                            Ok(()) => break,
+                            Err(error) => self.emit_error(
+                                error,
+                                format!("persist unknown remote outcome {run_id}"),
+                            ),
+                        }
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
+                        }
                     }
+                    self.drop_cancel(task_id).await;
                     break;
                 }
                 // A dropped stream is not proof the execution stopped. Leave

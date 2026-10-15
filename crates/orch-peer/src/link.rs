@@ -1,0 +1,749 @@
+//! Persistent outbound links and pid-less execution streams.
+use crate::{
+    AbortOnDrop, Context,
+    codec::{read_frame, write_frame},
+    protocol::{Frame, PROTOCOL},
+};
+use async_trait::async_trait;
+use futures::stream;
+use orch_core::{
+    error::{Error, Result},
+    remote::{RemoteBridge, RemoteExecuteHandle, RemoteOutcome, RemoteRunEvent, RemoteSubmit},
+    storage::MessageStore,
+};
+use orch_domain::{Message, MessageStatus, RemoteConfig, RemoteStatus};
+use orch_infra::storage::remote::validate_snapshot;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{io::BufReader, net::TcpStream, sync::mpsc, time::Instant};
+
+struct Execution {
+    submit: Frame,
+    events: mpsc::Sender<RemoteRunEvent>,
+    attempted: bool,
+    seq: u64,
+    terminal: Option<RemoteRunEvent>,
+    delivered: bool,
+    hint: Option<String>,
+}
+#[derive(Default)]
+struct Queue {
+    executions: BTreeMap<String, Execution>,
+    commands: VecDeque<Frame>,
+}
+
+pub(crate) struct LinkHub {
+    queues: Mutex<BTreeMap<String, Queue>>,
+    messages: Arc<dyn MessageStore>,
+}
+impl LinkHub {
+    pub fn new(messages: Arc<dyn MessageStore>) -> Self {
+        Self {
+            queues: Mutex::new(BTreeMap::new()),
+            messages,
+        }
+    }
+    fn queues(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Queue>> {
+        self.queues.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn active(&self, alias: &str) -> Vec<String> {
+        self.queues()
+            .get(alias)
+            .map(|q| q.executions.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+    fn attachments(&self, alias: &str) -> Vec<Frame> {
+        self.queues()
+            .get(alias)
+            .map(|q| {
+                q.executions
+                    .iter()
+                    .map(|(key, e)| Frame::Attach {
+                        exec_key: key.clone(),
+                        after_seq: e.seq,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn commands(&self, alias: &str) -> Vec<Frame> {
+        self.queues()
+            .get_mut(alias)
+            .map(|q| q.commands.drain(..).collect())
+            .unwrap_or_default()
+    }
+    fn submits(&self, alias: &str) -> Vec<Frame> {
+        let mut guard = self.queues();
+        let Some(q) = guard.get_mut(alias) else {
+            return vec![];
+        };
+        q.executions
+            .values_mut()
+            .filter_map(|e| {
+                if e.attempted || e.terminal.is_some() {
+                    return None;
+                }
+                Some(e.submit.clone())
+            })
+            .collect()
+    }
+    fn mark_attempted(&self, alias: &str, frame: &Frame) {
+        if let Frame::Submit { exec_key, .. } = frame
+            && let Some(e) = self
+                .queues()
+                .get_mut(alias)
+                .and_then(|q| q.executions.get_mut(exec_key))
+        {
+            // Set only for the frame about to be written. A previous command
+            // failing must not turn later, wholly unsent requests into Unknown.
+            e.attempted = true;
+        }
+    }
+
+    fn terminal(&self, alias: &str, key: &str, event: RemoteRunEvent) -> bool {
+        let mut guard = self.queues();
+        let Some(q) = guard.get_mut(alias) else {
+            return false;
+        };
+        let Some(e) = q.executions.get_mut(key) else {
+            return false;
+        };
+        if e.terminal.is_none() {
+            e.terminal = Some(event);
+        }
+        Self::flush_execution(e);
+        if e.delivered && matches!(e.terminal, Some(RemoteRunEvent::Unknown)) {
+            q.executions.remove(key);
+        }
+        true
+    }
+    fn flush_execution(e: &mut Execution) {
+        if !e.delivered
+            && let Some(event) = &e.terminal
+        {
+            match e.events.try_send(event.clone()) {
+                Ok(()) => e.delivered = true,
+                Err(mpsc::error::TrySendError::Closed(_)) => e.delivered = true,
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+            }
+        }
+    }
+    fn flush(&self, alias: &str) {
+        if let Some(q) = self.queues().get_mut(alias) {
+            q.executions.retain(|_, e| {
+                Self::flush_execution(e);
+                !(e.delivered && matches!(e.terminal, Some(RemoteRunEvent::Unknown)))
+            });
+        }
+    }
+    fn event(&self, alias: &str, key: &str, seq: u64, event: orch_core::adapter::AgentEvent) {
+        if let Some(e) = self
+            .queues()
+            .get_mut(alias)
+            .and_then(|q| q.executions.get_mut(key))
+            && seq > e.seq
+        {
+            e.seq = seq;
+            // Progress is best effort. Preserve bounded memory even if a
+            // collector stalls; terminal envelopes use the separate retry slot.
+            let _ = e.events.try_send(RemoteRunEvent::Event(event));
+        }
+    }
+    fn hint(&self, alias: &str, key: &str, state: &str, timestamp: String) {
+        if let Some(e) = self
+            .queues()
+            .get_mut(alias)
+            .and_then(|q| q.executions.get_mut(key))
+            && e.hint.as_deref() != Some(state)
+        {
+            let text = match state {
+                "queued" => format!("waiting: queued on {alias}"),
+                "running" => format!("running on {alias}"),
+                _ => return,
+            };
+            e.hint = Some(state.into());
+            let event = orch_core::adapter::AgentEvent::new(
+                orch_core::adapter::AgentEventKind::Output,
+                timestamp,
+                serde_json::json!({"text": text, "remote_state": state}),
+            );
+            let _ = e.events.try_send(RemoteRunEvent::Event(event));
+        }
+    }
+
+    fn attempted(&self, alias: &str, key: &str) -> bool {
+        self.queues()
+            .get(alias)
+            .and_then(|q| q.executions.get(key))
+            .is_some_and(|e| e.attempted)
+    }
+    fn remove_alias(&self, alias: &str) {
+        self.queues().remove(alias);
+    }
+}
+
+#[async_trait]
+impl RemoteBridge for LinkHub {
+    fn submit(&self, request: RemoteSubmit) -> Result<RemoteExecuteHandle> {
+        let (tx, rx) = mpsc::channel(1024);
+        let mut queues = self.queues();
+        let queue = queues.entry(request.alias).or_default();
+        if queue.executions.contains_key(&request.exec_key) {
+            return Err(Error::other("Execution stream already registered"));
+        }
+        queue.executions.insert(
+            request.exec_key.clone(),
+            Execution {
+                submit: Frame::Submit {
+                    exec_key: request.exec_key,
+                    agent_id: request.agent_id,
+                    from: request.from,
+                    prompt: request.prompt,
+                    title: request.title,
+                    priority: request.priority,
+                    review_criteria: request.review_criteria,
+                    goal_id: request.goal_id,
+                },
+                events: tx,
+                attempted: false,
+                seq: 0,
+                terminal: None,
+                delivered: false,
+                hint: None,
+            },
+        );
+        Ok(RemoteExecuteHandle {
+            pid: 0,
+            events: Box::pin(stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|e| (e, rx))
+            })),
+        })
+    }
+    async fn cancel(&self, alias: &str, exec_key: &str) -> Result<()> {
+        let mut queues = self.queues();
+        let q = queues.entry(alias.into()).or_default();
+        q.executions.remove(exec_key);
+        q.commands.push_back(Frame::Cancel {
+            exec_key: exec_key.into(),
+        });
+        Ok(())
+    }
+    async fn ack_finished(&self, alias: &str, exec_key: &str) -> Result<()> {
+        let mut queues = self.queues();
+        let q = queues.entry(alias.into()).or_default();
+        q.executions.remove(exec_key);
+        q.commands.push_back(Frame::FinishedAck {
+            exec_key: exec_key.into(),
+        });
+        Ok(())
+    }
+    async fn send_msg(&self, peer: &str, message: &Message) -> Result<()> {
+        if !message
+            .to_agent_id
+            .as_deref()
+            .is_some_and(|to| to.rsplit_once('@').is_some_and(|(_, p)| p == peer))
+        {
+            return Err(Error::invalid_arguments(
+                "Message recipient does not match peer",
+            ));
+        }
+        // The file outbox is the durable queue, shared with ordinary CLI sends.
+        if self.messages.get(&message.id).await?.is_none() {
+            self.messages.save(message).await?;
+        }
+        let wait = async {
+            loop {
+                if self
+                    .messages
+                    .get(&message.id)
+                    .await?
+                    .is_some_and(|m| m.status == MessageStatus::Delivered)
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(15), wait)
+            .await
+            .map_err(|_| Error::other("Remote message pending acknowledgement"))?
+    }
+}
+
+#[derive(Default)]
+struct Backoff(u32);
+impl Backoff {
+    fn next(&mut self) -> Duration {
+        let seconds = (1u64 << self.0.min(5)).min(30);
+        self.0 = self.0.saturating_add(1);
+        Duration::from_secs(seconds)
+    }
+}
+
+struct Links(BTreeMap<String, (RemoteConfig, AbortOnDrop)>);
+
+pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
+    let mut links = Links(BTreeMap::new());
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tick.tick().await;
+        let configs = match ctx.store.list().await {
+            Ok(configs) => configs,
+            Err(error) => {
+                tracing::error!(%error,"Read peer registry");
+                continue;
+            }
+        };
+        let removed: Vec<_> = links
+            .0
+            .iter()
+            .filter(|(_, (old, _))| !configs.iter().any(|c| c == old))
+            .map(|(alias, _)| alias.clone())
+            .collect();
+        for alias in removed {
+            links.0.remove(&alias);
+            if !configs.iter().any(|config| config.alias == alias) {
+                hub.remove_alias(&alias);
+            }
+        }
+        for config in configs {
+            if !links.0.contains_key(&config.alias) {
+                let alias = config.alias.clone();
+                let task = tokio::spawn(run_link(ctx.clone(), hub.clone(), config.clone()));
+                links.0.insert(alias, (config, AbortOnDrop(task)));
+            }
+        }
+    }
+}
+
+async fn blocked() -> bool {
+    if let Some(path) = std::env::var_os("ORCH_TEST_PEER_BLOCK_FILE") {
+        tokio::fs::try_exists(path).await.unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+async fn run_link(ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
+    let mut status = ctx
+        .store
+        .read_status(&config.alias)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| RemoteStatus {
+            alias: config.alias.clone(),
+            addr: config.addr.clone(),
+            online: false,
+            last_seen: None,
+            last_error: None,
+            peer_name: None,
+            instance_id: None,
+            os: None,
+            agents: vec![],
+        });
+    status.addr = config.addr.clone();
+    status.online = false;
+    let mut backoff = Backoff::default();
+    loop {
+        while blocked().await {
+            status.online = false;
+            status.last_error = Some("Peer link blocked by test hook".into());
+            persist_status(&ctx, &status).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let result = session(&ctx, &hub, &config, &mut status).await;
+        let connected = status.online;
+        status.online = false;
+        status.last_error = Some(
+            result
+                .err()
+                .map_or_else(|| "Peer disconnected".into(), |e| e.to_string()),
+        );
+        persist_status(&ctx, &status).await;
+        if connected {
+            backoff = Backoff::default();
+        }
+        let delay = backoff.next();
+        tracing::debug!(alias=%config.alias,error=?status.last_error,?delay,"Peer reconnect pending");
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn persist_status(ctx: &Context, status: &RemoteStatus) {
+    // A removal must not recreate its status file after the command deleted it.
+    if ctx
+        .store
+        .list()
+        .await
+        .is_ok_and(|configs| configs.iter().any(|c| c.alias == status.alias))
+        && let Err(error) = ctx.store.write_status(status).await
+    {
+        tracing::error!(%error,alias=%status.alias,"Write peer status");
+    }
+}
+
+async fn session(
+    ctx: &Context,
+    hub: &Arc<LinkHub>,
+    config: &RemoteConfig,
+    status: &mut RemoteStatus,
+) -> Result<()> {
+    let socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&config.addr))
+        .await
+        .map_err(|_| Error::other("Peer connect timed out"))?
+        .map_err(net_error)?;
+    socket.set_nodelay(true).map_err(net_error)?;
+    let (reader, mut writer) = socket.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut local = ctx.local_agents().await?;
+    write_frame(
+        &mut writer,
+        &Frame::Hello {
+            proto: PROTOCOL,
+            instance_id: ctx.instance_id.clone(),
+            name: ctx.name.clone(),
+            os: std::env::consts::OS.into(),
+            agents: local.clone(),
+        },
+    )
+    .await
+    .map_err(net_error)?;
+    let welcome = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader))
+        .await
+        .map_err(|_| Error::other("Peer handshake timed out"))?
+        .map_err(net_error)?;
+    match welcome {
+        Some(Frame::Welcome {
+            proto,
+            instance_id,
+            name,
+            os,
+            agents,
+        }) => {
+            if proto != PROTOCOL {
+                return Err(Error::other("Peer protocol mismatch"));
+            }
+            if instance_id == ctx.instance_id {
+                return Err(Error::other("Cannot connect a peer to itself"));
+            }
+            if instance_id.is_empty() || name.is_empty() || name.contains('@') {
+                return Err(Error::other("Invalid peer identity"));
+            }
+            validate_snapshot(&agents)?;
+            status.instance_id = Some(instance_id);
+            status.peer_name = Some(name);
+            status.os = Some(os);
+            status.agents = agents;
+        }
+        Some(Frame::Busy { controller }) => {
+            return Err(Error::other(format!(
+                "Worker busy: controlled by {controller}"
+            )));
+        }
+        Some(Frame::Error { msg }) => return Err(Error::other(msg)),
+        _ => return Err(Error::other("Expected peer welcome")),
+    }
+    // Must be the first post-handshake frame. It also cancels orphan mirrors
+    // after a controller restart, whose local recovery ran before this link.
+    write_frame(
+        &mut writer,
+        &Frame::Sync {
+            active: hub.active(&config.alias),
+        },
+    )
+    .await
+    .map_err(net_error)?;
+    for frame in hub.attachments(&config.alias) {
+        write_frame(&mut writer, &frame).await.map_err(net_error)?;
+    }
+    status.online = true;
+    status.last_error = None;
+    status.last_seen = Some(ctx.engine.clock.now_iso());
+    persist_status(ctx, status).await;
+    let (tx, mut frames) = mpsc::channel(128);
+    let _reader = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            let result = read_frame(&mut reader).await;
+            let stop = !matches!(result, Ok(Some(_)));
+            if tx.send(result).await.is_err() || stop {
+                break;
+            }
+        }
+    }));
+    let mut synced = false;
+    let mut last_frame = Instant::now();
+    let mut last_ping = Instant::now();
+    let mut last_poll = Instant::now() - Duration::from_secs(1);
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let frame = frame
+                    .ok_or_else(|| Error::other("Peer reader stopped"))?
+                    .map_err(net_error)?
+                    .ok_or_else(|| Error::other("Peer closed connection"))?;
+                last_frame = Instant::now();
+                status.last_seen = Some(ctx.engine.clock.now_iso());
+                handle_frame(ctx, hub, config, status, frame, &mut writer, &mut synced).await?;
+            }
+            _ = tick.tick() => {
+                if blocked().await {
+                    return Err(Error::other("Peer link blocked by test hook"));
+                }
+                if last_frame.elapsed() >= Duration::from_secs(15) {
+                    return Err(Error::other("Peer heartbeat timed out"));
+                }
+                if last_ping.elapsed() >= Duration::from_secs(5) {
+                    write_frame(&mut writer, &Frame::Ping).await.map_err(net_error)?;
+                    last_ping = Instant::now();
+                }
+                hub.flush(&config.alias);
+                if synced {
+                    let frames = hub.commands(&config.alias).into_iter()
+                        .chain(hub.submits(&config.alias));
+                    for frame in frames {
+                        hub.mark_attempted(&config.alias, &frame);
+                        write_frame(&mut writer, &frame).await.map_err(net_error)?;
+                    }
+                }
+                if last_poll.elapsed() >= Duration::from_secs(1) {
+                    let agents = ctx.local_agents().await?;
+                    if agents != local {
+                        local = agents.clone();
+                        write_frame(&mut writer, &Frame::Agents { agents }).await.map_err(net_error)?;
+                    }
+                    for frame in ctx.outbox(&config.alias).await? {
+                        write_frame(&mut writer, &frame).await.map_err(net_error)?;
+                    }
+                    persist_status(ctx, status).await;
+                    last_poll = Instant::now();
+                }
+            }
+        }
+    }
+}
+async fn handle_frame(
+    ctx: &Context,
+    hub: &LinkHub,
+    config: &RemoteConfig,
+    status: &mut RemoteStatus,
+    frame: Frame,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    synced: &mut bool,
+) -> Result<()> {
+    match frame {
+        Frame::Ping => write_frame(writer, &Frame::Pong).await.map_err(net_error)?,
+        Frame::Pong => {}
+        Frame::Agents { agents } => {
+            validate_snapshot(&agents)?;
+            status.agents = agents;
+            persist_status(ctx, status).await;
+        }
+        Frame::SyncState { items } => {
+            *synced = true;
+            for item in items {
+                match item.state.as_str() {
+                    "finished" => {
+                        let outcome = item
+                            .outcome
+                            .ok_or_else(|| Error::other("Finished sync item has no outcome"))?;
+                        if !hub.terminal(
+                            &config.alias,
+                            &item.exec_key,
+                            RemoteRunEvent::Finished(outcome),
+                        ) {
+                            write_frame(
+                                writer,
+                                &Frame::FinishedAck {
+                                    exec_key: item.exec_key,
+                                },
+                            )
+                            .await
+                            .map_err(net_error)?;
+                        }
+                    }
+                    "unknown" if hub.attempted(&config.alias, &item.exec_key) => {
+                        hub.terminal(&config.alias, &item.exec_key, RemoteRunEvent::Unknown);
+                    }
+                    "queued" | "running" => hub.hint(
+                        &config.alias,
+                        &item.exec_key,
+                        &item.state,
+                        ctx.engine.clock.now_iso(),
+                    ),
+                    "unknown" => {}
+                    _ => return Err(Error::other("Invalid peer sync state")),
+                }
+            }
+        }
+        Frame::Finished { exec_key, outcome } => {
+            if !hub.terminal(&config.alias, &exec_key, RemoteRunEvent::Finished(outcome)) {
+                tracing::debug!(alias=%config.alias,%exec_key,"Acknowledge untracked remote outcome");
+                write_frame(writer, &Frame::FinishedAck { exec_key })
+                    .await
+                    .map_err(net_error)?;
+            }
+        }
+        Frame::Rejected { exec_key, reason } => {
+            hub.terminal(
+                &config.alias,
+                &exec_key,
+                RemoteRunEvent::Finished(RemoteOutcome::Failed {
+                    error: format!("Remote rejected submit: {reason}"),
+                    error_kind: None,
+                }),
+            );
+        }
+        Frame::Event {
+            exec_key,
+            seq,
+            event,
+        } => hub.event(&config.alias, &exec_key, seq, event),
+        Frame::Msg { .. } => {
+            let ack = ctx.ingest(&config.alias, &frame).await?;
+            write_frame(writer, &ack).await.map_err(net_error)?;
+        }
+        Frame::MsgAck { id } => ctx.msg_ack(&config.alias, &id).await?,
+        Frame::State { exec_key, state } => {
+            hub.hint(&config.alias, &exec_key, &state, ctx.engine.clock.now_iso())
+        }
+        Frame::Submitted { .. } | Frame::CancelAck { .. } | Frame::Gap { .. } => {}
+        Frame::Error { msg } => return Err(Error::other(msg)),
+        _ => return Err(Error::other("Unexpected worker frame")),
+    }
+    Ok(())
+}
+
+fn net_error(error: std::io::Error) -> Error {
+    Error::other(format!("Peer connection: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use orch_core::test_support::FakeMessageStore;
+    fn request() -> RemoteSubmit {
+        RemoteSubmit {
+            alias: "w1".into(),
+            exec_key: "run1".into(),
+            agent_id: "agent1".into(),
+            from: "cli".into(),
+            prompt: "p".into(),
+            title: "t".into(),
+            priority: 2,
+            review_criteria: vec![],
+            goal_id: None,
+        }
+    }
+    #[tokio::test]
+    async fn later_submissions_are_not_uncertain_when_an_earlier_write_fails() {
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let _one = hub.submit(request()).unwrap();
+        let mut two = request();
+        two.exec_key = "run2".into();
+        let _two = hub.submit(two).unwrap();
+        let batch = hub.submits("w1");
+        assert_eq!(batch.len(), 2);
+        assert!(!hub.attempted("w1", "run1"));
+        assert!(!hub.attempted("w1", "run2"));
+        hub.mark_attempted("w1", &batch[0]);
+        assert!(hub.attempted("w1", "run1"));
+        assert!(!hub.attempted("w1", "run2"));
+        assert!(
+            matches!(&hub.submits("w1")[0], Frame::Submit {exec_key, ..} if exec_key == "run2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_progress_queue_never_drops_the_terminal_envelope() {
+        use orch_core::adapter::{AgentEvent, AgentEventKind};
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let mut handle = hub.submit(request()).unwrap();
+        for seq in 1..=1025 {
+            hub.event(
+                "w1",
+                "run1",
+                seq,
+                AgentEvent::new(
+                    AgentEventKind::Output,
+                    "now",
+                    serde_json::json!({"text": "progress"}),
+                ),
+            );
+        }
+        assert!(hub.terminal("w1", "run1", RemoteRunEvent::Unknown));
+        assert_eq!(hub.active("w1"), vec!["run1"]);
+        for _ in 0..1024 {
+            assert!(matches!(
+                handle.events.next().await,
+                Some(RemoteRunEvent::Event(_))
+            ));
+        }
+        hub.flush("w1");
+        assert!(hub.active("w1").is_empty());
+        assert!(matches!(
+            handle.events.next().await,
+            Some(RemoteRunEvent::Unknown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_hints_are_visible_progress_and_only_sent_on_change() {
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let mut handle = hub.submit(request()).unwrap();
+        hub.hint("w1", "run1", "queued", "now".into());
+        hub.hint("w1", "run1", "queued", "later".into());
+        match handle.events.next().await.unwrap() {
+            RemoteRunEvent::Event(event) => assert_eq!(event.data["text"], "waiting: queued on w1"),
+            other => panic!("expected queued progress, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), handle.events.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn backoff_caps_at_thirty_seconds_forever() {
+        let mut b = Backoff::default();
+        assert_eq!(
+            (0..8).map(|_| b.next().as_secs()).collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 16, 30, 30, 30]
+        );
+    }
+    #[tokio::test]
+    async fn streams_survive_reconnect_and_cancel_removes_active_key() {
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let mut handle = hub.submit(request()).unwrap();
+        assert_eq!(handle.pid, 0);
+        assert_eq!(hub.active("w1"), vec!["run1"]);
+        let submits = hub.submits("w1");
+        assert_eq!(submits.len(), 1);
+        assert!(!hub.attempted("w1", "run1"));
+        hub.mark_attempted("w1", &submits[0]);
+        assert!(hub.submits("w1").is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), handle.events.next())
+                .await
+                .is_err()
+        );
+        hub.terminal("w1", "run1", RemoteRunEvent::Unknown);
+        assert!(
+            hub.active("w1").is_empty(),
+            "unknown keys must retire after delivery"
+        );
+        assert!(matches!(
+            handle.events.next().await,
+            Some(RemoteRunEvent::Unknown)
+        ));
+        hub.cancel("w1", "run1").await.unwrap();
+        assert!(hub.active("w1").is_empty());
+        assert!(matches!(&hub.commands("w1")[0],Frame::Cancel{exec_key} if exec_key=="run1"));
+    }
+}

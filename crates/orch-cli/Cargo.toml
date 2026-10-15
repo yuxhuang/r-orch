@@ -30,6 +30,7 @@ orch-domain.workspace = true
 orch-core.workspace = true
 orch-engine.workspace = true
 orch-infra.workspace = true
+orch-peer.workspace = true
 orch-tui.workspace = true
 
 # anyhow is allowed here and in xtask only — never in a library signature.

@@ -1689,6 +1689,7 @@ dependencies = [
  "orch-domain",
  "orch-engine",
  "orch-infra",
+ "orch-peer",
  "orch-tui",
  "portable-pty",
  "ratatui",
@@ -1780,6 +1781,23 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "orch-peer"
+version = "0.3.1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "orch-core",
+ "orch-domain",
+ "orch-engine",
+ "orch-infra",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

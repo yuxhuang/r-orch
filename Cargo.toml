@@ -5,6 +5,7 @@ members = [
     "crates/orch-core",
     "crates/orch-infra",
     "crates/orch-engine",
+    "crates/orch-peer",
     "crates/orch-cli",
     "crates/orch-tui",
     "xtask",
@@ -28,6 +29,7 @@ orch-domain = { path = "crates/orch-domain" }
 orch-core = { path = "crates/orch-core" }
 orch-infra = { path = "crates/orch-infra" }
 orch-engine = { path = "crates/orch-engine" }
+orch-peer = { path = "crates/orch-peer" }
 orch-tui = { path = "crates/orch-tui" }
 
 # ── Core (ARCHITECTURE §4.1) ───────────────────────────────────────────────
