@@ -1336,3 +1336,229 @@ fn s16_removing_remote_with_pending_message_preserves_outbox_without_delivering_
     );
     assert!(!controller.path(".orchestry/remotes/removed.json").exists());
 }
+
+// Regression: S2 — cap incomplete handshakes and retain the listening socket
+// after transient descriptor exhaustion. Found by the security gate 2026-10-15.
+// Python is used only at the OS boundary for child rlimits and RSS sampling;
+// the actual protocol, sockets, engine and files are real and isolated.
+const S2_RESOURCE_PROBE: &str = r###"# Standard library only: Python supplies portable child rlimits without unsafe Rust.
+import json, os, re, resource, signal, socket, subprocess, sys, tempfile, threading, time
+from pathlib import Path
+
+binary = str(Path(sys.argv[1]).resolve())
+mode = sys.argv[2]
+result = {'scenario': mode, 'attempts': 80, 'partial_bytes': 1024*1024-64,
+          'rss_watchdog_kib': 384*1024, 'wall_deadline_seconds': 55, 'cpu_limit_seconds': 25}
+
+def rss(pid):
+    return int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(pid)], text=True, timeout=2).strip())
+
+def fds(pid):
+    proc = Path('/proc')/str(pid)/'fd'
+    if proc.exists():
+        return len(list(proc.iterdir()))
+    lines = subprocess.check_output(['/usr/sbin/lsof', '-nP', '-p', str(pid)], text=True, stderr=subprocess.DEVNULL, timeout=3).splitlines()[1:]
+    return len({row.split()[3] for row in lines if len(row.split()) > 3 and re.match(r'^\d', row.split()[3])})
+
+def await_condition(label, check, seconds=8):
+    deadline = time.monotonic()+seconds
+    while not check():
+        assert owner.poll() is None, 'owner exited: '+log_path.read_text()
+        assert time.monotonic() < deadline, label+': '+log_path.read_text()
+        # Poll a real process/IO boundary, never assume readiness after a sleep.
+        stop.wait(.02)
+
+class Controller:
+    def __init__(self, port, identity='controller'):
+        self.s = socket.create_connection(('127.0.0.1', port), timeout=4)
+        sockets.append(self.s)
+        self.s.settimeout(4)
+        self.f = self.s.makefile('rb')
+        files.append(self.f)
+        self.send({'t':'hello','proto':1,'instance_id':identity,'name':identity,'os':'linux','agents':[]})
+        assert self.next()['t'] == 'welcome', 'valid reconnect did not receive Welcome'
+        self.until('agents')
+        self.send({'t':'sync','active':[]})
+        assert self.until('sync_state')['items'] == []
+    def send(self, frame):
+        self.s.sendall(json.dumps(frame).encode()+b'\n')
+    def next(self):
+        line = self.f.readline()
+        assert line, 'unexpected controller EOF'
+        return json.loads(line)
+    def until(self, kind):
+        for _ in range(30):
+            frame = self.next()
+            if frame['t'] == kind:
+                return frame
+            if frame['t'] == 'ping':
+                self.send({'t':'pong'})
+        raise AssertionError('missing '+kind)
+    def ping(self):
+        self.send({'t':'ping'})
+        self.until('pong')
+    def close(self):
+        self.f.close()
+        self.s.close()
+
+with tempfile.TemporaryDirectory(prefix='orch-s2-regression-') as temporary:
+    root = Path(temporary)
+    home = root/'home'
+    home.mkdir()
+    env = {k:v for k,v in os.environ.items() if not k.startswith(('ORCH','GIT_'))}
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home/'.config'),
+        ORCHESTRY_GLOBAL_CONFIG_PATH=str(home/'global.yml'),
+        GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
+        RUST_LOG='warn', NO_COLOR='1', TERM='dumb')
+    subprocess.run([binary,'init','--name','s2-regression','--adapter','shell'],
+        cwd=root, env=env, check=True, capture_output=True, timeout=8)
+    # No agents/tasks are created: no adapter or AI CLI can run.
+    nofile = 128 if mode == 'flood' else 24
+    result['nofile'] = nofile
+    def limits():
+        resource.setrlimit(resource.RLIMIT_NOFILE, (nofile,nofile))
+        resource.setrlimit(resource.RLIMIT_CPU, (25,25))
+    log_path = root/'owner.log'
+    stop = threading.Event()
+    sockets, files, held = [], [], []
+    with log_path.open('w') as log:
+        # Inherit the runner process group so its timeout guard also kills this child.
+        owner = subprocess.Popen([binary,'serve','--listen','127.0.0.1:0','--peer-name','s2-worker'],
+            cwd=root, env=env, stdout=log, stderr=log, preexec_fn=limits)
+        result['owner_pid'] = owner.pid
+        def watchdog():
+            deadline = time.monotonic()+55
+            while not stop.wait(.1) and owner.poll() is None:
+                try:
+                    usage = rss(owner.pid)
+                    if usage > 384*1024 or time.monotonic() > deadline:
+                        result['watchdog_tripped'] = {'rss_kib':usage}
+                        owner.kill()
+                        return
+                except (subprocess.SubprocessError, ValueError):
+                    return
+        monitor = threading.Thread(target=watchdog)
+        monitor.start()
+        try:
+            status = root/'.orchestry/remotes/_listener.json'
+            await_condition('listener readiness', lambda: status.exists())
+            port = int(json.loads(status.read_text())['listen_addr'].rsplit(':',1)[1])
+            controller = Controller(port) if mode == 'flood' else None
+            baseline = {'fds':fds(owner.pid),'rss_kib':rss(owner.pid)}
+            result['baseline'] = baseline
+            peak_rss = baseline['rss_kib']
+            errors = 0
+            payload = b'x' * result['partial_bytes']
+            begin = time.monotonic()
+            for i in range(80):
+                try:
+                    s = socket.create_connection(('127.0.0.1',port),timeout=.08)
+                    sockets.append(s)
+                    held.append(s)
+                    s.settimeout(.04)
+                    s.sendall(payload)
+                except OSError:
+                    errors += 1
+                if i % 8 == 7 and owner.poll() is None:
+                    peak_rss = max(peak_rss,rss(owner.pid))
+            result.update(flood_seconds=round(time.monotonic()-begin,3),client_errors=errors)
+            if mode == 'flood':
+                # Ping is a processing barrier on the retained, admitted connection.
+                controller.ping()
+                result['admitted_controller_survived'] = True
+                during = {'fds':fds(owner.pid),'rss_kib':rss(owner.pid)}
+                peak_rss = max(peak_rss,during['rss_kib'])
+                result.update(during=during,peak_rss_kib=peak_rss)
+                assert during['fds']-baseline['fds'] <= 15, 'unbounded admitted sockets: '+str(result)
+                assert peak_rss-baseline['rss_kib'] < 32*1024, 'unbounded partial-frame RSS: '+str(result)
+            else:
+                def retried():
+                    return len(re.findall('Peer accept failed; retrying',log_path.read_text())) >= 3
+                await_condition('real EMFILE retries',retried)
+                logs = log_path.read_text()
+                assert 'Too many open files' in logs, logs
+                result['accept_errors'] = [line for line in logs.splitlines() if 'Peer accept failed; retrying' in line]
+                assert len(result['accept_errors']) <= 8, 'accept retry hot loop'
+                result['during'] = {'fds':fds(owner.pid),'rss_kib':rss(owner.pid)}
+            for s in held:
+                s.close()
+            held.clear()
+            await_condition('hostile sockets drained',lambda: fds(owner.pid) <= baseline['fds'])
+            replacement = Controller(port)
+            replacement.ping()
+            result['reconnected_without_restart'] = True
+            if controller:
+                # Skip any keepalive sent just before takeover; require EOF fencing.
+                while True:
+                    line = controller.f.readline()
+                    if not line:
+                        break
+                    assert json.loads(line)['t'] == 'ping', line
+                controller.close()
+                result['same_identity_takeover_fenced_old_controller'] = True
+            replacement.close()
+            if mode == 'flood':
+                await_condition('controller disconnected',lambda: json.loads(status.read_text())['controller_name'] is None)
+                partial = socket.create_connection(('127.0.0.1',port),timeout=2)
+                sockets.append(partial)
+                partial.sendall(b'{"t":')
+                partial.settimeout(17)
+                begin = time.monotonic()
+                assert partial.recv(1) == b'', 'partial Hello never timed out'
+                result['partial_eof_seconds'] = round(time.monotonic()-begin,3)
+                assert 14 <= result['partial_eof_seconds'] <= 17, 'incorrect handshake timeout'
+                final = Controller(port,'different-controller')
+                final.ping()
+                final.close()
+                result['new_identity_after_partial_timeout'] = True
+            assert owner.poll() is None, 'engine unexpectedly restarted/exited'
+            assert 'watchdog_tripped' not in result, result
+            result['passed'] = True
+        finally:
+            for f in files:
+                f.close()
+            for s in sockets:
+                s.close()
+            if owner.poll() is None:
+                owner.kill()
+            owner.wait(timeout=5)
+            stop.set()
+            monitor.join(timeout=3)
+            result['owner_reaped'] = owner.poll() is not None
+            result['monitor_stopped'] = not monitor.is_alive()
+            result['owner_log'] = log_path.read_text()
+            # Emit evidence on assertion failure too.
+            print(json.dumps(result,indent=2),flush=True)
+assert not root.exists(), 'temporary project leaked'
+"###;
+
+fn s2_resource_probe(scenario: &str) {
+    let sandbox = Peer::new("s2-resource-supervisor");
+    let mut command = sandbox.command("python3");
+    command.args([
+        "-c",
+        S2_RESOURCE_PROBE,
+        env!("CARGO_BIN_EXE_orch"),
+        scenario,
+    ]);
+    let output = sandbox
+        .spawn(command, "s2-probe")
+        .output(Duration::from_secs(65));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("{stdout}");
+    assert!(
+        output.status.success(),
+        "S2 {scenario}: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn s2_partial_handshake_flood_is_bounded_and_controller_takeover_recovers() {
+    s2_resource_probe("flood");
+}
+
+#[test]
+fn s2_transient_descriptor_exhaustion_retries_and_listener_recovers_without_restart() {
+    s2_resource_probe("emfile");
+}
