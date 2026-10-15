@@ -1670,7 +1670,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orch-cli"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "orch-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1722,7 +1722,7 @@ dependencies = [
 
 [[package]]
 name = "orch-domain"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "indexmap",
  "serde",
@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "orch-engine"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "orch-infra"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "async-stream",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "orch-tui"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "indexmap",
@@ -3463,7 +3463,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xtask"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
