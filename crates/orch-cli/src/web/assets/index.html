@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orch</title>
+<link rel="stylesheet" href="/xterm.css">
+<style>
+  html, body { height: 100%; margin: 0; background: #000; }
+  #term { height: 100%; padding: 4px; box-sizing: border-box; }
+  #status {
+    position: fixed; top: 0; left: 0; right: 0; padding: 8px 12px;
+    background: #b00020; color: #fff; font: 14px sans-serif; text-align: center;
+  }
+  #status[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="status" hidden>Disconnected. Reload the page to start a new session.</div>
+<script src="/xterm.js"></script>
+<script src="/addon-fit.js"></script>
+<script>
+  const MAX_CHUNK = 16 * 1024; // the server bounds incoming messages
+  const encoder = new TextEncoder();
+  const term = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
+    fontSize: 14,
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+  fit.fit();
+
+  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  // Carry the access token from the page URL, when there is one, to the socket.
+  const params = new URLSearchParams({ cols: term.cols, rows: term.rows });
+  const token = new URLSearchParams(location.search).get('token');
+  if (token) params.set('token', token);
+  const ws = new WebSocket(`${scheme}//${location.host}/ws?${params}`);
+  ws.binaryType = 'arraybuffer';
+
+  function sendBytes(bytes) {
+    for (let i = 0; i < bytes.length; i += MAX_CHUNK) {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(bytes.subarray(i, i + MAX_CHUNK));
+    }
+  }
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) term.write(new Uint8Array(event.data));
+  };
+  ws.onclose = () => {
+    document.getElementById('status').hidden = false;
+    term.write('\r\n\x1b[31m[disconnected]\x1b[0m\r\n');
+  };
+
+  term.onData((data) => sendBytes(encoder.encode(data)));
+  // Legacy mouse reports are raw bytes in a string, not UTF-8 text.
+  term.onBinary((data) => sendBytes(Uint8Array.from(data, (c) => c.charCodeAt(0))));
+  term.onResize(({ cols, rows }) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+  });
+  window.addEventListener('resize', () => fit.fit());
+  term.focus();
+</script>
+</body>
+</html>

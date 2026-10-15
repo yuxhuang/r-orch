@@ -24,9 +24,9 @@ use clap::{Args, Parser, Subcommand};
 /// Used by the pre-parse routing guard, which has to decide whether the first
 /// non-flag token is a real subcommand *before* clap sees the argv
 /// (`docs/parity/cli.md` §1.6).
-pub const ALL_KNOWN_COMMANDS: [&str; 16] = [
+pub const ALL_KNOWN_COMMANDS: [&str; 17] = [
     "task", "agent", "status", "logs", "config", "context", "msg", "goal", "team", "org", "run",
-    "doctor", "tui", "serve", "init", "update",
+    "doctor", "tui", "serve", "web", "init", "update",
 ];
 
 /// The three commands that run without a container, and so without
@@ -91,9 +91,11 @@ pub enum Command {
     /// Check adapters and dependencies
     Doctor,
     /// Launch interactive TUI dashboard
-    Tui,
+    Tui(TuiCmd),
     /// Headless daemon mode — structured logs to stdout
     Serve(ServeCmd),
+    /// Serve the TUI dashboard in a browser (xterm.js over a websocket)
+    Web(WebCmd),
     /// Initialize .orchestry/ in the current directory
     Init(InitCmd),
     /// Check for updates and install the latest version
@@ -116,8 +118,9 @@ impl Command {
             Command::Org(_) => "org",
             Command::Run(_) => "run",
             Command::Doctor => "doctor",
-            Command::Tui => "tui",
+            Command::Tui(_) => "tui",
             Command::Serve(_) => "serve",
+            Command::Web(_) => "web",
             Command::Init(_) => "init",
             Command::Update(_) => "update",
         }
@@ -692,6 +695,18 @@ pub struct RunCmd {
     pub verbose: bool,
 }
 
+// ── tui ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct TuiCmd {
+    #[arg(
+        long,
+        help = "Do not start the orchestrator; watch the project as an observer. \
+                Not read-only: tasks and agents can still be changed and run from here"
+    )]
+    pub observe: bool,
+}
+
 // ── serve ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Args)]
@@ -719,6 +734,46 @@ pub struct ServeCmd {
     pub log_format: String,
     #[arg(long, help = "Include high-frequency agent:output events")]
     pub verbose: bool,
+}
+
+// ── web ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct WebCmd {
+    #[arg(
+        long,
+        value_name = "addr:port",
+        default_value = "127.0.0.1:7681",
+        help = "Address to listen on (default: 127.0.0.1:7681)"
+    )]
+    pub bind: String,
+    #[arg(
+        long,
+        value_name = "pw",
+        help = "Require this password (HTTP Basic, any username) instead of the generated access token. \
+                Set ORCH_WEB_PASSWORD to keep it out of `ps`. At least 16 characters on a non-loopback bind"
+    )]
+    pub password: Option<String>,
+    #[arg(
+        long = "no-auth",
+        conflicts_with = "password",
+        help = "Serve with NO authentication. Anyone who can reach the port can run code as you, \
+                and the session is unencrypted. Wildcard binds are refused; restrict reachability \
+                with a firewall, Tailscale ACLs or an SSH tunnel"
+    )]
+    pub no_auth: bool,
+    #[arg(
+        long = "allow-host",
+        value_name = "name",
+        help = "Accept this Host header name (repeatable, exact match, no port). Needed behind a reverse proxy or DNS name"
+    )]
+    pub allow_host: Vec<String>,
+    #[arg(
+        long,
+        help = "Run each tab's dashboard with `orch tui --observe`: the orchestrator is not started. \
+                Not read-only: tasks and agents can still be changed and run from the page"
+    )]
+    pub observe: bool,
 }
 
 // ── update ─────────────────────────────────────────────────────────────────
@@ -875,7 +930,7 @@ mod tests {
         ("org deploy", &["<template>"], &["--goal <goal>"]),
         ("run", &["[task-id]"], &["--all", "--watch", "--verbose"]),
         ("doctor", &[], &[]),
-        ("tui", &[], &[]),
+        ("tui", &[], &["--observe"]),
         (
             "serve",
             &[],
@@ -885,6 +940,17 @@ mod tests {
                 "--log-file <path>",
                 "--log-format <format>",
                 "--verbose",
+            ],
+        ),
+        (
+            "web",
+            &[],
+            &[
+                "--bind <addr:port>",
+                "--password <pw>",
+                "--no-auth",
+                "--allow-host <name>",
+                "--observe",
             ],
         ),
         ("update", &[], &["--check"]),
@@ -1068,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn the_root_has_all_sixteen_commands_and_the_global_flags() {
+    fn the_root_has_all_seventeen_commands_and_the_global_flags() {
         let command = Cli::command();
         let mut names: Vec<&str> = command
             .get_subcommands()

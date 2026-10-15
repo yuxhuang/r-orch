@@ -305,6 +305,21 @@ not open-ended work.
 | `indexmap` | `2.14` | Insertion-ordered maps where TS object order matters. |
 | `toml` | `1.1` | Only for our own tooling/config, not for `.orchestry/`. |
 
+### 4.5.1 `orch web` (`orch-cli` only)
+
+| Crate | Version | Why |
+|---|---|---|
+| `axum` | `0.8` (`http1`, `tokio`, `ws`) | Router, middleware and websocket upgrade for `orch web`. Features are minimal: no `json`, `form`, `query` or HTTP/2. Rejected: a hand-rolled server over `hyper` + `tokio-tungstenite` (more code for the same routing, middleware and upgrade hooks); `actix-web` (a second runtime model next to tokio). |
+| `portable-pty` | `0.9` | Opens the pseudo-terminal `orch tui` runs in. Rejected: `nix::pty::openpty` plus hand-rolled spawn, `setsid` and `TIOCSCTTY` (this crate forbids `unsafe`, and portable-pty already does it and handles resize); `pty-process` (async API, but smaller and less used). Its I/O is blocking, so it runs on plain threads bridged by channels. |
+| `base64` | `0.22` | Decodes the HTTP Basic header. Already in the tree via axum. |
+| `sha2` + `subtle` | `0.10` / `2.6` | Credentials are compared as SHA-256 digests with `subtle`'s constant-time equality: fixed-length inputs, so neither content nor length leaks. `sha2` was already in the tree; `subtle` is new and tiny. Rejected: a hand-written compare (easy to get subtly wrong, and optimisers can undo it). |
+| `nanoid` | `0.5` | The 128-bit access token. Already how the workspace makes ids; its default RNG is an OS-seeded `StdRng`. Rejected: adding `rand` or `getrandom` directly for one call. |
+| `nix` (`signal`) | `0.31` | SIGHUP, then SIGKILL after a grace period, to the pty child. `portable-pty`'s own `kill()` escalates in about 200 ms, too fast for `orch tui` to stop its agents. |
+| `tokio-tungstenite` | `0.29` (dev) | Websocket client for the bridge tests. Pinned to the `tungstenite` axum already uses, so there is one copy in the graph. |
+
+Windows is out of scope: the cargo-deny graph is Linux-only (`deny.toml`) and `portable-pty` pulls in
+Windows-only crates the gate never resolves.
+
 ### 4.6 Dev-dependencies
 
 | Crate | Version | Why |

@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"
@@ -131,6 +131,18 @@ arboard = "3.6"
 # PNG-encodes clipboard images (already in the tree via arboard).
 png = "0.18"
 
+# ── Web (`orch web`) ───────────────────────────────────────────────────────
+# Serves the TUI to a browser: a pty running `orch tui`, bridged over a
+# websocket to xterm.js. Only the pieces that bridge needs are enabled.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+portable-pty = "0.9"
+# Basic-auth header decoding; already in the tree via axum.
+base64 = "0.22"
+# Credentials are compared as SHA-256 digests (fixed length, so the comparison
+# leaks neither content nor length) with `subtle`'s constant-time equality.
+sha2 = "0.10"
+subtle = "2.6"
+
 # ── Dev (ARCHITECTURE §4.6) ────────────────────────────────────────────────
 insta = "1.49"
 assert_cmd = "2.2"
@@ -140,6 +152,8 @@ proptest = "1.12"
 # Diffs in the parity harness and in test failures (ARCHITECTURE §4.8).
 similar = "3.2"
 pretty_assertions = "1.4"
+# Websocket client for the `orch web` bridge test.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 
 # Disk is tight and debuginfo is the bulk of a dev build's target/ size.
 [profile.dev]

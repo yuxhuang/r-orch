@@ -34,5 +34,5 @@ pub mod wizard;
 pub use app::App;
 pub use backend::{FakeBackend, TuiBackend};
 pub use clock::{Clock, SystemClock, TestClock};
-pub use runner::run;
+pub use runner::{run, run_until};
 pub use state::{AppState, ViewId};

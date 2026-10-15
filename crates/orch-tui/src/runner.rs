@@ -7,7 +7,8 @@
 //! testing is in [`crate::app`], [`crate::keys`] and [`crate::views`].
 
 use std::io::{self, Stdout, Write};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::crossterm::event::{
@@ -27,12 +28,22 @@ use crate::clock::SystemClock;
 use crate::messages::ANIM_TICK_MS;
 use crate::views;
 
+const MAX_EVENTS_PER_FRAME: usize = 64;
+const MAX_DRAIN: Duration = Duration::from_millis(40);
+
 /// Run the dashboard until the user quits.
 ///
 /// Restores the terminal on every exit path, including a panic in the draw
 /// loop: the guard's `Drop` leaves the alternate screen before the panic
 /// unwinds past it.
 pub fn run<B: TuiBackend>(backend: B) -> io::Result<()> {
+    run_until(backend, &AtomicBool::new(false))
+}
+
+/// [`run`], but also returns once `stop` is set (checked at least once per
+/// animation tick). `orch tui` sets it on SIGHUP or SIGTERM so a closed
+/// terminal takes the same graceful path as `q`.
+pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<()> {
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new(backend, SystemClock);
 
@@ -43,19 +54,36 @@ pub fn run<B: TuiBackend>(backend: B) -> io::Result<()> {
         app.tick();
         guard.terminal.draw(|frame| views::draw(frame, &app))?;
 
-        if app.state.should_exit {
+        if app.state.should_exit || stop.load(Ordering::Relaxed) {
             return Ok(());
         }
 
         // Never wait longer than one animation tick, so spinners and the
         // scanner bar keep moving while the user is idle.
         if event::poll(Duration::from_millis(ANIM_TICK_MS as u64))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-                // A resize is picked up from `terminal.size()` on the next
-                // iteration; the event itself only wakes the loop.
-                Event::Resize(_, _) => {}
-                _ => {}
+            // Drain what is already queued before drawing again, so a flood of
+            // input (a big paste) cannot keep a stop request or `q` waiting
+            // behind one frame per key, but not so long that the screen
+            // freezes under a continuous one.
+            let started = Instant::now();
+            let mut handled = 0;
+            loop {
+                handled += 1;
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                    // A resize is picked up from `terminal.size()` on the next
+                    // iteration; the event itself only wakes the loop.
+                    Event::Resize(_, _) => {}
+                    _ => {}
+                }
+                if app.state.should_exit
+                    || stop.load(Ordering::Relaxed)
+                    || handled >= MAX_EVENTS_PER_FRAME
+                    || started.elapsed() >= MAX_DRAIN
+                    || !event::poll(Duration::ZERO)?
+                {
+                    break;
+                }
             }
         }
     }

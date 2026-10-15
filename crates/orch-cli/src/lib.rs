@@ -2,7 +2,7 @@
 //!
 //! WP-0b wired the walking-skeleton slice — `init`, `agent add`, `task add`,
 //! `task list` — end to end. WP-5 extends the tree in place: [`tree`] now
-//! carries all sixteen commands, and [`routing`] holds the three L0 routing
+//! carries all seventeen commands, and [`routing`] holds the three L0 routing
 //! properties (container-before-parse, the help fast path, Commander's exit
 //! codes) that the parity harness exercises from its first scenario.
 //!
@@ -24,6 +24,7 @@ pub mod tree;
 pub mod tui;
 pub mod update;
 pub mod update_check;
+pub mod web;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ use crate::routing::ArgvShape;
 use crate::tree::{
     AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
     ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, OrgCmd, OrgSub, RunCmd,
-    ServeCmd, TaskCmd, TaskSub, TeamCmd, TeamSub,
+    ServeCmd, TaskCmd, TaskSub, TeamCmd, TeamSub, WebCmd,
 };
 
 /// The single entry point behind the `orch`, `orchestry` and `ao` binaries.
@@ -304,6 +305,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         }
 
         Some(Command::Serve(args)) => run_serve(cli, env, &cwd, args).await,
+
+        Some(Command::Web(args)) => run_web(cli, env, &cwd, args).await,
 
         Some(Command::Status) => {
             let (ctx, styles, engine) = build(cli, env, &cwd).await?;
@@ -573,11 +576,11 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     .await
             }
         }
-        Some(Command::Tui) => {
+        Some(Command::Tui(args)) => {
             let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
             // The dashboard needs the orchestrator, so this is the one command
             // that builds the full container up front.
-            tui::run(ctx.project_root, version()).await
+            tui::run(ctx.project_root, version(), args.observe).await
         }
 
         // Bare `orch` is the first-run experience (PARITY.md §2.3): it inits
@@ -685,6 +688,29 @@ async fn run_serve(
         },
     )
     .await
+}
+
+async fn run_web(
+    cli: &Cli,
+    env: EnvFlags,
+    cwd: &std::path::Path,
+    args: &WebCmd,
+) -> Result<ExitCode> {
+    let web_args = match web::WebArgs::parse(web::WebOptions {
+        bind: &args.bind,
+        password: args.password.clone(),
+        env_password: std::env::var(web::PASSWORD_ENV).ok(),
+        no_auth: args.no_auth,
+        allow_hosts: &args.allow_host,
+        observe: args.observe,
+    }) {
+        Ok(web_args) => web_args,
+        Err(message) => {
+            print_error(&styles_for(cli, env), &message, None);
+            return Ok(ExitCode::from(2));
+        }
+    };
+    web::run(web_args, cwd.to_path_buf()).await
 }
 
 /// The version the dashboard reports, which is the one `--version` prints.
