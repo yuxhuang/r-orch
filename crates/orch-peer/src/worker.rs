@@ -24,6 +24,13 @@ use crate::{AbortOnDrop, Context};
 const RING_CAPACITY: usize = 1000;
 const DEAD_AFTER: Duration = Duration::from_secs(15);
 const PING_EVERY: Duration = Duration::from_secs(5);
+// Includes the controller and replaced sessions still shutting down. Admission
+// happens before accept/spawn, so incomplete hellos cannot each allocate 1 MiB
+// or consume a descriptor without a bound. An active controller leaves room
+// for reconnects and same-instance takeover.
+const MAX_CONNECTIONS: usize = 16;
+const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(100);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct EventRing {
@@ -155,11 +162,38 @@ impl Worker {
             self.register(&task);
         }
         let mut sessions = JoinSet::new();
+        let mut accept_after = Instant::now();
+        let mut accept_backoff = ACCEPT_RETRY_MIN;
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
-                    let (socket, _) = accepted
-                        .map_err(|e| Error::other(format!("peer accept: {e}")))?;
+                biased;
+                // Reap completed tasks before accepting more, including under
+                // a constant stream of short-lived connections.
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
+                accepted = async {
+                    tokio::time::sleep_until(accept_after).await;
+                    listener.accept().await
+                }, if sessions.len() < MAX_CONNECTIONS => {
+                    let (socket, _) = match accepted {
+                        Ok(accepted) => {
+                            accept_backoff = ACCEPT_RETRY_MIN;
+                            accepted
+                        }
+                        Err(error) => {
+                            // EMFILE/ENFILE and other temporary resource faults
+                            // must not drop the listener or active controller.
+                            let retry_ms = accept_backoff.as_millis();
+                            tracing::warn!(%error, retry_ms, "Peer accept failed; retrying");
+                            self.ctx.engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                                error: format!("peer accept: {error}"),
+                                context: format!("Peer listener {addr}; retrying in {retry_ms} ms. Check available file descriptors and memory"),
+                                fatal: false,
+                            });
+                            accept_after = Instant::now() + accept_backoff;
+                            accept_backoff = (accept_backoff * 2).min(ACCEPT_RETRY_MAX);
+                            continue;
+                        }
+                    };
                     let worker = self.clone();
                     let addr = addr.clone();
                     sessions.spawn(async move {
@@ -168,7 +202,6 @@ impl Worker {
                         }
                     });
                 }
-                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
             }
         }
     }
