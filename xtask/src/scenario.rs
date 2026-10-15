@@ -102,6 +102,19 @@ pub struct Scenario {
     /// switching off a comparison that had started working.
     #[serde(default)]
     pub excluded_tree_paths: Vec<String>,
+
+    /// Files this scenario deliberately corrupts, as path prefixes relative to
+    /// `.orchestry/`.
+    ///
+    /// The cross-parse check (§6.4, red-team O2) runs js-yaml over every YAML
+    /// artifact and fails on anything it cannot read — which is right, except
+    /// for a scenario whose whole point is a malformed file on disk. Listing it
+    /// here does **not** merely exempt it: the file is then *required* to be
+    /// unreadable, so a listing that matches nothing unreadable fails. That
+    /// keeps the declaration from outliving the corruption it describes, the
+    /// same way a stale `excluded_tree_paths` entry fails.
+    #[serde(default)]
+    pub unparseable_files: Vec<String>,
     /// Why this scenario exists, printed with the results.
     #[serde(default)]
     pub description: Option<String>,
@@ -229,6 +242,11 @@ impl Scenario {
     /// Whether only this step's exit code is compared, its output being L2.
     pub fn exit_only(step: &str) -> bool {
         Directives::parse(step).0.exit_only
+    }
+
+    /// Whether only the `  ✕ ` marker on stderr's first line is compared.
+    pub fn stderr_prefix_only(step: &str) -> bool {
+        Directives::parse(step).0.stderr_prefix_only
     }
 
     /// Whether the author gave a reason for `@exit-only` (`@exit-only:<why>`).
@@ -360,6 +378,24 @@ pub struct Directives {
     /// output genuinely is L2", which the lint then accepts. It is also the
     /// one place a reader of the scenario finds out which L2 clause applies.
     pub exit_only_reason: bool,
+    /// `@stderr-prefix-only:<reason>` — compare only the leading `  ✕ ` of
+    /// stderr's first line, and nothing else on that channel.
+    ///
+    /// For malformed-input errors, where the *reason* text comes from a
+    /// different parser on each side and cannot be made byte-equal (§14, the
+    /// malformed-input row). TS renders js-yaml's message plus a source
+    /// excerpt of one to five ` N | ` lines and a `-----^` caret, the count
+    /// varying with where the fault falls; r-orch renders saphyr's message.
+    /// Reimplementing js-yaml's wording and caret layout is neither feasible
+    /// nor worth it.
+    ///
+    /// What stays compared is everything the contract does fix: the exit code,
+    /// stdout (empty), the `  ✕ ` prefix that says an error was reported at
+    /// all, and the bytes of the offending file — a malformed file must be
+    /// left exactly as found, which is the part a reader actually depends on.
+    /// Narrow by construction: it masks one channel of one step, and the
+    /// reason is mandatory so nobody reaches for it to silence a real diff.
+    pub stderr_prefix_only: bool,
     /// `@unordered:<reason>` — the JSON arrays in this step's output hold the
     /// same elements on both sides but not necessarily in the same order, so
     /// they are compared as multisets. Applies at every depth: `status
@@ -421,6 +457,9 @@ impl Directives {
                     directives.exit_only_reason = true;
                 }
                 _ if token.starts_with("@unordered:") => directives.unordered = true,
+                _ if token.starts_with("@stderr-prefix-only:") => {
+                    directives.stderr_prefix_only = true
+                }
                 _ if token.starts_with("@ticks-vary:") => directives.ticks_vary = true,
                 _ if token.starts_with("@stop-after:") => {
                     match token["@stop-after:".len()..].parse::<u64>() {

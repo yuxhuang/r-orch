@@ -7,7 +7,11 @@
 //!   `--tick-interval`, which only changes the orchestrator's own tick;
 //! - an **empty project exits immediately**, before any waiting;
 //! - any `failed` task makes the result `has_failed` and the exit code 1 —
-//!   `cancelled` does not.
+//!   `cancelled` does not;
+//! - and a signal arriving while work is **still outstanding** makes the
+//!   result `interrupted` with exit code 1 (PARITY.md §14.38, a deliberate
+//!   divergence: the oracle reports `all_done` and exits 0 here, claiming a
+//!   success it did not achieve).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +45,14 @@ pub trait ServeOrchestrator: Send + Sync {
 pub enum OnceResult {
     AllDone,
     HasFailed,
+    /// Stopped by a signal with tasks still unfinished.
+    ///
+    /// §14.38, FIX rather than REPLICATE by user decision. The oracle returns
+    /// `all_done` and exit 0 for this — measured — because it computes the
+    /// verdict from the task list without asking why it stopped waiting. A run
+    /// that was killed mid-flight reporting success is the kind of wrong answer
+    /// that devalues every true one.
+    Interrupted,
 }
 
 impl OnceResult {
@@ -48,13 +60,15 @@ impl OnceResult {
         match self {
             OnceResult::AllDone => "all_done",
             OnceResult::HasFailed => "has_failed",
+            OnceResult::Interrupted => "interrupted",
         }
     }
 
     pub fn exit_code(self) -> u8 {
         match self {
             OnceResult::AllDone => 0,
-            OnceResult::HasFailed => 1,
+            // Every non-success `--once` outcome exits 1 (§3, §14.38).
+            OnceResult::HasFailed | OnceResult::Interrupted => 1,
         }
     }
 }
@@ -83,20 +97,38 @@ pub async fn run_once(
     });
 
     orchestrator.start_watch(true).await?;
-    let final_tasks = wait_for_all_terminal(tasks, poll_interval, &stopped).await?;
+    let (final_tasks, stop_reason) = wait_for_all_terminal(tasks, poll_interval, &stopped).await?;
+    // Unconditional, and before the verdict: the wind-down releases the lock,
+    // so an interrupted run must not leave the project wedged (§14.15).
     orchestrator.stop().await?;
     watcher.abort();
 
-    Ok(
-        if final_tasks
-            .iter()
-            .any(|task| task.status == orch_domain::TaskStatus::Failed)
-        {
-            OnceResult::HasFailed
-        } else {
-            OnceResult::AllDone
-        },
-    )
+    Ok(match stop_reason {
+        StopReason::Interrupted => OnceResult::Interrupted,
+        StopReason::WorkFinished => {
+            if final_tasks
+                .iter()
+                .any(|task| task.status == orch_domain::TaskStatus::Failed)
+            {
+                OnceResult::HasFailed
+            } else {
+                OnceResult::AllDone
+            }
+        }
+    })
+}
+
+/// Why `wait_for_all_terminal` stopped waiting.
+///
+/// The distinction the oracle does not make. It computes the verdict from the
+/// task list alone, so a signal mid-run and a genuine completion are
+/// indistinguishable to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// Nothing left to do: every task terminal, or no tasks at all.
+    WorkFinished,
+    /// A shutdown arrived with work still outstanding.
+    Interrupted,
 }
 
 /// `waitForAllTerminal` — the three exit conditions, checked in this order.
@@ -104,19 +136,24 @@ async fn wait_for_all_terminal(
     tasks: &dyn TaskStore,
     poll_interval: Duration,
     stopped: &AtomicBool,
-) -> Result<Vec<Task>> {
+) -> Result<(Vec<Task>, StopReason)> {
     loop {
         let current = tasks.list(&TaskFilter::default()).await?;
         // An empty project exits immediately.
         if current.is_empty() {
-            return Ok(current);
+            return Ok((current, StopReason::WorkFinished));
         }
         if current.iter().all(|task| is_terminal(task.status)) {
-            return Ok(current);
+            return Ok((current, StopReason::WorkFinished));
         }
         // The orchestrator gave up: return what we have rather than spin.
+        //
+        // Checked *after* the terminal test on purpose, and the order is the
+        // contract: a signal that arrives once everything is already terminal
+        // is a normal completion and still reports `all_done`. Only a signal
+        // with work outstanding is an interruption.
         if stopped.load(Ordering::SeqCst) {
-            return Ok(current);
+            return Ok((current, StopReason::Interrupted));
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -258,7 +295,96 @@ mod tests {
         .await
         .expect("the shutdown ends the wait")
         .expect("runs");
-        assert_eq!(result, OnceResult::AllDone);
+
+        // §14.38. This asserted `AllDone` until the user ruled on it, which is
+        // what the oracle reports — measured: a planted unreadable task file
+        // makes `serve --once` tick forever, and on SIGTERM it emits
+        // `result="all_done" exit_code=0`. The task here never left `Todo`, so
+        // claiming success is a wrong answer, not a cosmetic one.
+        assert_eq!(result, OnceResult::Interrupted);
+        assert_eq!(result.exit_code(), 1);
+        assert_eq!(result.as_str(), "interrupted");
+    }
+
+    /// The other half of the rule, and the reason the `stopped` check sits
+    /// *after* the terminal check: a signal that arrives once the work is
+    /// already done is an ordinary completion.
+    #[tokio::test]
+    async fn a_shutdown_after_everything_is_terminal_is_still_all_done() {
+        let store = FakeTaskStore::new();
+        store.seed(task(TaskStatus::Done));
+
+        let events = Arc::new(EventBus::new());
+        let orchestrator = FakeOrchestrator {
+            shutdown_on_start: Some(Arc::clone(&events)),
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_once(&orchestrator, &store, &events, FAST),
+        )
+        .await
+        .expect("returns promptly")
+        .expect("runs");
+
+        assert_eq!(result, OnceResult::AllDone, "byte-identical to today");
+        assert_eq!(result.exit_code(), 0);
+    }
+
+    /// A failed task still wins over an interruption when the work *is*
+    /// finished, so the existing `has_failed` verdict is untouched.
+    #[tokio::test]
+    async fn a_failure_with_a_late_shutdown_is_still_has_failed() {
+        let store = FakeTaskStore::new();
+        store.seed(task(TaskStatus::Failed));
+
+        let events = Arc::new(EventBus::new());
+        let orchestrator = FakeOrchestrator {
+            shutdown_on_start: Some(Arc::clone(&events)),
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_once(&orchestrator, &store, &events, FAST),
+        )
+        .await
+        .expect("returns promptly")
+        .expect("runs");
+
+        assert_eq!(result, OnceResult::HasFailed);
+        assert_eq!(result.exit_code(), 1);
+    }
+
+    /// The wind-down runs on the interrupted path too, which is what releases
+    /// the lock. Asserted on the fake rather than through a real project here;
+    /// `tests/serve_interrupted.rs` covers the lock file end to end.
+    #[tokio::test]
+    async fn an_interrupted_run_still_stops_the_orchestrator() {
+        let store = FakeTaskStore::new();
+        store.seed(task(TaskStatus::Todo));
+
+        let events = Arc::new(EventBus::new());
+        let orchestrator = FakeOrchestrator {
+            shutdown_on_start: Some(Arc::clone(&events)),
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_once(&orchestrator, &store, &events, FAST),
+        )
+        .await
+        .expect("the shutdown ends the wait")
+        .expect("runs");
+
+        assert_eq!(result, OnceResult::Interrupted);
+        assert_eq!(
+            *orchestrator.stops.lock().unwrap(),
+            1,
+            "stop() must run on the interrupted path, or the lock is stranded"
+        );
     }
 
     #[tokio::test]
