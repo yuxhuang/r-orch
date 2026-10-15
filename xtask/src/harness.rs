@@ -737,7 +737,7 @@ pub fn run_scenario(
             let tree = collect_tree(&project.root, &mut norm)?;
             failures.extend(claimed_matches_state_file(&verified_claimed, &tree));
         }
-        failures.extend(cross_parse_failures(bins, &project)?);
+        failures.extend(cross_parse_failures(bins, &project, scenario)?);
         return Ok(ScenarioResult {
             name: scenario.name.clone(),
             kind: scenario.kind,
@@ -914,8 +914,19 @@ pub fn run_scenario(
                 failures.push(format!("step `{step}`: {what} differ(s)\n{diff}"));
             }
 
-            let left = rust_norm.text(&rust_out.stderr);
-            let right = ts_norm.text(&ts_out.stderr);
+            let (left, right) = if Scenario::stderr_prefix_only(step) {
+                // §14 malformed-input row: the reason text comes from a
+                // different parser on each side. Only the marker is contract.
+                (
+                    stderr_error_prefix(&rust_out.stderr),
+                    stderr_error_prefix(&ts_out.stderr),
+                )
+            } else {
+                (
+                    rust_norm.text(&rust_out.stderr),
+                    ts_norm.text(&ts_out.stderr),
+                )
+            };
             if left != right {
                 failures.push(format!(
                     "step `{step}`: stderr differs\n{}",
@@ -934,7 +945,7 @@ pub fn run_scenario(
         ));
         failures.extend(claimed_matches_state_file(&masked_claimed, &rust_tree));
 
-        failures.extend(cross_parse_failures(bins, &rust)?);
+        failures.extend(cross_parse_failures(bins, &rust, scenario)?);
 
         Ok(ScenarioResult {
             name: scenario.name.clone(),
@@ -1811,7 +1822,11 @@ fn compare_values(
 /// cross-compat crux: verifying both trees with the Rust parser alone would
 /// make every "js-yaml reads r-orch's bytes differently" bug invisible by
 /// construction. It subsumes the timestamp assertion (V8) as a special case.
-fn cross_parse_failures(bins: &Binaries, project: &Project) -> Result<Vec<String>> {
+fn cross_parse_failures(
+    bins: &Binaries,
+    project: &Project,
+    scenario: &Scenario,
+) -> Result<Vec<String>> {
     let root = project.root.join(".orchestry");
     let mut files = Vec::new();
     collect_files(&root, &root, &mut files)?;
@@ -1904,6 +1919,10 @@ process.stdout.write(JSON.stringify(out));
         serde_json::from_slice(&output.stdout).context("parse the js-yaml cross-parse output")?;
 
     let mut failures = Vec::new();
+    // Which `unparseable_files` declarations actually matched an unreadable
+    // file. A declaration that matches nothing is stale and fails.
+    let mut satisfied: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     for (path, relative) in absolute.iter().zip(&yaml) {
         let Some(js) = parsed.get(path) else {
             failures.push(format!(
@@ -1913,6 +1932,18 @@ process.stdout.write(JSON.stringify(out));
             continue;
         };
         if !js.ok {
+            // Declared as deliberately corrupt? Then being unreadable is the
+            // assertion, not a failure — and it is recorded as satisfied so a
+            // declaration that stops matching anything fails below.
+            let relative_str = relative.to_string_lossy().replace('\\', "/");
+            if let Some(prefix) = scenario
+                .unparseable_files
+                .iter()
+                .find(|prefix| relative_str.starts_with(prefix.as_str()))
+            {
+                satisfied.insert(prefix.clone());
+                continue;
+            }
             failures.push(format!(
                 "js-yaml cannot read `.orchestry/{}`: {}",
                 relative.display(),
@@ -1932,6 +1963,16 @@ process.stdout.write(JSON.stringify(out));
                  this is the cross-compat crux (PARITY.md §6.4)\n{}",
                 relative.display(),
                 unified_diff(&pretty(&theirs), &pretty(&ours))
+            ));
+        }
+    }
+
+    for prefix in &scenario.unparseable_files {
+        if !satisfied.contains(prefix) {
+            failures.push(format!(
+                "`unparseable_files` lists `{prefix}`, but every YAML file matching it parsed \
+                 cleanly. The corruption this scenario is built on did not happen, so the \
+                 masked steps are asserting nothing — fix the `@write`, or drop the entry."
             ));
         }
     }
@@ -2083,6 +2124,21 @@ fn records_text(records: &[Value]) -> String {
 
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Everything stderr keeps under `@stderr-prefix-only`: the `  ✕ ` marker on
+/// the first line, and nothing after it.
+///
+/// Deliberately not "the first line" — TS's first line already carries
+/// js-yaml's reason and a `(line:col)`, which is the part that cannot match.
+fn stderr_error_prefix(stderr: &str) -> String {
+    let first = stderr.lines().next().unwrap_or_default();
+    match first.find('\u{2715}') {
+        Some(at) => first[..at + '\u{2715}'.len_utf8()].to_string(),
+        // No marker at all is itself a difference worth failing on: one side
+        // reported an error and the other did not.
+        None => String::new(),
+    }
 }
 
 /// A unified diff, `expected` (the oracle) against `actual` (r-orch).
