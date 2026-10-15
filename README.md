@@ -27,7 +27,7 @@ review criteria (`typecheck`, `lint`, `test_pass`).
 
 ## Install
 
-Requires a Rust toolchain; the version is pinned in `rust-toolchain.toml`.
+From source, which requires a Rust toolchain; the version is pinned in `rust-toolchain.toml`.
 
 ```bash
 git clone <this repo> && cd r-orch
