@@ -55,6 +55,48 @@ impl FileMessageStore {
         expires_at.as_str() < self.clock.now_iso().as_str()
     }
 
+    /// Serialize the complete file/index operation across CLI processes and
+    /// store instances. The stable lock inode is never removed. A detached
+    /// transaction finishes even if its caller (e.g. the expiry task) is aborted
+    /// between writing an entity and updating its index.
+    async fn transaction<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+    {
+        let store = Self::new(self.paths.clone(), self.clock.clone());
+        tokio::spawn(async move {
+            ensure_dir(&store.paths.messages_dir()).await?;
+            let path = store.paths.messages_dir().join(".mutation.lock");
+            let guard = tokio::task::spawn_blocking(move || {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+                    .map_err(|e| Error::io("Open message mutation lock", &path, e))?;
+                file.lock()
+                    .map_err(|e| Error::io("Lock message mutations", &path, e))?;
+                Ok::<_, Error>(file)
+            })
+            .await
+            .map_err(|e| Error::other(format!("Acquire message mutation lock: {e}")))??;
+            let result = operation(store).await;
+            drop(guard);
+            result
+        })
+        .await
+        .map_err(|e| Error::other(format!("Message transaction: {e}")))?
+    }
+
+    async fn list_unlocked(&self) -> Result<Vec<Message>> {
+        let mut messages = self.index.read_index().await?;
+        messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(messages)
+    }
+
     async fn remove_file(&self, id: &str) -> Result<()> {
         let path = self.paths.message_path(id)?;
         match tokio::fs::remove_file(&path).await {
@@ -68,12 +110,15 @@ impl FileMessageStore {
 #[async_trait]
 impl MessageStore for FileMessageStore {
     async fn save(&self, message: &Message) -> Result<()> {
-        ensure_dir(&self.paths.messages_dir()).await?;
-        write_json(&self.paths.message_path(&message.id)?, message).await?;
         let message = message.clone();
-        self.index
-            .update_index(move |items| replace_at_end(items, message, |m| &m.id))
-            .await
+        self.transaction(move |store| async move {
+            write_json(&store.paths.message_path(&message.id)?, &message).await?;
+            store
+                .index
+                .update_index(move |items| replace_at_end(items, message, |m| &m.id))
+                .await
+        })
+        .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Message>> {
@@ -82,9 +127,9 @@ impl MessageStore for FileMessageStore {
 
     /// Sorted by `created_at` ascending.
     async fn list(&self) -> Result<Vec<Message>> {
-        let mut messages = self.index.read_index().await?;
-        messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        Ok(messages)
+        // Even a read can rebuild the index, so it takes the writer lock too.
+        self.transaction(|store| async move { store.list_unlocked().await })
+            .await
     }
 
     /// Pending, unexpired, addressed to exactly this agent — so a broadcast
@@ -103,64 +148,78 @@ impl MessageStore for FileMessageStore {
     }
 
     async fn mark_delivered(&self, id: &str) -> Result<()> {
-        // A missing id is a no-op, not an error.
-        let Some(mut message) = self.get(id).await? else {
-            return Ok(());
-        };
-        message.status = MessageStatus::Delivered;
-        message.delivered_at = Some(self.clock.now_iso());
+        let id = id.to_owned();
+        self.transaction(move |store| async move {
+            // A missing id is a no-op, not an error.
+            let Some(mut message) = store.get(&id).await? else {
+                return Ok(());
+            };
+            message.status = MessageStatus::Delivered;
+            message.delivered_at = Some(store.clock.now_iso());
 
-        write_json(&self.paths.message_path(id)?, &message).await?;
-        self.index
-            .update_index(move |items| replace_at_end(items, message, |m| &m.id))
-            .await
+            write_json(&store.paths.message_path(&id)?, &message).await?;
+            store
+                .index
+                .update_index(move |items| replace_at_end(items, message, |m| &m.id))
+                .await
+        })
+        .await
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
-        self.remove_file(id).await?;
         let id = id.to_owned();
-        self.index
-            .update_index(move |items| items.into_iter().filter(|m| m.id != id).collect())
-            .await
+        self.transaction(move |store| async move {
+            store.remove_file(&id).await?;
+            store
+                .index
+                .update_index(move |items| items.into_iter().filter(|m| m.id != id).collect())
+                .await
+        })
+        .await
     }
 
     /// Delete every message that has expired **or** was delivered more than an
     /// hour ago, in one index rewrite. Returns how many went.
     async fn purge_expired(&self) -> Result<usize> {
-        let now = self.clock.now_ms();
-        let doomed: Vec<Message> = self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|m| {
-                let expired = self.is_expired(m);
-                let stale_delivery = m
-                    .delivered_at
-                    .as_deref()
-                    .and_then(parse_epoch_ms)
-                    .is_some_and(|at| now - at > DELIVERED_RETENTION_MS);
-                expired || stale_delivery
-            })
-            .collect();
+        self.transaction(|store| async move {
+            let now = store.clock.now_ms();
+            let doomed: Vec<Message> = store
+                .list_unlocked()
+                .await?
+                .into_iter()
+                .filter(|m| {
+                    let expired = store.is_expired(m);
+                    let stale_delivery = m
+                        .delivered_at
+                        .as_deref()
+                        .and_then(parse_epoch_ms)
+                        .is_some_and(|at| now - at > DELIVERED_RETENTION_MS);
+                    expired || stale_delivery
+                })
+                .collect();
 
-        if doomed.is_empty() {
-            return Ok(0);
-        }
+            if doomed.is_empty() {
+                return Ok(0);
+            }
 
-        for message in &doomed {
-            self.remove_file(&message.id).await?;
-        }
-        let gone: std::collections::HashSet<String> = doomed.iter().map(|m| m.id.clone()).collect();
-        self.index
-            .update_index(move |items| {
-                items
-                    .into_iter()
-                    .filter(|m| !gone.contains(&m.id))
-                    .collect()
-            })
-            .await?;
+            for message in &doomed {
+                store.remove_file(&message.id).await?;
+            }
+            let gone: std::collections::HashSet<String> =
+                doomed.iter().map(|m| m.id.clone()).collect();
+            store
+                .index
+                .update_index(move |items| {
+                    items
+                        .into_iter()
+                        .filter(|m| !gone.contains(&m.id))
+                        .collect()
+                })
+                .await?;
 
-        Ok(doomed.len())
+            Ok(doomed.len())
+        })
+        .await
     }
 }
 
@@ -412,6 +471,94 @@ mod tests {
         }
         // Idempotent.
         assert_eq!(store.purge_expired().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_stores_preserve_valid_messages_during_expiry_and_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, clock) = store(temp.path());
+        for n in 0..16 {
+            store
+                .save(&message(&format!("msg_ack{n}"), Some("cli@offline"), "t"))
+                .await
+                .unwrap();
+            store
+                .save(&Message {
+                    expires_at: Some(orch_core::clock::iso_from_epoch_ms(clock.now_ms() - 1)),
+                    ..message(&format!("msg_expired{n}"), Some("cli@removed"), "t")
+                })
+                .await
+                .unwrap();
+        }
+        let mut tasks = Vec::new();
+        for n in 0..32 {
+            let other = FileMessageStore::new(store.paths.clone(), clock.clone());
+            tasks.push(tokio::spawn(async move {
+                other
+                    .save(&message(&format!("msg_new{n}"), Some("cli@offline"), "t"))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for n in 0..16 {
+            let other = FileMessageStore::new(store.paths.clone(), clock.clone());
+            tasks.push(tokio::spawn(async move {
+                other.mark_delivered(&format!("msg_ack{n}")).await.unwrap();
+                other.purge_expired().await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let messages = store.list().await.unwrap();
+        assert_eq!(messages.len(), 48);
+        for m in messages {
+            assert_eq!(store.get(&m.id).await.unwrap().as_ref(), Some(&m));
+            if m.id.starts_with("msg_ack") {
+                assert_eq!(m.status, MessageStatus::Delivered);
+            }
+        }
+        for n in 0..16 {
+            assert!(
+                store
+                    .get(&format!("msg_expired{n}"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_caller_does_not_interrupt_its_file_index_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let other = FileMessageStore::new(store.paths.clone(), store.clock.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            other
+                .transaction(move |store| async move {
+                    let msg = message("msg_inflight", Some("cli@offline"), "t");
+                    write_json(&store.paths.message_path(&msg.id)?, &msg).await?;
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    store
+                        .index
+                        .update_index(move |items| replace_at_end(items, msg, |m| &m.id))
+                        .await?;
+                    done_tx.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        assert_eq!(ids(&store.list().await.unwrap()), vec!["msg_inflight"]);
     }
 
     #[tokio::test]

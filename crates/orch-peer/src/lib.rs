@@ -5,11 +5,36 @@ pub mod protocol;
 mod worker;
 
 use orch_core::error::{Error, Result};
+use orch_core::storage::MessageStore;
 use orch_domain::{Agent, Message, MessageChannel, MessageStatus};
-use orch_engine::FullEngine;
-use orch_infra::storage::remote::{FileRemoteStore, default_peer_name, validate_snapshot};
+use orch_engine::{EventBus, FullEngine};
+use orch_infra::storage::remote::{
+    FileRemoteStore, default_peer_name, public_snapshot, validate_snapshot,
+};
 use protocol::Frame;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// While an owner is running, expired messages (including removed aliases)
+/// are physically pruned at startup and every 30 seconds, plus storage/lock
+/// latency. No quota is imposed on valid pending messages; without a TTL they
+/// remain until acknowledged/deleted. Missed sweeps do not accumulate bursts.
+const MESSAGE_EXPIRY_INTERVAL: Duration = Duration::from_secs(30);
+
+async fn expire_messages(messages: Arc<dyn MessageStore>, events: Arc<EventBus>) {
+    let mut interval = tokio::time::interval(MESSAGE_EXPIRY_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if let Err(error) = messages.purge_expired().await {
+            events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                error: error.to_string(),
+                context: "Expire queued messages; check message storage permissions and free space. Cleanup will retry in 30 seconds".into(),
+                fatal: false,
+            });
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Context {
@@ -23,7 +48,7 @@ impl Context {
     pub async fn local_agents(&self) -> Result<Vec<Agent>> {
         let agents = self.engine.agents.list().await?;
         validate_snapshot(&agents)?;
-        Ok(agents)
+        Ok(public_snapshot::project(&agents))
     }
 
     pub async fn ingest(&self, peer: &str, frame: &Frame) -> Result<Frame> {
@@ -138,6 +163,17 @@ impl PeerRuntime {
                 }
             }
         }
+        // Refresh retained inbound discovery too, even when listening is now
+        // disabled, so legacy snapshots no longer retain private agent config.
+        if let Some(inbound) = store.read_inbound().await?
+            && let Err(error) = store.write_inbound(&inbound).await
+        {
+            engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                error: error.to_string(),
+                context: format!("Refresh public inbound peer snapshot; legacy private data may remain on disk. Check permissions and free space in {}", engine.paths.remotes_dir().display()),
+                fatal: false,
+            });
+        }
         let listener_status = engine.paths.remotes_dir().join("_listener.json");
         match tokio::fs::remove_file(&listener_status).await {
             Ok(()) => {}
@@ -181,6 +217,10 @@ impl PeerRuntime {
         engine.orchestrator.set_remote_bridge(hub.clone());
         engine.orchestrator.set_run_event_tap(worker.clone());
         let mut tasks = Vec::new();
+        tasks.push(AbortOnDrop(tokio::spawn(expire_messages(
+            engine.messages.clone(),
+            engine.events.clone(),
+        ))));
         if let Some(listener) = listener {
             tasks.push(AbortOnDrop(tokio::spawn(async move {
                 if let Err(error) = worker.listen(listener).await {
@@ -200,5 +240,69 @@ impl Drop for PeerRuntime {
             .orchestrator
             .set_remote_bridge(Arc::new(orch_core::remote::NoopRemoteBridge));
         self.engine.orchestrator.clear_run_event_tap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct ExpiryStore(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl MessageStore for ExpiryStore {
+        async fn save(&self, _: &Message) -> Result<()> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> Result<Option<Message>> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<Message>> {
+            unreachable!()
+        }
+        async fn list_pending(&self, _: &str) -> Result<Vec<Message>> {
+            unreachable!()
+        }
+        async fn mark_delivered(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn purge_expired(&self) -> Result<usize> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::other("injected storage fault"))
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_runs_without_connections_and_retries_storage_errors_every_thirty_seconds() {
+        let store = Arc::new(ExpiryStore::default());
+        let events = Arc::new(EventBus::new());
+        let mut receiver = events.subscribe();
+        let cleanup = AbortOnDrop(tokio::spawn(expire_messages(store.clone(), events)));
+        tokio::task::yield_now().await;
+        assert_eq!(store.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            receiver.recv().await.unwrap().as_ref(),
+            orch_domain::OrchestratorEvent::OrchestratorError { fatal: false, .. }
+        ));
+        tokio::time::advance(MESSAGE_EXPIRY_INTERVAL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.0.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.0.load(Ordering::SeqCst), 2);
+        tokio::time::advance(MESSAGE_EXPIRY_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.0.load(Ordering::SeqCst), 3);
+        drop(cleanup);
+        tokio::time::advance(MESSAGE_EXPIRY_INTERVAL).await;
+        assert_eq!(store.0.load(Ordering::SeqCst), 3);
     }
 }

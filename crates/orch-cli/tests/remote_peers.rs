@@ -53,6 +53,7 @@ struct Process {
     child: Child,
     stdout: PathBuf,
     stderr: PathBuf,
+    sweep_group_on_drop: bool,
 }
 
 impl Process {
@@ -66,6 +67,7 @@ impl Process {
             child: command.spawn().expect("spawn isolated child"),
             stdout,
             stderr,
+            sweep_group_on_drop: true,
         }
     }
 
@@ -109,7 +111,9 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        self.terminate(Signal::SIGKILL);
+        if self.sweep_group_on_drop {
+            self.terminate(Signal::SIGKILL);
+        }
     }
 }
 
@@ -212,7 +216,13 @@ impl Peer {
     }
 
     fn cli(&self, args: &[&str]) -> Output {
-        let mut command = self.command(env!("CARGO_BIN_EXE_orch"));
+        let copied = self.home.join("orch-copy");
+        let executable = if copied.exists() {
+            copied.as_path()
+        } else {
+            Path::new(env!("CARGO_BIN_EXE_orch"))
+        };
+        let mut command = self.command(executable);
         command.args(args);
         self.spawn(command, "cli").output(Duration::from_secs(15))
     }
@@ -252,7 +262,13 @@ impl Peer {
 
     fn start(&self, listen: Option<SocketAddr>) {
         assert!(self.owner.borrow().is_none(), "already running");
-        let mut command = self.command(env!("CARGO_BIN_EXE_orch"));
+        let copied = self.home.join("orch-copy");
+        let executable = if copied.exists() {
+            copied.as_path()
+        } else {
+            Path::new(env!("CARGO_BIN_EXE_orch"))
+        };
+        let mut command = self.command(executable);
         command.args(["serve", "--peer-name", &self.name, "--verbose"]);
         if let Some(addr) = listen {
             command.args(["--listen", &addr.to_string()]);
@@ -273,6 +289,19 @@ impl Peer {
         if let Some(mut process) = self.owner.borrow_mut().take() {
             process.terminate(signal);
         }
+    }
+
+    fn crash_owner_only(&self) {
+        let mut process = self.owner.borrow_mut().take().expect("running owner");
+        kill(Pid::from_raw(process.child.id() as i32), Signal::SIGKILL).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process.running() && Instant::now() < deadline {
+            thread::sleep(POLL);
+        }
+        assert!(!process.running(), "killed owner did not exit");
+        // This regression deliberately leaves every child untouched. The
+        // Peer guard still owns adapter group cleanup on failure.
+        process.sweep_group_on_drop = false;
     }
 
     fn signal(&self, signal: Signal) {
@@ -1385,17 +1414,38 @@ fn s23_sigterm_offline_cancellation_is_bounded_reports_pending_and_sync_cancels(
 
 #[test]
 fn s17_worker_restart_loses_collector_without_repeating_surviving_shell_effect() {
-    worker_restart_does_not_repeat(false);
+    worker_restart_does_not_repeat(false, "complete");
 }
 
 #[test]
 fn s17b_worker_restart_after_child_exit_does_not_repeat_effect() {
-    worker_restart_does_not_repeat(true);
+    worker_restart_does_not_repeat(true, "complete");
 }
 
-fn worker_restart_does_not_repeat(exit_before_restart: bool) {
+#[test]
+fn s17c_worker_restart_without_running_entry_cancels_partial_reservation() {
+    worker_restart_does_not_repeat(false, "missing-entry");
+}
+
+#[test]
+fn s17d_worker_restart_with_preparing_run_and_no_saved_pid_stops_adapter() {
+    worker_restart_does_not_repeat(false, "preparing");
+}
+
+#[test]
+fn s17e_worker_restart_ignores_unrelated_recycled_saved_pid() {
+    worker_restart_does_not_repeat(false, "recycled-pid");
+}
+
+fn worker_restart_does_not_repeat(exit_before_restart: bool, persistence: &str) {
     let worker = Peer::new("worker");
     let controller = Peer::new("controller");
+    for peer in [&worker, &controller] {
+        fs::copy(env!("CARGO_BIN_EXE_orch"), peer.home.join("orch-copy")).unwrap();
+    }
+    let mut unrelated_command = worker.command("/bin/sleep");
+    unrelated_command.arg("60");
+    let mut unrelated = worker.spawn(unrelated_command, "unrelated");
     // No stdout after the owner dies: a broken pipe must not prevent the
     // original shell's side effect and hide the lost-collector regression.
     let body = format!(
@@ -1417,7 +1467,7 @@ fn worker_restart_does_not_repeat(exit_before_restart: bool) {
     });
     let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
     let mirror = worker.tasks()[0]["id"].as_str().unwrap().to_owned();
-    worker.stop(Signal::SIGKILL);
+    worker.crash_owner_only();
     assert!(
         kill(Pid::from_raw(pid), None).is_ok(),
         "shell did not survive owner kill"
@@ -1428,17 +1478,37 @@ fn worker_restart_does_not_repeat(exit_before_restart: bool) {
             kill(Pid::from_raw(pid), None).is_err()
         });
     }
+    let state_path = worker.path(".orchestry/state.json");
+    let mut state = read_json(&state_path);
+    if matches!(persistence, "missing-entry" | "preparing") {
+        state["running"].as_object_mut().unwrap().clear();
+        // Retain a claim to exercise cleanup of a partially persisted dispatch.
+        state["claimed"] = json!([mirror]);
+    } else if persistence == "recycled-pid" {
+        state["running"][&mirror]["pid"] = json!(unrelated.child.id());
+    }
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let run = worker.runs(&mirror)[0].clone();
+    let run_path = worker.path(&format!(
+        ".orchestry/runs/{}.json",
+        run["id"].as_str().unwrap()
+    ));
+    if persistence == "preparing" {
+        let mut run = run;
+        run["status"] = json!("preparing");
+        run.as_object_mut().unwrap().remove("pid");
+        fs::write(&run_path, serde_json::to_vec(&run).unwrap()).unwrap();
+    } else if persistence == "recycled-pid" {
+        let mut run = run;
+        run["pid"] = json!(unrelated.child.id());
+        fs::write(&run_path, serde_json::to_vec(&run).unwrap()).unwrap();
+    }
     worker.start(Some(addr));
     controller.online("w1", &peers);
     if !exit_before_restart {
-        remains(
-            "surviving shell remains reserved",
-            Duration::from_millis(400),
-            || {
-                worker.task_value(&mirror)["status"] == "in_progress"
-                    && controller.task_value(&task)["attempts"] == 1
-            },
-        );
+        wait("surviving adapter stopped at startup", &peers, || {
+            kill(Pid::from_raw(pid), None).is_err()
+        });
         release(&worker);
     }
     let value = controller.wait_task(&task, "cancelled", &peers);
@@ -1447,7 +1517,27 @@ fn worker_restart_does_not_repeat(exit_before_restart: bool) {
     assert_eq!(controller.runs(&task)[0]["status"], "cancelled");
     assert_eq!(worker.tasks().len(), 1);
     assert_eq!(worker.task_value(&mirror)["status"], "cancelled");
-    assert_eq!(text(worker.path("effect")), format!("{mirror}\n"));
+    let expected_original_effects = usize::from(exit_before_restart);
+    assert_eq!(
+        text(worker.path("effect")).lines().count(),
+        expected_original_effects
+    );
+    assert!(
+        unrelated.running(),
+        "recovery signalled an unrelated saved PID"
+    );
+    assert!(
+        read_json(worker.path(".orchestry/state.json"))["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        worker
+            .runs(&mirror)
+            .iter()
+            .all(|run| run["status"] == "cancelled")
+    );
     assert!(
         read_json(worker.path(".orchestry/state.json"))["running"]
             .as_object()
@@ -1464,7 +1554,7 @@ fn worker_restart_does_not_repeat(exit_before_restart: bool) {
     }
     // A second owner restart and a new successful task are barriers proving
     // both durable cancellation and release of the original reservation.
-    worker.stop(Signal::SIGKILL);
+    worker.crash_owner_only();
     worker.start(Some(addr));
     controller.online("w1", &peers);
     let next = controller.task("worker reusable", Some(&remote_id(&agent, "w1")), &[]);
@@ -1472,8 +1562,11 @@ fn worker_restart_does_not_repeat(exit_before_restart: bool) {
     assert_eq!(controller.task_value(&task)["status"], "cancelled");
     assert_eq!(controller.runs(&task).len(), 1);
     let effects = text(worker.path("effect"));
-    assert_eq!(effects.lines().filter(|line| *line == mirror).count(), 1);
-    assert_eq!(effects.lines().count(), 2);
+    assert_eq!(
+        effects.lines().filter(|line| *line == mirror).count(),
+        expected_original_effects
+    );
+    assert_eq!(effects.lines().count(), expected_original_effects + 1);
 }
 
 #[test]

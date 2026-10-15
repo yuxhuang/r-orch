@@ -12,6 +12,131 @@ use super::fs_utils::{atomic_write, ensure_dir, read_json, read_yaml, write_json
 use super::lock::{check_lock, is_stale_by_age};
 use super::paths::{Paths, sanitize_id};
 
+/// The discovery contract is an allowlist, shared by wire frames and cached
+/// snapshots. Never serialize an execution-capable Agent across this boundary.
+pub mod public_snapshot {
+    use orch_domain::{Agent, AgentConfig, AgentStatus, ApprovalPolicy};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Default, Deserialize)]
+    struct LegacyPublicConfig {
+        approval_policy: Option<ApprovalPolicy>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct PublicAgent {
+        id: String,
+        name: String,
+        adapter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        status: AgentStatus,
+        /// Completion policy is public scheduling metadata; execution config is not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_policy: Option<ApprovalPolicy>,
+        // Read only the bounded public policy from pre-projection snapshots.
+        #[serde(default, skip_serializing)]
+        config: LegacyPublicConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_task: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    }
+
+    impl From<&Agent> for PublicAgent {
+        fn from(agent: &Agent) -> Self {
+            Self {
+                id: agent.id.clone(),
+                name: agent.name.clone(),
+                adapter: agent.adapter.clone(),
+                role: agent.role.clone(),
+                status: agent.status,
+                approval_policy: agent.config.approval_policy,
+                config: LegacyPublicConfig::default(),
+                current_task: agent.current_task.clone(),
+                capabilities: agent.capabilities.clone(),
+            }
+        }
+    }
+
+    impl From<PublicAgent> for Agent {
+        fn from(agent: PublicAgent) -> Self {
+            Self {
+                id: agent.id,
+                name: agent.name,
+                adapter: agent.adapter,
+                role: agent.role,
+                config: AgentConfig {
+                    approval_policy: agent.approval_policy.or(agent.config.approval_policy),
+                    ..Default::default()
+                },
+                status: agent.status,
+                current_task: agent.current_task,
+                autonomous: Some(false),
+                stats: Default::default(),
+                last_error: None,
+                capabilities: agent.capabilities,
+                remote: None,
+            }
+        }
+    }
+
+    pub fn project(agents: &[Agent]) -> Vec<Agent> {
+        agents
+            .iter()
+            .map(|agent| PublicAgent::from(agent).into())
+            .collect()
+    }
+
+    pub fn serialize<S: Serializer>(agents: &[Agent], serializer: S) -> Result<S::Ok, S::Error> {
+        agents
+            .iter()
+            .map(PublicAgent::from)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Agent>, D::Error> {
+        // Unknown legacy/private fields are discarded before they can enter the
+        // remote directory or be written back to a snapshot.
+        Ok(Vec::<PublicAgent>::deserialize(deserializer)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(remote = "RemoteStatus")]
+struct PublicRemoteStatus {
+    alias: String,
+    addr: String,
+    online: bool,
+    last_seen: Option<String>,
+    last_error: Option<String>,
+    peer_name: Option<String>,
+    instance_id: Option<String>,
+    os: Option<String>,
+    #[serde(default, with = "public_snapshot")]
+    agents: Vec<Agent>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RemoteStatusRecord(#[serde(with = "PublicRemoteStatus")] RemoteStatus);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(remote = "InboundStatus")]
+struct PublicInboundStatus {
+    controller_name: String,
+    instance_id: String,
+    connected_since: String,
+    #[serde(default, with = "public_snapshot")]
+    agents: Vec<Agent>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InboundStatusRecord(#[serde(with = "PublicInboundStatus")] InboundStatus);
+
 /// Display name fallback; persisted configuration and CLI overrides take precedence.
 pub fn default_peer_name() -> String {
     for key in ["HOSTNAME", "HOST"] {
@@ -205,7 +330,9 @@ impl FileRemoteStore {
     pub async fn read_status(&self, alias: &str) -> Result<Option<RemoteStatus>> {
         validate_alias(alias)?;
         let path = self.paths.remotes_dir().join(format!("{alias}.json"));
-        let mut status: Option<RemoteStatus> = read_json(&path).await?;
+        let mut status = read_json::<RemoteStatusRecord>(&path)
+            .await?
+            .map(|record| record.0);
         if let Some(status) = &mut status {
             if status.alias != alias {
                 return Err(Error::other("Remote status alias does not match filename"));
@@ -234,7 +361,7 @@ impl FileRemoteStore {
                 .paths
                 .remotes_dir()
                 .join(format!("{}.json", status.alias)),
-            status,
+            &RemoteStatusRecord(status.clone()),
         )
         .await;
         let result = result.and_then(|()| {
@@ -251,8 +378,10 @@ impl FileRemoteStore {
     }
 
     pub async fn read_inbound(&self) -> Result<Option<InboundStatus>> {
-        let inbound: Option<InboundStatus> =
-            read_json(&self.paths.remotes_dir().join("_inbound.json")).await?;
+        let inbound =
+            read_json::<InboundStatusRecord>(&self.paths.remotes_dir().join("_inbound.json"))
+                .await?
+                .map(|record| record.0);
         if let Some(inbound) = &inbound {
             validate_snapshot(&inbound.agents)?;
         }
@@ -261,7 +390,11 @@ impl FileRemoteStore {
 
     pub async fn write_inbound(&self, status: &InboundStatus) -> Result<()> {
         validate_snapshot(&status.agents)?;
-        write_json(&self.paths.remotes_dir().join("_inbound.json"), status).await
+        write_json(
+            &self.paths.remotes_dir().join("_inbound.json"),
+            &InboundStatusRecord(status.clone()),
+        )
+        .await
     }
 
     /// Stable UUID v4. Publish by hard link so concurrent first readers cannot
@@ -427,6 +560,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn legacy_snapshots_discard_private_fields_and_refresh_with_only_public_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        let store = FileRemoteStore::new(paths.clone());
+        let mut status = status("w1");
+        let agent = &mut status.agents[0];
+        agent.status = AgentStatus::Disabled;
+        agent.config.approval_policy = Some(orch_domain::ApprovalPolicy::Auto);
+        agent.role = Some("public worker role".into());
+        agent.config.command = Some("PRIVATE_COMMAND_CANARY".into());
+        agent.config.system_prompt = Some("PRIVATE_PROMPT_CANARY".into());
+        agent.config.env = Some([("TOKEN".into(), "PRIVATE_ENV_CANARY".into())].into());
+        agent.last_error = Some(orch_domain::AgentLastError {
+            message: "PRIVATE_ERROR_CANARY".into(),
+            kind: "unknown".into(),
+            timestamp: "now".into(),
+        });
+        let inbound = InboundStatus {
+            controller_name: "controller".into(),
+            instance_id: "controller-id".into(),
+            connected_since: "now".into(),
+            agents: status.agents.clone(),
+        };
+        let outbound_path = paths.remotes_dir().join("w1.json");
+        let inbound_path = paths.remotes_dir().join("_inbound.json");
+        // Seed the old full-Agent format directly, bypassing the public store.
+        write_json(&outbound_path, &status).await.unwrap();
+        write_json(&inbound_path, &inbound).await.unwrap();
+        let read_status = store.read_status("w1").await.unwrap().unwrap();
+        let read_inbound = store.read_inbound().await.unwrap().unwrap();
+        assert_eq!(read_status.agents, public_snapshot::project(&status.agents));
+        assert_eq!(
+            read_inbound.agents,
+            public_snapshot::project(&inbound.agents)
+        );
+        store.write_status(&read_status).await.unwrap();
+        store.write_inbound(&read_inbound).await.unwrap();
+        for path in [outbound_path, inbound_path] {
+            let value: serde_json::Value = read_json(&path).await.unwrap().unwrap();
+            assert_eq!(
+                value["agents"],
+                serde_json::json!([{
+                    "id": "agt_test1", "name": "TestAgent", "adapter": status.agents[0].adapter,
+                    "role": "public worker role", "status": "disabled", "approval_policy": "auto", "capabilities": ["linux"]
+                }])
+            );
+            assert!(!serde_json::to_string(&value).unwrap().contains("PRIVATE_"));
+        }
+        // New writes must project even callers that still hold private config.
+        store.write_status(&status).await.unwrap();
+        store.write_inbound(&inbound).await.unwrap();
+        for name in ["w1.json", "_inbound.json"] {
+            let text = tokio::fs::read_to_string(paths.remotes_dir().join(name))
+                .await
+                .unwrap();
+            assert!(!text.contains("PRIVATE_"));
+            assert!(!text.contains("\"config\""));
+            assert!(!text.contains("\"last_error\": {"));
+        }
+    }
+
     #[test]
     fn peer_name_uses_short_hostname() {
         assert_eq!(short_hostname("worker.lan\n"), Some("worker".into()));
@@ -512,11 +707,11 @@ mod tests {
         let reader = FileRemoteStore::new(paths.clone());
         assert!(reader.read_status("w1").await.unwrap().unwrap().online);
         drop(store);
-        let cached: RemoteStatus = read_json(&paths.remotes_dir().join("w1.json"))
+        let cached: RemoteStatusRecord = read_json(&paths.remotes_dir().join("w1.json"))
             .await
             .unwrap()
             .unwrap();
-        assert!(cached.online);
+        assert!(cached.0.online);
         let observed = reader.read_status("w1").await.unwrap().unwrap();
         assert!(!observed.online);
         assert!(observed.last_error.is_some());
@@ -553,11 +748,11 @@ mod tests {
         assert_eq!(agents[0].status, AgentStatus::Offline);
         assert!(!agents[0].remote.as_ref().unwrap().online);
         // Read-time guard must not destroy the reported snapshot on disk.
-        let persisted: RemoteStatus = read_json(&paths.remotes_dir().join("w1.json"))
+        let persisted: RemoteStatusRecord = read_json(&paths.remotes_dir().join("w1.json"))
             .await
             .unwrap()
             .unwrap();
-        assert!(persisted.online);
+        assert!(persisted.0.online);
     }
 
     #[tokio::test]
