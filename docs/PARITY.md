@@ -3092,7 +3092,7 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.35 `config.yml` / `agents/*.yml` written 0600 | FIX | `none` — **modes are not compared**, hence the row |
 | §14.36 three favourable divergences (sandboxed Liquid, negative-PID reject, in-process clipboard) | DIVERGENCE (favourable) | `none`, except Liquid partials: `scenario exclusion required (custom-template-*)` |
 | §14.37 malformed YAML/JSON error text is parser-specific | DIVERGENCE | `scenario exclusion required (malformed-input-*)` — all stderr after `  ✕ ` masked |
-| §14.38 `serve --once` reports success after interruption | **FIX** (user decision) | `none` today; a scenario covering it needs a named exclusion |
+| §14.38 `serve --once` reports success after interruption | **FIX** (user decision) — **shipped** | `none`; Rust-side test, no exclusion |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -3879,6 +3879,14 @@ harness.
 the `  ✕ ` marker while keeping **exit code, stdout and the file's bytes exact**. Nothing covered this
 before, which is why an L0 divergence went undocumented.
 
+**Two safeguards keep that exclusion from hiding an empty test**, which is the usual failure of a masked
+assertion:
+
+- the **corrupt `_index.json` step is an unmasked positive control** — it must still exit 0 and list
+  normally, so the scenario proves the harness is comparing *something* on the same tree;
+- **`unparseable_files`** makes the cross-parse check (V32) *require* that the corruption actually happened,
+  so a scenario whose fixture silently stopped being corrupt fails instead of passing vacuously.
+
 #### What TS prints
 
 Measured against the oracle. A `tasks/<id>.yml` with an unterminated quoted scalar:
@@ -3975,10 +3983,24 @@ This row covers both malformed **YAML** (entity files, `config.yml`) and malform
 |---|---|---|---|
 | malformed `config.yml` | `status` | reason + `(l:c)` + excerpt + caret, **no path** | `  ✕ <path> is not valid YAML: <saphyr reason>` |
 | malformed task `.yml` | `task show <id>` | same shape | same shape |
-| corrupt `context/<key>.json` | `context get <key>` | `  ✕ Unexpected end of JSON input` — **no path, no excerpt** | **path + `serde_json`'s reason** |
+| corrupt `context/<key>.json` | `context get <key>` | `  ✕ Unexpected end of JSON input` — **no path, no excerpt** | `  ✕ parse <path>` — **path, no reason** |
 
-So r-orch names the failing file in **both** formats, where TS names it in neither. Exit 1, empty stdout and
-the file left byte-identical in every case.
+Exit 1, empty stdout and the file left byte-identical in every case.
+
+**The two implementations are near-opposites on what they tell you**, and neither is strictly better:
+
+| | names the file | gives a reason |
+|---|---|---|
+| TS, YAML | no | yes — plus `(l:c)` and an excerpt |
+| TS, JSON | no | yes — the engine's `JSON.parse` message |
+| r-orch, YAML | **yes** | yes — `saphyr`'s reason |
+| r-orch, JSON | **yes** | **no** |
+
+**r-orch's JSON message is the one gap**: `  ✕ parse <path>` is the terse pre-C0 form, which the YAML path
+outgrew and the JSON path did not. Not a parity concern — TS's JSON message is equally partial, just in the
+other half — but a reader hitting a corrupt `context/<key>.json` learns *which* file and nothing about *why*.
+Worth closing when convenient; it is additive and costs no comparison, since everything after the `  ✕ `
+marker is masked anyway.
 
 #### Both read paths behave identically
 
@@ -3993,8 +4015,8 @@ each.
 
 ### 14.38 `serve --once` reports success after being interrupted — **FIX (user decision, 2026-10-14)**
 
-**Effect on differential comparison: `none` today** — no existing scenario interrupts `serve --once`.
-**A scenario that does will need an exclusion**; see the scenario note below.
+**Effect on differential comparison: `none`** — and, as it turned out, **no exclusion was needed.** See the
+scenario note below.
 
 #### The bug
 
@@ -4049,16 +4071,27 @@ No existing scenario reaches this. `@stop-after` appears only on `run --watch`
 (`v7-run-watch.toml`, itself `@exit-only`), and `o7-serve-once-exit-codes.toml` runs `--once` to completion
 four times for V21. So nothing goes red today.
 
-**A new scenario covering the interrupted case cannot be a plain differential scenario**: TS reports
-`all_done`/0 where r-orch reports `interrupted`/1, by design. It needs either a named exclusion masking the
-exit code *and* the `serve:finished` line, or to be a Rust-side-only test asserting the new contract. **The
-exclusion must not mask the whole `serve` log**, or it would void V20's record-field coverage on the same
-step.
+A differential scenario could not cover this — TS reports `all_done`/0 where r-orch reports
+`interrupted`/1, by design — so it is a **Rust-side test**, `tests/serve_interrupted.rs`, asserting the new
+contract directly. **No exclusion was added**, and that is the better outcome: an exclusion would have
+masked the exit code and the `serve:finished` line on a `serve` step, which is exactly where V20's
+record-field coverage lives.
 
-#### Still to settle with wp0
+The existing scenarios confirm nothing regressed: `o7-*` and `v7-run-watch` are **10/10 green against TS**,
+so the clean-run paths are still byte-identical.
 
-The exact `result` string (`interrupted` as above) and the exit code are specified here but **wp0
-implements them** — confirm both match before this row is treated as describing shipped behaviour.
+#### Implemented and confirmed
+
+Shipped as specified: `result="interrupted"`, **exit 1**.
+
+One implementation detail is what preserves the clean-run guarantee, and it is worth recording because the
+obvious ordering would have broken it: **the stopped check runs *after* the terminal check.** So a signal
+arriving once every task is already terminal still yields `all_done` — byte-identical to the original —
+and only a signal arriving with work outstanding produces `interrupted`. Had the checks been ordered the
+other way, every clean run that happened to be signalled at the end would have flipped to a non-zero exit.
+
+The wind-down still runs, so the lock is released (§14.15) — an interrupted `--once` does not leave the
+project wedged.
 
 ---
 
