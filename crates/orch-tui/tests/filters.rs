@@ -33,6 +33,48 @@ fn seed_messages(harness: &mut Harness) {
     ];
 }
 
+/// 40 messages, `msg-00` … `msg-39`, alternating `Output` and `Error` so a
+/// type filter leaves a sparse, non-contiguous set of indices behind.
+fn seed_numbered_messages(harness: &mut Harness) {
+    harness.app.state.messages = (0..40)
+        .map(|i| {
+            let (token, msg_type) = if i % 2 == 0 {
+                (Token::White, MsgType::Output)
+            } else {
+                (Token::Red, MsgType::Error)
+            };
+            Message::new(i as u64 + 1, 0, &format!("msg-{i:02}"), token, msg_type)
+        })
+        .collect();
+}
+
+/// How tall the logs rows area is in this frame: the main region, less the
+/// status bar and the agent-chip row (`views/logs.rs`).
+fn logs_view_h(harness: &Harness) -> usize {
+    harness.app.state.regions(true).main_h as usize - 2
+}
+
+/// The `msg-NN` numbers the frame actually drew, top row first.
+fn rendered_log_numbers(harness: &mut Harness) -> Vec<usize> {
+    harness
+        .text()
+        .lines()
+        .filter_map(|line| line.split_once("msg-"))
+        .map(|(_, rest)| rest[..2].parse::<usize>().expect("a two-digit number"))
+        .collect()
+}
+
+/// The numbers [`orch_tui::state::AppState::visible_log_indices`] says are on
+/// screen, read back through the message list the renderer reads.
+fn mapped_log_numbers(harness: &Harness) -> Vec<usize> {
+    let state = &harness.app.state;
+    state
+        .visible_log_indices(logs_view_h(harness))
+        .into_iter()
+        .map(|index| state.messages[index].text["msg-".len()..].parse().unwrap())
+        .collect()
+}
+
 // ── Agent picker ───────────────────────────────────────────────────────────
 
 #[test]
@@ -514,4 +556,66 @@ fn f044_opening_a_picker_shrinks_the_logs_list() {
     harness.key('a');
     harness.assert_text("Agent Filter");
     harness.assert_text("LIVE");
+}
+
+// ── Row → message-index mapping (PARITY.md §14.20) ─────────────────────────
+
+#[test]
+fn f045_the_visible_window_matches_the_rendered_rows_in_tail_mode() {
+    let mut harness = logs_harness();
+    seed_numbered_messages(&mut harness);
+    let view_h = logs_view_h(&harness);
+    let drawn = rendered_log_numbers(&mut harness);
+
+    assert_eq!(drawn, mapped_log_numbers(&harness));
+    // Tail mode is pinned to the newest message, which is the last row.
+    assert_eq!(drawn.len(), view_h);
+    assert_eq!(drawn.last(), Some(&39));
+    assert_eq!(drawn.first(), Some(&(40 - view_h)));
+}
+
+#[test]
+fn f046_the_visible_window_matches_the_rendered_rows_while_browsing() {
+    let mut harness = logs_harness();
+    seed_numbered_messages(&mut harness);
+    // The first `Up` leaves tail mode on the last message; the rest walk back
+    // through the list, moving `log_scroll_offset` with them.
+    for _ in 0..12 {
+        harness.press(KeyCode::Up);
+    }
+    assert!(harness.app.state.log_selected_index >= 0);
+    assert_eq!(
+        rendered_log_numbers(&mut harness),
+        mapped_log_numbers(&harness)
+    );
+
+    // And from a window that is neither at the head nor at the tail.
+    harness.app.state.log_scroll_offset = 7;
+    assert_eq!(
+        rendered_log_numbers(&mut harness),
+        mapped_log_numbers(&harness)
+    );
+    assert_eq!(rendered_log_numbers(&mut harness).first(), Some(&7));
+}
+
+#[test]
+fn f047_the_window_indexes_the_filtered_set_and_not_the_message_list() {
+    let mut harness = logs_harness();
+    seed_numbered_messages(&mut harness);
+    // Only the odd `msg-NN` are errors, so a correct window is odd-numbered
+    // throughout; indexing `messages` instead of `filtered_messages` would
+    // draw a contiguous run.
+    harness.app.state.log_type_filter = preset_types("errors");
+
+    let tail = rendered_log_numbers(&mut harness);
+    assert_eq!(tail, mapped_log_numbers(&harness));
+    assert!(tail.iter().all(|n| n % 2 == 1), "{tail:?}");
+    assert_eq!(tail.last(), Some(&39));
+
+    harness.app.state.log_selected_index = 4;
+    harness.app.state.log_scroll_offset = 3;
+    let browsed = rendered_log_numbers(&mut harness);
+    assert_eq!(browsed, mapped_log_numbers(&harness));
+    // Filtered index 3 is `msg-07`, not `msg-03`.
+    assert_eq!(browsed.first(), Some(&7));
 }

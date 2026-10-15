@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use orch_core::error::{Error, Result};
 use orch_infra::storage::{ORCHESTRY_DIR, find_project_root};
@@ -15,6 +16,19 @@ use orch_infra::storage::{ORCHESTRY_DIR, find_project_root};
 use super::backend::EngineBackend;
 use crate::commands::init;
 use crate::output::Styles;
+
+/// How long the wind-down gets when the terminal is already gone.
+///
+/// `Orchestrator::stop()` is unbounded, and nothing enforces a run timeout
+/// except `stall_timeout_ms`, which fires only from the watch loop (PARITY.md
+/// §6.5) — so one hung agent can hold the shutdown, and the lock, for as long
+/// as it likes. With a terminal there that is the right trade: the user is
+/// watching and the agents get their full grace. With the terminal gone nobody
+/// is watching, and a process that will not exit is worse than a lock released
+/// a moment late — `acquire_lock` deletes a lock whose PID is not alive
+/// (`orch-infra/src/storage/lock.rs:51-62`), so the next `orch` reclaims it as
+/// soon as this process is gone. See PARITY.md §14.40.
+const DEAD_TTY_WIND_DOWN: Duration = Duration::from_secs(5);
 
 /// Bare `orch`: the first-run experience (PARITY.md §2.3, `src/bin/cli.ts`
 /// `isBareOrch`).
@@ -75,7 +89,8 @@ pub async fn run(project_root: PathBuf, version: &str, observe: bool) -> Result<
     // Installed before anything slow, so a signal during startup or recovery
     // is also deferred to the cleanup rather than hitting the default action.
     let stop = Arc::new(AtomicBool::new(false));
-    watch_termination(Arc::clone(&stop));
+    let hungup = Arc::new(AtomicBool::new(false));
+    watch_termination(Arc::clone(&stop), Arc::clone(&hungup));
 
     let engine = Arc::new(orch_engine::build_full(project_root).await?);
     let backend = EngineBackend::launch_with(Arc::clone(&engine), version, observe).await;
@@ -111,7 +126,7 @@ pub async fn run(project_root: PathBuf, version: &str, observe: bool) -> Result<
     let outcome = if stop.load(Ordering::Relaxed) {
         // Signalled while starting up: no dashboard, straight to cleanup.
         drop(backend);
-        Ok(Ok(()))
+        Ok(Ok(orch_tui::Exit::Requested))
     } else {
         let draw = std::thread::Builder::new()
             .name("orch-tui".to_owned())
@@ -132,7 +147,24 @@ pub async fn run(project_root: PathBuf, version: &str, observe: bool) -> Result<
     if watch_active {
         // `stop()` already reports its own failures on the bus; the TS
         // swallows this rejection outright (`.catch(() => {})`).
-        let _ = engine.orchestrator.stop().await;
+        let stopping = engine.orchestrator.stop();
+        if bound_wind_down(
+            outcome.as_ref().ok().and_then(|r| r.as_ref().ok().copied()),
+            hungup.load(Ordering::Relaxed),
+        ) {
+            if tokio::time::timeout(DEAD_TTY_WIND_DOWN, stopping)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    grace_ms = DEAD_TTY_WIND_DOWN.as_millis(),
+                    "the terminal is gone and the orchestrator did not stop in time; \
+                     releasing the lock and exiting with agents possibly still running"
+                );
+            }
+        } else {
+            let _ = stopping.await;
+        }
     }
     engine.events.clear();
 
@@ -144,13 +176,43 @@ pub async fn run(project_root: PathBuf, version: &str, observe: bool) -> Result<
             panic_message(&panic)
         ))),
         Ok(Err(err)) => Err(Error::other(format!("dashboard: {err}"))),
-        Ok(Ok(())) => Ok(ExitCode::SUCCESS),
+        Ok(Ok(_)) => Ok(ExitCode::SUCCESS),
     }
 }
 
+/// Should the wind-down be bounded by [`DEAD_TTY_WIND_DOWN`]?
+///
+/// Yes exactly when the terminal is gone, which happens two ways the draw
+/// loop cannot tell apart: it returns `TerminalGone` when it detected the
+/// hang-up itself, but a **SIGHUP** reaches it as the generic `stop` flag and
+/// comes back as `Requested` — indistinguishable from `q`. So the signal
+/// watcher records the hang-up separately and it is or-ed in here.
+///
+/// SIGTERM and SIGINT are *not* included: those come from a service manager
+/// or the user, who are waiting for the shutdown, so the agents keep their
+/// full grace. Nobody is waiting on a terminal that has gone away.
+fn bound_wind_down(exit: Option<orch_tui::Exit>, hungup: bool) -> bool {
+    // Only an orderly `Exit::Requested` — `q`, SIGTERM, SIGINT — waits
+    // indefinitely. `None` is a dashboard that **panicked or errored**, and it
+    // belongs with the gone-terminal cases: the guard has already restored the
+    // terminal on its way out, so there is nothing left to show a shutdown on
+    // and nobody waiting for the agents' grace. Leaving that path unbounded is
+    // how a panicked dashboard could sit forever inside `stop()` — alive,
+    // re-parented, and unable to act on a single SIGTERM because the signal
+    // task is waiting for a *second* one (QA B4).
+    !matches!(exit, Some(orch_tui::Exit::Requested)) || hungup
+}
+
 /// Set `stop` when SIGHUP or SIGTERM arrives; a second one exits at once.
+///
+/// `hungup` additionally records that it was **SIGHUP**, which is a different
+/// situation from SIGTERM however similar the shutdown looks: SIGHUP means the
+/// terminal went away, so nobody is watching and nobody is waiting out an
+/// agent's stop grace — exactly the condition that bounds the wind-down for a
+/// dead tty (PARITY.md §14.40). SIGTERM and SIGINT come from a service manager
+/// or the user, who *are* waiting, and keep the unbounded wait.
 #[cfg(unix)]
-fn watch_termination(stop: Arc<AtomicBool>) {
+fn watch_termination(stop: Arc<AtomicBool>, hungup: Arc<AtomicBool>) {
     use tokio::signal::unix::{SignalKind, signal};
 
     let (mut hangup, mut terminate) = match (
@@ -165,7 +227,10 @@ fn watch_termination(stop: Arc<AtomicBool>) {
     };
     tokio::spawn(async move {
         tokio::select! {
-            _ = hangup.recv() => tracing::info!("SIGHUP: shutting the dashboard down"),
+            _ = hangup.recv() => {
+                tracing::info!("SIGHUP: shutting the dashboard down");
+                hungup.store(true, Ordering::Relaxed);
+            }
             _ = terminate.recv() => tracing::info!("SIGTERM: shutting the dashboard down"),
         }
         stop.store(true, Ordering::Relaxed);
@@ -182,7 +247,7 @@ fn watch_termination(stop: Arc<AtomicBool>) {
 }
 
 #[cfg(not(unix))]
-fn watch_termination(_stop: Arc<AtomicBool>) {}
+fn watch_termination(_stop: Arc<AtomicBool>, _hungup: Arc<AtomicBool>) {}
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(msg) = panic.downcast_ref::<&str>() {
@@ -191,5 +256,41 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
         msg.clone()
     } else {
         "unknown cause".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_tui::Exit;
+
+    /// PARITY.md §14.40 bounds the wind-down only when the terminal is gone.
+    /// A SIGHUP *is* that, but it arrives as `Requested`, so the flag is what
+    /// carries it — and getting this wrong means a hung agent holds the lock
+    /// after the terminal has closed, which is the case §14.40 exists for.
+    #[test]
+    fn only_a_vanished_terminal_bounds_the_wind_down() {
+        assert!(
+            bound_wind_down(Some(Exit::TerminalGone), false),
+            "the draw loop detected the hang-up itself"
+        );
+        assert!(
+            bound_wind_down(Some(Exit::Requested), true),
+            "SIGHUP arrives as `Requested`; the flag is the only signal of it"
+        );
+        assert!(
+            !bound_wind_down(Some(Exit::Requested), false),
+            "`q`, SIGTERM and SIGINT keep the unbounded wait: someone is watching"
+        );
+        assert!(
+            bound_wind_down(None, true),
+            "a panicked dashboard after SIGHUP is still a gone terminal"
+        );
+        assert!(
+            bound_wind_down(None, false),
+            "a panic or an I/O error is bounded too: the guard restored the \
+             terminal on the way out, so nobody is watching the shutdown, and \
+             an unbounded `stop()` there can hang the process for good"
+        );
     }
 }

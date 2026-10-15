@@ -71,6 +71,19 @@ orch                                        # the TUI dashboard
 
 Bare `orch` launches the dashboard. In a directory with no `.orchestry/`, it initialises one first.
 
+**Mouse.** Click tabs, list rows, `+ add …` rows, filter chips and the footer hint buttons;
+double-click a row to open its detail; the wheel moves the selection. Everything is also a key —
+the mouse adds nothing you cannot type.
+
+Capture holds the pointer, which takes click-drag **text selection** away from the terminal. To get
+it back: hold **Shift** while dragging (most terminals), or press **F2** to release the pointer for
+the session. **Under tmux, Shift+drag is not the answer** — tmux holds the outer terminal's mouse
+mode, so it selects across pane borders; use `F2` (or `/mouse off`), which also restores tmux's own
+drag-to-copy. `prefix [` copy mode always works. Under tmux you also need `set -g mouse on`, or no
+clicks reach the dashboard at all.
+
+To start with the mouse off: `ORCH_TUI_MOUSE=0 orch`. `/mouse status` says which it is.
+
 Two things that will bite you on first use, both covered in the [runbook](docs/RUNBOOK.md):
 
 - **`approval_policy: auto`** above is deliberate. The default `agt_creator` agent uses `suggest`, which

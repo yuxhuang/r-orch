@@ -11,6 +11,7 @@ use ratatui::text::Span;
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::format::{format_duration, format_tokens, parse_timestamp_ms};
+use crate::hit::{ZoneId, ZoneKind};
 use crate::state::ViewId;
 use crate::theme::{
     CHECK, CIRCLE, CIRCLE_FILLED, CROSS, DIAMOND, DOT, HEAVY_RULE, LOZENGE, RETRY_ARROW, SIGMA,
@@ -77,7 +78,7 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 
     // Centre: the tab pills.
     spans.push(Span::raw("  "));
-    spans.extend(tab_pills(ctx));
+    spans.extend(tab_pills(area, ctx, &spans));
 
     // Right: the mode chip, the active count and the uptime.
     spans.push(Span::raw("  "));
@@ -120,10 +121,19 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 
 /// The tab pills: the active tab is an inverted amber pill, the others are
 /// `{key} {label}` in ghost/dim.
-fn tab_pills(ctx: &RenderCtx) -> Vec<Span<'static>> {
+///
+/// Registers each pill's zone as it emits it, because a pill's start column
+/// is only knowable here: it follows the pulsing diamond, `" ORCH"`, the
+/// version, an optional update chip, a separator and the project name, so it
+/// depends on the project name's length and on `state.latest_version`
+/// (design §3.2). `before` is everything already in the line.
+fn tab_pills(area: Rect, ctx: &RenderCtx, before: &[Span<'_>]) -> Vec<Span<'static>> {
     let state = ctx.state;
-    let mut spans = Vec::new();
+    let y = area.y + 1;
+    let mut x = area.x + crate::views::spans_width(before);
+    let mut spans: Vec<Span<'static>> = Vec::new();
     for view in ViewId::ALL {
+        let pill_start = spans.len();
         let badge = if view == ViewId::Tasks && state.hidden_task_count() > 0 {
             format!(" ({})", state.sorted_tasks().len())
         } else {
@@ -156,7 +166,16 @@ fn tab_pills(ctx: &RenderCtx) -> Vec<Span<'static>> {
                 ));
             }
         }
+        let width = crate::views::spans_width(&spans[pill_start..]);
+        ctx.zone(
+            Rect::new(x, y, width, 1),
+            area,
+            ZoneKind::Tab(view),
+            ZoneId::Tab(view),
+        );
+        x += width;
         spans.push(Span::raw(" "));
+        x += 1;
     }
     spans
 }

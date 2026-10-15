@@ -8,10 +8,13 @@
 use orch_tui::App;
 use orch_tui::backend::{Call, FakeBackend};
 use orch_tui::clock::{Clock, TestClock};
+use orch_tui::hit::{HitMap, Zone};
 use orch_tui::views;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 pub const WIDTH: u16 = 100;
 pub const HEIGHT: u16 = 30;
@@ -76,10 +79,135 @@ impl Harness {
         self
     }
 
+    /// Draw a frame and adopt its hit map, exactly as the runner does — so a
+    /// test has to draw before it can click, which mirrors reality.
     pub fn draw(&mut self) -> &mut Self {
         let app = &self.app;
-        self.terminal.draw(|frame| views::draw(frame, app)).unwrap();
+        let mut hits = None;
+        self.terminal
+            .draw(|frame| hits = Some(views::draw(frame, app)))
+            .unwrap();
+        self.app.set_hits(hits.expect("draw ran the callback"));
         self
+    }
+
+    // ── Mouse ──────────────────────────────────────────────────────────────
+
+    fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) -> &mut Self {
+        self.app.handle_mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        self
+    }
+
+    pub fn press_at(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Down(MouseButton::Left), x, y)
+    }
+
+    pub fn release_at(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Up(MouseButton::Left), x, y)
+    }
+
+    /// A full click: press and release on the same cell.
+    pub fn click(&mut self, x: u16, y: u16) -> &mut Self {
+        self.press_at(x, y).release_at(x, y)
+    }
+
+    /// Two clicks with no clock movement between them, so they land inside
+    /// the double-click window.
+    pub fn double_click(&mut self, x: u16, y: u16) -> &mut Self {
+        self.click(x, y).click(x, y)
+    }
+
+    /// A right-button press with no release, for the legacy-encoding case.
+    pub fn press_right_at(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Down(MouseButton::Right), x, y)
+    }
+
+    pub fn right_click(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Down(MouseButton::Right), x, y)
+            .mouse(MouseEventKind::Up(MouseButton::Right), x, y)
+    }
+
+    pub fn middle_click(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Down(MouseButton::Middle), x, y)
+            .mouse(MouseEventKind::Up(MouseButton::Middle), x, y)
+    }
+
+    pub fn wheel_up(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::ScrollUp, x, y)
+    }
+
+    pub fn wheel_down(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::ScrollDown, x, y)
+    }
+
+    pub fn scroll_left(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::ScrollLeft, x, y)
+    }
+
+    pub fn scroll_right(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::ScrollRight, x, y)
+    }
+
+    pub fn drag_to(&mut self, x: u16, y: u16) -> &mut Self {
+        self.mouse(MouseEventKind::Drag(MouseButton::Left), x, y)
+    }
+
+    /// Where `needle` was drawn, as a cell. The column is a **display width**,
+    /// not a byte offset: these frames carry `↑↓`, `━` and box glyphs.
+    pub fn find_text(&mut self, needle: &str) -> Option<(u16, u16)> {
+        let text = self.text();
+        for (y, line) in text.lines().enumerate() {
+            if let Some(byte_offset) = line.find(needle) {
+                let column = unicode_width::UnicodeWidthStr::width(&line[..byte_offset]) as u16;
+                return Some((column, y as u16));
+            }
+        }
+        None
+    }
+
+    /// Draw, find `needle` and click its first cell.
+    ///
+    /// The highest-value affordance in this harness: a test reads as "click
+    /// the `R run` hint" rather than carrying coordinates that a layout change
+    /// would silently invalidate.
+    #[track_caller]
+    pub fn click_text(&mut self, needle: &str) -> &mut Self {
+        let (x, y) = self
+            .find_text(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{}", self.text()));
+        self.click(x, y)
+    }
+
+    #[track_caller]
+    pub fn double_click_text(&mut self, needle: &str) -> &mut Self {
+        let (x, y) = self
+            .find_text(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{}", self.text()));
+        self.double_click(x, y)
+    }
+
+    /// The hit map of the last drawn frame.
+    pub fn hits(&self) -> &HitMap {
+        &self.app.state.mouse.hits
+    }
+
+    /// The zone under a cell, for asserting *and* for printing what was
+    /// actually found when an assert fails.
+    pub fn zone_at(&self, x: u16, y: u16) -> Option<&Zone> {
+        self.app.state.mouse.hits.resolve(x, y)
+    }
+
+    /// One rendered row, as text. Does not redraw.
+    pub fn line(&self, y: u16) -> String {
+        let buffer = self.terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
     }
 
     /// Draw and flatten the buffer to text, one line per row.

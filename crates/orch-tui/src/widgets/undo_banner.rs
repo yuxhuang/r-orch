@@ -7,12 +7,22 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 
 use crate::format::cap_line;
+use crate::hit::{ZoneId, ZoneKind};
 use crate::messages::UNDO_TIMEOUT_MS;
 use crate::theme::{BALLOT_X, PIPE, Token};
 use crate::views::{RenderCtx, put_line};
 
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     for (row, deletion) in ctx.state.pending_deletions.iter().enumerate() {
+        // The row index is what `undo_deletion_at` needs; the deletion's key
+        // is what identifies it. Pointing at the row rather than the last
+        // deletion is the whole reason `undo_deletion_at` exists (§3.2.2).
+        ctx.row_zone(
+            area,
+            area.y + row as u16,
+            ZoneKind::UndoRow { index: row },
+            ZoneId::UndoRow(deletion.key),
+        );
         let label = deletion.entity_type.label();
         let remaining_ms = (deletion.expires_at - ctx.now_ms).clamp(0, UNDO_TIMEOUT_MS);
         let seconds = (remaining_ms as f64 / 1000.0).ceil() as i64;

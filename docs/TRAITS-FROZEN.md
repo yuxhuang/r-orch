@@ -741,3 +741,56 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
     same hazard: a process that kills itself because a pid field was missing
     is not behaviour, and nothing observable depends on it. The test can only
     fail by killing the test runner.
+
+20. **`orch tui` outlived its own terminal, at 100 % of a core.** Closing the
+    terminal sends SIGHUP, which `crates/orch-cli/src/tui/command.rs` catches
+    and turns into the `stop` flag the draw loop checks once a frame — so
+    far, correct. But the loop was waiting for input in
+    `crossterm::event::poll`, and crossterm's unix event source answers both
+    `poll` and `read` by looping on the tty fd: a read of **0 bytes**, or an
+    error that is neither `WouldBlock` nor `Interrupted`, neither produces an
+    event nor breaks that loop (crossterm-0.29.0
+    `src/event/source/unix/mio.rs`, the `TTY_TOKEN` arm). On a hung-up pty the
+    fd is readable forever and every read is one of those two, so `poll` never
+    returned at all. Measured: the `orch-tui` thread pinned one core at 101 %,
+    the process re-parented to init, `.orchestry/orchestry.lock` still held
+    and the agents it started orphaned — with the SIGHUP already recorded in a
+    flag nobody would read again.
+
+    Fixed by doing the *waiting* ourselves: `crates/orch-tui/src/tty.rs` is a
+    `poll(2)` that reports `POLLHUP`, and crossterm is entered only once the
+    terminal has data and has not hung up. Reading and parsing stay
+    crossterm's, per ARCHITECTURE §4.8. The same check runs before every
+    re-entry into crossterm inside the per-frame drain, and after a failed
+    ioctl or frame write, so a terminal that goes away mid-frame is reported
+    as the hangup it is rather than as a dashboard error.
+
+    Two second-order details the fix has to carry. `POLLNVAL` means "fd not
+    open", and which fd it is decides what that implies. The poll runs on
+    **stdin** whenever stdin is a terminal — every terminal, every tmux pane,
+    and `orch web`'s pty child — and on `/dev/tty` only when it is not,
+    mirroring crossterm's own `tty_fd`. On stdin it means the terminal is gone,
+    so it is treated as a hang-up. On `/dev/tty` it may instead be the
+    documented macOS limitation that `poll(2)` does not work on that file, so
+    only there does detection turn off for the session and the wait revert to
+    crossterm's — the behaviour being replaced, not a new way to fail. The
+    split is what keeps dead-tty detection working on the path a macOS user
+    actually takes. And ratatui's `Terminal::drop`
+    retries `show_cursor` and `eprintln!`s the failure, which on a closed
+    stderr *panics*: that turned a closed terminal into "the dashboard
+    panicked" and a non-zero exit, so `TerminalGuard::drop` skips that drop
+    once it knows the terminal is gone.
+
+    Invisible to every test above the binary: `TestBackend` never goes near
+    crossterm's event source and a pipe has no hangup semantics. Covered by
+    `crates/orch-cli/tests/tui_hangup.rs`, which runs the real binary on a
+    real pty, lets it park in its wait, closes both master fds, and asserts it
+    exits with status 0 and no lock left behind. Reverting
+    `crates/orch-tui/src/runner.rs` fails it with "outlived its terminal by
+    10s and had to be killed".
+
+    `orch web` needed no separate fix: its pty child *is* `orch tui`, and its
+    teardown (`crates/orch-cli/src/web/pty.rs`) sends SIGHUP while a reader
+    thread still holds a dup of the master, so the child's tty never hangs up
+    before it exits and the flag path was always reached. That path is now
+    pinned by a test of its own in the same file.

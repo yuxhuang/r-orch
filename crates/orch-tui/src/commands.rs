@@ -208,6 +208,30 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.emit(&text, Token::Silver, MsgType::System);
                 }
             }
+            // A second route to the capture toggle, because `F2` is a weak
+            // sole escape hatch: on many laptops it is brightness or media
+            // without `Fn`, and some terminal menus claim it. This one is
+            // typable and discoverable — it appears in the `/` suggestion
+            // list, which is the TUI's own discovery surface (design §3.5).
+            // Argument matching is lowercased, so `/mouse OFF` behaves like
+            // `ORCH_TUI_MOUSE=OFF` — the feature's two switches should not
+            // disagree about case.
+            "mouse" => match arg(1).map(str::to_ascii_lowercase).as_deref() {
+                Some("on") => self.set_mouse_enabled(true),
+                Some("off") => self.set_mouse_enabled(false),
+                Some("status") | None => {
+                    let text = if self.state.mouse.enabled {
+                        "Mouse capture is on — /mouse off to release the pointer"
+                    } else {
+                        "Mouse capture is off — /mouse on, or F2"
+                    };
+                    self.emit(text, Token::Silver, MsgType::System);
+                }
+                Some(other) => {
+                    let text = format!("Usage: mouse on|off|status (got {other})");
+                    self.refuse(&text);
+                }
+            },
             "quit" => self.state.should_exit = true,
             other => {
                 let text = format!("Unknown: {other}. Type /help for commands");

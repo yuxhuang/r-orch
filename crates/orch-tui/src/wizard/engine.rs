@@ -411,6 +411,24 @@ impl Wizard {
         &self.textarea
     }
 
+    /// Scroll the textarea one wheel notch.
+    ///
+    /// `tui-textarea-2` supports exactly `MouseScrollUp`/`MouseScrollDown`
+    /// and nothing else from a mouse, so the wheel is forwarded to it rather
+    /// than reimplemented here (ARCHITECTURE §4.8).
+    pub fn scroll_textarea(&mut self, up: bool) {
+        self.textarea.input(tui_textarea::Input {
+            key: if up {
+                tui_textarea::Key::MouseScrollUp
+            } else {
+                tui_textarea::Key::MouseScrollDown
+            },
+            ctrl: false,
+            alt: false,
+            shift: false,
+        });
+    }
+
     pub fn textarea_value(&self) -> String {
         self.textarea.lines().join("\n")
     }

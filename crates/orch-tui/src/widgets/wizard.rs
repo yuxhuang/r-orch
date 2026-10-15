@@ -5,9 +5,10 @@ use ratatui::layout::Rect;
 use ratatui::text::Span;
 
 use crate::format::cap_line;
+use crate::hit::{RowPart, ScrollRegion, VerbId, ZoneId, ZoneKind};
 use crate::text::cursor::{Cursor, display_width, text_display_width};
 use crate::theme::{BLOCK, CHECK, CIRCLE, CIRCLE_FILLED, CURSOR, Token, light_rule};
-use crate::views::{RenderCtx, put_line};
+use crate::views::{RenderCtx, put_line, spans_width};
 use crate::wizard::engine::{StepKind, Wizard};
 
 /// `CMD_KEY` — `⌘` on macOS, `Ctrl` elsewhere.
@@ -90,7 +91,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard) {
     let field_area = Rect::new(area.x, y, area.width, field_h);
     let used = match step.kind {
         StepKind::Text => render_text_field(frame, field_area, ctx, wizard),
-        StepKind::Textarea => render_textarea_field(frame, field_area, wizard),
+        StepKind::Textarea => render_textarea_field(frame, field_area, ctx, wizard),
         StepKind::Select => render_select_field(frame, field_area, ctx, wizard),
         StepKind::Multiselect => render_multiselect_field(frame, field_area, ctx, wizard),
     };
@@ -141,11 +142,59 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard) {
     } else {
         "  Esc cancel"
     });
+    // The hint row stays one span — the output is unchanged — and the verbs
+    // are located by name inside it, so a mouse-only user can confirm, toggle
+    // and go back (§3.7). `↑↓`-style movement hints stay unclickable.
+    let hint_y = area.bottom().saturating_sub(1);
+    let confirm_textarea = format!("{CMD_KEY}+Enter/Tab confirm");
+    for (needles, verb) in [
+        (
+            // Longest first: these overlap as substrings, and only the first
+            // match is registered, so the whole visible label is clickable —
+            // including the `Ctrl+` (or `⌘+`) part on a textarea step, which
+            // was previously outside the zone.
+            vec![
+                confirm_textarea.as_str(),
+                "Enter/Tab confirm",
+                "Tab confirm",
+            ],
+            VerbId::WizardConfirm,
+        ),
+        (vec!["Space toggle"], VerbId::WizardToggle),
+        (vec!["Esc back", "Esc cancel"], VerbId::WizardBack),
+    ] {
+        let Some((needle, byte_offset)) = needles
+            .iter()
+            .find_map(|needle| hint.find(needle).map(|at| (*needle, at)))
+        else {
+            continue;
+        };
+        let offset = hint[..byte_offset].chars().count() as u16;
+        let width = unicode_width::UnicodeWidthStr::width(needle) as u16;
+        ctx.zone(
+            Rect::new(area.x + offset, hint_y, width, 1),
+            area,
+            ZoneKind::Verb(verb),
+            ZoneId::Verb(verb),
+        );
+    }
     let mut hint_spans = vec![Span::styled(hint, ctx.style(Token::Gray))];
     if let Some(extra) = wizard.footer_extra.as_deref() {
         hint_spans.push(Span::styled(format!("  {extra}"), ctx.style(Token::Amber)));
     }
-    put_line(frame, area, area.bottom().saturating_sub(1), hint_spans);
+    put_line(frame, area, hint_y, hint_spans);
+}
+
+/// Identity for a wizard row: the wizard, the step and the option's own
+/// value. `WizardOption { index }` alone was identical on every step, so
+/// three fast clicks could walk a wizard to "create" with defaults — the
+/// `step_id` is what stops a double click surviving a step change (§3.3.1).
+fn option_id(wizard: &Wizard, value: &str) -> ZoneId {
+    ZoneId::WizardOption {
+        kind: wizard.kind.clone(),
+        step_id: wizard.step_id().to_string(),
+        value: value.to_string(),
+    }
 }
 
 fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard) -> u16 {
@@ -196,6 +245,18 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
         for (row, index) in (start..suggestions.len()).take(visible).enumerate() {
             let choice = &suggestions[index];
             let is_selected = wizard.is_browsing() && index == selected;
+            ctx.row_zone(
+                area,
+                area.y + used + row as u16,
+                ZoneKind::WizardSuggestion {
+                    value: choice.value.clone(),
+                },
+                ZoneId::WizardSuggestion {
+                    kind: wizard.kind.clone(),
+                    step_id: wizard.step_id().to_string(),
+                    value: choice.value.clone(),
+                },
+            );
             let spans = vec![
                 Span::styled(
                     if is_selected {
@@ -229,11 +290,19 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
     used
 }
 
-fn render_textarea_field(frame: &mut Frame, area: Rect, wizard: &Wizard) -> u16 {
+fn render_textarea_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard) -> u16 {
     // `tui-textarea-2` owns the buffer, the line numbers, the soft wrapping and
     // the cursor (ARCHITECTURE §4.8).
     let height = area.height.max(3);
     let widget_area = Rect::new(area.x, area.y, area.width, height);
+    // The wheel over a textarea is forwarded to the library, which supports
+    // exactly `MouseScrollUp`/`Down` and nothing else.
+    ctx.zone(
+        widget_area,
+        area,
+        ZoneKind::Scroll(ScrollRegion::WizardTextarea),
+        ZoneId::ScrollRegion(ScrollRegion::WizardTextarea),
+    );
     frame.render_widget(wizard.textarea(), widget_area);
     height
 }
@@ -245,9 +314,25 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
     let start = selected.saturating_sub(visible.saturating_sub(1));
     let numbered = options.len() >= 10;
 
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Scroll(ScrollRegion::WizardOptions),
+        ZoneId::ScrollRegion(ScrollRegion::WizardOptions),
+    );
+
     for (row, index) in (start..options.len()).take(visible).enumerate() {
         let choice = &options[index];
         let is_selected = index == selected;
+        ctx.row_zone(
+            area,
+            area.y + row as u16,
+            ZoneKind::WizardOption {
+                index,
+                part: RowPart::Label,
+            },
+            option_id(wizard, &choice.value),
+        );
         let marker = if is_selected {
             format!("  {CURSOR} ")
         } else if numbered {
@@ -298,6 +383,13 @@ fn render_multiselect_field(
     let selected = wizard.select_index();
     let start = selected.saturating_sub(visible.saturating_sub(1));
 
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Scroll(ScrollRegion::WizardOptions),
+        ZoneId::ScrollRegion(ScrollRegion::WizardOptions),
+    );
+
     for (row, index) in (start..options.len()).take(visible).enumerate() {
         let choice = &options[index];
         let is_cursor = index == selected;
@@ -325,7 +417,34 @@ fn render_multiselect_field(
                 ctx.style(Token::Dim),
             ),
         ];
-        put_line(frame, area, area.y + row as u16, spans);
+        let row_y = area.y + row as u16;
+        let checkbox_x = area.x + spans_width(&spans[..1]);
+        let checkbox_w = spans_width(&spans[1..2]);
+        let id = option_id(wizard, &choice.value);
+        ctx.zone(
+            Rect::new(checkbox_x, row_y, checkbox_w, 1),
+            area,
+            ZoneKind::WizardOption {
+                index,
+                part: RowPart::Checkbox,
+            },
+            id.clone(),
+        );
+        ctx.zone(
+            Rect::new(
+                checkbox_x + checkbox_w,
+                row_y,
+                area.width.saturating_sub(checkbox_x + checkbox_w - area.x),
+                1,
+            ),
+            area,
+            ZoneKind::WizardOption {
+                index,
+                part: RowPart::Label,
+            },
+            id,
+        );
+        put_line(frame, area, row_y, spans);
     }
     let mut used = visible.min(options.len().saturating_sub(start)).max(1) as u16;
     let checked = wizard.multi_selected().len();

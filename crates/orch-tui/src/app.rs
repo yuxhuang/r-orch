@@ -401,11 +401,31 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.state.clamp_all(can_create);
     }
 
+    // ── Mouse ──────────────────────────────────────────────────────────────
+
+    /// Adopt the hit map for the frame just drawn (design §3.1).
+    ///
+    /// A frame is also where the wheel's per-frame budget resets: the drain
+    /// can deliver dozens of notches from one flick, and the frame is the
+    /// only place the user sees a result.
+    pub fn set_hits(&mut self, hits: crate::hit::HitMap) {
+        self.state.mouse.hits = hits;
+        self.start_frame();
+    }
+
     // ── Soft delete ────────────────────────────────────────────────────────
 
     /// `Z` — restore the most recent pending deletion.
     pub fn undo_deletion(&mut self) {
-        if let Some(deletion) = self.state.undo_deletion() {
+        if let Some(last) = self.state.pending_deletions.len().checked_sub(1) {
+            self.undo_deletion_at(last);
+        }
+    }
+
+    /// [`Self::undo_deletion`] for one named undo-banner row; see
+    /// [`AppState::undo_deletion_at`](crate::state::AppState::undo_deletion_at).
+    pub fn undo_deletion_at(&mut self, index: usize) {
+        if let Some(deletion) = self.state.undo_deletion_at(index) {
             let text = format!("↶ Undo: \"{}\" restored", deletion.entity_name);
             self.emit(&text, Token::Green, MsgType::System);
         }
@@ -1455,6 +1475,49 @@ mod tests {
                 .iter()
                 .any(|m| m.text.contains("restored"))
         );
+    }
+
+    #[test]
+    fn undo_deletion_at_restores_the_banner_row_and_lets_the_others_expire() {
+        let mut backend = FakeBackend::new();
+        backend.tasks = vec![
+            make_task("tsk_1", "First", TaskStatus::Todo),
+            make_task("tsk_2", "Second", TaskStatus::Todo),
+        ];
+        let clock = TestClock::new(0);
+        let mut app = App::new(backend, clock.clone());
+        app.delete_task_by_id("tsk_1");
+        app.delete_task_by_id("tsk_2");
+        assert_eq!(app.state.pending_deletions.len(), 2);
+
+        // Banner row 0 is "First"; `undo_deletion`'s LIFO would restore
+        // "Second" instead.
+        app.undo_deletion_at(0);
+        app.state.flush_messages(clock.now_ms());
+        assert!(
+            app.state
+                .messages
+                .iter()
+                .any(|m| m.text.contains("\"First\" restored"))
+        );
+        clock.advance_ms(10_000);
+        app.tick();
+        assert!(
+            !app.backend
+                .called(|c| matches!(c, crate::backend::Call::DeleteTask(id) if id == "tsk_1"))
+        );
+        assert!(
+            app.backend
+                .called(|c| matches!(c, crate::backend::Call::DeleteTask(id) if id == "tsk_2"))
+        );
+    }
+
+    #[test]
+    fn undo_deletion_with_nothing_pending_is_a_no_op() {
+        let mut app = App::new(FakeBackend::new(), TestClock::new(0));
+        app.undo_deletion();
+        app.undo_deletion_at(0);
+        assert!(app.state.messages.is_empty());
     }
 
     #[test]

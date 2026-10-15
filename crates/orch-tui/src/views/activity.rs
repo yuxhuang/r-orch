@@ -10,9 +10,10 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 
 use crate::format::{cap_line, relative_time};
+use crate::hit::{VerbId, ZoneId, ZoneKind};
 use crate::messages::{MsgType, preset_label};
 use crate::theme::{ACCENT_BAR, THIN_BAR, Token};
-use crate::views::{RenderCtx, put_line, section_label};
+use crate::views::{RenderCtx, put_line, section_label, spans_width};
 
 /// 9 spaces — `AGENT_INDENT`.
 const AGENT_INDENT: &str = "         ";
@@ -31,12 +32,22 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx.style(Token::Ghost),
         ),
     ];
-    section_label(
+    // The `F:PRESET │ n/m` suffix cycles the preset, which is what `f`/`F`
+    // does off the logs view. `section_label` reports where it put the suffix
+    // rather than this view re-deriving that layout.
+    let suffix_width = spans_width(&suffix);
+    let suffix_x = section_label(
         frame,
         Rect::new(area.x, area.y, area.width, 1),
         ctx,
         "ACTIVITY",
         Some(suffix),
+    );
+    ctx.zone(
+        Rect::new(suffix_x, area.y, suffix_width, 1),
+        area,
+        ZoneKind::Verb(VerbId::CycleActivityFilter),
+        ZoneId::Verb(VerbId::CycleActivityFilter),
     );
 
     let rows_area = Rect::new(

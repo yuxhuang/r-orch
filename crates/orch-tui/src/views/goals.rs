@@ -7,6 +7,8 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 
 use crate::format::{cap_line, format_age_days, parse_timestamp_ms};
+use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
+use crate::state::EntityType;
 use crate::theme::{BLOCK, BULLSEYE, CHECK, CROSS, CURSOR, EM_DASH, PAUSE_BARS, SHADE, Token};
 use crate::views::{RenderCtx, put_line};
 
@@ -47,12 +49,25 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let order = state.sorted_goals();
     let mut y = area.y;
 
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Scroll(ScrollRegion::MainList),
+        ZoneId::ScrollRegion(ScrollRegion::MainList),
+    );
+
     for (selection, goal_index) in order.iter().enumerate().skip(state.goal_scroll) {
         if y >= area.bottom() {
             return;
         }
         let goal = &state.goals[*goal_index];
         let selected = selection == state.goal_selected;
+        ctx.row_zone(
+            area,
+            y,
+            ZoneKind::GoalRow { selection },
+            ZoneId::Entity(EntityType::Goal, goal.id.clone()),
+        );
         let linked = state.tasks_of_goal(&goal.id);
         let done = linked
             .iter()
@@ -149,6 +164,12 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     // `+ add goal...` at selection index `goals.len()`.
     if ctx.caps.can_create_goal && y < area.bottom() {
         let selected = state.goal_selected == order.len();
+        ctx.row_zone(
+            area,
+            y,
+            ZoneKind::Pseudo(PseudoRow::AddGoal),
+            ZoneId::Pseudo(PseudoRow::AddGoal),
+        );
         put_line(
             frame,
             area,

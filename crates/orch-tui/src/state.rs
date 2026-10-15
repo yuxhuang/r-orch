@@ -10,6 +10,7 @@ use orch_domain::{
 };
 
 use crate::command_bar::CommandHistory;
+use crate::hit::{HitMap, ZoneId, ZoneKind};
 use crate::messages::{
     MAX_MESSAGES, MAX_TOASTS, Message, MsgType, PendingMessage, RunMaps, TASK_LIST_LIMIT,
     UNDO_TIMEOUT_MS, preset_types,
@@ -108,6 +109,72 @@ pub struct PendingDeletion {
     pub entity_name: String,
     pub expires_at: i64,
     pub needs_force_stop: bool,
+}
+
+/// A left press waiting for its release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmedClick {
+    /// Which target was pressed. The release must resolve to the same one.
+    pub id: ZoneId,
+    /// What that target does, captured at press time.
+    pub kind: ZoneKind,
+    /// Whether this press was inside the double-click window of the previous
+    /// click on the same target, so the release fires the secondary action.
+    pub secondary: bool,
+    pub at_ms: i64,
+}
+
+/// Mouse bookkeeping. Lives in `AppState` like everything else that holds
+/// app state and arithmetic (`lib.rs:10`), so every mouse case is inspectable
+/// from a test and `App` stays a thin shell.
+#[derive(Debug, Clone)]
+pub struct MouseState {
+    /// Whether capture is on. `App` owns only this desire; the runner
+    /// reconciles the terminal modes from it, so the toggle is testable
+    /// without a terminal (design §3.5).
+    pub enabled: bool,
+    /// What the last drawn frame made clickable. Written only by
+    /// `App::set_hits`; invalidated on a resize, on any layout-changing
+    /// action, and on every `handle_key` (§3.2.3).
+    pub hits: HitMap,
+    pub armed: Option<ArmedClick>,
+    /// The last completed primary click, for double-click matching. Cleared
+    /// when a secondary fires, on any invalidation, and on any step or mode
+    /// change — so a third click is a fresh primary, not another double.
+    pub last_click: Option<(ZoneId, i64)>,
+    /// When `Q quit` was armed. A second click inside the window exits.
+    pub quit_armed_at: Option<i64>,
+    /// Clicks in the command-bar row are dropped until this time: the hint
+    /// set is status-conditional and reflows under the pointer (§3.3.3).
+    pub footer_suppressed_until: Option<i64>,
+    /// Selection steps the wheel has already spent this frame (§3.3.2).
+    pub wheel_steps: u8,
+}
+
+impl MouseState {
+    /// Is `Q quit` armed at `now_ms`? Read by both the dispatcher and the
+    /// footer, so the rendered `Q quit?` cannot disagree with the behaviour.
+    pub fn quit_armed(&self, now_ms: i64) -> bool {
+        self.quit_armed_at
+            .is_some_and(|at| now_ms - at <= crate::mouse::QUIT_ARM_MS)
+    }
+}
+
+impl Default for MouseState {
+    fn default() -> Self {
+        MouseState {
+            // On by default: the feature was asked for in three environments
+            // the user actually uses, and an opt-in default works in none of
+            // them unconfigured (§3.5).
+            enabled: true,
+            hits: HitMap::default(),
+            armed: None,
+            last_click: None,
+            quit_armed_at: None,
+            footer_suppressed_until: None,
+            wheel_steps: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +433,9 @@ pub struct AppState {
     pub runs: RunMaps,
     pub(crate) next_message_id: u64,
 
+    // ── Mouse ──────────────────────────────────────────────────────────────
+    pub mouse: MouseState,
+
     // ── Modes / overlays ───────────────────────────────────────────────────
     pub input_mode: InputMode,
     pub show_help: bool,
@@ -440,6 +510,7 @@ impl Default for AppState {
             refresh_at: None,
             runs: RunMaps::default(),
             next_message_id: 1,
+            mouse: MouseState::default(),
             input_mode: InputMode::None,
             show_help: false,
             command_bar: CommandBarState::default(),
@@ -910,6 +981,31 @@ impl AppState {
             .collect()
     }
 
+    /// The message indices the logs view shows, top row first, for a rows
+    /// area `view_h` terminal rows tall.
+    ///
+    /// Row `r` of that area is index `visible_log_indices(view_h)[r]`. The
+    /// window is picked two different ways — tail mode
+    /// (`log_selected_index < 0`) pins it to the end of the *filtered* list,
+    /// a selection scrolls it by `log_scroll_offset` — and both of them index
+    /// into `filtered_messages`, not into `messages`. Confusing the two is
+    /// the bug PARITY.md §14.20 records, so this is the only implementation:
+    /// `views/logs.rs` draws from it, and anything that has to turn a row
+    /// back into a message reads the same vector.
+    pub fn visible_log_indices(&self, view_h: usize) -> Vec<usize> {
+        let filtered = self.filtered_messages();
+        if self.log_selected_index < 0 {
+            let skip = filtered.len().saturating_sub(view_h);
+            filtered.into_iter().skip(skip).collect()
+        } else {
+            filtered
+                .into_iter()
+                .skip(self.log_scroll_offset)
+                .take(view_h)
+                .collect()
+        }
+    }
+
     /// Activity-feed filtering; skipped entirely when the set is full-size.
     pub fn activity_messages(&self) -> Vec<usize> {
         if self.activity_filter.len() >= MsgType::ALL.len() {
@@ -945,7 +1041,20 @@ impl AppState {
 
     /// `Z` — pop the most recent pending deletion (LIFO).
     pub fn undo_deletion(&mut self) -> Option<PendingDeletion> {
-        self.pending_deletions.pop()
+        self.undo_deletion_at(self.pending_deletions.len().checked_sub(1)?)
+    }
+
+    /// [`Self::undo_deletion`] for one *named* pending deletion.
+    ///
+    /// The undo banner renders one row per pending deletion in index order
+    /// (`widgets/undo_banner.rs`), so a caller that points at a row — rather
+    /// than pressing `Z` — has to address that row and not the last one.
+    /// Restoring row 0 of three with the LIFO form would restore row 2.
+    ///
+    /// The remaining deletions keep their order, so the rows that are still
+    /// on screen keep meaning what they meant. Out of range is a no-op.
+    pub fn undo_deletion_at(&mut self, index: usize) -> Option<PendingDeletion> {
+        (index < self.pending_deletions.len()).then(|| self.pending_deletions.remove(index))
     }
 
     /// Collect every expired deletion, atomically.
@@ -1444,6 +1553,31 @@ mod tests {
         assert_eq!(undone.entity_name, "Second");
         assert!(undone.needs_force_stop);
         assert_eq!(state.pending_deletions.len(), 1);
+    }
+
+    #[test]
+    fn undo_deletion_at_addresses_the_banner_row_and_lifo_still_takes_the_last() {
+        let mut state = AppState::default();
+        for (id, name) in [("tsk_1", "First"), ("tsk_2", "Second"), ("tsk_3", "Third")] {
+            state.schedule_deletion(EntityType::Task, id, name, false, 0);
+        }
+        // Row 0 is the *first* deletion, which is what `undo_deletion` would
+        // have got wrong by restoring "Third".
+        let undone = state.undo_deletion_at(0).unwrap();
+        assert_eq!(undone.entity_name, "First");
+        // The rows that are still on screen keep their order.
+        let left: Vec<&str> = state
+            .pending_deletions
+            .iter()
+            .map(|d| d.entity_name.as_str())
+            .collect();
+        assert_eq!(left, ["Second", "Third"]);
+        // `Z` is unchanged: still the most recent one.
+        assert_eq!(state.undo_deletion().unwrap().entity_name, "Third");
+        assert_eq!(state.undo_deletion_at(1), None);
+        assert_eq!(state.undo_deletion_at(0).unwrap().entity_name, "Second");
+        assert_eq!(state.undo_deletion(), None);
+        assert_eq!(state.undo_deletion_at(0), None);
     }
 
     #[test]

@@ -9,8 +9,10 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 
 use crate::format::{cap_line, relative_time};
+use crate::hit::{PickerKind, ScrollRegion, VerbId, ZoneId, ZoneKind};
 use crate::messages::{LOG_SESSION_GAP_MS, type_filter_label};
 use crate::theme::{CURSOR, Token, spinner_frame};
+use crate::views::spans_width;
 use crate::views::{RenderCtx, put_line};
 
 const EMPTY_BOX: [&str; 7] = [
@@ -64,21 +66,14 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         return;
     }
 
-    let view_h = rows_area.height as usize;
-    let visible: Vec<usize> = if state.log_selected_index < 0 {
-        filtered
-            .iter()
-            .skip(filtered.len().saturating_sub(view_h))
-            .copied()
-            .collect()
-    } else {
-        filtered
-            .iter()
-            .skip(state.log_scroll_offset)
-            .take(view_h)
-            .copied()
-            .collect()
-    };
+    ctx.zone(
+        rows_area,
+        rows_area,
+        ZoneKind::Scroll(ScrollRegion::MainList),
+        ZoneId::ScrollRegion(ScrollRegion::MainList),
+    );
+
+    let visible = state.visible_log_indices(rows_area.height as usize);
 
     let agent_col_w = state
         .agents
@@ -192,6 +187,18 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         }
 
         put_line(frame, rows_area, rows_area.y + row as u16, spans);
+        // From the same vector the row was drawn from, so the row → message
+        // mapping has one implementation (PARITY.md §14.20, §3.2.2). The
+        // filtered index is what the action needs; the message id is what
+        // identifies the row across frames.
+        if let Some(filtered_index) = filtered.iter().position(|i| i == message_index) {
+            ctx.row_zone(
+                rows_area,
+                rows_area.y + row as u16,
+                ZoneKind::LogRow { filtered_index },
+                ZoneId::LogMessage(message.id),
+            );
+        }
         previous = Some(*message_index);
     }
 }
@@ -212,6 +219,13 @@ fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx.chip(Token::Amber, Token::WarnBg),
         ));
     }
+    // Both forms of the chip return to tail, which is what `Esc` does here.
+    ctx.zone(
+        Rect::new(area.x, area.y, spans_width(&spans), 1),
+        area,
+        ZoneKind::Verb(VerbId::LogsTail),
+        ZoneId::Verb(VerbId::LogsTail),
+    );
     spans.push(Span::styled(
         format!(" {} events", filtered.len()),
         ctx.style(Token::Dim),
@@ -236,9 +250,23 @@ fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
 
     spans.push(Span::raw("  "));
-    for (key, label) in [("a", "filter"), ("f", "type"), ("F", "cycle")] {
+    for (key, label, verb) in [
+        ("a", "filter", VerbId::OpenAgentPicker),
+        ("f", "type", VerbId::OpenTypePicker),
+        ("F", "cycle", VerbId::CycleLogTypes),
+    ] {
+        // Measured before the pair is pushed, so the zone covers exactly the
+        // `<key> <label>` cells this iteration adds.
+        let x = area.x + spans_width(&spans);
         spans.push(Span::styled(key.to_string(), ctx.bold(Token::Amber)));
         spans.push(Span::styled(format!(" {label}  "), ctx.style(Token::Dim)));
+        let width = area.x + spans_width(&spans) - x;
+        ctx.zone(
+            Rect::new(x, area.y, width, 1),
+            area,
+            ZoneKind::Verb(verb),
+            ZoneId::Verb(verb),
+        );
     }
 
     put_line(frame, area, area.y, spans);
@@ -252,7 +280,8 @@ fn render_agent_chips(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let chip_len =
         (((area.width as i64 - 20) / state.agents.len().max(1) as i64 - 1).max(4) as usize).min(10);
     let mut spans = Vec::new();
-    for agent in &state.agents {
+    for (index, agent) in state.agents.iter().enumerate() {
+        let x = area.x + spans_width(&spans);
         let active =
             state.log_agent_filter.is_empty() || state.log_agent_filter.contains(&agent.id);
         let style = if active {
@@ -265,6 +294,12 @@ fn render_agent_chips(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             format!("{} ", cap_line(&agent.name, chip_len)),
             style,
         ));
+        ctx.zone(
+            Rect::new(x, area.y + 1, area.x + spans_width(&spans) - x, 1),
+            area,
+            ZoneKind::LogAgentChip { index },
+            ZoneId::PickerItem(PickerKind::Agent, agent.id.clone()),
+        );
     }
     put_line(frame, area, area.y + 1, spans);
 }

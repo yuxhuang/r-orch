@@ -15,6 +15,8 @@ pub mod goals;
 pub mod logs;
 pub mod tasks;
 
+use std::cell::RefCell;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -24,6 +26,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use crate::app::App;
 use crate::backend::TuiBackend;
 use crate::clock::Clock;
+use crate::hit::{ChromeId, HitMap, VerbId, ZoneId, ZoneKind};
 use crate::layout::{MIN_HEIGHT, MIN_WIDTH, regions};
 use crate::state::{AppState, DetailPanel, InputMode, ViewId};
 use crate::theme::{HEAVY_RULE, Palette, Token};
@@ -55,9 +58,38 @@ pub struct RenderCtx<'a> {
     pub state: &'a AppState,
     pub caps: Caps,
     pub now_ms: i64,
+    /// What this frame drew where, filled in as it is drawn (design §3.2).
+    ///
+    /// A `RefCell` rather than a `&mut HitMap` threaded through every
+    /// signature: this ctx is already the one parameter all ~20 `render`
+    /// functions take, it is built once per frame and never escapes it, so
+    /// there is no aliasing hazard and the borrow is taken and dropped inside
+    /// [`RenderCtx::zone`].
+    pub hits: RefCell<HitMap>,
 }
 
 impl<'a> RenderCtx<'a> {
+    /// A ctx that records into a map for `area`.
+    pub fn new(state: &'a AppState, caps: Caps, now_ms: i64, area: Rect) -> Self {
+        RenderCtx {
+            state,
+            caps,
+            now_ms,
+            hits: RefCell::new(HitMap::new(area)),
+        }
+    }
+
+    /// Record a clickable zone. `rect` is the cells the caller painted and
+    /// `area` the region it painted into; the zone is clipped to the
+    /// intersection and dropped if nothing is left (§3.2.1).
+    pub fn zone(&self, rect: Rect, area: Rect, kind: ZoneKind, id: ZoneId) {
+        self.hits.borrow_mut().push(rect, area, kind, id);
+    }
+
+    /// A whole-row zone: `rect` spanning `area`'s width at row `y`.
+    pub fn row_zone(&self, area: Rect, y: u16, kind: ZoneKind, id: ZoneId) {
+        self.zone(Rect::new(area.x, y, area.width, 1), area, kind, id);
+    }
     pub fn palette(&self) -> &Palette {
         &self.state.palette
     }
@@ -78,20 +110,21 @@ impl<'a> RenderCtx<'a> {
     }
 }
 
-/// Draw one frame.
-pub fn draw<B: TuiBackend, C: Clock>(frame: &mut Frame, app: &App<B, C>) {
+/// Draw one frame and return what it made clickable.
+///
+/// Still takes `&App` and still mutates nothing outside the frame: the map is
+/// built here and handed back, rather than written into `App`, so its
+/// lifetime is obvious and the read-only rendering contract is unchanged.
+pub fn draw<B: TuiBackend, C: Clock>(frame: &mut Frame, app: &App<B, C>) -> HitMap {
     let caps = Caps {
         can_create_task: app.backend.can_create_task(),
         can_add_agent: app.backend.can_add_agent(),
         can_create_goal: app.backend.can_create_goal(),
         can_force_stop_agent: app.backend.can_force_stop_agent(),
     };
-    let ctx = RenderCtx {
-        state: &app.state,
-        caps,
-        now_ms: app.now(),
-    };
+    let ctx = RenderCtx::new(&app.state, caps, app.now(), frame.area());
     render(frame, frame.area(), &ctx);
+    ctx.hits.into_inner()
 }
 
 /// Render into an explicit area — the entry point the tests drive.
@@ -120,6 +153,15 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     y += 1;
 
     if state.show_help {
+        // Everything outside the overlay's box dismisses it — including the
+        // header and command-bar rows, which the overlay widget never sees.
+        // Registered first so the box's own zone lands on top of it.
+        ctx.zone(
+            area,
+            area,
+            ZoneKind::Chrome(ChromeId::HelpOverlayOutside),
+            ZoneId::Chrome(ChromeId::HelpOverlayOutside),
+        );
         // The overlay replaces the content area and the bottom panel.
         let overlay_h = area.height.saturating_sub(7);
         widgets::help_overlay::render(frame, Rect::new(area.x, y, area.width, overlay_h), ctx);
@@ -258,13 +300,18 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 
 /// `SectionLabel`: `━━━` + ` {LABEL} ` + a trailing rule, with an optional
 /// suffix before the rule.
+/// Draw a `━━━ LABEL ━━<suffix>━━━…` section rule.
+///
+/// Returns the column the suffix starts at, so a caller that wants the suffix
+/// clickable does not have to re-derive this layout — the drift bug the hit
+/// map exists to avoid (design §3.2).
 pub fn section_label(
     frame: &mut Frame,
     area: Rect,
     ctx: &RenderCtx,
     label: &str,
     suffix: Option<Vec<Span<'static>>>,
-) {
+) -> u16 {
     let mut spans = vec![
         Span::styled(HEAVY_RULE.to_string().repeat(3), ctx.style(Token::Ghost)),
         Span::styled(
@@ -274,12 +321,14 @@ pub fn section_label(
         ),
     ];
     let mut used = 3 + label.chars().count() + 2;
+    let mut suffix_x = area.x + used as u16;
     if let Some(suffix) = suffix {
         spans.push(Span::styled(
             HEAVY_RULE.to_string().repeat(2),
             ctx.style(Token::Ghost),
         ));
         used += 2;
+        suffix_x = area.x + used as u16;
         for span in suffix {
             used += span.content.chars().count();
             spans.push(span);
@@ -291,6 +340,7 @@ pub fn section_label(
         ctx.style(Token::Ghost),
     ));
     Paragraph::new(Line::from(spans)).render(area, frame.buffer_mut());
+    suffix_x
 }
 
 /// The detail-panel resize hint.
@@ -302,7 +352,41 @@ pub fn resize_hint(maximized: bool) -> &'static str {
     }
 }
 
+/// Register one zone per verb in a resize hint drawn at `(x, y)`.
+///
+/// The hint stays a single span — the rendering is untouched — and the verbs
+/// are located by name inside it, so `+`, `-` and `M` each get their own cell
+/// without a hardcoded offset (design §3.7).
+pub fn resize_hint_zones(ctx: &RenderCtx, area: Rect, x: u16, y: u16, hint: &str) {
+    for (needle, verb) in [
+        ("+", VerbId::DetailGrow),
+        ("-", VerbId::DetailShrink),
+        ("M", VerbId::DetailMax),
+    ] {
+        if let Some(byte_offset) = hint.find(needle) {
+            let offset = hint[..byte_offset].chars().count() as u16;
+            ctx.zone(
+                Rect::new(x + offset, y, 1, 1),
+                area,
+                ZoneKind::Verb(verb),
+                ZoneId::Verb(verb),
+            );
+        }
+    }
+}
+
 /// Render a single line of spans at `y`, clipped to `area`.
+/// The display width of a run of spans, in terminal cells.
+///
+/// Zone x-ranges are measured the same way ratatui lays the spans out, so a
+/// glyph that is two cells wide (or zero) cannot shift a zone off its label.
+pub fn spans_width(spans: &[Span<'_>]) -> u16 {
+    spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()) as u16)
+        .sum()
+}
+
 pub fn put_line(frame: &mut Frame, area: Rect, y: u16, spans: Vec<Span<'_>>) {
     if y >= area.bottom() {
         return;
@@ -335,7 +419,7 @@ mod tests {
     fn a_tiny_terminal_renders_the_minimum_size_guard() {
         let app = App::new(FakeBackend::new(), TestClock::new(0));
         let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| _ = draw(frame, &app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("terminal too small"), "{text}");
     }
@@ -344,7 +428,7 @@ mod tests {
     fn a_normal_terminal_renders_the_dashboard_chrome() {
         let app = App::new(FakeBackend::new(), TestClock::new(0));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| _ = draw(frame, &app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(!text.contains("terminal too small"), "{text}");
         assert!(text.contains("ORCH"), "{text}");

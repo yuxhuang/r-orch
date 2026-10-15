@@ -2883,7 +2883,7 @@ solid text, selection); exact hex values are L2.
 ### 12.8 Deliberate divergences in r-orch's TUI
 
 WP-6 is complete: **100 % of this section’s checklist**, with the case count and its per-area breakdown in
-`crates/orch-tui/TEST-COVERAGE.md` (**authoritative** — deliberately not restated here; see V33). Nine
+`crates/orch-tui/TEST-COVERAGE.md` (**authoritative** — deliberately not restated here; see V33). Ten
 divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
@@ -2899,9 +2899,11 @@ each is justified on its own merits rather than by the gate.
 | g | `log_selected_index` consistently indexes the **filtered** list | L1 | The original mixes filtered and unfiltered indexing, so the highlighted row and the detail shown disagree whenever a filter is active. | §14.20 |
 | h | Pre-dispatch failures reported synchronously as `Err` | L1 | The TUI renders no `orchestrator:error` case, so a stream-only dispatch error is **invisible**. | §12.10 |
 | i | Grapheme display width from `unicode-width`, not the TS range table | **L2** | The TS table under-measures several emoji classes; r-orch matches what terminals actually render. | §12.8.1 |
+| j | Mouse support added: click targets, double click, wheel | **L2** (plus one additive **L1** verb) | The Ink original has no mouse support at all, so this is an **addition, not parity**. Every click calls an action the keyboard already calls, so no keymap semantics change and `tests/keymap.rs` is untouched. Capture is on by default with DEC **1000 + 1006 only** — not 1002/1003/1015 — and is released by `ORCH_TUI_MOUSE=0`, `F2` or `/mouse off`. The `/mouse` verb extends the §12.4 verb set, which is the one **L1** part; no CLI flag and no `config.yml` key is added, because those surfaces are **L0** (§1.1 item 2, §6.5). **Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1), and no *existing* key binding changes meaning, which an unedited `tests/keymap.rs` is the proof of. The keyboard surface is not byte-for-byte unchanged: `F2` and the `/mouse` verb are additions, both listed above. | §12.11 |
 
-Items (b), (f) and (i) are recorded only here, because they are additions, layout or presentation rather
-than behaviours of the original. The others have §13, §14 or §12.10 entries.
+Items (b), (f), (i) and (j) are recorded only here (plus (j)'s prose in §12.11), because they are
+additions, layout or presentation rather than behaviours of the original. The others have §13, §14
+or §12.10 entries.
 
 #### 12.8.1 Display width (L2)
 
@@ -2982,6 +2984,171 @@ information exists; it simply never reaches the screen.
 
 ---
 
+### 12.11 Mouse support (addition, L2)
+
+**Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1), the keyboard
+surface is unchanged, and no CLI flag, config key or on-disk field is added.
+
+#### What is clickable
+
+| Surface | Single click | Double click |
+|---|---|---|
+| Tab pill | switch view; **with a detail open, close it and then switch** | — |
+| Task / agent / goal row | select | open the detail |
+| Log message row | select (indexing the **filtered** list, §14.20) | toggle the log detail |
+| `+ add …`, `Show all`, welcome `N new task`, onboarding hints, run nudge | the action the key performs | — |
+| Logs `LIVE` chip, `a filter`, `f type`, `F cycle`; activity `F:PRESET` | the key's action | — |
+| Logs agent chip | toggle that agent in the filter | — |
+| Picker row: `[✓]` / label | toggle / move the cursor | — / toggle |
+| Picker and wizard footer verbs, type-picker presets | the verb | — |
+| Wizard `Select` option row | move the cursor there | confirm the step |
+| Wizard `Multiselect` row: `[✓]` / label | toggle (every click) / move the cursor there | — / **toggle, never confirm** |
+| Wizard suggestion row | apply the suggestion | — |
+| Command suggestion row | select it | execute it |
+| Command-bar hints | the hint's action | — |
+| Detail `+` `-` `M` | resize / maximize | — |
+| Undo banner row | undo **that** deletion | — |
+| Help overlay: inside / outside the box | nothing / dismiss | — |
+
+**Not clickable**, each because no existing action maps to it: the header brand, version, project
+name, mode chip, active count, uptime and scanner bar; the header stats and token chips (there is no
+status-filter field in `AppState` — inventing one would be a new feature, not mouse support);
+section labels, rules, dividers and box borders; task and agent section headers (they consume no
+selection index); row sub-elements such as status chips, priority pips and progress bars; activity
+feed rows (no selection state exists); the logs empty-state box; the detail panel body; the help
+overlay's shortcut table (the same letter means different things in different columns); wizard
+progress dots (the engine exposes no safe jump-to-step); toast rows (they self-expire); text carets;
+the `↑↓` and `Tab/←→` hints (one two-cell span, two opposite meanings); blank space below the last
+list row; and everything at all when the frame is below 40×14.
+
+#### The hit-map invariant
+
+Targets are recorded **by the code that draws them**, during the draw, and never recomputed. A tab
+pill's start column depends on the project name's length and on `state.latest_version`; the pickers
+render in two different places; the logs row→message mapping is the arithmetic §14.20 was a bug in.
+Recomputing any of those at click time means a second copy that can drift from what is on screen.
+
+Each zone's rect is intersected with the area it was drawn into, so a hint the frame clipped is not
+clickable in the cells that were never painted.
+
+The map is retired by **every** keystroke, by a resize that reports a size the last frame was not drawn
+at, and by any mouse action that changes the layout — a view switch, an overlay or wizard or picker
+opening or closing, a detail toggle. A mouse event against a retired map, or outside the frame, is
+dropped rather than guessed at, and an armed press is cancelled with it: a press is only meaningful
+against the frame it was pressed on.
+
+Two deliberate exceptions, because "invalidate on anything that could change the frame" is not what the
+code holds and should not be read as such. **Selecting a row** does not retire the map: it reflows only
+the command-bar row, whose hint set is conditional on the selection, and that row has its own narrower
+mechanism (below) — retiring the whole map would also drop the second click of a double-click when both
+arrive in one write, which is how a real double-click reaches us. **A resize notice matching the size
+already drawn** does not retire it either: crossterm delivers SIGWINCH on the first read after the
+signal, by which time the loop has usually redrawn, so treating that late notice as a change would throw
+away the click it arrived with.
+
+When a mouse action does retire the map, the event drain **stops** rather than continuing against
+geometry that no longer exists. The rest of that batch stays queued in crossterm and is handled against
+the next frame, so a burst of clicks is deferred rather than discarded.
+
+Press and release are the same click only if the **identity** matches, where identity is an entity
+id, a message id or a wizard step id — never a row position. A refresh between press and release
+therefore cancels the click instead of firing it on whatever moved into that row.
+
+#### The mouse chain, beside §12.2's five key stages
+
+| # | Key chain | Mouse chain |
+|---|---|---|
+| 0 | *(none)* | `F2` toggles capture before every other stage |
+| 1 | help overlay swallows `?`/`Esc`/F1; any other key dismisses **and acts** | inside the box: nothing. Outside: dismiss, and nothing else |
+| 2 | a picker swallows every global key | only picker zones act; everything else is swallowed |
+| 3 | Ctrl+S opens the agent shop | no mouse equivalent (a modifier chord with no on-screen target) |
+| 4 | `input_mode` takes the key | Command: suggestions and the bar's verbs. Wizard: wizard zones and the command-bar row |
+| 5 | normal mode, source order | the full zone table |
+
+Only an overlay that holds no user-authored draft dismisses on an outside click. The help overlay
+holds none, so it dismisses. A picker, a wizard and a half-typed command each hold one, so they
+swallow the click and offer a labelled cancel verb instead — nothing is ever lost by surprise.
+
+A zone names an **action**, never a key. A synthesized `a` approves a review task in Tasks and
+switches to the Agents tab everywhere else; a synthesized `g` groups in Tasks and switches tab
+elsewhere. A click on a target labelled `A` must do what that label means. The single exception is
+`Wizard::handle_key`, the engine's only entry point, where nothing is overloaded.
+
+#### The agent picker's first click clears every other row
+
+Not a mouse behaviour, and worth stating because it reads as one. The agent
+picker's draft starts **empty**, which renders as *every* row ticked — "no filter"
+and "all agents" are the same state. Ticking one row from there yields a single
+explicit selection rather than all-minus-one (`keys.rs`, the `Space` body), so
+clicking one checkbox leaves that row ticked and clears all the others, and the
+counter goes to `1/n selected`.
+
+With two agents that is indistinguishable from "the wrong row toggled", which is
+how it was first reported. With three it is unambiguous: clicking Beta's box
+leaves Beta ticked and clears Alpha *and* Gamma. The row clicked is always the
+row acted on, and a click on a checkbox is exactly `Space` on that row — pinned
+by `tests/mouse.rs` m109 (asserted by entity id, cursor parked elsewhere) and
+m110 (mouse and keyboard land identically).
+
+The **type** picker looks different only because its draft starts as the live
+filter, which is all eight types *explicitly*, so there is no implicit-all to
+collapse out of.
+
+#### Guards on destructive and reflowing targets
+
+- `Q quit` arms on the first click, renders as `Q quit?`, and exits on a second click within 2 s.
+- After any other command-bar hint fires, the **whole row** is dead for a double-click window: the
+  hint set is status-conditional, so approving a task makes `A`/`X` vanish and everything to their
+  right shift left under the pointer. `Q quit` does not set that suppression — its own design is a
+  second click in that row — but it is still subject to one another action set.
+- `D delete` acts on a single click because it is a *soft* delete with a 5 s window, and the undo
+  banner is itself clickable, row by row.
+
+#### Capture, and how to turn it off
+
+DEC **1000** (normal tracking) and **1006** (SGR coordinates) only. Not 1002, and emphatically not
+1003: that reports every pointer move, which over tmux and the `orch web` websocket is a continuous
+stream for a consumer that does not exist, since there is no hover state. 1006 is mandatory — legacy
+X10 encodes a coordinate in one byte and cannot address past column 223, so a terminal that refuses
+1006 is unsupported above that width. Windows delegates to crossterm, whose `EnableMouseCapture`
+writes no ANSI there at all.
+
+Three off switches, in precedence order: `F2` at runtime (stage 0, so it works from inside a modal),
+`/mouse on|off|status`, and `ORCH_TUI_MOUSE=0` at startup — which reaches `orch web`'s child for
+free. While capture is off the footer carries a `⌨ F2 mouse` marker, placed **first** in the row
+because the footer already overflows 100 columns and an appended marker would be clipped away
+exactly when it is needed.
+
+**Under tmux, `set -g mouse on` is required.** With tmux's mouse off, no reports reach the pane:
+clicks do nothing, no stray characters appear, and the keyboard is unaffected.
+
+**Known upstream behaviour, not caused by this feature.** crossterm 0.29.0 converts a report's
+1-based coordinate with an unguarded `coord - 1`
+(`crossterm-0.29.0/src/event/sys/unix/parse.rs:679`, `:707`, `:737`), so a malformed report
+carrying a coordinate of **0** underflows: it panics in a debug build and wraps to `65535` in a
+release build. Release is the shipped configuration and the wrapped value is outside any frame, so
+`HitMap::contains` drops the event and nothing acts on it. No terminal in normal use emits a zero
+coordinate — it would have to be hand-written or corrupted in transit. Recorded because the
+dashboard is now the thing reading those reports, and because the debug-build panic is worth
+knowing about if one ever shows up in a backtrace.
+
+**Text selection** stops while capture holds the pointer. In a plain terminal, Shift+drag bypasses
+reporting (the modifier differs on a few terminals — check yours). **Under tmux, Shift+drag is not
+the answer**: tmux holds the outer terminal's mouse mode, so Shift+drag selects raw outer-terminal
+cells across pane borders. `F2` or `ORCH_TUI_MOUSE=0` is the documented answer there, and restores
+tmux's own drag-to-copy; `prefix [` copy mode always works. In `orch web`, Shift+drag selects
+(verified end to end), and `macOptionClickForcesSelection` gives macOS users Option+drag.
+
+#### Required single-sourcing
+
+`AppState::undo_deletion_at(index)` and `AppState::visible_log_indices(view_h)` are design
+constraints, not implementation detail. The first exists because `undo_deletion` is LIFO while the
+banner renders in index order, so a click on row 0 of three would otherwise restore the wrong
+entity. The second exists because the logs row→message mapping is §14.20's bug class, and a second
+copy of it for hit testing would reintroduce it.
+
+---
+
 ## 13. Out of parity scope
 
 | Item | Reason |
@@ -3032,10 +3199,12 @@ that the *same capabilities* are reachable from a library consumer without going
 
 Default policy: **fix**, and document. Exceptions are called out.
 
-Most entries are bugs in the **reference implementation**. A few (§14.25, §14.26) are **port defects** —
-places where r-orch had drifted from the original and was corrected *toward* it. They live here because the
-effect-on-comparison accounting in §14.0 applies identically, and because a reader asking "why does r-orch do
-X" deserves one list, not two. Each entry's heading states its kind.
+Most entries are bugs in the **reference implementation**. A few are **port defects**: §14.25 and §14.26 are
+places where r-orch had drifted from the original and was corrected *toward* it, while §14.39 and §14.40 have
+no counterpart in the original at all — they are defects in machinery the port introduced, where the Ink TUI
+has nothing of the same shape to converge on. They live here because the effect-on-comparison accounting in
+§14.0 applies identically, and because a reader asking "why does r-orch do X" deserves one list, not two.
+Each entry's heading states its kind.
 
 ### 14.0 Every entry must state its effect on the differential comparison
 
@@ -3093,6 +3262,8 @@ fix's benefit *in terms of the harness* is incoherent unless this is traced.
 | §14.36 three favourable divergences (sandboxed Liquid, negative-PID reject, in-process clipboard) | DIVERGENCE (favourable) | `none`, except Liquid partials: `scenario exclusion required (custom-template-*)` |
 | §14.37 malformed YAML/JSON error text is parser-specific | DIVERGENCE | `scenario exclusion required (malformed-input-*)` — all stderr after `  ✕ ` masked |
 | §14.38 `serve --once` reports success after interruption | **FIX** (user decision) — **shipped** | `none`; Rust-side test, no exclusion |
+| §14.39 the TUI spins at 100 % CPU on a hung-up tty and never exits | **FIX (port defect)** | `none` — TUI |
+| §14.40 the dead-tty wind-down is bounded, so a hung agent cannot hold the lock | **FIX (port defect)** | `none` — TUI |
 
 Note that §14.4 and §14.12 were *both* originally specified as fixes that would have required scenario
 exclusions. Tracing this column is what caused both to be reworked into forms that need none — which is the
@@ -4094,6 +4265,132 @@ The wind-down still runs, so the lock is released (§14.15) — an interrupted `
 project wedged.
 
 ---
+
+### 14.39 The TUI spins at 100 % CPU on a hung-up tty and never exits — **FIX (port defect)**
+
+**Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1), and no flag, config
+key or on-disk field changes.
+
+An r-orch port defect, not a behaviour of the original: the Ink TUI has no event loop of this shape. Framed
+the way §14.25 and §14.26 are.
+
+#### The bug
+
+Close the terminal — a pty master closing, a terminal window going away — and `orch tui` stayed alive,
+pinning one core, re-parented to init, with `.orchestry/orchestry.lock` still held and its agents orphaned.
+Measured under `pty.fork()`: thread `orch-tui` at **101 %** of a core with `syscall=running`.
+
+SIGHUP was *not* being swallowed. `watch_termination`
+(`crates/orch-cli/src/tui/command.rs:151`) catches it and sets the `stop` flag correctly. The draw loop
+simply never reached the check again, because it was inside `crossterm::event::poll` and that call never
+returns on a hung-up tty.
+
+crossterm 0.29 compiles one of two Unix event sources. With the `use-dev-tty` feature **off** — this build;
+`cargo tree -e features` shows no `use-dev-tty`, and `mio` and `signal-hook-mio` are compiled in — the
+source is `src/event/source/unix/mio.rs`, whose `TTY_TOKEN` arm loops on `read` and breaks only on
+`WouldBlock`:
+
+```text
+loop {                                              // mio.rs:93
+    match self.tty_fd.read(&mut buf) {
+        Ok(n) => if n > 0 { parser.advance(…) }      // n == 0: nothing, no break
+        Err(e) => if WouldBlock { break }
+                  else if Interrupted { continue }   // any other error: nothing, no break
+    }
+    if let Some(ev) = self.parser.next() { return Ok(Some(ev)) }
+}
+```
+
+A hung-up fd is readable forever and every read is `Ok(0)` or a latched error, so no arm breaks and
+`try_read` never returns. There is no EOF or hang-up signal in the API at either layer.
+
+Relying on the signal is not an option either: a closed master signals the controlling terminal's foreground
+process group, which a process spawned by a harness need not be in, and `watch_termination` degrades to a
+logged warning if the handlers cannot be installed
+(`crates/orch-cli/src/tui/command.rs:161-165`).
+
+#### The fix
+
+The **blocking wait itself** is now ours: `crates/orch-tui/src/tty.rs` is a `poll(2)` for `POLLIN` that
+also reads the `POLLHUP` and `POLLERR` that `poll(2)` reports whether or not they were requested, and
+crossterm is entered only once the terminal has data and has not hung up. Reading and parsing stay
+crossterm's, which is what ARCHITECTURE §4.8 protects; `nix` is §4.8's sanctioned route to real POSIX
+semantics, the same class of check as its `kill(pid, 0)` liveness test.
+
+Checking **once per loop iteration would not have been enough**, and this is the part worth remembering:
+with `mio.rs` there is no next iteration to check from. The same check does run again before every
+re-entry into crossterm inside the per-frame drain, and after a failed `size()` or `draw()`, so a terminal
+that goes away mid-frame is reported as the hang-up it is rather than as a dashboard error.
+
+A hang-up returns `Ok(Exit::TerminalGone)`, not `Err`: a closed terminal is a normal end of session, exactly
+as the SIGHUP path already framed it. `Err` would print `dashboard: …` to a terminal that no longer exists
+and turn a clean shutdown into a non-zero exit.
+
+Two second-order details the fix has to carry:
+
+- `POLLNVAL` means "fd not open", and which fd it is decides what that implies. The poll runs on **stdin**
+  whenever stdin is a terminal — every terminal, every tmux pane, and `orch web`'s pty child — and on
+  `/dev/tty` only when it is not, mirroring crossterm's own `tty_fd`. On **stdin** it means the terminal is
+  gone, so it is treated as a hang-up. On **`/dev/tty`** it may instead be the documented macOS limitation
+  that `poll(2)` does not work on that file, so only there does detection turn off for the session and the
+  wait revert to crossterm's — the behaviour being replaced, not a new way to fail. The split is what keeps
+  dead-tty detection working on the path a macOS user actually takes. A `/dev/tty` that will not **open** at
+  all is different again, and counts as hung up: there is no controlling terminal to wait on.
+- ratatui's `Terminal::drop` retries `show_cursor` and `eprintln!`s the failure, and `eprintln!` to a closed
+  stderr **panics** — which turned a closed terminal into `the dashboard panicked` and exit 1.
+  `TerminalGuard::drop` skips that drop once it knows the terminal is gone.
+
+One residual window is accepted rather than closed: `event::read()` blocks inside crossterm's own loop,
+so a hang-up that happens *after* our wait reported readable input but before crossterm produces an event
+is back in the original spin, with the check unreachable because `read()` never returns. It needs the last
+bytes on the wire to be a truncated escape sequence. Every other path — the blocking wait, each re-entry
+inside the drain, and a failed `size()` or `draw()` — is checked.
+
+#### Why no test above the binary could have caught it
+
+`TestBackend` never goes near crossterm's event source, and a pipe has no hang-up semantics to get wrong.
+Covered by `crates/orch-cli/tests/tui_hangup.rs`, which runs the real binary on a real pty, lets it park in
+its wait, closes both master fds, and asserts exit status 0 with no lock left behind; reverting
+`crates/orch-tui/src/runner.rs` fails it with *"outlived its terminal by 10s and had to be killed"*.
+
+`orch web` needed no separate change: its pty child **is** `orch tui`, and its teardown sends SIGHUP while a
+reader thread still holds a dup of the master (`crates/orch-cli/src/web/pty.rs`), so the child's tty never
+hangs up before it exits and the flag path was always reached.
+
+---
+
+### 14.40 The dead-tty wind-down is bounded, so a hung agent cannot hold the lock — **FIX (port defect)**
+
+**Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1). This changes
+shutdown timing only for a dashboard whose terminal is already gone.
+
+#### The bug
+
+`Orchestrator::stop()` is unbounded, and nothing enforces a run timeout except `stall_timeout_ms`, which
+fires only from the watch loop (§6.5). So §14.39's orderly exit was still not enough on its own: a single
+hung agent could hold `stop()` — and therefore `.orchestry/orchestry.lock` — indefinitely after the terminal
+was gone, which is the same wedged project §14.39 set out to prevent, reached a different way.
+
+#### The fix
+
+> **Decided by the team lead**, 2026-10-15, on the architect's `major` finding.
+
+The wind-down in `crates/orch-cli/src/tui/command.rs` is wrapped in a `DEAD_TTY_WIND_DOWN` (5 s) timeout
+**only** when the draw loop reported `Exit::TerminalGone`; on expiry it logs what was abandoned, releases the
+lock and exits anyway. A `q` quit, a SIGTERM, or any other exit with a terminal still attached keeps today's
+unbounded wait: the user is watching and the agents get their full grace.
+
+Releasing the lock on a timeout is safe because a lock is only honoured while its holder lives:
+`acquire_lock` deletes a lock whose PID is not alive (`crates/orch-infra/src/storage/lock.rs:51-62`), so the
+next `orch` reclaims it as soon as this process is gone. The agents that outlive it are the pre-existing
+hazard §14.27's orphan sweep and the RUNBOOK's stray-subprocess entry already cover.
+
+Covered by the `NO_AGENT_EXIT_BUDGET` assertion in `crates/orch-cli/tests/tui_hangup.rs`: with nothing
+running, the wind-down has nothing to wait for and the exit must land well inside 2 s, so a regression that
+waits out the whole grace regardless fails.
+
+---
+
 
 ## 15. Verification matrix
 

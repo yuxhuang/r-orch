@@ -27,6 +27,10 @@
     cursorBlink: true,
     fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
     fontSize: 14,
+    // `orch tui` holds mouse reporting, which takes click-drag selection
+    // away from the browser. Option+drag forces a local selection on macOS;
+    // Shift+drag does elsewhere. F2 or /mouse release the pointer entirely.
+    macOptionClickForcesSelection: true,
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);

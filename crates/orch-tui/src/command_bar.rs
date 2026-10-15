@@ -33,7 +33,7 @@ pub struct CommandSpec {
 }
 
 /// `COMMAND_REGISTRY`, in insertion order.
-pub const COMMAND_REGISTRY: [CommandSpec; 12] = [
+pub const COMMAND_REGISTRY: [CommandSpec; 13] = [
     CommandSpec {
         verb: "task",
         sub: &[
@@ -119,6 +119,13 @@ pub const COMMAND_REGISTRY: [CommandSpec; 12] = [
         sub: &[],
         args: None,
         help: "List all commands",
+        category: CAT_SETTINGS,
+    },
+    CommandSpec {
+        verb: "mouse",
+        sub: &["on", "off", "status"],
+        args: None,
+        help: "Mouse capture on/off",
         category: CAT_SETTINGS,
     },
     CommandSpec {
@@ -343,9 +350,14 @@ mod tests {
         let verbs: Vec<&str> = COMMAND_REGISTRY.iter().map(|s| s.verb).collect();
         assert_eq!(
             verbs,
+            // `mouse` is a deliberate addition to this **L1** verb set
+            // (PARITY.md §12.4), recorded in §12.8 row (j): `F2` alone is a
+            // weak escape hatch for mouse capture, and a verb is the TUI's
+            // own discovery surface. Harness effect `none` — the TUI is
+            // outside the differential harness (§15.1).
             [
                 "task", "agent", "team", "goal", "run", "run-all", "watch", "pause", "status",
-                "config", "help", "quit"
+                "config", "help", "mouse", "quit"
             ]
         );
         assert_eq!(
@@ -409,8 +421,8 @@ mod tests {
         assert_eq!(separators[0].desc, "── MANAGEMENT ──");
         assert_eq!(separators[1].desc, "── MONITORING ──");
         assert_eq!(separators[2].desc, "── SETTINGS ──");
-        // 12 verbs + 3 separators.
-        assert_eq!(suggestions.len(), 15);
+        // 13 verbs + 3 separators.
+        assert_eq!(suggestions.len(), 16);
         // The `[id]` args hint is baked into the command text.
         assert!(suggestions.iter().any(|s| s.cmd == "/run [id]"));
         assert_eq!(

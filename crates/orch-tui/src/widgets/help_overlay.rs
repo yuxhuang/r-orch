@@ -8,6 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Span;
 
+use crate::hit::{ChromeId, ZoneId, ZoneKind};
 use crate::theme::Token;
 use crate::views::{RenderCtx, put_line};
 
@@ -17,7 +18,9 @@ const INNER_W: usize = COL_W * 3 + 3 + 3 + 2;
 const OUTER_W: usize = INNER_W + 2;
 const MAX_ROWS: usize = 10;
 
-pub const NAVIGATION: [(&str, &str); 7] = [
+// Eight entries against `MAX_ROWS = 10`, so adding `F2` does not change the
+// overlay's layout.
+pub const NAVIGATION: [(&str, &str); 8] = [
     ("↑↓/j/k", "Navigate"),
     ("Tab/←→", "Switch tabs"),
     ("Enter", "Detail view"),
@@ -25,6 +28,7 @@ pub const NAVIGATION: [(&str, &str); 7] = [
     ("T", "Tasks tab"),
     ("A", "Agents tab"),
     ("L", "Logs tab"),
+    ("F2", "Mouse on/off"),
 ];
 
 pub const ACTIONS: [(&str, &str); 10] = [
@@ -57,6 +61,17 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let width = OUTER_W.min(area.width as usize) as u16;
     let inner = Rect::new(x, area.y, width, area.height);
     let mut y = area.y + margin_top as u16;
+
+    // A click on the box itself does nothing; the "outside" half is
+    // registered by `views::render` over the **whole frame** before this runs,
+    // because outside includes the header and command-bar rows, which are not
+    // in this widget's area (design §3.3.5).
+    ctx.zone(
+        inner,
+        area,
+        ZoneKind::Chrome(ChromeId::HelpOverlayInside),
+        ZoneId::Chrome(ChromeId::HelpOverlayInside),
+    );
 
     let border = ctx.style(Token::Amber);
     let centre = |text: String| -> String {

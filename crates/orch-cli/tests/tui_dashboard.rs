@@ -79,7 +79,7 @@ where
 }
 
 fn frame(app: &App<EngineBackend, TestClock>, terminal: &mut Terminal<TestBackend>) -> String {
-    terminal.draw(|f| views::draw(f, app)).expect("draw");
+    terminal.draw(|f| _ = views::draw(f, app)).expect("draw");
     let buffer = terminal.backend().buffer();
     let mut out = String::new();
     for y in 0..buffer.area.height {

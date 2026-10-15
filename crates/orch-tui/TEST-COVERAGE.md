@@ -16,11 +16,13 @@ Run everything with `cargo test -p orch-tui`.
 | `tests/wizards.rs` (`w001..w093`) | 93 | All 11 wizards: fields, defaults, skip predicates, mappers, validation |
 | `tests/command_surface.rs` (`c001..c112`) | 112 | Every verb, subcommand, alias, usage and confirmation string |
 | `tests/views_render.rs` (`v001..v094`) | 94 | Sort orders, glyphs, caps, badges, detail panels, header, onboarding, overlays |
-| `tests/filters.rs` (`f001..f044`) | 44 | Both filter pickers and every filter predicate |
+| `tests/filters.rs` (`f001..f047`) | 47 | Both filter pickers, every filter predicate, and the logs row→index mapping |
+| `tests/mouse.rs` (`m001..m111`) | 111 | Every clickable target, every unclickable surface, and the identity/reflow/wheel hazards |
+| `tests/hitmap.rs` (`h001..h021`) | 21 | The per-frame hit map: row↔frame agreement, every clickable target, clipping, invalidation |
 | `tests/live_updates.rs` (`l001..l055`) | 55 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history and its timestamps, endurance |
-| **Integration total** | **494** | |
-| In-module unit tests | 271 | Pure logic: see the table below |
-| **Grand total** | **765** | |
+| **Integration total** | **629** | |
+| In-module unit tests | 314 | Pure logic: see the table below |
+| **Grand total** | **943** | |
 
 In-module unit tests, by file:
 
@@ -28,19 +30,23 @@ In-module unit tests, by file:
 |---|---:|---|
 | `messages/format.rs` | 84 | `formatAgentOutput` and friends — every legacy adapter shape |
 | `text/cursor.rs` | 27 | `text-cursor.test.ts` (grapheme, width, navigation, kills) |
-| `state.rs` | 27 | Sort orders, selection spaces, rows, batching, deletions, toasts |
+| `state.rs` | 28 | Sort orders, selection spaces, rows, batching, deletions, toasts |
 | `wizard/engine.rs` | 27 | `form-wizard.test.tsx`, `form-wizard-validation.test.tsx` |
-| `app.rs` | 21 | Event ingestion, `entityListChanged`, notifications, soft delete |
+| `keys.rs` | 24 | New: every named action leaves the state its key leaves |
+| `app.rs` | 23 | Event ingestion, `entityListChanged`, notifications, soft delete |
 | `text/input.rs` | 16 | `text-input.test.tsx` (kill ring, undo, debounce) |
 | `messages/mod.rs` | 14 | `formatEvent`, message types, activity presets |
 | `onboarding.rs` | 12 | `onboarding.test.tsx`, `onboarding-agents.test.ts` |
 | `command_bar.rs` | 10 | `help-overlay.test.tsx` (completion, suggestions, history) |
 | `theme.rs` | 8 | `colors.test.ts` (palettes, remap, WCAG contrast) |
+| `hit.rs` | 8 | New: z-order, clipping, scroll vs click, invalidation, identity |
 | `layout.rs` | 8 | The region arithmetic and the clamp tests |
 | `format.rs` | 7 | `capLine`/`capText`/`formatDuration`/`relativeTime` |
 | `widgets/wizard.rs` | 6 | The text field's display-width sliding viewport |
+| `tty.rs` | 5 | New: hang-up beats pending input, the poll timeout, no controlling tty, which fd is polled |
 | `views/mod.rs` | 2 | Frame composition and the minimum-size guard |
 | `clock.rs` | 2 | The injected clock |
+| `runner.rs` | 3 | New: the DEC mode set, its reverse order, and the env switch |
 
 ## Spec item → case map
 
@@ -56,7 +62,7 @@ In-module unit tests, by file:
 | §1.2 Task detail panel and its row budget | `v042`–`v047` |
 | §1.3 Agents list: chips, autonomous/lead glyphs, team badge, stats | `v002`, `v013`, `v031`–`v033` |
 | §1.3 Agent detail panel, `ERROR_HINTS` panel | `v034`–`v041`, `v048`–`v051` |
-| §1.4 Logs view: status bar, agent chips, rows, empty states | `f035`–`f044`, `v092` |
+| §1.4 Logs view: status bar, agent chips, rows, empty states | `f035`–`f047`, `v092` |
 | §1.4 Log detail panel | `k085` |
 | §2.1 Dispatch order (overlay, pickers, Ctrl+S, input modes) | `k018`–`k023`, `k080`, `k081`, `k089`–`k091` |
 | §2.2 Normal-mode chain, every binding and overload | `k001`–`k088` |

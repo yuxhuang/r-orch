@@ -9,9 +9,10 @@ use ratatui::text::Span;
 
 use crate::command_bar::{resolve_completion, resolve_suggestions};
 use crate::format::cap_line;
+use crate::hit::{FooterAction, ScrollRegion, VerbId, ZoneId, ZoneKind};
 use crate::state::{InputMode, ViewId};
 use crate::theme::{BLOCK, CROSS, CURSOR, Token};
-use crate::views::{RenderCtx, put_line};
+use crate::views::{RenderCtx, put_line, spans_width};
 
 const HINT_SUGGESTIONS: &str = "  ↑↓ select  Tab fill  Esc ✕";
 const HINT_COMMAND: &str = "  Enter exec  ↑↓ history  Tab complete  Esc ✕";
@@ -55,6 +56,40 @@ fn render_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         Span::styled(BLOCK, ctx.style(Token::Amber)),
         Span::styled(hint.to_string(), ctx.style(Token::Gray)),
     ];
+
+    // The ghost completion: clicking it accepts it, which is what `Tab` does
+    // when there are no suggestions.
+    let ghost_x = area.x + spans_width(&spans[..2]);
+    let ghost_w = spans_width(&spans[2..3]);
+    if ghost_w > 0 {
+        ctx.zone(
+            Rect::new(ghost_x, area.y, ghost_w, 1),
+            area,
+            ZoneKind::CommandGhost,
+            ZoneId::Verb(VerbId::CommandComplete),
+        );
+    }
+    // The hint row is one span; its verbs are found by name rather than by a
+    // hardcoded offset, so editing a hint string cannot silently move a zone.
+    // `↑↓ history` / `↑↓ select` stay unclickable — two meanings, one span.
+    let hint_x = area.x + spans_width(&spans[..4]);
+    for (needle, verb) in [
+        ("Enter exec", VerbId::CommandExec),
+        ("Tab complete", VerbId::CommandComplete),
+        ("Tab fill", VerbId::CommandComplete),
+        ("Esc ✕", VerbId::CommandCancel),
+    ] {
+        if let Some(byte_offset) = hint.find(needle) {
+            let offset = hint[..byte_offset].chars().count() as u16;
+            let width = unicode_width::UnicodeWidthStr::width(needle) as u16;
+            ctx.zone(
+                Rect::new(hint_x + offset, area.y, width, 1),
+                area,
+                ZoneKind::Verb(verb),
+                ZoneId::Verb(verb),
+            );
+        }
+    }
     put_line(frame, area, area.y, spans);
 }
 
@@ -80,41 +115,112 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let hint = |spans: &mut Vec<Span<'static>>, key: &str, label: &str, token: Token| {
+    // Each hint is two spans and, when it names an action, one zone over its
+    // own `<key> <label>` cells — the two spaces of padding are excluded, so
+    // the gap between two hints belongs to neither.
+    let hint = |spans: &mut Vec<Span<'static>>,
+                key: &str,
+                label: &str,
+                token: Token,
+                action: Option<FooterAction>| {
+        let x = area.x + spans_width(spans);
         spans.push(Span::styled(
             key.to_string(),
             ctx.style(token).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(format!(" {label}  "), ctx.style(Token::Gray)));
+        if let Some(action) = action {
+            let width = (area.x + spans_width(spans) - x).saturating_sub(2);
+            ctx.zone(
+                Rect::new(x, area.y, width, 1),
+                area,
+                ZoneKind::FooterHint(action),
+                ZoneId::Footer(action),
+            );
+        }
     };
 
-    hint(&mut spans, "↑↓", "", Token::Gray);
-    hint(&mut spans, "Tab/←→", "", Token::Gray);
-    hint(&mut spans, "/", "cmd", Token::Gray);
+    // The mouse-state indicator, rendered **only** while capture is off — the
+    // exceptional state, so it costs zero cells in the common case. It goes
+    // **first**, not last: this footer already overflows 100 columns inside
+    // `? help`, so an appended marker would be clipped away exactly when the
+    // user needs to be told why their clicks stopped working. It is not
+    // clickable; the mouse is off.
+    if !state.mouse.enabled {
+        // Reads as a *state*, not a key hint: "⌨ F2 mouse" could be mistaken
+        // for "press F2 for mouse things" by someone who never turned it off.
+        spans.push(Span::styled(
+            "⌨ mouse off · F2  ".to_string(),
+            ctx.style(Token::Amber),
+        ));
+    }
+
+    // `↑↓` and `Tab/←→` stay unclickable: a 2-cell span with two opposite
+    // meanings would have to guess the direction from the sub-cell.
+    hint(&mut spans, "↑↓", "", Token::Gray, None);
+    hint(&mut spans, "Tab/←→", "", Token::Gray, None);
+    hint(
+        &mut spans,
+        "/",
+        "cmd",
+        Token::Gray,
+        Some(FooterAction::CommandMode),
+    );
     if can_new {
-        hint(&mut spans, "N", "new", Token::Gray);
+        hint(&mut spans, "N", "new", Token::Gray, Some(FooterAction::New));
     }
     if can_run {
-        hint(&mut spans, "R", "run", Token::Gray);
+        hint(&mut spans, "R", "run", Token::Gray, Some(FooterAction::Run));
     }
     if view == ViewId::Tasks && selected_task.is_some() {
-        hint(&mut spans, "C", "cancel", Token::Amber);
+        hint(
+            &mut spans,
+            "C",
+            "cancel",
+            Token::Amber,
+            Some(FooterAction::Cancel),
+        );
     }
     if can_approve {
-        hint(&mut spans, "A", "approve", Token::Green);
-        hint(&mut spans, "X", "reject", Token::Red);
+        hint(
+            &mut spans,
+            "A",
+            "approve",
+            Token::Green,
+            Some(FooterAction::Approve),
+        );
+        hint(
+            &mut spans,
+            "X",
+            "reject",
+            Token::Red,
+            Some(FooterAction::Reject),
+        );
     }
     if matches!(view, ViewId::Tasks | ViewId::Agents | ViewId::Goals) {
-        hint(&mut spans, "E", "edit", Token::Cyan);
+        hint(
+            &mut spans,
+            "E",
+            "edit",
+            Token::Cyan,
+            Some(FooterAction::Edit),
+        );
     }
     if view == ViewId::Agents && selected_agent.is_some() {
-        hint(&mut spans, "S", "stop", Token::Red);
+        hint(
+            &mut spans,
+            "S",
+            "stop",
+            Token::Red,
+            Some(FooterAction::StopAgent),
+        );
         let autonomous = selected_agent.and_then(|a| a.autonomous).unwrap_or(false);
         hint(
             &mut spans,
             "U",
             if autonomous { "auto off" } else { "auto on" },
             Token::Cyan,
+            Some(FooterAction::ToggleAutonomous),
         );
     }
     if view == ViewId::Goals
@@ -129,6 +235,7 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 "resume"
             },
             Token::Amber,
+            Some(FooterAction::PauseGoal),
         );
     }
     if view == ViewId::Tasks {
@@ -141,20 +248,64 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 "show all"
             },
             Token::Gray,
+            Some(FooterAction::ShowAllTasks),
         );
     }
     if can_delete && !can_approve {
-        hint(&mut spans, "D", "delete", Token::Gray);
+        hint(
+            &mut spans,
+            "D",
+            "delete",
+            Token::Gray,
+            Some(FooterAction::Delete),
+        );
     }
     if !state.pending_deletions.is_empty() {
-        hint(&mut spans, "Z", "undo", Token::Yellow);
+        hint(
+            &mut spans,
+            "Z",
+            "undo",
+            Token::Yellow,
+            Some(FooterAction::Undo),
+        );
     }
     if detail_open {
-        hint(&mut spans, "Esc", "close", Token::Gray);
+        hint(
+            &mut spans,
+            "Esc",
+            "close",
+            Token::Gray,
+            Some(FooterAction::CloseDetail),
+        );
     } else if matches!(view, ViewId::Tasks | ViewId::Agents | ViewId::Goals) {
-        hint(&mut spans, "Enter", "detail", Token::Gray);
+        hint(
+            &mut spans,
+            "Enter",
+            "detail",
+            Token::Gray,
+            Some(FooterAction::Enter),
+        );
     }
-    hint(&mut spans, "Q", "quit", Token::Gray);
+    // `Q quit` arms before it exits, and the arming is shown in place rather
+    // than as a toast: at most two toasts are ever drawn (`state.rs:985`), so
+    // a toast could be invisible exactly when it matters (design §3.5).
+    if state.mouse.quit_armed(ctx.now_ms) {
+        hint(
+            &mut spans,
+            "Q",
+            "quit?",
+            Token::Amber,
+            Some(FooterAction::Quit),
+        );
+    } else {
+        hint(
+            &mut spans,
+            "Q",
+            "quit",
+            Token::Gray,
+            Some(FooterAction::Quit),
+        );
+    }
     hint(
         &mut spans,
         "?",
@@ -164,6 +315,7 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         } else {
             Token::Amber
         },
+        Some(FooterAction::Help),
     );
 
     let count = match view {
@@ -195,6 +347,13 @@ pub fn render_suggestions(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         .saturating_sub(max_visible.saturating_sub(1))
         .min(suggestions.len().saturating_sub(1));
 
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Scroll(ScrollRegion::CommandSuggestions),
+        ZoneId::ScrollRegion(ScrollRegion::CommandSuggestions),
+    );
+
     let cmd_pad = suggestions
         .iter()
         .map(|s| s.cmd.chars().count() + 1)
@@ -208,6 +367,14 @@ pub fn render_suggestions(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     {
         let suggestion = &suggestions[index];
         let is_selected = index == selected;
+        // Identity is the command text, so a list that re-resolves between a
+        // press and a release cannot fire the wrong verb.
+        ctx.row_zone(
+            area,
+            area.y + row as u16,
+            ZoneKind::SuggestionRow { index },
+            ZoneId::Suggestion(suggestion.cmd.to_string()),
+        );
         let marker = if is_selected {
             format!("  {CURSOR} ")
         } else {

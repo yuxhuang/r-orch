@@ -23,6 +23,8 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | An agent has run for hours and nothing stopped it | [`timeout_ms` is not a timeout](#timeout_ms-is-not-a-timeout) |
 | Running r-orch from inside a Claude Code session | [Nested agent sessions](#nested-agent-sessions) |
 | Worried about API keys in agent config | [Secrets in agent config](#secrets-in-agent-config) |
+| Cannot select text in the dashboard any more | [Mouse capture holds the pointer](#mouse-capture-holds-the-pointer) |
+| The terminal prints `[<0;44;8M` when you click | [A leaked mouse mode](#a-leaked-mouse-mode-after-an-abnormal-exit) |
 
 ---
 
@@ -353,6 +355,60 @@ inside an agent session, this is why; it is the outer CLI declining, not an r-or
   Understand what this does: it removes the guard rather than satisfying it, so you get genuinely nested
   sessions competing for the same credentials and rate limits, with interleaved output that is hard to
   attribute. Use it knowingly, not as the default fix.
+
+---
+
+## Mouse capture holds the pointer
+
+**Symptom.** `orch tui` is running and you cannot select text with the mouse: dragging moves the
+dashboard's selection instead of highlighting, and your terminal's own copy-on-drag does nothing.
+
+**Why.** The dashboard asks the terminal for mouse reports (DEC 1000 + 1006), so button events are
+routed to the application instead of to the terminal's selection handling. That is the trade mouse
+support makes; PARITY.md §12.11 records it.
+
+**Fix**, in increasing order of permanence:
+
+```bash
+# 1. In the dashboard: release the pointer for this session.
+#    F2, or type the command:
+/mouse off          # /mouse on to re-enable, /mouse status to check
+
+# 2. Keep it: hold Shift while dragging (most terminals bypass reporting).
+#    NOT under tmux — see below.
+
+# 3. Start with it off, every time:
+ORCH_TUI_MOUSE=0 orch
+```
+
+While capture is off the footer shows `⌨ F2 mouse`, so there is never a doubt about which mode you
+are in.
+
+**Under tmux.** Shift+drag is **not** the bypass here: tmux holds the *outer* terminal's mouse mode,
+so Shift+drag selects raw outer-terminal cells, spanning pane borders and neighbouring panes rather
+than the pane's text. Use `F2` or `/mouse off`, which also gives tmux's own drag-to-copy back.
+`prefix [` copy mode works either way. And note that tmux must have `set -g mouse on` for clicks to
+reach the dashboard in the first place — with it off, mouse support silently does nothing, which is
+not a fault.
+
+---
+
+## A leaked mouse mode after an abnormal exit
+
+**Symptom.** `orch tui` is gone, but clicking in that terminal prints gibberish like `[<0;44;8M`, or
+the shell receives it as input.
+
+**Why.** Mouse reporting is a terminal mode the application turns on and is responsible for turning
+off. Every normal exit does: `q`, a signal, a panic, and a terminal that hangs up all run the same
+restore (PARITY.md §14.39), and the disable is written *first*, before leaving the alternate screen.
+`SIGKILL` and an abort cannot be covered — nothing runs on the way out.
+
+**Fix.**
+
+```bash
+printf '\033[?1006l\033[?1000l'   # turn the two modes back off
+reset                               # or just reset the terminal wholesale
+```
 
 ---
 

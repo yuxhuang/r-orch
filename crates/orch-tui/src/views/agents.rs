@@ -7,7 +7,8 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 
 use crate::format::{cap_line, format_duration, parse_timestamp_ms};
-use crate::state::AgentRow;
+use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
+use crate::state::{AgentRow, EntityType};
 use crate::theme::{
     CHECK, CIRCLE, CROSS, CURSOR, DIAMOND_OUTLINE, EM_DASH, LOOP, LOZENGE, STAR, Token, light_rule,
     spinner_frame,
@@ -55,6 +56,13 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let rows = state.agent_rows(ctx.caps.can_add_agent);
     let mut y = area.y;
 
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Scroll(ScrollRegion::MainList),
+        ZoneId::ScrollRegion(ScrollRegion::MainList),
+    );
+
     for row in rows.iter().skip(state.agent_scroll) {
         if y >= area.bottom() {
             return;
@@ -101,10 +109,26 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 );
             }
             AgentRow::Agent { index, selection } => {
-                render_agent_row(frame, area, ctx, y, *index, *selection)
+                render_agent_row(frame, area, ctx, y, *index, *selection);
+                if let Some(agent) = state.agents.get(*index) {
+                    ctx.row_zone(
+                        area,
+                        y,
+                        ZoneKind::AgentRow {
+                            selection: *selection,
+                        },
+                        ZoneId::Entity(EntityType::Agent, agent.id.clone()),
+                    );
+                }
             }
             AgentRow::AddAgent { selection } => {
                 let selected = *selection == state.agent_selected;
+                ctx.row_zone(
+                    area,
+                    y,
+                    ZoneKind::Pseudo(PseudoRow::AddAgent),
+                    ZoneId::Pseudo(PseudoRow::AddAgent),
+                );
                 put_line(
                     frame,
                     area,

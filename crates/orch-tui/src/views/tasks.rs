@@ -7,12 +7,14 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 
 use crate::format::{cap_line, format_duration, parse_timestamp_ms};
+use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
 use crate::onboarding::OnboardingStep;
-use crate::state::TaskRow;
+use crate::state::{EntityType, TaskRow};
 use crate::theme::{
     CHECK, CIRCLE, CROSS, CURSOR, DIAMOND, EM_DASH, LOZENGE, PAPERCLIP, PLUS_CIRCLE, TRIANGLE_DOWN,
     Token, heavy_rule, light_rule, priority_pips, priority_token, spinner_frame,
 };
+use crate::views::spans_width;
 use crate::views::{RenderCtx, put_line};
 
 const GOAL_BADGE_W: usize = 18;
@@ -69,6 +71,15 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let skip = state.task_scroll;
     let mut y = area.y;
 
+    // First within this area, so a row wins a click while the whole list
+    // still answers the wheel (design §3.2).
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Scroll(ScrollRegion::MainList),
+        ZoneId::ScrollRegion(ScrollRegion::MainList),
+    );
+
     for row in rows.iter().skip(skip) {
         if y >= area.bottom() {
             break;
@@ -117,9 +128,28 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             }
             TaskRow::Task { index, selection } => {
                 render_task_row(frame, area, ctx, y, *index, *selection);
+                // Identity is the task id, not the row: a refresh between a
+                // press and a release must cancel the click, not move it to
+                // whatever slid into this row (§3.3).
+                if let Some(task) = state.tasks.get(*index) {
+                    ctx.row_zone(
+                        area,
+                        y,
+                        ZoneKind::TaskRow {
+                            selection: *selection,
+                        },
+                        ZoneId::Entity(EntityType::Task, task.id.clone()),
+                    );
+                }
             }
             TaskRow::ShowAll { hidden, selection } => {
                 let selected = *selection == state.task_selected;
+                ctx.row_zone(
+                    area,
+                    y,
+                    ZoneKind::Pseudo(PseudoRow::ShowAll),
+                    ZoneId::Pseudo(PseudoRow::ShowAll),
+                );
                 put_line(
                     frame,
                     area,
@@ -136,6 +166,12 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             }
             TaskRow::AddTask { selection } => {
                 let selected = *selection == state.task_selected;
+                ctx.row_zone(
+                    area,
+                    y,
+                    ZoneKind::Pseudo(PseudoRow::AddTask),
+                    ZoneId::Pseudo(PseudoRow::AddTask),
+                );
                 put_line(
                     frame,
                     area,
@@ -176,10 +212,18 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             Span::styled(text.to_string(), ctx.style(Token::Silver)),
         ];
         if let Some((key, label)) = hint {
+            let x = area.x + spans_width(&spans) + 2;
             spans.push(Span::styled(
                 format!("  {key} {label}"),
                 ctx.style(Token::Gray),
             ));
+            // Exactly what pressing `R` does, no more.
+            ctx.zone(
+                Rect::new(x, y, (key.len() + 1 + label.len()) as u16, 1),
+                area,
+                ZoneKind::Pseudo(PseudoRow::RunNudge),
+                ZoneId::Pseudo(PseudoRow::RunNudge),
+            );
         }
         put_line(frame, area, y, spans);
     } else if state.onboarding == OnboardingStep::Completed && y < area.bottom() {
@@ -349,15 +393,17 @@ fn render_welcome(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         )],
     );
     y += 1;
-    put_line(
-        frame,
+    let spans = vec![
+        Span::styled("N", ctx.bold(Token::Amber)),
+        Span::styled(" new task".to_string(), ctx.style(Token::Gray)),
+    ];
+    ctx.zone(
+        Rect::new(area.x, y, spans_width(&spans), 1),
         area,
-        y,
-        vec![
-            Span::styled("N", ctx.bold(Token::Amber)),
-            Span::styled(" new task".to_string(), ctx.style(Token::Gray)),
-        ],
+        ZoneKind::Pseudo(PseudoRow::AddTask),
+        ZoneId::Pseudo(PseudoRow::AddTask),
     );
+    put_line(frame, area, y, spans);
     y += 1;
     put_line(
         frame,

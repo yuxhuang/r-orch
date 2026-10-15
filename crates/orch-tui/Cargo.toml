@@ -23,6 +23,13 @@ unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `poll(2)` with POLLHUP: the only way to tell a dead terminal from an idle
+# one, since crossterm reports no EOF or hang-up (src/tty.rs, PARITY §14.39).
+# ARCHITECTURE §4.8 keeps `nix` for exactly this class of POSIX check, and
+# this crate forbids `unsafe_code`, so raw `libc::poll` is not available.
+nix = { workspace = true, features = ["poll"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 

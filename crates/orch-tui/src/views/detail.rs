@@ -14,7 +14,9 @@ use crate::theme::{
     EM_DASH, HEAVY_RULE, LOOP, Token, agent_status_token, goal_status_token, light_rule,
     task_status_token,
 };
-use crate::views::{RenderCtx, put_line, resize_hint, section_label};
+use crate::views::{
+    RenderCtx, put_line, resize_hint, resize_hint_zones, section_label, spans_width,
+};
 
 /// `col1Width` in the goal and agent panels.
 const COL1_W: usize = 24;
@@ -54,6 +56,13 @@ fn detail_label(
         Span::styled(cap_line(title, title_w), ctx.bold(Token::White)),
         Span::styled(format!("  {hint}"), ctx.style(Token::Gray)),
     ];
+    resize_hint_zones(
+        ctx,
+        area,
+        area.x + spans_width(&spans[..4]) + 2,
+        area.y,
+        hint,
+    );
     put_line(frame, area, area.y, spans);
 }
 
@@ -621,20 +630,23 @@ fn render_goal_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         return;
     };
     let hint = resize_hint(state.detail_maximized);
-    put_line(
-        frame,
+    let spans = vec![
+        Span::styled(HEAVY_RULE.to_string().repeat(3), ctx.style(Token::Ghost)),
+        Span::styled(
+            format!(" GOAL: {} ", cap_line(&goal.title, 40)),
+            ctx.chip(Token::Amber, Token::AccentBg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {hint}"), ctx.style(Token::Gray)),
+    ];
+    resize_hint_zones(
+        ctx,
         area,
+        area.x + spans_width(&spans[..2]) + 2,
         area.y,
-        vec![
-            Span::styled(HEAVY_RULE.to_string().repeat(3), ctx.style(Token::Ghost)),
-            Span::styled(
-                format!(" GOAL: {} ", cap_line(&goal.title, 40)),
-                ctx.chip(Token::Amber, Token::AccentBg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {hint}"), ctx.style(Token::Gray)),
-        ],
+        hint,
     );
+    put_line(frame, area, area.y, spans);
 
     // Built as a virtual line list so scrolling never rebuilds the rows.
     let width = area.width as usize;
