@@ -15,6 +15,8 @@ pub struct RunningEntry {
     pub pid: u32,
     pub started_at: String,
     pub last_event_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::remote::RemoteRunRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +294,7 @@ mod tests {
         state.running.insert(
             "tsk_1".into(),
             RunningEntry {
+                remote: None,
                 run_id: "run_1".into(),
                 agent_id: "agt_1".into(),
                 task_id: "tsk_1".into(),

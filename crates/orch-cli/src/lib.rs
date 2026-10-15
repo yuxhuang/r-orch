@@ -308,6 +308,14 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
         Some(Command::Web(args)) => run_web(cli, env, &cwd, args).await,
 
+        Some(Command::Remote(args)) => {
+            let Some(sub) = &args.command else {
+                return Ok(print_group_help(&["remote"]));
+            };
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            commands::remote::run(&engine, &ctx, &styles, sub).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(Command::Status) => {
             let (ctx, styles, engine) = build(cli, env, &cwd).await?;
             commands::status::run(&engine, &ctx, &styles).await?;
@@ -550,6 +558,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             all,
             watch,
             verbose,
+            peer,
         })) => {
             // The argument check is the command's own, and it exits 2 before
             // anything else happens (`docs/parity/cli.md` §13.1).
@@ -564,7 +573,13 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             // The full tier: every mode drives the orchestrator.
             let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
             let styles = ctx.styles(env);
-            let engine = orch_engine::build_full(ctx.project_root.clone()).await?;
+            if peer.listen.is_some() && !*watch {
+                return Err(orch_core::Error::invalid_arguments(
+                    "--listen requires run --watch",
+                ));
+            }
+            let engine =
+                orch_engine::build_full_with_peer(ctx.project_root.clone(), peer.config()).await?;
             // `--watch` wins over `--all`, which wins over a task id, as the
             // original's if/else chain does.
             if *watch {
@@ -580,7 +595,14 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
             // The dashboard needs the orchestrator, so this is the one command
             // that builds the full container up front.
-            tui::run(ctx.project_root, version(), args.observe).await
+            tui::run_with_peer(
+                ctx.project_root,
+                version(),
+                args.observe,
+                args.peer.config(),
+                args.peer.listen.is_some(),
+            )
+            .await
         }
 
         // Bare `orch` is the first-run experience (PARITY.md §2.3): it inits
@@ -676,7 +698,8 @@ async fn run_serve(
 
     // The full tier: `serve` is the orchestrator.
     let ctx = CliContext::resolve(cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
-    let engine = orch_engine::build_full(ctx.project_root.clone()).await?;
+    let engine =
+        orch_engine::build_full_with_peer(ctx.project_root.clone(), args.peer.config()).await?;
     serve::run(
         engine,
         serve::ServeArgs {

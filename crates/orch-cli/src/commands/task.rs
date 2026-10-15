@@ -125,16 +125,76 @@ pub async fn list(
         return Ok(());
     }
 
-    let rows: Vec<Vec<String>> = tasks.iter().map(|task| task_row(styles, task)).collect();
+    let mut rows = Vec::new();
+    for task in &tasks {
+        let mut row = task_row(styles, task);
+        row.push(waiting_reason(engine, task).await?.unwrap_or_default());
+        rows.push(row);
+    }
     println!();
     print_table(
         styles,
-        &["STATUS", "PRI", "TASK", "AGENT", "TIME"],
+        &["STATUS", "PRI", "TASK", "AGENT", "TIME", "WAITING"],
         &rows,
         2,
     );
     println!("\n  {}\n", summary_line(&tasks));
     Ok(())
+}
+
+/// Describe dispatch blockers from persisted peer snapshots; this is display
+/// only and does not expand the directory's six permitted consumers.
+async fn waiting_reason(engine: &Engine, task: &Task) -> Result<Option<String>> {
+    use orch_infra::storage::remote::FileRemoteStore;
+    if !matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress) {
+        return Ok(None);
+    }
+    let store = FileRemoteStore::new(engine.paths.clone());
+    if let Some((_, alias)) = task.assignee.as_deref().and_then(|id| id.split_once('@'))
+        && !store.read_status(alias).await?.is_some_and(|s| s.online)
+    {
+        return Ok(Some(format!(
+            "remote {alias} offline{}",
+            if task.status == TaskStatus::InProgress {
+                " (outcome pending)"
+            } else {
+                ""
+            }
+        )));
+    }
+    if task.status != TaskStatus::Todo {
+        return Ok(None);
+    }
+    let caps: Vec<_> = task
+        .labels
+        .iter()
+        .filter_map(|l| l.strip_prefix("cap:"))
+        .collect();
+    if caps.is_empty() {
+        return Ok(None);
+    }
+    let mut candidates = engine.agents.list().await?;
+    for remote in store.list().await? {
+        if let Some(status) = store.read_status(&remote.alias).await?
+            && status.online
+        {
+            for mut agent in status.agents {
+                agent.id = format!("{}@{}", agent.id, remote.alias);
+                candidates.push(agent);
+            }
+        }
+    }
+    let eligible = candidates.iter().any(|agent| {
+        task.assignee.as_ref().is_none_or(|id| id == &agent.id)
+            && !matches!(
+                agent.status,
+                orch_domain::AgentStatus::Disabled | orch_domain::AgentStatus::Offline
+            )
+            && caps
+                .iter()
+                .all(|cap| agent.capabilities.iter().any(|c| c == cap))
+    });
+    Ok((!eligible).then(|| format!("no online agent with cap {}", caps.join(", "))))
 }
 
 fn task_row(styles: &Styles, task: &Task) -> Vec<String> {
@@ -213,6 +273,9 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
         ),
         ("Priority".to_owned(), styles.priority_label(task.priority)),
     ];
+    if let Some(reason) = waiting_reason(engine, &task).await? {
+        pairs.push(("Waiting".to_owned(), reason));
+    }
     if let Some(assignee) = &task.assignee {
         pairs.push(("Agent".to_owned(), styles.agent_name(assignee)));
     }
@@ -453,6 +516,40 @@ mod tests {
             status,
             ..make_task()
         }
+    }
+
+    #[tokio::test]
+    async fn waiting_reasons_distinguish_missing_cap_and_pending_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = orch_infra::storage::Paths::new(temp.path());
+        std::fs::create_dir_all(paths.root()).unwrap();
+        let engine = orch_engine::build_light_with(
+            temp.path(),
+            orch_engine::EngineSeams {
+                global_config_path: Some(paths.root().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut task = task(TaskStatus::Todo);
+        task.labels = vec!["cap:freebsd".into()];
+        assert_eq!(
+            waiting_reason(&engine, &task).await.unwrap().as_deref(),
+            Some("no online agent with cap freebsd")
+        );
+        task.assignee = Some("agt_worker@w1".into());
+        assert_eq!(
+            waiting_reason(&engine, &task).await.unwrap().as_deref(),
+            Some("remote w1 offline")
+        );
+        task.status = TaskStatus::InProgress;
+        assert_eq!(
+            waiting_reason(&engine, &task).await.unwrap().as_deref(),
+            Some("remote w1 offline (outcome pending)")
+        );
+        task.status = TaskStatus::Done;
+        assert_eq!(waiting_reason(&engine, &task).await.unwrap(), None);
     }
 
     #[test]

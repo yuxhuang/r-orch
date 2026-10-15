@@ -229,6 +229,8 @@ pub fn make_task(id: &str, title: &str, status: TaskStatus) -> Task {
 
 pub fn make_agent(id: &str, name: &str, status: AgentStatus) -> Agent {
     Agent {
+        capabilities: Vec::new(),
+        remote: None,
         id: id.into(),
         name: name.into(),
         adapter: "claude".into(),

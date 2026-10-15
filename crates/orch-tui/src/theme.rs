@@ -243,7 +243,7 @@ pub fn agent_status_token(status: orch_domain::AgentStatus) -> Token {
         orch_domain::AgentStatus::Idle => Token::Dim,
         orch_domain::AgentStatus::Running => Token::Green,
         orch_domain::AgentStatus::Error => Token::Red,
-        orch_domain::AgentStatus::Disabled => Token::Ghost,
+        orch_domain::AgentStatus::Disabled | orch_domain::AgentStatus::Offline => Token::Ghost,
     }
 }
 

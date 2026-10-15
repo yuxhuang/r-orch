@@ -19,6 +19,7 @@ use orch_domain::{
 use orch_infra::storage::{Paths, fs_utils};
 
 use crate::events::EventBus;
+use orch_infra::storage::remote::RemoteAgentDirectory;
 
 /// Fields `task edit` may change. `None` leaves a field alone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub struct UpdateTaskFields {
 }
 
 pub struct TaskService {
+    remote_directory: Option<RemoteAgentDirectory>,
     tasks: Arc<dyn TaskStore>,
     agents: Arc<dyn AgentStore>,
     events: Arc<EventBus>,
@@ -56,6 +58,7 @@ impl TaskService {
         paths: Option<Paths>,
     ) -> Self {
         TaskService {
+            remote_directory: None,
             tasks,
             agents,
             events,
@@ -64,6 +67,11 @@ impl TaskService {
             ids,
             paths,
         }
+    }
+
+    pub fn with_remote_directory(mut self, directory: RemoteAgentDirectory) -> Self {
+        self.remote_directory = Some(directory);
+        self
     }
 
     pub async fn create(&self, input: CreateTaskInput) -> Result<Task> {
@@ -97,11 +105,22 @@ impl TaskService {
 
         let assignee = self.resolve_assignee(input.assignee.as_deref()).await?;
         let now = self.clock.now_iso();
+        let mirror = input
+            .labels
+            .as_ref()
+            .is_some_and(|labels| labels.iter().any(|label| label.starts_with("remote-ctl:")));
+        let description = input.description.as_deref().unwrap_or("");
+        let description = if mirror {
+            description
+        } else {
+            description.trim()
+        }
+        .to_owned();
 
         let mut task = Task {
             id: self.ids.generate("tsk"),
             title: input.title.trim().to_owned(),
-            description: input.description.as_deref().unwrap_or("").trim().to_owned(),
+            description,
             status: TaskStatus::Todo,
             priority,
             assignee,
@@ -281,7 +300,16 @@ impl TaskService {
             task.title = title.trim().to_owned();
         }
         if let Some(description) = fields.description.as_deref() {
-            task.description = description.trim().to_owned();
+            task.description = if task
+                .labels
+                .iter()
+                .any(|label| label.starts_with("remote-ctl:"))
+            {
+                description
+            } else {
+                description.trim()
+            }
+            .to_owned();
         }
         if let Some(priority) = fields.priority {
             if !(1..=4).contains(&priority) {
@@ -400,6 +428,19 @@ impl TaskService {
             return Ok(None);
         };
 
+        if assignee.contains('@') {
+            if let Some(directory) = &self.remote_directory
+                && let Some(agent) = directory
+                    .resolve(assignee, self.agents.list().await?)
+                    .await?
+            {
+                return Ok(Some(agent.id));
+            }
+            return Err(Error::invalid_arguments(format!(
+                "Unknown remote agent: {assignee}"
+            )));
+        }
+
         if assignee.starts_with("agt_") {
             return match self.agents.get(assignee).await? {
                 Some(agent) => Ok(Some(agent.id)),
@@ -500,6 +541,76 @@ mod tests {
     }
 
     // ── create ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mirror_task_description_is_preserved_verbatim() {
+        let h = harness(Vec::new());
+        let prompt = "  Controller prompt\n\nKeep exact spacing.\n";
+        let task = h
+            .service
+            .create(CreateTaskInput {
+                title: "mirror".into(),
+                description: Some(prompt.into()),
+                labels: Some(vec!["remote-ctl:controller".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.description, prompt);
+    }
+
+    #[tokio::test]
+    async fn remote_assignee_resolves_from_offline_directory() {
+        let mut h = harness(Vec::new());
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        let store = orch_infra::storage::remote::FileRemoteStore::new(paths.clone());
+        store
+            .add(orch_domain::RemoteConfig {
+                alias: "w1".into(),
+                addr: "worker:7690".into(),
+                added_at: "now".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .write_status(&orch_domain::RemoteStatus {
+                alias: "w1".into(),
+                addr: "worker:7690".into(),
+                online: false,
+                last_seen: None,
+                last_error: None,
+                peer_name: None,
+                instance_id: None,
+                os: Some("linux".into()),
+                agents: vec![make_agent()],
+            })
+            .await
+            .unwrap();
+        h.service = h
+            .service
+            .with_remote_directory(RemoteAgentDirectory::new(paths));
+        assert_eq!(
+            h.service
+                .resolve_assignee(Some("agt_test1@w1"))
+                .await
+                .unwrap(),
+            Some("agt_test1@w1".into())
+        );
+        assert_eq!(
+            h.service
+                .resolve_assignee(Some("TestAgent@w1"))
+                .await
+                .unwrap(),
+            Some("agt_test1@w1".into())
+        );
+        assert!(
+            h.service
+                .resolve_assignee(Some("agt_test1@missing"))
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn create_applies_the_documented_defaults() {

@@ -60,6 +60,7 @@ fn entry(task_id: &str, agent_id: &str, run_id: &str) -> RunningEntry {
         pid: 1,
         started_at: NOW_ISO.into(),
         last_event_at: NOW_ISO.into(),
+        remote: None,
     }
 }
 

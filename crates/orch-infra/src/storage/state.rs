@@ -112,6 +112,7 @@ mod tests {
         state.running.insert(
             "tsk_1".into(),
             RunningEntry {
+                remote: None,
                 run_id: "run_1".into(),
                 agent_id: "agt_1".into(),
                 task_id: "tsk_1".into(),

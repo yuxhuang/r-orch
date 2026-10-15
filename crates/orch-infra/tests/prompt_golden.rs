@@ -85,13 +85,21 @@ struct Templates {
 }
 
 #[test]
-fn default_templates_match_the_ts_constants() {
+fn default_templates_extend_the_reference_team_with_peer_metadata() {
     let t: Templates =
         serde_json::from_str(&fs::read_to_string(fixtures_dir().join("_templates.json")).unwrap())
             .unwrap();
     assert_eq!(DEFAULT_SYSTEM_TEMPLATE, t.system);
-    assert_eq!(DEFAULT_USER_TEMPLATE, t.user);
-    assert_eq!(default_prompt_template(), t.legacy);
+    // Peer capabilities intentionally extend the old team display. The rest
+    // of both templates remains covered by the original reference fixtures.
+    let original = " · ID: `{{ a.id }}`";
+    let peer = concat!(
+        " · ID: `{{ a.id }}`",
+        "{% if a.capabilities.size > 0 %} · caps: {{ a.capabilities | join: \", \" }}{% endif %}",
+        "{% if a.remote %} · remote {{ a.remote.alias }} {% if a.remote.online %}online{% else %}offline{% endif %}{% endif %}"
+    );
+    assert_eq!(DEFAULT_USER_TEMPLATE, t.user.replace(original, peer));
+    assert_eq!(default_prompt_template(), t.legacy.replace(original, peer));
 }
 
 #[derive(Deserialize)]
@@ -187,4 +195,46 @@ async fn documented_residual_unknown_property_of_a_loop_variable_errors() {
         )
         .await;
     assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn team_prompt_exposes_capabilities_and_remote_online_state() {
+    use orch_core::test_support::{make_agent, make_task};
+    use orch_infra::template::{BuildPromptOptions, build_prompt_context};
+    let local = make_agent();
+    for online in [true, false] {
+        let remote = orch_domain::Agent {
+            id: "agt_worker@w1".into(),
+            name: "Worker@w1".into(),
+            adapter: "remote".into(),
+            capabilities: vec!["linux".into()],
+            remote: Some(orch_domain::RemoteRef {
+                alias: "w1".into(),
+                online,
+            }),
+            ..make_agent()
+        };
+        let context = build_prompt_context(
+            &make_task(),
+            &local,
+            1,
+            "/tmp/worker",
+            &orch_domain::default_config(),
+            BuildPromptOptions {
+                all_agents: &[local.clone(), remote],
+                ..Default::default()
+            },
+        );
+        let rendered = LiquidTemplateEngine::new()
+            .render(DEFAULT_USER_TEMPLATE, &context)
+            .await
+            .unwrap();
+        assert!(rendered.contains("caps: linux"));
+        assert!(rendered.contains(if online {
+            "remote w1 online"
+        } else {
+            "remote w1 offline"
+        }));
+        assert!(rendered.contains("agt_worker@w1"));
+    }
 }

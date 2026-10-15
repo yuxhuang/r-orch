@@ -33,6 +33,12 @@ fn status_chip(status: AgentStatus, tick: u64) -> (String, Token, Token, bool) {
             false,
         ),
         AgentStatus::Error => (format!("{CROSS} ERROR"), Token::Red, Token::ErrorBg, true),
+        AgentStatus::Offline => (
+            format!("{CIRCLE} OFFLINE"),
+            Token::Ghost,
+            Token::NeutralBg,
+            false,
+        ),
         AgentStatus::Disabled => (
             format!("{CIRCLE} OFF"),
             Token::Ghost,
@@ -171,7 +177,7 @@ fn render_agent_row(
     let team_col_w = team
         .map(|t| (t.name.chars().count() + 2).min(12))
         .unwrap_or(0);
-    let fixed_cols = 2 + 11 + 8 + team_col_w + 10;
+    let fixed_cols = 2 + 11 + 8 + team_col_w + 10 + 26;
     let name_w = (area.width as usize).saturating_sub(fixed_cols).max(8);
 
     let (chip_text, chip_fg, chip_bg, chip_bold) = status_chip(agent.status, state.tick);
@@ -237,6 +243,25 @@ fn render_agent_row(
 
     spans.push(Span::styled(
         format!(" {:<8}", cap_line(&agent.adapter, 8)),
+        ctx.style(Token::Dim),
+    ));
+    let location = agent
+        .remote
+        .as_ref()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r.alias,
+                if r.online { "online" } else { "offline" }
+            )
+        })
+        .unwrap_or_else(|| "local".into());
+    spans.push(Span::styled(
+        format!(
+            " CAPS:{:<8} WHERE:{:<16}",
+            cap_line(&agent.capabilities.join(","), 8),
+            cap_line(&location, 16)
+        ),
         ctx.style(Token::Dim),
     ));
     if let Some(team) = team {

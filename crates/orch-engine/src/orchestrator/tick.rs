@@ -111,13 +111,17 @@ impl Orchestrator {
             // 1. The task is gone or already terminal: the running entry is
             // stale bookkeeping, nothing more.
             if !live {
-                self.drop_cancel(task_id).await;
+                if let Some(remote) = &entry.remote {
+                    self.cancel_remote(remote).await;
+                }
+                self.take_cancel(task_id).await;
                 state.running.shift_remove(task_id);
-                if let Err(err) = self
-                    .deps()
-                    .agent_service
-                    .set_status(&entry.agent_id, AgentStatus::Idle)
-                    .await
+                if entry.remote.is_none()
+                    && let Err(err) = self
+                        .deps()
+                        .agent_service
+                        .set_status(&entry.agent_id, AgentStatus::Idle)
+                        .await
                 {
                     self.emit_error(
                         err,
@@ -126,6 +130,29 @@ impl Orchestrator {
                             entry.agent_id
                         ),
                     );
+                }
+                continue;
+            }
+
+            // A peer owns both process liveness and stall detection. A lost
+            // link leaves the outcome pending, regardless of the local clock.
+            if let Some(remote) = &entry.remote {
+                let registry = orch_infra::storage::remote::FileRemoteStore::new(
+                    orch_infra::storage::Paths::new(self.deps().project_root.clone()),
+                );
+                if !registry
+                    .list()
+                    .await?
+                    .iter()
+                    .any(|item| item.alias == remote.alias)
+                {
+                    self.cancel_remote(remote).await;
+                    self.fail_remote_unknown_locked(
+                        state,
+                        task_id,
+                        &format!("remote {} removed; outcome unknown", remote.alias),
+                    )
+                    .await?;
                 }
                 continue;
             }

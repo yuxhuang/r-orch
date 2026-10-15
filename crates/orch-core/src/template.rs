@@ -50,6 +50,10 @@ pub struct AgentInfo {
     pub name: String,
     pub role: Option<String>,
     pub adapter: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub remote: Option<orch_domain::RemoteRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +159,8 @@ mod tests {
                 name: "shelly".into(),
                 role: None,
                 adapter: "shell".into(),
+                capabilities: Vec::new(),
+                remote: None,
             }],
             attempt: None,
             workspace_path: "/tmp/ws".into(),

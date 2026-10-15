@@ -83,7 +83,9 @@ pub async fn add(
 /// The TIME column is **hard-coded** to a dim em dash: the reference never
 /// computes it (`docs/parity/cli.md` §22.7).
 pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
-    let agents = engine.agent_service.list().await?;
+    let agents = orch_infra::storage::remote::RemoteAgentDirectory::new(engine.paths.clone())
+        .list(engine.agent_service.list().await?)
+        .await?;
 
     if ctx.json {
         return print_json(&agents);
@@ -109,7 +111,9 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
         .collect();
     print_table(
         styles,
-        &["STATUS", "AGENT", "ADAPTER", "TASK", "TIME"],
+        &[
+            "STATUS", "AGENT", "ADAPTER", "CAPS", "WHERE", "TASK", "TIME",
+        ],
         &rows,
         2,
     );
@@ -126,6 +130,18 @@ fn agent_row(styles: &Styles, agent: &orch_domain::Agent) -> Vec<String> {
         ),
         styles.agent_name(&agent.name),
         agent.adapter.clone(),
+        agent.capabilities.join(","),
+        agent
+            .remote
+            .as_ref()
+            .map(|remote| {
+                format!(
+                    "remote {} {}",
+                    remote.alias,
+                    if remote.online { "online" } else { "offline" }
+                )
+            })
+            .unwrap_or_else(|| "local".into()),
         agent
             .current_task
             .clone()
@@ -172,7 +188,10 @@ pub async fn set_enabled(engine: &Engine, styles: &Styles, id: &str, enabled: bo
 /// order is adapter/command/status/policy for shell and
 /// adapter/status/effort/policy otherwise.
 pub async fn status(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
-    let agent = engine.agent_service.get(id).await?;
+    let agent = orch_infra::storage::remote::RemoteAgentDirectory::new(engine.paths.clone())
+        .resolve(id, engine.agent_service.list().await?)
+        .await?
+        .ok_or_else(|| orch_core::Error::invalid_arguments(format!("Agent not found: {id}")))?;
 
     if ctx.json {
         return print_json(&agent);
@@ -220,6 +239,21 @@ pub async fn status(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str
                 .unwrap_or_else(|| "default".to_owned()),
         ));
     }
+    pairs.push(("CAPS".to_owned(), agent.capabilities.join(", ")));
+    pairs.push((
+        "WHERE".to_owned(),
+        agent
+            .remote
+            .as_ref()
+            .map(|remote| {
+                format!(
+                    "remote {} {}",
+                    remote.alias,
+                    if remote.online { "online" } else { "offline" }
+                )
+            })
+            .unwrap_or_else(|| "local".into()),
+    ));
     pairs.push(("Policy".to_owned(), policy));
     if let Some(task) = &agent.current_task {
         pairs.push(("Task".to_owned(), task.clone()));

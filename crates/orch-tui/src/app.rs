@@ -52,6 +52,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
         state.tasks = backend.refresh_tasks().unwrap_or_default();
         state.agents = backend.refresh_agents().unwrap_or_default();
+        state.peer_status = backend.peer_status().unwrap_or_default();
         state.goals = backend.refresh_goals().unwrap_or_default();
         state.teams = backend.list_teams().unwrap_or_default();
         if let Ok(orch_state) = backend.refresh_state() {
@@ -383,6 +384,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// `refreshAll({ includeTeams })` — commit only what actually changed.
     pub fn refresh_all(&mut self, include_teams: bool) {
         self.last_refresh_at = self.now();
+        if let Ok(status) = self.backend.peer_status() {
+            self.state.peer_status = status;
+        }
         if let Ok(tasks) = self.backend.refresh_tasks()
             && tasks_changed(&self.state.tasks, &tasks)
         {

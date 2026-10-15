@@ -53,6 +53,20 @@ pub struct PromptConfig {
     pub user_template: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+}
+
+impl PeerConfig {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.listen.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
     pub project: ProjectConfig,
@@ -60,6 +74,8 @@ pub struct OrchestratorConfig {
     pub scheduling: SchedulingConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptConfig>,
+    #[serde(default, skip_serializing_if = "PeerConfig::is_empty")]
+    pub peer: PeerConfig,
 }
 
 /// The TS `DEFAULT_CONFIG` constant (PARITY.md §6.5).
@@ -90,6 +106,7 @@ pub fn default_config() -> OrchestratorConfig {
             retry_max_delay_ms: 300_000,
         },
         prompt: None,
+        peer: PeerConfig::default(),
     }
 }
 
@@ -301,5 +318,19 @@ mod tests {
         let mut value = json!({ "a": 1 });
         set_by_path(&mut value, "b", json!(2));
         assert_eq!(value, json!({ "a": 1, "b": 2 }));
+    }
+    #[test]
+    fn peer_configuration_is_optional_and_round_trips_name_and_listen() {
+        let mut config = default_config();
+        assert!(config.peer.listen.is_none());
+        assert!(config.peer.name.is_none());
+        assert!(serde_json::to_value(&config).unwrap().get("peer").is_none());
+        config.peer = PeerConfig {
+            name: Some("controller".into()),
+            listen: Some("0.0.0.0:7690".into()),
+        };
+        let read: OrchestratorConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(read.peer, config.peer);
     }
 }

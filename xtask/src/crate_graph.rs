@@ -105,6 +105,22 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
          implementation",
     ),
     (
+        "message_service.rs",
+        "remote recipient validation uses the explicitly opt-in RemoteAgentDirectory; AgentStore remains local",
+    ),
+    (
+        "orchestrator/tick.rs",
+        "reconcile reads the persistent remote registry to fail removed executions without retry",
+    ),
+    (
+        "orchestrator/tests/harness.rs",
+        "test assembly wires the explicit RemoteAgentDirectory to TaskService",
+    ),
+    (
+        "orchestrator/tests/remote.rs",
+        "remote lifecycle tests exercise real registry/status files and stale-lock guards",
+    ),
+    (
         "orchestrator/tests/skills.rs",
         "a test asserting the dispatch templates are the real ones",
     ),

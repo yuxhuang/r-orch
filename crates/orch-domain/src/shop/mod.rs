@@ -110,6 +110,8 @@ pub fn default_agents(adapter: &str) -> Vec<Agent> {
         autonomous: None,
         stats: AgentStats::default(),
         last_error: None,
+        capabilities: Vec::new(),
+        remote: None,
     }]
 }
 

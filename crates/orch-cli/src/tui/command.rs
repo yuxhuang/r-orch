@@ -83,6 +83,28 @@ pub fn attach_observer(
 /// `observe` is `--observe`: never start the orchestrator, only watch the
 /// project as an observer (see [`EngineBackend::launch_with`]).
 pub async fn run(project_root: PathBuf, version: &str, observe: bool) -> Result<ExitCode> {
+    run_with_peer(
+        project_root,
+        version,
+        observe,
+        orch_domain::PeerConfig::default(),
+        false,
+    )
+    .await
+}
+
+pub async fn run_with_peer(
+    project_root: PathBuf,
+    version: &str,
+    observe: bool,
+    peer: orch_domain::PeerConfig,
+    explicit_listen: bool,
+) -> Result<ExitCode> {
+    if explicit_listen && observe {
+        return Err(Error::invalid_arguments(
+            "--listen requires the engine owner; --observe cannot listen",
+        ));
+    }
     // SIGHUP (the terminal went away) and SIGTERM end the draw loop the same
     // way `q` does, so the cleanup below runs: agents get their stop grace and
     // the lock is released, instead of the process dying with them orphaned.
@@ -92,12 +114,17 @@ pub async fn run(project_root: PathBuf, version: &str, observe: bool) -> Result<
     let hungup = Arc::new(AtomicBool::new(false));
     watch_termination(Arc::clone(&stop), Arc::clone(&hungup));
 
-    let engine = Arc::new(orch_engine::build_full(project_root).await?);
+    let engine = Arc::new(orch_engine::build_full_with_peer(project_root, peer).await?);
     let backend = EngineBackend::launch_with(Arc::clone(&engine), version, observe).await;
 
     // Read before the move: `orch_tui::run` consumes the backend, and the
     // cleanup below needs to know whether *this* process started watch mode.
     let watch_active = backend.is_watch_active();
+    if explicit_listen && !watch_active {
+        return Err(Error::invalid_arguments(
+            "--listen requires the engine owner; another orchestrator holds the lock",
+        ));
+    }
 
     // Observer mode: another process holds the lock, so there is no in-process
     // bus traffic to subscribe to and the live events have to come off disk.
@@ -292,5 +319,26 @@ mod tests {
              terminal on the way out, so nobody is watching the shutdown, and \
              an unbounded `stop()` there can hang the process for good"
         );
+    }
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+    #[tokio::test]
+    async fn explicit_listen_refuses_observer_mode_before_starting_engine() {
+        let err = run_with_peer(
+            PathBuf::from("/unused"),
+            "test",
+            true,
+            orch_domain::PeerConfig {
+                name: None,
+                listen: Some("127.0.0.1:0".into()),
+            },
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--observe cannot listen"));
     }
 }

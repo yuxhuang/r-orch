@@ -24,9 +24,9 @@ use clap::{Args, Parser, Subcommand};
 /// Used by the pre-parse routing guard, which has to decide whether the first
 /// non-flag token is a real subcommand *before* clap sees the argv
 /// (`docs/parity/cli.md` §1.6).
-pub const ALL_KNOWN_COMMANDS: [&str; 17] = [
+pub const ALL_KNOWN_COMMANDS: [&str; 18] = [
     "task", "agent", "status", "logs", "config", "context", "msg", "goal", "team", "org", "run",
-    "doctor", "tui", "serve", "web", "init", "update",
+    "doctor", "tui", "serve", "web", "init", "update", "remote",
 ];
 
 /// The three commands that run without a container, and so without
@@ -70,6 +70,8 @@ pub enum Command {
     Task(TaskCmd),
     /// Manage agents
     Agent(AgentCmd),
+    /// Manage remote orch peers
+    Remote(RemoteCmd),
     /// Show orchestrator status
     Status,
     /// View run logs
@@ -108,6 +110,7 @@ impl Command {
         match self {
             Command::Task(_) => "task",
             Command::Agent(_) => "agent",
+            Command::Remote(_) => "remote",
             Command::Status => "status",
             Command::Logs(_) => "logs",
             Command::Config(_) => "config",
@@ -288,6 +291,7 @@ pub enum AgentSub {
     /// List all agents
     List,
     /// Show agent details
+    #[command(alias = "show")]
     Status {
         #[arg(value_name = "id")]
         id: String,
@@ -684,7 +688,56 @@ pub enum OrgSub {
 // ── run ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Args)]
+pub struct PeerFlags {
+    #[arg(long, num_args = 0..=1, default_missing_value = "0.0.0.0:7690", value_parser = parse_listen_address, value_name = "ADDR", help = "Allow incoming peer connections (engine owner only)")]
+    pub listen: Option<String>,
+    #[arg(long, value_name = "NAME", help = "Peer display name")]
+    pub peer_name: Option<String>,
+}
+
+fn parse_listen_address(raw: &str) -> std::result::Result<String, String> {
+    raw.parse::<std::net::SocketAddr>()
+        .map(|addr| addr.to_string())
+        .map_err(|_| "Listen address must be an IP address and port".into())
+}
+
+impl PeerFlags {
+    pub fn config(&self) -> orch_domain::PeerConfig {
+        orch_domain::PeerConfig {
+            name: self.peer_name.clone(),
+            listen: self.listen.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct RemoteCmd {
+    #[command(subcommand)]
+    pub command: Option<RemoteSub>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RemoteSub {
+    Add {
+        alias: String,
+        addr: String,
+    },
+    Remove {
+        alias: String,
+    },
+    List,
+    Status,
+    Listen {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        addr: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
 pub struct RunCmd {
+    #[command(flatten)]
+    pub peer: PeerFlags,
     #[arg(value_name = "task-id")]
     pub task_id: Option<String>,
     #[arg(long, help = "Run all todo tasks")]
@@ -699,6 +752,8 @@ pub struct RunCmd {
 
 #[derive(Debug, Args)]
 pub struct TuiCmd {
+    #[command(flatten)]
+    pub peer: PeerFlags,
     #[arg(
         long,
         help = "Do not start the orchestrator; watch the project as an observer. \
@@ -711,6 +766,8 @@ pub struct TuiCmd {
 
 #[derive(Debug, Args)]
 pub struct ServeCmd {
+    #[command(flatten)]
+    pub peer: PeerFlags,
     #[arg(long, help = "Process todo tasks and exit when all are terminal")]
     pub once: bool,
     #[arg(
@@ -928,9 +985,23 @@ mod tests {
         ("team disband", &["<id>"], &[]),
         ("org list", &[], &[]),
         ("org deploy", &["<template>"], &["--goal <goal>"]),
-        ("run", &["[task-id]"], &["--all", "--watch", "--verbose"]),
+        (
+            "run",
+            &["[task-id]"],
+            &[
+                "--all",
+                "--watch",
+                "--verbose",
+                "--listen <ADDR>",
+                "--peer-name <NAME>",
+            ],
+        ),
         ("doctor", &[], &[]),
-        ("tui", &[], &["--observe"]),
+        (
+            "tui",
+            &[],
+            &["--observe", "--listen <ADDR>", "--peer-name <NAME>"],
+        ),
         (
             "serve",
             &[],
@@ -940,6 +1011,8 @@ mod tests {
                 "--log-file <path>",
                 "--log-format <format>",
                 "--verbose",
+                "--listen <ADDR>",
+                "--peer-name <NAME>",
             ],
         ),
         (
@@ -966,6 +1039,43 @@ mod tests {
                 .clone();
         }
         current
+    }
+
+    #[test]
+    fn peer_options_parse_for_owner_commands() {
+        let cli =
+            Cli::try_parse_from(["orch", "serve", "--listen", "--peer-name", "worker"]).unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("serve")
+        };
+        assert_eq!(args.peer.listen.as_deref(), Some("0.0.0.0:7690"));
+        assert_eq!(args.peer.peer_name.as_deref(), Some("worker"));
+        let cli =
+            Cli::try_parse_from(["orch", "run", "--watch", "--listen", "127.0.0.1:1234"]).unwrap();
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("run")
+        };
+        assert_eq!(args.peer.listen.as_deref(), Some("127.0.0.1:1234"));
+        let cli = Cli::try_parse_from(["orch", "tui", "--listen"]).unwrap();
+        let Some(Command::Tui(args)) = cli.command else {
+            panic!("tui")
+        };
+        assert_eq!(args.peer.listen.as_deref(), Some("0.0.0.0:7690"));
+    }
+
+    #[test]
+    fn remote_commands_and_show_alias_parse() {
+        for argv in [
+            vec!["orch", "remote", "add", "w1", "worker:7690"],
+            vec!["orch", "remote", "remove", "w1"],
+            vec!["orch", "remote", "list", "--json"],
+            vec!["orch", "remote", "status"],
+            vec!["orch", "remote", "listen", "on", "127.0.0.1:7690"],
+            vec!["orch", "remote", "listen", "off"],
+            vec!["orch", "agent", "show", "agt_worker@w1", "--json"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok());
+        }
     }
 
     #[test]
@@ -1084,6 +1194,7 @@ mod tests {
                 ],
             ),
             ("org", &["list", "deploy"]),
+            ("remote", &["add", "remove", "list", "status", "listen"]),
         ];
 
         for (group, subs) in expected {
@@ -1100,6 +1211,7 @@ mod tests {
     #[test]
     fn the_three_documented_aliases_exist() {
         for (path, alias) in [
+            ("agent status", "show"),
             ("goal list", "ls"),
             ("goal delete", "rm"),
             ("org list", "ls"),
@@ -1116,7 +1228,10 @@ mod tests {
         // And nothing else has one.
         let mut aliased = Vec::new();
         collect_aliases(&Cli::command(), String::new(), &mut aliased);
-        assert_eq!(aliased, ["goal list", "goal delete", "org list"]);
+        assert_eq!(
+            aliased,
+            ["agent status", "goal list", "goal delete", "org list"]
+        );
     }
 
     fn collect_aliases(command: &clap::Command, prefix: String, out: &mut Vec<String>) {

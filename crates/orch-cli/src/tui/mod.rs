@@ -57,4 +57,4 @@ pub mod backend;
 pub mod command;
 
 pub use backend::EngineBackend;
-pub use command::{first_run, run};
+pub use command::{first_run, run, run_with_peer};

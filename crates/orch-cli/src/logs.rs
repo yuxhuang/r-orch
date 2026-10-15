@@ -668,6 +668,7 @@ mod tests {
             prompt: "p".to_owned(),
             pid: None,
             error: None,
+            error_kind: None,
             tokens: None,
         }
     }

@@ -571,7 +571,7 @@ mod tests {
             default_prompt_template()
         );
         // The prompt template is a prompt input, so its size is pinned.
-        assert_eq!(default_prompt_template().len(), 4822);
+        assert_eq!(default_prompt_template().len(), 5026);
     }
 
     #[tokio::test]

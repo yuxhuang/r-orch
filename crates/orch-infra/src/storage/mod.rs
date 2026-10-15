@@ -16,6 +16,7 @@ pub mod index;
 pub mod lock;
 pub mod message;
 pub mod paths;
+pub mod remote;
 pub mod run;
 pub mod state;
 pub mod task;
@@ -34,3 +35,5 @@ pub use run::FileRunStore;
 pub use state::FileStateStore;
 pub use task::FileTaskStore;
 pub use team::FileTeamStore;
+
+pub use remote::{FileRemoteStore, RemoteAgentDirectory};

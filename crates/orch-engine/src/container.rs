@@ -168,7 +168,10 @@ pub async fn build_light_with(
         Some(path) => Arc::new(FileGlobalConfigStore::at(path.clone())),
         None => Arc::new(FileGlobalConfigStore::new()),
     };
-    let config = config_store.read().await?;
+    let mut config = config_store.read().await?;
+    if config.peer.name.is_none() {
+        config.peer.name = Some(orch_infra::storage::remote::default_peer_name());
+    }
     // The light tier does not read `global.yml`: the TS container leaves
     // `globalConfig` at its default until the full tier loads it, and no
     // read-only command consults it.
@@ -190,15 +193,20 @@ pub async fn build_light_with(
     let teams: Arc<dyn TeamStore> = Arc::new(FileTeamStore::new(paths.clone()));
     let events = Arc::new(EventBus::new());
 
-    let task_service = Arc::new(TaskService::new(
-        Arc::clone(&tasks),
-        Arc::clone(&agents),
-        Arc::clone(&events),
-        config.clone(),
-        Arc::clone(&seams.clock),
-        Arc::clone(&seams.ids),
-        Some(paths.clone()),
-    ));
+    let task_service = Arc::new(
+        TaskService::new(
+            Arc::clone(&tasks),
+            Arc::clone(&agents),
+            Arc::clone(&events),
+            config.clone(),
+            Arc::clone(&seams.clock),
+            Arc::clone(&seams.ids),
+            Some(paths.clone()),
+        )
+        .with_remote_directory(orch_infra::storage::remote::RemoteAgentDirectory::new(
+            paths.clone(),
+        )),
+    );
     let agent_service = Arc::new(AgentService::new(
         Arc::clone(&agents),
         Arc::clone(&state),
@@ -212,14 +220,19 @@ pub async fn build_light_with(
         Arc::clone(&seams.clock),
         Arc::clone(&seams.ids),
     ));
-    let message_service = Arc::new(MessageService::new(
-        Arc::clone(&messages),
-        Arc::clone(&agents),
-        Arc::clone(&teams),
-        Arc::clone(&events),
-        Arc::clone(&seams.clock),
-        Arc::clone(&seams.ids),
-    ));
+    let message_service = Arc::new(
+        MessageService::new(
+            Arc::clone(&messages),
+            Arc::clone(&agents),
+            Arc::clone(&teams),
+            Arc::clone(&events),
+            Arc::clone(&seams.clock),
+            Arc::clone(&seams.ids),
+        )
+        .with_remote_directory(orch_infra::storage::remote::RemoteAgentDirectory::new(
+            paths.clone(),
+        )),
+    );
     let goal_service = Arc::new(GoalService::new(
         Arc::clone(&goals),
         Arc::clone(&events),
@@ -274,8 +287,33 @@ pub async fn build_full_with(
     project_root: impl Into<PathBuf>,
     seams: EngineSeams,
 ) -> Result<FullEngine> {
-    let project_root = project_root.into();
+    build_full_internal(
+        project_root.into(),
+        seams,
+        orch_domain::PeerConfig::default(),
+    )
+    .await
+}
+
+pub async fn build_full_with_peer(
+    project_root: impl Into<PathBuf>,
+    peer: orch_domain::PeerConfig,
+) -> Result<FullEngine> {
+    build_full_internal(project_root.into(), EngineSeams::default(), peer).await
+}
+
+async fn build_full_internal(
+    project_root: PathBuf,
+    seams: EngineSeams,
+    peer: orch_domain::PeerConfig,
+) -> Result<FullEngine> {
     let mut engine = build_light_with(project_root.clone(), seams).await?;
+    if peer.name.is_some() {
+        engine.config.peer.name = peer.name;
+    }
+    if peer.listen.is_some() {
+        engine.config.peer.listen = peer.listen;
+    }
     engine.global_config = engine.global_config_store.read().await?;
 
     let processes: Arc<dyn ProcessManager> = Arc::new(orch_infra::process::SystemProcessManager);

@@ -15,6 +15,7 @@ pub mod global_config;
 pub mod goal;
 pub mod message;
 pub mod model_tiers;
+pub mod remote;
 pub mod run;
 pub mod scope;
 pub mod shop;
@@ -28,8 +29,8 @@ pub use agent::{
     ReasoningEffort,
 };
 pub use config::{
-    AgentDefaults, Defaults, OrchestratorConfig, ProjectConfig, PromptConfig, SchedulingConfig,
-    TaskDefaults, deep_merge, default_config, get_by_path, set_by_path,
+    AgentDefaults, Defaults, OrchestratorConfig, PeerConfig, ProjectConfig, PromptConfig,
+    SchedulingConfig, TaskDefaults, deep_merge, default_config, get_by_path, set_by_path,
 };
 pub use error::{
     AdapterErrorHint, AdapterErrorKind, DomainError, ERROR_HINTS, Result, classify_adapter_error,
@@ -72,3 +73,5 @@ pub use transitions::{
     TaskSource, calculate_retry_delay, can_transition, is_blocked, is_dispatchable, is_terminal,
     resolve_completion_status, resolve_failure_status,
 };
+
+pub use remote::{InboundStatus, RemoteConfig, RemoteRef, RemoteRunRef, RemoteStatus};

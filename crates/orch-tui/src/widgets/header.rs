@@ -24,6 +24,17 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         return;
     }
     render_brand_bar(frame, area, ctx);
+    if area.height > 2 {
+        put_line(
+            frame,
+            area,
+            area.y + 2,
+            vec![Span::styled(
+                ctx.state.peer_status.clone(),
+                ctx.style(Token::Dim),
+            )],
+        );
+    }
     if area.height > 3 {
         render_stats_bar(frame, area, ctx);
     }

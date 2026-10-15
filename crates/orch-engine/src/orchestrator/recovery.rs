@@ -21,7 +21,9 @@ impl Orchestrator {
         let dead: Vec<(String, orch_domain::RunningEntry)> = state
             .running
             .iter()
-            .filter(|(_, entry)| !self.deps().processes.is_alive(entry.pid))
+            .filter(|(_, entry)| {
+                entry.remote.is_some() || !self.deps().processes.is_alive(entry.pid)
+            })
             .map(|(task_id, entry)| (task_id.clone(), entry.clone()))
             .collect();
 
@@ -30,11 +32,12 @@ impl Orchestrator {
         }
 
         futures::future::join_all(dead.iter().map(|(task_id, entry)| async move {
-            if let Err(err) = self
-                .deps()
-                .agent_service
-                .set_status(&entry.agent_id, AgentStatus::Idle)
-                .await
+            if entry.remote.is_none()
+                && let Err(err) = self
+                    .deps()
+                    .agent_service
+                    .set_status(&entry.agent_id, AgentStatus::Idle)
+                    .await
             {
                 self.emit_error(
                     err,
@@ -186,9 +189,13 @@ impl Orchestrator {
             .collect();
 
         for run in orphaned {
+            if run.agent_id.contains('@') {
+                self.force_task_cancelled(&run.task_id).await;
+            }
             // Sequential, not `join_all`: each of these may spend the full
             // kill grace, and a crashed daemon's leftovers are a handful.
-            if let Some(pid) = run.pid
+            if !run.agent_id.contains('@')
+                && let Some(pid) = run.pid
                 && self.deps().processes.is_alive(pid)
             {
                 self.deps()
@@ -273,10 +280,14 @@ impl Orchestrator {
 
         for (task_id, entry) in entries {
             self.take_cancel(&task_id).await;
-            self.deps()
-                .processes
-                .kill_with_grace(entry.pid, orch_core::process::DEFAULT_KILL_GRACE)
-                .await;
+            if let Some(remote) = &entry.remote {
+                self.cancel_remote(remote).await;
+            } else {
+                self.deps()
+                    .processes
+                    .kill_with_grace(entry.pid, orch_core::process::DEFAULT_KILL_GRACE)
+                    .await;
+            }
 
             if let Err(err) = self
                 .deps()
@@ -289,7 +300,11 @@ impl Orchestrator {
 
             match self.deps().task_store.get(&task_id).await {
                 Ok(Some(task)) => {
-                    let next = resolve_failure_status(&task);
+                    let next = if entry.remote.is_some() {
+                        TaskStatus::Cancelled
+                    } else {
+                        resolve_failure_status(&task)
+                    };
                     if let Err(err) = self.deps().task_service.update_status(&task_id, next).await {
                         self.emit_error(err, format!("stop: set task {task_id} to {next}"));
                     }
@@ -298,11 +313,12 @@ impl Orchestrator {
                 Err(err) => self.emit_error(err, format!("stop: read task {task_id}")),
             }
 
-            if let Err(err) = self
-                .deps()
-                .agent_service
-                .set_status(&entry.agent_id, AgentStatus::Idle)
-                .await
+            if entry.remote.is_none()
+                && let Err(err) = self
+                    .deps()
+                    .agent_service
+                    .set_status(&entry.agent_id, AgentStatus::Idle)
+                    .await
             {
                 self.emit_error(
                     err,

@@ -38,6 +38,7 @@
 mod collect;
 mod dispatch;
 mod recovery;
+mod remote;
 mod tick;
 
 #[cfg(test)]
@@ -184,6 +185,9 @@ struct Inner {
     /// Per-agent auto-seed cooldown. In-memory, as in TS — a restart reseeds.
     last_auto_seed_at: Mutex<HashMap<String, i64>>,
 
+    remote_state_dirty: AtomicBool,
+    remote_bridge: std::sync::RwLock<Arc<dyn orch_core::remote::RemoteBridge>>,
+    event_tap: std::sync::RwLock<Option<Arc<dyn orch_core::remote::RunEventTap>>>,
     lazy_save: Mutex<LazySave>,
     immediate_dispatch: Mutex<Option<tokio::task::JoinHandle<()>>>,
     watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -236,6 +240,11 @@ impl Orchestrator {
 
         Orchestrator {
             inner: Arc::new(Inner {
+                remote_state_dirty: AtomicBool::new(false),
+                remote_bridge: std::sync::RwLock::new(Arc::new(
+                    orch_core::remote::NoopRemoteBridge,
+                )),
+                event_tap: std::sync::RwLock::new(None),
                 deps,
                 state: Mutex::new(None),
                 active_collectors: Mutex::new(HashSet::new()),
@@ -318,12 +327,26 @@ impl Orchestrator {
     /// Replace the in-memory state from the store. Always called at the start
     /// of a critical section, never outside one.
     async fn load_state(&self, slot: &mut Option<OrchestratorState>) -> Result<()> {
+        // Do not reload an old running entry after an outcome's final write
+        // failed. Persist the in-memory removal before any tick can replace it.
+        if self.inner.remote_state_dirty.load(Ordering::SeqCst)
+            && let Some(state) = slot.as_ref()
+        {
+            self.save_state(state).await?;
+        }
         *slot = Some(self.deps().state_store.read().await?);
         Ok(())
     }
 
     async fn save_state(&self, state: &OrchestratorState) -> Result<()> {
-        self.deps().state_store.write(state).await
+        self.deps().state_store.write(state).await?;
+        self.inner.remote_state_dirty.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn save_remote_state(&self, state: &OrchestratorState) -> Result<()> {
+        self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+        self.save_state(state).await
     }
 
     /// Debounced write, for the non-critical `last_event_at` updates
@@ -624,10 +647,14 @@ impl Orchestrator {
         let entry = state.running.get(task_id).cloned();
         if let Some(entry) = entry {
             self.take_cancel(task_id).await;
-            self.deps()
-                .processes
-                .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
-                .await;
+            if let Some(remote) = &entry.remote {
+                self.cancel_remote(remote).await;
+            } else {
+                self.deps()
+                    .processes
+                    .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
+                    .await;
+            }
             if let Err(err) = self
                 .deps()
                 .run_service
@@ -636,11 +663,12 @@ impl Orchestrator {
             {
                 self.emit_error(err, format!("cancelTask finish run {}", entry.run_id));
             }
-            if let Err(err) = self
-                .deps()
-                .agent_service
-                .set_status(&entry.agent_id, orch_domain::AgentStatus::Idle)
-                .await
+            if entry.remote.is_none()
+                && let Err(err) = self
+                    .deps()
+                    .agent_service
+                    .set_status(&entry.agent_id, orch_domain::AgentStatus::Idle)
+                    .await
             {
                 self.emit_error(
                     err,
@@ -693,10 +721,14 @@ impl Orchestrator {
 
         for (task_id, entry) in owned {
             self.take_cancel(&task_id).await;
-            self.deps()
-                .processes
-                .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
-                .await;
+            if let Some(remote) = &entry.remote {
+                self.cancel_remote(remote).await;
+            } else {
+                self.deps()
+                    .processes
+                    .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
+                    .await;
+            }
             self.deps()
                 .run_service
                 .finish(&entry.run_id, orch_domain::RunStatus::Cancelled, None, None)
@@ -711,10 +743,12 @@ impl Orchestrator {
             state.running.shift_remove(&task_id);
         }
 
-        self.deps()
-            .agent_service
-            .set_status(agent_id, orch_domain::AgentStatus::Idle)
-            .await?;
+        if !agent_id.contains('@') {
+            self.deps()
+                .agent_service
+                .set_status(agent_id, orch_domain::AgentStatus::Idle)
+                .await?;
+        }
         self.save_state(state).await
     }
 

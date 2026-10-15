@@ -14,3 +14,5 @@ pub mod run;
 pub mod status;
 pub mod task;
 pub mod team;
+
+pub mod remote;

@@ -156,6 +156,8 @@ pub struct ReviewResult {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TaskProof {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,

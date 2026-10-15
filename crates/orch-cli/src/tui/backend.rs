@@ -342,6 +342,24 @@ impl TuiBackend for EngineBackend {
         self.context.clone()
     }
 
+    fn peer_status(&mut self) -> BackendResult<String> {
+        self.block_on(async {
+            let inbound =
+                orch_infra::storage::remote::FileRemoteStore::new(self.engine.paths.clone())
+                    .read_inbound()
+                    .await?;
+            Ok::<_, orch_core::Error>(format!(
+                "listen {} · controller {}",
+                self.engine.config.peer.listen.as_deref().unwrap_or("off"),
+                inbound
+                    .as_ref()
+                    .map(|i| i.controller_name.as_str())
+                    .unwrap_or("none")
+            ))
+        })
+        .map_err(to_message)
+    }
+
     // ── Refresh (`tui.ts:72-82`, `203`, `181`) ───────────────────────────
 
     fn refresh_tasks(&mut self) -> BackendResult<Vec<Task>> {
@@ -350,8 +368,13 @@ impl TuiBackend for EngineBackend {
     }
 
     fn refresh_agents(&mut self) -> BackendResult<Vec<Agent>> {
-        self.block_on(self.engine.agent_service.list())
-            .map_err(to_message)
+        self.block_on(async {
+            let local = self.engine.agent_service.list().await?;
+            orch_infra::storage::remote::RemoteAgentDirectory::new(self.engine.paths.clone())
+                .list(local)
+                .await
+        })
+        .map_err(to_message)
     }
 
     fn refresh_goals(&mut self) -> BackendResult<Vec<Goal>> {
