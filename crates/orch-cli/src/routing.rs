@@ -243,7 +243,7 @@ mod tests {
         // parsing, so `orch frobnicate` reports `Not initialized`, not a usage
         // error.
         assert!(shape(&["orch", "frobnicate"]).requires_initialized_project());
-        // `orch help task` likewise — `help` is not one of the sixteen.
+        // `orch help task` likewise — `help` is not one of the seventeen.
         assert!(shape(&["orch", "help", "task"]).requires_initialized_project());
         // A bare `orch` is the first-run path, not a guarded command.
         assert!(!shape(&["orch"]).requires_initialized_project());

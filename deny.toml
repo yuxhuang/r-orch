@@ -7,6 +7,9 @@
 # Only what we actually ship. Without this, advisories for other platforms'
 # crates (winapi, redox, wasm) count against a Linux build that never links
 # them, and the signal drowns.
+# Windows is out of scope for the gate: `portable-pty` (orch web) pulls in
+# Windows-only crates such as `shared_library` and `winreg`, which this graph
+# deliberately never resolves.
 targets = ["x86_64-unknown-linux-gnu"]
 all-features = true
 

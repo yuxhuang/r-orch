@@ -171,7 +171,7 @@ fn help_and_version_work_without_a_project() {
     let output = orch(dir.path()).arg("--help").output().expect("run");
     assert_eq!(output.status.code(), Some(0));
     let help = stdout_of(&output);
-    // Every one of the sixteen commands is listed.
+    // Every one of the seventeen commands is listed.
     for command in orch_cli::tree::ALL_KNOWN_COMMANDS {
         assert!(help.contains(command), "--help omits {command}");
     }

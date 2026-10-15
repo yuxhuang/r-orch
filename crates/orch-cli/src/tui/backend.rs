@@ -115,6 +115,20 @@ impl EngineBackend {
     /// Must be called from the runtime. `version` is the CLI's own version
     /// string, which the dashboard shows in its header.
     pub async fn launch(engine: Arc<FullEngine>, version: impl Into<String>) -> EngineBackend {
+        Self::launch_with(engine, version, false).await
+    }
+
+    /// [`EngineBackend::launch`], optionally skipping watch mode.
+    ///
+    /// `observe` is `orch tui --observe`: it goes
+    /// straight to the observer fallback below without trying the lock, so
+    /// this process never starts the orchestrator. That is not a read-only
+    /// view: task and agent mutations and `run` still work from it.
+    pub async fn launch_with(
+        engine: Arc<FullEngine>,
+        version: impl Into<String>,
+        observe: bool,
+    ) -> EngineBackend {
         // Subscribe *before* starting watch mode: a broadcast receiver sees
         // nothing emitted earlier, so the first tick's events would be lost.
         let subscription = engine.events.subscribe();
@@ -138,13 +152,23 @@ impl EngineBackend {
 
         // Watch mode auto-starts so the orchestrator is live, with seeding on —
         // `startWatch()` with no options (`tui.ts:254`).
-        let watch_active = match engine
-            .orchestrator
-            .start_watch(WatchOptions::watching())
-            .await
-        {
+        let started = if observe {
+            Err(None)
+        } else {
+            engine
+                .orchestrator
+                .start_watch(WatchOptions::watching())
+                .await
+                .map_err(Some)
+        };
+        let watch_active = match started {
             Ok(()) => true,
-            Err(err) => {
+            Err(None) => {
+                tracing::info!("--observe: not starting watch mode; entering observer mode");
+                context.observer_mode = true;
+                false
+            }
+            Err(Some(err)) => {
                 // Another process holds the lock. The dashboard becomes a
                 // read-only observer of *their* orchestrator, and the message
                 // is **suppressed** in the UI: the TS passes
