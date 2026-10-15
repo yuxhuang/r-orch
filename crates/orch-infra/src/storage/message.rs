@@ -10,6 +10,7 @@
 //! `write_yaml` either way.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use orch_core::clock::Clock;
@@ -23,6 +24,8 @@ use super::paths::Paths;
 
 /// A delivered message is purged once it is older than this.
 const DELIVERED_RETENTION_MS: i64 = 3_600_000;
+
+const MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct FileMessageStore {
     paths: Paths,
@@ -66,23 +69,49 @@ impl FileMessageStore {
         Fut: std::future::Future<Output = Result<T>> + Send,
     {
         let store = Self::new(self.paths.clone(), self.clock.clone());
-        tokio::spawn(async move {
-            ensure_dir(&store.paths.messages_dir()).await?;
-            let path = store.paths.messages_dir().join(".mutation.lock");
-            let guard = tokio::task::spawn_blocking(move || {
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)
-                    .map_err(|e| Error::io("Open message mutation lock", &path, e))?;
-                file.lock()
-                    .map_err(|e| Error::io("Lock message mutations", &path, e))?;
-                Ok::<_, Error>(file)
-            })
+        // Waiting is cancellable; only an acquired transaction is detached.
+        // Never put a blocking lock acquisition in Tokio's blocking pool: it
+        // cannot be aborted and runtime shutdown would wait for it forever.
+        ensure_dir(&store.paths.messages_dir()).await?;
+        let path = store.paths.messages_dir().join(".mutation.lock");
+        let guard = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
             .await
-            .map_err(|e| Error::other(format!("Acquire message mutation lock: {e}")))??;
+            .map_err(|e| Error::io("Open message mutation lock", &path, e))?
+            .into_std()
+            .await;
+        let deadline = tokio::time::Instant::now() + MUTATION_LOCK_TIMEOUT;
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            match guard.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(Error::io("Lock message mutations", &path, err));
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(Error::io(
+                    format!(
+                        "Timed out after {} ms waiting for message mutation lock {}; retry the operation",
+                        MUTATION_LOCK_TIMEOUT.as_millis(),
+                        path.display()
+                    ),
+                    &path,
+                    std::io::Error::from(std::io::ErrorKind::TimedOut),
+                ));
+            }
+            tokio::time::sleep_until(deadline.min(now + backoff)).await;
+            backoff = (backoff * 2).min(Duration::from_millis(5));
+        }
+        // No await between acquiring the lock and transferring it to the
+        // owned task: caller cancellation cannot tear a file/index update.
+        tokio::spawn(async move {
             let result = operation(store).await;
             drop(guard);
             result
@@ -559,6 +588,159 @@ mod tests {
         release_tx.send(()).unwrap();
         done_rx.await.unwrap();
         assert_eq!(ids(&store.list().await.unwrap()), vec!["msg_inflight"]);
+    }
+
+    fn hold_mutation_lock(store: &FileMessageStore) -> std::fs::File {
+        std::fs::create_dir_all(store.paths.messages_dir()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.paths.messages_dir().join(".mutation.lock"))
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn contended_mutation_times_out_without_writing_and_can_be_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let msg = message("msg_retry", Some("cli@offline"), "t");
+        let err = tokio::time::timeout(Duration::from_secs(7), store.save(&msg))
+            .await
+            .expect("mutation lock wait must be bounded")
+            .unwrap_err();
+        assert!(err.to_string().contains("Timed out after 5000 ms"));
+        assert!(err.to_string().contains("retry the operation"));
+        assert_eq!(
+            err.path(),
+            Some(store.paths.messages_dir().join(".mutation.lock").as_path())
+        );
+        assert!(
+            matches!(err, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(store.get(&msg.id).await.unwrap().is_none());
+        drop(lock);
+        store.save(&msg).await.unwrap();
+        assert_eq!(store.list().await.unwrap(), vec![msg]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_lock_waiter_discards_its_unstarted_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut waiting = Box::pin(store.transaction(move |_| async move {
+            let _ = started_tx.send(());
+            Ok(())
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(waiting);
+        // The closure must be dropped with the waiter, before unlocking.
+        // Otherwise an aborted request could mutate storage much later.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx)
+                .await
+                .expect("cancelled waiter retained its operation")
+                .is_err()
+        );
+        drop(lock);
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contended_shutdown_child() {
+        let Some(root) = std::env::var_os("ORCH_MESSAGE_LOCK_TEST_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            let (store, _) = store(&root);
+            let mut caller = tokio::spawn(async move { store.purge_expired().await });
+            tokio::select! {
+                result = &mut caller => panic!("contended mutation finished before shutdown: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            std::fs::write(root.join("ready"), "waiting").unwrap();
+            terminate.recv().await;
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        });
+        // Exercise real runtime drop, which waits for non-abortable blocking
+        // tasks. The parent keeps the external lock until after child exit.
+        drop(runtime);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_shutdown_exits_while_another_process_keeps_the_lock() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::message::tests::contended_shutdown_child",
+                    "--nocapture",
+                ])
+                .env("ORCH_MESSAGE_LOCK_TEST_ROOT", temp.path())
+                .env("HOME", temp.path())
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !temp.path().join("ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before becoming ready"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child readiness deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.0.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "child shutdown failed: {status}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown waited for external mutation lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(lock);
     }
 
     #[tokio::test]
