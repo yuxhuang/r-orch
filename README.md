@@ -4,7 +4,8 @@ An AI agent orchestrator: a CLI, a terminal dashboard, and a runtime that drives
 (`claude`, `codex`, `cursor`, `opencode`, `pi`, `grok`, `agy`) as child processes, moves tasks through a state
 machine, and keeps everything in plain files under `.orchestry/`.
 
-No database, no daemon to install, no server. One process per project, guarded by a PID lock file.
+No database or daemon to install. One engine process per project, guarded by a PID lock file; optional
+peer connections let it delegate work to other installations.
 
 This is a **Rust reimplementation of [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH)** (npm
 `@oxgeneral/orch`), built to operate on the same projects as the original — see
@@ -93,6 +94,66 @@ Two things that will bite you on first use, both covered in the [runbook](docs/R
 
 ---
 
+## Remote agents (alpha)
+
+Peers use plain TCP on a trusted LAN, **without authentication or encryption**. Listening is off by
+default. Only the process that owns the project engine opens peer connections; a TUI observing an
+existing owner cannot enable listening.
+
+On the worker, start an engine with a unique display name and an explicit listen address:
+
+```bash
+orch serve --listen 0.0.0.0:7690 --peer-name worker-linux
+# Also supported: orch run --watch --listen 0.0.0.0:7690 --peer-name worker-linux
+# Or: orch tui --listen 0.0.0.0:7690 --peer-name worker-linux
+```
+
+To persist the preference for future engine starts, use `orch remote listen on 0.0.0.0:7690`;
+`orch remote listen off` disables it on the next start. A `--listen` flag applies to that invocation.
+Use `--peer-name` or `peer.name` in `.orchestry/config.yml` to distinguish installations.
+
+On the controller, register the worker and run the engine:
+
+```bash
+orch remote add w1 worker-host:7690
+orch serve --peer-name controller
+# In another terminal:
+orch remote status
+orch agent list
+orch task add "Run the worker's checks" --assignee 'agt_x@w1'
+orch msg send 'agt_x@w1' "Please include the test results in your summary"
+# On the worker, reply to the controller's CLI:
+orch msg send 'cli@controller' "Checks passed"
+```
+
+Replace `agt_x` with an agent ID from the worker. Remote agents appear as `<id>@<alias>`, with
+`linux` or `macos` host capabilities in the CAPS column. Add `--labels cap:linux` to a task to require
+Linux; unsupported capabilities leave the task waiting. The TUI header and `orch remote status` show
+the effective listen address, connected controller, and each configured remote's online state.
+
+A controller can connect to several workers. Each worker accepts one controller at a time. Registry
+entries persist across restarts; links reconnect with backoff until `orch remote remove w1`. Offline
+agents remain visible, and new tasks assigned to them wait in `todo`. During a link outage an active
+remote task waits for its outcome without a retry: the worker owns execution and stall detection.
+Cancelling the task or removing the remote ends that wait. A controller restart cancels its active
+remote tasks; reconnecting reconciles and cancels their worker mirrors. Messages queue while offline
+and deduplicate when delivered. Broadcast messages stay local.
+
+**Remote agents are leaf executors using worker-local resources.** There is no repository, input,
+file, or artifact synchronization. Paths refer to the worker, which runs its own agent command, role,
+skills, workspace integration and review criteria. Prepare required resources there before assigning
+work. Hand results back in summaries or direct messages. Remote agents must not orchestrate the
+controller's graph with `orch task add`, `orch goal`, or `orch context`: those commands operate on the
+worker's own project. Task proofs record the remote alias, worker branch and changed files. Worker
+review failures and merge conflicts put the controller task in `review` and keep dependents blocked.
+
+This feature is developed on `feature/remote-peers`; no Homebrew formula or stable release is changed.
+To try the local checkout explicitly, build it with `cargo build --release -p orch-cli` and invoke
+`./target/release/orch`. Before rolling back to v0.3.1, stop the alpha engine with **no remote runs in
+flight**. The old binary cannot resume remote execution entries and will cancel them.
+
+---
+
 ## Documentation
 
 | Document | For |
@@ -114,6 +175,10 @@ TypeScript is executed at runtime.
 
 ### Cross-compatibility
 
+The remote-peer extension described above is specific to r-orch. The historical parity documentation
+and differential harness describe the original command set; they do not promise parity for remote
+agents, peer metadata, or the extended prompts.
+
 **Both binaries can operate on the same project directory, in either order.** That is a design goal, not a
 side effect, and it is enforced by a differential test harness that runs the same commands against both
 implementations in parallel temporary directories and compares stdout, stderr, exit codes and the entire
@@ -133,7 +198,7 @@ What is deliberately *not* identical:
 - **the TUI** is a `ratatui` reimplementation matching views, keybindings and wizards rather than pixels;
 - **`--help` output** is clap's layout;
 - **no self-update.** The original updates itself via npm after almost every command. r-orch does not
-  update itself at all, and makes no network calls; `orch update` reports your version and how to upgrade.
+  update itself at all; `orch update` reports your version and how to upgrade.
   This is a deliberate scope cut on security grounds, not an omission.
 
 A handful of original bugs are **replicated on purpose**, because `--json` output and on-disk format are a
