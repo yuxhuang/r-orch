@@ -19,10 +19,10 @@ Run everything with `cargo test -p orch-tui`.
 | `tests/filters.rs` (`f001..f047`) | 47 | Both filter pickers, every filter predicate, and the logs row→index mapping |
 | `tests/mouse.rs` (`m001..m111`) | 111 | Every clickable target, every unclickable surface, and the identity/reflow/wheel hazards |
 | `tests/hitmap.rs` (`h001..h021`) | 21 | The per-frame hit map: row↔frame agreement, every clickable target, clipping, invalidation |
-| `tests/live_updates.rs` (`l001..l055`) | 55 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history and its timestamps, endurance |
-| **Integration total** | **629** | |
+| `tests/live_updates.rs` (`l001..l062`) | 62 | Batching, caps, the run-id LRU, soft-delete timing, notifications, history and its timestamps, endurance, repeated-line collapse |
+| **Integration total** | **636** | |
 | In-module unit tests | 314 | Pure logic: see the table below |
-| **Grand total** | **943** | |
+| **Grand total** | **950** | |
 
 In-module unit tests, by file:
 
@@ -85,6 +85,7 @@ In-module unit tests, by file:
 | §6 Layout arithmetic, resize, minimum-size guard | `layout.rs` (8), `k007`–`k017`, `v060`–`v062`, `v090`, `v091` |
 | §6 Header contents | `v063`–`v072` |
 | §7 Live updates: batching, debounce, caps, LRU, formatters | `l001`–`l021`, `l044`–`l048`, `messages/format.rs` (84) |
+| PARITY §12.8 (k) Repeated feed lines collapse | `l056`–`l062` |
 | §7 History loading, incl. per-entry timestamps | `l037`–`l043`, `l049`–`l055` |
 | §8.1 Soft delete with undo | `l022`–`l026`, `k046`–`k049`, `k061`, `k062`, `k068` |
 | §8.2 Paste image / attachments | `app.rs` paste cases, `w0xx` paste cases, `v020`, `v044` |

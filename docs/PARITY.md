@@ -2883,7 +2883,7 @@ solid text, selection); exact hex values are L2.
 ### 12.8 Deliberate divergences in r-orch's TUI
 
 WP-6 is complete: **100 % of this section’s checklist**, with the case count and its per-area breakdown in
-`crates/orch-tui/TEST-COVERAGE.md` (**authoritative** — deliberately not restated here; see V33). Ten
+`crates/orch-tui/TEST-COVERAGE.md` (**authoritative** — deliberately not restated here; see V33). Eleven
 divergences from the Ink original
 were taken deliberately. **All have comparison effect `none`** — the TUI is outside the harness (§15.1) — so
 each is justified on its own merits rather than by the gate.
@@ -2900,8 +2900,9 @@ each is justified on its own merits rather than by the gate.
 | h | Pre-dispatch failures reported synchronously as `Err` | L1 | The TUI renders no `orchestrator:error` case, so a stream-only dispatch error is **invisible**. | §12.10 |
 | i | Grapheme display width from `unicode-width`, not the TS range table | **L2** | The TS table under-measures several emoji classes; r-orch matches what terminals actually render. | §12.8.1 |
 | j | Mouse support added: click targets, double click, wheel | **L2** (plus one additive **L1** verb) | The Ink original has no mouse support at all, so this is an **addition, not parity**. Every click calls an action the keyboard already calls, so no keymap semantics change and `tests/keymap.rs` is untouched. Capture is on by default with DEC **1000 + 1006 only** — not 1002/1003/1015 — and is released by `ORCH_TUI_MOUSE=0`, `F2` or `/mouse off`. The `/mouse` verb extends the §12.4 verb set, which is the one **L1** part; no CLI flag and no `config.yml` key is added, because those surfaces are **L0** (§1.1 item 2, §6.5). **Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1), and no *existing* key binding changes meaning, which an unedited `tests/keymap.rs` is the proof of. The keyboard surface is not byte-for-byte unchanged: `F2` and the `/mouse` verb are additions, both listed above. | §12.11 |
+| k | Repeated feed lines collapse | **L2** | The original adds a line per event, so while work runs the activity feed and the logs view fill with an identical `◆ N running · M queued` every tick, and Claude's frequent `[thinking_token]` progress events add one line each. r-orch adds the orchestrator status line only when its counts change, or when work resumes after an idle tick, and drops any agent line identical (same type and text) to the most recent line from the same agent and task, looking back at most 64 lines. The kept line keeps its first timestamp, so its age in the activity feed reads as how long that state has lasted. Different agents' identical lines both stay, and a line that recurs after a different one from the same agent stays. **Effect on differential comparison: `none`** — the TUI is outside the harness (§15.1). | here |
 
-Items (b), (f), (i) and (j) are recorded only here (plus (j)'s prose in §12.11), because they are
+Items (b), (f), (i), (j) and (k) are recorded only here (plus (j)'s prose in §12.11), because they are
 additions, layout or presentation rather than behaviours of the original. The others have §13, §14
 or §12.10 entries.
 

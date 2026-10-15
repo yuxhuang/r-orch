@@ -432,6 +432,9 @@ pub struct AppState {
     pub refresh_at: Option<i64>,
     pub runs: RunMaps,
     pub(crate) next_message_id: u64,
+    /// `(running, queued)` from the last `orchestrator:tick`, so an unchanged
+    /// count does not add a feed line every tick (PARITY.md §12.8 (k)).
+    pub(crate) last_tick: Option<(usize, usize)>,
 
     // ── Mouse ──────────────────────────────────────────────────────────────
     pub mouse: MouseState,
@@ -509,6 +512,7 @@ impl Default for AppState {
             message_flush_at: None,
             refresh_at: None,
             runs: RunMaps::default(),
+            last_tick: None,
             next_message_id: 1,
             mouse: MouseState::default(),
             input_mode: InputMode::None,
@@ -913,20 +917,29 @@ impl AppState {
         if self.pending_messages.is_empty() {
             return;
         }
-        let batch = std::mem::take(&mut self.pending_messages);
-        let batch: Vec<Message> = batch
-            .into_iter()
-            .map(|p| {
-                let id = self.next_message_id;
-                self.next_message_id += 1;
-                // A message with its own instant (a history entry) keeps it;
-                // everything else is stamped with the flush time.
+        let pending = std::mem::take(&mut self.pending_messages);
+        let mut batch: Vec<Message> = Vec::with_capacity(pending.len());
+        for p in pending {
+            // A line identical to the latest one from the same source adds
+            // nothing: keep the first, whose timestamp then reads as how long
+            // the state has lasted (PARITY.md §12.8 (k)).
+            if repeats_latest(&self.messages, &batch, &p) {
+                continue;
+            }
+            let id = self.next_message_id;
+            self.next_message_id += 1;
+            // A message with its own instant (a history entry) keeps it;
+            // everything else is stamped with the flush time.
+            batch.push(
                 Message::new(id, p.ts_ms.unwrap_or(now_ms), &p.text, p.color, p.msg_type)
                     .with_agent(p.agent_id)
                     .with_task(p.task_id)
-                    .with_detail(p.detail)
-            })
-            .collect();
+                    .with_detail(p.detail),
+            );
+        }
+        if batch.is_empty() {
+            return;
+        }
 
         if batch.len() >= MAX_MESSAGES {
             let start = batch.len() - MAX_MESSAGES;
@@ -1165,6 +1178,29 @@ impl AppState {
             "idle"
         }
     }
+}
+
+/// How far back [`repeats_latest`] looks for the previous line from the same
+/// source. A source silent for longer than this simply gets a fresh line.
+const REPEAT_LOOKBACK: usize = 64;
+
+/// Whether `p` repeats the most recent feed line from the same source — the
+/// same agent and task — with the same type and text.
+///
+/// Agent-less system lines are exempt: the orchestrator's own status line is
+/// deduplicated by its counts in `App::handle_event`, which also knows when
+/// work resumed after an idle spell and a fresh line is wanted.
+fn repeats_latest(feed: &[Message], batch: &[Message], p: &PendingMessage) -> bool {
+    if p.msg_type == MsgType::System && p.agent_id.is_none() {
+        return false;
+    }
+    batch
+        .iter()
+        .rev()
+        .chain(feed.iter().rev())
+        .take(REPEAT_LOOKBACK)
+        .find(|m| m.agent_id == p.agent_id && m.task_id == p.task_id)
+        .is_some_and(|m| m.msg_type == p.msg_type && m.text == p.text)
 }
 
 #[cfg(test)]

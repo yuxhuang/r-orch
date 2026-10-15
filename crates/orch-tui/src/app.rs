@@ -220,8 +220,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             self.state.runs.record(run_id, agent_id, task_id);
         }
 
-        // (b) feed message.
-        if let Some(message) = format_event(event, &self.state.runs) {
+        // (b) feed message. A tick whose counts have not changed adds no line;
+        // the existing one's timestamp keeps counting (PARITY.md §12.8 (k)).
+        let repeated_tick = match event {
+            OrchestratorEvent::OrchestratorTick { running, queued } => {
+                let counts = (*running, *queued);
+                self.state.last_tick.replace(counts) == Some(counts)
+            }
+            _ => false,
+        };
+        if !repeated_tick && let Some(message) = format_event(event, &self.state.runs) {
             let now = self.now();
             let batch = self.batch_ms;
             self.state.add_message(message, now, batch);

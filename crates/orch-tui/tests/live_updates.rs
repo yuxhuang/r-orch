@@ -808,3 +808,158 @@ fn l055_a_nameless_tool_call_payload_falls_back_to_tool() {
     harness.app.tick();
     harness.assert_message("⚙ tool()");
 }
+
+// ── Repeated lines collapse (PARITY.md §12.8 (k)) ──────────────────────────
+
+fn tick(running: usize, queued: usize) -> OrchestratorEvent {
+    OrchestratorEvent::OrchestratorTick { running, queued }
+}
+
+fn started(run_id: &str, agent_id: &str, task_id: &str) -> OrchestratorEvent {
+    OrchestratorEvent::AgentStarted {
+        run_id: run_id.into(),
+        agent_id: agent_id.into(),
+        task_id: task_id.into(),
+    }
+}
+
+fn output_from(run_id: &str, agent_id: &str, data: &str) -> OrchestratorEvent {
+    OrchestratorEvent::AgentOutput {
+        run_id: run_id.into(),
+        agent_id: agent_id.into(),
+        data: data.into(),
+    }
+}
+
+fn texts(harness: &Harness) -> Vec<String> {
+    harness
+        .app
+        .state
+        .messages
+        .iter()
+        .map(|m| m.text.clone())
+        .collect()
+}
+
+#[test]
+fn l056_an_unchanged_tick_adds_no_line_and_keeps_the_first_timestamp() {
+    let mut harness = event_harness();
+    harness.app.batch_ms = 0;
+    harness.app.handle_event(&tick(1, 0));
+    let first_ts = harness.app.state.messages[0].ts_ms;
+    for _ in 0..30 {
+        harness.advance(1000);
+        harness.app.handle_event(&tick(1, 0));
+    }
+    assert_eq!(texts(&harness), vec!["1 running · 0 queued"]);
+    assert_eq!(harness.app.state.messages[0].ts_ms, first_ts);
+}
+
+#[test]
+fn l057_a_changed_tick_adds_a_line() {
+    let mut harness = event_harness();
+    harness.app.batch_ms = 0;
+    harness.app.handle_event(&tick(1, 0));
+    harness.app.handle_event(&tick(1, 0));
+    harness.app.handle_event(&tick(2, 1));
+    harness.app.handle_event(&tick(2, 1));
+    assert_eq!(
+        texts(&harness),
+        vec!["1 running · 0 queued", "2 running · 1 queued"]
+    );
+}
+
+#[test]
+fn l058_work_resuming_after_idle_adds_a_line_even_with_the_same_counts() {
+    let mut harness = event_harness();
+    harness.app.batch_ms = 0;
+    harness.app.handle_event(&tick(1, 0));
+    harness.app.handle_event(&tick(0, 0)); // idle: no line, but resets
+    harness.app.handle_event(&tick(1, 0));
+    assert_eq!(
+        texts(&harness),
+        vec!["1 running · 0 queued", "1 running · 0 queued"]
+    );
+}
+
+#[test]
+fn l059_an_unchanged_tick_is_suppressed_even_after_other_system_lines() {
+    let mut harness = event_harness();
+    harness.app.batch_ms = 0;
+    harness.app.handle_event(&tick(1, 0));
+    harness
+        .app
+        .handle_event(&started("run_1", "agt_1", "tsk_1"));
+    let after_start = harness.app.state.messages.len();
+    harness.app.handle_event(&tick(1, 0));
+    assert_eq!(harness.app.state.messages.len(), after_start);
+}
+
+#[test]
+fn l060_a_repeated_agent_line_collapses_within_and_across_flushes() {
+    let mut harness = event_harness();
+    harness
+        .app
+        .handle_event(&started("run_1", "agt_1", "tsk_1"));
+    harness.advance(80);
+    let base = harness.app.state.messages.len();
+    let thinking = r#"{"type":"system","subtype":"thinking_token"}"#;
+    // A burst inside one 80 ms batch …
+    for _ in 0..20 {
+        harness
+            .app
+            .handle_event(&output_from("run_1", "agt_1", thinking));
+    }
+    harness.advance(80);
+    // … and more in later batches.
+    for _ in 0..20 {
+        harness
+            .app
+            .handle_event(&output_from("run_1", "agt_1", thinking));
+        harness.advance(80);
+    }
+    let lines = &texts(&harness)[base..];
+    assert_eq!(lines, ["[thinking_token]"]);
+}
+
+#[test]
+fn l061_identical_lines_from_different_agents_both_stay() {
+    let mut harness = event_harness();
+    harness.app.batch_ms = 0;
+    harness
+        .app
+        .handle_event(&started("run_1", "agt_1", "tsk_1"));
+    harness
+        .app
+        .handle_event(&started("run_2", "agt_2", "tsk_2"));
+    let base = harness.app.state.messages.len();
+    harness
+        .app
+        .handle_event(&output_from("run_1", "agt_1", "Running tests"));
+    harness
+        .app
+        .handle_event(&output_from("run_2", "agt_2", "Running tests"));
+    harness
+        .app
+        .handle_event(&output_from("run_1", "agt_1", "Running tests"));
+    assert_eq!(&texts(&harness)[base..], ["Running tests", "Running tests"]);
+}
+
+#[test]
+fn l062_a_line_repeated_after_a_different_one_from_the_same_agent_stays() {
+    let mut harness = event_harness();
+    harness.app.batch_ms = 0;
+    harness
+        .app
+        .handle_event(&started("run_1", "agt_1", "tsk_1"));
+    let base = harness.app.state.messages.len();
+    for line in ["Running tests", "3 passed", "Running tests"] {
+        harness
+            .app
+            .handle_event(&output_from("run_1", "agt_1", line));
+    }
+    assert_eq!(
+        &texts(&harness)[base..],
+        ["Running tests", "3 passed", "Running tests"]
+    );
+}
