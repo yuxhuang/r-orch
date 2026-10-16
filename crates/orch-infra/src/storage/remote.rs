@@ -18,7 +18,11 @@ use super::paths::{Paths, sanitize_id};
 /// Keep untrusted display metadata on one bounded line, including Unicode line
 /// separators that Rust does not classify as control characters. Limits are
 /// bytes, and truncation always preserves complete UTF-8 characters.
-fn metadata_text(text: &str, max_bytes: usize) -> String {
+///
+/// Public because every peer-supplied string that reaches a log line, a
+/// `state.json` field or a terminal has to pass through it, and the peer
+/// crate ingests several of those.
+pub fn metadata_text(text: &str, max_bytes: usize) -> String {
     let mut clean = String::with_capacity(text.len().min(max_bytes));
     for ch in text.chars() {
         if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {

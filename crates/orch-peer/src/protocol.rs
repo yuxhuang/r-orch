@@ -21,6 +21,36 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").into()
 }
 
+/// Caps for the peer-supplied strings this release added. Each one reaches a
+/// log line, `state.json` or an operator's terminal, and a frame may be a
+/// megabyte, so every one is bounded and stripped of control characters at
+/// ingest rather than at display.
+pub const MAX_REASON_BYTES: usize = 512;
+pub const MAX_TASK_ID_BYTES: usize = 64;
+pub const MAX_VERSION_BYTES: usize = 32;
+/// The longest instance id this peer will admit. A peer id is a UUID; the
+/// cap exists because the id becomes a map key, a task label and a filename
+/// component in `remotes/`.
+pub const MAX_INSTANCE_ID_BYTES: usize = 128;
+
+/// Bound and sanitize a peer-supplied display string.
+pub fn text(value: Option<String>, max_bytes: usize) -> Option<String> {
+    value
+        .map(|value| orch_infra::storage::remote::metadata_text(&value, max_bytes))
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether a peer's instance id is one this release will talk to. Identity
+/// ends up in a label (`remote-ctl:<id>`), in `_controllers.json` and in
+/// operator output, so it is an allowlist rather than a length check.
+pub fn valid_instance_id(instance_id: &str) -> bool {
+    !instance_id.is_empty()
+        && instance_id.len() <= MAX_INSTANCE_ID_BYTES
+        && instance_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncItem {
     pub exec_key: String,

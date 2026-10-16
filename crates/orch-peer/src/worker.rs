@@ -66,6 +66,11 @@ const CANCEL_RETRY_MAX: Duration = Duration::from_secs(60);
 const CANCEL_REWARN_EVERY: Duration = Duration::from_secs(3_600);
 /// Deferred cancels are peer-driven, so the map is bounded.
 const MAX_UNAPPLIED_CANCELS: usize = 1024;
+/// A controller's display name, which reaches logs and `remote status`.
+const MAX_CONTROLLER_NAME_BYTES: usize = 64;
+/// How many controllers `_controllers.json` remembers. Peer-chosen keys, so
+/// the map is bounded; the least recently seen makes way.
+const MAX_REMEMBERED_CONTROLLERS: usize = 256;
 
 #[derive(Default)]
 struct EventRing {
@@ -282,6 +287,7 @@ impl Worker {
         let path = self.controllers_path();
         let mut seen: BTreeMap<String, String> = read_json(&path).await?.unwrap_or_default();
         seen.insert(instance_id.into(), self.ctx.engine.clock.now_iso());
+        evict_oldest_controllers(&mut seen, instance_id);
         write_json_with_mode(&path, &seen, owner_only()).await
     }
 
@@ -334,6 +340,9 @@ impl Worker {
         }
         // A controller with no mirrors left needs no record either.
         seen.retain(|instance_id, _| known.contains(instance_id));
+        if let Some(current) = &current {
+            evict_oldest_controllers(&mut seen, current);
+        }
         write_json_with_mode(&path, &seen, owner_only()).await?;
 
         let mut cancelled = 0;
@@ -485,9 +494,12 @@ impl Worker {
             .await?;
             return Ok(());
         };
+        // Identity is peer input that becomes a task label, a key in
+        // `_controllers.json` and operator output, so it is an allowlist.
         if proto != PROTOCOL
-            || instance_id.is_empty()
+            || !crate::protocol::valid_instance_id(&instance_id)
             || name.is_empty()
+            || name.len() > MAX_CONTROLLER_NAME_BYTES
             || name.contains('@')
             || validate_snapshot(&agents).is_err()
         {
@@ -536,7 +548,10 @@ impl Worker {
                     instance_id: instance_id.clone(),
                     connected_since: self.ctx.engine.clock.now_iso(),
                     agents,
-                    controller_version: version,
+                    controller_version: crate::protocol::text(
+                        version,
+                        crate::protocol::MAX_VERSION_BYTES,
+                    ),
                 })
                 .await?;
             self.listener_status(addr, Some(&name)).await?;
@@ -1391,6 +1406,23 @@ impl RunEventTap for Worker {
                 event: event.clone(),
             },
         ));
+    }
+}
+
+/// Keep the map of remembered controllers bounded, dropping the ones seen
+/// longest ago. `keep` is never evicted: it is the controller connected now.
+fn evict_oldest_controllers(seen: &mut BTreeMap<String, String>, keep: &str) {
+    while seen.len() > MAX_REMEMBERED_CONTROLLERS {
+        let Some(oldest) = seen
+            .iter()
+            .filter(|(instance_id, _)| instance_id.as_str() != keep)
+            .min_by(|left, right| left.1.cmp(right.1))
+            .map(|(instance_id, _)| instance_id.clone())
+        else {
+            return;
+        };
+        tracing::warn!(instance_id = %oldest, "Forgetting the least recently seen controller");
+        seen.remove(&oldest);
     }
 }
 

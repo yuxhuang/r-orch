@@ -511,6 +511,68 @@ async fn an_unreadable_mirror_is_reported_unknown_and_keeps_the_session() {
     assert_eq!((item.state.as_str(), item.reason.as_deref()), ("queued", None));
 }
 
+/// A controller's instance id becomes a task label, a key in
+/// `_controllers.json` and operator output. It is an allowlist at admission,
+/// and the map it keys is bounded, because both are peer-chosen.
+#[tokio::test]
+async fn a_hostile_controller_identity_is_refused_and_the_map_is_bounded() {
+    let listener = TestListener::start().await;
+    for hostile in [
+        String::new(),
+        "x".repeat(129),
+        "../../etc/passwd".into(),
+        "id with spaces".into(),
+        "\u{1b}]0;pwned\u{7}".into(),
+    ] {
+        let mut socket = TcpStream::connect(listener.addr).await.unwrap();
+        write_frame(
+            &mut socket,
+            &Frame::Hello {
+                proto: PROTOCOL,
+                instance_id: hostile.clone(),
+                name: "controller".into(),
+                os: "test".into(),
+                agents: vec![],
+                version: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut read = BufReader::new(socket);
+        assert!(
+            matches!(socket_next(&mut read).await, Some(Frame::Error { .. })),
+            "admitted {hostile:?}"
+        );
+        socket_closed(&mut read).await;
+    }
+    // A long-lived listener must not accumulate one record per identity.
+    let mut seen = std::collections::BTreeMap::new();
+    for index in 0..300 {
+        seen.insert(
+            format!("ctl-{index:04}"),
+            format!("2026-10-16T00:{:02}:{:02}Z", index / 60, index % 60),
+        );
+    }
+    orch_infra::storage::fs_utils::write_json(&listener.worker.controllers_path(), &seen)
+        .await
+        .unwrap();
+    listener.worker.record_controller("newcomer").await.unwrap();
+    let stored: std::collections::BTreeMap<String, String> =
+        orch_infra::storage::fs_utils::read_json(&listener.worker.controllers_path())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(stored.len(), 256);
+    assert!(stored.contains_key("newcomer"), "the current controller stays");
+    assert!(
+        !stored.contains_key("ctl-0000"),
+        "the least recently seen made way"
+    );
+    assert!(stored.contains_key("ctl-0299"));
+    // And a valid id is still admitted.
+    listener.healthy().await;
+}
+
 /// A mirror only runs for the controller currently connected, so one left by
 /// a controller that never comes back would sit `todo` in a local agent's
 /// queue for ever. After a day it is cancelled, and the task says why.
