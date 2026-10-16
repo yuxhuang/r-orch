@@ -169,15 +169,12 @@ impl Context {
     pub async fn msg_ack(&self, peer: &str, id: &str, reason: Option<&str>) -> Result<()> {
         let result = async {
             if let Some(reason) = reason {
-                let mut end = reason.len().min(256);
-                while !reason.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let reason = orch_infra::storage::remote::metadata_text(reason, 256);
                 orch_infra::storage::message::FileMessageStore::new(
                     self.engine.paths.clone(),
                     self.engine.clock.clone(),
                 )
-                .reject_remote_message(id, peer, &reason[..end])
+                .reject_remote_message(id, peer, &reason)
                 .await?;
             } else if let Some(message) = self.engine.messages.get(id).await?
                 && message

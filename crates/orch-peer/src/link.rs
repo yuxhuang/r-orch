@@ -789,10 +789,11 @@ async fn session(
         Some(Frame::Busy { controller }) => {
             health.busy = true;
             return Err(Error::other(format!(
-                "Worker busy: controlled by {controller}"
+                "Worker busy: controlled by {}",
+                peer_text(&controller)
             )));
         }
-        Some(Frame::Error { msg }) => return Err(Error::other(msg)),
+        Some(Frame::Error { msg }) => return Err(Error::other(peer_text(&msg))),
         _ => return Err(Error::other("Expected peer welcome")),
     }
     // Must be the first post-handshake frame. It also cancels orphan mirrors
@@ -996,7 +997,7 @@ async fn handle_frame(
                 &config.alias,
                 &exec_key,
                 RemoteRunEvent::Finished(RemoteOutcome::Failed {
-                    error: format!("Remote rejected submit: {reason}"),
+                    error: format!("Remote rejected submit: {}", peer_text(&reason)),
                     error_kind: None,
                 }),
             );
@@ -1042,7 +1043,7 @@ async fn handle_frame(
             worker_task_id,
         } => hub.phase_submitted(&config.alias, &exec_key, worker_task_id),
         Frame::Gap { .. } => {}
-        Frame::Error { msg } => return Err(Error::other(msg)),
+        Frame::Error { msg } => return Err(Error::other(peer_text(&msg))),
         _ => return Err(Error::other("Unexpected worker frame")),
     }
     Ok(())
@@ -1067,6 +1068,12 @@ fn log_reason(config: &RemoteConfig, exec_key: &str, state: &str, reason: Option
 
 fn net_error(error: std::io::Error) -> Error {
     Error::other(format!("Peer connection: {error}"))
+}
+
+/// A worker's free-form error text ends up in `last_error`, a task's error and
+/// operator output, so it gets the same bound as every other peer string.
+fn peer_text(text: &str) -> String {
+    metadata_text(text, MAX_REASON_BYTES)
 }
 
 #[cfg(test)]
@@ -1594,6 +1601,14 @@ mod tests {
                 .len(),
             MAX_VERSION_BYTES
         );
+        // So is the free text of Error, Busy and Rejected, which reaches
+        // `last_error` and a task's error rather than a phase.
+        let error = peer_text(&format!(
+            "\u{1b}]0;pwned\u{7}\nboom {}",
+            "x".repeat(1 << 20)
+        ));
+        assert!(error.starts_with("]0;pwnedboom "), "{error:?}");
+        assert!(error.len() <= MAX_REASON_BYTES, "{}", error.len());
     }
 
     #[tokio::test]
