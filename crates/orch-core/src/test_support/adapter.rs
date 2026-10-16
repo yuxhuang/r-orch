@@ -214,6 +214,7 @@ mod tests {
             system_prompt: Some("you are a shell".into()),
             workspace: PathBuf::from("/tmp/ws"),
             env: BTreeMap::from([("ORCH_TASK_ID".to_owned(), "tsk_test1".to_owned())]),
+            inherit_env: Default::default(),
             config: AgentConfig::default(),
             cancel: CancellationToken::new(),
         }

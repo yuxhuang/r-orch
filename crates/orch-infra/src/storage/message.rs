@@ -10,6 +10,7 @@
 //! `write_yaml` either way.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use orch_core::clock::Clock;
@@ -23,6 +24,8 @@ use super::paths::Paths;
 
 /// A delivered message is purged once it is older than this.
 const DELIVERED_RETENTION_MS: i64 = 3_600_000;
+
+const MUTATION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct FileMessageStore {
     paths: Paths,
@@ -48,11 +51,148 @@ impl FileMessageStore {
         }
     }
 
+    /// A peer acknowledged transport receipt but rejected this message. Keep
+    /// the existing terminal status and expose the rejection through `msg list`.
+    pub async fn reject_remote_message(
+        &self,
+        id: &str,
+        peer_alias: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let id = id.to_owned();
+        let peer_alias = peer_alias.to_owned();
+        let mut end = reason.len().min(256);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        let reason = reason[..end].to_owned();
+        self.transaction(move |store| async move {
+            let Some(mut message) = store.get(&id).await? else {
+                return Ok(());
+            };
+            if !message
+                .to_agent_id
+                .as_deref()
+                .and_then(|to| to.rsplit_once('@'))
+                .is_some_and(|(_, alias)| alias == peer_alias)
+            {
+                tracing::debug!(%id, %peer_alias, "Ignore message rejection from a different peer");
+                return Ok(());
+            }
+            if message.status == MessageStatus::Delivered
+                && message
+                    .body
+                    .starts_with(&format!("[rejected by {peer_alias}: "))
+            {
+                // A prior entity write may have succeeded before its index
+                // update failed. A repeated ack must repair that stale outbox.
+                if store
+                    .index
+                    .read_index()
+                    .await?
+                    .iter()
+                    .any(|item| item == &message)
+                {
+                    return Ok(());
+                }
+                return store
+                    .index
+                    .update_index(move |items| replace_at_end(items, message, |m| &m.id))
+                    .await;
+            }
+            message.status = MessageStatus::Delivered;
+            message.delivered_at = Some(store.clock.now_iso());
+            if !message.subject.starts_with("[rejected] ") {
+                message.subject.insert_str(0, "[rejected] ");
+            }
+            if !message
+                .body
+                .starts_with(&format!("[rejected by {peer_alias}: "))
+            {
+                message.body = format!("[rejected by {peer_alias}: {reason}]\n\n{}", message.body);
+            }
+            write_json(&store.paths.message_path(&id)?, &message).await?;
+            store
+                .index
+                .update_index(move |items| replace_at_end(items, message, |m| &m.id))
+                .await
+        })
+        .await
+    }
+
     fn is_expired(&self, message: &Message) -> bool {
         let Some(expires_at) = &message.expires_at else {
             return false;
         };
         expires_at.as_str() < self.clock.now_iso().as_str()
+    }
+
+    /// Serialize the complete file/index operation across CLI processes and
+    /// store instances. The stable lock inode is never removed. A detached
+    /// transaction finishes even if its caller (e.g. the expiry task) is aborted
+    /// between writing an entity and updating its index.
+    async fn transaction<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+    {
+        let store = Self::new(self.paths.clone(), self.clock.clone());
+        // Waiting is cancellable; only an acquired transaction is detached.
+        // Never put a blocking lock acquisition in Tokio's blocking pool: it
+        // cannot be aborted and runtime shutdown would wait for it forever.
+        ensure_dir(&store.paths.messages_dir()).await?;
+        let path = store.paths.messages_dir().join(".mutation.lock");
+        let guard = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .await
+            .map_err(|e| Error::io("Open message mutation lock", &path, e))?
+            .into_std()
+            .await;
+        let deadline = tokio::time::Instant::now() + MUTATION_LOCK_TIMEOUT;
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            match guard.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(Error::io("Lock message mutations", &path, err));
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(Error::io(
+                    format!(
+                        "Timed out after {} ms waiting for message mutation lock {}; retry the operation",
+                        MUTATION_LOCK_TIMEOUT.as_millis(),
+                        path.display()
+                    ),
+                    &path,
+                    std::io::Error::from(std::io::ErrorKind::TimedOut),
+                ));
+            }
+            tokio::time::sleep_until(deadline.min(now + backoff)).await;
+            backoff = (backoff * 2).min(Duration::from_millis(5));
+        }
+        // No await between acquiring the lock and transferring it to the
+        // owned task: caller cancellation cannot tear a file/index update.
+        tokio::spawn(async move {
+            let result = operation(store).await;
+            drop(guard);
+            result
+        })
+        .await
+        .map_err(|e| Error::other(format!("Message transaction: {e}")))?
+    }
+
+    async fn list_unlocked(&self) -> Result<Vec<Message>> {
+        let mut messages = self.index.read_index().await?;
+        messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(messages)
     }
 
     async fn remove_file(&self, id: &str) -> Result<()> {
@@ -68,12 +208,15 @@ impl FileMessageStore {
 #[async_trait]
 impl MessageStore for FileMessageStore {
     async fn save(&self, message: &Message) -> Result<()> {
-        ensure_dir(&self.paths.messages_dir()).await?;
-        write_json(&self.paths.message_path(&message.id)?, message).await?;
         let message = message.clone();
-        self.index
-            .update_index(move |items| replace_at_end(items, message, |m| &m.id))
-            .await
+        self.transaction(move |store| async move {
+            write_json(&store.paths.message_path(&message.id)?, &message).await?;
+            store
+                .index
+                .update_index(move |items| replace_at_end(items, message, |m| &m.id))
+                .await
+        })
+        .await
     }
 
     async fn get(&self, id: &str) -> Result<Option<Message>> {
@@ -82,9 +225,9 @@ impl MessageStore for FileMessageStore {
 
     /// Sorted by `created_at` ascending.
     async fn list(&self) -> Result<Vec<Message>> {
-        let mut messages = self.index.read_index().await?;
-        messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        Ok(messages)
+        // Even a read can rebuild the index, so it takes the writer lock too.
+        self.transaction(|store| async move { store.list_unlocked().await })
+            .await
     }
 
     /// Pending, unexpired, addressed to exactly this agent — so a broadcast
@@ -103,64 +246,78 @@ impl MessageStore for FileMessageStore {
     }
 
     async fn mark_delivered(&self, id: &str) -> Result<()> {
-        // A missing id is a no-op, not an error.
-        let Some(mut message) = self.get(id).await? else {
-            return Ok(());
-        };
-        message.status = MessageStatus::Delivered;
-        message.delivered_at = Some(self.clock.now_iso());
+        let id = id.to_owned();
+        self.transaction(move |store| async move {
+            // A missing id is a no-op, not an error.
+            let Some(mut message) = store.get(&id).await? else {
+                return Ok(());
+            };
+            message.status = MessageStatus::Delivered;
+            message.delivered_at = Some(store.clock.now_iso());
 
-        write_json(&self.paths.message_path(id)?, &message).await?;
-        self.index
-            .update_index(move |items| replace_at_end(items, message, |m| &m.id))
-            .await
+            write_json(&store.paths.message_path(&id)?, &message).await?;
+            store
+                .index
+                .update_index(move |items| replace_at_end(items, message, |m| &m.id))
+                .await
+        })
+        .await
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
-        self.remove_file(id).await?;
         let id = id.to_owned();
-        self.index
-            .update_index(move |items| items.into_iter().filter(|m| m.id != id).collect())
-            .await
+        self.transaction(move |store| async move {
+            store.remove_file(&id).await?;
+            store
+                .index
+                .update_index(move |items| items.into_iter().filter(|m| m.id != id).collect())
+                .await
+        })
+        .await
     }
 
     /// Delete every message that has expired **or** was delivered more than an
     /// hour ago, in one index rewrite. Returns how many went.
     async fn purge_expired(&self) -> Result<usize> {
-        let now = self.clock.now_ms();
-        let doomed: Vec<Message> = self
-            .list()
-            .await?
-            .into_iter()
-            .filter(|m| {
-                let expired = self.is_expired(m);
-                let stale_delivery = m
-                    .delivered_at
-                    .as_deref()
-                    .and_then(parse_epoch_ms)
-                    .is_some_and(|at| now - at > DELIVERED_RETENTION_MS);
-                expired || stale_delivery
-            })
-            .collect();
+        self.transaction(|store| async move {
+            let now = store.clock.now_ms();
+            let doomed: Vec<Message> = store
+                .list_unlocked()
+                .await?
+                .into_iter()
+                .filter(|m| {
+                    let expired = store.is_expired(m);
+                    let stale_delivery = m
+                        .delivered_at
+                        .as_deref()
+                        .and_then(parse_epoch_ms)
+                        .is_some_and(|at| now - at > DELIVERED_RETENTION_MS);
+                    expired || stale_delivery
+                })
+                .collect();
 
-        if doomed.is_empty() {
-            return Ok(0);
-        }
+            if doomed.is_empty() {
+                return Ok(0);
+            }
 
-        for message in &doomed {
-            self.remove_file(&message.id).await?;
-        }
-        let gone: std::collections::HashSet<String> = doomed.iter().map(|m| m.id.clone()).collect();
-        self.index
-            .update_index(move |items| {
-                items
-                    .into_iter()
-                    .filter(|m| !gone.contains(&m.id))
-                    .collect()
-            })
-            .await?;
+            for message in &doomed {
+                store.remove_file(&message.id).await?;
+            }
+            let gone: std::collections::HashSet<String> =
+                doomed.iter().map(|m| m.id.clone()).collect();
+            store
+                .index
+                .update_index(move |items| {
+                    items
+                        .into_iter()
+                        .filter(|m| !gone.contains(&m.id))
+                        .collect()
+                })
+                .await?;
 
-        Ok(doomed.len())
+            Ok(doomed.len())
+        })
+        .await
     }
 }
 
@@ -230,6 +387,101 @@ mod tests {
 
     fn ids(messages: &[Message]) -> Vec<&str> {
         messages.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn rejecting_remote_message_annotates_once_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let msg = message("msg_reject", Some("agt_one@peer"), "now");
+        store.save(&msg).await.unwrap();
+        store
+            .reject_remote_message(&msg.id, "peer", &"é".repeat(300))
+            .await
+            .unwrap();
+        let first = store.get(&msg.id).await.unwrap().unwrap();
+        assert_eq!(first.status, MessageStatus::Delivered);
+        assert_eq!(first.subject, "[rejected] Hi");
+        assert_eq!(
+            first.body,
+            format!("[rejected by peer: {}]\n\nhello there", "é".repeat(128))
+        );
+        store
+            .reject_remote_message(&msg.id, "peer", "second reason")
+            .await
+            .unwrap();
+        assert_eq!(store.get(&msg.id).await.unwrap().unwrap(), first);
+        assert_eq!(store.list().await.unwrap(), vec![first]);
+    }
+
+    #[tokio::test]
+    async fn rejecting_remote_message_retry_repairs_a_stale_pending_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let msg = message("msg_repair", Some("agt_one@peer"), "now");
+        store.save(&msg).await.unwrap();
+        store
+            .reject_remote_message(&msg.id, "peer", "unknown recipient")
+            .await
+            .unwrap();
+        let rejected = store.get(&msg.id).await.unwrap().unwrap();
+        // Model the entity write succeeding but the index write failing.
+        write_json(&store.index.index_path(), &vec![msg.clone()])
+            .await
+            .unwrap();
+        store
+            .reject_remote_message(&msg.id, "peer", "unknown recipient")
+            .await
+            .unwrap();
+        assert_eq!(store.get(&msg.id).await.unwrap().unwrap(), rejected);
+        assert_eq!(store.list().await.unwrap(), vec![rejected]);
+    }
+
+    #[tokio::test]
+    async fn rejecting_remote_message_never_resurrects_a_missing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        store
+            .reject_remote_message("msg_absent", "peer", "unknown recipient")
+            .await
+            .unwrap();
+        assert!(store.get("msg_absent").await.unwrap().is_none());
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejecting_remote_message_from_wrong_alias_leaves_record_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let msg = message("msg_wrong_alias", Some("agt_one@peer"), "now");
+        store.save(&msg).await.unwrap();
+        store
+            .reject_remote_message(&msg.id, "other", "unknown recipient")
+            .await
+            .unwrap();
+        assert_eq!(store.get(&msg.id).await.unwrap().unwrap(), msg);
+    }
+
+    #[tokio::test]
+    async fn rejecting_remote_message_lock_timeout_writes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let msg = message("msg_locked", Some("agt_one@peer"), "now");
+        store.save(&msg).await.unwrap();
+        let lock = hold_mutation_lock(&store);
+        let error = tokio::time::timeout(
+            Duration::from_secs(7),
+            store.reject_remote_message(&msg.id, "peer", "unknown recipient"),
+        )
+        .await
+        .expect("bounded rejection lock wait")
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert_eq!(store.get(&msg.id).await.unwrap().unwrap(), msg);
+        drop(lock);
+        assert_eq!(store.list().await.unwrap(), vec![msg]);
     }
 
     #[tokio::test]
@@ -412,6 +664,247 @@ mod tests {
         }
         // Idempotent.
         assert_eq!(store.purge_expired().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_stores_preserve_valid_messages_during_expiry_and_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, clock) = store(temp.path());
+        for n in 0..16 {
+            store
+                .save(&message(&format!("msg_ack{n}"), Some("cli@offline"), "t"))
+                .await
+                .unwrap();
+            store
+                .save(&Message {
+                    expires_at: Some(orch_core::clock::iso_from_epoch_ms(clock.now_ms() - 1)),
+                    ..message(&format!("msg_expired{n}"), Some("cli@removed"), "t")
+                })
+                .await
+                .unwrap();
+        }
+        let mut tasks = Vec::new();
+        for n in 0..32 {
+            let other = FileMessageStore::new(store.paths.clone(), clock.clone());
+            tasks.push(tokio::spawn(async move {
+                other
+                    .save(&message(&format!("msg_new{n}"), Some("cli@offline"), "t"))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for n in 0..16 {
+            let other = FileMessageStore::new(store.paths.clone(), clock.clone());
+            tasks.push(tokio::spawn(async move {
+                other.mark_delivered(&format!("msg_ack{n}")).await.unwrap();
+                other.purge_expired().await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let messages = store.list().await.unwrap();
+        assert_eq!(messages.len(), 48);
+        for m in messages {
+            assert_eq!(store.get(&m.id).await.unwrap().as_ref(), Some(&m));
+            if m.id.starts_with("msg_ack") {
+                assert_eq!(m.status, MessageStatus::Delivered);
+            }
+        }
+        for n in 0..16 {
+            assert!(
+                store
+                    .get(&format!("msg_expired{n}"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_caller_does_not_interrupt_its_file_index_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let other = FileMessageStore::new(store.paths.clone(), store.clock.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            other
+                .transaction(move |store| async move {
+                    let msg = message("msg_inflight", Some("cli@offline"), "t");
+                    write_json(&store.paths.message_path(&msg.id)?, &msg).await?;
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    store
+                        .index
+                        .update_index(move |items| replace_at_end(items, msg, |m| &m.id))
+                        .await?;
+                    done_tx.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        assert_eq!(ids(&store.list().await.unwrap()), vec!["msg_inflight"]);
+    }
+
+    fn hold_mutation_lock(store: &FileMessageStore) -> std::fs::File {
+        std::fs::create_dir_all(store.paths.messages_dir()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.paths.messages_dir().join(".mutation.lock"))
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn contended_mutation_times_out_without_writing_and_can_be_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let msg = message("msg_retry", Some("cli@offline"), "t");
+        let err = tokio::time::timeout(Duration::from_secs(7), store.save(&msg))
+            .await
+            .expect("mutation lock wait must be bounded")
+            .unwrap_err();
+        assert!(err.to_string().contains("Timed out after 5000 ms"));
+        assert!(err.to_string().contains("retry the operation"));
+        assert_eq!(
+            err.path(),
+            Some(store.paths.messages_dir().join(".mutation.lock").as_path())
+        );
+        assert!(
+            matches!(err, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(store.get(&msg.id).await.unwrap().is_none());
+        drop(lock);
+        store.save(&msg).await.unwrap();
+        assert_eq!(store.list().await.unwrap(), vec![msg]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_lock_waiter_discards_its_unstarted_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut waiting = Box::pin(store.transaction(move |_| async move {
+            let _ = started_tx.send(());
+            Ok(())
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(waiting);
+        // The closure must be dropped with the waiter, before unlocking.
+        // Otherwise an aborted request could mutate storage much later.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx)
+                .await
+                .expect("cancelled waiter retained its operation")
+                .is_err()
+        );
+        drop(lock);
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contended_shutdown_child() {
+        let Some(root) = std::env::var_os("ORCH_MESSAGE_LOCK_TEST_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            let (store, _) = store(&root);
+            let mut caller = tokio::spawn(async move { store.purge_expired().await });
+            tokio::select! {
+                result = &mut caller => panic!("contended mutation finished before shutdown: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            std::fs::write(root.join("ready"), "waiting").unwrap();
+            terminate.recv().await;
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        });
+        // Exercise real runtime drop, which waits for non-abortable blocking
+        // tasks. The parent keeps the external lock until after child exit.
+        drop(runtime);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_shutdown_exits_while_another_process_keeps_the_lock() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::message::tests::contended_shutdown_child",
+                    "--nocapture",
+                ])
+                .env("ORCH_MESSAGE_LOCK_TEST_ROOT", temp.path())
+                .env("HOME", temp.path())
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !temp.path().join("ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "child exited before becoming ready"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child readiness deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.0.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "child shutdown failed: {status}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown waited for external mutation lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(lock);
     }
 
     #[tokio::test]

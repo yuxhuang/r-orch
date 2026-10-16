@@ -102,14 +102,41 @@ impl Orchestrator {
         .await;
 
         for (index, (task_id, entry)) in entries.iter().enumerate() {
-            let live = tasks
+            let task = tasks
                 .get(index)
                 .and_then(|result| result.as_ref().ok())
-                .and_then(Option::as_ref)
-                .is_some_and(|task| !is_terminal(task.status));
+                .and_then(Option::as_ref);
+            // Consult durable run evidence before terminal/task-read cleanup.
+            if self.worker_signal_unverified(entry).await {
+                let result = async {
+                    if let Some(task) = task {
+                        let run = self.deps().run_store.get(&entry.run_id).await?;
+                        self.quarantine_worker_mirror(state, task, run.as_ref())
+                            .await
+                    } else {
+                        self.update_worker_reservation(
+                            state,
+                            task_id,
+                            Some(&entry.run_id),
+                            Some(&entry.agent_id),
+                            self.deps().processes.is_alive(entry.pid),
+                        )
+                        .await
+                    }
+                }
+                .await;
+                if let Err(err) = result {
+                    self.emit_error(err, format!("reconcile worker mirror {task_id}"));
+                }
+                continue;
+            }
+            let live = task.is_some_and(|task| !is_terminal(task.status));
 
-            // 1. The task is gone or already terminal: the running entry is
-            // stale bookkeeping, nothing more.
+            // 1. The task is gone or already terminal (deleted, or made
+            // terminal outside this run, e.g. `orch task cancel` or a remote
+            // cancel): the run is cancelled and the entry dropped. Taking the
+            // token cancels a local collector, whose adapter kills the child;
+            // a remote run also gets a cancel sent to its worker.
             if !live {
                 if let Some(remote) = &entry.remote {
                     self.cancel_remote(remote).await;
@@ -298,7 +325,7 @@ impl Orchestrator {
     /// Tasks stuck in `in_progress` with no running entry. Force-written when
     /// the transition is rejected — this is one of the recovery paths that
     /// deliberately bypasses the state machine (PARITY.md §7.1).
-    async fn reconcile_orphaned_tasks(&self, state: &OrchestratorState) -> Result<()> {
+    async fn reconcile_orphaned_tasks(&self, state: &mut OrchestratorState) -> Result<()> {
         let tasks = self.inner.cached_tasks.list(&Default::default()).await?;
         let orphaned: Vec<orch_domain::Task> = tasks
             .into_iter()
@@ -310,7 +337,27 @@ impl Orchestrator {
             return Ok(());
         }
 
-        futures::future::join_all(orphaned.into_iter().map(|mut task| async move {
+        let mut local = Vec::new();
+        for task in orphaned {
+            if task
+                .labels
+                .iter()
+                .any(|label| label.starts_with("remote-ctl:"))
+            {
+                let result = async {
+                    let runs = self.deps().run_store.list_for_task(&task.id).await?;
+                    let run = runs.iter().max_by_key(|run| run.attempt);
+                    self.quarantine_worker_mirror(state, &task, run).await
+                }
+                .await;
+                if let Err(err) = result {
+                    self.emit_error(err, format!("reconcile orphaned mirror {}", task.id));
+                }
+            } else {
+                local.push(task);
+            }
+        }
+        futures::future::join_all(local.into_iter().map(|mut task| async move {
             if self
                 .deps()
                 .task_service

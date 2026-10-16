@@ -26,3 +26,4 @@ mod retry_race;
 mod skills;
 
 mod remote;
+mod watch_restart;

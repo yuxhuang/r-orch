@@ -168,6 +168,7 @@ impl Adapter for AntigravityAdapter {
                 cwd: params.workspace,
                 env: params.env,
                 stdin: StdioMode::Ignore,
+                inherit_env: params.inherit_env,
             },
             StderrPolicy::Discard,
             &params.cancel,

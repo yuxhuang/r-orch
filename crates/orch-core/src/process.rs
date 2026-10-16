@@ -3,6 +3,7 @@
 //! `readLines` implementation and POSIX details belong to `orch-infra`).
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -53,12 +54,112 @@ pub enum StdioMode {
     Pipe,
 }
 
+/// Which part of the orch process's own environment a child inherits.
+///
+/// Local runs inherit everything (PARITY.md §8.3). Work submitted by a remote
+/// peer must not receive the worker user's credentials, so it inherits
+/// [`EnvInheritance::WithoutSecrets`] (security review F2). The explicit
+/// overlay ([`SpawnOptions::env`]: the agent's own `config.env` plus the
+/// `ORCH_*` keys) is applied after filtering and always reaches the child.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EnvInheritance {
+    #[default]
+    Full,
+    /// Drops every inherited variable whose name [`is_secret_env_name`]
+    /// matches, unless the worker owner lists it in
+    /// [`REMOTE_ENV_PASSTHROUGH`].
+    WithoutSecrets,
+}
+
+/// Set on the worker's `orch` process to a comma/whitespace separated list of
+/// exact variable names that remote-submitted runs may still inherit, e.g.
+/// `ORCH_REMOTE_ENV_PASSTHROUGH=ANTHROPIC_API_KEY`. Read at spawn time.
+pub const REMOTE_ENV_PASSTHROUGH: &str = "ORCH_REMOTE_ENV_PASSTHROUGH";
+
+/// Name segments (split on `_`, case-insensitive) that mark a credential.
+const SECRET_SEGMENTS: &[&str] = &[
+    "KEY",
+    "KEYS",
+    "APIKEY",
+    "TOKEN",
+    "TOKENS",
+    "SECRET",
+    "SECRETS",
+    "PASSWORD",
+    "PASSWD",
+    "PASS",
+    "PAT",
+    "AUTH",
+    "OAUTH",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "COOKIE",
+];
+
+/// Substrings that mark a credential even inside a single segment
+/// (`PGPASSWORD`, `GITHUBTOKEN`, `MYSECRET`).
+const SECRET_SUBSTRINGS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "APIKEY",
+    "CREDENTIAL",
+    "PRIVATEKEY",
+];
+
+/// Whether an inherited variable looks like a credential: `*_KEY`, `*_TOKEN`,
+/// `*_SECRET`, `*PASSWORD*`, `SSH_AUTH_SOCK`, `AWS_ACCESS_KEY_ID`, ….
+///
+/// Name-based, so it is a denylist: a secret stored under an innocuous name
+/// (`DATABASE_URL=postgres://u:p@…`) is not caught. `GIT_AUTHOR_*` and
+/// similar are deliberately *not* matched (`AUTHOR` is not the `AUTH`
+/// segment).
+pub fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper
+        .split('_')
+        .any(|segment| SECRET_SEGMENTS.contains(&segment))
+        || SECRET_SUBSTRINGS
+            .iter()
+            .any(|needle| upper.contains(needle))
+}
+
+/// The inherited variables a [`EnvInheritance::WithoutSecrets`] child must
+/// not see: every secret-looking name in `inherited`, minus the exact names
+/// listed in `passthrough` (the value of [`REMOTE_ENV_PASSTHROUGH`]).
+/// A name that is not valid UTF-8 cannot be vetted, so it is dropped too.
+pub fn secret_env_names<I>(inherited: I, passthrough: Option<&OsStr>) -> Vec<OsString>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let allowed: Vec<String> = passthrough
+        .map(|list| {
+            list.to_string_lossy()
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    inherited
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| match name.to_str() {
+            Some(name) => is_secret_env_name(name) && !allowed.iter().any(|a| a == name),
+            None => true,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SpawnOptions {
     pub cwd: PathBuf,
     /// Overlaid on the inherited environment.
     pub env: BTreeMap<String, String>,
     pub stdin: StdioMode,
+    /// Filter applied to the inherited environment before `env` is overlaid.
+    pub inherit_env: EnvInheritance,
 }
 
 /// How a child ended, as reported to node's `close` handler.
@@ -247,6 +348,83 @@ mod tests {
     #[test]
     fn stdin_defaults_to_ignore() {
         assert_eq!(SpawnOptions::default().stdin, StdioMode::Ignore);
+    }
+
+    #[test]
+    fn spawn_inherits_the_full_environment_by_default() {
+        assert_eq!(SpawnOptions::default().inherit_env, EnvInheritance::Full);
+    }
+
+    #[test]
+    fn credential_shaped_names_are_secret() {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENROUTER_API_KEY",
+            "HF_TOKEN",
+            "OMNIROUTE_API_KEY",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GITHUB_PAT",
+            "GH_TOKEN",
+            "PGPASSWORD",
+            "SMTP_PASS",
+            "SSH_AUTH_SOCK",
+            "ORCH_WEB_PASSWORD",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "client_secret",
+        ] {
+            assert!(is_secret_env_name(name), "{name} must be treated as secret");
+        }
+    }
+
+    #[test]
+    fn ordinary_environment_names_are_not_secret() {
+        for name in [
+            "PATH",
+            "HOME",
+            "USER",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "TMPDIR",
+            "PWD",
+            "XDG_CONFIG_HOME",
+            "CARGO_HOME",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_ASKPASS",
+            "ANTHROPIC_BASE_URL",
+            "NO_PROXY",
+            "ORCH_AGENT_ID",
+            "KEYCHAIN_PATH",
+        ] {
+            assert!(!is_secret_env_name(name), "{name} must be inherited");
+        }
+    }
+
+    #[test]
+    fn secret_env_names_honours_exact_passthrough() {
+        let inherited = [
+            ("ANTHROPIC_API_KEY", "a"),
+            ("HF_TOKEN", "b"),
+            ("PATH", "/bin"),
+            ("hf_token", "c"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let removed = secret_env_names(
+            inherited.clone(),
+            Some(OsStr::new("ANTHROPIC_API_KEY, OTHER")),
+        );
+        assert_eq!(
+            removed,
+            vec![OsString::from("HF_TOKEN"), OsString::from("hf_token")]
+        );
+        let removed = secret_env_names(inherited, None);
+        assert_eq!(removed.len(), 3);
     }
 
     #[test]

@@ -116,7 +116,14 @@ async fn show_run_logs(
         return Ok(ExitCode::SUCCESS);
     }
 
-    if events.is_empty() {
+    // The run's terminal error lives on the record, not in its event log:
+    // e.g. a remote cancel the worker never acknowledged before shutdown.
+    let error = deps
+        .runs
+        .get(run_id)
+        .await?
+        .and_then(|run| format_run_error(styles, &run));
+    if events.is_empty() && error.is_none() {
         println!("\n  No events for run {run_id}\n");
         return Ok(ExitCode::SUCCESS);
     }
@@ -124,6 +131,9 @@ async fn show_run_logs(
     println!();
     for event in &events {
         println!("{}", format_event(styles, event));
+    }
+    if let Some(error) = error {
+        println!("{error}");
     }
     println!();
     Ok(ExitCode::SUCCESS)
@@ -164,6 +174,9 @@ async fn show_task_logs(
         for event in last(events, 10) {
             println!("{}", format_event(styles, &event));
         }
+        if let Some(error) = format_run_error(styles, run) {
+            println!("{error}");
+        }
     }
     println!();
     Ok(ExitCode::SUCCESS)
@@ -196,6 +209,9 @@ async fn show_agent_logs(
         println!("\n  Run {} · task {} · {}", run.id, run.task_id, run.status);
         for event in last(events, 5) {
             println!("{}", format_event(styles, &event));
+        }
+        if let Some(error) = format_run_error(styles, run) {
+            println!("{error}");
         }
     }
     println!();
@@ -352,7 +368,7 @@ fn event_agent_id(event: &OrchestratorEvent) -> Option<&str> {
     }
 }
 
-/// The seven rendered event shapes; everything else is silently dropped.
+/// The eight rendered event shapes; everything else is silently dropped.
 pub fn format_live_event(styles: &Styles, event: &OrchestratorEvent, time: &str) -> Option<String> {
     let dim_time = styles.dim(time);
     let action = styles.icon(Icon::AgentAction);
@@ -395,9 +411,43 @@ pub fn format_live_event(styles: &Styles, event: &OrchestratorEvent, time: &str)
             "  {dim_time}  {} STALL  {run_id}",
             styles.icon(Icon::Warning)
         ),
+        OrchestratorEvent::OrchestratorError { error, context, .. } => {
+            format_orchestrator_error(styles, &dim_time, error, context)
+        }
         _ => return None,
     };
     Some(line)
+}
+
+/// `  {time}  ⚠ {context}: {error}`, untruncated: the diagnostic is the
+/// point (e.g. which peer and execution a shutdown could not confirm).
+pub(crate) fn format_orchestrator_error(
+    styles: &Styles,
+    time: &str,
+    error: &str,
+    context: &str,
+) -> String {
+    format!(
+        "  {time}  {} {context}: {error}",
+        styles.icon(Icon::Warning)
+    )
+}
+
+/// A run's persisted terminal error, untruncated, stamped with its finish
+/// time. `None` for a run without one.
+pub fn format_run_error(styles: &Styles, run: &Run) -> Option<String> {
+    let error = run.error.as_deref()?;
+    let icon = if run.status == orch_domain::RunStatus::Failed {
+        Icon::Failed
+    } else {
+        Icon::Warning
+    };
+    let at = run.finished_at.as_deref().unwrap_or(&run.started_at);
+    Some(format!(
+        "  {}  {} {error}",
+        styles.dim(&local_time(at)),
+        styles.icon(icon)
+    ))
 }
 
 /// `  {dim(time)}  {icon} {data.slice(0, 80)}`, with the error icon for an
@@ -799,6 +849,23 @@ mod tests {
     }
 
     #[test]
+    fn a_run_error_is_rendered_untruncated_and_absent_without_one() {
+        let styles = Styles::plain();
+        let mut cancelled = run("run_1", "2020-01-01T00:00:00.000Z", None);
+        assert_eq!(format_run_error(&styles, &cancelled), None);
+
+        let diagnostic = format!("Remote cancel outcome unknown: {}", "x".repeat(200));
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.error = Some(diagnostic.clone());
+        let line = format_run_error(&styles, &cancelled).expect("error line");
+        assert!(line.ends_with(&format!("⚠ {diagnostic}")), "{line}");
+
+        cancelled.status = RunStatus::Failed;
+        let line = format_run_error(&styles, &cancelled).expect("error line");
+        assert!(line.ends_with(&format!("✕ {diagnostic}")), "{line}");
+    }
+
+    #[test]
     fn the_live_renderer_covers_the_documented_shapes_and_drops_the_rest() {
         let styles = Styles::plain();
         let time = "12:03:45";
@@ -865,6 +932,14 @@ mod tests {
                     run_id: "run_1".into(),
                 },
                 "  12:03:45  ⚠ STALL  run_1",
+            ),
+            (
+                OrchestratorEvent::OrchestratorError {
+                    error: "Remote cancel outcome unknown".into(),
+                    context: "stop: cancel remote w1:run_1".into(),
+                    fatal: false,
+                },
+                "  12:03:45  ⚠ stop: cancel remote w1:run_1: Remote cancel outcome unknown",
             ),
         ];
 

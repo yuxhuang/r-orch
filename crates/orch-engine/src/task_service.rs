@@ -13,8 +13,8 @@ use orch_core::error::{Error, Result};
 use orch_core::ids::IdGenerator;
 use orch_core::storage::{AgentStore, TaskFilter, TaskStore};
 use orch_domain::{
-    CreateTaskInput, DomainError, OrchestratorConfig, OrchestratorEvent, Task, TaskStatus,
-    can_transition, is_terminal,
+    AWAITING_APPROVAL_LABEL, CreateTaskInput, DomainError, OrchestratorConfig, OrchestratorEvent,
+    Task, TaskStatus, can_transition, is_terminal,
 };
 use orch_infra::storage::{Paths, fs_utils};
 
@@ -197,6 +197,20 @@ impl TaskService {
         });
 
         Ok(task)
+    }
+
+    /// `orch task approve`. A `todo` task held by [`AWAITING_APPROVAL_LABEL`]
+    /// is released for dispatch (the hold is the only change); anything else
+    /// takes the ordinary `review → done` transition.
+    pub async fn approve(&self, id: &str) -> Result<Task> {
+        let mut task = self.get(id).await?;
+        if task.status == TaskStatus::Todo && task.awaits_approval() {
+            task.labels.retain(|label| label != AWAITING_APPROVAL_LABEL);
+            task.updated_at = self.clock.now_iso();
+            self.tasks.save(&task).await?;
+            return Ok(task);
+        }
+        self.update_status(id, TaskStatus::Done).await
     }
 
     /// Assign a task. `agent_id` may be an id or an exact agent name; the
@@ -944,6 +958,61 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
         // Nothing was written.
         assert_eq!(h.tasks.peek("tsk_test1").unwrap().status, TaskStatus::Todo);
+    }
+
+    // ── approve ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn approve_releases_a_held_todo_task_without_changing_its_status() {
+        let h = seeded(vec![Task {
+            labels: vec!["exec:key".into(), AWAITING_APPROVAL_LABEL.into()],
+            ..make_task()
+        }]);
+        let mut sub = h.bus.subscribe();
+        let task = h.service.approve("tsk_test1").await.unwrap();
+        let stored = h.tasks.peek("tsk_test1").unwrap();
+        assert_eq!(
+            (
+                task.status,
+                stored.status,
+                stored.labels,
+                sub.try_drain().len()
+            ),
+            (
+                TaskStatus::Todo,
+                TaskStatus::Todo,
+                vec!["exec:key".to_owned()],
+                0
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_moves_a_reviewed_task_to_done() {
+        let h = seeded(vec![task_with("tsk_1", TaskStatus::Review)]);
+        h.service.approve("tsk_1").await.unwrap();
+        assert_eq!(h.tasks.peek("tsk_1").unwrap().status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn approve_still_refuses_an_unheld_todo_task() {
+        let h = seeded(vec![make_task()]);
+        let err = h.service.approve("tsk_test1").await.expect_err("rejected");
+        assert_eq!(
+            err.to_string(),
+            "Invalid transition for tsk_test1: todo → done"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_does_not_release_a_cancelled_held_task() {
+        let h = seeded(vec![Task {
+            status: TaskStatus::Cancelled,
+            labels: vec![AWAITING_APPROVAL_LABEL.into()],
+            ..make_task()
+        }]);
+        assert!(h.service.approve("tsk_test1").await.is_err());
+        assert!(h.tasks.peek("tsk_test1").unwrap().awaits_approval());
     }
 
     // ── assign ───────────────────────────────────────────────────────────

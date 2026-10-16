@@ -116,6 +116,7 @@ mod tests {
                 system_prompt: None,
                 workspace: std::path::PathBuf::from("."),
                 env: Default::default(),
+                inherit_env: Default::default(),
                 config: orch_domain::AgentConfig {
                     command: Some("echo hello".to_owned()),
                     ..Default::default()

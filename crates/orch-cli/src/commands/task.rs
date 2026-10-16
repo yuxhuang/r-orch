@@ -453,11 +453,12 @@ pub async fn cancel(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
 }
 
 pub async fn approve(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
-    engine
-        .task_service
-        .update_status(id, TaskStatus::Done)
-        .await?;
-    print_success(styles, &format!("Approved {id}"));
+    let task = engine.task_service.approve(id).await?;
+    if task.status == TaskStatus::Done {
+        print_success(styles, &format!("Approved {id}"));
+    } else {
+        print_success(styles, &format!("Approved {id} → released to run"));
+    }
     Ok(())
 }
 

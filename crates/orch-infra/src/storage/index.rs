@@ -14,13 +14,21 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use orch_core::error::Result;
+use orch_core::error::{Error, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use super::fs_utils::{ensure_dir, list_files, read_json, read_yaml, write_json};
+use super::fs_utils::{atomic_write, ensure_dir, list_files, read_json, read_yaml};
+
+const WRITER_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct IndexWriteGuard {
+    _process: OwnedMutexGuard<()>,
+    _file: std::fs::File,
+}
 
 /// How an index reads one entity file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +46,8 @@ impl ItemFormat {
     }
 }
 
-/// Serializes all index read-modify-write cycles within the process, replacing
-/// the TS promise-chain mutex.
+/// Serializes index mutations within a manager and across processes.
+/// All owner and CLI binaries must take the advisory lock; old binaries do not.
 ///
 /// `tokio::sync::Mutex` rather than `std::sync::Mutex` because the critical
 /// section awaits file I/O — holding it across the await is the point
@@ -93,9 +101,9 @@ where
     /// the one tie-order case that stays unverifiable, reachable only when the
     /// index is missing **and** ≥2 entities exist (PARITY.md §14.4).
     pub async fn rebuild_index(&self) -> Result<Vec<T>> {
+        let guard = self.lock_writer().await?;
         let items = self.scan_items().await?;
-        let _guard = self.mutex.lock().await;
-        self.write_index_unlocked(&items).await?;
+        self.write_index_locked(&items, guard).await?;
         Ok(items)
     }
 
@@ -138,28 +146,110 @@ where
     /// Used by the context store's lazy expiry purge, which deletes a batch of
     /// files and then rewrites the index **once** rather than per entry.
     pub async fn write_index(&self, items: &[T]) -> Result<()> {
-        let _guard = self.mutex.lock().await;
-        self.write_index_unlocked(items).await
+        let guard = self.lock_writer().await?;
+        self.write_index_locked(items, guard).await
     }
 
     /// Apply a mutation to the index and write it back, serialized against
-    /// every other index mutation in this process.
+    /// every other index mutation, including other processes.
     pub async fn update_index(&self, mutate: impl FnOnce(Vec<T>) -> Vec<T> + Send) -> Result<()> {
         // The read must happen under the lock, or two concurrent `task add`
         // calls lose one of the two writes.
-        let _guard = self.mutex.lock().await;
+        let guard = self.lock_writer().await?;
         let current = match read_json::<Vec<T>>(&self.index_path()).await {
             Ok(Some(items)) => items,
             // Rebuild inline — taking the lock again would deadlock.
             _ => self.scan_items().await?,
         };
         let updated = mutate(current);
-        self.write_index_unlocked(&updated).await
+        self.write_index_locked(&updated, guard).await
     }
 
-    async fn write_index_unlocked(&self, items: &[T]) -> Result<()> {
-        ensure_dir(&self.dir).await?;
-        write_json(&self.index_path(), &items).await
+    async fn lock_writer(&self) -> Result<IndexWriteGuard> {
+        let path = self.dir.join(".index.lock");
+        let deadline = tokio::time::Instant::now() + WRITER_LOCK_TIMEOUT;
+        let timed_out = || {
+            Error::io(
+                format!(
+                    "Timed out after {} ms waiting for index writer lock {}; retry the operation",
+                    WRITER_LOCK_TIMEOUT.as_millis(),
+                    path.display()
+                ),
+                &path,
+                std::io::Error::from(std::io::ErrorKind::TimedOut),
+            )
+        };
+        tokio::time::timeout_at(deadline, async {
+            let process = self.mutex.clone().lock_owned().await;
+            ensure_dir(&self.dir).await?;
+            // Keep the lock inode stable. Its extension matches neither entity
+            // format, so rebuilding an index never reads it as an item.
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Create owner-only locks and refuse symlinks into another
+                // inode's mutual-exclusion domain.
+                options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+            }
+            let file = tokio::fs::OpenOptions::from(options)
+                .open(&path)
+                .await
+                .map_err(|e| {
+                    Error::io(
+                        format!("Open index writer lock {}", path.display()),
+                        &path,
+                        e,
+                    )
+                })?
+                .into_std()
+                .await;
+            let mut backoff = Duration::from_millis(1);
+            loop {
+                match file.try_lock() {
+                    Ok(()) => {
+                        // A timeout polls its inner future first. Never accept a
+                        // lock acquired after the deadline on a delayed poll.
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(timed_out());
+                        }
+                        return Ok(IndexWriteGuard {
+                            _process: process,
+                            _file: file,
+                        });
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(std::fs::TryLockError::Error(err)) => {
+                        return Err(Error::io("Lock index writers", &path, err));
+                    }
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(timed_out());
+                }
+                tokio::time::sleep_until(deadline.min(now + backoff)).await;
+                backoff = (backoff * 2).min(Duration::from_millis(5));
+            }
+        })
+        .await
+        .map_err(|_| timed_out())?
+    }
+
+    async fn write_index_locked(&self, items: &[T], guard: IndexWriteGuard) -> Result<()> {
+        let path = self.index_path();
+        let mut content = serde_json::to_string_pretty(items)
+            .map_err(|err| Error::serde(format!("serialize {}", path.display()), &path, err))?;
+        content.push('\n');
+        // Tokio filesystem operations may finish after their caller is aborted.
+        // Give publication ownership of both locks so a cancelled caller cannot
+        // unlock before its pending rename and overwrite a later writer.
+        tokio::spawn(async move {
+            let _guard = guard;
+            atomic_write(&path, &content).await
+        })
+        .await
+        .map_err(|e| Error::other(format!("Index publication: {e}")))?
     }
 }
 
@@ -174,7 +264,7 @@ pub fn replace_at_end<T>(mut items: Vec<T>, entity: T, id_of: impl Fn(&T) -> &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::fs_utils::{atomic_write, clear_ensured_dirs, write_yaml};
+    use crate::storage::fs_utils::{atomic_write, clear_ensured_dirs, write_json, write_yaml};
     use serde::Deserialize;
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -407,5 +497,104 @@ mod tests {
 
         let after = replace_at_end(after, item("c", 3), |i| &i.id);
         assert_eq!(ids(&after), vec!["b", "a", "c"]);
+    }
+    #[tokio::test]
+    async fn aborting_before_publication_releases_both_writer_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = Arc::new(manager(temp.path()));
+        let waiting_index = index.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            let _guard = waiting_index.lock_writer().await.unwrap();
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            index.write_index(&[item("after", 1)]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(index.read_index().await.unwrap(), vec![item("after", 1)]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_retains_locks_until_atomic_write_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = manager(temp.path());
+        let guard = index.lock_writer().await.unwrap();
+        let items = [item("first", 1)];
+        let mut publishing = Box::pin(index.write_index_locked(&items, guard));
+        // Poll through the ownership transfer, then cancel before the spawned
+        // publisher can run on this single-threaded runtime.
+        tokio::select! {
+            biased;
+            result = &mut publishing => panic!("publisher completed without yielding: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        drop(publishing);
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path().join(".index.lock"))
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            index.update_index(|items| replace_at_end(items, item("second", 2), |i| &i.id)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            index.read_index().await.unwrap(),
+            vec![item("first", 1), item("second", 2)]
+        );
+        contender.try_lock().unwrap();
+    }
+
+    #[test]
+    fn lock_becoming_available_on_an_expired_poll_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let index = manager(temp.path());
+            index.write_index(&[]).await.unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp.path().join(".index.lock"))
+                .unwrap();
+            lock.try_lock().unwrap();
+            let mut acquiring = Box::pin(index.lock_writer());
+            // Drive the cold filesystem awaits to completion without advancing
+            // the clock. A barrier on the sole worker drains each queued step;
+            // subsequent polls wait in the contended-lock backoff.
+            for _ in 0..3 {
+                assert!(futures::poll!(&mut acquiring).is_pending());
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+            }
+            tokio::time::pause();
+            tokio::time::advance(WRITER_LOCK_TIMEOUT + Duration::from_secs(1)).await;
+            drop(lock);
+            // The timeout polls acquisition first; its ready lock must still
+            // fail once the original deadline has expired.
+            let result = acquiring.await;
+            assert!(matches!(result, Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::TimedOut));
+            tokio::time::resume();
+            index.write_index(&[item("after", 1)]).await.unwrap();
+            assert_eq!(index.read_index().await.unwrap(), vec![item("after", 1)]);
+        });
     }
 }

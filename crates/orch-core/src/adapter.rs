@@ -180,6 +180,10 @@ pub struct ExecuteParams {
     /// orchestrator as `{ ...agent.config.env, ORCH_AGENT_ID, ORCH_AGENT_NAME,
     /// ORCH_TASK_ID }` — the three `ORCH_*` keys win (PARITY.md §8.3).
     pub env: BTreeMap<String, String>,
+    /// Filter on the inherited parent environment, passed to
+    /// [`SpawnOptions::inherit_env`](crate::process::SpawnOptions). Remote
+    /// mirror runs use `WithoutSecrets` (security review F2).
+    pub inherit_env: crate::process::EnvInheritance,
     pub config: AgentConfig,
     /// Replaces the TS `AbortSignal`.
     pub cancel: CancellationToken,

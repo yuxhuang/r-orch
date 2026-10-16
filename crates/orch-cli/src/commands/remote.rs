@@ -6,9 +6,14 @@ use orch_infra::storage::{lock, remote::FileRemoteStore};
 
 use crate::{
     context::CliContext,
-    output::{Styles, print_json, print_success, print_table},
+    output::{Color, Icon, Styles, print_json, print_success, print_table},
     tree::RemoteSub,
 };
+
+/// Where `remote listen on` and a bare `--listen` bind: this host only. The
+/// peer protocol has no authentication, so any address reachable from other
+/// hosts must be typed explicitly (security review F1).
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:7690";
 
 pub async fn run(
     engine: &Engine,
@@ -69,8 +74,8 @@ pub async fn run(
         RemoteSub::Status => {
             let config = engine.config_store.read().await?;
             let inbound = store.read_inbound().await?;
-            let (listen, controller) =
-                listener_status(&engine.paths, config.peer.listen.as_deref()).await?;
+            let configured = config.peer.listen;
+            let (listen, controller) = listener_status(&engine.paths, false).await?;
             let mut remotes = Vec::new();
             for entry in store.list().await? {
                 remotes.push(
@@ -92,10 +97,13 @@ pub async fn run(
             }
             if ctx.json {
                 return print_json(
-                    &serde_json::json!({"listen": listen, "controller": controller, "inbound": inbound, "remotes": remotes}),
+                    &serde_json::json!({"listen": listen, "listen_configured": configured, "controller": controller, "inbound": inbound, "remotes": remotes}),
                 );
             }
-            println!("  Listen: {}", listen.as_deref().unwrap_or("off"));
+            println!(
+                "  Listen: {}",
+                describe_listen(listen.as_deref(), configured.as_deref())
+            );
             println!("  Controller: {}", controller.as_deref().unwrap_or("none"));
             for status in remotes {
                 println!(
@@ -116,33 +124,47 @@ pub async fn run(
                     "remote listen off does not accept an address",
                 ));
             }
-            let value = if state == "on" {
-                serde_json::Value::String(normalize_listen(
-                    addr.as_deref().unwrap_or("0.0.0.0:7690"),
-                )?)
+            let listen = if state == "on" {
+                Some(normalize_listen(addr.as_deref().unwrap_or(DEFAULT_LISTEN))?)
             } else {
-                serde_json::Value::Null
+                None
             };
+            let value = listen
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String);
             engine.config_store.set("peer.listen", value).await?;
             print_success(
                 styles,
-                &format!("Peer listening {state}; takes effect when the engine starts"),
+                &match &listen {
+                    Some(listen) => {
+                        format!("Peer listening on {listen}; takes effect when the engine starts")
+                    }
+                    None => "Peer listening off; takes effect when the engine starts".into(),
+                },
             );
+            if let Some(listen) = &listen {
+                warn_if_exposed(styles, listen);
+            }
         }
     }
     Ok(())
 }
 
-/// Prefer the live owner's effective address (including an ephemeral port or
-/// flag override). Cached listener files never imply a live connection.
+/// The address of a socket a live engine owner has bound, and its connected
+/// controller. A configured preference (which may be port 0) is never an
+/// active listener: `(None, None)` unless the lock holder is alive, fresh, and
+/// published the record itself. `own_runtime` says whether this process
+/// currently runs a peer runtime; without one, a record stamped with our own
+/// PID is left over from a stopped listener (TUI `/pause`).
 pub(crate) async fn listener_status(
     paths: &orch_infra::storage::Paths,
-    configured: Option<&str>,
+    own_runtime: bool,
 ) -> Result<(Option<String>, Option<String>)> {
     #[derive(serde::Deserialize)]
     struct Listener {
         listen_addr: String,
         controller_name: Option<String>,
+        pid: Option<u32>,
     }
 
     let recent = tokio::fs::metadata(paths.lock_path())
@@ -154,15 +176,62 @@ pub(crate) async fn listener_status(
                 .duration_since(modified)
                 .map_or(true, |age| age <= lock::LOCK_STALE)
         });
-    if recent && lock::check_lock(&paths.lock_path()).await.acquired {
+    let holder = lock::check_lock(&paths.lock_path()).await;
+    if recent && holder.acquired {
         let listener: Option<Listener> =
             orch_infra::storage::fs_utils::read_json(&paths.remotes_dir().join("_listener.json"))
                 .await?;
-        if let Some(listener) = listener {
+        if let Some(listener) = listener
+            && listener.pid == holder.pid
+            && (own_runtime || listener.pid != Some(std::process::id()))
+        {
             return Ok((Some(listener.listen_addr), listener.controller_name));
         }
     }
-    Ok((configured.map(str::to_owned), None))
+    Ok((None, None))
+}
+
+/// One wording for the CLI and the TUI header: only a bound socket is shown
+/// as an address; a configured preference is labelled as such.
+pub(crate) fn describe_listen(active: Option<&str>, configured: Option<&str>) -> String {
+    match (active, configured) {
+        (Some(addr), _) if exposure_warning(addr).is_some() => {
+            format!("{addr} (EXPOSED, no auth)")
+        }
+        (Some(addr), _) => addr.to_owned(),
+        (None, Some(configured)) => format!("off (configured {configured}, not active)"),
+        (None, None) => "off".to_owned(),
+    }
+}
+
+/// The warning for a listen address other hosts may reach, or `None` for a
+/// loopback IP. Anything that does not parse as one (a hand-edited
+/// `peer.listen` such as `localhost:7690`) warns rather than guess.
+pub fn exposure_warning(addr: &str) -> Option<String> {
+    let parsed = addr.parse::<std::net::SocketAddr>().ok();
+    if parsed.is_some_and(|parsed| parsed.ip().is_loopback()) {
+        return None;
+    }
+    let reach = if parsed.is_some_and(|parsed| parsed.ip().is_unspecified()) {
+        "on ALL network interfaces"
+    } else {
+        "beyond this host"
+    };
+    Some(format!(
+        "Peer listener {addr} accepts connections {reach} with no authentication \
+         or encryption: any host that can reach it can run tasks on this instance's \
+         agents, including shell commands. Use it only on a trusted network; bind \
+         127.0.0.1 to keep it local."
+    ))
+}
+
+/// Prints [`exposure_warning`] on stderr, so it survives a redirected or
+/// machine-read stdout (`serve --log-format json`).
+pub(crate) fn warn_if_exposed(styles: &Styles, addr: &str) {
+    if let Some(warning) = exposure_warning(addr) {
+        let glyph = styles.paint(Color::Yellow, styles.icon(Icon::Warning));
+        eprintln!("  {glyph} {warning}");
+    }
 }
 
 pub fn normalize_listen(addr: &str) -> Result<String> {
@@ -258,29 +327,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_status_uses_live_owner_address_and_hides_stale_connections() {
+    async fn listener_status_reports_only_a_live_owners_bound_socket() {
         let (_temp, engine, _ctx) = fixture().await;
+        let record = engine.paths.remotes_dir().join("_listener.json");
+        let publish = |pid: u32| {
+            let record = record.clone();
+            async move {
+                orch_infra::storage::fs_utils::write_json(
+                    &record,
+                    &serde_json::json!({
+                        "listen_addr": "127.0.0.1:41234",
+                        "controller_name": "controller-a",
+                        "pid": pid,
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let live = (Some("127.0.0.1:41234".into()), Some("controller-a".into()));
+        let inactive = (None, None);
+        publish(std::process::id()).await;
+        // No owner: a leftover record is not a listener.
+        assert_eq!(
+            listener_status(&engine.paths, true).await.unwrap(),
+            inactive
+        );
+
+        let acquired = lock::acquire_lock(&engine.paths.lock_path()).await.unwrap();
+        assert!(acquired.acquired);
+        assert_eq!(listener_status(&engine.paths, true).await.unwrap(), live);
+        // This process holds the lock but its peer runtime stopped (TUI
+        // `/pause`): the record it left behind is stale.
+        assert_eq!(
+            listener_status(&engine.paths, false).await.unwrap(),
+            inactive
+        );
+        // Published by a different process than the lock holder.
+        publish(std::process::id() + 1).await;
+        assert_eq!(
+            listener_status(&engine.paths, true).await.unwrap(),
+            inactive
+        );
+        // Records from builds without an owner stamp are never trusted.
         orch_infra::storage::fs_utils::write_json(
-            &engine.paths.remotes_dir().join("_listener.json"),
-            &serde_json::json!({
-                "listen_addr": "127.0.0.1:41234",
-                "controller_name": "controller-a"
-            }),
+            &record,
+            &serde_json::json!({"listen_addr": "127.0.0.1:41234", "controller_name": null}),
         )
         .await
         .unwrap();
         assert_eq!(
-            listener_status(&engine.paths, Some("0.0.0.0:7690"))
-                .await
-                .unwrap(),
-            (Some("0.0.0.0:7690".into()), None),
+            listener_status(&engine.paths, true).await.unwrap(),
+            inactive
         );
-        let acquired = lock::acquire_lock(&engine.paths.lock_path()).await.unwrap();
-        assert!(acquired.acquired);
+        tokio::fs::remove_file(&record).await.unwrap();
         assert_eq!(
-            listener_status(&engine.paths, None).await.unwrap(),
-            (Some("127.0.0.1:41234".into()), Some("controller-a".into())),
+            listener_status(&engine.paths, true).await.unwrap(),
+            inactive
         );
+
+        publish(std::process::id()).await;
         std::fs::OpenOptions::new()
             .write(true)
             .open(engine.paths.lock_path())
@@ -290,14 +396,75 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(
-            listener_status(&engine.paths, None).await.unwrap(),
-            (None, None),
+            listener_status(&engine.paths, true).await.unwrap(),
+            inactive
         );
         lock::release_lock(&engine.paths.lock_path()).await;
         assert_eq!(
-            listener_status(&engine.paths, None).await.unwrap(),
-            (None, None)
+            listener_status(&engine.paths, true).await.unwrap(),
+            inactive
         );
+    }
+
+    #[test]
+    fn describe_listen_never_presents_a_preference_as_a_listener() {
+        assert_eq!(
+            describe_listen(Some("127.0.0.1:50162"), Some("127.0.0.1:0")),
+            "127.0.0.1:50162"
+        );
+        assert_eq!(
+            describe_listen(None, Some("127.0.0.1:0")),
+            "off (configured 127.0.0.1:0, not active)"
+        );
+        assert_eq!(describe_listen(None, None), "off");
+    }
+
+    #[test]
+    fn describe_listen_marks_an_active_network_listener_as_exposed() {
+        for addr in ["0.0.0.0:7690", "[::]:7690", "192.168.1.5:7690"] {
+            assert_eq!(
+                describe_listen(Some(addr), None),
+                format!("{addr} (EXPOSED, no auth)")
+            );
+        }
+        assert_eq!(describe_listen(Some("[::1]:7690"), None), "[::1]:7690");
+    }
+
+    #[test]
+    fn loopback_listen_addresses_need_no_exposure_warning() {
+        for addr in [
+            DEFAULT_LISTEN,
+            "127.0.0.1:0",
+            "127.8.9.10:7690",
+            "[::1]:7690",
+        ] {
+            assert_eq!(exposure_warning(addr), None, "{addr}");
+        }
+    }
+
+    #[test]
+    fn wildcard_listen_addresses_warn_about_all_interfaces() {
+        for addr in ["0.0.0.0:7690", "[::]:7690"] {
+            let warning = exposure_warning(addr).expect(addr);
+            for needle in [
+                addr,
+                "ALL network interfaces",
+                "no authentication",
+                "127.0.0.1",
+            ] {
+                assert!(warning.contains(needle), "{needle} missing: {warning}");
+            }
+        }
+    }
+
+    #[test]
+    fn specific_network_and_unparsed_listen_addresses_warn() {
+        let lan = exposure_warning("192.168.1.5:7690").expect("LAN address");
+        assert!(lan.contains("192.168.1.5:7690") && lan.contains("no authentication"));
+        assert!(!lan.contains("ALL network interfaces"), "{lan}");
+        // `peer.listen` set by hand is bound as given; never stay silent about
+        // an address this check cannot prove is loopback.
+        assert!(exposure_warning("localhost:7690").is_some());
     }
 
     #[tokio::test]
@@ -336,7 +503,7 @@ mod tests {
                 .peer
                 .listen
                 .as_deref(),
-            Some("0.0.0.0:7690")
+            Some("127.0.0.1:7690")
         );
         run(
             &engine,

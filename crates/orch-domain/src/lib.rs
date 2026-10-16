@@ -62,8 +62,8 @@ pub use shop::{
 };
 pub use state::{OrchestratorState, RetryEntry, RunningEntry, StateStats, default_state};
 pub use task::{
-    AUTONOMOUS_LABEL, CreateTaskInput, ReviewCriterion, ReviewResult, Task, TaskProof, TaskStatus,
-    WorkspaceMode,
+    AUTONOMOUS_LABEL, AWAITING_APPROVAL_LABEL, CreateTaskInput, ReviewCriterion, ReviewResult,
+    Task, TaskProof, TaskStatus, WorkspaceMode,
 };
 pub use team::{
     CreateTeamInput, DEFAULT_TEAM_CONFIG, PartialTeamConfig, Team, TeamConfig, TeamMember,

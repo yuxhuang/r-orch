@@ -100,16 +100,31 @@ Peers use plain TCP on a trusted LAN, **without authentication or encryption**. 
 default. Only the process that owns the project engine opens peer connections; a TUI observing an
 existing owner cannot enable listening.
 
+> [!WARNING]
+> **A listening worker runs whatever a connecting peer sends it.** Any host that can reach the port can
+> list the worker's agents and submit tasks to them, including `shell` agents that run arbitrary
+> commands. There is no password, token or allowlist. Only expose the listener on a network where you
+> trust every host: never on a public interface, shared Wi-Fi or a VPN with strangers on it, and
+> preferably behind a firewall that admits only your controller's IP.
+
+A bare `--listen` and `orch remote listen on` bind **`127.0.0.1:7690`**, which only accepts
+connections from the same machine. To accept another machine you must give an address explicitly,
+either a specific LAN IP of the worker (preferred) or `0.0.0.0:7690` (all interfaces). For any
+address other than loopback, `orch remote listen on`, `orch serve` and `orch run --watch` print a
+warning on stderr, and `orch remote status` and the TUI header show the address as
+`(EXPOSED, no auth)`.
+
 On the worker, start an engine with a unique display name and an explicit listen address:
 
 ```bash
-orch serve --listen 0.0.0.0:7690 --peer-name worker-linux
-# Also supported: orch run --watch --listen 0.0.0.0:7690 --peer-name worker-linux
-# Or: orch tui --listen 0.0.0.0:7690 --peer-name worker-linux
+orch serve --listen 192.168.1.20:7690 --peer-name worker-linux   # the worker's own LAN IP
+# Or every interface: orch serve --listen 0.0.0.0:7690 --peer-name worker-linux
+# Also supported: orch run --watch --listen ... or orch tui --listen ...
 ```
 
-To persist the preference for future engine starts, use `orch remote listen on 0.0.0.0:7690`;
-`orch remote listen off` disables it on the next start. A `--listen` flag applies to that invocation.
+To persist the preference for future engine starts, use `orch remote listen on 192.168.1.20:7690`
+(without an address it saves `127.0.0.1:7690`); `orch remote listen off` disables it on the next
+start. A `--listen` flag applies to that invocation.
 Use `--peer-name` or `peer.name` in `.orchestry/config.yml` to distinguish installations.
 
 On the controller, register the worker and run the engine:
@@ -138,6 +153,17 @@ remote task waits for its outcome without a retry: the worker owns execution and
 Cancelling the task or removing the remote ends that wait. A controller restart cancels its active
 remote tasks; reconnecting reconciles and cancels their worker mirrors. Messages queue while offline
 and deduplicate when delivered. Broadcast messages stay local.
+Remote runs do not use the controller's local slot cap (`scheduling.max_concurrent_agents`): the
+worker enforces its own, and each remote agent runs one task at a time.
+
+A remote counts as online only while its link is live **and** the controller can record that state in
+`.orchestry/remotes/`. If that directory is unwritable or the disk is full, or the socket drops, the
+remote reports `offline` in `orch remote status`, the TUI and `orch agent list`, even if a cached
+snapshot file still says online, and `orch task show` reports `remote w1 offline` for tasks waiting on
+it. Nothing new is dispatched to it until the status can be saved again. The engine prints a
+non-fatal `Write peer status for w1 … Check permissions and free space` (or `Peer w1 disconnected`)
+error without `RUST_LOG`. Fix the permissions or free space; once the link reconnects and saves its status, the remote is online
+again and waiting tasks dispatch. Local agents keep running throughout, including after an engine restart.
 
 **Remote agents are leaf executors using worker-local resources.** There is no repository, input,
 file, or artifact synchronization. Paths refer to the worker, which runs its own agent command, role,

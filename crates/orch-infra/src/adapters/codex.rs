@@ -363,6 +363,7 @@ impl Adapter for CodexAdapter {
                 env: params.env,
                 // stdin must be a pipe to carry the prompt.
                 stdin: StdioMode::Pipe,
+                inherit_env: params.inherit_env,
             },
             StderrPolicy::Tail,
             &params.cancel,

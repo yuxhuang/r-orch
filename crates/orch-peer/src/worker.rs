@@ -9,8 +9,14 @@ use orch_core::adapter::AgentEvent;
 use orch_core::error::{Error, Result};
 use orch_core::remote::{RemoteOutcome, RunEventTap};
 use orch_core::storage::TaskFilter;
-use orch_domain::{AgentStatus, CreateTaskInput, InboundStatus, Run, RunStatus, Task, TaskStatus};
-use orch_infra::storage::{fs_utils::write_json, remote::validate_snapshot};
+use orch_domain::{
+    AWAITING_APPROVAL_LABEL, AgentStatus, ApprovalPolicy, CreateTaskInput, InboundStatus, Run,
+    RunStatus, Task, TaskStatus,
+};
+use orch_infra::storage::{
+    fs_utils::{owner_only, write_json_with_mode},
+    remote::validate_snapshot,
+};
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -145,9 +151,15 @@ impl Worker {
     }
 
     async fn listener_status(&self, addr: &str, controller: Option<&str>) -> Result<()> {
-        write_json(
+        // Owner-only like every file under remotes/ (security review F7).
+        write_json_with_mode(
             &self.ctx.engine.paths.remotes_dir().join("_listener.json"),
-            &serde_json::json!({"listen_addr": addr, "controller_name": controller}),
+            &serde_json::json!({
+                "listen_addr": addr,
+                "controller_name": controller,
+                "pid": std::process::id(),
+            }),
+            owner_only(),
         )
         .await
     }
@@ -157,10 +169,10 @@ impl Worker {
             .local_addr()
             .map_err(|e| Error::other(format!("peer listener: {e}")))?
             .to_string();
-        self.listener_status(&addr, None).await?;
         for task in self.ctx.engine.tasks.list(&TaskFilter::default()).await? {
             self.register(&task);
         }
+        self.listener_status(&addr, None).await?;
         let mut sessions = JoinSet::new();
         let mut accept_after = Instant::now();
         let mut accept_backoff = ACCEPT_RETRY_MIN;
@@ -246,6 +258,25 @@ impl Worker {
                 },
             )
             .await?;
+            return Ok(());
+        }
+        if self
+            .ctx
+            .store
+            .list()
+            .await?
+            .iter()
+            .any(|config| config.alias == name)
+        {
+            let error = "Inbound controller name collides with a configured outbound alias";
+            tracing::warn!("{error}; rejecting peer hello");
+            self.ctx.engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                error: error.into(),
+                context: "Peer admission rejected; choose a controller name distinct from outbound aliases".into(),
+                fatal: false,
+            });
+            self.write(&mut write, &Frame::Error { msg: error.into() })
+                .await?;
             return Ok(());
         }
         let (generation, mut cancelled) = {
@@ -438,7 +469,15 @@ impl Worker {
             });
         };
         let state = self.ctx.engine.state.read().await?;
-        if state.running.contains_key(&task.id) || state.claimed.contains(&task.id) {
+        // A quarantined mirror is terminal even while its unverified saved
+        // PID reserves the workspace. Report its non-retryable outcome now.
+        let quarantined = task.status == TaskStatus::Cancelled
+            && task.feedback.as_deref().is_some_and(|error| {
+                error.starts_with("Worker execution collector lost; outcome unknown")
+            });
+        if !quarantined
+            && (state.running.contains_key(&task.id) || state.claimed.contains(&task.id))
+        {
             return Ok(SyncItem {
                 exec_key: key.into(),
                 state: "running".into(),
@@ -565,17 +604,26 @@ impl Worker {
                         reason: "invalid submit or unknown/disabled local agent".into(),
                     }]);
                 }
+                let mut labels = vec![
+                    format!("remote:{name}"),
+                    format!("remote-ctl:{controller}"),
+                    format!("exec:{exec_key}"),
+                    format!("remote-from:{from}"),
+                ];
+                // Security F4: a peer must not make a `suggest`/`manual` agent
+                // run unattended. The mirror waits, reported as queued, until
+                // this instance's owner runs `orch task approve`.
+                let held = agent.as_ref().and_then(|a| a.config.approval_policy)
+                    != Some(ApprovalPolicy::Auto);
+                if held {
+                    labels.push(AWAITING_APPROVAL_LABEL.into());
+                }
                 let input = CreateTaskInput {
                     title,
                     description: Some(prompt),
                     priority: Some(priority),
                     assignee: Some(agent_id),
-                    labels: Some(vec![
-                        format!("remote:{name}"),
-                        format!("remote-ctl:{controller}"),
-                        format!("exec:{exec_key}"),
-                        format!("remote-from:{from}"),
-                    ]),
+                    labels: Some(labels),
                     max_attempts: Some(1),
                     review_criteria: Some(review_criteria),
                     goal_id,
@@ -584,6 +632,9 @@ impl Worker {
                 match self.ctx.engine.task_service.create(input).await {
                     Ok(task) => {
                         self.register(&task);
+                        if held {
+                            tracing::info!(task_id = %task.id, "Remote task awaits approval: orch task approve");
+                        }
                         Ok(vec![
                             Frame::Submitted {
                                 exec_key: exec_key.clone(),
@@ -665,9 +716,11 @@ impl Worker {
                 }
                 Ok(vec![])
             }
-            frame @ Frame::Msg { .. } => Ok(vec![self.ctx.ingest(name, &frame).await?]),
-            Frame::MsgAck { id } => {
-                self.ctx.msg_ack(name, &id).await?;
+            frame @ Frame::Msg { .. } => {
+                Ok(self.ctx.ingest(name, &frame).await?.into_iter().collect())
+            }
+            Frame::MsgAck { id, reason } => {
+                self.ctx.msg_ack(name, &id, reason.as_deref()).await?;
                 Ok(vec![])
             }
             Frame::Ping => Ok(vec![Frame::Pong]),
@@ -718,6 +771,7 @@ impl RunEventTap for Worker {
         let Some((key, controller)) = tap.tasks.get(task_id).cloned() else {
             return;
         };
+        let event = crate::codec::bounded_event(&key, event.clone());
         let seq = tap
             .rings
             .entry(key.clone())
@@ -745,6 +799,7 @@ fn derive_outcome(task: &Task, run: Option<&Run>) -> Option<RemoteOutcome> {
         return Some(RemoteOutcome::Cancelled {
             reason: run
                 .and_then(|r| r.error.clone())
+                .or_else(|| task.feedback.clone())
                 .unwrap_or_else(|| "Worker task cancelled".into()),
         });
     }
@@ -954,6 +1009,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_alias_collision_gets_error_and_cannot_receive_queued_messages() {
+        let (_temp, worker, _agent) = fixture().await;
+        worker
+            .ctx
+            .store
+            .add(orch_domain::RemoteConfig {
+                alias: "w1".into(),
+                addr: "127.0.0.1:1".into(),
+                added_at: "now".into(),
+            })
+            .await
+            .unwrap();
+        let message = orch_domain::Message {
+            id: "msg_collision".into(),
+            channel: orch_domain::MessageChannel::Direct,
+            from_agent_id: "local".into(),
+            to_agent_id: Some("agt_remote@w1".into()),
+            subject: "private".into(),
+            body: "must not leak".into(),
+            reply_to: None,
+            created_at: "now".into(),
+            expires_at: None,
+            status: orch_domain::MessageStatus::Pending,
+            delivered_at: None,
+            team_id: None,
+        };
+        worker.ctx.engine.messages.save(&message).await.unwrap();
+        let mut events = worker.ctx.engine.events.subscribe();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_worker = worker.clone();
+        let mut server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server_worker.connection(socket, "test").await.unwrap();
+        });
+        let mut socket = TcpStream::connect(addr).await.unwrap();
+        write_frame(
+            &mut socket,
+            &Frame::Hello {
+                proto: PROTOCOL,
+                instance_id: "impostor".into(),
+                name: "w1".into(),
+                os: "test".into(),
+                agents: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = BufReader::new(socket);
+        let first = timeout(Duration::from_secs(5), read_frame(&mut reader))
+            .await
+            .unwrap()
+            .unwrap();
+        if !matches!(&first, Some(Frame::Error { msg }) if msg.contains("outbound alias")) {
+            server.abort();
+            let _ = server.await;
+            panic!("expected collision error, got {first:?}");
+        }
+        let completed = timeout(Duration::from_secs(5), &mut server).await;
+        if completed.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(matches!(completed, Ok(Ok(()))));
+        assert!(
+            timeout(Duration::from_secs(5), read_frame(&mut reader))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(worker.session.lock().await.controller.is_none());
+        assert!(worker.ctx.store.read_inbound().await.unwrap().is_none());
+        assert_eq!(
+            worker
+                .ctx
+                .engine
+                .messages
+                .get(&message.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            orch_domain::MessageStatus::Pending
+        );
+        assert!(
+            matches!(timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap().as_ref(), orch_domain::OrchestratorEvent::OrchestratorError { error, fatal: false, .. } if error.contains("outbound alias"))
+        );
+    }
+
+    #[tokio::test]
     async fn protocol_mismatch_gets_error_then_eof() {
         let (_temp, worker, _agent) = fixture().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1061,6 +1207,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status["controller_name"], "C-restarted");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let listener = worker.ctx.engine.paths.remotes_dir().join("_listener.json");
+            let mode = std::fs::metadata(&listener).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "_listener.json must be owner-only (F7)");
+        }
         server.abort();
         let _ = server.await;
     }
@@ -1105,42 +1258,50 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mirror_without_criteria_autoapproves_even_when_agent_policy_is_suggest() {
-        let (temp, worker, agent_id) = fixture().await;
+    /// Configures the fixture agent with `policy` and a bounded shell run, then
+    /// submits `key` from a remote controller.
+    async fn submit_with_policy(
+        temp: &tempfile::TempDir,
+        worker: &Worker,
+        agent_id: &str,
+        policy: orch_domain::ApprovalPolicy,
+    ) -> Vec<Frame> {
         let mut agent = worker
             .ctx
             .engine
             .agents
-            .get(&agent_id)
+            .get(agent_id)
             .await
             .unwrap()
             .unwrap();
-        agent.config.approval_policy = Some(orch_domain::ApprovalPolicy::Suggest);
+        agent.config.approval_policy = Some(policy);
         agent.config.workspace_mode = Some(orch_domain::WorkspaceMode::Shared);
-        agent.config.timeout_ms = Some(1_000);
+        agent.config.timeout_ms = Some(5_000);
         agent.config.env =
             Some(std::iter::once(("HOME".into(), temp.path().to_str().unwrap().into())).collect());
         worker.ctx.engine.agents.save(&agent).await.unwrap();
         worker
-            .handle("controller", "C", submit("key", &agent_id))
+            .handle("controller", "C", submit("key", agent_id))
             .await
-            .unwrap();
-        let task = mirror(&worker, "key").await;
-        assert!(task.review_criteria.as_ref().unwrap().is_empty());
+            .unwrap()
+    }
 
-        let execution = timeout(Duration::from_secs(5), async {
-            worker.ctx.engine.orchestrator.run_task(&task.id).await?;
+    /// Dispatch every ready task once (`orch run --all`) and the mirror by id
+    /// (`orch run <id>`), then wait for whatever started to be collected.
+    async fn dispatch_mirror(worker: &Worker, task_id: &str) {
+        timeout(Duration::from_secs(30), async {
+            worker.ctx.engine.orchestrator.run_all().await?;
+            worker.ctx.engine.orchestrator.run_task(task_id).await?;
             worker.ctx.engine.orchestrator.wait_for_collectors().await;
             Result::<()>::Ok(())
         })
-        .await;
-        // Shutdown also kills the bounded shell process on a timeout/error.
-        let stopped = worker.ctx.engine.orchestrator.stop().await;
-        execution.unwrap().unwrap();
-        stopped.unwrap();
+        .await
+        .expect("bounded dispatch")
+        .unwrap();
+    }
 
-        let completed = mirror(&worker, "key").await;
+    async fn assert_succeeded_and_reported(worker: &Worker) {
+        let completed = mirror(worker, "key").await;
         assert_eq!(completed.status, TaskStatus::Done);
         let runs = worker
             .ctx
@@ -1151,10 +1312,91 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Succeeded);
-        assert!(matches!(
-            worker.item("key", Some(&completed)).await.unwrap().outcome,
-            Some(RemoteOutcome::Succeeded { .. })
-        ));
+        // The controller receives the outcome on its next update.
+        let frames = worker
+            .updates("controller", &mut HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::Finished {
+                    exec_key,
+                    outcome: RemoteOutcome::Succeeded { .. },
+                } if exec_key == "key"
+            )),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_for_auto_policy_agent_runs_without_owner_approval() {
+        let (temp, worker, agent_id) = fixture().await;
+        let replies =
+            submit_with_policy(&temp, &worker, &agent_id, orch_domain::ApprovalPolicy::Auto).await;
+        assert!(matches!(&replies[0], Frame::Submitted { .. }));
+        let task = mirror(&worker, "key").await;
+        assert!(!task.awaits_approval());
+        assert!(task.review_criteria.as_ref().unwrap().is_empty());
+
+        dispatch_mirror(&worker, &task.id).await;
+        worker.ctx.engine.orchestrator.stop().await.unwrap();
+        assert_succeeded_and_reported(&worker).await;
+    }
+
+    /// Security F4: a peer cannot make a `suggest`/`manual` agent run
+    /// unattended. The mirror is held (reported to the controller as queued,
+    /// never running) until the worker owner approves it; it then runs once
+    /// and its outcome reaches the controller.
+    async fn mirror_waits_for_owner_approval(policy: orch_domain::ApprovalPolicy) {
+        let (temp, worker, agent_id) = fixture().await;
+        let replies = submit_with_policy(&temp, &worker, &agent_id, policy).await;
+        assert!(matches!(&replies[0], Frame::Submitted { .. }));
+        assert!(
+            matches!(&replies[1], Frame::State { state, .. } if state == "queued"),
+            "{replies:?}"
+        );
+        let task = mirror(&worker, "key").await;
+        assert!(task.awaits_approval(), "{:?}", task.labels);
+
+        dispatch_mirror(&worker, &task.id).await;
+        let held = mirror(&worker, "key").await;
+        assert_eq!(held.status, TaskStatus::Todo);
+        assert!(
+            worker
+                .ctx
+                .engine
+                .runs
+                .list_for_task(&held.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "held mirror must not execute"
+        );
+        let item = worker.item("key", Some(&held)).await.unwrap();
+        assert_eq!((item.state.as_str(), item.outcome), ("queued", None));
+
+        // `orch task approve <id>` on the worker.
+        worker
+            .ctx
+            .engine
+            .task_service
+            .approve(&task.id)
+            .await
+            .unwrap();
+        dispatch_mirror(&worker, &task.id).await;
+        worker.ctx.engine.orchestrator.stop().await.unwrap();
+        assert_succeeded_and_reported(&worker).await;
+    }
+
+    #[tokio::test]
+    async fn mirror_for_suggest_policy_agent_waits_for_owner_approval() {
+        mirror_waits_for_owner_approval(orch_domain::ApprovalPolicy::Suggest).await;
+    }
+
+    #[tokio::test]
+    async fn mirror_for_manual_policy_agent_waits_for_owner_approval() {
+        mirror_waits_for_owner_approval(orch_domain::ApprovalPolicy::Manual).await;
     }
 
     #[tokio::test]
@@ -1462,4 +1704,5 @@ mod tests {
     }
 
     include!("worker_hardening_tests.rs");
+    include!("worker_env_tests.rs");
 }

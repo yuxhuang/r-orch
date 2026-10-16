@@ -359,6 +359,14 @@ fn print_watch_event(styles: &Styles, event: &OrchestratorEvent, verbose: bool) 
         OrchestratorEvent::OrchestratorShutdown { .. } => {
             println!("\n{}", styles.dim("Shutting down..."));
         }
+        // Includes shutdown's unacknowledged remote cancels, which name the
+        // peer and execution that may still be running.
+        OrchestratorEvent::OrchestratorError { error, context, .. } => {
+            println!(
+                "{}",
+                crate::logs::format_orchestrator_error(styles, &time, error, context)
+            );
+        }
         _ => {}
     }
 }

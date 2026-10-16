@@ -1,6 +1,8 @@
 //! Network-independent peer boundary. A link owns streams across reconnects;
 //! losing a socket must never finish an execution or trigger a retry.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use orch_domain::{AdapterErrorKind, Message, ReviewCriterion, ReviewResult, TokenUsage};
@@ -65,6 +67,13 @@ pub struct RemoteExecuteHandle {
     pub events: BoxStream<'static, RemoteRunEvent>,
 }
 
+/// Cancellation still awaiting proof that the worker stopped the execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRemoteCancellation {
+    pub alias: String,
+    pub exec_key: String,
+}
+
 #[async_trait]
 pub trait RemoteBridge: Send + Sync {
     /// Called only after the pid-less running entry is durable. Register and
@@ -76,6 +85,15 @@ pub trait RemoteBridge: Send + Sync {
     /// Enqueue promptly and preserve submit order; never await the network
     /// while the controller is holding its state mutex.
     async fn cancel(&self, alias: &str, exec_key: &str) -> Result<()>;
+    /// Flush queued cancellations, then wait up to one batch deadline for
+    /// worker acknowledgements. Called outside the controller state mutex.
+    /// Offline peers return immediately; unresolved keys survive for Sync.
+    async fn drain_cancellations(
+        &self,
+        _deadline: Duration,
+    ) -> Result<Vec<PendingRemoteCancellation>> {
+        Ok(vec![])
+    }
     /// Sent after the controller's task/run/state writes have completed.
     async fn ack_finished(&self, _alias: &str, _exec_key: &str) -> Result<()> {
         Ok(())

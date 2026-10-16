@@ -153,7 +153,11 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["_index.json".to_owned(), "tsk_test1.yml".to_owned()]
+            vec![
+                ".index.lock".to_owned(),
+                "_index.json".to_owned(),
+                "tsk_test1.yml".to_owned()
+            ]
         );
     }
 

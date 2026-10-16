@@ -583,6 +583,9 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             // `--watch` wins over `--all`, which wins over a task id, as the
             // original's if/else chain does.
             if *watch {
+                if let Some(listen) = &engine.config.peer.listen {
+                    commands::remote::warn_if_exposed(&styles, listen);
+                }
                 commands::run::watch(std::sync::Arc::new(engine), &styles, *verbose).await
             } else if *all {
                 commands::run::all(&engine, &styles).await
@@ -700,6 +703,9 @@ async fn run_serve(
     let ctx = CliContext::resolve(cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
     let engine =
         orch_engine::build_full_with_peer(ctx.project_root.clone(), args.peer.config()).await?;
+    if let Some(listen) = &engine.config.peer.listen {
+        commands::remote::warn_if_exposed(&styles, listen);
+    }
     serve::run(
         engine,
         serve::ServeArgs {

@@ -689,7 +689,7 @@ pub enum OrgSub {
 
 #[derive(Debug, Args)]
 pub struct PeerFlags {
-    #[arg(long, num_args = 0..=1, default_missing_value = "0.0.0.0:7690", value_parser = parse_listen_address, value_name = "ADDR", help = "Allow incoming peer connections (engine owner only)")]
+    #[arg(long, num_args = 0..=1, default_missing_value = crate::commands::remote::DEFAULT_LISTEN, value_parser = parse_listen_address, value_name = "ADDR", help = "Allow incoming peer connections (engine owner only; default 127.0.0.1:7690; no authentication, so other hosts need an explicit address such as 0.0.0.0:7690)")]
     pub listen: Option<String>,
     #[arg(long, value_name = "NAME", help = "Peer display name")]
     pub peer_name: Option<String>,
@@ -718,18 +718,38 @@ pub struct RemoteCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum RemoteSub {
+    /// Register a remote orch peer; persists and reconnects until removed
     Add {
+        #[arg(
+            help = "Local name for the remote, [a-z0-9][a-z0-9-]*; its agents appear as <id>@<alias>"
+        )]
         alias: String,
+        #[arg(help = "Peer address as host[:port] or [ipv6]:port; the port defaults to 7690")]
         addr: String,
     },
+    /// Unregister a remote; its in-flight remote tasks fail with an unknown outcome
     Remove {
+        #[arg(help = "Alias given to `remote add`")]
         alias: String,
     },
+    /// List registered remotes with their addresses and online state
     List,
+    /// Show the listen address, connected controller and each remote's state
     Status,
+    /// Save the incoming-connection preference for the next engine start
+    #[command(
+        long_about = "Save the incoming-connection preference for the next engine start.\n\n\
+                      The setting is stored as peer.listen and does not affect a running engine. \
+                      A --listen flag on serve, run or tui overrides it for that invocation."
+    )]
     Listen {
-        #[arg(value_parser = ["on", "off"])]
+        #[arg(value_parser = ["on", "off"], help = "Enable (on) or disable (off) listening")]
         state: String,
+        #[arg(
+            help = "IP address and port to bind with `on` (default 127.0.0.1:7690, this host only; \
+                    peers have no authentication, so accept other hosts only with an explicit \
+                    address such as 0.0.0.0:7690 on a trusted network)"
+        )]
         addr: Option<String>,
     },
 }
@@ -1048,7 +1068,7 @@ mod tests {
         let Some(Command::Serve(args)) = cli.command else {
             panic!("serve")
         };
-        assert_eq!(args.peer.listen.as_deref(), Some("0.0.0.0:7690"));
+        assert_eq!(args.peer.listen.as_deref(), Some("127.0.0.1:7690"));
         assert_eq!(args.peer.peer_name.as_deref(), Some("worker"));
         let cli =
             Cli::try_parse_from(["orch", "run", "--watch", "--listen", "127.0.0.1:1234"]).unwrap();
@@ -1060,7 +1080,7 @@ mod tests {
         let Some(Command::Tui(args)) = cli.command else {
             panic!("tui")
         };
-        assert_eq!(args.peer.listen.as_deref(), Some("0.0.0.0:7690"));
+        assert_eq!(args.peer.listen.as_deref(), Some("127.0.0.1:7690"));
     }
 
     #[test]
