@@ -75,7 +75,7 @@ pub async fn run(
             let config = engine.config_store.read().await?;
             let inbound = store.read_inbound().await?;
             let configured = config.peer.listen;
-            let (listen, controller) = listener_status(&engine.paths, false).await?;
+            let listener = listener_status(&engine.paths, false).await?;
             let mut remotes = Vec::new();
             for entry in store.list().await? {
                 remotes.push(
@@ -92,24 +92,49 @@ pub async fn run(
                             instance_id: None,
                             os: None,
                             agents: Vec::new(),
+                            peer_version: None,
                         }),
                 );
             }
             if ctx.json {
-                return print_json(
-                    &serde_json::json!({"listen": listen, "listen_configured": configured, "controller": controller, "inbound": inbound, "remotes": remotes}),
-                );
+                return print_json(&serde_json::json!({
+                    "listen": listener.addr,
+                    "listen_configured": configured,
+                    "controller": listener.controller,
+                    "last_session_error": listener.last_session_error,
+                    "inbound": inbound,
+                    "remotes": remotes,
+                }));
             }
             println!(
-                "  Listen: {}",
-                describe_listen(listen.as_deref(), configured.as_deref())
+                "  Listen: {}{}",
+                describe_listen(listener.addr.as_deref(), configured.as_deref()),
+                listener
+                    .last_session_error
+                    .as_ref()
+                    .map(|error| format!(" (last session ended: {error})"))
+                    .unwrap_or_default()
             );
-            println!("  Controller: {}", controller.as_deref().unwrap_or("none"));
+            println!(
+                "  Controller: {}{}",
+                listener.controller.as_deref().unwrap_or("none"),
+                inbound
+                    .as_ref()
+                    .filter(|_| listener.controller.is_some())
+                    .and_then(|inbound| inbound.controller_version.as_deref())
+                    .map(|version| format!(" (v{version})"))
+                    .unwrap_or_default()
+            );
             for status in remotes {
                 println!(
-                    "  {}: {}{}",
+                    "  {}: {}{}{}",
                     status.alias,
                     if status.online { "online" } else { "offline" },
+                    status
+                        .peer_version
+                        .as_ref()
+                        .map(|version| format!(" v{version}"))
+                        .unwrap_or_default(),
                     status
                         .last_error
                         .as_ref()
@@ -150,21 +175,34 @@ pub async fn run(
     Ok(())
 }
 
+/// What a live engine owner's peer listener has published.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListenerStatus {
+    pub addr: Option<String>,
+    pub controller: Option<String>,
+    /// Why the last inbound controller session ended. It outlives the session
+    /// on purpose: a controller that keeps reconnecting is only explicable
+    /// from the error the worker recorded as each session died.
+    pub last_session_error: Option<String>,
+}
+
 /// The address of a socket a live engine owner has bound, and its connected
 /// controller. A configured preference (which may be port 0) is never an
-/// active listener: `(None, None)` unless the lock holder is alive, fresh, and
-/// published the record itself. `own_runtime` says whether this process
+/// active listener: an empty [`ListenerStatus`] unless the lock holder is
+/// alive, fresh, and published the record itself. `own_runtime` says whether this process
 /// currently runs a peer runtime; without one, a record stamped with our own
 /// PID is left over from a stopped listener (TUI `/pause`).
 pub(crate) async fn listener_status(
     paths: &orch_infra::storage::Paths,
     own_runtime: bool,
-) -> Result<(Option<String>, Option<String>)> {
+) -> Result<ListenerStatus> {
     #[derive(serde::Deserialize)]
     struct Listener {
         listen_addr: String,
         controller_name: Option<String>,
         pid: Option<u32>,
+        #[serde(default)]
+        last_session_error: Option<String>,
     }
 
     let recent = tokio::fs::metadata(paths.lock_path())
@@ -185,10 +223,14 @@ pub(crate) async fn listener_status(
             && listener.pid == holder.pid
             && (own_runtime || listener.pid != Some(std::process::id()))
         {
-            return Ok((Some(listener.listen_addr), listener.controller_name));
+            return Ok(ListenerStatus {
+                addr: Some(listener.listen_addr),
+                controller: listener.controller_name,
+                last_session_error: listener.last_session_error,
+            });
         }
     }
-    Ok((None, None))
+    Ok(ListenerStatus::default())
 }
 
 /// One wording for the CLI and the TUI header: only a bound socket is shown
@@ -345,29 +387,33 @@ mod tests {
                 .unwrap();
             }
         };
-        let live = (Some("127.0.0.1:41234".into()), Some("controller-a".into()));
-        let inactive = (None, None);
+        let live = || ListenerStatus {
+            addr: Some("127.0.0.1:41234".into()),
+            controller: Some("controller-a".into()),
+            last_session_error: None,
+        };
+        let inactive = ListenerStatus::default;
         publish(std::process::id()).await;
         // No owner: a leftover record is not a listener.
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
 
         let acquired = lock::acquire_lock(&engine.paths.lock_path()).await.unwrap();
         assert!(acquired.acquired);
-        assert_eq!(listener_status(&engine.paths, true).await.unwrap(), live);
+        assert_eq!(listener_status(&engine.paths, true).await.unwrap(), live());
         // This process holds the lock but its peer runtime stopped (TUI
         // `/pause`): the record it left behind is stale.
         assert_eq!(
             listener_status(&engine.paths, false).await.unwrap(),
-            inactive
+            inactive()
         );
         // Published by a different process than the lock holder.
         publish(std::process::id() + 1).await;
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
         // Records from builds without an owner stamp are never trusted.
         orch_infra::storage::fs_utils::write_json(
@@ -378,12 +424,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
         tokio::fs::remove_file(&record).await.unwrap();
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
 
         publish(std::process::id()).await;
@@ -397,12 +443,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
         lock::release_lock(&engine.paths.lock_path()).await;
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
     }
 

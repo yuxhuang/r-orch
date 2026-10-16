@@ -1,5 +1,18 @@
 //! The worker owns mirrors and execution. A disconnected controller never
 //! cancels a process; only an explicit cancel or a successful sync can do so.
+//!
+//! # Error barrier
+//!
+//! A mirror's storage fault degrades that key, never the link. One mirror this
+//! instance cannot read used to error the whole tick, which closed the socket;
+//! the controller then redialled, hit the same mirror, and the peer looked
+//! permanently offline while the worker logged nothing. So every fallible read
+//! is caught by class instead:
+//!
+//! - per key (`item`): report `unknown` with a reason, and warn once per fault;
+//! - per session (`mirrors`, `local_agents`, `outbox`, `updates`): log, emit a
+//!   debounced `OrchestratorError`, skip this tick, keep the session;
+//! - fatal, closing the session: transport, the handshake, and "expected sync".
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -37,6 +50,9 @@ const PING_EVERY: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 16;
 const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(100);
 const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(2);
+/// One `OrchestratorError` per fault kind per window. A fault that recurs on
+/// every one-second tick must stay visible without flooding the feed.
+const FAULT_REPORT_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct EventRing {
@@ -113,6 +129,19 @@ impl SessionSlot {
     }
 }
 
+#[derive(Default)]
+struct Faults {
+    /// Execution key -> the reason last reported for it, so a key that stays
+    /// unreadable is warned about once rather than on every tick.
+    degraded: HashMap<String, String>,
+    /// Fault kind -> when it was last reported to the event feed.
+    reported: HashMap<&'static str, Instant>,
+    /// Why this instance's last controller session ended, published in
+    /// `_listener.json` so `orch remote status` can explain a peer that keeps
+    /// reconnecting.
+    last_session_error: Option<(String, String)>,
+}
+
 pub struct Worker {
     ctx: Context,
     tap: Mutex<TapState>,
@@ -120,6 +149,7 @@ pub struct Worker {
     /// Serializes takeover and protocol mutations, so the replaced session
     /// cannot mutate a mirror after the new controller's sync.
     session: tokio::sync::Mutex<SessionSlot>,
+    faults: Mutex<Faults>,
 }
 
 impl Worker {
@@ -130,7 +160,53 @@ impl Worker {
             tap: Mutex::new(TapState::default()),
             events,
             session: tokio::sync::Mutex::new(SessionSlot::default()),
+            faults: Mutex::new(Faults::default()),
         })
+    }
+
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.faults.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Emit at most one `OrchestratorError` per `kind` per
+    /// [`FAULT_REPORT_EVERY`].
+    fn report_fault(&self, kind: &'static str, error: &Error, context: String) {
+        let due = {
+            let mut faults = self.faults();
+            let due = faults
+                .reported
+                .get(kind)
+                .is_none_or(|at| at.elapsed() >= FAULT_REPORT_EVERY);
+            if due {
+                faults.reported.insert(kind, Instant::now());
+            }
+            due
+        };
+        if due {
+            self.ctx
+                .engine
+                .events
+                .emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                    error: error.to_string(),
+                    context,
+                    fatal: false,
+                });
+        }
+    }
+
+    /// Log a fault in this instance's own bookkeeping and report it. The
+    /// caller skips the work it was doing; the session stays up.
+    fn session_fault(&self, operation: &'static str, error: &Error) {
+        tracing::warn!(%error, operation, "Peer worker degraded; session kept");
+        self.report_fault(
+            operation,
+            error,
+            format!(
+                "Peer worker {operation}; the controller session is kept and retries. \
+                 Check permissions and free space in {}",
+                self.ctx.engine.paths.root().display()
+            ),
+        );
     }
 
     fn register(&self, task: &Task) {
@@ -151,6 +227,7 @@ impl Worker {
     }
 
     async fn listener_status(&self, addr: &str, controller: Option<&str>) -> Result<()> {
+        let last_error = self.faults().last_session_error.clone();
         // Owner-only like every file under remotes/ (security review F7).
         write_json_with_mode(
             &self.ctx.engine.paths.remotes_dir().join("_listener.json"),
@@ -158,10 +235,32 @@ impl Worker {
                 "listen_addr": addr,
                 "controller_name": controller,
                 "pid": std::process::id(),
+                "last_session_error": last_error.as_ref().map(|(error, _)| error),
+                "last_session_error_at": last_error.as_ref().map(|(_, at)| at),
             }),
             owner_only(),
         )
         .await
+    }
+
+    /// Record and report why a controller session ended. The session error is
+    /// the one thing a worker owner needs when a controller keeps redialling,
+    /// and until now the worker logged it at `debug!` with no identity.
+    async fn session_ended(&self, instance_id: &str, name: &str, generation: u64, error: &Error) {
+        tracing::warn!(
+            controller = %name,
+            %instance_id,
+            generation,
+            %error,
+            "Peer worker session ended"
+        );
+        self.faults().last_session_error =
+            Some((error.to_string(), self.ctx.engine.clock.now_iso()));
+        self.report_fault(
+            "session end",
+            error,
+            format!("Peer worker session with controller {name} ended; awaiting its reconnect"),
+        );
     }
 
     pub async fn listen(self: Arc<Self>, listener: TcpListener) -> Result<()> {
@@ -233,6 +332,7 @@ impl Worker {
             instance_id,
             name,
             agents,
+            version,
             ..
         }) = hello
         else {
@@ -296,11 +396,20 @@ impl Worker {
                     instance_id: instance_id.clone(),
                     connected_since: self.ctx.engine.clock.now_iso(),
                     agents,
+                    controller_version: version,
                 })
                 .await?;
             self.listener_status(addr, Some(&name)).await?;
-            slot.claim(&instance_id, &name)
-                .expect("admission checked while holding session lock")
+            let claimed = slot
+                .claim(&instance_id, &name)
+                .expect("admission checked while holding session lock");
+            // Mirrors belong to the controller that submitted them, and only
+            // this session can be told that one started running.
+            self.ctx
+                .engine
+                .orchestrator
+                .set_inbound_controller(Some(instance_id.clone()));
+            claimed
         };
         let result = async {
             let mut agents = self.ctx.local_agents().await?;
@@ -312,6 +421,7 @@ impl Worker {
                     name: self.ctx.name.clone(),
                     os: std::env::consts::OS.into(),
                     agents: agents.clone(),
+                    version: Some(crate::protocol::version()),
                 },
             )
             .await?;
@@ -399,38 +509,53 @@ impl Worker {
                         if !synced {
                             continue;
                         }
-                        let snapshot = self.ctx.local_agents().await?;
-                        if snapshot != agents {
-                            self.write(
-                                &mut write,
-                                &Frame::Agents {
-                                    agents: snapshot.clone(),
-                                },
-                            )
-                            .await?;
-                            agents = snapshot;
+                        // Everything below reads this instance's own records.
+                        // A fault there skips the tick, never the session.
+                        match self.ctx.local_agents().await {
+                            Ok(snapshot) if snapshot != agents => {
+                                self.write(
+                                    &mut write,
+                                    &Frame::Agents {
+                                        agents: snapshot.clone(),
+                                    },
+                                )
+                                .await?;
+                                agents = snapshot;
+                            }
+                            Ok(_) => {}
+                            Err(error) => self.session_fault("read local agents", &error),
                         }
                         let updates = {
                             let slot = self.session.lock().await;
                             if !slot.is_current(generation) {
                                 return Ok(());
                             }
-                            self.updates(&instance_id, &mut sent).await?
+                            self.updates(&instance_id, &mut sent).await
                         };
                         for frame in updates {
                             self.write(&mut write, &frame).await?;
                         }
-                        for frame in self.ctx.outbox(&name).await? {
-                            self.write(&mut write, &frame).await?;
+                        match self.ctx.outbox(&name).await {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    self.write(&mut write, &frame).await?;
+                                }
+                            }
+                            Err(error) => self.session_fault("read outbox", &error),
                         }
                     }
                 }
             }
         }
         .await;
+        if let Err(error) = &result {
+            self.session_ended(&instance_id, &name, generation, error)
+                .await;
+        }
         let mut slot = self.session.lock().await;
         if slot.is_current(generation) {
             slot.controller = None;
+            self.ctx.engine.orchestrator.set_inbound_controller(None);
             self.listener_status(addr, None).await?;
         }
         result
@@ -460,13 +585,43 @@ impl Worker {
         Ok(mirrors)
     }
 
-    async fn item(&self, key: &str, task: Option<&Task>) -> Result<SyncItem> {
+    /// The controller's view of one execution key, and the error barrier for
+    /// it: a mirror this instance cannot read is reported as `unknown` with a
+    /// reason instead of failing the session. The same fault is warned about
+    /// once, not once per tick.
+    async fn item(&self, key: &str, task: Option<&Task>) -> SyncItem {
+        match self.read_item(key, task).await {
+            Ok(item) => {
+                self.faults().degraded.remove(key);
+                item
+            }
+            Err(error) => {
+                let reason = format!("worker storage error: {}", fault_kind(&error));
+                let first = self
+                    .faults()
+                    .degraded
+                    .insert(key.into(), reason.clone())
+                    .as_deref()
+                    != Some(reason.as_str());
+                if first {
+                    tracing::warn!(
+                        exec_key = %key,
+                        task_id = task.map(|task| task.id.as_str()).unwrap_or_default(),
+                        %error,
+                        "Mirror state unreadable; reporting the key as unknown"
+                    );
+                }
+                SyncItem {
+                    worker_task_id: task.map(|task| task.id.clone()),
+                    ..SyncItem::new(key, "unknown").with_reason(reason)
+                }
+            }
+        }
+    }
+
+    async fn read_item(&self, key: &str, task: Option<&Task>) -> Result<SyncItem> {
         let Some(task) = task else {
-            return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "unknown".into(),
-                outcome: None,
-            });
+            return Ok(SyncItem::new(key, "unknown"));
         };
         let state = self.ctx.engine.state.read().await?;
         // A quarantined mirror is terminal even while its unverified saved
@@ -479,20 +634,15 @@ impl Worker {
             && (state.running.contains_key(&task.id) || state.claimed.contains(&task.id))
         {
             return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "running".into(),
-                outcome: None,
+                worker_task_id: Some(task.id.clone()),
+                ..SyncItem::new(key, "running")
             });
         }
         // The caller's snapshot may predate the final state write. Reading
         // the task after the reservation disappeared observes post-processing.
         let latest = self.ctx.engine.tasks.get(&task.id).await?;
         let Some(task) = latest.as_ref() else {
-            return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "unknown".into(),
-                outcome: None,
-            });
+            return Ok(SyncItem::new(key, "unknown"));
         };
         let run = self
             .ctx
@@ -503,34 +653,61 @@ impl Worker {
             .into_iter()
             .max_by_key(|run| run.attempt);
         if run.is_none() && matches!(task.status, TaskStatus::Done | TaskStatus::Review) {
-            return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "unknown".into(),
-                outcome: None,
-            });
+            return Ok(SyncItem::new(key, "unknown").with_reason("worker has no execution record"));
         }
         let outcome = derive_outcome(task, run.as_ref());
-        Ok(SyncItem {
-            exec_key: key.into(),
-            state: if outcome.is_some() {
-                "finished"
-            } else if matches!(
-                task.status,
-                TaskStatus::InProgress | TaskStatus::Review | TaskStatus::Done | TaskStatus::Failed
-            ) {
-                "running"
-            } else {
-                "queued"
-            }
-            .into(),
+        let state = if outcome.is_some() {
+            "finished"
+        } else if matches!(
+            task.status,
+            TaskStatus::InProgress | TaskStatus::Review | TaskStatus::Done | TaskStatus::Failed
+        ) {
+            "running"
+        } else {
+            "queued"
+        };
+        let item = SyncItem {
             outcome,
+            worker_task_id: Some(task.id.clone()),
+            ..SyncItem::new(key, state)
+        };
+        // Security F4 holds this mirror until the worker's owner approves it.
+        // Naming the command is the only way the controller's owner can tell
+        // this apart from a worker that is merely busy.
+        Ok(if task.awaits_approval() {
+            item.with_reason(format!(
+                "awaiting approval: run `orch task approve {}` on this worker",
+                task.id
+            ))
+        } else {
+            item
         })
     }
 
     async fn handle(&self, controller: &str, name: &str, frame: Frame) -> Result<Vec<Frame>> {
         match frame {
             Frame::Sync { active } => {
-                let mirrors = self.mirrors(controller).await?;
+                // The controller's first post-handshake frame. It must always
+                // be answered: without a SyncState the controller cannot tell
+                // a degraded worker from a lost one.
+                let mirrors = match self.mirrors(controller).await {
+                    Ok(mirrors) => mirrors,
+                    Err(error) => {
+                        self.session_fault("read mirrors for sync", &error);
+                        let reason = format!("worker storage error: {}", fault_kind(&error));
+                        return Ok(vec![Frame::SyncState {
+                            items: active
+                                .iter()
+                                .map(|key| {
+                                    SyncItem::new(key, "unknown").with_reason(reason.clone())
+                                })
+                                .collect(),
+                        }]);
+                    }
+                };
+                // Cleanup never gates the reply: an orphan this instance
+                // cannot cancel is retried on the controller's next sync.
+                let mut orphans = 0;
                 for task in &mirrors {
                     if let Some(key) = label(task, "exec:")
                         && !active.iter().any(|k| k == key)
@@ -538,25 +715,45 @@ impl Worker {
                             task.status,
                             TaskStatus::Todo | TaskStatus::InProgress | TaskStatus::Retrying
                         )
+                        && let Err(error) = self.ctx.engine.orchestrator.cancel_task(&task.id).await
                     {
-                        self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
+                        orphans += 1;
+                        tracing::warn!(task_id = %task.id, exec_key = %key, %error, "Orphan mirror not cancelled; retrying on the next sync");
                     }
+                }
+                if orphans > 0 {
+                    self.report_fault(
+                        "orphan cleanup",
+                        &Error::other(format!("{orphans} orphan mirror(s) could not be cancelled")),
+                        format!(
+                            "Peer worker sync for controller {name}; the mirrors stay as they are \
+                             and cleanup retries on the next sync"
+                        ),
+                    );
                 }
                 let mut items = Vec::with_capacity(active.len());
                 for key in active {
                     // Re-read after cancellation and any concurrently completed run.
-                    let task = mirrors
+                    let mirror = mirrors
                         .iter()
                         .find(|t| label(t, "exec:") == Some(key.as_str()));
-                    let task = if let Some(task) = task {
-                        self.ctx.engine.tasks.get(&task.id).await?
-                    } else {
-                        None
+                    let task = match mirror {
+                        // A read failure is handed on rather than swallowed:
+                        // `item` meets the same fault and degrades this key
+                        // alone to `unknown` with a reason.
+                        Some(mirror) => self
+                            .ctx
+                            .engine
+                            .tasks
+                            .get(&mirror.id)
+                            .await
+                            .unwrap_or_else(|_| Some(mirror.clone())),
+                        None => None,
                     };
-                    items.push(self.item(&key, task.as_ref()).await?);
+                    items.push(self.item(&key, task.as_ref()).await);
                 }
                 let mut replies = vec![Frame::SyncState { items }];
-                replies.extend(self.updates(controller, &mut HashMap::new()).await?);
+                replies.extend(self.updates(controller, &mut HashMap::new()).await);
                 Ok(replies)
             }
             Frame::Submit {
@@ -569,7 +766,18 @@ impl Worker {
                 review_criteria,
                 goal_id,
             } => {
-                let tasks = self.ctx.engine.tasks.list(&TaskFilter::default()).await?;
+                // Rejected rather than skipped: without the duplicate check
+                // this request could create a second mirror for one key.
+                let tasks = match self.ctx.engine.tasks.list(&TaskFilter::default()).await {
+                    Ok(tasks) => tasks,
+                    Err(error) => {
+                        self.session_fault("read tasks for submit", &error);
+                        return Ok(vec![Frame::Rejected {
+                            exec_key,
+                            reason: format!("worker storage error: {}", fault_kind(&error)),
+                        }]);
+                    }
+                };
                 if let Some(task) = tasks
                     .iter()
                     .find(|t| label(t, "exec:") == Some(exec_key.as_str()))
@@ -589,7 +797,16 @@ impl Worker {
                 let agent = if agent_id.contains('@') {
                     None
                 } else {
-                    self.ctx.engine.agents.get(&agent_id).await?
+                    match self.ctx.engine.agents.get(&agent_id).await {
+                        Ok(agent) => agent,
+                        Err(error) => {
+                            self.session_fault("read agent for submit", &error);
+                            return Ok(vec![Frame::Rejected {
+                                exec_key,
+                                reason: format!("worker storage error: {}", fault_kind(&error)),
+                            }]);
+                        }
+                    }
                 };
                 if exec_key.is_empty()
                     || exec_key.len() > 256
@@ -635,14 +852,21 @@ impl Worker {
                         if held {
                             tracing::info!(task_id = %task.id, "Remote task awaits approval: orch task approve");
                         }
+                        let worker_task_id = task.id;
                         Ok(vec![
                             Frame::Submitted {
                                 exec_key: exec_key.clone(),
-                                worker_task_id: task.id,
+                                worker_task_id: worker_task_id.clone(),
                             },
                             Frame::State {
                                 exec_key,
                                 state: "queued".into(),
+                                reason: held.then(|| {
+                                    format!(
+                                        "awaiting approval: run `orch task approve {worker_task_id}` on this worker"
+                                    )
+                                }),
+                                worker_task_id: Some(worker_task_id),
                             },
                         ])
                     }
@@ -653,31 +877,50 @@ impl Worker {
                 }
             }
             Frame::Cancel { exec_key } => {
-                if let Some(task) = self
-                    .mirrors(controller)
-                    .await?
+                // Unacknowledged on a fault: an ack the controller cannot
+                // trust would retire a cancellation key that never took.
+                let mirrors = match self.mirrors(controller).await {
+                    Ok(mirrors) => mirrors,
+                    Err(error) => {
+                        self.session_fault("read mirrors for cancel", &error);
+                        return Ok(vec![]);
+                    }
+                };
+                if let Some(task) = mirrors
                     .iter()
                     .find(|t| label(t, "exec:") == Some(exec_key.as_str()))
                     && !matches!(
                         task.status,
                         TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
                     )
+                    && let Err(error) = self.ctx.engine.orchestrator.cancel_task(&task.id).await
                 {
-                    self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
+                    self.session_fault("cancel mirror", &error);
+                    return Ok(vec![]);
                 }
                 Ok(vec![Frame::CancelAck { exec_key }])
             }
             Frame::FinishedAck { exec_key } => {
-                if let Some(mut task) = self
-                    .mirrors(controller)
-                    .await?
+                // Not recording the ack costs one resend of the outcome on
+                // the next sync, so every fault here simply retries.
+                let mirrors = match self.mirrors(controller).await {
+                    Ok(mirrors) => mirrors,
+                    Err(error) => {
+                        self.session_fault("read mirrors for finished ack", &error);
+                        return Ok(vec![]);
+                    }
+                };
+                if let Some(mut task) = mirrors
                     .into_iter()
                     .find(|t| label(t, "exec:") == Some(exec_key.as_str()))
-                    && self.item(&exec_key, Some(&task)).await?.outcome.is_some()
+                    && self.item(&exec_key, Some(&task)).await.outcome.is_some()
                     && !task.labels.iter().any(|l| l == "remote-finished-ack")
                 {
                     task.labels.push("remote-finished-ack".into());
-                    self.ctx.engine.tasks.save(&task).await?;
+                    if let Err(error) = self.ctx.engine.tasks.save(&task).await {
+                        self.session_fault("record finished ack", &error);
+                        return Ok(vec![]);
+                    }
                     let mut tap = self.tap.lock().expect("worker event ring poisoned");
                     tap.rings.remove(&exec_key);
                     tap.tasks.remove(&task.id);
@@ -688,7 +931,12 @@ impl Worker {
                 exec_key,
                 after_seq,
             } => {
-                let mirrors = self.mirrors(controller).await?;
+                // A Gap alone is a valid answer: the controller re-attaches
+                // and the live event stream is unaffected.
+                let mirrors = self.mirrors(controller).await.unwrap_or_else(|error| {
+                    self.session_fault("read mirrors for attach", &error);
+                    Vec::new()
+                });
                 let mut replay = Vec::new();
                 if mirrors
                     .iter()
@@ -709,10 +957,19 @@ impl Worker {
                 Ok(replay)
             }
             Frame::Agents { agents } => {
+                // The snapshot itself is peer input, so an invalid one stays
+                // fatal; failing to *store* a valid one only costs staleness.
                 validate_snapshot(&agents)?;
-                if let Some(mut inbound) = self.ctx.store.read_inbound().await? {
-                    inbound.agents = agents;
-                    self.ctx.store.write_inbound(&inbound).await?;
+                if let Err(error) = async {
+                    if let Some(mut inbound) = self.ctx.store.read_inbound().await? {
+                        inbound.agents = agents;
+                        self.ctx.store.write_inbound(&inbound).await?;
+                    }
+                    Ok::<(), Error>(())
+                }
+                .await
+                {
+                    self.session_fault("record inbound agents", &error);
                 }
                 Ok(vec![])
             }
@@ -729,20 +986,25 @@ impl Worker {
         }
     }
 
-    async fn updates(
-        &self,
-        controller: &str,
-        sent: &mut HashMap<String, String>,
-    ) -> Result<Vec<Frame>> {
+    async fn updates(&self, controller: &str, sent: &mut HashMap<String, String>) -> Vec<Frame> {
         let mut replies = Vec::new();
-        for task in self.mirrors(controller).await? {
+        // Nothing to send this tick rather than an ended session: the next
+        // tick, one second later, tries again.
+        let mirrors = match self.mirrors(controller).await {
+            Ok(mirrors) => mirrors,
+            Err(error) => {
+                self.session_fault("read mirrors for updates", &error);
+                return replies;
+            }
+        };
+        for task in mirrors {
             if task.labels.iter().any(|l| l == "remote-finished-ack") {
                 continue;
             }
             let Some(key) = label(&task, "exec:") else {
                 continue;
             };
-            let item = self.item(key, Some(&task)).await?;
+            let item = self.item(key, Some(&task)).await;
             if sent.get(key) == Some(&item.state) {
                 continue;
             }
@@ -758,10 +1020,27 @@ impl Worker {
                 replies.push(Frame::State {
                     exec_key: key.into(),
                     state: item.state,
+                    reason: item.reason,
+                    worker_task_id: item.worker_task_id,
                 });
             }
         }
-        Ok(replies)
+        replies
+    }
+}
+
+/// A coarse class for a storage fault, for the `reason` the controller shows
+/// its owner. Never the error's own text: that can carry a local path or an
+/// error chain, and neither belongs on the wire (see `Context::ingest`).
+fn fault_kind(error: &Error) -> &'static str {
+    match error {
+        Error::Io { .. } => "unreadable file",
+        Error::Serde { .. } => "corrupt record",
+        Error::Command { .. } => "command failed",
+        Error::Adapter(_) => "adapter failed",
+        // Everything else, including the YAML size and alias guards, which
+        // report through `Error::other`.
+        Error::Domain(_) => "read failed",
     }
 }
 
@@ -1059,6 +1338,7 @@ mod tests {
                 name: "w1".into(),
                 os: "test".into(),
                 agents: vec![],
+                version: None,
             },
         )
         .await
@@ -1123,6 +1403,7 @@ mod tests {
                 name: "C".into(),
                 os: "test".into(),
                 agents: vec![],
+                version: None,
             },
         )
         .await
@@ -1166,6 +1447,7 @@ mod tests {
                     name: name.into(),
                     os: "test".into(),
                     agents: vec![],
+                    version: None,
                 },
             )
             .await
@@ -1319,10 +1601,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Succeeded);
         // The controller receives the outcome on its next update.
-        let frames = worker
-            .updates("controller", &mut HashMap::new())
-            .await
-            .unwrap();
+        let frames = worker.updates("controller", &mut HashMap::new()).await;
         assert!(
             frames.iter().any(|frame| matches!(
                 frame,
@@ -1379,7 +1658,7 @@ mod tests {
                 .is_empty(),
             "held mirror must not execute"
         );
-        let item = worker.item("key", Some(&held)).await.unwrap();
+        let item = worker.item("key", Some(&held)).await;
         assert_eq!((item.state.as_str(), item.outcome), ("queued", None));
 
         // `orch task approve <id>` on the worker.
@@ -1668,18 +1947,15 @@ mod tests {
         task.status = TaskStatus::Failed;
         worker.ctx.engine.tasks.save(&task).await.unwrap();
         assert!(matches!(
-            worker.item("key", Some(&task)).await.unwrap().outcome,
+            worker.item("key", Some(&task)).await.outcome,
             Some(RemoteOutcome::Failed { .. })
         ));
         task.status = TaskStatus::Review;
         worker.ctx.engine.tasks.save(&task).await.unwrap();
-        let item = worker.item("key", Some(&task)).await.unwrap();
+        let item = worker.item("key", Some(&task)).await;
         assert_eq!(item.state, "unknown");
         assert!(item.outcome.is_none());
-        let updates = worker
-            .updates("controller", &mut HashMap::new())
-            .await
-            .unwrap();
+        let updates = worker.updates("controller", &mut HashMap::new()).await;
         assert!(matches!(&updates[0], Frame::SyncState { items } if items[0].state == "unknown"));
     }
 
@@ -1694,19 +1970,12 @@ mod tests {
         let mut state = worker.ctx.engine.state.read().await.unwrap();
         state.claimed.insert(task.id.clone());
         worker.ctx.engine.state.write(&state).await.unwrap();
-        let item = worker.item("key", Some(&task)).await.unwrap();
+        let item = worker.item("key", Some(&task)).await;
         assert_eq!(item.state, "running");
         assert!(item.outcome.is_none());
         state.claimed.clear();
         worker.ctx.engine.state.write(&state).await.unwrap();
-        assert!(
-            worker
-                .item("key", Some(&task))
-                .await
-                .unwrap()
-                .outcome
-                .is_some()
-        );
+        assert!(worker.item("key", Some(&task)).await.outcome.is_some());
     }
 
     include!("worker_hardening_tests.rs");

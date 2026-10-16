@@ -35,6 +35,7 @@ impl TestListener {
                 name: "controller".into(),
                 os: "test".into(),
                 agents: vec![],
+                version: None,
             },
         )
         .await
@@ -422,6 +423,146 @@ async fn oversized_sync_and_finished_keep_session_open_for_next_frame() {
     finished.sort();
     assert_eq!(synced, keys);
     assert_eq!(finished, keys);
+}
+
+/// The live failure this branch fixes: one mirror whose task file could not be
+/// read errored the whole tick, so the worker closed the connection right after
+/// every handshake and the controller saw the peer as permanently offline. The
+/// mirror's index entry survives a corrupt file, so `mirrors()` still lists a
+/// task that `tasks.get` cannot read — exactly the production shape.
+#[tokio::test]
+async fn an_unreadable_mirror_is_reported_unknown_and_keeps_the_session() {
+    let listener = TestListener::start().await;
+    let mut read = listener.hello("sender").await;
+    listener.sync(&mut read).await;
+    write_frame(read.get_mut(), &submit("poison", &listener.agent))
+        .await
+        .unwrap();
+    assert!(matches!(
+        socket_data(&mut read).await,
+        Some(Frame::Submitted { .. })
+    ));
+    let task = mirror(&listener.worker, "poison").await;
+    let path = listener
+        .worker
+        .ctx
+        .engine
+        .paths
+        .task_path(&task.id)
+        .unwrap();
+    tokio::fs::write(&path, b"{not: [valid").await.unwrap();
+
+    write_frame(
+        read.get_mut(),
+        &Frame::Sync {
+            active: vec!["poison".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let Some(Frame::SyncState { items }) = socket_data(&mut read).await else {
+        panic!("sync must be answered even when a mirror is unreadable")
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].state, "unknown");
+    assert_eq!(
+        items[0].reason.as_deref(),
+        Some("worker storage error: read failed"),
+        "the reason names a class, never the error text: that can carry a local path"
+    );
+    assert_eq!(items[0].worker_task_id.as_deref(), Some(task.id.as_str()));
+
+    // The session is still usable: the next frame is answered, and a tick's
+    // worth of updates reports the same key as unknown rather than ending it.
+    write_frame(read.get_mut(), &Frame::Ping).await.unwrap();
+    loop {
+        match socket_data(&mut read).await {
+            // The sync reply's trailing updates repeat the degraded key.
+            Some(Frame::SyncState { items }) => assert_eq!(items[0].state, "unknown"),
+            Some(Frame::Pong) => break,
+            other => panic!("session closed instead of answering: {other:?}"),
+        }
+    }
+    let updates = listener
+        .worker
+        .updates("sender", &mut HashMap::new())
+        .await;
+    assert!(
+        matches!(&updates[0], Frame::SyncState { items } if items[0].state == "unknown"
+            && items[0].reason.is_some()),
+        "{updates:?}"
+    );
+
+    // And it recovers by itself once the record is readable again.
+    listener
+        .worker
+        .ctx
+        .engine
+        .tasks
+        .save(&task)
+        .await
+        .unwrap();
+    let item = listener.worker.item("poison", Some(&task)).await;
+    assert_eq!((item.state.as_str(), item.reason.as_deref()), ("queued", None));
+}
+
+/// 2com's `serve.log` had no peer lines at all while every session died, so
+/// there was nothing to debug from. A session that ends with an error is now
+/// logged, reported, and left behind in `_listener.json` for `remote status`.
+#[tokio::test]
+async fn a_failed_session_records_why_in_the_listener_record() {
+    let listener = TestListener::start().await;
+    let mut events = listener.worker.ctx.engine.events.subscribe();
+    let mut read = listener.hello("sender").await;
+    listener.sync(&mut read).await;
+    // A worker-to-controller frame arriving from the controller: a contract
+    // violation, and one of the few things that still ends a session.
+    write_frame(
+        read.get_mut(),
+        &Frame::CancelAck {
+            exec_key: "key".into(),
+        },
+    )
+    .await
+    .unwrap();
+    socket_closed(&mut read).await;
+
+    let record = timeout(Duration::from_secs(5), async {
+        loop {
+            let status: serde_json::Value = serde_json::from_slice(
+                &tokio::fs::read(
+                    listener
+                        .worker
+                        .ctx
+                        .engine
+                        .paths
+                        .remotes_dir()
+                        .join("_listener.json"),
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            if !status["last_session_error"].is_null() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the ended session was never recorded");
+    assert_eq!(record["last_session_error"], "unexpected controller frame");
+    assert!(record["last_session_error_at"].is_string());
+    assert!(record["controller_name"].is_null(), "{record}");
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap().as_ref(),
+            orch_domain::OrchestratorEvent::OrchestratorError { error, fatal: false, .. }
+                if error.contains("unexpected controller frame")
+        ),
+        "the session end must reach the event feed"
+    );
+    listener.healthy().await;
 }
 
 fn incoming_message(id: &str, to: &str) -> Frame {

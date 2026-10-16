@@ -174,7 +174,7 @@ mod tests {
         let runtime = start_watch(Arc::clone(&engine), options()).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let addr = loop {
-            if let (Some(addr), _) = status().await.unwrap() {
+            if let Some(addr) = status().await.unwrap().addr {
                 break addr;
             }
             assert!(
@@ -192,7 +192,10 @@ mod tests {
         // The TUI's `/pause`: stop the engine, then drop its peer runtime.
         engine.orchestrator.stop().await.unwrap();
         drop(runtime);
-        assert_eq!(status().await.unwrap(), (None, None));
+        assert_eq!(
+            status().await.unwrap(),
+            crate::commands::remote::ListenerStatus::default()
+        );
         assert!(!paths.remotes_dir().join("_listener.json").exists());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::net::TcpStream::connect(&addr).await.is_ok() {

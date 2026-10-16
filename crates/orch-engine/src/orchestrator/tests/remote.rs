@@ -156,6 +156,7 @@ impl PeerFixture {
                     capabilities: vec!["linux".into()],
                     ..make_agent()
                 }],
+                peer_version: None,
             })
             .await
             .unwrap();

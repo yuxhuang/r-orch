@@ -516,6 +516,7 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
             instance_id: None,
             os: None,
             agents: vec![],
+            peer_version: None,
         });
     status.addr = config.addr.clone();
     status.online = false;
@@ -596,6 +597,7 @@ async fn session(
             name: ctx.name.clone(),
             os: std::env::consts::OS.into(),
             agents: local.clone(),
+            version: Some(crate::protocol::version()),
         },
     )
     .await
@@ -611,6 +613,7 @@ async fn session(
             name,
             os,
             agents,
+            version,
         }) => {
             if proto != PROTOCOL {
                 return Err(Error::other("Peer protocol mismatch"));
@@ -626,6 +629,7 @@ async fn session(
             status.peer_name = Some(name);
             status.os = Some(os);
             status.agents = agents;
+            status.peer_version = version;
         }
         Some(Frame::Busy { controller }) => {
             return Err(Error::other(format!(
@@ -775,15 +779,21 @@ async fn handle_frame(
                         }
                     }
                     "unknown" if hub.attempted(&config.alias, &item.exec_key) => {
+                        log_reason(config, &item.exec_key, &item.state, item.reason.as_deref());
                         hub.terminal(&config.alias, &item.exec_key, RemoteRunEvent::Unknown);
                     }
-                    "queued" | "running" => hub.hint(
-                        &config.alias,
-                        &item.exec_key,
-                        &item.state,
-                        ctx.engine.clock.now_iso(),
-                    ),
-                    "unknown" => {}
+                    "queued" | "running" => {
+                        log_reason(config, &item.exec_key, &item.state, item.reason.as_deref());
+                        hub.hint(
+                            &config.alias,
+                            &item.exec_key,
+                            &item.state,
+                            ctx.engine.clock.now_iso(),
+                        );
+                    }
+                    "unknown" => {
+                        log_reason(config, &item.exec_key, &item.state, item.reason.as_deref())
+                    }
                     _ => return Err(Error::other("Invalid peer sync state")),
                 }
             }
@@ -817,7 +827,13 @@ async fn handle_frame(
             }
         }
         Frame::MsgAck { id, reason } => ctx.msg_ack(&config.alias, &id, reason.as_deref()).await?,
-        Frame::State { exec_key, state } => {
+        Frame::State {
+            exec_key,
+            state,
+            reason,
+            ..
+        } => {
+            log_reason(config, &exec_key, &state, reason.as_deref());
             hub.hint(&config.alias, &exec_key, &state, ctx.engine.clock.now_iso())
         }
         Frame::CancelAck { exec_key } => hub.cancel_ack(&config.alias, &exec_key),
@@ -826,6 +842,15 @@ async fn handle_frame(
         _ => return Err(Error::other("Unexpected worker frame")),
     }
     Ok(())
+}
+
+/// Surface a worker's explanation for a state. The phase model that shows it
+/// in task views is not here yet, so the log is where an operator reads why a
+/// key is unknown, or which `orch task approve` a mirror is waiting for.
+fn log_reason(config: &RemoteConfig, exec_key: &str, state: &str, reason: Option<&str>) {
+    if let Some(reason) = reason {
+        tracing::warn!(alias = %config.alias, %exec_key, %state, %reason, "Remote execution state");
+    }
 }
 
 fn net_error(error: std::io::Error) -> Error {
@@ -896,6 +921,7 @@ mod tests {
                 instance_id: None,
                 os: None,
                 agents: vec![],
+                peer_version: None,
             };
             let _ = session(
                 &ctx,
@@ -921,6 +947,7 @@ mod tests {
                     name: "worker".into(),
                     os: "test".into(),
                     agents: vec![],
+                    version: None,
                 },
             )
             .await
@@ -932,11 +959,7 @@ mod tests {
             write_frame(
                 read.get_mut(),
                 &Frame::SyncState {
-                    items: vec![crate::protocol::SyncItem {
-                        exec_key: "run1".into(),
-                        state: "unknown".into(),
-                        outcome: None,
-                    }],
+                    items: vec![crate::protocol::SyncItem::new("run1", "unknown")],
                 },
             )
             .await
@@ -955,11 +978,7 @@ mod tests {
             write_frame(
                 read.get_mut(),
                 &Frame::SyncState {
-                    items: vec![crate::protocol::SyncItem {
-                        exec_key: "run2".into(),
-                        state: "unknown".into(),
-                        outcome: None,
-                    }],
+                    items: vec![crate::protocol::SyncItem::new("run2", "unknown")],
                 },
             )
             .await

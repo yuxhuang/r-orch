@@ -278,9 +278,8 @@ mod tests {
         let frame = Frame::SyncState {
             items: (0..3)
                 .map(|n| SyncItem {
-                    exec_key: format!("key{n}"),
-                    state: "finished".into(),
                     outcome: Some(outcome.clone()),
+                    ..SyncItem::new(&format!("key{n}"), "finished")
                 })
                 .collect(),
         };

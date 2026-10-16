@@ -34,6 +34,10 @@ pub struct RemoteStatus {
     pub os: Option<String>,
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// The peer's release, as its `Welcome` reported it. `None` from a peer
+    /// older than the field, or before the first handshake.
+    #[serde(default)]
+    pub peer_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +47,9 @@ pub struct InboundStatus {
     pub connected_since: String,
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// The controller's release, as its `Hello` reported it.
+    #[serde(default)]
+    pub controller_version: Option<String>,
 }
 
 #[cfg(test)]

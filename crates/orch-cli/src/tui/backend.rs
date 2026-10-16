@@ -378,15 +378,15 @@ impl TuiBackend for EngineBackend {
         self.block_on(async {
             let store =
                 orch_infra::storage::remote::FileRemoteStore::new(self.engine.paths.clone());
-            let (listen, controller) =
+            let listener =
                 crate::commands::remote::listener_status(&self.engine.paths, own_runtime).await?;
             let mut status = format!(
                 "listen {} · controller {}",
                 crate::commands::remote::describe_listen(
-                    listen.as_deref(),
+                    listener.addr.as_deref(),
                     self.engine.config.peer.listen.as_deref(),
                 ),
-                controller.as_deref().unwrap_or("none"),
+                listener.controller.as_deref().unwrap_or("none"),
             );
             for remote in store.list().await? {
                 let online = store

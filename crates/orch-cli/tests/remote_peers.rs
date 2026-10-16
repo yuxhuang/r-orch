@@ -882,6 +882,7 @@ impl HealthLeaseFixture {
             instance_id: None,
             os: None,
             agents: vec![],
+            peer_version: None,
         };
         publisher.write_status(&status).await.unwrap();
         Self {

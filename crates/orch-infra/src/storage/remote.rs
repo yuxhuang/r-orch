@@ -150,6 +150,8 @@ struct PublicRemoteStatus {
     os: Option<String>,
     #[serde(default, with = "public_snapshot")]
     agents: Vec<Agent>,
+    #[serde(default)]
+    peer_version: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -163,6 +165,8 @@ struct PublicInboundStatus {
     connected_since: String,
     #[serde(default, with = "public_snapshot")]
     agents: Vec<Agent>,
+    #[serde(default)]
+    controller_version: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -680,6 +684,7 @@ mod tests {
             instance_id: None,
             os: Some("linux".into()),
             agents: vec![agent],
+            peer_version: None,
         }
     }
 
@@ -748,6 +753,7 @@ mod tests {
             instance_id: "id".into(),
             connected_since: "now".into(),
             agents: hostile.agents.clone(),
+            controller_version: None,
         };
         write_json(&paths.remotes_dir().join("_inbound.json"), &inbound)
             .await
@@ -1010,6 +1016,7 @@ mod tests {
             instance_id: "controller-id".into(),
             connected_since: "now".into(),
             agents: status.agents.clone(),
+            controller_version: None,
         };
         let outbound_path = paths.remotes_dir().join("w1.json");
         let inbound_path = paths.remotes_dir().join("_inbound.json");
@@ -1195,6 +1202,7 @@ mod tests {
             instance_id: "id".into(),
             connected_since: "now".into(),
             agents: bad.agents.clone(),
+            controller_version: None,
         };
         assert!(store.write_inbound(&inbound).await.is_err());
         write_json(&paths.remotes_dir().join("w1.json"), &bad)
@@ -1219,6 +1227,7 @@ mod tests {
                 instance_id: "id".into(),
                 connected_since: "now".into(),
                 agents: vec![make_agent()],
+                controller_version: None,
             })
             .await
             .unwrap();
@@ -1271,6 +1280,7 @@ mod tests {
                 instance_id: "C".into(),
                 connected_since: "2026-10-15T00:00:00Z".into(),
                 agents: vec![make_agent()],
+                controller_version: None,
             })
             .await
             .unwrap();
