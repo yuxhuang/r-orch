@@ -465,10 +465,15 @@ async fn an_unreadable_mirror_is_reported_unknown_and_keeps_the_session() {
     };
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].state, "unknown");
-    assert_eq!(
-        items[0].reason.as_deref(),
-        Some("worker storage error: read failed"),
-        "the reason names a class, never the error text: that can carry a local path"
+    // Which class it is depends on which read path meets the corrupt file
+    // first, so pin the shape rather than the word.
+    let reason = items[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        matches!(
+            reason,
+            "worker storage error: read failed" | "worker storage error: corrupt record"
+        ),
+        "the reason names a class, never the error text: that can carry a local path; got {reason:?}"
     );
     assert_eq!(items[0].worker_task_id.as_deref(), Some(task.id.as_str()));
 
