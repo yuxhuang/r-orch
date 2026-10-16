@@ -201,6 +201,9 @@ struct Inner {
     remote_state_dirty: AtomicBool,
     remote_bridge: std::sync::RwLock<Arc<dyn orch_core::remote::RemoteBridge>>,
     event_tap: std::sync::RwLock<Option<Arc<dyn orch_core::remote::RunEventTap>>>,
+    /// The instance id of the controller connected to this instance's peer
+    /// listener, if any. Dispatch consults it before starting a mirror.
+    inbound_controller: std::sync::RwLock<Option<String>>,
     lazy_save: Mutex<LazySave>,
     immediate_dispatch: Mutex<Option<tokio::task::JoinHandle<()>>>,
     watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -262,6 +265,7 @@ impl Orchestrator {
                     orch_core::remote::NoopRemoteBridge,
                 )),
                 event_tap: std::sync::RwLock::new(None),
+                inbound_controller: std::sync::RwLock::new(None),
                 deps,
                 state: Mutex::new(None),
                 active_collectors: Mutex::new(HashSet::new()),

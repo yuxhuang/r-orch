@@ -31,6 +31,24 @@ impl Orchestrator {
             .unwrap_or_else(|e| e.into_inner()) = Some(tap);
     }
 
+    /// Publish the controller this instance's peer listener is serving, or
+    /// `None` once its session ends. Set by the peer worker on admission.
+    pub fn set_inbound_controller(&self, instance_id: Option<String>) {
+        *self
+            .inner
+            .inbound_controller
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = instance_id;
+    }
+
+    pub(super) fn inbound_controller(&self) -> Option<String> {
+        self.inner
+            .inbound_controller
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Release the owner's in-process tap when its peer runtime stops.
     pub fn clear_run_event_tap(&self) {
         *self

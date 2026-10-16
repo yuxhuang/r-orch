@@ -892,6 +892,12 @@ mod tests {
             .await
             .unwrap(),
         );
+        // The tests drive `handle` directly, so nothing claims a session slot.
+        // A mirror only runs while its controller is connected, which here is
+        // the `"controller"` every test submits as.
+        engine
+            .orchestrator
+            .set_inbound_controller(Some("controller".into()));
         let agent = engine
             .agent_service
             .create(CreateAgentInput {

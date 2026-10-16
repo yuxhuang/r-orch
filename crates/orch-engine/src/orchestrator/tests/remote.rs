@@ -821,6 +821,9 @@ async fn mirror_task_failing_criteria_never_force_approves() {
         }])
         .review_outcome(review_fail())
         .build();
+    // The mirror only runs while its controller holds the session.
+    h.orchestrator
+        .set_inbound_controller(Some("controller-id".into()));
     h.set_state(OrchestratorState::default()).await;
     h.tick().await.unwrap();
     h.settle().await;
@@ -852,6 +855,8 @@ async fn mirror_prompt_is_verbatim_with_worker_role_skills_and_remote_instructio
             ..make_task()
         }])
         .build();
+    h.orchestrator
+        .set_inbound_controller(Some("controller-id".into()));
     h.set_state(OrchestratorState::default()).await;
     h.tick().await.unwrap();
     h.settle().await;
@@ -2019,4 +2024,49 @@ async fn local_collectorless_missing_task_releases_dead_reservation_without_sign
         orch_domain::AgentStatus::Idle
     );
     assert!(h.processes.killed_with_grace().is_empty());
+}
+
+/// A worker must not start a mirror whose `remote-ctl:` controller is not the
+/// session it is serving now: only that controller can be told the run started
+/// and only it will collect the outcome, so running the mirror for anyone else
+/// spends an agent on work nobody is waiting for. In the live failure the stale
+/// mirror of a long-gone controller sat dispatchable on the worker forever.
+#[tokio::test]
+async fn a_mirror_is_dispatched_only_while_its_own_controller_is_connected() {
+    use orch_core::test_support::{FakeAdapter, done_event};
+    let adapter = FakeAdapter::new();
+    adapter.set_events([done_event(NOW_ISO)]);
+    let h = Harness::builder()
+        .agents([make_agent()])
+        .tasks([Task {
+            id: "tsk_mirror".into(),
+            assignee: Some("agt_test1".into()),
+            labels: vec![
+                "remote:mac".into(),
+                "remote-ctl:controller-a".into(),
+                "exec:run_a".into(),
+            ],
+            ..make_task()
+        }])
+        .adapter(Arc::new(adapter))
+        .build();
+    h.load_state().await.unwrap();
+
+    // Nobody connected, then a different controller connected: neither may
+    // start this mirror.
+    for controller in [None, Some("controller-b".to_owned())] {
+        h.orchestrator.set_inbound_controller(controller);
+        h.orchestrator.invalidate_caches().await;
+        h.tick().await.unwrap();
+        assert!(!h.was_dispatched("tsk_mirror"));
+        assert_eq!(h.task("tsk_mirror").status, TaskStatus::Todo);
+        assert!(h.adapter.execute_calls.is_empty());
+    }
+
+    h.orchestrator
+        .set_inbound_controller(Some("controller-a".into()));
+    h.orchestrator.invalidate_caches().await;
+    h.tick().await.unwrap();
+    assert!(h.was_dispatched("tsk_mirror"));
+    assert_eq!(h.adapter.execute_calls.len(), 1);
 }
