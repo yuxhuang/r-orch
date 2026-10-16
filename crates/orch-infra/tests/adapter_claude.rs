@@ -188,6 +188,58 @@ async fn an_empty_system_prompt_is_treated_as_none() {
     assert!(!record.has_flag("--system-prompt"));
 }
 
+fn run_with_prompts(
+    orchestrator: &str,
+    agent: Option<&str>,
+) -> (
+    Arc<ScriptedProcessManager>,
+    orch_core::adapter::ExecuteHandle,
+) {
+    let pm = ScriptedProcessManager::silent();
+    let handle = execute_keeping(
+        &pm,
+        with_system_prompt(
+            support::with_config(
+                params("p", "/tmp/workspace"),
+                AgentConfig {
+                    system_prompt: agent.map(str::to_owned),
+                    ..Default::default()
+                },
+            ),
+            orchestrator,
+        ),
+    );
+    (pm, handle)
+}
+
+#[tokio::test]
+async fn a_blank_orchestrator_prompt_falls_through_to_the_agent_one() {
+    for blank in ["", "  \n\t "] {
+        let (pm, _handle) = run_with_prompts(blank, Some("agent prompt"));
+        assert_eq!(
+            std::fs::read_to_string(system_prompt_file_of(&pm.spawn_record())).expect("read"),
+            "agent prompt"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_blank_agent_prompt_does_not_replace_the_orchestrator_one() {
+    let (pm, _handle) = run_with_prompts("orchestrator prompt", Some(" "));
+    assert_eq!(
+        std::fs::read_to_string(system_prompt_file_of(&pm.spawn_record())).expect("read"),
+        "orchestrator prompt"
+    );
+}
+
+#[tokio::test]
+async fn blank_prompts_everywhere_mean_no_system_prompt() {
+    for agent in [None, Some(""), Some(" \n")] {
+        let (pm, _handle) = run_with_prompts(" ", agent);
+        assert!(!pm.spawn_record().has_flag("--system-prompt-file"));
+    }
+}
+
 #[tokio::test]
 async fn the_input_format_is_always_text() {
     let pm = ScriptedProcessManager::silent();

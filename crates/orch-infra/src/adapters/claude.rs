@@ -11,6 +11,7 @@
 //! directory, deleted when the event stream is dropped, and the task prompt
 //! through stdin.
 
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ use async_trait::async_trait;
 use orch_core::adapter::{Adapter, AdapterError, AdapterTestResult, ExecuteHandle, ExecuteParams};
 use orch_core::clock::Clock;
 use orch_core::process::{DEFAULT_KILL_GRACE, ProcessManager, SpawnOptions, StdioMode};
+use orch_domain::AdapterErrorKind;
 use tempfile::TempPath;
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -119,28 +121,64 @@ fn build_args(
 }
 
 /// The orchestrator-generated (cacheable) system prompt wins over the
-/// per-agent one. An empty prompt counts as none: claude then uses its default
-/// system prompt (the old `--system-prompt ""` replaced it with nothing).
+/// per-agent one. A blank source (empty or whitespace) counts as absent and
+/// falls through to the next; if both are blank there is no system prompt and
+/// claude uses its default (the old `--system-prompt ""` replaced it with
+/// nothing).
 fn effective_system_prompt(params: &ExecuteParams) -> Option<&str> {
-    params
+    let non_blank = |prompt: &&str| !prompt.trim().is_empty();
+    params.system_prompt.as_deref().filter(non_blank).or(params
+        .config
         .system_prompt
         .as_deref()
-        .or(params.config.system_prompt.as_deref())
-        .filter(|prompt| !prompt.is_empty())
+        .filter(non_blank))
 }
 
 fn io_failure(what: &str, err: &std::io::Error) -> AdapterError {
     tracing::error!(error = %err, "{what}");
-    AdapterError::new(format!("{what}: {err}"), None)
+    AdapterError::with_kind(
+        format!("{what}: {err}"),
+        AdapterErrorKind::SpawnFailed,
+        None,
+    )
 }
 
-/// `$XDG_RUNTIME_DIR/orch` (per-user, tmpfs, 0700) when available, else
-/// `<temp dir>/orch-<uid>`.
-fn private_dir_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(runtime) if !runtime.is_empty() => Path::new(&runtime).join("orch"),
-        _ => std::env::temp_dir().join(format!("orch-{}", nix::unistd::Uid::current())),
+/// Candidate private directories, most preferred first: an absolute
+/// `$XDG_RUNTIME_DIR/orch` (per-user tmpfs), then `<temp dir>/orch-<uid>`.
+/// A relative `XDG_RUNTIME_DIR` is ignored: it would resolve against the
+/// process cwd, which may be a git-tracked directory.
+fn private_dir_candidates(
+    xdg_runtime_dir: Option<&OsStr>,
+    temp_dir: &Path,
+    uid: u32,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(runtime) = xdg_runtime_dir.map(Path::new)
+        && runtime.is_absolute()
+    {
+        candidates.push(runtime.join("orch"));
     }
+    candidates.push(temp_dir.join(format!("orch-{uid}")));
+    candidates
+}
+
+/// The first candidate that passes [`ensure_private_dir`]; the error of the
+/// last one if none does. The XDG directory is a preference, not a
+/// requirement, so its failures are only logged at debug.
+fn resolve_private_dir(candidates: &[PathBuf]) -> Result<PathBuf, AdapterError> {
+    let mut last_error = None;
+    for (index, dir) in candidates.iter().enumerate() {
+        match ensure_private_dir(dir) {
+            Ok(()) => return Ok(dir.clone()),
+            Err(err) => {
+                if index + 1 < candidates.len() {
+                    tracing::debug!(dir = %dir.display(), error = %err, "private directory unusable, trying the next");
+                }
+                last_error = Some(err);
+            }
+        }
+    }
+    Err(last_error.expect("at least one candidate"))
 }
 
 /// Create `dir` (mode 0700) if missing and refuse it unless it is a real
@@ -148,10 +186,21 @@ fn private_dir_path() -> PathBuf {
 /// predictable path in a shared `/tmp` could otherwise have been pre-created
 /// by someone else.
 fn ensure_private_dir(dir: &Path) -> Result<(), AdapterError> {
+    ensure_private_dir_created_with(dir, 0o700)
+}
+
+/// `create_mode` is a seam for tests simulating a restrictive umask, which
+/// masks the mode given at creation.
+fn ensure_private_dir_created_with(dir: &Path, create_mode: u32) -> Result<(), AdapterError> {
     let fail =
         |err: std::io::Error| io_failure("Failed to prepare the Claude private directory", &err);
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
+    match std::fs::DirBuilder::new().mode(create_mode).create(dir) {
+        // Only a directory we just created is repaired (a umask such as 0277
+        // would otherwise leave it unusable forever); a pre-existing one with
+        // the wrong mode is refused below, never chmod-ed.
+        Ok(()) => {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?
+        }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(fail(err)),
     }
@@ -163,13 +212,19 @@ fn ensure_private_dir(dir: &Path) -> Result<(), AdapterError> {
             dir.display()
         );
         tracing::error!("{message}");
-        return Err(AdapterError::new(message, None));
+        return Err(AdapterError::with_kind(
+            message,
+            AdapterErrorKind::SpawnFailed,
+            None,
+        ));
     }
     Ok(())
 }
 
 /// Remove prompt files older than [`STALE_AFTER`] from `dir`. Only regular
-/// files with our prefix are considered; fresh ones belong to live runs.
+/// files with our prefix are considered; fresh ones may belong to another
+/// running engine. A file of a run that has lasted over 24 h can be removed
+/// too, which is harmless: claude reads it once at startup.
 fn sweep_stale_files(dir: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -205,14 +260,18 @@ fn sweep_stale_files(dir: &Path, now: SystemTime) {
 }
 
 /// Write the system prompt to a fresh file in the private directory: random
-/// name, created exclusively with mode 0600, never under the (possibly
-/// git-tracked) agent workspace. The returned guard deletes the file when
+/// name, created exclusively with mode 0600. The directory is an absolute
+/// `$XDG_RUNTIME_DIR` subdirectory or one under the OS temp dir, never under
+/// the (possibly git-tracked) agent workspace. The returned guard deletes the file when
 /// dropped.
 fn write_system_prompt_file(system_prompt: &str) -> Result<TempPath, AdapterError> {
     static SWEEP: Once = Once::new();
 
-    let dir = private_dir_path();
-    ensure_private_dir(&dir)?;
+    let dir = resolve_private_dir(&private_dir_candidates(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        &std::env::temp_dir(),
+        nix::unistd::Uid::current().as_raw(),
+    ))?;
     SWEEP.call_once(|| sweep_stale_files(&dir, SystemTime::now()));
 
     let fail =
@@ -229,11 +288,14 @@ fn write_system_prompt_file(system_prompt: &str) -> Result<TempPath, AdapterErro
 
 /// Write the first chunk before returning. Tokio pipes only report
 /// writability after a reactor turn, so on a multi-thread runtime this blocks
-/// briefly (in place) for that turn; on a current-thread runtime blocking would
-/// stall the reactor itself, so nothing is written here and the spawned task
-/// delivers everything.
+/// briefly (in place) for that turn. `block_in_place` panics on a
+/// current-thread runtime, and with no runtime there is nothing to block on;
+/// in both cases nothing is written here and the spawned task delivers
+/// everything.
 fn write_first_chunk(stdin: &mut ChildWriter, bytes: &[u8]) -> std::io::Result<usize> {
-    let handle = Handle::current();
+    let Ok(handle) = Handle::try_current() else {
+        return Ok(0);
+    };
     if handle.runtime_flavor() != RuntimeFlavor::MultiThread {
         return Ok(0);
     }
@@ -252,9 +314,9 @@ fn write_first_chunk(stdin: &mut ChildWriter, bytes: &[u8]) -> std::io::Result<u
 /// to 3 s for the first byte, after which it proceeds without a prompt, and
 /// then reads until EOF.
 ///
-/// A failed write is logged with the adapter name; claude then exits non-zero
-/// ("Input must be provided"), which surfaces as the run's exit error with
-/// its stderr tail, so the failure is attributable without a separate event.
+/// A failed write is logged at `warn` with the adapter name, but is not
+/// surfaced as an event. A failure after the first chunk can leave claude with
+/// a truncated prompt and a run that still succeeds; only the log shows it.
 fn write_prompt(stdin: Option<ChildWriter>, prompt: String) {
     let Some(mut stdin) = stdin else {
         return;
@@ -429,5 +491,76 @@ mod tests {
         let bytes = vec![b'x'; 200 * 1024];
         let written = write_first_chunk(&mut stdin, &bytes).expect("write");
         assert_eq!(written, FIRST_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn a_missing_xdg_dir_falls_back_to_the_temp_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let candidates = private_dir_candidates(
+            Some(OsStr::new("/nonexistent-orch-test/run/user/1")),
+            temp.path(),
+            4242,
+        );
+        assert_eq!(candidates.len(), 2);
+        let dir = resolve_private_dir(&candidates).expect("fallback");
+        assert_eq!(dir, temp.path().join("orch-4242"));
+    }
+
+    #[test]
+    fn it_errors_only_when_every_candidate_fails() {
+        let candidates = [
+            PathBuf::from("/nonexistent-orch-test/a/orch"),
+            PathBuf::from("/nonexistent-orch-test/b/orch"),
+        ];
+        let err = resolve_private_dir(&candidates).expect_err("both fail");
+        assert_eq!(err.kind, AdapterErrorKind::SpawnFailed);
+    }
+
+    #[test]
+    fn a_relative_xdg_dir_is_ignored() {
+        let candidates = private_dir_candidates(Some(OsStr::new("run/user")), Path::new("/tmp"), 7);
+        assert_eq!(candidates, [PathBuf::from("/tmp/orch-7")]);
+        let candidates = private_dir_candidates(Some(OsStr::new("")), Path::new("/tmp"), 7);
+        assert_eq!(candidates, [PathBuf::from("/tmp/orch-7")]);
+        let candidates =
+            private_dir_candidates(Some(OsStr::new("/run/user/7")), Path::new("/tmp"), 7);
+        assert_eq!(candidates[0], PathBuf::from("/run/user/7/orch"));
+    }
+
+    #[test]
+    fn a_dir_created_under_a_restrictive_umask_is_repaired() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("orch");
+        ensure_private_dir_created_with(&dir, 0o600).expect("repaired");
+        let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o7777, 0o700);
+    }
+
+    #[test]
+    fn a_pre_existing_dir_is_never_repaired() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("orch");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert!(ensure_private_dir_created_with(&dir, 0o700).is_err());
+        let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600, "its mode must be left alone");
+    }
+
+    #[test]
+    fn no_runtime_means_no_synchronous_write() {
+        // `tokio::process` needs a runtime to build the pipe, so use one only
+        // for setup and call the function from outside it.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let mut stdin: ChildWriter = rt.block_on(async {
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("5")
+                .stdin(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn");
+            Box::new(child.stdin.take().expect("stdin")) as ChildWriter
+        });
+        assert_eq!(write_first_chunk(&mut stdin, b"hello").expect("ok"), 0);
     }
 }
