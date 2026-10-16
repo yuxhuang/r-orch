@@ -77,7 +77,13 @@ impl RemotePhaseUpdate {
 
 #[derive(Debug, Clone)]
 pub enum RemoteRunEvent {
+    /// An event from the worker's own run. Proof the agent is executing.
     Event(AgentEvent),
+    /// Progress the *controller* synthesized about the link itself, such as
+    /// "queued on 2com". It is logged like any other progress and must never
+    /// be read as evidence that the worker started anything: taking it as
+    /// such is what made an approval-held mirror show up as `RUN`.
+    Hint(AgentEvent),
     /// The worker acknowledged, queued or started the execution. Never an
     /// outcome: the phase only ever moves a view, not a task's status.
     Phase(RemotePhaseUpdate),

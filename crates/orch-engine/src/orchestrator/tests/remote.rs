@@ -355,6 +355,99 @@ async fn a_remote_run_stays_preparing_until_the_worker_reports_it_running() {
     no_process_calls(&h);
 }
 
+/// The live failure (tsk_EE4NJM4 → agt_creator@2com): the worker held the
+/// mirror for its owner's approval and said so, but the controller's own
+/// "waiting: queued on 2com" progress line promoted the phase to running
+/// first — so the task read `RUN @2com`, the run record started, and the
+/// approval reason was dropped as a backwards transition.
+#[tokio::test]
+async fn a_queued_hint_never_promotes_a_held_mirror_to_running() {
+    let fixture = PeerFixture::new(true).await;
+    let h = fixture
+        .builder()
+        .tasks([Task {
+            id: "tsk_remote".into(),
+            status: TaskStatus::InProgress,
+            assignee: Some("agt_peer@worker".into()),
+            attempts: 1,
+            ..make_task()
+        }])
+        .state(remote_state_in(NOW_ISO, RemotePhase::Dispatched))
+        .build();
+    h.runs.seed(Run {
+        id: "run_remote".into(),
+        task_id: "tsk_remote".into(),
+        agent_id: "agt_peer@worker".into(),
+        status: RunStatus::Preparing,
+        ..make_run()
+    });
+    h.set_state(remote_state_in(NOW_ISO, RemotePhase::Dispatched))
+        .await;
+    let reason =
+        format!("{AWAITING_APPROVAL_REASON} run `orch task approve tsk_cD_2lCH` on this worker");
+    let hint = orch_core::adapter::AgentEvent::new(
+        orch_core::adapter::AgentEventKind::Output,
+        NOW_ISO,
+        serde_json::json!({"text": "waiting: queued on worker", "remote_state": "queued"}),
+    );
+    h.orchestrator
+        .collect_remote_events(
+            Box::pin(futures::stream::iter([
+                // Exactly the live order: Submitted, then the hint the
+                // controller synthesizes for State{queued}, then the phase.
+                RemoteRunEvent::Phase(RemotePhaseUpdate {
+                    phase: RemotePhase::Queued,
+                    worker_task_id: Some("tsk_cD_2lCH".into()),
+                    reason: None,
+                }),
+                RemoteRunEvent::Hint(hint),
+                RemoteRunEvent::Phase(RemotePhaseUpdate {
+                    phase: RemotePhase::Queued,
+                    worker_task_id: Some("tsk_cD_2lCH".into()),
+                    reason: Some(reason.clone()),
+                }),
+            ])),
+            "run_remote",
+            "tsk_remote",
+            "agt_peer@worker",
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let remote = h.in_memory_state().await.running["tsk_remote"]
+        .remote
+        .clone()
+        .unwrap();
+    assert_eq!(
+        (remote.phase, remote.status_label().unwrap()),
+        (RemotePhase::Queued, "queued @worker".to_owned())
+    );
+    assert_eq!(remote.reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(
+        remote.hint().unwrap(),
+        "awaiting approval: orch task approve tsk_cD_2lCH on worker"
+    );
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().status,
+        RunStatus::Preparing,
+        "nothing has run on the worker"
+    );
+    assert!(
+        h.events_of(OrchestratorEventType::AgentStarted).is_empty(),
+        "agent:started must wait for the worker's own running signal"
+    );
+    // The hint is still progress: it belongs in the run log.
+    assert!(
+        h.runs.peek_events("run_remote").iter().any(|event| event
+            .data
+            .as_str()
+            .is_some_and(|data| data.contains("waiting: queued on worker"))),
+        "{:?}",
+        h.runs.peek_events("run_remote")
+    );
+}
+
 #[tokio::test]
 async fn progress_proves_a_run_the_worker_has_not_announced_yet() {
     let fixture = PeerFixture::new(true).await;

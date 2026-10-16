@@ -224,7 +224,7 @@ impl LinkHub {
                 timestamp,
                 serde_json::json!({"text": text, "remote_state": state}),
             );
-            let _ = e.events.try_send(RemoteRunEvent::Event(event));
+            let _ = e.events.try_send(RemoteRunEvent::Hint(event));
         }
     }
 
@@ -1241,7 +1241,7 @@ mod tests {
         let mut resolved = None;
         while resolved.is_none() {
             match handle.events.next().await {
-                Some(RemoteRunEvent::Event(_)) => {}
+                Some(RemoteRunEvent::Hint(_)) => {}
                 other => resolved = Some(phase(other)),
             }
         }
@@ -1332,9 +1332,12 @@ mod tests {
         let mut handle = hub.submit(request()).unwrap();
         hub.hint("w1", "run1", "queued", "now".into());
         hub.hint("w1", "run1", "queued", "later".into());
+        // A `Hint`, never an `Event`: this line is the controller talking
+        // about its own link, and reading it as the worker's progress is what
+        // showed an approval-held mirror as `RUN`.
         match handle.events.next().await.unwrap() {
-            RemoteRunEvent::Event(event) => assert_eq!(event.data["text"], "waiting: queued on w1"),
-            other => panic!("expected queued progress, got {other:?}"),
+            RemoteRunEvent::Hint(event) => assert_eq!(event.data["text"], "waiting: queued on w1"),
+            other => panic!("expected a queued hint, got {other:?}"),
         }
         assert!(
             tokio::time::timeout(Duration::from_millis(5), handle.events.next())

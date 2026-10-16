@@ -1811,13 +1811,45 @@ mod tests {
     async fn mirror_waits_for_owner_approval(policy: orch_domain::ApprovalPolicy) {
         let (temp, worker, agent_id) = fixture().await;
         let replies = submit_with_policy(&temp, &worker, &agent_id, policy).await;
-        assert!(matches!(&replies[0], Frame::Submitted { .. }));
-        assert!(
-            matches!(&replies[1], Frame::State { state, .. } if state == "queued"),
-            "{replies:?}"
-        );
+        let Frame::Submitted { worker_task_id, .. } = &replies[0] else {
+            panic!("{replies:?}")
+        };
         let task = mirror(&worker, "key").await;
+        assert_eq!(worker_task_id, &task.id);
         assert!(task.awaits_approval(), "{:?}", task.labels);
+        // The controller can only name the command its owner has to run here
+        // if this frame carries both the reason and the mirror's id.
+        let Frame::State {
+            state,
+            reason,
+            worker_task_id,
+            ..
+        } = &replies[1]
+        else {
+            panic!("{replies:?}")
+        };
+        assert_eq!(state, "queued");
+        assert_eq!(worker_task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                format!(
+                    "{AWAITING_APPROVAL_REASON} run `orch task approve {}` on this worker",
+                    task.id
+                )
+                .as_str()
+            )
+        );
+        // And so does every later sync of the same key.
+        let item = worker.item("key", Some(&task)).await;
+        assert_eq!(
+            (
+                item.state.as_str(),
+                item.reason.as_deref(),
+                item.worker_task_id.as_deref()
+            ),
+            ("queued", reason.as_deref(), Some(task.id.as_str()))
+        );
 
         dispatch_mirror(&worker, &task.id).await;
         let held = mirror(&worker, "key").await;

@@ -472,9 +472,20 @@ impl Orchestrator {
                         Err(err) => self.emit_error(err, format!("record remote phase {run_id}")),
                     }
                 }
+                // The controller's own progress line about the link. It is
+                // logged, and it says nothing about what the worker is doing.
+                Some(RemoteRunEvent::Hint(event)) => {
+                    if let Err(err) = self
+                        .record_event(&mut collected, event, run_id, task_id, agent_id)
+                        .await
+                    {
+                        self.emit_error(err, format!("record remote progress {run_id}"));
+                    }
+                }
                 Some(RemoteRunEvent::Event(event)) => {
-                    // An agent emitting progress is running, whatever frame
-                    // the worker's one-second tick has got round to sending.
+                    // An agent emitting progress *is* the worker's run, so it
+                    // promotes the phase whatever frame the worker's
+                    // one-second tick has got round to sending.
                     if !running {
                         match self
                             .apply_remote_phase(
