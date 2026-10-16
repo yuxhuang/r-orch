@@ -641,7 +641,7 @@ async fn a_cancel_for_an_unreadable_mirror_is_retried_until_it_applies() {
             .worker
             .faults()
             .unapplied_cancels
-            .iter()
+            .keys()
             .cloned()
             .collect::<Vec<_>>(),
         vec!["poison".to_owned()]

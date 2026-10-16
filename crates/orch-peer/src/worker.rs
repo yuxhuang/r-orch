@@ -14,7 +14,7 @@
 //!   debounced `OrchestratorError`, skip this tick, keep the session;
 //! - fatal, closing the session: transport, the handshake, and "expected sync".
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,6 +60,12 @@ const ORPHAN_GC_EVERY: Duration = Duration::from_secs(3_600);
 /// worth of a paused controller; short enough that a decommissioned one
 /// does not hold a local agent's queue for ever.
 const CONTROLLER_ABSENCE_LIMIT_MS: i64 = 24 * 3_600_000;
+/// The longest wait between attempts at a cancel that will not apply.
+const CANCEL_RETRY_MAX: Duration = Duration::from_secs(60);
+/// How often a cancel that still will not apply is warned about again.
+const CANCEL_REWARN_EVERY: Duration = Duration::from_secs(3_600);
+/// Deferred cancels are peer-driven, so the map is bounded.
+const MAX_UNAPPLIED_CANCELS: usize = 1024;
 
 #[derive(Default)]
 struct EventRing {
@@ -136,6 +142,29 @@ impl SessionSlot {
     }
 }
 
+/// One cancel awaiting a retry.
+struct PendingCancel {
+    /// When the next attempt is due.
+    next_at: Instant,
+    /// Consecutive failures, which set the delay.
+    attempts: u32,
+    /// When this key was last warned about, so a stuck one is re-warned
+    /// hourly rather than once ever.
+    warned_at: Instant,
+}
+
+/// `1s · 2^(attempts-1)`, capped. A mirror whose record is damaged is not
+/// going to be readable a millisecond later.
+fn cancel_retry_delay(attempts: u32) -> Duration {
+    Duration::from_secs(1u64 << attempts.min(6).saturating_sub(1)).min(CANCEL_RETRY_MAX)
+}
+
+/// The same bounds `Submit` puts on an execution key. It reaches a log line,
+/// a task label and the pending-cancel map, all from peer input.
+fn valid_exec_key(exec_key: &str) -> bool {
+    !exec_key.is_empty() && exec_key.len() <= 256
+}
+
 #[derive(Default)]
 struct Faults {
     /// Execution key -> the reason last reported for it, so a key that stays
@@ -144,11 +173,11 @@ struct Faults {
     /// Fault kind -> when it was last reported to the event feed.
     reported: HashMap<&'static str, Instant>,
     /// Cancels this instance accepted but could not apply, usually because
-    /// the mirror's record was unreadable at the time. Retried every tick
-    /// until they take: a mirror the controller has given up on must not keep
-    /// a local agent busy, and only an explicit cancel clears one between
-    /// reconnects.
-    unapplied_cancels: BTreeSet<String>,
+    /// the mirror's record was unreadable at the time. Retried on their own
+    /// backoff until they take: a mirror the controller has given up on must
+    /// not keep a local agent busy, and only an explicit cancel clears one
+    /// between reconnects.
+    unapplied_cancels: BTreeMap<String, PendingCancel>,
     /// Why this instance's last controller session ended, published in
     /// `_listener.json` so `orch remote status` can explain a peer that keeps
     /// reconnecting.
@@ -308,18 +337,16 @@ impl Worker {
         write_json_with_mode(&path, &seen, owner_only()).await?;
 
         let mut cancelled = 0;
-        for (mut task, controller, last_seen) in orphans {
-            let feedback =
-                format!("orphaned remote mirror: controller {controller} absent since {last_seen}");
-            tracing::warn!(task_id = %task.id, %controller, %last_seen, "Cancelling orphaned remote mirror");
-            task.feedback = Some(feedback);
-            // Feedback first: `cancel_task` re-reads the record, so a failure
-            // there leaves the explanation rather than a bare cancelled task.
-            if let Err(error) = self.ctx.engine.tasks.save(&task).await {
-                self.session_fault("record orphan mirror cancellation", &error);
-                continue;
-            }
-            match self.ctx.engine.orchestrator.cancel_task(&task.id).await {
+        for (task, controller, last_seen) in orphans {
+            match self
+                .cancel_mirror(
+                    &task,
+                    format!(
+                        "orphaned remote mirror: controller {controller} absent since {last_seen}"
+                    ),
+                )
+                .await
+            {
                 Ok(()) => cancelled += 1,
                 Err(error) => self.session_fault("cancel orphan mirror", &error),
             }
@@ -662,7 +689,7 @@ impl Worker {
                             Err(error) => self.session_fault("read outbox", &error),
                         }
                         // A cancel that could not be applied when it arrived.
-                        for frame in self.retry_cancels(&instance_id).await {
+                        for frame in self.retry_cancels(&instance_id, &name).await {
                             self.write(&mut write, &frame).await?;
                         }
                     }
@@ -829,6 +856,12 @@ impl Worker {
                 };
                 // Cleanup never gates the reply: an orphan this instance
                 // cannot cancel is retried on the controller's next sync.
+                //
+                // A key the controller no longer lists is one it has already
+                // accounted for — a finished or failed execution — so the
+                // mirror is dead work. The *reason* goes on the task: this
+                // sweep used to cancel silently, and a mirror found cancelled
+                // with no explanation cannot be attributed afterwards.
                 let mut orphans = 0;
                 for task in &mirrors {
                     if let Some(key) = label(task, "exec:")
@@ -837,7 +870,14 @@ impl Worker {
                             task.status,
                             TaskStatus::Todo | TaskStatus::InProgress | TaskStatus::Retrying
                         )
-                        && let Err(error) = self.ctx.engine.orchestrator.cancel_task(&task.id).await
+                        && let Err(error) = self
+                            .cancel_mirror(
+                                task,
+                                format!(
+                                    "orphaned remote mirror: controller {controller} no longer tracks execution {key}"
+                                ),
+                            )
+                            .await
                     {
                         orphans += 1;
                         tracing::warn!(task_id = %task.id, exec_key = %key, %error, "Orphan mirror not cancelled; retrying on the next sync");
@@ -992,9 +1032,15 @@ impl Worker {
                             },
                         ])
                     }
+                    // A class, never the error's own text: that can carry a
+                    // local path or an error chain, and neither belongs on
+                    // the wire (as for every other reason this worker sends).
                     Err(error) => Ok(vec![Frame::Rejected {
                         exec_key,
-                        reason: error.to_string(),
+                        reason: format!(
+                            "worker could not create the mirror: {}",
+                            fault_kind(&error)
+                        ),
                     }]),
                 }
             }
@@ -1004,17 +1050,34 @@ impl Worker {
                 // key is kept instead and retried every tick, because nothing
                 // else clears a mirror inside a live session — the orphan
                 // sweep only runs on a `Sync`, i.e. after a reconnect.
-                match self.apply_cancel(controller, &exec_key).await {
+                if !valid_exec_key(&exec_key) {
+                    // Peer input, and the key reaches a log line and the
+                    // pending map: bound it exactly as `Submit` does.
+                    tracing::warn!("Ignoring a cancel with an invalid execution key");
+                    return Ok(vec![]);
+                }
+                let mirrors = match self.mirrors(controller).await {
+                    Ok(mirrors) => mirrors,
+                    Err(error) => {
+                        self.session_fault("read mirrors for cancel", &error);
+                        self.defer_cancel(&exec_key, &error);
+                        return Ok(vec![]);
+                    }
+                };
+                match self
+                    .cancel_key(
+                        &mirrors,
+                        &exec_key,
+                        format!("cancelled by controller {name}"),
+                    )
+                    .await
+                {
                     Ok(()) => {
                         self.faults().unapplied_cancels.remove(&exec_key);
                         Ok(vec![Frame::CancelAck { exec_key }])
                     }
                     Err(error) => {
-                        if self.faults().unapplied_cancels.insert(exec_key.clone()) {
-                            self.session_fault("cancel mirror", &error);
-                        } else {
-                            tracing::debug!(%exec_key, %error, "Cancel still not applicable");
-                        }
+                        self.defer_cancel(&exec_key, &error);
                         Ok(vec![])
                     }
                 }
@@ -1105,18 +1168,32 @@ impl Worker {
         }
     }
 
-    /// Cancel one execution key's mirror. Idempotent: a mirror that is gone
-    /// or already terminal is cancelled as far as the controller is
-    /// concerned, so it is acknowledged rather than retried.
-    async fn apply_cancel(&self, controller: &str, exec_key: &str) -> Result<()> {
-        let mirrors = self.mirrors(controller).await?;
-        let Some(task) = mirrors
-            .iter()
-            .find(|task| label(task, "exec:") == Some(exec_key))
-            .filter(|task| !terminal(task.status))
-        else {
-            return Ok(());
-        };
+    /// Cancel one mirror and record **why** on the task.
+    ///
+    /// Every worker-side cancel goes through here. A mirror that simply turns
+    /// `cancelled` with no reason is unexplainable afterwards: the live
+    /// incident was a mirror cancelled at startup with no feedback and no log
+    /// line, which took an evening to attribute.
+    async fn cancel_mirror(&self, task: &Task, reason: String) -> Result<()> {
+        tracing::info!(
+            task_id = %task.id,
+            exec_key = label(task, "exec:").unwrap_or_default(),
+            status = %task.status,
+            %reason,
+            "Cancelling remote mirror"
+        );
+        // Feedback first: `cancel_task` re-reads the record, so writing it
+        // here survives the status change, and a failure below still leaves
+        // the explanation behind.
+        let mut fresh = self
+            .ctx
+            .engine
+            .tasks
+            .get(&task.id)
+            .await?
+            .unwrap_or_else(|| task.clone());
+        fresh.feedback = Some(reason);
+        self.ctx.engine.tasks.save(&fresh).await?;
         self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
         // `cancel_task` reports success even when its final status write
         // failed, because a refused transition usually means the task was
@@ -1132,22 +1209,105 @@ impl Worker {
         }
     }
 
-    /// Retry the cancels this instance could not apply, once per tick. A
-    /// mirror is typically unreadable for as long as its file is damaged;
-    /// once it is readable again, the next tick retires the key.
-    async fn retry_cancels(&self, controller: &str) -> Vec<Frame> {
-        let pending: Vec<String> = self.faults().unapplied_cancels.iter().cloned().collect();
+    /// Cancel the mirror of one execution key, from a mirror list this tick
+    /// has already read. Idempotent: a mirror that is gone or already
+    /// terminal is cancelled as far as the controller is concerned, so it is
+    /// acknowledged rather than retried.
+    async fn cancel_key(&self, mirrors: &[Task], exec_key: &str, reason: String) -> Result<()> {
+        let Some(task) = mirrors
+            .iter()
+            .find(|task| label(task, "exec:") == Some(exec_key))
+            .filter(|task| !terminal(task.status))
+        else {
+            return Ok(());
+        };
+        self.cancel_mirror(task, reason).await
+    }
+
+    /// Note a cancel this instance could not apply, warning once per key.
+    fn defer_cancel(&self, exec_key: &str, error: &Error) {
+        let now = Instant::now();
+        let mut faults = self.faults();
+        match faults.unapplied_cancels.get_mut(exec_key) {
+            Some(pending) => {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.next_at = now + cancel_retry_delay(pending.attempts);
+                // A key that cannot be applied for an hour is said again:
+                // silence after the first warning hides a stuck mirror.
+                if pending.warned_at.elapsed() >= CANCEL_REWARN_EVERY {
+                    pending.warned_at = now;
+                    tracing::warn!(%exec_key, %error, attempts = pending.attempts, "Cancel still not applicable");
+                }
+                return;
+            }
+            None => {
+                if faults.unapplied_cancels.len() >= MAX_UNAPPLIED_CANCELS {
+                    // Bounded: peer input decides how many keys exist. The
+                    // one whose retry is furthest out makes way.
+                    if let Some(evicted) = faults
+                        .unapplied_cancels
+                        .iter()
+                        .max_by_key(|(_, pending)| pending.next_at)
+                        .map(|(key, _)| key.clone())
+                    {
+                        tracing::warn!(exec_key = %evicted, "Dropping a deferred cancel: too many pending");
+                        faults.unapplied_cancels.remove(&evicted);
+                    }
+                }
+                faults.unapplied_cancels.insert(
+                    exec_key.into(),
+                    PendingCancel {
+                        next_at: now + cancel_retry_delay(1),
+                        attempts: 1,
+                        warned_at: now,
+                    },
+                );
+            }
+        }
+        drop(faults);
+        self.session_fault("cancel mirror", error);
+    }
+
+    /// Retry the cancels this instance could not apply, once per tick, each
+    /// on its own backoff. A mirror is typically unreadable for as long as
+    /// its file is damaged; once it is readable again the next due attempt
+    /// retires the key.
+    async fn retry_cancels(&self, controller: &str, name: &str) -> Vec<Frame> {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .faults()
+            .unapplied_cancels
+            .iter()
+            .filter(|(_, pending)| pending.next_at <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        // One listing for the whole tick, not one per key.
+        let mirrors = match self.mirrors(controller).await {
+            Ok(mirrors) => mirrors,
+            Err(error) => {
+                self.session_fault("read mirrors for deferred cancel", &error);
+                return Vec::new();
+            }
+        };
         let mut replies = Vec::new();
-        for exec_key in pending {
-            match self.apply_cancel(controller, &exec_key).await {
+        for exec_key in due {
+            match self
+                .cancel_key(
+                    &mirrors,
+                    &exec_key,
+                    format!("cancelled by controller {name}"),
+                )
+                .await
+            {
                 Ok(()) => {
                     self.faults().unapplied_cancels.remove(&exec_key);
                     tracing::info!(%exec_key, "Deferred cancel applied");
                     replies.push(Frame::CancelAck { exec_key });
                 }
-                Err(error) => {
-                    tracing::debug!(%exec_key, %error, "Cancel still not applicable")
-                }
+                Err(error) => self.defer_cancel(&exec_key, &error),
             }
         }
         replies
@@ -1964,9 +2124,15 @@ mod tests {
         assert_eq!(items[0].state, "queued");
         assert_eq!(items[1].state, "unknown");
         assert_eq!(mirror(&worker, "tracked").await.status, TaskStatus::Todo);
+        let abandoned = mirror(&worker, "abandoned").await;
+        assert_eq!(abandoned.status, TaskStatus::Cancelled);
+        // The live incident: a mirror found `cancelled` with no feedback and
+        // no log line could not be attributed to any path afterwards.
         assert_eq!(
-            mirror(&worker, "abandoned").await.status,
-            TaskStatus::Cancelled
+            abandoned.feedback.as_deref(),
+            Some(
+                "orphaned remote mirror: controller controller no longer tracks execution abandoned"
+            )
         );
         assert_eq!(mirror(&worker, "foreign").await.status, TaskStatus::Todo);
         assert!(matches!(
@@ -1982,6 +2148,41 @@ mod tests {
                 .unwrap()[0],
             Frame::CancelAck { .. }
         ));
+        // An explicit cancel says so on the mirror as well.
+        assert!(matches!(
+            &worker
+                .handle(
+                    "controller",
+                    "C",
+                    Frame::Cancel {
+                        exec_key: "tracked".into()
+                    }
+                )
+                .await
+                .unwrap()[0],
+            Frame::CancelAck { .. }
+        ));
+        let cancelled = mirror(&worker, "tracked").await;
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(
+            cancelled.feedback.as_deref(),
+            Some("cancelled by controller C")
+        );
+        // A key no `Submit` would have accepted is not even recorded.
+        assert!(
+            worker
+                .handle(
+                    "controller",
+                    "C",
+                    Frame::Cancel {
+                        exec_key: "x".repeat(257)
+                    }
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(worker.faults().unapplied_cancels.is_empty());
     }
 
     #[tokio::test]
