@@ -1195,14 +1195,18 @@ fn s06_inflight_link_outage_beyond_stall_timeout_never_retries_or_duplicates_eff
     assert_eq!(text(worker.path("effect")), "effect\n");
 }
 
+/// A controller restart used to cancel the reservation, which discarded an
+/// outcome the worker was still computing — and left the worker computing it.
+/// The execution is rehydrated instead: the first sync of the new session must
+/// not read the live mirror as an orphan, and the outcome must still land.
 #[test]
-fn s07_controller_restart_cancels_without_retry_and_sync_cancels_worker_mirror() {
+fn s07_controller_restart_rehydrates_a_remote_run_without_cancelling_its_mirror() {
     let worker = Peer::new("worker-one");
     let controller = Peer::new("controller");
     let agent = worker.add_agent("executor", &gated_body(&worker), "shared");
     connect(&controller, &worker, "w1", port());
     let task = controller.task(
-        "cancel when controller restarts",
+        "survive a controller restart",
         Some(&remote_id(&agent, "w1")),
         &[],
     );
@@ -1211,25 +1215,30 @@ fn s07_controller_restart_cancels_without_retry_and_sync_cancels_worker_mirror()
         &[&controller, &worker],
         || worker.path("started").exists(),
     );
+    let mirror = worker.tasks()[0]["id"].as_str().unwrap().to_owned();
     controller.stop(Signal::SIGKILL);
     controller.start(None);
-    let value = controller.wait_task(&task, "cancelled", &[&controller, &worker]);
     controller.online("w1", &[&controller, &worker]);
-    wait(
-        "sync cancels untracked mirror",
-        &[&controller, &worker],
+    // The worker's mirror is still running, so the sync is not allowed to
+    // cancel it — and the shell is still waiting for its gate.
+    remains(
+        "the live mirror survives the first sync",
+        Duration::from_millis(500),
         || {
-            worker
-                .tasks()
-                .first()
-                .is_some_and(|t| t["status"] == "cancelled")
+            worker.tasks()[0]["status"] == "in_progress"
+                && controller.task_value(&task)["status"] == "in_progress"
         },
     );
+    assert_eq!(worker.tasks()[0]["id"], mirror);
+    release(&worker);
+    let value = controller.wait_task(&task, "done", &[&controller, &worker]);
     assert_eq!(value["attempts"], 1);
+    // One run, one effect: a rehydrated execution is never submitted again.
     let runs = controller.runs(&task);
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["status"], "cancelled");
-    assert!(!worker.path("effect").exists());
+    assert_eq!(runs[0]["status"], "succeeded");
+    assert_eq!(worker.tasks().len(), 1);
+    assert_eq!(text(worker.path("effect")), "effect\n");
 }
 
 #[test]
