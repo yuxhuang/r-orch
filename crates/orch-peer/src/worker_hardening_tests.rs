@@ -545,6 +545,30 @@ async fn a_hostile_controller_identity_is_refused_and_the_map_is_bounded() {
         );
         socket_closed(&mut read).await;
     }
+    // The display name reaches operator output too: control characters and
+    // Unicode line separators are refused, not silently stripped.
+    for hostile in ["\u{1b}]0;pwned\u{7}\u{1b}[2J", "two\nlines", "sep\u{2028}arator"] {
+        let mut socket = TcpStream::connect(listener.addr).await.unwrap();
+        write_frame(
+            &mut socket,
+            &Frame::Hello {
+                proto: PROTOCOL,
+                instance_id: "ctl-name".into(),
+                name: hostile.into(),
+                os: "test".into(),
+                agents: vec![],
+                version: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut read = BufReader::new(socket);
+        assert!(
+            matches!(socket_next(&mut read).await, Some(Frame::Error { .. })),
+            "admitted name {hostile:?}"
+        );
+        socket_closed(&mut read).await;
+    }
     // A long-lived listener must not accumulate one record per identity.
     let mut seen = std::collections::BTreeMap::new();
     for index in 0..300 {

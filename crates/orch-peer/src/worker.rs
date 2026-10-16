@@ -506,6 +506,10 @@ impl Worker {
             || name.is_empty()
             || name.len() > MAX_CONTROLLER_NAME_BYTES
             || name.contains('@')
+            // The name is printed by `orch remote status` and written into
+            // mirror feedback, so refuse anything metadata_text would alter.
+            || orch_infra::storage::remote::metadata_text(&name, MAX_CONTROLLER_NAME_BYTES)
+                != name
             || validate_snapshot(&agents).is_err()
         {
             self.write(
