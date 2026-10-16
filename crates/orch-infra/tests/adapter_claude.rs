@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 
 use orch_core::adapter::{Adapter, AgentEventKind};
-use orch_core::process::DEFAULT_KILL_GRACE;
+use orch_core::process::{DEFAULT_KILL_GRACE, StdioMode};
 use orch_domain::{AdapterErrorKind, AgentConfig, ReasoningEffort, TokenUsage};
 use orch_infra::adapters::ClaudeAdapter;
 use serde_json::json;
@@ -56,10 +56,10 @@ async fn spawns_claude_with_the_contract_argv() {
             "10",
             "--verbose",
             "--dangerously-skip-permissions",
-            "test prompt",
         ]
     );
     assert_eq!(record.cwd, std::path::Path::new("/tmp/workspace"));
+    assert_eq!(record.stdin, StdioMode::Pipe);
 }
 
 #[tokio::test]
@@ -107,11 +107,28 @@ async fn includes_the_effort_only_when_configured() {
     assert!(!pm.spawn_record().has_flag("--effort"));
 }
 
+/// Spawn and keep the handle alive: the system-prompt file lives exactly as
+/// long as the event stream.
+fn execute_keeping(
+    pm: &Arc<ScriptedProcessManager>,
+    execute_params: orch_core::adapter::ExecuteParams,
+) -> orch_core::adapter::ExecuteHandle {
+    adapter(pm).execute(execute_params).expect("execute")
+}
+
+fn system_prompt_file_of(record: &support::SpawnRecord) -> std::path::PathBuf {
+    record
+        .value_after("--system-prompt-file")
+        .expect("--system-prompt-file")
+        .into()
+}
+
 #[tokio::test]
 async fn the_orchestrator_system_prompt_wins_over_the_agent_one() {
     let pm = ScriptedProcessManager::silent();
-    adapter(&pm)
-        .execute(with_system_prompt(
+    let _handle = execute_keeping(
+        &pm,
+        with_system_prompt(
             support::with_config(
                 params("p", "/tmp/workspace"),
                 AgentConfig {
@@ -120,29 +137,32 @@ async fn the_orchestrator_system_prompt_wins_over_the_agent_one() {
                 },
             ),
             "Orchestrator system prompt",
-        ))
-        .expect("execute");
+        ),
+    );
+    let record = pm.spawn_record();
+    assert!(!record.has_flag("--system-prompt"));
     assert_eq!(
-        pm.spawn_record().value_after("--system-prompt"),
-        Some("Orchestrator system prompt")
+        std::fs::read_to_string(system_prompt_file_of(&record)).expect("read"),
+        "Orchestrator system prompt"
     );
 }
 
 #[tokio::test]
 async fn falls_back_to_the_agent_system_prompt() {
     let pm = ScriptedProcessManager::silent();
-    adapter(&pm)
-        .execute(support::with_config(
+    let _handle = execute_keeping(
+        &pm,
+        support::with_config(
             params("p", "/tmp/workspace"),
             AgentConfig {
                 system_prompt: Some("Agent config prompt".to_owned()),
                 ..Default::default()
             },
-        ))
-        .expect("execute");
+        ),
+    );
     assert_eq!(
-        pm.spawn_record().value_after("--system-prompt"),
-        Some("Agent config prompt")
+        std::fs::read_to_string(system_prompt_file_of(&pm.spawn_record())).expect("read"),
+        "Agent config prompt"
     );
 }
 
@@ -152,25 +172,89 @@ async fn omits_the_system_prompt_when_there_is_none() {
     adapter(&pm)
         .execute(params("p", "/tmp/workspace"))
         .expect("execute");
-    assert!(!pm.spawn_record().has_flag("--system-prompt"));
+    let record = pm.spawn_record();
+    assert!(!record.has_flag("--system-prompt"));
+    assert!(!record.has_flag("--system-prompt-file"));
 }
 
 #[tokio::test]
-async fn the_prompt_is_the_last_argument_and_the_system_prompt_is_a_flag() {
+async fn neither_prompt_is_in_argv() {
     let pm = ScriptedProcessManager::silent();
-    adapter(&pm)
-        .execute(with_system_prompt(
+    let _handle = execute_keeping(
+        &pm,
+        with_system_prompt(
             params("user task prompt", "/tmp/workspace"),
             "system instructions",
-        ))
-        .expect("execute");
+        ),
+    );
 
     let record = pm.spawn_record();
-    assert_eq!(record.last_arg(), "user task prompt");
-    assert_eq!(
-        record.value_after("--system-prompt"),
-        Some("system instructions")
+    assert!(record.has_flag("--system-prompt-file"));
+    assert!(
+        record
+            .args
+            .iter()
+            .all(|arg| !arg.contains("user task prompt") && !arg.contains("system instructions")),
+        "prompts leaked into argv: {:?}",
+        record.args
     );
+}
+
+#[tokio::test]
+async fn the_system_prompt_file_is_private_and_outside_the_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pm = ScriptedProcessManager::silent();
+    let _handle = execute_keeping(&pm, with_system_prompt(run_params(), "secret"));
+    let path = system_prompt_file_of(&pm.spawn_record());
+
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(path.starts_with(std::env::temp_dir()));
+    assert!(!path.starts_with("/tmp/workspace"));
+}
+
+#[tokio::test]
+async fn the_prompt_is_written_to_stdin_and_stdin_is_closed() {
+    let pm = ScriptedProcessManager::new(Script::new().capturing_stdin().sleep_ms(200).exit(0));
+    let handle = execute_keeping(&pm, params("--user task\nprompt", "/tmp/workspace"));
+    collect(handle).await.expect_ok();
+    assert_eq!(
+        pm.stdin_capture().await.expect("stdin was written"),
+        format!("--user task\nprompt{}", support::STDIN_EOF_MARKER)
+    );
+}
+
+#[tokio::test]
+async fn the_system_prompt_file_is_removed_after_the_run() {
+    let pm = ScriptedProcessManager::silent();
+    let handle = execute_keeping(&pm, with_system_prompt(run_params(), "system"));
+    let path = system_prompt_file_of(&pm.spawn_record());
+    assert!(path.exists());
+    collect(handle).await.expect_ok();
+    assert!(!path.exists(), "{} was left behind", path.display());
+}
+
+#[tokio::test]
+async fn the_system_prompt_file_is_removed_when_the_run_is_dropped() {
+    let pm = ScriptedProcessManager::new(Script::new().sleep_ms(30_000));
+    let handle = execute_keeping(&pm, with_system_prompt(run_params(), "system"));
+    let path = system_prompt_file_of(&pm.spawn_record());
+    assert!(path.exists());
+    drop(handle);
+    assert!(!path.exists(), "{} was left behind", path.display());
+}
+
+#[tokio::test]
+async fn the_system_prompt_file_is_removed_when_spawning_fails() {
+    let pm = ScriptedProcessManager::silent().without(&["claude"]);
+    let result = adapter(&pm).execute(with_system_prompt(run_params(), "system"));
+    assert!(result.is_err());
+    let record = pm.spawn_record();
+    assert!(!system_prompt_file_of(&record).exists());
 }
 
 #[tokio::test]

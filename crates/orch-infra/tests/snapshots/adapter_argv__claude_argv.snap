@@ -11,9 +11,8 @@ command: claude
   argv[5]: "50"
   argv[6]: "--verbose"
   argv[7]: "--dangerously-skip-permissions"
-  argv[8]: "the user prompt"
 cwd: /ws
-stdin: Ignore
+stdin: Pipe
 
 [full]
 command: claude
@@ -28,11 +27,10 @@ command: claude
   argv[9]: "a-model"
   argv[10]: "--effort"
   argv[11]: "high"
-  argv[12]: "--system-prompt"
-  argv[13]: "the system prompt"
-  argv[14]: "the user prompt"
+  argv[12]: "--system-prompt-file"
+  argv[13]: "<system-prompt-file>"
 cwd: /ws
-stdin: Ignore
+stdin: Pipe
 
 [agent-system-prompt-only]
 command: claude
@@ -43,8 +41,7 @@ command: claude
   argv[5]: "50"
   argv[6]: "--verbose"
   argv[7]: "--dangerously-skip-permissions"
-  argv[8]: "--system-prompt"
-  argv[9]: "the agent prompt"
-  argv[10]: "the user prompt"
+  argv[8]: "--system-prompt-file"
+  argv[9]: "<system-prompt-file>"
 cwd: /ws
-stdin: Ignore
+stdin: Pipe

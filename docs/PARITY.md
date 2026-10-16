@@ -2014,7 +2014,7 @@ flag**.
 
 | Adapter | Binary | argv |
 |---|---|---|
-| `claude` | `claude` | `--print`, `--output-format stream-json`, `--max-turns <config.max_turns ?? 50>`, `--verbose`, `--dangerously-skip-permissions`, [`--model <m>`], [`--effort <e>`], [`--system-prompt <sp>`], then **`<prompt>` as the last positional** |
+| `claude` | `claude` | `--print`, `--output-format stream-json`, `--max-turns <config.max_turns ?? 50>`, `--verbose`, `--dangerously-skip-permissions`, [`--model <m>`], [`--effort <e>`], [`--system-prompt-file <path>`] — **system prompt written to a private (0600) temp file, removed when the run ends; task prompt goes on stdin** (write + close). Deliberate divergence from the TS `--system-prompt <sp>` + last-positional argv, which fails `exec` with `E2BIG` once one string exceeds Linux's 128 KiB `MAX_ARG_STRLEN` |
 | `codex` | `codex` | `exec`, `--json`, `--sandbox danger-full-access`, [`--model <m>`], `-` — **prompt goes on stdin** (write + `end()`) |
 | `cursor` | `cursor-agent`, falling back to `agent` | `-p`, `--output-format stream-json`, `--workspace <workspace>`, `--yolo`, `--trust`, [`--model <m>`], then `<fullPrompt>` last |
 | `opencode` | `opencode` | `run`, `--format json`, [`--model <m>`], then `<fullPrompt>` last |
