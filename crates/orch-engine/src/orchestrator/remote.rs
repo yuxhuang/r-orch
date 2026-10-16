@@ -355,13 +355,17 @@ impl Orchestrator {
                 );
             }
             // The worker's approval policy decides whether a successful
-            // outcome auto-approves, exactly as it did at dispatch.
-            let auto_approve = self
-                .deps()
-                .task_store
-                .get(&entry.task_id)
-                .await?
-                .is_some_and(|task| task.is_autonomous())
+            // outcome auto-approves, exactly as it did at dispatch. A read
+            // that fails here must not stop the owner from starting: the
+            // conservative answer leaves the outcome in review.
+            let autonomous = match self.deps().task_store.get(&entry.task_id).await {
+                Ok(task) => task.is_some_and(|task| task.is_autonomous()),
+                Err(error) => {
+                    self.emit_error(error, format!("rehydrate: read task {}", entry.task_id));
+                    false
+                }
+            };
+            let auto_approve = autonomous
                 || agents.iter().any(|agent| {
                     agent.id == entry.agent_id
                         && agent.config.approval_policy == Some(orch_domain::ApprovalPolicy::Auto)
