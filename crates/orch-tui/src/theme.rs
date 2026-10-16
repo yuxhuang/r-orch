@@ -227,6 +227,19 @@ pub fn task_status_token(status: TaskStatus) -> Token {
     }
 }
 
+/// The colour of a remote phase, which is **not** the task's status colour:
+/// a dispatched or queued task is `in_progress` locally, and painting it
+/// green is the same lie as calling it `RUN`.
+pub fn remote_phase_token(phase: orch_domain::RemotePhase) -> Token {
+    match phase {
+        orch_domain::RemotePhase::Dispatched => Token::Cyan,
+        orch_domain::RemotePhase::Queued => Token::Dim,
+        orch_domain::RemotePhase::Running => Token::Green,
+        orch_domain::RemotePhase::Unknown => Token::Yellow,
+        orch_domain::RemotePhase::Terminal => Token::Silver,
+    }
+}
+
 /// `getGoalStatusColor`.
 pub fn goal_status_token(status: GoalStatus) -> Token {
     match status {
