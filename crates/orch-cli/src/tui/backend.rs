@@ -21,16 +21,16 @@ use std::sync::{Arc, Mutex};
 
 use orch_core::storage::{GoalFilter, TaskFilter};
 use orch_domain::{
-    Agent, CreateAgentInput, CreateGoalInput, CreateTaskInput, CreateTeamInput, Goal, GoalStatus,
-    NotificationPreferences, OrchestratorEvent, OrchestratorState, ReasoningEffort, Run, RunStatus,
-    Task, TaskStatus, Team, TuiPaletteName,
+    Agent, CreateAgentInput, CreateGoalInput, CreateMessageInput, CreateTaskInput, CreateTeamInput,
+    Goal, GoalStatus, MessageChannel, NotificationPreferences, OrchestratorEvent,
+    OrchestratorState, ReasoningEffort, Run, RunStatus, Task, TaskStatus, Team, TuiPaletteName,
 };
 use orch_engine::{
     FullEngine, UpdateAgentFields, UpdateGoalFields, UpdateTaskFields, WatchOptions,
 };
 use orch_tui::backend::{
     AgentFields, AgentOpts, BackendResult, ClipboardPaste, CreateTaskOpts, GoalFields,
-    HistoryEntry, LaunchContext, ModelCatalog, ModelOption, TaskFields, TuiBackend,
+    HistoryEntry, LaunchContext, MessageTarget, ModelCatalog, ModelOption, TaskFields, TuiBackend,
 };
 use tokio::runtime::Handle;
 
@@ -42,6 +42,11 @@ const HISTORY_TOTAL_RUNS: usize = 10;
 const HISTORY_EVENTS_PER_RUN: usize = 30;
 /// Each delivered batch is capped at its last N entries (`tui.ts:166`).
 const HISTORY_BATCH_CAP: usize = 200;
+
+/// The sender a message from a human carries, matching `orch msg send`'s
+/// default (`commands/msg.rs`, `message-service.ts:37`). It is the one sender
+/// id the service accepts without a registered agent behind it.
+const CLI_SENDER_ID: &str = "cli";
 
 /// Where the model-catalog probe has got to.
 ///
@@ -355,6 +360,10 @@ impl TuiBackend for EngineBackend {
     // (`onPasteImage`) is gated on the open wizard's kind, which is the
     // dashboard's own state rather than anything the engine knows
     // (`App.tsx:2526`).
+    //
+    // `can_send_message` stays at its `true` default too; overriding it to
+    // `false` here is the kill switch if messaging has to be disabled without
+    // a revert.
 
     fn context(&self) -> LaunchContext {
         self.context.clone()
@@ -667,6 +676,54 @@ impl TuiBackend for EngineBackend {
         self.block_on(self.engine.goal_service.get_progress_report(id))
             .map(Option::unwrap_or_default)
             .map_err(to_message)
+    }
+
+    // ── Messaging ────────────────────────────────────────────────────────
+
+    /// The dashboard's half of `orch msg send` / `orch msg broadcast`:
+    /// sender `cli`, no subject (the service substitutes `(no subject)`) and
+    /// the default 24-hour TTL, exactly as the CLI leaves them when no flag is
+    /// given (`commands/msg.rs`).
+    ///
+    /// Works in observer mode too. Messages are files written through the
+    /// message store and `send` takes no project lock, so a dashboard watching
+    /// another process's orchestrator can still post to an agent's mailbox —
+    /// that orchestrator drains it on its next dispatch.
+    fn send_message(&mut self, target: MessageTarget, body: &str) -> BackendResult<Vec<String>> {
+        let (channel, to_agent_id) = match target {
+            MessageTarget::Agent(agent_id) => (MessageChannel::Direct, Some(agent_id)),
+            MessageTarget::Broadcast => (MessageChannel::Broadcast, None),
+        };
+        let ids: Vec<String> = self
+            .block_on(self.engine.message_service.send(CreateMessageInput {
+                channel,
+                from_agent_id: CLI_SENDER_ID.to_owned(),
+                to_agent_id: to_agent_id.clone(),
+                // Empty rather than derived from the body, so a TUI-sent and a
+                // CLI-sent message are identical on disk for the same intent.
+                subject: String::new(),
+                // Raw: the service's `truncate_utf16` is the single place the
+                // 4000-unit cut happens (PARITY §14.14).
+                body: body.to_owned(),
+                ttl_ms: None,
+                team_id: None,
+                reply_to: None,
+            }))
+            .map_err(to_message)?
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        // The body is deliberately not logged — only that it went, and to how
+        // many mailboxes, which is the half that is otherwise unrecoverable in
+        // observer mode, where `message:sent` reaches this process's bus and
+        // not the queue the dashboard drains.
+        tracing::debug!(
+            ?channel,
+            to = to_agent_id.as_deref().unwrap_or("*"),
+            count = ids.len(),
+            "TUI sent a message"
+        );
+        Ok(ids)
     }
 
     // ── Watch mode ───────────────────────────────────────────────────────

@@ -50,6 +50,7 @@ to `true`:
 | `can_create_goal` | `n`/`N` and `+ add goal...`, `/goal add` |
 | `can_force_stop_agent` | whether a *running* agent can be soft-deleted at all (otherwise the TUI refuses with `Cannot delete — agent "{name}" is running. Press S to stop first.`) |
 | `can_paste_image` | the `⌘+V paste image` hint in the task wizards |
+| `can_send_message` | whether the TUI offers to message an agent at all (`/msg` and the `m` binding) |
 
 ## Launch context
 
@@ -79,6 +80,29 @@ Grouped as in the trait; names map 1:1 onto the TS callbacks.
   `disband_team`, `set_team_lead`.
 * **Goals** — `create_goal(CreateGoalInput)`, `update_goal(id, GoalFields)`,
   `update_goal_status(id, status, force)`, `delete_goal`, `goal_progress(id)`.
+* **Messaging** — `send_message(MessageTarget, body) -> Vec<String>`, the id of
+  every record created, in fan-out order (one for a direct send, one per
+  recipient for a broadcast, **zero** for a broadcast that reached nobody — a
+  success, so the caller reports a count). Ids rather than the `Message`
+  records because that is all the dashboard consumes; required rather than
+  defaulted, so a backend without messaging is unrepresentable, and
+  `can_send_message()` defaults to `true` like every other capability flag —
+  overriding it to `false` is the kill switch if messaging has to be disabled
+  without a revert. `MessageTarget::Agent` carries an **already-resolved agent
+  id**, never a name: the TUI owns name resolution (`orch-tui/src/msg.rs`) and
+  the backend does none, so the two cannot disagree about the recipient
+  without the engine saying so; a *direct* send to a disabled agent still
+  delivers, and only the broadcast fan-out skips them. The implementation
+  sends as `"cli"` — a constraint, not a preference: it is the one sender id
+  `MessageService` accepts without a registered agent behind it — with an
+  empty subject (the service renders `(no subject)`) and the default TTL, and
+  does **not** pre-truncate the body, so a TUI-sent message is identical on
+  disk to a CLI-sent one and `truncate_utf16` stays the only place the
+  4000-unit cut happens. Both are pinned in
+  `crates/orch-cli/tests/tui_backend.rs`. It works in observer mode, where
+  `message:sent` goes to *this* process's bus rather than the queue the
+  dashboard drains — so confirmation is a locally emitted feed line, not an
+  event.
 * **Watch mode** — `start_watch`, `stop_watch` (reachable only through `/watch`
   and `/pause`).
 * **Settings persistence** — `save_palette`, `save_activity_filter`,

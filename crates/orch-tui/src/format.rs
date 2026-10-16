@@ -22,6 +22,37 @@ pub fn cap_line(s: &str, max_len: usize) -> String {
     }
 }
 
+/// [`cap_line`] measured in **display columns** rather than `char`s.
+///
+/// For text whose width is not its length: agent names may be CJK or emoji,
+/// where a `char` cap of 32 is 64 columns and overflows its budget. The rest
+/// of the bar keeps counting `char`s (an accepted L2 divergence, PARITY §12.8
+/// (i)); this is used where a name is involved.
+pub fn cap_display(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    if crate::text::text_display_width(s) <= max_cols {
+        return s.to_owned();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+    // One column is reserved for the ellipsis, and a wide character that
+    // would straddle the cap is dropped rather than half-drawn.
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > max_cols - 1 {
+            break;
+        }
+        used += width;
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
 /// `capText(s, max)` — appends `"\n…[truncated]"` past the cap.
 pub fn cap_text(s: &str, max: usize) -> String {
     if s.chars().count() > max {
@@ -181,6 +212,27 @@ mod tests {
         assert_eq!(format_age_days(0, 86_399_000), "<1d");
         assert_eq!(format_age_days(0, 86_400_000), "1d");
         assert_eq!(format_age_days(0, 3 * 86_400_000), "3d");
+    }
+
+    #[test]
+    fn cap_display_counts_columns_and_never_splits_a_wide_character() {
+        assert_eq!(cap_display("hello", 10), "hello");
+        assert_eq!(cap_display("hello", 5), "hello");
+        assert_eq!(cap_display("hello", 4), "hel…");
+        assert_eq!(cap_display("", 0), "");
+        assert_eq!(cap_display("hello", 0), "");
+        // Each of these is two columns, so a cap of 5 fits two of them plus
+        // the ellipsis — and never half of one.
+        assert_eq!(cap_display("名前です", 5), "名前…");
+        assert_eq!(cap_display("名前です", 8), "名前です");
+        // Seven columns fit three wide characters plus the ellipsis exactly.
+        assert_eq!(cap_display("名前です", 7), "名前で…");
+        for cap in 0..10 {
+            assert!(
+                crate::text::text_display_width(&cap_display("🚀🚀🚀", cap)) <= cap,
+                "cap {cap}"
+            );
+        }
     }
 
     #[test]

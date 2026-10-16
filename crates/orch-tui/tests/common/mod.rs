@@ -71,6 +71,12 @@ impl Harness {
         self
     }
 
+    /// A bracketed paste, as the runner's `Event::Paste` arm delivers it.
+    pub fn paste(&mut self, text: &str) -> &mut Self {
+        self.app.handle_paste(text);
+        self
+    }
+
     /// A key *release* event — the dispatcher must ignore it.
     pub fn release(&mut self, code: KeyCode) -> &mut Self {
         let mut event = KeyEvent::new(code, KeyModifiers::NONE);

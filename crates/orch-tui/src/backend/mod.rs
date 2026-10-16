@@ -81,6 +81,20 @@ pub struct GoalFields {
     pub assignee: Option<String>,
 }
 
+/// Who a [`TuiBackend::send_message`] goes to.
+///
+/// Only the two channels a dashboard can address: a named agent, or everyone.
+/// The service's third channel (`lead`) needs a team id the TUI has no verb
+/// for, so it is deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageTarget {
+    /// One agent, by **id** — not by name. Resolving a typed name to an id is
+    /// the TUI's job, because only it knows what the user typed.
+    Agent(String),
+    /// Every enabled agent except the sender.
+    Broadcast,
+}
+
 /// One model choice offered by a wizard `model` step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelOption {
@@ -188,6 +202,9 @@ pub trait TuiBackend {
     fn can_paste_image(&self) -> bool {
         true
     }
+    fn can_send_message(&self) -> bool {
+        true
+    }
 
     // ── Refresh ────────────────────────────────────────────────────────────
 
@@ -240,6 +257,24 @@ pub trait TuiBackend {
     ) -> BackendResult<Goal>;
     fn delete_goal(&mut self, id: &str) -> BackendResult<()>;
     fn goal_progress(&mut self, id: &str) -> BackendResult<String>;
+
+    // ── Messaging ──────────────────────────────────────────────────────────
+
+    /// `orch msg send` / `orch msg broadcast` with the CLI's own defaults:
+    /// sender `cli`, empty subject, default TTL. Returns the id of every
+    /// record created, in fan-out order.
+    ///
+    /// Ids rather than the `Message` records because that is all the dashboard
+    /// consumes — the result line names the id or the count, and the
+    /// disabled-recipient advisory comes from `state.agents`, not from the
+    /// record. Required rather than defaulted, so "messaging missing" is
+    /// unrepresentable.
+    ///
+    /// A direct send always yields exactly one id; a broadcast yields one per
+    /// recipient, and **zero** when it reached nobody — which is a success,
+    /// not a failure, so the caller reports the count rather than treating an
+    /// empty vector as an error.
+    fn send_message(&mut self, target: MessageTarget, body: &str) -> BackendResult<Vec<String>>;
 
     // ── Watch mode ─────────────────────────────────────────────────────────
 

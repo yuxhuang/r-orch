@@ -5,15 +5,21 @@
 
 use orch_domain::{AgentStatus, GOAL_STATUSES, GoalStatus, TUI_PALETTE_NAMES, TaskStatus};
 
-use crate::app::{App, parse_palette};
+use crate::app::{App, BroadcastArm, parse_palette};
+use crate::backend::MessageTarget;
 use crate::backend::TuiBackend;
 use crate::clock::Clock;
 use crate::command_bar::{COMMAND_REGISTRY, CONFIG_SETTINGS, is_config_setting};
 use crate::format::cap_line;
 use crate::messages::MsgType;
+use crate::msg::{Recipient, parse_recipient, resolve_recipient};
 use crate::state::is_runnable;
 use crate::theme::Token;
 use crate::wizard::configs;
+
+/// `MessageService` cuts a body at this many UTF-16 units, silently
+/// (PARITY §14.14). The TUI only reports it.
+const MESSAGE_BODY_UNITS: usize = 4000;
 
 const NO_TASK_SELECTED: &str = "No task selected";
 const NO_AGENT_SELECTED: &str = "No agent selected";
@@ -232,12 +238,154 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.refuse(&text);
                 }
             },
+            // The one verb whose argument can contain a space, so it takes the
+            // **raw tail** rather than `parts`: `split_whitespace` is left
+            // exactly as it is for every existing verb, whose parsing is L1
+            // and position-sensitive (design-v2 §3.2, R1).
+            "msg" => {
+                let tail = stripped
+                    .split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail)
+                    .unwrap_or("")
+                    .to_string();
+                self.cmd_msg(&tail);
+            }
             "quit" => self.state.should_exit = true,
             other => {
                 let text = format!("Unknown: {other}. Type /help for commands");
                 self.refuse(&text);
             }
         }
+    }
+
+    // ── /msg ───────────────────────────────────────────────────────────────
+
+    /// `/msg <agent|all> <message>` (design-v2 §3.2–§3.8).
+    ///
+    /// Every exit that is not a send sets [`App::retain_command_bar`], so the
+    /// bar stays open with its text: a refusal that asks for an id, or a
+    /// broadcast waiting for its confirming Enter, is useless if the text it
+    /// is about has been cleared.
+    fn cmd_msg(&mut self, tail: &str) {
+        // Every run starts clean, so a success never leaves the previous
+        // refusal on screen.
+        self.state.command_bar.retained_refusal.clear();
+        if !self.backend.can_send_message() {
+            // Retained like every other refusal: the typed body is the one
+            // thing the user cannot get back.
+            self.refuse_retaining("Messaging not available");
+            return;
+        }
+        let token = match parse_recipient(tail) {
+            Ok(token) => token,
+            Err(err) => return self.refuse_retaining(err.message()),
+        };
+        if token.rest.trim().is_empty() {
+            // Named, not a bare usage line: `m` chose this recipient.
+            let text = format!("Missing message for \"{}\"", token.text);
+            return self.refuse_retaining(&text);
+        }
+        let body = token.rest.clone();
+        let recipient = match resolve_recipient(&self.state.agents, &token, &body) {
+            Ok(recipient) => recipient,
+            Err(err) => {
+                let lines = err.lines();
+                for line in &lines {
+                    self.refuse(line);
+                }
+                self.retain(lines);
+                return;
+            }
+        };
+
+        let (target, name, disabled) = match recipient {
+            Recipient::Broadcast { enabled } => {
+                // The one irreversible, fan-out action in the TUI: agents are
+                // LLMs that act on what they read. The confirmation is the
+                // Enter that immediately follows the arming one — same text
+                // *and* same edit generation, so retyping the identical
+                // command, recalling it from history or leaving the bar and
+                // coming back all have to arm again (gate S2).
+                let armed = self.armed_broadcast.as_ref().is_some_and(|arm| {
+                    arm.tail == tail && arm.generation == self.submitted_generation
+                });
+                if !armed {
+                    self.armed_broadcast = Some(BroadcastArm {
+                        tail: tail.to_string(),
+                        generation: self.submitted_generation,
+                    });
+                    let text = format!("Broadcast to {enabled} agents — press Enter again to send");
+                    return self.refuse_retaining(&text);
+                }
+                self.armed_broadcast = None;
+                (MessageTarget::Broadcast, None, false)
+            }
+            Recipient::Agent { id, name, disabled } => {
+                (MessageTarget::Agent(id), Some(name), disabled)
+            }
+        };
+
+        let whom = name.clone().unwrap_or_else(|| "all agents".to_owned());
+        self.pending(&format!("Sending to {whom}..."));
+        let ids = match self.backend.send_message(target, &body) {
+            Ok(ids) => ids,
+            // Retained like a refusal: the body may be a pasted stack trace,
+            // and a transient store error is not a reason to make the user
+            // find it again (gate code F5).
+            Err(err) => {
+                self.fail(&err);
+                self.retain(vec![format!("Failed: {err}")]);
+                return;
+            }
+        };
+
+        // `Queued`, not `sent`: the write is immediate but delivery happens on
+        // the recipient's next dispatch, and an idle agent never drains.
+        // Observer mode *is* dispatching — in another process — so the case
+        // worth warning about is neither watch nor observer.
+        let hint = if self.state.watch_active || self.state.observer_mode {
+            String::new()
+        } else {
+            " — nothing is dispatching right now; /watch to start".to_string()
+        };
+        // The seam hands back the ids, which is all these two lines need: the
+        // first id for a direct send, the count for a broadcast.
+        let text = match &name {
+            Some(name) => {
+                let id = ids.first().map(String::as_str).unwrap_or("");
+                format!("✓ Queued for {name} ({id}) — delivered on its next run{hint}")
+            }
+            None => format!(
+                "✓ Queued for {} agents — delivered on their next run{hint}",
+                ids.len()
+            ),
+        };
+        self.ok(&text);
+        if disabled && let Some(name) = &name {
+            let text = format!("{name} is disabled — the message waits in its inbox");
+            self.pending(&text);
+        }
+        // The engine cuts at 4000 UTF-16 units and says nothing; the TUI makes
+        // that visible without pre-truncating — `truncate_utf16` stays the one
+        // place the cut happens.
+        if body.chars().map(char::len_utf16).sum::<usize>() > MESSAGE_BODY_UNITS {
+            let text = format!("Body truncated to {MESSAGE_BODY_UNITS} characters");
+            self.pending(&text);
+        }
+        // No `refresh_all`: nothing in `AppState` derives from messages.
+    }
+
+    /// A `/msg` refusal: the message, and the bar kept open with its text.
+    fn refuse_retaining(&mut self, text: &str) {
+        self.refuse(text);
+        self.retain(vec![text.to_owned()]);
+    }
+
+    /// Keep the bar open, and keep `lines` on screen above it — the feed is
+    /// not drawn while the bar is open.
+    fn retain(&mut self, lines: Vec<String>) {
+        self.retain_command_bar = true;
+        self.state.command_bar.retained_refusal = lines;
     }
 
     // ── /task ──────────────────────────────────────────────────────────────

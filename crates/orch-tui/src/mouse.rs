@@ -28,7 +28,6 @@ use ratatui::crossterm::event::{
 use crate::app::App;
 use crate::backend::TuiBackend;
 use crate::clock::Clock;
-use crate::command_bar::resolve_suggestions;
 use crate::hit::{
     ChromeId, FooterAction, PseudoRow, RowPart, ScrollRegion, VerbId, Zone, ZoneId, ZoneKind,
 };
@@ -427,11 +426,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             VerbId::WizardBack => self.wizard_key(KeyCode::Esc),
             VerbId::CommandExec => self.execute_selected_suggestion(),
             VerbId::CommandComplete => self.accept_command_completion(),
-            VerbId::CommandCancel => {
-                self.state.input_mode = InputMode::None;
-                self.state.command_bar.input.reset("");
-                self.state.command_bar.history.reset();
-            }
+            // The same exit `Esc` takes, not a copy of it: clicking `✕` used
+            // to clear the bar while leaving a broadcast armed behind it, so
+            // the UI said cancelled and the next Enter sent (gate S2).
+            VerbId::CommandCancel => self.leave_command_mode(),
             VerbId::DetailGrow => self.state.grow_detail(),
             VerbId::DetailShrink => self.state.grow_list(),
             VerbId::DetailMax => self.toggle_detail_maximized(),
@@ -495,6 +493,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 ViewId::Logs => {}
             },
             FooterAction::StopAgent => self.force_stop_selected_agent(),
+            FooterAction::Message => {
+                if let Some(agent) = self.state.selected_agent() {
+                    let name = agent.name.clone();
+                    self.compose_message_to(&name);
+                }
+            }
             FooterAction::ToggleAutonomous => {
                 if let Some(agent) = self.state.selected_agent().cloned() {
                     self.toggle_autonomous_by_id(&agent.id);
@@ -789,7 +793,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// walk history.
     fn wheel_suggestions(&mut self, delta: i32) {
         let value = self.state.command_bar.input.value().to_string();
-        let suggestions = resolve_suggestions(&value);
+        let suggestions = self.suggestions(&value);
         if suggestions.is_empty() {
             return;
         }

@@ -29,6 +29,11 @@ pub struct TextInput {
     /// Deadline for a debounced snapshot, or `None` when none is pending.
     pending_snapshot_at: Option<i64>,
     max_undo: usize,
+    /// Bumped by every mutation, so a caller can tell "the same text" from
+    /// "the same edit". The command bar's broadcast arm is stamped with it
+    /// (`app::BroadcastArm`); every mutation funnels through this type, which
+    /// is what makes the stamp hold for paths written later.
+    generation: u64,
 }
 
 impl TextInput {
@@ -39,6 +44,7 @@ impl TextInput {
             kill_ring: String::new(),
             pending_snapshot_at: None,
             max_undo: MAX_UNDO_DEPTH,
+            generation: 0,
         }
     }
 
@@ -56,7 +62,13 @@ impl TextInput {
     }
 
     pub fn cursor_mut(&mut self) -> &mut Cursor {
+        self.generation += 1;
         &mut self.cursor
+    }
+
+    /// How many times the value has been mutated. See [`TextInput::generation`].
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// `reset(newValue)` — new value, cursor at the end, undo history dropped.
@@ -64,6 +76,14 @@ impl TextInput {
         self.cursor = Cursor::new(value);
         self.undo.clear();
         self.pending_snapshot_at = None;
+        self.generation += 1;
+    }
+
+    /// Restore a generation taken before a `reset` that only put back what was
+    /// already there — the command bar's refusal retention, which is not a
+    /// user edit of the bar.
+    pub fn restore_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 
     pub fn kill_ring(&self) -> &str {
@@ -144,6 +164,14 @@ impl TextInput {
     /// Never consumes `Enter`, `Esc`, `Tab`, `↑` or `↓` — those belong to the
     /// parent (command bar / wizard).
     pub fn handle_key(&mut self, key: KeyEvent, now_ms: i64) -> bool {
+        let consumed = self.dispatch_key(key, now_ms);
+        if consumed {
+            self.generation += 1;
+        }
+        consumed
+    }
+
+    fn dispatch_key(&mut self, key: KeyEvent, now_ms: i64) -> bool {
         self.poll(now_ms);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let meta = is_meta(key);
@@ -247,6 +275,7 @@ impl TextInput {
     pub fn insert_str(&mut self, text: &str, now_ms: i64) {
         self.snapshot_debounced(now_ms);
         self.cursor.insert(text);
+        self.generation += 1;
     }
 }
 
@@ -292,6 +321,47 @@ mod tests {
         for ch in text.chars() {
             input.handle_key(key(KeyCode::Char(ch)), now);
         }
+    }
+
+    #[test]
+    fn every_mutation_moves_the_generation_on() {
+        // What the command bar's broadcast arm is keyed to: "the same text"
+        // must not read as "the same edit", or a backspace and retype
+        // confirms an irreversible send (app::BroadcastArm).
+        let mut input = TextInput::new("hi");
+        let mut generation = input.generation();
+        let mut moved_on = |input: &TextInput, what: &str| {
+            assert!(
+                input.generation() > generation,
+                "{what} left the generation at {generation}"
+            );
+            generation = input.generation();
+        };
+        input.handle_key(key(KeyCode::Char('x')), 0);
+        moved_on(&input, "typing");
+        input.handle_key(key(KeyCode::Backspace), 0);
+        moved_on(&input, "backspace");
+        input.handle_key(key(KeyCode::Char('x')), 0);
+        moved_on(&input, "retyping the same character");
+        assert_eq!(input.value(), "hix", "back to the text we had");
+        input.handle_key(key(KeyCode::Left), 0);
+        moved_on(&input, "a cursor move");
+        input.insert_str("pasted", 0);
+        moved_on(&input, "a paste");
+        input.reset("hix");
+        moved_on(&input, "reset");
+        input.cursor_mut().insert("!");
+        moved_on(&input, "a mutable cursor borrow");
+
+        // An unconsumed key is not a mutation.
+        let before = input.generation();
+        assert!(!input.handle_key(key(KeyCode::Enter), 0));
+        assert_eq!(input.generation(), before);
+        // …and a restore puts the stamp back, for the one caller that undoes
+        // its own reset (the retained command bar).
+        input.reset("hix!");
+        input.restore_generation(before);
+        assert_eq!(input.generation(), before);
     }
 
     #[test]
