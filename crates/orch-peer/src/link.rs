@@ -385,13 +385,49 @@ impl RemoteBridge for LinkHub {
     }
 }
 
+/// Longest wait between redials. Short enough that a worker coming back is
+/// noticed promptly, long enough that a worker which kills every session is
+/// dialled about four times a minute rather than once a second.
+const BACKOFF_CAP: Duration = Duration::from_secs(15);
+/// How long a session must stay up, *after* clearing the sync fence, before it
+/// counts as evidence the peer is healthy. A session that dies right after the
+/// handshake is the symptom of a worker fault; resetting the backoff on it
+/// turns the reconnect loop into a redial storm.
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 struct Backoff(u32);
 impl Backoff {
     fn next(&mut self) -> Duration {
-        let seconds = (1u64 << self.0.min(5)).min(30);
+        let seconds = (1u64 << self.0.min(4)).min(BACKOFF_CAP.as_secs());
         self.0 = self.0.saturating_add(1);
-        Duration::from_secs(seconds)
+        jittered(Duration::from_secs(seconds))
+    }
+}
+
+/// `base` ±25 %, so links that dropped together do not redial in lockstep.
+/// The entropy is the process's hasher seed rather than a `rand` dependency:
+/// this needs spread, not statistical quality.
+fn jittered(base: Duration) -> Duration {
+    use std::hash::{BuildHasher, RandomState};
+    let offset = RandomState::new().hash_one(base.as_nanos()) % (base.as_nanos() as u64 / 2 + 1);
+    base + Duration::from_nanos(offset) - base / 4
+}
+
+/// What a finished session proves about the peer, for the redial backoff.
+#[derive(Default)]
+struct SessionHealth {
+    /// When the worker answered the post-sync Ping, i.e. when the session
+    /// became usable rather than merely handshaken.
+    fenced_at: Option<Instant>,
+}
+
+impl SessionHealth {
+    /// Only a session that became usable and then stayed up resets the
+    /// backoff. Everything else keeps it escalating.
+    fn healthy(&self) -> bool {
+        self.fenced_at
+            .is_some_and(|at| at.elapsed() >= HEALTHY_SESSION)
     }
 }
 
@@ -422,7 +458,28 @@ pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
             }
         }
         for config in configs {
-            if !links.0.contains_key(&config.alias) {
+            // `run_link` never returns, so a finished handle means it panicked.
+            // Without a respawn that alias stays offline for the life of the
+            // process, with nothing in the registry to say why.
+            let stopped = links
+                .0
+                .get(&config.alias)
+                .is_some_and(|(_, task)| task.0.is_finished());
+            if stopped {
+                let error = format!("Peer link task for {} stopped unexpectedly", config.alias);
+                tracing::error!(alias = %config.alias, "{error}; restarting");
+                ctx.engine
+                    .events
+                    .emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                        error,
+                        context: format!(
+                            "Peer {}; restarting the link. Dispatch to it was unavailable meanwhile",
+                            config.alias
+                        ),
+                        fatal: false,
+                    });
+            }
+            if stopped || !links.0.contains_key(&config.alias) {
                 let alias = config.alias.clone();
                 let task = tokio::spawn(run_link(ctx.clone(), hub.clone(), config.clone()));
                 links.0.insert(alias, (config, AbortOnDrop(task)));
@@ -470,8 +527,8 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
             persist_status(&ctx, &status).await;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        let result = session(&ctx, &hub, &config, &mut status).await;
-        let connected = status.online;
+        let mut health = SessionHealth::default();
+        let result = session(&ctx, &hub, &config, &mut status, &mut health).await;
         status.online = false;
         ctx.store.mark_link_offline(&config.alias);
         status.last_error = Some(
@@ -490,11 +547,11 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
                 ),
                 fatal: false,
             });
-        if connected {
+        if health.healthy() {
             backoff = Backoff::default();
         }
         let delay = backoff.next();
-        tracing::debug!(alias=%config.alias,error=?status.last_error,?delay,"Peer reconnect pending");
+        tracing::debug!(alias=%config.alias,error=?status.last_error,?delay,healthy=health.healthy(),"Peer reconnect pending");
         tokio::time::sleep(delay).await;
     }
 }
@@ -521,6 +578,7 @@ async fn session(
     hub: &Arc<LinkHub>,
     config: &RemoteConfig,
     status: &mut RemoteStatus,
+    health: &mut SessionHealth,
 ) -> Result<()> {
     let socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&config.addr))
         .await
@@ -625,7 +683,10 @@ async fn session(
                     .map_err(net_error)?
                     .ok_or_else(|| Error::other("Peer closed connection"))?;
                 last_frame = Instant::now();
-                if matches!(&frame, Frame::Pong) { sync_fenced = true; }
+                if matches!(&frame, Frame::Pong) && !sync_fenced {
+                    sync_fenced = true;
+                    health.fenced_at = Some(Instant::now());
+                }
                 status.last_seen = Some(ctx.engine.clock.now_iso());
                 handle_frame(ctx, hub, config, status, frame, &mut writer, &mut synced).await?;
             }
@@ -836,7 +897,14 @@ mod tests {
                 os: None,
                 agents: vec![],
             };
-            let _ = session(&ctx, &linked, &config, &mut status).await;
+            let _ = session(
+                &ctx,
+                &linked,
+                &config,
+                &mut status,
+                &mut SessionHealth::default(),
+            )
+            .await;
         }));
         tokio::time::timeout(Duration::from_secs(3), async {
             let (socket, _) = listener.accept().await.unwrap();
@@ -1110,12 +1178,45 @@ mod tests {
     }
 
     #[test]
-    fn backoff_caps_at_thirty_seconds_forever() {
-        let mut b = Backoff::default();
-        assert_eq!(
-            (0..8).map(|_| b.next().as_secs()).collect::<Vec<_>>(),
-            vec![1, 2, 4, 8, 16, 30, 30, 30]
+    fn backoff_escalates_to_the_cap_within_a_quarter_either_way() {
+        let mut backoff = Backoff::default();
+        for base in [1u64, 2, 4, 8, 15, 15, 15, 15] {
+            let delay = backoff.next();
+            let base = Duration::from_secs(base);
+            assert!(
+                delay >= base - base / 4 && delay <= base + base / 4,
+                "{delay:?} is not {base:?} ±25%"
+            );
+        }
+        // Spread, not a fixed offset: a shared drop must not redial in step.
+        let mut backoff = Backoff::default();
+        let mut capped = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            capped.insert(backoff.next());
+        }
+        assert!(capped.len() > 1, "jitter produced one value: {capped:?}");
+    }
+
+    /// The live failure: a worker that closed every session right after the
+    /// handshake saw a redial about every second, because any handshake at all
+    /// reset the backoff. Only a session that cleared the sync fence and then
+    /// stayed up may reset it.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_fenced_session_that_stayed_up_resets_the_backoff() {
+        let mut dead_on_arrival = SessionHealth::default();
+        assert!(
+            !dead_on_arrival.healthy(),
+            "an unfenced session is no proof"
         );
+        dead_on_arrival.fenced_at = Some(Instant::now());
+        assert!(
+            !dead_on_arrival.healthy(),
+            "a session that died at the fence is no proof"
+        );
+        tokio::time::advance(HEALTHY_SESSION - Duration::from_millis(1)).await;
+        assert!(!dead_on_arrival.healthy());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(dead_on_arrival.healthy());
     }
     #[tokio::test]
     async fn streams_survive_reconnect_and_cancel_removes_active_key() {
