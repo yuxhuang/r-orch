@@ -71,6 +71,10 @@ impl RemotePhase {
         }
         match (self, next) {
             (RemotePhase::Terminal, _) => false,
+            // A sync can only resolve an unknown *forwards*: a worker that
+            // still holds the execution reports queued, running or finished,
+            // never "not submitted yet".
+            (RemotePhase::Unknown, RemotePhase::Dispatched) => false,
             (RemotePhase::Unknown, _) | (_, RemotePhase::Unknown) => true,
             (from, to) => to.rank() > from.rank(),
         }
@@ -92,6 +96,11 @@ pub struct RemoteRunRef {
     /// The worker's own explanation for the phase, verbatim. Display only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// When the worker first reported the agent executing. The run's own
+    /// clock: time spent queued behind a worker owner's approval is a wait,
+    /// not runtime, and must not be billed to the agent's stats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_since: Option<String>,
 }
 
 impl RemoteRunRef {
@@ -102,6 +111,7 @@ impl RemoteRunRef {
             phase: RemotePhase::Dispatched,
             worker_task_id: None,
             reason: None,
+            running_since: None,
         }
     }
 
@@ -302,5 +312,9 @@ mod tests {
         // A lost link interrupts any phase, and the sync after it resolves.
         assert!(Dispatched.advances_to(Unknown) && Running.advances_to(Unknown));
         assert!(Unknown.advances_to(Queued) && Unknown.advances_to(Running));
+        assert!(
+            !Unknown.advances_to(Dispatched),
+            "a sync resolves an unknown forwards, never back to unsubmitted"
+        );
     }
 }

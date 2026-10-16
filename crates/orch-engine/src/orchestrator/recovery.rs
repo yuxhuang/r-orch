@@ -253,24 +253,27 @@ impl Orchestrator {
         // cancelling the reservation here would discard an outcome that is
         // still on its way. So a remote entry whose peer is still registered
         // is kept, in `unknown` until the next session's sync resolves it.
-        // A peer that is gone (or a registry this process cannot read) has no
-        // sync to wait for, and keeps the old cancel-on-restart path.
+        // Only a peer that has been *removed* from the registry has no sync
+        // to wait for and keeps the old cancel-on-restart path; a registry
+        // this process cannot read proves nothing, and reconcile re-reads it
+        // on every tick, so those entries are kept too.
         let registry = orch_infra::storage::remote::FileRemoteStore::new(
             orch_infra::storage::Paths::new(self.deps().project_root.clone()),
         );
-        let registered: std::collections::HashSet<String> = match registry.list().await {
-            Ok(configs) => configs.into_iter().map(|config| config.alias).collect(),
+        let registered: Option<std::collections::HashSet<String>> = match registry.list().await {
+            Ok(configs) => Some(configs.into_iter().map(|config| config.alias).collect()),
             Err(err) => {
                 self.emit_error(err, "startup cleanup: read peer registry");
-                Default::default()
+                None
             }
         };
+        let kept = |remote: &orch_domain::RemoteRunRef| {
+            registered
+                .as_ref()
+                .is_none_or(|registered| registered.contains(&remote.alias))
+        };
         for entry in state.running.values_mut() {
-            if let Some(remote) = entry
-                .remote
-                .as_mut()
-                .filter(|remote| registered.contains(&remote.alias))
-            {
+            if let Some(remote) = entry.remote.as_mut().filter(|remote| kept(remote)) {
                 remote.phase = orch_domain::RemotePhase::Unknown;
             }
         }
@@ -278,7 +281,7 @@ impl Orchestrator {
             .running
             .iter()
             .filter(|(_, entry)| match &entry.remote {
-                Some(remote) => !registered.contains(&remote.alias),
+                Some(remote) => !kept(remote),
                 None => !self.deps().processes.is_alive(entry.pid),
             })
             .map(|(task_id, entry)| (task_id.clone(), entry.clone()))

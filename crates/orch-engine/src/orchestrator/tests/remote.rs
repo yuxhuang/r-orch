@@ -193,6 +193,9 @@ fn remote_state_in(at: &str, phase: RemotePhase) -> OrchestratorState {
     let mut state = state_running("tsk_remote", "agt_peer@worker", "run_remote", 0, at);
     state.running.get_mut("tsk_remote").unwrap().remote = Some(RemoteRunRef {
         phase,
+        // A worker that has reported `running` has already been accounted
+        // for, which is what stops the collector re-reading the run record.
+        running_since: (phase == RemotePhase::Running).then(|| at.to_owned()),
         ..RemoteRunRef::new("worker", "run_remote")
     });
     state
@@ -246,6 +249,20 @@ fn cancelled_once(bridge: &FakeBridge) {
         *bridge.cancelled.lock().unwrap(),
         vec![("worker".into(), "run_remote".into())]
     );
+}
+
+/// Let `ms` of *reconcile* time pass, in steps the phase clock will credit.
+/// A sample credits at most two poll intervals, so a single huge jump of the
+/// clock is deliberately not eight hours of a peer failing to answer.
+async fn elapse(h: &Harness, ms: i64) {
+    let step = 2 * super::harness::TEST_POLL_INTERVAL_MS as i64;
+    let mut left = ms;
+    while left > 0 {
+        let chunk = left.min(step);
+        h.clock.advance_ms(chunk);
+        h.reconcile().await.unwrap();
+        left -= chunk;
+    }
 }
 
 /// The phase of the one remote entry, with the label a view would show.
@@ -526,9 +543,7 @@ async fn an_unacknowledged_submit_fails_on_five_minutes_of_online_time() {
 
     // Offline time does not count, however long the worker is away.
     fixture.status(false).await;
-    h.reconcile().await.unwrap();
-    h.clock.advance_ms(10 * 60_000);
-    h.reconcile().await.unwrap();
+    elapse(&h, 10 * 60_000).await;
     assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
     assert!(bridge.cancelled.lock().unwrap().is_empty());
     assert_eq!(
@@ -541,8 +556,12 @@ async fn an_unacknowledged_submit_fails_on_five_minutes_of_online_time() {
     fixture.status(true).await;
     h.reconcile().await.unwrap();
     assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
-    h.clock.advance_ms(5 * 60_000);
+    // A single eight-hour jump of the wall clock credits one sample, not the
+    // whole deadline: a closed laptop lid is not a worker that went silent.
+    h.clock.advance_ms(8 * 3_600_000);
     h.reconcile().await.unwrap();
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
+    elapse(&h, 5 * 60_000).await;
     assert_eq!(h.task("tsk_remote").status, TaskStatus::Failed);
     let run = h.runs.peek("run_remote").unwrap();
     assert_eq!(
@@ -579,8 +598,7 @@ async fn a_long_queued_mirror_warns_hourly_and_never_fails() {
     h.state.write(&state).await.unwrap();
 
     h.reconcile().await.unwrap();
-    h.clock.advance_ms(59 * 60_000);
-    h.reconcile().await.unwrap();
+    elapse(&h, 59 * 60_000).await;
     let warnings = |h: &Harness| {
         h.events_of(OrchestratorEventType::OrchestratorError)
             .into_iter()
@@ -596,8 +614,7 @@ async fn a_long_queued_mirror_warns_hourly_and_never_fails() {
     };
     assert!(warnings(&h).is_empty(), "59 minutes is not an hour");
 
-    h.clock.advance_ms(60_000);
-    h.reconcile().await.unwrap();
+    elapse(&h, 60_000).await;
     h.reconcile().await.unwrap();
     assert_eq!(
         warnings(&h),
@@ -607,8 +624,7 @@ async fn a_long_queued_mirror_warns_hourly_and_never_fails() {
         )],
         "the warning repeats hourly, not every tick"
     );
-    h.clock.advance_ms(60 * 60_000);
-    h.reconcile().await.unwrap();
+    elapse(&h, 60 * 60_000).await;
     assert_eq!(warnings(&h).len(), 2);
     assert_eq!(
         warnings(&h)[1].0,
@@ -621,6 +637,111 @@ async fn a_long_queued_mirror_warns_hourly_and_never_fails() {
         (RemotePhase::Queued, "queued @worker".into())
     );
     assert!(bridge.cancelled.lock().unwrap().is_empty());
+}
+
+/// A `start` that fails must not leave the run `preparing` for ever: the
+/// transition into running happens once, so the repair has to be driven by
+/// the run record rather than by the transition.
+#[tokio::test]
+async fn a_failed_run_start_is_repaired_by_the_next_running_signal() {
+    let fixture = PeerFixture::new(true).await;
+    let (h, _) = running(&fixture).await;
+    h.state
+        .write(&remote_state_in(NOW_ISO, RemotePhase::Queued))
+        .await
+        .unwrap();
+    h.load_state().await.unwrap();
+    h.runs.seed(Run {
+        id: "run_remote".into(),
+        task_id: "tsk_remote".into(),
+        agent_id: "agt_peer@worker".into(),
+        status: RunStatus::Preparing,
+        ..make_run()
+    });
+    // The read that decides whether to start fails.
+    h.runs.faults.fail_once("run store temporarily unavailable");
+    assert!(
+        h.orchestrator
+            .apply_remote_phase(
+                "tsk_remote",
+                "run_remote",
+                &RemotePhaseUpdate::new(RemotePhase::Running)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().status,
+        RunStatus::Preparing
+    );
+    // The next running signal from the worker repairs it.
+    assert_eq!(
+        h.orchestrator
+            .apply_remote_phase(
+                "tsk_remote",
+                "run_remote",
+                &RemotePhaseUpdate::new(RemotePhase::Running)
+            )
+            .await
+            .unwrap(),
+        RemotePhase::Running
+    );
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().status,
+        RunStatus::Running
+    );
+    assert_eq!(h.events_of(OrchestratorEventType::AgentStarted).len(), 1);
+    let remote = h.in_memory_state().await.running["tsk_remote"]
+        .remote
+        .clone()
+        .unwrap();
+    assert_eq!(
+        remote.running_since.as_deref(),
+        Some(NOW_ISO),
+        "the run's own clock starts when the worker says running"
+    );
+}
+
+/// The phase a frame from a dead session carries must not undo what the
+/// worker has since said, and must not erase what this side already knows.
+#[tokio::test]
+async fn a_backwards_phase_keeps_the_running_state_and_its_reason() {
+    let fixture = PeerFixture::new(true).await;
+    let (h, _) = running(&fixture).await;
+    h.orchestrator
+        .apply_remote_phase(
+            "tsk_remote",
+            "run_remote",
+            &RemotePhaseUpdate {
+                phase: RemotePhase::Running,
+                worker_task_id: Some("tsk_mirror".into()),
+                reason: Some("running on the worker".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.orchestrator
+            .apply_remote_phase(
+                "tsk_remote",
+                "run_remote",
+                &RemotePhaseUpdate {
+                    phase: RemotePhase::Queued,
+                    worker_task_id: None,
+                    reason: Some("stale queued frame".into()),
+                },
+            )
+            .await
+            .unwrap(),
+        RemotePhase::Running
+    );
+    let remote = h.in_memory_state().await.running["tsk_remote"]
+        .remote
+        .clone()
+        .unwrap();
+    assert_eq!(remote.phase, RemotePhase::Running);
+    assert_eq!(remote.reason.as_deref(), Some("running on the worker"));
+    assert_eq!(remote.worker_task_id.as_deref(), Some("tsk_mirror"));
 }
 
 #[tokio::test]

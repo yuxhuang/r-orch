@@ -12,7 +12,9 @@ use orch_domain::{
     TaskStatus,
 };
 
-use super::{Orchestrator, REMOTE_QUEUED_WARN_MS, REMOTE_SUBMIT_DEADLINE_MS};
+use super::{
+    Orchestrator, REMOTE_CLOCK_MIN_SAMPLE_MS, REMOTE_QUEUED_WARN_MS, REMOTE_SUBMIT_DEADLINE_MS,
+};
 
 /// How long one remote entry has been in its current phase, for the two
 /// deadlines. `dispatched` counts only the time its peer was online; nothing
@@ -43,12 +45,18 @@ impl RemoteClock {
     }
 
     /// Fold one reconcile sample in and return the time spent in `phase`.
-    fn sample(&mut self, phase: RemotePhase, now_ms: i64, counts: bool) -> i64 {
+    ///
+    /// A sample credits at most `max_sample_ms`, so a closed laptop lid or a
+    /// stalled tick cannot jump a deadline in one step: a wall clock that
+    /// skipped eight hours is not eight hours of a peer failing to answer.
+    fn sample(&mut self, phase: RemotePhase, now_ms: i64, counts: bool, max_sample_ms: i64) -> i64 {
         if phase != self.phase {
             *self = RemoteClock::started(phase, now_ms);
             return 0;
         }
-        let delta = now_ms.saturating_sub(self.sampled_at_ms).max(0);
+        let delta = now_ms
+            .saturating_sub(self.sampled_at_ms)
+            .clamp(0, max_sample_ms);
         self.sampled_at_ms = now_ms;
         if counts {
             self.elapsed_ms = self.elapsed_ms.saturating_add(delta);
@@ -99,7 +107,12 @@ impl Orchestrator {
             // Only `dispatched` stops counting while the peer is away: an
             // offline worker has not failed to answer.
             let counts = online || remote.phase != RemotePhase::Dispatched;
-            let elapsed = clock.sample(remote.phase, now, counts);
+            // Two ticks' worth of credit per sample, so the clock tracks
+            // reconciles that actually ran rather than wall time.
+            let max_sample = (self.config().scheduling.poll_interval_ms as i64)
+                .saturating_mul(2)
+                .max(REMOTE_CLOCK_MIN_SAMPLE_MS);
+            let elapsed = clock.sample(remote.phase, now, counts, max_sample);
             let warn_due = remote.phase == RemotePhase::Queued
                 && elapsed >= REMOTE_QUEUED_WARN_MS
                 && clock.warn_due(now);
@@ -419,22 +432,38 @@ impl Orchestrator {
         if update.worker_task_id.is_some() {
             remote.worker_task_id = update.worker_task_id.clone();
         }
+        // A rejected transition keeps everything it already knew: the reason
+        // and the mirror id belong to the phase that is still in force.
         if before == update.phase || before.advances_to(update.phase) {
             remote.phase = update.phase;
             remote.reason = update.reason.clone();
         }
         let phase = remote.phase;
-        if phase == RemotePhase::Running && before != RemotePhase::Running {
-            // The run may already be `running` when a restart rehydrated this
-            // entry; starting it twice would emit a second `agent:started`.
-            if self
+        // Gated on `running_since` rather than on the transition: a `start`
+        // that failed once would otherwise leave the run `preparing` for
+        // ever, because the transition never happens twice. Until a start has
+        // been accounted for, every later phase update — the next sync, the
+        // next worker event — retries it.
+        if phase == RemotePhase::Running && remote.running_since.is_none() {
+            let preparing = self
                 .deps()
                 .run_store
                 .get(run_id)
                 .await?
-                .is_some_and(|run| run.status == RunStatus::Preparing)
-            {
+                .is_some_and(|run| run.status == RunStatus::Preparing);
+            // Already `running` when a restart rehydrated this entry:
+            // starting it again would emit a second `agent:started`.
+            if preparing {
                 self.deps().run_service.start(run_id, 0).await?;
+            }
+            // Only now, so a failed start above is retried rather than lost.
+            // The run's own clock starts here, not at dispatch.
+            if let Some(remote) = state
+                .running
+                .get_mut(task_id)
+                .and_then(|entry| entry.remote.as_mut())
+            {
+                remote.running_since = Some(self.deps().clock.now_iso());
             }
         }
         if phase != before {

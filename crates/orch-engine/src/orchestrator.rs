@@ -98,6 +98,9 @@ const MAX_LAST_ERROR_LEN: usize = 500;
 /// before the controller gives up on it. Offline time does not count: a
 /// worker that is simply unreachable has not failed to answer.
 const REMOTE_SUBMIT_DEADLINE_MS: i64 = 5 * 60_000;
+/// The floor on a phase clock's per-sample credit, for a configuration whose
+/// poll interval is tiny. Two reconciles' worth of the default interval.
+const REMOTE_CLOCK_MIN_SAMPLE_MS: i64 = 10_000;
 /// How long a mirror may stay queued on its worker before the controller
 /// says so, and how often it repeats. A queued mirror is usually waiting for
 /// the worker owner's `orch task approve`, which no deadline here can grant,
