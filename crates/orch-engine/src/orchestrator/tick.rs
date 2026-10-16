@@ -180,6 +180,15 @@ impl Orchestrator {
                         &format!("remote {} removed; outcome unknown", remote.alias),
                     )
                     .await?;
+                } else {
+                    // The phase deadlines: a submit the worker never
+                    // acknowledges fails, a mirror queued for hours warns.
+                    let online = registry
+                        .read_status(&remote.alias)
+                        .await?
+                        .is_some_and(|status| status.online);
+                    self.enforce_remote_deadlines(state, task_id, online)
+                        .await?;
                 }
                 continue;
             }
@@ -281,6 +290,7 @@ impl Orchestrator {
         self.reconcile_stale_agents(state).await?;
         self.reconcile_orphaned_tasks(state).await?;
         self.process_retry_queue(state).await?;
+        self.prune_remote_clocks(state).await;
         self.save_state(state).await
     }
 

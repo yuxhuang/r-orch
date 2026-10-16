@@ -829,6 +829,19 @@ async fn handle_frame(
                     }
                     "unknown" if hub.attempted(&config.alias, &item.exec_key) => {
                         log_reason(config, &item.exec_key, &item.state, item.reason.as_deref());
+                        // The phase carries the worker's explanation ahead of
+                        // the terminal event, which has nowhere to put it: an
+                        // unreadable mirror must reach the operator as more
+                        // than "remote lost execution record".
+                        hub.phase(
+                            &config.alias,
+                            &item.exec_key,
+                            RemotePhaseUpdate {
+                                phase: RemotePhase::Unknown,
+                                worker_task_id: item.worker_task_id,
+                                reason: item.reason,
+                            },
+                        );
                         hub.terminal(&config.alias, &item.exec_key, RemoteRunEvent::Unknown);
                     }
                     "queued" | "running" => {

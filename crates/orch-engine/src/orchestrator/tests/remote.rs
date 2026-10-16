@@ -398,6 +398,116 @@ async fn progress_proves_a_run_the_worker_has_not_announced_yet() {
     );
 }
 
+/// A worker that never answers a submit is a failure, but only once it has
+/// had five minutes of *link* to answer in. The original bug was the reverse:
+/// the controller claimed the run was live and waited forever.
+#[tokio::test]
+async fn an_unacknowledged_submit_fails_on_five_minutes_of_online_time() {
+    let fixture = PeerFixture::new(false).await;
+    let (h, bridge) = running(&fixture).await;
+    h.state
+        .write(&remote_state_in(NOW_ISO, RemotePhase::Dispatched))
+        .await
+        .unwrap();
+
+    // Offline time does not count, however long the worker is away.
+    h.reconcile().await.unwrap();
+    h.clock.advance_ms(10 * 60_000);
+    h.reconcile().await.unwrap();
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
+    assert!(bridge.cancelled.lock().unwrap().is_empty());
+    assert_eq!(
+        phase(&h, "tsk_remote").await.0,
+        RemotePhase::Dispatched,
+        "an absent worker has not failed to answer"
+    );
+
+    // Online, and still silent: now the clock runs.
+    fixture.status(true).await;
+    h.reconcile().await.unwrap();
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
+    h.clock.advance_ms(5 * 60_000);
+    h.reconcile().await.unwrap();
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::Failed);
+    let run = h.runs.peek("run_remote").unwrap();
+    assert_eq!(
+        (run.status, run.error.as_deref()),
+        (
+            RunStatus::Failed,
+            Some("remote worker never acknowledged submit")
+        ),
+        "a run nobody ever started must not stay preparing"
+    );
+    // The worker may hold a mirror whose acknowledgement was lost.
+    cancelled_once(&bridge);
+    assert!(h.persisted_state().running.is_empty());
+    assert!(h.persisted_state().retry_queue.is_empty());
+    no_process_calls(&h);
+}
+
+/// A queued mirror is usually waiting for the worker owner's approval, which
+/// the controller can neither grant nor cancel work over. It says so hourly
+/// and leaves the task alone.
+#[tokio::test]
+async fn a_long_queued_mirror_warns_hourly_and_never_fails() {
+    let fixture = PeerFixture::new(true).await;
+    let (h, bridge) = running(&fixture).await;
+    let mut state = remote_state_in(NOW_ISO, RemotePhase::Queued);
+    state.running.get_mut("tsk_remote").unwrap().remote = Some(RemoteRunRef {
+        phase: RemotePhase::Queued,
+        worker_task_id: Some("tsk_mirror".into()),
+        reason: Some(format!(
+            "{AWAITING_APPROVAL_REASON} run `orch task approve tsk_mirror` on this worker"
+        )),
+        ..RemoteRunRef::new("worker", "run_remote")
+    });
+    h.state.write(&state).await.unwrap();
+
+    h.reconcile().await.unwrap();
+    h.clock.advance_ms(59 * 60_000);
+    h.reconcile().await.unwrap();
+    let warnings = |h: &Harness| {
+        h.events_of(OrchestratorEventType::OrchestratorError)
+            .into_iter()
+            .filter_map(|event| match event {
+                OrchestratorEvent::OrchestratorError { error, context, .. }
+                    if error.contains("queued on worker") =>
+                {
+                    Some((error, context))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(warnings(&h).is_empty(), "59 minutes is not an hour");
+
+    h.clock.advance_ms(60_000);
+    h.reconcile().await.unwrap();
+    h.reconcile().await.unwrap();
+    assert_eq!(
+        warnings(&h),
+        vec![(
+            "tsk_remote has been queued on worker for 1h".to_owned(),
+            "awaiting approval: orch task approve tsk_mirror on worker".to_owned()
+        )],
+        "the warning repeats hourly, not every tick"
+    );
+    h.clock.advance_ms(60 * 60_000);
+    h.reconcile().await.unwrap();
+    assert_eq!(warnings(&h).len(), 2);
+    assert_eq!(
+        warnings(&h)[1].0,
+        "tsk_remote has been queued on worker for 2h"
+    );
+
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
+    assert_eq!(
+        phase(&h, "tsk_remote").await,
+        (RemotePhase::Queued, "queued @worker".into())
+    );
+    assert!(bridge.cancelled.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn a_lost_link_makes_a_running_remote_unknown_and_a_sync_resolves_it() {
     let fixture = PeerFixture::new(false).await;
@@ -821,6 +931,43 @@ async fn unknown_execution_fails_without_retry() {
         h.runs.peek("run_remote").unwrap().error.as_deref(),
         Some("remote lost execution record")
     );
+    no_process_calls(&h);
+}
+
+/// The live failure: a mirror the worker could not read reached the operator
+/// as the bare "remote lost execution record", with the worker's own
+/// explanation dropped on the floor — and the mirror left behind on a worker
+/// that could read it again a moment later.
+#[tokio::test]
+async fn an_unknown_key_carries_the_workers_reason_and_cancels_its_mirror() {
+    let fixture = PeerFixture::new(true).await;
+    let (h, bridge) = running(&fixture).await;
+    h.orchestrator
+        .collect_remote_events(
+            Box::pin(futures::stream::iter([
+                RemoteRunEvent::Phase(RemotePhaseUpdate {
+                    phase: RemotePhase::Unknown,
+                    worker_task_id: Some("tsk_mirror".into()),
+                    reason: Some("worker storage error: corrupt record".into()),
+                }),
+                RemoteRunEvent::Unknown,
+            ])),
+            "run_remote",
+            "tsk_remote",
+            "agt_peer@worker",
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::Failed);
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().error.as_deref(),
+        Some("remote lost execution record (worker: worker storage error: corrupt record)")
+    );
+    cancelled_once(&bridge);
+    assert!(h.persisted_state().running.is_empty());
+    assert!(h.in_memory_state().await.retry_queue.is_empty());
     no_process_calls(&h);
 }
 

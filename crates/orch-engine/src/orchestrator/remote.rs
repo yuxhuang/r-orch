@@ -12,7 +12,124 @@ use orch_domain::{
     TaskStatus,
 };
 
-use super::Orchestrator;
+use super::{Orchestrator, REMOTE_QUEUED_WARN_MS, REMOTE_SUBMIT_DEADLINE_MS};
+
+/// How long one remote entry has been in its current phase, for the two
+/// deadlines. `dispatched` counts only the time its peer was online; nothing
+/// else needs a wall clock that stops.
+#[derive(Debug, Default)]
+pub(super) struct RemoteClock {
+    phase: RemotePhase,
+    /// Milliseconds spent in `phase`. Online-only while `dispatched`.
+    elapsed_ms: i64,
+    /// When this entry was last sampled, so a tick adds its own interval.
+    sampled_at_ms: i64,
+    /// When the queued warning was last emitted, to keep it hourly.
+    warned_at_ms: Option<i64>,
+}
+
+impl RemoteClock {
+    /// Fold one reconcile sample in and return the time spent in `phase`.
+    fn sample(&mut self, phase: RemotePhase, now_ms: i64, counts: bool) -> i64 {
+        if phase != self.phase {
+            *self = RemoteClock {
+                phase,
+                sampled_at_ms: now_ms,
+                ..RemoteClock::default()
+            };
+            return 0;
+        }
+        let delta = now_ms.saturating_sub(self.sampled_at_ms).max(0);
+        self.sampled_at_ms = now_ms;
+        if counts {
+            self.elapsed_ms = self.elapsed_ms.saturating_add(delta);
+        }
+        self.elapsed_ms
+    }
+
+    fn warn_due(&mut self, now_ms: i64) -> bool {
+        let due = self
+            .warned_at_ms
+            .is_none_or(|at| now_ms.saturating_sub(at) >= REMOTE_QUEUED_WARN_MS);
+        if due {
+            self.warned_at_ms = Some(now_ms);
+        }
+        due
+    }
+}
+
+impl Orchestrator {
+    /// The two phase deadlines, from inside reconcile's remote branch.
+    ///
+    /// A submit the worker never acknowledges is a real failure: nothing ran,
+    /// so the task can fail and be retried. A mirror that stays queued is
+    /// not — it is usually waiting for its worker owner's approval, which the
+    /// controller cannot grant and must not cancel work over. So that one
+    /// only ever warns, once an hour, naming the command that would clear it.
+    ///
+    /// Returns true when the entry was failed and is gone from `state`.
+    pub(super) async fn enforce_remote_deadlines(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        online: bool,
+    ) -> Result<bool> {
+        let Some(remote) = state
+            .running
+            .get(task_id)
+            .and_then(|entry| entry.remote.clone())
+        else {
+            return Ok(false);
+        };
+        let now = self.deps().clock.now_ms();
+        let (elapsed, warn_due) = {
+            let mut clocks = self.inner.remote_clocks.lock().await;
+            let clock = clocks.entry(task_id.to_owned()).or_default();
+            // Only `dispatched` stops counting while the peer is away: an
+            // offline worker has not failed to answer.
+            let counts = online || remote.phase != RemotePhase::Dispatched;
+            let elapsed = clock.sample(remote.phase, now, counts);
+            let warn_due = remote.phase == RemotePhase::Queued
+                && elapsed >= REMOTE_QUEUED_WARN_MS
+                && clock.warn_due(now);
+            (elapsed, warn_due)
+        };
+        if remote.phase == RemotePhase::Dispatched && elapsed >= REMOTE_SUBMIT_DEADLINE_MS {
+            let error = format!("remote {} never acknowledged submit", remote.alias);
+            tracing::warn!(%task_id, alias = %remote.alias, online_ms = elapsed, "{error}");
+            // Cancel first: the worker may hold a mirror whose `Submitted`
+            // never reached us, and it must not run after this task fails.
+            self.cancel_remote(&remote).await;
+            self.fail_remote_unknown_locked(state, task_id, &error)
+                .await?;
+            return Ok(true);
+        }
+        if warn_due {
+            let hours = elapsed / 3_600_000;
+            self.emit(OrchestratorEvent::OrchestratorError {
+                error: format!("{task_id} has been queued on {} for {hours}h", remote.alias),
+                context: remote.hint().unwrap_or_else(|| {
+                    format!(
+                        "The mirror is waiting on {}; run `orch task list` there to see why",
+                        remote.alias
+                    )
+                }),
+                fatal: false,
+            });
+        }
+        Ok(false)
+    }
+
+    /// Forget the phase clocks of entries reconcile no longer holds, so a
+    /// long-lived owner does not accumulate one per completed remote run.
+    pub(super) async fn prune_remote_clocks(&self, state: &OrchestratorState) {
+        self.inner
+            .remote_clocks
+            .lock()
+            .await
+            .retain(|task_id, _| state.running.contains_key(task_id));
+    }
+}
 
 impl Orchestrator {
     /// Install before starting the owner. Light commands never create a link.
@@ -269,18 +386,34 @@ impl Orchestrator {
                     break;
                 }
                 Some(RemoteRunEvent::Unknown) => {
+                    // The worker has no execution record for this key, but it
+                    // may well still hold the mirror — an unreadable one is
+                    // reported unknown and then becomes readable again. This
+                    // task is about to fail here, so the mirror must go, and
+                    // only an explicit cancel clears one inside a session.
+                    if let Some(remote) = {
+                        let slot = self.inner.state.lock().await;
+                        slot.as_ref()
+                            .and_then(|state| state.running.get(task_id))
+                            .filter(|entry| entry.run_id == run_id)
+                            .and_then(|entry| entry.remote.clone())
+                    } {
+                        self.cancel_remote(&remote).await;
+                    }
                     // Sync is authoritative, but applying it still requires
                     // durable writes, exactly like a finished envelope.
                     loop {
                         let result = {
                             let mut slot = self.inner.state.lock().await;
                             if let Some(state) = slot.as_mut() {
-                                self.persist_remote_unknown_locked(
-                                    state,
-                                    task_id,
-                                    "remote lost execution record",
-                                )
-                                .await
+                                let error = remote_unknown_error(
+                                    state
+                                        .running
+                                        .get(task_id)
+                                        .and_then(|entry| entry.remote.as_ref()),
+                                );
+                                self.persist_remote_unknown_locked(state, task_id, &error)
+                                    .await
                             } else {
                                 Ok(())
                             }
@@ -501,5 +634,17 @@ impl Orchestrator {
         self.save_remote_state(state).await?;
         self.schedule_dispatch_after_run(task_id).await;
         Ok(())
+    }
+}
+
+/// Why a run with no outcome failed, including the worker's own explanation
+/// when it gave one. Without it a corrupt mirror on the worker reaches the
+/// operator as the bare "remote lost execution record", which says nothing
+/// about where to look or what to fix.
+fn remote_unknown_error(remote: Option<&RemoteRunRef>) -> String {
+    let base = "remote lost execution record";
+    match remote.and_then(|remote| remote.reason.as_deref().map(|r| (&remote.alias, r))) {
+        Some((alias, reason)) => format!("{base} ({alias}: {reason})"),
+        None => base.to_owned(),
     }
 }

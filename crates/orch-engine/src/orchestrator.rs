@@ -94,6 +94,15 @@ const STALL_KILL_GRACE: Duration = Duration::from_millis(5_000);
 const MAX_AGENT_SUMMARY_LEN: usize = 2000;
 /// `last_error.message` cap.
 const MAX_LAST_ERROR_LEN: usize = 500;
+/// How long a submit may sit unacknowledged *while its peer is online*
+/// before the controller gives up on it. Offline time does not count: a
+/// worker that is simply unreachable has not failed to answer.
+const REMOTE_SUBMIT_DEADLINE_MS: i64 = 5 * 60_000;
+/// How long a mirror may stay queued on its worker before the controller
+/// says so, and how often it repeats. A queued mirror is usually waiting for
+/// the worker owner's `orch task approve`, which no deadline here can grant,
+/// so this only ever warns.
+const REMOTE_QUEUED_WARN_MS: i64 = 60 * 60_000;
 /// Per-wait budget for watch lifecycle synchronization. Expiry leaves the
 /// current cycle intact; callers may retry once startup/cleanup has progressed.
 const WATCH_LIFECYCLE_WAIT: Duration = Duration::from_secs(3);
@@ -204,6 +213,10 @@ struct Inner {
     /// The instance id of the controller connected to this instance's peer
     /// listener, if any. Dispatch consults it before starting a mirror.
     inbound_controller: std::sync::RwLock<Option<String>>,
+    /// Per-task phase clocks for the remote deadlines. In memory on purpose:
+    /// a restart rehydrates every remote entry as `unknown`, which neither
+    /// deadline applies to, so there is nothing to carry across one.
+    remote_clocks: Mutex<HashMap<String, remote::RemoteClock>>,
     lazy_save: Mutex<LazySave>,
     immediate_dispatch: Mutex<Option<tokio::task::JoinHandle<()>>>,
     watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -272,6 +285,7 @@ impl Orchestrator {
                 cancels: Mutex::new(HashMap::new()),
                 single_task_runs: Mutex::new(HashSet::new()),
                 last_auto_seed_at: Mutex::new(HashMap::new()),
+                remote_clocks: Mutex::new(HashMap::new()),
                 lazy_save: Mutex::new(LazySave::default()),
                 immediate_dispatch: Mutex::new(None),
                 watch_task: Mutex::new(None),
