@@ -4,14 +4,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use orch_core::error::Result;
 use orch_core::remote::{
-    RemoteBridge, RemoteExecuteHandle, RemoteOutcome, RemoteRunEvent, RemoteSubmit,
+    RemoteBridge, RemoteExecuteHandle, RemoteOutcome, RemotePhaseUpdate, RemoteRunEvent,
+    RemoteSubmit,
 };
 use orch_core::storage::{AgentStore, StateStore, TaskStore};
 use orch_core::test_support::{FakeStateStore, make_agent, make_run, make_task};
 use orch_domain::{
-    AdapterErrorKind, Agent, ApprovalPolicy, Message, OrchestratorEvent, OrchestratorEventType,
-    OrchestratorState, RemoteConfig, RemoteRunRef, RemoteStatus, ReviewCriterion, ReviewResult,
-    Run, RunStatus, Task, TaskStatus,
+    AWAITING_APPROVAL_REASON, AdapterErrorKind, Agent, ApprovalPolicy, Message, OrchestratorEvent,
+    OrchestratorEventType, OrchestratorState, RemoteConfig, RemotePhase, RemoteRunRef,
+    RemoteStatus, ReviewCriterion, ReviewResult, Run, RunStatus, Task, TaskStatus,
 };
 use orch_infra::storage::{Paths, remote::FileRemoteStore};
 use tokio_util::sync::CancellationToken;
@@ -167,11 +168,17 @@ impl PeerFixture {
     }
 }
 
+/// A state whose one remote entry the worker has confirmed it is running —
+/// the phase every pre-existing regression here was written against.
 fn remote_state(at: &str) -> OrchestratorState {
+    remote_state_in(at, RemotePhase::Running)
+}
+
+fn remote_state_in(at: &str, phase: RemotePhase) -> OrchestratorState {
     let mut state = state_running("tsk_remote", "agt_peer@worker", "run_remote", 0, at);
     state.running.get_mut("tsk_remote").unwrap().remote = Some(RemoteRunRef {
-        alias: "worker".into(),
-        exec_key: "run_remote".into(),
+        phase,
+        ..RemoteRunRef::new("worker", "run_remote")
     });
     state
 }
@@ -224,6 +231,214 @@ fn cancelled_once(bridge: &FakeBridge) {
         *bridge.cancelled.lock().unwrap(),
         vec![("worker".into(), "run_remote".into())]
     );
+}
+
+/// The phase of the one remote entry, with the label a view would show.
+async fn phase(h: &Harness, task_id: &str) -> (RemotePhase, String) {
+    let state = h.in_memory_state().await;
+    let remote = state
+        .running
+        .get(task_id)
+        .unwrap_or_else(|| panic!("no running entry for {task_id}"))
+        .remote
+        .clone()
+        .expect("a remote entry");
+    (
+        remote.phase,
+        remote.status_label().unwrap_or_else(|| "—".into()),
+    )
+}
+
+#[tokio::test]
+async fn a_remote_run_stays_preparing_until_the_worker_reports_it_running() {
+    let fixture = PeerFixture::new(true).await;
+    let h = fixture
+        .builder()
+        .tasks([Task {
+            id: "tsk_one".into(),
+            ..make_task()
+        }])
+        .build();
+    let bridge = Arc::new(FakeBridge::for_harness(&h));
+    h.orchestrator.set_remote_bridge(bridge.clone());
+    h.set_state(OrchestratorState::default()).await;
+    h.tick().await.unwrap();
+    h.wait_for(|_| !bridge.submitted.lock().unwrap().is_empty())
+        .await;
+
+    let run_id = h.in_memory_state().await.running["tsk_one"].run_id.clone();
+    // Dispatched: the request is enqueued, and nothing has run anywhere.
+    assert_eq!(
+        phase(&h, "tsk_one").await,
+        (RemotePhase::Dispatched, "dispatched → worker".into())
+    );
+    assert_eq!(
+        h.runs.peek(&run_id).unwrap().status,
+        RunStatus::Preparing,
+        "a dispatched remote run has not started"
+    );
+    assert!(h.events_of(OrchestratorEventType::AgentStarted).is_empty());
+    assert_eq!(h.task("tsk_one").status, TaskStatus::InProgress);
+
+    // Queued, with the worker's own approval hint and mirror id.
+    h.orchestrator
+        .apply_remote_phase(
+            "tsk_one",
+            &run_id,
+            &RemotePhaseUpdate {
+                phase: RemotePhase::Queued,
+                worker_task_id: Some("tsk_mirror".into()),
+                reason: Some(format!(
+                    "{AWAITING_APPROVAL_REASON} run `orch task approve tsk_mirror` on this worker"
+                )),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&h, "tsk_one").await,
+        (RemotePhase::Queued, "queued @worker".into())
+    );
+    let state = h.in_memory_state().await;
+    let remote = state.running["tsk_one"].remote.clone().unwrap();
+    assert_eq!(
+        remote.hint().unwrap(),
+        "awaiting approval: orch task approve tsk_mirror on worker"
+    );
+    assert_eq!(h.runs.peek(&run_id).unwrap().status, RunStatus::Preparing);
+
+    // Running: now, and only now, does the run record start.
+    h.orchestrator
+        .apply_remote_phase(
+            "tsk_one",
+            &run_id,
+            &RemotePhaseUpdate::new(RemotePhase::Running),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&h, "tsk_one").await,
+        (RemotePhase::Running, "RUN @worker".into())
+    );
+    let run = h.runs.peek(&run_id).unwrap();
+    assert_eq!((run.status, run.pid), (RunStatus::Running, Some(0)));
+    assert_eq!(h.events_of(OrchestratorEventType::AgentStarted).len(), 1);
+    let remote = h.in_memory_state().await.running["tsk_one"]
+        .remote
+        .clone()
+        .unwrap();
+    assert_eq!(
+        remote.worker_task_id.as_deref(),
+        Some("tsk_mirror"),
+        "a later frame must not unlearn the mirror id"
+    );
+    assert!(remote.reason.is_none(), "running is not awaiting approval");
+    assert_eq!(
+        h.persisted_state().running,
+        h.in_memory_state().await.running
+    );
+    no_process_calls(&h);
+}
+
+#[tokio::test]
+async fn progress_proves_a_run_the_worker_has_not_announced_yet() {
+    let fixture = PeerFixture::new(true).await;
+    let h = fixture
+        .builder()
+        .tasks([Task {
+            id: "tsk_remote".into(),
+            status: TaskStatus::InProgress,
+            assignee: Some("agt_peer@worker".into()),
+            attempts: 1,
+            ..make_task()
+        }])
+        .state(remote_state_in(NOW_ISO, RemotePhase::Dispatched))
+        .build();
+    h.runs.seed(Run {
+        id: "run_remote".into(),
+        task_id: "tsk_remote".into(),
+        agent_id: "agt_peer@worker".into(),
+        status: RunStatus::Preparing,
+        ..make_run()
+    });
+    h.set_state(remote_state_in(NOW_ISO, RemotePhase::Dispatched))
+        .await;
+    let progress = orch_core::adapter::AgentEvent::new(
+        orch_core::adapter::AgentEventKind::Output,
+        NOW_ISO,
+        serde_json::json!({"text": "working"}),
+    );
+    h.orchestrator
+        .collect_remote_events(
+            Box::pin(futures::stream::iter([
+                RemoteRunEvent::Phase(RemotePhaseUpdate::new(RemotePhase::Queued)),
+                RemoteRunEvent::Event(progress.clone()),
+                RemoteRunEvent::Event(progress),
+            ])),
+            "run_remote",
+            "tsk_remote",
+            "agt_peer@worker",
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&h, "tsk_remote").await,
+        (RemotePhase::Running, "RUN @worker".into())
+    );
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().status,
+        RunStatus::Running
+    );
+    assert_eq!(
+        h.events_of(OrchestratorEventType::AgentStarted).len(),
+        1,
+        "the second event must not start the run again"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_link_makes_a_running_remote_unknown_and_a_sync_resolves_it() {
+    let fixture = PeerFixture::new(false).await;
+    let (h, _) = running(&fixture).await;
+    h.orchestrator
+        .apply_remote_phase(
+            "tsk_remote",
+            "run_remote",
+            &RemotePhaseUpdate::new(RemotePhase::Unknown),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&h, "tsk_remote").await,
+        (RemotePhase::Unknown, "RUN? (worker offline)".into())
+    );
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
+    // The worker is back and still has the mirror queued: unknown resolves
+    // backwards, which no other transition may do.
+    h.orchestrator
+        .apply_remote_phase(
+            "tsk_remote",
+            "run_remote",
+            &RemotePhaseUpdate::new(RemotePhase::Queued),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        phase(&h, "tsk_remote").await,
+        (RemotePhase::Queued, "queued @worker".into())
+    );
+    // A phase for a retired entry neither resurrects nor panics.
+    h.orchestrator
+        .apply_remote_phase(
+            "tsk_gone",
+            "run_gone",
+            &RemotePhaseUpdate::new(RemotePhase::Running),
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.in_memory_state().await.running.len(), 1);
 }
 
 #[tokio::test]

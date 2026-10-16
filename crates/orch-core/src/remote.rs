@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use orch_domain::{AdapterErrorKind, Message, ReviewCriterion, ReviewResult, TokenUsage};
+use orch_domain::{
+    AdapterErrorKind, Message, RemotePhase, ReviewCriterion, ReviewResult, TokenUsage,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::AgentEvent;
@@ -52,9 +54,33 @@ pub struct RemoteSubmit {
     pub goal_id: Option<String>,
 }
 
+/// What the worker last said about an execution that has not finished. The
+/// controller shows it instead of claiming the peer is running the work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePhaseUpdate {
+    pub phase: RemotePhase,
+    /// The mirror's task id on the worker, once it has named one.
+    pub worker_task_id: Option<String>,
+    /// The worker's explanation, verbatim. Display only.
+    pub reason: Option<String>,
+}
+
+impl RemotePhaseUpdate {
+    pub fn new(phase: RemotePhase) -> Self {
+        Self {
+            phase,
+            worker_task_id: None,
+            reason: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RemoteRunEvent {
     Event(AgentEvent),
+    /// The worker acknowledged, queued or started the execution. Never an
+    /// outcome: the phase only ever moves a view, not a task's status.
+    Phase(RemotePhaseUpdate),
     Finished(RemoteOutcome),
     /// A successful sync proved the worker has lost the execution record.
     /// Unlike a known failure, this must never be retried automatically.

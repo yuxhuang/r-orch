@@ -10,11 +10,11 @@ use orch_core::{
     error::{Error, Result},
     remote::{
         PendingRemoteCancellation, RemoteBridge, RemoteExecuteHandle, RemoteOutcome,
-        RemoteRunEvent, RemoteSubmit,
+        RemotePhaseUpdate, RemoteRunEvent, RemoteSubmit,
     },
     storage::MessageStore,
 };
-use orch_domain::{Message, MessageStatus, RemoteConfig, RemoteStatus};
+use orch_domain::{Message, MessageStatus, RemoteConfig, RemotePhase, RemoteStatus};
 use orch_infra::storage::remote::validate_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -36,6 +36,9 @@ struct Execution {
     terminal: Option<RemoteRunEvent>,
     delivered: bool,
     hint: Option<String>,
+    /// The last phase handed to the collector, so a worker that repeats a
+    /// state every tick does not repeat a state write on this side.
+    reported: Option<RemotePhaseUpdate>,
 }
 #[derive(Default)]
 struct Queue {
@@ -223,6 +226,42 @@ impl LinkHub {
         }
     }
 
+    /// Hand the worker's view of one execution to its collector. Deduplicated,
+    /// because a worker repeats a state on every tick of a long run.
+    fn phase(&self, alias: &str, key: &str, update: RemotePhaseUpdate) {
+        if let Some(e) = self
+            .queues()
+            .get_mut(alias)
+            .and_then(|q| q.executions.get_mut(key))
+        {
+            Self::report_phase(e, update);
+        }
+    }
+
+    fn report_phase(e: &mut Execution, mut update: RemotePhaseUpdate) {
+        // A worker names the mirror's task id once; later frames about the
+        // same execution must not unlearn it.
+        if update.worker_task_id.is_none() {
+            update.worker_task_id = e
+                .reported
+                .as_ref()
+                .and_then(|last| last.worker_task_id.clone());
+        }
+        if e.reported.as_ref() == Some(&update) {
+            return;
+        }
+        e.reported = Some(update.clone());
+        let _ = e.events.try_send(RemoteRunEvent::Phase(update));
+    }
+
+    fn phase_of(state: &str) -> Option<RemotePhase> {
+        match state {
+            "queued" => Some(RemotePhase::Queued),
+            "running" => Some(RemotePhase::Running),
+            _ => None,
+        }
+    }
+
     fn attempted(&self, alias: &str, key: &str) -> bool {
         self.queues()
             .get(alias)
@@ -243,6 +282,15 @@ impl Drop for Connected<'_> {
     fn drop(&mut self) {
         if let Some(q) = self.hub.queues().get_mut(&self.alias) {
             q.online = false;
+            // A submit that reached the socket may have been accepted, so the
+            // controller no longer knows what the worker is doing: that is
+            // `unknown` until a sync resolves it. A submit still queued here
+            // never left, so it stays `dispatched` and is written next time.
+            for e in q.executions.values_mut() {
+                if e.attempted && e.terminal.is_none() {
+                    LinkHub::report_phase(e, RemotePhaseUpdate::new(RemotePhase::Unknown));
+                }
+            }
         }
         self.hub.changed.notify_one();
     }
@@ -291,6 +339,7 @@ impl RemoteBridge for LinkHub {
                 terminal: None,
                 delivered: false,
                 hint: None,
+                reported: None,
             },
         );
         Ok(RemoteExecuteHandle {
@@ -790,6 +839,17 @@ async fn handle_frame(
                             &item.state,
                             ctx.engine.clock.now_iso(),
                         );
+                        if let Some(phase) = LinkHub::phase_of(&item.state) {
+                            hub.phase(
+                                &config.alias,
+                                &item.exec_key,
+                                RemotePhaseUpdate {
+                                    phase,
+                                    worker_task_id: item.worker_task_id,
+                                    reason: item.reason,
+                                },
+                            );
+                        }
                     }
                     "unknown" => {
                         log_reason(config, &item.exec_key, &item.state, item.reason.as_deref())
@@ -831,22 +891,47 @@ async fn handle_frame(
             exec_key,
             state,
             reason,
-            ..
+            worker_task_id,
         } => {
             log_reason(config, &exec_key, &state, reason.as_deref());
-            hub.hint(&config.alias, &exec_key, &state, ctx.engine.clock.now_iso())
+            hub.hint(&config.alias, &exec_key, &state, ctx.engine.clock.now_iso());
+            if let Some(phase) = LinkHub::phase_of(&state) {
+                hub.phase(
+                    &config.alias,
+                    &exec_key,
+                    RemotePhaseUpdate {
+                        phase,
+                        worker_task_id,
+                        reason,
+                    },
+                );
+            }
         }
         Frame::CancelAck { exec_key } => hub.cancel_ack(&config.alias, &exec_key),
-        Frame::Submitted { .. } | Frame::Gap { .. } => {}
+        // The worker owns the mirror from here on: the request is no longer
+        // merely dispatched, whatever happens to this link.
+        Frame::Submitted {
+            exec_key,
+            worker_task_id,
+        } => hub.phase(
+            &config.alias,
+            &exec_key,
+            RemotePhaseUpdate {
+                phase: RemotePhase::Queued,
+                worker_task_id: Some(worker_task_id),
+                reason: None,
+            },
+        ),
+        Frame::Gap { .. } => {}
         Frame::Error { msg } => return Err(Error::other(msg)),
         _ => return Err(Error::other("Unexpected worker frame")),
     }
     Ok(())
 }
 
-/// Surface a worker's explanation for a state. The phase model that shows it
-/// in task views is not here yet, so the log is where an operator reads why a
-/// key is unknown, or which `orch task approve` a mirror is waiting for.
+/// Log a worker's explanation for a state. The phase carries the same reason
+/// into task views; the log keeps it for the keys no view covers — an unknown
+/// key with no execution of its own, say.
 fn log_reason(config: &RemoteConfig, exec_key: &str, state: &str, reason: Option<&str>) {
     if let Some(reason) = reason {
         tracing::warn!(alias = %config.alias, %exec_key, %state, %reason, "Remote execution state");
@@ -1088,6 +1173,82 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(5), handle.events.next())
                 .await
                 .is_err()
+        );
+    }
+
+    fn phase(event: Option<RemoteRunEvent>) -> RemotePhaseUpdate {
+        match event {
+            Some(RemoteRunEvent::Phase(update)) => update,
+            other => panic!("expected a phase update, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_worker_drives_the_phase_and_repeats_are_not_forwarded() {
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let mut handle = hub.submit(request()).unwrap();
+        hub.phase(
+            "w1",
+            "run1",
+            RemotePhaseUpdate {
+                phase: RemotePhase::Queued,
+                worker_task_id: Some("tsk_mirror".into()),
+                reason: None,
+            },
+        );
+        assert_eq!(
+            phase(handle.events.next().await),
+            RemotePhaseUpdate {
+                phase: RemotePhase::Queued,
+                worker_task_id: Some("tsk_mirror".into()),
+                reason: None,
+            }
+        );
+        // The same state again, and without the task id the worker already
+        // named: neither is news.
+        hub.phase("w1", "run1", RemotePhaseUpdate::new(RemotePhase::Queued));
+        hub.phase("w1", "run1", RemotePhaseUpdate::new(RemotePhase::Running));
+        let running = phase(handle.events.next().await);
+        assert_eq!(running.phase, RemotePhase::Running);
+        assert_eq!(running.worker_task_id.as_deref(), Some("tsk_mirror"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), handle.events.next())
+                .await
+                .is_err(),
+            "a repeated state must not reach the collector"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_only_makes_a_written_submit_unknown() {
+        let hub = LinkHub::new(Arc::new(FakeMessageStore::new()));
+        let mut dispatched = hub.submit(request()).unwrap();
+        let mut written = {
+            let mut two = request();
+            two.exec_key = "run2".into();
+            hub.submit(two).unwrap()
+        };
+        let connected = hub.connected("w1");
+        let batch = hub.submits("w1");
+        let frame = batch
+            .iter()
+            .find(|frame| matches!(frame, Frame::Submit { exec_key, .. } if exec_key == "run2"))
+            .unwrap();
+        hub.mark_attempted("w1", frame);
+        drop(connected);
+        assert_eq!(
+            phase(written.events.next().await).phase,
+            RemotePhase::Unknown
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), dispatched.events.next())
+                .await
+                .is_err(),
+            "a submit that never left stays dispatched"
+        );
+        // And it is written again on the next connection.
+        assert!(
+            matches!(&hub.submits("w1")[..], [Frame::Submit { exec_key, .. }] if exec_key == "run1")
         );
     }
 

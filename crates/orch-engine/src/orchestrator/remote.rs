@@ -6,9 +6,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use orch_core::error::Result;
-use orch_core::remote::{RemoteBridge, RemoteOutcome, RunEventTap};
+use orch_core::remote::{RemoteBridge, RemoteOutcome, RemotePhaseUpdate, RunEventTap};
 use orch_domain::{
-    OrchestratorEvent, OrchestratorState, RemoteRunRef, RunStatus, TaskProof, TaskStatus,
+    OrchestratorEvent, OrchestratorState, RemotePhase, RemoteRunRef, RunStatus, TaskProof,
+    TaskStatus,
 };
 
 use super::Orchestrator;
@@ -134,6 +135,60 @@ impl Orchestrator {
         self.save_remote_state(state).await
     }
 
+    /// Record what the worker says about an execution that has not finished,
+    /// and start its run record the moment the worker says it is running.
+    ///
+    /// Only the phase moves. The task stays `in_progress` and the run stays
+    /// `preparing` until then, so no view claims a peer is running work it
+    /// has merely been sent. Returns the phase the entry ended up in.
+    pub(super) async fn apply_remote_phase(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        update: &RemotePhaseUpdate,
+    ) -> Result<RemotePhase> {
+        let mut slot = self.inner.state.lock().await;
+        let Some(state) = slot.as_mut() else {
+            return Ok(update.phase);
+        };
+        let Some(remote) = state
+            .running
+            .get_mut(task_id)
+            .filter(|entry| entry.run_id == run_id)
+            .and_then(|entry| entry.remote.as_mut())
+        else {
+            // The entry has been retired; a phase never resurrects one.
+            return Ok(RemotePhase::Terminal);
+        };
+        let before = remote.phase;
+        if update.worker_task_id.is_some() {
+            remote.worker_task_id = update.worker_task_id.clone();
+        }
+        if before == update.phase || before.advances_to(update.phase) {
+            remote.phase = update.phase;
+            remote.reason = update.reason.clone();
+        }
+        let phase = remote.phase;
+        if phase == RemotePhase::Running && before != RemotePhase::Running {
+            // The run may already be `running` when a restart rehydrated this
+            // entry; starting it twice would emit a second `agent:started`.
+            if self
+                .deps()
+                .run_store
+                .get(run_id)
+                .await?
+                .is_some_and(|run| run.status == RunStatus::Preparing)
+            {
+                self.deps().run_service.start(run_id, 0).await?;
+            }
+        }
+        if phase != before {
+            tracing::debug!(%task_id, %run_id, from = before.as_str(), to = phase.as_str(), "Remote execution phase");
+        }
+        self.save_remote_state(state).await?;
+        Ok(phase)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn collect_remote_events(
         &self,
@@ -145,13 +200,44 @@ impl Orchestrator {
         cancel: CancellationToken,
     ) -> Result<()> {
         let mut collected = super::collect::Collected::default();
+        // Phase bookkeeping, so a long run does not take the state lock once
+        // per progress event just to re-assert what it already said.
+        let mut running = false;
         loop {
             let item = tokio::select! {
                 _ = cancel.cancelled() => break,
                 item = events.next() => item,
             };
             match item {
+                Some(RemoteRunEvent::Phase(update)) => {
+                    match self.apply_remote_phase(task_id, run_id, &update).await {
+                        Ok(phase) => {
+                            running = matches!(phase, RemotePhase::Running | RemotePhase::Terminal)
+                        }
+                        Err(err) => self.emit_error(err, format!("record remote phase {run_id}")),
+                    }
+                }
                 Some(RemoteRunEvent::Event(event)) => {
+                    // An agent emitting progress is running, whatever frame
+                    // the worker's one-second tick has got round to sending.
+                    if !running {
+                        match self
+                            .apply_remote_phase(
+                                task_id,
+                                run_id,
+                                &RemotePhaseUpdate::new(RemotePhase::Running),
+                            )
+                            .await
+                        {
+                            Ok(phase) => {
+                                running =
+                                    matches!(phase, RemotePhase::Running | RemotePhase::Terminal)
+                            }
+                            Err(err) => {
+                                self.emit_error(err, format!("record remote phase {run_id}"))
+                            }
+                        }
+                    }
                     if let Err(err) = self
                         .record_event(&mut collected, event, run_id, task_id, agent_id)
                         .await

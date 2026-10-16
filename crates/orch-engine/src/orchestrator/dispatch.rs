@@ -635,11 +635,10 @@ impl Orchestrator {
 
         if let Some(remote) = &agent.remote {
             let now = self.deps().clock.now_iso();
-            let reference = orch_domain::RemoteRunRef {
-                alias: remote.alias.clone(),
-                exec_key: run.id.clone(),
-            };
-            self.deps().run_service.start(&run.id, 0).await?;
+            // The run stays `preparing` until the worker says it is running.
+            // Starting it here claimed a peer had begun work that had not
+            // even been written to the socket.
+            let reference = orch_domain::RemoteRunRef::new(&remote.alias, &run.id);
             state.claimed.shift_remove(&task_id);
             state.running.insert(
                 task_id.clone(),
