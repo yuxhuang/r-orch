@@ -46,7 +46,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "user"] }
 
 [dev-dependencies]
 orch-core = { workspace = true, features = ["test-support"] }
