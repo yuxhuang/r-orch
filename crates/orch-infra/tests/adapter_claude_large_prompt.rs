@@ -30,7 +30,6 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf '%s' "$file" > "$out/path"
-stat -c %a "$file" > "$out/mode"
 cp "$file" "$out/system"
 cat > "$out/stdin"
 printf '{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}\n'
@@ -65,6 +64,15 @@ impl ProcessManager for FakeClaude {
         opts: SpawnOptions,
     ) -> orch_core::Result<SpawnedChild> {
         assert_eq!(command, "claude");
+        let system_prompt_file = args
+            .windows(2)
+            .find(|pair| pair[0] == "--system-prompt-file")
+            .expect("system prompt file argument");
+        let mode = std::fs::metadata(&system_prompt_file[1])
+            .expect("system prompt file metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o600, "private system prompt file");
         let mut full = vec![self.capture.to_string_lossy().into_owned()];
         full.extend_from_slice(args);
         let opts = SpawnOptions {
@@ -118,7 +126,6 @@ async fn oversized_prompts_spawn_and_arrive_intact() {
     let seen = |name: &str| std::fs::read(pm.capture.join(name)).expect(name);
     assert_eq!(seen("stdin"), task.as_bytes(), "task prompt over stdin");
     assert_eq!(seen("system"), system.as_bytes(), "system prompt file");
-    assert_eq!(String::from_utf8(seen("mode")).expect("mode").trim(), "600");
 
     let path = PathBuf::from(String::from_utf8(seen("path")).expect("path"));
     assert!(
