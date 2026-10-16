@@ -47,6 +47,8 @@ fn orch(dir: &Path) -> Command {
     let mut command = Command::cargo_bin("orch").expect("the orch binary");
     command
         .current_dir(dir)
+        .env("HOME", dir.join("home"))
+        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", dir.join("home/global.yml"))
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .env_remove("RUST_LOG")
@@ -56,10 +58,11 @@ fn orch(dir: &Path) -> Command {
 
 fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("home")).unwrap();
     orch(dir.path())
         .args(["init", "--name", "p", "--adapter", "claude"])
-        .output()
-        .expect("init");
+        .assert()
+        .success();
     dir
 }
 
@@ -199,4 +202,44 @@ fn refusing_a_bomb_leaves_no_lock_behind() {
         !dir.path().join(".orchestry/orchestry.lock").exists(),
         "a refused read must not strand the lock (§14.15)"
     );
+}
+
+/// T-E2E: Markdown stars in a task description are text, not YAML aliases.
+#[test]
+fn task_show_prints_markdown_in_a_literal_block_scalar() {
+    let dir = project();
+    let added = orch(dir.path())
+        .args(["task", "add", "a markdown task", "--quiet"])
+        .output()
+        .expect("task add");
+    assert!(added.status.success(), "{added:?}");
+    let id = String::from_utf8(added.stdout).unwrap().trim().to_string();
+    assert!(id.starts_with("tsk_"), "expected task id, got {id:?}");
+    let path = dir.path().join(format!(".orchestry/tasks/{id}.yml"));
+    let task = std::fs::read_to_string(&path).unwrap();
+    let body = (0..40)
+        .map(|n| format!("- **Role {n}:** be *efficient*"))
+        .collect::<Vec<_>>();
+    // The task was created without a description; replace its empty field
+    // with a literal block while preserving the rest of the generated YAML.
+    let mut doc = task
+        .lines()
+        .filter(|line| !line.starts_with("description:"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    doc.push_str("description: |-\n");
+    for line in &body {
+        doc.push_str(&format!("  {line}\n"));
+    }
+    std::fs::write(&path, doc).unwrap();
+
+    let shown = orch(dir.path())
+        .args(["task", "show", &id])
+        .output()
+        .expect("task show");
+    assert!(shown.status.success(), "{shown:?}");
+    let output = String::from_utf8(shown.stdout).unwrap();
+    for line in body {
+        assert!(output.contains(&line), "missing {line:?}: {output}");
+    }
 }
