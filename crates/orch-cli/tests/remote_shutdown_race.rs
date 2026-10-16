@@ -2,11 +2,15 @@
 //!
 //! On SIGTERM the TUI's engine signal arm owns `stop()`; the dashboard then
 //! exits and calls `stop()` again before dropping the peer runtime. When the
-//! second call returned at once, the TUI exited mid-drain: the owner lock was
-//! left behind and the remote cancellation was cut short (SRE H1 / code
-//! review I-1, measured 2026-10-15). A worker whose adapter ignores SIGTERM
-//! acks the Cancel only after its kill grace, which keeps the controller's
-//! bounded drain running long enough to expose the race.
+//! second call returned at once, the TUI exited mid-shutdown: the owner lock
+//! was left behind and the wind-down was cut short (SRE H1 / code review
+//! I-1, measured 2026-10-15).
+//!
+//! The lever is an agent whose child ignores SIGTERM, so the owner's own
+//! wind-down sits in `kill_with_grace` for its full ten seconds — long
+//! enough for an early exit to be unmistakable. It used to be a remote
+//! cancellation, until a graceful shutdown stopped cancelling remote runs
+//! and started detaching them instead.
 //!
 //! Real, isolated installations; no AI CLI, user configuration or fixed port.
 //! Helpers are a minimal copy of `remote_peers.rs` so the two suites can be
@@ -30,8 +34,11 @@ use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(25);
 const POLL: Duration = Duration::from_millis(40);
-/// The controller's remote-cancel drain deadline (`REMOTE_CANCEL_DRAIN_DEADLINE`).
-const DRAIN: Duration = Duration::from_secs(3);
+/// The floor on a *completed* wind-down of a child that ignores SIGTERM.
+/// Measured: the regression exits in ~1.5 s (the dashboard's own path) and a
+/// shutdown that really waits for the kill grace takes ~5 s, so anything
+/// above three seconds separates the two on a slow machine too.
+const MIN_WIND_DOWN: Duration = Duration::from_secs(3);
 
 fn read_json(path: impl AsRef<Path>) -> Value {
     fs::read(path)
@@ -74,10 +81,6 @@ impl Process {
             stdout,
             stderr,
         }
-    }
-
-    fn running(&mut self) -> bool {
-        self.child.try_wait().expect("poll child").is_none()
     }
 
     fn output(mut self, limit: Duration) -> Output {
@@ -213,22 +216,6 @@ impl Peer {
             .unwrap_or_else(|err| panic!("{} invalid CLI JSON: {err}: {output}", self.name))
     }
 
-    fn start(&self, listen: SocketAddr) {
-        let mut command = self.command();
-        command.args(["serve", "--peer-name", &self.name, "--verbose"]);
-        command.args(["--listen", &listen.to_string()]);
-        let process = self.spawn(command, "owner");
-        let pid = process.child.id().to_string();
-        *self.owner.borrow_mut() = Some(process);
-        wait("engine owner lock", &[self], || {
-            self.owner
-                .borrow_mut()
-                .as_mut()
-                .is_some_and(Process::running)
-                && text(self.path(".orchestry/orchestry.lock")).trim() == pid
-        });
-    }
-
     fn add_agent(&self, name: &str, body: &str) -> String {
         let script = self.path(&format!("agent-{name}.sh"));
         fs::write(
@@ -288,25 +275,6 @@ impl Peer {
             .unwrap_or(Value::Null)
     }
 
-    fn online(&self, alias: &str, peers: &[&Peer]) {
-        wait(&format!("{alias} online"), peers, || {
-            read_json(self.path(&format!(".orchestry/remotes/{alias}.json")))["online"] == true
-        });
-    }
-
-    fn sigterm_owner(&self) -> Output {
-        let process = self.owner.borrow_mut().take().expect("running owner");
-        kill(Pid::from_raw(process.child.id() as i32), Signal::SIGTERM).unwrap();
-        let output = process.output(Duration::from_secs(15));
-        assert!(
-            output.status.success(),
-            "{} SIGTERM was not graceful: {:?}",
-            self.name,
-            output.status
-        );
-        output
-    }
-
     fn diagnostics(&self) -> String {
         format!(
             "{} at {}\nstate: {}\ntasks: {:?}",
@@ -358,8 +326,7 @@ fn port() -> SocketAddr {
         .unwrap()
 }
 
-/// Ignores SIGTERM, so the worker's `cancel_task` sits in its kill grace and
-/// the Cancel is acknowledged only after the controller's drain deadline.
+/// Ignores SIGTERM, so the owner's wind-down sits in its full kill grace.
 /// Publishes the PID by rename: the test waits for `started` to exist and
 /// then parses it, so it must never be observed empty.
 fn slow_ack_body(peer: &Peer) -> String {
@@ -373,7 +340,7 @@ fn slow_ack_body(peer: &Peer) -> String {
 }
 
 #[test]
-fn tui_sigterm_with_slow_remote_ack_exits_only_after_the_owners_drain() {
+fn tui_sigterm_exits_only_after_the_owners_own_shutdown() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
     struct Dashboard {
@@ -388,13 +355,9 @@ fn tui_sigterm_with_slow_remote_ack_exits_only_after_the_owners_drain() {
         }
     }
 
-    let worker = Peer::new("race-worker");
     let controller = Peer::new("race-controller");
-    let agent = worker.add_agent("executor", &slow_ack_body(&worker));
-    let worker_addr = port();
+    let agent = controller.add_agent("executor", &slow_ack_body(&controller));
     let controller_addr = port();
-    controller.ok(&["remote", "add", "w1", &worker_addr.to_string()]);
-    worker.start(worker_addr);
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -433,13 +396,15 @@ fn tui_sigterm_with_slow_remote_ack_exits_only_after_the_owners_drain() {
         let _ = std::io::copy(&mut reader, &mut log);
     });
 
-    let peers = [&controller, &worker];
-    controller.online("w1", &peers);
-    let task = controller.task("slow ack under TUI", &format!("{agent}@w1"));
-    wait("running remote shell under TUI", &peers, || {
-        worker.path("started").exists()
+    let peers = [&controller];
+    let task = controller.task("slow shutdown under TUI", &agent);
+    wait("running shell under TUI", &peers, || {
+        controller.path("started").exists()
     });
-    let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+    let pid = text(controller.path("started"))
+        .trim()
+        .parse::<i32>()
+        .unwrap();
 
     let owner = dashboard.child.process_id().unwrap();
     kill(Pid::from_raw(owner as i32), Signal::SIGTERM).unwrap();
@@ -449,8 +414,8 @@ fn tui_sigterm_with_slow_remote_ack_exits_only_after_the_owners_drain() {
             break status;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "TUI SIGTERM did not exit within 10 s: {}",
+            started.elapsed() < Duration::from_secs(25),
+            "TUI SIGTERM did not exit within 25 s: {}",
             text(&capture)
         );
         thread::sleep(POLL);
@@ -459,11 +424,10 @@ fn tui_sigterm_with_slow_remote_ack_exits_only_after_the_owners_drain() {
     // Read the controller's state at the instant the process is gone, before
     // anything else can tidy it up.
     let lock_left = controller.path(".orchestry/orchestry.lock").exists();
-    let controller_task = controller.task_status(&task);
+    let task_at_exit = controller.task_status(&task);
     eprintln!(
         "TUI SIGTERM exit in {elapsed:?}, status {status:?}, lock left {lock_left}, \
-         worker task at exit {}",
-        worker.tasks()[0]["status"]
+         task at exit {task_at_exit}"
     );
 
     assert!(status.success(), "TUI exit {status:?}: {}", text(&capture));
@@ -471,31 +435,29 @@ fn tui_sigterm_with_slow_remote_ack_exits_only_after_the_owners_drain() {
         !lock_left,
         "TUI exited after {elapsed:?} with the owner lock still on disk"
     );
-    // The drain can only end at its deadline: the worker acks after its own
-    // kill grace. Exiting sooner means the dashboard dropped the peer runtime
-    // while the owner was still draining.
+    // The wind-down cannot be quick: the child ignores TERM, so the owner
+    // sits in its kill grace. Exiting sooner means the dashboard left while
+    // the owner was still stopping.
     assert!(
-        elapsed >= DRAIN - Duration::from_millis(500),
-        "TUI exited after {elapsed:?}, before the owner's {DRAIN:?} remote drain"
+        elapsed >= MIN_WIND_DOWN,
+        "TUI exited after {elapsed:?}, before the owner's wind-down could finish"
     );
-    assert_eq!(controller_task, "cancelled");
-
-    // The Cancel reached the worker: its kill grace ends with SIGKILL.
-    wait("worker mirror cancelled", &peers, || {
-        worker.tasks()[0]["status"] == "cancelled"
-    });
-    wait("remote shell killed", &peers, || {
+    assert!(
+        matches!(task_at_exit.as_str(), Some("retrying") | Some("failed")),
+        "the owner left its task in {task_at_exit}"
+    );
+    // The grace ends with SIGKILL, so the child is gone and never ran on.
+    wait("shell killed", &peers, || {
         kill(Pid::from_raw(pid), None).is_err()
     });
-    fs::write(worker.path("release"), "go").unwrap();
+    fs::write(controller.path("release"), "go").unwrap();
     thread::sleep(Duration::from_millis(500));
     assert!(
-        !worker.path("effect").exists(),
-        "the remote shell produced its effect after a cancel"
+        !controller.path("effect").exists(),
+        "the shell produced its effect after the owner killed it"
     );
 
     drop(TcpListener::bind(controller_addr).expect("TUI listener released"));
     dashboard.master.take();
     reading.join().unwrap();
-    worker.sigterm_owner();
 }
