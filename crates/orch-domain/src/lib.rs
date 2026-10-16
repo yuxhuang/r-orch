@@ -75,6 +75,6 @@ pub use transitions::{
 };
 
 pub use remote::{
-    AWAITING_APPROVAL_REASON, InboundStatus, RemoteConfig, RemotePhase, RemoteRef, RemoteRunRef,
-    RemoteStatus,
+    AWAITING_APPROVAL_REASON, InboundStatus, LinkState, RemoteConfig, RemotePhase, RemoteRef,
+    RemoteRunRef, RemoteStatus,
 };

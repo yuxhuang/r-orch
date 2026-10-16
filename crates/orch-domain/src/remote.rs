@@ -139,6 +139,24 @@ pub struct RemoteConfig {
     pub added_at: String,
 }
 
+/// What an outbound link is doing, for `orch remote status`. A snapshot alone
+/// cannot say this: `offline` covers a worker that is down, one that is
+/// serving another controller, and one this instance is about to redial.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+    /// Dialling, or handshaking. Also what a record written before this field
+    /// reads as.
+    #[default]
+    Connecting,
+    /// Handshaken, and inside its heartbeat.
+    Online,
+    /// Waiting out the redial delay in `next_retry_at`.
+    Backoff,
+    /// The worker is serving a different controller.
+    Busy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteStatus {
     pub alias: String,
@@ -155,6 +173,15 @@ pub struct RemoteStatus {
     /// older than the field, or before the first handshake.
     #[serde(default)]
     pub peer_version: Option<String>,
+    #[serde(default)]
+    pub link_state: LinkState,
+    /// When the next dial is due, while in `backoff` or `busy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at: Option<String>,
+    /// Consecutive dials since the last session that proved the peer healthy.
+    /// A peer that keeps closing sessions is only visible from this.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

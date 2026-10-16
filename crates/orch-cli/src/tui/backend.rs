@@ -388,16 +388,23 @@ impl TuiBackend for EngineBackend {
                 ),
                 listener.controller.as_deref().unwrap_or("none"),
             );
+            let now = self.engine.clock.now_ms();
             for remote in store.list().await? {
-                let online = store
-                    .read_status(&remote.alias)
-                    .await?
-                    .is_some_and(|s| s.online);
-                status.push_str(&format!(
-                    " · {} {}",
-                    remote.alias,
-                    if online { "online" } else { "offline" },
-                ));
+                let link = match store.read_status(&remote.alias).await? {
+                    Some(status) => {
+                        let version = status
+                            .peer_version
+                            .as_ref()
+                            .map(|version| format!(" v{version}"))
+                            .unwrap_or_default();
+                        format!(
+                            "{}{version}",
+                            crate::commands::remote::describe_link(&status, now)
+                        )
+                    }
+                    None => "offline".into(),
+                };
+                status.push_str(&format!(" · {} {link}", remote.alias));
             }
             Ok::<_, orch_core::Error>(status)
         })

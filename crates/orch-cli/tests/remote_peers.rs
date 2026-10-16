@@ -883,6 +883,9 @@ impl HealthLeaseFixture {
             os: None,
             agents: vec![],
             peer_version: None,
+            link_state: orch_domain::LinkState::Online,
+            next_retry_at: None,
+            attempts: 0,
         };
         publisher.write_status(&status).await.unwrap();
         Self {

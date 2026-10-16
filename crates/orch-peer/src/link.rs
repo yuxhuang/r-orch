@@ -14,7 +14,7 @@ use orch_core::{
     },
     storage::MessageStore,
 };
-use orch_domain::{Message, MessageStatus, RemoteConfig, RemotePhase, RemoteStatus};
+use orch_domain::{LinkState, Message, MessageStatus, RemoteConfig, RemotePhase, RemoteStatus};
 use orch_infra::storage::remote::validate_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -500,6 +500,9 @@ struct SessionHealth {
     /// When the worker answered the post-sync Ping, i.e. when the session
     /// became usable rather than merely handshaken.
     fenced_at: Option<Instant>,
+    /// The worker refused this controller because it is serving another one.
+    /// Worth saying, because nothing is wrong with either side.
+    busy: bool,
 }
 
 impl SessionHealth {
@@ -597,6 +600,9 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
             os: None,
             agents: vec![],
             peer_version: None,
+            link_state: LinkState::Connecting,
+            next_retry_at: None,
+            attempts: 0,
         });
     status.addr = config.addr.clone();
     status.online = false;
@@ -608,6 +614,13 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
             persist_status(&ctx, &status).await;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        // Published before the dial, not after it: a link that is failing is
+        // the one an operator asks about, and until the dial returns this is
+        // all there is to tell them.
+        status.link_state = LinkState::Connecting;
+        status.next_retry_at = None;
+        status.attempts = status.attempts.saturating_add(1);
+        persist_status(&ctx, &status).await;
         let mut health = SessionHealth::default();
         let result = session(&ctx, &hub, &config, &mut status, &mut health).await;
         status.online = false;
@@ -617,7 +630,6 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
                 .err()
                 .map_or_else(|| "Peer disconnected".into(), |e| e.to_string()),
         );
-        persist_status(&ctx, &status).await;
         ctx.engine
             .events
             .emit(orch_domain::OrchestratorEvent::OrchestratorError {
@@ -630,9 +642,19 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
             });
         if health.healthy() {
             backoff = Backoff::default();
+            status.attempts = 0;
         }
         let delay = backoff.next();
-        tracing::debug!(alias=%config.alias,error=?status.last_error,?delay,healthy=health.healthy(),"Peer reconnect pending");
+        status.link_state = if health.busy {
+            LinkState::Busy
+        } else {
+            LinkState::Backoff
+        };
+        status.next_retry_at = Some(orch_core::clock::iso_from_epoch_ms(
+            ctx.engine.clock.now_ms() + delay.as_millis() as i64,
+        ));
+        persist_status(&ctx, &status).await;
+        tracing::debug!(alias=%config.alias,error=?status.last_error,?delay,healthy=health.healthy(),attempts=status.attempts,"Peer reconnect pending");
         tokio::time::sleep(delay).await;
     }
 }
@@ -712,6 +734,7 @@ async fn session(
             status.peer_version = version;
         }
         Some(Frame::Busy { controller }) => {
+            health.busy = true;
             return Err(Error::other(format!(
                 "Worker busy: controlled by {controller}"
             )));
@@ -739,6 +762,8 @@ async fn session(
         write_frame(&mut writer, &frame).await.map_err(net_error)?;
     }
     status.online = true;
+    status.link_state = LinkState::Online;
+    status.next_retry_at = None;
     status.last_error = None;
     status.last_seen = Some(ctx.engine.clock.now_iso());
     persist_status(ctx, status).await;
@@ -1045,6 +1070,9 @@ mod tests {
                 os: None,
                 agents: vec![],
                 peer_version: None,
+                link_state: LinkState::Connecting,
+                next_retry_at: None,
+                attempts: 0,
             };
             let _ = session(
                 &ctx,

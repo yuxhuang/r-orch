@@ -57,16 +57,17 @@ pub async fn run(
             if ctx.json {
                 return print_json(&entries);
             }
+            let now = engine.clock.now_ms();
             let mut rows = Vec::new();
             for entry in entries {
-                let online = store
-                    .read_status(&entry.alias)
-                    .await?
-                    .is_some_and(|status| status.online);
+                let status = store.read_status(&entry.alias).await?;
                 rows.push(vec![
                     entry.alias,
                     entry.addr,
-                    if online { "online" } else { "offline" }.into(),
+                    status
+                        .as_ref()
+                        .map(|status| describe_link(status, now))
+                        .unwrap_or_else(|| "offline".into()),
                 ]);
             }
             print_table(styles, &["ALIAS", "ADDRESS", "STATUS"], &rows, 2);
@@ -93,6 +94,9 @@ pub async fn run(
                             os: None,
                             agents: Vec::new(),
                             peer_version: None,
+                            link_state: orch_domain::LinkState::Connecting,
+                            next_retry_at: None,
+                            attempts: 0,
                         }),
                 );
             }
@@ -125,21 +129,23 @@ pub async fn run(
                     .map(|version| format!(" (v{version})"))
                     .unwrap_or_default()
             );
+            let now = engine.clock.now_ms();
             for status in remotes {
                 println!(
-                    "  {}: {}{}{}",
+                    "  {}: {}{}",
                     status.alias,
-                    if status.online { "online" } else { "offline" },
+                    describe_link(&status, now),
                     status
                         .peer_version
                         .as_ref()
                         .map(|version| format!(" v{version}"))
-                        .unwrap_or_default(),
-                    status
-                        .last_error
-                        .as_ref()
-                        .map(|e| format!(" ({e})"))
-                        .unwrap_or_default()
+                        .unwrap_or_else(|| if status.online {
+                            // A peer that predates the field, so there is no
+                            // version to show and nothing to infer from it.
+                            " (version unknown)".into()
+                        } else {
+                            String::new()
+                        })
                 );
             }
         }
@@ -231,6 +237,39 @@ pub(crate) async fn listener_status(
         }
     }
     Ok(ListenerStatus::default())
+}
+
+/// One wording for the CLI and the TUI: what this link is doing, and when it
+/// will try again. `offline` alone covered a worker that is down, one serving
+/// another controller, and one being redialled every second — which is how
+/// the live redial storm stayed invisible.
+pub(crate) fn describe_link(status: &RemoteStatus, now_ms: i64) -> String {
+    if status.online {
+        return "online".into();
+    }
+    let cause = status.last_error.clone().or_else(|| {
+        (status.link_state == orch_domain::LinkState::Connecting).then(|| "connecting".into())
+    });
+    let mut retry = Vec::new();
+    if let Some(due) = status
+        .next_retry_at
+        .as_deref()
+        .and_then(orch_core::clock::epoch_ms_from_iso)
+    {
+        retry.push(format!(
+            "retry in {}s",
+            due.saturating_sub(now_ms).max(0) / 1000
+        ));
+    }
+    if status.attempts > 1 {
+        retry.push(format!("attempt {}", status.attempts));
+    }
+    match (cause, retry.join(", ")) {
+        (None, retry) if retry.is_empty() => "offline".into(),
+        (None, retry) => format!("offline ({retry})"),
+        (Some(cause), retry) if retry.is_empty() => format!("offline ({cause})"),
+        (Some(cause), retry) => format!("offline ({cause}; {retry})"),
+    }
 }
 
 /// One wording for the CLI and the TUI header: only a bound socket is shown
@@ -366,6 +405,79 @@ mod tests {
             crate::context::EnvFlags::default(),
         );
         (temp, engine, ctx)
+    }
+
+    #[test]
+    fn a_links_description_says_what_it_is_doing_and_when_it_retries() {
+        let base = RemoteStatus {
+            alias: "w1".into(),
+            addr: "127.0.0.1:7690".into(),
+            online: false,
+            last_seen: None,
+            last_error: None,
+            peer_name: None,
+            instance_id: None,
+            os: None,
+            agents: Vec::new(),
+            peer_version: None,
+            link_state: orch_domain::LinkState::Connecting,
+            next_retry_at: None,
+            attempts: 0,
+        };
+        let now = 1_000_000;
+        assert_eq!(describe_link(&base, now), "offline (connecting)");
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    online: true,
+                    link_state: orch_domain::LinkState::Online,
+                    attempts: 5,
+                    ..base.clone()
+                },
+                now
+            ),
+            "online"
+        );
+        // The live failure: a worker that closed every session right after
+        // the handshake looked exactly like one that was simply down.
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    last_error: Some("Peer closed connection".into()),
+                    link_state: orch_domain::LinkState::Backoff,
+                    next_retry_at: Some(orch_core::clock::iso_from_epoch_ms(now + 12_400)),
+                    attempts: 5,
+                    ..base.clone()
+                },
+                now
+            ),
+            "offline (Peer closed connection; retry in 12s, attempt 5)"
+        );
+        // A retry already due, and a first attempt, carry no counters.
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    last_error: Some("Worker busy: controlled by mac".into()),
+                    link_state: orch_domain::LinkState::Busy,
+                    next_retry_at: Some(orch_core::clock::iso_from_epoch_ms(now - 5_000)),
+                    attempts: 1,
+                    ..base.clone()
+                },
+                now
+            ),
+            "offline (Worker busy: controlled by mac; retry in 0s)"
+        );
+        // A record written before these fields still reads sensibly.
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    last_error: Some("Peer heartbeat timed out".into()),
+                    ..base
+                },
+                now
+            ),
+            "offline (Peer heartbeat timed out)"
+        );
     }
 
     #[tokio::test]
