@@ -25,6 +25,10 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | Worried about API keys in agent config | [Secrets in agent config](#secrets-in-agent-config) |
 | Cannot select text in the dashboard any more | [Mouse capture holds the pointer](#mouse-capture-holds-the-pointer) |
 | The terminal prints `[<0;44;8M` when you click | [A leaked mouse mode](#a-leaked-mouse-mode-after-an-abnormal-exit) |
+| A task handed to a peer shows `dispatched`, `queued` or `RUN?` | [Remote task phases](#remote-task-phases) |
+| A peer is `offline` and you cannot tell why | [Reading a peer's link state](#reading-a-peers-link-state) |
+| A mirror on a worker sits `todo` for ever | [Mirrors left behind on a worker](#mirrors-left-behind-on-a-worker) |
+| Changing the peer protocol | [Peer protocol compatibility](#peer-protocol-compatibility) |
 
 ---
 
@@ -479,3 +483,101 @@ credentials, and keep versioning the rest:
 
 The guidance is the same either way: **version the definitions if you want to, keep secrets in the
 environment.**
+
+---
+
+## Remote task phases
+
+**A task dispatched to a peer is `in_progress` here from the moment the controller reserves it** — before a
+byte reaches the worker. So task views do not show that status for remote work; they show the phase the
+worker last reported, in `orch task list`, `orch task show` and the dashboard's status chip:
+
+| Shown | Means | What to do |
+|---|---|---|
+| `dispatched → 2com` | The request is queued locally. The worker has not acknowledged it. | Nothing, unless it stays. After **5 minutes of link time** (offline time does not count) the task fails with `remote 2com never acknowledged submit` and a cancel goes to the worker. |
+| `queued @2com` | The worker holds a mirror that has not started. | If the WAITING column says `awaiting approval: orch task approve <id> on 2com`, that command has to be run **on the worker** — its own owner decides whether a peer may use a `suggest`/`manual` agent. |
+| `RUN @2com` | The worker says its agent is executing. | Nothing. This is never shown without a running signal from the worker. |
+| `RUN? (2com offline)` | The link dropped after the submit was written, so nobody here knows what the worker has. | Nothing. The next session's sync resolves it to queued, running or finished — or to a failure if the worker has lost the record. |
+
+Two messages come out of the deadlines:
+
+- **`tsk_x has been queued on 2com for 1h`** (`orchestrator:error`, once an hour, with the approve command as
+  its context). A queued mirror is usually waiting for the worker owner's approval, which this side cannot
+  grant, so it is **never** failed automatically however long it waits.
+- **`remote lost execution record (2com: worker storage error: corrupt record)`**. The worker answered a sync
+  with `unknown`: it has no execution record for the key. The parenthesis is the worker's own reason, and it
+  is the part that says where to look — on the worker, in that example, at the mirror's task file. The task
+  fails without a retry, and a cancel goes out in case the mirror becomes readable again.
+
+A restart no longer loses any of this. Remote reservations whose peer is still in the registry survive it,
+in `RUN?` until the first sync answers; only a peer that has been **removed** from the registry turns its
+runs into `remote <alias> removed; outcome unknown`.
+
+---
+
+## Reading a peer's link state
+
+`orch remote status` and `orch remote list` no longer print a bare `offline`, which covered three very
+different situations:
+
+```
+  2com: offline (Peer closed connection; retry in 12s, attempt 5)
+  2com: offline (Worker busy: controlled by mac; retry in 8s)
+  2com: offline (connecting)
+  2com: online v0.5.0
+```
+
+- **`attempt N`** is the number of consecutive dials since the last session that proved the peer healthy. A
+  climbing count with a short `retry in` is the signature of a worker that accepts a connection and then
+  closes it — look in the **worker's** `serve.log` and at `orch remote status` there, which reports
+  `Listen: … (last session ended: <error>)`.
+- **`retry in Ns`** counts down to the next dial. The backoff is 1, 2, 4, 8, capped at 15 seconds with ±25 %
+  jitter, and it only resets after a session has cleared its sync fence and stayed up for 30 seconds.
+- **`(version unknown)`** beside an online peer means that peer predates the version field in the handshake.
+  Nothing is wrong with the link; it is an older build.
+
+---
+
+## Mirrors left behind on a worker
+
+A **mirror** is the task a worker creates for a controller's request (labelled `remote-ctl:<controller id>`).
+A mirror runs only while the controller that submitted it is connected, so one left behind by a controller
+that never comes back would sit `todo` in a local agent's queue indefinitely.
+
+The worker sweeps for those hourly, and once when `orch serve` starts listening. A `todo` mirror whose
+controller has not been admitted for **24 hours** is cancelled with:
+
+```
+orphaned remote mirror: controller <instance id> absent since <timestamp>
+```
+
+Three things are deliberately *not* swept:
+
+1. **`in_progress` mirrors.** They own a live local process, and the quarantine path owns that pid.
+2. **The connected controller's mirrors.** A controller that is here now is not absent.
+3. **A controller this worker has never recorded.** Its 24 hours start at the first sweep that sees it, which
+   is also what spares mirrors that predate the feature.
+
+Last-seen timestamps live in `.orchestry/remotes/_controllers.json` (owner-only). Deleting it restarts every
+controller's clock; it is safe to delete.
+
+To cancel one by hand, on the worker: `orch task cancel <mirror task id>`.
+
+---
+
+## Peer protocol compatibility
+
+**Within one `PROTOCOL` number, every peer must tolerate every frame variant and every omitted field.** Both
+sides of a link can be different builds — that is the normal case for a LAN of machines upgraded one at a
+time — so a change that keeps the current `PROTOCOL` may only **add fields**, each with
+`#[serde(default)]` (to read an old peer's frame) and `skip_serializing_if` (so an old peer reads ours
+byte-identically to what it used to see).
+
+A **new frame variant, a removed field, or a changed meaning for an existing one requires a `PROTOCOL`
+bump**, because an old peer treats a frame it cannot parse as fatal and closes the session. A mismatched
+`PROTOCOL` is refused at the handshake with `Peer protocol mismatch`, which is the honest failure: both
+owners then know to upgrade.
+
+The rule is enforced by tests in `crates/orch-peer/src/protocol.rs`, in both directions — current frames
+parsed by a copy of the previous release's shapes, and previous-release JSON parsed by the current frames.
+If you add a field, extend those tests; if you cannot keep them passing, you need the bump.
