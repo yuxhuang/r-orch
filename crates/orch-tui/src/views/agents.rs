@@ -60,7 +60,6 @@ pub fn row_error_text(kind: &str, raw: &str) -> String {
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let state = ctx.state;
     let rows = state.agent_rows(ctx.caps.can_add_agent);
-    let mut y = area.y;
 
     ctx.zone(
         area,
@@ -69,7 +68,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         ZoneId::ScrollRegion(ScrollRegion::MainList),
     );
 
-    for row in rows.iter().skip(state.agent_scroll) {
+    for (y, row) in (area.y..).zip(rows.iter().skip(state.agent_scroll)) {
         if y >= area.bottom() {
             return;
         }
@@ -157,7 +156,6 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 );
             }
         }
-        y += 1;
     }
 }
 

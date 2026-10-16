@@ -299,12 +299,13 @@ impl PeerRuntime {
         let worker = worker::Worker::new(ctx.clone());
         engine.orchestrator.set_remote_bridge(hub.clone());
         engine.orchestrator.set_run_event_tap(worker.clone());
-        let mut tasks = Vec::new();
-        tasks.push(AbortOnDrop(tokio::spawn(expire_messages(
-            engine.messages.clone(),
-            engine.events.clone(),
-        ))));
-        tasks.push(AbortOnDrop(tokio::spawn(link::manage(ctx, hub))));
+        let tasks = vec![
+            AbortOnDrop(tokio::spawn(expire_messages(
+                engine.messages.clone(),
+                engine.events.clone(),
+            ))),
+            AbortOnDrop(tokio::spawn(link::manage(ctx, hub))),
+        ];
         Ok(Self {
             engine,
             tasks,
