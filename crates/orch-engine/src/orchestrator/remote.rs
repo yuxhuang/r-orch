@@ -252,6 +252,129 @@ impl Orchestrator {
         self.save_remote_state(state).await
     }
 
+    /// Collect one remote execution on its own task, from a handle the bridge
+    /// has already registered. The entry in `state.running` is durable before
+    /// this is called, so a collector that never starts costs a sync, not an
+    /// outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn spawn_remote_collector(
+        &self,
+        handle: Result<orch_core::remote::RemoteExecuteHandle>,
+        run_id: &str,
+        task_id: &str,
+        agent_id: &str,
+        auto_approve: bool,
+        cancel: CancellationToken,
+    ) {
+        self.inner
+            .active_collectors
+            .lock()
+            .await
+            .insert(task_id.to_owned());
+        let orchestrator = self.clone();
+        let (run_id, task_id, agent_id) =
+            (run_id.to_owned(), task_id.to_owned(), agent_id.to_owned());
+        tokio::spawn(async move {
+            let result = match handle {
+                Ok(handle) => {
+                    orchestrator
+                        .collect_remote_events(
+                            handle.events,
+                            &run_id,
+                            &task_id,
+                            &agent_id,
+                            auto_approve,
+                            cancel,
+                        )
+                        .await
+                }
+                Err(err) => Err(err), // retain the durable entry pending sync
+            };
+            if let Err(err) = result {
+                orchestrator.emit_error(err, format!("remote execution for {task_id}"));
+            }
+            orchestrator
+                .inner
+                .active_collectors
+                .lock()
+                .await
+                .remove(&task_id);
+        });
+    }
+
+    /// Re-attach to the remote executions that outlived this controller.
+    ///
+    /// Startup recovery keeps a remote entry whose peer is still registered,
+    /// because the worker owns that execution and its outcome is still
+    /// coming. The peer runtime calls this before its first link exists, so
+    /// the request is never sent again, the key is in the first `Sync` — a
+    /// live mirror the controller forgot would be cancelled as an orphan —
+    /// and a collector is waiting when the sync answers.
+    pub async fn rehydrate_remote_runs(&self) -> Result<()> {
+        let entries: Vec<orch_domain::RunningEntry> = {
+            let slot = self.inner.state.lock().await;
+            match slot.as_ref() {
+                Some(state) => state
+                    .running
+                    .values()
+                    .filter(|entry| entry.remote.is_some())
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let directory = orch_infra::storage::remote::RemoteAgentDirectory::new(
+            orch_infra::storage::Paths::new(self.deps().project_root.clone()),
+        );
+        let agents = directory.list(Vec::new()).await.unwrap_or_default();
+        for entry in entries {
+            let remote = entry.remote.as_ref().expect("filtered on remote");
+            let handle = self
+                .remote_bridge()
+                .rehydrate(&remote.alias, &remote.exec_key);
+            if let Err(error) = &handle {
+                // Nothing is lost here: with no execution registered the next
+                // sync reports the key unknown and reconcile retires it.
+                self.emit_error(
+                    error.to_string(),
+                    format!("rehydrate remote execution {}", remote.exec_key),
+                );
+            }
+            // The worker's approval policy decides whether a successful
+            // outcome auto-approves, exactly as it did at dispatch.
+            let auto_approve = self
+                .deps()
+                .task_store
+                .get(&entry.task_id)
+                .await?
+                .is_some_and(|task| task.is_autonomous())
+                || agents.iter().any(|agent| {
+                    agent.id == entry.agent_id
+                        && agent.config.approval_policy == Some(orch_domain::ApprovalPolicy::Auto)
+                });
+            tracing::info!(
+                task_id = %entry.task_id,
+                alias = %remote.alias,
+                exec_key = %remote.exec_key,
+                "Rehydrated remote execution; awaiting the worker's sync"
+            );
+            let cancel = self.register_cancel(&entry.task_id).await;
+            self.spawn_remote_collector(
+                handle,
+                &entry.run_id,
+                &entry.task_id,
+                &entry.agent_id,
+                auto_approve,
+                cancel,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     /// Record what the worker says about an execution that has not finished,
     /// and start its run record the moment the worker says it is running.
     ///

@@ -679,41 +679,11 @@ impl Orchestrator {
             };
             let auto_approve = task.is_autonomous()
                 || agent.config.approval_policy == Some(orch_domain::ApprovalPolicy::Auto);
-            self.inner
-                .active_collectors
-                .lock()
-                .await
-                .insert(task_id.clone());
             // Enqueue before releasing the state lock, so a concurrent cancel
             // cannot overtake initial submission. No network I/O occurs here.
             let handle = self.remote_bridge().submit(request);
-            let orchestrator = self.clone();
-            tokio::spawn(async move {
-                let result = match handle {
-                    Ok(handle) => {
-                        orchestrator
-                            .collect_remote_events(
-                                handle.events,
-                                &run.id,
-                                &task_id,
-                                &agent.id,
-                                auto_approve,
-                                cancel,
-                            )
-                            .await
-                    }
-                    Err(err) => Err(err), // retain the durable entry pending sync
-                };
-                if let Err(err) = result {
-                    orchestrator.emit_error(err, format!("remote execution for {task_id}"));
-                }
-                orchestrator
-                    .inner
-                    .active_collectors
-                    .lock()
-                    .await
-                    .remove(&task_id);
-            });
+            self.spawn_remote_collector(handle, &run.id, &task_id, &agent.id, auto_approve, cancel)
+                .await;
             return Ok(());
         }
 

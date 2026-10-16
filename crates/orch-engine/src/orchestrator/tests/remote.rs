@@ -25,6 +25,7 @@ struct FakeBridge {
     submitted: Mutex<Vec<RemoteSubmit>>,
     cancelled: Mutex<Vec<(String, String)>>,
     acknowledged: Mutex<Vec<(String, String)>>,
+    rehydrated: Mutex<Vec<(String, String)>>,
     /// Cancels the drain reports as still unacknowledged at its deadline.
     unacknowledged: Mutex<Vec<(String, String)>>,
     drain_fails: std::sync::atomic::AtomicBool,
@@ -53,6 +54,17 @@ impl RemoteBridge for FakeBridge {
             assert_eq!(entry.remote.as_ref().unwrap().exec_key, request.exec_key);
         }
         self.submitted.lock().unwrap().push(request);
+        Ok(RemoteExecuteHandle {
+            pid: 0,
+            events: Box::pin(futures::stream::pending()),
+        })
+    }
+
+    fn rehydrate(&self, alias: &str, exec_key: &str) -> Result<RemoteExecuteHandle> {
+        self.rehydrated
+            .lock()
+            .unwrap()
+            .push((alias.into(), exec_key.into()));
         Ok(RemoteExecuteHandle {
             pid: 0,
             events: Box::pin(futures::stream::pending()),
@@ -680,10 +692,58 @@ async fn worker_mirror_without_run_or_reservation_cancels_without_retry() {
     assert!(h.processes.killed_with_grace().is_empty());
 }
 
+/// A controller restart used to cancel every remote reservation, which threw
+/// away an outcome the worker was still computing — and left the worker
+/// running it. The entry is kept instead, in `unknown` until the next
+/// session's sync says what the worker still has.
 #[tokio::test]
-async fn startup_cleanup_cancels_remote_without_pid_check_or_retry() {
+async fn startup_keeps_a_remote_run_whose_peer_is_still_registered() {
+    let fixture = PeerFixture::new(true).await;
+    let (h, bridge) = running(&fixture).await;
+    let mut state = remote_state(NOW_ISO);
+    h.orchestrator
+        .cleanup_stale_running_entries(&mut state)
+        .await
+        .unwrap();
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
+    let remote = state.running["tsk_remote"].remote.clone().unwrap();
+    assert_eq!(remote.phase, RemotePhase::Unknown);
+    assert_eq!(remote.status_label().unwrap(), "RUN? (worker offline)");
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().status,
+        RunStatus::Running,
+        "the worker's run record is not this process's to finish"
+    );
+    assert!(bridge.cancelled.lock().unwrap().is_empty());
+    no_process_calls(&h);
+
+    // The peer runtime re-registers it before its first link, so the first
+    // Sync lists the key and a collector is waiting for the answer.
+    h.set_state(state).await;
+    h.orchestrator.rehydrate_remote_runs().await.unwrap();
+    assert_eq!(
+        *bridge.rehydrated.lock().unwrap(),
+        vec![("worker".into(), "run_remote".into())]
+    );
+    assert!(
+        bridge.submitted.lock().unwrap().is_empty(),
+        "a rehydrated execution must never be submitted twice"
+    );
+    assert!(
+        h.orchestrator
+            .inner
+            .active_collectors
+            .lock()
+            .await
+            .contains("tsk_remote")
+    );
+}
+
+#[tokio::test]
+async fn startup_cancels_a_remote_run_whose_peer_is_gone() {
     let fixture = PeerFixture::new(true).await;
     let (h, _) = running(&fixture).await;
+    fixture.store.remove("worker").await.unwrap();
     let mut state = remote_state(NOW_ISO);
     h.orchestrator
         .cleanup_stale_running_entries(&mut state)

@@ -29,7 +29,9 @@ use tokio::{
 };
 
 struct Execution {
-    submit: Frame,
+    /// `None` for a rehydrated execution: there is nothing left to send, the
+    /// worker already has the request.
+    submit: Option<Frame>,
     events: mpsc::Sender<RemoteRunEvent>,
     attempted: bool,
     seq: u64,
@@ -138,7 +140,7 @@ impl LinkHub {
                 if e.attempted || e.terminal.is_some() {
                     return None;
                 }
-                Some(e.submit.clone())
+                e.submit.clone()
             })
             .collect()
     }
@@ -332,9 +334,38 @@ impl RemoteBridge for LinkHub {
         queue.executions.insert(
             key,
             Execution {
-                submit,
+                submit: Some(submit),
                 events: tx,
                 attempted: false,
+                seq: 0,
+                terminal: None,
+                delivered: false,
+                hint: None,
+                reported: None,
+            },
+        );
+        Ok(RemoteExecuteHandle {
+            pid: 0,
+            events: Box::pin(stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|e| (e, rx))
+            })),
+        })
+    }
+    fn rehydrate(&self, alias: &str, exec_key: &str) -> Result<RemoteExecuteHandle> {
+        let (tx, rx) = mpsc::channel(1024);
+        let mut queues = self.queues();
+        let queue = queues.entry(alias.into()).or_default();
+        if queue.executions.contains_key(exec_key) {
+            return Err(Error::other("Execution stream already registered"));
+        }
+        queue.executions.insert(
+            exec_key.into(),
+            Execution {
+                // Nothing to send: the worker has the request already, and a
+                // second one would be a second effect.
+                submit: None,
+                events: tx,
+                attempted: true,
                 seq: 0,
                 terminal: None,
                 delivered: false,
@@ -958,6 +989,7 @@ fn net_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SyncItem;
     use futures::StreamExt;
     use orch_core::test_support::FakeMessageStore;
     fn request() -> RemoteSubmit {
@@ -973,8 +1005,8 @@ mod tests {
             goal_id: None,
         }
     }
-    #[tokio::test]
-    async fn chunked_sync_finishes_before_new_submits_are_attempted() {
+    /// A controller context over a real engine in a temporary project.
+    async fn controller() -> (tempfile::TempDir, Context) {
         use orch_engine::{EngineSeams, build_full_with};
         use orch_infra::storage::remote::FileRemoteStore;
         let temp = tempfile::tempdir().unwrap();
@@ -996,19 +1028,12 @@ mod tests {
             instance_id: "controller-id".into(),
             name: "controller".into(),
         };
-        let hub = Arc::new(LinkHub::new(ctx.engine.messages.clone()));
-        let _one = hub.submit(request()).unwrap();
-        let mut two = request();
-        two.exec_key = "run2".into();
-        let _two = hub.submit(two).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let config = RemoteConfig {
-            alias: "w1".into(),
-            addr: listener.local_addr().unwrap().to_string(),
-            added_at: "now".into(),
-        };
-        let linked = hub.clone();
-        let _session = AbortOnDrop(tokio::spawn(async move {
+        (temp, ctx)
+    }
+
+    /// Run one real outbound session against a socket the test speaks for.
+    fn spawn_session(ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) -> AbortOnDrop {
+        AbortOnDrop(tokio::spawn(async move {
             let mut status = RemoteStatus {
                 alias: config.alias.clone(),
                 addr: config.addr.clone(),
@@ -1023,33 +1048,54 @@ mod tests {
             };
             let _ = session(
                 &ctx,
-                &linked,
+                &hub,
                 &config,
                 &mut status,
                 &mut SessionHealth::default(),
             )
             .await;
-        }));
+        }))
+    }
+
+    async fn welcome(read: &mut BufReader<tokio::net::TcpStream>) {
+        assert!(matches!(
+            read_frame(read).await.unwrap(),
+            Some(Frame::Hello { .. })
+        ));
+        write_frame(
+            read.get_mut(),
+            &Frame::Welcome {
+                proto: PROTOCOL,
+                instance_id: "worker-id".into(),
+                name: "worker".into(),
+                os: "test".into(),
+                agents: vec![],
+                version: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn chunked_sync_finishes_before_new_submits_are_attempted() {
+        let (_temp, ctx) = controller().await;
+        let hub = Arc::new(LinkHub::new(ctx.engine.messages.clone()));
+        let _one = hub.submit(request()).unwrap();
+        let mut two = request();
+        two.exec_key = "run2".into();
+        let _two = hub.submit(two).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = RemoteConfig {
+            alias: "w1".into(),
+            addr: listener.local_addr().unwrap().to_string(),
+            added_at: "now".into(),
+        };
+        let _session = spawn_session(ctx, hub.clone(), config);
         tokio::time::timeout(Duration::from_secs(3), async {
             let (socket, _) = listener.accept().await.unwrap();
             let mut read = BufReader::new(socket);
-            assert!(matches!(
-                read_frame(&mut read).await.unwrap(),
-                Some(Frame::Hello { .. })
-            ));
-            write_frame(
-                read.get_mut(),
-                &Frame::Welcome {
-                    proto: PROTOCOL,
-                    instance_id: "worker-id".into(),
-                    name: "worker".into(),
-                    os: "test".into(),
-                    agents: vec![],
-                    version: None,
-                },
-            )
-            .await
-            .unwrap();
+            welcome(&mut read).await;
             assert!(matches!(
                 read_frame(&mut read).await.unwrap(),
                 Some(Frame::Sync { .. })
@@ -1094,6 +1140,86 @@ mod tests {
         })
         .await
         .expect("chunked sync deadline");
+    }
+
+    /// A simulated controller restart: the reservation survived, so the key
+    /// must be in the first `Sync` — a live mirror missing from that list is
+    /// cancelled by the worker as an orphan — and the request must never be
+    /// sent a second time.
+    #[tokio::test]
+    async fn a_rehydrated_execution_is_in_the_first_sync_and_never_resubmitted() {
+        let (_temp, ctx) = controller().await;
+        let hub = Arc::new(LinkHub::new(ctx.engine.messages.clone()));
+        let mut handle = hub.rehydrate("w1", "run1").unwrap();
+        assert_eq!(hub.active("w1"), vec!["run1"]);
+        assert!(
+            hub.submits("w1").is_empty(),
+            "the worker already has the request"
+        );
+        assert!(hub.attempted("w1", "run1"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = RemoteConfig {
+            alias: "w1".into(),
+            addr: listener.local_addr().unwrap().to_string(),
+            added_at: "now".into(),
+        };
+        let _session = spawn_session(ctx, hub.clone(), config);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut read = BufReader::new(socket);
+            welcome(&mut read).await;
+            let Some(Frame::Sync { active }) = read_frame(&mut read).await.unwrap() else {
+                panic!("sync must be the first post-handshake frame")
+            };
+            assert_eq!(active, vec!["run1".to_owned()]);
+            // The worker still has it, queued behind its own approval.
+            write_frame(
+                read.get_mut(),
+                &Frame::SyncState {
+                    items: vec![SyncItem {
+                        worker_task_id: Some("tsk_mirror".into()),
+                        ..SyncItem::new("run1", "running")
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+            write_frame(read.get_mut(), &Frame::Pong).await.unwrap();
+            // Only the re-attachment and the heartbeat follow it.
+            let mut attached = false;
+            while !attached {
+                match read_frame(&mut read).await.unwrap() {
+                    Some(Frame::Attach {
+                        exec_key,
+                        after_seq,
+                    }) => {
+                        assert_eq!((exec_key.as_str(), after_seq), ("run1", 0));
+                        attached = true;
+                    }
+                    Some(Frame::Ping) => {}
+                    other => panic!("a rehydrated execution was resubmitted: {other:?}"),
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), read_frame(&mut read))
+                    .await
+                    .is_err(),
+                "nothing more is owed to the worker"
+            );
+        })
+        .await
+        .expect("rehydrated sync deadline");
+        // The text hint is progress for the run log; the phase follows it.
+        let mut resolved = None;
+        while resolved.is_none() {
+            match handle.events.next().await {
+                Some(RemoteRunEvent::Event(_)) => {}
+                other => resolved = Some(phase(other)),
+            }
+        }
+        let resolved = resolved.unwrap();
+        assert_eq!(resolved.phase, RemotePhase::Running);
+        assert_eq!(resolved.worker_task_id.as_deref(), Some("tsk_mirror"));
     }
 
     #[tokio::test]

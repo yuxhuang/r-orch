@@ -299,6 +299,10 @@ impl PeerRuntime {
         let worker = worker::Worker::new(ctx.clone());
         engine.orchestrator.set_remote_bridge(hub.clone());
         engine.orchestrator.set_run_event_tap(worker.clone());
+        // Before the first link: an execution this controller does not
+        // re-register is missing from the first `Sync`, and the worker reads
+        // a live mirror absent from that list as an orphan and cancels it.
+        engine.orchestrator.rehydrate_remote_runs().await?;
         let tasks = vec![
             AbortOnDrop(tokio::spawn(expire_messages(
                 engine.messages.clone(),

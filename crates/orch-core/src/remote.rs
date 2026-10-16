@@ -108,6 +108,16 @@ pub trait RemoteBridge: Send + Sync {
     /// enqueued. The owner retains its entry for sync rather than risking a
     /// duplicate effect. Submit and cancel must preserve enqueue order.
     fn submit(&self, request: RemoteSubmit) -> Result<RemoteExecuteHandle>;
+    /// Re-register an execution that outlived this controller, from a
+    /// reservation that was already durable. The request is **not** sent
+    /// again: the worker owns the execution, and the first sync of the next
+    /// session says what became of it. Registering it is also what keeps that
+    /// sync from reading the live mirror as an orphan and cancelling it.
+    fn rehydrate(&self, _alias: &str, _exec_key: &str) -> Result<RemoteExecuteHandle> {
+        Err(Error::invalid_arguments(
+            "Remote peer runtime is not installed",
+        ))
+    }
     /// Enqueue promptly and preserve submit order; never await the network
     /// while the controller is holding its state mutex.
     async fn cancel(&self, alias: &str, exec_key: &str) -> Result<()>;
