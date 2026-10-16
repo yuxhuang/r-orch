@@ -360,6 +360,10 @@ impl Drop for PeerRuntime {
             .orchestrator
             .set_remote_bridge(Arc::new(orch_core::remote::NoopRemoteBridge));
         self.engine.orchestrator.clear_run_event_tap();
+        // The listener is gone with this runtime, so no controller is served
+        // any more. Leaving the last one published would let its mirrors
+        // dispatch with no session to report them to (TUI `/pause`).
+        self.engine.orchestrator.set_inbound_controller(None);
     }
 }
 

@@ -105,6 +105,46 @@ mod tests {
         );
     }
 
+    /// Dropping the runtime takes the listener with it, so the controller it
+    /// was serving is no longer connected. Leaving that published would let
+    /// the controller's mirrors dispatch into a session that does not exist
+    /// — the dashboard's `/pause` and resume does exactly this.
+    #[tokio::test]
+    async fn dropping_the_runtime_unpublishes_the_controller_it_was_serving() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        tokio::fs::create_dir_all(paths.root()).await.unwrap();
+        let engine = Arc::new(
+            orch_engine::build_full_with(
+                temp.path(),
+                orch_engine::EngineSeams {
+                    global_config_path: Some(paths.root().join("global.yml")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = start_watch(
+            engine.clone(),
+            WatchOptions {
+                skip_autonomous_seeding: true,
+                handle_signals: false,
+            },
+        )
+        .await
+        .unwrap();
+        engine
+            .orchestrator
+            .set_inbound_controller(Some("controller-id".into()));
+        engine.orchestrator.stop().await.unwrap();
+        drop(runtime);
+        assert!(
+            engine.orchestrator.inbound_controller().is_none(),
+            "a stopped runtime still claimed to serve a controller"
+        );
+    }
+
     #[tokio::test]
     async fn a_listener_bind_failure_releases_the_engine_owner_lock() {
         let temp = tempfile::tempdir().unwrap();

@@ -183,7 +183,9 @@ impl Orchestrator {
             .unwrap_or_else(|e| e.into_inner()) = instance_id;
     }
 
-    pub(super) fn inbound_controller(&self) -> Option<String> {
+    /// The controller this instance's listener is serving, if any. Public so
+    /// the peer runtime's own tests can see what it published.
+    pub fn inbound_controller(&self) -> Option<String> {
         self.inner
             .inbound_controller
             .read()

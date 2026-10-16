@@ -487,6 +487,12 @@ impl RemoteBridge for LinkHub {
 /// noticed promptly, long enough that a worker which kills every session is
 /// dialled about four times a minute rather than once a second.
 const BACKOFF_CAP: Duration = Duration::from_secs(15);
+/// The shortest wait between respawns of one alias's link task. A link that
+/// panics during startup every time would otherwise respawn on every 250 ms
+/// tick, with an `orchestrator:error` each time.
+const RESPAWN_FLOOR: Duration = Duration::from_secs(5);
+/// One disconnect report per error per window, as on the worker side.
+const DISCONNECT_REPORT_EVERY: Duration = Duration::from_secs(30);
 /// How long a session must stay up, *after* clearing the sync fence, before it
 /// counts as evidence the peer is healthy. A session that dies right after the
 /// handshake is the symptom of a worker fault; resetting the backoff on it
@@ -536,6 +542,9 @@ struct Links(BTreeMap<String, (RemoteConfig, AbortOnDrop)>);
 
 pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
     let mut links = Links(BTreeMap::new());
+    // Per alias: when its link task may be respawned, and how long the next
+    // wait is. A link that panics on every attempt must not spin at 4 Hz.
+    let mut respawn: BTreeMap<String, (Instant, Backoff)> = BTreeMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tick.tick().await;
@@ -567,6 +576,15 @@ pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
                 .get(&config.alias)
                 .is_some_and(|(_, task)| task.0.is_finished());
             if stopped {
+                let due = respawn
+                    .entry(config.alias.clone())
+                    .or_insert_with(|| (Instant::now(), Backoff::default()));
+                if Instant::now() < due.0 {
+                    // Still inside this alias's respawn floor. The finished
+                    // handle stays, so the next tick reconsiders it.
+                    continue;
+                }
+                due.0 = Instant::now() + due.1.next().max(RESPAWN_FLOOR);
                 let error = format!("Peer link task for {} stopped unexpectedly", config.alias);
                 tracing::error!(alias = %config.alias, "{error}; restarting");
                 ctx.engine
@@ -625,6 +643,7 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
     status.addr = config.addr.clone();
     status.online = false;
     let mut backoff = Backoff::default();
+    let mut reported: Option<(String, Instant)> = None;
     loop {
         while blocked().await {
             status.online = false;
@@ -648,16 +667,28 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
                 .err()
                 .map_or_else(|| "Peer disconnected".into(), |e| e.to_string()),
         );
-        ctx.engine
-            .events
-            .emit(orch_domain::OrchestratorEvent::OrchestratorError {
-                error: status.last_error.clone().unwrap_or_default(),
-                context: format!(
-                    "Peer {} disconnected; dispatch unavailable, reconnecting",
-                    config.alias
-                ),
-                fatal: false,
+        // Debounced like the worker's own faults: a peer that drops every
+        // session would otherwise fill the feed with the same line four
+        // times a minute. A *different* error is always worth reporting.
+        let error = status.last_error.clone().unwrap_or_default();
+        let repeat = reported
+            .as_ref()
+            .is_some_and(|(last, at): &(String, Instant)| {
+                *last == error && at.elapsed() < DISCONNECT_REPORT_EVERY
             });
+        if !repeat {
+            reported = Some((error.clone(), Instant::now()));
+            ctx.engine
+                .events
+                .emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                    error,
+                    context: format!(
+                        "Peer {} disconnected; dispatch unavailable, reconnecting",
+                        config.alias
+                    ),
+                    fatal: false,
+                });
+        }
         if health.healthy() {
             backoff = Backoff::default();
             status.attempts = 0;
@@ -1195,6 +1226,65 @@ mod tests {
         })
         .await
         .expect("chunked sync deadline");
+    }
+
+    /// A peer that accepts a connection, handshakes and then goes silent —
+    /// SIGSTOPped, half-open, or blocked inside its own session — must not
+    /// pin this link. Every write is bounded by the codec's own 5s budget and
+    /// the session's 15s heartbeat ends it, so the alias goes offline and the
+    /// supervisor can redial.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_ends_the_session_and_takes_the_alias_offline() {
+        let (_temp, ctx) = controller().await;
+        let hub = Arc::new(LinkHub::new(ctx.engine.messages.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = RemoteConfig {
+            alias: "w1".into(),
+            addr: listener.local_addr().unwrap().to_string(),
+            added_at: "now".into(),
+        };
+        ctx.store.add(config.clone()).await.unwrap();
+        let (done, mut ended) = mpsc::channel(1);
+        let session_ctx = ctx.clone();
+        let session_config = config.clone();
+        let _session = AbortOnDrop(tokio::spawn(async move {
+            let mut status = RemoteStatus {
+                alias: session_config.alias.clone(),
+                addr: session_config.addr.clone(),
+                online: false,
+                last_seen: None,
+                last_error: None,
+                peer_name: None,
+                instance_id: None,
+                os: None,
+                agents: vec![],
+                peer_version: None,
+                link_state: LinkState::Connecting,
+                next_retry_at: None,
+                attempts: 1,
+            };
+            let result = session(
+                &session_ctx,
+                &hub,
+                &session_config,
+                &mut status,
+                &mut SessionHealth::default(),
+            )
+            .await;
+            let _ = done.send(result.map(|_| ()).unwrap_err().to_string()).await;
+        }));
+        // Handshake, then never read and never answer another frame.
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut read = BufReader::new(socket);
+        welcome(&mut read).await;
+        let error = tokio::time::timeout(Duration::from_secs(120), ended.recv())
+            .await
+            .expect("a silent peer must not hold the session open")
+            .expect("the session reported why it ended");
+        assert!(
+            error.contains("timed out") || error.contains("Peer connection"),
+            "unexpected session end: {error}"
+        );
     }
 
     /// A simulated controller restart: the reservation survived, so the key
