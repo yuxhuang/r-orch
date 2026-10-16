@@ -44,13 +44,20 @@ impl Orchestrator {
 
     /// Dispatch up to the free slots, in scheduling order, skipping anything
     /// whose scope overlaps work already in flight.
+    ///
+    /// `max_concurrent_agents` caps **local** runs only. A remote run executes
+    /// on its worker, which enforces its own cap, and each remote agent runs
+    /// one task at a time, so remote dispatch is already bounded by the online
+    /// remote agents. Once the local slots are full, the pass keeps going only
+    /// while an online remote agent is idle, and offers candidates to remote
+    /// agents alone.
     pub(super) async fn dispatch_all(&self, state: &mut OrchestratorState) -> Result<()> {
-        let available_slots = self
-            .config()
-            .scheduling
-            .max_concurrent_agents
-            .saturating_sub(state.running.len());
-        if available_slots == 0 {
+        let max_local = self.config().scheduling.max_concurrent_agents;
+        // Loaded at most once per pass, and only when the local slots are full.
+        let mut remote_agents: Option<Vec<String>> = None;
+        if local_running(state) >= max_local
+            && !self.has_idle_remote_agent(state, &mut remote_agents).await
+        {
             return Ok(());
         }
 
@@ -80,7 +87,6 @@ impl Orchestrator {
                 .then_with(|| a.goal_id.is_none().cmp(&b.goal_id.is_none()))
                 .then_with(|| b.updated_at.cmp(&a.updated_at))
         });
-        candidates.truncate(available_slots);
 
         // Scope gating. The index starts from everything in flight, and an
         // approved candidate is added to it so later candidates in the same
@@ -96,47 +102,75 @@ impl Orchestrator {
         let mut scope_index =
             ScopeIndex::new(in_progress_scoped.iter().map(|task| task.scope.as_deref()));
 
-        let mut blocked: HashSet<String> = HashSet::new();
-        for candidate in &candidates {
-            let Some(scope) = candidate.scope.as_deref().filter(|scope| !scope.is_empty()) else {
-                continue;
-            };
-            if scope_index.overlaps_any(Some(scope)) {
+        for task in &candidates {
+            let remote_only = local_running(state) >= max_local;
+            if remote_only && !self.has_idle_remote_agent(state, &mut remote_agents).await {
+                break;
+            }
+            if let Some(scope) = task.scope.as_deref().filter(|scope| !scope.is_empty())
+                && scope_index.overlaps_any(Some(scope))
+            {
                 let overlapper = in_progress_scoped
                     .iter()
-                    .find(|task| scopes_overlap(Some(scope), task.scope.as_deref()));
+                    .find(|other| scopes_overlap(Some(scope), other.scope.as_deref()));
                 self.emit(OrchestratorEvent::TaskScopeOverlap {
-                    task_id: candidate.id.clone(),
-                    // The index can report an overlap against an *approved
-                    // peer* rather than an in-progress task, in which case TS
-                    // falls back to naming the candidate itself. Replicated.
+                    task_id: task.id.clone(),
                     overlapping_task_id: overlapper
-                        .map(|task| task.id.clone())
-                        .unwrap_or_else(|| candidate.id.clone()),
+                        .map(|other| other.id.clone())
+                        .unwrap_or_else(|| task.id.clone()),
                     patterns: scope.to_vec(),
                 });
-                blocked.insert(candidate.id.clone());
-            } else {
-                scope_index.add(Some(scope));
-            }
-        }
-
-        for task in &candidates {
-            if blocked.contains(&task.id) {
                 continue;
             }
-            if let Err(err) = self.dispatch_task(state, &task.id, None).await {
-                // A workspace failure is the one dispatch error that counts
-                // against the attempt budget: it means the agent never got to
-                // run, and retrying forever would spin.
+            if let Err(err) = self
+                .dispatch_task_to(state, &task.id, None, remote_only)
+                .await
+            {
                 if matches!(err, Error::Domain(DomainError::Workspace { .. })) {
                     self.record_workspace_dispatch_failure(state, &task.id, &all_tasks, &err)
                         .await;
                 }
                 self.emit_error(&err, format!("dispatch task {}", task.id));
             }
+            // A task waiting for an eligible agent consumes neither a slot
+            // nor a scope reservation. Keep looking down the ready queue.
+            if state.running.contains_key(&task.id) {
+                scope_index.add(task.scope.as_deref());
+            }
         }
         Ok(())
+    }
+
+    /// Whether an online remote agent has no running entry. The directory is
+    /// read once per pass into `cache`; a read error is reported and treated
+    /// as "none", which is the old full-slots behaviour: stop dispatching.
+    async fn has_idle_remote_agent(
+        &self,
+        state: &OrchestratorState,
+        cache: &mut Option<Vec<String>>,
+    ) -> bool {
+        if cache.is_none() {
+            let directory = orch_infra::storage::remote::RemoteAgentDirectory::new(
+                orch_infra::storage::Paths::new(self.deps().project_root.clone()),
+            );
+            let online = match directory.list(Vec::new()).await {
+                Ok(agents) => agents
+                    .into_iter()
+                    .filter(|agent| agent.remote.as_ref().is_some_and(|remote| remote.online))
+                    .map(|agent| agent.id)
+                    .collect(),
+                Err(err) => {
+                    self.emit_error(err, "list remote agents for dispatch".to_owned());
+                    Vec::new()
+                }
+            };
+            *cache = Some(online);
+        }
+        cache
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|id| !state.running.values().any(|entry| &entry.agent_id == id))
     }
 
     /// Increment the attempt, apply `resolve_failure_status`, and either
@@ -263,6 +297,19 @@ impl Orchestrator {
         task_id: &str,
         prefetched: Option<Task>,
     ) -> Result<()> {
+        self.dispatch_task_to(state, task_id, prefetched, false)
+            .await
+    }
+
+    /// [`Self::dispatch_task`], optionally limited to remote agents: the
+    /// scheduler's pass uses that once the local slots are full.
+    async fn dispatch_task_to(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        prefetched: Option<Task>,
+        remote_only: bool,
+    ) -> Result<()> {
         if let Some(entry) = state.running.get(task_id) {
             return Err(Error::Domain(DomainError::TaskAlreadyRunning {
                 task_id: task_id.to_owned(),
@@ -276,14 +323,15 @@ impl Orchestrator {
             None => self.deps().task_service.get(task_id).await?,
         };
         // It may have finished through another path while it sat in a queue.
-        if !is_dispatchable(task.status) {
+        // A task held for the owner's approval waits like a blocked one.
+        if !is_dispatchable(task.status) || task.awaits_approval() {
             return Ok(());
         }
 
         state.claimed.insert(task_id.to_owned());
         self.save_state(state).await?;
 
-        match self.dispatch_claimed(state, task).await {
+        match self.dispatch_claimed(state, task, remote_only).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 // The process never launched, so the claim and the token are
@@ -296,11 +344,38 @@ impl Orchestrator {
         }
     }
 
-    async fn dispatch_claimed(&self, state: &mut OrchestratorState, task: Task) -> Result<()> {
+    async fn dispatch_claimed(
+        &self,
+        state: &mut OrchestratorState,
+        task: Task,
+        remote_only: bool,
+    ) -> Result<()> {
         let task_id = task.id.clone();
 
-        let all_agents = self.inner.cached_agents.list().await?;
-        let Some(agent) = self.deps().agent_service.find_best_agent(&task).await? else {
+        let local_agents = self.inner.cached_agents.list().await?;
+        let directory = orch_infra::storage::remote::RemoteAgentDirectory::new(
+            orch_infra::storage::Paths::new(self.deps().project_root.clone()),
+        );
+        let all_agents = directory.list(local_agents).await?;
+        let claimed_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
+        let eligible_agents = all_agents
+            .iter()
+            .filter(|agent| {
+                (!remote_only || agent.remote.is_some())
+                    && !state
+                        .running
+                        .values()
+                        .any(|entry| entry.agent_id == agent.id)
+                    && !claimed_tasks.iter().any(|claimed| {
+                        claimed.id != task.id
+                            && state.claimed.contains(&claimed.id)
+                            && claimed.assignee.as_deref() == Some(agent.id.as_str())
+                    })
+            })
+            .cloned()
+            .collect();
+        let Some(agent) = crate::agent_service::AgentService::find_best_in(&task, eligible_agents)
+        else {
             if all_agents.is_empty() {
                 return Err(Error::Domain(DomainError::NoAgents));
             }
@@ -310,13 +385,16 @@ impl Orchestrator {
             return Ok(());
         };
 
-        let prepared = self
-            .deps()
-            .workspace
-            .prepare(&task, &agent, self.config())
-            .await?;
-        let workspace_path = prepared.path.clone();
-        let worktree_branch = prepared.branch.clone();
+        let (workspace_path, worktree_branch) = if let Some(remote) = &agent.remote {
+            (format!("remote:{}", remote.alias), None)
+        } else {
+            let prepared = self
+                .deps()
+                .workspace
+                .prepare(&task, &agent, self.config())
+                .await?;
+            (prepared.path, prepared.branch)
+        };
 
         let attempt = task.attempts + 1;
         let retry_context = if attempt > 1 {
@@ -341,6 +419,9 @@ impl Orchestrator {
                 }
             },
             async {
+                if agent.remote.is_some() {
+                    return Vec::new();
+                }
                 match self.deps().message_service.as_ref() {
                     Some(messages) => messages
                         .drain_mailbox(&agent.id, &task_id)
@@ -405,35 +486,64 @@ impl Orchestrator {
         // Split mode keeps the system half cacheable between runs; a
         // user-supplied `prompt.template` opts out of the split entirely.
         let prompt_config = self.config().prompt.clone().unwrap_or_default();
-        let (mut prompt, mut system_prompt) = match prompt_config.template.as_deref() {
-            Some(legacy) => (
-                self.deps().templates.render(legacy, &context).await?,
-                None::<String>,
-            ),
-            None => {
-                let system = self
-                    .deps()
-                    .templates
-                    .render(
-                        prompt_config
-                            .system_template
-                            .as_deref()
-                            .unwrap_or(DEFAULT_SYSTEM_TEMPLATE),
-                        &context,
-                    )
-                    .await?;
-                let user = self
-                    .deps()
-                    .templates
-                    .render(
-                        prompt_config
-                            .user_template
-                            .as_deref()
-                            .unwrap_or(DEFAULT_USER_TEMPLATE),
-                        &context,
-                    )
-                    .await?;
-                (user, Some(system))
+        let mirror_controller = task
+            .labels
+            .iter()
+            .find_map(|label| label.strip_prefix("remote:"))
+            .filter(|_| {
+                task.labels
+                    .iter()
+                    .any(|label| label.starts_with("remote-ctl:"))
+            });
+        let (mut prompt, mut system_prompt) = if let Some(controller) = mirror_controller {
+            let from = task
+                .labels
+                .iter()
+                .find_map(|label| label.strip_prefix("remote-from:"))
+                .unwrap_or("cli");
+            (
+                task.description.clone(),
+                Some(format!(
+                    "You are {}{}\n\n## Remote execution\nYou are executing a task delegated by `{controller}`.\nPaths refer to this machine; controller files are not available. If a required input is missing, fail and say so.\nDo not use `orch task add`, `orch goal`, or `orch context` here: they are not visible to the requester.\nTo ask the requester, run `orch msg send {from}@{controller} \"…\"`.\nPut your result in your final message.",
+                    agent.name,
+                    agent
+                        .role
+                        .as_ref()
+                        .map(|role| format!(" ({role})"))
+                        .unwrap_or_default()
+                )),
+            )
+        } else {
+            match prompt_config.template.as_deref() {
+                Some(legacy) => (
+                    self.deps().templates.render(legacy, &context).await?,
+                    None::<String>,
+                ),
+                None => {
+                    let system = self
+                        .deps()
+                        .templates
+                        .render(
+                            prompt_config
+                                .system_template
+                                .as_deref()
+                                .unwrap_or(DEFAULT_SYSTEM_TEMPLATE),
+                            &context,
+                        )
+                        .await?;
+                    let user = self
+                        .deps()
+                        .templates
+                        .render(
+                            prompt_config
+                                .user_template
+                                .as_deref()
+                                .unwrap_or(DEFAULT_USER_TEMPLATE),
+                            &context,
+                        )
+                        .await?;
+                    (user, Some(system))
+                }
             }
         };
 
@@ -485,6 +595,20 @@ impl Orchestrator {
             .increment_attempts(&task_id)
             .await?;
 
+        // A task explicitly reassigned back to this machine cannot carry a
+        // worker branch into local merge-back (including shared workspaces).
+        if agent.remote.is_none()
+            && let Some(mut fresh) = self.deps().task_store.get(&task_id).await?
+            && fresh
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.remote.is_some())
+        {
+            fresh.proof = None;
+            fresh.workspace = None;
+            self.deps().task_store.save(&fresh).await?;
+        }
+
         // Persist the branch immediately, re-reading first so the
         // `in_progress` status set above is not overwritten. Without this a
         // later failure loses the branch and its work with it.
@@ -496,6 +620,91 @@ impl Orchestrator {
             fresh.proof = Some(proof);
             fresh.workspace = Some(workspace_path.clone());
             self.deps().task_store.save(&fresh).await?;
+        }
+
+        if let Some(remote) = &agent.remote {
+            let now = self.deps().clock.now_iso();
+            let reference = orch_domain::RemoteRunRef {
+                alias: remote.alias.clone(),
+                exec_key: run.id.clone(),
+            };
+            self.deps().run_service.start(&run.id, 0).await?;
+            state.claimed.shift_remove(&task_id);
+            state.running.insert(
+                task_id.clone(),
+                RunningEntry {
+                    run_id: run.id.clone(),
+                    agent_id: agent.id.clone(),
+                    task_id: task_id.clone(),
+                    pid: 0,
+                    started_at: now.clone(),
+                    last_event_at: now,
+                    remote: Some(reference),
+                },
+            );
+            // Reservation and execution key must survive a controller crash
+            // before the worker is ever allowed to execute the request.
+            self.save_state(state).await?;
+            let cancel = self.register_cancel(&task_id).await;
+            let request = orch_core::remote::RemoteSubmit {
+                alias: remote.alias.clone(),
+                exec_key: run.id.clone(),
+                agent_id: agent
+                    .id
+                    .rsplit_once('@')
+                    .map(|(id, _)| id)
+                    .unwrap_or(&agent.id)
+                    .to_owned(),
+                from: task
+                    .labels
+                    .iter()
+                    .find_map(|label| label.strip_prefix("remote-from:"))
+                    .unwrap_or("cli")
+                    .to_owned(),
+                prompt,
+                title: task.title.clone(),
+                priority: task.priority,
+                review_criteria: task.review_criteria.clone().unwrap_or_default(),
+                goal_id: task.goal_id.clone(),
+            };
+            let auto_approve = task.is_autonomous()
+                || agent.config.approval_policy == Some(orch_domain::ApprovalPolicy::Auto);
+            self.inner
+                .active_collectors
+                .lock()
+                .await
+                .insert(task_id.clone());
+            // Enqueue before releasing the state lock, so a concurrent cancel
+            // cannot overtake initial submission. No network I/O occurs here.
+            let handle = self.remote_bridge().submit(request);
+            let orchestrator = self.clone();
+            tokio::spawn(async move {
+                let result = match handle {
+                    Ok(handle) => {
+                        orchestrator
+                            .collect_remote_events(
+                                handle.events,
+                                &run.id,
+                                &task_id,
+                                &agent.id,
+                                auto_approve,
+                                cancel,
+                            )
+                            .await
+                    }
+                    Err(err) => Err(err), // retain the durable entry pending sync
+                };
+                if let Err(err) = result {
+                    orchestrator.emit_error(err, format!("remote execution for {task_id}"));
+                }
+                orchestrator
+                    .inner
+                    .active_collectors
+                    .lock()
+                    .await
+                    .remove(&task_id);
+            });
+            return Ok(());
         }
 
         self.deps()
@@ -525,12 +734,25 @@ impl Orchestrator {
         env.insert("ORCH_AGENT_ID".into(), agent.id.clone());
         env.insert("ORCH_AGENT_NAME".into(), agent.name.clone());
         env.insert("ORCH_TASK_ID".into(), task_id.clone());
+        // Work submitted by a remote peer must not run with this machine's
+        // credentials (security review F2). The agent's own `config.env` is
+        // the owner's explicit choice and is still applied on top.
+        let inherit_env = if task
+            .labels
+            .iter()
+            .any(|label| label.starts_with("remote-ctl:"))
+        {
+            orch_core::process::EnvInheritance::WithoutSecrets
+        } else {
+            orch_core::process::EnvInheritance::Full
+        };
 
         let handle = adapter.execute(ExecuteParams {
             prompt,
             system_prompt,
             workspace: std::path::PathBuf::from(&workspace_path),
             env,
+            inherit_env,
             config: agent_data.config.clone(),
             cancel,
         })?;
@@ -549,6 +771,7 @@ impl Orchestrator {
                 pid,
                 started_at: now.clone(),
                 last_event_at: now,
+                remote: None,
             },
         );
         self.save_state(state).await?;
@@ -699,4 +922,13 @@ impl Orchestrator {
             self.inner.cached_tasks.invalidate_async().await;
         }
     }
+}
+
+/// Running entries that hold a local slot: everything except remote runs.
+fn local_running(state: &OrchestratorState) -> usize {
+    state
+        .running
+        .values()
+        .filter(|entry| entry.remote.is_none())
+        .count()
 }

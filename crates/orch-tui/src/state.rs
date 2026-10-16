@@ -380,6 +380,7 @@ pub fn agent_status_order(status: AgentStatus) -> u8 {
         AgentStatus::Idle => 1,
         AgentStatus::Error => 2,
         AgentStatus::Disabled => 3,
+        AgentStatus::Offline => 4,
     }
 }
 
@@ -402,6 +403,7 @@ pub struct AppState {
     pub goals: Vec<Goal>,
     pub teams: Vec<Team>,
     pub orch_state: OrchestratorState,
+    pub peer_status: String,
 
     // ── View ───────────────────────────────────────────────────────────────
     pub view: ViewId,
@@ -490,6 +492,7 @@ impl Default for AppState {
             height: 24,
             tasks: Vec::new(),
             agents: Vec::new(),
+            peer_status: "listen off · controller none".into(),
             goals: Vec::new(),
             teams: Vec::new(),
             orch_state: default_state(),

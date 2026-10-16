@@ -29,8 +29,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 /// Owner-only, for files that carry credentials or agent instructions.
 ///
-/// `config.yml` holds adapter commands and API-key environment names, and
-/// `agents/*.yml` hold the role prompts an agent is run with. Both are worth
+/// `config.yml` holds adapter commands and API-key environment names,
+/// `agents/*.yml` hold the role prompts an agent is run with, and `peer-id`
+/// plus everything under `remotes/` hold the peer session identity and remote
+/// agent snapshots (security review F3/F7). All are worth
 /// keeping out of a group- or world-readable project directory on a shared
 /// machine. Everything else keeps the process umask: changing the mode of
 /// `state.json` or the indexes would be churn without a secret to protect.
@@ -143,10 +145,19 @@ fn random_hex8() -> String {
 /// newline**. `serde_json::to_string_pretty` matches the indentation but omits
 /// the newline (PARITY.md §6.4).
 pub async fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_with_mode(path, value, None).await
+}
+
+/// `write_json`, with an explicit unix mode — see [`atomic_write_with_mode`].
+pub async fn write_json_with_mode<T: Serialize>(
+    path: &Path,
+    value: &T,
+    mode: Option<u32>,
+) -> Result<()> {
     let mut content = serde_json::to_string_pretty(value)
         .map_err(|err| Error::serde(format!("serialize {}", path.display()), path, err))?;
     content.push('\n');
-    atomic_write(path, &content).await
+    atomic_write_with_mode(path, &content, mode).await
 }
 
 /// Read and parse a JSON file. `None` when the file does not exist; a parse

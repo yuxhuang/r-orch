@@ -261,6 +261,53 @@ fn help_on_a_subcommand_works_once_the_project_exists() {
     }
 }
 
+#[test]
+fn remote_help_describes_every_subcommand_and_argument() {
+    let dir = initialized_project();
+    let help_of = |args: &[&str]| {
+        let output = orch(dir.path()).args(args).output().expect("run");
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        stdout_of(&output)
+    };
+    let parent = help_of(&["remote", "--help"]);
+    for sub in ["add", "remove", "list", "status", "listen"] {
+        let line = parent
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{sub} ")))
+            .unwrap_or_else(|| panic!("remote --help omits {sub}:\n{parent}"));
+        assert!(
+            !line.trim_start()[sub.len()..].trim().is_empty(),
+            "remote --help has no description for {sub}: {line:?}"
+        );
+    }
+    let add = help_of(&["remote", "add", "--help"]);
+    for needle in ["[a-z0-9][a-z0-9-]*", "7690", "host[:port]", "persist"] {
+        assert!(
+            add.contains(needle),
+            "remote add --help omits {needle}:\n{add}"
+        );
+    }
+    let remove = help_of(&["remote", "remove", "--help"]);
+    assert!(
+        remove.contains("<ALIAS>") && remove.contains("Alias"),
+        "{remove}"
+    );
+    let listen = help_of(&["remote", "listen", "--help"]);
+    for needle in [
+        "next engine start",
+        "127.0.0.1:7690",
+        "0.0.0.0:7690",
+        "no authentication",
+        "--listen",
+        "on, off",
+    ] {
+        assert!(
+            listen.contains(needle),
+            "remote listen --help omits {needle}:\n{listen}"
+        );
+    }
+}
+
 // ── Per-command exit codes from §3.7 ───────────────────────────────────────
 
 #[test]

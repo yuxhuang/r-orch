@@ -382,6 +382,7 @@ mod tests {
 
     fn running(run_id: &str) -> RunningEntry {
         RunningEntry {
+            remote: None,
             run_id: run_id.to_owned(),
             agent_id: "agt_1".to_owned(),
             task_id: "tsk_1".to_owned(),

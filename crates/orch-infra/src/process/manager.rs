@@ -24,8 +24,8 @@ use nix::errno::Errno;
 use nix::unistd::Pid;
 use orch_core::error::{Error, Result};
 use orch_core::process::{
-    ExitOutcome, ExitSignal, KILL_POLL_INTERVAL, ProcessManager, Signal, SpawnOptions,
-    SpawnedChild, StdioMode,
+    EnvInheritance, ExitOutcome, ExitSignal, KILL_POLL_INTERVAL, ProcessManager,
+    REMOTE_ENV_PASSTHROUGH, Signal, SpawnOptions, SpawnedChild, StdioMode, secret_env_names,
 };
 
 /// The real process manager. Stateless and cheap to clone.
@@ -139,6 +139,12 @@ impl ProcessManager for SystemProcessManager {
 
         if !opts.cwd.as_os_str().is_empty() {
             cmd.current_dir(&opts.cwd);
+        }
+        if opts.inherit_env == EnvInheritance::WithoutSecrets {
+            let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
+            for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
+                cmd.env_remove(name);
+            }
         }
         for (key, value) in &opts.env {
             cmd.env(key, value);

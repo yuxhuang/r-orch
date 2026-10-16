@@ -114,6 +114,7 @@ pub(crate) struct Harness {
 
 /// Builder, standing in for the TS `buildDeps(overrides)` spread.
 pub(crate) struct HarnessBuilder {
+    project_root: Option<std::path::PathBuf>,
     tasks: Vec<Task>,
     agents: Vec<Agent>,
     goals: Vec<Goal>,
@@ -144,6 +145,7 @@ impl Default for HarnessBuilder {
 impl HarnessBuilder {
     pub(crate) fn new() -> Self {
         HarnessBuilder {
+            project_root: None,
             tasks: Vec::new(),
             agents: Vec::new(),
             goals: Vec::new(),
@@ -187,6 +189,11 @@ impl HarnessBuilder {
     /// What every auto-review criterion reports.
     pub(crate) fn review_outcome(mut self, outcome: crate::review_runner::CommandOutcome) -> Self {
         self.review_outcome = outcome;
+        self
+    }
+
+    pub(crate) fn project_root(mut self, root: std::path::PathBuf) -> Self {
+        self.project_root = Some(root);
         self
     }
 
@@ -300,7 +307,7 @@ impl HarnessBuilder {
             None => {}
         }
 
-        let task_service = Arc::new(TaskService::new(
+        let mut task_service = TaskService::new(
             Arc::clone(&task_store),
             Arc::clone(&agent_store),
             Arc::clone(&bus),
@@ -308,7 +315,15 @@ impl HarnessBuilder {
             Arc::clone(&clock) as Arc<dyn Clock>,
             Arc::clone(&ids),
             None,
-        ));
+        );
+        if let Some(root) = &self.project_root {
+            task_service = task_service.with_remote_directory(
+                orch_infra::storage::remote::RemoteAgentDirectory::new(
+                    orch_infra::storage::Paths::new(root.clone()),
+                ),
+            );
+        }
+        let task_service = Arc::new(task_service);
         let agent_service = Arc::new(AgentService::new(
             Arc::clone(&agent_store),
             Arc::clone(&state) as Arc<dyn StateStore>,
@@ -356,7 +371,9 @@ impl HarnessBuilder {
             lock: Arc::clone(&lock) as Arc<dyn crate::lock::ProjectLock>,
             command_runner: Arc::clone(&commands) as Arc<dyn crate::review_runner::CommandRunner>,
             config: self.config.clone(),
-            project_root: std::path::PathBuf::from("/tmp/project"),
+            project_root: self
+                .project_root
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/project")),
             context_store: self
                 .with_context
                 .then(|| Arc::clone(&context) as Arc<dyn ContextStore>),
@@ -589,6 +606,7 @@ pub(crate) fn running_entry(
         agent_id: agent_id.into(),
         task_id: task_id.into(),
         pid,
+        remote: None,
         started_at: at.into(),
         last_event_at: at.into(),
     }

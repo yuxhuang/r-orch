@@ -12,14 +12,16 @@ pub enum AgentStatus {
     Running,
     Error,
     Disabled,
+    Offline,
 }
 
 impl AgentStatus {
-    pub const ALL: [AgentStatus; 4] = [
+    pub const ALL: [AgentStatus; 5] = [
         AgentStatus::Idle,
         AgentStatus::Running,
         AgentStatus::Error,
         AgentStatus::Disabled,
+        AgentStatus::Offline,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -28,6 +30,7 @@ impl AgentStatus {
             AgentStatus::Running => "running",
             AgentStatus::Error => "error",
             AgentStatus::Disabled => "disabled",
+            AgentStatus::Offline => "offline",
         }
     }
 }
@@ -195,6 +198,10 @@ pub struct Agent {
     pub stats: AgentStats,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<AgentLastError>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::remote::RemoteRef>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +259,8 @@ mod tests {
             autonomous: None,
             stats: AgentStats::default(),
             last_error: None,
+            capabilities: Vec::new(),
+            remote: None,
         };
 
         let json = serde_json::to_string_pretty(&agent).unwrap();

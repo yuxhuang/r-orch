@@ -3,7 +3,9 @@
 . "$(dirname "$0")/_common.sh"
 
 fake_handle_version "$@"
-prompt=$(fake_last_arg "$@")
+# The prompt arrives on stdin (see ClaudeAdapter); read it all so the writer
+# never sees a closed pipe.
+prompt=$(cat)
 scenario=$(fake_scenario "$prompt")
 reply=$(fake_reply)
 

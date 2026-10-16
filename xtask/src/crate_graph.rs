@@ -39,6 +39,12 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // then as a table naming three of the five non-test sites — so
     // `ENGINE_INFRA_SITES` below checks it instead of prose describing it.
     ("orch-engine", &["orch-core", "orch-domain", "orch-infra"]),
+    // Transport composes the engine and concrete peer persistence; the engine
+    // reaches it only through the network-independent bridge in orch-core.
+    (
+        "orch-peer",
+        &["orch-core", "orch-domain", "orch-engine", "orch-infra"],
+    ),
     // **Tighter than ARCHITECTURE §3.1's diagram**, which has the TUI
     // depending on the engine. WP-6 inverted it: everything the dashboard
     // needs goes through one trait, `orch_tui::backend::TuiBackend`, so the
@@ -59,6 +65,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "orch-domain",
             "orch-engine",
             "orch-infra",
+            "orch-peer",
             "orch-tui",
         ],
     ),
@@ -103,6 +110,22 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
         "the PID-file lock mechanism, re-exported so the engine's \
          `ProjectLock` impl is a thin wrapper rather than a second \
          implementation",
+    ),
+    (
+        "message_service.rs",
+        "remote recipient validation uses the explicitly opt-in RemoteAgentDirectory; AgentStore remains local",
+    ),
+    (
+        "orchestrator/tick.rs",
+        "reconcile reads the persistent remote registry to fail removed executions without retry",
+    ),
+    (
+        "orchestrator/tests/harness.rs",
+        "test assembly wires the explicit RemoteAgentDirectory to TaskService",
+    ),
+    (
+        "orchestrator/tests/remote.rs",
+        "remote lifecycle tests exercise real registry/status files and stale-lock guards",
     ),
     (
         "orchestrator/tests/skills.rs",

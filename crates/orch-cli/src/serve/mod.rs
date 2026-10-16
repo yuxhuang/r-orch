@@ -14,6 +14,7 @@
 pub mod disk_observer;
 pub mod logger;
 pub mod once;
+pub(crate) mod peer;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -142,31 +143,45 @@ pub async fn run_with(
 /// The only translation is the watch options: `serve` chooses whether to seed
 /// autonomous tasks, and always handles signals — it is a daemon, and
 /// `SIGTERM` from systemd or pm2 is its normal way to stop.
-struct EngineOrchestrator(Arc<orch_engine::Orchestrator>);
+struct EngineOrchestrator {
+    engine: Arc<orch_engine::FullEngine>,
+    peer_runtime: tokio::sync::Mutex<Option<orch_peer::PeerRuntime>>,
+}
 
 #[async_trait::async_trait]
 impl ServeOrchestrator for EngineOrchestrator {
     async fn start_watch(&self, skip_autonomous_seeding: bool) -> Result<()> {
-        self.0
-            .start_watch(orch_engine::WatchOptions {
+        let runtime = peer::start_watch(
+            Arc::clone(&self.engine),
+            orch_engine::WatchOptions {
                 skip_autonomous_seeding,
                 handle_signals: true,
-            })
-            .await
+            },
+        )
+        .await?;
+        *self.peer_runtime.lock().await = Some(runtime);
+        Ok(())
     }
 
     async fn stop(&self) -> Result<()> {
-        self.0.stop().await
+        let result = self.engine.orchestrator.stop().await;
+        self.peer_runtime.lock().await.take();
+        result
     }
 
     async fn wait_for_stop(&self) {
-        self.0.wait_for_stop().await;
+        self.engine.orchestrator.wait_for_stop().await;
+        self.peer_runtime.lock().await.take();
     }
 }
 
 /// The entry point the CLI calls, over the full container.
 pub async fn run(engine: orch_engine::FullEngine, args: ServeArgs) -> Result<ExitCode> {
-    let orchestrator = EngineOrchestrator(Arc::clone(&engine.orchestrator));
+    let engine = Arc::new(engine);
+    let orchestrator = EngineOrchestrator {
+        engine: Arc::clone(&engine),
+        peer_runtime: tokio::sync::Mutex::new(None),
+    };
     run_with(&orchestrator, &engine.engine, args).await
 }
 

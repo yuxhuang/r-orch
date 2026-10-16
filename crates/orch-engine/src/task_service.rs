@@ -13,12 +13,13 @@ use orch_core::error::{Error, Result};
 use orch_core::ids::IdGenerator;
 use orch_core::storage::{AgentStore, TaskFilter, TaskStore};
 use orch_domain::{
-    CreateTaskInput, DomainError, OrchestratorConfig, OrchestratorEvent, Task, TaskStatus,
-    can_transition, is_terminal,
+    AWAITING_APPROVAL_LABEL, CreateTaskInput, DomainError, OrchestratorConfig, OrchestratorEvent,
+    Task, TaskStatus, can_transition, is_terminal,
 };
 use orch_infra::storage::{Paths, fs_utils};
 
 use crate::events::EventBus;
+use orch_infra::storage::remote::RemoteAgentDirectory;
 
 /// Fields `task edit` may change. `None` leaves a field alone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub struct UpdateTaskFields {
 }
 
 pub struct TaskService {
+    remote_directory: Option<RemoteAgentDirectory>,
     tasks: Arc<dyn TaskStore>,
     agents: Arc<dyn AgentStore>,
     events: Arc<EventBus>,
@@ -56,6 +58,7 @@ impl TaskService {
         paths: Option<Paths>,
     ) -> Self {
         TaskService {
+            remote_directory: None,
             tasks,
             agents,
             events,
@@ -64,6 +67,11 @@ impl TaskService {
             ids,
             paths,
         }
+    }
+
+    pub fn with_remote_directory(mut self, directory: RemoteAgentDirectory) -> Self {
+        self.remote_directory = Some(directory);
+        self
     }
 
     pub async fn create(&self, input: CreateTaskInput) -> Result<Task> {
@@ -97,11 +105,22 @@ impl TaskService {
 
         let assignee = self.resolve_assignee(input.assignee.as_deref()).await?;
         let now = self.clock.now_iso();
+        let mirror = input
+            .labels
+            .as_ref()
+            .is_some_and(|labels| labels.iter().any(|label| label.starts_with("remote-ctl:")));
+        let description = input.description.as_deref().unwrap_or("");
+        let description = if mirror {
+            description
+        } else {
+            description.trim()
+        }
+        .to_owned();
 
         let mut task = Task {
             id: self.ids.generate("tsk"),
             title: input.title.trim().to_owned(),
-            description: input.description.as_deref().unwrap_or("").trim().to_owned(),
+            description,
             status: TaskStatus::Todo,
             priority,
             assignee,
@@ -178,6 +197,20 @@ impl TaskService {
         });
 
         Ok(task)
+    }
+
+    /// `orch task approve`. A `todo` task held by [`AWAITING_APPROVAL_LABEL`]
+    /// is released for dispatch (the hold is the only change); anything else
+    /// takes the ordinary `review → done` transition.
+    pub async fn approve(&self, id: &str) -> Result<Task> {
+        let mut task = self.get(id).await?;
+        if task.status == TaskStatus::Todo && task.awaits_approval() {
+            task.labels.retain(|label| label != AWAITING_APPROVAL_LABEL);
+            task.updated_at = self.clock.now_iso();
+            self.tasks.save(&task).await?;
+            return Ok(task);
+        }
+        self.update_status(id, TaskStatus::Done).await
     }
 
     /// Assign a task. `agent_id` may be an id or an exact agent name; the
@@ -281,7 +314,16 @@ impl TaskService {
             task.title = title.trim().to_owned();
         }
         if let Some(description) = fields.description.as_deref() {
-            task.description = description.trim().to_owned();
+            task.description = if task
+                .labels
+                .iter()
+                .any(|label| label.starts_with("remote-ctl:"))
+            {
+                description
+            } else {
+                description.trim()
+            }
+            .to_owned();
         }
         if let Some(priority) = fields.priority {
             if !(1..=4).contains(&priority) {
@@ -400,6 +442,19 @@ impl TaskService {
             return Ok(None);
         };
 
+        if assignee.contains('@') {
+            if let Some(directory) = &self.remote_directory
+                && let Some(agent) = directory
+                    .resolve(assignee, self.agents.list().await?)
+                    .await?
+            {
+                return Ok(Some(agent.id));
+            }
+            return Err(Error::invalid_arguments(format!(
+                "Unknown remote agent: {assignee}"
+            )));
+        }
+
         if assignee.starts_with("agt_") {
             return match self.agents.get(assignee).await? {
                 Some(agent) => Ok(Some(agent.id)),
@@ -500,6 +555,76 @@ mod tests {
     }
 
     // ── create ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mirror_task_description_is_preserved_verbatim() {
+        let h = harness(Vec::new());
+        let prompt = "  Controller prompt\n\nKeep exact spacing.\n";
+        let task = h
+            .service
+            .create(CreateTaskInput {
+                title: "mirror".into(),
+                description: Some(prompt.into()),
+                labels: Some(vec!["remote-ctl:controller".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.description, prompt);
+    }
+
+    #[tokio::test]
+    async fn remote_assignee_resolves_from_offline_directory() {
+        let mut h = harness(Vec::new());
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        let store = orch_infra::storage::remote::FileRemoteStore::new(paths.clone());
+        store
+            .add(orch_domain::RemoteConfig {
+                alias: "w1".into(),
+                addr: "worker:7690".into(),
+                added_at: "now".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .write_status(&orch_domain::RemoteStatus {
+                alias: "w1".into(),
+                addr: "worker:7690".into(),
+                online: false,
+                last_seen: None,
+                last_error: None,
+                peer_name: None,
+                instance_id: None,
+                os: Some("linux".into()),
+                agents: vec![make_agent()],
+            })
+            .await
+            .unwrap();
+        h.service = h
+            .service
+            .with_remote_directory(RemoteAgentDirectory::new(paths));
+        assert_eq!(
+            h.service
+                .resolve_assignee(Some("agt_test1@w1"))
+                .await
+                .unwrap(),
+            Some("agt_test1@w1".into())
+        );
+        assert_eq!(
+            h.service
+                .resolve_assignee(Some("TestAgent@w1"))
+                .await
+                .unwrap(),
+            Some("agt_test1@w1".into())
+        );
+        assert!(
+            h.service
+                .resolve_assignee(Some("agt_test1@missing"))
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn create_applies_the_documented_defaults() {
@@ -833,6 +958,61 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
         // Nothing was written.
         assert_eq!(h.tasks.peek("tsk_test1").unwrap().status, TaskStatus::Todo);
+    }
+
+    // ── approve ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn approve_releases_a_held_todo_task_without_changing_its_status() {
+        let h = seeded(vec![Task {
+            labels: vec!["exec:key".into(), AWAITING_APPROVAL_LABEL.into()],
+            ..make_task()
+        }]);
+        let mut sub = h.bus.subscribe();
+        let task = h.service.approve("tsk_test1").await.unwrap();
+        let stored = h.tasks.peek("tsk_test1").unwrap();
+        assert_eq!(
+            (
+                task.status,
+                stored.status,
+                stored.labels,
+                sub.try_drain().len()
+            ),
+            (
+                TaskStatus::Todo,
+                TaskStatus::Todo,
+                vec!["exec:key".to_owned()],
+                0
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_moves_a_reviewed_task_to_done() {
+        let h = seeded(vec![task_with("tsk_1", TaskStatus::Review)]);
+        h.service.approve("tsk_1").await.unwrap();
+        assert_eq!(h.tasks.peek("tsk_1").unwrap().status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn approve_still_refuses_an_unheld_todo_task() {
+        let h = seeded(vec![make_task()]);
+        let err = h.service.approve("tsk_test1").await.expect_err("rejected");
+        assert_eq!(
+            err.to_string(),
+            "Invalid transition for tsk_test1: todo → done"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_does_not_release_a_cancelled_held_task() {
+        let h = seeded(vec![Task {
+            status: TaskStatus::Cancelled,
+            labels: vec![AWAITING_APPROVAL_LABEL.into()],
+            ..make_task()
+        }]);
+        assert!(h.service.approve("tsk_test1").await.is_err());
+        assert!(h.tasks.peek("tsk_test1").unwrap().awaits_approval());
     }
 
     // ── assign ───────────────────────────────────────────────────────────

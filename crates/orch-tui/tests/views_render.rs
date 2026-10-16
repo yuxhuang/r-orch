@@ -772,6 +772,7 @@ fn v071_the_active_count_chip_renders_while_an_agent_runs() {
     backend.state.running.insert(
         "run_1".into(),
         RunningEntry {
+            remote: None,
             run_id: "run_1".into(),
             agent_id: "agt_1".into(),
             task_id: "tsk_1".into(),
@@ -817,6 +818,7 @@ fn v075_the_run_started_nudge_renders_without_a_hint() {
     backend.state.running.insert(
         "run_1".into(),
         RunningEntry {
+            remote: None,
             run_id: "run_1".into(),
             agent_id: "agt_1".into(),
             task_id: "tsk_1".into(),
@@ -1047,4 +1049,18 @@ fn v094_an_empty_progress_report_renders_no_progress_section() {
     let mut harness = harness_for(ViewId::Goals, backend);
     harness.press(KeyCode::Enter);
     harness.refute_text("progress");
+}
+
+#[test]
+fn remote_agents_show_capabilities_location_and_offline_state() {
+    let mut agent = make_agent("agt_1@w1", "worker@w1", AgentStatus::Offline);
+    agent.capabilities = vec!["linux".into()];
+    agent.remote = Some(orch_domain::RemoteRef {
+        alias: "w1".into(),
+        online: false,
+    });
+    let mut harness = harness_for(ViewId::Agents, FakeBackend::new().with_agents(vec![agent]));
+    harness.assert_text("OFFLINE");
+    harness.assert_text("CAPS:linux");
+    harness.assert_text("WHERE:w1 offline");
 }

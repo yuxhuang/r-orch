@@ -444,6 +444,7 @@ pub fn params(prompt: &str, workspace: &str) -> ExecuteParams {
         system_prompt: None,
         workspace: PathBuf::from(workspace),
         env: BTreeMap::new(),
+        inherit_env: Default::default(),
         config: AgentConfig::default(),
         cancel: CancellationToken::new(),
     }

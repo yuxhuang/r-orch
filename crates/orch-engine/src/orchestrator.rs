@@ -38,6 +38,7 @@
 mod collect;
 mod dispatch;
 mod recovery;
+mod remote;
 mod tick;
 
 #[cfg(test)]
@@ -93,6 +94,9 @@ const STALL_KILL_GRACE: Duration = Duration::from_millis(5_000);
 const MAX_AGENT_SUMMARY_LEN: usize = 2000;
 /// `last_error.message` cap.
 const MAX_LAST_ERROR_LEN: usize = 500;
+/// Per-wait budget for watch lifecycle synchronization. Expiry leaves the
+/// current cycle intact; callers may retry once startup/cleanup has progressed.
+const WATCH_LIFECYCLE_WAIT: Duration = Duration::from_secs(3);
 
 /// Everything the orchestrator needs. Mirrors the TS `OrchestratorDeps`, with
 /// `lockPath: string` replaced by an injected [`ProjectLock`] and the two
@@ -167,6 +171,16 @@ struct LazySave {
     timer: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Release waiters even if shutdown is cancelled or unwinds before cleanup ends.
+struct StopNotification(watch::Sender<bool>);
+
+impl Drop for StopNotification {
+    fn drop(&mut self) {
+        // Retain the value even when no waiter has subscribed yet.
+        self.0.send_replace(true);
+    }
+}
+
 struct Inner {
     deps: OrchestratorDeps,
 
@@ -184,10 +198,17 @@ struct Inner {
     /// Per-agent auto-seed cooldown. In-memory, as in TS — a restart reseeds.
     last_auto_seed_at: Mutex<HashMap<String, i64>>,
 
+    remote_state_dirty: AtomicBool,
+    remote_bridge: std::sync::RwLock<Arc<dyn orch_core::remote::RemoteBridge>>,
+    event_tap: std::sync::RwLock<Option<Arc<dyn orch_core::remote::RunEventTap>>>,
     lazy_save: Mutex<LazySave>,
     immediate_dispatch: Mutex<Option<tokio::task::JoinHandle<()>>>,
     watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 
+    /// Serializes watch starts, including joining the previous watch loop.
+    watch_start: Mutex<()>,
+    /// Serializes startup with the selection of a stop owner.
+    lifecycle: Mutex<()>,
     lock_acquired: AtomicBool,
     shutting_down: AtomicBool,
     tick_in_progress: AtomicBool,
@@ -195,9 +216,9 @@ struct Inner {
     consecutive_tick_failures: AtomicU32,
 
     /// Cancels the watch loop.
-    shutdown: CancellationToken,
-    /// Flips to `true` once `stop` has finished, releasing `wait_for_stop`.
-    stopped: watch::Sender<bool>,
+    shutdown: std::sync::Mutex<CancellationToken>,
+    /// Flips to `true` once `stop` completes or is aborted, releasing waiters.
+    stopped: std::sync::Mutex<watch::Sender<bool>>,
 
     /// Tick-scoped memoized reads. Invalidated at the top of every tick and of
     /// every `fresh_dispatch`.
@@ -236,6 +257,11 @@ impl Orchestrator {
 
         Orchestrator {
             inner: Arc::new(Inner {
+                remote_state_dirty: AtomicBool::new(false),
+                remote_bridge: std::sync::RwLock::new(Arc::new(
+                    orch_core::remote::NoopRemoteBridge,
+                )),
+                event_tap: std::sync::RwLock::new(None),
                 deps,
                 state: Mutex::new(None),
                 active_collectors: Mutex::new(HashSet::new()),
@@ -245,13 +271,15 @@ impl Orchestrator {
                 lazy_save: Mutex::new(LazySave::default()),
                 immediate_dispatch: Mutex::new(None),
                 watch_task: Mutex::new(None),
+                watch_start: Mutex::new(()),
+                lifecycle: Mutex::new(()),
                 lock_acquired: AtomicBool::new(false),
                 shutting_down: AtomicBool::new(false),
                 tick_in_progress: AtomicBool::new(false),
                 skip_autonomous_seeding: AtomicBool::new(false),
                 consecutive_tick_failures: AtomicU32::new(0),
-                shutdown: CancellationToken::new(),
-                stopped,
+                shutdown: std::sync::Mutex::new(CancellationToken::new()),
+                stopped: std::sync::Mutex::new(stopped),
                 cached_tasks,
                 cached_agents,
                 cached_goals,
@@ -318,12 +346,26 @@ impl Orchestrator {
     /// Replace the in-memory state from the store. Always called at the start
     /// of a critical section, never outside one.
     async fn load_state(&self, slot: &mut Option<OrchestratorState>) -> Result<()> {
+        // Do not reload an old running entry after an outcome's final write
+        // failed. Persist the in-memory removal before any tick can replace it.
+        if self.inner.remote_state_dirty.load(Ordering::SeqCst)
+            && let Some(state) = slot.as_ref()
+        {
+            self.save_state(state).await?;
+        }
         *slot = Some(self.deps().state_store.read().await?);
         Ok(())
     }
 
     async fn save_state(&self, state: &OrchestratorState) -> Result<()> {
-        self.deps().state_store.write(state).await
+        self.deps().state_store.write(state).await?;
+        self.inner.remote_state_dirty.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn save_remote_state(&self, state: &OrchestratorState) -> Result<()> {
+        self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+        self.save_state(state).await
     }
 
     /// Debounced write, for the non-critical `last_event_at` updates
@@ -410,6 +452,60 @@ impl Orchestrator {
     /// Returns once the loop is running — like the TS method, which sets an
     /// interval and resolves. Use [`Orchestrator::wait_for_stop`] to block.
     pub async fn start_watch(&self, options: WatchOptions) -> Result<()> {
+        self.start_watch_with(options, || async { Ok(()) }).await
+    }
+
+    /// Install owner-only runtime services after recovery and before the first
+    /// dispatch. A failed setup releases the owner lock like any startup error.
+    pub async fn start_watch_with<F, Fut>(&self, options: WatchOptions, prepare: F) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let _start = self
+            .wait_for_watch_lifecycle("watch start", self.inner.watch_start.lock())
+            .await?;
+        let mut lifecycle = self
+            .wait_for_watch_lifecycle("watch startup", self.inner.lifecycle.lock())
+            .await?;
+        if self.is_shutting_down() {
+            let stopped = self
+                .inner
+                .stopped
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .subscribe();
+            drop(lifecycle);
+            self.wait_for_watch_lifecycle("previous shutdown", Self::wait_for_completion(stopped))
+                .await?;
+            // An interrupted stop releases waiters, but may leave resources
+            // owned. Do not turn incomplete cleanup into a fresh watch cycle.
+            if self.is_owner() {
+                return Err(Error::other(
+                    "Previous orchestrator shutdown did not complete",
+                ));
+            }
+            // stop cannot join its own watch task (signals and the circuit
+            // breaker run there). Join it here before resetting the lifecycle,
+            // so its final tick, stop calls and subscription cannot outlive it.
+            {
+                let mut previous = self
+                    .wait_for_watch_lifecycle("previous watch handle", self.inner.watch_task.lock())
+                    .await?;
+                if let Some(task) = previous.as_mut() {
+                    // Poll in place: timeout or caller cancellation must retain
+                    // the old task, so a retry cannot start an overlapping loop.
+                    let _ = self
+                        .wait_for_watch_lifecycle("previous watch loop", task)
+                        .await?;
+                    previous.take();
+                }
+            }
+            lifecycle = self
+                .wait_for_watch_lifecycle("watch restart", self.inner.lifecycle.lock())
+                .await?;
+        }
+        let _lifecycle = lifecycle;
         self.inner
             .skip_autonomous_seeding
             .store(options.skip_autonomous_seeding, Ordering::SeqCst);
@@ -419,6 +515,20 @@ impl Orchestrator {
             return Err(Error::Domain(DomainError::LockConflict(outcome.pid)));
         }
         self.inner.lock_acquired.store(true, Ordering::SeqCst);
+        if self.is_shutting_down() {
+            *self
+                .inner
+                .shutdown
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = CancellationToken::new();
+            // Each cycle has its own completion channel. Existing waiters keep
+            // the completed channel even if a new watch starts before they run.
+            *self.inner.stopped.lock().unwrap_or_else(|e| e.into_inner()) = watch::channel(false).0;
+            self.inner.shutting_down.store(false, Ordering::SeqCst);
+            self.inner
+                .consecutive_tick_failures
+                .store(0, Ordering::SeqCst);
+        }
 
         // **Installed before the first tick**, which is the whole point: until
         // these exist, `SIGTERM` and `SIGINT` keep their default disposition —
@@ -448,16 +558,22 @@ impl Orchestrator {
         // Reactive dispatch: a task created by any process in this binary
         // should not wait for the next poll.
         let reactive = self.clone();
-        let unsubscribe = self.deps().events.on(
+        let mut unsubscribe = Some(self.deps().events.on(
             orch_domain::OrchestratorEventType::TaskCreated,
             move |_event| {
                 reactive.schedule_immediate_dispatch(0);
             },
-        );
+        ));
 
-        match self.start_watch_prepared(signals, unsubscribe).await {
+        match self
+            .start_watch_prepared(signals, &mut unsubscribe, prepare)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(err) => {
+                if let Some(unsubscribe) = unsubscribe.take() {
+                    unsubscribe.unsubscribe();
+                }
                 self.inner.lock_acquired.store(false, Ordering::SeqCst);
                 self.deps().lock.release().await;
                 Err(err)
@@ -467,11 +583,16 @@ impl Orchestrator {
 
     /// The fallible half of [`Orchestrator::start_watch`], split out so one
     /// `match` can release the lock on every error path.
-    async fn start_watch_prepared(
+    async fn start_watch_prepared<F, Fut>(
         &self,
         signals: SignalArms,
-        unsubscribe: crate::events::Unsubscribe,
-    ) -> Result<()> {
+        unsubscribe: &mut Option<crate::events::Unsubscribe>,
+        prepare: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         {
             let mut slot = self.inner.state.lock().await;
             self.load_state(&mut slot).await?;
@@ -489,8 +610,9 @@ impl Orchestrator {
             self.save_state(state).await?;
         }
 
+        prepare().await?;
         self.tick_once().await?;
-        self.spawn_watch_loop(signals, unsubscribe);
+        self.spawn_watch_loop(signals, unsubscribe).await?;
         Ok(())
     }
 
@@ -516,13 +638,34 @@ impl Orchestrator {
         }
     }
 
-    /// Resolves once [`Orchestrator::stop`] has completed. Returns immediately
-    /// when shutdown has already begun, matching the TS `waitForStop`.
+    /// Resolves once stop has completed (or the orchestrator is dropped).
+    /// Cancellation or panic in [`Orchestrator::stop`] also releases waiters;
+    /// in that case cleanup may be incomplete.
     pub async fn wait_for_stop(&self) {
-        if self.is_shutting_down() {
-            return;
-        }
-        let mut stopped = self.inner.stopped.subscribe();
+        let stopped = self
+            .inner
+            .stopped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .subscribe();
+        Self::wait_for_completion(stopped).await;
+    }
+
+    async fn wait_for_watch_lifecycle<T>(
+        &self,
+        context: &'static str,
+        wait: impl Future<Output = T>,
+    ) -> Result<T> {
+        tokio::time::timeout(WATCH_LIFECYCLE_WAIT, wait)
+            .await
+            .map_err(|_| {
+                let error = Error::other(format!("Timed out waiting for {context}"));
+                self.emit_error(&error, context);
+                error
+            })
+    }
+
+    async fn wait_for_completion(mut stopped: watch::Receiver<bool>) {
         while !*stopped.borrow_and_update() {
             if stopped.changed().await.is_err() {
                 return;
@@ -541,33 +684,61 @@ impl Orchestrator {
         }
     }
 
-    /// Stop the loop and clean up. Idempotent.
+    /// Stop the loop and clean up. Idempotent: the first call owns the
+    /// cleanup; every other call — concurrent or later — returns `Ok(())` only
+    /// once the owner's cleanup has completed (see
+    /// [`Orchestrator::wait_for_stop`]), so a caller may drop the peer runtime
+    /// or exit as soon as it returns. Only the owner sees a cleanup error.
     ///
     /// Every running agent is aborted, killed with a 10 s grace, its run
     /// finished as `cancelled` and its task sent to `resolve_failure_status` so
     /// it retries if budget remains (PARITY.md §7.14).
+    ///
+    /// The in-engine callers — the signal arm and the tick circuit breaker —
+    /// may be non-owners and then wait inside the watch task. That cannot
+    /// deadlock: both call from the watch loop's select body with no lock,
+    /// guard or tick in flight, and the owner's cleanup never awaits the watch
+    /// task (the next start joins it instead).
     pub async fn stop(&self) -> Result<()> {
+        let lifecycle = self
+            .wait_for_watch_lifecycle("watch stop", self.inner.lifecycle.lock())
+            .await?;
+        let stopped = self
+            .inner
+            .stopped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
+            drop(lifecycle);
+            Self::wait_for_completion(stopped.subscribe()).await;
             return Ok(());
         }
+        let _stopped = StopNotification(stopped);
+        drop(lifecycle);
 
         // `clearInterval(this.timer)`: stop *future* ticks and let the one in
-        // flight finish. The handle is dropped rather than aborted, for two
-        // reasons found the hard way.
+        // flight finish. Retain the handle for the next start to join, rather
+        // than awaiting or aborting it here, for two reasons found the hard way.
         //
         // Aborting it cancels the caller: both the signal arms and the tick
         // circuit breaker call `stop()` **from inside the watch task**, so
         // the abort would land at the next await that pends — the state save,
-        // before the lock release and before `stopped.send(true)` — leaving
-        // `wait_for_stop` waiting forever, which is `serve` ignoring SIGTERM.
+        // before the lock release — releasing `wait_for_stop` with cleanup
+        // still incomplete.
         //
         // Aborting it also cancels whatever the *tick* is doing, and a tick
         // cancelled between `atomic_write`'s temp file and its rename leaves
         // `.orchestry/.state.json.<hash>.tmp` behind — litter the reference
         // cannot produce, because `clearInterval` cannot interrupt a running
         // callback.
-        self.inner.shutdown.cancel();
-        let _ = self.inner.watch_task.lock().await.take();
+        self.inner
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
+        // Synchronize with installation without awaiting the task itself.
+        drop(self.inner.watch_task.lock().await);
         if let Some(timer) = self.inner.immediate_dispatch.lock().await.take() {
             timer.abort();
         }
@@ -580,26 +751,27 @@ impl Orchestrator {
         // tick circuit breaker calls `stop()` precisely when the state store
         // is the thing that is broken. The error is still returned, so a
         // caller sees it; it just no longer costs the lock.
-        let saved = {
+        let (saved, deferred) = {
             let mut slot = self.inner.state.lock().await;
             match slot.as_mut() {
                 Some(state) => {
-                    self.shutdown_running_entries(state).await;
+                    let deferred = self.shutdown_running_entries(state).await;
                     state.running.clear();
                     state.claimed.clear();
                     state.pid = None;
                     state.started_at = None;
-                    self.save_state(state).await
+                    (self.save_state(state).await, deferred)
                 }
-                None => Ok(()),
+                None => (Ok(()), Vec::new()),
             }
         };
+
+        self.drain_remote_cancellations(deferred).await;
 
         if self.inner.lock_acquired.swap(false, Ordering::SeqCst) {
             self.deps().lock.release().await;
         }
 
-        let _ = self.inner.stopped.send(true);
         if let Err(err) = &saved {
             self.emit_error(err, "stop: persist the cleared state");
         }
@@ -623,11 +795,20 @@ impl Orchestrator {
 
         let entry = state.running.get(task_id).cloned();
         if let Some(entry) = entry {
+            if self.worker_signal_unverified(&entry).await {
+                return Err(orch_core::error::Error::other(
+                    "Worker execution ownership cannot verify; not signalled; reservation retained",
+                ));
+            }
             self.take_cancel(task_id).await;
-            self.deps()
-                .processes
-                .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
-                .await;
+            if let Some(remote) = &entry.remote {
+                self.cancel_remote(remote).await;
+            } else {
+                self.deps()
+                    .processes
+                    .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
+                    .await;
+            }
             if let Err(err) = self
                 .deps()
                 .run_service
@@ -636,11 +817,12 @@ impl Orchestrator {
             {
                 self.emit_error(err, format!("cancelTask finish run {}", entry.run_id));
             }
-            if let Err(err) = self
-                .deps()
-                .agent_service
-                .set_status(&entry.agent_id, orch_domain::AgentStatus::Idle)
-                .await
+            if entry.remote.is_none()
+                && let Err(err) = self
+                    .deps()
+                    .agent_service
+                    .set_status(&entry.agent_id, orch_domain::AgentStatus::Idle)
+                    .await
             {
                 self.emit_error(
                     err,
@@ -692,11 +874,20 @@ impl Orchestrator {
             .collect();
 
         for (task_id, entry) in owned {
+            if self.worker_signal_unverified(&entry).await {
+                return Err(orch_core::error::Error::other(
+                    "Worker execution ownership cannot verify; not signalled; reservation retained",
+                ));
+            }
             self.take_cancel(&task_id).await;
-            self.deps()
-                .processes
-                .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
-                .await;
+            if let Some(remote) = &entry.remote {
+                self.cancel_remote(remote).await;
+            } else {
+                self.deps()
+                    .processes
+                    .kill_with_grace(entry.pid, CANCEL_KILL_GRACE)
+                    .await;
+            }
             self.deps()
                 .run_service
                 .finish(&entry.run_id, orch_domain::RunStatus::Cancelled, None, None)
@@ -711,10 +902,12 @@ impl Orchestrator {
             state.running.shift_remove(&task_id);
         }
 
-        self.deps()
-            .agent_service
-            .set_status(agent_id, orch_domain::AgentStatus::Idle)
-            .await?;
+        if !agent_id.contains('@') {
+            self.deps()
+                .agent_service
+                .set_status(agent_id, orch_domain::AgentStatus::Idle)
+                .await?;
+        }
         self.save_state(state).await
     }
 
@@ -746,10 +939,24 @@ impl Orchestrator {
 
     // ── watch loop ───────────────────────────────────────────────────────
 
-    fn spawn_watch_loop(&self, signals: SignalArms, unsubscribe: crate::events::Unsubscribe) {
+    async fn spawn_watch_loop(
+        &self,
+        signals: SignalArms,
+        unsubscribe: &mut Option<crate::events::Unsubscribe>,
+    ) -> Result<()> {
+        // Acquire before spawning: installation failure must not detach a loop.
+        let mut watch_task = self
+            .wait_for_watch_lifecycle("watch loop installation", self.inner.watch_task.lock())
+            .await?;
+        let unsubscribe = unsubscribe.take().expect("startup subscription");
         let orchestrator = self.clone();
         let interval_ms = self.config().scheduling.poll_interval_ms.max(1);
-        let shutdown = self.inner.shutdown.clone();
+        let shutdown = self
+            .inner
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
@@ -767,6 +974,8 @@ impl Orchestrator {
 
             loop {
                 tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
                     _ = ticker.tick() => {
                         match orchestrator.tick_once().await {
                             Ok(()) => {
@@ -782,16 +991,13 @@ impl Orchestrator {
                         orchestrator.handle_signal(signal).await;
                         break;
                     }
-                    _ = shutdown.cancelled() => break,
                 }
             }
             unsubscribe.unsubscribe();
         });
 
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            *inner.watch_task.lock().await = Some(task);
-        });
+        *watch_task = Some(task);
+        Ok(())
     }
 
     /// The circuit breaker: five consecutive rejections shut the orchestrator

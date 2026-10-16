@@ -118,6 +118,8 @@ pub struct FakeBackend {
     pub clipboard: ClipboardPaste,
     /// When set, the next fallible call fails with this message.
     pub fail_next: Option<String>,
+    /// The header's peer line, as [`TuiBackend::peer_status`] reports it now.
+    pub peer_status: Option<String>,
     pub can_create_task: bool,
     pub can_add_agent: bool,
     pub can_create_goal: bool,
@@ -145,6 +147,7 @@ impl FakeBackend {
             goal_progress_report: String::new(),
             clipboard: ClipboardPaste::Empty,
             fail_next: None,
+            peer_status: None,
             can_create_task: true,
             can_add_agent: true,
             can_create_goal: true,
@@ -235,6 +238,8 @@ pub fn make_task(id: &str, title: &str, status: TaskStatus) -> Task {
 
 pub fn make_agent(id: &str, name: &str, status: AgentStatus) -> Agent {
     Agent {
+        capabilities: Vec::new(),
+        remote: None,
         id: id.into(),
         name: name.into(),
         adapter: "claude".into(),
@@ -660,6 +665,13 @@ impl TuiBackend for FakeBackend {
         self.calls.push(Call::GoalProgress(id.into()));
         self.check_failure()?;
         Ok(self.goal_progress_report.clone())
+    }
+
+    fn peer_status(&mut self) -> BackendResult<String> {
+        Ok(self
+            .peer_status
+            .clone()
+            .unwrap_or_else(|| "listen off · controller none".into()))
     }
 
     /// Mirrors the two refusals the real service can produce before it writes

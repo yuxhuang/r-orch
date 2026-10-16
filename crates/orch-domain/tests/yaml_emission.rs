@@ -113,6 +113,8 @@ fn an_agent_env_map_round_trips_in_declaration_order() {
         autonomous: None,
         stats: AgentStats::default(),
         last_error: None,
+        capabilities: Vec::new(),
+        remote: None,
     };
     let yaml = serde_yaml_ng::to_string(&agent).expect("serializes");
     let zzz = yaml.find("ZZZ").expect("ZZZ present");

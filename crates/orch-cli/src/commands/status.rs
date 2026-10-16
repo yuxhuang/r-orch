@@ -297,6 +297,7 @@ mod tests {
         state.running.insert(
             "run_1".to_owned(),
             orch_domain::RunningEntry {
+                remote: None,
                 run_id: "run_1".to_owned(),
                 agent_id: "agt_1".to_owned(),
                 task_id: "tsk_1".to_owned(),

@@ -178,6 +178,10 @@ pub trait TuiBackend {
 
     fn context(&self) -> LaunchContext;
 
+    fn peer_status(&mut self) -> BackendResult<String> {
+        Ok("listen off · controller none".into())
+    }
+
     // ── Capability flags ───────────────────────────────────────────────────
     //
     // The TS App keys several bindings off "was this callback passed?"

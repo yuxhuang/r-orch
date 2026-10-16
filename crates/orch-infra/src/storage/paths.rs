@@ -38,6 +38,18 @@ impl Paths {
         self.root().join("config.yml")
     }
 
+    pub fn remotes_path(&self) -> PathBuf {
+        self.root().join("remotes.yml")
+    }
+
+    pub fn remotes_dir(&self) -> PathBuf {
+        self.root().join("remotes")
+    }
+
+    pub fn peer_id_path(&self) -> PathBuf {
+        self.root().join("peer-id")
+    }
+
     pub fn state_path(&self) -> PathBuf {
         self.root().join("state.json")
     }

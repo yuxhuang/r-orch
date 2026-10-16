@@ -252,6 +252,7 @@ impl Adapter for ShellAdapter {
                 cwd: params.workspace,
                 env,
                 stdin: StdioMode::Ignore,
+                inherit_env: params.inherit_env,
             },
             StderrPolicy::Stream,
             &params.cancel,

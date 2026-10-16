@@ -77,6 +77,8 @@ pub fn make_agent() -> Agent {
             tokens_used: None,
         },
         last_error: None,
+        capabilities: Vec::new(),
+        remote: None,
     }
 }
 
@@ -93,6 +95,7 @@ pub fn make_run() -> Run {
         prompt: "do stuff".into(),
         pid: None,
         error: None,
+        error_kind: None,
         tokens: None,
     }
 }

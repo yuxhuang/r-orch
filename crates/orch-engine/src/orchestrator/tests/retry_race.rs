@@ -122,6 +122,7 @@ async fn the_failure_handler_returns_early_when_the_entry_is_already_gone() {
         pid: 99999,
         started_at: NOW_ISO.into(),
         last_event_at: NOW_ISO.into(),
+        remote: None,
     };
     h.orchestrator
         .handle_run_failure("tsk_race", &entry, "stall", None)

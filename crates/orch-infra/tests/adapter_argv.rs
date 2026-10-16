@@ -57,7 +57,15 @@ fn matrix() -> Vec<(&'static str, ExecuteParams)> {
 
 fn describe(case: &str, record: &SpawnRecord) -> String {
     let mut out = format!("[{case}]\ncommand: {}\n", record.command);
+    let mut previous = "";
     for (index, arg) in record.args.iter().enumerate() {
+        // The claude system prompt file has a random per-run name.
+        let arg = if previous == "--system-prompt-file" {
+            "<system-prompt-file>"
+        } else {
+            arg
+        };
+        previous = &record.args[index];
         out.push_str(&format!("  argv[{}]: {arg:?}\n", index + 1));
     }
     out.push_str(&format!("cwd: {}\n", record.cwd.display()));

@@ -791,6 +791,7 @@ impl Adapter for PiAdapter {
                 cwd: params.workspace,
                 env: params.env,
                 stdin: StdioMode::Pipe,
+                inherit_env: params.inherit_env,
             },
             // The tail surfaces auth and extension-load failures on a non-zero
             // exit instead of silently discarding them.

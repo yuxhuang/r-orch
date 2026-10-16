@@ -18,6 +18,7 @@ use orch_domain::{
 };
 
 use crate::events::EventBus;
+use orch_infra::storage::remote::RemoteAgentDirectory;
 
 /// The one sender that need not be a registered agent: a message sent by the
 /// human through the CLI (`message-service.ts:37`, PARITY.md §7.16).
@@ -29,6 +30,8 @@ const SUBJECT_MAX_UNITS: usize = 200;
 const BODY_MAX_UNITS: usize = 4000;
 
 pub struct MessageService {
+    remote_directory: Option<RemoteAgentDirectory>,
+    ingest_lock: tokio::sync::Mutex<()>,
     messages: Arc<dyn MessageStore>,
     agents: Arc<dyn AgentStore>,
     teams: Arc<dyn TeamStore>,
@@ -47,6 +50,8 @@ impl MessageService {
         ids: Arc<dyn IdGenerator>,
     ) -> Self {
         MessageService {
+            remote_directory: None,
+            ingest_lock: tokio::sync::Mutex::new(()),
             messages,
             agents,
             teams,
@@ -54,6 +59,52 @@ impl MessageService {
             clock,
             ids,
         }
+    }
+
+    pub fn with_remote_directory(mut self, directory: RemoteAgentDirectory) -> Self {
+        self.remote_directory = Some(directory);
+        self
+    }
+
+    /// Store a forwarded direct message once. `peer` is supplied by the link,
+    /// never trusted from the remote frame. Returns false for a duplicate id.
+    pub async fn ingest_incoming(&self, peer: &str, mut message: Message) -> Result<bool> {
+        let _guard = self.ingest_lock.lock().await;
+        if self.messages.get(&message.id).await?.is_some() {
+            return Ok(false);
+        }
+        let recipient = message
+            .to_agent_id
+            .as_deref()
+            .ok_or_else(|| Error::invalid_arguments("Incoming message requires a recipient"))?;
+        if recipient.contains('@')
+            || (recipient != CLI_SENDER_ID && self.agents.get(recipient).await?.is_none())
+        {
+            return Err(Error::invalid_arguments(
+                "Incoming message recipient must be a local agent",
+            ));
+        }
+        if peer.is_empty()
+            || peer.contains('@')
+            || message.from_agent_id.is_empty()
+            || message.from_agent_id.contains('@')
+        {
+            return Err(Error::invalid_arguments("Invalid incoming message sender"));
+        }
+        message.from_agent_id = format!("{}@{peer}", message.from_agent_id);
+        message.channel = MessageChannel::Direct;
+        message.status = MessageStatus::Pending;
+        message.delivered_at = None;
+        message.team_id = None;
+        message.subject = truncate_utf16(&message.subject, SUBJECT_MAX_UNITS);
+        message.body = truncate_utf16(&message.body, BODY_MAX_UNITS);
+        message.created_at = self.clock.now_iso();
+        message.expires_at = Some(iso_from_epoch_ms(
+            self.clock.now_ms() + DEFAULT_MESSAGE_TTL_MS as i64,
+        ));
+        self.messages.save(&message).await?;
+        self.emit_sent(&message);
+        Ok(true)
     }
 
     /// Send a message, returning every record created.
@@ -202,7 +253,13 @@ impl MessageService {
                 "to_agent_id is required for direct messages",
             ));
         };
-        if self.agents.get(to_agent_id).await?.is_none() {
+        let remote_recipient = match &self.remote_directory {
+            Some(directory) if to_agent_id.contains('@') => {
+                directory.accepts_recipient(to_agent_id).await?
+            }
+            _ => false,
+        };
+        if !remote_recipient && self.agents.get(to_agent_id).await?.is_none() {
             return Err(Error::invalid_arguments(format!(
                 "Recipient agent not found: {to_agent_id}"
             )));
@@ -218,6 +275,9 @@ impl MessageService {
     /// failure between `mark_delivered` and the prompt loses the message. The
     /// TS has the same window.
     pub async fn drain_mailbox(&self, agent_id: &str, task_id: &str) -> Result<Vec<Message>> {
+        if agent_id.contains('@') {
+            return Ok(Vec::new());
+        }
         let pending = self.messages.list_pending(agent_id).await?;
 
         for message in &pending {
@@ -333,6 +393,89 @@ mod tests {
     use orch_domain::{
         Agent, OrchestratorEventType, Team, TeamConfig, TeamMember, TeamMemberRole, TeamStatus,
     };
+
+    #[tokio::test]
+    async fn configured_remote_recipient_stays_in_outbox() {
+        let mut h = harness();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = orch_infra::storage::Paths::new(temp.path());
+        orch_infra::storage::remote::FileRemoteStore::new(paths.clone())
+            .add(orch_domain::RemoteConfig {
+                alias: "w1".into(),
+                addr: "127.0.0.1:7690".into(),
+                added_at: TIMESTAMP.into(),
+            })
+            .await
+            .unwrap();
+        h.service = h
+            .service
+            .with_remote_directory(RemoteAgentDirectory::new(paths));
+        let mut message = input(MessageChannel::Direct, "cli", "hello worker");
+        message.to_agent_id = Some("agt_worker@w1".into());
+        let sent = h.service.send(message).await.unwrap();
+        assert_eq!(sent[0].status, MessageStatus::Pending);
+        assert!(
+            h.service
+                .drain_mailbox("agt_worker@w1", "tsk_test")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            h.messages.get(&sent[0].id).await.unwrap().unwrap().status,
+            MessageStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_message_rejects_overlay_recipient_and_sender() {
+        let h = harness();
+        assert!(
+            h.service
+                .ingest_incoming(
+                    "worker",
+                    pending("msg_1", "agt_sender", "agt_receiver@other", TIMESTAMP)
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            h.service
+                .ingest_incoming(
+                    "worker",
+                    pending("msg_2", "agt_sender@other", "agt_receiver", TIMESTAMP)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(saves(&h.messages), 0);
+    }
+
+    #[tokio::test]
+    async fn incoming_message_is_deduplicated_after_delivery() {
+        let h = harness();
+        let message = pending("msg_remote", "agt_sender", "agt_receiver", TIMESTAMP);
+        assert!(
+            h.service
+                .ingest_incoming("controller", message.clone())
+                .await
+                .unwrap()
+        );
+        h.service
+            .drain_mailbox("agt_receiver", "tsk_test")
+            .await
+            .unwrap();
+        assert!(
+            !h.service
+                .ingest_incoming("controller", message)
+                .await
+                .unwrap()
+        );
+        let saved = h.messages.get("msg_remote").await.unwrap().unwrap();
+        assert_eq!(saved.from_agent_id, "agt_sender@controller");
+        assert_eq!(saved.status, MessageStatus::Delivered);
+        assert_eq!(saves(&h.messages), 1);
+    }
 
     #[test]
     fn truncation_stops_at_the_last_whole_character() {

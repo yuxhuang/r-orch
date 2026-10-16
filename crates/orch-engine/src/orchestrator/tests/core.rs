@@ -106,6 +106,37 @@ async fn run_task_does_not_reactive_dispatch_the_other_ready_tasks() {
 }
 
 #[tokio::test]
+async fn a_task_awaiting_approval_is_never_dispatched_until_released() {
+    let held = Task {
+        labels: vec![orch_domain::AWAITING_APPROVAL_LABEL.into()],
+        ..task_at("tsk_1", TaskStatus::Todo)
+    };
+    let h = Harness::builder()
+        .tasks([held])
+        .agents([agent_at("agt_1", AgentStatus::Idle)])
+        .adapter(done_adapter())
+        .build();
+
+    h.orchestrator.run_all().await.unwrap();
+    h.orchestrator.run_task("tsk_1").await.unwrap();
+    assert_eq!(
+        (h.task("tsk_1").status, h.runs.snapshot().len()),
+        (TaskStatus::Todo, 0)
+    );
+
+    h.orchestrator
+        .deps()
+        .task_service
+        .approve("tsk_1")
+        .await
+        .unwrap();
+    h.orchestrator.run_task("tsk_1").await.unwrap();
+    h.wait_for(|h| h.task("tsk_1").status == TaskStatus::Done)
+        .await;
+    assert_eq!(h.runs.snapshot().len(), 1);
+}
+
+#[tokio::test]
 async fn cancel_task_takes_a_temporary_lock_when_it_does_not_own_one() {
     let h = Harness::builder().build();
     h.orchestrator.cancel_task("tsk_1").await.unwrap();
@@ -295,6 +326,93 @@ async fn reconcile_drops_a_running_entry_whose_task_is_already_terminal() {
 
     assert!(!h.persisted_state().running.contains_key("tsk_dead"));
     assert_eq!(h.agent("agt_test1").status, AgentStatus::Idle);
+}
+
+/// Keeps its stream open until the run's cancellation token fires, the way a
+/// real adapter's child keeps working until the cancel path kills it.
+#[derive(Default)]
+struct CancelAwareAdapter {
+    tokens: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>,
+}
+
+#[async_trait::async_trait]
+impl orch_core::adapter::Adapter for CancelAwareAdapter {
+    fn kind(&self) -> &'static str {
+        "shell"
+    }
+
+    async fn test(&self) -> orch_core::adapter::AdapterTestResult {
+        orch_core::adapter::AdapterTestResult::ok("1.0.0")
+    }
+
+    fn execute(
+        &self,
+        params: orch_core::adapter::ExecuteParams,
+    ) -> std::result::Result<orch_core::adapter::ExecuteHandle, orch_core::adapter::AdapterError>
+    {
+        use futures::StreamExt;
+        let token = params.cancel.clone();
+        self.tokens.lock().unwrap().push(token.clone());
+        Ok(orch_core::adapter::ExecuteHandle {
+            pid: 99999,
+            events: Box::pin(
+                futures::stream::once(async move { token.cancelled().await }).filter_map(
+                    |()| async {
+                        None::<
+                            std::result::Result<
+                                orch_core::adapter::AgentEvent,
+                                orch_core::adapter::AdapterError,
+                            >,
+                        >
+                    },
+                ),
+            ),
+        })
+    }
+
+    async fn stop(&self, _pid: u32) -> orch_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn reconcile_cancels_a_live_local_run_whose_task_was_made_terminal_externally() {
+    use orch_core::storage::TaskStore;
+
+    let adapter = Arc::new(CancelAwareAdapter::default());
+    let h = Harness::builder()
+        .tasks([make_task()])
+        .agents([make_agent()])
+        .adapter_impl(adapter.clone() as Arc<dyn orch_core::adapter::Adapter>)
+        .build();
+    h.load_state().await.unwrap();
+    h.tick().await.unwrap();
+    assert!(h.in_memory_state().await.running.contains_key("tsk_test1"));
+    let token = adapter.tokens.lock().unwrap()[0].clone();
+    assert!(!token.is_cancelled());
+
+    // Another process (`orch task cancel`, a remote cancel) makes the task
+    // terminal without going through this engine.
+    let mut task = h.task("tsk_test1");
+    task.status = TaskStatus::Cancelled;
+    h.tasks.save(&task).await.unwrap();
+    h.tick().await.unwrap();
+
+    assert!(
+        token.is_cancelled(),
+        "the local collector must be cancelled, not left running"
+    );
+    assert!(!h.persisted_state().running.contains_key("tsk_test1"));
+    assert!(
+        h.orchestrator
+            .inner
+            .cancels
+            .lock()
+            .await
+            .get("tsk_test1")
+            .is_none()
+    );
+    h.settle().await;
 }
 
 #[tokio::test]

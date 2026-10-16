@@ -29,11 +29,19 @@ impl AgentStore for FileAgentStore {
     /// what `findBestAgent` breaks score ties on (PARITY.md §14.4). Do not add
     /// a sort here.
     async fn list(&self) -> Result<Vec<Agent>> {
-        self.index.read_index().await
+        self.index
+            .read_index()
+            .await?
+            .into_iter()
+            .map(local_agent)
+            .collect()
     }
 
     async fn get(&self, id: &str) -> Result<Option<Agent>> {
-        read_yaml(&self.paths.agent_path(id)?).await
+        read_yaml(&self.paths.agent_path(id)?)
+            .await?
+            .map(local_agent)
+            .transpose()
     }
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Agent>> {
@@ -41,11 +49,14 @@ impl AgentStore for FileAgentStore {
     }
 
     async fn save(&self, agent: &Agent) -> Result<()> {
+        super::paths::sanitize_id(&agent.id)?;
+        let mut agent = agent.clone();
+        agent.capabilities.clear();
+        agent.remote = None;
         ensure_dir(&self.paths.agents_dir()).await?;
         // Owner-only: an agent file is the role prompt the agent is run
         // with, i.e. instructions to an AI CLI (security review C3).
-        write_yaml_with_mode(&self.paths.agent_path(&agent.id)?, agent, owner_only()).await?;
-        let agent = agent.clone();
+        write_yaml_with_mode(&self.paths.agent_path(&agent.id)?, &agent, owner_only()).await?;
         self.index
             .update_index(move |items| replace_at_end(items, agent, |a| &a.id))
             .await
@@ -65,6 +76,18 @@ impl AgentStore for FileAgentStore {
             .update_index(move |items| items.into_iter().filter(|a| a.id != id).collect())
             .await
     }
+}
+
+/// Host capability is a read-time property, including for legacy persisted records.
+pub fn host_capability() -> String {
+    std::env::var("ORCH_TEST_OS_CAP").unwrap_or_else(|_| std::env::consts::OS.to_owned())
+}
+
+fn local_agent(mut agent: Agent) -> Result<Agent> {
+    super::paths::sanitize_id(&agent.id)?;
+    agent.capabilities = vec![host_capability()];
+    agent.remote = None;
+    Ok(agent)
 }
 
 #[cfg(test)]
@@ -163,7 +186,7 @@ mod tests {
         store.save(&creator).await.unwrap();
 
         let read_back = store.get("agt_creator").await.unwrap().unwrap();
-        assert_eq!(read_back, creator);
+        assert_eq!(read_back, local_agent(creator).unwrap());
         // The ~3.5 KB role prompt is injected into prompts verbatim.
         assert_eq!(
             read_back.role.as_deref(),
@@ -192,7 +215,10 @@ mod tests {
             ..make_agent()
         };
         store.save(&a).await.unwrap();
-        assert_eq!(store.get("agt_test1").await.unwrap().unwrap(), a);
+        assert_eq!(
+            store.get("agt_test1").await.unwrap().unwrap(),
+            local_agent(a).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -204,5 +230,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.list().await.unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn capabilities_are_host_derived_and_overlay_fields_never_persist() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path());
+        let mut agent = make_agent();
+        agent.capabilities = vec!["fictional-platform".into()];
+        agent.remote = Some(orch_domain::RemoteRef {
+            alias: "w1".into(),
+            online: true,
+        });
+        store.save(&agent).await.unwrap();
+        let saved = tokio::fs::read_to_string(store.paths.agent_path(&agent.id).unwrap())
+            .await
+            .unwrap();
+        assert!(!saved.contains("capabilities:"));
+        assert!(!saved.contains("remote:"));
+        let index = tokio::fs::read_to_string(store.index.index_path())
+            .await
+            .unwrap();
+        assert!(!index.contains("capabilities"));
+        assert!(!index.contains("remote"));
+        let read = store.get(&agent.id).await.unwrap().unwrap();
+        assert_eq!(read.capabilities, vec![host_capability()]);
+        assert!(read.remote.is_none());
+        assert_eq!(
+            store.list().await.unwrap()[0].capabilities,
+            vec![host_capability()]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_store_rejects_remote_ids_on_mutation_and_index_ingest() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path());
+        let mut agent = make_agent();
+        agent.id = "agt_test1@w1".into();
+        assert!(store.save(&agent).await.is_err());
+        assert!(store.delete(&agent.id).await.is_err());
+        assert!(store.get(&agent.id).await.is_err());
+        super::super::fs_utils::write_json(&store.index.index_path(), &vec![agent])
+            .await
+            .unwrap();
+        assert!(store.list().await.is_err());
     }
 }

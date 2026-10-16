@@ -1111,6 +1111,7 @@ async fn poll_history_delivers_the_two_batches_newest_runs_first() {
             prompt: "p".into(),
             pid: None,
             error: None,
+            error_kind: None,
             tokens: None,
         };
         engine.runs.save(&run).await.expect("save run");
@@ -1142,6 +1143,7 @@ async fn poll_history_delivers_the_two_batches_newest_runs_first() {
             prompt: "p".into(),
             pid: None,
             error: None,
+            error_kind: None,
             tokens: None,
         })
         .await
@@ -1366,6 +1368,7 @@ async fn in_observer_mode_the_disk_observer_feeds_the_event_queue() {
     state.running.insert(
         "tsk_watched".to_owned(),
         orch_domain::RunningEntry {
+            remote: None,
             run_id: "run_watched".to_owned(),
             agent_id: "agt_watched".to_owned(),
             task_id: "tsk_watched".to_owned(),

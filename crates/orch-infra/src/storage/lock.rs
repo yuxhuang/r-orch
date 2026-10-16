@@ -186,7 +186,7 @@ async fn read_lock_pid(lock_path: &Path) -> Option<u32> {
     content.trim().parse::<u32>().ok()
 }
 
-async fn is_stale_by_age(lock_path: &Path) -> bool {
+pub(crate) async fn is_stale_by_age(lock_path: &Path) -> bool {
     let Ok(meta) = tokio::fs::metadata(lock_path).await else {
         // Unreadable: treat as stale, as the TS `catch` does.
         return true;

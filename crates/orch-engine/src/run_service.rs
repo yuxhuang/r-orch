@@ -80,6 +80,7 @@ impl RunService {
             prompt: input.prompt,
             pid: None,
             error: None,
+            error_kind: None,
             tokens: None,
         };
 
@@ -122,12 +123,26 @@ impl RunService {
         tokens: Option<TokenUsage>,
         error: Option<String>,
     ) -> Result<Run> {
+        self.finish_with_error_kind(id, status, tokens, error, None)
+            .await
+    }
+
+    /// Keep the worker's authoritative classification on the persisted run.
+    pub async fn finish_with_error_kind(
+        &self,
+        id: &str,
+        status: RunStatus,
+        tokens: Option<TokenUsage>,
+        error: Option<String>,
+        error_kind: Option<orch_domain::AdapterErrorKind>,
+    ) -> Result<Run> {
         let mut run = self.require(id).await?;
 
         run.status = status;
         run.finished_at = Some(self.clock.now_iso());
         run.tokens = tokens;
         run.error = error;
+        run.error_kind = error_kind;
         self.runs.save(&run).await?;
 
         self.events.emit(OrchestratorEvent::AgentCompleted {

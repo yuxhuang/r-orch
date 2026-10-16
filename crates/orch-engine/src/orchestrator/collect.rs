@@ -67,7 +67,7 @@ fn slice_chars(value: &str, max: usize) -> &str {
 
 /// What one run's event stream produced, accumulated as it is consumed.
 #[derive(Default)]
-struct Collected {
+pub(super) struct Collected {
     tokens: Option<TokenUsage>,
     result_text: Option<String>,
     last_agent_message: Option<String>,
@@ -157,7 +157,7 @@ impl Orchestrator {
         .await
     }
 
-    async fn record_event(
+    pub(super) async fn record_event(
         &self,
         collected: &mut Collected,
         event: AgentEvent,
@@ -165,6 +165,15 @@ impl Orchestrator {
         task_id: &str,
         agent_id: &str,
     ) -> Result<()> {
+        let tap = self
+            .inner
+            .event_tap
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tap) = tap {
+            tap.record(task_id, run_id, &event);
+        }
         match event.kind {
             AgentEventKind::Done => {
                 if let Some(tokens) = event.tokens {
@@ -368,6 +377,10 @@ impl Orchestrator {
 
         let agent = self.deps().agent_store.get(agent_id).await?;
         let auto_approve = task.is_autonomous()
+            || task
+                .labels
+                .iter()
+                .any(|label| label.starts_with("remote-ctl:"))
             || agent
                 .as_ref()
                 .and_then(|agent| agent.config.approval_policy)
@@ -563,19 +576,48 @@ impl Orchestrator {
 
         self.deps()
             .run_service
-            .finish(
+            .finish_with_error_kind(
                 &entry.run_id,
                 RunStatus::Failed,
                 None,
                 Some(error.to_owned()),
+                error_kind,
             )
             .await?;
-        self.deps()
-            .agent_service
-            .set_status(&entry.agent_id, AgentStatus::Idle)
-            .await?;
-
-        let agent_after = self.deps().agent_store.get(&entry.agent_id).await?;
+        if entry.remote.is_none() {
+            self.deps()
+                .agent_service
+                .set_status(&entry.agent_id, AgentStatus::Idle)
+                .await?;
+        } else {
+            let event = AgentEvent::new(
+                AgentEventKind::Error,
+                self.deps().clock.now_iso(),
+                serde_json::json!({"message":error,"errorKind":error_kind}),
+            );
+            self.emit(OrchestratorEvent::AgentError {
+                run_id: entry.run_id.clone(),
+                agent_id: entry.agent_id.clone(),
+                error: error.to_owned(),
+                error_kind,
+            });
+            self.deps()
+                .run_store
+                .append_event(
+                    &entry.run_id,
+                    &orch_domain::RunEvent {
+                        timestamp: event.timestamp,
+                        event_type: orch_domain::RunEventType::Error,
+                        data: event.data,
+                    },
+                )
+                .await?;
+        }
+        let agent_after = if entry.remote.is_none() {
+            self.deps().agent_store.get(&entry.agent_id).await?
+        } else {
+            None
+        };
         if let Some(mut agent) = agent_after.clone() {
             agent.current_task = None;
             agent.last_error = Some(AgentLastError {
@@ -591,26 +633,34 @@ impl Orchestrator {
 
         let runtime_ms = self.runtime_ms(entry).unwrap_or(0);
         let previous = agent_after.as_ref().map(|agent| agent.stats.clone());
-        self.deps()
-            .agent_service
-            .update_stats(
-                &entry.agent_id,
-                AgentStatsUpdate {
-                    tasks_failed: Some(previous.as_ref().map_or(0, |s| s.tasks_failed) + 1),
-                    total_runs: Some(previous.as_ref().map_or(0, |s| s.total_runs) + 1),
-                    total_runtime_ms: Some(
-                        previous.as_ref().map_or(0, |s| s.total_runtime_ms) + runtime_ms,
-                    ),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        if entry.remote.is_none() {
+            self.deps()
+                .agent_service
+                .update_stats(
+                    &entry.agent_id,
+                    AgentStatsUpdate {
+                        tasks_failed: Some(previous.as_ref().map_or(0, |s| s.tasks_failed) + 1),
+                        total_runs: Some(previous.as_ref().map_or(0, |s| s.total_runs) + 1),
+                        total_runtime_ms: Some(
+                            previous.as_ref().map_or(0, |s| s.total_runtime_ms) + runtime_ms,
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+        }
 
-        let failure_status = resolve_failure_status(&task);
-        self.deps()
-            .task_service
-            .update_status(task_id, failure_status)
-            .await?;
+        let failure_status = if orch_domain::is_terminal(task.status) {
+            task.status
+        } else {
+            resolve_failure_status(&task)
+        };
+        if task.status != failure_status {
+            self.deps()
+                .task_service
+                .update_status(task_id, failure_status)
+                .await?;
+        }
 
         if failure_status == TaskStatus::Retrying {
             // `attempts - 1` as the exponent, so the first retry waits exactly
@@ -627,7 +677,6 @@ impl Orchestrator {
                 delay_ms: delay,
             });
         } else {
-            state.stats.total_tasks_failed += 1;
             self.inner.cached_tasks.invalidate_async().await;
             let all_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
             self.cascade_fail_dependents(
@@ -638,17 +687,24 @@ impl Orchestrator {
             .await;
         }
 
-        state.stats.total_runtime_ms += runtime_ms;
-
-        if let Some(branch) = task.proof.as_ref().and_then(|p| p.branch.as_deref())
+        if entry.remote.is_none()
+            && let Some(branch) = task.proof.as_ref().and_then(|p| p.branch.as_deref())
             && let Err(err) = self.deps().workspace.cleanup(task_id, Some(branch)).await
         {
             self.emit_error(err, format!("workspace cleanup for {task_id}"));
         }
 
         state.running.shift_remove(task_id);
+        state.stats.total_runtime_ms += runtime_ms;
         state.stats.total_runs += 1;
-        self.save_state(state).await?;
+        if failure_status == TaskStatus::Failed {
+            state.stats.total_tasks_failed += 1;
+        }
+        if entry.remote.is_some() {
+            self.save_remote_state(state).await?;
+        } else {
+            self.save_state(state).await?;
+        }
         self.schedule_dispatch_after_run(task_id).await;
         Ok(())
     }
@@ -686,7 +742,13 @@ impl Orchestrator {
             results,
         });
 
-        if !passed && !auto_approve {
+        if !passed
+            && (!auto_approve
+                || task
+                    .labels
+                    .iter()
+                    .any(|label| label.starts_with("remote-ctl:")))
+        {
             return Ok(());
         }
         if !passed {
@@ -724,7 +786,7 @@ impl Orchestrator {
     /// Force a task to `review` with a prefixed summary. Used when merge-back
     /// fails, where the work exists but is not on the target branch, so a
     /// human has to look.
-    async fn force_task_to_review(
+    pub(super) async fn force_task_to_review(
         &self,
         state: &OrchestratorState,
         mut task: Task,
@@ -744,18 +806,21 @@ impl Orchestrator {
         task.updated_at = self.deps().clock.now_iso();
         self.deps().task_store.save(&task).await?;
 
-        if let Err(err) = self
-            .deps()
-            .agent_service
-            .set_status(agent_id, AgentStatus::Idle)
-            .await
+        if !agent_id.contains('@')
+            && let Err(err) = self
+                .deps()
+                .agent_service
+                .set_status(agent_id, AgentStatus::Idle)
+                .await
         {
             self.emit_error(
                 err,
                 format!("forceTaskToReview setStatus idle for agent {agent_id}"),
             );
         }
-        if let Some(mut agent_after) = self.deps().agent_store.get(agent_id).await? {
+        if !agent_id.contains('@')
+            && let Some(mut agent_after) = self.deps().agent_store.get(agent_id).await?
+        {
             agent_after.current_task = None;
             self.deps().agent_store.save(&agent_after).await?;
         }
@@ -765,7 +830,7 @@ impl Orchestrator {
 
     /// Schedule a reactive dispatch now that an agent is free — unless this
     /// was a `run <id>` single-task run, which must not start anything else.
-    async fn schedule_dispatch_after_run(&self, task_id: &str) {
+    pub(super) async fn schedule_dispatch_after_run(&self, task_id: &str) {
         let was_single = self.inner.single_task_runs.lock().await.remove(task_id);
         if !was_single {
             self.schedule_immediate_dispatch(0);
@@ -774,7 +839,7 @@ impl Orchestrator {
 
     /// Wall-clock runtime of a running entry. `None` when `started_at` does
     /// not parse, where JS would produce `NaN` and poison the counter.
-    fn runtime_ms(&self, entry: &RunningEntry) -> Option<u64> {
+    pub(super) fn runtime_ms(&self, entry: &RunningEntry) -> Option<u64> {
         let started_at = epoch_ms_from_iso(&entry.started_at)?;
         Some(self.deps().clock.now_ms().saturating_sub(started_at).max(0) as u64)
     }

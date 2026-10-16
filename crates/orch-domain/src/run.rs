@@ -72,6 +72,8 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<crate::AdapterErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenUsage>,
 }
 
@@ -282,6 +284,7 @@ mod tests {
             prompt: "p".into(),
             pid: Some(360_135),
             error: None,
+            error_kind: None,
             tokens: None,
         };
         let json = serde_json::to_value(&run).unwrap();
@@ -310,5 +313,25 @@ mod tests {
             );
             assert_eq!(s.as_str().parse::<RunStatus>(), Ok(s));
         }
+    }
+    #[test]
+    fn persisted_failure_kind_defaults_for_legacy_runs_and_round_trips() {
+        let raw = serde_json::json!({
+            "id": "run1", "task_id": "task1", "agent_id": "agent1", "attempt": 1,
+            "status": "failed", "started_at": "now", "workspace_path": "/tmp", "prompt": "task"
+        });
+        let mut run: Run = serde_json::from_value(raw).unwrap();
+        assert!(run.error_kind.is_none());
+        assert!(
+            serde_json::to_value(&run)
+                .unwrap()
+                .get("error_kind")
+                .is_none()
+        );
+        run.error_kind = Some(crate::AdapterErrorKind::RateLimit);
+        assert_eq!(
+            serde_json::from_value::<Run>(serde_json::to_value(&run).unwrap()).unwrap(),
+            run
+        );
     }
 }

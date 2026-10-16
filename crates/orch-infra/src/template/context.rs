@@ -233,6 +233,8 @@ pub fn build_prompt_context(
                     a.role.clone()
                 },
                 adapter: a.adapter.clone(),
+                capabilities: a.capabilities.clone(),
+                remote: a.remote.clone(),
             })
             .collect(),
         attempt: (attempt > 1).then_some(i64::from(attempt)),

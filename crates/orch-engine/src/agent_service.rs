@@ -147,6 +147,8 @@ impl AgentService {
             autonomous: None,
             stats: AgentStats::default(),
             last_error: None,
+            capabilities: Vec::new(),
+            remote: None,
         };
 
         self.agents.save(&agent).await?;
@@ -173,6 +175,7 @@ impl AgentService {
     /// reset to `idle` and then deleted, because otherwise a crash would leave
     /// an undeletable agent behind.
     pub async fn remove(&self, id: &str) -> Result<()> {
+        reject_remote_id(id)?;
         let mut agent = self.get(id).await?;
         if agent.status == AgentStatus::Running {
             let state = self.state.read().await?;
@@ -189,6 +192,7 @@ impl AgentService {
     }
 
     pub async fn update(&self, id: &str, fields: UpdateAgentFields) -> Result<Agent> {
+        reject_remote_id(id)?;
         let mut agent = self.get(id).await?;
         let was_shell = agent.adapter == "shell";
 
@@ -278,6 +282,12 @@ impl AgentService {
     }
 
     pub async fn set_status(&self, id: &str, status: AgentStatus) -> Result<Agent> {
+        reject_remote_id(id)?;
+        if status == AgentStatus::Offline {
+            return Err(Error::invalid_arguments(
+                "Offline is a remote display status",
+            ));
+        }
         let mut agent = self.get(id).await?;
         agent.status = status;
         self.agents.save(&agent).await?;
@@ -322,21 +332,26 @@ impl AgentService {
     /// `AgentStore::list` order (PARITY.md §14.4).
     pub async fn find_best_agent(&self, task: &Task) -> Result<Option<Agent>> {
         let agents = self.agents.list().await?;
+        Ok(Self::find_best_in(task, agents))
+    }
+
+    /// Dispatch supplies its explicitly merged directory and reservations.
+    pub fn find_best_in(task: &Task, agents: Vec<Agent>) -> Option<Agent> {
         let available: Vec<Agent> = agents
             .iter()
-            .filter(|a| a.status == AgentStatus::Idle)
+            .filter(|a| agent_eligible(task, a))
             .cloned()
             .collect();
 
         if available.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         if let Some(assignee) = task.assignee.as_deref().filter(|a| !a.is_empty()) {
             let assigned = agents
                 .into_iter()
                 .find(|a| a.id == assignee || a.name == assignee);
-            return Ok(assigned.filter(|a| a.status == AgentStatus::Idle));
+            return assigned.filter(|a| agent_eligible(task, a));
         }
 
         // Lower-cased once, as the TS does, because the inner loops are O(n·m).
@@ -349,8 +364,29 @@ impl AgentService {
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
 
-        Ok(scored.into_iter().next().map(|(_, agent)| agent))
+        scored.into_iter().next().map(|(_, agent)| agent)
     }
+}
+
+fn reject_remote_id(id: &str) -> Result<()> {
+    if id.contains('@') {
+        Err(Error::invalid_arguments(
+            "Remote agents cannot be mutated locally",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Capability labels constrain explicit and automatic assignment alike.
+pub fn agent_eligible(task: &Task, agent: &Agent) -> bool {
+    agent.status == AgentStatus::Idle
+        && agent.remote.as_ref().is_none_or(|remote| remote.online)
+        && task
+            .labels
+            .iter()
+            .filter_map(|label| label.strip_prefix("cap:"))
+            .all(|cap| agent.capabilities.iter().any(|actual| actual == cap))
 }
 
 /// The scoring from PARITY.md §7.7. Split out so it is unit-testable without
@@ -446,6 +482,8 @@ mod tests {
             autonomous: None,
             stats: AgentStats::default(),
             last_error: None,
+            capabilities: Vec::new(),
+            remote: None,
         }
     }
 
@@ -702,6 +740,7 @@ mod tests {
                     pid: 1234,
                     started_at: "2025-01-01T00:00:00Z".into(),
                     last_event_at: "2025-01-01T00:00:00Z".into(),
+                    remote: None,
                 },
             )]
             .into_iter()

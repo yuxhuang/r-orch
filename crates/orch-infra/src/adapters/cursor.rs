@@ -122,6 +122,7 @@ impl Adapter for CursorAdapter {
                 cwd: params.workspace,
                 env: params.env,
                 stdin: StdioMode::Ignore,
+                inherit_env: params.inherit_env,
             },
             StderrPolicy::Tail,
             &params.cancel,
