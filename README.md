@@ -41,6 +41,24 @@ The binaries land in `target/release/`. Put them on your `PATH`, or:
 cargo install --path crates/orch-cli
 ```
 
+### Alpha builds (remote agents)
+
+The remote-agents feature ships as pre-release tags (`v0.5.0-alpha.N`) cut from `feature/remote-peers`. The
+Homebrew formula pins a stable tag (and `--HEAD` follows `master`), so `brew install` and `brew upgrade`
+never pick up an alpha. `orch update` does not self-update either: it only prints how to install. To try an
+alpha, install it explicitly from its tag, into a directory of its own so the Homebrew build stays untouched:
+
+```bash
+git clone <this repo> r-orch-alpha && cd r-orch-alpha
+git checkout v0.5.0-alpha.1
+cargo install --locked --path crates/orch-cli --root ~/.orch-alpha
+~/.orch-alpha/bin/orch --version      # 0.5.0-alpha.1
+```
+
+Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
+Run the alpha as `~/.orch-alpha/bin/orch`, or put `~/.orch-alpha/bin` ahead of Homebrew's `bin` on `PATH`
+for one shell. To go back, see [Upgrading and rolling back the alpha](#upgrading-and-rolling-back-the-alpha).
+
 ### The three binary names
 
 `orch`, `orchestry` and `ao` are **the same program** — three names for one binary, matching the original's
@@ -218,10 +236,126 @@ controller's graph with `orch task add`, `orch goal`, or `orch context`: those c
 worker's own project. Task proofs record the remote alias, worker branch and changed files. Worker
 review failures and merge conflicts put the controller task in `review` and keep dependents blocked.
 
-This feature is developed on `feature/remote-peers`; no Homebrew formula or stable release is changed.
-To try the local checkout explicitly, build it with `cargo build --release -p orch-cli` and invoke
-`./target/release/orch`. Before rolling back to v0.3.1, stop the alpha engine with **no remote runs in
-flight**. The old binary cannot resume remote execution entries and will cancel them.
+### Peer names and mutual links
+
+Every instance announces a peer name (`--peer-name`, `peer.name` in `.orchestry/config.yml`, default: the
+short hostname). A worker rejects an incoming controller whose peer name equals one of **its own outbound
+aliases** (`orch remote list`). This is deliberate: it keeps `<id>@<alias>` routing unambiguous.
+
+The natural mutual setup trips it. Two hosts, `mini` and `studio`, each listen and each register the other
+under its hostname:
+
+```bash
+# on studio:  orch remote add mini <mini-ip>        # outbound alias "mini"
+# on mini:    orch remote add studio <studio-ip>    # outbound alias "studio"
+```
+
+mini connects to studio announcing itself as `mini`, which is studio's alias for it, so studio refuses, and
+studio's link to mini is refused the same way. Both sides keep retrying and report, verbatim:
+
+```
+$ orch remote status      # on mini
+  Listen: 127.0.0.1:17690
+  Controller: none
+  studio: offline (Inbound controller name collides with a configured outbound alias)
+```
+
+Fix: give each side a `--peer-name` that is not an alias on the other side, or use different aliases:
+
+```bash
+orch serve --listen 192.168.1.20:7690 --peer-name mini-ctl      # on mini
+orch serve --listen 192.168.1.21:7690 --peer-name studio-ctl    # on studio
+```
+
+After that, `orch remote status` on both shows the peer `online` and the other side as `Controller:`.
+A one-directional setup (one controller, one worker) never hits this.
+
+### Environment of remote runs
+
+A run started on behalf of a remote controller does **not** inherit credential-shaped variables from the
+worker's `orch` process. Local runs are unaffected. A name is dropped when it matches, case-insensitively,
+one of these:
+
+- an underscore-separated segment equal to `KEY`, `KEYS`, `APIKEY`, `TOKEN`, `TOKENS`, `SECRET`, `SECRETS`,
+  `PASSWORD`, `PASSWD`, `PASS`, `PAT`, `AUTH`, `OAUTH`, `CREDENTIAL`, `CREDENTIALS` or `COOKIE`;
+- the substring `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `APIKEY`, `CREDENTIAL` or `PRIVATEKEY` anywhere.
+
+So `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, `AWS_ACCESS_KEY_ID` and `SSH_AUTH_SOCK` are
+stripped, and so is the harmless `TOKENIZERS_PARALLELISM` (it contains `TOKEN`). `GIT_AUTHOR_NAME` and
+`PLAIN_VAR` are kept. Matching is by name only: a secret under an innocent name, such as `DATABASE_URL`, is
+not caught.
+
+**Consequence:** if a worker's `claude` or `codex` authenticates through an environment variable, or git
+needs `SSH_AUTH_SOCK`, remote-submitted tasks fail on authentication while the same agent works locally.
+Re-admit variables explicitly, by exact name (no wildcards):
+
+```bash
+# On the worker, for the orch process that owns the engine (serve, run --watch or tui):
+ORCH_REMOTE_ENV_PASSTHROUGH=ANTHROPIC_API_KEY,SSH_AUTH_SOCK orch serve --listen 192.168.1.20:7690
+```
+
+The list is separated by commas or whitespace and is read each time a run starts. Variables set in the
+agent's own `config.env` are always passed, filtered or not. Checked with a `shell` agent: with
+`FAKE_API_KEY`, `SSH_AUTH_SOCK`, `TOKENIZERS_PARALLELISM`, `PLAIN_VAR` and `GIT_AUTHOR_NAME` set on the
+worker, a remote run saw only `PLAIN_VAR` and `GIT_AUTHOR_NAME`; with
+`ORCH_REMOTE_ENV_PASSTHROUGH=FAKE_API_KEY,TOKENIZERS_PARALLELISM` it also saw those two, and still not
+`SSH_AUTH_SOCK`.
+
+### Approval on the worker
+
+Remote submits honour the **worker** agent's approval policy. Only an agent whose policy is `auto` runs a
+remote task straight away; `suggest`, `manual` and an agent with no policy stored hold it. On a fresh
+project `orch agent add` stores `auto` for `shell` agents and the project default (`defaults.agent.approval_policy`,
+`auto` after `orch init`) for the others, but the `Agent Creator` agent from `orch init` is `suggest`. Check
+with `orch agent show <id>` (it prints `auto` for an agent with no policy, so a hand-edited agent file
+without one still holds remote tasks). A held task sits in `todo` on the worker with the `awaiting-approval` label, while the
+controller shows it `in_progress` (the worker reports it as queued). Approve it **on the worker**, using the
+worker's own task id (the controller's id differs):
+
+```bash
+orch task list            # on the worker: find the mirror task
+orch task approve tsk_05O0U7_
+# ✓ Approved tsk_05O0U7_ → released to run
+```
+
+Until then nothing runs there, so a remote task can wait indefinitely for someone at the worker.
+
+### Upgrading and rolling back the alpha
+
+Upgrade
+- Run **one tag on every peer**; mixed builds have not been tested.
+- Upgrade the engine owner (`orch serve`, `orch run --watch` or the TUI) and the CLI on the same host
+  together: processes of one project coordinate through lock files that only this build takes.
+- Back up first: `cp -R .orchestry .orchestry.bak` in each project that will run the alpha, then stop the old
+  engine, install the alpha (see [Alpha builds](#alpha-builds-remote-agents)) and start it.
+- Changes you may notice since v0.4.0:
+  - the listener binds `127.0.0.1:7690` by default; give `0.0.0.0:7690` or a LAN IP explicitly to accept
+    other hosts. There is still no authentication;
+  - the entity indexes under `.orchestry` (tasks, agents, messages, context) take a cross-process writer lock
+    (`.index.lock` in each folder), which fixes lost updates between concurrent CLI and engine writes. A writer that cannot get it within 5 seconds
+    fails with `Timed out after 5000 ms waiting for index writer lock …; retry the operation`;
+  - a remote counts as online only while the controller's engine holds a lock on
+    `.orchestry/remotes/<alias>.health`: after `kill -9` of the engine, `orch remote status` showed the remote
+    `offline` at once;
+  - remote tasks wait for worker approval (above) and run without credential-shaped variables (above);
+  - `.orchestry/peer-id` and `.orchestry/remotes/*.json` are written readable by the owner only.
+
+Roll back
+1. Stop every alpha engine on the project and make sure **no remote runs are in flight**: the old binary
+   cannot resume remote execution entries and will cancel them.
+2. Go back to the previous binary. The Homebrew build was never touched, so run it again (drop
+   `~/.orch-alpha/bin` from `PATH`, or `rm -rf ~/.orch-alpha`). If anything looks wrong, stop the engine and
+   restore `.orchestry` from `.orchestry.bak`.
+
+v0.4.0 is the release the alpha is based on; it has no remote support, so the `remote` commands and
+the `Controller` and `Listen` status lines disappear when you roll back.
+
+### Known gaps in this alpha
+
+- Verified only with several instances on one macOS machine: no real Linux host and no physical LAN.
+- Built and tested as a debug build with a Homebrew `rustc`; the pinned toolchain (Rust 1.94.1) and the
+  `--release` profile were not tested.
+- Messages and task results between peers are plain TCP: no authentication, no encryption.
 
 ---
 
