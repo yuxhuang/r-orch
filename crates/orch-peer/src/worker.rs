@@ -303,13 +303,18 @@ impl Worker {
     /// instance has never recorded starts its clock now rather than being
     /// cancelled on sight — including every mirror that predates this sweep.
     async fn collect_orphan_mirrors(&self) -> Result<usize> {
-        let current = self
-            .session
-            .lock()
-            .await
+        // `try_lock`, not `lock`: this runs on the listener's own loop, and a
+        // session that is mid-mutation must not stall admissions for it. The
+        // sweep is hourly; skipping one costs nothing.
+        let Ok(slot) = self.session.try_lock() else {
+            tracing::debug!("Skipping the orphan sweep: a session is mutating mirrors");
+            return Ok(0);
+        };
+        let current = slot
             .controller
             .as_ref()
             .map(|controller| controller.instance_id.clone());
+        drop(slot);
         let path = self.controllers_path();
         let mut seen: BTreeMap<String, String> = read_json(&path).await?.unwrap_or_default();
         let now = self.ctx.engine.clock.now_ms();
