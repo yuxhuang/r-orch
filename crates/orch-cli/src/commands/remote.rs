@@ -613,10 +613,7 @@ mod tests {
         state.running.insert(
             task.id.clone(),
             orch_domain::RunningEntry {
-                remote: Some(orch_domain::RemoteRunRef {
-                    alias: "w1".into(),
-                    exec_key: run.id.clone(),
-                }),
+                remote: Some(orch_domain::RemoteRunRef::new("w1", &run.id)),
                 run_id: run.id.clone(),
                 agent_id: run.agent_id.clone(),
                 task_id: task.id.clone(),

@@ -1,6 +1,6 @@
 //! The tasks list (docs/parity/tui.md §1.2).
 
-use orch_domain::TaskStatus;
+use orch_domain::{RemotePhase, RemoteRunRef, TaskStatus};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -11,8 +11,8 @@ use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
 use crate::onboarding::OnboardingStep;
 use crate::state::{EntityType, TaskRow};
 use crate::theme::{
-    CHECK, CIRCLE, CROSS, CURSOR, DIAMOND, EM_DASH, LOZENGE, PAPERCLIP, PLUS_CIRCLE, TRIANGLE_DOWN,
-    Token, heavy_rule, light_rule, priority_pips, priority_token, spinner_frame,
+    ARROW_RIGHT, CHECK, CIRCLE, CROSS, CURSOR, DIAMOND, EM_DASH, LOZENGE, PAPERCLIP, PLUS_CIRCLE,
+    TRIANGLE_DOWN, Token, heavy_rule, light_rule, priority_pips, priority_token, spinner_frame,
 };
 use crate::views::spans_width;
 use crate::views::{RenderCtx, put_line};
@@ -21,7 +21,41 @@ const GOAL_BADGE_W: usize = 18;
 const GOAL_TITLE_CAP: usize = 13;
 
 /// The status chip: glyph + label, on its status background.
-fn status_chip(status: TaskStatus, tick: u64) -> (String, Token, Token, bool) {
+///
+/// A task whose run is on a peer shows that peer's phase instead: `RUN` here
+/// used to mean nothing more than "dispatched", which is exactly what an
+/// operator cannot afford to misread. The alias itself is in the agent
+/// column, so the chip only carries the phase.
+fn status_chip(
+    status: TaskStatus,
+    tick: u64,
+    remote: Option<&RemoteRunRef>,
+) -> (String, Token, Token, bool) {
+    match remote.map(|remote| remote.phase) {
+        Some(RemotePhase::Dispatched) => (
+            format!("{ARROW_RIGHT} SENT"),
+            Token::Cyan,
+            Token::ToolBg,
+            false,
+        ),
+        Some(RemotePhase::Queued) => (
+            format!("{CIRCLE} QUEUE"),
+            Token::Dim,
+            Token::NeutralBg,
+            false,
+        ),
+        Some(RemotePhase::Unknown) => (
+            format!("{LOZENGE} RUN?"),
+            Token::Yellow,
+            Token::WarnBg,
+            true,
+        ),
+        // Running, terminal and local work all read from the task's status.
+        _ => local_status_chip(status, tick),
+    }
+}
+
+fn local_status_chip(status: TaskStatus, tick: u64) -> (String, Token, Token, bool) {
     match status {
         TaskStatus::InProgress => (
             format!("{} RUN", spinner_frame(tick)),
@@ -267,7 +301,8 @@ fn render_task_row(
     let fixed_cols = 2 + 10 + 4 + 14 + goal_badge_w + 7;
     let title_w = (area.width as usize).saturating_sub(fixed_cols).max(10);
 
-    let (chip_text, chip_fg, chip_bg, chip_bold) = status_chip(task.status, state.tick);
+    let (chip_text, chip_fg, chip_bg, chip_bold) =
+        status_chip(task.status, state.tick, state.remote_run(&task.id));
     let mut spans = vec![
         Span::styled(
             if selected {

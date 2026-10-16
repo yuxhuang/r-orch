@@ -169,7 +169,13 @@ fn render_task_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx,
             "status",
             Span::styled(
-                task.status.to_string(),
+                // The peer's phase, when there is one: the local status says
+                // `in_progress` for work the worker may not have started.
+                state
+                    .remote_run(&task.id)
+                    .and_then(|remote| remote.status_label())
+                    .map(|label| cap_line(&label, COL1_W.saturating_sub(11)))
+                    .unwrap_or_else(|| task.status.to_string()),
                 ctx.style(task_status_token(task.status)),
             ),
             Some(("assignee", assignee)),

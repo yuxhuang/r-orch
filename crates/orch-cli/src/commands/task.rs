@@ -14,7 +14,7 @@
 
 use orch_core::error::Result;
 use orch_core::storage::TaskFilter;
-use orch_domain::{CreateTaskInput, Task, TaskStatus};
+use orch_domain::{CreateTaskInput, RemoteRunRef, Task, TaskStatus};
 use orch_engine::Engine;
 
 use crate::context::CliContext;
@@ -125,10 +125,18 @@ pub async fn list(
         return Ok(());
     }
 
+    let running = engine.state.read().await?.running;
     let mut rows = Vec::new();
     for task in &tasks {
-        let mut row = task_row(styles, task);
-        row.push(waiting_reason(engine, task).await?.unwrap_or_default());
+        let remote = running
+            .get(&task.id)
+            .and_then(|entry| entry.remote.as_ref());
+        let mut row = task_row(styles, task, remote);
+        row.push(
+            waiting_reason(engine, task, remote)
+                .await?
+                .unwrap_or_default(),
+        );
         rows.push(row);
     }
     println!();
@@ -144,10 +152,19 @@ pub async fn list(
 
 /// Describe dispatch blockers from persisted peer snapshots; this is display
 /// only and does not expand the directory's six permitted consumers.
-async fn waiting_reason(engine: &Engine, task: &Task) -> Result<Option<String>> {
+async fn waiting_reason(
+    engine: &Engine,
+    task: &Task,
+    remote: Option<&RemoteRunRef>,
+) -> Result<Option<String>> {
     use orch_infra::storage::remote::FileRemoteStore;
     if !matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress) {
         return Ok(None);
+    }
+    // The worker's own explanation beats anything inferred from a snapshot:
+    // only it can say which `orch task approve` a mirror is waiting for.
+    if let Some(hint) = remote.and_then(|remote| remote.hint()) {
+        return Ok(Some(hint));
     }
     let store = FileRemoteStore::new(engine.paths.clone());
     if let Some((_, alias)) = task.assignee.as_deref().and_then(|id| id.split_once('@'))
@@ -197,7 +214,10 @@ async fn waiting_reason(engine: &Engine, task: &Task) -> Result<Option<String>> 
     Ok((!eligible).then(|| format!("no online agent with cap {}", caps.join(", "))))
 }
 
-fn task_row(styles: &Styles, task: &Task) -> Vec<String> {
+/// `remote` is the task's entry in `state.running`, when its run is on a peer.
+/// Its phase replaces the local status in the STATUS column: `in_progress`
+/// here can mean the worker has not even acknowledged the submit.
+fn task_row(styles: &Styles, task: &Task, remote: Option<&RemoteRunRef>) -> Vec<String> {
     // The TIME column shows an elapsed duration only for in_progress and done;
     // everything else is an em dash.
     let time = styles.dim("—");
@@ -205,7 +225,9 @@ fn task_row(styles: &Styles, task: &Task) -> Vec<String> {
         format!(
             "{} {}",
             styles.status_icon(task.status.as_str()),
-            task.status
+            remote
+                .and_then(|remote| remote.status_label())
+                .unwrap_or_else(|| task.status.to_string())
         ),
         styles.priority_label(task.priority),
         // `.slice(0, 35)` counts UTF-16 code units, so a surrogate pair can be
@@ -260,20 +282,30 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
     println!("  {}", "═".repeat(42));
     println!();
 
+    let remote = engine
+        .state
+        .read()
+        .await?
+        .running
+        .get(&task.id)
+        .and_then(|entry| entry.remote.clone());
     let mut pairs = vec![
         (
             "Status".to_owned(),
             format!(
                 "{} {} · attempt {}/{}",
                 styles.status_icon(task.status.as_str()),
-                task.status,
+                remote
+                    .as_ref()
+                    .and_then(|remote| remote.status_label())
+                    .unwrap_or_else(|| task.status.to_string()),
                 task.attempts,
                 task.max_attempts
             ),
         ),
         ("Priority".to_owned(), styles.priority_label(task.priority)),
     ];
-    if let Some(reason) = waiting_reason(engine, &task).await? {
+    if let Some(reason) = waiting_reason(engine, &task, remote.as_ref()).await? {
         pairs.push(("Waiting".to_owned(), reason));
     }
     if let Some(assignee) = &task.assignee {
@@ -536,21 +568,48 @@ mod tests {
         let mut task = task(TaskStatus::Todo);
         task.labels = vec!["cap:freebsd".into()];
         assert_eq!(
-            waiting_reason(&engine, &task).await.unwrap().as_deref(),
+            waiting_reason(&engine, &task, None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("no online agent with cap freebsd")
         );
         task.assignee = Some("agt_worker@w1".into());
         assert_eq!(
-            waiting_reason(&engine, &task).await.unwrap().as_deref(),
+            waiting_reason(&engine, &task, None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("remote w1 offline")
         );
         task.status = TaskStatus::InProgress;
         assert_eq!(
-            waiting_reason(&engine, &task).await.unwrap().as_deref(),
+            waiting_reason(&engine, &task, None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("remote w1 offline (outcome pending)")
         );
         task.status = TaskStatus::Done;
-        assert_eq!(waiting_reason(&engine, &task).await.unwrap(), None);
+        assert_eq!(waiting_reason(&engine, &task, None).await.unwrap(), None);
+        // A worker's own reason outranks anything inferred from a snapshot.
+        task.status = TaskStatus::InProgress;
+        let remote = RemoteRunRef {
+            phase: orch_domain::RemotePhase::Queued,
+            worker_task_id: Some("tsk_mirror".into()),
+            reason: Some(format!(
+                "{} run `orch task approve tsk_mirror` on this worker",
+                orch_domain::AWAITING_APPROVAL_REASON
+            )),
+            ..RemoteRunRef::new("w1", "run_1")
+        };
+        assert_eq!(
+            waiting_reason(&engine, &task, Some(&remote))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("awaiting approval: orch task approve tsk_mirror on w1")
+        );
     }
 
     #[test]
@@ -592,7 +651,7 @@ mod tests {
     fn a_row_renders_the_status_glyph_priority_and_an_em_dash_for_no_agent() {
         let styles = Styles::plain();
         assert_eq!(
-            task_row(&styles, &task(TaskStatus::Todo)),
+            task_row(&styles, &task(TaskStatus::Todo), None),
             vec!["○ todo", "P3", "Test task", "—", "—"]
         );
         assert_eq!(
@@ -601,9 +660,37 @@ mod tests {
                 &Task {
                     status: TaskStatus::InProgress,
                     ..make_task()
-                }
+                },
+                None
             )[0],
             "● in_progress"
+        );
+    }
+
+    #[test]
+    fn a_remote_row_shows_the_worker_phase_instead_of_the_local_status() {
+        let styles = Styles::plain();
+        let task = Task {
+            status: TaskStatus::InProgress,
+            assignee: Some("agt_peer@2com".into()),
+            ..make_task()
+        };
+        let mut remote = RemoteRunRef::new("2com", "run_1");
+        let status = |remote: &RemoteRunRef| task_row(&styles, &task, Some(remote))[0].clone();
+        assert_eq!(status(&remote), "● dispatched → 2com");
+        remote.phase = orch_domain::RemotePhase::Queued;
+        assert_eq!(status(&remote), "● queued @2com");
+        remote.phase = orch_domain::RemotePhase::Running;
+        assert_eq!(status(&remote), "● RUN @2com");
+        remote.phase = orch_domain::RemotePhase::Unknown;
+        assert_eq!(status(&remote), "● RUN? (2com offline)");
+        // Once the outcome has arrived the task's own status is the truth.
+        remote.phase = orch_domain::RemotePhase::Terminal;
+        assert_eq!(status(&remote), "● in_progress");
+        assert_eq!(
+            task_row(&styles, &task, None)[0],
+            "● in_progress",
+            "a local task is unaffected"
         );
     }
 
@@ -614,7 +701,7 @@ mod tests {
             assignee: Some("agt_creator".into()),
             ..make_task()
         };
-        assert_eq!(task_row(&styles, &task)[3], "agt_creator");
+        assert_eq!(task_row(&styles, &task, None)[3], "agt_creator");
     }
 
     #[test]
@@ -624,20 +711,20 @@ mod tests {
             title: "x".repeat(50),
             ..make_task()
         };
-        assert_eq!(task_row(&styles, &task)[2].chars().count(), 35);
+        assert_eq!(task_row(&styles, &task, None)[2].chars().count(), 35);
 
         let task = Task {
             title: "short".into(),
             ..make_task()
         };
-        assert_eq!(task_row(&styles, &task)[2], "short");
+        assert_eq!(task_row(&styles, &task, None)[2], "short");
     }
 
     #[test]
     fn the_rendered_table_matches_the_reference_padding() {
         let styles = Styles::plain();
         let tasks = [task(TaskStatus::Todo)];
-        let rows: Vec<Vec<String>> = tasks.iter().map(|t| task_row(&styles, t)).collect();
+        let rows: Vec<Vec<String>> = tasks.iter().map(|t| task_row(&styles, t, None)).collect();
         assert_eq!(
             crate::output::render_table(
                 &styles,

@@ -23,8 +23,8 @@ use orch_core::error::{Error, Result};
 use orch_core::remote::{RemoteOutcome, RunEventTap};
 use orch_core::storage::TaskFilter;
 use orch_domain::{
-    AWAITING_APPROVAL_LABEL, AgentStatus, ApprovalPolicy, CreateTaskInput, InboundStatus, Run,
-    RunStatus, Task, TaskStatus,
+    AWAITING_APPROVAL_LABEL, AWAITING_APPROVAL_REASON, AgentStatus, ApprovalPolicy,
+    CreateTaskInput, InboundStatus, Run, RunStatus, Task, TaskStatus,
 };
 use orch_infra::storage::{
     fs_utils::{owner_only, write_json_with_mode},
@@ -676,7 +676,7 @@ impl Worker {
         // this apart from a worker that is merely busy.
         Ok(if task.awaits_approval() {
             item.with_reason(format!(
-                "awaiting approval: run `orch task approve {}` on this worker",
+                "{AWAITING_APPROVAL_REASON} run `orch task approve {}` on this worker",
                 task.id
             ))
         } else {
@@ -863,7 +863,7 @@ impl Worker {
                                 state: "queued".into(),
                                 reason: held.then(|| {
                                     format!(
-                                        "awaiting approval: run `orch task approve {worker_task_id}` on this worker"
+                                        "{AWAITING_APPROVAL_REASON} run `orch task approve {worker_task_id}` on this worker"
                                     )
                                 }),
                                 worker_task_id: Some(worker_task_id),

@@ -291,6 +291,7 @@ pub const CURSOR: &str = "▸";
 pub const TRIANGLE_DOWN: &str = "▼";
 pub const PIPE: &str = "│";
 pub const ARROW_LEFT: &str = "←";
+pub const ARROW_RIGHT: &str = "→";
 pub const GEAR: &str = "⚙";
 pub const PENCIL: &str = "✎";
 pub const BLOCK: &str = "█";
