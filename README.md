@@ -50,9 +50,9 @@ alpha, install it explicitly from its tag, into a directory of its own so the Ho
 
 ```bash
 git clone <this repo> r-orch-alpha && cd r-orch-alpha
-git checkout v0.5.0-alpha.1
+git checkout v0.5.0-alpha.2
 cargo install --locked --path crates/orch-cli --root ~/.orch-alpha
-~/.orch-alpha/bin/orch --version      # 0.5.0-alpha.1
+~/.orch-alpha/bin/orch --version      # 0.5.0-alpha.2
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
