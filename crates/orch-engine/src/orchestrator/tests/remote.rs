@@ -1074,29 +1074,33 @@ async fn force_stop_agent_sends_remote_cancel_without_local_kill() {
     no_process_calls(&h);
 }
 
+/// A graceful shutdown **detaches** a remote run. Cancelling it would throw
+/// away an outcome the worker is still computing and leave the worker
+/// computing it; the user chose rehydration, and a restart is the common
+/// case. The live failure: a SIGTERM cancelled `tsk_EE4NJM4` mid-flight.
 #[tokio::test]
-async fn graceful_shutdown_cancels_remote_without_local_kill_or_retry() {
+async fn graceful_shutdown_detaches_a_remote_run_for_the_next_start() {
     let fixture = PeerFixture::new(true).await;
     let (h, bridge) = running(&fixture).await;
-    let deferred = h
-        .orchestrator
-        .shutdown_running_entries(&remote_state(NOW_ISO))
-        .await;
-    assert_eq!(h.task("tsk_remote").status, TaskStatus::Cancelled);
-    // The run waits for the drain's verdict.
+    h.orchestrator.stop().await.unwrap();
+
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
     assert_eq!(
         h.runs.peek("run_remote").unwrap().status,
-        RunStatus::Running
+        RunStatus::Running,
+        "the worker's run is not this process's to finish"
     );
-    h.orchestrator.drain_remote_cancellations(deferred).await;
-    let run = h.runs.peek("run_remote").unwrap();
-    assert_eq!(run.status, RunStatus::Cancelled);
-    assert_eq!(
-        run.error, None,
-        "acknowledged cancel is not an unknown outcome"
+    assert!(
+        bridge.cancelled.lock().unwrap().is_empty(),
+        "no cancel may reach the worker on a graceful exit"
     );
-    assert!(h.in_memory_state().await.retry_queue.is_empty());
-    cancelled_once(&bridge);
+    // The reservation survives the shutdown, as `unknown` until a sync.
+    let persisted = h.persisted_state();
+    let remote = persisted.running["tsk_remote"].remote.clone().unwrap();
+    assert_eq!(remote.phase, RemotePhase::Unknown);
+    assert_eq!(remote.status_label().unwrap(), "RUN? (worker offline)");
+    assert!(persisted.claimed.is_empty() && persisted.pid.is_none());
+    assert!(persisted.retry_queue.is_empty());
     no_process_calls(&h);
 }
 
@@ -1114,55 +1118,12 @@ fn unknown_cancel_warnings(h: &Harness) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A cancellation this owner could not deliver before exiting is disclosed,
+/// and its key survives in the hub for the next Sync. Shutdown itself no
+/// longer cancels anything remote, so the only unresolved keys are the ones
+/// an operator (or reconcile) asked for.
 #[tokio::test]
-async fn unacknowledged_shutdown_cancel_is_persisted_on_the_run_and_reported_once() {
-    let fixture = PeerFixture::new(true).await;
-    let (h, bridge) = running(&fixture).await;
-    bridge
-        .unacknowledged
-        .lock()
-        .unwrap()
-        .push(("worker".into(), "run_remote".into()));
-    h.orchestrator.stop().await.unwrap();
-
-    let run = h.runs.peek("run_remote").unwrap();
-    assert_eq!(run.status, RunStatus::Cancelled);
-    let error = run.error.expect("durable unknown-outcome diagnostic");
-    for part in ["worker", "run_remote", "outcome unknown", "next Sync"] {
-        assert!(error.contains(part), "{part:?} missing from {error:?}");
-    }
-    assert_eq!(h.task("tsk_remote").status, TaskStatus::Cancelled);
-    assert_eq!(
-        unknown_cancel_warnings(&h),
-        vec![(error, "stop: cancel remote worker:run_remote".to_owned())],
-        "one live warning per unresolved cancel"
-    );
-    cancelled_once(&bridge);
-    no_process_calls(&h);
-}
-
-#[tokio::test]
-async fn failed_shutdown_drain_records_every_deferred_cancel_as_unknown() {
-    let fixture = PeerFixture::new(true).await;
-    let (h, bridge) = running(&fixture).await;
-    bridge
-        .drain_fails
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    h.orchestrator.stop().await.unwrap();
-
-    let run = h.runs.peek("run_remote").unwrap();
-    assert_eq!(run.status, RunStatus::Cancelled);
-    assert!(
-        run.error
-            .as_deref()
-            .is_some_and(|error| error.contains("outcome unknown")),
-        "{run:?}"
-    );
-    assert_eq!(unknown_cancel_warnings(&h).len(), 1);
-}
-
-#[tokio::test]
-async fn unresolved_cancel_from_before_shutdown_is_still_reported_without_a_run_write() {
+async fn an_undelivered_cancellation_is_reported_once_at_shutdown() {
     let fixture = PeerFixture::new(true).await;
     let (h, bridge) = running(&fixture).await;
     bridge
@@ -1172,10 +1133,41 @@ async fn unresolved_cancel_from_before_shutdown_is_still_reported_without_a_run_
         .push(("worker".into(), "run_earlier".into()));
     h.orchestrator.stop().await.unwrap();
 
-    assert_eq!(h.runs.peek("run_remote").unwrap().error, None);
     let warnings = unknown_cancel_warnings(&h);
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert_eq!(warnings[0].1, "stop: cancel remote worker:run_earlier");
+    assert!(warnings[0].0.contains("next Sync"));
+    // The detached run is untouched by the drain.
+    assert_eq!(h.runs.peek("run_remote").unwrap().error, None);
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().status,
+        RunStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn a_failed_shutdown_drain_is_reported_without_touching_a_detached_run() {
+    let fixture = PeerFixture::new(true).await;
+    let (h, bridge) = running(&fixture).await;
+    bridge
+        .drain_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.orchestrator.stop().await.unwrap();
+
+    assert_eq!(
+        h.runs.peek("run_remote").unwrap().status,
+        RunStatus::Running
+    );
+    assert_eq!(
+        h.events_of(OrchestratorEventType::OrchestratorError)
+            .iter()
+            .filter(
+                |event| matches!(event, OrchestratorEvent::OrchestratorError { context, .. }
+                if context == "stop: drain remote cancellations")
+            )
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -2655,7 +2647,7 @@ async fn local_collectorless_missing_task_releases_dead_reservation_without_sign
         );
     }
     h.orchestrator
-        .shutdown_running_entries(&h.persisted_state())
+        .shutdown_running_entries(&mut h.persisted_state())
         .await;
     assert!(h.processes.killed_with_grace().is_empty());
     assert_eq!(h.runs.peek("run_local").unwrap(), run);

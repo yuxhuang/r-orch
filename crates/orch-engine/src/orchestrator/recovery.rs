@@ -530,59 +530,23 @@ impl Orchestrator {
     /// error (`orch logs <exec_key>`), independent of whichever terminal or
     /// event subscriber outlives the process. This moves those existing
     /// `finish` writes out of the state mutex; it adds no await.
-    pub(super) async fn drain_remote_cancellations(&self, deferred: Vec<DeferredRemoteFinish>) {
-        let pending = match self
+    pub(super) async fn drain_remote_cancellations(&self) {
+        match self
             .remote_bridge()
             .drain_cancellations(REMOTE_CANCEL_DRAIN_DEADLINE)
             .await
         {
+            // A cancellation this owner could not deliver before exiting is
+            // disclosed, and the hub's key survives for the next Sync.
             Ok(pending) => {
-                // Shutdown's own runs are reported below, with the run record.
-                for cancel in pending.iter().filter(|cancel| {
-                    !deferred.iter().any(|d| {
-                        d.remote.alias == cancel.alias && d.remote.exec_key == cancel.exec_key
-                    })
-                }) {
+                for cancel in pending {
                     self.emit_error(
                         orch_core::error::Error::other("Remote cancel outcome unknown; cancellation will be re-sent on the next Sync"),
                         format!("stop: cancel remote {}:{}", cancel.alias, cancel.exec_key),
                     );
                 }
-                Some(pending)
             }
-            Err(error) => {
-                self.emit_error(error, "stop: drain remote cancellations");
-                None
-            }
-        };
-
-        for deferred in deferred {
-            let remote = &deferred.remote;
-            // A failed drain proves nothing was acknowledged.
-            let unknown = pending.as_ref().is_none_or(|pending| {
-                pending
-                    .iter()
-                    .any(|p| p.alias == remote.alias && p.exec_key == remote.exec_key)
-            });
-            if unknown {
-                self.emit_error(
-                    orch_core::error::Error::other(remote_cancel_unknown(remote)),
-                    format!("stop: cancel remote {}:{}", remote.alias, remote.exec_key),
-                );
-            }
-            if let Err(err) = self
-                .deps()
-                .run_service
-                .finish(
-                    &deferred.run_id,
-                    RunStatus::Cancelled,
-                    None,
-                    unknown.then(|| remote_cancel_unknown(remote)),
-                )
-                .await
-            {
-                self.emit_error(err, format!("stop: finish run {}", deferred.run_id));
-            }
+            Err(error) => self.emit_error(error, "stop: drain remote cancellations"),
         }
     }
 
@@ -598,14 +562,17 @@ impl Orchestrator {
     /// continues, so the lock is always released. No ported test distinguishes
     /// the two (nothing throws with the in-memory fakes).
     ///
-    /// Remote runs are not finished here: they are returned so
-    /// [`Orchestrator::drain_remote_cancellations`] can record the drain's
-    /// verdict on them outside the state mutex.
+    /// A **remote** execution is not wound down at all: it is detached. The
+    /// worker owns it, so cancelling the reservation here would discard an
+    /// outcome that is still being computed — and leave the worker computing
+    /// it. The entry stays in `state.running` as `unknown` and the next start
+    /// rehydrates it. Returns the task ids that were detached, which the
+    /// caller must keep when it clears the rest of `state.running`.
     pub(super) async fn shutdown_running_entries(
         &self,
-        state: &OrchestratorState,
-    ) -> Vec<DeferredRemoteFinish> {
-        let mut deferred = Vec::new();
+        state: &mut OrchestratorState,
+    ) -> Vec<String> {
+        let mut detached = Vec::new();
         let entries: Vec<(String, orch_domain::RunningEntry)> = state
             .running
             .iter()
@@ -613,6 +580,26 @@ impl Orchestrator {
             .collect();
 
         for (task_id, entry) in entries {
+            if let Some(remote) = &entry.remote {
+                // Only the collector stops. No cancel reaches the worker, the
+                // run record is left alone, and the task stays in progress.
+                self.take_cancel(&task_id).await;
+                if let Some(remote) = state
+                    .running
+                    .get_mut(&task_id)
+                    .and_then(|entry| entry.remote.as_mut())
+                {
+                    remote.phase = orch_domain::RemotePhase::Unknown;
+                }
+                tracing::info!(
+                    %task_id,
+                    alias = %remote.alias,
+                    exec_key = %remote.exec_key,
+                    "Detaching remote execution for shutdown; it is rehydrated on the next start"
+                );
+                detached.push(task_id);
+                continue;
+            }
             if self.worker_signal_unverified(&entry).await {
                 self.emit_error(
                     "Worker execution ownership cannot verify; not signalled; reservation retained",
@@ -621,21 +608,12 @@ impl Orchestrator {
                 continue;
             }
             self.take_cancel(&task_id).await;
-            if let Some(remote) = &entry.remote {
-                self.cancel_remote(remote).await;
-            } else {
-                self.deps()
-                    .processes
-                    .kill_with_grace(entry.pid, orch_core::process::DEFAULT_KILL_GRACE)
-                    .await;
-            }
+            self.deps()
+                .processes
+                .kill_with_grace(entry.pid, orch_core::process::DEFAULT_KILL_GRACE)
+                .await;
 
-            if let Some(remote) = &entry.remote {
-                deferred.push(DeferredRemoteFinish {
-                    run_id: entry.run_id.clone(),
-                    remote: remote.clone(),
-                });
-            } else if let Err(err) = self
+            if let Err(err) = self
                 .deps()
                 .run_service
                 .finish(&entry.run_id, RunStatus::Cancelled, None, None)
@@ -646,11 +624,7 @@ impl Orchestrator {
 
             match self.deps().task_store.get(&task_id).await {
                 Ok(Some(task)) => {
-                    let next = if entry.remote.is_some() {
-                        TaskStatus::Cancelled
-                    } else {
-                        resolve_failure_status(&task)
-                    };
+                    let next = resolve_failure_status(&task);
                     if let Err(err) = self.deps().task_service.update_status(&task_id, next).await {
                         self.emit_error(err, format!("stop: set task {task_id} to {next}"));
                     }
@@ -659,12 +633,11 @@ impl Orchestrator {
                 Err(err) => self.emit_error(err, format!("stop: read task {task_id}")),
             }
 
-            if entry.remote.is_none()
-                && let Err(err) = self
-                    .deps()
-                    .agent_service
-                    .set_status(&entry.agent_id, AgentStatus::Idle)
-                    .await
+            if let Err(err) = self
+                .deps()
+                .agent_service
+                .set_status(&entry.agent_id, AgentStatus::Idle)
+                .await
             {
                 self.emit_error(
                     err,
@@ -672,21 +645,6 @@ impl Orchestrator {
                 );
             }
         }
-        deferred
+        detached
     }
-}
-
-/// A remote run cancelled by shutdown, finished once the drain has decided
-/// whether its worker acknowledged the cancel.
-pub(super) struct DeferredRemoteFinish {
-    run_id: String,
-    remote: orch_domain::remote::RemoteRunRef,
-}
-
-/// The durable diagnostic for a shutdown cancel the worker never confirmed.
-pub(crate) fn remote_cancel_unknown(remote: &orch_domain::remote::RemoteRunRef) -> String {
-    format!(
-        "Remote cancel outcome unknown: peer {} did not acknowledge cancellation of {} before shutdown, so it may still be running there; cancellation will be re-sent on the next Sync",
-        remote.alias, remote.exec_key
-    )
 }

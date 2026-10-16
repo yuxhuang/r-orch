@@ -772,22 +772,26 @@ impl Orchestrator {
         // tick circuit breaker calls `stop()` precisely when the state store
         // is the thing that is broken. The error is still returned, so a
         // caller sees it; it just no longer costs the lock.
-        let (saved, deferred) = {
+        let saved = {
             let mut slot = self.inner.state.lock().await;
             match slot.as_mut() {
                 Some(state) => {
-                    let deferred = self.shutdown_running_entries(state).await;
-                    state.running.clear();
+                    // Detached remote entries stay: their worker is still
+                    // executing them, and the next start rehydrates them.
+                    let detached = self.shutdown_running_entries(state).await;
+                    state
+                        .running
+                        .retain(|task_id, _| detached.contains(task_id));
                     state.claimed.clear();
                     state.pid = None;
                     state.started_at = None;
-                    (self.save_state(state).await, deferred)
+                    self.save_state(state).await
                 }
-                None => (Ok(()), Vec::new()),
+                None => Ok(()),
             }
         };
 
-        self.drain_remote_cancellations(deferred).await;
+        self.drain_remote_cancellations().await;
 
         if self.inner.lock_acquired.swap(false, Ordering::SeqCst) {
             self.deps().lock.release().await;
