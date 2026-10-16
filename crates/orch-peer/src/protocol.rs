@@ -217,10 +217,11 @@ mod tests {
         assert_eq!(id, "msg_one");
     }
 
-    /// The 0.5.0 shapes of every frame this release added a field to, with
-    /// that release's serde policy (additive fields ignored, nothing else
-    /// optional). Reading a current frame with it is the "old peer sees a new
-    /// peer" half of the compatibility rule.
+    /// The 0.5.0 shapes of every frame this release added a field to, field
+    /// for field from `git show v0.5.0:crates/orch-peer/src/protocol.rs`,
+    /// with that release's serde policy (additive fields ignored, nothing
+    /// else optional). Reading a current frame with it is the "old peer sees
+    /// a new peer" half of the compatibility rule.
     #[derive(Deserialize)]
     #[serde(tag = "t", rename_all = "snake_case")]
     enum LegacyFrame {
@@ -229,12 +230,18 @@ mod tests {
             instance_id: String,
             name: String,
             os: String,
+            // Required there as here: a field this release dropped would
+            // fail to parse, which is what makes this copy worth having.
+            #[serde(with = "orch_infra::storage::remote::public_snapshot")]
+            agents: Vec<Agent>,
         },
         Welcome {
             proto: u32,
             instance_id: String,
             name: String,
             os: String,
+            #[serde(with = "orch_infra::storage::remote::public_snapshot")]
+            agents: Vec<Agent>,
         },
         SyncState {
             items: Vec<LegacySyncItem>,
@@ -267,6 +274,7 @@ mod tests {
             instance_id,
             name,
             os,
+            agents,
         } = legacy(&Frame::Hello {
             proto: PROTOCOL,
             instance_id: "controller-id".into(),
@@ -282,11 +290,13 @@ mod tests {
             (proto, instance_id.as_str(), name.as_str(), os.as_str()),
             (PROTOCOL, "controller-id", "controller", "macos")
         );
+        assert!(agents.is_empty());
         let LegacyFrame::Welcome {
             proto,
             instance_id,
             name,
             os,
+            agents,
         } = legacy(&Frame::Welcome {
             proto: PROTOCOL,
             instance_id: "worker-id".into(),
@@ -302,6 +312,7 @@ mod tests {
             (proto, instance_id.as_str(), name.as_str(), os.as_str()),
             (PROTOCOL, "worker-id", "worker", "linux")
         );
+        assert!(agents.is_empty());
         let LegacyFrame::SyncState { items } = legacy(&Frame::SyncState {
             items: vec![
                 SyncItem::new("key", "unknown").with_reason("worker storage error: data"),

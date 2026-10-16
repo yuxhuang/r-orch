@@ -499,6 +499,13 @@ worker last reported, in `orch task list`, `orch task show` and the dashboard's 
 | `RUN @2com` | The worker says its agent is executing. | Nothing. This is never shown without a running signal from the worker. |
 | `RUN? (2com offline)` | The link dropped after the submit was written, so nobody here knows what the worker has. | Nothing. The next session's sync resolves it to queued, running or finished — or to a failure if the worker has lost the record. |
 
+**A restart or a shutdown does not change any of this.** A graceful exit
+(`SIGTERM`, the dashboard's `/pause`, a service-manager restart) **detaches** a
+remote run: no cancel is sent, the worker keeps executing, and the entry stays
+in `state.running` as `RUN?` for the next start to pick back up. Only a peer
+that has been **removed** from the registry turns its runs into
+`remote <alias> removed; outcome unknown`.
+
 Two messages come out of the deadlines:
 
 - **`tsk_x has been queued on 2com for 1h`** (`orchestrator:error`, once an hour, with the approve command as
@@ -509,9 +516,25 @@ Two messages come out of the deadlines:
   is the part that says where to look — on the worker, in that example, at the mirror's task file. The task
   fails without a retry, and a cancel goes out in case the mirror becomes readable again.
 
-A restart no longer loses any of this. Remote reservations whose peer is still in the registry survive it,
-in `RUN?` until the first sync answers; only a peer that has been **removed** from the registry turns its
-runs into `remote <alias> removed; outcome unknown`.
+### What the deadlines do not cover
+
+- **`RUN?` has no deadline.** An execution nobody can account for — a dropped
+  link, a detached shutdown, a rehydrated restart — waits for a sync, for as
+  long as that takes. Nothing times it out, because the only thing that can
+  resolve it is the worker. If the peer never returns, `orch remote remove
+  <alias>` is the deliberate way to end it (that fails its runs as
+  `removed; outcome unknown`).
+- **The clocks live in memory.** A restart starts every phase clock again, so a
+  dispatched run gets a fresh five minutes and a queued one a fresh hour.
+- **A clock counts reconciles, not wall time.** Each pass credits at most two
+  poll intervals, so a laptop that slept for eight hours does not fail a
+  dispatched run on the first tick after it wakes.
+- **A deadline is final for the controller, not for the worker.** When a
+  dispatched run is failed, a Cancel goes out, but if the worker's acceptance
+  was merely slow, a success landing after that is dropped: the task is
+  terminal and the key is no longer tracked, and the worker's mirror is
+  cancelled on the next sync. Check the worker before re-running such a task,
+  or the work may happen twice.
 
 ---
 
@@ -531,8 +554,11 @@ different situations:
   climbing count with a short `retry in` is the signature of a worker that accepts a connection and then
   closes it — look in the **worker's** `serve.log` and at `orch remote status` there, which reports
   `Listen: … (last session ended: <error>)`.
-- **`retry in Ns`** counts down to the next dial. The backoff is 1, 2, 4, 8, capped at 15 seconds with ±25 %
-  jitter, and it only resets after a session has cleared its sync fence and stayed up for 30 seconds.
+- **`retry in Ns`** counts down to the next dial. The backoff is 1, 2, 4, 8, capped at 15 seconds, each with
+  ±25 % jitter — so the longest real wait is about 18.75 s — and it only resets after a session has cleared
+  its sync fence and stayed up for 30 seconds. The disconnect event in the activity feed is debounced to one
+  per distinct error per 30 s, so a peer that drops every session reports once, not once per redial; the
+  `attempt` counter is what shows the rate.
 - **`(version unknown)`** beside an online peer means that peer predates the version field in the handshake.
   Nothing is wrong with the link; it is an older build.
 
@@ -550,6 +576,17 @@ controller has not been admitted for **24 hours** is cancelled with:
 ```
 orphaned remote mirror: controller <instance id> absent since <timestamp>
 ```
+
+A mirror can also be cancelled for two other reasons, and both say so on the
+task:
+
+- **`orphaned remote mirror: controller <id> no longer tracks execution <key>`**
+  — the controller synced and did not list that key, so it has already
+  accounted for the execution (finished, failed, or given up as unknown). This
+  is the common one after a controller failed a run whose mirror it could not
+  read.
+- **`cancelled by controller <name>`** — an `orch task cancel` on the
+  controller, or its reconcile, reached this worker.
 
 Three things are deliberately *not* swept:
 
@@ -577,6 +614,12 @@ A **new frame variant, a removed field, or a changed meaning for an existing one
 bump**, because an old peer treats a frame it cannot parse as fatal and closes the session. A mismatched
 `PROTOCOL` is refused at the handshake with `Peer protocol mismatch`, which is the honest failure: both
 owners then know to upgrade.
+
+**Downgrading is not symmetric.** A 0.5.0 build understands every frame this release sends, but it does
+not have the behaviour behind them: it **cancels** remote runs on a restart or a `SIGTERM` instead of
+detaching them, it never sweeps orphaned mirrors on a worker, and it shows a dispatched or queued remote
+task as `RUN`. So a downgrade with remote runs in flight loses them, and the work may already have happened
+on the worker. Drain remote work first, or check each worker's task list afterwards.
 
 The rule is enforced by tests in `crates/orch-peer/src/protocol.rs`, in both directions — current frames
 parsed by a copy of the previous release's shapes, and previous-release JSON parsed by the current frames.
