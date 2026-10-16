@@ -418,14 +418,21 @@ async fn progress_proves_a_run_the_worker_has_not_announced_yet() {
 /// the controller claimed the run was live and waited forever.
 #[tokio::test]
 async fn an_unacknowledged_submit_fails_on_five_minutes_of_online_time() {
-    let fixture = PeerFixture::new(false).await;
+    let fixture = PeerFixture::new(true).await;
     let (h, bridge) = running(&fixture).await;
     h.state
         .write(&remote_state_in(NOW_ISO, RemotePhase::Dispatched))
         .await
         .unwrap();
 
+    // A phase seen for the first time starts its clock at zero. (It counted
+    // from the epoch once, which failed every remote dispatch on sight.)
+    h.reconcile().await.unwrap();
+    assert_eq!(h.task("tsk_remote").status, TaskStatus::InProgress);
+    assert!(bridge.cancelled.lock().unwrap().is_empty());
+
     // Offline time does not count, however long the worker is away.
+    fixture.status(false).await;
     h.reconcile().await.unwrap();
     h.clock.advance_ms(10 * 60_000);
     h.reconcile().await.unwrap();

@@ -17,7 +17,7 @@ use super::{Orchestrator, REMOTE_QUEUED_WARN_MS, REMOTE_SUBMIT_DEADLINE_MS};
 /// How long one remote entry has been in its current phase, for the two
 /// deadlines. `dispatched` counts only the time its peer was online; nothing
 /// else needs a wall clock that stops.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct RemoteClock {
     phase: RemotePhase,
     /// Milliseconds spent in `phase`. Online-only while `dispatched`.
@@ -29,14 +29,23 @@ pub(super) struct RemoteClock {
 }
 
 impl RemoteClock {
+    /// A phase observed for the first time, with its clock at zero. There is
+    /// no `Default`: an entry whose `sampled_at_ms` defaulted to the epoch
+    /// counted every millisecond since 1970 on its first sample, which failed
+    /// a freshly dispatched run instantly.
+    fn started(phase: RemotePhase, now_ms: i64) -> Self {
+        Self {
+            phase,
+            elapsed_ms: 0,
+            sampled_at_ms: now_ms,
+            warned_at_ms: None,
+        }
+    }
+
     /// Fold one reconcile sample in and return the time spent in `phase`.
     fn sample(&mut self, phase: RemotePhase, now_ms: i64, counts: bool) -> i64 {
         if phase != self.phase {
-            *self = RemoteClock {
-                phase,
-                sampled_at_ms: now_ms,
-                ..RemoteClock::default()
-            };
+            *self = RemoteClock::started(phase, now_ms);
             return 0;
         }
         let delta = now_ms.saturating_sub(self.sampled_at_ms).max(0);
@@ -84,7 +93,9 @@ impl Orchestrator {
         let now = self.deps().clock.now_ms();
         let (elapsed, warn_due) = {
             let mut clocks = self.inner.remote_clocks.lock().await;
-            let clock = clocks.entry(task_id.to_owned()).or_default();
+            let clock = clocks
+                .entry(task_id.to_owned())
+                .or_insert_with(|| RemoteClock::started(remote.phase, now));
             // Only `dispatched` stops counting while the peer is away: an
             // offline worker has not failed to answer.
             let counts = online || remote.phase != RemotePhase::Dispatched;
