@@ -511,6 +511,87 @@ async fn an_unreadable_mirror_is_reported_unknown_and_keeps_the_session() {
     assert_eq!((item.state.as_str(), item.reason.as_deref()), ("queued", None));
 }
 
+/// A mirror only runs for the controller currently connected, so one left by
+/// a controller that never comes back would sit `todo` in a local agent's
+/// queue for ever. After a day it is cancelled, and the task says why.
+#[tokio::test]
+async fn an_orphaned_mirror_is_cancelled_after_a_day_without_its_controller() {
+    let (_temp, worker, agent) = fixture().await;
+    // Two mirrors from a controller that is not the connected one.
+    for key in ["gone-todo", "gone-running"] {
+        worker
+            .handle("ghost", "ghost", submit(key, &agent))
+            .await
+            .unwrap();
+    }
+    let mut running = mirror(&worker, "gone-running").await;
+    running.status = TaskStatus::InProgress;
+    worker.ctx.engine.tasks.save(&running).await.unwrap();
+    // And one from the controller that is connected right now.
+    worker
+        .handle("controller", "controller", submit("live", &agent))
+        .await
+        .unwrap();
+    worker
+        .session
+        .lock()
+        .await
+        .claim("controller", "controller")
+        .unwrap();
+
+    // First sweep: the absence of a controller is dated from the first time
+    // this instance noticed it, so nothing is cancelled on sight.
+    assert_eq!(worker.collect_orphan_mirrors().await.unwrap(), 0);
+    assert_eq!(
+        mirror(&worker, "gone-todo").await.status,
+        TaskStatus::Todo,
+        "a controller seen for the first time gets its full day"
+    );
+    let seen: std::collections::BTreeMap<String, String> =
+        orch_infra::storage::fs_utils::read_json(&worker.controllers_path())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        seen.keys().cloned().collect::<Vec<_>>(),
+        vec!["controller".to_owned(), "ghost".to_owned()]
+    );
+
+    // A day and an hour later.
+    let absent = orch_core::clock::iso_from_epoch_ms(
+        worker.ctx.engine.clock.now_ms() - 25 * 3_600_000,
+    );
+    orch_infra::storage::fs_utils::write_json(
+        &worker.controllers_path(),
+        &std::collections::BTreeMap::from([
+            ("ghost".to_owned(), absent.clone()),
+            ("controller".to_owned(), absent.clone()),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(worker.collect_orphan_mirrors().await.unwrap(), 1);
+
+    let orphan = mirror(&worker, "gone-todo").await;
+    assert_eq!(orphan.status, TaskStatus::Cancelled);
+    assert_eq!(
+        orphan.feedback.as_deref(),
+        Some(
+            format!("orphaned remote mirror: controller ghost absent since {absent}").as_str()
+        )
+    );
+    assert_eq!(
+        mirror(&worker, "gone-running").await.status,
+        TaskStatus::InProgress,
+        "a running mirror owns a local process and belongs to quarantine"
+    );
+    assert_eq!(
+        mirror(&worker, "live").await.status,
+        TaskStatus::Todo,
+        "the connected controller is never absent"
+    );
+}
+
 /// The live failure: the controller gave up on an unreadable mirror and sent
 /// a cancel, which the worker could not apply either — and nothing retried
 /// it, so the mirror sat `todo` on the worker until the next reconnect. The

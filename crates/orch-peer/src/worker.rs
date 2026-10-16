@@ -14,7 +14,7 @@
 //!   debounced `OrchestratorError`, skip this tick, keep the session;
 //! - fatal, closing the session: transport, the handshake, and "expected sync".
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ use orch_domain::{
     CreateTaskInput, InboundStatus, Run, RunStatus, Task, TaskStatus,
 };
 use orch_infra::storage::{
-    fs_utils::{owner_only, write_json_with_mode},
+    fs_utils::{owner_only, read_json, write_json_with_mode},
     remote::validate_snapshot,
 };
 use tokio::io::BufReader;
@@ -53,6 +53,13 @@ const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(2);
 /// One `OrchestratorError` per fault kind per window. A fault that recurs on
 /// every one-second tick must stay visible without flooding the feed.
 const FAULT_REPORT_EVERY: Duration = Duration::from_secs(30);
+/// How often the orphan sweep runs, besides once at `listen()`.
+const ORPHAN_GC_EVERY: Duration = Duration::from_secs(3_600);
+/// How long a controller may stay away before its queued mirrors are
+/// cancelled. Long enough to cover an overnight laptop and a weekend's
+/// worth of a paused controller; short enough that a decommissioned one
+/// does not hold a local agent's queue for ever.
+const CONTROLLER_ABSENCE_LIMIT_MS: i64 = 24 * 3_600_000;
 
 #[derive(Default)]
 struct EventRing {
@@ -232,6 +239,94 @@ impl Worker {
         }
     }
 
+    fn controllers_path(&self) -> std::path::PathBuf {
+        self.ctx
+            .engine
+            .paths
+            .remotes_dir()
+            .join("_controllers.json")
+    }
+
+    /// When each controller was last admitted here. Owner-only, like every
+    /// other file under `remotes/`.
+    async fn record_controller(&self, instance_id: &str) -> Result<()> {
+        let path = self.controllers_path();
+        let mut seen: BTreeMap<String, String> = read_json(&path).await?.unwrap_or_default();
+        seen.insert(instance_id.into(), self.ctx.engine.clock.now_iso());
+        write_json_with_mode(&path, &seen, owner_only()).await
+    }
+
+    /// Cancel the mirrors of controllers that have not come back.
+    ///
+    /// A mirror only runs for the controller currently connected, so one left
+    /// behind by a controller that never returns sits `todo` for ever, in the
+    /// queue of a local agent, counted against nothing. After a day without
+    /// its controller it is cancelled and said so on the task.
+    ///
+    /// Only `todo` mirrors: an `in_progress` one has a live local process and
+    /// belongs to the quarantine path, which owns that pid. A controller this
+    /// instance has never recorded starts its clock now rather than being
+    /// cancelled on sight — including every mirror that predates this sweep.
+    async fn collect_orphan_mirrors(&self) -> Result<usize> {
+        let current = self
+            .session
+            .lock()
+            .await
+            .controller
+            .as_ref()
+            .map(|controller| controller.instance_id.clone());
+        let path = self.controllers_path();
+        let mut seen: BTreeMap<String, String> = read_json(&path).await?.unwrap_or_default();
+        let now = self.ctx.engine.clock.now_ms();
+        let tasks = self.ctx.engine.tasks.list(&TaskFilter::default()).await?;
+        let mut orphans: Vec<(Task, String, String)> = Vec::new();
+        let mut known: Vec<String> = Vec::new();
+        if let Some(current) = &current {
+            seen.insert(current.clone(), self.ctx.engine.clock.now_iso());
+            known.push(current.clone());
+        }
+        for task in tasks {
+            let Some(controller) = label(&task, "remote-ctl:").map(str::to_owned) else {
+                continue;
+            };
+            known.push(controller.clone());
+            if current.as_ref() == Some(&controller) || task.status != TaskStatus::Todo {
+                continue;
+            }
+            let Some(last_seen) = seen.get(&controller).cloned() else {
+                seen.insert(controller, self.ctx.engine.clock.now_iso());
+                continue;
+            };
+            if orch_core::clock::epoch_ms_from_iso(&last_seen)
+                .is_some_and(|at| now.saturating_sub(at) >= CONTROLLER_ABSENCE_LIMIT_MS)
+            {
+                orphans.push((task, controller, last_seen));
+            }
+        }
+        // A controller with no mirrors left needs no record either.
+        seen.retain(|instance_id, _| known.contains(instance_id));
+        write_json_with_mode(&path, &seen, owner_only()).await?;
+
+        let mut cancelled = 0;
+        for (mut task, controller, last_seen) in orphans {
+            let feedback =
+                format!("orphaned remote mirror: controller {controller} absent since {last_seen}");
+            tracing::warn!(task_id = %task.id, %controller, %last_seen, "Cancelling orphaned remote mirror");
+            task.feedback = Some(feedback);
+            // Feedback first: `cancel_task` re-reads the record, so a failure
+            // there leaves the explanation rather than a bare cancelled task.
+            if let Err(error) = self.ctx.engine.tasks.save(&task).await {
+                self.session_fault("record orphan mirror cancellation", &error);
+                continue;
+            }
+            match self.ctx.engine.orchestrator.cancel_task(&task.id).await {
+                Ok(()) => cancelled += 1,
+                Err(error) => self.session_fault("cancel orphan mirror", &error),
+            }
+        }
+        Ok(cancelled)
+    }
+
     async fn listener_status(&self, addr: &str, controller: Option<&str>) -> Result<()> {
         let last_error = self.faults().last_session_error.clone();
         // Owner-only like every file under remotes/ (security review F7).
@@ -281,12 +376,24 @@ impl Worker {
         let mut sessions = JoinSet::new();
         let mut accept_after = Instant::now();
         let mut accept_backoff = ACCEPT_RETRY_MIN;
+        // Ticks immediately, so the sweep also runs once at startup: a
+        // controller that went away while this instance was down is exactly
+        // the case that leaves mirrors behind.
+        let mut orphan_gc = tokio::time::interval(ORPHAN_GC_EVERY);
+        orphan_gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 // Reap completed tasks before accepting more, including under
                 // a constant stream of short-lived connections.
                 Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
+                _ = orphan_gc.tick() => {
+                    match self.collect_orphan_mirrors().await {
+                        Ok(0) => {}
+                        Ok(cancelled) => tracing::info!(cancelled, "Cancelled orphaned remote mirrors"),
+                        Err(error) => self.session_fault("sweep orphaned mirrors", &error),
+                    }
+                }
                 accepted = async {
                     tokio::time::sleep_until(accept_after).await;
                     listener.accept().await
@@ -406,6 +513,11 @@ impl Worker {
                 })
                 .await?;
             self.listener_status(addr, Some(&name)).await?;
+            // Seen now: the orphan sweep dates a controller's absence from
+            // the last time it was admitted here.
+            if let Err(error) = self.record_controller(&instance_id).await {
+                self.session_fault("record controller", &error);
+            }
             let claimed = slot
                 .claim(&instance_id, &name)
                 .expect("admission checked while holding session lock");
