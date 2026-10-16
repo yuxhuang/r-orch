@@ -52,6 +52,8 @@ async fn spawns_claude_with_the_contract_argv() {
             "--print",
             "--output-format",
             "stream-json",
+            "--input-format",
+            "text",
             "--max-turns",
             "10",
             "--verbose",
@@ -178,6 +180,25 @@ async fn omits_the_system_prompt_when_there_is_none() {
 }
 
 #[tokio::test]
+async fn an_empty_system_prompt_is_treated_as_none() {
+    let pm = ScriptedProcessManager::silent();
+    let _handle = execute_keeping(&pm, with_system_prompt(run_params(), ""));
+    let record = pm.spawn_record();
+    assert!(!record.has_flag("--system-prompt-file"));
+    assert!(!record.has_flag("--system-prompt"));
+}
+
+#[tokio::test]
+async fn the_input_format_is_always_text() {
+    let pm = ScriptedProcessManager::silent();
+    adapter(&pm).execute(run_params()).expect("execute");
+    assert_eq!(
+        pm.spawn_record().value_after("--input-format"),
+        Some("text")
+    );
+}
+
+#[tokio::test]
 async fn neither_prompt_is_in_argv() {
     let pm = ScriptedProcessManager::silent();
     let _handle = execute_keeping(
@@ -213,8 +234,12 @@ async fn the_system_prompt_file_is_private_and_outside_the_workspace() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600);
-    assert!(path.starts_with(std::env::temp_dir()));
     assert!(!path.starts_with("/tmp/workspace"));
+
+    let dir = path.parent().expect("parent");
+    let dir_meta = std::fs::symlink_metadata(dir).expect("dir metadata");
+    assert!(dir_meta.is_dir());
+    assert_eq!(dir_meta.permissions().mode() & 0o7777, 0o700);
 }
 
 #[tokio::test]

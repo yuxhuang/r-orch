@@ -99,7 +99,7 @@ fn install(dir: &Path) -> Arc<FakeClaude> {
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_prompts_spawn_and_arrive_intact() {
     let dir = tempfile::tempdir().expect("tempdir");
     let pm = install(dir.path());
