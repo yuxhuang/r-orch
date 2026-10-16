@@ -511,6 +511,89 @@ async fn an_unreadable_mirror_is_reported_unknown_and_keeps_the_session() {
     assert_eq!((item.state.as_str(), item.reason.as_deref()), ("queued", None));
 }
 
+/// The live failure: the controller gave up on an unreadable mirror and sent
+/// a cancel, which the worker could not apply either — and nothing retried
+/// it, so the mirror sat `todo` on the worker until the next reconnect. The
+/// key is kept and retried every tick instead.
+#[tokio::test]
+async fn a_cancel_for_an_unreadable_mirror_is_retried_until_it_applies() {
+    let listener = TestListener::start().await;
+    let mut read = listener.hello("sender").await;
+    listener.sync(&mut read).await;
+    write_frame(read.get_mut(), &submit("poison", &listener.agent))
+        .await
+        .unwrap();
+    assert!(matches!(
+        socket_data(&mut read).await,
+        Some(Frame::Submitted { .. })
+    ));
+    let task = mirror(&listener.worker, "poison").await;
+    let path = listener
+        .worker
+        .ctx
+        .engine
+        .paths
+        .task_path(&task.id)
+        .unwrap();
+    tokio::fs::write(&path, b"{not: [valid").await.unwrap();
+
+    write_frame(
+        read.get_mut(),
+        &Frame::Cancel {
+            exec_key: "poison".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // No acknowledgement: one the controller cannot trust would retire a
+    // cancellation key that never took. The key is held instead.
+    write_frame(read.get_mut(), &Frame::Ping).await.unwrap();
+    loop {
+        match socket_data(&mut read).await {
+            Some(Frame::Pong) => break,
+            Some(Frame::SyncState { .. }) => {}
+            other => panic!("an unapplied cancel must not be acknowledged: {other:?}"),
+        }
+    }
+    assert_eq!(
+        listener
+            .worker
+            .faults()
+            .unapplied_cancels
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["poison".to_owned()]
+    );
+    assert_eq!(mirror(&listener.worker, "poison").await.status, TaskStatus::Todo);
+
+    // The record is readable again: the next tick applies the cancel and
+    // acknowledges it, with no reconnect and no second cancel frame.
+    listener
+        .worker
+        .ctx
+        .engine
+        .tasks
+        .save(&task)
+        .await
+        .unwrap();
+    loop {
+        match socket_data(&mut read).await {
+            Some(Frame::CancelAck { exec_key }) => {
+                assert_eq!(exec_key, "poison");
+                break;
+            }
+            Some(Frame::SyncState { .. } | Frame::Pong) => {}
+            other => panic!("the deferred cancel was never applied: {other:?}"),
+        }
+    }
+    assert_eq!(
+        mirror(&listener.worker, "poison").await.status,
+        TaskStatus::Cancelled
+    );
+    assert!(listener.worker.faults().unapplied_cancels.is_empty());
+}
+
 /// 2com's `serve.log` had no peer lines at all while every session died, so
 /// there was nothing to debug from. A session that ends with an error is now
 /// logged, reported, and left behind in `_listener.json` for `remote status`.

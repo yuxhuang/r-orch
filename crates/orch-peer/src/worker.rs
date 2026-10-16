@@ -14,7 +14,7 @@
 //!   debounced `OrchestratorError`, skip this tick, keep the session;
 //! - fatal, closing the session: transport, the handshake, and "expected sync".
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -136,6 +136,12 @@ struct Faults {
     degraded: HashMap<String, String>,
     /// Fault kind -> when it was last reported to the event feed.
     reported: HashMap<&'static str, Instant>,
+    /// Cancels this instance accepted but could not apply, usually because
+    /// the mirror's record was unreadable at the time. Retried every tick
+    /// until they take: a mirror the controller has given up on must not keep
+    /// a local agent busy, and only an explicit cancel clears one between
+    /// reconnects.
+    unapplied_cancels: BTreeSet<String>,
     /// Why this instance's last controller session ended, published in
     /// `_listener.json` so `orch remote status` can explain a peer that keeps
     /// reconnecting.
@@ -543,6 +549,10 @@ impl Worker {
                             }
                             Err(error) => self.session_fault("read outbox", &error),
                         }
+                        // A cancel that could not be applied when it arrived.
+                        for frame in self.retry_cancels(&instance_id).await {
+                            self.write(&mut write, &frame).await?;
+                        }
                     }
                 }
             }
@@ -878,27 +888,24 @@ impl Worker {
             }
             Frame::Cancel { exec_key } => {
                 // Unacknowledged on a fault: an ack the controller cannot
-                // trust would retire a cancellation key that never took.
-                let mirrors = match self.mirrors(controller).await {
-                    Ok(mirrors) => mirrors,
-                    Err(error) => {
-                        self.session_fault("read mirrors for cancel", &error);
-                        return Ok(vec![]);
+                // trust would retire a cancellation key that never took. The
+                // key is kept instead and retried every tick, because nothing
+                // else clears a mirror inside a live session — the orphan
+                // sweep only runs on a `Sync`, i.e. after a reconnect.
+                match self.apply_cancel(controller, &exec_key).await {
+                    Ok(()) => {
+                        self.faults().unapplied_cancels.remove(&exec_key);
+                        Ok(vec![Frame::CancelAck { exec_key }])
                     }
-                };
-                if let Some(task) = mirrors
-                    .iter()
-                    .find(|t| label(t, "exec:") == Some(exec_key.as_str()))
-                    && !matches!(
-                        task.status,
-                        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-                    )
-                    && let Err(error) = self.ctx.engine.orchestrator.cancel_task(&task.id).await
-                {
-                    self.session_fault("cancel mirror", &error);
-                    return Ok(vec![]);
+                    Err(error) => {
+                        if self.faults().unapplied_cancels.insert(exec_key.clone()) {
+                            self.session_fault("cancel mirror", &error);
+                        } else {
+                            tracing::debug!(%exec_key, %error, "Cancel still not applicable");
+                        }
+                        Ok(vec![])
+                    }
                 }
-                Ok(vec![Frame::CancelAck { exec_key }])
             }
             Frame::FinishedAck { exec_key } => {
                 // Not recording the ack costs one resend of the outcome on
@@ -986,6 +993,54 @@ impl Worker {
         }
     }
 
+    /// Cancel one execution key's mirror. Idempotent: a mirror that is gone
+    /// or already terminal is cancelled as far as the controller is
+    /// concerned, so it is acknowledged rather than retried.
+    async fn apply_cancel(&self, controller: &str, exec_key: &str) -> Result<()> {
+        let mirrors = self.mirrors(controller).await?;
+        let Some(task) = mirrors
+            .iter()
+            .find(|task| label(task, "exec:") == Some(exec_key))
+            .filter(|task| !terminal(task.status))
+        else {
+            return Ok(());
+        };
+        self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
+        // `cancel_task` reports success even when its final status write
+        // failed, because a refused transition usually means the task was
+        // already terminal. Here it is the difference between a mirror that
+        // stopped and one still waiting for a local agent, so confirm it
+        // from the record instead of trusting the call.
+        match self.ctx.engine.tasks.get(&task.id).await? {
+            Some(fresh) if !terminal(fresh.status) => Err(Error::other(format!(
+                "mirror {} is still {}",
+                fresh.id, fresh.status
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Retry the cancels this instance could not apply, once per tick. A
+    /// mirror is typically unreadable for as long as its file is damaged;
+    /// once it is readable again, the next tick retires the key.
+    async fn retry_cancels(&self, controller: &str) -> Vec<Frame> {
+        let pending: Vec<String> = self.faults().unapplied_cancels.iter().cloned().collect();
+        let mut replies = Vec::new();
+        for exec_key in pending {
+            match self.apply_cancel(controller, &exec_key).await {
+                Ok(()) => {
+                    self.faults().unapplied_cancels.remove(&exec_key);
+                    tracing::info!(%exec_key, "Deferred cancel applied");
+                    replies.push(Frame::CancelAck { exec_key });
+                }
+                Err(error) => {
+                    tracing::debug!(%exec_key, %error, "Cancel still not applicable")
+                }
+            }
+        }
+        replies
+    }
+
     async fn updates(&self, controller: &str, sent: &mut HashMap<String, String>) -> Vec<Frame> {
         let mut replies = Vec::new();
         // Nothing to send this tick rather than an ended session: the next
@@ -1065,6 +1120,14 @@ impl RunEventTap for Worker {
             },
         ));
     }
+}
+
+/// A mirror in this state is finished as far as a controller's cancel goes.
+fn terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+    )
 }
 
 fn label<'a>(task: &'a Task, prefix: &str) -> Option<&'a str> {
