@@ -41,23 +41,23 @@ The binaries land in `target/release/`. Put them on your `PATH`, or:
 cargo install --path crates/orch-cli
 ```
 
-### Alpha builds (remote agents)
+### Installing a release
 
-The remote-agents feature ships as pre-release tags (`v0.5.0-alpha.N`) cut from `feature/remote-peers`. The
-Homebrew formula pins a stable tag (and `--HEAD` follows `master`), so `brew install` and `brew upgrade`
-never pick up an alpha. `orch update` does not self-update either: it only prints how to install. To try an
-alpha, install it explicitly from its tag, into a directory of its own so the Homebrew build stays untouched:
+Releases are tags on `master` (`vX.Y.Z`). v0.5.0 is the first release with
+[remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
+`v0.5.0-alpha.2`. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
+`orch update` does not self-update: it only prints how to install. To build a specific release from source:
 
 ```bash
-git clone <this repo> r-orch-alpha && cd r-orch-alpha
-git checkout v0.5.0-alpha.2
-cargo install --locked --path crates/orch-cli --root ~/.orch-alpha
-~/.orch-alpha/bin/orch --version      # 0.5.0-alpha.2
+git clone <this repo> r-orch && cd r-orch
+git checkout v0.5.0
+cargo install --locked --path crates/orch-cli
+orch --version      # 0.5.0
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
-Run the alpha as `~/.orch-alpha/bin/orch`, or put `~/.orch-alpha/bin` ahead of Homebrew's `bin` on `PATH`
-for one shell. To go back, see [Upgrading and rolling back the alpha](#upgrading-and-rolling-back-the-alpha).
+Before upgrading a project that runs v0.4.0, read
+[Upgrading from v0.4.0 and rolling back](#upgrading-from-v040-and-rolling-back).
 
 ### The three binary names
 
@@ -157,7 +157,7 @@ Two things that will bite you on first use, both covered in the [runbook](docs/R
 
 ---
 
-## Remote agents (alpha)
+## Remote agents
 
 Peers use plain TCP on a trusted LAN, **without authentication or encryption**. Listening is off by
 default. Only the process that owns the project engine opens peer connections; a TUI observing an
@@ -320,14 +320,14 @@ orch task approve tsk_05O0U7_
 
 Until then nothing runs there, so a remote task can wait indefinitely for someone at the worker.
 
-### Upgrading and rolling back the alpha
+### Upgrading from v0.4.0 and rolling back
 
 Upgrade
-- Run **one tag on every peer**; mixed builds have not been tested.
+- Run **one version on every peer**; mixed builds have not been tested.
 - Upgrade the engine owner (`orch serve`, `orch run --watch` or the TUI) and the CLI on the same host
   together: processes of one project coordinate through lock files that only this build takes.
-- Back up first: `cp -R .orchestry .orchestry.bak` in each project that will run the alpha, then stop the old
-  engine, install the alpha (see [Alpha builds](#alpha-builds-remote-agents)) and start it.
+- Back up first: `cp -R .orchestry .orchestry.bak` in each project, then stop the old engine, install v0.5.0
+  (`brew upgrade r-orch`, or from source as in [Installing a release](#installing-a-release)) and start it.
 - Changes you may notice since v0.4.0:
   - the listener binds `127.0.0.1:7690` by default; give `0.0.0.0:7690` or a LAN IP explicitly to accept
     other hosts. There is still no authentication;
@@ -338,24 +338,33 @@ Upgrade
     `.orchestry/remotes/<alias>.health`: after `kill -9` of the engine, `orch remote status` showed the remote
     `offline` at once;
   - remote tasks wait for worker approval (above) and run without credential-shaped variables (above);
-  - `.orchestry/peer-id` and `.orchestry/remotes/*.json` are written readable by the owner only.
+  - `.orchestry/peer-id` and `.orchestry/remotes/*.json` are written readable by the owner only;
+  - `claude` agents get the system prompt through a private file (`--system-prompt-file`, in a 0700
+    per-user directory: `$XDG_RUNTIME_DIR/orch`, else `<temp dir>/orch-<uid>`) and the task prompt on
+    stdin, instead of as command-line arguments. This fixes `Failed to spawn process: claude` on Linux
+    when the prompt exceeded the 128 KiB single-argument limit. A blank system prompt now counts as none.
 
 Roll back
-1. Stop every alpha engine on the project and make sure **no remote runs are in flight**: the old binary
+1. Stop every v0.5.0 engine on the project and make sure **no remote runs are in flight**: the old binary
    cannot resume remote execution entries and will cancel them.
-2. Go back to the previous binary. The Homebrew build was never touched, so run it again (drop
-   `~/.orch-alpha/bin` from `PATH`, or `rm -rf ~/.orch-alpha`). If anything looks wrong, stop the engine and
-   restore `.orchestry` from `.orchestry.bak`.
+2. Go back to the v0.4.0 binary: reinstall it from its tag (the steps in
+   [Installing a release](#installing-a-release) with `git checkout v0.4.0`), or switch back to a v0.4.0
+   install you kept. If anything looks wrong, stop the engine and restore `.orchestry` from
+   `.orchestry.bak`.
 
-v0.4.0 is the release the alpha is based on; it has no remote support, so the `remote` commands and
-the `Controller` and `Listen` status lines disappear when you roll back.
+v0.4.0 has no remote support, so the `remote` commands and the `Controller` and `Listen` status lines
+disappear when you roll back.
 
-### Known gaps in this alpha
+### Known gaps in v0.5.0
 
-- Verified only with several instances on one macOS machine: no real Linux host and no physical LAN.
-- Built and tested as a debug build with a Homebrew `rustc`; the pinned toolchain (Rust 1.94.1) and the
-  `--release` profile were not tested.
+- The automated multi-instance tests run every instance on one machine; no automated test covers two
+  hosts or a physical network.
 - Messages and task results between peers are plain TCP: no authentication, no encryption.
+- If a stdin write to `claude` fails after the first 32 KiB, claude can run with a truncated prompt. This
+  is logged at `warn` but not reported as a run error.
+- `cursor`, `opencode`, `agy` and `grok` pass the prompt as a command-line argument, and `pi` passes the
+  system prompt as one, so they can still hit the Linux 128 KiB single-argument limit. `claude` and
+  `codex` do not.
 
 ---
 
