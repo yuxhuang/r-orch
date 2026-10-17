@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-16
+
+Maintenance release: no behaviour or protocol change, so peers on 0.5.1 and 0.5.2 can be mixed.
+
 ### Added
 - `AGENTS.md` (and a `CLAUDE.md` that imports it): engineering instructions for the agents and humans working
   on the repo.
@@ -17,6 +21,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
   held back for MSRV.
 - Parity with the TypeScript original is no longer a goal. `docs/PARITY.md` and `docs/parity/` are marked
   historical ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)).
+- Dependencies refreshed (`cargo update`), including `fancy-regex` 0.19 and `tokio-tungstenite` 0.30.
 
 ## [0.5.1] - 2026-10-16
 
@@ -82,7 +87,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/yuxhuang/r-orch/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/yuxhuang/r-orch/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/yuxhuang/r-orch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yuxhuang/r-orch/compare/v0.3.1...v0.4.0
