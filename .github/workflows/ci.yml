@@ -1,0 +1,71 @@
+# Lean CI: Linux only, the cheap hermetic steps of xtask/gate.sh (plus an
+# unconditional cargo-deny, which gate.sh skips when not installed). Not run here:
+# parity, probes, scenario lint (need Node / the gitignored TS oracle) and the
+# cold-target, no-real-cli and real-home gate steps (see gate.sh for those).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  # Weekly: a new RUSTSEC advisory should surface on a quiet week too, not
+  # only on the next PR. Runs the check job alone (see its `if`).
+  schedule:
+    - cron: '17 6 * * 1'
+
+# One run per ref. A newer PR push makes the older run irrelevant; on master a
+# push and the weekly schedule share the ref, so there we let both finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml points ORCHESTRY_GLOBAL_CONFIG_PATH into target/, so
+  # tests never touch ~/.orchestry on the runner. No override needed here.
+
+jobs:
+  # Fast signals first: nothing here needs a full test build.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes; keep the token out of .git/config, which
+          # build scripts and the cargo-deny container can read.
+          persist-credentials: false
+      # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
+      # explicit version), so let rustup read the file: one pin, not two.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo xtask crate-graph
+      # Runs in its own container; checks deny.toml (advisories, licences,
+      # bans, sources). Advisories are fetched live, so a new RUSTSEC entry can
+      # redden an unchanged tree. That is intended.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes; keep the token out of .git/config, which
+          # build scripts and the cargo-deny container can read.
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Build and run in one step; --no-fail-fast reports every failing binary,
+      # as gate.sh does. Some orch-cli tests need python3 (preinstalled) and
+      # open their own pty/localhost sockets, which work without a TTY.
+      - run: cargo test --workspace --no-fail-fast

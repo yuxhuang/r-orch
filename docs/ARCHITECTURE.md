@@ -84,9 +84,10 @@ r-orch/
 │   ├── orch-core/             # the port traits (storage, adapter, process, workspace, clock, ids)
 │   ├── orch-infra/            # implementations of orch-core traits
 │   ├── orch-engine/           # services + orchestrator + event bus + container
+│   ├── orch-peer/             # remote-peer protocol: links, mirrors, reconnect (core, domain, engine, infra)
 │   ├── orch-cli/              # clap command tree, human + JSON rendering, serve mode. bins live here.
 │   └── orch-tui/              # ratatui dashboard
-├── xtask/                     # dev tooling: parity harness runner, fixture generation
+├── xtask/                     # dev tooling: crate-graph, lint-scenarios, parity harness
 ├── tests/                     # workspace-level differential + cross-compat harness
 ├── fixtures/                  # golden prompts, adapter stdout recordings, scenario definitions
 ├── skills/library/            # shipped skill markdown (byte-identical to the TS package)
@@ -105,6 +106,8 @@ r-orch/
     orch-infra ◄───── orch-engine           (engine → infra: 5 sites, see below)
         ▲                 ▲
         └────────┬────────┘
+                 │
+             orch-peer                      (remote-peer protocol; composes engine + infra)
                  │
              orch-cli                       (top of the stack; may name anything below)
                  │

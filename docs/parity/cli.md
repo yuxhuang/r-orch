@@ -1,5 +1,8 @@
 # ORCH TypeScript CLI — Complete Surface Specification (input to Rust parity spec)
 
+> **Status: historical.** Matching the TypeScript original is no longer a goal; this appendix is not updated.
+> See [ADR 0002](../decisions/0002-parity-is-no-longer-a-goal.md).
+
 Source of truth: `parity/orch-ts` (read-only).
 Package `@oxgeneral/orch`, version **1.0.34**, `"type": "module"`, Node `>=20.0.0`.
 Binaries (all three map to `./dist/cli.js`): `orchestry`, `orch`, `ao`.

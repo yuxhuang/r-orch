@@ -393,12 +393,16 @@ cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.m
 | Document | For |
 |---|---|
 | **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and the gotchas that are inherited rather than fixed — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
-| [docs/PARITY.md](docs/PARITY.md) | The parity contract: every command, flag, exit code, `--json` shape and on-disk field, graded L0/L1/L2, plus every known bug and whether it was replicated or fixed |
+| [docs/PARITY.md](docs/PARITY.md) | **Historical.** The contract the port was built to: every command, flag, exit code, `--json` shape and on-disk field, graded L0/L1/L2, plus known bugs of the original. No longer a goal ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |
-| [docs/parity/](docs/parity/) | Per-area appendices behind the contract — CLI, adapters, infrastructure, TUI, tests |
+| [docs/parity/](docs/parity/) | Historical per-area appendices behind the contract — CLI, adapters, infrastructure, TUI, tests |
+| [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each release |
+| [docs/plans/](docs/plans/) | Plans for non-trivial work, before it is built |
+| [docs/decisions/](docs/decisions/) | Decision records: why things are the way they are |
 
-Start with the **runbook** if something is wrong, and **PARITY.md** if you are wondering whether a behaviour
-is intentional. It usually is, and it usually says why.
+Start with the **runbook** if something is wrong. PARITY.md can still explain why an inherited behaviour is the
+way it is, but it no longer binds new work.
 
 ---
 
@@ -449,6 +453,8 @@ but one-shot commands do not take it.
 ---
 
 ## Development
+
+Contributing, human or agent: read [AGENTS.md](AGENTS.md) first.
 
 ```bash
 cargo test --workspace            # unit, integration and TUI tests

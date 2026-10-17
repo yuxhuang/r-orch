@@ -1,5 +1,8 @@
 # ORCH TUI — Exhaustive Feature Inventory (input to the Rust/ratatui parity spec)
 
+> **Status: historical.** Matching the TypeScript original is no longer a goal; this appendix is not updated.
+> See [ADR 0002](../decisions/0002-parity-is-no-longer-a-goal.md).
+
 Derived from a full read of the Ink/React implementation at `parity/orch-ts`.
 
 **Primary sources**

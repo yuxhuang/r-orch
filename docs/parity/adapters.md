@@ -1,5 +1,8 @@
 # ORCH-TS Adapter Layer — Behavioural Specification for Rust Reimplementation
 
+> **Status: historical.** Matching the TypeScript original is no longer a goal; this appendix is not updated.
+> See [ADR 0002](../decisions/0002-parity-is-no-longer-a-goal.md).
+
 Source repo: `parity/orch-ts` (read-only; nothing modified).
 
 > **Finding up front: there is no `AgentResult` type anywhere in the codebase.**
