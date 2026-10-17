@@ -1,6 +1,6 @@
 //! Tail-follow policy for live feeds. Expanded text remains an immutable snapshot.
 use crate::navigation::{NavAction, ScrollState};
-use crate::state::{AppState, Focus, PaneEntity, PaneKey, TaskSection, ViewId};
+use crate::state::{AppState, DetailPanel, Focus, PaneEntity, PaneKey, TaskSection, ViewId};
 
 pub(crate) fn resumes_tail(
     action: NavAction,
@@ -82,7 +82,7 @@ impl AppState {
                     self.activity_follow_tail = true;
                 }
             }
-            Focus::MainList if self.view == ViewId::Logs => {
+            Focus::MainList if self.view == ViewId::Logs && self.detail != DetailPanel::Log => {
                 let n = self.filtered_messages().len();
                 if self.log_selected_index >= 0
                     && (self.log_selected_index as usize >= n.saturating_sub(1)

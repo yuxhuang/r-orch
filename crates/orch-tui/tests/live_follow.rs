@@ -351,3 +351,16 @@ fn opening_log_inspector_pins_tail_content_and_body_scroll_on_append() {
     append(&mut h, "resumed arrival");
     assert_eq!(h.app.state.selected_log().unwrap().text, "resumed arrival");
 }
+
+#[test]
+fn refocusing_list_with_log_inspector_open_keeps_pinned_entry_on_append() {
+    let mut h = feed(Focus::MainList, ViewId::Logs);
+    append(&mut h, "first\nsecond\nthird");
+    h.draw().press(KeyCode::End).key('i');
+    assert_eq!(h.app.state.detail, DetailPanel::Log);
+    let id = h.app.state.selected_log().unwrap().id;
+    h.app.state.set_focus(Focus::LogDetail(LogSection::Body));
+    h.app.state.set_focus(Focus::MainList);
+    append(&mut h, "new arrival");
+    assert_eq!(h.app.state.selected_log().unwrap().id, id);
+}
