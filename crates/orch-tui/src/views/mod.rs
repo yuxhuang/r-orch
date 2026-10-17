@@ -347,6 +347,32 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         );
         widgets::help_overlay::render(frame, overlay, ctx);
     }
+    mark_zwj_trailing_cells(frame.buffer_mut());
+}
+
+/// xterm's default Unicode provider can store a ZWJ suffix in its own cell.
+/// Ratatui stores that cell as a blank continuation and would otherwise omit
+/// it when the grapheme is replaced by blank content. Retain a diff marker on
+/// the hidden cells so the next frame explicitly repaints them. While the
+/// grapheme is present, ratatui skips these cells as usual.
+fn mark_zwj_trailing_cells(buffer: &mut ratatui::buffer::Buffer) {
+    use ratatui::buffer::{CellDiffOption, CellWidth};
+
+    for row in buffer.content.chunks_mut(usize::from(buffer.area.width)) {
+        let mut x = 0;
+        while x < row.len() {
+            let width = usize::from(row[x].cell_width()).max(1);
+            if row[x].symbol().contains('\u{200d}') {
+                let end = (x + width).min(row.len());
+                for cell in &mut row[x + 1..end] {
+                    if cell.diff_option == CellDiffOption::None {
+                        cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                    }
+                }
+            }
+            x += width;
+        }
+    }
 }
 
 /// Fit a label by terminal columns, including a visible elision marker.
@@ -820,6 +846,49 @@ mod tests {
     use crate::clock::TestClock;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn closing_a_zwj_viewer_repaints_its_blank_trailing_cells() {
+        use crate::widgets::text_viewer::{
+            Completeness, Representation, TextViewer, ViewerDocument, ViewerSource,
+        };
+
+        let mut app = App::new(FakeBackend::new(), TestClock::new(0));
+        let body = "prefix 👩‍💻 suffix\n".repeat(12);
+        app.state.viewer = Some(TextViewer::new(ViewerDocument {
+            source: ViewerSource::Message(1),
+            title: "Unicode".into(),
+            body: body.clone().into(),
+            representation: Representation::Raw,
+            raw_body: None,
+            completeness: Completeness::Complete,
+            original_bytes: body.len(),
+            captured_at_ms: 0,
+            initial_anchor: 0,
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let before = terminal
+            .draw(|frame| _ = draw(frame, &app))
+            .unwrap()
+            .buffer
+            .clone();
+        let (x, y) = (8, 14);
+        assert_eq!(before[(x, y)].symbol(), "👩‍💻");
+        app.state.viewer = None;
+        let after = terminal
+            .draw(|frame| _ = draw(frame, &app))
+            .unwrap()
+            .buffer
+            .clone();
+        assert_eq!(after[(x + 1, y)].symbol(), " ");
+        assert!(
+            before
+                .diff(&after)
+                .iter()
+                .any(|(col, row, cell)| (*col, *row) == (x + 1, y) && cell.symbol() == " "),
+            "clearing the leading cell alone leaves a suffix in terminals that split ZWJ emoji"
+        );
+    }
 
     pub fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
