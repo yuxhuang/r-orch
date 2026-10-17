@@ -1532,7 +1532,7 @@ fn v103_activity_reports_cumulative_retention_losses_at_minimum_width() {
     harness.app.state.flush_messages(harness.now());
     harness.app.state.retained_evicted = 2;
     harness.app.state.retained_rejected = 3;
-    harness.assert_text("evicted2 rejected3");
+    harness.assert_text("ev2 rej3");
 }
 
 #[test]
@@ -1589,5 +1589,45 @@ fn activity_header_drops_filter_to_preserve_losses_and_follow_label() {
             z.kind,
             orch_tui::hit::ZoneKind::Verb(orch_tui::hit::VerbId::CycleActivityFilter)
         ) && z.rect.width > 0));
+    }
+}
+
+#[test]
+fn activity_header_keeps_recovery_hint_with_three_digit_retention_counts() {
+    for width in [54, 64] {
+        for focused in [false, true] {
+            for following in [false, true] {
+                for (evicted, rejected) in [(184, 0), (236, 999)] {
+                    let mut h = Harness::sized(FakeBackend::new(), width, 24);
+                    h.app.execute_command("status");
+                    h.app.state.flush_messages(h.now());
+                    h.app.state.focus = if focused {
+                        Focus::Activity
+                    } else {
+                        Focus::MainList
+                    };
+                    h.app.state.activity_follow_tail = following;
+                    h.app.state.retained_evicted = evicted;
+                    h.app.state.retained_rejected = rejected;
+                    h.draw();
+                    let (_, y) = h.find_text("ACTIVITY").unwrap();
+                    let header = h.line(y);
+                    let label = if following {
+                        "following"
+                    } else {
+                        "paused · End follows"
+                    };
+                    assert!(
+                        header.contains(label),
+                        "width={width}, focused={focused}: {header}"
+                    );
+                    assert!(
+                        header.contains(&format!("evicted{evicted} rejected{rejected}"))
+                            || header.contains(&format!("ev{evicted} rej{rejected}")),
+                        "{header}"
+                    );
+                }
+            }
+        }
     }
 }

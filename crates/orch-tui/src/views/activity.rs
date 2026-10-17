@@ -30,6 +30,14 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         ZoneKind::Pane(Focus::Activity),
         ZoneId::Pane(key.clone()),
     );
+    let label = if state.focus == Focus::Activity {
+        "> ACTIVITY"
+    } else {
+        "ACTIVITY"
+    };
+    // section_label adds three leading rules, two spaces and two suffix rules.
+    let suffix_budget =
+        (area.width as usize).saturating_sub(7 + unicode_width::UnicodeWidthStr::width(label));
     let mut suffix = vec![
         Span::styled("F:".to_string(), ctx.style(Token::Dim)),
         Span::styled(
@@ -46,20 +54,30 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     } else {
         " · paused · End follows"
     };
+    let follow_width = unicode_width::UnicodeWidthStr::width(follow_label);
     let mut filter_width = spans_width(&suffix);
     if state.retained_evicted > 0 || state.retained_rejected > 0 {
-        let losses = format!(
+        let mut losses = format!(
             "evicted{} rejected{}",
             state.retained_evicted, state.retained_rejected
         );
         if spans_width(&suffix) as usize
             + unicode_width::UnicodeWidthStr::width(losses.as_str())
-            + unicode_width::UnicodeWidthStr::width(follow_label)
-            + 20
-            > area.width as usize
+            + 1
+            + follow_width
+            > suffix_budget
         {
             suffix.clear();
             filter_width = 0;
+        }
+        // Removing the filter alone may still leave large counters crowding
+        // out the recovery hint. Keep both counts with shorter labels then.
+        if 1 + unicode_width::UnicodeWidthStr::width(losses.as_str()) + follow_width > suffix_budget
+        {
+            losses = format!(
+                "ev{} rej{}",
+                state.retained_evicted, state.retained_rejected
+            );
         }
         suffix.push(Span::styled(
             format!(" {}", losses),
@@ -82,11 +100,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         frame,
         Rect::new(area.x, area.y, area.width, 1),
         ctx,
-        if state.focus == Focus::Activity {
-            "> ACTIVITY"
-        } else {
-            "ACTIVITY"
-        },
+        label,
         Some(suffix),
     );
     ctx.zone(
