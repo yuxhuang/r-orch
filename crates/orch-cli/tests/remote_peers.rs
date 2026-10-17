@@ -41,6 +41,27 @@ fn quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
+/// Spawn, retrying while the kernel reports the executable as busy.
+///
+/// `registry_binary` copies the `orch` binary and then runs the copy. If
+/// another test thread forks while the copy's write descriptor is still open,
+/// that child holds the descriptor until it execs, and exec of the copy fails
+/// with `ETXTBSY` in the meantime (rust-lang/rust#114554). The window is short.
+fn spawn_retrying_busy(command: &mut Command) -> Child {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match command.spawn() {
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result.expect("spawn isolated child"),
+        }
+    }
+}
+
 fn signal_group(pid: u32, signal: Signal) {
     if let Ok(pid) = i32::try_from(pid)
         && pid > 1
@@ -64,7 +85,7 @@ impl Process {
             .stdout(File::create(&stdout).expect("create stdout capture"))
             .stderr(File::create(&stderr).expect("create stderr capture"));
         Self {
-            child: command.spawn().expect("spawn isolated child"),
+            child: spawn_retrying_busy(&mut command),
             stdout,
             stderr,
             sweep_group_on_drop: true,
@@ -169,6 +190,14 @@ impl Peer {
             serde_json::to_vec_pretty(&config).unwrap(),
         )
         .expect("fixture config");
+    }
+
+    /// `PATH` for a dashboard child: this fixture's bin dir, then the system
+    /// directories, where no agent CLI is installed.
+    fn dashboard_path(&self) -> std::ffi::OsString {
+        let mut path = self.bin.clone().into_os_string();
+        path.push(":/usr/bin:/bin");
+        path
     }
 
     fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -1292,6 +1321,9 @@ fn s22c_sigterm_tui_detaches_a_remote_run() {
         }
     }
     command.env("TERM", "xterm-256color");
+    // The dashboard probes every adapter CLI for its model list on the first
+    // tick: keep the developer's own agent CLIs off its PATH.
+    command.env("PATH", controller.dashboard_path());
     command.cwd(controller.dir.path());
     command.args(["tui", "--listen", &controller_addr.to_string()]);
     let mut dashboard = Dashboard {
@@ -1514,6 +1546,9 @@ impl PtyOwner {
             }
         }
         command.env("TERM", "xterm-256color");
+        // The dashboard probes every adapter CLI for its model list on the first
+        // tick: keep the developer's own agent CLIs off its PATH.
+        command.env("PATH", peer.dashboard_path());
         command.cwd(peer.dir.path());
         command.args(args);
         let child = pair.slave.spawn_command(command).unwrap();

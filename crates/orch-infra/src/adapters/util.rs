@@ -535,10 +535,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_version_probe_trims_the_version() {
-        // `env --version` is not a real adapter probe, but it exists
-        // everywhere and prints a version.
+        // `cargo --version` is not a real adapter probe, but `cargo` is on the
+        // PATH wherever this test runs. (`env --version` is GNU-only.)
         let pm = crate::process::SystemProcessManager::new();
-        let version = probe_version(&pm, "env").await.expect("env has --version");
+        let version = probe_version(&pm, "cargo")
+            .await
+            .expect("cargo has --version");
         assert!(!version.is_empty());
         assert_eq!(version, version.trim());
     }

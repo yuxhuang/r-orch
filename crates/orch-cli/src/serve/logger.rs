@@ -591,7 +591,10 @@ mod tests {
         );
     }
 
+    // `resident_mb` reads `/proc/self/status`; elsewhere it reports 0.0 (see
+    // its doc comment).
     #[test]
+    #[cfg(target_os = "linux")]
     fn heap_mb_is_the_resident_set_in_mib_to_one_decimal() {
         let mb = resident_mb();
         // This process is linked against tokio and serde; it is not using a

@@ -107,6 +107,7 @@ pub struct EngineBackend {
     queue: Arc<EventQueue>,
     history: Arc<Mutex<VecDeque<Vec<HistoryEntry>>>>,
     catalog: Arc<Mutex<CatalogState>>,
+    model_discovery: Arc<orch_infra::models::ModelDiscovery>,
     watch_active: bool,
     peer_runtime: Arc<Mutex<Option<orch_peer::PeerRuntime>>>,
     copy: CopyTransport,
@@ -220,6 +221,7 @@ impl EngineBackend {
             queue: Arc::new(EventQueue::default()),
             history: Arc::new(Mutex::new(VecDeque::new())),
             catalog: Arc::new(Mutex::new(CatalogState::NotStarted)),
+            model_discovery: Arc::new(orch_infra::models::ModelDiscovery::new()),
             watch_active,
             peer_runtime,
             // Opens nothing and starts no thread: the native worker waits for
@@ -235,6 +237,13 @@ impl EngineBackend {
         // polls the eight adapter spawns a probe costs.
         backend.spawn_history_load();
         backend
+    }
+
+    /// Replace the model discovery the catalog load uses. Tests pass one whose
+    /// runtime execs nothing, so no test reaches a real agent CLI or `~/.codex`.
+    pub fn with_model_discovery(mut self, discovery: orch_infra::models::ModelDiscovery) -> Self {
+        self.model_discovery = Arc::new(discovery);
+        self
     }
 
     pub fn is_watch_active(&self) -> bool {
@@ -338,8 +347,9 @@ impl EngineBackend {
     /// publish the catalog once they have all answered.
     fn spawn_catalog_load(&self) {
         let catalog = Arc::clone(&self.catalog);
+        let discovery = Arc::clone(&self.model_discovery);
         self.handle.spawn(async move {
-            let discovered = orch_infra::models::ModelDiscovery::new()
+            let discovered = discovery
                 .load_catalog(&orch_domain::SUPPORTED_ADAPTERS, |_, _| {})
                 .await;
             let converted = discovered

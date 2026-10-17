@@ -410,9 +410,10 @@ mod tests {
     #[tokio::test]
     async fn the_editor_round_trip_uses_the_editor_env_var() {
         // `sed -i` is a non-interactive "editor": it rewrites the buffer in
-        // place, which is exactly what a real editor does.
+        // place, which is exactly what a real editor does. The attached `.bak`
+        // suffix is the form both GNU and BSD sed accept.
         let buffer = open_in_editor_with(
-            "sed -i s/before/after/",
+            "sed -i.bak s/before/after/",
             "---\ntitle: before\n---\n\nbefore\n",
             ".yml",
         )
