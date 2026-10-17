@@ -1,7 +1,14 @@
 //! `formatAgentOutput` and friends — the defensive JSON-shape dispatcher that
 //! turns one agent event's `data` / `error` payload into an activity-feed
-//! summary plus a capped detail string (`src/tui/App.tsx`, docs/parity/tui.md
-//! §7).
+//! summary plus the complete received detail (`src/tui/App.tsx`,
+//! docs/parity/tui.md §7).
+//!
+//! The summary is a one-row *preview* and may be cut; the detail is the
+//! canonical body and never is (design D4). A payload over
+//! [`MAX_BODY_BYTES`](super::MAX_BODY_BYTES) is rejected whole, before any
+//! parsing, into an explicit "Body unavailable" record rather than a
+//! misleading prefix. [`human_text`] decodes the complete human-readable text
+//! of a known envelope for the full-text viewer.
 //!
 //! Every legacy adapter shape is accepted on purpose: run histories on disk
 //! predate adapter normalization, so a `.jsonl` replay still contains the flat
@@ -17,11 +24,7 @@
 use orch_domain::extract_error_message;
 use serde_json::Value;
 
-/// Max length of a stored detail string (`MAX_DETAIL_LEN` in `App.tsx`).
-///
-/// The formatters append a bare `…` past the cap; `addMessage` appends
-/// `…[truncated]` to the detail it stores (docs/parity/tui.md §7).
-pub const MAX_DETAIL_LEN: usize = 2048;
+use super::{MAX_BODY_BYTES, unavailable_notice};
 
 /// A formatted agent payload. `summary: None` means the caller skips the entry
 /// entirely (`reasoning` items and tool_use-only assistant messages).
@@ -64,6 +67,10 @@ static NULL: Value = Value::Null;
 /// Extract a human-readable summary from an agent output payload, which may be
 /// raw JSON from any adapter, a bracket lifecycle tag, or plain text.
 pub fn format_agent_output(raw: &str) -> Formatted {
+    // Checked before any parse or copy: an oversized body is rejected whole.
+    if let Some(rejected) = oversized(raw) {
+        return rejected;
+    }
     // Bracket-tags like [init], [hook_started], [hook_response] pass through.
     let trimmed = js_trim(raw);
     if is_lifecycle_tag(trimmed) {
@@ -86,6 +93,9 @@ pub fn format_agent_output(raw: &str) -> Formatted {
 /// Unwrap nested provider envelopes while preserving the full payload for the
 /// detail view.
 pub fn format_agent_error(raw: &str) -> Formatted {
+    if let Some(rejected) = oversized(raw) {
+        return rejected;
+    }
     let message = extract_error_message(&Value::String(raw.to_owned()));
     // `message || raw` — an empty unwrap falls back to the untouched payload.
     let source = if message.is_empty() { raw } else { &message };
@@ -298,7 +308,7 @@ fn dispatch(parsed: &Value, raw: &str) -> Formatted {
         let inner = serde_json::to_string(field(parsed, "item")).unwrap_or_default();
         return Formatted {
             summary: format_agent_output(&inner).summary,
-            detail: cap_detail(raw),
+            detail: raw.to_owned(),
         };
     }
 
@@ -603,20 +613,202 @@ fn is_lifecycle_tag(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
 }
 
-/// `raw.length > MAX_DETAIL_LEN ? raw.slice(0, MAX_DETAIL_LEN) + '…' : raw`.
-fn cap_detail(raw: &str) -> String {
-    if char_len(raw) > MAX_DETAIL_LEN {
-        format!("{}…", slice_chars(raw, MAX_DETAIL_LEN))
-    } else {
-        raw.to_owned()
-    }
+/// The whole-record rejection of a payload over [`MAX_BODY_BYTES`]: a short
+/// notice naming the received size, and an empty detail. The pair (notice
+/// text, empty detail) cannot come from a real payload — an empty payload
+/// has an empty summary — so the viewer can tell it apart without a new
+/// field on the shared pending-message type.
+fn oversized(raw: &str) -> Option<Formatted> {
+    (raw.len() > MAX_BODY_BYTES).then(|| Formatted {
+        summary: Some(unavailable_notice(raw.len())),
+        detail: String::new(),
+    })
 }
 
+/// The detail is the complete received payload. Only the summary is a
+/// preview (design D4: no display truncation as storage).
 fn with_detail(summary: impl Into<String>, raw: &str) -> Formatted {
     Formatted {
         summary: Some(summary.into()),
-        detail: cap_detail(raw),
+        detail: raw.to_owned(),
     }
+}
+
+/* ── Complete human text for the viewer (design D3/O1) ── */
+
+/// The complete decoded human text of one known envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanText {
+    pub text: String,
+    /// More than one text block, joined in order with a single newline.
+    pub joined_blocks: bool,
+}
+
+/// What the full-text viewer shows by default for one stored payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedBody {
+    /// A recognised envelope: its complete human text (the raw payload stays
+    /// available as the alternative representation).
+    Human(HumanText),
+    /// Plain text: the payload *is* the human text, byte for byte.
+    Plain,
+    /// JSON-looking but unknown or malformed: show the exact received bytes.
+    Raw,
+}
+
+/// Decode an agent output payload for the viewer.
+///
+/// Mirrors the dispatcher's shape recognition but never reuses its
+/// truncated summaries: every field is taken whole. Unknown or malformed
+/// envelopes default to `Raw`, never to a guess.
+pub fn human_text(raw: &str) -> DecodedBody {
+    if raw.len() > MAX_BODY_BYTES || !looks_like_json(raw) {
+        return DecodedBody::Plain;
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(parsed) => human_from_value(&parsed, 0).map_or(DecodedBody::Raw, DecodedBody::Human),
+        Err(_) => DecodedBody::Raw,
+    }
+}
+
+/// Decode an agent *error* payload: the same nested-envelope unwrap the
+/// summary uses, but complete.
+pub fn human_error_text(raw: &str) -> DecodedBody {
+    if raw.len() > MAX_BODY_BYTES {
+        return DecodedBody::Plain;
+    }
+    let message = extract_error_message(&Value::String(raw.to_owned()));
+    if message.is_empty() || message == raw {
+        return if looks_like_json(raw) {
+            DecodedBody::Raw
+        } else {
+            DecodedBody::Plain
+        };
+    }
+    DecodedBody::Human(HumanText {
+        text: message,
+        joined_blocks: false,
+    })
+}
+
+fn looks_like_json(raw: &str) -> bool {
+    matches!(js_trim(raw).as_bytes().first(), Some(b'{' | b'['))
+}
+
+/// Bounded like the dispatcher's own provider re-entry.
+fn human_from_value(parsed: &Value, depth: u8) -> Option<HumanText> {
+    if depth > 4 {
+        return None;
+    }
+    let ty = str_field(parsed, "type");
+    let role = str_field(parsed, "role");
+    let has_type = truthy(field(parsed, "type"));
+    let has_role = truthy(field(parsed, "role"));
+    let single = |text: &str| {
+        Some(HumanText {
+            text: text.to_owned(),
+            joined_blocks: false,
+        })
+    };
+
+    if matches!(ty, Some("item.started") | Some("item.completed")) && truthy(field(parsed, "item"))
+    {
+        return human_from_value(field(parsed, "item"), depth + 1);
+    }
+    if ty == Some("agent_message")
+        && let Some(text) = str_field(parsed, "text")
+    {
+        return single(text);
+    }
+    if ty == Some("reasoning") {
+        // Reasoning-only records are excluded from the feed; never decode one.
+        return None;
+    }
+    if ty == Some("command_execution")
+        && let Some(command) = str_field(parsed, "command")
+    {
+        let output = str_field(parsed, "aggregated_output")
+            .or_else(|| str_field(parsed, "result"))
+            .filter(|s| !s.is_empty());
+        return Some(command_text(command, output));
+    }
+    if let Some(text) = str_field(parsed, "text")
+        && !text.is_empty()
+        && !has_type
+        && !has_role
+    {
+        return single(text);
+    }
+    if let Some(command) = str_field(parsed, "command")
+        && !has_type
+    {
+        let output = str_field(parsed, "result").filter(|s| !s.is_empty());
+        return Some(command_text(command, output));
+    }
+    if let Some(message) = str_field(parsed, "message")
+        && !has_role
+        && !truthy(field(parsed, "content"))
+        && !truthy(field(parsed, "subtype"))
+    {
+        return single(message);
+    }
+    if let Some(result) = str_field(parsed, "result")
+        && !has_type
+    {
+        return single(result);
+    }
+    if ty == Some("message") && role == Some("assistant") {
+        return text_blocks(field(parsed, "content"));
+    }
+    if ty == Some("assistant") || role == Some("assistant") {
+        return text_blocks(resolve_content(parsed));
+    }
+    if ty == Some("result")
+        && let Some(result) = str_field(parsed, "result").filter(|s| !s.is_empty())
+    {
+        return single(result);
+    }
+    if truthy(field(parsed, "subtype")) && truthy(field(parsed, "message")) {
+        let message = field(parsed, "message");
+        let content = nullish(message.get("content")).unwrap_or(message);
+        return text_blocks(content);
+    }
+    None
+}
+
+fn command_text(command: &str, output: Option<&str>) -> HumanText {
+    let mut text = format!("$ {command}");
+    if let Some(output) = output {
+        text.push('\n');
+        text.push_str(output);
+    }
+    HumanText {
+        text,
+        joined_blocks: false,
+    }
+}
+
+/// Every `text` block, complete and in order, joined by one newline.
+fn text_blocks(content: &Value) -> Option<HumanText> {
+    if let Value::String(text) = content {
+        return (!text.is_empty()).then(|| HumanText {
+            text: text.clone(),
+            joined_blocks: false,
+        });
+    }
+    let blocks: Vec<&str> = content
+        .as_array()?
+        .iter()
+        .filter(|block| str_field(block, "type") == Some("text"))
+        .filter_map(|block| str_field(block, "text"))
+        .collect();
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(HumanText {
+        text: blocks.join("\n"),
+        joined_blocks: blocks.len() > 1,
+    })
 }
 
 /// `s.slice(0, n)`. See the module note on UTF-16 vs `char` counting.
@@ -1236,17 +1428,107 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_output_is_capped_at_200_chars() {
+    fn plain_text_output_previews_200_chars_but_keeps_the_whole_detail() {
         let raw = "x".repeat(3000);
         let out = format_agent_output(&raw);
         assert_eq!(out.summary.as_deref(), Some("x".repeat(200).as_str()));
-        assert_eq!(out.detail, format!("{}…", "x".repeat(MAX_DETAIL_LEN)));
+        assert_eq!(out.detail, raw);
     }
 
     #[test]
-    fn details_under_the_cap_are_untouched() {
-        let raw = "y".repeat(MAX_DETAIL_LEN);
+    fn a_body_at_the_one_mebibyte_limit_is_kept_whole() {
+        let raw = "y".repeat(MAX_BODY_BYTES);
         assert_eq!(format_agent_output(&raw).detail, raw);
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_rejected_whole_before_parsing() {
+        // Multibyte so a byte slice at the limit would split a character.
+        let raw = format!("{{\"text\":\"{}\"}}", "é".repeat(MAX_BODY_BYTES / 2));
+        assert!(raw.len() > MAX_BODY_BYTES);
+        let out = format_agent_output(&raw);
+        assert_eq!(out.detail, "");
+        assert_eq!(out.summary, Some(unavailable_notice(raw.len())));
+        let err = format_agent_error(&raw);
+        assert_eq!(err.detail, "");
+        assert_eq!(err.summary, Some(unavailable_notice(raw.len())));
+    }
+
+    #[test]
+    fn wrapped_codex_message_decodes_its_complete_text() {
+        let text = "First paragraph with \"quotes\".\n\nRun: `cargo test -p orch-tui`\n".to_owned()
+            + &"z".repeat(5_000);
+        let raw = serde_json::to_string(&json!({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": text},
+        }))
+        .unwrap();
+        let DecodedBody::Human(human) = human_text(&raw) else {
+            panic!("a known envelope decodes");
+        };
+        assert_eq!(human.text, text);
+        assert!(!human.joined_blocks);
+    }
+
+    #[test]
+    fn assistant_text_blocks_join_in_order_and_skip_tool_use() {
+        let raw = serde_json::to_string(&json!({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "one\ntwo"},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/a/b"}},
+                {"type": "text", "text": "three"},
+            ]},
+        }))
+        .unwrap();
+        assert_eq!(
+            human_text(&raw),
+            DecodedBody::Human(HumanText {
+                text: "one\ntwo\nthree".into(),
+                joined_blocks: true,
+            })
+        );
+    }
+
+    #[test]
+    fn command_execution_keeps_command_and_complete_output() {
+        let raw = serde_json::to_string(&json!({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "ls -la", "aggregated_output": "a\nb\n"},
+        }))
+        .unwrap();
+        let DecodedBody::Human(human) = human_text(&raw) else {
+            panic!("known");
+        };
+        assert_eq!(human.text, "$ ls -la\na\nb\n");
+    }
+
+    #[test]
+    fn unknown_or_malformed_envelopes_fall_back_to_raw_and_plain_text_is_plain() {
+        assert_eq!(human_text(r#"{"type":"mystery","x":1}"#), DecodedBody::Raw);
+        assert_eq!(
+            human_text(r#"{"type":"assistant","message":{"#),
+            DecodedBody::Raw
+        );
+        assert_eq!(
+            human_text(r#"{"type":"reasoning","text":"t"}"#),
+            DecodedBody::Raw
+        );
+        assert_eq!(human_text("plain line\n"), DecodedBody::Plain);
+    }
+
+    #[test]
+    fn error_payloads_decode_the_complete_nested_message() {
+        let long = "m".repeat(4_000);
+        let raw = serde_json::to_string(&json!({"type": "error", "message": long})).unwrap();
+        assert_eq!(
+            human_error_text(&raw),
+            DecodedBody::Human(HumanText {
+                text: long,
+                joined_blocks: false,
+            })
+        );
+        assert_eq!(human_error_text("plain failure"), DecodedBody::Plain);
     }
 
     /* ── format_agent_error ──────────────────────────── */
@@ -1302,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_error_keeps_plain_text_and_caps_the_detail() {
+    fn agent_error_keeps_plain_text_and_the_whole_detail() {
         let out = format_agent_error("ConnectionRefused: localhost:1234");
         assert_eq!(
             out.summary.as_deref(),
@@ -1311,10 +1593,10 @@ mod tests {
 
         let huge = "X".repeat(10 * 1024);
         let out = format_agent_error(&huge);
-        // tui-endurance.test.tsx pins the 2 KB detail cap.
+        // The summary is a preview; the detail is the complete payload (D4
+        // replaces the old 2 KB detail cap).
         assert_eq!(out.summary.as_deref(), Some("X".repeat(200).as_str()));
-        assert_eq!(out.detail.chars().count(), MAX_DETAIL_LEN + 1);
-        assert!(out.detail.ends_with('…'));
+        assert_eq!(out.detail, huge);
     }
 
     #[test]

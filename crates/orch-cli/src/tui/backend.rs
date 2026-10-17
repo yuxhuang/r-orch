@@ -18,7 +18,10 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use orch_core::storage::{GoalFilter, TaskFilter};
 use orch_domain::{
     Agent, CreateAgentInput, CreateGoalInput, CreateMessageInput, CreateTaskInput, CreateTeamInput,
@@ -28,9 +31,13 @@ use orch_domain::{
 use orch_engine::{
     FullEngine, UpdateAgentFields, UpdateGoalFields, UpdateTaskFields, WatchOptions,
 };
+use orch_infra::clipboard::{
+    NativeCopyStatus, NativeCopySubmitError, NativeCopyWorker, TextClipboardOpener,
+};
 use orch_tui::backend::{
-    AgentFields, AgentOpts, BackendResult, ClipboardPaste, CreateTaskOpts, GoalFields,
-    HistoryEntry, LaunchContext, MessageTarget, ModelCatalog, ModelOption, TaskFields, TuiBackend,
+    AgentFields, AgentOpts, BackendResult, ClipboardPaste, CopyOutcome, CopyResult, CopyTarget,
+    CopyTicket, CreateTaskOpts, GoalFields, HistoryEntry, LaunchContext, MessageTarget,
+    ModelCatalog, ModelOption, TaskFields, TuiBackend, copy,
 };
 use tokio::runtime::Handle;
 
@@ -102,6 +109,7 @@ pub struct EngineBackend {
     catalog: Arc<Mutex<CatalogState>>,
     watch_active: bool,
     peer_runtime: Arc<Mutex<Option<orch_peer::PeerRuntime>>>,
+    copy: CopyTransport,
 }
 
 impl std::fmt::Debug for EngineBackend {
@@ -214,6 +222,9 @@ impl EngineBackend {
             catalog: Arc::new(Mutex::new(CatalogState::NotStarted)),
             watch_active,
             peer_runtime,
+            // Opens nothing and starts no thread: the native worker waits for
+            // a native copy request that may never come.
+            copy: CopyTransport::system(),
         };
         // History is loaded eagerly because the dashboard's activity view
         // wants it on the first frame. The model catalog starts on the first
@@ -874,6 +885,20 @@ impl TuiBackend for EngineBackend {
         }
     }
 
+    /// Accept one copy request, routed by [`CopyTransport`].
+    ///
+    /// A *request*, like every other method here: the native route returns a
+    /// ticket and answers through [`TuiBackend::poll_copy_results`], because
+    /// an OS clipboard call can take seconds and a frame cannot wait for it.
+    fn copy_text_via(&mut self, text: &str, target: CopyTarget) -> BackendResult<CopyTicket> {
+        self.copy.copy_text_via(text, target)
+    }
+
+    /// Copy outcomes that have become known since the last frame.
+    fn poll_copy_results(&mut self) -> Vec<CopyResult> {
+        self.copy.poll_copy_results()
+    }
+
     /// Read the clipboard, writing any image to a temp file
     /// (`docs/parity/tui.md` §8.2).
     ///
@@ -920,6 +945,352 @@ impl TuiBackend for EngineBackend {
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(b"\x07");
         let _ = stdout.flush();
+    }
+}
+
+// ── Copy transport (design D5) ───────────────────────────────────────────────
+
+/// `ESC ] 5 2 ; c ;` — OSC 52 "set clipboard", selection `c`.
+///
+/// Written bare, with no tmux (`\x1bPtmux;…`) or screen (`\x1bP…\x1b\\`)
+/// passthrough wrapper: a wrapper that does not match the real outer
+/// multiplexer corrupts the sequence, and the hints cannot tell us the
+/// nesting. Under a multiplexer the request may simply be ignored, which is
+/// what the guidance in `copy::terminal_guidance` says.
+const OSC52_SET_CLIPBOARD: &[u8] = b"\x1b]52;c;";
+/// `BEL` — the sequence terminator, and the lone byte written to close a
+/// sequence a failed write may have left open.
+const BEL: &[u8] = b"\x07";
+
+/// The routing hints, read once per request.
+///
+/// Per request and never cached: `TMUX` and `SSH_*` change under a running
+/// dashboard when the user re-attaches, and a stale snapshot would route to a
+/// destination that is no longer there.
+trait CopyEnvSource: Send {
+    fn env(&self) -> copy::CopyEnv;
+}
+
+struct ProcessEnv;
+
+impl CopyEnvSource for ProcessEnv {
+    fn env(&self) -> copy::CopyEnv {
+        copy::CopyEnv::current()
+    }
+}
+
+/// Where an OSC 52 request is written.
+trait TerminalSink: Send {
+    /// Write one complete sequence and flush it.
+    ///
+    /// Whole-sequence rather than byte-wise on purpose: a terminal that sees
+    /// half an OSC 52 treats the next frame as clipboard payload, so the
+    /// framing and the body must not be separable by the caller.
+    fn write_sequence(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+/// The real terminal. The lock is taken for the single write so no draw can
+/// interleave into the middle of the sequence.
+struct StdoutSink;
+
+impl TerminalSink for StdoutSink {
+    fn write_sequence(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(bytes)?;
+        stdout.flush()
+    }
+}
+
+/// Monotonic now, for the native timeout.
+trait CopyClock: Send {
+    fn now(&self) -> Instant;
+}
+
+struct SystemClock;
+
+impl CopyClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// A native write the worker has not answered yet.
+struct PendingCopy {
+    ticket: CopyTicket,
+    /// When the UI stops waiting. The OS call keeps going; only the waiting
+    /// ends.
+    deadline: Instant,
+    /// Captured when the request was accepted, so a later environment change
+    /// cannot relabel it.
+    guidance: Option<String>,
+}
+
+/// The CLI's half of the copy contract: it owns the native worker, writes
+/// OSC 52, and turns both into tickets and [`CopyResult`]s.
+///
+/// Routing itself lives in `orch_tui::backend::copy` and is a pure function;
+/// what is here is the part that touches the machine. Every such part is a
+/// seam — environment, terminal, clipboard opener, clock — so the tests below
+/// never write a real clipboard, never open `arboard` and never put a byte on
+/// the real stdout.
+struct CopyTransport {
+    env: Box<dyn CopyEnvSource>,
+    sink: Box<dyn TerminalSink>,
+    clock: Box<dyn CopyClock>,
+    /// Taken on the first native request. `None` afterwards, which is what
+    /// makes "one worker, never replaced" structural rather than a rule: a
+    /// timed-out worker cannot be answered by starting a second one, because
+    /// two writers would fight over one X11 selection.
+    opener: Option<TextClipboardOpener>,
+    worker: Option<NativeCopyWorker>,
+    next_ticket: u64,
+    pending: Vec<PendingCopy>,
+    /// Finished tickets waiting for the next poll. They still count against
+    /// the ticket bound: capacity frees only once the UI has seen them.
+    completed: Vec<CopyResult>,
+    /// Learned from a result, never guessed. Only this — definite knowledge
+    /// from an earlier open failure — lets Auto fall back to the terminal.
+    native_unavailable: bool,
+    /// Jobs the UI gave up on and the worker has not answered. While any
+    /// exist the thread may still be inside an uncancellable OS call, so a
+    /// native request is refused instead of queueing behind it.
+    abandoned: usize,
+}
+
+impl CopyTransport {
+    /// The production wiring. Touches nothing until a request arrives.
+    fn system() -> CopyTransport {
+        CopyTransport::new(
+            Box::new(ProcessEnv),
+            Box::new(StdoutSink),
+            Box::new(SystemClock),
+            orch_infra::clipboard::system_text_clipboard_opener(),
+        )
+    }
+
+    fn new(
+        env: Box<dyn CopyEnvSource>,
+        sink: Box<dyn TerminalSink>,
+        clock: Box<dyn CopyClock>,
+        opener: TextClipboardOpener,
+    ) -> CopyTransport {
+        CopyTransport {
+            env,
+            sink,
+            clock,
+            opener: Some(opener),
+            worker: None,
+            next_ticket: 1,
+            pending: Vec::new(),
+            completed: Vec::new(),
+            native_unavailable: false,
+            abandoned: 0,
+        }
+    }
+
+    fn copy_text_via(&mut self, text: &str, target: CopyTarget) -> BackendResult<CopyTicket> {
+        let env = self.env.env();
+        if self.pending.len() + self.completed.len() >= copy::MAX_COPY_TICKETS {
+            return Err(copy::FAIL_BUSY.to_owned());
+        }
+        match copy::route(target, env) {
+            copy::CopyRoute::Terminal => self.request_terminal(text, copy::terminal_guidance(env)),
+            copy::CopyRoute::Native => self.write_native(text, env),
+            // Auto falls back only on knowledge it already had, and only
+            // before the request is accepted. Once accepted as native, a
+            // failure — unavailable, busy or timeout — is reported as a
+            // failure: no second destination, no dual write (D5).
+            copy::CopyRoute::NativeFirst if self.native_unavailable => {
+                self.request_terminal(text, copy::GUIDANCE_AUTO_FALLBACK)
+            }
+            copy::CopyRoute::NativeFirst => self.write_native(text, env),
+        }
+    }
+
+    /// One OSC 52 request. Completes immediately: the terminal never answers,
+    /// which is why the outcome is `TerminalRequested` and not "written".
+    fn request_terminal(
+        &mut self,
+        text: &str,
+        guidance: &'static str,
+    ) -> BackendResult<CopyTicket> {
+        if text.len() > copy::TERMINAL_COPY_MAX_BYTES {
+            // Nothing is written at all. A truncated clipboard is worse than
+            // a refused one, and terminals drop over-long sequences anyway.
+            return Err(copy::FAIL_TERMINAL_TOO_LARGE.to_owned());
+        }
+        // Base64 is what makes the body safe: the payload is pure
+        // `A-Za-z0-9+/=`, so text containing `ESC`, `BEL` or a C1 string
+        // terminator cannot close the sequence early or inject another.
+        let payload = STANDARD.encode(text.as_bytes());
+        let mut sequence =
+            Vec::with_capacity(OSC52_SET_CLIPBOARD.len() + payload.len() + BEL.len());
+        sequence.extend_from_slice(OSC52_SET_CLIPBOARD);
+        sequence.extend_from_slice(payload.as_bytes());
+        sequence.extend_from_slice(BEL);
+
+        if let Err(error) = self.sink.write_sequence(&sequence) {
+            // A partial write can leave the terminal inside an OSC, where it
+            // would eat the next frame as clipboard payload. A lone BEL ends
+            // it; the source text is never written a second time.
+            let _ = self.sink.write_sequence(BEL);
+            tracing::warn!(%error, "OSC 52 copy request could not be written");
+            return Err(copy::terminal_failure(&error.to_string()));
+        }
+
+        let (ticket, next) = self.reserve_ticket()?;
+        self.next_ticket = next;
+        self.completed.push(CopyResult {
+            ticket,
+            outcome: CopyOutcome::TerminalRequested,
+            guidance: Some(guidance.to_owned()),
+        });
+        Ok(ticket)
+    }
+
+    /// One native write, submitted to the worker.
+    ///
+    /// This route never writes OSC 52 — not on a full queue, not on an
+    /// unavailable clipboard, not on a timeout. A copy the user aimed at this
+    /// host must not silently become a request to their terminal, which may
+    /// be a different machine's clipboard.
+    fn write_native(&mut self, text: &str, env: copy::CopyEnv) -> BackendResult<CopyTicket> {
+        if text.len() > copy::NATIVE_COPY_MAX_BYTES {
+            return Err(copy::FAIL_NATIVE_TOO_LARGE.to_owned());
+        }
+        if self.abandoned > 0 {
+            return Err(copy::FAIL_BUSY.to_owned());
+        }
+        if self.native_unavailable {
+            return Err(copy::FAIL_NATIVE_UNAVAILABLE.to_owned());
+        }
+
+        let (ticket, next) = self.reserve_ticket()?;
+        let deadline = self.clock.now() + Duration::from_millis(copy::NATIVE_COPY_TIMEOUT_MS);
+        let guidance = copy::native_guidance(env).map(str::to_owned);
+
+        let Some(worker) = self.native_worker() else {
+            // The opener is spent, so the worker it started is the only one
+            // there will ever be — and it is gone.
+            return Err(copy::FAIL_NATIVE_UNAVAILABLE.to_owned());
+        };
+        // The job id *is* the ticket: one request, one job, so the completion
+        // needs no second mapping.
+        match worker.submit(ticket.0, text.to_owned()) {
+            Ok(()) => {}
+            Err(NativeCopySubmitError::Busy) => return Err(copy::FAIL_BUSY.to_owned()),
+            Err(NativeCopySubmitError::Gone) => {
+                tracing::error!("the clipboard writer thread is gone");
+                self.native_unavailable = true;
+                return Err(copy::FAIL_NATIVE_UNAVAILABLE.to_owned());
+            }
+        }
+
+        self.next_ticket = next;
+        self.pending.push(PendingCopy {
+            ticket,
+            deadline,
+            guidance,
+        });
+        Ok(ticket)
+    }
+
+    /// The worker, started on the first native request.
+    ///
+    /// `None` only once the opener has been spent, which cannot happen while
+    /// a worker is still held: the two are set together.
+    fn native_worker(&mut self) -> Option<&NativeCopyWorker> {
+        if self.worker.is_none() {
+            self.worker = Some(NativeCopyWorker::spawn(self.opener.take()?));
+        }
+        self.worker.as_ref()
+    }
+
+    /// The id the next accepted request carries, and the counter after it.
+    ///
+    /// Reserving and committing are separate because the native path has to
+    /// submit the job under the id before it knows the request was accepted;
+    /// a refused request leaves the counter alone, so ids stay gapless as
+    /// well as unique and increasing. Checked, so an exhausted counter
+    /// refuses rather than reissuing a live ticket.
+    fn reserve_ticket(&self) -> BackendResult<(CopyTicket, u64)> {
+        let id = self.next_ticket;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| copy::FAIL_BUSY.to_owned())?;
+        Ok((CopyTicket(id), next))
+    }
+
+    fn poll_copy_results(&mut self) -> Vec<CopyResult> {
+        let done = self
+            .worker
+            .as_ref()
+            .map(NativeCopyWorker::drain_done)
+            .unwrap_or_default();
+        for completion in done {
+            let Some(index) = self
+                .pending
+                .iter()
+                .position(|pending| pending.ticket.0 == completion.id)
+            else {
+                // A job the UI already gave up on. Its ticket failed with a
+                // timeout and must not be reported twice — but the answer
+                // proves the thread is out of the OS call and usable again.
+                self.abandoned = self.abandoned.saturating_sub(1);
+                if let NativeCopyStatus::Unavailable(reason) = &completion.status {
+                    tracing::warn!(%reason, "the host clipboard is unavailable for writing");
+                    self.native_unavailable = true;
+                }
+                continue;
+            };
+            let pending = self.pending.remove(index);
+            // Guidance describes a write that happened; a failure carries
+            // only the failure, so nothing claims "copied on this host".
+            let (outcome, guidance) = match completion.status {
+                NativeCopyStatus::Written => (CopyOutcome::NativeWritten, pending.guidance),
+                NativeCopyStatus::Unavailable(reason) => {
+                    tracing::warn!(%reason, "the host clipboard is unavailable for writing");
+                    self.native_unavailable = true;
+                    (
+                        CopyOutcome::Failed(copy::FAIL_NATIVE_UNAVAILABLE.to_owned()),
+                        None,
+                    )
+                }
+                NativeCopyStatus::Failed(reason) => {
+                    tracing::warn!(%reason, "the host clipboard refused a write");
+                    (CopyOutcome::Failed(copy::native_failure(&reason)), None)
+                }
+            };
+            self.completed.push(CopyResult {
+                ticket: pending.ticket,
+                outcome,
+                guidance,
+            });
+        }
+
+        let now = self.clock.now();
+        let (expired, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|pending| now >= pending.deadline);
+        self.pending = live;
+        for pending in expired {
+            // The OS call cannot be cancelled, so the worker is left strictly
+            // alone and only counted: see `write_native`.
+            self.abandoned += 1;
+            tracing::warn!(ticket = pending.ticket.0, "native copy timed out");
+            self.completed.push(CopyResult {
+                ticket: pending.ticket,
+                outcome: CopyOutcome::Failed(copy::FAIL_NATIVE_TIMEOUT.to_owned()),
+                guidance: None,
+            });
+        }
+
+        // Oldest ticket first, whatever order the answers arrived in. Stable,
+        // though tickets are unique so it only fixes the order of the two.
+        let mut results = std::mem::take(&mut self.completed);
+        results.sort_by_key(|result| result.ticket.0);
+        results
     }
 }
 
@@ -974,4 +1345,810 @@ fn parse_one<T: std::str::FromStr>(value: &str, what: &str) -> BackendResult<T> 
     value
         .parse()
         .map_err(|_| format!("Unknown {what}: \"{value}\""))
+}
+
+/// [`CopyTransport`] against fakes.
+///
+/// Nothing here touches the machine running the suite: the host clipboard, the
+/// terminal, the environment and the clock are all injected, so a test can
+/// assert the exact bytes of an OSC 52 request and drive a 3 s timeout without
+/// waiting 3 s or changing a developer's clipboard.
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    use orch_infra::clipboard::TextClipboard;
+    use orch_tui::backend::copy::{
+        self, CopyEnv, FAIL_BUSY, FAIL_NATIVE_TIMEOUT, FAIL_NATIVE_TOO_LARGE,
+        FAIL_NATIVE_UNAVAILABLE, FAIL_TERMINAL_TOO_LARGE, GUIDANCE_AUTO_FALLBACK,
+        GUIDANCE_NATIVE_REMOTE, GUIDANCE_STY, GUIDANCE_STY_TMUX, GUIDANCE_TERMINAL, GUIDANCE_TMUX,
+        NATIVE_COPY_MAX_BYTES, NATIVE_COPY_TIMEOUT_MS, TERMINAL_COPY_MAX_BYTES,
+    };
+
+    use super::*;
+
+    /// The bound on waiting for the worker *thread*, which is real. It is
+    /// never a bound on the fake clock, which only moves when a test moves it.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    // ── Fakes ───────────────────────────────────────────────────────────────
+
+    struct FixedEnv(CopyEnv);
+
+    impl CopyEnvSource for FixedEnv {
+        fn env(&self) -> CopyEnv {
+            self.0
+        }
+    }
+
+    #[derive(Default)]
+    struct SinkLog {
+        /// One entry per attempted write, holding the bytes the sink accepted.
+        writes: Vec<Vec<u8>>,
+        /// Accept this many bytes of the next write, then fail it.
+        fail_next: Option<usize>,
+    }
+
+    impl SinkLog {
+        fn only(&self) -> &[u8] {
+            assert_eq!(
+                self.writes.len(),
+                1,
+                "expected exactly one write, got {:?}",
+                self.writes
+            );
+            &self.writes[0]
+        }
+    }
+
+    struct FakeSink(Arc<Mutex<SinkLog>>);
+
+    impl TerminalSink for FakeSink {
+        fn write_sequence(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            let mut log = self.0.lock().unwrap();
+            if let Some(accepted) = log.fail_next.take() {
+                let accepted = accepted.min(bytes.len());
+                log.writes.push(bytes[..accepted].to_vec());
+                return Err(std::io::Error::other("tty gone"));
+            }
+            log.writes.push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeClock {
+        base: Instant,
+        offset_ms: Arc<AtomicU64>,
+    }
+
+    impl FakeClock {
+        fn new() -> FakeClock {
+            FakeClock {
+                base: Instant::now(),
+                offset_ms: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn advance_ms(&self, ms: u64) {
+            self.offset_ms.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
+
+    impl CopyClock for FakeClock {
+        fn now(&self) -> Instant {
+            self.base + Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+        }
+    }
+
+    #[derive(Default)]
+    struct NativeLog {
+        /// Every text the fake host clipboard accepted, in order.
+        written: Vec<String>,
+        /// How many times the opener ran.
+        opens: usize,
+    }
+
+    struct FakeNative {
+        log: Arc<Mutex<NativeLog>>,
+        /// Fail every write with this reason.
+        reject: Option<String>,
+        /// Announce entry into `set_text`, so "in flight" is a fact.
+        entered: Option<mpsc::Sender<()>>,
+        /// Hold every write until the test releases it.
+        gate: Option<mpsc::Receiver<()>>,
+    }
+
+    impl TextClipboard for FakeNative {
+        fn set_text(&mut self, text: &str) -> Result<(), String> {
+            if let Some(entered) = &self.entered {
+                let _ = entered.send(());
+            }
+            if let Some(gate) = &self.gate {
+                // `Err` means the test has gone; never stay wedged after it.
+                let _ = gate.recv();
+            }
+            if let Some(reason) = &self.reject {
+                return Err(reason.clone());
+            }
+            self.log.lock().unwrap().written.push(text.to_owned());
+            Ok(())
+        }
+    }
+
+    fn native_log() -> Arc<Mutex<NativeLog>> {
+        Arc::new(Mutex::new(NativeLog::default()))
+    }
+
+    /// An opener for a host clipboard that accepts writes.
+    fn accepting(log: &Arc<Mutex<NativeLog>>) -> TextClipboardOpener {
+        let log = Arc::clone(log);
+        Box::new(move || {
+            log.lock().unwrap().opens += 1;
+            Ok(Box::new(FakeNative {
+                log,
+                reject: None,
+                entered: None,
+                gate: None,
+            }) as Box<dyn TextClipboard>)
+        })
+    }
+
+    /// An opener for a host clipboard that is open but refuses writes.
+    fn rejecting(log: &Arc<Mutex<NativeLog>>, reason: &str) -> TextClipboardOpener {
+        let log = Arc::clone(log);
+        let reason = reason.to_owned();
+        Box::new(move || {
+            log.lock().unwrap().opens += 1;
+            Ok(Box::new(FakeNative {
+                log,
+                reject: Some(reason),
+                entered: None,
+                gate: None,
+            }) as Box<dyn TextClipboard>)
+        })
+    }
+
+    /// An opener that fails, as on a headless host.
+    fn unopenable(log: &Arc<Mutex<NativeLog>>) -> TextClipboardOpener {
+        let log = Arc::clone(log);
+        Box::new(move || {
+            log.lock().unwrap().opens += 1;
+            Err("no display".into())
+        })
+    }
+
+    /// An opener whose writes wedge until released: a job stuck in the OS.
+    fn wedging(
+        log: &Arc<Mutex<NativeLog>>,
+    ) -> (TextClipboardOpener, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let log = Arc::clone(log);
+        let (entered, entries) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let opener: TextClipboardOpener = Box::new(move || {
+            log.lock().unwrap().opens += 1;
+            Ok(Box::new(FakeNative {
+                log,
+                reject: None,
+                entered: Some(entered),
+                gate: Some(gate),
+            }) as Box<dyn TextClipboard>)
+        });
+        (opener, entries, release)
+    }
+
+    fn fixture(
+        env: CopyEnv,
+        opener: TextClipboardOpener,
+    ) -> (CopyTransport, Arc<Mutex<SinkLog>>, FakeClock) {
+        let sink = Arc::new(Mutex::new(SinkLog::default()));
+        let clock = FakeClock::new();
+        let transport = CopyTransport::new(
+            Box::new(FixedEnv(env)),
+            Box::new(FakeSink(Arc::clone(&sink))),
+            Box::new(clock.clone()),
+            opener,
+        );
+        (transport, sink, clock)
+    }
+
+    fn hints(ssh: bool, tmux: bool, sty: bool) -> CopyEnv {
+        CopyEnv {
+            web: false,
+            ssh,
+            tmux,
+            sty,
+        }
+    }
+
+    fn local() -> CopyEnv {
+        CopyEnv::default()
+    }
+
+    // ── Assertions on captured bytes ────────────────────────────────────────
+
+    /// The decoded body of one captured sequence, after checking the framing.
+    fn decode_sequence(sequence: &[u8]) -> Vec<u8> {
+        let payload = sequence
+            .strip_prefix(OSC52_SET_CLIPBOARD)
+            .and_then(|rest| rest.strip_suffix(BEL))
+            .unwrap_or_else(|| panic!("not an OSC 52 set-clipboard sequence: {sequence:?}"));
+        assert!(
+            payload.iter().all(|byte| byte.is_ascii_alphanumeric()
+                || *byte == b'+'
+                || *byte == b'/'
+                || *byte == b'='),
+            "the payload must be pure base64 ASCII, got {payload:?}"
+        );
+        STANDARD
+            .decode(payload)
+            .expect("the payload must be decodable base64")
+    }
+
+    /// Poll until the worker thread has answered. Bounded, because a hung
+    /// worker must fail the test rather than hang the suite.
+    fn poll_until_result(transport: &mut CopyTransport) -> Vec<CopyResult> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let results = transport.poll_copy_results();
+            if !results.is_empty() {
+                return results;
+            }
+            assert!(Instant::now() < deadline, "the worker never answered");
+            std::thread::yield_now();
+        }
+    }
+
+    fn one_result(transport: &mut CopyTransport) -> CopyResult {
+        let mut results = poll_until_result(transport);
+        assert_eq!(results.len(), 1, "expected one result, got {results:?}");
+        results.remove(0)
+    }
+
+    // ── C1: tickets, routing and the native worker ──────────────────────────
+
+    #[test]
+    fn nothing_is_opened_or_spawned_until_a_native_request() {
+        let log = native_log();
+        let (mut transport, _sink, _clock) = fixture(local(), accepting(&log));
+
+        transport
+            .copy_text_via("body", CopyTarget::Terminal)
+            .unwrap();
+
+        assert_eq!(log.lock().unwrap().opens, 0);
+        assert!(
+            transport.worker.is_none(),
+            "a terminal request must not start the clipboard thread"
+        );
+    }
+
+    #[test]
+    fn a_native_copy_writes_the_exact_text_and_nothing_to_the_terminal() {
+        let log = native_log();
+        let (mut transport, sink, _clock) = fixture(local(), accepting(&log));
+
+        let ticket = transport
+            .copy_text_via("hello\n\u{1b}🦀", CopyTarget::Native)
+            .unwrap();
+
+        assert_eq!(ticket, CopyTicket(1));
+        assert_eq!(
+            one_result(&mut transport),
+            CopyResult {
+                ticket,
+                outcome: CopyOutcome::NativeWritten,
+                guidance: None,
+            }
+        );
+        assert_eq!(log.lock().unwrap().written, vec!["hello\n\u{1b}🦀"]);
+        assert!(
+            sink.lock().unwrap().writes.is_empty(),
+            "a native copy must never write OSC 52"
+        );
+    }
+
+    #[test]
+    fn a_native_copy_over_ssh_carries_the_remote_guidance() {
+        let log = native_log();
+        let (mut transport, _sink, _clock) = fixture(hints(true, false, false), accepting(&log));
+
+        transport.copy_text_via("body", CopyTarget::Native).unwrap();
+
+        assert_eq!(
+            one_result(&mut transport).guidance.as_deref(),
+            Some(GUIDANCE_NATIVE_REMOTE)
+        );
+    }
+
+    #[test]
+    fn an_unopenable_host_clipboard_fails_as_unavailable() {
+        let log = native_log();
+        let (mut transport, sink, _clock) = fixture(local(), unopenable(&log));
+
+        let ticket = transport.copy_text_via("body", CopyTarget::Native).unwrap();
+
+        assert_eq!(
+            one_result(&mut transport),
+            CopyResult {
+                ticket,
+                outcome: CopyOutcome::Failed(FAIL_NATIVE_UNAVAILABLE.to_owned()),
+                guidance: None,
+            }
+        );
+        assert!(sink.lock().unwrap().writes.is_empty());
+        // Now *known* unavailable, so an explicit native request is refused
+        // outright rather than queued behind another doomed open.
+        assert_eq!(
+            transport.copy_text_via("body", CopyTarget::Native),
+            Err(FAIL_NATIVE_UNAVAILABLE.to_owned())
+        );
+    }
+
+    #[test]
+    fn an_explicit_native_write_failure_never_reaches_the_terminal() {
+        let log = native_log();
+        // Under tmux, where Auto would have gone to the terminal: an explicit
+        // native request must not borrow that destination on failure.
+        let (mut transport, sink, _clock) = fixture(
+            hints(true, true, false),
+            rejecting(&log, "selection refused"),
+        );
+
+        let ticket = transport.copy_text_via("body", CopyTarget::Native).unwrap();
+
+        assert_eq!(
+            one_result(&mut transport),
+            CopyResult {
+                ticket,
+                outcome: CopyOutcome::Failed(copy::native_failure("selection refused")),
+                guidance: None,
+            }
+        );
+        assert!(
+            sink.lock().unwrap().writes.is_empty(),
+            "a failed native copy must not fall back to OSC 52"
+        );
+    }
+
+    #[test]
+    fn a_third_native_ticket_is_refused_until_the_first_two_are_drained() {
+        let log = native_log();
+        let (mut transport, _sink, _clock) = fixture(local(), accepting(&log));
+
+        let first = transport.copy_text_via("a", CopyTarget::Native).unwrap();
+        let second = transport.copy_text_via("b", CopyTarget::Native).unwrap();
+        assert_eq!(
+            transport.copy_text_via("c", CopyTarget::Native),
+            Err(FAIL_BUSY.to_owned())
+        );
+
+        let deadline = Instant::now() + WAIT;
+        let mut results = Vec::new();
+        while results.len() < 2 {
+            results.extend(transport.poll_copy_results());
+            assert!(Instant::now() < deadline, "the worker never answered twice");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            results.iter().map(|r| r.ticket).collect::<Vec<_>>(),
+            vec![first, second],
+            "results come back oldest ticket first"
+        );
+        assert!(transport.copy_text_via("c", CopyTarget::Native).is_ok());
+    }
+
+    #[test]
+    fn two_undrained_terminal_tickets_also_fill_the_bound() {
+        let log = native_log();
+        let (mut transport, sink, _clock) = fixture(hints(false, true, false), accepting(&log));
+
+        transport.copy_text_via("a", CopyTarget::Terminal).unwrap();
+        transport.copy_text_via("b", CopyTarget::Terminal).unwrap();
+        assert_eq!(
+            transport.copy_text_via("c", CopyTarget::Terminal),
+            Err(FAIL_BUSY.to_owned()),
+            "a completed ticket occupies the bound until it is drained"
+        );
+        assert_eq!(
+            sink.lock().unwrap().writes.len(),
+            2,
+            "the refused request must write nothing"
+        );
+
+        let results = transport.poll_copy_results();
+        assert_eq!(
+            results.iter().map(|r| r.ticket.0).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            transport.copy_text_via("c", CopyTarget::Terminal),
+            Ok(CopyTicket(3)),
+            "tickets keep increasing after a drain"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_native_copy_fails_and_the_worker_is_reused_once_it_answers() {
+        let log = native_log();
+        let (opener, entries, release) = wedging(&log);
+        let (mut transport, sink, clock) = fixture(local(), opener);
+
+        let stuck = transport
+            .copy_text_via("wedged", CopyTarget::Native)
+            .unwrap();
+        entries.recv_timeout(WAIT).expect("the write started");
+        assert!(
+            transport.poll_copy_results().is_empty(),
+            "nothing is decided before the deadline"
+        );
+
+        clock.advance_ms(NATIVE_COPY_TIMEOUT_MS);
+        assert_eq!(
+            transport.poll_copy_results(),
+            vec![CopyResult {
+                ticket: stuck,
+                outcome: CopyOutcome::Failed(FAIL_NATIVE_TIMEOUT.to_owned()),
+                guidance: None,
+            }]
+        );
+
+        // The thread may still be inside the OS call, so native is busy — and
+        // the fix is never a second worker.
+        assert_eq!(
+            transport.copy_text_via("next", CopyTarget::Native),
+            Err(FAIL_BUSY.to_owned())
+        );
+        assert_eq!(log.lock().unwrap().opens, 1);
+
+        // The late answer is discarded: the ticket already failed and must not
+        // be reported twice. But it frees the worker.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + WAIT;
+        while transport.abandoned > 0 {
+            assert!(
+                transport.poll_copy_results().is_empty(),
+                "a late completion must not be reported"
+            );
+            assert!(Instant::now() < deadline, "the late answer never arrived");
+            std::thread::yield_now();
+        }
+
+        let reused = transport
+            .copy_text_via("after", CopyTarget::Native)
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            one_result(&mut transport),
+            CopyResult {
+                ticket: reused,
+                outcome: CopyOutcome::NativeWritten,
+                guidance: None,
+            }
+        );
+        assert_eq!(log.lock().unwrap().opens, 1, "still the one handle");
+        assert_eq!(
+            log.lock().unwrap().written,
+            vec!["wedged".to_owned(), "after".to_owned()]
+        );
+        assert!(sink.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn auto_goes_native_while_the_host_is_unproven_and_falls_back_once_it_is_not() {
+        let log = native_log();
+        let (mut transport, sink, _clock) = fixture(local(), unopenable(&log));
+
+        // Unknown availability is not a reason to ask the terminal.
+        let first = transport.copy_text_via("body", CopyTarget::Auto).unwrap();
+        assert!(
+            sink.lock().unwrap().writes.is_empty(),
+            "Auto must not write both destinations"
+        );
+        assert_eq!(
+            one_result(&mut transport).outcome,
+            CopyOutcome::Failed(FAIL_NATIVE_UNAVAILABLE.to_owned())
+        );
+
+        // Now it is definite, so the fallback is allowed — and it is labelled
+        // as a fallback, not as a plain terminal request.
+        let second = transport.copy_text_via("body", CopyTarget::Auto).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            one_result(&mut transport),
+            CopyResult {
+                ticket: second,
+                outcome: CopyOutcome::TerminalRequested,
+                guidance: Some(GUIDANCE_AUTO_FALLBACK.to_owned()),
+            }
+        );
+        let log = sink.lock().unwrap();
+        assert_eq!(decode_sequence(log.only()), b"body");
+    }
+
+    // ── C2: the body cannot escape the framing ──────────────────────────────
+
+    #[test]
+    fn a_hostile_body_cannot_escape_the_osc_52_framing() {
+        let bodies = [
+            "\x1b]52;c;ATTACK\x07\x1b\\",
+            "two\nlines",
+            "semi;colons;everywhere",
+            "c1 terminator \u{9c} here",
+            "héllo 🦀 ünicode",
+            "",
+        ];
+        for body in bodies {
+            let log = native_log();
+            let (mut transport, sink, _clock) = fixture(local(), accepting(&log));
+
+            transport
+                .copy_text_via(body, CopyTarget::Terminal)
+                .unwrap_or_else(|err| panic!("{body:?} was refused: {err}"));
+
+            let sink = sink.lock().unwrap();
+            let sequence = sink.only();
+            assert_eq!(
+                decode_sequence(sequence),
+                body.as_bytes(),
+                "{body:?} must arrive byte-exact"
+            );
+            // The only control bytes on the wire are the framing constants.
+            assert_eq!(
+                sequence
+                    .iter()
+                    .filter(|byte| matches!(byte, 0x1b | 0x07 | 0x9c))
+                    .count(),
+                2,
+                "{body:?} put control bytes in the payload: {sequence:?}"
+            );
+            assert!(sequence.starts_with(OSC52_SET_CLIPBOARD));
+            assert!(sequence.ends_with(BEL));
+            assert_eq!(
+                log.lock().unwrap().opens,
+                0,
+                "a terminal request must not touch the host clipboard"
+            );
+        }
+    }
+
+    // ── C3: the size limits ─────────────────────────────────────────────────
+
+    #[test]
+    fn sixty_four_kib_is_allowed_and_one_byte_more_is_refused() {
+        let log = native_log();
+        let (mut transport, sink, _clock) = fixture(local(), accepting(&log));
+
+        let body = "a".repeat(TERMINAL_COPY_MAX_BYTES);
+        transport
+            .copy_text_via(&body, CopyTarget::Terminal)
+            .unwrap();
+        {
+            let sink = sink.lock().unwrap();
+            let sequence = sink.only();
+            assert_eq!(
+                sequence.len(),
+                OSC52_SET_CLIPBOARD.len() + 87_384 + BEL.len(),
+                "65,536 bytes encode to an 87,384-byte payload"
+            );
+            assert_eq!(decode_sequence(sequence).len(), TERMINAL_COPY_MAX_BYTES);
+        }
+
+        let over = "a".repeat(TERMINAL_COPY_MAX_BYTES + 1);
+        assert_eq!(
+            transport.copy_text_via(&over, CopyTarget::Terminal),
+            Err(FAIL_TERMINAL_TOO_LARGE.to_owned())
+        );
+        assert_eq!(
+            sink.lock().unwrap().writes.len(),
+            1,
+            "an over-sized body writes nothing at all"
+        );
+    }
+
+    #[test]
+    fn an_over_sized_native_body_is_refused_without_starting_the_worker() {
+        let log = native_log();
+        let (mut transport, sink, _clock) = fixture(local(), accepting(&log));
+
+        let over = "a".repeat(NATIVE_COPY_MAX_BYTES + 1);
+        assert_eq!(
+            transport.copy_text_via(&over, CopyTarget::Native),
+            Err(FAIL_NATIVE_TOO_LARGE.to_owned())
+        );
+
+        assert_eq!(log.lock().unwrap().opens, 0);
+        assert!(transport.worker.is_none());
+        assert!(sink.lock().unwrap().writes.is_empty());
+        assert_eq!(
+            transport.copy_text_via("small", CopyTarget::Terminal),
+            Ok(CopyTicket(1)),
+            "a refused request consumes no ticket"
+        );
+    }
+
+    // ── C4: the environment matrix ──────────────────────────────────────────
+
+    /// Every hint combination, for all three targets: exactly one destination
+    /// gets the bytes, and the guidance is the constant for that environment.
+    #[test]
+    fn the_env_matrix_routes_each_target_to_exactly_one_destination() {
+        let cases = [
+            ("ssh only", hints(true, false, false), GUIDANCE_TERMINAL),
+            ("tmux only", hints(false, true, false), GUIDANCE_TMUX),
+            ("screen only", hints(false, false, true), GUIDANCE_STY),
+            (
+                "tmux and screen",
+                hints(false, true, true),
+                GUIDANCE_STY_TMUX,
+            ),
+            (
+                "stale ssh with tmux",
+                hints(true, true, false),
+                GUIDANCE_TMUX,
+            ),
+            (
+                "stale ssh with screen",
+                hints(true, false, true),
+                GUIDANCE_STY,
+            ),
+            (
+                "stale ssh with tmux and screen",
+                hints(true, true, true),
+                GUIDANCE_STY_TMUX,
+            ),
+            (
+                "orch web",
+                CopyEnv {
+                    web: true,
+                    ..CopyEnv::default()
+                },
+                GUIDANCE_TERMINAL,
+            ),
+            (
+                "orch web inside tmux",
+                CopyEnv {
+                    web: true,
+                    tmux: true,
+                    ..CopyEnv::default()
+                },
+                GUIDANCE_TMUX,
+            ),
+            ("no hints", local(), GUIDANCE_TERMINAL),
+        ];
+
+        for (name, env, guidance) in cases {
+            // Explicit Terminal: always OSC 52, with this environment's note.
+            let log = native_log();
+            let (mut transport, sink, _clock) = fixture(env, accepting(&log));
+            let ticket = transport
+                .copy_text_via("body 🦀", CopyTarget::Terminal)
+                .unwrap();
+            assert_eq!(
+                transport.poll_copy_results(),
+                vec![CopyResult {
+                    ticket,
+                    outcome: CopyOutcome::TerminalRequested,
+                    guidance: Some(guidance.to_owned()),
+                }],
+                "{name}: explicit Terminal"
+            );
+            assert_eq!(
+                decode_sequence(sink.lock().unwrap().only()),
+                "body 🦀".as_bytes(),
+                "{name}: explicit Terminal bytes"
+            );
+            assert_eq!(
+                log.lock().unwrap().opens,
+                0,
+                "{name}: Terminal stayed off the host"
+            );
+
+            // Explicit Native: always the host clipboard, never OSC 52.
+            let log = native_log();
+            let (mut transport, sink, _clock) = fixture(env, accepting(&log));
+            let ticket = transport
+                .copy_text_via("body 🦀", CopyTarget::Native)
+                .unwrap();
+            assert_eq!(
+                one_result(&mut transport),
+                CopyResult {
+                    ticket,
+                    outcome: CopyOutcome::NativeWritten,
+                    guidance: copy::native_guidance(env).map(str::to_owned),
+                },
+                "{name}: explicit Native"
+            );
+            assert_eq!(
+                log.lock().unwrap().written,
+                vec!["body 🦀".to_owned()],
+                "{name}: explicit Native bytes"
+            );
+            assert!(
+                sink.lock().unwrap().writes.is_empty(),
+                "{name}: Native wrote OSC 52"
+            );
+
+            // Auto: the terminal under any hint, this host when there is none.
+            let log = native_log();
+            let (mut transport, sink, _clock) = fixture(env, accepting(&log));
+            let ticket = transport
+                .copy_text_via("body 🦀", CopyTarget::Auto)
+                .unwrap();
+            if env.prefers_terminal() {
+                assert_eq!(
+                    transport.poll_copy_results(),
+                    vec![CopyResult {
+                        ticket,
+                        outcome: CopyOutcome::TerminalRequested,
+                        guidance: Some(guidance.to_owned()),
+                    }],
+                    "{name}: Auto"
+                );
+                assert_eq!(
+                    decode_sequence(sink.lock().unwrap().only()),
+                    "body 🦀".as_bytes(),
+                    "{name}: Auto bytes"
+                );
+                assert_eq!(
+                    log.lock().unwrap().opens,
+                    0,
+                    "{name}: Auto stayed off the host"
+                );
+            } else {
+                assert_eq!(
+                    one_result(&mut transport).outcome,
+                    CopyOutcome::NativeWritten,
+                    "{name}: Auto"
+                );
+                assert_eq!(
+                    log.lock().unwrap().written,
+                    vec!["body 🦀".to_owned()],
+                    "{name}: Auto bytes"
+                );
+                assert!(
+                    sink.lock().unwrap().writes.is_empty(),
+                    "{name}: Auto wrote OSC 52"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_terminal_write_closes_the_sequence_and_never_repeats_the_text() {
+        let log = native_log();
+        let (mut transport, sink, _clock) = fixture(local(), accepting(&log));
+        // Half the framing went out before the tty died, which is the case a
+        // bare BEL has to clean up.
+        sink.lock().unwrap().fail_next = Some(OSC52_SET_CLIPBOARD.len());
+
+        assert_eq!(
+            transport.copy_text_via("secret", CopyTarget::Terminal),
+            Err(copy::terminal_failure("tty gone"))
+        );
+
+        {
+            let sink = sink.lock().unwrap();
+            assert_eq!(
+                sink.writes,
+                vec![OSC52_SET_CLIPBOARD.to_vec(), BEL.to_vec()],
+                "recovery is one bare BEL and nothing else"
+            );
+            let after_failure = &sink.writes[1];
+            assert!(
+                !after_failure.windows(6).any(|window| window == b"secret")
+                    && !after_failure
+                        .windows(8)
+                        .any(|window| window == STANDARD.encode("secret").as_bytes()),
+                "the source text must never be written again"
+            );
+        }
+        // No ticket was issued, and no result is owed.
+        assert!(transport.poll_copy_results().is_empty());
+        assert_eq!(
+            transport.copy_text_via("later", CopyTarget::Terminal),
+            Ok(CopyTicket(1))
+        );
+    }
 }
