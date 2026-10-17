@@ -1260,7 +1260,7 @@ fn m078_the_wheel_does_nothing_over_a_log_detail() {
     h.click_text("msg-38");
     h.key('i');
     let index = h.app.state.filtered_messages()[h.app.state.log_selected_index as usize];
-    h.app.state.messages[index].detail = Some("line\n".repeat(100));
+    h.app.state.messages[index].detail = Some("line\n".repeat(100).into());
     h.app.state.set_focus(Focus::LogDetail(LogSection::Body));
     h.draw();
     let before = h.app.state.log_selected_index;
