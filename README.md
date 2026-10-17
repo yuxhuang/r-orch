@@ -45,14 +45,14 @@ cargo install --path crates/orch-cli
 
 Releases are tags on `master` (`vX.Y.Z`). v0.5.0 is the first release with
 [remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
-`v0.5.0-alpha.2`. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
+`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
 `orch update` does not self-update: it only prints how to install. To build a specific release from source:
 
 ```bash
 git clone <this repo> r-orch && cd r-orch
-git checkout v0.5.0
+git checkout v0.5.1
 cargo install --locked --path crates/orch-cli
-orch --version      # 0.5.0
+orch --version      # 0.5.1
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
@@ -355,10 +355,30 @@ Roll back
 v0.4.0 has no remote support, so the `remote` commands and the `Controller` and `Listen` status lines
 disappear when you roll back.
 
-### Known gaps in v0.5.0
+### Upgrading from v0.5.0 and rolling back
+
+Upgrade every peer to v0.5.1 together: the fixes below are mostly on the worker, so a v0.5.1 controller
+talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notice:
+- a task file containing Markdown emphasis no longer fails with `contains N YAML aliases, over the limit
+  of 64` (the alias guard now counts real aliases from the parser, not `*` characters);
+- a remote task shows where it really is: `dispatched → <alias>`, `queued @<alias>` (with
+  `awaiting approval: orch task approve <id> on <alias>` when the worker holds it), `RUN @<alias>` only once
+  the worker runs it, and `RUN? (<alias> offline)` while the link is down;
+- one unreadable task file on a worker no longer drops every connection; `orch remote status` on the
+  worker shows why the last session ended, and on the controller the retry countdown and attempt;
+- a controller restart, graceful or not, keeps remote runs and reattaches to them instead of cancelling;
+- a submit the worker never acknowledges fails after 5 minutes online; a task queued for an hour is
+  reported hourly but never failed;
+- a worker cancels leftover task copies of a controller it has not seen for 24 hours (todo copies only).
+
+Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
+cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
+
+### Known gaps in v0.5.1
 
 - The automated multi-instance tests run every instance on one machine; no automated test covers two
-  hosts or a physical network.
+  hosts or a physical network (v0.5.1 was verified by hand between a macOS controller and a Linux worker
+  on a LAN).
 - Messages and task results between peers are plain TCP: no authentication, no encryption.
 - If a stdin write to `claude` fails after the first 32 KiB, claude can run with a truncated prompt. This
   is logged at `warn` but not reported as a run error.

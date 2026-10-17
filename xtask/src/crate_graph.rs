@@ -120,6 +120,14 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
         "reconcile reads the persistent remote registry to fail removed executions without retry",
     ),
     (
+        "orchestrator/recovery.rs",
+        "startup cleanup reads the same remote registry as tick.rs, to keep remote runs whose peer is still registered",
+    ),
+    (
+        "orchestrator/remote.rs",
+        "rehydrating remote runs at startup reads the persisted RemoteAgentDirectory snapshot, as message_service.rs does",
+    ),
+    (
         "orchestrator/tests/harness.rs",
         "test assembly wires the explicit RemoteAgentDirectory to TaskService",
     ),
