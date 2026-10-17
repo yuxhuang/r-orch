@@ -103,6 +103,43 @@ clicks reach the dashboard at all.
 
 To start with the mouse off: `ORCH_TUI_MOUSE=0 orch`. `/mouse status` says which it is.
 
+### Reading, navigating and editing in the dashboard
+
+`Left`/`Right` switch views; `Tab`/`Shift-Tab` move between the list, activity and available detail sections.
+The Agents view aligns rows in a table. Arrows, PageUp/PageDown, Home/End and the wheel navigate the focused
+section. A click or wheel focuses the section under the pointer. Entity action letters act from the main list;
+return there to edit or delete. Opening a detail initially focuses its Overview section.
+
+Press `i` on supported text, or activate a message with Enter/double-click, to open its full-text viewer.
+The viewer shows an immutable Snapshot: close and reopen to see new content. Known message envelopes open as
+Human text; Raw preserves the received bytes. The footer offers the representation switch. Arrows and paging
+keys scroll; mouse drags select text across wrapped lines. Only complete admitted bodies are available: bodies
+over 1 MiB show an unavailable notice, and older records can be evicted under the 500-record/32 MiB text budget.
+These are component limits, not a process memory cap.
+
+`Ctrl+Y` copies the whole current field/representation. Viewer `y` copies its selection; in an editor use
+Copy selection on the F6 rail. In a focused read-only section Ctrl+Y copies directly. `F6` opens the copy rail; arrows or Tab choose an action and Enter invokes
+it. `F6`, End, Enter chooses **Copy on this host** without needing Option/Alt. The mouse `Copy…` chip and
+previous/next controls offer the same choices; `x` closes the rail. `F1` shows contextual help, full route guidance
+and matching copy status. Escape/F1 closes help and restores the inspected text.
+
+Auto copy requests the terminal under SSH, tmux, screen or `orch web`; otherwise it uses the host clipboard when
+available. Explicit **Copy on this host** targets the machine running Orch, including a remote host. A terminal
+status says *requested*, because OSC 52 cannot confirm clipboard delivery. Terminal requests are limited to
+64 KiB; host requests support 1 MiB. Native failure never silently writes to another destination. In the browser,
+click **Copy to clipboard** after requesting a copy; permission denial or an insecure context provides selectable
+fallback text. See [copy troubleshooting](docs/RUNBOOK.md#copying-text-from-the-dashboard).
+
+Selection endpoints differ between widgets: the viewer includes the pressed glyph, while the textarea uses
+insertion positions. The same reverse drag can therefore include one extra glyph in the viewer. Tabs, combining
+characters, trailing spaces and source bytes are preserved; review the highlight before copying.
+
+Leaving a changed editor asks whether to continue, keep a draft or discard. Drafts live only in this process,
+with at most 20 drafts, 256 KiB per draft and 2 MiB total; a full store refuses another draft rather than silently
+evicting one. Quitting with unsaved edits or saved drafts asks for confirmation; exit discards RAM drafts.
+Primary submit failures keep the form; a failure after creation reports the created entity and avoids another
+create. Vim editing is not included; the [plan](docs/plans/2026-10-16-tui-qol.md) records feasibility and limits.
+
 **Messaging an agent from the dashboard.** On the Agents tab, select an agent and press **`m`**: the
 command bar opens prefilled `/msg "Code Reviewer" `, ready for the body. Or type `/msg ` and pick from
 the agent list — Tab or a double-click fills the name, already quoted. The message is queued exactly as

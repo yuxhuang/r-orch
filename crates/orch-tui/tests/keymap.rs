@@ -82,12 +82,12 @@ fn k003_esc_closes_the_detail_panel() {
 
 #[test]
 fn k004_esc_resets_the_goal_detail_scroll() {
-    let mut harness = goals_harness();
-    harness.press(KeyCode::Enter);
-    harness.press(KeyCode::Down);
-    assert_eq!(harness.app.state.goal_detail_scroll, 1);
-    harness.press(KeyCode::Esc);
-    assert_eq!(harness.app.state.goal_detail_scroll, 0);
+    let mut h = goals_harness();
+    h.press(KeyCode::Enter);
+    h.app.state.goal_detail_scroll = 5;
+    h.press(KeyCode::Esc);
+    assert_eq!(h.app.state.goal_detail_scroll, 0);
+    assert_eq!(h.app.state.focus, orch_tui::state::Focus::MainList);
 }
 
 #[test]
@@ -274,15 +274,12 @@ fn k025_slash_is_blocked_while_the_detail_panel_is_open() {
 
 #[test]
 fn k026_tab_cycles_forward_with_wrap() {
-    let mut harness = tasks_harness();
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.state.view, ViewId::Agents);
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.state.view, ViewId::Logs);
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.state.view, ViewId::Goals);
-    harness.press(KeyCode::Tab);
-    assert_eq!(harness.app.state.view, ViewId::Tasks);
+    let mut h = tasks_harness();
+    h.press(KeyCode::Tab);
+    assert_eq!(h.app.state.focus, orch_tui::state::Focus::Activity);
+    assert_eq!(h.app.state.view, ViewId::Tasks);
+    h.press(KeyCode::Tab);
+    assert_eq!(h.app.state.focus, orch_tui::state::Focus::MainList);
 }
 
 #[test]
@@ -500,12 +497,17 @@ fn k051_r_refuses_a_non_runnable_task() {
 
 #[test]
 fn k052_enter_opens_and_closes_the_task_detail_panel() {
-    let mut harness = tasks_harness();
-    harness.press(KeyCode::Enter);
-    assert_eq!(harness.app.state.detail, DetailPanel::Entity);
-    harness.assert_text("DETAIL");
-    harness.press(KeyCode::Enter);
-    assert_eq!(harness.app.state.detail, DetailPanel::None);
+    let mut h = tasks_harness();
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    h.press(KeyCode::Enter);
+    assert_eq!(
+        h.app.state.detail,
+        DetailPanel::Entity,
+        "Overview Enter is inspection, Escape closes"
+    );
+    h.press(KeyCode::Esc);
+    assert_eq!(h.app.state.detail, DetailPanel::None);
 }
 
 #[test]
@@ -735,16 +737,23 @@ fn k075_enter_on_the_add_goal_row_opens_the_wizard() {
 
 #[test]
 fn k076_up_and_down_scroll_the_open_goal_detail_panel() {
-    let mut harness = goals_harness();
-    harness.press(KeyCode::Enter);
-    harness.key('j');
-    assert_eq!(harness.app.state.goal_detail_scroll, 1);
-    harness.key('k');
-    assert_eq!(harness.app.state.goal_detail_scroll, 0);
-    assert_eq!(
-        harness.app.state.goal_selected, 0,
-        "the list selection does not move while the panel is open"
-    );
+    use orch_tui::state::{Focus, GoalSection};
+    let mut h = goals_harness();
+    h.app.state.goals[0].description = (0..100)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    h.press(KeyCode::Enter);
+    h.app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Description));
+    h.draw();
+    let key = h.app.state.pane_key(h.app.state.focus);
+    h.key('j');
+    assert_eq!(h.app.state.pane_scroll(&key).offset, 1);
+    h.key('k');
+    assert_eq!(h.app.state.pane_scroll(&key).offset, 0);
+    assert_eq!(h.app.state.goal_selected, 0);
 }
 
 // ── Logs view ──────────────────────────────────────────────────────────────
@@ -828,16 +837,17 @@ fn k084_down_past_the_last_index_returns_to_tail() {
 
 #[test]
 fn k085_enter_toggles_the_log_detail_panel_only_with_a_selection() {
-    let mut harness = logs_harness();
-    harness.press(KeyCode::Enter);
-    assert_eq!(harness.app.state.detail, DetailPanel::None);
-    harness.app.execute_command("status");
-    harness.app.state.flush_messages(harness.now());
-    harness.press(KeyCode::Up);
-    harness.press(KeyCode::Enter);
-    assert_eq!(harness.app.state.detail, DetailPanel::Log);
-    harness.press(KeyCode::Enter);
-    assert_eq!(harness.app.state.detail, DetailPanel::None);
+    let mut h = logs_harness();
+    h.press(KeyCode::Enter);
+    assert!(h.app.state.viewer.is_none());
+    h.app.execute_command("status");
+    h.app.state.flush_messages(h.now());
+    h.press(KeyCode::Up).press(KeyCode::Enter);
+    assert!(
+        h.app.state.viewer.is_some(),
+        "Actions Enter opens complete snapshot"
+    );
+    assert_eq!(h.app.state.detail, DetailPanel::None);
 }
 
 // ── Activity filter ────────────────────────────────────────────────────────

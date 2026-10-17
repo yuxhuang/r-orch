@@ -1,976 +1,750 @@
-//! The four detail panels (docs/parity/tui.md §1.1–§1.4).
+//! Sectioned inspectors. The rail and optional overview pin are chrome;
+//! metrics describe only the independently navigable section body.
 
 use orch_domain::{AdapterErrorKind, TaskStatus, error_hint};
-use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Modifier;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::{Frame, layout::Rect, text::Span};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
-use crate::format::{MAX_PANEL_TEXT, cap_line, cap_text, format_duration, parse_timestamp_ms};
-use crate::messages::MsgType;
-use crate::state::{DetailPanel, ViewId};
-use crate::theme::{
-    EM_DASH, HEAVY_RULE, LOOP, Token, agent_status_token, goal_status_token, light_rule,
-    task_status_token,
+use crate::backend::CopyOutcome;
+use crate::format::{format_duration, parse_timestamp_ms};
+use crate::hit::{FooterAction, PaneMetrics, VerbId, ZoneId, ZoneKind};
+use crate::state::{
+    AgentSection, AppState, CopyOrigin, EntityType, Focus, GoalSection, LogSection, TaskSection,
 };
-use crate::views::{
-    RenderCtx, put_line, resize_hint, resize_hint_zones, section_label, spans_width,
-};
+use crate::theme::{EM_DASH, Token};
+use crate::views::{RenderCtx, fit_cells, put_line};
+use crate::widgets::text_viewer::ViewerSource;
 
-/// `col1Width` in the goal and agent panels.
-const COL1_W: usize = 24;
+pub fn section_name(focus: Focus) -> &'static str {
+    match focus {
+        Focus::GoalDetail(GoalSection::Overview)
+        | Focus::TaskDetail(TaskSection::Overview)
+        | Focus::AgentDetail(AgentSection::Overview) => "Overview",
+        Focus::GoalDetail(GoalSection::Description)
+        | Focus::TaskDetail(TaskSection::Description) => "Description",
+        Focus::GoalDetail(GoalSection::Progress) => "Progress",
+        Focus::GoalDetail(GoalSection::Tasks) => "Tasks",
+        Focus::TaskDetail(TaskSection::Attachments) => "Attachments",
+        Focus::TaskDetail(TaskSection::Result) => "Result",
+        Focus::TaskDetail(TaskSection::Files) => "Files",
+        Focus::TaskDetail(TaskSection::Activity) => "Activity",
+        Focus::AgentDetail(AgentSection::Error) => "Error",
+        Focus::AgentDetail(AgentSection::Role) => "Role",
+        Focus::LogDetail(LogSection::Metadata) => "Metadata",
+        Focus::LogDetail(LogSection::Body) => "Body",
+        _ => "Overview",
+    }
+}
+
+fn entity_source(kind: EntityType, id: &str, field: &str) -> ViewerSource {
+    ViewerSource::Entity {
+        kind,
+        id: id.into(),
+        field: field.into(),
+    }
+}
+
+/// Source text shared with navigation/source resolution. No panel-length
+/// cap is applied: scrolling and expansion retain the complete field.
+pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
+    match focus {
+        Focus::GoalDetail(section) => {
+            let Some(goal) = state.selected_goal() else {
+                return Vec::new();
+            };
+            let linked = state.tasks_of_goal(&goal.id);
+            match section {
+                GoalSection::Overview => {
+                    let mut lines = vec![
+                        format!("GOAL: {}", goal.title),
+                        format!(
+                            "status    {}    assignee  {}",
+                            goal.status.to_string().to_uppercase(),
+                            goal.assignee
+                                .as_deref()
+                                .map(|id| state.agent_name(id))
+                                .unwrap_or_else(|| EM_DASH.into())
+                        ),
+                        format!(
+                            "id        {}    created   {}",
+                            goal.id,
+                            goal.created_at.chars().take(10).collect::<String>()
+                        ),
+                    ];
+                    if let Some(updated) =
+                        goal.updated_at.as_ref().filter(|u| *u != &goal.created_at)
+                    {
+                        lines.push(format!(
+                            "Updated   {}",
+                            updated.chars().take(10).collect::<String>()
+                        ));
+                    }
+                    let breakdown: Vec<_> = TaskStatus::ALL
+                        .into_iter()
+                        .filter_map(|status| {
+                            let count = linked
+                                .iter()
+                                .filter(|i| state.tasks[**i].status == status)
+                                .count();
+                            (count > 0).then(|| format!("{count} {}", status.as_str()))
+                        })
+                        .collect();
+                    lines.push(format!(
+                        "tasks     {}    {}",
+                        linked.len(),
+                        breakdown.join(" · ")
+                    ));
+                    lines
+                }
+                GoalSection::Description => field_lines(&goal.description, "No description."),
+                GoalSection::Progress => field_lines(
+                    state.goal_progress_report.as_deref().unwrap_or(""),
+                    "No progress report.",
+                ),
+                GoalSection::Tasks => linked
+                    .iter()
+                    .map(|i| {
+                        format!(
+                            "{:<12}{}",
+                            state.tasks[*i].status.as_str(),
+                            state.tasks[*i].title
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        Focus::TaskDetail(section) => {
+            let Some(task) = state.selected_task() else {
+                return Vec::new();
+            };
+            match section {
+                TaskSection::Overview => {
+                    let status = state
+                        .remote_run(&task.id)
+                        .and_then(|r| r.status_label())
+                        .unwrap_or_else(|| task.status.to_string());
+                    let depends: Vec<_> = task
+                        .depends_on
+                        .iter()
+                        .map(|id| {
+                            state
+                                .task_by_id(id)
+                                .map(|t| t.title.clone())
+                                .unwrap_or_else(|| id.clone())
+                        })
+                        .collect();
+                    let mut lines = vec![
+                        format!("DETAIL: {}", task.title),
+                        format!(
+                            "status    {status}    assignee  {}",
+                            task.assignee
+                                .as_deref()
+                                .map(|id| state.agent_name(id))
+                                .unwrap_or_else(|| EM_DASH.into())
+                        ),
+                        format!(
+                            "priority  P{}    attempts  {}/{}",
+                            task.priority, task.attempts, task.max_attempts
+                        ),
+                        format!(
+                            "labels    {}    depends   {}",
+                            if task.labels.is_empty() {
+                                EM_DASH.into()
+                            } else {
+                                task.labels.join(", ")
+                            },
+                            if depends.is_empty() {
+                                EM_DASH.into()
+                            } else {
+                                depends.join(", ")
+                            }
+                        ),
+                    ];
+                    if let Some(hint) = state.remote_run(&task.id).and_then(|r| r.hint()) {
+                        lines.push(format!("remote    {hint}"));
+                    }
+                    lines
+                }
+                TaskSection::Attachments => task.attachments.clone().unwrap_or_default(),
+                TaskSection::Description => field_lines(&task.description, "No description."),
+                TaskSection::Result => field_lines(
+                    task.proof
+                        .as_ref()
+                        .and_then(|p| p.agent_summary.as_deref())
+                        .unwrap_or(""),
+                    "No result summary.",
+                ),
+                TaskSection::Files => {
+                    let Some(proof) = &task.proof else {
+                        return Vec::new();
+                    };
+                    proof.files_changed.clone()
+                }
+                TaskSection::Activity => state
+                    .messages
+                    .iter()
+                    .filter(|m| m.task_id.as_deref() == Some(&task.id))
+                    .map(|m| m.text.clone())
+                    .collect(),
+            }
+        }
+        Focus::AgentDetail(section) => {
+            let Some(agent) = state.selected_agent() else {
+                return Vec::new();
+            };
+            match section {
+                AgentSection::Overview => {
+                    let task = agent
+                        .current_task
+                        .as_deref()
+                        .and_then(|id| state.task_by_id(id))
+                        .map(|t| t.title.as_str())
+                        .unwrap_or(EM_DASH);
+                    let team = state
+                        .teams
+                        .iter()
+                        .find(|t| t.members.iter().any(|m| m.agent_id == agent.id))
+                        .map(|t| t.name.as_str())
+                        .unwrap_or(EM_DASH);
+                    let mut lines = vec![
+                        format!("AGENT: {}", agent.name),
+                        format!("status    {}    adapter   {}", agent.status, agent.adapter),
+                    ];
+                    if agent.adapter == "shell" {
+                        lines.push(format!(
+                            "task      {task}    command   {}",
+                            agent.config.command.as_deref().unwrap_or(EM_DASH)
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "model     {}    task      {task}",
+                            agent.config.model.as_deref().unwrap_or(EM_DASH)
+                        ));
+                    }
+                    lines.push(format!(
+                        "runs      {} ({}/{})    team      {team}",
+                        agent.stats.total_runs,
+                        agent.stats.tasks_completed,
+                        agent.stats.tasks_failed
+                    ));
+                    if agent.autonomous == Some(true) {
+                        lines.push("auto      ↻ ON".into());
+                    }
+                    if let Some(skills) = agent.config.skills.as_ref().filter(|s| !s.is_empty()) {
+                        lines.push(format!("skills    {}", skills.join(", ")));
+                    }
+                    lines
+                }
+                AgentSection::Role => {
+                    field_lines(agent.role.as_deref().unwrap_or(""), "No role description.")
+                }
+                AgentSection::Error => {
+                    let Some(error) = &agent.last_error else {
+                        return Vec::new();
+                    };
+                    let mut lines = vec!["⚠ Error".into()];
+                    if let Ok(kind) = error.kind.parse::<AdapterErrorKind>() {
+                        let hint = error_hint(kind);
+                        lines.push(hint.message.into());
+                        lines.push(hint.fix.into());
+                        if hint.doctor_hint == Some(true) {
+                            lines.push("Diagnostics: orch doctor".into());
+                        }
+                    }
+                    if error
+                        .kind
+                        .parse::<AdapterErrorKind>()
+                        .ok()
+                        .is_none_or(|kind| kind == AdapterErrorKind::Unknown)
+                    {
+                        lines.extend(field_lines(&error.message, "No error message."));
+                    }
+                    lines.push(error.timestamp.clone());
+                    lines
+                }
+            }
+        }
+        Focus::LogDetail(section) => {
+            let filtered = state.filtered_messages();
+            let Some(index) = usize::try_from(state.log_selected_index)
+                .ok()
+                .and_then(|i| filtered.get(i))
+            else {
+                return Vec::new();
+            };
+            let message = &state.messages[*index];
+            match section {
+                LogSection::Metadata => vec![
+                    format!("{} {}", message.msg_type.icon(), message.msg_type.as_str()),
+                    format!(
+                        "Agent: {}",
+                        message
+                            .agent_id
+                            .as_deref()
+                            .map(|id| state.agent_name(id))
+                            .unwrap_or_else(|| EM_DASH.into())
+                    ),
+                    format!("Task: {}", message.task_id.as_deref().unwrap_or(EM_DASH)),
+                    format!("Timestamp: {}", message.ts_ms),
+                    message.text.clone(),
+                ],
+                LogSection::Body => state
+                    .text_for_source(&ViewerSource::Message(message.id), 0, 0)
+                    .map(|document| field_lines(&document.body, "No message body."))
+                    .unwrap_or_default(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn field_lines(text: &str, empty: &str) -> Vec<String> {
+    if text.is_empty() {
+        vec![empty.into()]
+    } else {
+        text.split('\n').map(str::to_owned).collect()
+    }
+}
+
+pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<ViewerSource>> {
+    match focus {
+        Focus::GoalDetail(GoalSection::Overview)
+        | Focus::TaskDetail(TaskSection::Overview)
+        | Focus::AgentDetail(AgentSection::Overview)
+        | Focus::LogDetail(LogSection::Metadata) => vec![None; section_text(state, focus).len()],
+        Focus::AgentDetail(AgentSection::Error) => {
+            let lines = section_text(state, focus);
+            let mut sources = vec![None; lines.len()];
+            if let Some(agent) = state.selected_agent()
+                && let Some(error) = &agent.last_error
+                && error
+                    .kind
+                    .parse::<AdapterErrorKind>()
+                    .ok()
+                    .is_none_or(|kind| kind == AdapterErrorKind::Unknown)
+            {
+                let raw_lines = field_lines(&error.message, "No error message.");
+                let start = lines.len().saturating_sub(raw_lines.len() + 1);
+                for source in sources.iter_mut().skip(start).take(raw_lines.len()) {
+                    *source = Some(entity_source(EntityType::Agent, &agent.id, "error"));
+                }
+            }
+            sources
+        }
+
+        Focus::GoalDetail(GoalSection::Tasks) => state
+            .selected_goal()
+            .map(|g| {
+                state
+                    .tasks_of_goal(&g.id)
+                    .into_iter()
+                    .map(|i| {
+                        Some(entity_source(
+                            EntityType::Task,
+                            &state.tasks[i].id,
+                            "description",
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Focus::TaskDetail(TaskSection::Activity) => state
+            .selected_task()
+            .map(|t| {
+                state
+                    .messages
+                    .iter()
+                    .filter(|m| m.task_id.as_deref() == Some(&t.id))
+                    .map(|m| Some(ViewerSource::Message(m.id)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => {
+            let source = match focus {
+                Focus::GoalDetail(section) => state.selected_goal().map(|g| {
+                    entity_source(
+                        EntityType::Goal,
+                        &g.id,
+                        match section {
+                            GoalSection::Description => "description",
+                            GoalSection::Progress => "progress",
+                            _ => "overview",
+                        },
+                    )
+                }),
+                Focus::TaskDetail(section) => state.selected_task().map(|t| {
+                    entity_source(
+                        EntityType::Task,
+                        &t.id,
+                        match section {
+                            TaskSection::Description => "description",
+                            TaskSection::Result => "result",
+                            TaskSection::Attachments => "attachments",
+                            TaskSection::Files => "files",
+                            _ => "overview",
+                        },
+                    )
+                }),
+                Focus::AgentDetail(section) => state.selected_agent().map(|a| {
+                    entity_source(
+                        EntityType::Agent,
+                        &a.id,
+                        match section {
+                            AgentSection::Role => "role",
+                            AgentSection::Error => "error",
+                            _ => "overview",
+                        },
+                    )
+                }),
+                Focus::LogDetail(_) => usize::try_from(state.log_selected_index)
+                    .ok()
+                    .and_then(|i| state.filtered_messages().get(i).copied())
+                    .map(|i| ViewerSource::Message(state.messages[i].id)),
+                _ => None,
+            };
+            vec![source; section_text(state, focus).len()]
+        }
+    }
+}
+
+fn selectable(focus: Focus) -> bool {
+    matches!(
+        focus,
+        Focus::GoalDetail(GoalSection::Tasks)
+            | Focus::TaskDetail(
+                TaskSection::Attachments | TaskSection::Files | TaskSection::Activity
+            )
+    )
+}
+
+/// Visual rows and byte offsets refer to the unmodified source string.
+/// Controls are replaced only in displayed cells, never in copy bytes.
+pub(crate) fn wrap_rows(text: &str, width: usize) -> Vec<(String, usize)> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut cells = 0;
+    let mut visible = String::new();
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        if grapheme == "\n" || grapheme == "\r\n" {
+            rows.push((std::mem::take(&mut visible), start));
+            start = byte + grapheme.len();
+            cells = 0;
+            continue;
+        }
+        let mut displayed: String = grapheme
+            .chars()
+            .map(|ch| {
+                if ch.is_control()
+                    || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        if grapheme == "\t" {
+            displayed = " ".repeat(4 - cells % 4);
+        }
+        let mut w = displayed.width();
+        if cells + w > width.max(1) && !visible.is_empty() {
+            rows.push((std::mem::take(&mut visible), start));
+            start = byte;
+            cells = 0;
+            if grapheme == "\t" {
+                displayed = " ".repeat(4);
+                w = 4;
+            }
+        }
+        visible.push_str(&displayed);
+        cells += w;
+    }
+    rows.push((visible, start));
+    rows
+}
 
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let state = ctx.state;
-    match (state.detail, state.view) {
-        (DetailPanel::Log, _) => render_log_detail(frame, area, ctx),
-        (DetailPanel::Entity, ViewId::Tasks) => render_task_detail(frame, area, ctx),
-        (DetailPanel::Entity, ViewId::Agents) => render_agent_detail(frame, area, ctx),
-        (DetailPanel::Entity, ViewId::Goals) => render_goal_detail(frame, area, ctx),
-        _ => {}
-    }
-}
-
-/// `DetailSectionLabel` — a chip, the entity name and the resize hint.
-fn detail_label(
-    frame: &mut Frame,
-    area: Rect,
-    ctx: &RenderCtx,
-    chip: &str,
-    chip_fg: Token,
-    chip_bg: Token,
-    title: &str,
-) {
-    let hint = resize_hint(ctx.state.detail_maximized);
-    let title_w = (area.width as usize)
-        .saturating_sub(chip.chars().count() + hint.chars().count() + 10)
-        .max(4);
-    let spans = vec![
-        Span::styled(HEAVY_RULE.to_string().repeat(3), ctx.style(Token::Ghost)),
-        Span::styled(
-            chip.to_string(),
-            ctx.chip(chip_fg, chip_bg).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("{HEAVY_RULE} "), ctx.style(Token::Ghost)),
-        Span::styled(cap_line(title, title_w), ctx.bold(Token::White)),
-        Span::styled(format!("  {hint}"), ctx.style(Token::Gray)),
-    ];
-    resize_hint_zones(
-        ctx,
-        area,
-        area.x + spans_width(&spans[..4]) + 2,
-        area.y,
-        hint,
-    );
-    put_line(frame, area, area.y, spans);
-}
-
-/// A two-column key/value row.
-fn kv_row<'a>(
-    ctx: &RenderCtx,
-    key1: &'a str,
-    value1: Span<'a>,
-    key2: Option<(&'a str, Span<'a>)>,
-) -> Vec<Span<'a>> {
-    let mut spans = vec![
-        Span::styled(format!("{key1:<10}"), ctx.style(Token::Dim)),
-        value1,
-    ];
-    if let Some((key2, value2)) = key2 {
-        let used = 10 + 1;
-        spans.push(Span::raw(" ".repeat(COL1_W.saturating_sub(used))));
-        spans.push(Span::styled(format!("{key2:<10}"), ctx.style(Token::Dim)));
-        spans.push(value2);
-    }
-    spans
-}
-
-// ── Task ───────────────────────────────────────────────────────────────────
-
-fn render_task_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    let state = ctx.state;
-    let Some(task) = state.selected_task() else {
-        return;
-    };
-    detail_label(
-        frame,
-        area,
-        ctx,
-        " DETAIL ",
-        Token::Amber,
-        Token::AccentBg,
-        &task.title,
-    );
-
-    let height = area.height.saturating_sub(1) as usize;
-    let width = area.width as usize;
-    let task_logs: Vec<usize> = (0..state.messages.len())
-        .filter(|i| state.messages[*i].task_id.as_deref() == Some(task.id.as_str()))
+    let ring: Vec<_> = state
+        .focus_ring()
+        .into_iter()
+        .filter(|f| !matches!(f, Focus::MainList | Focus::Activity | Focus::TextViewer))
         .collect();
-    let summary = task
-        .proof
-        .as_ref()
-        .and_then(|p| p.agent_summary.as_deref())
-        .filter(|s| !s.is_empty());
-    let attachments = task.attachments.as_deref().unwrap_or(&[]);
-    let description_lines: Vec<&str> = if task.description.is_empty() {
-        Vec::new()
+    let focus = if ring.contains(&state.focus) {
+        state.focus
+    } else if ring.contains(&state.detail_focus) {
+        state.detail_focus
+    } else if let Some(first) = ring.first() {
+        *first
     } else {
-        task.description.lines().collect()
-    };
-    let files = task
-        .proof
-        .as_ref()
-        .map(|p| p.files_changed.len())
-        .unwrap_or(0);
-
-    // Row budget (ported verbatim), plus the one row a remote phase's hint
-    // takes when there is one.
-    let remote_hint = state.remote_run(&task.id).and_then(|remote| remote.hint());
-    let mut used_rows = 3usize + usize::from(remote_hint.is_some());
-    if !attachments.is_empty() {
-        used_rows += 2 + attachments.len();
-    }
-    let desc_cap = (((height as f64 - 10.0) * 0.3).ceil() as i64).max(1) as usize;
-    if !description_lines.is_empty() {
-        used_rows += 1 + description_lines.len().min(desc_cap);
-    } else if summary.is_none() {
-        used_rows += 2;
-    }
-    if summary.is_some() {
-        used_rows += 2;
-    }
-    if files > 0 {
-        used_rows += 1;
-    }
-    if !task_logs.is_empty() {
-        used_rows += 2;
-    }
-    let remaining = height.saturating_sub(used_rows);
-    let (summary_max, log_max) = match (summary.is_some(), !task_logs.is_empty()) {
-        (true, true) => {
-            let s = ((remaining as f64 * 0.4).floor() as usize).max(1);
-            (s, remaining.saturating_sub(s).max(1))
-        }
-        (true, false) => (remaining, 0),
-        (false, true) => (0, remaining),
-        (false, false) => (0, 0),
-    };
-
-    let mut y = area.y + 1;
-    let assignee = match task.assignee.as_deref() {
-        Some(id) => Span::styled(state.agent_name(id), ctx.style(Token::Green)),
-        None => Span::styled(EM_DASH.to_string(), ctx.style(Token::Dim)),
-    };
-    put_line(
-        frame,
-        area,
-        y,
-        kv_row(
-            ctx,
-            "status",
-            // The peer's phase, when there is one: the local status says
-            // `in_progress` for work the worker may not have started, and
-            // its colour would say the same.
-            match state
-                .remote_run(&task.id)
-                .and_then(|remote| remote.status_label().map(|label| (remote.phase, label)))
-            {
-                Some((phase, label)) => Span::styled(
-                    cap_line(&label, COL1_W.saturating_sub(11)),
-                    ctx.style(crate::theme::remote_phase_token(phase)),
-                ),
-                None => Span::styled(
-                    task.status.to_string(),
-                    ctx.style(task_status_token(task.status)),
-                ),
-            },
-            Some(("assignee", assignee)),
-        ),
-    );
-    y += 1;
-    put_line(
-        frame,
-        area,
-        y,
-        kv_row(
-            ctx,
-            "priority",
-            Span::styled(format!("P{}", task.priority), {
-                let style = ctx.style(crate::theme::priority_token(task.priority));
-                if task.priority <= 2 {
-                    style.add_modifier(Modifier::BOLD)
-                } else {
-                    style
-                }
-            }),
-            Some((
-                "attempts",
-                Span::styled(
-                    format!("{}/{}", task.attempts, task.max_attempts),
-                    ctx.style(Token::Silver),
-                ),
-            )),
-        ),
-    );
-    y += 1;
-    let labels = if task.labels.is_empty() {
-        Span::styled(EM_DASH.to_string(), ctx.style(Token::Dim))
-    } else {
-        Span::styled(task.labels.join(", "), ctx.style(Token::Purple))
-    };
-    let depends = if task.depends_on.is_empty() {
-        Span::styled(EM_DASH.to_string(), ctx.style(Token::Dim))
-    } else {
-        let titles: Vec<String> = task
-            .depends_on
-            .iter()
-            .map(|id| {
-                state
-                    .task_by_id(id)
-                    .map(|t| t.title.clone())
-                    .unwrap_or_else(|| id.clone())
-            })
-            .collect();
-        Span::styled(titles.join(", "), ctx.style(Token::Dim))
-    };
-    put_line(
-        frame,
-        area,
-        y,
-        kv_row(ctx, "labels", labels, Some(("depends", depends))),
-    );
-    y += 1;
-    // What the operator has to *do* about this phase — most often the
-    // `orch task approve` its worker's own owner has to run.
-    if let Some(hint) = remote_hint.as_deref() {
-        put_line(
-            frame,
-            area,
-            y,
-            kv_row(
-                ctx,
-                "remote",
-                Span::styled(
-                    cap_line(hint, width.saturating_sub(14)),
-                    ctx.style(Token::Amber),
-                ),
-                None,
-            ),
-        );
-        y += 1;
-    }
-
-    if !attachments.is_empty() {
-        y += 1;
-        divider(
-            frame,
-            area,
-            ctx,
-            y,
-            &format!("attachments ({})", attachments.len()),
-        );
-        y += 1;
-        for path in attachments {
-            put_line(
-                frame,
-                area,
-                y,
-                vec![Span::styled(path.clone(), ctx.style(Token::Cyan))],
-            );
-            y += 1;
-        }
-    }
-
-    if !description_lines.is_empty() {
-        y += 1;
-        for line in description_lines.iter().take(desc_cap) {
-            put_line(
-                frame,
-                area,
-                y,
-                vec![Span::styled(
-                    cap_line(line, width.saturating_sub(8)),
-                    ctx.style(Token::Silver),
-                )],
-            );
-            y += 1;
-        }
-    } else if summary.is_none() {
-        y += 1;
-        put_line(
-            frame,
-            area,
-            y,
-            vec![Span::styled(
-                "No description.".to_string(),
-                ctx.style(Token::Dim),
-            )],
-        );
-        y += 1;
-    }
-
-    if let Some(summary) = summary {
-        y += 1;
-        divider(frame, area, ctx, y, "result");
-        y += 1;
-        for line in summary.lines().take(summary_max.max(1)) {
-            put_line(
-                frame,
-                area,
-                y,
-                vec![Span::styled(
-                    cap_line(line, width.saturating_sub(8)),
-                    ctx.style(Token::White),
-                )],
-            );
-            y += 1;
-        }
-    }
-
-    if files > 0 {
-        let branch = task
-            .proof
-            .as_ref()
-            .and_then(|p| p.branch.as_deref())
-            .map(|b| format!(" · {b}"))
-            .unwrap_or_default();
-        put_line(
-            frame,
-            area,
-            y,
-            vec![Span::styled(
-                format!("files {files} changed{branch}"),
-                ctx.style(Token::Dim),
-            )],
-        );
-        y += 1;
-    }
-
-    if !task_logs.is_empty() && log_max > 0 {
-        y += 1;
-        divider(frame, area, ctx, y, "activity");
-        y += 1;
-        let text_w = width.saturating_sub(12).max(10);
-        for index in task_logs.iter().rev().take(log_max).rev() {
-            let message = &state.messages[*index];
-            let token = match message.msg_type {
-                MsgType::Tool => Token::Cyan,
-                MsgType::File => Token::Purple,
-                MsgType::Error => Token::Red,
-                MsgType::Lifecycle => Token::Green,
-                MsgType::System => Token::Dim,
-                _ => message.color,
-            };
-            put_line(
-                frame,
-                area,
-                y,
-                vec![
-                    Span::styled(
-                        format!(
-                            "{} {} ",
-                            crate::format::relative_time(message.ts_ms, ctx.now_ms),
-                            message.msg_type.icon()
-                        ),
-                        ctx.style(Token::Ghost),
-                    ),
-                    Span::styled(cap_line(&message.text, text_w), ctx.style(token)),
-                ],
-            );
-            y += 1;
-        }
-    }
-}
-
-// ── Agent ──────────────────────────────────────────────────────────────────
-
-fn render_agent_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    let state = ctx.state;
-    let Some(agent) = state.selected_agent() else {
         return;
     };
-    detail_label(
-        frame,
-        area,
-        ctx,
-        " AGENT ",
-        Token::Green,
-        Token::SuccessBg,
-        &agent.name,
-    );
-    let mut y = area.y + 1;
-    let is_shell = agent.adapter == "shell";
-
-    put_line(
-        frame,
-        area,
-        y,
-        kv_row(
-            ctx,
-            "status",
-            Span::styled(
-                agent.status.to_string(),
-                ctx.style(agent_status_token(agent.status)),
-            ),
-            Some((
-                "adapter",
-                Span::styled(agent.adapter.clone(), ctx.style(Token::Cyan)),
-            )),
-        ),
-    );
-    y += 1;
-
-    let current_task = agent
-        .current_task
-        .as_deref()
-        .and_then(|id| state.task_by_id(id))
-        .map(|t| t.title.clone())
-        .unwrap_or_else(|| EM_DASH.to_string());
-    if is_shell {
-        // Shell agents swap the two: task first, then the command.
-        put_line(
-            frame,
-            area,
-            y,
-            kv_row(
-                ctx,
-                "task",
-                Span::styled(current_task, ctx.style(Token::Silver)),
-                Some((
-                    "command",
-                    Span::styled(
-                        agent
-                            .config
-                            .command
-                            .clone()
-                            .unwrap_or_else(|| EM_DASH.to_string()),
-                        ctx.style(Token::Cyan),
-                    ),
-                )),
-            ),
-        );
-    } else {
-        put_line(
-            frame,
-            area,
-            y,
-            kv_row(
-                ctx,
-                "model",
-                Span::styled(
-                    agent
-                        .config
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| EM_DASH.to_string()),
-                    ctx.style(Token::Silver),
-                ),
-                Some(("task", Span::styled(current_task, ctx.style(Token::Silver)))),
-            ),
-        );
-    }
-    y += 1;
-
-    let stats = &agent.stats;
-    put_line(
-        frame,
-        area,
-        y,
-        kv_row(
-            ctx,
-            "runs",
-            Span::styled(
+    let key = state.pane_key(focus);
+    ctx.zone(area, area, ZoneKind::Pane(focus), ZoneId::Pane(key.clone()));
+    let active = state.focus == focus;
+    let name = match focus {
+        Focus::TaskDetail(TaskSection::Files) => state
+            .selected_task()
+            .and_then(|task| task.proof.as_ref())
+            .map(|proof| {
                 format!(
-                    "{} ({}/{})",
-                    stats.total_runs, stats.tasks_completed, stats.tasks_failed
-                ),
-                ctx.style(if stats.tasks_failed > 0 {
-                    Token::Red
-                } else {
-                    Token::Green
-                }),
-            ),
-            Some((
-                "team",
-                match state
-                    .teams
-                    .iter()
-                    .find(|t| t.members.iter().any(|m| m.agent_id == agent.id))
-                {
-                    Some(team) => Span::styled(team.name.clone(), ctx.style(Token::Amber)),
-                    None => Span::styled(EM_DASH.to_string(), ctx.style(Token::Dim)),
-                },
-            )),
-        ),
+                    "Files ({} changed{})",
+                    proof.files_changed.len(),
+                    proof
+                        .branch
+                        .as_deref()
+                        .map(|b| format!(" · {b}"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| "Files".into()),
+        _ => section_name(focus).into(),
+    };
+    let label = fit_cells(
+        &format!("{}{}", if active { "> " } else { "" }, name),
+        area.width as usize,
     );
-    y += 1;
-
-    if agent.autonomous == Some(true) {
+    let mut x = area.x;
+    let rail = Rect::new(area.x, area.y, area.width, 1);
+    let width =
+        unicode_width::UnicodeWidthStr::width(label.as_str()).min(area.width as usize) as u16;
+    put_line(
+        frame,
+        rail,
+        rail.y,
+        vec![Span::styled(
+            label,
+            ctx.bold(if active { Token::Amber } else { Token::Dim }),
+        )],
+    );
+    ctx.zone(
+        Rect::new(x, rail.y, width, 1),
+        rail,
+        ZoneKind::DetailSection(focus),
+        ZoneId::DetailSection(key.clone()),
+    );
+    x += width;
+    for other in ring.iter().copied().filter(|f| *f != focus) {
+        let text = format!(" │ {}", section_name(other));
+        let width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+        if x + width > area.right() {
+            continue;
+        }
         put_line(
             frame,
-            area,
-            y,
-            kv_row(
-                ctx,
-                "auto",
-                Span::styled(format!("{LOOP} ON"), ctx.style(Token::Cyan)),
-                None,
-            ),
+            Rect::new(x, rail.y, width, 1),
+            rail.y,
+            vec![Span::styled(text, ctx.style(Token::Dim))],
         );
-        y += 1;
+        ctx.zone(
+            Rect::new(x, rail.y, width, 1),
+            rail,
+            ZoneKind::DetailSection(other),
+            ZoneId::DetailSection(state.pane_key(other)),
+        );
+        x += width;
     }
-
-    if let Some(skills) = agent.config.skills.as_ref()
-        && !skills.is_empty()
+    let footer_rows = u16::from(area.height >= 3);
+    let mut body = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1 + footer_rows),
+    );
+    let overview = ring.iter().copied().find(|f| {
+        matches!(
+            f,
+            Focus::GoalDetail(GoalSection::Overview)
+                | Focus::TaskDetail(TaskSection::Overview)
+                | Focus::AgentDetail(AgentSection::Overview)
+                | Focus::LogDetail(LogSection::Metadata)
+        )
+    });
+    if let Some(overview) = overview.filter(|o| *o != focus && body.height >= 6) {
+        for (row, line) in section_text(state, overview).iter().take(2).enumerate() {
+            put_line(
+                frame,
+                body,
+                body.y + row as u16,
+                vec![Span::styled(
+                    fit_cells(line, body.width as usize),
+                    ctx.style(Token::Dim),
+                )],
+            );
+        }
+        let pin = Rect::new(body.x, body.y, body.width, 2);
+        ctx.zone(
+            pin,
+            area,
+            ZoneKind::DetailSection(overview),
+            ZoneId::DetailSection(state.pane_key(overview)),
+        );
+        body.y += 2;
+        body.height -= 2;
+    }
+    let mut lines = section_text(state, focus);
+    if focus == Focus::AgentDetail(AgentSection::Error)
+        && let Some(ts) = state
+            .selected_agent()
+            .and_then(|agent| agent.last_error.as_ref())
+            .and_then(|error| parse_timestamp_ms(&error.timestamp))
     {
-        put_line(
-            frame,
-            area,
-            y,
-            kv_row(
-                ctx,
-                "skills",
-                Span::styled(cap_line(&skills.join(", "), 500), ctx.style(Token::Cyan)),
-                None,
-            ),
-        );
-        y += 1;
+        lines.push(format!(
+            "{} ago",
+            format_duration(ctx.now_ms.saturating_sub(ts))
+        ));
     }
-
-    if let Some(error) = agent.last_error.as_ref() {
-        let kind = error.kind.parse::<AdapterErrorKind>().ok();
-        let hint = kind.map(error_hint);
-        put_line(
-            frame,
-            area,
-            y,
-            vec![Span::styled(
-                format!("╭{}╮", light_rule((area.width as usize).saturating_sub(4))),
-                ctx.style(Token::Red),
-            )],
-        );
-        y += 1;
-        put_line(
-            frame,
-            area,
-            y,
-            vec![Span::styled("⚠ Error".to_string(), ctx.bold(Token::Red))],
-        );
-        y += 1;
-        if let Some(hint) = hint {
-            put_line(
-                frame,
-                area,
-                y,
-                vec![Span::styled(
-                    hint.message.to_string(),
-                    ctx.style(Token::White),
-                )],
+    let sources = section_sources(state, focus);
+    let is_list = selectable(focus);
+    let mut rows = Vec::new();
+    let mut byte_offset = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let source = sources.get(index).cloned().flatten();
+        if is_list {
+            let continuous = matches!(
+                focus,
+                Focus::TaskDetail(TaskSection::Attachments | TaskSection::Files)
             );
-            y += 1;
-            put_line(
-                frame,
-                area,
-                y,
-                vec![Span::styled(hint.fix.to_string(), ctx.style(Token::Cyan))],
-            );
-            y += 1;
-            if hint.doctor_hint == Some(true) {
-                put_line(
-                    frame,
-                    area,
-                    y,
-                    vec![Span::styled(
-                        "Diagnostics: orch doctor".to_string(),
-                        ctx.style(Token::Yellow),
-                    )],
-                );
-                y += 1;
+            rows.push((
+                line.clone(),
+                source,
+                if continuous { byte_offset } else { 0 },
+            ));
+            if continuous {
+                byte_offset += line.len() + 1;
+            }
+        } else {
+            for (text, byte) in wrap_rows(line, body.width as usize) {
+                rows.push((text, source.clone(), byte_offset + byte));
+            }
+            if source.is_some() {
+                byte_offset += line.len() + 1;
             }
         }
-        // The raw message shows only when the hint is missing or `unknown`.
-        if hint.is_none() || kind == Some(AdapterErrorKind::Unknown) {
-            put_line(
-                frame,
-                area,
-                y,
-                vec![Span::styled(
-                    cap_line(&error.message, 120),
-                    ctx.style(Token::Dim),
-                )],
+    }
+    if rows.is_empty() {
+        rows.push(("No entries.".into(), None, 0));
+    }
+    let scroll = state.pane_scroll(&key);
+    let offset = scroll
+        .offset
+        .min(rows.len().saturating_sub(body.height as usize));
+    let items = if is_list { lines.len() } else { 0 };
+    ctx.publish_pane_metrics(PaneMetrics {
+        key,
+        body,
+        items,
+        display_rows: rows.len(),
+        selection_rows: (0..items).collect(),
+    });
+    ctx.zone(
+        body,
+        area,
+        ZoneKind::Pane(focus),
+        ZoneId::Pane(state.pane_key(focus)),
+    );
+    for (screen_row, (text, source, byte)) in rows
+        .iter()
+        .skip(offset)
+        .take(body.height as usize)
+        .enumerate()
+    {
+        let row = Rect::new(body.x, body.y + screen_row as u16, body.width, 1);
+        let selected = is_list && scroll.selected == Some(offset + screen_row);
+        let visible = if selected {
+            format!(
+                "> {}",
+                fit_cells(text, body.width.saturating_sub(2) as usize)
+            )
+        } else {
+            fit_cells(text, body.width as usize)
+        };
+        put_line(
+            frame,
+            row,
+            row.y,
+            vec![Span::styled(
+                visible,
+                ctx.style(if selected {
+                    Token::Amber
+                } else {
+                    Token::Silver
+                }),
+            )],
+        );
+        if let Some(source) = source {
+            ctx.zone(
+                row,
+                body,
+                ZoneKind::ExpandText,
+                ZoneId::ExpandText(source.clone()),
             );
-            y += 1;
+            ctx.publish_text_anchor(source.clone(), row, *byte);
         }
-        if let Some(ts) = parse_timestamp_ms(&error.timestamp) {
-            put_line(
-                frame,
-                area,
-                y,
-                vec![Span::styled(
-                    format!("{} ago", format_duration(ctx.now_ms - ts)),
-                    ctx.style(Token::Dim),
-                )],
+    }
+    if footer_rows > 0 {
+        let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        let hint = if state.detail_maximized {
+            "M restores to act; Esc closes detail"
+        } else {
+            "Tab/Esc to list to act; Enter expands; Ctrl+Y copies"
+        };
+        let feedback = state
+            .active_copy_origin()
+            .filter(|o| matches!(o, CopyOrigin::Field { .. }) && state.copy_footer_visible(o));
+        let idle = feedback.is_none();
+        let text = if let Some(origin) = feedback {
+            field_feedback(ctx, &origin)
+        } else {
+            let resize = crate::views::resize_hint(state.detail_maximized);
+            if hint.width() + resize.width() + 2 <= footer.width as usize {
+                let x = footer.x + hint.width() as u16 + 2;
+                crate::views::resize_hint_zones(ctx, footer, x, footer.y, resize);
+                format!("{hint}  {resize}")
+            } else {
+                let compact = if state.detail_maximized {
+                    hint
+                } else {
+                    "Tab/Esc to list to act; M max"
+                };
+                if let Some(byte) = compact.find('M') {
+                    let x = footer.x + compact[..byte].width() as u16;
+                    ctx.zone(
+                        Rect::new(x, footer.y, 1, 1),
+                        footer,
+                        ZoneKind::Verb(VerbId::DetailMax),
+                        ZoneId::Verb(VerbId::DetailMax),
+                    );
+                }
+                compact.into()
+            }
+        };
+        if idle && let Some(byte) = text.find("Esc") {
+            ctx.zone(
+                Rect::new(footer.x + text[..byte].width() as u16, footer.y, 3, 1),
+                footer,
+                ZoneKind::FooterHint(FooterAction::CloseDetail),
+                ZoneId::Footer(FooterAction::CloseDetail),
             );
-            y += 1;
         }
         put_line(
             frame,
-            area,
-            y,
+            footer,
+            footer.y,
             vec![Span::styled(
-                format!("╰{}╯", light_rule((area.width as usize).saturating_sub(4))),
-                ctx.style(Token::Red),
-            )],
-        );
-        y += 1;
-    }
-
-    y += 1;
-    let role_cap = (area.height as usize)
-        .saturating_sub(if agent.last_error.is_some() { 10 } else { 4 })
-        .max(1);
-    match agent.role.as_deref().filter(|r| !r.is_empty()) {
-        Some(role) => {
-            for line in role.lines().take(role_cap) {
-                put_line(
-                    frame,
-                    area,
-                    y,
-                    vec![Span::styled(cap_line(line, 500), ctx.style(Token::Silver))],
-                );
-                y += 1;
-            }
-        }
-        None => put_line(
-            frame,
-            area,
-            y,
-            vec![Span::styled(
-                "No role description.".to_string(),
+                fit_cells(&text, footer.width as usize),
                 ctx.style(Token::Dim),
             )],
-        ),
-    }
-}
-
-// ── Goal ───────────────────────────────────────────────────────────────────
-
-fn render_goal_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    let state = ctx.state;
-    let Some(goal) = state.selected_goal() else {
-        return;
-    };
-    let hint = resize_hint(state.detail_maximized);
-    let spans = vec![
-        Span::styled(HEAVY_RULE.to_string().repeat(3), ctx.style(Token::Ghost)),
-        Span::styled(
-            format!(" GOAL: {} ", cap_line(&goal.title, 40)),
-            ctx.chip(Token::Amber, Token::AccentBg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {hint}"), ctx.style(Token::Gray)),
-    ];
-    resize_hint_zones(
-        ctx,
-        area,
-        area.x + spans_width(&spans[..2]) + 2,
-        area.y,
-        hint,
-    );
-    put_line(frame, area, area.y, spans);
-
-    // Built as a virtual line list so scrolling never rebuilds the rows.
-    let width = area.width as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let assignee = match goal.assignee.as_deref() {
-        Some(id) => Span::styled(state.agent_name(id), ctx.style(Token::Green)),
-        None => Span::styled(EM_DASH.to_string(), ctx.style(Token::Dim)),
-    };
-    lines.push(Line::from(kv_row(
-        ctx,
-        "status",
-        Span::styled(
-            goal.status.to_string().to_uppercase(),
-            ctx.style(goal_status_token(goal.status))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Some(("assignee", assignee)),
-    )));
-    lines.push(Line::from(kv_row(
-        ctx,
-        "id",
-        Span::styled(goal.id.clone(), ctx.style(Token::Dim)),
-        Some((
-            "created",
-            Span::styled(
-                goal.created_at.chars().take(10).collect::<String>(),
-                ctx.style(Token::Silver),
-            ),
-        )),
-    )));
-    if let Some(updated) = goal.updated_at.as_deref()
-        && updated != goal.created_at
-    {
-        lines.push(Line::from(kv_row(
-            ctx,
-            "Updated",
-            Span::styled(
-                updated.chars().take(10).collect::<String>(),
-                ctx.style(Token::Silver),
-            ),
-            None,
-        )));
-    }
-
-    let linked = state.tasks_of_goal(&goal.id);
-    let mut breakdown: Vec<String> = Vec::new();
-    for status in TaskStatus::ALL {
-        let count = linked
-            .iter()
-            .filter(|i| state.tasks[**i].status == status)
-            .count();
-        if count > 0 {
-            breakdown.push(format!("{count} {}", status.as_str()));
-        }
-    }
-    lines.push(Line::from(kv_row(
-        ctx,
-        "tasks",
-        Span::styled(linked.len().to_string(), ctx.style(Token::Cyan)),
-        Some((
-            "",
-            Span::styled(breakdown.join(" · "), ctx.style(Token::Dim)),
-        )),
-    )));
-
-    lines.push(Line::from(""));
-    let description = cap_text(&goal.description, MAX_PANEL_TEXT);
-    if description.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No description.".to_string(),
-            ctx.style(Token::Dim),
-        )));
-    } else {
-        let wrap_w = width.saturating_sub(6).max(20);
-        for line in description.lines() {
-            for chunk in wrap(line, wrap_w) {
-                lines.push(Line::from(Span::styled(chunk, ctx.style(Token::Silver))));
-            }
-        }
-    }
-
-    if let Some(report) = state.goal_progress_report.as_deref() {
-        lines.push(Line::from(""));
-        lines.push(divider_line(ctx, "progress", width));
-        // No line cap — the full report renders.
-        for line in cap_text(report, MAX_PANEL_TEXT).lines() {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                ctx.style(Token::White),
-            )));
-        }
-    }
-
-    if !linked.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(divider_line(
-            ctx,
-            &format!("tasks ({})", linked.len()),
-            width,
-        ));
-        let title_w = width.saturating_sub(22).max(10);
-        for index in &linked {
-            let task = &state.tasks[*index];
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<12}", task.status.as_str()),
-                    ctx.style(task_status_token(task.status)),
-                ),
-                Span::styled(
-                    task.title.chars().take(title_w).collect::<String>(),
-                    ctx.style(Token::Silver),
-                ),
-            ]));
-        }
-    }
-
-    let height = area.height.saturating_sub(1) as usize;
-    let max_scroll = lines.len().saturating_sub(height);
-    let offset = state.goal_detail_scroll.min(max_scroll);
-    let remaining = lines.len().saturating_sub(offset + height);
-    let rows = if remaining > 0 {
-        height.saturating_sub(1)
-    } else {
-        height
-    };
-
-    for (row, line) in lines.iter().skip(offset).take(rows).enumerate() {
-        Paragraph::new(line.clone()).render(
-            Rect::new(area.x, area.y + 1 + row as u16, area.width, 1),
-            frame.buffer_mut(),
-        );
-    }
-    if remaining > 0 {
-        put_line(
-            frame,
-            area,
-            area.y + 1 + rows as u16,
-            vec![Span::styled(
-                format!("  ↓ {remaining} more — ↑↓ to scroll"),
-                ctx.style(Token::Ghost),
-            )],
         );
     }
 }
 
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    if text.chars().count() <= width {
-        return vec![text.to_string()];
+pub(crate) fn field_feedback(ctx: &RenderCtx, origin: &CopyOrigin) -> String {
+    match ctx.state.feedback_for(origin).map(|f| &f.outcome) {
+        None => "Copy pending; F1 help".into(),
+        Some(CopyOutcome::NativeWritten) => "Copied on this host; F1 help".into(),
+        Some(CopyOutcome::TerminalRequested) => "Requested from terminal; F1 help".into(),
+        Some(CopyOutcome::Failed(_)) => "Copy failed; Ctrl+Y retry; F1 help".into(),
     }
-    let chars: Vec<char> = text.chars().collect();
-    chars
-        .chunks(width.max(1))
-        .map(|chunk| chunk.iter().collect())
-        .collect()
-}
-
-// ── Log ────────────────────────────────────────────────────────────────────
-
-fn render_log_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    let state = ctx.state;
-    let filtered = state.filtered_messages();
-    let Some(index) = usize::try_from(state.log_selected_index)
-        .ok()
-        .and_then(|i| filtered.get(i))
-    else {
-        return;
-    };
-    let message = &state.messages[*index];
-    section_label(
-        frame,
-        Rect::new(area.x, area.y, area.width, 1),
-        ctx,
-        "LOG",
-        None,
-    );
-
-    let max_w = (area.width as usize).saturating_sub(6).max(4);
-    let mut y = area.y + 1;
-    let agent = message
-        .agent_id
-        .as_deref()
-        .map(|id| state.agent_name(id))
-        .unwrap_or_else(|| EM_DASH.to_string());
-    let task = message
-        .task_id
-        .as_deref()
-        .and_then(|id| state.task_by_id(id))
-        .map(|t| format!(" │ #{}", t.title.chars().take(30).collect::<String>()))
-        .unwrap_or_default();
-    put_line(
-        frame,
-        area,
-        y,
-        vec![Span::styled(
-            format!(
-                "{} │ {agent} │ {} {}{task}",
-                crate::format::relative_time(message.ts_ms, ctx.now_ms),
-                message.msg_type.icon(),
-                message.msg_type.as_str()
-            ),
-            ctx.style(Token::Dim),
-        )],
-    );
-    y += 1;
-    put_line(
-        frame,
-        area,
-        y,
-        vec![Span::styled(
-            message.text.chars().take(max_w).collect::<String>(),
-            ctx.bold(message.color),
-        )],
-    );
-    y += 1;
-    put_line(
-        frame,
-        area,
-        y,
-        vec![Span::styled(light_rule(max_w), ctx.style(Token::Ghost))],
-    );
-    y += 1;
-
-    let body = message
-        .detail
-        .clone()
-        .unwrap_or_else(|| message.text.clone());
-    let body_rows = (area.height as usize).saturating_sub(4).max(1);
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(parsed) => {
-            let pretty = serde_json::to_string_pretty(&parsed).unwrap_or(body);
-            for (row, line) in pretty.lines().take(body_rows).enumerate() {
-                let token = if line.contains('"') {
-                    Token::Cyan
-                } else if line.trim_start().starts_with(['}', ']']) {
-                    Token::Ghost
-                } else {
-                    Token::Silver
-                };
-                put_line(
-                    frame,
-                    area,
-                    y + row as u16,
-                    vec![
-                        Span::styled(format!("{:<3}", row + 1), ctx.style(Token::Ghost)),
-                        Span::styled(
-                            line.chars()
-                                .take(max_w.saturating_sub(4))
-                                .collect::<String>(),
-                            ctx.style(token),
-                        ),
-                    ],
-                );
-            }
-        }
-        Err(_) => {
-            for (row, line) in body.lines().take(body_rows).enumerate() {
-                let token = if line.starts_with("error") || line.starts_with("Error") {
-                    Token::Red
-                } else {
-                    Token::Silver
-                };
-                put_line(
-                    frame,
-                    area,
-                    y + row as u16,
-                    vec![Span::styled(
-                        line.chars().take(max_w).collect::<String>(),
-                        ctx.style(token),
-                    )],
-                );
-            }
-        }
-    }
-}
-
-// ── Shared ─────────────────────────────────────────────────────────────────
-
-fn divider(frame: &mut Frame, area: Rect, ctx: &RenderCtx, y: u16, label: &str) {
-    put_line(
-        frame,
-        area,
-        y,
-        divider_line(ctx, label, area.width as usize).spans,
-    );
-}
-
-fn divider_line(ctx: &RenderCtx, label: &str, width: usize) -> Line<'static> {
-    let rule = width.saturating_sub(label.chars().count() + 6);
-    Line::from(vec![
-        Span::styled(light_rule(3), ctx.style(Token::Ghost)),
-        Span::styled(format!(" {label} "), ctx.style(Token::Dim)),
-        Span::styled(light_rule(rule), ctx.style(Token::Ghost)),
-    ])
 }

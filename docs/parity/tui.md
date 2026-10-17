@@ -3,6 +3,15 @@
 > **Status: historical.** Matching the TypeScript original is no longer a goal; this appendix is not updated.
 > See [ADR 0002](../decisions/0002-parity-is-no-longer-a-goal.md).
 
+## Current Rust additions
+
+The historical inventory below describes the TypeScript source, not current Rust behavior. The Rust dashboard
+adds aligned Agents rows, explicit pane focus, display-row paging/wheel navigation, full-text immutable viewers,
+Human/Raw representations, source-byte selection, bounded host/terminal/browser copy and guarded RAM drafts.
+Tab moves pane focus; Left/Right switch views. The historical 2,048-character detail cap and absence of clipboard
+writing below do not apply to the Rust implementation. See [dashboard usage](../../README.md#reading-navigating-and-editing-in-the-dashboard),
+[copy troubleshooting](../RUNBOOK.md#copying-text-from-the-dashboard) and [ADR 0003](../decisions/0003-tui-focus-viewer-and-clipboard-boundaries.md).
+
 Derived from a full read of the Ink/React implementation at `parity/orch-ts`.
 
 **Primary sources**
@@ -156,18 +165,39 @@ Task logs are `messages.filter(m => m.taskId === selectedTask.id)` (memoized to 
 
 **Data / sort.** `sortedAgents` = `liveAgents` sorted by: (1) agents belonging to an **active** team first; (2) team name `localeCompare`; (3) `AGENT_STATUS_ORDER = { running: 0, idle: 1, error: 2, disabled: 3 }`.
 
-**Row (`AgentRow`):**
+**Row (`AgentRow`).** The Rust port lays the row out as an aligned table, like the goals and tasks rows (an L2 presentation divergence from the TS row, which ran the task and error inline after the name and had a team badge). `AgentColumns::for_width` (`crates/orch-tui/src/views/agents.rs`) computes one set of column widths per frame, so every row lines up with the one above it. Widths are in display cells, not `char`s.
 
 | Column | Width | Content |
 |---|---|---|
 | cursor | 2 | `▸` / space |
-| status chip | 11 | `running` → spinner + `ACTIVE` green/successBg bold; `idle` → `○` `IDLE` dim/neutralBg; `error` → `✕` `ERROR` red/errorBg bold; `disabled` → `○` `OFF` ghost/neutralBg |
-| name | `max(8, width - fixedCols)` | optional `⟳ ` (LOOP U+27F3, cyan) when `autonomous`; optional `★ ` (U+2605, amber) when team lead; then the name; when running with a known current task, ` · {taskTitle}` in dim; when `status === 'error' && last_error`, ` · {capLine(ERROR_HINTS[kind].message ?? last_error.message, 30)}` in red. Bold when selected or running; white when selected, green when running, else silver |
-| adapter | 8 | dim |
-| team badge | `min(teamName.length + 2, 12)`, only when in a team | amber, truncated |
-| time / stats | 10, right-aligned | running with a `RunningEntry` → `formatDuration(now - started_at)` cyan; else `total_runs > 0` → `"{completed}/{total} ✓"` colored green (success ≥ 80%), yellow (≥ 50%), red (< 50%); else `—` |
+| status chip | 10 + gap | `running` → spinner + `ACTIVE` green/successBg bold; `idle` → `○` `IDLE` dim/neutralBg; `error` → `✕` `ERROR` red/errorBg bold; `offline` → `○` `OFFLINE` ghost/neutralBg; `disabled` → `○` `OFF` ghost/neutralBg |
+| marks | 2 + gap | `⟳` (LOOP U+27F3, cyan) when `autonomous`, else a space; `★` (U+2605, amber) when team lead, else a space. A fixed slot, so every name starts in the same column |
+| name | 10 min, grows | Bold when selected or running; white when selected, green when running, else silver |
+| adapter/model | 10–20 | `{adapter}/{config.model}`, or just the adapter when no model is set; dim |
+| task | 12 min, elastic | `status === 'error' && last_error` → the mapped hint, or the raw message for an unrecognised kind, capped at 30 (`ROW_ERROR_CAP`), red; else running with a current task → its title (or the task id when the task is not mirrored locally), gray; else `—` ghost |
+| caps | 10 | `capabilities.join(',')`, dim; `—` ghost when empty |
+| where | 12 | `local` dim; remote → `{alias} online` cyan or `{alias} offline` yellow. The alias is cut to fit, never the state word |
+| time / stats | 9, right-aligned | running with a `RunningEntry` → `formatDuration(now - started_at)` cyan; else `total_runs > 0` → `"{completed}/{total} ✓"` colored green (success ≥ 80%), yellow (≥ 50%), red (< 50%); else `—` dim |
 
-`fixedCols = 2 + 11 + 8 + teamColWidth + 10`.
+Each optional column costs its width plus a one-cell gap. **Narrow terminals drop whole columns** rather than squeezing them. Columns are offered in priority order (runs, task, where, model, caps), and each is taken only if it still fits whole. A narrower, lower-priority column can therefore survive where a wider one doesn't: at 60 columns the model shows and the where column doesn't. The name is never dropped. The slack is then shared out in steps: name to 14, task to 30, model to 16, name to 22, model to 20, and the rest to the task (or to the name when the task column is hidden). So the longest mapped hint (`Failed to start the process.`, 28 cells) reads whole from 104 columns, and any row error, including a raw message capped at 30, from **106 columns** (`ERROR_WHOLE_FROM`). Narrower, it ends in `…`, and the full hint is in the detail panel's ErrorHintPanel.
+
+Widths, pinned by `the_documented_column_widths_hold`:
+
+| Terminal width | name | model | task | caps | where | time |
+|---|---|---|---|---|---|---|
+| 60 | 10 | 10 | 12 | — | — | 9 |
+| 70 | 14 | — | 16 | — | 12 | 9 |
+| 80 | 14 | 10 | 15 | — | 12 | 9 |
+| 90 | 14 | 10 | 14 | 10 | 12 | 9 |
+| 100 | 14 | 10 | 24 | 10 | 12 | 9 |
+| 104 | 14 | 10 | 28 | 10 | 12 | 9 |
+| 106 | 14 | 10 | 30 | 10 | 12 | 9 |
+| 120 | 22 | 16 | 30 | 10 | 12 | 9 |
+| 160 | 22 | 20 | 66 | 10 | 12 | 9 |
+
+**Hostile text in a cell.** Control characters, such as a newline in a task title, become spaces. Zero-width graphemes are dropped: ZWSP, bidi marks and overrides, soft hyphens, and lone combining marks. ratatui draws them in zero cells, but `text_display_width` counts them as one, so leaving them in would shift every later column. Dropping them also keeps a bidi override in a peer's agent name off the terminal. An overlong value is cut per grapheme with `…`, and a wide glyph is never split.
+
+There is no team column: the team section headers above each group carry the team.
 
 Asserted (`error-hint-panel.test.tsx`): the row shows the **mapped hint, never the raw error message**, for a recognised `kind`; it falls back to the raw message for an unrecognised kind. The role is no longer a row column — it lives in the detail panel.
 

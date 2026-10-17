@@ -9,16 +9,184 @@ use orch_domain::{
     TaskStatus, Team, TeamStatus, default_state, goal_status_order,
 };
 
+use crate::backend::{BackendResult, CopyOutcome, CopyResult, CopyTarget, CopyTicket};
 use crate::command_bar::CommandHistory;
 use crate::hit::{HitMap, ZoneId, ZoneKind};
 use crate::messages::{
-    MAX_MESSAGES, MAX_TOASTS, Message, MsgType, PendingMessage, RunMaps, TASK_LIST_LIMIT,
-    UNDO_TIMEOUT_MS, preset_types,
+    MAX_TOASTS, Message, MsgType, PendingMessage, RunMaps, TASK_LIST_LIMIT, UNDO_TIMEOUT_MS,
+    message_document, preset_types,
 };
 use crate::onboarding::OnboardingStep;
 use crate::text::TextInput;
 use crate::theme::{Palette, Token};
-use crate::wizard::Wizard;
+use crate::widgets::text_viewer::{TextViewer, ViewerDocument, ViewerSource};
+use crate::wizard::{DraftKey, Wizard, WizardSessionStore};
+/// Pane focus is separate from the selected entity. B0 wires the focus ring.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Focus {
+    #[default]
+    MainList,
+    Activity,
+    GoalDetail(GoalSection),
+    TaskDetail(TaskSection),
+    AgentDetail(AgentSection),
+    LogDetail(LogSection),
+    TextViewer,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalSection {
+    Overview,
+    Description,
+    Progress,
+    Tasks,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSection {
+    Overview,
+    Attachments,
+    Description,
+    Result,
+    Files,
+    Activity,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSection {
+    Overview,
+    Error,
+    Role,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSection {
+    Metadata,
+    Body,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneEntity {
+    Entity(String),
+    Message(u64),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneKey {
+    pub view: ViewId,
+    pub entity: Option<PaneEntity>,
+    pub section: Focus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyOrigin {
+    Viewer {
+        source: ViewerSource,
+        generation: u64,
+    },
+    Editor {
+        draft: DraftKey,
+        step_id: String,
+        generation: u64,
+    },
+    Field {
+        source: ViewerSource,
+        generation: u64,
+    },
+}
+impl CopyOrigin {
+    fn slot(&self) -> usize {
+        match self {
+            Self::Viewer { .. } => 0,
+            Self::Editor { .. } => 1,
+            Self::Field { .. } => 2,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyRequestMeta {
+    pub origin: CopyOrigin,
+    pub target: CopyTarget,
+    pub request_seq: u64,
+    pub at_ms: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyFeedback {
+    pub ticket: Option<CopyTicket>,
+    pub request: CopyRequestMeta,
+    pub outcome: CopyOutcome,
+    pub guidance: Option<String>,
+    pub completed_at_ms: i64,
+}
+#[derive(Debug, Clone, Default)]
+pub struct CopyFeedbackSlot {
+    pub latest: Option<CopyRequestMeta>,
+    pub feedback: Option<CopyFeedback>,
+    pub footer_hidden: bool,
+}
+#[derive(Debug, Clone, Default)]
+pub struct CopyFeedbackStore {
+    pub viewer: CopyFeedbackSlot,
+    pub editor: CopyFeedbackSlot,
+    pub field: CopyFeedbackSlot,
+    pending: [Option<(CopyTicket, CopyRequestMeta)>; 2],
+    request_seq: u64,
+    /// Broken facade contracts are observable, never an excuse to grow/drop.
+    pub contract_errors: usize,
+    pub unknown_results: usize,
+}
+impl CopyFeedbackStore {
+    fn slot(&self, origin: &CopyOrigin) -> &CopyFeedbackSlot {
+        match origin.slot() {
+            0 => &self.viewer,
+            1 => &self.editor,
+            _ => &self.field,
+        }
+    }
+    fn slot_mut(&mut self, origin: &CopyOrigin) -> &mut CopyFeedbackSlot {
+        match origin.slot() {
+            0 => &mut self.viewer,
+            1 => &mut self.editor,
+            _ => &mut self.field,
+        }
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending.iter().flatten().count()
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyHelpContext {
+    pub origin: CopyOrigin,
+    pub scroll_row: usize,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextFooterGuard {
+    pub origin: CopyOrigin,
+    pub until_ms: i64,
+}
+
+/// Copy feedback is untrusted display data; never retain terminal controls.
+/// Byte caps include the visible ellipsis, and end at UTF-8 boundaries.
+fn safe_copy_detail(text: &str, limit: usize) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let ch =
+            if ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                ' '
+            } else {
+                ch
+            };
+        if result.len()
+            + ch.len_utf8()
+            + if chars.peek().is_some() {
+                '…'.len_utf8()
+            } else {
+                0
+            }
+            > limit
+        {
+            result.push('…');
+            break;
+        }
+        result.push(ch);
+    }
+    result
+}
 
 /// `TABS` — the single source of truth for rendering and `Tab`-cycle order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,6 +317,9 @@ pub struct MouseState {
     pub footer_suppressed_until: Option<i64>,
     /// Selection steps the wheel has already spent this frame (§3.3.2).
     pub wheel_steps: u8,
+    pub press_cell: Option<(u16, u16)>,
+    pub last_pointer: Option<(u16, u16)>,
+    pub cancelled_left: bool,
 }
 
 impl MouseState {
@@ -173,6 +344,9 @@ impl Default for MouseState {
             quit_armed_at: None,
             footer_suppressed_until: None,
             wheel_steps: 0,
+            press_cell: None,
+            last_pointer: None,
+            cancelled_left: false,
         }
     }
 }
@@ -394,6 +568,7 @@ pub fn is_runnable(status: TaskStatus) -> bool {
 
 pub struct AppState {
     // ── Terminal ───────────────────────────────────────────────────────────
+    pub frame_generation: u64,
     pub width: u16,
     pub height: u16,
 
@@ -406,6 +581,30 @@ pub struct AppState {
     pub peer_status: String,
 
     // ── View ───────────────────────────────────────────────────────────────
+    pub focus: Focus,
+    pub detail_focus: Focus,
+    pub pane_states: Vec<(PaneKey, crate::navigation::ScrollState)>,
+    pub activity_selected: Option<u64>,
+    /// Fallback position only; message IDs remain authoritative.
+    pub activity_last_position: usize,
+    pub activity_scroll: usize,
+    pub activity_follow_tail: bool,
+    pub log_selected_id: Option<u64>,
+    pub picker_scroll: usize,
+    pub suggestion_scroll: usize,
+    pub retained_evicted: usize,
+    pub retained_rejected: usize,
+    pub retained_bytes: usize,
+    /// A clicked row anchor and its source snapshot; never applied to changed bytes.
+    pub text_anchor: Option<(ViewerSource, usize, u64)>,
+    pub viewer: Option<TextViewer>,
+    pub wizard_sessions: WizardSessionStore,
+    pub copy_feedback: CopyFeedbackStore,
+    pub copy_help: Option<CopyHelpContext>,
+    /// Fixed viewer/editor slots, keyed by complete origin and generation.
+    pub text_footer_guards: [Option<TextFooterGuard>; 2],
+    pub(crate) copy_origins: [Option<CopyOrigin>; 3],
+    pub(crate) next_copy_generation: u64,
     pub view: ViewId,
     pub goal_selected: usize,
     pub task_selected: usize,
@@ -488,6 +687,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         AppState {
+            frame_generation: 0,
             width: 80,
             height: 24,
             tasks: Vec::new(),
@@ -496,6 +696,27 @@ impl Default for AppState {
             goals: Vec::new(),
             teams: Vec::new(),
             orch_state: default_state(),
+            focus: Focus::default(),
+            detail_focus: Focus::MainList,
+            pane_states: Vec::new(),
+            activity_selected: None,
+            activity_last_position: 0,
+            activity_scroll: 0,
+            activity_follow_tail: true,
+            log_selected_id: None,
+            picker_scroll: 0,
+            suggestion_scroll: 0,
+            retained_evicted: 0,
+            retained_rejected: 0,
+            retained_bytes: 0,
+            text_anchor: None,
+            viewer: None,
+            wizard_sessions: WizardSessionStore::default(),
+            copy_feedback: CopyFeedbackStore::default(),
+            copy_help: None,
+            text_footer_guards: [None, None],
+            copy_origins: [None, None, None],
+            next_copy_generation: 0,
             view: ViewId::Tasks,
             goal_selected: 0,
             task_selected: 0,
@@ -561,6 +782,689 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// Allocate a fresh opening epoch. Exhaustion retires all identities and
+    /// returns an error; no generation can silently alias a prior instance.
+    fn copy_generation(&mut self) -> BackendResult<u64> {
+        let Some(next) = self.next_copy_generation.checked_add(1) else {
+            self.copy_origins = [None, None, None];
+            self.text_footer_guards = [None, None];
+            self.copy_feedback.viewer = CopyFeedbackSlot::default();
+            self.copy_feedback.editor = CopyFeedbackSlot::default();
+            self.copy_feedback.field = CopyFeedbackSlot::default();
+            self.copy_help = None;
+            self.invalidate_copy_hits();
+            return Err("Copy generation exhausted".into());
+        };
+        self.next_copy_generation = next;
+        Ok(next)
+    }
+    fn invalidate_copy_hits(&mut self) {
+        self.mouse.hits.invalidate();
+        self.mouse.armed = None;
+        self.mouse.last_click = None;
+    }
+    fn install_copy_origin(&mut self, origin: CopyOrigin) -> CopyOrigin {
+        let index = origin.slot();
+        if let Some(old) = self.copy_origins[index].clone() {
+            self.retire_copy_origin(&old);
+        }
+        self.copy_origins[index] = Some(origin.clone());
+        self.invalidate_copy_hits();
+        origin
+    }
+    pub fn register_viewer_origin(&mut self, source: ViewerSource) -> BackendResult<CopyOrigin> {
+        let generation = self.copy_generation()?;
+        Ok(self.install_copy_origin(CopyOrigin::Viewer { source, generation }))
+    }
+    pub fn register_editor_origin(
+        &mut self,
+        draft: DraftKey,
+        step_id: String,
+    ) -> BackendResult<CopyOrigin> {
+        let generation = self.copy_generation()?;
+        Ok(self.install_copy_origin(CopyOrigin::Editor {
+            draft,
+            step_id,
+            generation,
+        }))
+    }
+    pub fn register_field_origin(&mut self, source: ViewerSource) -> BackendResult<CopyOrigin> {
+        let generation = self.copy_generation()?;
+        Ok(self.install_copy_origin(CopyOrigin::Field { source, generation }))
+    }
+    pub fn live_copy_origin(&self, surface: &crate::hit::TextSurfaceId) -> Option<&CopyOrigin> {
+        use crate::hit::TextSurfaceId;
+        let origin = self.copy_origins[match surface {
+            TextSurfaceId::Viewer(_) => 0,
+            TextSurfaceId::Editor(..) => 1,
+        }]
+        .as_ref()?;
+        match (surface, origin) {
+            (TextSurfaceId::Viewer(source), CopyOrigin::Viewer { source: live, .. })
+                if source == live =>
+            {
+                Some(origin)
+            }
+            (
+                TextSurfaceId::Editor(draft, step),
+                CopyOrigin::Editor {
+                    draft: live,
+                    step_id,
+                    ..
+                },
+            ) if draft == live && step == step_id => Some(origin),
+            _ => None,
+        }
+    }
+    pub fn copy_origin_is_live(&self, origin: &CopyOrigin) -> bool {
+        self.copy_origins[origin.slot()].as_ref() == Some(origin)
+    }
+    pub fn retire_copy_origin(&mut self, origin: &CopyOrigin) {
+        if !self.copy_origin_is_live(origin) {
+            return;
+        }
+        self.clear_copy_feedback(origin);
+        self.copy_origins[origin.slot()] = None;
+        if origin.slot() < 2 {
+            self.text_footer_guards[origin.slot()] = None;
+        }
+        if self
+            .copy_help
+            .as_ref()
+            .is_some_and(|help| &help.origin == origin)
+        {
+            self.copy_help = None;
+            self.show_help = false;
+        }
+        self.invalidate_copy_hits();
+    }
+    /// Identity only: no editor text or replacement session is cloned.
+    pub fn active_copy_origin(&self) -> Option<CopyOrigin> {
+        if self.show_help
+            || self.show_agent_picker
+            || self.show_type_picker
+            || self.input_mode == InputMode::Command
+            || self.wizard_sessions.pending_leave.is_some()
+        {
+            return None;
+        }
+        self.copy_origins.iter().flatten().next().cloned()
+    }
+    pub fn suppress_text_footer(&mut self, origin: &CopyOrigin, now_ms: i64) {
+        if origin.slot() >= 2 || !self.copy_origin_is_live(origin) {
+            return;
+        }
+        self.text_footer_guards[origin.slot()] = Some(TextFooterGuard {
+            origin: origin.clone(),
+            until_ms: now_ms.saturating_add(crate::mouse::DOUBLE_CLICK_MS),
+        });
+    }
+    pub fn text_footer_suppressed(&self, origin: &CopyOrigin, now_ms: i64) -> bool {
+        origin.slot() < 2
+            && self.copy_origin_is_live(origin)
+            && self.text_footer_guards[origin.slot()]
+                .as_ref()
+                .is_some_and(|guard| &guard.origin == origin && now_ms < guard.until_ms)
+    }
+    pub fn register_copy_request(
+        &mut self,
+        origin: CopyOrigin,
+        target: CopyTarget,
+        accepted: BackendResult<CopyTicket>,
+        now_ms: i64,
+    ) {
+        let Some(seq) = self.copy_feedback.request_seq.checked_add(1) else {
+            self.copy_feedback.viewer = CopyFeedbackSlot::default();
+            self.copy_feedback.editor = CopyFeedbackSlot::default();
+            self.copy_feedback.field = CopyFeedbackSlot::default();
+            self.copy_feedback.contract_errors =
+                self.copy_feedback.contract_errors.saturating_add(1);
+            return;
+        };
+        self.copy_feedback.request_seq = seq;
+        let meta = CopyRequestMeta {
+            origin: origin.clone(),
+            target,
+            request_seq: seq,
+            at_ms: now_ms,
+        };
+        let accepted = match accepted {
+            Ok(ticket)
+                if self
+                    .copy_feedback
+                    .pending
+                    .iter()
+                    .flatten()
+                    .any(|(id, _)| *id == ticket)
+                    || self.copy_feedback.pending_count() == 2 =>
+            {
+                self.copy_feedback.contract_errors =
+                    self.copy_feedback.contract_errors.saturating_add(1);
+                Err("Copy facade contract violation".into())
+            }
+            other => other,
+        };
+        let feedback = match accepted {
+            Ok(ticket) => {
+                if let Some(entry) = self
+                    .copy_feedback
+                    .pending
+                    .iter_mut()
+                    .find(|entry| entry.is_none())
+                {
+                    *entry = Some((ticket, meta.clone()));
+                }
+                None
+            }
+            Err(error) => {
+                let destination = match target {
+                    CopyTarget::Auto => "Auto",
+                    CopyTarget::Terminal => "Terminal",
+                    CopyTarget::Native => "Host",
+                };
+                Some(CopyFeedback {
+                    ticket: None,
+                    request: meta.clone(),
+                    outcome: CopyOutcome::Failed(safe_copy_detail(
+                        &format!("{destination}: {error}"),
+                        256,
+                    )),
+                    guidance: None,
+                    completed_at_ms: now_ms,
+                })
+            }
+        };
+        // A retired caller still drains accepted work but cannot resurrect UI.
+        if !self.copy_origin_is_live(&origin) {
+            return;
+        }
+        *self.copy_feedback.slot_mut(&origin) = CopyFeedbackSlot {
+            latest: Some(meta),
+            feedback,
+            footer_hidden: false,
+        };
+    }
+    pub fn apply_copy_result(&mut self, result: CopyResult, now_ms: i64) {
+        let Some(index) = self
+            .copy_feedback
+            .pending
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|(id, _)| *id == result.ticket))
+        else {
+            self.copy_feedback.unknown_results =
+                self.copy_feedback.unknown_results.saturating_add(1);
+            return;
+        };
+        let Some((_, meta)) = self.copy_feedback.pending[index].take() else {
+            return;
+        };
+        if !self.copy_origin_is_live(&meta.origin)
+            || self.copy_feedback.slot(&meta.origin).latest.as_ref() != Some(&meta)
+        {
+            return;
+        }
+        let outcome = match result.outcome {
+            CopyOutcome::Failed(error) => CopyOutcome::Failed(safe_copy_detail(&error, 256)),
+            other => other,
+        };
+        let slot = self.copy_feedback.slot_mut(&meta.origin);
+        slot.feedback = Some(CopyFeedback {
+            ticket: Some(result.ticket),
+            request: meta,
+            outcome,
+            guidance: result.guidance.as_deref().map(|s| safe_copy_detail(s, 512)),
+            completed_at_ms: now_ms,
+        });
+        slot.footer_hidden = false;
+    }
+    pub fn feedback_for(&self, origin: &CopyOrigin) -> Option<&CopyFeedback> {
+        let slot = self.copy_feedback.slot(origin);
+        slot.feedback
+            .as_ref()
+            .filter(|feedback| &feedback.request.origin == origin)
+    }
+    pub fn clear_copy_feedback(&mut self, origin: &CopyOrigin) {
+        if self
+            .copy_feedback
+            .slot(origin)
+            .latest
+            .as_ref()
+            .is_some_and(|meta| &meta.origin == origin)
+        {
+            *self.copy_feedback.slot_mut(origin) = CopyFeedbackSlot::default();
+        }
+    }
+    pub fn dismiss_copy_feedback(&mut self, origin: &CopyOrigin) {
+        if self
+            .copy_feedback
+            .slot(origin)
+            .latest
+            .as_ref()
+            .is_some_and(|meta| &meta.origin == origin)
+        {
+            self.copy_feedback.slot_mut(origin).footer_hidden = true;
+        }
+    }
+    pub fn copy_footer_visible(&self, origin: &CopyOrigin) -> bool {
+        let slot = self.copy_feedback.slot(origin);
+        !slot.footer_hidden
+            && slot
+                .latest
+                .as_ref()
+                .is_some_and(|meta| &meta.origin == origin)
+    }
+    pub fn pane_key(&self, focus: Focus) -> PaneKey {
+        let entity = match focus {
+            Focus::GoalDetail(_) => self
+                .selected_goal()
+                .map(|g| PaneEntity::Entity(g.id.clone())),
+            Focus::TaskDetail(_) => self
+                .selected_task()
+                .map(|t| PaneEntity::Entity(t.id.clone())),
+            Focus::AgentDetail(_) => self
+                .selected_agent()
+                .map(|a| PaneEntity::Entity(a.id.clone())),
+            Focus::LogDetail(_) => self.selected_log().map(|m| PaneEntity::Message(m.id)),
+            _ => None,
+        };
+        PaneKey {
+            view: self.view,
+            entity,
+            section: focus,
+        }
+    }
+    pub fn pane_scroll(&self, key: &PaneKey) -> crate::navigation::ScrollState {
+        self.pane_states
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default()
+    }
+    pub fn set_pane_scroll(&mut self, key: PaneKey, scroll: crate::navigation::ScrollState) {
+        self.pane_states
+            .retain(|(saved, _)| saved.view != key.view || saved.entity == key.entity);
+        if let Some((_, state)) = self.pane_states.iter_mut().find(|(saved, _)| saved == &key) {
+            *state = scroll;
+        } else {
+            self.pane_states.push((key, scroll));
+        }
+    }
+    pub fn focus_ring(&self) -> Vec<Focus> {
+        if self.width < crate::layout::MIN_WIDTH || self.height < crate::layout::MIN_HEIGHT {
+            return vec![Focus::MainList];
+        }
+        let mut ring = Vec::new();
+        if !self.detail_maximized || !self.detail_open() && self.view == ViewId::Logs {
+            ring.push(Focus::MainList);
+        }
+        if !self.detail_open() {
+            if self.view != ViewId::Logs {
+                ring.push(Focus::Activity);
+            }
+            return ring;
+        }
+        match self.view {
+            ViewId::Goals => {
+                if let Some(g) = self.selected_goal() {
+                    ring.extend([
+                        Focus::GoalDetail(GoalSection::Overview),
+                        Focus::GoalDetail(GoalSection::Description),
+                    ]);
+                    if self.goal_progress_report.is_some() {
+                        ring.push(Focus::GoalDetail(GoalSection::Progress));
+                    }
+                    if !self.tasks_of_goal(&g.id).is_empty() {
+                        ring.push(Focus::GoalDetail(GoalSection::Tasks));
+                    }
+                }
+            }
+            ViewId::Tasks => {
+                if let Some(t) = self.selected_task() {
+                    ring.push(Focus::TaskDetail(TaskSection::Overview));
+                    if t.attachments.as_ref().is_some_and(|a| !a.is_empty()) {
+                        ring.push(Focus::TaskDetail(TaskSection::Attachments));
+                    }
+                    ring.push(Focus::TaskDetail(TaskSection::Description));
+                    if t.proof
+                        .as_ref()
+                        .and_then(|p| p.agent_summary.as_ref())
+                        .is_some_and(|s| !s.is_empty())
+                    {
+                        ring.push(Focus::TaskDetail(TaskSection::Result));
+                    }
+                    if t.proof
+                        .as_ref()
+                        .is_some_and(|p| !p.files_changed.is_empty())
+                    {
+                        ring.push(Focus::TaskDetail(TaskSection::Files));
+                    }
+                    if self
+                        .messages
+                        .iter()
+                        .any(|m| m.task_id.as_deref() == Some(t.id.as_str()))
+                    {
+                        ring.push(Focus::TaskDetail(TaskSection::Activity));
+                    }
+                }
+            }
+            ViewId::Agents => {
+                if let Some(a) = self.selected_agent() {
+                    ring.push(Focus::AgentDetail(AgentSection::Overview));
+                    if a.last_error.is_some() {
+                        ring.push(Focus::AgentDetail(AgentSection::Error));
+                    }
+                    ring.push(Focus::AgentDetail(AgentSection::Role));
+                }
+            }
+            ViewId::Logs => {
+                if self.selected_log().is_some() {
+                    ring.extend([
+                        Focus::LogDetail(LogSection::Metadata),
+                        Focus::LogDetail(LogSection::Body),
+                    ]);
+                }
+            }
+        }
+        if ring.is_empty() {
+            ring.push(Focus::MainList);
+        }
+        ring
+    }
+    pub fn set_focus(&mut self, focus: Focus) {
+        if self.focus != focus {
+            self.text_anchor = None;
+        }
+        self.focus = focus;
+        if !matches!(focus, Focus::MainList | Focus::Activity | Focus::TextViewer) {
+            self.detail_focus = focus;
+        }
+        self.sync_field_origin();
+    }
+    pub fn normalize_focus(&mut self) {
+        let log = self
+            .log_selected_id
+            .or_else(|| self.selected_log().map(|m| m.id));
+        self.reconcile_message_selection(log);
+        if self.detail_open()
+            && match self.view {
+                ViewId::Goals => self.selected_goal().is_none(),
+                ViewId::Tasks => self.selected_task().is_none(),
+                ViewId::Agents => self.selected_agent().is_none(),
+                ViewId::Logs => self.selected_log().is_none(),
+            }
+        {
+            self.detail = DetailPanel::None;
+            self.detail_maximized = false;
+        }
+        let ring = self.focus_ring();
+        if !ring.contains(&self.detail_focus) {
+            self.detail_focus = ring
+                .iter()
+                .copied()
+                .find(|f| *f != Focus::MainList)
+                .unwrap_or(Focus::MainList);
+        }
+        if self.viewer.is_none() && !ring.contains(&self.focus) {
+            self.focus = ring[0];
+        }
+        // Only the current entity's per-section state is retained per view.
+        let keys: Vec<_> = ring.iter().map(|f| self.pane_key(*f)).collect();
+        self.pane_states
+            .retain(|(k, _)| k.view != self.view || keys.contains(k));
+        self.sync_field_origin();
+    }
+    pub fn sync_field_origin(&mut self) {
+        let source = if self.viewer.is_none() && self.input_mode == InputMode::None {
+            self.focused_source()
+        } else {
+            None
+        };
+        let previous = self.copy_origins[2].clone();
+        if let Some(source) = source {
+            if !matches!(&previous,Some(CopyOrigin::Field{source:s,..}) if s==&source) {
+                let _ = self.register_field_origin(source);
+            }
+        } else if let Some(old) = previous {
+            self.retire_copy_origin(&old);
+        }
+    }
+    pub fn focused_source(&self) -> Option<ViewerSource> {
+        let entity = |kind, id: String, field: &str| {
+            Some(ViewerSource::Entity {
+                kind,
+                id,
+                field: field.into(),
+            })
+        };
+        match self.focus {
+            Focus::Activity => self
+                .activity_selected
+                .or_else(|| {
+                    self.activity_messages()
+                        .last()
+                        .map(|i| self.messages[*i].id)
+                })
+                .map(ViewerSource::Message),
+            Focus::MainList if self.view == ViewId::Logs => {
+                self.selected_log().map(|m| ViewerSource::Message(m.id))
+            }
+            Focus::GoalDetail(GoalSection::Description) => entity(
+                EntityType::Goal,
+                self.selected_goal()?.id.clone(),
+                "description",
+            ),
+            Focus::GoalDetail(GoalSection::Progress) => entity(
+                EntityType::Goal,
+                self.selected_goal()?.id.clone(),
+                "progress",
+            ),
+            Focus::TaskDetail(TaskSection::Description) => entity(
+                EntityType::Task,
+                self.selected_task()?.id.clone(),
+                "description",
+            ),
+            Focus::TaskDetail(TaskSection::Result) => {
+                entity(EntityType::Task, self.selected_task()?.id.clone(), "result")
+            }
+            Focus::AgentDetail(AgentSection::Role) => {
+                entity(EntityType::Agent, self.selected_agent()?.id.clone(), "role")
+            }
+            Focus::AgentDetail(AgentSection::Error) => entity(
+                EntityType::Agent,
+                self.selected_agent()?.id.clone(),
+                "error",
+            ),
+            Focus::LogDetail(LogSection::Body) => {
+                self.selected_log().map(|m| ViewerSource::Message(m.id))
+            }
+            Focus::GoalDetail(GoalSection::Tasks) => {
+                let goal = self.selected_goal()?;
+                let rows = self.tasks_of_goal(&goal.id);
+                let selected = self
+                    .pane_scroll(&self.pane_key(self.focus))
+                    .selected
+                    .unwrap_or(0);
+                let task = self.tasks.get(*rows.get(selected)?)?;
+                entity(EntityType::Task, task.id.clone(), "description")
+            }
+            Focus::TaskDetail(TaskSection::Attachments) => entity(
+                EntityType::Task,
+                self.selected_task()?.id.clone(),
+                "attachments",
+            ),
+            Focus::TaskDetail(TaskSection::Files) => {
+                entity(EntityType::Task, self.selected_task()?.id.clone(), "files")
+            }
+            Focus::TaskDetail(TaskSection::Activity) => {
+                let task = self.selected_task()?;
+                let rows: Vec<_> = self
+                    .messages
+                    .iter()
+                    .filter(|m| m.task_id.as_deref() == Some(task.id.as_str()))
+                    .collect();
+                let selected = self
+                    .pane_scroll(&self.pane_key(self.focus))
+                    .selected
+                    .unwrap_or(0);
+                rows.get(selected).map(|m| ViewerSource::Message(m.id))
+            }
+            _ => None,
+        }
+    }
+    pub fn selected_log(&self) -> Option<&Message> {
+        let index = usize::try_from(self.log_selected_index).ok()?;
+        let filtered = self.filtered_messages();
+        if let Some(id) = self.log_selected_id
+            && let Some(message) = filtered
+                .iter()
+                .map(|i| &self.messages[*i])
+                .find(|m| m.id == id)
+        {
+            return Some(message);
+        }
+        filtered
+            .get(index.min(filtered.len().saturating_sub(1)))
+            .and_then(|i| self.messages.get(*i))
+    }
+    /// Resolve original bytes before panel clipping; viewers freeze this document.
+    pub fn focused_text(&self) -> Option<ViewerDocument> {
+        let source = self.focused_source()?;
+        let mut document = self.text_for_source(&source, 0, 0)?;
+        let fingerprint = Self::source_fingerprint(&document.body);
+        if let Some((saved, byte, hash)) = &self.text_anchor
+            && saved == &source
+            && *hash == fingerprint
+        {
+            document.initial_anchor = (*byte).min(document.body.len());
+            return Some(document);
+        }
+        let key = self.pane_key(self.focus);
+        // Keyboard anchors may reuse the last body geometry after click invalidation.
+        if let Some(metrics) = self.mouse.hits.metrics.panes.iter().find(|p| p.key == key) {
+            let current_frame = self
+                .mouse
+                .hits
+                .source_versions
+                .iter()
+                .any(|(saved, hash)| saved == &source && *hash == fingerprint);
+            if current_frame
+                && let Some((_, _, byte)) = self
+                    .mouse
+                    .hits
+                    .source_anchors
+                    .iter()
+                    .find(|(r, s, _)| s == &source && r.y >= metrics.body.y)
+            {
+                document.initial_anchor = *byte;
+            } else if matches!(
+                self.focus,
+                Focus::GoalDetail(GoalSection::Description | GoalSection::Progress)
+                    | Focus::TaskDetail(TaskSection::Description | TaskSection::Result)
+                    | Focus::AgentDetail(AgentSection::Role | AgentSection::Error)
+                    | Focus::LogDetail(LogSection::Body)
+            ) {
+                let rows =
+                    crate::views::detail::wrap_rows(&document.body, metrics.body.width as usize);
+                let offset = self
+                    .pane_scroll(&key)
+                    .offset
+                    .min(rows.len().saturating_sub(metrics.body.height as usize));
+                document.initial_anchor = rows.get(offset).map(|(_, byte)| *byte).unwrap_or(0);
+            }
+        }
+        Some(document)
+    }
+    pub fn source_fingerprint(body: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        body.hash(&mut h);
+        h.finish()
+    }
+    pub fn text_for_source(
+        &self,
+        source: &ViewerSource,
+        initial_anchor: usize,
+        captured_at_ms: i64,
+    ) -> Option<ViewerDocument> {
+        use crate::widgets::text_viewer::{Completeness, Representation};
+        use std::borrow::Cow;
+        let (title, text): (String, Cow<'_, str>) = match source {
+            ViewerSource::Message(id) => {
+                let message = self.messages.iter().find(|m| m.id == *id)?;
+                return Some(message_document(message, initial_anchor, captured_at_ms));
+            }
+            ViewerSource::Entity { kind, id, field } => match kind {
+                EntityType::Goal => {
+                    let g = self.goals.iter().find(|g| &g.id == id)?;
+                    let text = match field.as_str() {
+                        "description" => Cow::Borrowed(g.description.as_str()),
+                        "progress"
+                            if self
+                                .selected_goal()
+                                .is_some_and(|selected| &selected.id == id) =>
+                        {
+                            Cow::Borrowed(self.goal_progress_report.as_deref()?)
+                        }
+                        _ => return None,
+                    };
+                    (format!("{} · {field}", g.title), text)
+                }
+                EntityType::Task => {
+                    let t = self.tasks.iter().find(|t| &t.id == id)?;
+                    let text = match field.as_str() {
+                        "description" => Cow::Borrowed(t.description.as_str()),
+                        "result" => Cow::Borrowed(t.proof.as_ref()?.agent_summary.as_deref()?),
+                        "attachments" => Cow::Owned(t.attachments.as_ref()?.join("\n")),
+                        "files" => Cow::Owned(t.proof.as_ref()?.files_changed.join("\n")),
+                        _ => return None,
+                    };
+                    (format!("{} · {field}", t.title), text)
+                }
+                EntityType::Agent => {
+                    let a = self.agents.iter().find(|a| &a.id == id)?;
+                    let text = match field.as_str() {
+                        "role" => Cow::Borrowed(a.role.as_deref().unwrap_or_default()),
+                        "error" => Cow::Borrowed(a.last_error.as_ref()?.message.as_str()),
+                        _ => return None,
+                    };
+                    (format!("{} · {field}", a.name), text)
+                }
+            },
+        };
+        let original_bytes = text.len();
+        let unavailable = original_bytes > 1024 * 1024;
+        let body: std::sync::Arc<str> = if unavailable {
+            "".into()
+        } else {
+            text.as_ref().into()
+        };
+        let mut anchor = initial_anchor.min(body.len());
+        while !body.is_char_boundary(anchor) {
+            anchor -= 1;
+        }
+        Some(ViewerDocument {
+            source: source.clone(),
+            title,
+            body,
+            representation: if matches!(source, ViewerSource::Message(_)) {
+                Representation::Raw
+            } else {
+                Representation::Field
+            },
+            raw_body: None,
+            completeness: if unavailable {
+                Completeness::Unavailable {
+                    reason: "Body unavailable: exceeds 1 MiB".into(),
+                }
+            } else {
+                Completeness::Complete
+            },
+            original_bytes,
+            captured_at_ms,
+            initial_anchor: anchor,
+        })
+    }
+
     // ── Derived collections ────────────────────────────────────────────────
 
     /// `sortedGoals` — by status rank, stable within a rank.
@@ -922,82 +1826,116 @@ impl AppState {
     /// `addMessage` — stage a message and arm the 80 ms batch flush. The
     /// staging buffer is itself truncated to `MAX_MESSAGES`.
     pub fn add_message(&mut self, message: PendingMessage, now_ms: i64, batch_ms: i64) {
-        self.pending_messages.push(message);
-        if self.pending_messages.len() > MAX_MESSAGES {
-            let overflow = self.pending_messages.len() - MAX_MESSAGES;
-            self.pending_messages.drain(..overflow);
-        }
+        let anchors = self.message_viewport_anchors();
+        let log = self.selected_log().map(|m| m.id).or(self.log_selected_id);
+        let report = crate::messages::retention::stage_message(
+            &mut self.pending_messages,
+            &mut self.messages,
+            message,
+        );
+        self.record_retention(report);
+        self.reconcile_message_selection(log);
+        self.restore_message_viewports(anchors);
         if batch_ms <= 0 {
             self.flush_messages(now_ms);
         } else if self.message_flush_at.is_none() {
-            self.message_flush_at = Some(now_ms + batch_ms);
+            self.message_flush_at = Some(now_ms.saturating_add(batch_ms));
         }
     }
-
-    /// Drain the staging buffer into the feed, honouring the 500-entry cap.
     pub fn flush_messages(&mut self, now_ms: i64) {
         self.message_flush_at = None;
-        if self.pending_messages.is_empty() {
-            return;
+        let anchors = self.message_viewport_anchors();
+        let log = self.selected_log().map(|m| m.id).or(self.log_selected_id);
+        let report = crate::messages::retention::flush_messages(
+            &mut self.pending_messages,
+            &mut self.messages,
+            &mut self.next_message_id,
+            now_ms,
+        );
+        self.record_retention(report);
+        self.reconcile_message_selection(log);
+        self.restore_message_viewports(anchors);
+    }
+    pub fn prepend_messages(&mut self, messages: Vec<PendingMessage>, now_ms: i64) {
+        let anchors = self.message_viewport_anchors();
+        let log = self.selected_log().map(|m| m.id).or(self.log_selected_id);
+        let report = crate::messages::retention::prepend_messages(
+            &mut self.pending_messages,
+            &mut self.messages,
+            messages,
+            &mut self.next_message_id,
+            now_ms,
+        );
+        self.record_retention(report);
+        self.reconcile_message_selection(log);
+        self.restore_message_viewports(anchors);
+    }
+    fn message_viewport_anchors(&self) -> (Option<u64>, Option<u64>) {
+        let logs = self.filtered_messages();
+        let activity = self.activity_messages();
+        (
+            if self.log_selected_index >= 0 {
+                logs.get(self.log_scroll_offset)
+                    .map(|i| self.messages[*i].id)
+            } else {
+                None
+            },
+            if !self.activity_follow_tail {
+                activity
+                    .get(self.activity_scroll)
+                    .map(|i| self.messages[*i].id)
+            } else {
+                None
+            },
+        )
+    }
+    fn restore_message_viewports(&mut self, (log, activity): (Option<u64>, Option<u64>)) {
+        if let Some(row) = log.and_then(|id| {
+            self.filtered_messages()
+                .iter()
+                .position(|i| self.messages[*i].id == id)
+        }) {
+            self.log_scroll_offset = row;
         }
-        let pending = std::mem::take(&mut self.pending_messages);
-        let mut batch: Vec<Message> = Vec::with_capacity(pending.len());
-        for p in pending {
-            // A line identical to the latest one from the same source adds
-            // nothing: keep the first, whose timestamp then reads as how long
-            // the state has lasted (PARITY.md §12.8 (k)).
-            if repeats_latest(&self.messages, &batch, &p) {
-                continue;
-            }
-            let id = self.next_message_id;
-            self.next_message_id += 1;
-            // A message with its own instant (a history entry) keeps it;
-            // everything else is stamped with the flush time.
-            batch.push(
-                Message::new(id, p.ts_ms.unwrap_or(now_ms), &p.text, p.color, p.msg_type)
-                    .with_agent(p.agent_id)
-                    .with_task(p.task_id)
-                    .with_detail(p.detail),
-            );
-        }
-        if batch.is_empty() {
-            return;
-        }
-
-        if batch.len() >= MAX_MESSAGES {
-            let start = batch.len() - MAX_MESSAGES;
-            self.messages = batch[start..].to_vec();
-        } else {
-            let keep = MAX_MESSAGES - batch.len();
-            if self.messages.len() > keep {
-                let drop = self.messages.len() - keep;
-                self.messages.drain(..drop);
-            }
-            self.messages.extend(batch);
+        if let Some(row) = activity.and_then(|id| {
+            self.activity_messages()
+                .iter()
+                .position(|i| self.messages[*i].id == id)
+        }) {
+            self.activity_scroll = row;
         }
     }
-
-    /// `onLoadHistory` — history batches are **prepended**, then truncated.
-    pub fn prepend_messages(&mut self, messages: Vec<PendingMessage>, now_ms: i64) {
-        let mut prefix: Vec<Message> = messages
-            .into_iter()
-            .map(|p| {
-                let id = self.next_message_id;
-                self.next_message_id += 1;
-                // A message with its own instant (a history entry) keeps it;
-                // everything else is stamped with the flush time.
-                Message::new(id, p.ts_ms.unwrap_or(now_ms), &p.text, p.color, p.msg_type)
-                    .with_agent(p.agent_id)
-                    .with_task(p.task_id)
-                    .with_detail(p.detail)
-            })
-            .collect();
-        prefix.extend(std::mem::take(&mut self.messages));
-        if prefix.len() > MAX_MESSAGES {
-            let drop = prefix.len() - MAX_MESSAGES;
-            prefix.drain(..drop);
+    fn record_retention(&mut self, report: crate::messages::retention::RetentionReport) {
+        self.retained_evicted = self.retained_evicted.saturating_add(report.evicted);
+        self.retained_rejected = self.retained_rejected.saturating_add(report.rejected);
+        self.retained_bytes = report.owned_bytes;
+    }
+    fn reconcile_message_selection(&mut self, log: Option<u64>) {
+        if self.log_selected_index >= 0 {
+            let rows = self.filtered_messages();
+            self.log_selected_index = log
+                .and_then(|id| rows.iter().position(|i| self.messages[*i].id == id))
+                .unwrap_or((self.log_selected_index as usize).min(rows.len().saturating_sub(1)))
+                as i64;
+            self.log_selected_id = self.selected_log().map(|m| m.id);
         }
-        self.messages = prefix;
+        let rows = self.activity_messages();
+        let position = if self.activity_follow_tail {
+            rows.len().checked_sub(1)
+        } else {
+            rows.iter()
+                .position(|i| Some(self.messages[*i].id) == self.activity_selected)
+                .or_else(|| {
+                    (!rows.is_empty()).then_some(
+                        self.activity_last_position
+                            .min(rows.len().saturating_sub(1)),
+                    )
+                })
+        };
+        self.activity_last_position = position.unwrap_or(0);
+        self.activity_selected = position
+            .and_then(|p| rows.get(p))
+            .map(|i| self.messages[*i].id);
     }
 
     /// Logs-view filtering: the agent filter never drops a message without an
@@ -1177,13 +2115,82 @@ impl AppState {
         self.agent_selected = self
             .agent_selected
             .min(self.agent_selection_max(can_create));
+        self.split_offset = crate::layout::clamp_split_offset(
+            self.split_offset,
+            crate::layout::content_height(self.height),
+        );
         let regions = self.regions(can_create);
-        let main_h = regions.main_h as usize;
-        let clamp = |len: usize| len.saturating_sub(main_h);
-        self.goal_scroll = self.goal_scroll.min(clamp(self.sorted_goals().len()));
-        self.task_scroll = self.task_scroll.min(clamp(self.visible_tasks().len()));
-        self.agent_scroll = self.agent_scroll.min(clamp(self.sorted_agents().len()));
-        self.split_offset = crate::layout::clamp_split_offset(self.split_offset, regions.content_h);
+        let goal_rows: Vec<_> = (0..self.sorted_goals().len() + usize::from(can_create)).collect();
+        let task_rows: Vec<_> = self
+            .task_rows(can_create)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                matches!(
+                    r,
+                    TaskRow::Task { .. } | TaskRow::ShowAll { .. } | TaskRow::AddTask { .. }
+                )
+                .then_some(i)
+            })
+            .collect();
+        let agent_rows: Vec<_> = self
+            .agent_rows(can_create)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                matches!(r, AgentRow::Agent { .. } | AgentRow::AddAgent { .. }).then_some(i)
+            })
+            .collect();
+        fn reveal(selected: usize, offset: usize, rows: &[usize], total: usize, h: usize) -> usize {
+            let mut offset = offset.min(total.saturating_sub(h));
+            if h > 0
+                && let Some(row) = rows.get(selected)
+            {
+                if *row < offset {
+                    offset = *row;
+                } else if *row >= offset.saturating_add(h) {
+                    offset = row.saturating_add(1).saturating_sub(h);
+                }
+            }
+            offset
+        }
+        let viewport = |view: ViewId, chrome: u16| {
+            self.mouse
+                .hits
+                .metrics
+                .panes
+                .iter()
+                .find(|m| m.key.view == view && m.key.section == Focus::MainList)
+                .map_or(regions.main_h.saturating_sub(chrome) as usize, |m| {
+                    m.body.height as usize
+                })
+        };
+        self.goal_scroll = reveal(
+            self.goal_selected,
+            self.goal_scroll,
+            &goal_rows,
+            goal_rows.len(),
+            viewport(ViewId::Goals, 0),
+        );
+        self.task_scroll = reveal(
+            self.task_selected,
+            self.task_scroll,
+            &task_rows,
+            self.task_rows(can_create).len(),
+            viewport(ViewId::Tasks, 0),
+        );
+        self.agent_scroll = reveal(
+            self.agent_selected,
+            self.agent_scroll,
+            &agent_rows,
+            self.agent_rows(can_create).len(),
+            viewport(ViewId::Agents, 0),
+        );
+        self.reconcile_message_selection(self.log_selected_id);
+        self.normalize_focus();
+        self.mouse.hits.invalidate();
+        self.mouse.armed = None;
+        self.mouse.last_click = None;
     }
 
     // ── Status helpers used by the header and `/status` ────────────────────
@@ -1203,29 +2210,6 @@ impl AppState {
     }
 }
 
-/// How far back [`repeats_latest`] looks for the previous line from the same
-/// source. A source silent for longer than this simply gets a fresh line.
-const REPEAT_LOOKBACK: usize = 64;
-
-/// Whether `p` repeats the most recent feed line from the same source — the
-/// same agent and task — with the same type and text.
-///
-/// Agent-less system lines are exempt: the orchestrator's own status line is
-/// deduplicated by its counts in `App::handle_event`, which also knows when
-/// work resumed after an idle spell and a fresh line is wanted.
-fn repeats_latest(feed: &[Message], batch: &[Message], p: &PendingMessage) -> bool {
-    if p.msg_type == MsgType::System && p.agent_id.is_none() {
-        return false;
-    }
-    batch
-        .iter()
-        .rev()
-        .chain(feed.iter().rev())
-        .take(REPEAT_LOOKBACK)
-        .find(|m| m.agent_id == p.agent_id && m.task_id == p.task_id)
-        .is_some_and(|m| m.msg_type == p.msg_type && m.text == p.text)
-}
-
 #[cfg(test)]
 // Fixtures build an `AppState` field by field; struct-update syntax would bury
 // what each test is actually setting.
@@ -1233,6 +2217,7 @@ fn repeats_latest(feed: &[Message], batch: &[Message], p: &PendingMessage) -> bo
 mod tests {
     use super::*;
     use crate::backend::{make_agent, make_goal, make_task, make_team};
+    use crate::messages::MAX_MESSAGES;
     use orch_domain::GoalStatus;
 
     fn state_with_tasks(specs: &[(&str, TaskStatus)]) -> AppState {
@@ -1757,5 +2742,53 @@ mod tests {
         assert!(!is_runnable(TaskStatus::Review));
         assert!(!is_runnable(TaskStatus::Done));
         assert!(!is_runnable(TaskStatus::Retrying));
+    }
+}
+
+#[cfg(test)]
+mod copy_foundation_tests {
+    use super::*;
+    #[test]
+    fn exhausted_generation_retires_live_guards_and_does_not_reuse_ids() {
+        let mut state = AppState::default();
+        let origin = state
+            .register_viewer_origin(ViewerSource::Message(1))
+            .unwrap();
+        state.suppress_text_footer(&origin, 0);
+        state.next_copy_generation = u64::MAX;
+        assert!(
+            state
+                .register_viewer_origin(ViewerSource::Message(1))
+                .is_err()
+        );
+        assert!(!state.copy_origin_is_live(&origin));
+        assert!(!state.text_footer_suppressed(&origin, 1));
+        assert!(
+            state
+                .register_viewer_origin(ViewerSource::Message(1))
+                .is_err()
+        );
+    }
+    #[test]
+    fn exhausted_request_sequence_clears_presentation_and_drops_old_completions() {
+        let mut state = AppState::default();
+        let origin = state
+            .register_viewer_origin(ViewerSource::Message(1))
+            .unwrap();
+        state.register_copy_request(origin.clone(), CopyTarget::Auto, Ok(CopyTicket(1)), 0);
+        state.copy_feedback.request_seq = u64::MAX;
+        state.register_copy_request(origin.clone(), CopyTarget::Auto, Err("Busy".into()), 1);
+        state.apply_copy_result(
+            CopyResult {
+                ticket: CopyTicket(1),
+                outcome: CopyOutcome::NativeWritten,
+                guidance: None,
+            },
+            2,
+        );
+        assert!(state.feedback_for(&origin).is_none());
+        assert!(!state.copy_footer_visible(&origin));
+        assert_eq!(state.copy_feedback.pending_count(), 0);
+        assert_eq!(state.copy_feedback.contract_errors, 1);
     }
 }

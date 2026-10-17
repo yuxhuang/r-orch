@@ -212,7 +212,10 @@ fn h005_a_section_header_registers_no_zone_and_the_row_below_it_does() {
         .find(|y| harness.line(*y).contains("GOAL NUMBER 0"))
         .expect("the grouped section header renders");
     assert!(
-        harness.zone_at(4, header_y).is_none(),
+        matches!(
+            harness.zone_at(4, header_y).map(|z| &z.kind),
+            Some(ZoneKind::Pane(orch_tui::state::Focus::MainList))
+        ),
         "a section header consumes no selection index, so it must not be clickable; \
          found {:?}",
         harness.zone_at(4, header_y).map(|z| z.kind.clone())
@@ -537,7 +540,7 @@ fn h015_the_footer_hints_are_addressable_and_the_arrows_are_not() {
     }
     // Two opposite meanings in one 2-cell span: not a button.
     assert_eq!(
-        zone_on_text(&mut harness, "Tab/←→"),
+        zone_on_text(&mut harness, "Tab panes; ←→ views"),
         None,
         "a hint whose direction would have to be guessed from the sub-cell \
          must not be clickable"
@@ -711,34 +714,19 @@ fn h020_the_logs_status_bar_verbs_and_agent_chips_are_addressable() {
 
 #[test]
 fn h021_a_footer_hint_the_frame_clips_is_only_clickable_where_it_was_painted() {
-    // At 100 columns the task footer runs out of room inside `? help`, and
-    // ratatui paints `? h`. Recording the computed x-range would have made
-    // three invisible cells clickable — one of them two cells from `Q quit`
-    // (§3.2.1, objection #10b).
-    let backend = FakeBackend::new().with_tasks(tasks(2));
-    let mut harness = Harness::sized(backend, 100, 30);
-    harness.app.state.view = ViewId::Tasks;
-    harness.draw();
-
-    let footer_y = harness.app.state.height - 1;
-    let help = harness
-        .hits()
-        .zones()
-        .iter()
-        .find(|z| z.kind == ZoneKind::FooterHint(FooterAction::Help))
-        .expect("the help hint is registered");
-    assert!(
-        help.rect.right() <= 100,
-        "the zone must stop where the paint stopped, got {help:?}"
-    );
-    assert!(
-        help.rect.width < 5,
-        "`? help` was clipped, so its zone must be shorter than the full hint"
-    );
-    assert!(
-        harness.zone_at(99, footer_y).is_some(),
-        "the last painted cell is still clickable"
-    );
-    // And nothing claims a cell past the frame.
-    assert!(harness.zone_at(100, footer_y).is_none());
+    let mut h = Harness::sized(FakeBackend::new().with_tasks(tasks(2)), 100, 30);
+    h.draw();
+    let footer = h.app.state.height - 1;
+    for z in h.hits().zones().iter().filter(|z| z.rect.y == footer) {
+        assert!(z.rect.right() <= 100);
+        assert!(z.rect.width > 0);
+        assert!(
+            h.line(footer)
+                .chars()
+                .skip(z.rect.x as usize)
+                .take(z.rect.width as usize)
+                .any(|c| c != ' ')
+        );
+    }
+    assert!(h.zone_at(100, footer).is_none());
 }

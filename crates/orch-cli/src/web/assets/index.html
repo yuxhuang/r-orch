@@ -12,12 +12,26 @@
     position: fixed; top: 0; left: 0; right: 0; padding: 8px 12px;
     background: #b00020; color: #fff; font: 14px sans-serif; text-align: center;
   }
-  #status[hidden] { display: none; }
+  #status[hidden], #copy-panel[hidden], #copy-fallback[hidden] { display: none; }
+  #copy-panel {
+    position: fixed; bottom: 8px; right: 8px; max-width: min(32em, 90vw);
+    padding: 8px; background: #222; color: #fff; font: 14px sans-serif;
+    border: 1px solid #888;
+  }
+  #copy-panel button:focus-visible, #copy-fallback:focus-visible { outline: 2px solid #fff; }
+  #copy-fallback { display: block; width: 100%; box-sizing: border-box; margin-top: 8px; }
+
 </style>
 </head>
 <body>
 <div id="term"></div>
 <div id="status" hidden>Disconnected. Reload the page to start a new session.</div>
+<section id="copy-panel" aria-label="Terminal clipboard request" hidden>
+  <button id="copy-button" type="button" disabled>Copy to clipboard</button>
+  <button id="copy-dismiss" type="button">Dismiss</button>
+  <span id="copy-status" role="status" aria-live="polite"></span>
+  <textarea id="copy-fallback" aria-label="Text to select and copy" readonly hidden></textarea>
+</section>
 <script src="/xterm.js"></script>
 <script src="/addon-fit.js"></script>
 <script>
@@ -52,10 +66,118 @@
     }
   }
 
+  const copyPanel = document.getElementById('copy-panel');
+  const copyButton = document.getElementById('copy-button');
+  const copyStatus = document.getElementById('copy-status');
+  const copyFallback = document.getElementById('copy-fallback');
+  const MAX_COPY_BYTES = 64 * 1024;
+  const MAX_COPY_BASE64 = 4 * Math.ceil(MAX_COPY_BYTES / 3);
+  // Matches the host clipboard's UI wait. Bounds what the page shows, not the
+  // browser's write, which cannot be cancelled.
+  const COPY_WAIT_MS = 3000;
+  let pendingCopy = null;
+  let copyGeneration = 0;
+  // At most one unresolved browser write, across requests: a second write
+  // could overtake the first and leave older text on the clipboard.
+  let copyWriting = false;
+  let copyTimer = null;
+
+  function clearCopy() {
+    copyGeneration++;
+    clearTimeout(copyTimer);
+    copyTimer = null;
+    pendingCopy = null;
+    copyButton.disabled = true;
+    copyFallback.value = '';
+    copyFallback.hidden = true;
+    copyStatus.textContent = '';
+    copyPanel.hidden = true;
+  }
+
+  function copyFallbackMessage(message) {
+    copyStatus.textContent = message;
+    copyFallback.value = pendingCopy;
+    copyFallback.hidden = false;
+  }
+
+  // A terminal request carries data, not browser activation or success. Keep
+  // one bounded request and require a fresh click before invoking the browser.
+  term.parser.registerOscHandler(52, (data) => {
+    clearCopy();
+    copyPanel.hidden = false;
+    try {
+      if (!data.startsWith('c;')) throw new Error();
+      const encoded = data.slice(2);
+      if (encoded.length > MAX_COPY_BASE64 ||
+          !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+        throw new Error();
+      }
+      const decoded = atob(encoded);
+      if (decoded.length > MAX_COPY_BYTES || btoa(decoded) !== encoded) throw new Error();
+      const bytes = Uint8Array.from(decoded, (c) => c.charCodeAt(0));
+      pendingCopy = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      copyButton.disabled = copyWriting;
+      copyStatus.textContent = 'Terminal copy requested; click Copy to clipboard.';
+      if (!isSecureContext || !navigator.clipboard?.writeText) {
+        copyFallbackMessage('Clipboard unavailable in this insecure or unsupported browser. Select and copy the text below.');
+      } else if (copyWriting) {
+        copyFallbackMessage('An earlier browser copy has not finished, so Copy to clipboard is unavailable. Select and copy the text below.');
+      }
+    } catch {
+      pendingCopy = null;
+      copyStatus.textContent = 'Terminal clipboard request rejected: invalid UTF-8/base64 or over 64 KiB.';
+    }
+    return true; // consume queries and malformed input too; never read a clipboard
+  });
+
+  copyButton.onclick = async () => {
+    if (pendingCopy === null || copyButton.disabled || copyWriting) return;
+    if (!isSecureContext || !navigator.clipboard?.writeText) {
+      copyFallbackMessage('Clipboard unavailable in this insecure or unsupported browser. Select and copy the text below.');
+      return;
+    }
+    const generation = copyGeneration;
+    copyWriting = true;
+    copyButton.disabled = true;
+    copyStatus.textContent = 'Copying in browser\u2026';
+    // Stop waiting, not writing: the button stays disabled until the browser
+    // answers, and the exact text becomes selectable meanwhile.
+    copyTimer = setTimeout(() => {
+      copyTimer = null;
+      if (generation !== copyGeneration) return;
+      copyFallbackMessage('The browser clipboard did not answer within 3 seconds; it may or may not have changed. Select and copy the text below.');
+    }, COPY_WAIT_MS);
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(pendingCopy);
+      copied = true;
+    } catch {}
+    copyWriting = false;
+    if (generation === copyGeneration) {
+      clearTimeout(copyTimer);
+      copyTimer = null;
+      if (copied) {
+        clearCopy();
+        copyPanel.hidden = false;
+        copyStatus.textContent = 'Copied in browser.';
+      } else {
+        copyButton.disabled = false;
+        copyFallbackMessage('Clipboard permission denied or unavailable. Select and copy the text below.');
+      }
+    } else if (pendingCopy !== null) {
+      // An older request settled. Its outcome says nothing about this text;
+      // only the button becomes usable again.
+      copyButton.disabled = false;
+      copyStatus.textContent = 'Earlier browser copy finished. Click Copy to clipboard, or select the text below.';
+    }
+  };
+  document.getElementById('copy-dismiss').onclick = clearCopy;
+
   ws.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) term.write(new Uint8Array(event.data));
   };
   ws.onclose = () => {
+    clearCopy();
     document.getElementById('status').hidden = false;
     term.write('\r\n\x1b[31m[disconnected]\x1b[0m\r\n');
   };

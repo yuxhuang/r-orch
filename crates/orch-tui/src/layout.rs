@@ -82,7 +82,7 @@ pub fn regions(
 
 /// Re-clamp `splitOffset` to ±`maxSplitOffset`, as every `contentH` change does.
 pub fn clamp_split_offset(offset: i32, content_h: u16) -> i32 {
-    let max = max_split_offset(content_h);
+    let max = max_split_offset(content_h).max(0);
     offset.clamp(-max, max)
 }
 
@@ -152,6 +152,22 @@ mod tests {
         assert_eq!(max_split_offset(content_h), 14);
         assert_eq!(clamp_split_offset(100, content_h), 14);
         assert_eq!(clamp_split_offset(-100, content_h), -14);
+    }
+
+    #[test]
+    fn n10_small_height_split_clamp_has_nonnegative_magnitude() {
+        for height in [13, 14, 15, 16, 24] {
+            let content_h = content_height(height);
+            let magnitude = max_split_offset(content_h).max(0);
+            for offset in [i32::MIN, -1, 0, 1, i32::MAX] {
+                assert_eq!(
+                    clamp_split_offset(offset, content_h),
+                    offset.clamp(-magnitude, magnitude)
+                );
+            }
+        }
+        let regions = regions(40, 14, ViewId::Tasks, 7, 0, false);
+        assert_eq!((regions.main_h, regions.feed_h), (3, 2));
     }
 
     #[test]

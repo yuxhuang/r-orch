@@ -17,6 +17,7 @@
 //!    they are `poll_*` methods drained once per frame, which is what makes the
 //!    TUI tests synchronous (ARCHITECTURE §8.4).
 
+pub mod copy;
 pub mod fake;
 
 pub use fake::{Call, FakeBackend, make_agent, make_goal, make_task, make_team};
@@ -30,6 +31,27 @@ use orch_domain::{
 /// Every fallible facade call reports a human message — the TUI only ever
 /// renders `Failed: {err}`.
 pub type BackendResult<T> = Result<T, String>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyTarget {
+    Auto,
+    Terminal,
+    Native,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyTicket(pub u64);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyOutcome {
+    NativeWritten,
+    TerminalRequested,
+    Failed(String),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyResult {
+    pub ticket: CopyTicket,
+    pub outcome: CopyOutcome,
+    pub guidance: Option<String>,
+}
 
 /// `onCreateTask(title, opts)`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -174,6 +196,17 @@ impl Default for LaunchContext {
 /// "not available" implementation where the TS prop was optional, so a partial
 /// backend (and the capability flags below) behave like a missing callback.
 pub trait TuiBackend {
+    fn copy_text(&mut self, text: &str) -> BackendResult<CopyTicket> {
+        self.copy_text_via(text, CopyTarget::Auto)
+    }
+    /// I0 safe default; B1 supplies asynchronous native/terminal transport.
+    fn copy_text_via(&mut self, _text: &str, _target: CopyTarget) -> BackendResult<CopyTicket> {
+        Err("Copy is not available".into())
+    }
+    fn poll_copy_results(&mut self) -> Vec<CopyResult> {
+        Vec::new()
+    }
+
     // ── Launch context ─────────────────────────────────────────────────────
 
     fn context(&self) -> LaunchContext;

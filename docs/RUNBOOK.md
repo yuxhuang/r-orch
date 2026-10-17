@@ -367,7 +367,7 @@ inside an agent session, this is why; it is the outer CLI declining, not an r-or
 **Symptom.** `orch tui` is running and you cannot select text with the mouse: dragging moves the
 dashboard's selection instead of highlighting, and your terminal's own copy-on-drag does nothing.
 
-**Why.** The dashboard asks the terminal for mouse reports (DEC 1000 + 1006), so button events are
+**Why.** The dashboard asks the terminal for mouse reports (DEC 1000 + 1002 + 1006), so button events are
 routed to the application instead of to the terminal's selection handling. That is the trade mouse
 support makes; PARITY.md §12.11 records it.
 
@@ -411,7 +411,7 @@ the alternate screen. `SIGKILL` and an abort cannot be covered — nothing runs 
 **Fix.**
 
 ```bash
-printf '\033[?1006l\033[?1000l\033[?2004l'   # mouse SGR, mouse, bracketed paste
+printf '\033[?1006l\033[?1002l\033[?1000l\033[?2004l'   # mouse SGR, mouse, bracketed paste
 reset                                         # or just reset the terminal wholesale
 ```
 
@@ -624,3 +624,36 @@ on the worker. Drain remote work first, or check each worker's task list afterwa
 The rule is enforced by tests in `crates/orch-peer/src/protocol.rs`, in both directions — current frames
 parsed by a copy of the previous release's shapes, and previous-release JSON parsed by the current frames.
 If you add a field, extend those tests; if you cannot keep them passing, you need the bump.
+
+## Copying text from the dashboard
+
+1. Focus a text section or open its viewer. Ctrl+Y copies the whole field/representation; viewer `y` copies its selection. Open F6 and choose
+   Copy selection or an explicit destination with arrows/Tab and Enter. F6, End, Enter explicitly chooses **Copy on this host**. The mouse
+   Copy chip/carousel offers the same actions. F1 shows the full matching request status and route guidance.
+2. **Copy requested from terminal** acknowledges emission only. The terminal must support and permit OSC 52.
+   Under tmux, `set-clipboard on` permits application requests subject to terminal policy; `external` ignores
+   application requests. Orch never changes this setting. Choose Copy on this host when the host clipboard is
+   the intended destination. With SSH, that host may be the server rather than your client.
+3. Under GNU screen the unwrapped OSC path is unsupported. Choose the host route or retry outside screen in a
+   supporting terminal. Auto under screen still requests the terminal; it does not write both clipboards.
+4. In `orch web`, request copy, then click **Copy to clipboard**. A secure context and browser permission are
+   needed. Denial or an insecure page exposes a selectable text box. Select that text and use the browser's
+   ordinary copy command. The client never reads the clipboard.
+5. **Busy** means the bounded host worker/tickets are occupied. Let results drain; a timed-out OS call cannot
+   be killed by the UI and no replacement worker is spawned. Native failure does not trigger a terminal write.
+   Requests over 64 KiB on the terminal route or 1 MiB on the host route are refused whole; select less text.
+
+The viewer includes the pressed glyph in a drag. Textarea selection uses insertion-position endpoints, so the
+same reverse drag can copy one fewer glyph there. Both preserve original source bytes. F2 releases capture for
+terminal-native selection. Hardware Option/Alt delivery depends on the terminal profile; use F6/arrows/Enter
+when modified copy keys are unavailable. Native Terminal.app/iTerm2 profiles and a real clipboard smoke have
+not been verified for this change; fake-sink tests do not prove OS delivery.
+
+## Editor exits and session drafts
+
+A changed editor offers Continue, Keep draft and Discard before navigation drops its edits. Keeping a draft
+uses RAM only, keyed to the edited form/entity. Reopening offers recovery; full/oversized draft storage refuses
+the save visibly. Quitting with drafts asks for confirmation and discards them on exit. A signal exits without
+an interactive prompt. Drafts do not survive crashes or restart, and wall-clock backsteps are not a durability
+mechanism. On a primary submit error, correct the retained form and retry. A partial post-create failure names
+the created entity; repair that entity rather than creating a duplicate.

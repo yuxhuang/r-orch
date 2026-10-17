@@ -45,21 +45,21 @@ const MAX_DRAIN: Duration = Duration::from_millis(40);
 /// and `config.yml` is a closed **L0** schema both binaries read (§6.5).
 pub const MOUSE_ENV: &str = "ORCH_TUI_MOUSE";
 
-/// The DEC private modes mouse capture turns on: normal tracking (1000) and
-/// SGR extended coordinates (1006).
+/// The DEC private modes mouse capture turns on: normal tracking (1000),
+/// button-motion tracking (1002) and SGR extended coordinates (1006).
 ///
-/// Deliberately **not** `crossterm::EnableMouseCapture`, which also sets 1002
-/// and **1003**. 1003 reports every pointer move — a continuous stream
+/// Deliberately **not** `crossterm::EnableMouseCapture`, which also sets
+/// **1003**. 1003 reports every pointer move — a continuous stream
 /// through tmux and the `orch web` websocket for a consumer we do not have,
-/// since there is no hover state. 1015 is redundant under 1006, ambiguous
+/// since there is no hover state. 1002 reports drags for text selection. 1015 is redundant under 1006, ambiguous
 /// with other CSI sequences, and unimplemented by xterm.js. 1006 is not
 /// optional: legacy X10 encodes a coordinate in one byte, so it cannot
 /// address past column 223.
-pub const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1006h";
+pub const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
 /// The reverse of [`ENABLE_MOUSE`], innermost mode first — mirroring
 /// crossterm's own `DisableMouseCapture`.
-pub const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1000l";
+pub const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 /// Does the environment forbid mouse capture at startup?
 fn mouse_env_allows() -> bool {
@@ -79,12 +79,25 @@ fn mouse_allowed_by(value: Option<&str>) -> bool {
     }
 }
 
-/// Write the narrow mode pair ourselves. The enable/disable *write* is ours;
+/// Write the narrow mode set ourselves. The enable/disable *write* is ours;
 /// **parsing stays crossterm's**, which is what ARCHITECTURE §4.8 protects.
 #[cfg(unix)]
 fn set_mouse_capture(stdout: &mut Stdout, on: bool) -> io::Result<()> {
-    stdout.write_all(if on { ENABLE_MOUSE } else { DISABLE_MOUSE }.as_bytes())?;
-    stdout.flush()
+    write_mouse_capture(stdout, on)
+}
+
+#[cfg(any(unix, test))]
+fn write_mouse_capture(writer: &mut impl Write, on: bool) -> io::Result<()> {
+    let result = writer
+        .write_all(if on { ENABLE_MOUSE } else { DISABLE_MOUSE }.as_bytes())
+        .and_then(|()| writer.flush());
+    if result.is_err() && on {
+        // An enable can fail after its first mode reached the terminal. The
+        // guard has not marked capture active yet, so undo partial writes here.
+        let _ = writer.write_all(DISABLE_MOUSE.as_bytes());
+        let _ = writer.flush();
+    }
+    result
 }
 
 /// On Windows `EnableMouseCapture` writes no ANSI at all — it reports
@@ -163,7 +176,10 @@ pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exi
         }
         guard.reconcile_mouse(app.state.mouse.enabled);
 
-        if app.state.should_exit || stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) {
+            app.request_exit(crate::keys::ExitCause::Signal);
+        }
+        if app.state.should_exit {
             return Ok(Exit::Requested);
         }
 
@@ -402,9 +418,9 @@ mod tests {
     /// part of this module that can be tested without a terminal — which also
     /// covers the restore *ordering* requirement.
     #[test]
-    fn the_enable_set_is_exactly_normal_tracking_plus_sgr() {
-        assert_eq!(ENABLE_MOUSE, "\x1b[?1000h\x1b[?1006h");
-        for unwanted in ["1002", "1003", "1015"] {
+    fn the_enable_set_is_exactly_normal_button_motion_and_sgr() {
+        assert_eq!(ENABLE_MOUSE, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        for unwanted in ["1003", "1015"] {
             assert!(
                 !ENABLE_MOUSE.contains(unwanted),
                 "mode {unwanted} must never be enabled: 1003 streams a report \
@@ -417,7 +433,7 @@ mod tests {
 
     #[test]
     fn the_disable_set_is_the_enable_set_reversed() {
-        assert_eq!(DISABLE_MOUSE, "\x1b[?1006l\x1b[?1000l");
+        assert_eq!(DISABLE_MOUSE, "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
         let enabled: Vec<&str> = ENABLE_MOUSE.split("\x1b[?").skip(1).collect();
         let disabled: Vec<&str> = DISABLE_MOUSE.split("\x1b[?").skip(1).collect();
         let modes = |seq: &[&str]| -> Vec<String> {
@@ -433,6 +449,85 @@ mod tests {
             "the innermost mode is turned off first, as crossterm's own \
              DisableMouseCapture does"
         );
+    }
+
+    #[test]
+    fn capture_writer_emits_exact_enable_and_reverse_disable_modes() {
+        let mut output = Vec::new();
+        write_mouse_capture(&mut output, true).unwrap();
+        write_mouse_capture(&mut output, false).unwrap();
+        assert_eq!(output, format!("{ENABLE_MOUSE}{DISABLE_MOUSE}").as_bytes());
+    }
+
+    #[derive(Default)]
+    struct FailingWriter {
+        bytes: Vec<u8>,
+        fail_after: Option<usize>,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(left) = self.fail_after {
+                if left == 0 {
+                    self.fail_after = None;
+                    return Err(io::Error::other("injected capture write failure"));
+                }
+                let count = left.min(buf.len());
+                self.bytes.extend_from_slice(&buf[..count]);
+                self.fail_after = Some(left - count);
+                return Ok(count);
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if std::mem::take(&mut self.fail_flush) {
+                Err(io::Error::other("injected capture flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn partial_enable_failure_disables_every_mode_before_returning_error() {
+        for fail_after in 0..ENABLE_MOUSE.len() {
+            let mut output = FailingWriter {
+                fail_after: Some(fail_after),
+                ..Default::default()
+            };
+            let error = write_mouse_capture(&mut output, true).unwrap_err();
+            assert_eq!(error.to_string(), "injected capture write failure");
+            let mut expected = ENABLE_MOUSE.as_bytes()[..fail_after].to_vec();
+            expected.extend_from_slice(DISABLE_MOUSE.as_bytes());
+            assert_eq!(output.bytes, expected);
+        }
+    }
+
+    #[test]
+    fn enable_flush_failure_still_tears_down_all_mouse_modes() {
+        let mut output = FailingWriter {
+            fail_flush: true,
+            ..Default::default()
+        };
+        let error = write_mouse_capture(&mut output, true).unwrap_err();
+        assert_eq!(error.to_string(), "injected capture flush failure");
+        assert_eq!(
+            output.bytes,
+            format!("{ENABLE_MOUSE}{DISABLE_MOUSE}").as_bytes()
+        );
+    }
+
+    #[test]
+    fn disable_failure_never_reenables_capture() {
+        let mut output = FailingWriter {
+            fail_after: Some(0),
+            ..Default::default()
+        };
+        assert!(write_mouse_capture(&mut output, false).is_err());
+        assert!(output.bytes.is_empty());
     }
 
     #[test]

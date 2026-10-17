@@ -25,6 +25,7 @@ pub mod layout;
 pub mod messages;
 pub mod mouse;
 pub mod msg;
+pub mod navigation;
 pub mod onboarding;
 pub mod runner;
 pub mod state;

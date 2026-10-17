@@ -84,6 +84,7 @@ impl PtySession {
         command.args(&spec.args);
         command.cwd(&spec.cwd);
         command.env("TERM", "xterm-256color");
+        command.env("ORCH_TUI_CLIENT", "web");
         command.env_remove(SCRUBBED_ENV);
 
         let child = pair

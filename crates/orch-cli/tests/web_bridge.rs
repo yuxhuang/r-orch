@@ -430,3 +430,15 @@ fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
+
+#[tokio::test]
+async fn the_web_child_is_explicitly_marked_for_client_clipboard_routing() {
+    let (addr, _) = start(
+        Auth::Open,
+        "printf 'client=%s marker-end\\n' \"$ORCH_TUI_CLIENT\"",
+    )
+    .await;
+    let mut client = connect(addr, &[]).await.expect("connect");
+    let seen = read_until(&mut client, "marker-end").await;
+    assert!(seen.contains("client=web"), "{seen:?}");
+}

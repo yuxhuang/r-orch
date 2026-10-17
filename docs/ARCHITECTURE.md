@@ -1419,3 +1419,25 @@ genuine cross-implementation value of the TS suite; the unit tests are worth por
 **Port the TUI tests as-is, sleeps included.** Cheapest path through 681 cases. **Rejected:** those sleeps are
 the direct cause of the 5–6 flaky failures in the reference suite. `TestBackend` makes them synchronous, which
 is strictly better and no more work.
+
+### TUI focus, snapshots and copy ownership
+
+The dashboard keeps explicit pane focus separate from entity selection. Rendered hit maps publish actual
+content rectangles, display-row navigation metrics and generations; key and mouse routing consume that frame.
+Viewer and editor hooks each run once before legacy dispatch. Click-caused editor transitions invalidate stale
+hits and suppress that exact footer before either hook or legacy actions; keyboard input remains independent.
+All user quit routes converge on guarded exit, while signals restore the terminal without prompting.
+
+Canonical message storage retains complete bodies under admission/count/text-allocation budgets. Live Raw
+bodies use shared immutable Arcs so a pinned viewer reuses source ownership and survives record eviction.
+Pending Strings charge capacity, live Arc text charges payload bytes, and IDs/previews charge String capacity.
+Control blocks, incoming backend queues, domain objects, allocator arenas and temporary rendering allocations
+are outside this component budget. One immutable viewer caches Human/Raw representations and only its active
+row index; visible rows escape controls without altering copy bytes. These limits do not bound process RSS.
+
+`TuiBackend` owns copy request/result contracts; orch-cli owns route selection, serialized OSC output and browser
+glue; orch-infra owns the native worker. Only the viewer Tick hook drains shared results. Feedback is matched by
+full origin and generation across viewer, editor and direct-field surfaces. Draft state belongs to the wizard
+session and remains memory only. No frozen orch-core port, storage format or peer protocol changes.
+See [ADR 0003](decisions/0003-tui-focus-viewer-and-clipboard-boundaries.md), the
+[backend contract](../crates/orch-tui/BACKEND.md) and [operator guidance](RUNBOOK.md#copying-text-from-the-dashboard).

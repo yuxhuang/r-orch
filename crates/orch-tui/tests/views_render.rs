@@ -10,7 +10,7 @@ use orch_domain::{
     TaskStatus,
 };
 use orch_tui::backend::{FakeBackend, make_agent, make_goal, make_task, make_team};
-use orch_tui::state::{ToastKind, ViewId};
+use orch_tui::state::{AgentSection, Focus, GoalSection, TaskSection, ToastKind, ViewId};
 use ratatui::crossterm::event::KeyCode;
 
 fn harness_for(view: ViewId, backend: FakeBackend) -> Harness {
@@ -411,6 +411,10 @@ fn v036_the_error_panel_shows_the_hint_the_fix_and_the_doctor_line() {
         agent_with_error("adapter_not_found", "spawn claude ENOENT"),
     );
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Error));
     harness.assert_text("⚠ Error");
     harness.assert_text("CLI is not installed.");
     harness.assert_text("Install it with: npm i -g @anthropic-ai/claude-code");
@@ -421,6 +425,10 @@ fn v036_the_error_panel_shows_the_hint_the_fix_and_the_doctor_line() {
 fn v037_a_kind_without_a_doctor_hint_omits_the_doctor_line() {
     let mut harness = harness_for(ViewId::Agents, agent_with_error("process_crash", "killed"));
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Error));
     harness.assert_text("Agent process crashed.");
     harness.refute_text("Diagnostics: orch doctor");
 }
@@ -429,6 +437,10 @@ fn v037_a_kind_without_a_doctor_hint_omits_the_doctor_line() {
 fn v038_the_unknown_kind_also_shows_the_raw_message() {
     let mut harness = harness_for(ViewId::Agents, agent_with_error("unknown", "raw detail"));
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Error));
     harness.assert_text("Unknown error.");
     harness.assert_text("raw detail");
 }
@@ -440,6 +452,10 @@ fn v039_auth_failed_hides_the_raw_message() {
         agent_with_error("auth_failed", "401 unauthorized"),
     );
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Error));
     harness.assert_text("API key is invalid.");
     harness.refute_text("401 unauthorized");
 }
@@ -448,6 +464,10 @@ fn v039_auth_failed_hides_the_raw_message() {
 fn v040_the_error_panel_shows_a_relative_age() {
     let mut harness = harness_for(ViewId::Agents, agent_with_error("timeout", "slow"));
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Error));
     harness.assert_text("ago");
 }
 
@@ -482,6 +502,10 @@ fn v043_a_task_without_a_description_or_summary_says_so() {
         FakeBackend::new().with_tasks(vec![make_task("tsk_1", "Bare", TaskStatus::Todo)]),
     );
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Description));
     harness.assert_text("No description.");
 }
 
@@ -491,7 +515,11 @@ fn v044_the_task_detail_panel_lists_attachments_by_name() {
     task.attachments = Some(vec!["/tmp/shot.png".into()]);
     let mut harness = harness_for(ViewId::Tasks, FakeBackend::new().with_tasks(vec![task]));
     harness.press(KeyCode::Enter);
-    harness.assert_text("attachments (1)");
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Attachments));
+    harness.assert_text("Attachments");
     harness.assert_text("/tmp/shot.png");
 }
 
@@ -516,9 +544,17 @@ fn v046_the_task_detail_panel_shows_the_agent_summary_as_the_result() {
     });
     let mut harness = harness_for(ViewId::Tasks, FakeBackend::new().with_tasks(vec![task]));
     harness.press(KeyCode::Enter);
-    harness.assert_text("result");
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Result));
+    harness.assert_text("Result");
     harness.assert_text("Implemented the thing");
-    harness.assert_text("files 1 changed · feat/x");
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Files));
+    harness.assert_text("Files (1 changed · feat/x)");
 }
 
 #[test]
@@ -573,6 +609,10 @@ fn v051_an_agent_without_a_role_says_so() {
         FakeBackend::new().with_agents(vec![make_agent("agt_1", "plain", AgentStatus::Idle)]),
     );
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Role));
     harness.assert_text("No role description.");
 }
 
@@ -622,7 +662,11 @@ fn v054_the_updated_row_appears_only_when_it_differs_from_created() {
 fn v055_the_goal_detail_panel_lists_only_its_linked_tasks() {
     let mut harness = harness_for(ViewId::Goals, linked_backend());
     harness.press(KeyCode::Enter);
-    harness.assert_text("tasks (2)");
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Tasks));
+    harness.assert_text("Tasks");
     harness.assert_text("Linked task");
     harness.refute_text("Orphan");
 }
@@ -641,7 +685,11 @@ fn v057_the_goal_detail_panel_renders_the_full_progress_report() {
     backend.goal_progress_report = "line one\nline two\nline three\nline four".into();
     let mut harness = harness_for(ViewId::Goals, backend);
     harness.press(KeyCode::Enter);
-    harness.assert_text("progress");
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Progress));
+    harness.assert_text("Progress");
     harness.assert_text("line four");
 }
 
@@ -652,6 +700,10 @@ fn v058_a_goal_without_a_description_says_so() {
         FakeBackend::new().with_goals(vec![make_goal("goal_1", "G", GoalStatus::Active)]),
     );
     harness.press(KeyCode::Enter);
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Description));
     harness.assert_text("No description.");
 }
 
@@ -674,7 +726,7 @@ fn v060_the_detail_panel_advertises_the_resize_and_max_hints() {
         FakeBackend::new().with_tasks(vec![make_task("tsk_1", "T", TaskStatus::Todo)]),
     );
     harness.press(KeyCode::Enter);
-    harness.assert_text("+/- resize │ M max");
+    harness.assert_text("Tab/Esc to list to act");
 }
 
 #[test]
@@ -685,7 +737,7 @@ fn v061_a_maximized_panel_advertises_exit_max() {
     );
     harness.press(KeyCode::Enter);
     harness.key('M');
-    harness.assert_text("+/- exit max");
+    harness.assert_text("M restores to act; Esc closes detail");
 }
 
 #[test]
@@ -1064,8 +1116,8 @@ fn remote_agents_show_capabilities_location_and_offline_state() {
     });
     let mut harness = harness_for(ViewId::Agents, FakeBackend::new().with_agents(vec![agent]));
     harness.assert_text("OFFLINE");
-    harness.assert_text("CAPS:linux");
-    harness.assert_text("WHERE:w1 offline");
+    harness.assert_text("linux");
+    harness.assert_text("w1 offline");
 }
 
 /// The detail panel shows the phase, in the phase's own colour, and the one
@@ -1149,4 +1201,370 @@ fn remote_task_chips_come_from_the_worker_phase() {
     assert!(chip(RemotePhase::Unknown).contains("◈ RUN?"));
     // An outcome has arrived: the task's own status is the truth again.
     assert!(chip(RemotePhase::Terminal).contains("⠋ RUN"));
+}
+
+#[test]
+fn v095_wizard_reserves_two_rows_before_banners_at_minimum_size() {
+    use orch_tui::state::{Focus, InputMode};
+    use orch_tui::wizard::{StepKind, Wizard, WizardKind, WizardStep};
+    for (toasts, expected_height, expected_y) in [(0, 3, 11), (1, 3, 10), (2, 2, 9)] {
+        let backend = FakeBackend::new().with_tasks(
+            (0..8)
+                .map(|i| make_task(&format!("t{i}"), "T", TaskStatus::Todo))
+                .collect(),
+        );
+        let mut harness = Harness::sized(backend, 40, 14);
+        harness.app.state.input_mode = InputMode::Wizard;
+        harness.app.state.wizard = Some(Wizard::new(
+            WizardKind::Task,
+            "New task",
+            vec![WizardStep::new(
+                "description",
+                "Description",
+                StepKind::Textarea,
+            )],
+        ));
+        for _ in 0..toasts {
+            harness
+                .app
+                .state
+                .push_toast(ToastKind::Done, "Notice", "done", harness.now());
+        }
+        harness.draw();
+        let key = orch_tui::state::PaneKey {
+            view: ViewId::Tasks,
+            entity: None,
+            section: Focus::MainList,
+        };
+        let metrics = harness
+            .app
+            .state
+            .mouse
+            .hits
+            .pane_metrics(&key)
+            .expect("main geometry published");
+        assert_eq!(
+            metrics.body,
+            ratatui::layout::Rect::new(0, 7, 40, expected_height)
+        );
+        let label: String = (0..40)
+            .map(|x| harness.terminal.backend().buffer()[(x, 6)].symbol())
+            .collect();
+        assert!(label.contains("Description"), "{label}");
+        assert!(expected_y + 2 <= 13 - toasts);
+    }
+}
+
+#[test]
+fn v096_details_render_one_section_with_size_dependent_overview_pin() {
+    for (width, height) in [(40, 14), (80, 24), (120, 40)] {
+        let mut goal = make_goal("goal", "Pinned identity", GoalStatus::Active);
+        goal.description = (0..40)
+            .map(|n| format!("description-row-{n:02}\n"))
+            .collect();
+        let mut harness = Harness::sized(FakeBackend::new().with_goals(vec![goal]), width, height);
+        harness.app.state.view = ViewId::Goals;
+        harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+        harness
+            .app
+            .state
+            .set_focus(Focus::GoalDetail(GoalSection::Description));
+        harness.draw();
+        let key = harness
+            .app
+            .state
+            .pane_key(Focus::GoalDetail(GoalSection::Description));
+        let metrics = harness
+            .hits()
+            .pane_metrics(&key)
+            .expect("visible section geometry");
+        assert!(metrics.body.height > 0);
+        assert_eq!(
+            metrics.items, 0,
+            "read-only description has no selectable rows"
+        );
+        assert_eq!(metrics.display_rows, 41, "complete source rows retained");
+        assert!(harness.text().contains("> Description"));
+        let pin = harness.hits().zones().iter().any(|zone| {
+            zone.rect.height == 2
+                && zone.kind
+                    == orch_tui::hit::ZoneKind::DetailSection(Focus::GoalDetail(
+                        GoalSection::Overview,
+                    ))
+        });
+        assert_eq!(pin, height > 14, "overview pin floor at {width}x{height}");
+    }
+}
+
+#[test]
+fn v097_contextual_help_preserves_exact_step_and_scrolls_at_minimum_size() {
+    use orch_tui::state::{CopyHelpContext, InputMode};
+    use orch_tui::wizard::{DraftKey, StepKind, Wizard, WizardKind, WizardStep};
+    let mut harness = Harness::sized(FakeBackend::new(), 40, 14);
+    let description = format!(
+        "Start of full help. {} End of full help.",
+        "wide description ".repeat(30)
+    );
+    let wizard = Wizard::new(
+        WizardKind::Task,
+        "Task",
+        vec![
+            WizardStep::new("description", "Description", StepKind::Textarea)
+                .description(&description),
+        ],
+    );
+    let draft = DraftKey::from_wizard(&wizard);
+    harness.app.state.wizard = Some(wizard);
+    harness.app.state.input_mode = InputMode::Wizard;
+    let origin = harness
+        .app
+        .state
+        .register_editor_origin(draft, "description".into())
+        .expect("live origin");
+    harness.app.state.copy_help = Some(CopyHelpContext {
+        origin: origin.clone(),
+        scroll_row: 0,
+    });
+    harness.app.state.show_help = true;
+    let text = harness.text();
+    assert!(text.contains("COPY HELP — Description"), "{text}");
+    assert!(text.contains("Start of full help."), "{text}");
+    assert!(
+        text.contains("Esc/F1 closes; outside click closes"),
+        "{text}"
+    );
+    harness.app.state.copy_help.as_mut().unwrap().scroll_row = usize::MAX;
+    let text = harness.text();
+    assert!(text.contains("maximized detail to the list."), "{text}");
+    assert_eq!(harness.app.state.copy_help.as_ref().unwrap().origin, origin);
+    assert_eq!(
+        harness.app.state.wizard.as_ref().unwrap().step_id(),
+        "description"
+    );
+}
+
+#[test]
+fn v098_wrapped_detail_rows_publish_source_byte_anchors_beyond_u16() {
+    let mut task = make_task("task", "Long document", TaskStatus::Todo);
+    task.description = (0..8000)
+        .map(|n| format!("line {n:05} and more text\n"))
+        .collect();
+    let mut harness = Harness::sized(FakeBackend::new().with_tasks(vec![task]), 80, 24);
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    let focus = Focus::TaskDetail(TaskSection::Description);
+    harness.app.state.set_focus(focus);
+    let key = harness.app.state.pane_key(focus);
+    harness.app.state.pane_states.push((
+        key.clone(),
+        orch_tui::navigation::ScrollState {
+            selected: None,
+            offset: 7000,
+        },
+    ));
+    harness.draw();
+    assert!(harness.text().contains("line 07000 and more text"));
+    assert!(
+        harness
+            .hits()
+            .source_anchors
+            .iter()
+            .any(|(_, _, byte)| *byte > u16::MAX as usize)
+    );
+    assert_eq!(
+        harness.hits().pane_metrics(&key).unwrap().display_rows,
+        8001
+    );
+}
+
+#[test]
+fn v099_wizard_main_metrics_follow_exact_banner_budget_at_ordinary_sizes() {
+    use orch_tui::state::{InputMode, PaneKey};
+    use orch_tui::wizard::{StepKind, Wizard, WizardKind, WizardStep};
+    for (width, height) in [(80, 24), (120, 40)] {
+        for toast_count in 0..=2 {
+            let backend = FakeBackend::new().with_tasks(
+                (0..20)
+                    .map(|i| make_task(&format!("t{i}"), "T", TaskStatus::Todo))
+                    .collect(),
+            );
+            let mut harness = Harness::sized(backend, width, height);
+            harness.app.state.input_mode = InputMode::Wizard;
+            harness.app.state.wizard = Some(Wizard::new(
+                WizardKind::Task,
+                "Create",
+                vec![WizardStep::new(
+                    "description",
+                    "Description",
+                    StepKind::Textarea,
+                )],
+            ));
+            for _ in 0..toast_count {
+                harness
+                    .app
+                    .state
+                    .push_toast(ToastKind::Done, "Notice", "done", harness.now());
+            }
+            harness.draw();
+            let key = PaneKey {
+                view: ViewId::Tasks,
+                entity: None,
+                section: Focus::MainList,
+            };
+            let actual = harness.hits().pane_metrics(&key).unwrap().body;
+            let baseline = orch_tui::layout::regions(
+                width,
+                height,
+                ViewId::Tasks,
+                harness.app.state.list_item_count(true),
+                0,
+                false,
+            );
+            let work = height - 8;
+            let expected_main = baseline.main_h.min(work - toast_count - 2);
+            assert_eq!(
+                actual,
+                ratatui::layout::Rect::new(0, 7, width, expected_main)
+            );
+        }
+    }
+}
+
+#[test]
+fn v100_compact_pickers_reveal_the_last_item_and_keep_confirm_cancel_clickable() {
+    use orch_tui::hit::{VerbId, ZoneKind};
+    for agent_picker in [false, true] {
+        let agents = (0..30)
+            .map(|i| make_agent(&format!("a{i}"), &format!("agent {i}"), AgentStatus::Idle))
+            .collect();
+        let mut harness = Harness::sized(FakeBackend::new().with_agents(agents), 40, 14);
+        harness.app.state.view = ViewId::Logs;
+        harness.app.state.show_agent_picker = agent_picker;
+        harness.app.state.show_type_picker = !agent_picker;
+        harness.app.state.picker_cursor = if agent_picker { 29 } else { 7 };
+        harness.draw();
+        let zones = harness.hits().zones();
+        assert!(
+            zones.iter().any(|zone| if agent_picker {
+                matches!(zone.kind, ZoneKind::PickerRow { index: 29, .. })
+            } else {
+                matches!(zone.kind, ZoneKind::TypePickerRow { index: 7, .. })
+            }),
+            "last item must be visible"
+        );
+        for verb in [VerbId::PickerConfirm, VerbId::PickerCancel] {
+            assert!(
+                zones.iter().any(|zone| zone.kind == ZoneKind::Verb(verb)),
+                "{verb:?} must remain clickable"
+            );
+        }
+    }
+}
+
+#[test]
+fn v101_detail_soft_wrap_anchors_preserve_whole_graphemes() {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut goal = make_goal("g", "Unicode", GoalStatus::Active);
+    let body = format!("{}👩‍👩‍👧‍👦 {}", "a".repeat(38), "e\u{301}".repeat(50));
+    goal.description = body.clone();
+    let mut harness = Harness::sized(FakeBackend::new().with_goals(vec![goal]), 40, 14);
+    harness.app.state.view = ViewId::Goals;
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness.app.state.detail_maximized = true;
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Description));
+    harness.draw();
+    let boundaries: Vec<_> = body
+        .grapheme_indices(true)
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(body.len()))
+        .collect();
+    assert!(harness.hits().source_anchors.len() > 1);
+    for (_, _, byte) in &harness.hits().source_anchors {
+        assert!(boundaries.contains(byte), "anchor {byte} splits a grapheme");
+    }
+}
+
+#[test]
+fn v102_direct_field_feedback_uses_reserved_footer_without_opening_viewer() {
+    use orch_tui::backend::{CopyOutcome, CopyResult, CopyTarget, CopyTicket};
+    for (width, height) in [(40, 14), (80, 24)] {
+        let mut task = make_task("t", "Copy source", TaskStatus::Todo);
+        task.description = "Copy these exact bytes".into();
+        let mut harness = Harness::sized(FakeBackend::new().with_tasks(vec![task]), width, height);
+        harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+        harness
+            .app
+            .state
+            .set_focus(Focus::TaskDetail(TaskSection::Description));
+        let origin = harness
+            .app
+            .state
+            .active_copy_origin()
+            .expect("field origin");
+        harness.app.state.register_copy_request(
+            origin.clone(),
+            CopyTarget::Auto,
+            Ok(CopyTicket(7)),
+            harness.now(),
+        );
+        harness.assert_text("Copy pending");
+        harness.app.state.apply_copy_result(
+            CopyResult {
+                ticket: CopyTicket(7),
+                outcome: CopyOutcome::NativeWritten,
+                guidance: None,
+            },
+            harness.now(),
+        );
+        harness.assert_text("Copied on this host");
+        assert!(harness.app.state.viewer.is_none());
+        harness.app.state.dismiss_copy_feedback(&origin);
+        harness.refute_text("Copied on this host");
+    }
+}
+
+#[test]
+fn v103_activity_reports_cumulative_retention_losses_at_minimum_width() {
+    let mut harness = Harness::sized(FakeBackend::new(), 40, 14);
+    harness.app.execute_command("status");
+    harness.app.state.flush_messages(harness.now());
+    harness.app.state.retained_evicted = 2;
+    harness.app.state.retained_rejected = 3;
+    harness.assert_text("evicted2 rejected3");
+}
+
+#[test]
+fn v104_viewer_help_retains_the_full_capture_date_and_source_provenance() {
+    use orch_tui::state::CopyHelpContext;
+    use orch_tui::widgets::text_viewer::{
+        Completeness, Representation, TextViewer, ViewerDocument, ViewerSource,
+    };
+    let mut harness = Harness::sized(FakeBackend::new(), 80, 24);
+    let source = ViewerSource::Message(7);
+    harness.app.state.viewer = Some(TextViewer::new(ViewerDocument {
+        source: source.clone(),
+        title: "Full source name".into(),
+        body: "full bytes".into(),
+        representation: Representation::Raw,
+        raw_body: None,
+        completeness: Completeness::Complete,
+        original_bytes: 10,
+        captured_at_ms: 0,
+        initial_anchor: 0,
+    }));
+    let origin = harness
+        .app
+        .state
+        .register_viewer_origin(source)
+        .expect("viewer origin");
+    harness.app.state.copy_help = Some(CopyHelpContext {
+        origin,
+        scroll_row: 0,
+    });
+    harness.app.state.show_help = true;
+    harness.assert_text("1970-01-01T00:00:00.000Z");
+    harness.assert_text("Full source name");
+    harness.assert_text("10 original bytes");
 }

@@ -5,6 +5,19 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- Inspect complete retained messages and fields in a snapshot viewer, select text, and copy through explicit host or terminal routes, with browser gesture and selectable fallback support.
+- Focus and page through lists, activity and detail sections with keyboard or mouse; Agents rows now align in a table.
+- Confirm changed-editor exits and recover bounded drafts for the current dashboard session.
+
+### Changed
+- Tab moves pane focus; Left/Right switch views, and entity action letters require main-list focus.
+- Mouse capture includes button-motion reporting for text selection; F2 returns selection to the terminal.
+
+### Fixed
+- Retain complete admitted message bodies, charge owned text capacity, share pinned Raw ownership, and count oversized-body rejection once.
+- Repaint cleared continuation cells after inspected ZWJ text in the browser.
+
 ## [0.5.2] - 2026-10-16
 
 Maintenance release: no behaviour or protocol change, so peers on 0.5.1 and 0.5.2 can be mixed.
