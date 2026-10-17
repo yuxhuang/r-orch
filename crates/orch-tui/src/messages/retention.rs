@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_accounting_includes_empty_allocations_and_moves_them_on_flush() {
+    fn capacity_accounting_charges_pending_capacity_and_shared_live_payload() {
         let incoming = PendingMessage {
             text: spare_capacity("preview", 128),
             detail: Some(spare_capacity("body", 256)),
@@ -345,7 +345,6 @@ mod tests {
             + incoming.task_id.as_ref().unwrap().capacity();
         let pointers = (
             incoming.text.as_ptr(),
-            incoming.detail.as_ref().unwrap().as_ptr(),
             incoming.agent_id.as_ref().unwrap().as_ptr(),
             incoming.task_id.as_ref().unwrap().as_ptr(),
         );
@@ -355,12 +354,18 @@ mod tests {
         let report = stage_message(&mut staged, &mut live, incoming);
         assert_eq!(report.owned_bytes, capacity);
         let report = flush_messages(&mut staged, &mut live, &mut next_id, 1);
-        assert_eq!(report.owned_bytes, capacity);
+        // Conversion drops the String's spare capacity. The exact-size Arc
+        // payload is charged once and shared with the pinned Raw document.
+        assert_eq!(report.owned_bytes, capacity - 256 + 4);
         let message = &live[0];
+        let document = super::super::message_document(message, 0, 0);
+        assert!(std::sync::Arc::ptr_eq(
+            message.detail.as_ref().unwrap(),
+            &document.body,
+        ));
         assert_eq!(
             (
                 message.text.as_ptr(),
-                message.detail.as_ref().unwrap().as_ptr(),
                 message.agent_id.as_ref().unwrap().as_ptr(),
                 message.task_id.as_ref().unwrap().as_ptr(),
             ),

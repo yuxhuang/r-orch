@@ -3,6 +3,15 @@
 > **Status: historical.** Matching the TypeScript original is no longer a goal; this appendix is not updated.
 > See [ADR 0002](../decisions/0002-parity-is-no-longer-a-goal.md).
 
+## Current Rust additions
+
+The historical inventory below describes the TypeScript source, not current Rust behavior. The Rust dashboard
+adds aligned Agents rows, explicit pane focus, display-row paging/wheel navigation, full-text immutable viewers,
+Human/Raw representations, source-byte selection, bounded host/terminal/browser copy and guarded RAM drafts.
+Tab moves pane focus; Left/Right switch views. The historical 2,048-character detail cap and absence of clipboard
+writing below do not apply to the Rust implementation. See [dashboard usage](../../README.md#reading-navigating-and-editing-in-the-dashboard),
+[copy troubleshooting](../RUNBOOK.md#copying-text-from-the-dashboard) and [ADR 0003](../decisions/0003-tui-focus-viewer-and-clipboard-boundaries.md).
+
 Derived from a full read of the Ink/React implementation at `parity/orch-ts`.
 
 **Primary sources**

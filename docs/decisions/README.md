@@ -49,5 +49,6 @@ What gets easier, what gets harder, what must change as a result.
 |---|---|---|
 | [0001](0001-plans-and-decision-records.md) | Plans and decision records | accepted |
 | [0002](0002-parity-is-no-longer-a-goal.md) | Parity with the TypeScript original is no longer a goal | accepted |
+| [0003](0003-tui-focus-viewer-and-clipboard-boundaries.md) | TUI focus, snapshot viewer and clipboard transport boundaries | accepted |
 
 `docs/reviews/` holds historical gate reviews from the port; new material does not go there.

@@ -259,3 +259,23 @@ Two notes back:
 * **Feeding `DiskObserver` into the same queue is exactly right.** The TUI has
   no way to tell the sources apart and must not: `observer_mode` in
   `LaunchContext` only drives the header chip and the 3 s poll interval.
+
+## Copy request and result boundary
+
+`copy_text(text)` delegates to `copy_text_via(text, CopyTarget::Auto)`. The explicit targets are Auto, Terminal
+and Native. Implementations return a `CopyTicket` or an immediate safe error; the default facade declines copy
+and drains no results. `EngineBackend` overrides both `copy_text_via` and `poll_copy_results` with its CLI
+transport. A ticket is registered with the full viewer/editor/field origin before input handling returns.
+
+Only the viewer Tick hook drains `poll_copy_results`, including when no viewer is open. Outcomes are
+`NativeWritten`, `TerminalRequested` and `Failed(String)`, with per-request fixed `guidance`. The bounded
+`CopyFeedbackStore` correlates full origins and generations; completed-but-undrained tickets count toward the
+two-ticket transport limit. Dismissal hides presentation without canceling a pending association; obsolete
+origins are drained without presenting a result on another field. The TUI never calls arboard or writes OSC.
+
+The CLI serializes bounded OSC 52 on its output sink or queues the native worker in orch-infra. Native retains
+one clipboard handle, at most two tickets and a three-second UI deadline. An OS stall is not cancellable; no
+worker replacement or uncertain-result fallback is allowed. Explicit Native never writes OSC, including on
+failure. Auto chooses terminal under web/SSH/TMUX/STY; otherwise it attempts the host route, with terminal
+fallback only for definite initial unavailability. The browser PTY marker and first-party write-only handler
+belong to orch-cli. Their gesture/denial/fallback UI is separate from the terminal-request acknowledgement.

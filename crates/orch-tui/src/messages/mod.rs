@@ -257,7 +257,7 @@ impl Message {
     pub fn owned_bytes(&self) -> usize {
         record_bytes(
             &self.text,
-            self.detail.as_ref(),
+            self.detail.as_ref().map_or(0, |detail| detail.len()),
             self.agent_id.as_ref(),
             self.task_id.as_ref(),
         )
@@ -429,12 +429,12 @@ fn known_message_text(value: &serde_json::Value, depth: usize) -> Option<(String
 
 pub(crate) fn record_bytes(
     text: &String,
-    detail: Option<&String>,
+    detail_bytes: usize,
     agent: Option<&String>,
     task: Option<&String>,
 ) -> usize {
     text.capacity()
-        .saturating_add(detail.map_or(0, String::capacity))
+        .saturating_add(detail_bytes)
         .saturating_add(agent.map_or(0, String::capacity))
         .saturating_add(task.map_or(0, String::capacity))
 }
@@ -505,7 +505,7 @@ impl PendingMessage {
     pub fn owned_bytes(&self) -> usize {
         record_bytes(
             &self.text,
-            self.detail.as_ref(),
+            self.detail.as_ref().map_or(0, String::capacity),
             self.agent_id.as_ref(),
             self.task_id.as_ref(),
         )
