@@ -1603,7 +1603,9 @@ impl AppState {
                         AgentSortField::Original => agent_status_order(left.status)
                             .cmp(&agent_status_order(right.status))
                             .then_with(|| a.cmp(b)),
-                        AgentSortField::Name => left.name.cmp(&right.name),
+                        AgentSortField::Name => {
+                            left.name.to_lowercase().cmp(&right.name.to_lowercase())
+                        }
                         AgentSortField::Status => {
                             agent_status_order(left.status).cmp(&agent_status_order(right.status))
                         }
@@ -1621,11 +1623,13 @@ impl AppState {
                             .remote
                             .as_ref()
                             .map_or("local", |remote| remote.alias.as_str())
+                            .to_lowercase()
                             .cmp(
-                                right
+                                &right
                                     .remote
                                     .as_ref()
-                                    .map_or("local", |remote| remote.alias.as_str()),
+                                    .map_or("local", |remote| remote.alias.as_str())
+                                    .to_lowercase(),
                             ),
                     };
                     let order = if self.agent_sort.descending {

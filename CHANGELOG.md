@@ -10,6 +10,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - `docs/specs/` and a spec-driven workflow for contributors and agents ([ADR 0004](docs/decisions/0004-spec-driven-development.md)): requirements with acceptance checks, short execution plans with task tables, and bounded design-review loops.
 
 ### Fixed
+- Keep the Logs inspector pinned while messages arrive, preserve `G` navigation with `End` for follow, sort agent names and locations without case sensitivity, and reserve Activity header space for the follow state.
 - Follow new entries in the Activity panel, ACTIONS list and task-detail Activity at the bottom; scrolling up pauses, and returning to the bottom or focusing a feed there resumes.
 
 ## [0.6.0] - 2026-10-17

@@ -41,6 +41,11 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx.style(Token::Ghost),
         ),
     ];
+    let follow_label = if state.activity_follow_tail {
+        " · following"
+    } else {
+        " · paused · End follows"
+    };
     let mut filter_width = spans_width(&suffix);
     if state.retained_evicted > 0 || state.retained_rejected > 0 {
         let losses = format!(
@@ -49,6 +54,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         );
         if spans_width(&suffix) as usize
             + unicode_width::UnicodeWidthStr::width(losses.as_str())
+            + unicode_width::UnicodeWidthStr::width(follow_label)
             + 20
             > area.width as usize
         {
@@ -65,11 +71,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     // rather than this view re-deriving that layout.
     let suffix_width = filter_width;
     suffix.push(Span::styled(
-        if state.activity_follow_tail {
-            " · following"
-        } else {
-            " · paused · End follows"
-        },
+        follow_label,
         ctx.style(if state.activity_follow_tail {
             Token::Green
         } else {

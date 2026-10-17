@@ -331,7 +331,7 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 
     if state.focus != crate::state::Focus::MainList {
         let text = if state.is_live_feed(state.focus) {
-            "↑↓ scroll; End/G follows; Up pauses; Tab panes; Enter expands; F1 help"
+            "↑↓ scroll; End follows; Up pauses; Tab panes; Enter expands; F1 help"
         } else if state.detail_maximized {
             "M restores to act; Esc closes detail; Ctrl+Y copy; F1 help"
         } else if detail_open {

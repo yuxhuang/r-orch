@@ -1568,3 +1568,26 @@ fn v104_viewer_help_retains_the_full_capture_date_and_source_provenance() {
     harness.assert_text("Full source name");
     harness.assert_text("10 original bytes");
 }
+
+#[test]
+fn activity_header_drops_filter_to_preserve_losses_and_follow_label() {
+    for (width, following, label) in [(54, true, "following"), (64, false, "paused · End follows")]
+    {
+        let mut h = Harness::sized(FakeBackend::new(), width, 24);
+        h.app.execute_command("status");
+        h.app.state.flush_messages(h.now());
+        h.app.state.activity_follow_tail = following;
+        h.app.state.retained_evicted = 2;
+        h.app.state.retained_rejected = 3;
+        h.draw();
+        let (_, y) = h.find_text("ACTIVITY").unwrap();
+        let header = h.line(y);
+        assert!(header.contains(label), "{header}");
+        assert!(header.contains("evicted2 rejected3"), "{header}");
+        assert!(!header.contains("F:"), "{header}");
+        assert!(!h.hits().zones().iter().any(|z| matches!(
+            z.kind,
+            orch_tui::hit::ZoneKind::Verb(orch_tui::hit::VerbId::CycleActivityFilter)
+        ) && z.rect.width > 0));
+    }
+}

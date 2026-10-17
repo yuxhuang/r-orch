@@ -268,7 +268,7 @@ fn sort_and_follow_keys_keep_independent_state_in_agents_view() {
     assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
     assert!(!h.app.state.activity_follow_tail);
     let sort = h.app.state.agent_sort;
-    h.key('G');
+    h.press(KeyCode::End);
     assert!(h.app.state.activity_follow_tail);
     assert_eq!(h.app.state.agent_sort, sort);
     h.press(KeyCode::Up).key('0');
@@ -279,4 +279,40 @@ fn sort_and_follow_keys_keep_independent_state_in_agents_view() {
     h.app.state.set_focus(Focus::MainList);
     h.key('G');
     assert_eq!(h.app.state.view, ViewId::Goals);
+}
+
+#[test]
+fn name_and_location_sort_ignore_case_then_break_ties_by_raw_name_and_id() {
+    use orch_tui::state::{AgentSort, AgentSortField};
+    for field in [AgentSortField::Name, AgentSortField::Location] {
+        let agents = [
+            ("b", "bob"),
+            ("z", "Zed"),
+            ("a2", "alice"),
+            ("a1", "alice"),
+            ("upper", "ALICE"),
+        ]
+        .into_iter()
+        .map(|(id, name)| {
+            let mut agent = make_agent(id, name, AgentStatus::Idle);
+            agent.remote = Some(RemoteRef {
+                alias: name.into(),
+                online: true,
+            });
+            agent
+        })
+        .collect();
+        let mut h = Harness::with(FakeBackend::new().with_agents(agents));
+        h.app.state.view = ViewId::Agents;
+        h.app.state.set_agent_sort(AgentSort {
+            field,
+            descending: false,
+        });
+        assert_eq!(ids(&h), ["upper", "a1", "a2", "b", "z"], "{field:?}");
+        h.app.state.set_agent_sort(AgentSort {
+            field,
+            descending: true,
+        });
+        assert_eq!(ids(&h), ["z", "b", "upper", "a1", "a2"], "{field:?}");
+    }
 }

@@ -173,7 +173,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         inner,
         y,
         vec![Span::styled(
-            "Tab panes; ←→ views; Home/End edges. Feeds: End/G follows; Up pauses.",
+            "Tab panes; ←→ views; Home/End edges. Feeds: End follows; Up pauses.",
             ctx.style(Token::Dim),
         )],
     );

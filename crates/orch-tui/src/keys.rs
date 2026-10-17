@@ -255,7 +255,13 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 return;
             }
             KeyCode::Char('i') if view == ViewId::Logs && !detail_open => {
-                if self.state.selected_log().is_some() {
+                if let Some(id) = self.state.selected_log().map(|m| m.id) {
+                    // Inspect the current entry without following incoming messages.
+                    if self.state.log_selected_index < 0 {
+                        self.state.log_selected_index =
+                            self.state.filtered_messages().len().saturating_sub(1) as i64;
+                        self.state.log_selected_id = Some(id);
+                    }
                     self.state.detail = DetailPanel::Log;
                     self.state.set_focus(Focus::LogDetail(LogSection::Metadata));
                 }
@@ -279,10 +285,6 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             }
             KeyCode::Home => {
                 self.navigate_focus(NavAction::Home, false);
-                return;
-            }
-            KeyCode::Char('G') if self.state.is_live_feed(self.state.focus) => {
-                self.navigate_focus(NavAction::End, false);
                 return;
             }
             KeyCode::End => {

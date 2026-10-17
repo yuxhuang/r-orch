@@ -5,7 +5,7 @@ use orch_domain::TaskStatus;
 use orch_tui::backend::{FakeBackend, make_task};
 use orch_tui::messages::{Message, MsgType, PendingMessage};
 use orch_tui::navigation::ScrollState;
-use orch_tui::state::{DetailPanel, Focus, TaskSection, ViewId};
+use orch_tui::state::{DetailPanel, Focus, LogSection, TaskSection, ViewId};
 use orch_tui::theme::Token;
 use ratatui::crossterm::event::KeyCode;
 
@@ -147,7 +147,7 @@ fn focusing_a_feed_whose_viewport_is_at_bottom_resumes_following() {
 }
 
 #[test]
-fn g_and_page_down_resume_each_feed_and_up_moves_off_the_last_entry() {
+fn end_and_page_down_resume_each_feed_and_up_moves_off_the_last_entry() {
     for (focus, view) in focuses() {
         let mut h = feed(focus, view);
         h.press(KeyCode::Up);
@@ -164,7 +164,7 @@ fn g_and_page_down_resume_each_feed_and_up_moves_off_the_last_entry() {
         assert_eq!(selected, 78, "{focus:?}");
         h.press(KeyCode::PageDown);
         assert!(following(&h));
-        h.press(KeyCode::Home).key('G');
+        h.press(KeyCode::Home).press(KeyCode::End);
         assert!(following(&h));
         assert_eq!(h.app.state.view, view);
     }
@@ -306,4 +306,48 @@ fn bottom_log_row_can_still_expand_while_following() {
         &*h.app.state.viewer.as_ref().unwrap().document().body,
         "entry-079"
     );
+}
+
+#[test]
+fn shift_g_leaves_live_feeds_for_goals_instead_of_resuming() {
+    for (focus, view) in [
+        (Focus::MainList, ViewId::Logs),
+        (Focus::Activity, ViewId::Logs),
+        (Focus::Activity, ViewId::Agents),
+        (Focus::Activity, ViewId::Goals),
+    ] {
+        let mut h = feed(focus, view);
+        h.press(KeyCode::Home).key('G');
+        assert_eq!(h.app.state.view, ViewId::Goals, "{focus:?} in {view:?}");
+    }
+}
+
+#[test]
+fn opening_log_inspector_pins_tail_content_and_body_scroll_on_append() {
+    let mut h = feed(Focus::MainList, ViewId::Logs);
+    let text = (0..100)
+        .map(|i| format!("pinned line {i}\n"))
+        .collect::<String>();
+    append(&mut h, &text);
+    // A previous paused selection must not override the current tail entry.
+    h.draw().press(KeyCode::Up).press(KeyCode::End).key('i');
+    assert_eq!(h.app.state.detail, DetailPanel::Log);
+    assert_eq!(h.app.state.log_selected_index, 80);
+    let id = h.app.state.selected_log().unwrap().id;
+    h.app.state.set_focus(Focus::LogDetail(LogSection::Body));
+    h.draw().press(KeyCode::PageDown).draw();
+    let key = h.app.state.pane_key(h.app.state.focus);
+    let scroll = h.app.state.pane_scroll(&key);
+    assert!(scroll.offset > 0);
+    let before = visible(&mut h);
+    append(&mut h, "new arrival");
+    assert_eq!(h.app.state.selected_log().unwrap().id, id);
+    assert_eq!(visible(&mut h), before);
+    assert_eq!(h.app.state.pane_scroll(&key), scroll);
+    // Returning to the list still permits explicit follow.
+    h.app.state.set_focus(Focus::MainList);
+    h.press(KeyCode::End);
+    assert!(following(&h));
+    append(&mut h, "resumed arrival");
+    assert_eq!(h.app.state.selected_log().unwrap().text, "resumed arrival");
 }
