@@ -11,7 +11,7 @@ mod common;
 use common::Harness;
 use orch_domain::AgentStatus;
 use orch_tui::backend::{Call, FakeBackend, make_agent};
-use orch_tui::state::{InputMode, ViewId};
+use orch_tui::state::{Focus, InputMode, ViewId};
 use ratatui::crossterm::event::KeyCode;
 
 fn fleet() -> FakeBackend {
@@ -597,11 +597,30 @@ fn msg032_uppercase_m_still_maximizes_the_detail_panel() {
 }
 
 #[test]
-fn msg033_m_works_with_the_detail_panel_open_like_its_neighbours() {
+fn msg033_m_waits_for_main_list_focus_with_the_detail_panel_open_like_its_neighbours() {
     let mut harness = fleet_harness();
     harness.app.state.view = ViewId::Agents;
     harness.app.state.agent_selected = 0;
     harness.press(KeyCode::Enter);
+    assert!(harness.app.state.detail_open());
+    assert_ne!(
+        harness.app.state.focus,
+        Focus::MainList,
+        "Enter moves focus into the detail panel"
+    );
+
+    // D1: entity actions belong to the main list. With a detail section
+    // focused, `m` must not open, prefill or send anything.
+    harness.key('m');
+    assert_eq!(harness.app.state.input_mode, InputMode::None);
+    assert_eq!(harness.app.state.command_bar.input.value(), "");
+    assert!(harness.app.state.detail_open());
+    assert!(harness.calls().is_empty());
+
+    // Explicitly returning focus to the main list (the panel stays open)
+    // re-enables messaging the selected agent.
+    harness.press(KeyCode::BackTab);
+    assert_eq!(harness.app.state.focus, Focus::MainList);
     assert!(harness.app.state.detail_open());
 
     harness.key('m');
