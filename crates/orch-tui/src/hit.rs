@@ -252,6 +252,9 @@ pub struct HitMap {
     zones: Vec<Zone>,
     valid: bool,
     pub metrics: FrameMetrics,
+    /// Source byte anchors for the visible read-only rows, in draw order.
+    pub source_anchors: Vec<(Rect, ViewerSource, usize)>,
+    pub source_versions: Vec<(ViewerSource, u64)>,
 }
 
 impl HitMap {
@@ -262,7 +265,20 @@ impl HitMap {
             zones: Vec::new(),
             valid: true,
             metrics: FrameMetrics::default(),
+            source_anchors: Vec::new(),
+            source_versions: Vec::new(),
         }
+    }
+
+    pub fn source_anchor(&self, x: u16, y: u16) -> Option<(&ViewerSource, usize)> {
+        if !self.contains(x, y) {
+            return None;
+        }
+        self.source_anchors
+            .iter()
+            .rev()
+            .find(|(rect, _, _)| rect.contains((x, y).into()))
+            .map(|(_, source, byte)| (source, *byte))
     }
 
     /// Absent or invalidated frame metrics never authorize a footer hit.

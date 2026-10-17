@@ -329,6 +329,38 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let selected_agent = state.selected_agent();
     let selected_goal = state.selected_goal();
 
+    if state.focus != crate::state::Focus::MainList {
+        let text = if state.detail_maximized {
+            "M restores to act; Esc closes detail; Ctrl+Y copy; F1 help"
+        } else if detail_open {
+            "Tab/Esc to list to act; Enter expands; Ctrl+Y copy; F1 help"
+        } else {
+            "Tab next pane; Enter expands; Ctrl+Y copy; F1 help"
+        };
+        put_line(
+            frame,
+            area,
+            area.y,
+            vec![Span::styled(text, ctx.style(Token::Dim))],
+        );
+        if let Some(byte) = text.find("Esc") {
+            ctx.zone(
+                Rect::new(area.x + byte as u16, area.y, 3, 1),
+                area,
+                ZoneKind::FooterHint(FooterAction::CloseDetail),
+                ZoneId::Footer(FooterAction::CloseDetail),
+            );
+        }
+        if text.starts_with('M') {
+            ctx.zone(
+                Rect::new(area.x, area.y, 1, 1),
+                area,
+                ZoneKind::Verb(VerbId::DetailMax),
+                ZoneId::Verb(VerbId::DetailMax),
+            );
+        }
+        return;
+    }
     let can_new = !detail_open && ctx.caps.can_create_for(view);
     let can_run =
         view == ViewId::Tasks && selected_task.is_some_and(|t| crate::state::is_runnable(t.status));
@@ -385,7 +417,7 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     // `↑↓` and `Tab/←→` stay unclickable: a 2-cell span with two opposite
     // meanings would have to guess the direction from the sub-cell.
     hint(&mut spans, "↑↓", "", Token::Gray, None);
-    hint(&mut spans, "Tab/←→", "", Token::Gray, None);
+    hint(&mut spans, "Tab panes; ←→ views", "", Token::Gray, None);
     hint(
         &mut spans,
         "/",
@@ -525,6 +557,9 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             Some(FooterAction::Enter),
         );
     }
+    if view == ViewId::Logs {
+        hint(&mut spans, "i", "inspector", Token::Dim, None);
+    }
     // `Q quit` arms before it exits, and the arming is shown in place rather
     // than as a toast: at most two toasts are ever drawn (`state.rs:985`), so
     // a toast could be invisible exactly when it matters (design §3.5).
@@ -591,9 +626,15 @@ pub fn render_suggestions(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
     let selected = ctx.state.command_bar.suggestion_index;
     let max_visible = area.height as usize;
-    let scroll_start = selected
-        .saturating_sub(max_visible.saturating_sub(1))
-        .min(suggestions.len().saturating_sub(1));
+    let mut scroll_start = ctx
+        .state
+        .suggestion_scroll
+        .min(suggestions.len().saturating_sub(max_visible));
+    if selected < scroll_start {
+        scroll_start = selected;
+    } else if selected >= scroll_start.saturating_add(max_visible) {
+        scroll_start = selected.saturating_add(1).saturating_sub(max_visible);
+    }
 
     ctx.zone(
         area,

@@ -19,6 +19,18 @@ use orch_tui::state::{DetailPanel, InputMode, ViewId};
 use orch_tui::theme::Token;
 use ratatui::crossterm::event::KeyCode;
 
+// Resolve the semantic control: I0 uses Enter/Tab, while B2 renders Tab OK.
+fn click_wizard_confirm(harness: &mut Harness) {
+    let rect = harness
+        .hits()
+        .zones()
+        .iter()
+        .find(|z| z.kind == ZoneKind::Verb(orch_tui::hit::VerbId::WizardConfirm))
+        .expect("visible wizard confirm control")
+        .rect;
+    harness.click(rect.x, rect.y);
+}
+
 fn tasks(n: usize) -> Vec<orch_domain::Task> {
     (0..n)
         .map(|i| {
@@ -190,9 +202,13 @@ fn m008_a_log_row_click_under_a_filter_indexes_the_filtered_set() {
 
 #[test]
 fn m009_double_clicking_a_log_row_toggles_the_log_detail() {
-    let mut harness = logs_with_messages();
-    harness.double_click_text("msg-38");
-    assert_eq!(harness.app.state.detail, DetailPanel::Log);
+    let mut h = logs_with_messages();
+    h.click_text("msg-38");
+    h.draw();
+    h.click_text("msg-38");
+    let snapshot = h.app.state.viewer.as_ref().expect("complete snapshot");
+    assert!(snapshot.document().body.contains("msg-38"));
+    assert_eq!(h.app.state.detail, DetailPanel::None);
 }
 
 #[test]
@@ -582,7 +598,7 @@ fn m038_clicking_enter_detail_and_esc_close_open_and_close_the_panel() {
     // (§3.3.3), so a second footer click has to wait that out.
     harness.clock.advance_ms(DOUBLE_CLICK_MS + 1);
     harness.draw();
-    harness.click_text("Esc close");
+    harness.click_text("Esc to list");
     assert_eq!(harness.app.state.detail, DetailPanel::None);
 }
 
@@ -762,7 +778,7 @@ fn m047_a_section_header_row_is_not_clickable() {
 fn m048_the_arrow_hints_are_not_clickable() {
     let mut harness = wide();
     let before = harness.app.state.task_selected;
-    harness.click_text("Tab/←→");
+    harness.click_text("Tab panes; ←→ views");
     assert_eq!(harness.app.state.view, ViewId::Tasks, "no tab switch");
     assert_eq!(harness.app.state.task_selected, before);
 }
@@ -1214,30 +1230,45 @@ fn m076_the_wheel_does_nothing_over_a_task_or_agent_detail() {
 
 #[test]
 fn m077_the_wheel_scrolls_an_open_goal_detail_without_moving_the_selection() {
-    let mut harness = view(ViewId::Goals);
-    harness.app.state.goal_selected = 1;
-    harness.app.state.detail = DetailPanel::Entity;
-    harness.draw();
-    let (_, y) = harness.find_text("GOAL:").expect("the goal detail");
-    harness.wheel_down(20, y.saturating_sub(2));
-    assert_eq!(harness.app.state.goal_selected, 1, "selection unchanged");
-    assert_eq!(
-        harness.app.state.goal_detail_scroll, 1,
-        "the one detail panel that has scroll state scrolls"
-    );
+    use orch_tui::state::{Focus, GoalSection};
+    let mut h = view(ViewId::Goals);
+    h.app.state.goal_selected = 1;
+    let id = h.app.state.selected_goal().unwrap().id.clone();
+    h.app
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.id == id)
+        .unwrap()
+        .description = "line\n".repeat(100);
+    h.app.state.detail = DetailPanel::Entity;
+    h.app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Description));
+    h.draw();
+    let key = h.app.state.pane_key(h.app.state.focus);
+    let body = h.hits().pane_metrics(&key).unwrap().body;
+    h.wheel_down(body.x, body.y);
+    assert_eq!(h.app.state.goal_selected, 1);
+    assert_eq!(h.app.state.pane_scroll(&key).offset, 3);
 }
 
 #[test]
 fn m078_the_wheel_does_nothing_over_a_log_detail() {
-    let mut harness = logs_with_messages();
-    harness.click_text("msg-38");
-    harness.draw();
-    harness.double_click_text("msg-38");
-    assert_eq!(harness.app.state.detail, DetailPanel::Log);
-    harness.draw();
-    let before = harness.app.state.log_selected_index;
-    harness.wheel_down(20, 10);
-    assert_eq!(harness.app.state.log_selected_index, before);
+    use orch_tui::state::{Focus, LogSection};
+    let mut h = logs_with_messages();
+    h.click_text("msg-38");
+    h.key('i');
+    let index = h.app.state.filtered_messages()[h.app.state.log_selected_index as usize];
+    h.app.state.messages[index].detail = Some("line\n".repeat(100));
+    h.app.state.set_focus(Focus::LogDetail(LogSection::Body));
+    h.draw();
+    let before = h.app.state.log_selected_index;
+    let key = h.app.state.pane_key(h.app.state.focus);
+    let body = h.hits().pane_metrics(&key).unwrap().body;
+    h.wheel_down(body.x, body.y);
+    assert_eq!(h.app.state.log_selected_index, before);
+    assert_eq!(h.app.state.pane_scroll(&key).offset, 3);
 }
 
 #[test]
@@ -1408,7 +1439,7 @@ fn m085_clicking_a_wizard_hint_verb_confirms_and_goes_back() {
     harness.click_text("+ add agent...");
     harness.type_str("alpha");
     harness.draw();
-    harness.click_text("Enter/Tab confirm");
+    click_wizard_confirm(&mut harness);
     let step = harness
         .app
         .state
@@ -1421,6 +1452,12 @@ fn m085_clicking_a_wizard_hint_verb_confirms_and_goes_back() {
 
     harness.draw();
     harness.click_text("Esc back");
+    if harness.app.state.wizard_sessions.pending_leave.is_some() {
+        harness.draw().click_text("Continue editing");
+        assert_eq!(harness.app.state.wizard.as_ref().unwrap().step_id(), step);
+        harness.draw().click_text("Esc back");
+        harness.draw().click_text("Discard and leave");
+    }
     assert_eq!(
         harness.app.state.wizard.as_ref().unwrap().step_id(),
         "name",
@@ -1747,6 +1784,7 @@ fn m098_every_click_on_a_multiselect_checkbox_toggles_it() {
             .len(),
         1
     );
+    harness.draw();
     // Second click, inside the double-click window, on the same cell.
     harness.click(x + 1, y);
     assert_eq!(
@@ -1964,7 +2002,7 @@ fn m105_the_textarea_confirm_hint_finishes_the_wizard() {
             break;
         }
         harness.draw();
-        harness.click_text("confirm");
+        click_wizard_confirm(&mut harness);
     }
     let kind = harness.app.state.wizard.as_ref().map(|w| w.step().kind);
     assert_eq!(
@@ -1974,9 +2012,7 @@ fn m105_the_textarea_confirm_hint_finishes_the_wizard() {
         harness.text()
     );
     harness.draw();
-    harness.assert_text("Tab confirm");
-
-    harness.click_text("Tab confirm");
+    click_wizard_confirm(&mut harness);
     assert_eq!(
         harness.app.state.input_mode,
         InputMode::None,
@@ -2181,10 +2217,8 @@ fn m110_the_mouse_and_the_keyboard_select_the_same_entity() {
 }
 
 #[test]
-fn m111_the_whole_confirm_label_is_clickable_including_its_modifier() {
-    // QA B2 nit: the textarea hint reads `Ctrl+Enter/Tab confirm`, and only
-    // the `Enter/Tab confirm` part used to be inside the zone, so clicking
-    // the `Ctrl+` did nothing.
+fn m111_the_whole_confirm_label_is_clickable_from_its_first_cell() {
+    // The first cell of the rendered confirmation label must be actionable.
     let mut harness = view(ViewId::Goals);
     harness.click_text("+ add goal...");
     harness.type_str("Ship it");
@@ -2195,20 +2229,22 @@ fn m111_the_whole_confirm_label_is_clickable_including_its_modifier() {
             break;
         }
         harness.draw();
-        harness.click_text("confirm");
+        click_wizard_confirm(&mut harness);
     }
     harness.draw();
-    // The first cell of the whole label, i.e. the `Ctrl`/`⌘` itself —
-    // searched as part of the label so it cannot match a `Ctrl` elsewhere.
-    let label = format!("{}+Enter/Tab confirm", orch_tui::widgets::wizard::CMD_KEY);
-    let (x, y) = harness
-        .find_text(&label)
-        .unwrap_or_else(|| panic!("{label:?} not on screen:\n{}", harness.text()));
+    // Locate the visible text independently of its hit rectangle, so a clipped
+    // zone cannot make this check pass by moving its own first cell.
+    let label = if harness.find_text("Tab OK").is_some() {
+        "Tab OK".into()
+    } else {
+        format!("{}+Enter/Tab confirm", orch_tui::widgets::wizard::CMD_KEY)
+    };
+    let (x, y) = harness.find_text(&label).expect("visible confirm label");
     harness.click(x, y);
     assert_eq!(
         harness.app.state.input_mode,
         InputMode::None,
-        "clicking the modifier end of the label confirms too"
+        "clicking the first cell of the visible label confirms too"
     );
     harness.assert_called(|c| matches!(c, Call::CreateGoal { .. }));
 }
