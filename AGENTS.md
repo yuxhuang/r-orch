@@ -315,6 +315,11 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
 6. On `master`: `git tag -a vX.Y.Z -m "vX.Y.Z"` then `git push origin vX.Y.Z`.
 7. Create the GitHub release with notes copied from the CHANGELOG section:
    `gh release create vX.Y.Z --title vX.Y.Z --notes-file <extract>`.
+8. The tag push runs `.github/workflows/homebrew.yml`, which points the Homebrew formula at the new tag and
+   commit. It skips pre-release tags, and refuses a tag that is not on `master` or does not match `Cargo.toml`.
+   Check that the run is green. To retry it, or for a tag created before the workflow existed, run
+   `gh workflow run homebrew -f tag=vX.Y.Z`. The tap's name and token live in repository variables and secrets
+   (see the workflow's header), never in the repo.
 
 `orch update` does not self-update; it only prints install instructions, so there is no update channel to
 publish. Never tag from a branch other than `master`, and never move or delete a pushed tag.
@@ -323,8 +328,8 @@ The release procedure is this section. Do not write a new release runbook or one
 release. If a step is missing, fix this section in the release PR. Scripts that are needed again belong under
 `xtask/`. They must stop on any failed command and must take the version as a parameter. Agent sessions may have
 no SSH agent, so use an HTTPS remote with the `gh` credential helper for pushes, and put HTTPS (or `<host>`)
-URLs in docs. Downstream packaging (a Homebrew formula and the like) lives outside this repo and is the owner's
-to update.
+URLs in docs. Apart from the formula update in step 8, downstream packaging lives outside this repo and is the
+owner's to update.
 
 ## Roles
 

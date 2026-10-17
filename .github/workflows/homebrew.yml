@@ -1,0 +1,133 @@
+# Point the Homebrew formula at a new release.
+#
+# Pushing a release tag (`vX.Y.Z`) rewrites the formula's `tag:` and `revision:`
+# in the tap repository and pushes that commit. Pre-release tags
+# (`vX.Y.Z-alpha.N`) are skipped: those stay opt-in and never reach the formula.
+#
+# The tap is private, so its name is kept in repository settings, not here
+# (AGENTS.md: no private infrastructure names in the repo):
+#
+#   vars.HOMEBREW_TAP_REPO       owner/name of the tap repository
+#   vars.HOMEBREW_FORMULA_PATH   the formula's path in it, e.g. Formula/<name>.rb
+#   secrets.HOMEBREW_TAP_TOKEN   fine-grained token for that repository only,
+#                                with Contents read and write
+#
+# A tag push runs the workflow file as it is at the tagged commit, so a tag
+# created before this file existed never triggers it. Run it by hand instead:
+#   gh workflow run homebrew -f tag=vX.Y.Z
+name: homebrew
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to point the formula at, e.g. v0.7.0'
+        required: true
+
+# One formula update at a time, and never cancel one halfway through a push.
+concurrency:
+  group: homebrew
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  formula:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Through env, never interpolated into a script: a tag name is input.
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+      FORMULA: ${{ vars.HOMEBREW_FORMULA_PATH }}
+    steps:
+      - name: Check the tag and the settings
+        id: tag
+        run: |
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::notice::$TAG is a pre-release; the formula is left alone"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$TAG' is not a vX.Y.Z tag"
+            exit 1
+          fi
+          if [ -z "$TAP_REPO" ] || [ -z "$FORMULA" ]; then
+            echo "::error::set the HOMEBREW_TAP_REPO and HOMEBREW_FORMULA_PATH repository variables"
+            exit 1
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.tag.outputs.release == 'true'
+        with:
+          path: src
+          ref: ${{ env.TAG }}
+          # Full history, so the tagged commit can be checked against master.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tagged commit
+        id: release
+        if: steps.tag.outputs.release == 'true'
+        working-directory: src
+        run: |
+          set -eu
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          # AGENTS.md, Release: tags are cut on master only.
+          if ! git merge-base --is-ancestor "$commit" origin/master; then
+            echo "::error::$TAG ($commit) is not on master"
+            exit 1
+          fi
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Cargo.toml says $version but the tag is $TAG"
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.tag.outputs.release == 'true'
+        with:
+          repository: ${{ vars.HOMEBREW_TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update the formula and push
+        if: steps.tag.outputs.release == 'true'
+        working-directory: tap
+        env:
+          COMMIT: ${{ steps.release.outputs.commit }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -eu
+          # Exactly one stable `tag:` and one `revision:` line; the `head` block
+          # has neither, so it is left alone.
+          for key in tag revision; do
+            count=$(grep -cE "^ +$key: +\"[^\"]*\",?$" "$FORMULA" || true)
+            if [ "$count" != 1 ]; then
+              echo "::error::expected one '$key:' line in $FORMULA, found $count"
+              exit 1
+            fi
+          done
+          sed -E -i \
+            -e "s/^( +tag: +)\"[^\"]*\"/\1\"$TAG\"/" \
+            -e "s/^( +revision: +)\"[^\"]*\"/\1\"$COMMIT\"/" \
+            "$FORMULA"
+          ruby -c "$FORMULA" > /dev/null
+          if git diff --quiet; then
+            echo "::notice::$FORMULA already points at $TAG"
+            exit 0
+          fi
+          git diff
+          name=$(basename "$FORMULA" .rb)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -am "$name $VERSION"
+          git push
+          echo "::notice::$FORMULA now points at $TAG ($COMMIT)"
