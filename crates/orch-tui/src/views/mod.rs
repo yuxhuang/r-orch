@@ -472,6 +472,13 @@ fn render_main(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             area.width,
             area.height.saturating_sub(2),
         )
+    } else if state.view == ViewId::Agents {
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        )
     } else {
         area
     };

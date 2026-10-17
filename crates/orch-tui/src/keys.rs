@@ -255,7 +255,13 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 return;
             }
             KeyCode::Char('i') if view == ViewId::Logs && !detail_open => {
-                if self.state.selected_log().is_some() {
+                if let Some(id) = self.state.selected_log().map(|m| m.id) {
+                    // Inspect the current entry without following incoming messages.
+                    if self.state.log_selected_index < 0 {
+                        self.state.log_selected_index =
+                            self.state.filtered_messages().len().saturating_sub(1) as i64;
+                        self.state.log_selected_id = Some(id);
+                    }
                     self.state.detail = DetailPanel::Log;
                     self.state.set_focus(Focus::LogDetail(LogSection::Metadata));
                 }
@@ -324,6 +330,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 return;
             }
             _ => {}
+        }
+
+        if view == ViewId::Agents {
+            match key.code {
+                KeyCode::Char('o') => {
+                    self.cycle_agent_sort();
+                    return;
+                }
+                KeyCode::Char('O') => {
+                    self.reverse_agent_sort();
+                    return;
+                }
+                KeyCode::Char('0') => {
+                    self.reset_agent_sort();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // Logs-only filter keys.
@@ -720,6 +744,27 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.retain_command_bar = false;
     }
 
+    pub(crate) fn cycle_agent_sort(&mut self) {
+        let mut sort = self.state.agent_sort;
+        sort.field = sort.field.next();
+        self.change_agent_sort(sort);
+    }
+
+    pub(crate) fn reverse_agent_sort(&mut self) {
+        let mut sort = self.state.agent_sort;
+        sort.descending = !sort.descending;
+        self.change_agent_sort(sort);
+    }
+
+    pub(crate) fn reset_agent_sort(&mut self) {
+        self.change_agent_sort(crate::state::AgentSort::default());
+    }
+
+    fn change_agent_sort(&mut self, sort: crate::state::AgentSort) {
+        self.state.set_agent_sort(sort);
+        self.state.clamp_all(self.backend.can_add_agent());
+    }
+
     /// Logs `a` — the agent filter picker, drafting the live filter.
     pub(crate) fn open_agent_picker(&mut self) {
         self.state.show_agent_picker = true;
@@ -961,7 +1006,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     fallback.main_h.saturating_sub(match self.state.view {
                         ViewId::Goals => 0,
                         ViewId::Tasks => 0,
-                        ViewId::Agents => 0,
+                        ViewId::Agents => 1,
                         ViewId::Logs => 2,
                     }) as usize
                 } else {
@@ -1095,7 +1140,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     |m| m.display_rows,
                 );
                 (
-                    self.state.pane_scroll(&key),
+                    if focus == Focus::TaskDetail(TaskSection::Activity) {
+                        self.state.task_activity_scroll(&key, h)
+                    } else {
+                        self.state.pane_scroll(&key)
+                    },
                     text.len(),
                     rows,
                     Vec::new(),
@@ -1107,20 +1156,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 )
             }
         };
-        let at_last = scroll.selected == items.checked_sub(1);
-        let following = match focus {
-            Focus::MainList if self.state.view == ViewId::Logs => self.state.log_selected_index < 0,
-            Focus::Activity => self.state.activity_follow_tail,
-            _ => false,
-        };
-        let effective = if following && action == NavAction::Up {
-            NavAction::End
-        } else {
-            action
-        };
         navigate(
             &mut scroll,
-            effective,
+            action,
             ScrollMetrics {
                 items,
                 display_rows,
@@ -1144,8 +1182,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.state.agent_scroll = scroll.offset;
                 }
                 ViewId::Logs => {
-                    let tail = action == NavAction::End
-                        || ((!wheel || following) && action == NavAction::Down && at_last);
+                    let tail = crate::follow::resumes_tail(action, &scroll, items, h, wheel);
                     self.state.log_selected_index = if tail {
                         -1
                     } else {
@@ -1159,8 +1196,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
             },
             Focus::Activity => {
-                self.state.activity_follow_tail = action == NavAction::End
-                    || ((!wheel || following) && action == NavAction::Down && at_last);
+                self.state.activity_follow_tail =
+                    crate::follow::resumes_tail(action, &scroll, items, h, wheel);
                 let rows = self.state.activity_messages();
                 self.state.activity_selected = scroll
                     .selected
@@ -1170,6 +1207,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.state.activity_last_position = scroll.selected.unwrap_or(0);
             }
             _ => {
+                if focus == Focus::TaskDetail(TaskSection::Activity)
+                    && crate::follow::resumes_tail(action, &scroll, items, h, wheel)
+                {
+                    scroll.selected = None;
+                }
                 self.state.set_pane_scroll(key, scroll);
             }
         }

@@ -258,11 +258,22 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if let Some(pane) = pane {
             self.state.set_focus(pane.key.section);
             if pane.items > 0 {
-                let mut scroll = self.state.pane_scroll(&pane.key);
+                let mut scroll =
+                    if pane.key.section == Focus::TaskDetail(crate::state::TaskSection::Activity) {
+                        self.state
+                            .task_activity_scroll(&pane.key, pane.body.height as usize)
+                    } else {
+                        self.state.pane_scroll(&pane.key)
+                    };
                 scroll.selected = Some(
                     (scroll.offset + usize::from(y.saturating_sub(pane.body.y)))
                         .min(pane.items.saturating_sub(1)),
                 );
+                if pane.key.section == Focus::TaskDetail(crate::state::TaskSection::Activity)
+                    && scroll.selected == pane.items.checked_sub(1)
+                {
+                    scroll.selected = None;
+                }
                 self.state.set_pane_scroll(pane.key, scroll);
             }
         }
@@ -498,6 +509,19 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             ZoneKind::Pane(focus) | ZoneKind::DetailSection(focus) => self.state.set_focus(*focus),
             ZoneKind::ActivityRow { message_id } => {
                 self.state.set_focus(Focus::Activity);
+                if self.state.activity_follow_tail {
+                    let height = self
+                        .state
+                        .mouse
+                        .hits
+                        .metrics
+                        .panes
+                        .iter()
+                        .find(|m| m.key.section == Focus::Activity)
+                        .map_or(0, |m| m.body.height as usize);
+                    self.state.activity_scroll =
+                        self.state.activity_messages().len().saturating_sub(height);
+                }
                 self.state.activity_selected = Some(*message_id);
                 self.state.activity_last_position = self
                     .state
@@ -505,7 +529,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     .iter()
                     .position(|i| self.state.messages[*i].id == *message_id)
                     .unwrap_or(0);
-                self.state.activity_follow_tail = false;
+                self.state.activity_follow_tail = self
+                    .state
+                    .activity_messages()
+                    .last()
+                    .is_some_and(|i| self.state.messages[*i].id == *message_id);
                 self.state.sync_field_origin();
             }
             // Inside the overlay, and the wheel-only regions: nothing.
@@ -602,6 +630,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             VerbId::OpenTypePicker => self.open_type_picker(),
             VerbId::CycleLogTypes => self.cycle_log_types(),
             VerbId::CycleActivityFilter => self.cycle_activity_filter(),
+            VerbId::CycleAgentSort => self.cycle_agent_sort(),
+            VerbId::ReverseAgentSort => self.reverse_agent_sort(),
+            VerbId::ResetAgentSort => self.reset_agent_sort(),
             VerbId::PickerToggle => {
                 if self.state.show_type_picker {
                     self.type_picker_toggle_cursor();
@@ -826,7 +857,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         // Leaving tail mode changes the footer's `Esc close` / `Enter detail`
         // pair, so the same reflow window applies.
         self.suppress_footer();
-        self.state.log_selected_index = filtered_index as i64;
+        self.state.log_selected_index = if filtered_index + 1 == filtered.len() {
+            -1
+        } else {
+            filtered_index as i64
+        };
         self.state.log_selected_id = filtered
             .get(filtered_index)
             .map(|i| self.state.messages[*i].id);

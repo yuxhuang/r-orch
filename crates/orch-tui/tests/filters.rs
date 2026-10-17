@@ -502,7 +502,7 @@ fn f038_the_live_chip_shows_in_tail_mode_and_the_browse_chip_when_selecting() {
     seed_messages(&mut harness);
     harness.assert_text("LIVE");
     harness.press(KeyCode::Up);
-    harness.assert_text("4/4");
+    harness.assert_text("3/4");
 }
 
 #[test]

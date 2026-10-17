@@ -857,7 +857,7 @@ fn f5_activity_selects_then_expands_exact_message_after_runner_redraw() {
 }
 
 #[test]
-fn n7_activity_wheel_at_final_never_reenters_tail_but_keyboard_down_does() {
+fn n7_activity_wheel_at_final_reenters_tail_like_keyboard_down() {
     use orch_tui::messages::{Message, MsgType};
     use orch_tui::theme::Token;
     let mut h = Harness::new();
@@ -872,8 +872,8 @@ fn n7_activity_wheel_at_final_never_reenters_tail_but_keyboard_down_does() {
     let key = h.app.state.pane_key(Focus::Activity);
     let body = h.hits().pane_metrics(&key).unwrap().body;
     h.wheel_down(body.x, body.y);
-    assert!(!h.app.state.activity_follow_tail);
-    h.press(KeyCode::Down);
+    assert!(h.app.state.activity_follow_tail);
+    h.press(KeyCode::Up).press(KeyCode::Down);
     assert!(h.app.state.activity_follow_tail);
 }
 

@@ -808,13 +808,16 @@ fn k081_the_type_picker_also_swallows_global_keys() {
 }
 
 #[test]
-fn k082_up_from_tail_jumps_to_the_last_message() {
+fn k082_up_from_tail_moves_to_the_previous_message() {
     let mut harness = logs_harness();
     harness.app.execute_command("status");
     harness.app.state.flush_messages(harness.now());
     let count = harness.app.state.messages.len();
     harness.press(KeyCode::Up);
-    assert_eq!(harness.app.state.log_selected_index, count as i64 - 1);
+    assert_eq!(
+        harness.app.state.log_selected_index,
+        count.saturating_sub(2) as i64
+    );
 }
 
 #[test]

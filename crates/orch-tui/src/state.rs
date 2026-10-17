@@ -513,6 +513,45 @@ pub enum TaskRow {
     },
 }
 
+/// Session-only agent ordering; Original preserves status then source order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentSortField {
+    #[default]
+    Original,
+    Name,
+    Status,
+    AdapterModel,
+    Location,
+}
+
+impl AgentSortField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Original => Self::Name,
+            Self::Name => Self::Status,
+            Self::Status => Self::AdapterModel,
+            Self::AdapterModel => Self::Location,
+            Self::Location => Self::Original,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::Name => "Name",
+            Self::Status => "Status",
+            Self::AdapterModel => "Adapter/Model",
+            Self::Location => "Location",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentSort {
+    pub field: AgentSortField,
+    pub descending: bool,
+}
+
 /// A rendered row of the agent list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRow {
@@ -609,6 +648,7 @@ pub struct AppState {
     pub goal_selected: usize,
     pub task_selected: usize,
     pub agent_selected: usize,
+    pub agent_sort: AgentSort,
     pub goal_scroll: usize,
     pub task_scroll: usize,
     pub agent_scroll: usize,
@@ -721,6 +761,7 @@ impl Default for AppState {
             goal_selected: 0,
             task_selected: 0,
             agent_selected: 0,
+            agent_sort: AgentSort::default(),
             goal_scroll: 0,
             task_scroll: 0,
             agent_scroll: 0,
@@ -1173,6 +1214,7 @@ impl AppState {
     pub fn set_focus(&mut self, focus: Focus) {
         if self.focus != focus {
             self.text_anchor = None;
+            self.resume_feed_at_bottom(focus);
         }
         self.focus = focus;
         if !matches!(focus, Focus::MainList | Focus::Activity | Focus::TextViewer) {
@@ -1305,13 +1347,16 @@ impl AppState {
                 let selected = self
                     .pane_scroll(&self.pane_key(self.focus))
                     .selected
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| rows.len().saturating_sub(1));
                 rows.get(selected).map(|m| ViewerSource::Message(m.id))
             }
             _ => None,
         }
     }
     pub fn selected_log(&self) -> Option<&Message> {
+        if self.log_selected_index < 0 {
+            return self.filtered_messages().last().map(|i| &self.messages[*i]);
+        }
         let index = usize::try_from(self.log_selected_index).ok()?;
         let filtered = self.filtered_messages();
         if let Some(id) = self.log_selected_id
@@ -1536,7 +1581,9 @@ impl AppState {
         self.sorted_tasks().len() - self.visible_tasks().len()
     }
 
-    /// `sortedAgents` — active-team members first, then team name, then status.
+    /// Active teams remain grouped; the session sort applies inside each section.
+    /// Original is the existing status/source order, not a timestamp order:
+    /// Agent carries neither created nor updated timestamps.
     pub fn sorted_agents(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.agents.len()).collect();
         order.sort_by(|a, b| {
@@ -1551,11 +1598,69 @@ impl AppState {
                     na.cmp(nb)
                 })
                 .then_with(|| {
-                    agent_status_order(self.agents[*a].status)
-                        .cmp(&agent_status_order(self.agents[*b].status))
+                    let (left, right) = (&self.agents[*a], &self.agents[*b]);
+                    let order = match self.agent_sort.field {
+                        AgentSortField::Original => agent_status_order(left.status)
+                            .cmp(&agent_status_order(right.status))
+                            .then_with(|| a.cmp(b)),
+                        AgentSortField::Name => {
+                            left.name.to_lowercase().cmp(&right.name.to_lowercase())
+                        }
+                        AgentSortField::Status => {
+                            agent_status_order(left.status).cmp(&agent_status_order(right.status))
+                        }
+                        AgentSortField::AdapterModel => {
+                            left.adapter.cmp(&right.adapter).then_with(|| {
+                                left.config
+                                    .model
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .cmp(right.config.model.as_deref().unwrap_or("").trim())
+                            })
+                        }
+                        AgentSortField::Location => left
+                            .remote
+                            .as_ref()
+                            .map_or("local", |remote| remote.alias.as_str())
+                            .to_lowercase()
+                            .cmp(
+                                &right
+                                    .remote
+                                    .as_ref()
+                                    .map_or("local", |remote| remote.alias.as_str())
+                                    .to_lowercase(),
+                            ),
+                    };
+                    let order = if self.agent_sort.descending {
+                        order.reverse()
+                    } else {
+                        order
+                    };
+                    // Keep equal field values deterministic in either direction.
+                    if self.agent_sort.field == AgentSortField::Original {
+                        order
+                    } else {
+                        order
+                            .then_with(|| left.name.cmp(&right.name))
+                            .then_with(|| left.id.cmp(&right.id))
+                    }
                 })
         });
         order
+    }
+
+    pub fn set_agent_sort(&mut self, sort: AgentSort) {
+        let selected = self.selected_agent().map(|agent| agent.id.clone());
+        self.agent_sort = sort;
+        if let Some(id) = selected
+            && let Some(position) = self
+                .sorted_agents()
+                .iter()
+                .position(|index| self.agents[*index].id == id)
+        {
+            self.agent_selected = position;
+        }
     }
 
     /// The **active** team an agent belongs to.
@@ -1805,7 +1910,7 @@ impl AppState {
                             | OnboardingStep::Completed
                     ))
             }
-            ViewId::Agents => self.agents.len() + 1 + self.agent_section_rows(),
+            ViewId::Agents => self.agents.len() + 2 + self.agent_section_rows(),
             ViewId::Logs => 0,
         }
     }
@@ -1870,7 +1975,13 @@ impl AppState {
         self.reconcile_message_selection(log);
         self.restore_message_viewports(anchors);
     }
-    fn message_viewport_anchors(&self) -> (Option<u64>, Option<u64>) {
+    fn message_viewport_anchors(
+        &self,
+    ) -> (
+        Option<u64>,
+        Option<u64>,
+        Option<crate::follow::TaskActivityAnchor>,
+    ) {
         let logs = self.filtered_messages();
         let activity = self.activity_messages();
         (
@@ -1887,22 +1998,31 @@ impl AppState {
             } else {
                 None
             },
+            self.task_activity_anchor(),
         )
     }
-    fn restore_message_viewports(&mut self, (log, activity): (Option<u64>, Option<u64>)) {
-        if let Some(row) = log.and_then(|id| {
-            self.filtered_messages()
+    fn restore_message_viewports(
+        &mut self,
+        (log, activity, task): (
+            Option<u64>,
+            Option<u64>,
+            Option<crate::follow::TaskActivityAnchor>,
+        ),
+    ) {
+        self.restore_task_activity_anchor(task);
+        if let Some(id) = log {
+            self.log_scroll_offset = self
+                .filtered_messages()
                 .iter()
                 .position(|i| self.messages[*i].id == id)
-        }) {
-            self.log_scroll_offset = row;
+                .unwrap_or(0);
         }
-        if let Some(row) = activity.and_then(|id| {
-            self.activity_messages()
+        if let Some(id) = activity {
+            self.activity_scroll = self
+                .activity_messages()
                 .iter()
                 .position(|i| self.messages[*i].id == id)
-        }) {
-            self.activity_scroll = row;
+                .unwrap_or(0);
         }
     }
     fn record_retention(&mut self, report: crate::messages::retention::RetentionReport) {
@@ -2184,7 +2304,7 @@ impl AppState {
             self.agent_scroll,
             &agent_rows,
             self.agent_rows(can_create).len(),
-            viewport(ViewId::Agents, 0),
+            viewport(ViewId::Agents, 1),
         );
         self.reconcile_message_selection(self.log_selected_id);
         self.normalize_focus();
