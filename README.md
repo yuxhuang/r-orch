@@ -45,14 +45,14 @@ cargo install --path crates/orch-cli
 
 Releases are tags on `master` (`vX.Y.Z`). v0.5.0 is the first release with
 [remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
-`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build). The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
+`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
 `orch update` does not self-update: it only prints how to install. To build a specific release from source:
 
 ```bash
 git clone <this repo> r-orch && cd r-orch
-git checkout v0.5.2
+git checkout v0.6.0
 cargo install --locked --path crates/orch-cli
-orch --version      # 0.5.2
+orch --version      # 0.6.0
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
@@ -411,8 +411,18 @@ talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notic
 Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
 cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
 
-### Known gaps in v0.5.2
+### Upgrading from v0.5.x
 
+v0.6.0 changes only the dashboard; 0.5.x and 0.6.0 peers interoperate, so upgrade them in any order. Keys
+you may notice: Tab now moves focus between panes, Left/Right switch views, and entity action letters only act
+while the main list has focus. Mouse capture now reports drags for text selection; press F2 to hand selection
+back to the terminal. Roll back by installing v0.5.2: v0.6.0 writes nothing new to `.orchestry/` (editor
+drafts last only for the dashboard session).
+
+### Known gaps in v0.6.0
+
+- Copy and mouse selection in a native terminal (Terminal.app, iTerm2) were not verified by hand before
+  release; the automated tests cover the copy routing, and the web dashboard's browser copy.
 - The automated multi-instance tests run every instance on one machine; no automated test covers two
   hosts or a physical network (v0.5.1 was verified by hand between a macOS controller and a Linux worker
   on a LAN).
