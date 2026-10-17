@@ -6,9 +6,9 @@ says how we will build it. Adopted in [ADR 0004](../decisions/0004-spec-driven-d
 ## When a spec is required
 
 Write one when a plan is required (see [plans](../plans/README.md#when-a-plan-is-required)) **and** the work has
-behaviour a user or operator will notice: in practice, every owner goal or feature request. Pure internal work
-(a refactor, a dependency swap, a release) needs a plan at most, with the requirements in its Goal section. Fixes
-need neither.
+behaviour a user or operator will notice. An owner request that meets no plan trigger needs no spec. Pure
+internal work (a refactor, a dependency swap, a release) needs a plan at most, with the requirements in its Goal
+section. Fixes need neither.
 
 ## Naming
 
@@ -24,7 +24,7 @@ need neither.
   shall \<response\>* when it always holds. Give each a source (an owner item number, or the review finding that
   added it), a priority (`must` / `should` / `won't`), and an acceptance check. Every owner item maps to at least
   one requirement or to an explicit `won't` row with a reason.
-- **Acceptance check.** A test path and name (`crates/orch-tui/tests/viewer.rs::opens_full_message`), or an exact
+- **Acceptance check.** A test path and name (`crates/orch-tui/tests/text_viewer.rs::<test_name>`), or an exact
   command with its expected result, plus the platform it runs on. "Reviewed" is not an acceptance check.
 - **Non-goals** and **constraints.** For anything that listens on a socket, crosses a process boundary or
   handles untrusted text, fill in the security checklist in the template before building, not at the gate.
@@ -43,8 +43,8 @@ The `status:` line at the top is the single source of truth.
 | Status | Meaning |
 |---|---|
 | `draft` | Written, not yet approved. |
-| `approved` | The owner (or the lead, where the owner delegated it) agreed to the requirements. Build may start. |
-| `done` | Every `must` row passes, or is recorded as `waived by owner`. Set in the PR that completes the work. |
+| `approved` | The owner agreed to the requirements. The lead may approve them only where the owner's request says so; quote that line in Source. Build may start. |
+| `done` | Every `must` row passes, or is recorded as `waived by owner`. An `env-limited` `must` row blocks `done` until it passes where it can run. Set in the PR that completes the work. |
 | `superseded` | Replaced; link the replacement. |
 
 Rules:
@@ -60,7 +60,7 @@ The acceptance column is the trace: requirement → test → result. Test names 
 ids in code comments or test names, so a superseded spec does not leave markers behind in the code.
 
 The PR that completes the work fills the spec's **Verification** table: for each requirement, the result
-(`pass`, `env-limited`, `waived by owner`), the commit and the platform it ran on. The rules:
+(`pass`, `env-limited`, `waived by owner`), the commit the check ran at, and the platform. The rules:
 - A failure that was already on the base commit is still a failure, not a pass.
 - `env-limited` means the check could not run where the work was done. Name where it must run instead.
 - List any defect found outside the requirement rows, and what happened to it.

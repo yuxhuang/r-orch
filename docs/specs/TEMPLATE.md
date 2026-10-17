@@ -3,7 +3,7 @@
 status: draft
 owner: <role or name>
 date: YYYY-MM-DD
-plan: [../plans/YYYY-MM-DD-<slug>.md](../plans/YYYY-MM-DD-<slug>.md)
+plan: [../plans/YYYY-MM-DD-<slug>.md](../plans/YYYY-MM-DD-<slug>.md) (or "to be written"; link it when the plan lands)
 
 ## Source
 > The owner's request, verbatim, items numbered 1..n.
@@ -39,7 +39,7 @@ What runs locally, what only on Linux CI, and what needs owner permission or har
 ## Verification
 Filled in by the PR that completes the work.
 
-| Id | Result (`pass` / `env-limited` / `waived by owner`) | Commit | Platform |
+| Id | Result (`pass` / `env-limited` / `waived by owner`) | Commit the check ran at | Platform |
 |---|---|---|---|
 | R1 | | | |
 

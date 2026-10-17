@@ -36,7 +36,9 @@ split it into versions.
 The loop is bounded by what each round finds, not by how many rounds there are:
 - A design gets one independent challenge, then one rebuttal from its author. Another round is justified only
   if the last one found something backed by executable evidence (a failing test, a compile probe, a reproduced
-  behaviour) or a blocking contract or safety problem.
+  behaviour), or a blocking problem that names the requirement or contract it breaks.
+- The lead, not the reviewer, decides whether another round runs. From the third round on, the lead writes the
+  reason in the plan, or escalates to the owner.
 - If an objection can be settled by a test or a probe, write the test or probe. Do not write another revision.
 - Before a second design revision, build a walking skeleton: the thinnest end-to-end slice, with the first
   acceptance test failing for the right reason.

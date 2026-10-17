@@ -90,7 +90,9 @@ prefix. A red PR is not reviewed or merged.
 
 **Merge policy.** The human owner merges by default. The owner may standing-delegate categories to the
 orchestrator; current delegation: docs-only, test-only, and CHANGELOG/plan-status PRs, once required checks are
-green. Everything else waits for the owner. Changes to the delegation are recorded here, in this paragraph.
+green. The exception is a change to the process itself (`AGENTS.md`, `docs/decisions/`, and the `docs/specs/` or
+`docs/plans/` README and TEMPLATE files), which the owner merges. Everything else waits for the owner. Changes to
+the delegation are recorded here, in this paragraph.
 
 ### Pre-PR check
 
@@ -141,8 +143,9 @@ Each task lands as a PR whose verify command passes.
 
 ### Specs (`docs/specs/`)
 
-Required when a plan is required **and** the work has behaviour a user or operator will notice (in practice,
-every owner goal). Read [docs/specs/README.md](docs/specs/README.md); start from `docs/specs/TEMPLATE.md`.
+Required when a plan is required **and** the work has behaviour a user or operator will notice. An owner
+request that meets no plan trigger needs no spec. Read [docs/specs/README.md](docs/specs/README.md); start from
+`docs/specs/TEMPLATE.md`.
 
 - The owner's request is quoted verbatim, with numbered items. Every item maps to a requirement (`R1`, `R2`, ...)
   or to a `won't` row with a reason.
@@ -151,10 +154,12 @@ every owner goal). Read [docs/specs/README.md](docs/specs/README.md); start from
   untrusted text before building, not at the review gate.
 - List the verification environment (what needs Linux, a second host, a real terminal, owner permission) and
   ask about it in the first approval request.
-- `status: draft -> approved -> done | superseded`. The owner approves requirements before the build starts.
-  Review findings that are real requirements become new rows.
+- `status: draft -> approved -> done | superseded`. The owner approves the requirements before the build
+  starts. The lead may approve them only where the owner's request says so; quote that line in the spec's
+  Source. Review findings that are real requirements become new rows.
 - The completing PR fills the spec's Verification table: result (`pass` / `env-limited` / `waived by owner`),
-  commit and platform for every row.
+  the commit the check ran at, and the platform, for every row. A `must` row that is `env-limited` blocks
+  `done` until it passes where it can run, or until the owner waives it.
 
 ### Plans (`docs/plans/`)
 
@@ -175,15 +180,10 @@ does not require a plan (the layered workspace makes that routine). Other fixes 
 
 ### Design review loops
 
-Bound them by what each round finds, not by how many rounds there are. See
+Bounded by what each round finds, not by a count. The lead decides whether another round runs, and from the
+third round on writes the reason in the plan or escalates to the owner. A test settles what a test can settle,
+and a walking skeleton comes before a second revision. The rules are in
 [docs/plans/README.md](docs/plans/README.md#design-review).
-
-- After one challenge round and one rebuttal, another round runs only if the last one found something backed by
-  executable evidence (a failing test, a compile probe, a reproduced behaviour) or a blocking contract or
-  safety problem.
-- If a test can settle an objection, write the test. Do not revise the document. Build a walking skeleton
-  before a second revision.
-- The reviewer who challenged a design does not build the slice they challenged.
 
 ### Handing out and finishing tasks
 
@@ -197,7 +197,7 @@ Bound them by what each round finds, not by how many rounds there are. See
 - **Reviewers write the verdict skeleton first** (scope, what will be checked), then fill it in, so an
   interrupted review still leaves a report. A diff over about 800 lines is reviewed in slices.
 - **Checkpoints change something.** A lead checkpoint must produce or change a deliverable (code, test, doc) or
-  record a decision. Reading or coverage ledgers are not gates.
+  record a decision in the spec, the plan, an ADR or a PR. Reading or coverage ledgers are not gates.
 - If a required reviewer is unavailable, use a substitute and record the substitution and why it is still
   independent. Do not retry the same failing reviewer again and again.
 
