@@ -17,6 +17,21 @@ use format::{
 
 /// Activity-feed ring buffer size.
 pub const MAX_MESSAGES: usize = 500;
+/// Largest retained message body or document representation, in UTF-8 bytes
+/// (design D4). A larger payload is rejected whole into an explicit
+/// "Body unavailable" record, never cut.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Shared budget for every owned text allocation of the pending and live
+/// message collections together, counted once per record (design D4).
+pub const RETENTION_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+const UNAVAILABLE_PREFIX: &str = "Body unavailable: exceeds 1 MiB (";
+const UNAVAILABLE_SUFFIX: &str = " bytes received)";
+
+/// The short record stored in place of a body over [`MAX_BODY_BYTES`].
+pub fn unavailable_notice(original_bytes: usize) -> String {
+    format!("{UNAVAILABLE_PREFIX}{original_bytes}{UNAVAILABLE_SUFFIX}")
+}
 /// `runId → agentId` / `runId → taskId` map cap (insertion-ordered LRU).
 pub const MAX_RUN_MAP_SIZE: usize = 500;
 /// Toast queue cap.
@@ -204,18 +219,138 @@ impl Message {
         self
     }
 
+    /// Store the complete detail. Size admission is the retention helpers'
+    /// job (design D4); nothing here cuts a body.
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
-        // `addMessage` caps the stored detail.
-        self.detail = detail.map(|d| {
-            if d.chars().count() > format::MAX_DETAIL_LEN {
-                let head: String = d.chars().take(format::MAX_DETAIL_LEN).collect();
-                format!("{head}…[truncated]")
-            } else {
-                d
-            }
-        });
+        self.detail = detail;
         self
     }
+
+    /// The received size of a body that was rejected whole for exceeding
+    /// [`MAX_BODY_BYTES`], or `None` for a retained body.
+    ///
+    /// A rejection is the pair (notice in the text, empty detail): a real
+    /// payload cannot produce it, because an empty payload also has an empty
+    /// summary.
+    pub fn unavailable_bytes(&self) -> Option<usize> {
+        if self.detail.as_deref() != Some("") {
+            return None;
+        }
+        let start = self.text.find(UNAVAILABLE_PREFIX)? + UNAVAILABLE_PREFIX.len();
+        let rest = &self.text[start..];
+        rest.strip_suffix(UNAVAILABLE_SUFFIX)
+            .unwrap_or(rest.split(UNAVAILABLE_SUFFIX).next()?)
+            .parse()
+            .ok()
+    }
+
+    /// Owned text bytes this record holds, as charged against
+    /// [`RETENTION_BUDGET_BYTES`]: body, detail, preview and ID strings.
+    pub fn owned_bytes(&self) -> usize {
+        record_bytes(
+            &self.text,
+            self.detail.as_deref(),
+            self.agent_id.as_deref(),
+            self.task_id.as_deref(),
+        )
+    }
+}
+
+/// The frozen viewer document for one retained message (design D3/O1).
+///
+/// The default is the **complete decoded human text** of a recognised
+/// envelope, with the exact received payload pinned beside it as Raw; plain
+/// text and unknown or malformed envelopes default to the exact received
+/// bytes. A record rejected for size becomes an explicit unavailable
+/// document, never an empty "complete" body. A legacy record without a
+/// stored detail falls back to its full text and says so.
+///
+/// Both representations are copied once here, on open, and then shared:
+/// switching never re-reads or re-decodes the (possibly evicted) record.
+pub fn message_document(
+    message: &Message,
+    initial_anchor: usize,
+    captured_at_ms: i64,
+) -> crate::widgets::text_viewer::ViewerDocument {
+    use crate::widgets::text_viewer::{Completeness, Representation, ViewerDocument, ViewerSource};
+    use format::{DecodedBody, human_error_text, human_text};
+    use std::sync::Arc;
+
+    let source = ViewerSource::Message(message.id);
+    let legacy = message.detail.is_none();
+    let base_title = if legacy {
+        format!(
+            "Message {} (legacy text source; completeness unknown)",
+            message.id
+        )
+    } else {
+        format!("Message {}", message.id)
+    };
+    if let Some(original_bytes) = message.unavailable_bytes() {
+        return ViewerDocument {
+            source,
+            title: base_title,
+            body: Arc::from(""),
+            representation: Representation::Raw,
+            raw_body: None,
+            completeness: Completeness::Unavailable {
+                reason: "Body unavailable: exceeds 1 MiB".into(),
+            },
+            original_bytes,
+            captured_at_ms,
+            initial_anchor: 0,
+        };
+    }
+    let raw = message.detail.as_deref().unwrap_or(&message.text);
+    let decoded = if message.msg_type == MsgType::Error {
+        human_error_text(raw)
+    } else {
+        human_text(raw)
+    };
+    let (body, representation, raw_body, title): (Arc<str>, _, _, _) = match decoded {
+        DecodedBody::Human(human) if human.text.len() <= MAX_BODY_BYTES => {
+            let title = if human.joined_blocks {
+                format!("{base_title} \u{b7} Human (text blocks joined)")
+            } else {
+                base_title
+            };
+            let raw: Arc<str> = Arc::from(raw);
+            (
+                Arc::from(human.text),
+                Representation::Human,
+                Some(raw),
+                title,
+            )
+        }
+        _ => (Arc::from(raw), Representation::Raw, None, base_title),
+    };
+    let mut anchor = initial_anchor.min(body.len());
+    while !body.is_char_boundary(anchor) {
+        anchor -= 1;
+    }
+    ViewerDocument {
+        source,
+        title,
+        body,
+        representation,
+        raw_body,
+        completeness: Completeness::Complete,
+        original_bytes: raw.len(),
+        captured_at_ms,
+        initial_anchor: anchor,
+    }
+}
+
+pub(crate) fn record_bytes(
+    text: &str,
+    detail: Option<&str>,
+    agent: Option<&str>,
+    task: Option<&str>,
+) -> usize {
+    text.len()
+        .saturating_add(detail.map_or(0, str::len))
+        .saturating_add(agent.map_or(0, str::len))
+        .saturating_add(task.map_or(0, str::len))
 }
 
 /// Insertion-ordered `runId → value` map with an oldest-first prune, matching
@@ -277,6 +412,18 @@ pub struct PendingMessage {
     /// than `now`. `None` means "stamp it with the flush time", which is what
     /// every live event wants.
     pub ts_ms: Option<i64>,
+}
+
+impl PendingMessage {
+    /// Owned text bytes, charged exactly like [`Message::owned_bytes`].
+    pub fn owned_bytes(&self) -> usize {
+        record_bytes(
+            &self.text,
+            self.detail.as_deref(),
+            self.agent_id.as_deref(),
+            self.task_id.as_deref(),
+        )
+    }
 }
 
 fn pending(text: String, color: Token, msg_type: MsgType) -> PendingMessage {
@@ -576,13 +723,29 @@ mod tests {
     }
 
     #[test]
-    fn details_are_capped_at_2kb() {
-        let long = "x".repeat(5_000);
+    fn details_are_stored_whole() {
+        let long = "x".repeat(50 * 1024);
         let msg =
             Message::new(1, 0, "t", Token::White, MsgType::Output).with_detail(Some(long.clone()));
-        let detail = msg.detail.unwrap();
-        assert!(detail.ends_with("…[truncated]"));
-        assert_eq!(detail.chars().count(), format::MAX_DETAIL_LEN + 12);
+        assert_eq!(msg.detail.as_deref(), Some(long.as_str()));
+        assert_eq!(msg.unavailable_bytes(), None);
+    }
+
+    #[test]
+    fn the_unavailable_pair_reports_its_received_size() {
+        let msg = Message::new(
+            1,
+            0,
+            &unavailable_notice(1_048_577),
+            Token::White,
+            MsgType::Output,
+        )
+        .with_detail(Some(String::new()));
+        assert_eq!(msg.unavailable_bytes(), Some(1_048_577));
+        // The same text with a real detail is just text.
+        let forged = Message::new(2, 0, &unavailable_notice(5), Token::White, MsgType::Output)
+            .with_detail(Some("x".into()));
+        assert_eq!(forged.unavailable_bytes(), None);
     }
 
     #[test]
