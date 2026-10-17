@@ -256,6 +256,7 @@ pub enum WizardKind {
     Config,
 }
 
+#[derive(Clone)]
 pub struct Wizard {
     pub kind: WizardKind,
     pub title: String,
@@ -270,6 +271,17 @@ pub struct Wizard {
     /// `onPasteImage` was provided (task / edit_task only).
     pub paste_capable: bool,
 
+    pub(crate) baseline: Values,
+    pub(crate) source_defaults: Values,
+    scratch: IndexMap<String, FieldState>,
+    pub session_notice: Option<String>,
+    pub session_error: Option<String>,
+    pub copy_rail: Option<usize>,
+    pub copy_notice: Option<String>,
+    pub suppress_validation_footer: bool,
+    pub(crate) viewport_rows: std::cell::Cell<usize>,
+    missing_selection: Option<String>,
+    pub(crate) text_render: std::cell::Cell<Option<(ratatui::layout::Rect, usize, usize)>>,
     steps: Vec<WizardStep>,
     values: Values,
     /// Index into the **full** step list.
@@ -290,6 +302,15 @@ pub struct Wizard {
     enter_block_until: Option<i64>,
 }
 
+#[derive(Clone)]
+struct FieldState {
+    text: TextInput,
+    textarea: TextArea<'static>,
+    select_index: usize,
+    value: String,
+    multi_selected: IndexSet<String>,
+}
+
 impl Wizard {
     pub fn new(kind: WizardKind, title: &str, steps: Vec<WizardStep>) -> Self {
         let mut wizard = Wizard {
@@ -300,6 +321,17 @@ impl Wizard {
             setting: None,
             footer_extra: None,
             paste_capable: false,
+            baseline: Values::new(),
+            source_defaults: Values::new(),
+            scratch: IndexMap::new(),
+            session_notice: None,
+            session_error: None,
+            copy_rail: None,
+            copy_notice: None,
+            suppress_validation_footer: false,
+            viewport_rows: std::cell::Cell::new(1),
+            missing_selection: None,
+            text_render: std::cell::Cell::new(None),
             steps,
             values: Values::new(),
             index: 0,
@@ -316,6 +348,7 @@ impl Wizard {
         };
         wizard.index = wizard.first_active_index();
         wizard.prefill();
+        wizard.source_defaults = wizard.default_values();
         wizard
     }
 
@@ -462,6 +495,7 @@ impl Wizard {
     /// Per-step pre-fill (`text` → reset, `textarea` → split, `select` → index
     /// of the default, `multiselect` → set of comma-separated values).
     fn prefill(&mut self) {
+        self.missing_selection = None;
         let step = self.steps[self.index].clone();
         let default = step.default_value.resolve(&self.values);
         match step.kind {
@@ -483,7 +517,118 @@ impl Wizard {
                     .collect();
             }
         }
+        let effective = self.current_value();
+        self.baseline.entry(step.id.clone()).or_insert(effective);
+        if let Some(saved) = self.scratch.get(&step.id).cloned() {
+            self.text = saved.text;
+            self.textarea = saved.textarea;
+            self.select_index = saved.select_index;
+            if step.kind == StepKind::Select {
+                if let Some(at) = self.options().iter().position(|o| o.value == saved.value) {
+                    self.select_index = at;
+                } else {
+                    self.missing_selection = Some(saved.value);
+                    self.session_error =
+                        Some("Saved option is no longer available; choose again".into());
+                }
+            }
+            self.multi_selected = saved.multi_selected;
+        } else if let Some(value) = self.values.get(&step.id).cloned() {
+            self.set_current_value(&value);
+        }
         self.reset_step_state();
+    }
+
+    pub(crate) fn save_step(&mut self) {
+        self.scratch.insert(
+            self.step_id().to_string(),
+            FieldState {
+                text: self.text.clone(),
+                textarea: self.textarea.clone(),
+                select_index: self.select_index,
+                value: self.current_value(),
+                multi_selected: self.multi_selected.clone(),
+            },
+        );
+    }
+
+    pub fn default_values(&self) -> Values {
+        let mut values = Values::new();
+        for step in &self.steps {
+            values.insert(step.id.clone(), step.default_value.resolve(&values));
+        }
+        values
+    }
+
+    pub fn semantic_values(&self) -> Values {
+        let mut values = self.values.clone();
+        for (id, field) in &self.scratch {
+            if let Some(step) = self.steps.iter().find(|s| s.id == *id) {
+                let value = match step.kind {
+                    StepKind::Text => field.text.value().to_string(),
+                    StepKind::Textarea => field.textarea.lines().join("\n"),
+                    StepKind::Select => field.value.clone(),
+                    StepKind::Multiselect => field
+                        .multi_selected
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(","),
+                };
+                values.insert(id.clone(), value);
+            }
+        }
+        values.insert(self.step_id().to_string(), self.current_value());
+        values
+    }
+
+    pub fn semantic_dirty(&self, attachments: &[String]) -> bool {
+        !attachments.is_empty()
+            || self.semantic_values().iter().any(|(id, value)| {
+                normalized(value)
+                    != normalized(self.baseline.get(id).map(String::as_str).unwrap_or(""))
+            })
+    }
+
+    pub(crate) fn discard_current(&mut self) {
+        let id = self.step_id().to_string();
+        let value = self.baseline.get(&id).cloned().unwrap_or_default();
+        self.scratch.shift_remove(&id);
+        self.values.shift_remove(&id);
+        self.set_current_value(&value);
+    }
+
+    pub(crate) fn draft_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        // Drafts promise source/caret/selection recovery, not unbounded hidden
+        // undo allocations. The active editor's library history is untouched.
+        snapshot.text.clear_history();
+        snapshot.textarea = snapshot_textarea(&snapshot.textarea);
+        for field in snapshot.scratch.values_mut() {
+            field.text.clear_history();
+            field.textarea = snapshot_textarea(&field.textarea);
+        }
+        snapshot
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let values_size = |v: &Values| v.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        values_size(&self.baseline)
+            + values_size(&self.source_defaults)
+            + values_size(&self.values)
+            + self.text.value().len()
+            + self.textarea.lines().iter().map(String::len).sum::<usize>()
+            + self
+                .scratch
+                .iter()
+                .map(|(k, f)| {
+                    k.len()
+                        + f.text.value().len()
+                        + f.textarea.lines().iter().map(String::len).sum::<usize>()
+                        + f.value.len()
+                        + f.multi_selected.iter().map(String::len).sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     /// Everything that resets on both forward and backward navigation.
@@ -499,13 +644,42 @@ impl Wizard {
     /// Replace the step list in place, keeping the answers and position — the
     /// live model-catalog refresh (docs/parity/tui.md §5.2).
     pub fn replace_steps(&mut self, steps: Vec<WizardStep>) {
+        if steps.is_empty() {
+            return;
+        }
         let current_id = self.step_id().to_string();
+        let current = self.current_value();
+        let untouched = self
+            .baseline
+            .get(&current_id)
+            .is_some_and(|v| normalized(v) == normalized(&current));
         self.steps = steps;
-        self.index = self
-            .steps
-            .iter()
-            .position(|s| s.id == current_id)
-            .unwrap_or_else(|| self.first_active_index());
+        if let Some(index) = self.steps.iter().position(|s| s.id == current_id) {
+            self.index = index;
+            // Catalog reordering must not select a different value by index.
+            if self.step().kind == StepKind::Select {
+                if let Some(at) = self.options().iter().position(|c| c.value == current) {
+                    self.select_index = at;
+                } else if untouched {
+                    let default = self.step().default_value.resolve(&self.values);
+                    self.select_index = self
+                        .options()
+                        .iter()
+                        .position(|c| c.value == default)
+                        .unwrap_or(0);
+                    self.baseline.insert(current_id, self.current_value());
+                } else {
+                    self.missing_selection = Some(current);
+                    self.session_error = Some(
+                        "Selected option is no longer available; choose an option again".into(),
+                    );
+                }
+                self.save_step();
+            }
+        } else {
+            self.index = self.first_active_index();
+            self.prefill();
+        }
     }
 
     // ── Validation ─────────────────────────────────────────────────────────
@@ -528,10 +702,13 @@ impl Wizard {
         self.enter_block_until.is_some()
     }
 
-    fn current_value(&self) -> String {
+    pub fn current_value(&self) -> String {
         match self.step().kind {
             StepKind::Text => self.text.value().to_string(),
             StepKind::Textarea => self.textarea_value(),
+            StepKind::Select if self.missing_selection.is_some() => {
+                self.missing_selection.clone().unwrap_or_default()
+            }
             StepKind::Select => self
                 .options()
                 .get(self.select_index)
@@ -579,6 +756,7 @@ impl Wizard {
     /// resolved against the **merged** answers. Returns `Complete` past the end.
     fn advance(&mut self, value: String) -> WizardOutcome {
         let id = self.step_id().to_string();
+        self.save_step();
         self.values.insert(id, value);
         let next = self.steps[self.index + 1..]
             .iter()
@@ -596,20 +774,15 @@ impl Wizard {
 
     /// `Esc` / `Backspace` on an empty field — the previous non-skipped step,
     /// restoring its stored answer.
-    fn go_back(&mut self) -> WizardOutcome {
+    pub(crate) fn go_back(&mut self) -> WizardOutcome {
+        self.save_step();
         let prev = self.steps[..self.index]
             .iter()
             .rposition(|s| !s.is_skipped(&self.values));
         match prev {
             Some(idx) => {
                 self.index = idx;
-                let id = self.step_id().to_string();
-                let stored = self.values.get(&id).cloned();
                 self.prefill();
-                if let Some(stored) = stored {
-                    self.set_current_value(&stored);
-                    self.dirty = true;
-                }
                 WizardOutcome::Consumed
             }
             None => WizardOutcome::Cancelled,
@@ -625,6 +798,7 @@ impl Wizard {
                 self.textarea.move_cursor(CursorMove::End);
             }
             StepKind::Select => {
+                self.missing_selection = None;
                 if let Some(idx) = self.options().iter().position(|o| o.value == value) {
                     self.select_index = idx;
                 }
@@ -711,6 +885,9 @@ impl Wizard {
         let suggestions = self.filtered_suggestions();
 
         if self.browsing {
+            if self.option_navigation(key.code, suggestions.len(), true) {
+                return WizardOutcome::Consumed;
+            }
             match key.code {
                 KeyCode::Up => {
                     if self.suggestion_index == 0 {
@@ -763,7 +940,7 @@ impl Wizard {
             _ => {}
         }
 
-        if self.text.handle_key(key, now_ms) {
+        if self.text.handle_editor_key(key, now_ms) {
             self.dirty = true;
             self.browsing = false;
             self.schedule_validation(now_ms);
@@ -790,8 +967,28 @@ impl Wizard {
             return self.advance(value);
         }
 
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+        {
+            self.textarea.input(key);
+            return WizardOutcome::Consumed;
+        }
         if ctrl {
             match key.code {
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    self.textarea.undo();
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.textarea.redo();
+                }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     self.textarea.move_cursor(CursorMove::Head)
                 }
@@ -826,7 +1023,21 @@ impl Wizard {
             return WizardOutcome::Consumed;
         }
 
+        if matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        ) {
+            self.textarea.cancel_selection();
+        }
         match key.code {
+            KeyCode::PageUp | KeyCode::PageDown => {
+                self.textarea.input(key);
+            }
             KeyCode::Enter => {
                 self.textarea.insert_newline();
                 self.dirty = true;
@@ -850,6 +1061,97 @@ impl Wizard {
         WizardOutcome::Consumed
     }
 
+    pub fn selected_text(&self) -> Option<String> {
+        match self.step().kind {
+            StepKind::Text => self.text.selected_text(),
+            StepKind::Textarea => {
+                let ((sr, sc), (er, ec)) = self.textarea.selection_range()?;
+                if (sr, sc) == (er, ec) {
+                    return None;
+                }
+                Some(
+                    self.textarea.lines()[sr..=er]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, line)| {
+                            let start = if i == 0 { sc } else { 0 };
+                            let end = if sr + i == er {
+                                ec
+                            } else {
+                                line.chars().count()
+                            };
+                            line.chars()
+                                .skip(start)
+                                .take(end.saturating_sub(start))
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pointer(
+        &mut self,
+        position: ratatui::layout::Position,
+        body: ratatui::layout::Rect,
+        start: bool,
+    ) {
+        let position = ratatui::layout::Position::new(
+            position.x.clamp(body.x, body.right().saturating_sub(1)),
+            position.y.clamp(body.y, body.bottom().saturating_sub(1)),
+        );
+        match self.step().kind {
+            StepKind::Textarea => {
+                if let Some((row, col)) = self.textarea.cursor_at_position(position) {
+                    if start {
+                        self.textarea.cancel_selection();
+                    }
+                    self.textarea.move_cursor(CursorMove::Jump(
+                        row.min(u16::MAX as usize) as u16,
+                        col.min(u16::MAX as usize) as u16,
+                    ));
+                    if start {
+                        self.textarea.start_selection();
+                    }
+                }
+            }
+            StepKind::Text => {
+                let Some((rendered, start_at, draw_cursor)) = self.text_render.get() else {
+                    return;
+                };
+                if rendered.y != body.y || rendered.x != body.x || rendered.width != body.width {
+                    return;
+                }
+                let mut cells = 0;
+                let mut at = start_at;
+                let mut target = position.x.saturating_sub(body.x + 2) as usize;
+                let segments = crate::text::grapheme_segments(self.text.value());
+                let before_width =
+                    crate::text::text_display_width(&segments[start_at..draw_cursor].concat());
+                // Map against the last drawn block/viewport, not the moving caret.
+                if target > before_width {
+                    target -= 1;
+                }
+                for segment in crate::text::grapheme_segments(self.text.value())
+                    .iter()
+                    .skip(start_at)
+                {
+                    let w = crate::text::display_width(segment);
+                    if cells + w > target {
+                        break;
+                    }
+                    cells += w;
+                    at += 1;
+                }
+                self.text.select_to(at, start);
+            }
+            _ => {}
+        }
+    }
+
     /// Multi-line paste: `\r\n` normalises to `\n` and the cursor lands at the
     /// end of the last pasted part.
     pub fn insert_paste(&mut self, text: &str, now_ms: i64) {
@@ -861,7 +1163,7 @@ impl Wizard {
             }
             StepKind::Text => {
                 let flat = text.replace(['\r', '\n'], " ");
-                self.text.insert_str(&flat, now_ms);
+                self.text.insert_editor_str(&flat, now_ms);
                 self.dirty = true;
                 self.schedule_validation(now_ms);
             }
@@ -869,8 +1171,51 @@ impl Wizard {
         }
     }
 
+    fn option_navigation(&mut self, key: KeyCode, len: usize, suggestions: bool) -> bool {
+        let current = if suggestions {
+            self.suggestion_index
+        } else {
+            self.select_index
+        };
+        let page = self.viewport_rows.get().saturating_sub(1).max(1);
+        let next = match key {
+            KeyCode::Home => 0,
+            KeyCode::End => len.saturating_sub(1),
+            KeyCode::PageUp => current.saturating_sub(page),
+            KeyCode::PageDown => (current + page).min(len.saturating_sub(1)),
+            _ => return false,
+        };
+        if suggestions {
+            self.suggestion_index = next;
+        } else {
+            self.select_index = next;
+        }
+        true
+    }
+
     fn handle_select_key(&mut self, key: KeyEvent) -> WizardOutcome {
+        if self.missing_selection.is_some() {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
+                return WizardOutcome::Consumed;
+            }
+            if matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char('1'..='9' | 'j' | 'k')
+            ) {
+                self.missing_selection = None;
+                self.session_error = None;
+            }
+        }
         let options = self.options();
+        if self.option_navigation(key.code, options.len(), false) {
+            return WizardOutcome::Consumed;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_index = self.select_index.saturating_sub(1);
@@ -914,6 +1259,9 @@ impl Wizard {
 
     fn handle_multiselect_key(&mut self, key: KeyEvent) -> WizardOutcome {
         let options = self.options();
+        if self.option_navigation(key.code, options.len(), false) {
+            return WizardOutcome::Consumed;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_index = self.select_index.saturating_sub(1);
@@ -950,6 +1298,28 @@ impl Wizard {
             _ => WizardOutcome::Ignored,
         }
     }
+}
+
+fn snapshot_textarea(source: &TextArea<'static>) -> TextArea<'static> {
+    let mut target = new_textarea(&source.lines().join("\n"));
+    let cursor = source.cursor();
+    if let Some((start, end)) = source.selection_range() {
+        let anchor = if cursor == start { end } else { start };
+        target.move_cursor(CursorMove::Jump(
+            anchor.0.min(u16::MAX as usize) as u16,
+            anchor.1.min(u16::MAX as usize) as u16,
+        ));
+        target.start_selection();
+    }
+    target.move_cursor(CursorMove::Jump(
+        cursor.0.min(u16::MAX as usize) as u16,
+        cursor.1.min(u16::MAX as usize) as u16,
+    ));
+    target
+}
+
+fn normalized(value: &str) -> String {
+    value.replace("\r\n", "\n").trim().to_string()
 }
 
 fn new_textarea(initial: &str) -> TextArea<'static> {

@@ -24,6 +24,9 @@ pub const MAX_UNDO_DEPTH: usize = 50;
 #[derive(Debug, Clone, Default)]
 pub struct TextInput {
     cursor: Cursor,
+    selection_anchor: Option<usize>,
+    editor_undo: Vec<Cursor>,
+    editor_redo: Vec<Cursor>,
     undo: Vec<Cursor>,
     kill_ring: String,
     /// Deadline for a debounced snapshot, or `None` when none is pending.
@@ -40,6 +43,9 @@ impl TextInput {
     pub fn new(initial: &str) -> Self {
         TextInput {
             cursor: Cursor::new(initial),
+            selection_anchor: None,
+            editor_undo: Vec::new(),
+            editor_redo: Vec::new(),
             undo: Vec::new(),
             kill_ring: String::new(),
             pending_snapshot_at: None,
@@ -71,10 +77,131 @@ impl TextInput {
         self.generation
     }
 
+    pub(crate) fn clear_history(&mut self) {
+        self.undo.clear();
+        self.editor_undo.clear();
+        self.editor_redo.clear();
+        self.kill_ring.clear();
+        self.pending_snapshot_at = None;
+    }
+
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        let at = self.cursor.pos();
+        (anchor != at).then_some((anchor.min(at), anchor.max(at)))
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        Some(super::grapheme_segments(self.value())[start..end].concat())
+    }
+
+    pub fn select_to(&mut self, at: usize, start: bool) {
+        if start {
+            self.selection_anchor = Some(at);
+        }
+        self.cursor = Cursor::at(self.value(), at);
+    }
+
+    fn editor_snapshot(&mut self) {
+        if !self
+            .editor_undo
+            .last()
+            .is_some_and(|c| c.text() == self.value())
+        {
+            self.editor_undo.push(self.cursor.clone());
+            if self.editor_undo.len() > MAX_UNDO_DEPTH {
+                self.editor_undo.remove(0);
+            }
+        }
+        self.editor_redo.clear();
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            return false;
+        };
+        let segments = super::grapheme_segments(self.value());
+        self.cursor = Cursor::at(
+            &(segments[..start].concat() + &segments[end..].concat()),
+            start,
+        );
+        self.selection_anchor = None;
+        true
+    }
+
+    /// Wizard-only selection/history adaptation; command-bar kill/yank semantics stay intact.
+    pub fn handle_editor_key(&mut self, key: KeyEvent, now_ms: i64) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('z' | 'Z' | 'r' | 'R')) {
+            let redo = matches!(key.code, KeyCode::Char('r' | 'R'));
+            let stack = if redo {
+                &mut self.editor_redo
+            } else {
+                &mut self.editor_undo
+            };
+            if let Some(cursor) = stack.pop() {
+                let old = std::mem::replace(&mut self.cursor, cursor);
+                if redo {
+                    self.editor_undo.push(old);
+                } else {
+                    self.editor_redo.push(old);
+                }
+                self.generation += 1;
+            }
+            self.selection_anchor = None;
+            return true;
+        }
+        if matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+        ) {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.selection_anchor.get_or_insert(self.cursor.pos());
+            } else {
+                self.selection_anchor = None;
+            }
+            return self.handle_key(key, now_ms);
+        }
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.selection_anchor.get_or_insert(self.cursor.pos());
+            if key.code == KeyCode::Up {
+                self.cursor.move_to_start();
+            } else {
+                self.cursor.move_to_end();
+            }
+            return true;
+        }
+        let editing = matches!(
+            key.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+        );
+        if editing {
+            self.editor_snapshot();
+            let removed = self.delete_selection();
+            if removed && matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
+                self.generation += 1;
+                return true;
+            }
+        }
+        self.handle_key(key, now_ms)
+    }
+
+    pub fn insert_editor_str(&mut self, text: &str, now_ms: i64) {
+        self.editor_snapshot();
+        self.delete_selection();
+        self.insert_str(text, now_ms);
+    }
+
     /// `reset(newValue)` — new value, cursor at the end, undo history dropped.
     pub fn reset(&mut self, value: &str) {
         self.cursor = Cursor::new(value);
         self.undo.clear();
+        self.editor_undo.clear();
+        self.editor_redo.clear();
+        self.selection_anchor = None;
         self.pending_snapshot_at = None;
         self.generation += 1;
     }
