@@ -3,7 +3,9 @@ mod common;
 use common::Harness;
 use orch_domain::{Agent, AgentStatus, RemoteRef};
 use orch_tui::backend::{FakeBackend, make_agent, make_team};
-use orch_tui::state::{DetailPanel, ViewId};
+use orch_tui::messages::{MsgType, PendingMessage};
+use orch_tui::state::{DetailPanel, Focus, ViewId};
+use orch_tui::theme::Token;
 use ratatui::crossterm::event::KeyCode;
 
 fn agents() -> Vec<Agent> {
@@ -238,4 +240,43 @@ fn every_sort_chip_is_visible_and_clickable_at_minimum_width() {
         }
         h.key('o');
     }
+}
+
+#[test]
+fn sort_and_follow_keys_keep_independent_state_in_agents_view() {
+    let mut h = harness();
+    h.app.state.messages.clear();
+    for i in 0..80 {
+        h.app.state.add_message(
+            PendingMessage {
+                text: format!("entry-{i:03}"),
+                color: Token::White,
+                msg_type: MsgType::Info,
+                agent_id: None,
+                task_id: None,
+                detail: None,
+                ts_ms: None,
+            },
+            1_000_000,
+            0,
+        );
+    }
+    h.app.state.set_focus(Focus::Activity);
+    h.draw().press(KeyCode::Up);
+    assert!(!h.app.state.activity_follow_tail);
+    h.key('o').key('O');
+    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
+    assert!(!h.app.state.activity_follow_tail);
+    let sort = h.app.state.agent_sort;
+    h.key('G');
+    assert!(h.app.state.activity_follow_tail);
+    assert_eq!(h.app.state.agent_sort, sort);
+    h.press(KeyCode::Up).key('0');
+    assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
+    assert!(!h.app.state.activity_follow_tail);
+    h.press(KeyCode::End);
+    assert!(h.app.state.activity_follow_tail);
+    h.app.state.set_focus(Focus::MainList);
+    h.key('G');
+    assert_eq!(h.app.state.view, ViewId::Goals);
 }

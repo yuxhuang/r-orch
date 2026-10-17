@@ -110,6 +110,17 @@ The Agents view aligns rows in a table. Arrows, PageUp/PageDown, Home/End and th
 section. A click or wheel focuses the section under the pointer. Entity action letters act from the main list;
 return there to edit or delete. Opening a detail initially focuses its Overview section.
 
+In Agents, `o` cycles the sort field through Original, Name, Status, Adapter/Model and Location; `O` switches
+ascending/descending, and `0` resets to Original ascending. The sort chips above the list offer the same controls.
+Sorting preserves team sections and the selected agent, and lasts only for this dashboard session. Original is
+exactly the previous team/status/source order: agents have no created/updated timestamps. Original descending
+reverses that order within each section while keeping the sections in place.
+
+The Activity panel, ACTIONS list and task-detail Activity follow new entries at the tail. Scrolling up pauses
+following so you can read older entries. Resume with `End` or `G`, scroll down to the bottom with the wheel or
+PageDown, click the final entry, or focus a feed whose viewport is already at the bottom. The feed shows
+whether it is following or paused. Expanded text viewers keep their immutable snapshots.
+
 Press `i` on supported text, or activate a message with Enter/double-click, to open its full-text viewer.
 The viewer shows an immutable Snapshot: close and reopen to see new content. Known message envelopes open as
 Human text; Raw preserves the received bytes. The footer offers the representation switch. Arrows and paging

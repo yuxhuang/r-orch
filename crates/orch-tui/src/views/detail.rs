@@ -266,14 +266,9 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
             }
         }
         Focus::LogDetail(section) => {
-            let filtered = state.filtered_messages();
-            let Some(index) = usize::try_from(state.log_selected_index)
-                .ok()
-                .and_then(|i| filtered.get(i))
-            else {
+            let Some(message) = state.selected_log() else {
                 return Vec::new();
             };
-            let message = &state.messages[*index];
             match section {
                 LogSection::Metadata => vec![
                     format!("{} {}", message.msg_type.icon(), message.msg_type.as_str()),
@@ -397,10 +392,7 @@ pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<View
                         },
                     )
                 }),
-                Focus::LogDetail(_) => usize::try_from(state.log_selected_index)
-                    .ok()
-                    .and_then(|i| state.filtered_messages().get(i).copied())
-                    .map(|i| ViewerSource::Message(state.messages[i].id)),
+                Focus::LogDetail(_) => state.selected_log().map(|m| ViewerSource::Message(m.id)),
                 _ => None,
             };
             vec![source; section_text(state, focus).len()]
@@ -484,6 +476,14 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     ctx.zone(area, area, ZoneKind::Pane(focus), ZoneId::Pane(key.clone()));
     let active = state.focus == focus;
     let name = match focus {
+        Focus::TaskDetail(TaskSection::Activity) => format!(
+            "Activity · {}",
+            if state.task_activity_following(&key) {
+                "following"
+            } else {
+                "paused · End follows"
+            }
+        ),
         Focus::TaskDetail(TaskSection::Files) => state
             .selected_task()
             .and_then(|task| task.proof.as_ref())
@@ -626,7 +626,11 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     if rows.is_empty() {
         rows.push(("No entries.".into(), None, 0));
     }
-    let scroll = state.pane_scroll(&key);
+    let scroll = if focus == Focus::TaskDetail(TaskSection::Activity) {
+        state.task_activity_scroll(&key, body.height as usize)
+    } else {
+        state.pane_scroll(&key)
+    };
     let offset = scroll
         .offset
         .min(rows.len().saturating_sub(body.height as usize));

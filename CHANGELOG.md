@@ -6,7 +6,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Added
+- Sort the Agents list by Original, Name, Status, Adapter/Model or Location in either direction for the current session, with keyboard and clickable reset controls.
 - `docs/specs/` and a spec-driven workflow for contributors and agents ([ADR 0004](docs/decisions/0004-spec-driven-development.md)): requirements with acceptance checks, short execution plans with task tables, and bounded design-review loops.
+
+### Fixed
+- Follow new entries in the Activity panel, ACTIONS list and task-detail Activity at the bottom; scrolling up pauses, and returning to the bottom or focusing a feed there resumes.
 
 ## [0.6.0] - 2026-10-17
 

@@ -281,6 +281,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.navigate_focus(NavAction::Home, false);
                 return;
             }
+            KeyCode::Char('G') if self.state.is_live_feed(self.state.focus) => {
+                self.navigate_focus(NavAction::End, false);
+                return;
+            }
             KeyCode::End => {
                 self.navigate_focus(NavAction::End, false);
                 return;
@@ -1134,7 +1138,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     |m| m.display_rows,
                 );
                 (
-                    self.state.pane_scroll(&key),
+                    if focus == Focus::TaskDetail(TaskSection::Activity) {
+                        self.state.task_activity_scroll(&key, h)
+                    } else {
+                        self.state.pane_scroll(&key)
+                    },
                     text.len(),
                     rows,
                     Vec::new(),
@@ -1146,20 +1154,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 )
             }
         };
-        let at_last = scroll.selected == items.checked_sub(1);
-        let following = match focus {
-            Focus::MainList if self.state.view == ViewId::Logs => self.state.log_selected_index < 0,
-            Focus::Activity => self.state.activity_follow_tail,
-            _ => false,
-        };
-        let effective = if following && action == NavAction::Up {
-            NavAction::End
-        } else {
-            action
-        };
         navigate(
             &mut scroll,
-            effective,
+            action,
             ScrollMetrics {
                 items,
                 display_rows,
@@ -1183,8 +1180,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.state.agent_scroll = scroll.offset;
                 }
                 ViewId::Logs => {
-                    let tail = action == NavAction::End
-                        || ((!wheel || following) && action == NavAction::Down && at_last);
+                    let tail = crate::follow::resumes_tail(action, &scroll, items, h, wheel);
                     self.state.log_selected_index = if tail {
                         -1
                     } else {
@@ -1198,8 +1194,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
             },
             Focus::Activity => {
-                self.state.activity_follow_tail = action == NavAction::End
-                    || ((!wheel || following) && action == NavAction::Down && at_last);
+                self.state.activity_follow_tail =
+                    crate::follow::resumes_tail(action, &scroll, items, h, wheel);
                 let rows = self.state.activity_messages();
                 self.state.activity_selected = scroll
                     .selected
@@ -1209,6 +1205,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.state.activity_last_position = scroll.selected.unwrap_or(0);
             }
             _ => {
+                if focus == Focus::TaskDetail(TaskSection::Activity)
+                    && crate::follow::resumes_tail(action, &scroll, items, h, wheel)
+                {
+                    scroll.selected = None;
+                }
                 self.state.set_pane_scroll(key, scroll);
             }
         }
