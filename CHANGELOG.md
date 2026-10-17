@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- `docs/specs/` and a spec-driven workflow for contributors and agents ([ADR 0004](docs/decisions/0004-spec-driven-development.md)): requirements with acceptance checks, short execution plans with task tables, and bounded design-review loops.
+
 ## [0.6.0] - 2026-10-17
 
 Dashboard (TUI) quality-of-life release. No peer-protocol or on-disk change, so 0.5.x and 0.6.0 peers can be

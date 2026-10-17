@@ -30,7 +30,8 @@ Authoritative docs:
 | What users see and how they install | [README.md](README.md) |
 | What changed per release | [CHANGELOG.md](CHANGELOG.md) |
 | Why we chose X | [docs/decisions/](docs/decisions/) |
-| What we are about to build | [docs/plans/](docs/plans/) |
+| What a piece of work must do, and how we check it | [docs/specs/](docs/specs/) |
+| How and in what order we will build it | [docs/plans/](docs/plans/) |
 | Frozen trait signatures | [docs/TRAITS-FROZEN.md](docs/TRAITS-FROZEN.md) |
 | Historical: the old parity contract and port reviews | `docs/PARITY.md`, `docs/parity/`, `docs/reviews/` |
 
@@ -66,18 +67,20 @@ Authoritative docs:
 
 ## Workflow
 
-Everything reaches `master` through a PR (a GitHub ruleset enforces it; 0 approvals required). The `ci / check`
-and `ci / test` jobs are to become required status checks on `master` (the owner enables them after this setup's
-first green run; see the open-source-readiness plan). Until then CI green is on the author. A red PR is not
-reviewed or merged.
+Everything reaches `master` through a PR. A GitHub ruleset enforces this, needs 0 approvals, and requires the
+`check` and `test` CI jobs to pass. The same ruleset protects `release/**`, so do not create branches under that
+prefix. A red PR is not reviewed or merged.
 
-1. Branch from current `master`: `fix/<slug>`, `feature/<slug>`, `docs/<slug>`, `release/vX.Y.Z`.
+1. Branch from current `master`: `fix/<slug>`, `feature/<slug>`, `docs/<slug>`, `chore/<slug>`, and
+   `chore/release-vX.Y.Z` for releases.
 2. Commit as `type(scope): summary`, imperative, no trailing period. Types in use: `feat`, `fix`, `docs`,
    `test`, `chore`, `refactor`. Scope is a crate or area: `fix(peer): bound a worker's free-form error text`,
-   `chore(release): 0.5.1`.
+   `chore(release): 0.5.1`. The summary says what changed in behaviour. Process labels ("integrate verified v6
+   b0 slice") do not belong there.
 3. Run the pre-PR check (below) before opening the PR.
 4. Open the PR using `.github/PULL_REQUEST_TEMPLATE.md`; fill every section, delete none. One concern per PR;
-   if the title needs "and", split it.
+   if the title needs "and", split it. A PR over about 3,000 changed lines is split, or the plan explains why
+   it cannot be.
 5. CI (`.github/workflows/ci.yml`, Linux only) must be green: fmt, clippy `-D warnings`, test, `cargo xtask
    crate-graph`, cargo-deny.
 6. Merge, per the policy below. Implementers and reviewers never merge their own work.
@@ -87,7 +90,9 @@ reviewed or merged.
 
 **Merge policy.** The human owner merges by default. The owner may standing-delegate categories to the
 orchestrator; current delegation: docs-only, test-only, and CHANGELOG/plan-status PRs, once required checks are
-green. Everything else waits for the owner. Changes to the delegation are recorded here, in this paragraph.
+green. The exception is a change to the process itself (`AGENTS.md`, `docs/decisions/`, and the `docs/specs/` or
+`docs/plans/` README and TEMPLATE files), which the owner merges. Everything else waits for the owner. Changes to
+the delegation are recorded here, in this paragraph.
 
 ### Pre-PR check
 
@@ -106,26 +111,96 @@ security-relevant code. It is not a superset of CI: its `advisories` step silent
 missing. It also runs `parity`, `lint-scenarios` and `probes`, which need the TS oracle (`./parity/setup.sh`,
 Node) and fail without it (every probe reports HARNESS BROKE); `probes` also fails on a dirty tree. Without the
 oracle, expect those steps to fail and say so in the PR; do not contort code (ADR 0002). `--warm` reuses your
-`target/` and is not a gate. Its verdict is written to `target/gate-result.txt`.
+`target/` and is not a gate. Its verdict is written to `target/gate-result.txt`. Today the script needs GNU
+coreutils (`df -BG`, `date -Is`), so on macOS its preflight reads 0 GB free and refuses to run cold.
+
+Say in the PR which platform each check ran on (macOS, Linux CI, both). A failure that also occurs on the base
+commit is still a failure. Report it as one; it is not a pass.
+
+### Broken tooling
+
+If a repo script, test helper or fixture does not work on the platform you are using, fix it in its own small PR
+(or report it to the lead), then continue. Never build an external harness, shim or runner around it. If a
+check truly cannot run where you are, report it as `env-limited` and name where it must run (usually Linux CI).
+
+A test that fails during your work gets one re-run on the base commit. If it also fails there, it is
+pre-existing: it gets its own fix or issue, and your PR states that. It does not reopen the review of your
+change.
 
 ### Parallel agent work
 
-Use a git worktree per agent: `git worktree add .worktrees/<name> -b
-<branch>` (`.worktrees/` is git-excluded), or a sibling dir `../r-orch-<name>`. Never share a
-`CARGO_TARGET_DIR` between worktrees (a harness once graded the wrong binary).
+Use a git worktree and a branch per agent: `git worktree add .worktrees/<name> -b
+<branch>` (`.worktrees/` is git-excluded), or a sibling dir `../r-orch-<name>`. Parallel builders never share a
+worktree. Commit early, and integrate by merging branches, not by passing patch files around. Never share a
+`CARGO_TARGET_DIR` between worktrees (a harness once graded the wrong binary). Delete your throwaway target
+dirs and worktrees when the work merges.
 
-## Plans (`docs/plans/`)
+## Specs and plans
+
+Goal-sized work follows **spec → plan → tasks → PRs** ([ADR 0004](docs/decisions/0004-spec-driven-development.md)).
+The spec says what must be true and how it is checked. The plan says how it is built and splits it into tasks.
+Each task lands as a PR whose verify command passes.
+
+### Specs (`docs/specs/`)
+
+Required when a plan is required **and** the work has behaviour a user or operator will notice. An owner
+request that meets no plan trigger needs no spec. Read [docs/specs/README.md](docs/specs/README.md); start from
+`docs/specs/TEMPLATE.md`.
+
+- The owner's request is quoted verbatim, with numbered items. Every item maps to a requirement (`R1`, `R2`, ...)
+  or to a `won't` row with a reason.
+- Every requirement has an acceptance check: a named test or an exact command, and the platform it runs on.
+- Fill in the security checklist for anything that listens on a socket, crosses a process boundary or handles
+  untrusted text before building, not at the review gate.
+- List the verification environment (what needs Linux, a second host, a terminal other than tmux, a browser,
+  owner permission) and ask about it in the first approval request. Terminal behaviour is verified in tmux (see
+  TUI end-to-end tests).
+- `status: draft -> approved -> done | superseded`. The owner approves the requirements before the build
+  starts. The lead may approve them only where the owner's request says so; quote that line in the spec's
+  Source. Review findings that are real requirements become new rows.
+- The completing PR fills the spec's Verification table: result (`pass` / `env-limited` / `waived by owner`),
+  the commit the check ran at, and the platform, for every row. A `must` row that is `env-limited` blocks
+  `done` until it passes where it can run, or until the owner waives it.
+
+### Plans (`docs/plans/`)
 
 A plan is required when the change: alters an on-disk, CLI, `--json` or peer-protocol contract; adds a subsystem
 or a load-bearing dependency; will take more than about a day; or the lead asks for one. Crossing crates alone
 does not require a plan (the layered workspace makes that routine). Other fixes need none.
 
-- File: `docs/plans/YYYY-MM-DD-<slug>.md`, from `docs/plans/TEMPLATE.md`.
+- File: `docs/plans/YYYY-MM-DD-<slug>.md` (same slug as its spec), from `docs/plans/TEMPLATE.md`.
 - First line under the title: `status: proposed | active | done | abandoned`. Lifecycle:
   `proposed -> active -> done`, or `abandoned` with a one-line reason. Do not delete finished plans.
+- About a page of design, then a **task table**. Each task row gives the requirements it covers, the paths in
+  scope, its dependencies, a verify command and the PR it lands in. The task table is the PR split. Evidence
+  goes in PRs, not in the plan.
 - The plan lands before or in the same PR as the implementation. Never after the fact.
 - When reality diverges from the plan, edit the plan in the PR that diverges. A stale plan is worse than none.
-- Set `done` in the PR that completes the last checklist item.
+  Do not fork it into versions.
+- Set `done` (plan and spec) in the PR that completes the last task.
+
+### Design review loops
+
+Bounded by what each round finds, not by a count. The lead decides whether another round runs, and from the
+third round on writes the reason in the plan or escalates to the owner. A test settles what a test can settle,
+and a walking skeleton comes before a second revision. The rules are in
+[docs/plans/README.md](docs/plans/README.md#design-review).
+
+### Handing out and finishing tasks
+
+- **A task brief is self-contained.** It gives: links to the spec and plan, the task id and the requirement ids
+  it covers, the paths in scope, the worktree and branch, the verify command, and what "done" means. Touching an
+  adjacent file is allowed without a round-trip to the lead, as long as the PR still has one concern and its
+  description names the file.
+- **"Done" means evidence.** A task is done when a commit exists on its branch and its verify command passed
+  there, both stated in the PR or handoff. Status in a tracker is not evidence. A lead releases dependent tasks
+  only after checking that evidence.
+- **Reviewers write the verdict skeleton first** (scope, what will be checked), then fill it in, so an
+  interrupted review still leaves a report. A diff over about 800 lines is reviewed in slices.
+- **Checkpoints change something.** A lead checkpoint must produce or change a deliverable (code, test, doc) or
+  record a decision in the spec, the plan, an ADR or a PR. Reading or coverage ledgers are not gates.
+- If a required reviewer is unavailable, use a substitute and record the substitution and why it is still
+  independent. Do not retry the same failing reviewer again and again.
 
 ## Decisions (`docs/decisions/`)
 
@@ -150,7 +225,9 @@ Docs ship in the same PR as the change. The PR template asks which row applied.
 | Anything a user could notice | `CHANGELOG.md`, under `## [Unreleased]` |
 | A trait in `orch-core` listed in `docs/TRAITS-FROZEN.md` | Only via an ADR, then that file |
 | A choice someone will later ask "why?" about | An ADR |
+| What goal-sized work must do, and how it is accepted | A spec |
 | Scope or sequencing of non-trivial work | A plan |
+| A wire format, on-disk layout or protocol | An ADR, plus a reference doc under `docs/` in the same PR. Never only in an agent's scratch state |
 
 CHANGELOG entries are one line, user-voiced, under Added / Changed / Deprecated / Removed / Fixed / Security.
 Pure refactors, tests and CI need no entry.
@@ -161,6 +238,7 @@ Pure refactors, tests and CI need no entry.
 - **Integration tests:** `crates/<crate>/tests/`. CLI tests drive the real binary with `assert_cmd`
   (`crates/orch-cli/tests/`). Engine tests use the fakes in `crates/orch-engine/tests/common`.
 - **TUI:** `orch-tui` tests render against an in-crate `FakeBackend` (`crates/orch-tui/tests/`); dashboard flows run in `crates/orch-cli/tests/tui_*.rs`.
+  What an operator sees in a real terminal is covered by end-to-end tests in tmux (below).
 - **Snapshots:** `insta` is used for adapter argv (`crates/orch-infra/tests/adapter_argv.rs`); review with `cargo insta review`, never accept blindly.
 - **Adapters:** unit tests inject a scripted `FakeProcessManager` and assert exact argv and stdin. Recorded
   adapter output is under `fixtures/adapters/<cli>/`.
@@ -173,10 +251,63 @@ Pure refactors, tests and CI need no entry.
 - **Differential parity harness** (`cargo xtask parity`, `fixtures/scenarios`): optional and historical. Keep
   the scenarios green where cheap; do not extend the harness for new features.
 - **Run one crate:** `cargo test -p orch-peer`; one test: `cargo test -p orch-cli --test remote_peers <name>`.
+- **Portable by default.** Tests, fixtures and scripts run on macOS and Linux, or are marked Linux-only (and
+  then CI runs them). No GNU-only flags (`sed -i` without a suffix argument, `df -BG`, `date -Is`); no
+  `/proc` outside `#[cfg(target_os = "linux")]`. A test that fails on macOS is a bug to fix, not a "baseline".
+- **Hermetic child processes.** A test that spawns a binary gives it its own temp root and a cleared or explicit
+  environment. Runner variables (`CARGO_TARGET_DIR`, `TMPDIR`, wrapper `PATH`s) must not leak in. Keep
+  scenario-heavy test files split by scenario group, so parallel work does not serialise on one file.
+
+### TUI end-to-end tests (tmux)
+
+The dashboard is tested at three levels:
+
+| Level | Where | Proves |
+|---|---|---|
+| Render and state | `crates/orch-tui/tests/`, `FakeBackend` | Layout, key handling, state transitions |
+| Dashboard flow | `crates/orch-cli/tests/tui_dashboard.rs` (ratatui `TestBackend`, real engine) | The TUI and the engine agree |
+| End to end | The real `orch` binary running in tmux | What an operator sees and does in a real terminal |
+
+A requirement about keys, mouse, focus, scrolling, resize, copy or anything else on screen is not `pass` until an
+end-to-end test covers it. Tests against `FakeBackend` or `TestBackend` alone do not count. Process-level tty
+behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/tests/tui_hangup.rs`.
+
+**Use tmux as the terminal**, both for automated tests and for manual or agent acceptance runs:
+
+- **Isolated server.** Run every command as `tmux -L <unique-socket> -f /dev/null ...`. That gives each test its
+  own server and no user config. Never attach to or touch the developer's tmux server. Run `kill-server` when
+  the test ends, including on failure (use a drop guard).
+- **Hermetic session.** Run the dashboard in a temp project, and pin the terminal type before the session
+  exists, so key encodings do not depend on the host:
+  `tmux -L <sock> -f /dev/null start-server \; set-option -g default-terminal tmux-256color \; new-session -d
+  -s <name> -x 120 -y 40 -e VAR=value '<orch binary> tui'`. Pass the environment the binary needs with `-e`,
+  including `ORCHESTRY_GLOBAL_CONFIG_PATH`.
+- **Input.**
+  - Named keys: `send-keys -t <name> Down PageDown Home End Enter Escape Tab`.
+  - Literal text: `send-keys -t <name> -l '<text>'`.
+  - Raw bytes, such as SGR mouse events: `send-keys -t <name> -H 1b 5b 3c 30 3b 31 30 3b 35 4d` is
+    `ESC[<0;10;5M`, a left-button press at column 10, row 5.
+- **Output.** `capture-pane -p -t <name>` returns the screen as text; add `-e` when the test asserts colours or
+  attributes. Poll until the expected text appears, with a bounded deadline. Never use a fixed sleep as the
+  assertion.
+- **Resize.** `resize-window -t <name> -x 80 -y 24`, then assert the redrawn screen.
+- **Clipboard.** After `set-option -s set-clipboard on`, an OSC 52 write from the dashboard lands in tmux's paste
+  buffer. Read it back with `show-buffer`. This checks the terminal copy route without touching the system
+  clipboard.
+- **Not covered by tmux:** native terminal profiles (Terminal.app, iTerm2), the native system clipboard, and
+  `orch web` in a browser. List these in the spec's Verification environment. Record them as `env-limited` or
+  `waived by owner` if they are not run.
+- **Installing tmux.** Use `brew install tmux` on macOS and the distro package on Linux. CI does not install
+  tmux yet, so the first PR that adds a tmux test also adds the install step to `.github/workflows/ci.yml`. A
+  tmux test must fail with a clear message when tmux is missing, never pass silently.
+- **Manual and agent acceptance** use the same commands against a temp project, never a real `.orchestry`.
+  Paste the `capture-pane` output into the PR as evidence.
 
 ## Release
 
-1. Branch `release/vX.Y.Z` from `master`. Run the cold `./xtask/gate.sh` (after `./parity/setup.sh`); it must pass.
+1. Branch `chore/release-vX.Y.Z` from `master`. Do not use `release/vX.Y.Z`: the ruleset protects
+   `release/**`. Run the cold `./xtask/gate.sh` (after `./parity/setup.sh`) on a platform it supports (see
+   Pre-PR check); it must pass. Record the platform in the PR.
 2. Set `workspace.package.version` in `Cargo.toml` (and let `Cargo.lock` update).
 3. In `CHANGELOG.md` rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh empty `## [Unreleased]`,
    and update the compare links at the bottom.
@@ -189,20 +320,30 @@ Pure refactors, tests and CI need no entry.
 `orch update` does not self-update; it only prints install instructions, so there is no update channel to
 publish. Never tag from a branch other than `master`, and never move or delete a pushed tag.
 
+The release procedure is this section. Do not write a new release runbook or one-off publish scripts for each
+release. If a step is missing, fix this section in the release PR. Scripts that are needed again belong under
+`xtask/`. They must stop on any failed command and must take the version as a parameter. Agent sessions may have
+no SSH agent, so use an HTTPS remote with the `gh` credential helper for pushes, and put HTTPS (or `<host>`)
+URLs in docs. Downstream packaging (a Homebrew formula and the like) lives outside this repo and is the owner's
+to update.
+
 ## Roles
 
-**Lead / orchestrator.** Reads: this file, open PRs, `docs/plans/`. Owns: scope, splitting work into one-concern
-PRs, deciding plan and ADR need, merging when delegated. Must not skip: writing or approving the plan before
-work that needs a plan starts; telling implementers which worktree and branch to use.
+**Lead / orchestrator.** Reads: this file, open PRs, `docs/specs/`, `docs/plans/`. Owns: turning the owner's
+request into a spec, scope, splitting work into one-concern PRs through the plan's task table, deciding plan and
+ADR need, merging when delegated. Must not skip: getting the spec approved and writing or approving the plan
+before work that needs them starts; self-contained task briefs (see Handing out and finishing tasks); checking
+the evidence that a task is done before releasing the tasks that depend on it.
 
-**Implementer.** Reads: the plan, the crate's ARCHITECTURE section, neighbouring tests. Owns: code, tests and the
-doc updates from the duties table, in one PR. Must not skip: the green commands, the CHANGELOG line, a test that
-fails without the change.
+**Implementer.** Reads: the task brief, the spec and plan, the crate's ARCHITECTURE section, neighbouring tests.
+Owns: code, tests and the doc updates from the duties table, in one PR. Must not skip: the green commands, the
+CHANGELOG line, a test that fails without the change, the commit and verify result in the PR.
 
-**Reviewer.** Read-only: does not edit, push or merge. Reads: the PR description, the diff, the plan and ADRs it
-cites. Owns: a findings list with severity (blocker / should-fix / nit). Must not skip: stating what was checked
-(commands run, files read, what was not checked) and checking the Don'ts below. Do not reject for
-parity divergence.
+**Reviewer.** Read-only: does not edit, push or merge. Reads: the PR description, the diff, and the spec, plan
+and ADRs it cites. Owns: a findings list with severity (blocker / should-fix / nit). Must not skip: stating
+what was checked (commands run, files read, platform, what was not checked); checking the Don'ts below; checking
+that the spec and plan status lines are correct. A finding that is a missing requirement goes into the spec as a
+new row. Do not reject for parity divergence.
 
 **Tech writer.** Reads: the code and tests being documented, existing docs. Owns: README, RUNBOOK, ARCHITECTURE,
 CHANGELOG wording, plans and ADR clarity. Must not skip: verifying every command and message against the code.
@@ -225,3 +366,6 @@ pushing a tag.
 - Don't edit `docs/TRAITS-FROZEN.md` without an ADR.
 - Don't push to `master`, force-push shared branches, or merge your own PR.
 - Don't skip hooks or silence clippy with `#[allow]` without a reason comment.
+- Don't wrap a broken repo script in an external harness; fix the script (see Broken tooling).
+- Don't create `release/**` branches; the ruleset protects them.
+- Don't report a check as passed that did not run, ran only on another platform, or fails on the base commit too.

@@ -445,7 +445,8 @@ drafts last only for the dashboard session).
 | [docs/parity/](docs/parity/) | Historical per-area appendices behind the contract — CLI, adapters, infrastructure, TUI, tests |
 | [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release |
-| [docs/plans/](docs/plans/) | Plans for non-trivial work, before it is built |
+| [docs/specs/](docs/specs/) | Specs: what goal-sized work must do and how it is accepted |
+| [docs/plans/](docs/plans/) | Plans for non-trivial work, before it is built: design, task split, status |
 | [docs/decisions/](docs/decisions/) | Decision records: why things are the way they are |
 
 Start with the **runbook** if something is wrong. PARITY.md can still explain why an inherited behaviour is the

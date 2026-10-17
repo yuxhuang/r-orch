@@ -1,6 +1,6 @@
 # 0001. Plans and decision records
 
-- Status: accepted
+- Status: superseded by [0004](0004-spec-driven-development.md)
 - Date: 2026-10-16
 
 ## Context
