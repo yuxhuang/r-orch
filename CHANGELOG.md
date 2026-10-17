@@ -5,6 +5,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-17
+
+Dashboard (TUI) release: agent sorting and live-following activity feeds. No peer-protocol or on-disk change, so
+0.5.x, 0.6.0 and 0.7.0 peers can be mixed.
+
 ### Added
 - Sort the Agents list by Original, Name, Status, Adapter/Model or Location in either direction for the current session, with keyboard and clickable reset controls.
 - `docs/specs/` and a spec-driven workflow for contributors and agents ([ADR 0004](docs/decisions/0004-spec-driven-development.md)): requirements with acceptance checks, short execution plans with task tables, and bounded design-review loops.
@@ -113,7 +118,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/yuxhuang/r-orch/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/yuxhuang/r-orch/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/yuxhuang/r-orch/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/yuxhuang/r-orch/compare/v0.5.0...v0.5.1

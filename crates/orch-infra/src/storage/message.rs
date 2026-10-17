@@ -763,7 +763,7 @@ mod tests {
             .truncate(false)
             .open(store.paths.messages_dir().join(".mutation.lock"))
             .unwrap();
-        file.try_lock().unwrap();
+        crate::storage::test_locks::lock_when_free(&file);
         file
     }
 

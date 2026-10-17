@@ -72,7 +72,11 @@ impl TestListener {
 }
 
 async fn socket_next(read: &mut BufReader<TcpStream>) -> Option<Frame> {
-    timeout(Duration::from_secs(2), read_frame(read))
+    socket_next_within(read, Duration::from_secs(2)).await
+}
+
+async fn socket_next_within(read: &mut BufReader<TcpStream>, limit: Duration) -> Option<Frame> {
+    timeout(limit, read_frame(read))
         .await
         .expect("peer response deadline")
         .expect("valid peer response")
@@ -318,8 +322,12 @@ async fn duplicate_message_after_reconnect_is_acked_without_reopening_delivered_
 }
 
 async fn socket_data(read: &mut BufReader<TcpStream>) -> Option<Frame> {
+    socket_data_within(read, Duration::from_secs(2)).await
+}
+
+async fn socket_data_within(read: &mut BufReader<TcpStream>, limit: Duration) -> Option<Frame> {
     loop {
-        match socket_next(read).await {
+        match socket_next_within(read, limit).await {
             Some(Frame::State { .. } | Frame::Agents { .. }) => {}
             Some(Frame::Ping) => write_frame(read.get_mut(), &Frame::Pong).await.unwrap(),
             frame => return frame,
@@ -738,8 +746,12 @@ async fn a_cancel_for_an_unreadable_mirror_is_retried_until_it_applies() {
     );
     assert_eq!(mirror(&listener.worker, "poison").await.status, TaskStatus::Todo);
 
-    // The record is readable again: the next tick applies the cancel and
-    // acknowledges it, with no reconnect and no second cancel frame.
+    // The record is readable again: the next retry applies the cancel and
+    // acknowledges it, with no reconnect and no second cancel frame. Retries
+    // back off 1 s, 2 s, 4 s, ... and on a loaded machine more than one may
+    // have failed before the save above, so the ack can be several seconds
+    // away: wait longer than the 2 s per-frame deadline the rest of this file
+    // uses.
     listener
         .worker
         .ctx
@@ -749,7 +761,7 @@ async fn a_cancel_for_an_unreadable_mirror_is_retried_until_it_applies() {
         .await
         .unwrap();
     loop {
-        match socket_data(&mut read).await {
+        match socket_data_within(&mut read, Duration::from_secs(20)).await {
             Some(Frame::CancelAck { exec_key }) => {
                 assert_eq!(exec_key, "poison");
                 break;

@@ -377,6 +377,9 @@ fn tui_sigterm_exits_only_after_the_owners_own_shutdown() {
         }
     }
     command.env("TERM", "xterm-256color");
+    // The dashboard probes every adapter CLI for its model list on the first
+    // tick: keep the developer's own agent CLIs off its PATH.
+    command.env("PATH", "/usr/bin:/bin");
     command.cwd(controller.dir.path());
     command.args(["tui", "--listen", &controller_addr.to_string()]);
     let mut dashboard = Dashboard {

@@ -45,14 +45,14 @@ cargo install --path crates/orch-cli
 
 Releases are tags on `master` (`vX.Y.Z`). v0.5.0 is the first release with
 [remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
-`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
+`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard; v0.7.0 adds Agents-list sorting and activity feeds that follow new entries. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
 `orch update` does not self-update: it only prints how to install. To build a specific release from source:
 
 ```bash
 git clone <this repo> r-orch && cd r-orch
-git checkout v0.6.0
+git checkout v0.7.0
 cargo install --locked --path crates/orch-cli
-orch --version      # 0.6.0
+orch --version      # 0.7.0
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
@@ -424,6 +424,13 @@ talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notic
 Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
 cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
 
+### Upgrading from v0.6.0
+
+v0.7.0 changes only the dashboard, and peers on 0.5.x, 0.6.0 and 0.7.0 interoperate. The Agents list can be
+sorted for the session, and the Activity, ACTIONS and task-detail feeds stay at the newest entry until you scroll
+up. Roll back by installing v0.6.0: v0.7.0 writes nothing new to `.orchestry/` (the sort order lasts only for
+the dashboard session).
+
 ### Upgrading from v0.5.x
 
 v0.6.0 changes only the dashboard; 0.5.x and 0.6.0 peers interoperate, so upgrade them in any order. Keys
@@ -432,7 +439,7 @@ while the main list has focus. Mouse capture now reports drags for text selectio
 back to the terminal. Roll back by installing v0.5.2: v0.6.0 writes nothing new to `.orchestry/` (editor
 drafts last only for the dashboard session).
 
-### Known gaps in v0.6.0
+### Known gaps in v0.7.0
 
 - Copy and mouse selection in a native terminal (Terminal.app, iTerm2) were not verified by hand before
   release; the automated tests cover the copy routing, and the web dashboard's browser copy.

@@ -166,6 +166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn this_process_is_in_its_own_group() {
         // A live check that the /proc scan and the parse agree with reality.
         let pgid = own_pgid();
@@ -185,6 +186,7 @@ mod tests {
 
     /// This process's group, read from its own stat line — no libc needed in
     /// orch-core for one value.
+    #[cfg(target_os = "linux")]
     fn own_pgid() -> u32 {
         let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
         parse_stat(std::process::id(), &stat).expect("parse").pgid as u32

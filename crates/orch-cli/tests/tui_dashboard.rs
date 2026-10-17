@@ -9,6 +9,8 @@
 //! → `context()` → render path that `orch tui` runs before anything is
 //! interactive.
 
+mod common;
+
 use std::sync::Arc;
 
 use orch_core::storage::ConfigStore;
@@ -119,7 +121,9 @@ async fn the_dashboard_renders_what_the_engine_has_on_disk() {
         .await
         .expect("create agent");
 
-    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9").await;
+    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9")
+        .await
+        .with_model_discovery(common::offline_model_discovery());
     let (header, tasks, agents) = on_dashboard(backend, |app, terminal| {
         // `App::new` has already called `context()` and the three refreshes,
         // which is what the first frame of `orch tui` does.
@@ -143,7 +147,9 @@ async fn the_dashboard_renders_what_the_engine_has_on_disk() {
 #[tokio::test(flavor = "multi_thread")]
 async fn creating_a_task_through_the_dashboard_reaches_the_store() {
     let (_temp, engine) = project("round-trip").await;
-    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9").await;
+    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9")
+        .await
+        .with_model_discovery(common::offline_model_discovery());
 
     // `/task add <title>` is the shortest real mutation path: it goes through
     // the same `create_task` the wizard calls, and proves a write survives the
@@ -175,7 +181,9 @@ async fn creating_a_task_through_the_dashboard_reaches_the_store() {
 #[tokio::test(flavor = "multi_thread")]
 async fn quitting_sets_the_exit_flag_the_runner_loops_on() {
     let (_temp, engine) = project("quit").await;
-    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9").await;
+    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9")
+        .await
+        .with_model_discovery(common::offline_model_discovery());
 
     let should_exit = on_dashboard(backend, |app, terminal| {
         frame(app, terminal);
@@ -196,7 +204,9 @@ async fn a_lock_conflict_is_rendered_to_the_user_not_swallowed() {
     let held = orch_engine::FileLock::new(engine.paths.lock_path());
     assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
 
-    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9").await;
+    let backend = EngineBackend::launch(Arc::clone(&engine), "9.9.9")
+        .await
+        .with_model_discovery(common::offline_model_discovery());
     assert!(backend.context().observer_mode);
 
     let rendered = on_dashboard(backend, |app, terminal| {

@@ -557,7 +557,7 @@ mod tests {
             index.read_index().await.unwrap(),
             vec![item("first", 1), item("second", 2)]
         );
-        contender.try_lock().unwrap();
+        crate::storage::test_locks::lock_when_free(&contender);
     }
 
     #[test]
@@ -576,7 +576,7 @@ mod tests {
                 .write(true)
                 .open(temp.path().join(".index.lock"))
                 .unwrap();
-            lock.try_lock().unwrap();
+            crate::storage::test_locks::lock_when_free(&lock);
             let mut acquiring = Box::pin(index.lock_writer());
             // Drive the cold filesystem awaits to completion without advancing
             // the clock. A barrier on the sole worker drains each queued step;

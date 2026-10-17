@@ -76,7 +76,9 @@ struct Dashboard {
 }
 
 /// Launch the dashboard on a 100×30 pty. The project has no tasks, so the
-/// orchestrator it starts never runs an agent and no AI CLI is executed.
+/// orchestrator it starts never runs an agent. The dashboard does probe every
+/// adapter's CLI for its model list on the first tick, so `PATH` is cut down
+/// to the system directories, where no agent CLI is installed.
 fn launch(dir: &Path, args: &[&str]) -> Dashboard {
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -92,6 +94,7 @@ fn launch(dir: &Path, args: &[&str]) -> Dashboard {
     command.cwd(dir);
     command.env("HOME", dir.join("home"));
     command.env("TERM", "xterm-256color");
+    command.env("PATH", "/usr/bin:/bin");
     let child = pair.slave.spawn_command(command).expect("spawn orch tui");
     // The child holds its own copy; keeping ours would mean the pty never
     // reports a hangup to it.

@@ -6,6 +6,8 @@
 //! methods directly from `#[tokio::test]` would panic, which is precisely the
 //! mistake this file exists to make impossible.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,7 +108,9 @@ where
 }
 
 async fn launch(engine: Arc<FullEngine>) -> EngineBackend {
-    EngineBackend::launch(engine, "9.9.9").await
+    EngineBackend::launch(engine, "9.9.9")
+        .await
+        .with_model_discovery(common::offline_model_discovery())
 }
 
 // ── launch ───────────────────────────────────────────────────────────────
