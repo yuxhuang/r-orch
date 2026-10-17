@@ -225,6 +225,39 @@ fn n5_actual_tasks_and_agents_share_display_row_paging_and_refresh_units() {
         };
         h.app.state.group_by_goal = true;
         h.draw();
+        let actual_rows: Vec<_> = if agents {
+            h.app
+                .state
+                .agent_rows(true)
+                .iter()
+                .enumerate()
+                .filter_map(|(row, kind)| {
+                    matches!(
+                        kind,
+                        orch_tui::state::AgentRow::Agent { .. }
+                            | orch_tui::state::AgentRow::AddAgent { .. }
+                    )
+                    .then_some(row)
+                })
+                .collect()
+        } else {
+            h.app
+                .state
+                .task_rows(true)
+                .iter()
+                .enumerate()
+                .filter_map(|(row, kind)| {
+                    matches!(
+                        kind,
+                        orch_tui::state::TaskRow::Task { .. }
+                            | orch_tui::state::TaskRow::AddTask { .. }
+                            | orch_tui::state::TaskRow::ShowAll { .. }
+                    )
+                    .then_some(row)
+                })
+                .collect()
+        };
+        assert_eq!(actual_rows, [1, 2, 4, 5, 7, 8, 9]);
         let key = h.app.state.pane_key(Focus::MainList);
         let metrics = PaneMetrics {
             key: key.clone(),
@@ -952,5 +985,79 @@ fn v6_shrinking_source_clamps_anchor_to_the_new_top_of_the_last_page() {
             .document()
             .initial_anchor,
         expected
+    );
+}
+
+#[test]
+fn n5_agents_permission_and_unassigned_boundaries_recompute_the_actual_rows() {
+    use orch_domain::AgentStatus;
+    use orch_tui::backend::{make_agent, make_team};
+    use orch_tui::state::AgentRow;
+    let mut h = Harness::new();
+    h.app.state.view = ViewId::Agents;
+    h.app.state.onboarding = orch_tui::onboarding::OnboardingStep::Dismissed;
+    h.app.state.agents = (0..6)
+        .map(|i| make_agent(&format!("a{i}"), &format!("agent{i}"), AgentStatus::Idle))
+        .collect();
+    h.app.state.teams = vec![
+        make_team("a", "A", "a0", &["a0", "a1"]),
+        make_team("b", "B", "a2", &["a2", "a3"]),
+    ];
+    h.app.backend.can_add_agent = false;
+    h.draw();
+    let key = h.app.state.pane_key(Focus::MainList);
+    let rows = h.app.state.agent_rows(false);
+    assert_eq!(rows.len(), 9);
+    assert_eq!(
+        rows.iter()
+            .enumerate()
+            .filter_map(|(i, row)| matches!(row, AgentRow::Agent { .. }).then_some(i))
+            .collect::<Vec<_>>(),
+        [1, 2, 4, 5, 7, 8]
+    );
+    h.app
+        .state
+        .mouse
+        .hits
+        .metrics
+        .panes
+        .iter_mut()
+        .find(|p| p.key == key)
+        .unwrap()
+        .body
+        .height = 5;
+    h.press(KeyCode::End);
+    assert_eq!(
+        (h.app.state.agent_selected, h.app.state.agent_scroll),
+        (5, 4)
+    );
+    h.app.state.teams.clear();
+    h.draw().press(KeyCode::End);
+    let metrics = h
+        .hits()
+        .metrics
+        .panes
+        .iter()
+        .find(|p| p.key == key)
+        .unwrap();
+    assert_eq!(metrics.selection_rows, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(h.app.state.agent_selected, 5);
+    h.app.state.agents.clear();
+    h.app.state.clamp_all(false);
+    h.draw().press(KeyCode::End);
+    assert_eq!(
+        (h.app.state.agent_selected, h.app.state.agent_scroll),
+        (0, 0)
+    );
+    assert!(h.app.state.agent_rows(false).is_empty());
+    h.app.backend.can_add_agent = true;
+    h.draw().press(KeyCode::End);
+    assert_eq!(
+        h.app.state.agent_rows(true),
+        [AgentRow::AddAgent { selection: 0 }]
+    );
+    assert_eq!(
+        (h.app.state.agent_selected, h.app.state.agent_scroll),
+        (0, 0)
     );
 }
