@@ -20,6 +20,7 @@ use crate::state::{
 };
 use crate::theme::{Palette, Token};
 use crate::wizard::engine::{Values, WizardKind};
+use crate::wizard::session::{DraftKey, LeaveIntent, SubmitOutcome, WizardDraft};
 use crate::wizard::{Wizard, configs};
 
 /// A broadcast waiting for its confirming second Enter (design-v2 §3.4.4).
@@ -504,28 +505,135 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     // ── Wizards ────────────────────────────────────────────────────────────
 
     pub fn open_wizard(&mut self, wizard: Wizard) {
-        let attachments = self.state.pending_attachments.len();
-        let wizard = if attachments > 0 && wizard.paste_capable {
-            wizard.with_footer_extra(Some(format!("📎{attachments}")))
-        } else {
-            wizard
-        };
-        self.state.wizard = Some(wizard);
-        self.state.input_mode = InputMode::Wizard;
+        if self.state.wizard_sessions.pending_leave.is_some() {
+            return;
+        }
+        let key = DraftKey::from_wizard(&wizard);
+        if self.state.wizard.is_some() && self.guard_wizard_leave(LeaveIntent::Replace(key)) {
+            self.state.wizard_sessions.replacement = Some(wizard);
+            return;
+        }
+        self.close_wizard();
+        self.install_wizard(wizard);
     }
 
-    /// Cancel the wizard. Unlike the TS App's `Esc` path this always clears
-    /// pending attachments (docs/parity/tui.md §8.2 records the leak).
+    pub(crate) fn install_wizard(&mut self, mut wizard: Wizard) {
+        let key = DraftKey::from_wizard(&wizard);
+        self.state.wizard_sessions.recovery = false;
+        if let Some(draft) = self.state.wizard_sessions.draft_for(&key).cloned() {
+            let exists = match key.kind {
+                WizardKind::EditTask => self
+                    .state
+                    .tasks
+                    .iter()
+                    .any(|t| Some(&t.id) == key.target_id.as_ref()),
+                WizardKind::EditGoal => self
+                    .state
+                    .goals
+                    .iter()
+                    .any(|g| Some(&g.id) == key.target_id.as_ref()),
+                WizardKind::EditAgent => self
+                    .state
+                    .agents
+                    .iter()
+                    .any(|a| Some(&a.id) == key.target_id.as_ref()),
+                _ => true,
+            };
+            let stale = matches!(
+                key.kind,
+                WizardKind::EditTask
+                    | WizardKind::EditGoal
+                    | WizardKind::EditAgent
+                    | WizardKind::Config
+            ) && (!exists || draft.source_defaults() != &wizard.source_defaults);
+            if stale {
+                self.state.wizard_sessions.replacement = Some(wizard);
+                self.state.wizard_sessions.recovery = true;
+            }
+            wizard = draft.restore();
+            wizard.session_notice = Some(if stale {
+                "Stale session draft — recovery only. Esc, Discard to restart from current data."
+            } else { "Session draft restored" }.into());
+            wizard.copy_notice = Some(
+                if stale {
+                    "Stale draft; Esc restart; F6"
+                } else {
+                    "Session draft restored; F6"
+                }
+                .into(),
+            );
+            self.state.pending_attachments = draft.attachments;
+        }
+        let attachments = self.state.pending_attachments.len();
+        if attachments > 0 && wizard.paste_capable {
+            wizard.footer_extra = Some(format!("📎{attachments}"));
+        }
+        let _ = self
+            .state
+            .register_editor_origin(key.clone(), wizard.step_id().into());
+        self.state.wizard_sessions.active_key = Some(key);
+        self.state.wizard = Some(wizard);
+        self.state.input_mode = InputMode::Wizard;
+        if self.state.wizard_sessions.recovery {
+            use crate::widgets::text_viewer::{
+                Completeness, Representation, TextViewer, ViewerDocument, ViewerSource,
+            };
+            let wizard = self.state.wizard.as_ref().expect("installed wizard");
+            let body = wizard
+                .semantic_values()
+                .iter()
+                .map(|(key, value)| format!("{key}:\n{value}\n"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + &format!(
+                    "\nAttachments:\n{}",
+                    self.state.pending_attachments.join("\n")
+                );
+            let kind = match wizard.kind {
+                WizardKind::EditAgent => EntityType::Agent,
+                WizardKind::EditGoal => EntityType::Goal,
+                _ => EntityType::Task,
+            };
+            let source = ViewerSource::Entity {
+                kind,
+                id: wizard
+                    .target_id
+                    .clone()
+                    .unwrap_or_else(|| "session-recovery".into()),
+                field: format!(
+                    "session-draft:{:?}:{:?}:{:?}",
+                    wizard.kind, wizard.setting, wizard.template_key
+                ),
+            };
+            let document = ViewerDocument {
+                source: source.clone(),
+                title:
+                    "Stale session draft — recovery only; close viewer, Esc then Discard to restart"
+                        .into(),
+                original_bytes: body.len(),
+                body: body.into(),
+                representation: Representation::Field,
+                raw_body: None,
+                completeness: Completeness::Complete,
+                captured_at_ms: self.clock.now_ms(),
+                initial_anchor: 0,
+            };
+            if self.state.register_viewer_origin(source).is_ok() {
+                self.state.viewer = Some(TextViewer::new(document));
+            }
+        }
+        self.invalidate_hits();
+    }
+
     pub fn cancel_wizard(&mut self) {
-        self.state.wizard = None;
-        self.state.input_mode = InputMode::None;
-        self.state.pending_attachments.clear();
+        if self.guard_wizard_leave(LeaveIntent::Cancel) {
+            return;
+        }
+        self.close_wizard();
     }
 
     pub fn open_task_wizard(&mut self) {
-        self.state.pending_attachments.clear();
-        let wizard = configs::new_task_wizard(&self.state.agents);
-        self.open_wizard(wizard);
+        self.open_wizard(configs::new_task_wizard(&self.state.agents));
     }
 
     pub fn open_edit_task_wizard(&mut self) {
@@ -591,6 +699,17 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     pub fn open_config_wizard(&mut self, setting: &str) {
+        if !matches!(
+            setting,
+            "palette"
+                | "activity-filter"
+                | "max-concurrent"
+                | "notifications-toast"
+                | "notifications-bell"
+        ) {
+            self.submission_failed("Unknown setting");
+            return;
+        }
         let palette = self.state.palette.name.as_str().to_string();
         let filter = crate::messages::preset_label(&self.state.activity_filter).to_string();
         let wizard = configs::config_wizard(
@@ -676,26 +795,63 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     /// Dispatch a completed wizard to the backend (docs/parity/tui.md §5.2).
     pub fn submit_wizard(&mut self, values: Values) {
-        let Some(wizard) = self.state.wizard.take() else {
+        if self.state.wizard_sessions.recovery {
+            self.submission_failed("Stale draft is recovery only; explicitly discard and restart");
+            return;
+        }
+        let Some(wizard) = self.state.wizard.as_ref() else {
             return;
         };
-        self.state.input_mode = InputMode::None;
-        match wizard.kind {
+        let kind = wizard.kind.clone();
+        let target = wizard.target_id.clone();
+        let setting = wizard.setting.clone();
+        let key = DraftKey::from_wizard(wizard);
+        let surface = crate::hit::TextSurfaceId::Editor(key.clone(), wizard.step_id().into());
+        if let Some(origin) = self.state.live_copy_origin(&surface).cloned() {
+            self.state.clear_copy_feedback(&origin);
+        }
+        let outcome = match kind {
             WizardKind::Task => self.submit_task(&values),
-            WizardKind::EditTask => self.submit_edit_task(&values, wizard.target_id.as_deref()),
+            WizardKind::EditTask => self.submit_edit_task(&values, target.as_deref()),
             WizardKind::Agent | WizardKind::AgentFromShop => self.submit_agent(&values),
-            WizardKind::EditAgent => self.submit_edit_agent(&values, wizard.target_id.as_deref()),
+            WizardKind::EditAgent => self.submit_edit_agent(&values, target.as_deref()),
             WizardKind::AgentShop => self.submit_shop(&values),
             WizardKind::Team => self.submit_team(&values),
             WizardKind::Goal => self.submit_goal(&values),
-            WizardKind::EditGoal => self.submit_edit_goal(&values, wizard.target_id.as_deref()),
-            WizardKind::Config => self.submit_config(&values, wizard.setting.as_deref()),
+            WizardKind::EditGoal => self.submit_edit_goal(&values, target.as_deref()),
+            WizardKind::Config => self.submit_config(&values, setting.as_deref()),
+        };
+        match outcome {
+            SubmitOutcome::Failed => {
+                if let Some(wizard) = self.state.wizard.as_ref() {
+                    let draft = WizardDraft::capture(wizard, &self.state.pending_attachments);
+                    if let Err(error) = self.state.wizard_sessions.save_draft(draft) {
+                        // The active form is retained regardless of saved-draft capacity.
+                        self.state.wizard_sessions.error = Some(error);
+                    }
+                }
+                self.state.input_mode = InputMode::Wizard;
+            }
+            SubmitOutcome::Committed => {
+                self.state.wizard_sessions.discard_draft(&key);
+                self.close_wizard();
+            }
+            SubmitOutcome::Advanced => self.state.wizard_sessions.discard_draft(&key),
         }
+        self.invalidate_hits();
     }
 
-    fn submit_task(&mut self, values: &Values) {
+    fn submission_failed(&mut self, error: &str) -> SubmitOutcome {
+        if let Some(w) = self.state.wizard.as_mut() {
+            w.session_error = Some(error.into());
+        }
+        self.fail(error);
+        SubmitOutcome::Failed
+    }
+
+    fn submit_task(&mut self, values: &Values) -> SubmitOutcome {
         let (title, mut opts, assignee) = configs::task_wizard_to_input(values);
-        let attachments = std::mem::take(&mut self.state.pending_attachments);
+        let attachments = self.state.pending_attachments.clone();
         let count = attachments.len();
         if count > 0 {
             opts.attachments = Some(attachments);
@@ -717,19 +873,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     Token::Green,
                     MsgType::System,
                 );
-                if let Some(agent_id) = assignee {
-                    let _ = self.backend.assign_task(&task.id, &agent_id);
+                if let Some(agent_id) = assignee
+                    && let Err(error) = self.backend.assign_task(&task.id, &agent_id)
+                {
+                    self.fail(&format!("Task {} committed; assignment failed: {error}. Use explicit assignment; do not create again",task.id));
                 }
                 self.refresh_all(false);
+                SubmitOutcome::Committed
             }
-            Err(err) => self.fail(&err),
+            Err(err) => self.submission_failed(&err),
         }
     }
 
-    fn submit_edit_task(&mut self, values: &Values, target: Option<&str>) {
-        let Some(target) = target else { return };
+    fn submit_edit_task(&mut self, values: &Values, target: Option<&str>) -> SubmitOutcome {
+        let Some(target) = target else {
+            return self.submission_failed("Missing target");
+        };
         let (mut fields, assignee) = configs::edit_task_wizard_to_fields(values);
-        let attachments = std::mem::take(&mut self.state.pending_attachments);
+        let attachments = self.state.pending_attachments.clone();
         let count = attachments.len();
         if count > 0 {
             fields.attachments = Some(attachments);
@@ -747,16 +908,21 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     Token::Green,
                     MsgType::System,
                 );
-                if let Some(agent_id) = assignee {
-                    let _ = self.backend.assign_task(target, &agent_id);
+                if let Some(agent_id) = assignee
+                    && let Err(error) = self.backend.assign_task(target, &agent_id)
+                {
+                    self.fail(&format!(
+                        "Task {target} updated; assignment failed: {error}. Use explicit assignment"
+                    ));
                 }
                 self.refresh_all(false);
+                SubmitOutcome::Committed
             }
-            Err(err) => self.fail(&err),
+            Err(err) => self.submission_failed(&err),
         }
     }
 
-    fn submit_agent(&mut self, values: &Values) {
+    fn submit_agent(&mut self, values: &Values) -> SubmitOutcome {
         let default_adapter = self.state.default_adapter.clone();
         let input = configs::agent_wizard_to_input(values, &default_adapter);
         self.emit(
@@ -786,24 +952,30 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 );
                 match input.team_id {
                     Some(team_id) => {
-                        if let Ok(team) = self.backend.join_team(&team_id, &agent.id) {
+                        match self.backend.join_team(&team_id, &agent.id) {
+                            Ok(team) => {
                             self.emit(
                                 &format!("✓ Joined team \"{}\"", team.name),
                                 Token::Green,
                                 MsgType::System,
                             );
+                            }
+                            Err(error) => self.fail(&format!("Agent {} committed; team assignment failed: {error}. Use explicit team assignment",agent.id)),
                         }
                         self.refresh_all(true);
                     }
                     None => self.refresh_all(false),
                 }
+                SubmitOutcome::Committed
             }
-            Err(err) => self.fail(&err),
+            Err(err) => self.submission_failed(&err),
         }
     }
 
-    fn submit_edit_agent(&mut self, values: &Values, target: Option<&str>) {
-        let Some(target) = target else { return };
+    fn submit_edit_agent(&mut self, values: &Values, target: Option<&str>) -> SubmitOutcome {
+        let Some(target) = target else {
+            return self.submission_failed("Missing target");
+        };
         let (fields, team_id) = configs::edit_agent_wizard_to_fields(values);
         let old_team = self
             .state
@@ -830,32 +1002,33 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     && !old.is_empty()
                     && old != new_team
                 {
-                    if let Ok(team) = self.backend.leave_team(old, target) {
+                    match self.backend.leave_team(old, target) { Ok(team) => {
                         self.emit(
                             &format!("✓ Left team \"{}\"", team.name),
                             Token::Green,
                             MsgType::System,
                         );
-                    }
+                    }, Err(error) => self.fail(&format!("Agent {target} updated; team operation failed: {error}. Use explicit team assignment")) }
                     team_ops += 1;
                 }
                 if !new_team.is_empty() && Some(new_team.as_str()) != old_team.as_deref() {
-                    if let Ok(team) = self.backend.join_team(&new_team, target) {
+                    match self.backend.join_team(&new_team, target) { Ok(team) => {
                         self.emit(
                             &format!("✓ Joined team \"{}\"", team.name),
                             Token::Green,
                             MsgType::System,
                         );
-                    }
+                    }, Err(error) => self.fail(&format!("Agent {target} updated; team operation failed: {error}. Use explicit team assignment")) }
                     team_ops += 1;
                 }
                 self.refresh_all(team_ops > 0);
+                SubmitOutcome::Committed
             }
-            Err(err) => self.fail(&err),
+            Err(err) => self.submission_failed(&err),
         }
     }
 
-    fn submit_shop(&mut self, values: &Values) {
+    fn submit_shop(&mut self, values: &Values) -> SubmitOutcome {
         let key = values.get("shop_template").cloned().unwrap_or_default();
         match orch_domain::get_shop_template_by_key(&key) {
             Some(template) => {
@@ -866,13 +1039,15 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     &self.model_catalog,
                     &self.state.default_adapter,
                 );
-                self.open_wizard(wizard);
+                self.close_wizard();
+                self.install_wizard(wizard);
+                SubmitOutcome::Advanced
             }
-            None => self.emit("No template selected", Token::Yellow, MsgType::System),
+            None => self.submission_failed("No template selected"),
         }
     }
 
-    fn submit_team(&mut self, values: &Values) {
+    fn submit_team(&mut self, values: &Values) -> SubmitOutcome {
         let input = configs::team_wizard_to_input(values);
         self.emit(
             &format!("Creating team \"{}\"...", input.name),
@@ -892,12 +1067,13 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     MsgType::System,
                 );
                 self.refresh_all(true);
+                SubmitOutcome::Committed
             }
-            Err(err) => self.fail(&err),
+            Err(err) => self.submission_failed(&err),
         }
     }
 
-    fn submit_goal(&mut self, values: &Values) {
+    fn submit_goal(&mut self, values: &Values) -> SubmitOutcome {
         let input = configs::goal_wizard_to_input(values);
         self.emit(
             &format!("Creating goal \"{}\"...", input.title),
@@ -912,13 +1088,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     MsgType::System,
                 );
                 self.refresh_all(false);
+                SubmitOutcome::Committed
             }
-            Err(err) => self.fail(&err),
+            Err(err) => self.submission_failed(&err),
         }
     }
 
-    fn submit_edit_goal(&mut self, values: &Values, target: Option<&str>) {
-        let Some(target) = target else { return };
+    fn submit_edit_goal(&mut self, values: &Values, target: Option<&str>) -> SubmitOutcome {
+        let Some(target) = target else {
+            return self.submission_failed("Missing target");
+        };
         let fields = configs::edit_goal_wizard_to_fields(values);
         self.emit("Updating goal...", Token::Amber, MsgType::System);
         match self.backend.update_goal(target, fields) {
@@ -929,53 +1108,74 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     MsgType::System,
                 );
                 self.refresh_all(false);
+                SubmitOutcome::Committed
             }
-            Err(err) => self.fail(&err),
+            Err(err) => self.submission_failed(&err),
         }
     }
 
-    fn submit_config(&mut self, values: &Values, setting: Option<&str>) {
-        let Some(setting) = setting else { return };
-        match setting {
+    fn submit_config(&mut self, values: &Values, setting: Option<&str>) -> SubmitOutcome {
+        let Some(setting) = setting else {
+            return self.submission_failed("Missing setting");
+        };
+        let result = match setting {
             "palette" => {
-                if let Some(value) = values.get("palette")
-                    && let Some(palette) = parse_palette(value)
-                {
-                    self.change_palette(palette);
-                }
+                let Some(palette) = values.get("palette").and_then(|v| parse_palette(v)) else {
+                    return self.submission_failed("Invalid palette");
+                };
+                self.backend
+                    .save_palette(palette)
+                    .map(|()| self.state.palette = Palette::new(palette))
             }
             "activity-filter" => {
-                if let Some(preset) = values.get("activity_filter") {
-                    self.state.activity_filter = crate::messages::preset_types(preset);
-                    let _ = self.backend.save_activity_filter(preset);
-                }
+                let Some(preset) = values.get("activity_filter") else {
+                    return self.submission_failed("Missing activity filter");
+                };
+                self.backend
+                    .save_activity_filter(preset)
+                    .map(|()| self.state.activity_filter = crate::messages::preset_types(preset))
             }
             "max-concurrent" => {
-                if let Some(value) = values.get("max_concurrent")
-                    && let Ok(parsed) = value.parse::<u32>()
-                    && parsed > 0
-                {
-                    self.state.max_concurrent = parsed;
-                    let _ = self.backend.save_max_concurrent(parsed);
-                }
+                let Some(parsed) = values
+                    .get("max_concurrent")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|v| *v > 0)
+                else {
+                    return self.submission_failed("Invalid maximum concurrency");
+                };
+                self.backend
+                    .save_max_concurrent(parsed)
+                    .map(|()| self.state.max_concurrent = parsed)
             }
-            "notifications-toast" => {
-                if let Some(value) = values.get("notifications_toast") {
-                    self.state.notifications.toast = value == "true";
-                    let notifications = self.state.notifications;
-                    let _ = self.backend.save_notifications(notifications);
+            "notifications-toast" | "notifications-bell" => {
+                let field = if setting == "notifications-toast" {
+                    "notifications_toast"
+                } else {
+                    "notifications_bell"
+                };
+                let Some(value) = values
+                    .get(field)
+                    .filter(|v| matches!(v.as_str(), "true" | "false"))
+                else {
+                    return self.submission_failed("Invalid notification setting");
+                };
+                let mut notifications = self.state.notifications;
+                if setting == "notifications-toast" {
+                    notifications.toast = value == "true";
+                } else {
+                    notifications.bell = value == "true";
                 }
+                self.backend
+                    .save_notifications(notifications)
+                    .map(|()| self.state.notifications = notifications)
             }
-            "notifications-bell" => {
-                if let Some(value) = values.get("notifications_bell") {
-                    self.state.notifications.bell = value == "true";
-                    let notifications = self.state.notifications;
-                    let _ = self.backend.save_notifications(notifications);
-                }
-            }
-            _ => {}
+            _ => return self.submission_failed("Unknown setting"),
+        };
+        if let Err(error) = result {
+            return self.submission_failed(&error);
         }
         self.emit("Settings saved", Token::Green, MsgType::System);
+        SubmitOutcome::Committed
     }
 
     pub fn change_palette(&mut self, palette: TuiPaletteName) {
@@ -1736,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_wizard_clears_pending_attachments() {
+    fn confirming_discard_clears_pending_attachments() {
         let mut backend = FakeBackend::new();
         backend.clipboard = ClipboardPaste::Image {
             path: "/tmp/x.png".into(),
@@ -1746,6 +1946,9 @@ mod tests {
         app.open_task_wizard();
         app.paste_image();
         app.cancel_wizard();
+        assert_eq!(app.state.pending_attachments, ["/tmp/x.png"]);
+        assert!(app.state.wizard_sessions.pending_leave.is_some());
+        app.resolve_wizard_leave(crate::wizard::LeaveChoice::Discard);
         assert!(app.state.pending_attachments.is_empty());
         assert!(app.state.wizard.is_none());
     }
