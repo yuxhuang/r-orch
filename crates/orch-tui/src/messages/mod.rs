@@ -34,6 +34,19 @@ const UNAVAILABLE_SUFFIX: &str = " bytes received)";
 pub fn unavailable_notice(original_bytes: usize) -> String {
     format!("{UNAVAILABLE_PREFIX}{original_bytes}{UNAVAILABLE_SUFFIX}")
 }
+
+/// Recognize the existing in-memory unavailable pair in pending or live text.
+fn unavailable_bytes(text: &str, detail: Option<&str>) -> Option<usize> {
+    if detail != Some("") {
+        return None;
+    }
+    let start = text.find(UNAVAILABLE_PREFIX)? + UNAVAILABLE_PREFIX.len();
+    let rest = &text[start..];
+    rest.strip_suffix(UNAVAILABLE_SUFFIX)
+        .unwrap_or(rest.split(UNAVAILABLE_SUFFIX).next()?)
+        .parse()
+        .ok()
+}
 /// `runId → agentId` / `runId → taskId` map cap (insertion-ordered LRU).
 pub const MAX_RUN_MAP_SIZE: usize = 500;
 /// Toast queue cap.
@@ -236,15 +249,7 @@ impl Message {
     /// payload cannot produce it, because an empty payload also has an empty
     /// summary.
     pub fn unavailable_bytes(&self) -> Option<usize> {
-        if self.detail.as_deref() != Some("") {
-            return None;
-        }
-        let start = self.text.find(UNAVAILABLE_PREFIX)? + UNAVAILABLE_PREFIX.len();
-        let rest = &self.text[start..];
-        rest.strip_suffix(UNAVAILABLE_SUFFIX)
-            .unwrap_or(rest.split(UNAVAILABLE_SUFFIX).next()?)
-            .parse()
-            .ok()
+        unavailable_bytes(&self.text, self.detail.as_deref())
     }
 
     /// Owned text allocation capacity this record holds, as charged against

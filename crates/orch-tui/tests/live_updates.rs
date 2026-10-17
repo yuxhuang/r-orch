@@ -38,6 +38,80 @@ fn history(event_type: &str, data: &str) -> HistoryEntry {
     }
 }
 
+#[test]
+fn oversized_live_output_and_error_each_count_one_rejection_after_flush() {
+    use orch_tui::messages::MAX_BODY_BYTES;
+
+    let body = "x".repeat(MAX_BODY_BYTES + 1);
+    let events = [
+        output_event(&body),
+        OrchestratorEvent::AgentError {
+            run_id: "run_1".into(),
+            agent_id: "agt_1".into(),
+            error: body,
+            error_kind: None,
+        },
+    ];
+    for event in events {
+        let mut harness = event_harness();
+        harness.app.handle_event(&event);
+        assert_eq!(harness.app.state.retained_rejected, 1);
+        harness.advance(80);
+        assert_eq!(harness.app.state.retained_rejected, 1);
+        assert_eq!(harness.app.state.messages.len(), 1);
+        assert_eq!(
+            harness.app.state.messages[0].unavailable_bytes(),
+            Some(MAX_BODY_BYTES + 1)
+        );
+    }
+}
+
+#[test]
+fn oversized_history_output_and_error_each_count_one_rejection() {
+    use orch_tui::messages::MAX_BODY_BYTES;
+
+    let body = "x".repeat(MAX_BODY_BYTES + 1);
+    for event_type in ["output", "error"] {
+        let mut backend = FakeBackend::new();
+        backend.pending_history = vec![vec![history(event_type, &body)]];
+        let mut harness = Harness::with(backend);
+        harness.app.tick();
+        assert_eq!(harness.app.state.retained_rejected, 1);
+        assert_eq!(harness.app.state.messages.len(), 1);
+        assert_eq!(
+            harness.app.state.messages[0].unavailable_bytes(),
+            Some(MAX_BODY_BYTES + 1)
+        );
+    }
+}
+
+#[test]
+fn excluded_reasoning_and_literal_unavailable_text_do_not_count_as_rejections() {
+    use orch_tui::messages::{MAX_BODY_BYTES, unavailable_notice};
+
+    let literal = unavailable_notice(MAX_BODY_BYTES + 1);
+    let mut harness = event_harness();
+    harness
+        .app
+        .handle_event(&output_event(r#"{"type":"reasoning","text":null}"#));
+    harness.app.handle_event(&output_event(&literal));
+    harness.advance(80);
+    assert_eq!(harness.app.state.retained_rejected, 0);
+    assert_eq!(harness.app.state.messages.len(), 1);
+    assert_eq!(harness.app.state.messages[0].unavailable_bytes(), None);
+
+    let mut backend = FakeBackend::new();
+    backend.pending_history = vec![vec![
+        history("output", r#"{"type":"reasoning","text":null}"#),
+        history("output", &literal),
+    ]];
+    let mut harness = Harness::with(backend);
+    harness.app.tick();
+    assert_eq!(harness.app.state.retained_rejected, 0);
+    assert_eq!(harness.app.state.messages.len(), 1);
+    assert_eq!(harness.app.state.messages[0].unavailable_bytes(), None);
+}
+
 // ── Batching ───────────────────────────────────────────────────────────────
 
 #[test]

@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 
 use super::{
     MAX_BODY_BYTES, MAX_MESSAGES, Message, MsgType, PendingMessage, RETENTION_BUDGET_BYTES,
-    unavailable_notice,
+    unavailable_bytes, unavailable_notice,
 };
 
 /// What one helper call did. Counts are per call; the caller keeps any
@@ -83,6 +83,12 @@ fn admit_body(message: &mut PendingMessage) -> bool {
     true
 }
 
+/// Initial admission also counts bodies already rejected by the formatter.
+/// Flush uses only `admit_body`: a staged notice has already been counted.
+fn admit_incoming_body(message: &mut PendingMessage) -> bool {
+    admit_body(message) || unavailable_bytes(&message.text, message.detail.as_deref()).is_some()
+}
+
 /// Evict the oldest live records, then the oldest pending ones, until the
 /// combined total plus `incoming` fits the budget. Returns how many went.
 fn make_room(
@@ -113,7 +119,7 @@ pub fn stage_message(
     live: &mut Vec<Message>,
     mut incoming: PendingMessage,
 ) -> RetentionReport {
-    let rejected = usize::from(admit_body(&mut incoming));
+    let rejected = usize::from(admit_incoming_body(&mut incoming));
     let mut total = bytes_of_pending(pending).saturating_add(bytes_of_live(live));
     let size = incoming.owned_bytes();
     if size > RETENTION_BUDGET_BYTES {
@@ -204,11 +210,12 @@ pub fn prepend_messages(
     let mut prefix: VecDeque<Message> = VecDeque::new();
     let mut prefix_bytes = 0usize;
     for mut p in incoming {
-        report.rejected += usize::from(admit_body(&mut p));
+        let body_rejected = admit_incoming_body(&mut p);
+        report.rejected += usize::from(body_rejected);
         let size = p.owned_bytes();
         if size > room_bytes || room_entries == 0 {
             // Cannot fit even alone: newer records always win.
-            report.rejected += 1;
+            report.rejected += usize::from(!body_rejected);
             continue;
         }
         while prefix_bytes.saturating_add(size) > room_bytes || prefix.len() >= room_entries {
@@ -567,5 +574,29 @@ mod tests {
         assert_eq!(staged[0].detail.as_deref(), Some(exact.as_str()));
         assert_eq!(staged[1].detail.as_deref(), Some(""));
         assert_eq!(staged[1].text, unavailable_notice(MAX_BODY_BYTES + 1));
+        let flushed = flush_messages(&mut staged, &mut live, &mut 1, 0);
+        assert_eq!(flushed.rejected, 0, "stage already counted the rejection");
+    }
+
+    #[test]
+    fn oversized_history_that_cannot_fit_counts_the_record_once() {
+        for preformatted in [false, true] {
+            let mut staged = Vec::new();
+            let mut live = (0..MAX_MESSAGES)
+                .map(|id| Message::new(id as u64, 0, "live", Token::Dim, MsgType::Output))
+                .collect();
+            let incoming = if preformatted {
+                from_agent(
+                    "a",
+                    &unavailable_notice(MAX_BODY_BYTES + 1),
+                    Some(String::new()),
+                )
+            } else {
+                from_agent("a", "body", Some("x".repeat(MAX_BODY_BYTES + 1)))
+            };
+            let report = prepend_messages(&mut staged, &mut live, [incoming], &mut 1, 0);
+            assert_eq!(report.rejected, 1);
+            assert_eq!(live.len(), MAX_MESSAGES);
+        }
     }
 }
