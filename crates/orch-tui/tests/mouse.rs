@@ -19,6 +19,18 @@ use orch_tui::state::{DetailPanel, InputMode, ViewId};
 use orch_tui::theme::Token;
 use ratatui::crossterm::event::KeyCode;
 
+// Resolve the semantic control: I0 uses Enter/Tab, while B2 renders Tab OK.
+fn click_wizard_confirm(harness: &mut Harness) {
+    let rect = harness
+        .hits()
+        .zones()
+        .iter()
+        .find(|z| z.kind == ZoneKind::Verb(orch_tui::hit::VerbId::WizardConfirm))
+        .expect("visible wizard confirm control")
+        .rect;
+    harness.click(rect.x, rect.y);
+}
+
 fn tasks(n: usize) -> Vec<orch_domain::Task> {
     (0..n)
         .map(|i| {
@@ -1427,7 +1439,7 @@ fn m085_clicking_a_wizard_hint_verb_confirms_and_goes_back() {
     harness.click_text("+ add agent...");
     harness.type_str("alpha");
     harness.draw();
-    harness.click_text("Enter/Tab confirm");
+    click_wizard_confirm(&mut harness);
     let step = harness
         .app
         .state
@@ -1440,6 +1452,12 @@ fn m085_clicking_a_wizard_hint_verb_confirms_and_goes_back() {
 
     harness.draw();
     harness.click_text("Esc back");
+    if harness.app.state.wizard_sessions.pending_leave.is_some() {
+        harness.draw().click_text("Continue editing");
+        assert_eq!(harness.app.state.wizard.as_ref().unwrap().step_id(), step);
+        harness.draw().click_text("Esc back");
+        harness.draw().click_text("Discard and leave");
+    }
     assert_eq!(
         harness.app.state.wizard.as_ref().unwrap().step_id(),
         "name",
@@ -1984,7 +2002,7 @@ fn m105_the_textarea_confirm_hint_finishes_the_wizard() {
             break;
         }
         harness.draw();
-        harness.click_text("confirm");
+        click_wizard_confirm(&mut harness);
     }
     let kind = harness.app.state.wizard.as_ref().map(|w| w.step().kind);
     assert_eq!(
@@ -1994,9 +2012,7 @@ fn m105_the_textarea_confirm_hint_finishes_the_wizard() {
         harness.text()
     );
     harness.draw();
-    harness.assert_text("Tab confirm");
-
-    harness.click_text("Tab confirm");
+    click_wizard_confirm(&mut harness);
     assert_eq!(
         harness.app.state.input_mode,
         InputMode::None,
@@ -2201,10 +2217,8 @@ fn m110_the_mouse_and_the_keyboard_select_the_same_entity() {
 }
 
 #[test]
-fn m111_the_whole_confirm_label_is_clickable_including_its_modifier() {
-    // QA B2 nit: the textarea hint reads `Ctrl+Enter/Tab confirm`, and only
-    // the `Enter/Tab confirm` part used to be inside the zone, so clicking
-    // the `Ctrl+` did nothing.
+fn m111_the_whole_confirm_label_is_clickable_from_its_first_cell() {
+    // The first cell of the rendered confirmation label must be actionable.
     let mut harness = view(ViewId::Goals);
     harness.click_text("+ add goal...");
     harness.type_str("Ship it");
@@ -2215,20 +2229,22 @@ fn m111_the_whole_confirm_label_is_clickable_including_its_modifier() {
             break;
         }
         harness.draw();
-        harness.click_text("confirm");
+        click_wizard_confirm(&mut harness);
     }
     harness.draw();
-    // The first cell of the whole label, i.e. the `Ctrl`/`⌘` itself —
-    // searched as part of the label so it cannot match a `Ctrl` elsewhere.
-    let label = format!("{}+Enter/Tab confirm", orch_tui::widgets::wizard::CMD_KEY);
-    let (x, y) = harness
-        .find_text(&label)
-        .unwrap_or_else(|| panic!("{label:?} not on screen:\n{}", harness.text()));
+    // Locate the visible text independently of its hit rectangle, so a clipped
+    // zone cannot make this check pass by moving its own first cell.
+    let label = if harness.find_text("Tab OK").is_some() {
+        "Tab OK".into()
+    } else {
+        format!("{}+Enter/Tab confirm", orch_tui::widgets::wizard::CMD_KEY)
+    };
+    let (x, y) = harness.find_text(&label).expect("visible confirm label");
     harness.click(x, y);
     assert_eq!(
         harness.app.state.input_mode,
         InputMode::None,
-        "clicking the modifier end of the label confirms too"
+        "clicking the first cell of the visible label confirms too"
     );
     harness.assert_called(|c| matches!(c, Call::CreateGoal { .. }));
 }

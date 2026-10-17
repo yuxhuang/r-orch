@@ -748,6 +748,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     pub(crate) fn cycle_activity_filter(&mut self) {
         let next = cycle_preset(&self.state.activity_filter);
         self.state.activity_filter = preset_types(next);
+        self.state.normalize_focus();
         let _ = self.backend.save_activity_filter(next);
     }
 

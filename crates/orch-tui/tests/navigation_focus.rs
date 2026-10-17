@@ -765,7 +765,7 @@ fn v5_existing_subtype_and_generic_content_shapes_decode_but_unknown_errors_stay
 
 #[test]
 fn f4_activity_filter_removal_chooses_nearest_surviving_position() {
-    use orch_tui::messages::{Message, MsgType, preset_types};
+    use orch_tui::messages::{Message, MsgType};
     use orch_tui::theme::Token;
     let mut h = Harness::new();
     h.app.state.messages = vec![
@@ -780,9 +780,15 @@ fn f4_activity_filter_removal_chooses_nearest_surviving_position() {
         .press(KeyCode::Down)
         .press(KeyCode::Down);
     assert_eq!(h.app.state.activity_selected, Some(3));
-    h.app.state.activity_filter = preset_types("text");
-    h.app.state.normalize_focus();
+    h.key('F');
+    h.press_mod(KeyCode::Char('y'), KeyModifiers::CONTROL);
+    assert_eq!(h.app.backend.copy_requests.last().unwrap().1, "D");
     assert_eq!(h.app.state.activity_selected, Some(4));
+    h.press(KeyCode::Enter);
+    assert_eq!(
+        h.app.state.viewer.as_ref().unwrap().document().source,
+        ViewerSource::Message(4)
+    );
 }
 
 #[test]
@@ -873,4 +879,41 @@ fn n8_textarea_adapter_forwards_three_rows_per_accepted_notch() {
     }
     h.draw();
     assert!(h.line(field.y).contains("row09"), "{}", h.line(field.y));
+}
+
+#[test]
+fn v6_changed_source_uses_current_scrolled_top_instead_of_stale_click() {
+    let mut task = make_task("t", "Task", TaskStatus::Todo);
+    task.description = (0..100).map(|i| format!("old line{i:02}\n")).collect();
+    let mut h = Harness::with(FakeBackend::new().with_tasks(vec![task]));
+    h.app.state.detail = DetailPanel::Entity;
+    h.app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Description));
+    h.draw().press(KeyCode::PageDown).draw();
+    let key = h.app.state.pane_key(h.app.state.focus);
+    let body = h.hits().pane_metrics(&key).unwrap().body;
+    h.click(body.x, body.y + 1);
+    let offset = h.app.state.pane_scroll(&key).offset;
+    assert!(offset > 0);
+    let updated: String = (0..100)
+        .map(|i| format!("new longer line{i:02}\n"))
+        .collect();
+    let expected = updated
+        .split_inclusive('\n')
+        .take(offset)
+        .map(str::len)
+        .sum::<usize>();
+    h.app.state.tasks[0].description = updated;
+    h.press(KeyCode::Enter);
+    assert_eq!(
+        h.app
+            .state
+            .viewer
+            .as_ref()
+            .unwrap()
+            .document()
+            .initial_anchor,
+        expected
+    );
 }

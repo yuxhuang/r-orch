@@ -1330,30 +1330,47 @@ impl AppState {
     pub fn focused_text(&self) -> Option<ViewerDocument> {
         let source = self.focused_source()?;
         let mut document = self.text_for_source(&source, 0, 0)?;
-        if let Some((saved, byte, hash)) = &self.text_anchor {
-            if saved == &source && *hash == Self::source_fingerprint(&document.body) {
-                document.initial_anchor = (*byte).min(document.body.len());
-            }
-        } else {
-            let key = self.pane_key(self.focus);
-            let offset = self.pane_scroll(&key).offset;
-            if let Some(metrics) = self.mouse.hits.metrics.panes.iter().find(|p| p.key == key) {
-                if let Some((_, _, byte)) = self
+        let fingerprint = Self::source_fingerprint(&document.body);
+        if let Some((saved, byte, hash)) = &self.text_anchor
+            && saved == &source
+            && *hash == fingerprint
+        {
+            document.initial_anchor = (*byte).min(document.body.len());
+            return Some(document);
+        }
+        let key = self.pane_key(self.focus);
+        // Keyboard anchors may reuse the last body geometry after click invalidation.
+        if let Some(metrics) = self.mouse.hits.metrics.panes.iter().find(|p| p.key == key) {
+            let current_frame = self
+                .mouse
+                .hits
+                .source_versions
+                .iter()
+                .any(|(saved, hash)| saved == &source && *hash == fingerprint);
+            if current_frame
+                && let Some((_, _, byte)) = self
                     .mouse
                     .hits
                     .source_anchors
                     .iter()
                     .find(|(r, s, _)| s == &source && r.y >= metrics.body.y)
-                {
-                    document.initial_anchor = *byte;
-                } else {
-                    document.initial_anchor = document
-                        .body
-                        .split_inclusive('\n')
-                        .take(offset)
-                        .map(str::len)
-                        .sum();
-                }
+            {
+                document.initial_anchor = *byte;
+            } else if matches!(
+                self.focus,
+                Focus::GoalDetail(GoalSection::Description | GoalSection::Progress)
+                    | Focus::TaskDetail(TaskSection::Description | TaskSection::Result)
+                    | Focus::AgentDetail(AgentSection::Role | AgentSection::Error)
+                    | Focus::LogDetail(LogSection::Body)
+            ) {
+                let rows =
+                    crate::views::detail::wrap_rows(&document.body, metrics.body.width as usize);
+                let offset = self.pane_scroll(&key).offset;
+                document.initial_anchor = rows
+                    .get(offset)
+                    .or_else(|| rows.last())
+                    .map(|(_, byte)| *byte)
+                    .unwrap_or(0);
             }
         }
         Some(document)
