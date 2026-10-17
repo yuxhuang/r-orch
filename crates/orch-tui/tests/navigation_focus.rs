@@ -633,3 +633,101 @@ fn f2_every_optional_detail_section_cycles_once_and_maximize_skips_main_at_all_s
         }
     }
 }
+
+#[test]
+fn v5_source_resolution_keeps_complete_human_and_exact_raw_for_known_envelopes() {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    use orch_tui::widgets::text_viewer::Representation;
+    let expected = "First paragraph\n\nprintf 'hello world'\nlast line";
+    let raw=serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":expected}}).to_string();
+    let mut state = AppState::default();
+    state.messages.push(
+        Message::new(1, 0, "short preview", Token::White, MsgType::Output)
+            .with_detail(Some(raw.clone())),
+    );
+    let doc = state
+        .text_for_source(&ViewerSource::Message(1), 3, 42)
+        .unwrap();
+    assert_eq!(&*doc.body, expected);
+    assert_eq!(doc.representation, Representation::Human);
+    assert_eq!(doc.raw_body.as_deref(), Some(raw.as_str()));
+    assert_eq!(doc.original_bytes, raw.len());
+    let blocks=serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"first\nquote \"one\""},{"type":"text","text":"second"}]}}).to_string();
+    state.messages.push(
+        Message::new(2, 0, "preview", Token::White, MsgType::Output).with_detail(Some(blocks)),
+    );
+    let doc = state
+        .text_for_source(&ViewerSource::Message(2), 0, 0)
+        .unwrap();
+    assert_eq!(&*doc.body, "first\nquote \"one\"\nsecond");
+    assert!(doc.title.contains("text blocks joined"));
+    let unknown = "{\"type\":\"unknown\",\"text\":\"do not infer\"}";
+    state.messages.push(
+        Message::new(3, 0, "preview", Token::White, MsgType::Output)
+            .with_detail(Some(unknown.into())),
+    );
+    let doc = state
+        .text_for_source(&ViewerSource::Message(3), 0, 0)
+        .unwrap();
+    assert_eq!(&*doc.body, unknown);
+    assert_eq!(doc.representation, Representation::Raw);
+    assert!(doc.raw_body.is_none());
+}
+
+#[test]
+fn c8_repainted_field_feedback_does_not_leave_invisible_footer_actions() {
+    let mut task = make_task("t", "Task", TaskStatus::Todo);
+    task.description = "body".into();
+    let mut h = Harness::sized(FakeBackend::new().with_tasks(vec![task]), 40, 14);
+    h.app.state.detail = DetailPanel::Entity;
+    h.app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Description));
+    h.press_mod(KeyCode::Char('y'), KeyModifiers::CONTROL)
+        .draw();
+    assert!(h.line(13).contains("Copy pending"));
+    h.click(5, 13);
+    assert_eq!(
+        h.app.state.detail,
+        DetailPanel::Entity,
+        "pending text must not hide an active Esc close hit"
+    );
+}
+
+#[test]
+fn f3_logs_inspector_mouse_maximize_and_keyboard_restore_have_no_hidden_main_focus() {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let mut h = Harness::new();
+    h.app.state.view = ViewId::Logs;
+    h.app
+        .state
+        .messages
+        .push(Message::new(1, 0, "body", Token::White, MsgType::Info));
+    h.press(KeyCode::Up).key('i').draw();
+    h.click_text("M max");
+    assert!(h.app.state.detail_maximized);
+    assert!(!h.app.state.focus_ring().contains(&Focus::MainList));
+    h.key('M');
+    assert!(!h.app.state.detail_maximized);
+    assert_eq!(h.app.state.focus, Focus::MainList);
+}
+
+#[test]
+fn f4_filter_then_copy_in_one_key_drain_preserves_the_selected_message_id() {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let mut h = Harness::new();
+    h.app.state.view = ViewId::Logs;
+    h.app.state.messages = vec![
+        Message::new(1, 0, "tool", Token::White, MsgType::Tool),
+        Message::new(2, 0, "selected B", Token::White, MsgType::Output),
+        Message::new(3, 0, "other C", Token::White, MsgType::Output),
+    ];
+    h.press(KeyCode::Home).press(KeyCode::Down);
+    assert_eq!(h.app.state.log_selected_id, Some(2));
+    h.key('F')
+        .press_mod(KeyCode::Char('y'), KeyModifiers::CONTROL);
+    assert_eq!(h.app.backend.copy_requests.last().unwrap().1, "selected B");
+}

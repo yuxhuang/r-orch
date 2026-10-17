@@ -311,7 +311,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 return;
             }
             // Uppercase only — there is no lowercase `m` binding.
-            KeyCode::Char('M') if view != ViewId::Logs => {
+            KeyCode::Char('M') if view != ViewId::Logs || detail_open => {
                 self.toggle_detail_maximized();
                 return;
             }
@@ -738,8 +738,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     /// Logs `F` — the next type preset, with no picker.
     pub(crate) fn cycle_log_types(&mut self) {
+        self.state.log_selected_id = self.state.selected_log().map(|m| m.id);
         let next = cycle_preset(&self.state.log_type_filter);
         self.state.log_type_filter = preset_types(next);
+        self.state.normalize_focus();
     }
 
     /// `f` / `F` off the logs view — the next activity-feed preset, persisted.
@@ -1149,7 +1151,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                         scroll.selected.map_or(-1, |i| i as i64)
                     };
                     self.state.log_scroll_offset = if tail { 0 } else { scroll.offset };
-                    self.state.log_selected_id = self.state.selected_log().map(|m| m.id);
+                    self.state.log_selected_id = usize::try_from(self.state.log_selected_index)
+                        .ok()
+                        .and_then(|i| self.state.filtered_messages().get(i).copied())
+                        .map(|i| self.state.messages[i].id);
                 }
             },
             Focus::Activity => {
@@ -1704,7 +1709,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// Agent picker `Enter`.
     pub(crate) fn picker_confirm(&mut self) {
         // An empty set is a legal confirm value meaning "no filter".
+        self.state.log_selected_id = self.state.selected_log().map(|m| m.id);
         self.state.log_agent_filter = self.state.picker_draft.clone();
+        self.state.normalize_focus();
         self.state.show_agent_picker = false;
     }
 
@@ -1773,12 +1780,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// Type picker `Enter`.
     pub(crate) fn type_picker_confirm(&mut self) {
         // An empty draft normalises to all 8 — unlike the agent picker.
+        self.state.log_selected_id = self.state.selected_log().map(|m| m.id);
         self.state.log_type_filter = if self.state.type_picker_draft.is_empty() {
             MsgType::ALL.into_iter().collect()
         } else {
             self.state.type_picker_draft.clone()
         };
         self.state.show_type_picker = false;
+        self.state.normalize_focus();
     }
 
     /// Type picker `Esc` — the draft is discarded.

@@ -319,6 +319,20 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             )],
         );
     }
+    // Feedback replaces both the painted footer and its hit ownership.
+    if state.active_copy_origin().is_some_and(|origin| {
+        matches!(origin, crate::state::CopyOrigin::Field { .. })
+            && state.copy_footer_visible(&origin)
+    }) && (state.detail == DetailPanel::None || panel_h < 3)
+    {
+        let footer = Rect::new(area.x, command_y, area.width, 1);
+        ctx.zone(
+            footer,
+            footer,
+            ZoneKind::Pane(state.focus),
+            ZoneId::Pane(state.pane_key(state.focus)),
+        );
+    }
     // These are peer-owned render hooks. I0 intentionally draws nothing;
     // the same calls compose the real B1/B2 surfaces after integration.
     let overlay = Rect::new(area.x, area.y + 6, area.width, area.height - 7);

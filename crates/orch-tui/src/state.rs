@@ -1091,7 +1091,7 @@ impl AppState {
             return vec![Focus::MainList];
         }
         let mut ring = Vec::new();
-        if !self.detail_maximized || self.view == ViewId::Logs {
+        if !self.detail_maximized || !self.detail_open() && self.view == ViewId::Logs {
             ring.push(Focus::MainList);
         }
         if !self.detail_open() {
@@ -1310,8 +1310,17 @@ impl AppState {
     }
     pub fn selected_log(&self) -> Option<&Message> {
         let index = usize::try_from(self.log_selected_index).ok()?;
-        self.filtered_messages()
-            .get(index)
+        let filtered = self.filtered_messages();
+        if let Some(id) = self.log_selected_id
+            && let Some(message) = filtered
+                .iter()
+                .map(|i| &self.messages[*i])
+                .find(|m| m.id == id)
+        {
+            return Some(message);
+        }
+        filtered
+            .get(index.min(filtered.len().saturating_sub(1)))
             .and_then(|i| self.messages.get(*i))
     }
     /// Resolve original bytes before panel clipping; viewers freeze this document.
@@ -1362,18 +1371,8 @@ impl AppState {
         use std::borrow::Cow;
         let (title, text): (String, Cow<'_, str>) = match source {
             ViewerSource::Message(id) => {
-                let m = self.messages.iter().find(|m| m.id == *id)?;
-                (
-                    format!(
-                        "Message {id}{}",
-                        if m.detail.is_none() {
-                            " (legacy text source)"
-                        } else {
-                            ""
-                        }
-                    ),
-                    Cow::Borrowed(m.detail.as_deref().unwrap_or(&m.text)),
-                )
+                let message = self.messages.iter().find(|m| m.id == *id)?;
+                return Some(message_document(message, initial_anchor, captured_at_ms));
             }
             ViewerSource::Entity { kind, id, field } => match kind {
                 EntityType::Goal => {
@@ -2184,6 +2183,136 @@ impl AppState {
             "idle"
         }
     }
+}
+
+/// Resolve complete known provider text at the source boundary. Raw is frozen
+/// alongside Human; a display summary never supplies the copied bytes.
+fn message_document(
+    message: &Message,
+    initial_anchor: usize,
+    captured_at_ms: i64,
+) -> ViewerDocument {
+    use crate::widgets::text_viewer::{Completeness, Representation};
+    let raw = message.detail.as_deref().unwrap_or(&message.text);
+    let source = ViewerSource::Message(message.id);
+    let title = format!(
+        "Message {}{}",
+        message.id,
+        if message.detail.is_none() {
+            " (legacy text source)"
+        } else {
+            ""
+        }
+    );
+    if raw.len() > 1024 * 1024 {
+        return ViewerDocument {
+            source,
+            title,
+            body: "".into(),
+            representation: Representation::Raw,
+            raw_body: None,
+            completeness: Completeness::Unavailable {
+                reason: "Body unavailable: exceeds 1 MiB".into(),
+            },
+            original_bytes: raw.len(),
+            captured_at_ms,
+            initial_anchor: 0,
+        };
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let human = parsed
+        .as_ref()
+        .and_then(|value| known_message_text(value, 0))
+        .or_else(|| {
+            if message.msg_type != MsgType::Error {
+                return None;
+            }
+            let decoded =
+                orch_domain::extract_error_message(&serde_json::Value::String(raw.into()));
+            (!decoded.is_empty() && decoded != raw).then_some((decoded, false))
+        });
+    let (body, representation, raw_body, title) = if let Some((human, joined)) = human {
+        (
+            std::sync::Arc::<str>::from(human),
+            Representation::Human,
+            Some(std::sync::Arc::from(raw)),
+            if joined {
+                format!("{title} · Human (text blocks joined)")
+            } else {
+                title
+            },
+        )
+    } else {
+        (std::sync::Arc::from(raw), Representation::Raw, None, title)
+    };
+    let mut anchor = initial_anchor.min(body.len());
+    while !body.is_char_boundary(anchor) {
+        anchor -= 1;
+    }
+    ViewerDocument {
+        source,
+        title,
+        body,
+        representation,
+        raw_body,
+        completeness: Completeness::Complete,
+        original_bytes: raw.len(),
+        captured_at_ms,
+        initial_anchor: anchor,
+    }
+}
+
+fn known_message_text(value: &serde_json::Value, depth: usize) -> Option<(String, bool)> {
+    use serde_json::Value;
+    if depth >= 8 {
+        return None;
+    }
+    let kind = value.get("type").and_then(Value::as_str);
+    if matches!(kind, Some("item.started" | "item.completed")) {
+        return known_message_text(value.get("item")?, depth + 1);
+    }
+    if (kind == Some("agent_message") || (kind.is_none() && value.get("role").is_none()))
+        && let Some(text) = value.get("text").and_then(Value::as_str)
+    {
+        return Some((text.into(), false));
+    }
+    if matches!(kind, Some("message" | "assistant"))
+        || value.get("role").and_then(Value::as_str) == Some("assistant")
+    {
+        let content = value
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .or_else(|| value.get("content"))?;
+        if let Some(text) = content.as_str() {
+            return Some((text.into(), false));
+        }
+        let blocks: Vec<_> = content
+            .as_array()?
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        if !blocks.is_empty() {
+            return Some((blocks.join("\n"), blocks.len() > 1));
+        }
+    }
+    if (kind == Some("result") || kind.is_none())
+        && let Some(result) = value.get("result").and_then(Value::as_str)
+    {
+        return Some((result.into(), false));
+    }
+    if kind == Some("command_execution") {
+        let command = value.get("command").and_then(Value::as_str)?;
+        let output = value
+            .get("aggregated_output")
+            .or_else(|| value.get("result"))
+            .and_then(Value::as_str);
+        return Some((
+            output.map_or_else(|| command.into(), |output| format!("{command}\n{output}")),
+            false,
+        ));
+    }
+    None
 }
 
 #[cfg(test)]

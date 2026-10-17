@@ -289,10 +289,10 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     format!("Timestamp: {}", message.ts_ms),
                     message.text.clone(),
                 ],
-                LogSection::Body => field_lines(
-                    message.detail.as_deref().unwrap_or(&message.text),
-                    "No message body.",
-                ),
+                LogSection::Body => state
+                    .text_for_source(&ViewerSource::Message(message.id), 0, 0)
+                    .map(|document| field_lines(&document.body, "No message body."))
+                    .unwrap_or_default(),
             }
         }
         _ => Vec::new(),

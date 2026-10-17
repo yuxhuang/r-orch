@@ -447,11 +447,13 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 // with the picker's own semantics and is instantly reversible.
                 if let Some(agent) = self.state.agents.get(*index) {
                     let id = agent.id.clone();
+                    self.state.log_selected_id = self.state.selected_log().map(|m| m.id);
                     if self.state.log_agent_filter.contains(&id) {
                         self.state.log_agent_filter.shift_remove(&id);
                     } else {
                         self.state.log_agent_filter.insert(id);
                     }
+                    self.state.normalize_focus();
                     // This changes the *length* of `filtered_messages`, so
                     // every `LogRow` zone on screen now names a different
                     // message. Without this, a row click later in the same
