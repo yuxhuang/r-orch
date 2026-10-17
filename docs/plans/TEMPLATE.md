@@ -34,7 +34,8 @@ choices go in an ADR.
 
 ## Test plan
 What proves it works: the spec's acceptance checks, other unit/integration tests, the CI set; the cold
-`./xtask/gate.sh` if layering, process handling or security is touched. Say which platform runs each.
+`./xtask/gate.sh` if layering, process handling or security is touched. Say which platform runs each. For
+dashboard changes, name the tmux end-to-end tests (AGENTS.md, "TUI end-to-end tests").
 
 ## Rollback / compatibility
 What happens to existing `.orchestry` data and to peers on other versions; how to back out.

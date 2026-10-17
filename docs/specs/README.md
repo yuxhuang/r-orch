@@ -29,8 +29,10 @@ section. Fixes need neither.
 - **Non-goals** and **constraints.** For anything that listens on a socket, crosses a process boundary or
   handles untrusted text, fill in the security checklist in the template before building, not at the gate.
 - **Verification environment.** What runs on a developer's machine, what only runs on Linux CI, and what needs
-  the owner's permission or hardware (a real terminal profile, a second host, a native clipboard). Ask for these
-  in the first approval request. Do not discover them at the end.
+  the owner's permission or hardware (a second host, a native terminal profile, the native clipboard, a
+  browser). Terminal and dashboard behaviour is checked end to end in tmux (see AGENTS.md, "TUI end-to-end
+  tests"), so name only what tmux cannot cover. Ask for these in the first approval request. Do not discover
+  them at the end.
 - **Open questions** for the owner.
 
 A spec contains no design. Choices of crate, module, type or layout go in the plan or an ADR. Keep it short:

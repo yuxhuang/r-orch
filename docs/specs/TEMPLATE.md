@@ -32,6 +32,8 @@ untrusted text; otherwise write "n/a":
 
 ## Verification environment
 What runs locally, what only on Linux CI, and what needs owner permission or hardware. Name who runs it.
+Dashboard behaviour: the tmux end-to-end tests that cover it, and what tmux cannot cover (native terminal
+profiles, the native clipboard, `orch web` in a browser).
 
 ## Open questions
 - ...

@@ -152,8 +152,9 @@ request that meets no plan trigger needs no spec. Read [docs/specs/README.md](do
 - Every requirement has an acceptance check: a named test or an exact command, and the platform it runs on.
 - Fill in the security checklist for anything that listens on a socket, crosses a process boundary or handles
   untrusted text before building, not at the review gate.
-- List the verification environment (what needs Linux, a second host, a real terminal, owner permission) and
-  ask about it in the first approval request.
+- List the verification environment (what needs Linux, a second host, a terminal other than tmux, a browser,
+  owner permission) and ask about it in the first approval request. Terminal behaviour is verified in tmux (see
+  TUI end-to-end tests).
 - `status: draft -> approved -> done | superseded`. The owner approves the requirements before the build
   starts. The lead may approve them only where the owner's request says so; quote that line in the spec's
   Source. Review findings that are real requirements become new rows.
@@ -237,6 +238,7 @@ Pure refactors, tests and CI need no entry.
 - **Integration tests:** `crates/<crate>/tests/`. CLI tests drive the real binary with `assert_cmd`
   (`crates/orch-cli/tests/`). Engine tests use the fakes in `crates/orch-engine/tests/common`.
 - **TUI:** `orch-tui` tests render against an in-crate `FakeBackend` (`crates/orch-tui/tests/`); dashboard flows run in `crates/orch-cli/tests/tui_*.rs`.
+  What an operator sees in a real terminal is covered by end-to-end tests in tmux (below).
 - **Snapshots:** `insta` is used for adapter argv (`crates/orch-infra/tests/adapter_argv.rs`); review with `cargo insta review`, never accept blindly.
 - **Adapters:** unit tests inject a scripted `FakeProcessManager` and assert exact argv and stdin. Recorded
   adapter output is under `fixtures/adapters/<cli>/`.
@@ -255,6 +257,51 @@ Pure refactors, tests and CI need no entry.
 - **Hermetic child processes.** A test that spawns a binary gives it its own temp root and a cleared or explicit
   environment. Runner variables (`CARGO_TARGET_DIR`, `TMPDIR`, wrapper `PATH`s) must not leak in. Keep
   scenario-heavy test files split by scenario group, so parallel work does not serialise on one file.
+
+### TUI end-to-end tests (tmux)
+
+The dashboard is tested at three levels:
+
+| Level | Where | Proves |
+|---|---|---|
+| Render and state | `crates/orch-tui/tests/`, `FakeBackend` | Layout, key handling, state transitions |
+| Dashboard flow | `crates/orch-cli/tests/tui_dashboard.rs` (ratatui `TestBackend`, real engine) | The TUI and the engine agree |
+| End to end | The real `orch` binary running in tmux | What an operator sees and does in a real terminal |
+
+A requirement about keys, mouse, focus, scrolling, resize, copy or anything else on screen is not `pass` until an
+end-to-end test covers it. Tests against `FakeBackend` or `TestBackend` alone do not count. Process-level tty
+behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/tests/tui_hangup.rs`.
+
+**Use tmux as the terminal**, both for automated tests and for manual or agent acceptance runs:
+
+- **Isolated server.** Run every command as `tmux -L <unique-socket> -f /dev/null ...`. That gives each test its
+  own server and no user config. Never attach to or touch the developer's tmux server. Run `kill-server` when
+  the test ends, including on failure (use a drop guard).
+- **Hermetic session.** Run the dashboard in a temp project, and pin the terminal type before the session
+  exists, so key encodings do not depend on the host:
+  `tmux -L <sock> -f /dev/null start-server \; set-option -g default-terminal tmux-256color \; new-session -d
+  -s <name> -x 120 -y 40 -e VAR=value '<orch binary> tui'`. Pass the environment the binary needs with `-e`,
+  including `ORCHESTRY_GLOBAL_CONFIG_PATH`.
+- **Input.**
+  - Named keys: `send-keys -t <name> Down PageDown Home End Enter Escape Tab`.
+  - Literal text: `send-keys -t <name> -l '<text>'`.
+  - Raw bytes, such as SGR mouse events: `send-keys -t <name> -H 1b 5b 3c 30 3b 31 30 3b 35 4d` is
+    `ESC[<0;10;5M`, a left-button press at column 10, row 5.
+- **Output.** `capture-pane -p -t <name>` returns the screen as text; add `-e` when the test asserts colours or
+  attributes. Poll until the expected text appears, with a bounded deadline. Never use a fixed sleep as the
+  assertion.
+- **Resize.** `resize-window -t <name> -x 80 -y 24`, then assert the redrawn screen.
+- **Clipboard.** After `set-option -s set-clipboard on`, an OSC 52 write from the dashboard lands in tmux's paste
+  buffer. Read it back with `show-buffer`. This checks the terminal copy route without touching the system
+  clipboard.
+- **Not covered by tmux:** native terminal profiles (Terminal.app, iTerm2), the native system clipboard, and
+  `orch web` in a browser. List these in the spec's Verification environment. Record them as `env-limited` or
+  `waived by owner` if they are not run.
+- **Installing tmux.** Use `brew install tmux` on macOS and the distro package on Linux. CI does not install
+  tmux yet, so the first PR that adds a tmux test also adds the install step to `.github/workflows/ci.yml`. A
+  tmux test must fail with a clear message when tmux is missing, never pass silently.
+- **Manual and agent acceptance** use the same commands against a temp project, never a real `.orchestry`.
+  Paste the `capture-pane` output into the PR as evidence.
 
 ## Release
 
