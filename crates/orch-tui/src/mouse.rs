@@ -499,6 +499,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             ZoneKind::ActivityRow { message_id } => {
                 self.state.set_focus(Focus::Activity);
                 self.state.activity_selected = Some(*message_id);
+                self.state.activity_last_position = self
+                    .state
+                    .activity_messages()
+                    .iter()
+                    .position(|i| self.state.messages[*i].id == *message_id)
+                    .unwrap_or(0);
                 self.state.activity_follow_tail = false;
                 self.state.sync_field_origin();
             }
@@ -545,6 +551,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             ZoneKind::ActivityRow { message_id } => {
                 self.state.set_focus(Focus::Activity);
                 self.state.activity_selected = Some(*message_id);
+                self.state.activity_last_position = self
+                    .state
+                    .activity_messages()
+                    .iter()
+                    .position(|i| self.state.messages[*i].id == *message_id)
+                    .unwrap_or(0);
                 self.open_focused_viewer();
             }
             ZoneKind::PickerRow { index, part } if *part == RowPart::Label => {

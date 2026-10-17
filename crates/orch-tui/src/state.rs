@@ -585,6 +585,8 @@ pub struct AppState {
     pub detail_focus: Focus,
     pub pane_states: Vec<(PaneKey, crate::navigation::ScrollState)>,
     pub activity_selected: Option<u64>,
+    /// Fallback position only; message IDs remain authoritative.
+    pub activity_last_position: usize,
     pub activity_scroll: usize,
     pub activity_follow_tail: bool,
     pub log_selected_id: Option<u64>,
@@ -698,6 +700,7 @@ impl Default for AppState {
             detail_focus: Focus::MainList,
             pane_states: Vec::new(),
             activity_selected: None,
+            activity_last_position: 0,
             activity_scroll: 0,
             activity_follow_tail: true,
             log_selected_id: None,
@@ -1901,16 +1904,22 @@ impl AppState {
             self.log_selected_id = self.selected_log().map(|m| m.id);
         }
         let rows = self.activity_messages();
-        if self.activity_follow_tail {
-            self.activity_selected = rows.last().map(|i| self.messages[*i].id);
-        } else if !rows
-            .iter()
-            .any(|i| Some(self.messages[*i].id) == self.activity_selected)
-        {
-            self.activity_selected = rows
-                .get(self.activity_scroll.min(rows.len().saturating_sub(1)))
-                .map(|i| self.messages[*i].id);
-        }
+        let position = if self.activity_follow_tail {
+            rows.len().checked_sub(1)
+        } else {
+            rows.iter()
+                .position(|i| Some(self.messages[*i].id) == self.activity_selected)
+                .or_else(|| {
+                    (!rows.is_empty()).then_some(
+                        self.activity_last_position
+                            .min(rows.len().saturating_sub(1)),
+                    )
+                })
+        };
+        self.activity_last_position = position.unwrap_or(0);
+        self.activity_selected = position
+            .and_then(|p| rows.get(p))
+            .map(|i| self.messages[*i].id);
     }
 
     /// Logs-view filtering: the agent filter never drops a message without an
@@ -2224,12 +2233,22 @@ fn message_document(
         .as_ref()
         .and_then(|value| known_message_text(value, 0))
         .or_else(|| {
-            if message.msg_type != MsgType::Error {
+            let value = parsed.as_ref()?;
+            if message.msg_type != MsgType::Error
+                || !["error", "message", "detail", "reason"]
+                    .iter()
+                    .any(|key| value.get(key).is_some())
+            {
                 return None;
             }
-            let decoded =
-                orch_domain::extract_error_message(&serde_json::Value::String(raw.into()));
-            (!decoded.is_empty() && decoded != raw).then_some((decoded, false))
+            let decoded = orch_domain::extract_error_message(value);
+            // The domain helper falls back to serializing an unsupported
+            // object. That is not decoded human content: keep exact Raw.
+            let unchanged = serde_json::from_str::<serde_json::Value>(&decoded)
+                .ok()
+                .as_ref()
+                == Some(value);
+            (!decoded.is_empty() && decoded != raw && !unchanged).then_some((decoded, false))
         });
     let (body, representation, raw_body, title) = if let Some((human, joined)) = human {
         (
@@ -2276,13 +2295,20 @@ fn known_message_text(value: &serde_json::Value, depth: usize) -> Option<(String
     {
         return Some((text.into(), false));
     }
-    if matches!(kind, Some("message" | "assistant"))
+    let content = if matches!(kind, Some("message" | "assistant"))
         || value.get("role").and_then(Value::as_str) == Some("assistant")
+        || value.get("subtype").is_some()
     {
-        let content = value
+        value
             .get("message")
-            .and_then(|m| m.get("content"))
-            .or_else(|| value.get("content"))?;
+            .and_then(|message| message.get("content"))
+            .filter(|content| !content.is_null())
+            .or_else(|| value.get("content"))
+            .or_else(|| value.get("subtype").and_then(|_| value.get("message")))
+    } else {
+        value.get("content")
+    };
+    if let Some(content) = content {
         if let Some(text) = content.as_str() {
             return Some((text.into(), false));
         }

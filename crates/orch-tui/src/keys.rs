@@ -1166,6 +1166,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     .and_then(|i| rows.get(i))
                     .map(|i| self.state.messages[*i].id);
                 self.state.activity_scroll = scroll.offset;
+                self.state.activity_last_position = scroll.selected.unwrap_or(0);
             }
             _ => {
                 self.state.set_pane_scroll(key, scroll);

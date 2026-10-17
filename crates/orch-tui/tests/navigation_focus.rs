@@ -731,3 +731,146 @@ fn f4_filter_then_copy_in_one_key_drain_preserves_the_selected_message_id() {
         .press_mod(KeyCode::Char('y'), KeyModifiers::CONTROL);
     assert_eq!(h.app.backend.copy_requests.last().unwrap().1, "selected B");
 }
+
+#[test]
+fn v5_existing_subtype_and_generic_content_shapes_decode_but_unknown_errors_stay_raw() {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    use orch_tui::widgets::text_viewer::Representation;
+    let mut state = AppState::default();
+    for (index,raw) in [r#"{"type":"system","subtype":"task_progress","message":{"content":[{"type":"text","text":"first\nsecond"}]}}"#,r#"{"content":[{"type":"text","text":"first\nsecond"}]}"#].iter().enumerate() {
+        let id=index as u64+1;
+        state.messages.push(Message::new(id,0,"preview",Token::White,MsgType::Output).with_detail(Some((*raw).into())));
+        let doc=state.text_for_source(&ViewerSource::Message(id),0,0).unwrap();assert_eq!(&*doc.body,"first\nsecond");assert_eq!(doc.representation,Representation::Human);assert_eq!(doc.raw_body.as_deref(),Some(*raw));
+    }
+    for (index, raw) in [
+        r#"{ "type": "unknown", "text": "preserve me" }"#,
+        r#"{ "error":broken"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = index as u64 + 10;
+        state.messages.push(
+            Message::new(id, 0, "error", Token::Red, MsgType::Error)
+                .with_detail(Some((*raw).into())),
+        );
+        let doc = state
+            .text_for_source(&ViewerSource::Message(id), 0, 0)
+            .unwrap();
+        assert_eq!(&*doc.body, *raw);
+        assert_eq!(doc.representation, Representation::Raw);
+    }
+}
+
+#[test]
+fn f4_activity_filter_removal_chooses_nearest_surviving_position() {
+    use orch_tui::messages::{Message, MsgType, preset_types};
+    use orch_tui::theme::Token;
+    let mut h = Harness::new();
+    h.app.state.messages = vec![
+        Message::new(1, 0, "A", Token::White, MsgType::Tool),
+        Message::new(2, 0, "B", Token::White, MsgType::Output),
+        Message::new(3, 0, "C", Token::White, MsgType::Tool),
+        Message::new(4, 0, "D", Token::White, MsgType::Output),
+    ];
+    h.app.state.set_focus(Focus::Activity);
+    h.draw()
+        .press(KeyCode::Home)
+        .press(KeyCode::Down)
+        .press(KeyCode::Down);
+    assert_eq!(h.app.state.activity_selected, Some(3));
+    h.app.state.activity_filter = preset_types("text");
+    h.app.state.normalize_focus();
+    assert_eq!(h.app.state.activity_selected, Some(4));
+}
+
+#[test]
+fn f5_activity_selects_then_expands_exact_message_after_runner_redraw() {
+    use orch_tui::hit::ZoneId;
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let mut h = Harness::new();
+    h.app.state.messages = (1..=3)
+        .map(|id| Message::new(id, 0, &format!("message {id}"), Token::White, MsgType::Info))
+        .collect();
+    h.draw();
+    let row = h
+        .hits()
+        .zones()
+        .iter()
+        .find(|z| z.id == ZoneId::ActivityMessage(2))
+        .unwrap()
+        .rect;
+    h.click(row.x, row.y);
+    assert_eq!(h.app.state.focus, Focus::Activity);
+    assert_eq!(h.app.state.activity_selected, Some(2));
+    assert!(h.app.state.viewer.is_none());
+    h.draw().click(row.x, row.y);
+    assert_eq!(
+        h.app.state.viewer.as_ref().unwrap().document().source,
+        ViewerSource::Message(2)
+    );
+    assert_eq!(
+        &*h.app.state.viewer.as_ref().unwrap().document().body,
+        "message 2"
+    );
+}
+
+#[test]
+fn n7_activity_wheel_at_final_never_reenters_tail_but_keyboard_down_does() {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let mut h = Harness::new();
+    h.app.state.messages = (1..=3)
+        .map(|id| Message::new(id, 0, "body", Token::White, MsgType::Info))
+        .collect();
+    h.app.state.set_focus(Focus::Activity);
+    h.draw();
+    h.press(KeyCode::End).press(KeyCode::Up);
+    assert!(!h.app.state.activity_follow_tail);
+    h.draw();
+    let key = h.app.state.pane_key(Focus::Activity);
+    let body = h.hits().pane_metrics(&key).unwrap().body;
+    h.wheel_down(body.x, body.y);
+    assert!(!h.app.state.activity_follow_tail);
+    h.press(KeyCode::Down);
+    assert!(h.app.state.activity_follow_tail);
+}
+
+#[test]
+fn n8_textarea_adapter_forwards_three_rows_per_accepted_notch() {
+    use orch_tui::hit::{ScrollRegion, ZoneKind};
+    use orch_tui::wizard::engine::{StepKind, Wizard, WizardKind, WizardStep};
+    let value = (0..80)
+        .map(|i| format!("row{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut h = Harness::new();
+    h.app.state.input_mode = InputMode::Wizard;
+    h.app.state.wizard = Some(Wizard::new(
+        WizardKind::Task,
+        "Task",
+        vec![
+            WizardStep::new("description", "Description", StepKind::Textarea).default_value(&value),
+        ],
+    ));
+    h.draw();
+    for _ in 0..80 {
+        h.press(KeyCode::Up);
+    }
+    h.draw();
+    let field = h
+        .hits()
+        .zones()
+        .iter()
+        .find(|z| z.kind == ZoneKind::Scroll(ScrollRegion::WizardTextarea))
+        .unwrap()
+        .rect;
+    assert!(h.line(field.y).contains("row00"));
+    for _ in 0..4 {
+        h.wheel_down(field.x, field.y);
+    }
+    h.draw();
+    assert!(h.line(field.y).contains("row09"), "{}", h.line(field.y));
+}
