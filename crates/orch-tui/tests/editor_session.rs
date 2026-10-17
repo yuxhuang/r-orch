@@ -300,6 +300,156 @@ fn e2_and_e10_selection_navigation_and_undo_are_semantically_clean_redo_is_dirty
 }
 
 #[test]
+fn selected_single_line_ctrl_a_moves_without_deleting_text() {
+    let mut app = app();
+    app.open_wizard(field(StepKind::Text, "a界b"));
+    modified(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+    modified(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    let wizard = app.state.wizard.as_ref().unwrap();
+    assert_eq!(wizard.current_value(), "a界b");
+    assert_eq!(wizard.text_input().cursor().pos(), 0);
+    assert_eq!(wizard.selected_text(), None);
+    assert!(!wizard.semantic_dirty(&[]));
+}
+
+#[test]
+fn selected_single_line_ctrl_e_moves_without_deleting_text() {
+    let mut app = app();
+    app.open_wizard(field(StepKind::Text, "a界b"));
+    modified(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+    modified(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    let wizard = app.state.wizard.as_ref().unwrap();
+    assert_eq!(wizard.current_value(), "a界b");
+    assert_eq!(wizard.text_input().cursor().pos(), 3);
+    assert_eq!(wizard.selected_text(), None);
+    assert!(!wizard.semantic_dirty(&[]));
+}
+
+#[test]
+fn single_line_navigation_after_undo_preserves_redo() {
+    for event in [
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('E'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('F'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::META),
+    ] {
+        let mut app = app();
+        app.open_wizard(field(StepKind::Text, "a"));
+        type_text(&mut app, "b");
+        modified(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        app.handle_key(event);
+        modified(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.state.wizard.as_ref().unwrap().current_value(),
+            "ab",
+            "{event:?}"
+        );
+    }
+}
+
+#[test]
+fn selected_single_line_control_navigation_clears_or_extends_selection_without_editing() {
+    for (code, mods, position, selected) in [
+        ('B', KeyModifiers::CONTROL, 1, None),
+        ('f', KeyModifiers::CONTROL, 3, None),
+        ('A', KeyModifiers::ALT, 0, None),
+        ('b', KeyModifiers::ALT, 0, None),
+        ('F', KeyModifiers::META, 3, None),
+        (
+            'a',
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            0,
+            Some("a界b"),
+        ),
+        (
+            'b',
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            1,
+            Some("界b"),
+        ),
+    ] {
+        let mut app = app();
+        app.open_wizard(field(StepKind::Text, "a界b"));
+        modified(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        modified(&mut app, KeyCode::Char(code), mods);
+        let wizard = app.state.wizard.as_ref().unwrap();
+        assert_eq!(wizard.current_value(), "a界b", "{code:?} {mods:?}");
+        assert_eq!(
+            wizard.text_input().cursor().pos(),
+            position,
+            "{code:?} {mods:?}"
+        );
+        assert_eq!(
+            wizard.selected_text().as_deref(),
+            selected,
+            "{code:?} {mods:?}"
+        );
+        modified(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(app.state.wizard.as_ref().unwrap().current_value(), "a界b");
+    }
+}
+
+#[test]
+fn single_line_ignored_modified_characters_preserve_selection_and_redo() {
+    use orch_tui::text::TextInput;
+    for (code, mods) in [
+        ('g', KeyModifiers::CONTROL),
+        ('G', KeyModifiers::CONTROL),
+        ('x', KeyModifiers::ALT),
+    ] {
+        let mut text = TextInput::new("a界");
+        text.handle_editor_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), 0);
+        text.handle_editor_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL), 0);
+        text.handle_editor_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), 0);
+        let generation = text.generation();
+        assert!(!text.handle_editor_key(KeyEvent::new(KeyCode::Char(code), mods), 0));
+        assert_eq!(text.value(), "a界");
+        assert_eq!(text.selected_text().as_deref(), Some("界"));
+        assert_eq!(text.generation(), generation);
+        text.handle_editor_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL), 0);
+        assert_eq!(text.value(), "a界b");
+    }
+}
+
+#[test]
+fn single_line_noop_edits_preserve_redo_until_source_changes() {
+    for event in [
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    ] {
+        let mut app = app();
+        app.open_wizard(field(StepKind::Text, "a"));
+        type_text(&mut app, "b");
+        modified(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        key(&mut app, KeyCode::Home);
+        app.handle_key(event);
+        modified(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.state.wizard.as_ref().unwrap().current_value(),
+            "ab",
+            "{event:?}"
+        );
+        modified(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        key(&mut app, KeyCode::End);
+        type_text(&mut app, "c");
+        modified(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(app.state.wizard.as_ref().unwrap().current_value(), "ac");
+    }
+}
+
+#[test]
 fn e3_back_keeps_unadvanced_multiline_scratch_and_exact_draft() {
     let mut app = app();
     let wizard = Wizard::new(

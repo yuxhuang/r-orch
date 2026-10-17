@@ -103,13 +103,16 @@ impl TextInput {
         self.cursor = Cursor::at(self.value(), at);
     }
 
-    fn editor_snapshot(&mut self) {
+    fn editor_snapshot(&mut self, before: Cursor) {
+        if before.text() == self.value() {
+            return;
+        }
         if !self
             .editor_undo
             .last()
-            .is_some_and(|c| c.text() == self.value())
+            .is_some_and(|c| c.text() == before.text())
         {
-            self.editor_undo.push(self.cursor.clone());
+            self.editor_undo.push(before);
             if self.editor_undo.len() > MAX_UNDO_DEPTH {
                 self.editor_undo.remove(0);
             }
@@ -133,6 +136,8 @@ impl TextInput {
     /// Wizard-only selection/history adaptation; command-bar kill/yank semantics stay intact.
     pub fn handle_editor_key(&mut self, key: KeyEvent, now_ms: i64) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let meta = is_meta(key);
+        let ch = char_of(key.code).map(|ch| ch.to_ascii_lowercase());
         if ctrl && matches!(key.code, KeyCode::Char('z' | 'Z' | 'r' | 'R')) {
             let redo = matches!(key.code, KeyCode::Char('r' | 'R'));
             let stack = if redo {
@@ -152,10 +157,18 @@ impl TextInput {
             self.selection_anchor = None;
             return true;
         }
-        if matches!(
-            key.code,
-            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
-        ) {
+        let navigation = if ctrl {
+            matches!(ch, Some('a' | 'e' | 'b' | 'f'))
+        } else if meta {
+            matches!(key.code, KeyCode::Left | KeyCode::Right)
+                || matches!(ch, Some('a' | 'b' | 'f'))
+        } else {
+            matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+            )
+        };
+        if navigation {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 self.selection_anchor.get_or_insert(self.cursor.pos());
             } else {
@@ -174,25 +187,38 @@ impl TextInput {
             }
             return true;
         }
-        let editing = matches!(
-            key.code,
-            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
-        );
-        if editing {
-            self.editor_snapshot();
-            let removed = self.delete_selection();
-            if removed && matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
-                self.generation += 1;
-                return true;
-            }
+        // Match the delegated keymap: modified characters may navigate or be
+        // ignored, and must never replace a selection as ordinary typing does.
+        let editing = if ctrl {
+            matches!(ch, Some('k' | 'u' | 'w' | 'y' | 'd' | 'h'))
+        } else if meta {
+            matches!(key.code, KeyCode::Backspace | KeyCode::Delete) || ch == Some('z')
+        } else {
+            matches!(
+                key.code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+            )
+        };
+        if !editing {
+            return self.handle_key(key, now_ms);
         }
-        self.handle_key(key, now_ms)
+        let before = self.cursor.clone();
+        let removed = self.delete_selection();
+        let consumed = if removed && matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
+            self.generation += 1;
+            true
+        } else {
+            self.handle_key(key, now_ms)
+        };
+        self.editor_snapshot(before);
+        consumed
     }
 
     pub fn insert_editor_str(&mut self, text: &str, now_ms: i64) {
-        self.editor_snapshot();
+        let before = self.cursor.clone();
         self.delete_selection();
         self.insert_str(text, now_ms);
+        self.editor_snapshot(before);
     }
 
     /// `reset(newValue)` — new value, cursor at the end, undo history dropped.
