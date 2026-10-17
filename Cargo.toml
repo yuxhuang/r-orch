@@ -14,9 +14,9 @@ members = [
 [workspace.package]
 version = "0.5.1"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.99"
 license = "MIT"
-repository = "https://github.com/oxgeneral/r-orch"
+repository = "https://github.com/yuxhuang/r-orch"
 # Nothing here is published. Besides preventing an irreversible accident, this
 # is what lets `deny.toml`'s `allow-wildcard-paths` apply: cargo-deny treats a
 # publishable crate's `*` path dependency as a real wildcard, because crates.io
@@ -63,10 +63,6 @@ saphyr-parser = "0.2"
 
 # ── Templates (ARCHITECTURE §4.3) ──────────────────────────────────────────
 liquid = "0.26.11"
-# liquid 0.26.11 resolves kstring 2.0.5, whose MSRV (1.96.0) exceeds our pinned
-# toolchain (1.94.1). 2.0.2 is the newest version that builds on 1.94.1.
-# Remove this pin only together with a toolchain bump.
-kstring = "2.0.2"
 
 # ── TUI (ARCHITECTURE §4.4) ────────────────────────────────────────────────
 ratatui = "0.30"

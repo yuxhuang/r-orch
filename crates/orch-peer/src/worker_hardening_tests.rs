@@ -420,7 +420,11 @@ async fn oversized_sync_and_finished_keep_session_open_for_next_frame() {
         }
     }
     synced.sort();
+    // `Finished` is sent by the sync reply and again by the periodic update
+    // tick if one fires before the pong; the controller's ack is idempotent,
+    // so the protocol promises every key, not every key exactly once.
     finished.sort();
+    finished.dedup();
     assert_eq!(synced, keys);
     assert_eq!(finished, keys);
 }

@@ -1952,9 +1952,15 @@ mod tests {
 
     /// Dispatch every ready task once (`orch run --all`) and the mirror by id
     /// (`orch run <id>`), then wait for whatever started to be collected.
+    ///
+    /// The collectors are drained between the two calls: `run_all` returns as
+    /// soon as the child is spawned, and until its collector clears
+    /// `state.running`, `run_task` on the same id is `TaskAlreadyRunning` —
+    /// correct for the CLI, a race here. It lost reliably on Linux CI.
     async fn dispatch_mirror(worker: &Worker, task_id: &str) {
         timeout(Duration::from_secs(30), async {
             worker.ctx.engine.orchestrator.run_all().await?;
+            worker.ctx.engine.orchestrator.wait_for_collectors().await;
             worker.ctx.engine.orchestrator.run_task(task_id).await?;
             worker.ctx.engine.orchestrator.wait_for_collectors().await;
             Result::<()>::Ok(())

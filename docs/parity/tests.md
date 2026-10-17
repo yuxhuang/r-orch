@@ -1,5 +1,8 @@
 # orch-ts Test Suite Inventory — Rust Port Spec
 
+> **Status: historical.** Matching the TypeScript original is no longer a goal; this appendix is not updated.
+> See [ADR 0002](../decisions/0002-parity-is-no-longer-a-goal.md).
+
 Source repo: `parity/orch-ts` (read-only; nothing was modified).
 Generated 2026-10-13.
 

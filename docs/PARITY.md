@@ -1,5 +1,9 @@
 # ORCH → r-orch Parity Contract
 
+> **Status: historical.** Matching the TypeScript original is no longer a goal (owner decision, 2026-10-15).
+> This contract and `docs/parity/` are kept as a record of the port and are not updated; new work may diverge.
+> See [ADR 0002](decisions/0002-parity-is-no-longer-a-goal.md).
+
 **Reference implementation:** `oxgeneral/ORCH` @ `c066dc0` (npm `@oxgeneral/orch` v1.0.34), vendored read-only at
 `parity/orch-ts/` (gitignored; re-created by `parity/setup.sh`).
 

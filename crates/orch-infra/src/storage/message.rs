@@ -70,11 +70,11 @@ impl FileMessageStore {
             let Some(mut message) = store.get(&id).await? else {
                 return Ok(());
             };
-            if !message
+            if message
                 .to_agent_id
                 .as_deref()
                 .and_then(|to| to.rsplit_once('@'))
-                .is_some_and(|(_, alias)| alias == peer_alias)
+                .is_none_or(|(_, alias)| alias != peer_alias)
             {
                 tracing::debug!(%id, %peer_alias, "Ignore message rejection from a different peer");
                 return Ok(());

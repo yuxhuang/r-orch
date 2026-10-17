@@ -1,5 +1,8 @@
 # ORCH infrastructure parity specification (TypeScript → Rust)
 
+> **Status: historical.** Matching the TypeScript original is no longer a goal; this appendix is not updated.
+> See [ADR 0002](../decisions/0002-parity-is-no-longer-a-goal.md).
+
 Source of truth: `parity/orch-ts` — package `@oxgeneral/orch` v1.0.34, ESM, Node ≥ 20, dependency `liquidjs ^10.27.2`.
 
 All file paths in this document are relative to that repo root unless written absolute. Sections 5.3, 6.1 and 1.6 end with **verbatim source dumps** appended mechanically from the source files (not retyped), so they are byte-exact.
