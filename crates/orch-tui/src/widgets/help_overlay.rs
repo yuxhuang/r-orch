@@ -70,7 +70,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
     Clear.render(area, frame.buffer_mut());
     let pad_x = ((area.width as usize).saturating_sub(OUTER_W)) / 2;
-    let margin_top = ((area.height as usize).saturating_sub(MAX_ROWS + 10)) / 2;
+    let margin_top = ((area.height as usize).saturating_sub(MAX_ROWS + 11)) / 2;
     let x = area.x + pad_x as u16;
     let width = OUTER_W.min(area.width as usize) as u16;
     let inner = Rect::new(x, area.y, width, area.height);
@@ -174,6 +174,16 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         y,
         vec![Span::styled(
             "Tab: next pane; Left/Right: view. One pane: Tab stays. Home/End: first/last.",
+            ctx.style(Token::Dim),
+        )],
+    );
+    y += 1;
+    put_line(
+        frame,
+        inner,
+        y,
+        vec![Span::styled(
+            "Agents: o sort; O reverse; 0 original (team/status/source order).",
             ctx.style(Token::Dim),
         )],
     );

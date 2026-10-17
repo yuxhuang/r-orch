@@ -9,14 +9,14 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::format::{cap_display, cap_line, format_duration, parse_timestamp_ms};
-use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
+use crate::hit::{PseudoRow, ScrollRegion, VerbId, ZoneId, ZoneKind};
 use crate::state::{AgentRow, EntityType};
 use crate::text::text_display_width;
 use crate::theme::{
     CHECK, CIRCLE, CROSS, CURSOR, DIAMOND_OUTLINE, EM_DASH, LOOP, LOZENGE, STAR, Token, light_rule,
     spinner_frame,
 };
-use crate::views::{RenderCtx, put_line};
+use crate::views::{RenderCtx, put_line, spans_width};
 
 /// The agent-row error hint is capped at 30 characters. The task column
 /// grows to this before the model column takes any slack, so from
@@ -63,6 +63,13 @@ pub fn row_error_text(kind: &str, raw: &str) -> String {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    render_status_bar(frame, area, ctx);
+    let area = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
     let state = ctx.state;
     let rows = state.agent_rows(ctx.caps.can_add_agent);
 
@@ -162,6 +169,46 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             }
         }
     }
+}
+
+/// Like the Actions filter row, each hint owns a clipped semantic hit zone.
+fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    if area.height == 0 {
+        return;
+    }
+    let sort = ctx.state.agent_sort;
+    let mut spans = Vec::new();
+    for (text, verb, token) in [
+        (
+            format!("o sort:{}", sort.field.label()),
+            VerbId::CycleAgentSort,
+            Token::Amber,
+        ),
+        (
+            format!(
+                "O {}",
+                if sort.descending {
+                    "desc ↓"
+                } else {
+                    "asc ↑"
+                }
+            ),
+            VerbId::ReverseAgentSort,
+            Token::Cyan,
+        ),
+        ("0 reset".to_string(), VerbId::ResetAgentSort, Token::Dim),
+    ] {
+        let x = area.x + spans_width(&spans);
+        spans.push(Span::styled(text, ctx.chip(token, Token::NeutralBg)));
+        ctx.zone(
+            Rect::new(x, area.y, area.x + spans_width(&spans) - x, 1),
+            area,
+            ZoneKind::Verb(verb),
+            ZoneId::Verb(verb),
+        );
+        spans.push(Span::raw(" "));
+    }
+    put_line(frame, area, area.y, spans);
 }
 
 // ── Row layout ──────────────────────────────────────────────────────────────
@@ -668,7 +715,7 @@ mod tests {
             .enumerate()
             .map(|(i, name)| make_agent(&format!("agt_{i}"), name, AgentStatus::Idle))
             .collect();
-        for (width, height) in [(80, 24), (100, 24), (120, 40)] {
+        for (width, height) in [(80, 26), (100, 26), (120, 40)] {
             let buffer = draw(
                 FakeBackend::new().with_agents(agents.clone()),
                 width,

@@ -326,6 +326,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             _ => {}
         }
 
+        if view == ViewId::Agents {
+            match key.code {
+                KeyCode::Char('o') => {
+                    self.cycle_agent_sort();
+                    return;
+                }
+                KeyCode::Char('O') => {
+                    self.reverse_agent_sort();
+                    return;
+                }
+                KeyCode::Char('0') => {
+                    self.reset_agent_sort();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Logs-only filter keys.
         if view == ViewId::Logs && !detail_open {
             match key.code {
@@ -720,6 +738,27 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.retain_command_bar = false;
     }
 
+    pub(crate) fn cycle_agent_sort(&mut self) {
+        let mut sort = self.state.agent_sort;
+        sort.field = sort.field.next();
+        self.change_agent_sort(sort);
+    }
+
+    pub(crate) fn reverse_agent_sort(&mut self) {
+        let mut sort = self.state.agent_sort;
+        sort.descending = !sort.descending;
+        self.change_agent_sort(sort);
+    }
+
+    pub(crate) fn reset_agent_sort(&mut self) {
+        self.change_agent_sort(crate::state::AgentSort::default());
+    }
+
+    fn change_agent_sort(&mut self, sort: crate::state::AgentSort) {
+        self.state.set_agent_sort(sort);
+        self.state.clamp_all(self.backend.can_add_agent());
+    }
+
     /// Logs `a` — the agent filter picker, drafting the live filter.
     pub(crate) fn open_agent_picker(&mut self) {
         self.state.show_agent_picker = true;
@@ -961,7 +1000,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     fallback.main_h.saturating_sub(match self.state.view {
                         ViewId::Goals => 0,
                         ViewId::Tasks => 0,
-                        ViewId::Agents => 0,
+                        ViewId::Agents => 1,
                         ViewId::Logs => 2,
                     }) as usize
                 } else {

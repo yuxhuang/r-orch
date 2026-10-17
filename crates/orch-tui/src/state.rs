@@ -513,6 +513,45 @@ pub enum TaskRow {
     },
 }
 
+/// Session-only agent ordering; Original preserves status then source order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentSortField {
+    #[default]
+    Original,
+    Name,
+    Status,
+    AdapterModel,
+    Location,
+}
+
+impl AgentSortField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Original => Self::Name,
+            Self::Name => Self::Status,
+            Self::Status => Self::AdapterModel,
+            Self::AdapterModel => Self::Location,
+            Self::Location => Self::Original,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::Name => "Name",
+            Self::Status => "Status",
+            Self::AdapterModel => "Adapter/Model",
+            Self::Location => "Location",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentSort {
+    pub field: AgentSortField,
+    pub descending: bool,
+}
+
 /// A rendered row of the agent list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRow {
@@ -609,6 +648,7 @@ pub struct AppState {
     pub goal_selected: usize,
     pub task_selected: usize,
     pub agent_selected: usize,
+    pub agent_sort: AgentSort,
     pub goal_scroll: usize,
     pub task_scroll: usize,
     pub agent_scroll: usize,
@@ -721,6 +761,7 @@ impl Default for AppState {
             goal_selected: 0,
             task_selected: 0,
             agent_selected: 0,
+            agent_sort: AgentSort::default(),
             goal_scroll: 0,
             task_scroll: 0,
             agent_scroll: 0,
@@ -1536,7 +1577,9 @@ impl AppState {
         self.sorted_tasks().len() - self.visible_tasks().len()
     }
 
-    /// `sortedAgents` — active-team members first, then team name, then status.
+    /// Active teams remain grouped; the session sort applies inside each section.
+    /// Original is the existing status/source order, not a timestamp order:
+    /// Agent carries neither created nor updated timestamps.
     pub fn sorted_agents(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.agents.len()).collect();
         order.sort_by(|a, b| {
@@ -1551,11 +1594,65 @@ impl AppState {
                     na.cmp(nb)
                 })
                 .then_with(|| {
-                    agent_status_order(self.agents[*a].status)
-                        .cmp(&agent_status_order(self.agents[*b].status))
+                    let (left, right) = (&self.agents[*a], &self.agents[*b]);
+                    let order = match self.agent_sort.field {
+                        AgentSortField::Original => agent_status_order(left.status)
+                            .cmp(&agent_status_order(right.status))
+                            .then_with(|| a.cmp(b)),
+                        AgentSortField::Name => left.name.cmp(&right.name),
+                        AgentSortField::Status => {
+                            agent_status_order(left.status).cmp(&agent_status_order(right.status))
+                        }
+                        AgentSortField::AdapterModel => {
+                            left.adapter.cmp(&right.adapter).then_with(|| {
+                                left.config
+                                    .model
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .cmp(right.config.model.as_deref().unwrap_or("").trim())
+                            })
+                        }
+                        AgentSortField::Location => left
+                            .remote
+                            .as_ref()
+                            .map_or("local", |remote| remote.alias.as_str())
+                            .cmp(
+                                right
+                                    .remote
+                                    .as_ref()
+                                    .map_or("local", |remote| remote.alias.as_str()),
+                            ),
+                    };
+                    let order = if self.agent_sort.descending {
+                        order.reverse()
+                    } else {
+                        order
+                    };
+                    // Keep equal field values deterministic in either direction.
+                    if self.agent_sort.field == AgentSortField::Original {
+                        order
+                    } else {
+                        order
+                            .then_with(|| left.name.cmp(&right.name))
+                            .then_with(|| left.id.cmp(&right.id))
+                    }
                 })
         });
         order
+    }
+
+    pub fn set_agent_sort(&mut self, sort: AgentSort) {
+        let selected = self.selected_agent().map(|agent| agent.id.clone());
+        self.agent_sort = sort;
+        if let Some(id) = selected
+            && let Some(position) = self
+                .sorted_agents()
+                .iter()
+                .position(|index| self.agents[*index].id == id)
+        {
+            self.agent_selected = position;
+        }
     }
 
     /// The **active** team an agent belongs to.
@@ -1805,7 +1902,7 @@ impl AppState {
                             | OnboardingStep::Completed
                     ))
             }
-            ViewId::Agents => self.agents.len() + 1 + self.agent_section_rows(),
+            ViewId::Agents => self.agents.len() + 2 + self.agent_section_rows(),
             ViewId::Logs => 0,
         }
     }
@@ -2184,7 +2281,7 @@ impl AppState {
             self.agent_scroll,
             &agent_rows,
             self.agent_rows(can_create).len(),
-            viewport(ViewId::Agents, 0),
+            viewport(ViewId::Agents, 1),
         );
         self.reconcile_message_selection(self.log_selected_id);
         self.normalize_focus();
