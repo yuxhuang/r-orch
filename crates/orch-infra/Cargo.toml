@@ -22,7 +22,6 @@ indexmap.workspace = true
 jiff.workspace = true
 liquid.workspace = true
 # Pinned for the toolchain MSRV — see the root manifest.
-kstring.workspace = true
 nanoid.workspace = true
 png.workspace = true
 regex.workspace = true

@@ -78,7 +78,7 @@ provide. Two consequences:
 ```
 r-orch/
 ├── Cargo.toml                 # workspace root, shared [workspace.dependencies]
-├── rust-toolchain.toml        # pin 1.94.1, edition 2024
+├── rust-toolchain.toml        # pin 1.99.1, edition 2024
 ├── crates/
 │   ├── orch-domain/           # pure types + pure functions. NO I/O, NO async.
 │   ├── orch-core/             # the port traits (storage, adapter, process, workspace, clock, ids)
@@ -265,7 +265,7 @@ becomes the better choice on both axes.
 
 | Crate | Version | Notes |
 |---|---|---|
-| `liquid` | `0.26.11` | The only maintained Liquid implementation for Rust. **Requires pinning `kstring = "2.0.2"`** — `liquid` 0.26.11 resolves `kstring` 2.0.5, whose MSRV (1.96.0) exceeds our toolchain (1.94.1). |
+| `liquid` | `0.26.11` | The only maintained Liquid implementation for Rust. `kstring` floats (the 2.0.2 MSRV pin went with the 1.99 toolchain); its 2.0.3+ crate-wide deprecation is allowed in `template/lenient.rs`, whose trait impls must name `KStringCow`. |
 
 I measured `liquid` 0.26.11 against `liquidjs` 10.27.2 on the exact constructs ORCH uses
 ([PARITY.md §9.5](PARITY.md)). Summary:
@@ -352,7 +352,7 @@ Windows-only crates the gate never resolves.
 **Where a well-supported third-party crate covers a complex feature, use it instead of hand-rolling.**
 Hand-roll only when (a) no maintained crate fits, or (b) a parity requirement in PARITY.md rules the crate
 out — and say which in a code comment. Candidates for areas that would otherwise be hand-written (verify
-version compatibility with `ratatui` 0.30 / rustc 1.94.1 before adopting; record the choice in
+version compatibility with `ratatui` 0.30 / the pinned toolchain before adopting; record the choice in
 `[workspace.dependencies]`):
 
 | Area | Crate(s) | Note |

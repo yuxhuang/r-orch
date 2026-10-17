@@ -13,6 +13,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - `docs/plans/2026-10-16-open-source-readiness.md`: the checklist of gaps before the repo can be opened.
 
 ### Changed
+- Building from source needs Rust 1.99.1 (was 1.94.1); `rust-toolchain.toml` pins it and `kstring` is no longer
+  held back for MSRV.
 - Parity with the TypeScript original is no longer a goal. `docs/PARITY.md` and `docs/parity/` are marked
   historical ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)).
 

@@ -36,7 +36,7 @@ Authoritative docs:
 
 ## Non-negotiables
 
-1. **Pinned toolchain.** `rust-toolchain.toml` pins 1.94.1 (edition 2024). Do not override it or bump it casually
+1. **Pinned toolchain.** `rust-toolchain.toml` pins 1.99.1 (edition 2024). Do not override it or bump it casually
    (see Don'ts). Only rustup honours the pin: if `rustup which cargo` fails, your `cargo` (e.g. Homebrew) ignores
    it and your clippy/fmt results will differ from CI. Match CI (install rustup).
 2. **Green before a PR:** the CI set, run locally (see Pre-PR check). A red PR is not reviewed or merged.
@@ -215,8 +215,8 @@ pushing a tag.
 - Don't commit `parity/orch-ts/`; it is gitignored and re-created by `./parity/setup.sh`.
 - Don't add PARITY.md §14 entries or extend the contract; leave existing `PARITY` code comments alone.
 - Don't use `sort_unstable*`; clippy will fail.
-- Don't bump `rust-toolchain.toml` without re-checking the `kstring = "2.0.2"` pin in `Cargo.toml` (2.0.5 needs
-  Rust 1.96); remove the pin only with the bump.
+- Don't bump `rust-toolchain.toml` without bumping `rust-version` in `Cargo.toml` to match and running the CI set
+  under the new toolchain; new clippy lints are fixed in the same PR, not allowed.
 - Don't run tests or experiments against the real home directory or a real project's `.orchestry`.
 - Don't flip the repo public, add remotes, or paste private names (taps, hosts, paths) anywhere in the repo or PRs.
 - Don't add a dependency without the §4.8 check; add an ADR when it is load-bearing.

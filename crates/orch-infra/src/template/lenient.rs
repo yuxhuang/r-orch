@@ -10,6 +10,12 @@
 //! `{% for %}` loop variable, because loop variables are copied out as plain
 //! values. Documented variables never hit either: every key is always present.
 
+// `liquid`'s `ValueView`/`ObjectView` traits name `KStringCow` in their
+// signatures, and `kstring` 2.0.3+ deprecates the whole crate. Implementing
+// the traits means spelling the type, so the warning cannot be fixed here;
+// it goes away when `liquid` moves off `kstring`.
+#![allow(deprecated)]
+
 use std::sync::LazyLock;
 
 use liquid::model::{
