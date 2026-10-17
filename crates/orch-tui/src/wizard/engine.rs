@@ -585,8 +585,25 @@ impl Wizard {
     pub fn semantic_dirty(&self, attachments: &[String]) -> bool {
         !attachments.is_empty()
             || self.semantic_values().iter().any(|(id, value)| {
-                normalized(value)
-                    != normalized(self.baseline.get(id).map(String::as_str).unwrap_or(""))
+                let value = normalized(value);
+                let baseline = normalized(self.baseline.get(id).map(String::as_str).unwrap_or(""));
+                if self
+                    .steps
+                    .iter()
+                    .any(|s| s.id == *id && s.kind == StepKind::Multiselect)
+                {
+                    // Compare membership only; drafts and submission keep insertion order.
+                    value
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .collect::<IndexSet<_>>()
+                        != baseline
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .collect::<IndexSet<_>>()
+                } else {
+                    value != baseline
+                }
             })
     }
 

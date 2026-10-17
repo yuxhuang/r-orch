@@ -300,6 +300,74 @@ fn e2_and_e10_selection_navigation_and_undo_are_semantically_clean_redo_is_dirty
 }
 
 #[test]
+fn reverted_multiselect_membership_is_semantically_clean() {
+    use orch_tui::wizard::Choice;
+    let mut wizard = Wizard::new(
+        WizardKind::Team,
+        "Team",
+        vec![
+            WizardStep::new("members", "Members", StepKind::Multiselect)
+                .options(vec![
+                    Choice::new("a", "A", ""),
+                    Choice::new("b", "B", ""),
+                    Choice::new("c", "C", ""),
+                ])
+                .default_value("a,b"),
+            WizardStep::new("name", "Name", StepKind::Text).default_value("Team"),
+        ],
+    );
+    let press = |wizard: &mut Wizard, code| {
+        wizard.handle_key(KeyEvent::new(code, KeyModifiers::NONE), 1000)
+    };
+    assert!(!wizard.semantic_dirty(&[]));
+    press(&mut wizard, KeyCode::Char(' '));
+    assert!(wizard.semantic_dirty(&[]), "removed a member");
+    press(&mut wizard, KeyCode::Char(' '));
+    assert_eq!(wizard.current_value(), "b,a");
+    assert!(
+        !wizard.semantic_dirty(&[]),
+        "restored the original membership"
+    );
+    press(&mut wizard, KeyCode::Down);
+    press(&mut wizard, KeyCode::Down);
+    press(&mut wizard, KeyCode::Char(' '));
+    assert!(wizard.semantic_dirty(&[]), "added a member");
+    press(&mut wizard, KeyCode::Home);
+    press(&mut wizard, KeyCode::Char(' '));
+    assert!(
+        wizard.semantic_dirty(&[]),
+        "changed membership at the same count"
+    );
+    press(&mut wizard, KeyCode::Char(' '));
+    press(&mut wizard, KeyCode::End);
+    press(&mut wizard, KeyCode::Char(' '));
+    assert!(!wizard.semantic_dirty(&[]));
+    assert!(wizard.semantic_dirty(&["fixture.png".into()]));
+
+    press(&mut wizard, KeyCode::Tab);
+    assert_eq!(wizard.step_id(), "name");
+    assert!(
+        !wizard.semantic_dirty(&[]),
+        "saved multiselect scratch is clean"
+    );
+    let draft = WizardDraft::capture(&wizard, &[]);
+    assert_eq!(draft.baseline["members"], "a,b");
+    assert_eq!(draft.values["members"], "b,a");
+    press(&mut wizard, KeyCode::Esc);
+    assert_eq!(wizard.current_value(), "b,a");
+    assert!(!wizard.semantic_dirty(&[]));
+    press(&mut wizard, KeyCode::Tab);
+    let orch_tui::wizard::WizardOutcome::Complete(values) = press(&mut wizard, KeyCode::Enter)
+    else {
+        panic!("expected the final text step to submit");
+    };
+    assert_eq!(
+        values["members"], "b,a",
+        "submission retains insertion order"
+    );
+}
+
+#[test]
 fn selected_single_line_ctrl_a_moves_without_deleting_text() {
     let mut app = app();
     app.open_wizard(field(StepKind::Text, "a界b"));
