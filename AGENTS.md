@@ -111,8 +111,7 @@ security-relevant code. It is not a superset of CI: its `advisories` step silent
 missing. It also runs `parity`, `lint-scenarios` and `probes`, which need the TS oracle (`./parity/setup.sh`,
 Node) and fail without it (every probe reports HARNESS BROKE); `probes` also fails on a dirty tree. Without the
 oracle, expect those steps to fail and say so in the PR; do not contort code (ADR 0002). `--warm` reuses your
-`target/` and is not a gate. Its verdict is written to `target/gate-result.txt`. Today the script needs GNU
-coreutils (`df -BG`, `date -Is`), so on macOS its preflight reads 0 GB free and refuses to run cold.
+`target/` and is not a gate. Its verdict is written to `target/gate-result.txt`. It runs on macOS and Linux.
 
 Say in the PR which platform each check ran on (macOS, Linux CI, both). A failure that also occurs on the base
 commit is still a failure. Report it as one; it is not a pass.
