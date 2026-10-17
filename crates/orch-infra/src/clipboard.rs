@@ -13,12 +13,14 @@
 //! selection — so the write side keeps one long-lived thread and one
 //! long-lived handle instead of opening a handle per call.
 
+use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use arboard::Clipboard;
 
 const EXEC_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_NATIVE_COPY_JOBS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardContentType {
@@ -141,14 +143,14 @@ pub struct NativeCopyDone {
 /// Why a submission was refused. Neither case ever blocks the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeCopySubmitError {
-    /// One job is in flight and another is already queued. Retryable.
+    /// Two jobs are outstanding, including undrained completions. Retryable.
     Busy,
     /// The worker thread is gone — it panicked, or could not be started.
     /// Not retryable: this worker will never run anything again.
     Gone,
 }
 
-/// One OS thread that writes the host clipboard, with a two-deep queue.
+/// One OS thread that writes the host clipboard, with at most two outstanding jobs.
 ///
 /// The OS call cannot be cancelled or timed out from outside, which drives
 /// every choice here:
@@ -165,6 +167,9 @@ pub enum NativeCopySubmitError {
 pub struct NativeCopyWorker {
     jobs: mpsc::SyncSender<Job>,
     done: mpsc::Receiver<NativeCopyDone>,
+    /// Only the caller changes this count; the worker finishing a write does
+    /// not free capacity until its completion is consumed.
+    outstanding: Cell<usize>,
 }
 
 struct Job {
@@ -176,9 +181,10 @@ impl NativeCopyWorker {
     /// Start the thread. The opener runs on it, not here, so this never
     /// touches the OS clipboard on the caller's thread.
     pub fn spawn(opener: TextClipboardOpener) -> Self {
-        // Capacity 1: one job in the buffer (pending) plus the one the thread
-        // has already taken (in flight). That is the whole bound.
-        let (jobs, job_rx) = mpsc::sync_channel::<Job>(1);
+        // Both admitted jobs must fit before the opener returns or the worker
+        // is scheduled. The outstanding count bounds queued, running and
+        // completed jobs together, independently of channel occupancy.
+        let (jobs, job_rx) = mpsc::sync_channel::<Job>(MAX_NATIVE_COPY_JOBS);
         let (done_tx, done) = mpsc::channel();
         let started = std::thread::Builder::new()
             .name("orch-clipboard-write".into())
@@ -188,17 +194,27 @@ impl NativeCopyWorker {
             // disconnected and every submission reports `Gone`.
             tracing::error!(%error, "could not start the clipboard writer thread");
         }
-        NativeCopyWorker { jobs, done }
+        NativeCopyWorker {
+            jobs,
+            done,
+            outstanding: Cell::new(0),
+        }
     }
 
     /// Hand over one write without ever blocking.
     pub fn submit(&self, id: u64, text: String) -> Result<(), NativeCopySubmitError> {
+        let outstanding = self.outstanding.get();
+        if outstanding >= MAX_NATIVE_COPY_JOBS {
+            return Err(NativeCopySubmitError::Busy);
+        }
         self.jobs
             .try_send(Job { id, text })
             .map_err(|err| match err {
                 mpsc::TrySendError::Full(_) => NativeCopySubmitError::Busy,
                 mpsc::TrySendError::Disconnected(_) => NativeCopySubmitError::Gone,
-            })
+            })?;
+        self.outstanding.set(outstanding + 1);
+        Ok(())
     }
 
     /// Take every completion that has arrived. Never blocks, so a UI loop can
@@ -208,6 +224,7 @@ impl NativeCopyWorker {
         while let Ok(completion) = self.done.try_recv() {
             done.push(completion);
         }
+        self.outstanding.set(self.outstanding.get() - done.len());
         done
     }
 
@@ -217,7 +234,9 @@ impl NativeCopyWorker {
     /// uses [`NativeCopyWorker::drain_done`]; a frame must not wait on an OS
     /// clipboard call.
     pub fn wait_done(&self, timeout: Duration) -> Option<NativeCopyDone> {
-        self.done.recv_timeout(timeout).ok()
+        let done = self.done.recv_timeout(timeout).ok()?;
+        self.outstanding.set(self.outstanding.get() - 1);
+        Some(done)
     }
 }
 
@@ -452,6 +471,77 @@ mod tests {
         );
 
         drop(release);
+    }
+
+    #[test]
+    fn two_jobs_are_accepted_before_the_opener_returns() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&written);
+        let (started, opening) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let worker = NativeCopyWorker::spawn(Box::new(move || {
+            started.send(()).unwrap();
+            let _ = gate.recv();
+            Ok(Box::new(Recorder(recorded)) as _)
+        }));
+
+        worker.submit(1, "first".into()).unwrap();
+        opening.recv_timeout(WAIT).unwrap();
+        worker.submit(2, "second".into()).unwrap();
+        assert_eq!(worker.wait_done(Duration::ZERO), None);
+        assert_eq!(
+            worker.submit(3, "third".into()),
+            Err(NativeCopySubmitError::Busy)
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(worker.wait_done(WAIT).map(|done| done.id), Some(1));
+        assert_eq!(worker.wait_done(WAIT).map(|done| done.id), Some(2));
+        worker.submit(3, "third".into()).unwrap();
+        assert_eq!(worker.wait_done(WAIT).map(|done| done.id), Some(3));
+        assert_eq!(*written.lock().unwrap(), vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn completed_jobs_hold_capacity_until_their_results_are_drained() {
+        let (worker, entries, release) = blocking_worker();
+        worker.submit(1, "first".into()).unwrap();
+        entries.recv_timeout(WAIT).unwrap();
+        worker.submit(2, "second".into()).unwrap();
+        release.send(()).unwrap();
+        // Entering the second write proves the first completion was sent.
+        entries.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            worker.submit(3, "third".into()),
+            Err(NativeCopySubmitError::Busy)
+        );
+        assert_eq!(
+            worker.drain_done(),
+            vec![NativeCopyDone {
+                id: 1,
+                status: NativeCopyStatus::Written,
+            }]
+        );
+        worker.submit(3, "third".into()).unwrap();
+        assert_eq!(
+            worker.submit(4, "fourth".into()),
+            Err(NativeCopySubmitError::Busy)
+        );
+
+        release.send(()).unwrap();
+        entries.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            worker.drain_done(),
+            vec![NativeCopyDone {
+                id: 2,
+                status: NativeCopyStatus::Written,
+            }]
+        );
+        release.send(()).unwrap();
+        assert_eq!(worker.wait_done(WAIT).map(|done| done.id), Some(3));
+        worker.submit(4, "fourth".into()).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(worker.wait_done(WAIT).map(|done| done.id), Some(4));
     }
 
     #[test]

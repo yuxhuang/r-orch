@@ -1715,15 +1715,26 @@ mod tests {
     #[test]
     fn a_third_native_ticket_is_refused_until_the_first_two_are_drained() {
         let log = native_log();
-        let (mut transport, _sink, _clock) = fixture(local(), accepting(&log));
+        let accept = accepting(&log);
+        let (started, opening) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let opener: TextClipboardOpener = Box::new(move || {
+            started.send(()).unwrap();
+            // Hold the worker before its first receive, independent of scheduling.
+            let _ = gate.recv();
+            accept()
+        });
+        let (mut transport, sink, _clock) = fixture(local(), opener);
 
         let first = transport.copy_text_via("a", CopyTarget::Native).unwrap();
+        opening.recv_timeout(WAIT).expect("the opener started");
         let second = transport.copy_text_via("b", CopyTarget::Native).unwrap();
         assert_eq!(
             transport.copy_text_via("c", CopyTarget::Native),
             Err(FAIL_BUSY.to_owned())
         );
 
+        release.send(()).unwrap();
         let deadline = Instant::now() + WAIT;
         let mut results = Vec::new();
         while results.len() < 2 {
@@ -1736,7 +1747,17 @@ mod tests {
             vec![first, second],
             "results come back oldest ticket first"
         );
-        assert!(transport.copy_text_via("c", CopyTarget::Native).is_ok());
+        assert_eq!(
+            transport.copy_text_via("c", CopyTarget::Native),
+            Ok(CopyTicket(3))
+        );
+        assert_eq!(
+            one_result(&mut transport).outcome,
+            CopyOutcome::NativeWritten
+        );
+        assert_eq!(log.lock().unwrap().written, vec!["a", "b", "c"]);
+        assert_eq!(log.lock().unwrap().opens, 1);
+        assert!(sink.lock().unwrap().writes.is_empty());
     }
 
     #[test]
