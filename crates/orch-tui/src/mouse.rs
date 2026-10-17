@@ -32,9 +32,10 @@ use crate::hit::{
     ChromeId, FooterAction, PseudoRow, RowPart, ScrollRegion, VerbId, Zone, ZoneId, ZoneKind,
 };
 use crate::messages::MsgType;
-use crate::state::{ArmedClick, DetailPanel, InputMode, ViewId};
+use crate::navigation::NavAction;
+use crate::state::{ArmedClick, Focus, InputMode, ViewId};
 use crate::theme::Token;
-use crate::wizard::engine::{StepKind, WizardOutcome};
+use crate::wizard::engine::StepKind;
 
 /// Two clicks on the same target inside this window are a double click.
 pub const DOUBLE_CLICK_MS: i64 = 400;
@@ -48,6 +49,101 @@ pub const QUIT_ARM_MS: i64 = 2_000;
 pub const WHEEL_MAX_STEPS_PER_FRAME: u8 = 3;
 
 impl<B: TuiBackend, C: Clock> App<B, C> {
+    /// Fresh whole-footer guards run before either modal hook and again on
+    /// the legacy click path. A cancelled Down cannot revive on a late Up.
+    pub(crate) fn guard_surface_mouse(&mut self, event: MouseEvent) -> bool {
+        let cell = (event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.state.mouse.cancelled_left = false;
+                self.state.mouse.press_cell = Some(cell);
+                self.state.mouse.last_pointer = Some(cell);
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.state.mouse.cancelled_left => {
+                self.state.mouse.cancelled_left = false;
+                self.state.mouse.press_cell = None;
+                return true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.state.mouse.last_pointer == Some(cell) {
+                    return true;
+                }
+                self.state.mouse.last_pointer = Some(cell);
+                if !self
+                    .state
+                    .mouse
+                    .armed
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.kind, ZoneKind::ViewerText | ZoneKind::EditorText))
+                {
+                    self.state.mouse.armed = None;
+                    self.state.mouse.last_click = None;
+                    return true;
+                }
+            }
+            MouseEventKind::Drag(_) | MouseEventKind::Moved => return true,
+            _ => {}
+        }
+        if !self.state.mouse.enabled || !self.state.mouse.hits.is_valid() {
+            return false;
+        }
+        if self.state.show_help
+            || self.state.wizard_sessions.pending_leave.is_some()
+            || self.state.show_agent_picker
+            || self.state.show_type_picker
+        {
+            return false;
+        }
+        let is_click = matches!(
+            event.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        );
+        if is_click && self.text_footer_blocked(event.column, event.row) {
+            if matches!(event.kind, MouseEventKind::Down(_)) {
+                self.state.mouse.cancelled_left = true;
+            }
+            self.state.mouse.armed = None;
+            self.state.mouse.last_click = None;
+            return true;
+        }
+        false
+    }
+    fn text_footer_blocked(&self, x: u16, y: u16) -> bool {
+        let origin = if self.state.viewer.is_some() {
+            self.state.copy_origins[0].as_ref()
+        } else if self.state.input_mode == InputMode::Wizard {
+            self.state.copy_origins[1].as_ref()
+        } else {
+            None
+        };
+        let hits = &self.state.mouse.hits;
+        // A hit naming a text surface without its full current origin's
+        // metric is never authorized, including after same-key reopen.
+        let text_action = hits
+            .resolve(x, y)
+            .is_some_and(|z| matches!(z.kind, ZoneKind::TextAction(_)));
+        if let Some(origin) = origin {
+            if let Some(footer) = hits.text_footer(origin) {
+                if footer.rect.contains((x, y).into()) {
+                    return self.state.text_footer_suppressed(origin, self.now());
+                }
+            } else if text_action
+                || hits.resolve(x, y).is_some_and(|z| {
+                    matches!(
+                        z.kind,
+                        ZoneKind::Verb(
+                            VerbId::WizardConfirm | VerbId::WizardToggle | VerbId::WizardBack
+                        )
+                    )
+                })
+            {
+                return true;
+            }
+        } else if text_action {
+            return true;
+        }
+        false
+    }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         self.dispatch_ui_event(&crate::keys::UiEvent::Terminal(
             ratatui::crossterm::event::Event::Mouse(event),
@@ -110,14 +206,84 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if zone.id != armed.id {
             return;
         }
+        if matches!(zone.kind, ZoneKind::ExpandText) {
+            self.select_text_row(x, y);
+            if armed.secondary {
+                self.open_focused_viewer();
+                self.state.mouse.last_click = None;
+            } else {
+                self.state.mouse.last_click = Some((armed.id, armed.at_ms));
+            }
+            return;
+        }
         if armed.secondary {
             // A third click is a fresh primary, not a toggle-closed.
             self.state.mouse.last_click = None;
             self.fire_secondary(&zone.kind);
         } else {
-            self.state.mouse.last_click = Some((armed.id, armed.at_ms));
+            let selection = matches!(
+                zone.kind,
+                ZoneKind::TaskRow { .. }
+                    | ZoneKind::AgentRow { .. }
+                    | ZoneKind::GoalRow { .. }
+                    | ZoneKind::LogRow { .. }
+                    | ZoneKind::ActivityRow { .. }
+            );
+            let identity = (armed.id, armed.at_ms);
+            self.state.mouse.last_click = Some(identity.clone());
             self.fire_primary(&zone.kind);
+            if selection {
+                self.state.mouse.last_click = Some(identity);
+            }
         }
+    }
+
+    fn select_text_row(&mut self, x: u16, y: u16) {
+        let anchor = self
+            .state
+            .mouse
+            .hits
+            .source_anchor(x, y)
+            .map(|(s, b)| (s.clone(), b));
+        let pane = self
+            .state
+            .mouse
+            .hits
+            .metrics
+            .panes
+            .iter()
+            .rev()
+            .find(|p| p.body.contains((x, y).into()))
+            .cloned();
+        if let Some(pane) = pane {
+            self.state.set_focus(pane.key.section);
+            if pane.items > 0 {
+                let mut scroll = self.state.pane_scroll(&pane.key);
+                scroll.selected = Some(
+                    (scroll.offset + usize::from(y.saturating_sub(pane.body.y)))
+                        .min(pane.items.saturating_sub(1)),
+                );
+                self.state.set_pane_scroll(pane.key, scroll);
+            }
+        }
+        if let Some((source, byte)) = anchor
+            && let Some(doc) = self.state.text_for_source(&source, byte, self.now())
+        {
+            let fingerprint = crate::state::AppState::source_fingerprint(&doc.body);
+            if self
+                .state
+                .mouse
+                .hits
+                .source_versions
+                .iter()
+                .any(|(saved, hash)| saved == &source && *hash == fingerprint)
+            {
+                self.state.text_anchor = Some((source, byte, fingerprint));
+            } else {
+                self.state.text_anchor = None;
+            }
+        }
+        self.state.sync_field_origin();
     }
 
     /// Resolve a coordinate to a zone that is allowed to act right now.
@@ -135,6 +301,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 kind: ZoneKind::Chrome(chrome),
                 id: ZoneId::Chrome(chrome),
             });
+        }
+        if self.text_footer_blocked(x, y) {
+            return None;
         }
         let zone = self.state.mouse.hits.resolve(x, y)?.clone();
         if self.suppressed(&zone, y) || !self.stage_allows(&zone.kind) {
@@ -254,18 +423,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             // The reflow is confined to one row, and that row already has a
             // mechanism for exactly this (§3.3.3).
             ZoneKind::TaskRow { selection } => {
+                self.state.set_focus(Focus::MainList);
                 self.state.task_selected = *selection;
                 self.suppress_footer();
             }
             ZoneKind::AgentRow { selection } => {
+                self.state.set_focus(Focus::MainList);
                 self.state.agent_selected = *selection;
                 self.suppress_footer();
             }
             ZoneKind::GoalRow { selection } => {
+                self.state.set_focus(Focus::MainList);
                 self.state.goal_selected = *selection;
                 self.suppress_footer();
             }
-            ZoneKind::LogRow { filtered_index } => self.select_log_row(*filtered_index),
+            ZoneKind::LogRow { filtered_index } => {
+                self.state.set_focus(Focus::MainList);
+                self.select_log_row(*filtered_index);
+            }
             ZoneKind::LogAgentChip { index } => {
                 // The one action with no single-key equivalent: the keyboard
                 // route is picker → Space → Enter. It mutates one filter field
@@ -315,14 +490,19 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             ZoneKind::UndoRow { index } => self.undo_deletion_at(*index),
             ZoneKind::Chrome(ChromeId::HelpOverlayOutside) => {
                 self.state.show_help = false;
+                self.state.copy_help = None;
                 self.invalidate_hits();
+            }
+            ZoneKind::Pane(focus) | ZoneKind::DetailSection(focus) => self.state.set_focus(*focus),
+            ZoneKind::ActivityRow { message_id } => {
+                self.state.set_focus(Focus::Activity);
+                self.state.activity_selected = Some(*message_id);
+                self.state.activity_follow_tail = false;
+                self.state.sync_field_origin();
             }
             // Inside the overlay, and the wheel-only regions: nothing.
             ZoneKind::Chrome(ChromeId::HelpOverlayInside)
             | ZoneKind::Scroll(_)
-            | ZoneKind::Pane(_)
-            | ZoneKind::DetailSection(_)
-            | ZoneKind::ActivityRow { .. }
             | ZoneKind::ExpandText
             | ZoneKind::ViewerText
             | ZoneKind::EditorText
@@ -334,28 +514,36 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     fn fire_secondary(&mut self, kind: &ZoneKind) {
         match kind {
             ZoneKind::TaskRow { selection } => {
+                self.state.set_focus(Focus::MainList);
                 self.state.task_selected = *selection;
                 self.handle_enter();
                 self.invalidate_hits();
             }
             ZoneKind::AgentRow { selection } => {
+                self.state.set_focus(Focus::MainList);
                 self.state.agent_selected = *selection;
                 self.handle_enter();
                 self.invalidate_hits();
             }
             ZoneKind::GoalRow { selection } => {
+                self.state.set_focus(Focus::MainList);
                 self.state.goal_selected = *selection;
                 self.toggle_goal_detail();
+                if self.state.detail_open() {
+                    self.focus_initial_detail();
+                }
                 self.invalidate_hits();
             }
             ZoneKind::LogRow { filtered_index } => {
                 self.select_log_row(*filtered_index);
-                self.state.detail = if self.state.detail == DetailPanel::Log {
-                    DetailPanel::None
-                } else {
-                    DetailPanel::Log
-                };
+                self.state.set_focus(Focus::MainList);
+                self.open_focused_viewer();
                 self.invalidate_hits();
+            }
+            ZoneKind::ActivityRow { message_id } => {
+                self.state.set_focus(Focus::Activity);
+                self.state.activity_selected = Some(*message_id);
+                self.open_focused_viewer();
             }
             ZoneKind::PickerRow { index, part } if *part == RowPart::Label => {
                 self.picker_toggle_at(*index)
@@ -458,6 +646,19 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     fn fire_footer(&mut self, action: FooterAction) {
+        if self.state.focus != Focus::MainList
+            && !matches!(
+                action,
+                FooterAction::Quit
+                    | FooterAction::Help
+                    | FooterAction::CloseDetail
+                    | FooterAction::Enter
+                    | FooterAction::CommandMode
+            )
+        {
+            return;
+        }
+
         // The row goes dead for a double-click window, because the hint set is
         // status-conditional and everything right of the hint that fired
         // shifts left (§3.3.3).
@@ -612,6 +813,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         // pair, so the same reflow window applies.
         self.suppress_footer();
         self.state.log_selected_index = filtered_index as i64;
+        self.state.log_selected_id = filtered
+            .get(filtered_index)
+            .map(|i| self.state.messages[*i].id);
+        self.state.sync_field_origin();
 
         // Only a row outside the window moves it, which a clicked row cannot
         // be. Kept as a guard rather than an assertion: a stale map is
@@ -681,7 +886,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             } else {
                 KeyCode::Up
             };
-            self.wizard_key(code);
+            let now = self.now();
+            if let Some(wizard) = self.state.wizard.as_mut() {
+                let _ = wizard.handle_key(KeyEvent::new(code, KeyModifiers::NONE), now);
+            }
             let Some(wizard) = self.state.wizard.as_ref() else {
                 return;
             };
@@ -703,32 +911,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// engine's only entry point and its step-kind dispatch is internal, so
     /// nothing is overloaded the way the view chain overloads `a` and `g`.
     fn wizard_key(&mut self, code: KeyCode) {
-        let now = self.now();
-        let Some(wizard) = self.state.wizard.as_mut() else {
-            return;
-        };
-        let before = wizard.step_id().to_string();
-        let outcome = wizard.handle_key(KeyEvent::new(code, KeyModifiers::NONE), now);
-        let after = self
-            .state
-            .wizard
-            .as_ref()
-            .map(|w| w.step_id().to_string())
-            .unwrap_or_default();
-        if before != after {
-            // A step change retires every zone on screen, and must also retire
-            // the double-click window: otherwise a third fast click would
-            // count as a double against the *new* step's option 0.
-            self.state.mouse.last_click = None;
-            self.invalidate_hits();
-        }
-        match outcome {
-            WizardOutcome::Consumed | WizardOutcome::Ignored => {}
-            WizardOutcome::Cancelled => self.cancel_wizard(),
-            WizardOutcome::Complete(values) => self.submit_wizard(values),
-            WizardOutcome::SuggestionSelected(value) => self.apply_name_suggestion(&value),
-            WizardOutcome::PasteImage => self.paste_image(),
-        }
+        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
     fn execute_selected_suggestion(&mut self) {
@@ -746,6 +929,46 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             return;
         }
         if !self.state.mouse.hits.contains(x, y) {
+            return;
+        }
+        let action = if delta < 0 {
+            NavAction::Up
+        } else {
+            NavAction::Down
+        };
+        if self.state.show_help && self.state.copy_help.is_some() {
+            if y >= 6 && y < self.state.height.saturating_sub(1) {
+                self.state.mouse.wheel_steps += 1;
+                for _ in 0..3 {
+                    self.navigate_copy_help(action);
+                }
+            }
+            return;
+        }
+        if self.state.input_mode == InputMode::None
+            && !self.state.show_help
+            && self.state.viewer.is_none()
+            && !self.state.show_agent_picker
+            && !self.state.show_type_picker
+            && self.state.wizard_sessions.pending_leave.is_none()
+            && let Some(pane) = self
+                .state
+                .mouse
+                .hits
+                .metrics
+                .panes
+                .iter()
+                .rev()
+                .find(|p| p.body.contains((x, y).into()))
+                .cloned()
+        {
+            self.state.set_focus(pane.key.section);
+            self.state.mouse.wheel_steps += 1;
+            let list =
+                pane.items > 0 || matches!(pane.key.section, Focus::MainList | Focus::Activity);
+            for _ in 0..if list { 1 } else { 3 } {
+                self.navigate_focus(action, true);
+            }
             return;
         }
         let Some(region) = self.state.mouse.hits.resolve_scroll(x, y) else {
@@ -792,14 +1015,15 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// surprise this avoids; the goal detail is the one panel with scroll
     /// state, and `move_selection_up/down` already scrolls it there.
     fn wheel_main_list(&mut self, delta: i32) {
-        if self.state.detail_open() && self.state.view != ViewId::Goals {
-            return;
-        }
-        if delta < 0 {
-            self.move_selection_up();
-        } else {
-            self.move_selection_down();
-        }
+        self.state.set_focus(Focus::MainList);
+        self.navigate_focus(
+            if delta < 0 {
+                NavAction::Up
+            } else {
+                NavAction::Down
+            },
+            true,
+        );
     }
 
     /// Only when there are suggestions: `Up`/`Down` in command mode fall back
@@ -811,19 +1035,20 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if suggestions.is_empty() {
             return;
         }
-        let index = self.state.command_bar.suggestion_index;
-        self.state.command_bar.suggestion_index = if delta < 0 {
-            index.saturating_sub(1)
+        self.navigate_suggestions(if delta < 0 {
+            NavAction::Up
         } else {
-            (index + 1).min(suggestions.len() - 1)
-        };
+            NavAction::Down
+        });
     }
 
     fn wheel_textarea(&mut self, delta: i32) {
         let Some(wizard) = self.state.wizard.as_mut() else {
             return;
         };
-        wizard.scroll_textarea(delta < 0);
+        for _ in 0..3 {
+            wizard.scroll_textarea(delta < 0);
+        }
     }
 
     /// Reset the per-frame wheel budget. Called when a frame is adopted.
@@ -843,6 +1068,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             self.state.mouse.armed = None;
             self.state.mouse.last_click = None;
             self.state.mouse.quit_armed_at = None;
+            self.state.mouse.press_cell = None;
+            self.state.mouse.last_pointer = None;
+            self.state.mouse.cancelled_left = true;
         }
         let text = if enabled {
             "Mouse capture on"
@@ -872,8 +1100,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// Comparing against the map's own recorded area is what tells the two
     /// cases apart: a map built before the resize has the old dimensions.
     pub fn resize(&mut self, width: u16, height: u16) {
+        self.state.width = width;
+        self.state.height = height;
         let area = self.state.mouse.hits.area();
         if area.width != width || area.height != height {
+            self.state.clamp_all(self.backend.can_create_task());
             self.invalidate_hits();
         }
     }
@@ -890,6 +1121,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// matter.
     pub(crate) fn invalidate_hits(&mut self) {
         self.state.mouse.hits.invalidate();
+        self.state.mouse.hits.metrics.panes.clear();
         self.state.mouse.last_click = None;
         self.state.mouse.armed = None;
     }

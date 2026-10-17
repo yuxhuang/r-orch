@@ -13,8 +13,8 @@ use crate::backend::{BackendResult, CopyOutcome, CopyResult, CopyTarget, CopyTic
 use crate::command_bar::CommandHistory;
 use crate::hit::{HitMap, ZoneId, ZoneKind};
 use crate::messages::{
-    MAX_MESSAGES, MAX_TOASTS, Message, MsgType, PendingMessage, RunMaps, TASK_LIST_LIMIT,
-    UNDO_TIMEOUT_MS, preset_types,
+    MAX_TOASTS, Message, MsgType, PendingMessage, RunMaps, TASK_LIST_LIMIT, UNDO_TIMEOUT_MS,
+    preset_types,
 };
 use crate::onboarding::OnboardingStep;
 use crate::text::TextInput;
@@ -317,6 +317,9 @@ pub struct MouseState {
     pub footer_suppressed_until: Option<i64>,
     /// Selection steps the wheel has already spent this frame (§3.3.2).
     pub wheel_steps: u8,
+    pub press_cell: Option<(u16, u16)>,
+    pub last_pointer: Option<(u16, u16)>,
+    pub cancelled_left: bool,
 }
 
 impl MouseState {
@@ -341,6 +344,9 @@ impl Default for MouseState {
             quit_armed_at: None,
             footer_suppressed_until: None,
             wheel_steps: 0,
+            press_cell: None,
+            last_pointer: None,
+            cancelled_left: false,
         }
     }
 }
@@ -576,6 +582,19 @@ pub struct AppState {
 
     // ── View ───────────────────────────────────────────────────────────────
     pub focus: Focus,
+    pub detail_focus: Focus,
+    pub pane_states: Vec<(PaneKey, crate::navigation::ScrollState)>,
+    pub activity_selected: Option<u64>,
+    pub activity_scroll: usize,
+    pub activity_follow_tail: bool,
+    pub log_selected_id: Option<u64>,
+    pub picker_scroll: usize,
+    pub suggestion_scroll: usize,
+    pub retained_evicted: usize,
+    pub retained_rejected: usize,
+    pub retained_bytes: usize,
+    /// A clicked row anchor and its source snapshot; never applied to changed bytes.
+    pub text_anchor: Option<(ViewerSource, usize, u64)>,
     pub viewer: Option<TextViewer>,
     pub wizard_sessions: WizardSessionStore,
     pub copy_feedback: CopyFeedbackStore,
@@ -676,6 +695,18 @@ impl Default for AppState {
             teams: Vec::new(),
             orch_state: default_state(),
             focus: Focus::default(),
+            detail_focus: Focus::MainList,
+            pane_states: Vec::new(),
+            activity_selected: None,
+            activity_scroll: 0,
+            activity_follow_tail: true,
+            log_selected_id: None,
+            picker_scroll: 0,
+            suggestion_scroll: 0,
+            retained_evicted: 0,
+            retained_rejected: 0,
+            retained_bytes: 0,
+            text_anchor: None,
             viewer: None,
             wizard_sessions: WizardSessionStore::default(),
             copy_feedback: CopyFeedbackStore::default(),
@@ -1019,18 +1050,401 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|meta| &meta.origin == origin)
     }
-    /// I0 source-resolution seed. B0 resolves focused fields and stable hits.
-    pub fn focused_text(&self) -> Option<ViewerDocument> {
-        None
+    pub fn pane_key(&self, focus: Focus) -> PaneKey {
+        let entity = match focus {
+            Focus::GoalDetail(_) => self
+                .selected_goal()
+                .map(|g| PaneEntity::Entity(g.id.clone())),
+            Focus::TaskDetail(_) => self
+                .selected_task()
+                .map(|t| PaneEntity::Entity(t.id.clone())),
+            Focus::AgentDetail(_) => self
+                .selected_agent()
+                .map(|a| PaneEntity::Entity(a.id.clone())),
+            Focus::LogDetail(_) => self.selected_log().map(|m| PaneEntity::Message(m.id)),
+            _ => None,
+        };
+        PaneKey {
+            view: self.view,
+            entity,
+            section: focus,
+        }
     }
-    /// I0 source-resolution seed. Capture/anchor are supplied by B0 on open.
+    pub fn pane_scroll(&self, key: &PaneKey) -> crate::navigation::ScrollState {
+        self.pane_states
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default()
+    }
+    pub fn set_pane_scroll(&mut self, key: PaneKey, scroll: crate::navigation::ScrollState) {
+        self.pane_states
+            .retain(|(saved, _)| saved.view != key.view || saved.entity == key.entity);
+        if let Some((_, state)) = self.pane_states.iter_mut().find(|(saved, _)| saved == &key) {
+            *state = scroll;
+        } else {
+            self.pane_states.push((key, scroll));
+        }
+    }
+    pub fn focus_ring(&self) -> Vec<Focus> {
+        if self.width < crate::layout::MIN_WIDTH || self.height < crate::layout::MIN_HEIGHT {
+            return vec![Focus::MainList];
+        }
+        let mut ring = Vec::new();
+        if !self.detail_maximized || self.view == ViewId::Logs {
+            ring.push(Focus::MainList);
+        }
+        if !self.detail_open() {
+            if self.view != ViewId::Logs {
+                ring.push(Focus::Activity);
+            }
+            return ring;
+        }
+        match self.view {
+            ViewId::Goals => {
+                if let Some(g) = self.selected_goal() {
+                    ring.extend([
+                        Focus::GoalDetail(GoalSection::Overview),
+                        Focus::GoalDetail(GoalSection::Description),
+                    ]);
+                    if self.goal_progress_report.is_some() {
+                        ring.push(Focus::GoalDetail(GoalSection::Progress));
+                    }
+                    if !self.tasks_of_goal(&g.id).is_empty() {
+                        ring.push(Focus::GoalDetail(GoalSection::Tasks));
+                    }
+                }
+            }
+            ViewId::Tasks => {
+                if let Some(t) = self.selected_task() {
+                    ring.push(Focus::TaskDetail(TaskSection::Overview));
+                    if t.attachments.as_ref().is_some_and(|a| !a.is_empty()) {
+                        ring.push(Focus::TaskDetail(TaskSection::Attachments));
+                    }
+                    ring.push(Focus::TaskDetail(TaskSection::Description));
+                    if t.proof
+                        .as_ref()
+                        .and_then(|p| p.agent_summary.as_ref())
+                        .is_some_and(|s| !s.is_empty())
+                    {
+                        ring.push(Focus::TaskDetail(TaskSection::Result));
+                    }
+                    if t.proof
+                        .as_ref()
+                        .is_some_and(|p| !p.files_changed.is_empty())
+                    {
+                        ring.push(Focus::TaskDetail(TaskSection::Files));
+                    }
+                    if self
+                        .messages
+                        .iter()
+                        .any(|m| m.task_id.as_deref() == Some(t.id.as_str()))
+                    {
+                        ring.push(Focus::TaskDetail(TaskSection::Activity));
+                    }
+                }
+            }
+            ViewId::Agents => {
+                if let Some(a) = self.selected_agent() {
+                    ring.push(Focus::AgentDetail(AgentSection::Overview));
+                    if a.last_error.is_some() {
+                        ring.push(Focus::AgentDetail(AgentSection::Error));
+                    }
+                    ring.push(Focus::AgentDetail(AgentSection::Role));
+                }
+            }
+            ViewId::Logs => {
+                if self.selected_log().is_some() {
+                    ring.extend([
+                        Focus::LogDetail(LogSection::Metadata),
+                        Focus::LogDetail(LogSection::Body),
+                    ]);
+                }
+            }
+        }
+        if ring.is_empty() {
+            ring.push(Focus::MainList);
+        }
+        ring
+    }
+    pub fn set_focus(&mut self, focus: Focus) {
+        if self.focus != focus {
+            self.text_anchor = None;
+        }
+        self.focus = focus;
+        if !matches!(focus, Focus::MainList | Focus::Activity | Focus::TextViewer) {
+            self.detail_focus = focus;
+        }
+        self.sync_field_origin();
+    }
+    pub fn normalize_focus(&mut self) {
+        let log = self
+            .log_selected_id
+            .or_else(|| self.selected_log().map(|m| m.id));
+        self.reconcile_message_selection(log);
+        if self.detail_open()
+            && match self.view {
+                ViewId::Goals => self.selected_goal().is_none(),
+                ViewId::Tasks => self.selected_task().is_none(),
+                ViewId::Agents => self.selected_agent().is_none(),
+                ViewId::Logs => self.selected_log().is_none(),
+            }
+        {
+            self.detail = DetailPanel::None;
+            self.detail_maximized = false;
+        }
+        let ring = self.focus_ring();
+        if !ring.contains(&self.detail_focus) {
+            self.detail_focus = ring
+                .iter()
+                .copied()
+                .find(|f| *f != Focus::MainList)
+                .unwrap_or(Focus::MainList);
+        }
+        if self.viewer.is_none() && !ring.contains(&self.focus) {
+            self.focus = ring[0];
+        }
+        // Only the current entity's per-section state is retained per view.
+        let keys: Vec<_> = ring.iter().map(|f| self.pane_key(*f)).collect();
+        self.pane_states
+            .retain(|(k, _)| k.view != self.view || keys.contains(k));
+        self.sync_field_origin();
+    }
+    pub fn sync_field_origin(&mut self) {
+        let source = if self.viewer.is_none() && self.input_mode == InputMode::None {
+            self.focused_source()
+        } else {
+            None
+        };
+        let previous = self.copy_origins[2].clone();
+        if let Some(source) = source {
+            if !matches!(&previous,Some(CopyOrigin::Field{source:s,..}) if s==&source) {
+                let _ = self.register_field_origin(source);
+            }
+        } else if let Some(old) = previous {
+            self.retire_copy_origin(&old);
+        }
+    }
+    pub fn focused_source(&self) -> Option<ViewerSource> {
+        let entity = |kind, id: String, field: &str| {
+            Some(ViewerSource::Entity {
+                kind,
+                id,
+                field: field.into(),
+            })
+        };
+        match self.focus {
+            Focus::Activity => self
+                .activity_selected
+                .or_else(|| {
+                    self.activity_messages()
+                        .last()
+                        .map(|i| self.messages[*i].id)
+                })
+                .map(ViewerSource::Message),
+            Focus::MainList if self.view == ViewId::Logs => {
+                self.selected_log().map(|m| ViewerSource::Message(m.id))
+            }
+            Focus::GoalDetail(GoalSection::Description) => entity(
+                EntityType::Goal,
+                self.selected_goal()?.id.clone(),
+                "description",
+            ),
+            Focus::GoalDetail(GoalSection::Progress) => entity(
+                EntityType::Goal,
+                self.selected_goal()?.id.clone(),
+                "progress",
+            ),
+            Focus::TaskDetail(TaskSection::Description) => entity(
+                EntityType::Task,
+                self.selected_task()?.id.clone(),
+                "description",
+            ),
+            Focus::TaskDetail(TaskSection::Result) => {
+                entity(EntityType::Task, self.selected_task()?.id.clone(), "result")
+            }
+            Focus::AgentDetail(AgentSection::Role) => {
+                entity(EntityType::Agent, self.selected_agent()?.id.clone(), "role")
+            }
+            Focus::AgentDetail(AgentSection::Error) => entity(
+                EntityType::Agent,
+                self.selected_agent()?.id.clone(),
+                "error",
+            ),
+            Focus::LogDetail(LogSection::Body) => {
+                self.selected_log().map(|m| ViewerSource::Message(m.id))
+            }
+            Focus::GoalDetail(GoalSection::Tasks) => {
+                let goal = self.selected_goal()?;
+                let rows = self.tasks_of_goal(&goal.id);
+                let selected = self
+                    .pane_scroll(&self.pane_key(self.focus))
+                    .selected
+                    .unwrap_or(0);
+                let task = self.tasks.get(*rows.get(selected)?)?;
+                entity(EntityType::Task, task.id.clone(), "description")
+            }
+            Focus::TaskDetail(TaskSection::Attachments) => entity(
+                EntityType::Task,
+                self.selected_task()?.id.clone(),
+                "attachments",
+            ),
+            Focus::TaskDetail(TaskSection::Files) => {
+                entity(EntityType::Task, self.selected_task()?.id.clone(), "files")
+            }
+            Focus::TaskDetail(TaskSection::Activity) => {
+                let task = self.selected_task()?;
+                let rows: Vec<_> = self
+                    .messages
+                    .iter()
+                    .filter(|m| m.task_id.as_deref() == Some(task.id.as_str()))
+                    .collect();
+                let selected = self
+                    .pane_scroll(&self.pane_key(self.focus))
+                    .selected
+                    .unwrap_or(0);
+                rows.get(selected).map(|m| ViewerSource::Message(m.id))
+            }
+            _ => None,
+        }
+    }
+    pub fn selected_log(&self) -> Option<&Message> {
+        let index = usize::try_from(self.log_selected_index).ok()?;
+        self.filtered_messages()
+            .get(index)
+            .and_then(|i| self.messages.get(*i))
+    }
+    /// Resolve original bytes before panel clipping; viewers freeze this document.
+    pub fn focused_text(&self) -> Option<ViewerDocument> {
+        let source = self.focused_source()?;
+        let mut document = self.text_for_source(&source, 0, 0)?;
+        if let Some((saved, byte, hash)) = &self.text_anchor {
+            if saved == &source && *hash == Self::source_fingerprint(&document.body) {
+                document.initial_anchor = (*byte).min(document.body.len());
+            }
+        } else {
+            let key = self.pane_key(self.focus);
+            let offset = self.pane_scroll(&key).offset;
+            if let Some(metrics) = self.mouse.hits.metrics.panes.iter().find(|p| p.key == key) {
+                if let Some((_, _, byte)) = self
+                    .mouse
+                    .hits
+                    .source_anchors
+                    .iter()
+                    .find(|(r, s, _)| s == &source && r.y >= metrics.body.y)
+                {
+                    document.initial_anchor = *byte;
+                } else {
+                    document.initial_anchor = document
+                        .body
+                        .split_inclusive('\n')
+                        .take(offset)
+                        .map(str::len)
+                        .sum();
+                }
+            }
+        }
+        Some(document)
+    }
+    pub fn source_fingerprint(body: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        body.hash(&mut h);
+        h.finish()
+    }
     pub fn text_for_source(
         &self,
-        _source: &ViewerSource,
-        _initial_anchor: usize,
-        _captured_at_ms: i64,
+        source: &ViewerSource,
+        initial_anchor: usize,
+        captured_at_ms: i64,
     ) -> Option<ViewerDocument> {
-        None
+        use crate::widgets::text_viewer::{Completeness, Representation};
+        use std::borrow::Cow;
+        let (title, text): (String, Cow<'_, str>) = match source {
+            ViewerSource::Message(id) => {
+                let m = self.messages.iter().find(|m| m.id == *id)?;
+                (
+                    format!(
+                        "Message {id}{}",
+                        if m.detail.is_none() {
+                            " (legacy text source)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Cow::Borrowed(m.detail.as_deref().unwrap_or(&m.text)),
+                )
+            }
+            ViewerSource::Entity { kind, id, field } => match kind {
+                EntityType::Goal => {
+                    let g = self.goals.iter().find(|g| &g.id == id)?;
+                    let text = match field.as_str() {
+                        "description" => Cow::Borrowed(g.description.as_str()),
+                        "progress"
+                            if self
+                                .selected_goal()
+                                .is_some_and(|selected| &selected.id == id) =>
+                        {
+                            Cow::Borrowed(self.goal_progress_report.as_deref()?)
+                        }
+                        _ => return None,
+                    };
+                    (format!("{} · {field}", g.title), text)
+                }
+                EntityType::Task => {
+                    let t = self.tasks.iter().find(|t| &t.id == id)?;
+                    let text = match field.as_str() {
+                        "description" => Cow::Borrowed(t.description.as_str()),
+                        "result" => Cow::Borrowed(t.proof.as_ref()?.agent_summary.as_deref()?),
+                        "attachments" => Cow::Owned(t.attachments.as_ref()?.join("\n")),
+                        "files" => Cow::Owned(t.proof.as_ref()?.files_changed.join("\n")),
+                        _ => return None,
+                    };
+                    (format!("{} · {field}", t.title), text)
+                }
+                EntityType::Agent => {
+                    let a = self.agents.iter().find(|a| &a.id == id)?;
+                    let text = match field.as_str() {
+                        "role" => Cow::Borrowed(a.role.as_deref().unwrap_or_default()),
+                        "error" => Cow::Borrowed(a.last_error.as_ref()?.message.as_str()),
+                        _ => return None,
+                    };
+                    (format!("{} · {field}", a.name), text)
+                }
+            },
+        };
+        let original_bytes = text.len();
+        let unavailable = original_bytes > 1024 * 1024;
+        let body: std::sync::Arc<str> = if unavailable {
+            "".into()
+        } else {
+            text.as_ref().into()
+        };
+        let mut anchor = initial_anchor.min(body.len());
+        while !body.is_char_boundary(anchor) {
+            anchor -= 1;
+        }
+        Some(ViewerDocument {
+            source: source.clone(),
+            title,
+            body,
+            representation: if matches!(source, ViewerSource::Message(_)) {
+                Representation::Raw
+            } else {
+                Representation::Field
+            },
+            raw_body: None,
+            completeness: if unavailable {
+                Completeness::Unavailable {
+                    reason: "Body unavailable: exceeds 1 MiB".into(),
+                }
+            } else {
+                Completeness::Complete
+            },
+            original_bytes,
+            captured_at_ms,
+            initial_anchor: anchor,
+        })
     }
 
     // ── Derived collections ────────────────────────────────────────────────
@@ -1394,82 +1808,110 @@ impl AppState {
     /// `addMessage` — stage a message and arm the 80 ms batch flush. The
     /// staging buffer is itself truncated to `MAX_MESSAGES`.
     pub fn add_message(&mut self, message: PendingMessage, now_ms: i64, batch_ms: i64) {
-        self.pending_messages.push(message);
-        if self.pending_messages.len() > MAX_MESSAGES {
-            let overflow = self.pending_messages.len() - MAX_MESSAGES;
-            self.pending_messages.drain(..overflow);
-        }
+        let anchors = self.message_viewport_anchors();
+        let log = self.selected_log().map(|m| m.id).or(self.log_selected_id);
+        let report = crate::messages::retention::stage_message(
+            &mut self.pending_messages,
+            &mut self.messages,
+            message,
+        );
+        self.record_retention(report);
+        self.reconcile_message_selection(log);
+        self.restore_message_viewports(anchors);
         if batch_ms <= 0 {
             self.flush_messages(now_ms);
         } else if self.message_flush_at.is_none() {
-            self.message_flush_at = Some(now_ms + batch_ms);
+            self.message_flush_at = Some(now_ms.saturating_add(batch_ms));
         }
     }
-
-    /// Drain the staging buffer into the feed, honouring the 500-entry cap.
     pub fn flush_messages(&mut self, now_ms: i64) {
         self.message_flush_at = None;
-        if self.pending_messages.is_empty() {
-            return;
+        let anchors = self.message_viewport_anchors();
+        let log = self.selected_log().map(|m| m.id).or(self.log_selected_id);
+        let report = crate::messages::retention::flush_messages(
+            &mut self.pending_messages,
+            &mut self.messages,
+            &mut self.next_message_id,
+            now_ms,
+        );
+        self.record_retention(report);
+        self.reconcile_message_selection(log);
+        self.restore_message_viewports(anchors);
+    }
+    pub fn prepend_messages(&mut self, messages: Vec<PendingMessage>, now_ms: i64) {
+        let anchors = self.message_viewport_anchors();
+        let log = self.selected_log().map(|m| m.id).or(self.log_selected_id);
+        let report = crate::messages::retention::prepend_messages(
+            &mut self.pending_messages,
+            &mut self.messages,
+            messages,
+            &mut self.next_message_id,
+            now_ms,
+        );
+        self.record_retention(report);
+        self.reconcile_message_selection(log);
+        self.restore_message_viewports(anchors);
+    }
+    fn message_viewport_anchors(&self) -> (Option<u64>, Option<u64>) {
+        let logs = self.filtered_messages();
+        let activity = self.activity_messages();
+        (
+            if self.log_selected_index >= 0 {
+                logs.get(self.log_scroll_offset)
+                    .map(|i| self.messages[*i].id)
+            } else {
+                None
+            },
+            if !self.activity_follow_tail {
+                activity
+                    .get(self.activity_scroll)
+                    .map(|i| self.messages[*i].id)
+            } else {
+                None
+            },
+        )
+    }
+    fn restore_message_viewports(&mut self, (log, activity): (Option<u64>, Option<u64>)) {
+        if let Some(row) = log.and_then(|id| {
+            self.filtered_messages()
+                .iter()
+                .position(|i| self.messages[*i].id == id)
+        }) {
+            self.log_scroll_offset = row;
         }
-        let pending = std::mem::take(&mut self.pending_messages);
-        let mut batch: Vec<Message> = Vec::with_capacity(pending.len());
-        for p in pending {
-            // A line identical to the latest one from the same source adds
-            // nothing: keep the first, whose timestamp then reads as how long
-            // the state has lasted (PARITY.md §12.8 (k)).
-            if repeats_latest(&self.messages, &batch, &p) {
-                continue;
-            }
-            let id = self.next_message_id;
-            self.next_message_id += 1;
-            // A message with its own instant (a history entry) keeps it;
-            // everything else is stamped with the flush time.
-            batch.push(
-                Message::new(id, p.ts_ms.unwrap_or(now_ms), &p.text, p.color, p.msg_type)
-                    .with_agent(p.agent_id)
-                    .with_task(p.task_id)
-                    .with_detail(p.detail),
-            );
-        }
-        if batch.is_empty() {
-            return;
-        }
-
-        if batch.len() >= MAX_MESSAGES {
-            let start = batch.len() - MAX_MESSAGES;
-            self.messages = batch[start..].to_vec();
-        } else {
-            let keep = MAX_MESSAGES - batch.len();
-            if self.messages.len() > keep {
-                let drop = self.messages.len() - keep;
-                self.messages.drain(..drop);
-            }
-            self.messages.extend(batch);
+        if let Some(row) = activity.and_then(|id| {
+            self.activity_messages()
+                .iter()
+                .position(|i| self.messages[*i].id == id)
+        }) {
+            self.activity_scroll = row;
         }
     }
-
-    /// `onLoadHistory` — history batches are **prepended**, then truncated.
-    pub fn prepend_messages(&mut self, messages: Vec<PendingMessage>, now_ms: i64) {
-        let mut prefix: Vec<Message> = messages
-            .into_iter()
-            .map(|p| {
-                let id = self.next_message_id;
-                self.next_message_id += 1;
-                // A message with its own instant (a history entry) keeps it;
-                // everything else is stamped with the flush time.
-                Message::new(id, p.ts_ms.unwrap_or(now_ms), &p.text, p.color, p.msg_type)
-                    .with_agent(p.agent_id)
-                    .with_task(p.task_id)
-                    .with_detail(p.detail)
-            })
-            .collect();
-        prefix.extend(std::mem::take(&mut self.messages));
-        if prefix.len() > MAX_MESSAGES {
-            let drop = prefix.len() - MAX_MESSAGES;
-            prefix.drain(..drop);
+    fn record_retention(&mut self, report: crate::messages::retention::RetentionReport) {
+        self.retained_evicted = self.retained_evicted.saturating_add(report.evicted);
+        self.retained_rejected = self.retained_rejected.saturating_add(report.rejected);
+        self.retained_bytes = report.owned_bytes;
+    }
+    fn reconcile_message_selection(&mut self, log: Option<u64>) {
+        if self.log_selected_index >= 0 {
+            let rows = self.filtered_messages();
+            self.log_selected_index = log
+                .and_then(|id| rows.iter().position(|i| self.messages[*i].id == id))
+                .unwrap_or((self.log_selected_index as usize).min(rows.len().saturating_sub(1)))
+                as i64;
+            self.log_selected_id = self.selected_log().map(|m| m.id);
         }
-        self.messages = prefix;
+        let rows = self.activity_messages();
+        if self.activity_follow_tail {
+            self.activity_selected = rows.last().map(|i| self.messages[*i].id);
+        } else if !rows
+            .iter()
+            .any(|i| Some(self.messages[*i].id) == self.activity_selected)
+        {
+            self.activity_selected = rows
+                .get(self.activity_scroll.min(rows.len().saturating_sub(1)))
+                .map(|i| self.messages[*i].id);
+        }
     }
 
     /// Logs-view filtering: the agent filter never drops a message without an
@@ -1649,13 +2091,82 @@ impl AppState {
         self.agent_selected = self
             .agent_selected
             .min(self.agent_selection_max(can_create));
+        self.split_offset = crate::layout::clamp_split_offset(
+            self.split_offset,
+            crate::layout::content_height(self.height),
+        );
         let regions = self.regions(can_create);
-        let main_h = regions.main_h as usize;
-        let clamp = |len: usize| len.saturating_sub(main_h);
-        self.goal_scroll = self.goal_scroll.min(clamp(self.sorted_goals().len()));
-        self.task_scroll = self.task_scroll.min(clamp(self.visible_tasks().len()));
-        self.agent_scroll = self.agent_scroll.min(clamp(self.sorted_agents().len()));
-        self.split_offset = crate::layout::clamp_split_offset(self.split_offset, regions.content_h);
+        let goal_rows: Vec<_> = (0..self.sorted_goals().len() + usize::from(can_create)).collect();
+        let task_rows: Vec<_> = self
+            .task_rows(can_create)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                matches!(
+                    r,
+                    TaskRow::Task { .. } | TaskRow::ShowAll { .. } | TaskRow::AddTask { .. }
+                )
+                .then_some(i)
+            })
+            .collect();
+        let agent_rows: Vec<_> = self
+            .agent_rows(can_create)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                matches!(r, AgentRow::Agent { .. } | AgentRow::AddAgent { .. }).then_some(i)
+            })
+            .collect();
+        fn reveal(selected: usize, offset: usize, rows: &[usize], total: usize, h: usize) -> usize {
+            let mut offset = offset.min(total.saturating_sub(h));
+            if h > 0
+                && let Some(row) = rows.get(selected)
+            {
+                if *row < offset {
+                    offset = *row;
+                } else if *row >= offset.saturating_add(h) {
+                    offset = row.saturating_add(1).saturating_sub(h);
+                }
+            }
+            offset
+        }
+        let viewport = |view: ViewId, chrome: u16| {
+            self.mouse
+                .hits
+                .metrics
+                .panes
+                .iter()
+                .find(|m| m.key.view == view && m.key.section == Focus::MainList)
+                .map_or(regions.main_h.saturating_sub(chrome) as usize, |m| {
+                    m.body.height as usize
+                })
+        };
+        self.goal_scroll = reveal(
+            self.goal_selected,
+            self.goal_scroll,
+            &goal_rows,
+            goal_rows.len(),
+            viewport(ViewId::Goals, 0),
+        );
+        self.task_scroll = reveal(
+            self.task_selected,
+            self.task_scroll,
+            &task_rows,
+            self.task_rows(can_create).len(),
+            viewport(ViewId::Tasks, 0),
+        );
+        self.agent_scroll = reveal(
+            self.agent_selected,
+            self.agent_scroll,
+            &agent_rows,
+            self.agent_rows(can_create).len(),
+            viewport(ViewId::Agents, 0),
+        );
+        self.reconcile_message_selection(self.log_selected_id);
+        self.normalize_focus();
+        self.mouse.hits.invalidate();
+        self.mouse.armed = None;
+        self.mouse.last_click = None;
     }
 
     // ── Status helpers used by the header and `/status` ────────────────────
@@ -1675,29 +2186,6 @@ impl AppState {
     }
 }
 
-/// How far back [`repeats_latest`] looks for the previous line from the same
-/// source. A source silent for longer than this simply gets a fresh line.
-const REPEAT_LOOKBACK: usize = 64;
-
-/// Whether `p` repeats the most recent feed line from the same source — the
-/// same agent and task — with the same type and text.
-///
-/// Agent-less system lines are exempt: the orchestrator's own status line is
-/// deduplicated by its counts in `App::handle_event`, which also knows when
-/// work resumed after an idle spell and a fresh line is wanted.
-fn repeats_latest(feed: &[Message], batch: &[Message], p: &PendingMessage) -> bool {
-    if p.msg_type == MsgType::System && p.agent_id.is_none() {
-        return false;
-    }
-    batch
-        .iter()
-        .rev()
-        .chain(feed.iter().rev())
-        .take(REPEAT_LOOKBACK)
-        .find(|m| m.agent_id == p.agent_id && m.task_id == p.task_id)
-        .is_some_and(|m| m.msg_type == p.msg_type && m.text == p.text)
-}
-
 #[cfg(test)]
 // Fixtures build an `AppState` field by field; struct-update syntax would bury
 // what each test is actually setting.
@@ -1705,6 +2193,7 @@ fn repeats_latest(feed: &[Message], batch: &[Message], p: &PendingMessage) -> bo
 mod tests {
     use super::*;
     use crate::backend::{make_agent, make_goal, make_task, make_team};
+    use crate::messages::MAX_MESSAGES;
     use orch_domain::GoalStatus;
 
     fn state_with_tasks(specs: &[(&str, TaskStatus)]) -> AppState {

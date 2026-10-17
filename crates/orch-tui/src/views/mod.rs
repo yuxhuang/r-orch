@@ -113,6 +113,27 @@ impl<'a> RenderCtx<'a> {
             crate::state::CopyOrigin::Field { .. } => {}
         }
     }
+    pub fn publish_text_anchor(
+        &self,
+        source: crate::widgets::text_viewer::ViewerSource,
+        rect: Rect,
+        byte: usize,
+    ) {
+        let mut hits = self.hits.borrow_mut();
+        let rect = rect.intersection(hits.area());
+        if rect.width > 0 && rect.height > 0 {
+            if !hits
+                .source_versions
+                .iter()
+                .any(|(saved, _)| saved == &source)
+                && let Some(document) = self.state.text_for_source(&source, 0, self.now_ms)
+            {
+                hits.source_versions
+                    .push((source.clone(), AppState::source_fingerprint(&document.body)));
+            }
+            hits.source_anchors.push((rect, source, byte));
+        }
+    }
     /// A whole-row zone: `rect` spanning `area`'s width at row `y`.
     pub fn row_zone(&self, area: Rect, y: u16, kind: ZoneKind, id: ZoneId) {
         self.zone(Rect::new(area.x, y, area.width, 1), area, kind, id);
@@ -173,90 +194,168 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         state.detail_maximized,
     );
 
-    let mut y = area.y;
-    // Header — exactly five rows.
-    widgets::header::render(frame, Rect::new(area.x, y, area.width, 5), ctx);
-    y += 5;
-    // Blank spacer.
-    y += 1;
-
+    widgets::header::render(frame, Rect::new(area.x, area.y, area.width, 5), ctx);
+    let work = area.height.saturating_sub(8);
+    let wizard_open = state.input_mode == InputMode::Wizard && state.wizard.is_some();
+    let banner_capacity = if wizard_open {
+        work.saturating_sub(2)
+    } else {
+        work
+    };
+    let undo_rows = state.pending_deletions.len().min(banner_capacity as usize) as u16;
+    let toast_rows = state
+        .visible_toasts()
+        .len()
+        .min(banner_capacity.saturating_sub(undo_rows) as usize) as u16;
+    let banners = undo_rows + toast_rows;
+    let (main_h, gap, panel_h) = if wizard_open {
+        let main = r.main_h.min(work.saturating_sub(banners + 2));
+        let gap = u16::from(work.saturating_sub(banners + 2) > main);
+        (main, gap, work.saturating_sub(banners + main + gap))
+    } else if state.view == ViewId::Logs && state.detail == DetailPanel::Log {
+        let remaining = work.saturating_sub(banners);
+        let main = if state.detail_maximized {
+            0
+        } else {
+            (remaining / 2).min(remaining.saturating_sub(3))
+        };
+        let gap = u16::from(main > 0 && remaining > main);
+        (main, gap, remaining.saturating_sub(main + gap))
+    } else {
+        let main = r.main_h.min(work.saturating_sub(banners));
+        let gap = u16::from(work.saturating_sub(banners) > main);
+        (
+            main,
+            gap,
+            r.feed_h.min(work.saturating_sub(banners + main + gap)),
+        )
+    };
+    let label = Rect::new(area.x, area.y + 6, area.width, 1);
+    if let Some(wizard) = state.wizard.as_ref().filter(|_| wizard_open) {
+        let field = fit_cells(
+            &format!(
+                "{} {}/{}",
+                wizard.step().label,
+                wizard.active_index() + 1,
+                wizard.active_count()
+            ),
+            area.width as usize,
+        );
+        let room = area
+            .width
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(field.as_str()) as u16 + 3)
+            as usize;
+        put_line(
+            frame,
+            label,
+            label.y,
+            vec![Span::styled(
+                if room == 0 {
+                    field
+                } else {
+                    format!("{} · {}", fit_cells(&wizard.title, room), field)
+                },
+                ctx.bold(Token::Amber),
+            )],
+        );
+    } else {
+        render_main_label(frame, label, ctx);
+    }
+    let mut main = Rect::new(area.x, area.y + 7, area.width, main_h);
+    // Pickers occupy their actual lower content rows; no hidden list rows
+    // are published as scrollable or clickable underneath them.
+    if state.view == ViewId::Logs && (state.show_agent_picker || state.show_type_picker) {
+        let list_h = if main.height < 7 {
+            0
+        } else {
+            main.height.saturating_sub(16).max(3).min(main.height)
+        };
+        let picker = Rect::new(main.x, main.y + list_h, main.width, main.height - list_h);
+        main.height = list_h;
+        if state.show_agent_picker {
+            render_picker(frame, picker, ctx, true);
+        } else {
+            render_picker(frame, picker, ctx, false);
+        }
+    }
+    if main.height > 0 {
+        render_main(frame, main, ctx);
+    }
+    if panel_h > 0 {
+        render_bottom(
+            frame,
+            Rect::new(area.x, area.y + 7 + main_h + gap, area.width, panel_h),
+            ctx,
+        );
+    }
+    let command_y = area.bottom() - 1;
+    widgets::command_bar::render(frame, Rect::new(area.x, command_y, area.width, 1), ctx);
+    if undo_rows > 0 {
+        widgets::undo_banner::render(
+            frame,
+            Rect::new(area.x, command_y - undo_rows, area.width, undo_rows),
+            ctx,
+        );
+    }
+    if toast_rows > 0 {
+        widgets::toast::render(
+            frame,
+            Rect::new(area.x, command_y - banners, area.width, toast_rows),
+            ctx,
+        );
+    }
+    if let Some(origin) = state.active_copy_origin().filter(|origin| {
+        matches!(origin, crate::state::CopyOrigin::Field { .. })
+            && state.copy_footer_visible(origin)
+    }) && (state.detail == DetailPanel::None || panel_h < 3)
+    {
+        put_line(
+            frame,
+            Rect::new(area.x, command_y, area.width, 1),
+            command_y,
+            vec![Span::styled(
+                fit_cells(&detail::field_feedback(ctx, &origin), area.width as usize),
+                ctx.style(Token::Amber),
+            )],
+        );
+    }
+    // These are peer-owned render hooks. I0 intentionally draws nothing;
+    // the same calls compose the real B1/B2 surfaces after integration.
+    let overlay = Rect::new(area.x, area.y + 6, area.width, area.height - 7);
+    crate::wizard::session::render_session_overlay(frame, overlay, ctx);
+    widgets::text_viewer::TextViewer::render(frame, overlay, ctx);
     if state.show_help {
-        // Everything outside the overlay's box dismisses it — including the
-        // header and command-bar rows, which the overlay widget never sees.
-        // Registered first so the box's own zone lands on top of it.
         ctx.zone(
             area,
             area,
             ZoneKind::Chrome(ChromeId::HelpOverlayOutside),
             ZoneId::Chrome(ChromeId::HelpOverlayOutside),
         );
-        // The overlay replaces the content area and the bottom panel.
-        let overlay_h = area.height.saturating_sub(7);
-        widgets::help_overlay::render(frame, Rect::new(area.x, y, area.width, overlay_h), ctx);
-    } else {
-        // The main region's section label is one of the nine fixed rows, so it
-        // sits *above* `main_h` rather than inside it (docs/parity/tui.md §6).
-        render_main_label(frame, Rect::new(area.x, y, area.width, 1), ctx);
-        y += 1;
-        if r.main_h > 0 {
-            let mut main_h = r.main_h.min(area.bottom().saturating_sub(y));
-            // A logs picker takes the lower part of the content area: the logs
-            // list shrinks to `max(3, mainH - 16)` (docs/parity/tui.md §6).
-            let picker_open = state.show_agent_picker || state.show_type_picker;
-            if state.view == ViewId::Logs && picker_open {
-                let list_h = main_h.saturating_sub(16).max(3);
-                let picker_h = main_h.saturating_sub(list_h);
-                main_h = list_h;
-                if picker_h > 0 {
-                    let picker = Rect::new(area.x, y + list_h, area.width, picker_h);
-                    if state.show_agent_picker {
-                        widgets::pickers::render_agent_picker(frame, picker, ctx);
-                    } else {
-                        widgets::pickers::render_type_picker(frame, picker, ctx);
-                    }
-                }
-            }
-            let main = Rect::new(area.x, y, area.width, main_h);
-            render_main(frame, main, ctx);
-            y += r.main_h.min(area.bottom().saturating_sub(y));
-        }
-        // Blank spacer between the regions.
-        if y < area.bottom() {
-            y += 1;
-        }
-        // Toasts and the undo banner are bottom-anchored above the command
-        // bar. Ink let them push the layout; with fixed regions they take their
-        // rows from the bottom panel, which is the only elastic region.
-        let banner_rows = (state.visible_toasts().len() + state.pending_deletions.len()) as u16;
-        let available = area.bottom().saturating_sub(y + 1);
-        let feed_h = r
-            .feed_h
-            .min(available)
-            .saturating_sub(banner_rows.min(available.saturating_sub(1)));
-        if feed_h > 0 {
-            render_bottom(frame, Rect::new(area.x, y, area.width, feed_h), ctx);
-        }
+        widgets::help_overlay::render(frame, overlay, ctx);
     }
+}
 
-    // The command bar always owns the last row.
-    let mut bottom = area.bottom() - 1;
-    widgets::command_bar::render(frame, Rect::new(area.x, bottom, area.width, 1), ctx);
-
-    let undo_rows = (state.pending_deletions.len() as u16).min(bottom.saturating_sub(area.y));
-    if undo_rows > 0 {
-        bottom -= undo_rows;
-        widgets::undo_banner::render(frame, Rect::new(area.x, bottom, area.width, undo_rows), ctx);
+/// Fit a label by terminal columns, including a visible elision marker.
+pub(crate) fn fit_cells(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if unicode_width::UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
     }
-
-    let toast_rows = (state.visible_toasts().len() as u16).min(bottom.saturating_sub(area.y));
-    if toast_rows > 0 {
-        bottom -= toast_rows;
-        widgets::toast::render(
-            frame,
-            Rect::new(area.x, bottom, area.width, toast_rows),
-            ctx,
-        );
+    if width == 0 {
+        return String::new();
     }
+    let mut used = 0;
+    let mut result = String::new();
+    for ch in text.chars() {
+        let cells = ch.width().unwrap_or(0);
+        if used + cells >= width {
+            break;
+        }
+        used += cells;
+        result.push(ch);
+    }
+    result.push('…');
+    result
 }
 
 fn render_too_small(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
@@ -270,10 +369,79 @@ fn render_too_small(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 }
 
 fn render_main_label(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    section_label(frame, area, ctx, ctx.state.view.label(), None);
+    let focused = ctx.state.focus == crate::state::Focus::MainList;
+    let title = format!(
+        "{}{}",
+        if focused { "> " } else { "" },
+        ctx.state.view.label()
+    );
+    section_label(frame, area, ctx, &title, None);
 }
 
 fn render_main(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    use crate::state::{AgentRow, Focus, TaskRow};
+    let state = ctx.state;
+    let key = state.pane_key(Focus::MainList);
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Pane(Focus::MainList),
+        ZoneId::Pane(key.clone()),
+    );
+    let (items, display_rows, selection_rows) = match state.view {
+        ViewId::Tasks => {
+            let rows = state.task_rows(ctx.caps.can_create_task);
+            let selected = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row, item)| {
+                    matches!(
+                        item,
+                        TaskRow::Task { .. } | TaskRow::ShowAll { .. } | TaskRow::AddTask { .. }
+                    )
+                    .then_some(row)
+                })
+                .collect::<Vec<_>>();
+            (selected.len(), rows.len(), selected)
+        }
+        ViewId::Agents => {
+            let rows = state.agent_rows(ctx.caps.can_add_agent);
+            let selected = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(row, item)| {
+                    matches!(item, AgentRow::Agent { .. } | AgentRow::AddAgent { .. })
+                        .then_some(row)
+                })
+                .collect::<Vec<_>>();
+            (selected.len(), rows.len(), selected)
+        }
+        ViewId::Goals => {
+            let count = state.goals.len() + usize::from(ctx.caps.can_create_goal);
+            (count, count, (0..count).collect())
+        }
+        ViewId::Logs => {
+            let count = state.filtered_messages().len();
+            (count, count, (0..count).collect())
+        }
+    };
+    let body = if state.view == ViewId::Logs {
+        Rect::new(
+            area.x,
+            area.y + 2,
+            area.width,
+            area.height.saturating_sub(2),
+        )
+    } else {
+        area
+    };
+    ctx.publish_pane_metrics(crate::hit::PaneMetrics {
+        key,
+        body,
+        items,
+        display_rows,
+        selection_rows,
+    });
     match ctx.state.view {
         ViewId::Goals => goals::render(frame, area, ctx),
         ViewId::Tasks => tasks::render(frame, area, ctx),
@@ -288,6 +456,28 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         && let Some(wizard) = state.wizard.as_ref()
     {
         widgets::wizard::render(frame, area, ctx, wizard);
+        let suggestion_rows: Vec<_> = ctx
+            .hits
+            .borrow()
+            .zones()
+            .iter()
+            .filter(|z| matches!(z.kind, ZoneKind::WizardSuggestion { .. }))
+            .map(|z| z.rect)
+            .collect();
+        if let (Some(first), Some(last)) = (suggestion_rows.first(), suggestion_rows.last()) {
+            let body = Rect::new(
+                area.x,
+                first.y,
+                area.width,
+                last.bottom().saturating_sub(first.y),
+            );
+            ctx.zone(
+                body,
+                area,
+                ZoneKind::Scroll(crate::hit::ScrollRegion::WizardOptions),
+                ZoneId::ScrollRegion(crate::hit::ScrollRegion::WizardOptions),
+            );
+        }
         return;
     }
     if state.input_mode == InputMode::Command {
@@ -306,16 +496,37 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         return;
     }
     if state.show_agent_picker {
-        widgets::pickers::render_agent_picker(frame, area, ctx);
+        render_picker(frame, area, ctx, true);
         return;
     }
     if state.show_type_picker {
-        widgets::pickers::render_type_picker(frame, area, ctx);
+        render_picker(frame, area, ctx, false);
         return;
     }
     if state.detail != DetailPanel::None {
         detail::render(frame, area, ctx);
         return;
+    }
+    if state.messages.is_empty() {
+        let key = state.pane_key(crate::state::Focus::Activity);
+        ctx.zone(
+            area,
+            area,
+            ZoneKind::Pane(crate::state::Focus::Activity),
+            ZoneId::Pane(key.clone()),
+        );
+        ctx.publish_pane_metrics(crate::hit::PaneMetrics {
+            key,
+            body: Rect::new(
+                area.x,
+                area.y + 1,
+                area.width,
+                area.height.saturating_sub(1),
+            ),
+            items: 0,
+            display_rows: 0,
+            selection_rows: Vec::new(),
+        });
     }
     if state.messages.is_empty()
         && let Some(_config) = crate::onboarding::config_for(state.view)
@@ -344,8 +555,15 @@ pub fn section_label(
         Span::styled(HEAVY_RULE.to_string().repeat(3), ctx.style(Token::Ghost)),
         Span::styled(
             format!(" {label} "),
-            ctx.chip(Token::Dim, Token::NeutralBg)
-                .add_modifier(Modifier::BOLD),
+            ctx.chip(
+                if label.starts_with("> ") {
+                    Token::Amber
+                } else {
+                    Token::Dim
+                },
+                Token::NeutralBg,
+            )
+            .add_modifier(Modifier::BOLD),
         ),
     ];
     let mut used = 3 + label.chars().count() + 2;
@@ -421,6 +639,164 @@ pub fn put_line(frame: &mut Frame, area: Rect, y: u16, spans: Vec<Span<'_>>) {
     }
     Paragraph::new(Line::from(spans))
         .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+}
+
+/// The original picker remains useful at normal sizes. At smaller sizes a
+/// bounded window reserves controls before rows so its last option remains
+/// reachable without borrowing cells from the command bar.
+fn render_picker(frame: &mut Frame, area: Rect, ctx: &RenderCtx, agents: bool) {
+    use crate::hit::{PickerKind, RowPart, ScrollRegion};
+    use crate::messages::MsgType;
+    if area.height >= if agents { 12 } else { 14 } {
+        if agents {
+            widgets::pickers::render_agent_picker(frame, area, ctx);
+        } else {
+            widgets::pickers::render_type_picker(frame, area, ctx);
+        }
+        return;
+    }
+    if area.height == 0 {
+        return;
+    }
+    let region = if agents {
+        ScrollRegion::AgentPicker
+    } else {
+        ScrollRegion::TypePicker
+    };
+    ctx.zone(
+        area,
+        area,
+        ZoneKind::Scroll(region),
+        ZoneId::ScrollRegion(region),
+    );
+    put_line(
+        frame,
+        area,
+        area.y,
+        vec![Span::styled(
+            if agents {
+                "Agent Filter"
+            } else {
+                "Type Filter"
+            },
+            ctx.bold(Token::Amber),
+        )],
+    );
+    let preset_rows = u16::from(!agents && area.height >= 5);
+    if preset_rows > 0 {
+        let mut x = area.x;
+        for (key, name) in [
+            ('1', "all"),
+            ('2', "text"),
+            ('3', "tools"),
+            ('4', "errors"),
+            ('5', "events"),
+        ] {
+            let label = format!("{key}={name} ");
+            let width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+            put_line(
+                frame,
+                Rect::new(x, area.y + 1, width.min(area.right().saturating_sub(x)), 1),
+                area.y + 1,
+                vec![Span::styled(label, ctx.style(Token::Dim))],
+            );
+            ctx.zone(
+                Rect::new(x, area.y + 1, width, 1),
+                area,
+                ZoneKind::Verb(VerbId::PickerPreset(key)),
+                ZoneId::Verb(VerbId::PickerPreset(key)),
+            );
+            x = x.saturating_add(width);
+        }
+    }
+    let rows_h = area.height.saturating_sub(2 + preset_rows) as usize;
+    let total = if agents {
+        ctx.state.agents.len()
+    } else {
+        MsgType::ALL.len()
+    };
+    let mut offset = ctx.state.picker_scroll.min(total.saturating_sub(rows_h));
+    if ctx.state.picker_cursor < offset {
+        offset = ctx.state.picker_cursor;
+    } else if rows_h > 0 && ctx.state.picker_cursor >= offset + rows_h {
+        offset = ctx.state.picker_cursor + 1 - rows_h;
+    }
+    for (row, index) in (offset..total).take(rows_h).enumerate() {
+        let (label, checked, id) = if agents {
+            let agent = &ctx.state.agents[index];
+            (
+                agent.name.clone(),
+                ctx.state.picker_draft.is_empty() || ctx.state.picker_draft.contains(&agent.id),
+                ZoneId::PickerItem(PickerKind::Agent, agent.id.clone()),
+            )
+        } else {
+            let kind = MsgType::ALL[index];
+            (
+                format!("{} {}", kind.picker_icon(), kind.label()),
+                ctx.state.type_picker_draft.contains(&kind),
+                ZoneId::PickerItem(PickerKind::Type, kind.label().into()),
+            )
+        };
+        let y = area.y + 1 + preset_rows + row as u16;
+        let selected = index == ctx.state.picker_cursor;
+        let line = format!(
+            " {} [{}] {}",
+            if selected { ">" } else { " " },
+            if checked { "✓" } else { " " },
+            label
+        );
+        put_line(
+            frame,
+            area,
+            y,
+            vec![Span::styled(
+                fit_cells(&line, area.width as usize),
+                ctx.style(if selected {
+                    Token::Amber
+                } else {
+                    Token::Silver
+                }),
+            )],
+        );
+        for (part, x, width) in [
+            (RowPart::Checkbox, area.x + 3, 3),
+            (RowPart::Label, area.x + 6, area.width.saturating_sub(6)),
+        ] {
+            let kind = if agents {
+                ZoneKind::PickerRow { index, part }
+            } else {
+                ZoneKind::TypePickerRow { index, part }
+            };
+            ctx.zone(Rect::new(x, y, width, 1), area, kind, id.clone());
+        }
+    }
+    if area.height > 1 {
+        let y = area.bottom() - 1;
+        let mut x = area.x;
+        for (label, verb) in [
+            ("Enter confirm", VerbId::PickerConfirm),
+            ("Esc cancel", VerbId::PickerCancel),
+            ("Space toggle", VerbId::PickerToggle),
+        ] {
+            let width = unicode_width::UnicodeWidthStr::width(label) as u16;
+            if x + width > area.right() {
+                continue;
+            }
+            put_line(
+                frame,
+                Rect::new(x, y, width, 1),
+                y,
+                vec![Span::styled(label, ctx.style(Token::Dim))],
+            );
+            ctx.zone(
+                Rect::new(x, y, width, 1),
+                area,
+                ZoneKind::Verb(verb),
+                ZoneId::Verb(verb),
+            );
+            x += width + 2;
+        }
+    }
 }
 
 #[cfg(test)]

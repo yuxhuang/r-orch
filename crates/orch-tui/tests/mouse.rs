@@ -190,9 +190,13 @@ fn m008_a_log_row_click_under_a_filter_indexes_the_filtered_set() {
 
 #[test]
 fn m009_double_clicking_a_log_row_toggles_the_log_detail() {
-    let mut harness = logs_with_messages();
-    harness.double_click_text("msg-38");
-    assert_eq!(harness.app.state.detail, DetailPanel::Log);
+    let mut h = logs_with_messages();
+    h.click_text("msg-38");
+    h.draw();
+    h.click_text("msg-38");
+    let snapshot = h.app.state.viewer.as_ref().expect("complete snapshot");
+    assert!(snapshot.document().body.contains("msg-38"));
+    assert_eq!(h.app.state.detail, DetailPanel::None);
 }
 
 #[test]
@@ -582,7 +586,7 @@ fn m038_clicking_enter_detail_and_esc_close_open_and_close_the_panel() {
     // (§3.3.3), so a second footer click has to wait that out.
     harness.clock.advance_ms(DOUBLE_CLICK_MS + 1);
     harness.draw();
-    harness.click_text("Esc close");
+    harness.click_text("Esc to list");
     assert_eq!(harness.app.state.detail, DetailPanel::None);
 }
 
@@ -762,7 +766,7 @@ fn m047_a_section_header_row_is_not_clickable() {
 fn m048_the_arrow_hints_are_not_clickable() {
     let mut harness = wide();
     let before = harness.app.state.task_selected;
-    harness.click_text("Tab/←→");
+    harness.click_text("Tab panes; ←→ views");
     assert_eq!(harness.app.state.view, ViewId::Tasks, "no tab switch");
     assert_eq!(harness.app.state.task_selected, before);
 }
@@ -1214,30 +1218,45 @@ fn m076_the_wheel_does_nothing_over_a_task_or_agent_detail() {
 
 #[test]
 fn m077_the_wheel_scrolls_an_open_goal_detail_without_moving_the_selection() {
-    let mut harness = view(ViewId::Goals);
-    harness.app.state.goal_selected = 1;
-    harness.app.state.detail = DetailPanel::Entity;
-    harness.draw();
-    let (_, y) = harness.find_text("GOAL:").expect("the goal detail");
-    harness.wheel_down(20, y.saturating_sub(2));
-    assert_eq!(harness.app.state.goal_selected, 1, "selection unchanged");
-    assert_eq!(
-        harness.app.state.goal_detail_scroll, 1,
-        "the one detail panel that has scroll state scrolls"
-    );
+    use orch_tui::state::{Focus, GoalSection};
+    let mut h = view(ViewId::Goals);
+    h.app.state.goal_selected = 1;
+    let id = h.app.state.selected_goal().unwrap().id.clone();
+    h.app
+        .state
+        .goals
+        .iter_mut()
+        .find(|g| g.id == id)
+        .unwrap()
+        .description = "line\n".repeat(100);
+    h.app.state.detail = DetailPanel::Entity;
+    h.app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Description));
+    h.draw();
+    let key = h.app.state.pane_key(h.app.state.focus);
+    let body = h.hits().pane_metrics(&key).unwrap().body;
+    h.wheel_down(body.x, body.y);
+    assert_eq!(h.app.state.goal_selected, 1);
+    assert_eq!(h.app.state.pane_scroll(&key).offset, 3);
 }
 
 #[test]
 fn m078_the_wheel_does_nothing_over_a_log_detail() {
-    let mut harness = logs_with_messages();
-    harness.click_text("msg-38");
-    harness.draw();
-    harness.double_click_text("msg-38");
-    assert_eq!(harness.app.state.detail, DetailPanel::Log);
-    harness.draw();
-    let before = harness.app.state.log_selected_index;
-    harness.wheel_down(20, 10);
-    assert_eq!(harness.app.state.log_selected_index, before);
+    use orch_tui::state::{Focus, LogSection};
+    let mut h = logs_with_messages();
+    h.click_text("msg-38");
+    h.key('i');
+    let index = h.app.state.filtered_messages()[h.app.state.log_selected_index as usize];
+    h.app.state.messages[index].detail = Some("line\n".repeat(100));
+    h.app.state.set_focus(Focus::LogDetail(LogSection::Body));
+    h.draw();
+    let before = h.app.state.log_selected_index;
+    let key = h.app.state.pane_key(h.app.state.focus);
+    let body = h.hits().pane_metrics(&key).unwrap().body;
+    h.wheel_down(body.x, body.y);
+    assert_eq!(h.app.state.log_selected_index, before);
+    assert_eq!(h.app.state.pane_scroll(&key).offset, 3);
 }
 
 #[test]
@@ -1747,6 +1766,7 @@ fn m098_every_click_on_a_multiselect_checkbox_toggles_it() {
             .len(),
         1
     );
+    harness.draw();
     // Second click, inside the double-click window, on the same cell.
     harness.click(x + 1, y);
     assert_eq!(

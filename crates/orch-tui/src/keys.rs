@@ -15,7 +15,11 @@ use crate::backend::TuiBackend;
 use crate::clock::Clock;
 use crate::command_bar::{SuggestionCtx, resolve_completion, resolve_suggestions_in};
 use crate::messages::{MsgType, cycle_preset, preset_types};
-use crate::state::{DetailPanel, InputMode, ViewId, is_runnable};
+use crate::navigation::{NavAction, ScrollMetrics, ScrollMode, ScrollState, navigate};
+use crate::state::{
+    AgentSection, CopyHelpContext, CopyOrigin, DetailPanel, Focus, GoalSection, InputMode,
+    LogSection, TaskSection, ViewId, is_runnable,
+};
 use crate::text::is_meta;
 use crate::theme::Token;
 use crate::wizard::engine::{WizardKind, WizardOutcome};
@@ -65,6 +69,10 @@ fn strip_args_hint(cmd: &str) -> &str {
     }
 }
 
+fn selection_rows_identity(view: ViewId) -> bool {
+    matches!(view, ViewId::Goals | ViewId::Logs)
+}
+
 impl<B: TuiBackend, C: Clock> App<B, C> {
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.dispatch_ui_event(&UiEvent::Terminal(Event::Key(key)));
@@ -79,9 +87,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 return;
             }
         }
-        // B0 extends this prelude with modal/footer guards before consumers.
+        if let UiEvent::Terminal(Event::Mouse(mouse)) = event
+            && self.guard_surface_mouse(*mouse)
+        {
+            return;
+        }
+        if matches!(event, UiEvent::Tick) {
+            self.state.normalize_focus();
+        }
+        if let UiEvent::Terminal(Event::Resize(width, height)) = event {
+            self.resize(*width, *height);
+        }
         if matches!(event, UiEvent::Terminal(Event::Mouse(_)))
             && (!self.state.mouse.enabled || !self.state.mouse.hits.is_valid())
+        {
+            return;
+        }
+        if let UiEvent::Terminal(Event::Key(key)) = event
+            && self.page_wizard_options(*key)
         {
             return;
         }
@@ -94,11 +117,31 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if viewer_handled || session_handled {
             return;
         }
+        // Contextual F1 sits after the two surface owners and before legacy
+        // input modes; opening it never recreates either underlying session.
+        if let UiEvent::Terminal(Event::Key(key)) = event {
+            if self.state.show_help && self.state.copy_help.is_some() {
+                self.handle_copy_help_key(*key);
+                return;
+            }
+            if key.code == KeyCode::F(1) && !self.state.show_help {
+                self.state.sync_field_origin();
+                if let Some(origin) = self.state.active_copy_origin() {
+                    self.state.copy_help = Some(CopyHelpContext {
+                        origin,
+                        scroll_row: 0,
+                    });
+                    self.state.show_help = true;
+                    self.invalidate_hits();
+                    return;
+                }
+            }
+        }
         match event {
             UiEvent::Terminal(Event::Key(key)) => self.handle_key_internal(*key),
             UiEvent::Terminal(Event::Mouse(mouse)) => self.handle_mouse_internal(*mouse),
             UiEvent::Terminal(Event::Paste(text)) => self.handle_paste_internal(text),
-            UiEvent::Terminal(Event::Resize(w, h)) => self.resize(*w, *h),
+            UiEvent::Terminal(Event::Resize(_, _)) => {}
             UiEvent::ExitRequested(_) => self.state.should_exit = true,
             UiEvent::Tick | UiEvent::Terminal(_) => {}
         }
@@ -186,6 +229,68 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         let view = self.state.view;
         let detail_open = self.state.detail_open();
 
+        if self.copy_focused_key(key) {
+            return;
+        }
+        // Letters are entity actions only with plain/Shift modifiers. Copy
+        // shortcuts were handled above; Ctrl+C is deliberately unbound.
+        if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
+            return;
+        }
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                let ring = self.state.focus_ring();
+                let current = ring
+                    .iter()
+                    .position(|f| *f == self.state.focus)
+                    .unwrap_or(0);
+                let backwards =
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                let next = if backwards {
+                    (current + ring.len() - 1) % ring.len()
+                } else {
+                    (current + 1) % ring.len()
+                };
+                self.state.set_focus(ring[next]);
+                return;
+            }
+            KeyCode::Char('i') if view == ViewId::Logs && !detail_open => {
+                if self.state.selected_log().is_some() {
+                    self.state.detail = DetailPanel::Log;
+                    self.state.set_focus(Focus::LogDetail(LogSection::Metadata));
+                }
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.navigate_focus(NavAction::Up, false);
+                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.navigate_focus(NavAction::Down, false);
+                return;
+            }
+            KeyCode::PageUp => {
+                self.navigate_focus(NavAction::PageUp, false);
+                return;
+            }
+            KeyCode::PageDown => {
+                self.navigate_focus(NavAction::PageDown, false);
+                return;
+            }
+            KeyCode::Home => {
+                self.navigate_focus(NavAction::Home, false);
+                return;
+            }
+            KeyCode::End => {
+                self.navigate_focus(NavAction::End, false);
+                return;
+            }
+            KeyCode::Enter if self.state.focus != Focus::MainList || view == ViewId::Logs => {
+                self.open_focused_viewer();
+                return;
+            }
+            _ => {}
+        }
         match key.code {
             // `q` is tested first, so it can never be typed in normal mode.
             KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -258,13 +363,15 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
 
         // `n` — the new-entity wizard for this view.
-        if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) && !detail_open {
+        if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
+            && self.state.focus == Focus::MainList
+        {
             self.open_new_wizard_for_view();
             return;
         }
 
         // Goal-view actions.
-        if view == ViewId::Goals {
+        if view == ViewId::Goals && self.state.focus == Focus::MainList {
             let selected = self.state.selected_goal().cloned();
             match (key.code, selected) {
                 (KeyCode::Char('e') | KeyCode::Char('E'), Some(_)) => {
@@ -305,7 +412,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
         // Task-view actions. `a` approves a review task — this overrides the
         // "A = agents tab" binding.
-        if view == ViewId::Tasks {
+        if view == ViewId::Tasks && self.state.focus == Focus::MainList {
             let selected = self.state.selected_task().cloned();
             match (key.code, selected.as_ref()) {
                 (KeyCode::Char('a') | KeyCode::Char('A'), Some(task))
@@ -359,7 +466,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
 
         // Agent-view actions.
-        if view == ViewId::Agents {
+        if view == ViewId::Agents && self.state.focus == Focus::MainList {
             let selected = self.state.selected_agent().cloned();
             match (key.code, selected) {
                 (KeyCode::Char('e') | KeyCode::Char('E'), Some(_)) => {
@@ -409,7 +516,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.switch_view(ViewId::Logs);
                     return;
                 }
-                KeyCode::Tab | KeyCode::Right => {
+                KeyCode::Right => {
                     self.switch_view(view.next());
                     return;
                 }
@@ -451,6 +558,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     pub(crate) fn close_detail_or_tail(&mut self) {
         if self.state.detail_open() {
             self.state.detail = DetailPanel::None;
+            self.state.detail_maximized = false;
+            self.state.set_focus(Focus::MainList);
             self.state.goal_detail_scroll = 0;
         } else if self.state.view == ViewId::Logs && self.state.log_selected_index >= 0 {
             self.state.log_selected_index = -1;
@@ -506,6 +615,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             InputMode::Command => {
                 self.state.command_bar.input.insert_str(&normalized, now);
                 self.state.command_bar.suggestion_index = 0;
+                self.state.suggestion_scroll = 0;
                 // The activity feed is not drawn while the bar is open, so an
                 // advisory about the text that just landed *in* the bar goes
                 // above it, where the refusals go (design-v2 §3.6.3). Cleared
@@ -528,10 +638,22 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// `M` — maximize the detail panel, or restore the split.
     pub(crate) fn toggle_detail_maximized(&mut self) {
         self.state.detail_maximized = !self.state.detail_maximized;
+        if self.state.detail_maximized {
+            let focus = self
+                .state
+                .focus_ring()
+                .into_iter()
+                .find(|f| *f != Focus::MainList)
+                .unwrap_or(Focus::MainList);
+            self.state.set_focus(focus);
+        } else {
+            self.state.set_focus(Focus::MainList);
+        }
     }
 
     /// `?` / `F1`.
     pub(crate) fn open_help(&mut self) {
+        self.state.copy_help = None;
         self.state.show_help = true;
     }
 
@@ -545,6 +667,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         let prefill = format!("/msg {} ", crate::msg::quote_recipient(name));
         self.state.command_bar.input.reset(&prefill);
         self.state.command_bar.suggestion_index = 0;
+        self.state.suggestion_scroll = 0;
     }
 
     /// The suggestion rows for an input, with the agent list `/msg` needs.
@@ -567,6 +690,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.state.input_mode = InputMode::Command;
         self.state.command_bar.input.reset("/");
         self.state.command_bar.suggestion_index = 0;
+        self.state.suggestion_scroll = 0;
         self.state.command_bar.retained_refusal.clear();
         // A fresh bar inherits nothing from the last one.
         self.disarm_broadcast();
@@ -600,6 +724,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     pub(crate) fn open_agent_picker(&mut self) {
         self.state.show_agent_picker = true;
         self.state.picker_cursor = 0;
+        self.state.picker_scroll = 0;
         self.state.picker_draft = self.state.log_agent_filter.clone();
     }
 
@@ -607,6 +732,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     pub(crate) fn open_type_picker(&mut self) {
         self.state.show_type_picker = true;
         self.state.picker_cursor = 0;
+        self.state.picker_scroll = 0;
         self.state.type_picker_draft = self.state.log_type_filter.clone();
     }
 
@@ -642,6 +768,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     pub(crate) fn switch_view(&mut self, view: ViewId) {
         self.state.view = view;
+        self.state.set_focus(Focus::MainList);
+        self.state.normalize_focus();
     }
 
     pub(crate) fn handle_enter(&mut self) {
@@ -684,6 +812,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
             }
         }
+        if self.state.detail_open() {
+            self.focus_initial_detail();
+        }
     }
 
     pub(crate) fn toggle_entity_detail(&mut self) {
@@ -692,104 +823,552 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         } else {
             DetailPanel::Entity
         };
+        if self.state.detail_open() {
+            self.focus_initial_detail();
+        } else {
+            self.state.set_focus(Focus::MainList);
+        }
     }
 
-    pub(crate) fn move_selection_up(&mut self) {
-        let regions = self.state.regions(self.backend.can_create_task());
-        let main_h = regions.main_h as usize;
-        match self.state.view {
-            ViewId::Goals if self.state.detail_open() => {
-                self.state.goal_detail_scroll = self.state.goal_detail_scroll.saturating_sub(1);
+    pub(crate) fn focus_initial_detail(&mut self) {
+        let focus = match self.state.view {
+            ViewId::Goals => Focus::GoalDetail(GoalSection::Overview),
+            ViewId::Tasks => Focus::TaskDetail(TaskSection::Overview),
+            ViewId::Agents => Focus::AgentDetail(AgentSection::Overview),
+            ViewId::Logs => Focus::LogDetail(LogSection::Metadata),
+        };
+        self.state.set_focus(focus);
+    }
+    pub(crate) fn open_focused_viewer(&mut self) {
+        let Some(mut document) = self.state.focused_text() else {
+            return;
+        };
+        document.captured_at_ms = self.now();
+        if self
+            .state
+            .register_viewer_origin(document.source.clone())
+            .is_err()
+        {
+            return;
+        }
+        self.state.viewer = Some(crate::widgets::text_viewer::TextViewer::new(document));
+        self.invalidate_hits();
+    }
+    fn copy_focused_key(&mut self, key: KeyEvent) -> bool {
+        use crate::backend::CopyTarget;
+        let target = match (key.code, key.modifiers) {
+            (KeyCode::Char('y' | 'Y'), KeyModifiers::CONTROL) => CopyTarget::Auto,
+            (KeyCode::Char('c' | 'C'), m) if m == KeyModifiers::CONTROL | KeyModifiers::ALT => {
+                CopyTarget::Terminal
             }
-            ViewId::Goals => {
-                self.state.goal_selected = self.state.goal_selected.saturating_sub(1);
-                if self.state.goal_selected < self.state.goal_scroll {
-                    self.state.goal_scroll = self.state.goal_selected;
-                }
+            _ => return false,
+        };
+        let Some(document) = self.state.focused_text() else {
+            return true;
+        };
+        self.state.sync_field_origin();
+        let Some(origin @ CopyOrigin::Field { .. }) = self.state.active_copy_origin() else {
+            return true;
+        };
+        let accepted = if matches!(
+            document.completeness,
+            crate::widgets::text_viewer::Completeness::Complete
+        ) {
+            self.backend.copy_text_via(&document.body, target)
+        } else {
+            Err("Body unavailable".into())
+        };
+        self.state
+            .register_copy_request(origin, target, accepted, self.now());
+        true
+    }
+    fn handle_copy_help_key(&mut self, key: KeyEvent) {
+        if self
+            .state
+            .copy_help
+            .as_ref()
+            .is_some_and(|h| !self.state.copy_origin_is_live(&h.origin))
+        {
+            self.state.show_help = false;
+            self.state.copy_help = None;
+            self.invalidate_hits();
+            return;
+        }
+        let action = match key.code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
+                self.state.show_help = false;
+                self.state.copy_help = None;
+                self.invalidate_hits();
+                return;
             }
-            ViewId::Tasks => {
-                self.state.task_selected = self.state.task_selected.saturating_sub(1);
-                if self.state.task_selected < self.state.task_scroll {
-                    self.state.task_scroll = self.state.task_selected;
-                }
-            }
-            ViewId::Agents => {
-                self.state.agent_selected = self.state.agent_selected.saturating_sub(1);
-                if self.state.agent_selected < self.state.agent_scroll {
-                    self.state.agent_scroll = self.state.agent_selected;
-                }
-            }
-            ViewId::Logs => {
-                let filtered = self.state.filtered_messages();
-                if filtered.is_empty() {
-                    return;
-                }
-                if self.state.log_selected_index < 0 {
-                    // From tail: jump to the last message.
-                    let last = filtered.len() as i64 - 1;
-                    self.state.log_selected_index = last;
-                    self.state.log_scroll_offset = (last - main_h as i64 + 2).max(0) as usize;
+            KeyCode::Up => NavAction::Up,
+            KeyCode::Down => NavAction::Down,
+            KeyCode::PageUp => NavAction::PageUp,
+            KeyCode::PageDown => NavAction::PageDown,
+            KeyCode::Home => NavAction::Home,
+            KeyCode::End => NavAction::End,
+            _ => return,
+        };
+        self.navigate_copy_help(action);
+        self.invalidate_hits();
+    }
+    pub(crate) fn navigate_copy_help(&mut self, action: NavAction) {
+        let rows = crate::widgets::help_overlay::contextual_rows(
+            &self.state,
+            self.state.width.saturating_sub(2) as usize,
+        )
+        .len();
+        if let Some(help) = self.state.copy_help.as_mut() {
+            let mut state = ScrollState {
+                selected: None,
+                offset: help.scroll_row,
+            };
+            navigate(
+                &mut state,
+                action,
+                ScrollMetrics {
+                    items: 0,
+                    display_rows: rows,
+                    viewport_rows: self.state.height.saturating_sub(9) as usize,
+                    selection_rows: &[],
+                    mode: ScrollMode::Text,
+                },
+            );
+            help.scroll_row = state.offset;
+        }
+    }
+    /// Keys reuse the last drawn body metric; a layout invalidation clears it.
+    /// Before the first draw, the baseline split provides the initial window.
+    pub(crate) fn navigate_focus(&mut self, action: NavAction, wheel: bool) {
+        let focus = self.state.focus;
+        let key = self.state.pane_key(focus);
+        let published = self
+            .state
+            .mouse
+            .hits
+            .metrics
+            .panes
+            .iter()
+            .find(|m| m.key == key)
+            .cloned();
+        let fallback = self.state.regions(self.backend.can_create_task());
+        let h = published.as_ref().map_or_else(
+            || {
+                if focus == Focus::MainList {
+                    fallback.main_h.saturating_sub(match self.state.view {
+                        ViewId::Goals => 0,
+                        ViewId::Tasks => 0,
+                        ViewId::Agents => 0,
+                        ViewId::Logs => 2,
+                    }) as usize
                 } else {
-                    self.state.log_selected_index = (self.state.log_selected_index - 1).max(0);
-                    if (self.state.log_selected_index as usize) < self.state.log_scroll_offset {
-                        self.state.log_scroll_offset = self.state.log_selected_index as usize;
+                    fallback.feed_h.saturating_sub(2) as usize
+                }
+            },
+            |m| m.body.height as usize,
+        );
+        let (mut scroll, items, display_rows, selection_rows, mode) = match focus {
+            Focus::MainList => {
+                let (selected, offset, count, map) = match self.state.view {
+                    ViewId::Goals => (
+                        Some(self.state.goal_selected),
+                        self.state.goal_scroll,
+                        self.state.sorted_goals().len()
+                            + usize::from(self.backend.can_create_goal()),
+                        Vec::new(),
+                    ),
+                    ViewId::Tasks => {
+                        let rows = self.state.task_rows(self.backend.can_create_task());
+                        let map: Vec<_> = rows
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, r)| {
+                                matches!(
+                                    r,
+                                    crate::state::TaskRow::Task { .. }
+                                        | crate::state::TaskRow::ShowAll { .. }
+                                        | crate::state::TaskRow::AddTask { .. }
+                                )
+                                .then_some(i)
+                            })
+                            .collect();
+                        (
+                            Some(self.state.task_selected),
+                            self.state.task_scroll,
+                            rows.len(),
+                            map,
+                        )
                     }
+                    ViewId::Agents => {
+                        let rows = self.state.agent_rows(self.backend.can_add_agent());
+                        let map: Vec<_> = rows
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, r)| {
+                                matches!(
+                                    r,
+                                    crate::state::AgentRow::Agent { .. }
+                                        | crate::state::AgentRow::AddAgent { .. }
+                                )
+                                .then_some(i)
+                            })
+                            .collect();
+                        (
+                            Some(self.state.agent_selected),
+                            self.state.agent_scroll,
+                            rows.len(),
+                            map,
+                        )
+                    }
+                    ViewId::Logs => {
+                        let n = self.state.filtered_messages().len();
+                        let tail = self.state.log_selected_index < 0;
+                        let selected = if tail {
+                            n.checked_sub(1)
+                        } else {
+                            usize::try_from(self.state.log_selected_index).ok()
+                        };
+                        let offset = if tail {
+                            n.saturating_sub(h)
+                        } else {
+                            self.state.log_scroll_offset
+                        };
+                        (selected, offset, n, Vec::new())
+                    }
+                };
+                let items = if selection_rows_identity(self.state.view) {
+                    count
+                } else {
+                    map.len()
+                };
+                (
+                    ScrollState { selected, offset },
+                    items,
+                    count,
+                    map,
+                    ScrollMode::Selectable,
+                )
+            }
+            Focus::Activity => {
+                let rows = self.state.activity_messages();
+                let n = rows.len();
+                let selected = if self.state.activity_follow_tail {
+                    n.checked_sub(1)
+                } else {
+                    rows.iter().position(|i| {
+                        Some(self.state.messages[*i].id) == self.state.activity_selected
+                    })
+                };
+                let offset = if self.state.activity_follow_tail {
+                    n.saturating_sub(h)
+                } else {
+                    self.state.activity_scroll
+                };
+                (
+                    ScrollState { selected, offset },
+                    n,
+                    n,
+                    Vec::new(),
+                    ScrollMode::Selectable,
+                )
+            }
+            _ => {
+                let text = crate::views::detail::section_text(&self.state, focus);
+                let list = matches!(
+                    focus,
+                    Focus::GoalDetail(GoalSection::Tasks)
+                        | Focus::TaskDetail(
+                            TaskSection::Activity | TaskSection::Attachments | TaskSection::Files
+                        )
+                );
+                let rows = published.as_ref().map_or_else(
+                    || {
+                        text.iter()
+                            .map(|s| {
+                                crate::views::detail::wrap_rows(s, self.state.width as usize).len()
+                            })
+                            .sum()
+                    },
+                    |m| m.display_rows,
+                );
+                (
+                    self.state.pane_scroll(&key),
+                    text.len(),
+                    rows,
+                    Vec::new(),
+                    if list {
+                        ScrollMode::Selectable
+                    } else {
+                        ScrollMode::Text
+                    },
+                )
+            }
+        };
+        let at_last = scroll.selected == items.checked_sub(1);
+        let following = match focus {
+            Focus::MainList if self.state.view == ViewId::Logs => self.state.log_selected_index < 0,
+            Focus::Activity => self.state.activity_follow_tail,
+            _ => false,
+        };
+        let effective = if following && action == NavAction::Up {
+            NavAction::End
+        } else {
+            action
+        };
+        navigate(
+            &mut scroll,
+            effective,
+            ScrollMetrics {
+                items,
+                display_rows,
+                viewport_rows: h,
+                selection_rows: &selection_rows,
+                mode,
+            },
+        );
+        match focus {
+            Focus::MainList => match self.state.view {
+                ViewId::Goals => {
+                    self.state.goal_selected = scroll.selected.unwrap_or(0);
+                    self.state.goal_scroll = scroll.offset;
                 }
+                ViewId::Tasks => {
+                    self.state.task_selected = scroll.selected.unwrap_or(0);
+                    self.state.task_scroll = scroll.offset;
+                }
+                ViewId::Agents => {
+                    self.state.agent_selected = scroll.selected.unwrap_or(0);
+                    self.state.agent_scroll = scroll.offset;
+                }
+                ViewId::Logs => {
+                    let tail = action == NavAction::End
+                        || ((!wheel || following) && action == NavAction::Down && at_last);
+                    self.state.log_selected_index = if tail {
+                        -1
+                    } else {
+                        scroll.selected.map_or(-1, |i| i as i64)
+                    };
+                    self.state.log_scroll_offset = if tail { 0 } else { scroll.offset };
+                    self.state.log_selected_id = self.state.selected_log().map(|m| m.id);
+                }
+            },
+            Focus::Activity => {
+                self.state.activity_follow_tail = action == NavAction::End
+                    || ((!wheel || following) && action == NavAction::Down && at_last);
+                let rows = self.state.activity_messages();
+                self.state.activity_selected = scroll
+                    .selected
+                    .and_then(|i| rows.get(i))
+                    .map(|i| self.state.messages[*i].id);
+                self.state.activity_scroll = scroll.offset;
+            }
+            _ => {
+                self.state.set_pane_scroll(key, scroll);
             }
         }
+        self.state.sync_field_origin();
+    }
+    pub(crate) fn move_selection_up(&mut self) {
+        self.navigate_focus(NavAction::Up, false);
+    }
+    pub(crate) fn move_selection_down(&mut self) {
+        self.navigate_focus(NavAction::Down, false);
     }
 
-    pub(crate) fn move_selection_down(&mut self) {
-        let can_create_task = self.backend.can_create_task();
-        let can_add_agent = self.backend.can_add_agent();
-        let can_create_goal = self.backend.can_create_goal();
-        let regions = self.state.regions(can_create_task);
-        let main_h = regions.main_h as usize;
-        match self.state.view {
-            ViewId::Goals if self.state.detail_open() => {
-                self.state.goal_detail_scroll += 1;
-            }
-            ViewId::Goals => {
-                let max = self.state.goal_selection_max(can_create_goal);
-                let next = (self.state.goal_selected + 1).min(max);
-                self.state.goal_selected = next;
-                if next >= self.state.goal_scroll + main_h {
-                    self.state.goal_scroll = next + 1 - main_h;
-                }
-            }
-            ViewId::Tasks => {
-                let max = self.state.task_selection_max(can_create_task);
-                let next = (self.state.task_selected + 1).min(max);
-                self.state.task_selected = next;
-                if next >= self.state.task_scroll + main_h {
-                    self.state.task_scroll = next + 1 - main_h;
-                }
-            }
-            ViewId::Agents => {
-                let max = self.state.agent_selection_max(can_add_agent);
-                let next = (self.state.agent_selected + 1).min(max);
-                self.state.agent_selected = next;
-                if next >= self.state.agent_scroll + main_h {
-                    self.state.agent_scroll = next + 1 - main_h;
-                }
-            }
-            ViewId::Logs => {
-                let filtered = self.state.filtered_messages();
-                if self.state.log_selected_index < 0 {
-                    // Already at tail — stay there.
-                    return;
-                }
-                let next = self.state.log_selected_index + 1;
-                if next as usize >= filtered.len() {
-                    // Past the last index returns to tail.
-                    self.state.log_selected_index = -1;
-                    self.state.log_scroll_offset = 0;
-                } else {
-                    self.state.log_selected_index = next;
-                    self.state.log_scroll_offset = (next - main_h as i64 + 2).max(0) as usize;
-                }
+    fn page_wizard_options(&mut self, key: KeyEvent) -> bool {
+        if self.state.viewer.is_some()
+            || self.state.show_help
+            || self.state.show_agent_picker
+            || self.state.show_type_picker
+            || self.state.wizard_sessions.pending_leave.is_some()
+            || self.state.input_mode != InputMode::Wizard
+        {
+            return false;
+        }
+        let Some(wizard) = self.state.wizard.as_ref() else {
+            return false;
+        };
+        use crate::wizard::engine::StepKind;
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        let suggestions = wizard.step().kind == StepKind::Text;
+        if !matches!(
+            wizard.step().kind,
+            StepKind::Select | StepKind::Multiselect | StepKind::Text
+        ) {
+            return false;
+        }
+        // A text input retains Home/End cursor semantics. Only its browse
+        // list takes page keys, and a rendered copy rail takes precedence.
+        if suggestions
+            && self.state.mouse.hits.zones().iter().any(|z| {
+                matches!(
+                    z.kind,
+                    crate::hit::ZoneKind::TextAction(
+                        crate::hit::TextAction::CopyAll
+                            | crate::hit::TextAction::CopySelection
+                            | crate::hit::TextAction::CopyTerminal
+                            | crate::hit::TextAction::CopyNative
+                    )
+                )
+            })
+        {
+            return false;
+        }
+        let action = match key.code {
+            KeyCode::Home if !suggestions => NavAction::Home,
+            KeyCode::End if !suggestions => NavAction::End,
+            KeyCode::PageUp => NavAction::PageUp,
+            KeyCode::PageDown => NavAction::PageDown,
+            _ => return false,
+        };
+        let h = self.option_page_rows(crate::hit::ScrollRegion::WizardOptions);
+        let (total, current) = if suggestions {
+            (
+                wizard.filtered_suggestions().len(),
+                wizard.suggestion_index(),
+            )
+        } else {
+            (wizard.options().len(), wizard.select_index())
+        };
+        if total == 0 {
+            return false;
+        }
+        let mut scroll = ScrollState {
+            selected: Some(current),
+            offset: current.saturating_sub(h.saturating_sub(1)),
+        };
+        navigate(
+            &mut scroll,
+            action,
+            ScrollMetrics {
+                items: total,
+                display_rows: total,
+                viewport_rows: h,
+                selection_rows: &[],
+                mode: ScrollMode::Selectable,
+            },
+        );
+        if let Some(target) = scroll.selected
+            && let Some(w) = self.state.wizard.as_mut()
+        {
+            for _ in 0..target.abs_diff(current) {
+                let _ = w.handle_key(
+                    KeyEvent::new(
+                        if target < current {
+                            KeyCode::Up
+                        } else {
+                            KeyCode::Down
+                        },
+                        KeyModifiers::NONE,
+                    ),
+                    self.clock.now_ms(),
+                );
             }
         }
+        self.invalidate_hits();
+        true
+    }
+    pub(crate) fn option_page_rows(&self, region: crate::hit::ScrollRegion) -> usize {
+        use crate::hit::{ScrollRegion, ZoneKind};
+        let mut rows = Vec::new();
+        for z in self.state.mouse.hits.zones() {
+            if matches!(
+                (&z.kind, region),
+                (ZoneKind::PickerRow { .. }, ScrollRegion::AgentPicker)
+                    | (ZoneKind::TypePickerRow { .. }, ScrollRegion::TypePicker)
+                    | (
+                        ZoneKind::WizardOption { .. } | ZoneKind::WizardSuggestion { .. },
+                        ScrollRegion::WizardOptions
+                    )
+            ) && !rows.contains(&z.rect.y)
+            {
+                rows.push(z.rect.y);
+            }
+        }
+        if !rows.is_empty() {
+            return rows.len();
+        }
+        self.state
+            .mouse
+            .hits
+            .zones()
+            .iter()
+            .find(|z| z.kind == ZoneKind::Scroll(region))
+            .map_or(0, |z| z.rect.height as usize)
+    }
+    fn page_picker(&mut self, action: NavAction, types: bool) {
+        let region = if types {
+            crate::hit::ScrollRegion::TypePicker
+        } else {
+            crate::hit::ScrollRegion::AgentPicker
+        };
+        let n = if types {
+            MsgType::ALL.len()
+        } else {
+            self.state.agents.len()
+        };
+        let mut scroll = ScrollState {
+            selected: Some(self.state.picker_cursor),
+            offset: self.state.picker_scroll,
+        };
+        navigate(
+            &mut scroll,
+            action,
+            ScrollMetrics {
+                items: n,
+                display_rows: n,
+                viewport_rows: self.option_page_rows(region),
+                selection_rows: &[],
+                mode: ScrollMode::Selectable,
+            },
+        );
+        self.state.picker_cursor = scroll.selected.unwrap_or(0);
+        self.state.picker_scroll = scroll.offset;
+    }
+    pub(crate) fn navigate_suggestions(&mut self, action: NavAction) {
+        let suggestions = self.suggestions(self.state.command_bar.input.value());
+        let rows: Vec<_> = suggestions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| (!s.is_separator()).then_some(i))
+            .collect();
+        let current = rows
+            .iter()
+            .position(|i| *i == self.state.command_bar.suggestion_index)
+            .unwrap_or(0);
+        let h = self
+            .state
+            .mouse
+            .hits
+            .zones()
+            .iter()
+            .find(|z| {
+                z.kind == crate::hit::ZoneKind::Scroll(crate::hit::ScrollRegion::CommandSuggestions)
+            })
+            .map_or(0, |z| z.rect.height as usize);
+        let mut scroll = ScrollState {
+            selected: Some(current),
+            offset: self.state.suggestion_scroll,
+        };
+        navigate(
+            &mut scroll,
+            action,
+            ScrollMetrics {
+                items: rows.len(),
+                display_rows: suggestions.len(),
+                viewport_rows: h,
+                selection_rows: &rows,
+                mode: ScrollMode::Selectable,
+            },
+        );
+        self.state.command_bar.suggestion_index = scroll
+            .selected
+            .and_then(|i| rows.get(i))
+            .copied()
+            .unwrap_or(0);
+        self.state.suggestion_scroll = scroll.offset;
     }
 
     // ── Command mode ───────────────────────────────────────────────────────
@@ -797,6 +1376,23 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     fn handle_command_key(&mut self, key: KeyEvent, now: i64) {
         let value = self.state.command_bar.input.value().to_string();
         let suggestions = self.suggestions(&value);
+        if !suggestions.is_empty() {
+            let action = match key.code {
+                KeyCode::Up => Some(NavAction::Up),
+                KeyCode::Down => Some(NavAction::Down),
+                KeyCode::PageUp => Some(NavAction::PageUp),
+                KeyCode::PageDown => Some(NavAction::PageDown),
+                KeyCode::Home if key.modifiers.is_empty() => Some(NavAction::Home),
+                KeyCode::End if key.modifiers.is_empty() => Some(NavAction::End),
+                _ => None,
+            };
+            if let Some(action) = action {
+                self.navigate_suggestions(action);
+                self.state.command_bar.retained_refusal.clear();
+                self.disarm_broadcast();
+                return;
+            }
+        }
         // Any key but Enter means the user has moved on from the refusal —
         // editing, history, Tab or Esc. Enter is excluded because it is what
         // sets these lines, and `cmd_msg` clears them itself on every run.
@@ -843,6 +1439,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     {
                         self.state.command_bar.input.reset(&insert);
                         self.state.command_bar.suggestion_index = 0;
+                        self.state.suggestion_scroll = 0;
                         return;
                     }
                     if selected.insert.is_none() {
@@ -855,6 +1452,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                         if selected.subs.is_some() && !cmd_part.contains(' ') {
                             self.state.command_bar.input.reset(&format!("{cmd_part} "));
                             self.state.command_bar.suggestion_index = 0;
+                            self.state.suggestion_scroll = 0;
                             return;
                         }
                     }
@@ -867,6 +1465,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.submitted_generation = self.state.command_bar.input.generation();
                 self.state.command_bar.input.reset("");
                 self.state.command_bar.suggestion_index = 0;
+                self.state.suggestion_scroll = 0;
                 self.state.command_bar.history.push(&cmd_to_run);
                 self.execute_command(&cmd_to_run);
                 // `/msg` refusals and the broadcast arm keep the bar open with
@@ -913,6 +1512,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                         if let Some(insert) = selected.insert.clone() {
                             self.state.command_bar.input.reset(&insert);
                             self.state.command_bar.suggestion_index = 0;
+                            self.state.suggestion_scroll = 0;
                             return;
                         }
                         let cmd_part = strip_args_hint(&selected.cmd);
@@ -923,6 +1523,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                         };
                         self.state.command_bar.input.reset(&filled);
                         self.state.command_bar.suggestion_index = 0;
+                        self.state.suggestion_scroll = 0;
                     }
                 } else if let Some(suffix) = resolve_completion(&value) {
                     self.state
@@ -951,6 +1552,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             _ => {
                 if self.state.command_bar.input.handle_key(key, now) {
                     self.state.command_bar.suggestion_index = 0;
+                    self.state.suggestion_scroll = 0;
                 }
             }
         }
@@ -976,6 +1578,25 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     fn handle_agent_picker_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Home => {
+                self.page_picker(NavAction::Home, false);
+                return;
+            }
+            KeyCode::End => {
+                self.page_picker(NavAction::End, false);
+                return;
+            }
+            KeyCode::PageUp => {
+                self.page_picker(NavAction::PageUp, false);
+                return;
+            }
+            KeyCode::PageDown => {
+                self.page_picker(NavAction::PageDown, false);
+                return;
+            }
+            _ => {}
+        }
+        match key.code {
             KeyCode::Up => self.picker_move(-1),
             KeyCode::Down => self.picker_move(1),
             KeyCode::Char(' ') => self.picker_toggle_cursor(),
@@ -987,6 +1608,25 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     fn handle_type_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Home => {
+                self.page_picker(NavAction::Home, true);
+                return;
+            }
+            KeyCode::End => {
+                self.page_picker(NavAction::End, true);
+                return;
+            }
+            KeyCode::PageUp => {
+                self.page_picker(NavAction::PageUp, true);
+                return;
+            }
+            KeyCode::PageDown => {
+                self.page_picker(NavAction::PageDown, true);
+                return;
+            }
+            _ => {}
+        }
         match key.code {
             KeyCode::Up => self.type_picker_move(-1),
             KeyCode::Down => self.type_picker_move(1),
