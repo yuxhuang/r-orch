@@ -3874,9 +3874,12 @@ the previous guard set failed: see §14.31.1.
 | Guard | Bound |
 |---|---|
 | Document size | > 1 MiB |
-| Alias count | > 64 |
+| Alias count | > 64, counted exactly from `Event::Alias` in the pre-pass walk |
 
-They are cheap, they reject obvious junk before the walk, and neither is load-bearing any more.
+The size cap rejects oversized input before the walk; the alias cap stops the walk at alias 65.
+Both are cheap defence in depth; the expanded-node budget remains the load-bearing control.
+Alias counting uses parser events rather than a text scan: Markdown in block scalars was
+miscounted as aliases, while apostrophes in plain scalars could hide real aliases.
 
 #### There is no timeout, deliberately
 

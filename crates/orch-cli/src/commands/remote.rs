@@ -57,16 +57,17 @@ pub async fn run(
             if ctx.json {
                 return print_json(&entries);
             }
+            let now = engine.clock.now_ms();
             let mut rows = Vec::new();
             for entry in entries {
-                let online = store
-                    .read_status(&entry.alias)
-                    .await?
-                    .is_some_and(|status| status.online);
+                let status = store.read_status(&entry.alias).await?;
                 rows.push(vec![
                     entry.alias,
                     entry.addr,
-                    if online { "online" } else { "offline" }.into(),
+                    status
+                        .as_ref()
+                        .map(|status| describe_link(status, now))
+                        .unwrap_or_else(|| "offline".into()),
                 ]);
             }
             print_table(styles, &["ALIAS", "ADDRESS", "STATUS"], &rows, 2);
@@ -75,7 +76,7 @@ pub async fn run(
             let config = engine.config_store.read().await?;
             let inbound = store.read_inbound().await?;
             let configured = config.peer.listen;
-            let (listen, controller) = listener_status(&engine.paths, false).await?;
+            let listener = listener_status(&engine.paths, false).await?;
             let mut remotes = Vec::new();
             for entry in store.list().await? {
                 remotes.push(
@@ -92,29 +93,59 @@ pub async fn run(
                             instance_id: None,
                             os: None,
                             agents: Vec::new(),
+                            peer_version: None,
+                            link_state: orch_domain::LinkState::Connecting,
+                            next_retry_at: None,
+                            attempts: 0,
                         }),
                 );
             }
             if ctx.json {
-                return print_json(
-                    &serde_json::json!({"listen": listen, "listen_configured": configured, "controller": controller, "inbound": inbound, "remotes": remotes}),
-                );
+                return print_json(&serde_json::json!({
+                    "listen": listener.addr,
+                    "listen_configured": configured,
+                    "controller": listener.controller,
+                    "last_session_error": listener.last_session_error,
+                    "inbound": inbound,
+                    "remotes": remotes,
+                }));
             }
             println!(
-                "  Listen: {}",
-                describe_listen(listen.as_deref(), configured.as_deref())
+                "  Listen: {}{}",
+                describe_listen(listener.addr.as_deref(), configured.as_deref()),
+                listener
+                    .last_session_error
+                    .as_ref()
+                    .map(|error| format!(" (last session ended: {error})"))
+                    .unwrap_or_default()
             );
-            println!("  Controller: {}", controller.as_deref().unwrap_or("none"));
+            println!(
+                "  Controller: {}{}",
+                listener.controller.as_deref().unwrap_or("none"),
+                inbound
+                    .as_ref()
+                    .filter(|_| listener.controller.is_some())
+                    .and_then(|inbound| inbound.controller_version.as_deref())
+                    .map(|version| format!(" (v{version})"))
+                    .unwrap_or_default()
+            );
+            let now = engine.clock.now_ms();
             for status in remotes {
                 println!(
                     "  {}: {}{}",
                     status.alias,
-                    if status.online { "online" } else { "offline" },
+                    describe_link(&status, now),
                     status
-                        .last_error
+                        .peer_version
                         .as_ref()
-                        .map(|e| format!(" ({e})"))
-                        .unwrap_or_default()
+                        .map(|version| format!(" v{version}"))
+                        .unwrap_or_else(|| if status.online {
+                            // A peer that predates the field, so there is no
+                            // version to show and nothing to infer from it.
+                            " (version unknown)".into()
+                        } else {
+                            String::new()
+                        })
                 );
             }
         }
@@ -150,21 +181,34 @@ pub async fn run(
     Ok(())
 }
 
+/// What a live engine owner's peer listener has published.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListenerStatus {
+    pub addr: Option<String>,
+    pub controller: Option<String>,
+    /// Why the last inbound controller session ended. It outlives the session
+    /// on purpose: a controller that keeps reconnecting is only explicable
+    /// from the error the worker recorded as each session died.
+    pub last_session_error: Option<String>,
+}
+
 /// The address of a socket a live engine owner has bound, and its connected
 /// controller. A configured preference (which may be port 0) is never an
-/// active listener: `(None, None)` unless the lock holder is alive, fresh, and
-/// published the record itself. `own_runtime` says whether this process
+/// active listener: an empty [`ListenerStatus`] unless the lock holder is
+/// alive, fresh, and published the record itself. `own_runtime` says whether this process
 /// currently runs a peer runtime; without one, a record stamped with our own
 /// PID is left over from a stopped listener (TUI `/pause`).
 pub(crate) async fn listener_status(
     paths: &orch_infra::storage::Paths,
     own_runtime: bool,
-) -> Result<(Option<String>, Option<String>)> {
+) -> Result<ListenerStatus> {
     #[derive(serde::Deserialize)]
     struct Listener {
         listen_addr: String,
         controller_name: Option<String>,
         pid: Option<u32>,
+        #[serde(default)]
+        last_session_error: Option<String>,
     }
 
     let recent = tokio::fs::metadata(paths.lock_path())
@@ -185,10 +229,47 @@ pub(crate) async fn listener_status(
             && listener.pid == holder.pid
             && (own_runtime || listener.pid != Some(std::process::id()))
         {
-            return Ok((Some(listener.listen_addr), listener.controller_name));
+            return Ok(ListenerStatus {
+                addr: Some(listener.listen_addr),
+                controller: listener.controller_name,
+                last_session_error: listener.last_session_error,
+            });
         }
     }
-    Ok((None, None))
+    Ok(ListenerStatus::default())
+}
+
+/// One wording for the CLI and the TUI: what this link is doing, and when it
+/// will try again. `offline` alone covered a worker that is down, one serving
+/// another controller, and one being redialled every second — which is how
+/// the live redial storm stayed invisible.
+pub(crate) fn describe_link(status: &RemoteStatus, now_ms: i64) -> String {
+    if status.online {
+        return "online".into();
+    }
+    let cause = status.last_error.clone().or_else(|| {
+        (status.link_state == orch_domain::LinkState::Connecting).then(|| "connecting".into())
+    });
+    let mut retry = Vec::new();
+    if let Some(due) = status
+        .next_retry_at
+        .as_deref()
+        .and_then(orch_core::clock::epoch_ms_from_iso)
+    {
+        retry.push(format!(
+            "retry in {}s",
+            due.saturating_sub(now_ms).max(0) / 1000
+        ));
+    }
+    if status.attempts > 1 {
+        retry.push(format!("attempt {}", status.attempts));
+    }
+    match (cause, retry.join(", ")) {
+        (None, retry) if retry.is_empty() => "offline".into(),
+        (None, retry) => format!("offline ({retry})"),
+        (Some(cause), retry) if retry.is_empty() => format!("offline ({cause})"),
+        (Some(cause), retry) => format!("offline ({cause}; {retry})"),
+    }
 }
 
 /// One wording for the CLI and the TUI header: only a bound socket is shown
@@ -326,6 +407,79 @@ mod tests {
         (temp, engine, ctx)
     }
 
+    #[test]
+    fn a_links_description_says_what_it_is_doing_and_when_it_retries() {
+        let base = RemoteStatus {
+            alias: "w1".into(),
+            addr: "127.0.0.1:7690".into(),
+            online: false,
+            last_seen: None,
+            last_error: None,
+            peer_name: None,
+            instance_id: None,
+            os: None,
+            agents: Vec::new(),
+            peer_version: None,
+            link_state: orch_domain::LinkState::Connecting,
+            next_retry_at: None,
+            attempts: 0,
+        };
+        let now = 1_000_000;
+        assert_eq!(describe_link(&base, now), "offline (connecting)");
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    online: true,
+                    link_state: orch_domain::LinkState::Online,
+                    attempts: 5,
+                    ..base.clone()
+                },
+                now
+            ),
+            "online"
+        );
+        // The live failure: a worker that closed every session right after
+        // the handshake looked exactly like one that was simply down.
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    last_error: Some("Peer closed connection".into()),
+                    link_state: orch_domain::LinkState::Backoff,
+                    next_retry_at: Some(orch_core::clock::iso_from_epoch_ms(now + 12_400)),
+                    attempts: 5,
+                    ..base.clone()
+                },
+                now
+            ),
+            "offline (Peer closed connection; retry in 12s, attempt 5)"
+        );
+        // A retry already due, and a first attempt, carry no counters.
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    last_error: Some("Worker busy: controlled by mac".into()),
+                    link_state: orch_domain::LinkState::Busy,
+                    next_retry_at: Some(orch_core::clock::iso_from_epoch_ms(now - 5_000)),
+                    attempts: 1,
+                    ..base.clone()
+                },
+                now
+            ),
+            "offline (Worker busy: controlled by mac; retry in 0s)"
+        );
+        // A record written before these fields still reads sensibly.
+        assert_eq!(
+            describe_link(
+                &RemoteStatus {
+                    last_error: Some("Peer heartbeat timed out".into()),
+                    ..base
+                },
+                now
+            ),
+            "offline (Peer heartbeat timed out)"
+        );
+    }
+
     #[tokio::test]
     async fn listener_status_reports_only_a_live_owners_bound_socket() {
         let (_temp, engine, _ctx) = fixture().await;
@@ -345,29 +499,33 @@ mod tests {
                 .unwrap();
             }
         };
-        let live = (Some("127.0.0.1:41234".into()), Some("controller-a".into()));
-        let inactive = (None, None);
+        let live = || ListenerStatus {
+            addr: Some("127.0.0.1:41234".into()),
+            controller: Some("controller-a".into()),
+            last_session_error: None,
+        };
+        let inactive = ListenerStatus::default;
         publish(std::process::id()).await;
         // No owner: a leftover record is not a listener.
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
 
         let acquired = lock::acquire_lock(&engine.paths.lock_path()).await.unwrap();
         assert!(acquired.acquired);
-        assert_eq!(listener_status(&engine.paths, true).await.unwrap(), live);
+        assert_eq!(listener_status(&engine.paths, true).await.unwrap(), live());
         // This process holds the lock but its peer runtime stopped (TUI
         // `/pause`): the record it left behind is stale.
         assert_eq!(
             listener_status(&engine.paths, false).await.unwrap(),
-            inactive
+            inactive()
         );
         // Published by a different process than the lock holder.
         publish(std::process::id() + 1).await;
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
         // Records from builds without an owner stamp are never trusted.
         orch_infra::storage::fs_utils::write_json(
@@ -378,12 +536,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
         tokio::fs::remove_file(&record).await.unwrap();
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
 
         publish(std::process::id()).await;
@@ -397,12 +555,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
         lock::release_lock(&engine.paths.lock_path()).await;
         assert_eq!(
             listener_status(&engine.paths, true).await.unwrap(),
-            inactive
+            inactive()
         );
     }
 
@@ -567,10 +725,7 @@ mod tests {
         state.running.insert(
             task.id.clone(),
             orch_domain::RunningEntry {
-                remote: Some(orch_domain::RemoteRunRef {
-                    alias: "w1".into(),
-                    exec_key: run.id.clone(),
-                }),
+                remote: Some(orch_domain::RemoteRunRef::new("w1", &run.id)),
                 run_id: run.id.clone(),
                 agent_id: run.agent_id.clone(),
                 task_id: task.id.clone(),

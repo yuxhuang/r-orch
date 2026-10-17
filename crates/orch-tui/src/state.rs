@@ -5,8 +5,8 @@
 
 use indexmap::IndexSet;
 use orch_domain::{
-    Agent, AgentStatus, Goal, NotificationPreferences, OrchestratorState, Task, TaskStatus, Team,
-    TeamStatus, default_state, goal_status_order,
+    Agent, AgentStatus, Goal, NotificationPreferences, OrchestratorState, RemoteRunRef, Task,
+    TaskStatus, Team, TeamStatus, default_state, goal_status_order,
 };
 
 use crate::command_bar::CommandHistory;
@@ -675,6 +675,16 @@ impl AppState {
 
     pub fn task_by_id(&self, task_id: &str) -> Option<&Task> {
         self.tasks.iter().find(|t| t.id == task_id)
+    }
+
+    /// The peer execution behind a task, when it has one. A task is
+    /// `in_progress` from the moment it is dispatched, so for remote work the
+    /// phase here is the only honest thing to show.
+    pub fn remote_run(&self, task_id: &str) -> Option<&RemoteRunRef> {
+        self.orch_state
+            .running
+            .get(task_id)
+            .and_then(|entry| entry.remote.as_ref())
     }
 
     /// Per-agent identity colour, assigned by position in the live agent list.

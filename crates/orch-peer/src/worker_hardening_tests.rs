@@ -35,6 +35,7 @@ impl TestListener {
                 name: "controller".into(),
                 os: "test".into(),
                 agents: vec![],
+                version: None,
             },
         )
         .await
@@ -422,6 +423,401 @@ async fn oversized_sync_and_finished_keep_session_open_for_next_frame() {
     finished.sort();
     assert_eq!(synced, keys);
     assert_eq!(finished, keys);
+}
+
+/// The live failure this branch fixes: one mirror whose task file could not be
+/// read errored the whole tick, so the worker closed the connection right after
+/// every handshake and the controller saw the peer as permanently offline. The
+/// mirror's index entry survives a corrupt file, so `mirrors()` still lists a
+/// task that `tasks.get` cannot read — exactly the production shape.
+#[tokio::test]
+async fn an_unreadable_mirror_is_reported_unknown_and_keeps_the_session() {
+    let listener = TestListener::start().await;
+    let mut read = listener.hello("sender").await;
+    listener.sync(&mut read).await;
+    write_frame(read.get_mut(), &submit("poison", &listener.agent))
+        .await
+        .unwrap();
+    assert!(matches!(
+        socket_data(&mut read).await,
+        Some(Frame::Submitted { .. })
+    ));
+    let task = mirror(&listener.worker, "poison").await;
+    let path = listener
+        .worker
+        .ctx
+        .engine
+        .paths
+        .task_path(&task.id)
+        .unwrap();
+    tokio::fs::write(&path, b"{not: [valid").await.unwrap();
+
+    write_frame(
+        read.get_mut(),
+        &Frame::Sync {
+            active: vec!["poison".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let Some(Frame::SyncState { items }) = socket_data(&mut read).await else {
+        panic!("sync must be answered even when a mirror is unreadable")
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].state, "unknown");
+    // Which class it is depends on which read path meets the corrupt file
+    // first, so pin the shape rather than the word.
+    let reason = items[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        matches!(
+            reason,
+            "worker storage error: read failed" | "worker storage error: corrupt record"
+        ),
+        "the reason names a class, never the error text: that can carry a local path; got {reason:?}"
+    );
+    assert_eq!(items[0].worker_task_id.as_deref(), Some(task.id.as_str()));
+
+    // The session is still usable: the next frame is answered, and a tick's
+    // worth of updates reports the same key as unknown rather than ending it.
+    write_frame(read.get_mut(), &Frame::Ping).await.unwrap();
+    loop {
+        match socket_data(&mut read).await {
+            // The sync reply's trailing updates repeat the degraded key.
+            Some(Frame::SyncState { items }) => assert_eq!(items[0].state, "unknown"),
+            Some(Frame::Pong) => break,
+            other => panic!("session closed instead of answering: {other:?}"),
+        }
+    }
+    let updates = listener
+        .worker
+        .updates("sender", &mut HashMap::new())
+        .await;
+    assert!(
+        matches!(&updates[0], Frame::SyncState { items } if items[0].state == "unknown"
+            && items[0].reason.is_some()),
+        "{updates:?}"
+    );
+
+    // And it recovers by itself once the record is readable again.
+    listener
+        .worker
+        .ctx
+        .engine
+        .tasks
+        .save(&task)
+        .await
+        .unwrap();
+    let item = listener.worker.item("poison", Some(&task)).await;
+    assert_eq!((item.state.as_str(), item.reason.as_deref()), ("queued", None));
+}
+
+/// A controller's instance id becomes a task label, a key in
+/// `_controllers.json` and operator output. It is an allowlist at admission,
+/// and the map it keys is bounded, because both are peer-chosen.
+#[tokio::test]
+async fn a_hostile_controller_identity_is_refused_and_the_map_is_bounded() {
+    let listener = TestListener::start().await;
+    for hostile in [
+        String::new(),
+        "x".repeat(129),
+        "../../etc/passwd".into(),
+        "id with spaces".into(),
+        "\u{1b}]0;pwned\u{7}".into(),
+    ] {
+        let mut socket = TcpStream::connect(listener.addr).await.unwrap();
+        write_frame(
+            &mut socket,
+            &Frame::Hello {
+                proto: PROTOCOL,
+                instance_id: hostile.clone(),
+                name: "controller".into(),
+                os: "test".into(),
+                agents: vec![],
+                version: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut read = BufReader::new(socket);
+        assert!(
+            matches!(socket_next(&mut read).await, Some(Frame::Error { .. })),
+            "admitted {hostile:?}"
+        );
+        socket_closed(&mut read).await;
+    }
+    // The display name reaches operator output too: control characters and
+    // Unicode line separators are refused, not silently stripped.
+    for hostile in ["\u{1b}]0;pwned\u{7}\u{1b}[2J", "two\nlines", "sep\u{2028}arator"] {
+        let mut socket = TcpStream::connect(listener.addr).await.unwrap();
+        write_frame(
+            &mut socket,
+            &Frame::Hello {
+                proto: PROTOCOL,
+                instance_id: "ctl-name".into(),
+                name: hostile.into(),
+                os: "test".into(),
+                agents: vec![],
+                version: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut read = BufReader::new(socket);
+        assert!(
+            matches!(socket_next(&mut read).await, Some(Frame::Error { .. })),
+            "admitted name {hostile:?}"
+        );
+        socket_closed(&mut read).await;
+    }
+    // A long-lived listener must not accumulate one record per identity.
+    let mut seen = std::collections::BTreeMap::new();
+    for index in 0..300 {
+        seen.insert(
+            format!("ctl-{index:04}"),
+            format!("2026-10-16T00:{:02}:{:02}Z", index / 60, index % 60),
+        );
+    }
+    orch_infra::storage::fs_utils::write_json(&listener.worker.controllers_path(), &seen)
+        .await
+        .unwrap();
+    listener.worker.record_controller("newcomer").await.unwrap();
+    let stored: std::collections::BTreeMap<String, String> =
+        orch_infra::storage::fs_utils::read_json(&listener.worker.controllers_path())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(stored.len(), 256);
+    assert!(stored.contains_key("newcomer"), "the current controller stays");
+    assert!(
+        !stored.contains_key("ctl-0000"),
+        "the least recently seen made way"
+    );
+    assert!(stored.contains_key("ctl-0299"));
+    // And a valid id is still admitted.
+    listener.healthy().await;
+}
+
+/// A mirror only runs for the controller currently connected, so one left by
+/// a controller that never comes back would sit `todo` in a local agent's
+/// queue for ever. After a day it is cancelled, and the task says why.
+#[tokio::test]
+async fn an_orphaned_mirror_is_cancelled_after_a_day_without_its_controller() {
+    let (_temp, worker, agent) = fixture().await;
+    // Two mirrors from a controller that is not the connected one.
+    for key in ["gone-todo", "gone-running"] {
+        worker
+            .handle("ghost", "ghost", submit(key, &agent))
+            .await
+            .unwrap();
+    }
+    let mut running = mirror(&worker, "gone-running").await;
+    running.status = TaskStatus::InProgress;
+    worker.ctx.engine.tasks.save(&running).await.unwrap();
+    // And one from the controller that is connected right now.
+    worker
+        .handle("controller", "controller", submit("live", &agent))
+        .await
+        .unwrap();
+    worker
+        .session
+        .lock()
+        .await
+        .claim("controller", "controller")
+        .unwrap();
+
+    // First sweep: the absence of a controller is dated from the first time
+    // this instance noticed it, so nothing is cancelled on sight.
+    assert_eq!(worker.collect_orphan_mirrors().await.unwrap(), 0);
+    assert_eq!(
+        mirror(&worker, "gone-todo").await.status,
+        TaskStatus::Todo,
+        "a controller seen for the first time gets its full day"
+    );
+    let seen: std::collections::BTreeMap<String, String> =
+        orch_infra::storage::fs_utils::read_json(&worker.controllers_path())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        seen.keys().cloned().collect::<Vec<_>>(),
+        vec!["controller".to_owned(), "ghost".to_owned()]
+    );
+
+    // A day and an hour later.
+    let absent = orch_core::clock::iso_from_epoch_ms(
+        worker.ctx.engine.clock.now_ms() - 25 * 3_600_000,
+    );
+    orch_infra::storage::fs_utils::write_json(
+        &worker.controllers_path(),
+        &std::collections::BTreeMap::from([
+            ("ghost".to_owned(), absent.clone()),
+            ("controller".to_owned(), absent.clone()),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(worker.collect_orphan_mirrors().await.unwrap(), 1);
+
+    let orphan = mirror(&worker, "gone-todo").await;
+    assert_eq!(orphan.status, TaskStatus::Cancelled);
+    assert_eq!(
+        orphan.feedback.as_deref(),
+        Some(
+            format!("orphaned remote mirror: controller ghost absent since {absent}").as_str()
+        )
+    );
+    assert_eq!(
+        mirror(&worker, "gone-running").await.status,
+        TaskStatus::InProgress,
+        "a running mirror owns a local process and belongs to quarantine"
+    );
+    assert_eq!(
+        mirror(&worker, "live").await.status,
+        TaskStatus::Todo,
+        "the connected controller is never absent"
+    );
+}
+
+/// The live failure: the controller gave up on an unreadable mirror and sent
+/// a cancel, which the worker could not apply either — and nothing retried
+/// it, so the mirror sat `todo` on the worker until the next reconnect. The
+/// key is kept and retried every tick instead.
+#[tokio::test]
+async fn a_cancel_for_an_unreadable_mirror_is_retried_until_it_applies() {
+    let listener = TestListener::start().await;
+    let mut read = listener.hello("sender").await;
+    listener.sync(&mut read).await;
+    write_frame(read.get_mut(), &submit("poison", &listener.agent))
+        .await
+        .unwrap();
+    assert!(matches!(
+        socket_data(&mut read).await,
+        Some(Frame::Submitted { .. })
+    ));
+    let task = mirror(&listener.worker, "poison").await;
+    let path = listener
+        .worker
+        .ctx
+        .engine
+        .paths
+        .task_path(&task.id)
+        .unwrap();
+    tokio::fs::write(&path, b"{not: [valid").await.unwrap();
+
+    write_frame(
+        read.get_mut(),
+        &Frame::Cancel {
+            exec_key: "poison".into(),
+        },
+    )
+    .await
+    .unwrap();
+    // No acknowledgement: one the controller cannot trust would retire a
+    // cancellation key that never took. The key is held instead.
+    write_frame(read.get_mut(), &Frame::Ping).await.unwrap();
+    loop {
+        match socket_data(&mut read).await {
+            Some(Frame::Pong) => break,
+            Some(Frame::SyncState { .. }) => {}
+            other => panic!("an unapplied cancel must not be acknowledged: {other:?}"),
+        }
+    }
+    assert_eq!(
+        listener
+            .worker
+            .faults()
+            .unapplied_cancels
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["poison".to_owned()]
+    );
+    assert_eq!(mirror(&listener.worker, "poison").await.status, TaskStatus::Todo);
+
+    // The record is readable again: the next tick applies the cancel and
+    // acknowledges it, with no reconnect and no second cancel frame.
+    listener
+        .worker
+        .ctx
+        .engine
+        .tasks
+        .save(&task)
+        .await
+        .unwrap();
+    loop {
+        match socket_data(&mut read).await {
+            Some(Frame::CancelAck { exec_key }) => {
+                assert_eq!(exec_key, "poison");
+                break;
+            }
+            Some(Frame::SyncState { .. } | Frame::Pong) => {}
+            other => panic!("the deferred cancel was never applied: {other:?}"),
+        }
+    }
+    assert_eq!(
+        mirror(&listener.worker, "poison").await.status,
+        TaskStatus::Cancelled
+    );
+    assert!(listener.worker.faults().unapplied_cancels.is_empty());
+}
+
+/// 2com's `serve.log` had no peer lines at all while every session died, so
+/// there was nothing to debug from. A session that ends with an error is now
+/// logged, reported, and left behind in `_listener.json` for `remote status`.
+#[tokio::test]
+async fn a_failed_session_records_why_in_the_listener_record() {
+    let listener = TestListener::start().await;
+    let mut events = listener.worker.ctx.engine.events.subscribe();
+    let mut read = listener.hello("sender").await;
+    listener.sync(&mut read).await;
+    // A worker-to-controller frame arriving from the controller: a contract
+    // violation, and one of the few things that still ends a session.
+    write_frame(
+        read.get_mut(),
+        &Frame::CancelAck {
+            exec_key: "key".into(),
+        },
+    )
+    .await
+    .unwrap();
+    socket_closed(&mut read).await;
+
+    let record = timeout(Duration::from_secs(5), async {
+        loop {
+            let status: serde_json::Value = serde_json::from_slice(
+                &tokio::fs::read(
+                    listener
+                        .worker
+                        .ctx
+                        .engine
+                        .paths
+                        .remotes_dir()
+                        .join("_listener.json"),
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            if !status["last_session_error"].is_null() {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the ended session was never recorded");
+    assert_eq!(record["last_session_error"], "unexpected controller frame");
+    assert!(record["last_session_error_at"].is_string());
+    assert!(record["controller_name"].is_null(), "{record}");
+    assert!(
+        matches!(
+            timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap().as_ref(),
+            orch_domain::OrchestratorEvent::OrchestratorError { error, fatal: false, .. }
+                if error.contains("unexpected controller frame")
+        ),
+        "the session end must reach the event feed"
+    );
+    listener.healthy().await;
 }
 
 fn incoming_message(id: &str, to: &str) -> Frame {

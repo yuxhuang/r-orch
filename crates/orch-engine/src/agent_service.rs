@@ -362,7 +362,7 @@ impl AgentService {
             .into_iter()
             .map(|agent| (score_agent(&agent, labels), agent))
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
 
         scored.into_iter().next().map(|(_, agent)| agent)
     }

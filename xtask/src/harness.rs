@@ -2030,7 +2030,7 @@ fn with_sorted_keys(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut pairs: Vec<_> = map.iter().collect();
-            pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+            pairs.sort_by_key(|(key, _)| *key);
             Value::Object(
                 pairs
                     .into_iter()

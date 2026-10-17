@@ -125,8 +125,10 @@ fn render_task_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         .map(|p| p.files_changed.len())
         .unwrap_or(0);
 
-    // Row budget (ported verbatim).
-    let mut used_rows = 3usize;
+    // Row budget (ported verbatim), plus the one row a remote phase's hint
+    // takes when there is one.
+    let remote_hint = state.remote_run(&task.id).and_then(|remote| remote.hint());
+    let mut used_rows = 3usize + usize::from(remote_hint.is_some());
     if !attachments.is_empty() {
         used_rows += 2 + attachments.len();
     }
@@ -168,10 +170,22 @@ fn render_task_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         kv_row(
             ctx,
             "status",
-            Span::styled(
-                task.status.to_string(),
-                ctx.style(task_status_token(task.status)),
-            ),
+            // The peer's phase, when there is one: the local status says
+            // `in_progress` for work the worker may not have started, and
+            // its colour would say the same.
+            match state
+                .remote_run(&task.id)
+                .and_then(|remote| remote.status_label().map(|label| (remote.phase, label)))
+            {
+                Some((phase, label)) => Span::styled(
+                    cap_line(&label, COL1_W.saturating_sub(11)),
+                    ctx.style(crate::theme::remote_phase_token(phase)),
+                ),
+                None => Span::styled(
+                    task.status.to_string(),
+                    ctx.style(task_status_token(task.status)),
+                ),
+            },
             Some(("assignee", assignee)),
         ),
     );
@@ -228,6 +242,25 @@ fn render_task_detail(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         kv_row(ctx, "labels", labels, Some(("depends", depends))),
     );
     y += 1;
+    // What the operator has to *do* about this phase — most often the
+    // `orch task approve` its worker's own owner has to run.
+    if let Some(hint) = remote_hint.as_deref() {
+        put_line(
+            frame,
+            area,
+            y,
+            kv_row(
+                ctx,
+                "remote",
+                Span::styled(
+                    cap_line(hint, width.saturating_sub(14)),
+                    ctx.style(Token::Amber),
+                ),
+                None,
+            ),
+        );
+        y += 1;
+    }
 
     if !attachments.is_empty() {
         y += 1;

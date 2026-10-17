@@ -327,6 +327,21 @@ impl Orchestrator {
         if !is_dispatchable(task.status) || task.awaits_approval() {
             return Ok(());
         }
+        // A mirror belongs to the controller session that submitted it: only
+        // that session can be told the run started, and only it will collect
+        // the outcome. Running one for an absent controller burns an agent on
+        // work nobody is waiting for, so the mirror waits instead (a mirror
+        // whose controller never returns is cleaned up separately).
+        if let Some(controller) = mirror_controller(&task)
+            && self.inbound_controller().as_deref() != Some(controller)
+        {
+            tracing::debug!(
+                task_id = %task.id,
+                %controller,
+                "Skipping remote mirror: its controller is not the current session"
+            );
+            return Ok(());
+        }
 
         state.claimed.insert(task_id.to_owned());
         self.save_state(state).await?;
@@ -486,16 +501,12 @@ impl Orchestrator {
         // Split mode keeps the system half cacheable between runs; a
         // user-supplied `prompt.template` opts out of the split entirely.
         let prompt_config = self.config().prompt.clone().unwrap_or_default();
-        let mirror_controller = task
+        let mirror_peer = task
             .labels
             .iter()
             .find_map(|label| label.strip_prefix("remote:"))
-            .filter(|_| {
-                task.labels
-                    .iter()
-                    .any(|label| label.starts_with("remote-ctl:"))
-            });
-        let (mut prompt, mut system_prompt) = if let Some(controller) = mirror_controller {
+            .filter(|_| mirror_controller(&task).is_some());
+        let (mut prompt, mut system_prompt) = if let Some(controller) = mirror_peer {
             let from = task
                 .labels
                 .iter()
@@ -624,11 +635,10 @@ impl Orchestrator {
 
         if let Some(remote) = &agent.remote {
             let now = self.deps().clock.now_iso();
-            let reference = orch_domain::RemoteRunRef {
-                alias: remote.alias.clone(),
-                exec_key: run.id.clone(),
-            };
-            self.deps().run_service.start(&run.id, 0).await?;
+            // The run stays `preparing` until the worker says it is running.
+            // Starting it here claimed a peer had begun work that had not
+            // even been written to the socket.
+            let reference = orch_domain::RemoteRunRef::new(&remote.alias, &run.id);
             state.claimed.shift_remove(&task_id);
             state.running.insert(
                 task_id.clone(),
@@ -669,41 +679,11 @@ impl Orchestrator {
             };
             let auto_approve = task.is_autonomous()
                 || agent.config.approval_policy == Some(orch_domain::ApprovalPolicy::Auto);
-            self.inner
-                .active_collectors
-                .lock()
-                .await
-                .insert(task_id.clone());
             // Enqueue before releasing the state lock, so a concurrent cancel
             // cannot overtake initial submission. No network I/O occurs here.
             let handle = self.remote_bridge().submit(request);
-            let orchestrator = self.clone();
-            tokio::spawn(async move {
-                let result = match handle {
-                    Ok(handle) => {
-                        orchestrator
-                            .collect_remote_events(
-                                handle.events,
-                                &run.id,
-                                &task_id,
-                                &agent.id,
-                                auto_approve,
-                                cancel,
-                            )
-                            .await
-                    }
-                    Err(err) => Err(err), // retain the durable entry pending sync
-                };
-                if let Err(err) = result {
-                    orchestrator.emit_error(err, format!("remote execution for {task_id}"));
-                }
-                orchestrator
-                    .inner
-                    .active_collectors
-                    .lock()
-                    .await
-                    .remove(&task_id);
-            });
+            self.spawn_remote_collector(handle, &run.id, &task_id, &agent.id, auto_approve, cancel)
+                .await;
             return Ok(());
         }
 
@@ -737,11 +717,7 @@ impl Orchestrator {
         // Work submitted by a remote peer must not run with this machine's
         // credentials (security review F2). The agent's own `config.env` is
         // the owner's explicit choice and is still applied on top.
-        let inherit_env = if task
-            .labels
-            .iter()
-            .any(|label| label.starts_with("remote-ctl:"))
-        {
+        let inherit_env = if mirror_controller(&task).is_some() {
             orch_core::process::EnvInheritance::WithoutSecrets
         } else {
             orch_core::process::EnvInheritance::Full
@@ -925,6 +901,14 @@ impl Orchestrator {
 }
 
 /// Running entries that hold a local slot: everything except remote runs.
+/// The controller instance a mirror task belongs to, from its `remote-ctl:`
+/// label. `None` for ordinary local work.
+fn mirror_controller(task: &Task) -> Option<&str> {
+    task.labels
+        .iter()
+        .find_map(|label| label.strip_prefix("remote-ctl:"))
+}
+
 fn local_running(state: &OrchestratorState) -> usize {
     state
         .running

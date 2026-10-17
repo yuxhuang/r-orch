@@ -598,6 +598,10 @@ mod tests {
                 instance_id: None,
                 os: Some("linux".into()),
                 agents: vec![make_agent()],
+                peer_version: None,
+                link_state: orch_domain::LinkState::Connecting,
+                next_retry_at: None,
+                attempts: 0,
             })
             .await
             .unwrap();

@@ -180,6 +180,20 @@ impl Orchestrator {
                         &format!("remote {} removed; outcome unknown", remote.alias),
                     )
                     .await?;
+                } else {
+                    // The phase deadlines: a submit the worker never
+                    // acknowledges fails, a mirror queued for hours warns.
+                    // An unreadable status file is not a reason to fail the
+                    // whole tick; it reads as offline, which only pauses the
+                    // submit deadline's clock.
+                    let online = registry
+                        .read_status(&remote.alias)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|status| status.online);
+                    self.enforce_remote_deadlines(state, task_id, online)
+                        .await?;
                 }
                 continue;
             }
@@ -281,6 +295,7 @@ impl Orchestrator {
         self.reconcile_stale_agents(state).await?;
         self.reconcile_orphaned_tasks(state).await?;
         self.process_retry_queue(state).await?;
+        self.prune_remote_clocks(state).await;
         self.save_state(state).await
     }
 

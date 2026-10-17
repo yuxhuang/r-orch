@@ -309,12 +309,13 @@ const MAX_YAML_READ_SIZE: usize = 1024 * 1024;
 const MAX_YAML_EXPANDED_NODES: u64 = 200_000;
 
 /// Exact number of nodes the expanded document would contain, or an error if
-/// that exceeds [`MAX_YAML_EXPANDED_NODES`].
+/// that exceeds [`MAX_YAML_EXPANDED_NODES`]. Also enforces the exact
+/// [`MAX_YAML_ALIASES`] cap across the stream.
 ///
 /// # This is the sole DoS defence for YAML reads, and it is load-bearing alone
 ///
-/// There is no second line. The size and alias caps in front of it are cheap
-/// filters that catch nothing this does not, and **the 2 s parse deadline that
+/// There is no second line. The size cap before it and the alias cap enforced
+/// within it are defence in depth, and **the 2 s parse deadline that
 /// used to sit behind it has been deleted** — it could not cancel the work it
 /// timed, so it turned a slow failure into a non-terminating one (security
 /// review C0). Nothing else bounds what `serde_yaml_ng` is asked to build.
@@ -365,6 +366,7 @@ fn expanded_node_count(path: &Path, content: &str) -> Result<u64> {
     // the running total of its children's expanded counts.
     let mut open: Vec<(usize, u64)> = Vec::new();
     let mut total: u64 = 0;
+    let mut aliases: usize = 0;
 
     // Fold one finished node of `count` nodes into its parent, or into the
     // document total at the top level, checking the budget as we go.
@@ -423,6 +425,16 @@ fn expanded_node_count(path: &Path, content: &str) -> Result<u64> {
                 place(count, &mut open, &mut total)?;
             }
             Event::Alias(aid) => {
+                aliases += 1;
+                if aliases > MAX_YAML_ALIASES {
+                    return Err(Error::other(format!(
+                        "{} contains more than {MAX_YAML_ALIASES} YAML aliases, over the limit of \
+                         {MAX_YAML_ALIASES}: nested aliases amplify, and the parser spends \
+                         seconds on a few kilobytes of them. Nothing ORCH writes uses aliases \
+                         at all.",
+                        path.display()
+                    )));
+                }
                 // Absent means the anchor is not *closed* yet, i.e. the alias
                 // sits inside its own definition (`a: &r [*r]`). That is a
                 // cycle: its expansion is unbounded and serde_yaml_ng will
@@ -442,7 +454,8 @@ fn expanded_node_count(path: &Path, content: &str) -> Result<u64> {
     Ok(total)
 }
 
-/// Most YAML aliases a document may contain.
+/// Most YAML aliases a document may contain, counted exactly from parser
+/// events by [`expanded_node_count`].
 ///
 /// Defence in depth. A count alone cannot be the defence, because the cost of
 /// an alias depends entirely on what it points at:
@@ -469,46 +482,6 @@ fn expanded_node_count(path: &Path, content: &str) -> Result<u64> {
 /// repetition limit rejects them, though it spends seconds doing so.
 const MAX_YAML_ALIASES: usize = 64;
 
-/// Count `*alias` tokens outside quotes and comments.
-///
-/// Deliberately a scanner rather than a parse: the whole point is to decide
-/// before the parser gets the document. It does not need to be exact — a
-/// false positive on a document with 17+ aliases is acceptable, because
-/// nothing ORCH writes has any.
-fn count_yaml_aliases(content: &str) -> usize {
-    let bytes = content.as_bytes();
-    let mut count = 0usize;
-    let mut i = 0usize;
-    let (mut in_single, mut in_double, mut in_comment) = (false, false, false);
-
-    while i < bytes.len() {
-        let byte = bytes[i];
-        match byte {
-            b'\n' => {
-                in_comment = false;
-                // A newline also ends a single-quoted scalar only in the sense
-                // that we stop tracking it; YAML allows multi-line quotes, and
-                // over-counting is the safe direction.
-            }
-            b'#' if !in_single && !in_double => in_comment = true,
-            b'\'' if !in_double && !in_comment => in_single = !in_single,
-            b'"' if !in_single && !in_comment => in_double = !in_double,
-            b'*' if !in_single && !in_double && !in_comment => {
-                // An alias is `*` followed by a name character. `a * b` is
-                // multiplication in a plain scalar, not an alias.
-                if bytes.get(i + 1).is_some_and(|next| {
-                    next.is_ascii_alphanumeric() || *next == b'_' || *next == b'-'
-                }) {
-                    count += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    count
-}
-
 /// Read and parse a YAML file, resolving merge keys. `None` when absent.
 pub async fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let Some(value) = read_yaml_value(path).await? else {
@@ -528,9 +501,8 @@ pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>
     let Some(content) = read_to_string_opt(path).await? else {
         return Ok(None);
     };
-    // Three checks, all *before* the parser sees the document, because the cost
-    // being avoided is the parse itself. See the constants for what each one
-    // catches; none of them subsumes another.
+    // Two steps before the value parse: cap the input size, then walk parser
+    // events to enforce both the expanded-node budget and the exact alias cap.
     if content.len() > MAX_YAML_READ_SIZE {
         return Err(Error::other(format!(
             "{} is {} bytes, over the {MAX_YAML_READ_SIZE}-byte YAML limit",
@@ -538,25 +510,12 @@ pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>
             content.len()
         )));
     }
-    let aliases = count_yaml_aliases(&content);
-    if aliases > MAX_YAML_ALIASES {
-        return Err(Error::other(format!(
-            "{} contains {aliases} YAML aliases, over the limit of \
-             {MAX_YAML_ALIASES}: nested aliases amplify, and the parser spends \
-             seconds on a few kilobytes of them. Nothing ORCH writes uses aliases \
-             at all.",
-            path.display()
-        )));
-    }
-    // The exact one, last of the pre-parse checks because it is the only one
-    // that parses anything — events, never values.
-    //
-    // **This single call is what makes the parse below safe.** The three checks
-    // above are cheap filters that catch nothing it does not, and there is no
-    // backstop behind it: the deadline that used to be there was removed
-    // because it could not stop the parse it was timing. Removing or weakening
-    // this line reopens security review C0 (19.3 GiB RSS in 28 s, no exit), so
-    // it needs a security review rather than a green suite.
+    // **This single call is what makes the parse below safe.** The size and
+    // alias caps are defence in depth, and there is no backstop behind it:
+    // the deadline that used to be there was removed because it could not
+    // stop the parse it was timing. Removing or weakening this line reopens
+    // security review C0 (19.3 GiB RSS in 28 s, no exit), so it needs a
+    // security review rather than a green suite.
     expanded_node_count(path, &content)?;
     // Parsed on a blocking thread, with **no deadline**, because the work is
     // now bounded by construction rather than by a clock.
@@ -572,7 +531,7 @@ pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>
     // A timeout cannot be the defence here: a clock that fires on work it
     // cannot stop is a diagnostic, not a control. `expanded_node_count` above
     // is the control, and it bounds the parse exactly. Measured ceilings for a
-    // document that passes all four checks — 1 MiB, <=64 aliases, <=200,000
+    // document that passes all three limits — 1 MiB, <=64 aliases, <=200,000
     // expanded nodes:
     //
     // | worst case                | release | debug  |
@@ -1202,6 +1161,16 @@ pub async fn list_files(dir: &Path, ext: Option<&str>) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+fn alias_events(content: &str) -> usize {
+    use saphyr_parser::{Event, Parser};
+
+    Parser::new_from_str(content)
+        .map(|event| event.expect("valid YAML").0)
+        .filter(|event| matches!(event, Event::Alias(_)))
+        .count()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
@@ -1308,10 +1277,10 @@ mod tests {
         clear_ensured_dirs();
         let path = temp.path().join("flat.yml");
         let bomb = flat_anchor_bomb();
-        // Inside both cheap caps, which is what makes the timeout necessary.
+        // Inside the size and alias caps, so the node budget must refuse it.
         assert!(bomb.len() < MAX_YAML_READ_SIZE, "inside the size cap");
         assert!(
-            count_yaml_aliases(&bomb) <= MAX_YAML_ALIASES,
+            alias_events(&bomb) <= MAX_YAML_ALIASES,
             "inside the alias cap"
         );
         std::fs::write(&path, &bomb).unwrap();
@@ -1390,12 +1359,8 @@ mod tests {
             let err = read_yaml_value(&path).await.expect_err("must be refused");
             let elapsed = started.elapsed();
 
-            // Refused before the parser runs. These widths carry 1,500 and
-            // 6,000 aliases, so the cheap alias cap fires first and the exact
-            // node count never needs to; `shape_d_is_refused_in_microseconds`
-            // covers the shape that gets past the cap. Either way the property
-            // under test is the same: microseconds, against 7 s and 104 s
-            // unguarded.
+            // Refused in the event walk before the value parse, by either the
+            // alias cap or the node budget: against 7 s and 104 s unguarded.
             assert!(
                 elapsed < std::time::Duration::from_millis(200),
                 "w={w} took {elapsed:?}"
@@ -1446,7 +1411,7 @@ mod tests {
         // repetition limit, but only after about seven seconds; this test used
         // to assert the 2 s deadline, which was removed because it could not
         // stop the work it was timing (security review C0).
-        assert!(count_yaml_aliases(&bomb) <= MAX_YAML_ALIASES);
+        assert!(alias_events(&bomb) <= MAX_YAML_ALIASES);
 
         let started = std::time::Instant::now();
         let err = read_yaml_value(&path)
@@ -1473,10 +1438,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn too_many_aliases_is_refused_without_parsing_at_all() {
-        // The count cap's own test, now that both bombs are caught by the
-        // deadline. This document is cheap to parse, so only the count can be
-        // what rejects it — and it must do so without a parse.
+    async fn too_many_aliases_is_refused_before_the_value_parse() {
+        // This document is cheap to expand: only the alias count rejects it,
+        // during the event walk and before the value parse.
         let temp = tempfile::tempdir().unwrap();
         clear_ensured_dirs();
         let path = temp.path().join("many.yml");
@@ -1490,14 +1454,17 @@ mod tests {
         let err = read_yaml_value(&path).await.expect_err("over the cap");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(100),
-            "the count cap must not involve a parse"
+            "the count cap must stop before the value parse"
         );
         let message = format!("{err}");
         assert!(
             message.contains("many.yml"),
             "must name the file: {message}"
         );
-        assert!(message.contains("aliases"), "must say why: {message}");
+        assert!(
+            message.contains("YAML aliases, over the limit of 64"),
+            "must say why: {message}"
+        );
     }
 
     #[tokio::test]
@@ -1538,24 +1505,192 @@ mod tests {
     }
 
     #[test]
-    fn the_alias_scanner_ignores_quotes_comments_and_multiplication() {
-        // Over-counting is safe; under-counting is not. These are the cases
-        // where a naive `content.matches('*')` would over-count so badly that
-        // an ordinary file would be refused.
-        assert_eq!(count_yaml_aliases("a: *anchor\n"), 1);
-        assert_eq!(count_yaml_aliases("a: [*x, *y, *z]\n"), 3);
-        assert_eq!(count_yaml_aliases("a: '*not an alias'\n"), 0);
-        assert_eq!(count_yaml_aliases("a: \"*also not\"\n"), 0);
-        assert_eq!(count_yaml_aliases("# *commented out\n"), 0);
-        assert_eq!(count_yaml_aliases("a: 3 * 4\n"), 0, "multiplication");
-        assert_eq!(count_yaml_aliases("a: **\n"), 0, "no name after the star");
-        assert_eq!(count_yaml_aliases(""), 0);
-        // The scanner counts; it does not judge. The nested bomb sits
-        // *under* the cap and is caught by the deadline instead.
+    fn alias_events_ignore_quotes_comments_and_multiplication() {
+        assert_eq!(alias_events("anchor: &anchor 1\na: *anchor\n"), 1);
         assert_eq!(
-            count_yaml_aliases(&alias_bomb()),
-            30,
-            "14 levels of two, plus the two in `top`"
+            alias_events("x: &x 1\ny: &y 2\nz: &z 3\na: [*x, *y, *z]\n"),
+            3
+        );
+        for doc in [
+            "a: '*x'\n",
+            "b: \"*y\"\n",
+            "# *z\n",
+            "c: 3 * 4\n",
+            "d: '**'\n",
+            "",
+        ] {
+            assert_eq!(alias_events(doc), 0, "{doc:?}");
+        }
+        assert_eq!(alias_events(&alias_bomb()), 30);
+    }
+
+    // V1-V3: reverting the scanner deletion must refuse these valid scalars.
+    #[tokio::test]
+    async fn markdown_in_a_literal_block_scalar_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("literal.yml");
+        let body = (0..40)
+            .map(|n| format!("- **Role {n}:** be *efficient*\n"))
+            .collect::<String>();
+        let doc = format!(
+            "id: t\ndescription: |-\n{}",
+            body.lines()
+                .map(|line| format!("  {line}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(&path, doc).unwrap();
+        let value = read_yaml_value(&path).await.unwrap().expect("present");
+        assert_eq!(value["description"].as_str(), Some(body.trim_end()));
+    }
+
+    #[tokio::test]
+    async fn markdown_in_a_folded_block_scalar_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("folded.yml");
+        let lines = (0..40)
+            .map(|n| format!("- **Role {n}:** be *efficient*"))
+            .collect::<Vec<_>>();
+        let doc = format!(
+            "title: \"it's **done**\"\nresult: >-\n{}",
+            lines
+                .iter()
+                .map(|line| format!("  {line}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(&path, doc).unwrap();
+        let value = read_yaml_value(&path).await.unwrap().expect("present");
+        assert_eq!(value["result"].as_str(), Some(lines.join(" ").as_str()));
+    }
+
+    #[tokio::test]
+    async fn markdown_inside_plain_scalars_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.yml");
+        let doc = (0..70)
+            .map(|n| format!("k{n}: see *efficient* code\n"))
+            .collect::<String>();
+        std::fs::write(&path, doc).unwrap();
+        let value = read_yaml_value(&path).await.unwrap().expect("present");
+        assert_eq!(value.as_mapping().unwrap().len(), 70);
+        assert_eq!(value["k69"].as_str(), Some("see *efficient* code"));
+    }
+
+    #[tokio::test]
+    async fn exactly_64_aliases_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.yml");
+        let doc = format!("a: &a 1\nl: [{}]\n", vec!["*a"; 64].join(","));
+        std::fs::write(&path, &doc).unwrap();
+        assert_eq!(alias_events(&doc), 64);
+        let value = read_yaml_value(&path).await.unwrap().expect("present");
+        assert_eq!(value["l"].as_sequence().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn markdown_and_anchor_like_strings_round_trip_without_aliases() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+        struct Text {
+            document: String,
+            role: String,
+            alias: String,
+            anchor: String,
+        }
+
+        let original = Text {
+            document: (0..200)
+                .map(|n| format!("- **Role {n}:** be *efficient*; it's \"done\" # &anchor <<\n"))
+                .collect(),
+            role: "**Role:** x".into(),
+            alias: "*x".into(),
+            anchor: "&anchor".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("round-trip.yml");
+        write_yaml(&path, &original).await.unwrap();
+        assert_eq!(alias_events(&std::fs::read_to_string(&path).unwrap()), 0);
+        assert_eq!(read_yaml::<Text>(&path).await.unwrap(), Some(original));
+    }
+
+    // X2-X3: removing the event counter must allow these cheap expansions.
+    #[tokio::test]
+    async fn an_apostrophe_cannot_hide_200_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apostrophe.yml");
+        let doc = format!(
+            "note: it's fine\na: &a [1,2,3]\nl: [{}]\n",
+            vec!["*a"; 200].join(",")
+        );
+        std::fs::write(&path, doc).unwrap();
+        let err = read_yaml_value(&path)
+            .await
+            .expect_err("over the alias cap");
+        let message = err.to_string();
+        assert!(
+            message.contains("YAML aliases, over the limit of 64"),
+            "{message}"
+        );
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+    }
+
+    #[tokio::test]
+    async fn alias_65_is_refused_before_a_large_suffix_is_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suffix.yml");
+        let mut doc = format!("a: &a 1\nl: [{}]\n", vec!["*a"; 65].join(","));
+        for n in 0..30_000 {
+            doc.push_str(&format!("k{n}: a plain scalar value here\n"));
+        }
+        assert!(doc.len() > 900_000 && doc.len() < MAX_YAML_READ_SIZE);
+        std::fs::write(&path, &doc).unwrap();
+        let started = std::time::Instant::now();
+        let err = read_yaml_value(&path)
+            .await
+            .expect_err("over the alias cap");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "{elapsed:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("YAML aliases, over the limit of 64"),
+            "{message}"
+        );
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+        // An invalid tail must also remain unseen: this proves early stopping
+        // without relying solely on the timing assertion above.
+        doc.push_str("invalid: [\n");
+        let err = expanded_node_count(&path, &doc).expect_err("stop at alias 65");
+        assert!(
+            err.to_string()
+                .contains("YAML aliases, over the limit of 64")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_alias_is_refused_as_invalid_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown.yml");
+        std::fs::write(&path, "a: *nope\n").unwrap();
+        let message = read_yaml_value(&path)
+            .await
+            .expect_err("unknown anchor")
+            .to_string();
+        assert!(message.contains("not valid YAML"), "{message}");
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+    }
+
+    #[test]
+    fn the_alias_cap_counts_across_documents() {
+        let doc = format!(
+            "a: &a 1\nl: [{}]\n---\nb: &b 2\nl: [{}]\n",
+            vec!["*a"; 32].join(","),
+            vec!["*b"; 33].join(",")
+        );
+        let err = expanded_node_count(Path::new("stream.yml"), &doc).expect_err("65 across stream");
+        assert!(
+            err.to_string()
+                .contains("YAML aliases, over the limit of 64")
         );
     }
 
@@ -2343,7 +2478,7 @@ mod c0_rereview {
         println!(
             "shapeD: {} bytes, {} aliases",
             doc.len(),
-            count_yaml_aliases(&doc)
+            alias_events(&doc)
         );
         tokio::fs::write(&path, &doc).await.unwrap();
 
@@ -2383,7 +2518,7 @@ mod c0_rereview {
                 level - 1
             ));
         }
-        assert_eq!(count_yaml_aliases(&doc), 64, "exactly at the alias cap");
+        assert_eq!(alias_events(&doc), 64, "exactly at the alias cap");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deep.yml");
         tokio::fs::write(&path, &doc).await.unwrap();
@@ -2557,7 +2692,7 @@ mod worst_case_after_prepass {
 
     use super::*;
 
-    /// How slow can a document be that passes all four pre-parse checks?
+    /// How slow can a document be that passes all three pre-parse limits?
     /// Ceiling: 1 MiB, <=64 aliases, <=200,000 expanded nodes.
     #[tokio::test]
     #[ignore = "measurement, not an assertion"]
@@ -2592,7 +2727,7 @@ mod worst_case_after_prepass {
             println!(
                 "  {label:24} {} bytes, {} aliases -> {:?} in {:?}",
                 doc.len(),
-                count_yaml_aliases(&doc),
+                alias_events(&doc),
                 result
                     .as_ref()
                     .map(|v| v.is_some())

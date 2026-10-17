@@ -378,26 +378,33 @@ impl TuiBackend for EngineBackend {
         self.block_on(async {
             let store =
                 orch_infra::storage::remote::FileRemoteStore::new(self.engine.paths.clone());
-            let (listen, controller) =
+            let listener =
                 crate::commands::remote::listener_status(&self.engine.paths, own_runtime).await?;
             let mut status = format!(
                 "listen {} · controller {}",
                 crate::commands::remote::describe_listen(
-                    listen.as_deref(),
+                    listener.addr.as_deref(),
                     self.engine.config.peer.listen.as_deref(),
                 ),
-                controller.as_deref().unwrap_or("none"),
+                listener.controller.as_deref().unwrap_or("none"),
             );
+            let now = self.engine.clock.now_ms();
             for remote in store.list().await? {
-                let online = store
-                    .read_status(&remote.alias)
-                    .await?
-                    .is_some_and(|s| s.online);
-                status.push_str(&format!(
-                    " · {} {}",
-                    remote.alias,
-                    if online { "online" } else { "offline" },
-                ));
+                let link = match store.read_status(&remote.alias).await? {
+                    Some(status) => {
+                        let version = status
+                            .peer_version
+                            .as_ref()
+                            .map(|version| format!(" v{version}"))
+                            .unwrap_or_default();
+                        format!(
+                            "{}{version}",
+                            crate::commands::remote::describe_link(&status, now)
+                        )
+                    }
+                    None => "offline".into(),
+                };
+                status.push_str(&format!(" · {} {link}", remote.alias));
             }
             Ok::<_, orch_core::Error>(status)
         })

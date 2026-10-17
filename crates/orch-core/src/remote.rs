@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use orch_domain::{AdapterErrorKind, Message, ReviewCriterion, ReviewResult, TokenUsage};
+use orch_domain::{
+    AdapterErrorKind, Message, RemotePhase, ReviewCriterion, ReviewResult, TokenUsage,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::AgentEvent;
@@ -52,9 +54,39 @@ pub struct RemoteSubmit {
     pub goal_id: Option<String>,
 }
 
+/// What the worker last said about an execution that has not finished. The
+/// controller shows it instead of claiming the peer is running the work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePhaseUpdate {
+    pub phase: RemotePhase,
+    /// The mirror's task id on the worker, once it has named one.
+    pub worker_task_id: Option<String>,
+    /// The worker's explanation, verbatim. Display only.
+    pub reason: Option<String>,
+}
+
+impl RemotePhaseUpdate {
+    pub fn new(phase: RemotePhase) -> Self {
+        Self {
+            phase,
+            worker_task_id: None,
+            reason: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RemoteRunEvent {
+    /// An event from the worker's own run. Proof the agent is executing.
     Event(AgentEvent),
+    /// Progress the *controller* synthesized about the link itself, such as
+    /// "queued on 2com". It is logged like any other progress and must never
+    /// be read as evidence that the worker started anything: taking it as
+    /// such is what made an approval-held mirror show up as `RUN`.
+    Hint(AgentEvent),
+    /// The worker acknowledged, queued or started the execution. Never an
+    /// outcome: the phase only ever moves a view, not a task's status.
+    Phase(RemotePhaseUpdate),
     Finished(RemoteOutcome),
     /// A successful sync proved the worker has lost the execution record.
     /// Unlike a known failure, this must never be retried automatically.
@@ -82,6 +114,16 @@ pub trait RemoteBridge: Send + Sync {
     /// enqueued. The owner retains its entry for sync rather than risking a
     /// duplicate effect. Submit and cancel must preserve enqueue order.
     fn submit(&self, request: RemoteSubmit) -> Result<RemoteExecuteHandle>;
+    /// Re-register an execution that outlived this controller, from a
+    /// reservation that was already durable. The request is **not** sent
+    /// again: the worker owns the execution, and the first sync of the next
+    /// session says what became of it. Registering it is also what keeps that
+    /// sync from reading the live mirror as an orphan and cancelling it.
+    fn rehydrate(&self, _alias: &str, _exec_key: &str) -> Result<RemoteExecuteHandle> {
+        Err(Error::invalid_arguments(
+            "Remote peer runtime is not installed",
+        ))
+    }
     /// Enqueue promptly and preserve submit order; never await the network
     /// while the controller is holding its state mutex.
     async fn cancel(&self, alias: &str, exec_key: &str) -> Result<()>;

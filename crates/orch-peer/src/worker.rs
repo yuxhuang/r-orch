@@ -1,7 +1,20 @@
 //! The worker owns mirrors and execution. A disconnected controller never
 //! cancels a process; only an explicit cancel or a successful sync can do so.
+//!
+//! # Error barrier
+//!
+//! A mirror's storage fault degrades that key, never the link. One mirror this
+//! instance cannot read used to error the whole tick, which closed the socket;
+//! the controller then redialled, hit the same mirror, and the peer looked
+//! permanently offline while the worker logged nothing. So every fallible read
+//! is caught by class instead:
+//!
+//! - per key (`item`): report `unknown` with a reason, and warn once per fault;
+//! - per session (`mirrors`, `local_agents`, `outbox`, `updates`): log, emit a
+//!   debounced `OrchestratorError`, skip this tick, keep the session;
+//! - fatal, closing the session: transport, the handshake, and "expected sync".
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,11 +23,11 @@ use orch_core::error::{Error, Result};
 use orch_core::remote::{RemoteOutcome, RunEventTap};
 use orch_core::storage::TaskFilter;
 use orch_domain::{
-    AWAITING_APPROVAL_LABEL, AgentStatus, ApprovalPolicy, CreateTaskInput, InboundStatus, Run,
-    RunStatus, Task, TaskStatus,
+    AWAITING_APPROVAL_LABEL, AWAITING_APPROVAL_REASON, AgentStatus, ApprovalPolicy,
+    CreateTaskInput, InboundStatus, Run, RunStatus, Task, TaskStatus,
 };
 use orch_infra::storage::{
-    fs_utils::{owner_only, write_json_with_mode},
+    fs_utils::{owner_only, read_json, write_json_with_mode},
     remote::validate_snapshot,
 };
 use tokio::io::BufReader;
@@ -37,6 +50,27 @@ const PING_EVERY: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 16;
 const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(100);
 const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(2);
+/// One `OrchestratorError` per fault kind per window. A fault that recurs on
+/// every one-second tick must stay visible without flooding the feed.
+const FAULT_REPORT_EVERY: Duration = Duration::from_secs(30);
+/// How often the orphan sweep runs, besides once at `listen()`.
+const ORPHAN_GC_EVERY: Duration = Duration::from_secs(3_600);
+/// How long a controller may stay away before its queued mirrors are
+/// cancelled. Long enough to cover an overnight laptop and a weekend's
+/// worth of a paused controller; short enough that a decommissioned one
+/// does not hold a local agent's queue for ever.
+const CONTROLLER_ABSENCE_LIMIT_MS: i64 = 24 * 3_600_000;
+/// The longest wait between attempts at a cancel that will not apply.
+const CANCEL_RETRY_MAX: Duration = Duration::from_secs(60);
+/// How often a cancel that still will not apply is warned about again.
+const CANCEL_REWARN_EVERY: Duration = Duration::from_secs(3_600);
+/// Deferred cancels are peer-driven, so the map is bounded.
+const MAX_UNAPPLIED_CANCELS: usize = 1024;
+/// A controller's display name, which reaches logs and `remote status`.
+const MAX_CONTROLLER_NAME_BYTES: usize = 64;
+/// How many controllers `_controllers.json` remembers. Peer-chosen keys, so
+/// the map is bounded; the least recently seen makes way.
+const MAX_REMEMBERED_CONTROLLERS: usize = 256;
 
 #[derive(Default)]
 struct EventRing {
@@ -113,6 +147,48 @@ impl SessionSlot {
     }
 }
 
+/// One cancel awaiting a retry.
+struct PendingCancel {
+    /// When the next attempt is due.
+    next_at: Instant,
+    /// Consecutive failures, which set the delay.
+    attempts: u32,
+    /// When this key was last warned about, so a stuck one is re-warned
+    /// hourly rather than once ever.
+    warned_at: Instant,
+}
+
+/// `1s · 2^(attempts-1)`, capped. A mirror whose record is damaged is not
+/// going to be readable a millisecond later.
+fn cancel_retry_delay(attempts: u32) -> Duration {
+    Duration::from_secs(1u64 << attempts.min(6).saturating_sub(1)).min(CANCEL_RETRY_MAX)
+}
+
+/// The same bounds `Submit` puts on an execution key. It reaches a log line,
+/// a task label and the pending-cancel map, all from peer input.
+fn valid_exec_key(exec_key: &str) -> bool {
+    !exec_key.is_empty() && exec_key.len() <= 256
+}
+
+#[derive(Default)]
+struct Faults {
+    /// Execution key -> the reason last reported for it, so a key that stays
+    /// unreadable is warned about once rather than on every tick.
+    degraded: HashMap<String, String>,
+    /// Fault kind -> when it was last reported to the event feed.
+    reported: HashMap<&'static str, Instant>,
+    /// Cancels this instance accepted but could not apply, usually because
+    /// the mirror's record was unreadable at the time. Retried on their own
+    /// backoff until they take: a mirror the controller has given up on must
+    /// not keep a local agent busy, and only an explicit cancel clears one
+    /// between reconnects.
+    unapplied_cancels: BTreeMap<String, PendingCancel>,
+    /// Why this instance's last controller session ended, published in
+    /// `_listener.json` so `orch remote status` can explain a peer that keeps
+    /// reconnecting.
+    last_session_error: Option<(String, String)>,
+}
+
 pub struct Worker {
     ctx: Context,
     tap: Mutex<TapState>,
@@ -120,6 +196,7 @@ pub struct Worker {
     /// Serializes takeover and protocol mutations, so the replaced session
     /// cannot mutate a mirror after the new controller's sync.
     session: tokio::sync::Mutex<SessionSlot>,
+    faults: Mutex<Faults>,
 }
 
 impl Worker {
@@ -130,7 +207,53 @@ impl Worker {
             tap: Mutex::new(TapState::default()),
             events,
             session: tokio::sync::Mutex::new(SessionSlot::default()),
+            faults: Mutex::new(Faults::default()),
         })
+    }
+
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.faults.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Emit at most one `OrchestratorError` per `kind` per
+    /// [`FAULT_REPORT_EVERY`].
+    fn report_fault(&self, kind: &'static str, error: &Error, context: String) {
+        let due = {
+            let mut faults = self.faults();
+            let due = faults
+                .reported
+                .get(kind)
+                .is_none_or(|at| at.elapsed() >= FAULT_REPORT_EVERY);
+            if due {
+                faults.reported.insert(kind, Instant::now());
+            }
+            due
+        };
+        if due {
+            self.ctx
+                .engine
+                .events
+                .emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                    error: error.to_string(),
+                    context,
+                    fatal: false,
+                });
+        }
+    }
+
+    /// Log a fault in this instance's own bookkeeping and report it. The
+    /// caller skips the work it was doing; the session stays up.
+    fn session_fault(&self, operation: &'static str, error: &Error) {
+        tracing::warn!(%error, operation, "Peer worker degraded; session kept");
+        self.report_fault(
+            operation,
+            error,
+            format!(
+                "Peer worker {operation}; the controller session is kept and retries. \
+                 Check permissions and free space in {}",
+                self.ctx.engine.paths.root().display()
+            ),
+        );
     }
 
     fn register(&self, task: &Task) {
@@ -150,7 +273,103 @@ impl Worker {
         }
     }
 
+    fn controllers_path(&self) -> std::path::PathBuf {
+        self.ctx
+            .engine
+            .paths
+            .remotes_dir()
+            .join("_controllers.json")
+    }
+
+    /// When each controller was last admitted here. Owner-only, like every
+    /// other file under `remotes/`.
+    async fn record_controller(&self, instance_id: &str) -> Result<()> {
+        let path = self.controllers_path();
+        let mut seen: BTreeMap<String, String> = read_json(&path).await?.unwrap_or_default();
+        seen.insert(instance_id.into(), self.ctx.engine.clock.now_iso());
+        evict_oldest_controllers(&mut seen, instance_id);
+        write_json_with_mode(&path, &seen, owner_only()).await
+    }
+
+    /// Cancel the mirrors of controllers that have not come back.
+    ///
+    /// A mirror only runs for the controller currently connected, so one left
+    /// behind by a controller that never returns sits `todo` for ever, in the
+    /// queue of a local agent, counted against nothing. After a day without
+    /// its controller it is cancelled and said so on the task.
+    ///
+    /// Only `todo` mirrors: an `in_progress` one has a live local process and
+    /// belongs to the quarantine path, which owns that pid. A controller this
+    /// instance has never recorded starts its clock now rather than being
+    /// cancelled on sight — including every mirror that predates this sweep.
+    async fn collect_orphan_mirrors(&self) -> Result<usize> {
+        // `try_lock`, not `lock`: this runs on the listener's own loop, and a
+        // session that is mid-mutation must not stall admissions for it. The
+        // sweep is hourly; skipping one costs nothing.
+        let Ok(slot) = self.session.try_lock() else {
+            tracing::debug!("Skipping the orphan sweep: a session is mutating mirrors");
+            return Ok(0);
+        };
+        let current = slot
+            .controller
+            .as_ref()
+            .map(|controller| controller.instance_id.clone());
+        drop(slot);
+        let path = self.controllers_path();
+        let mut seen: BTreeMap<String, String> = read_json(&path).await?.unwrap_or_default();
+        let now = self.ctx.engine.clock.now_ms();
+        let tasks = self.ctx.engine.tasks.list(&TaskFilter::default()).await?;
+        let mut orphans: Vec<(Task, String, String)> = Vec::new();
+        let mut known: Vec<String> = Vec::new();
+        if let Some(current) = &current {
+            seen.insert(current.clone(), self.ctx.engine.clock.now_iso());
+            known.push(current.clone());
+        }
+        for task in tasks {
+            let Some(controller) = label(&task, "remote-ctl:").map(str::to_owned) else {
+                continue;
+            };
+            known.push(controller.clone());
+            if current.as_ref() == Some(&controller) || task.status != TaskStatus::Todo {
+                continue;
+            }
+            let Some(last_seen) = seen.get(&controller).cloned() else {
+                seen.insert(controller, self.ctx.engine.clock.now_iso());
+                continue;
+            };
+            if orch_core::clock::epoch_ms_from_iso(&last_seen)
+                .is_some_and(|at| now.saturating_sub(at) >= CONTROLLER_ABSENCE_LIMIT_MS)
+            {
+                orphans.push((task, controller, last_seen));
+            }
+        }
+        // A controller with no mirrors left needs no record either.
+        seen.retain(|instance_id, _| known.contains(instance_id));
+        if let Some(current) = &current {
+            evict_oldest_controllers(&mut seen, current);
+        }
+        write_json_with_mode(&path, &seen, owner_only()).await?;
+
+        let mut cancelled = 0;
+        for (task, controller, last_seen) in orphans {
+            match self
+                .cancel_mirror(
+                    &task,
+                    format!(
+                        "orphaned remote mirror: controller {controller} absent since {last_seen}"
+                    ),
+                )
+                .await
+            {
+                Ok(()) => cancelled += 1,
+                Err(error) => self.session_fault("cancel orphan mirror", &error),
+            }
+        }
+        Ok(cancelled)
+    }
+
     async fn listener_status(&self, addr: &str, controller: Option<&str>) -> Result<()> {
+        let last_error = self.faults().last_session_error.clone();
         // Owner-only like every file under remotes/ (security review F7).
         write_json_with_mode(
             &self.ctx.engine.paths.remotes_dir().join("_listener.json"),
@@ -158,10 +377,32 @@ impl Worker {
                 "listen_addr": addr,
                 "controller_name": controller,
                 "pid": std::process::id(),
+                "last_session_error": last_error.as_ref().map(|(error, _)| error),
+                "last_session_error_at": last_error.as_ref().map(|(_, at)| at),
             }),
             owner_only(),
         )
         .await
+    }
+
+    /// Record and report why a controller session ended. The session error is
+    /// the one thing a worker owner needs when a controller keeps redialling,
+    /// and until now the worker logged it at `debug!` with no identity.
+    async fn session_ended(&self, instance_id: &str, name: &str, generation: u64, error: &Error) {
+        tracing::warn!(
+            controller = %name,
+            %instance_id,
+            generation,
+            %error,
+            "Peer worker session ended"
+        );
+        self.faults().last_session_error =
+            Some((error.to_string(), self.ctx.engine.clock.now_iso()));
+        self.report_fault(
+            "session end",
+            error,
+            format!("Peer worker session with controller {name} ended; awaiting its reconnect"),
+        );
     }
 
     pub async fn listen(self: Arc<Self>, listener: TcpListener) -> Result<()> {
@@ -176,12 +417,24 @@ impl Worker {
         let mut sessions = JoinSet::new();
         let mut accept_after = Instant::now();
         let mut accept_backoff = ACCEPT_RETRY_MIN;
+        // Ticks immediately, so the sweep also runs once at startup: a
+        // controller that went away while this instance was down is exactly
+        // the case that leaves mirrors behind.
+        let mut orphan_gc = tokio::time::interval(ORPHAN_GC_EVERY);
+        orphan_gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 // Reap completed tasks before accepting more, including under
                 // a constant stream of short-lived connections.
                 Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
+                _ = orphan_gc.tick() => {
+                    match self.collect_orphan_mirrors().await {
+                        Ok(0) => {}
+                        Ok(cancelled) => tracing::info!(cancelled, "Cancelled orphaned remote mirrors"),
+                        Err(error) => self.session_fault("sweep orphaned mirrors", &error),
+                    }
+                }
                 accepted = async {
                     tokio::time::sleep_until(accept_after).await;
                     listener.accept().await
@@ -233,6 +486,7 @@ impl Worker {
             instance_id,
             name,
             agents,
+            version,
             ..
         }) = hello
         else {
@@ -245,10 +499,17 @@ impl Worker {
             .await?;
             return Ok(());
         };
+        // Identity is peer input that becomes a task label, a key in
+        // `_controllers.json` and operator output, so it is an allowlist.
         if proto != PROTOCOL
-            || instance_id.is_empty()
+            || !crate::protocol::valid_instance_id(&instance_id)
             || name.is_empty()
+            || name.len() > MAX_CONTROLLER_NAME_BYTES
             || name.contains('@')
+            // The name is printed by `orch remote status` and written into
+            // mirror feedback, so refuse anything metadata_text would alter.
+            || orch_infra::storage::remote::metadata_text(&name, MAX_CONTROLLER_NAME_BYTES)
+                != name
             || validate_snapshot(&agents).is_err()
         {
             self.write(
@@ -296,11 +557,28 @@ impl Worker {
                     instance_id: instance_id.clone(),
                     connected_since: self.ctx.engine.clock.now_iso(),
                     agents,
+                    controller_version: crate::protocol::text(
+                        version,
+                        crate::protocol::MAX_VERSION_BYTES,
+                    ),
                 })
                 .await?;
             self.listener_status(addr, Some(&name)).await?;
-            slot.claim(&instance_id, &name)
-                .expect("admission checked while holding session lock")
+            // Seen now: the orphan sweep dates a controller's absence from
+            // the last time it was admitted here.
+            if let Err(error) = self.record_controller(&instance_id).await {
+                self.session_fault("record controller", &error);
+            }
+            let claimed = slot
+                .claim(&instance_id, &name)
+                .expect("admission checked while holding session lock");
+            // Mirrors belong to the controller that submitted them, and only
+            // this session can be told that one started running.
+            self.ctx
+                .engine
+                .orchestrator
+                .set_inbound_controller(Some(instance_id.clone()));
+            claimed
         };
         let result = async {
             let mut agents = self.ctx.local_agents().await?;
@@ -312,6 +590,7 @@ impl Worker {
                     name: self.ctx.name.clone(),
                     os: std::env::consts::OS.into(),
                     agents: agents.clone(),
+                    version: Some(crate::protocol::version()),
                 },
             )
             .await?;
@@ -399,28 +678,42 @@ impl Worker {
                         if !synced {
                             continue;
                         }
-                        let snapshot = self.ctx.local_agents().await?;
-                        if snapshot != agents {
-                            self.write(
-                                &mut write,
-                                &Frame::Agents {
-                                    agents: snapshot.clone(),
-                                },
-                            )
-                            .await?;
-                            agents = snapshot;
+                        // Everything below reads this instance's own records.
+                        // A fault there skips the tick, never the session.
+                        match self.ctx.local_agents().await {
+                            Ok(snapshot) if snapshot != agents => {
+                                self.write(
+                                    &mut write,
+                                    &Frame::Agents {
+                                        agents: snapshot.clone(),
+                                    },
+                                )
+                                .await?;
+                                agents = snapshot;
+                            }
+                            Ok(_) => {}
+                            Err(error) => self.session_fault("read local agents", &error),
                         }
                         let updates = {
                             let slot = self.session.lock().await;
                             if !slot.is_current(generation) {
                                 return Ok(());
                             }
-                            self.updates(&instance_id, &mut sent).await?
+                            self.updates(&instance_id, &mut sent).await
                         };
                         for frame in updates {
                             self.write(&mut write, &frame).await?;
                         }
-                        for frame in self.ctx.outbox(&name).await? {
+                        match self.ctx.outbox(&name).await {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    self.write(&mut write, &frame).await?;
+                                }
+                            }
+                            Err(error) => self.session_fault("read outbox", &error),
+                        }
+                        // A cancel that could not be applied when it arrived.
+                        for frame in self.retry_cancels(&instance_id, &name).await {
                             self.write(&mut write, &frame).await?;
                         }
                     }
@@ -428,9 +721,14 @@ impl Worker {
             }
         }
         .await;
+        if let Err(error) = &result {
+            self.session_ended(&instance_id, &name, generation, error)
+                .await;
+        }
         let mut slot = self.session.lock().await;
         if slot.is_current(generation) {
             slot.controller = None;
+            self.ctx.engine.orchestrator.set_inbound_controller(None);
             self.listener_status(addr, None).await?;
         }
         result
@@ -460,13 +758,43 @@ impl Worker {
         Ok(mirrors)
     }
 
-    async fn item(&self, key: &str, task: Option<&Task>) -> Result<SyncItem> {
+    /// The controller's view of one execution key, and the error barrier for
+    /// it: a mirror this instance cannot read is reported as `unknown` with a
+    /// reason instead of failing the session. The same fault is warned about
+    /// once, not once per tick.
+    async fn item(&self, key: &str, task: Option<&Task>) -> SyncItem {
+        match self.read_item(key, task).await {
+            Ok(item) => {
+                self.faults().degraded.remove(key);
+                item
+            }
+            Err(error) => {
+                let reason = format!("worker storage error: {}", fault_kind(&error));
+                let first = self
+                    .faults()
+                    .degraded
+                    .insert(key.into(), reason.clone())
+                    .as_deref()
+                    != Some(reason.as_str());
+                if first {
+                    tracing::warn!(
+                        exec_key = %key,
+                        task_id = task.map(|task| task.id.as_str()).unwrap_or_default(),
+                        %error,
+                        "Mirror state unreadable; reporting the key as unknown"
+                    );
+                }
+                SyncItem {
+                    worker_task_id: task.map(|task| task.id.clone()),
+                    ..SyncItem::new(key, "unknown").with_reason(reason)
+                }
+            }
+        }
+    }
+
+    async fn read_item(&self, key: &str, task: Option<&Task>) -> Result<SyncItem> {
         let Some(task) = task else {
-            return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "unknown".into(),
-                outcome: None,
-            });
+            return Ok(SyncItem::new(key, "unknown"));
         };
         let state = self.ctx.engine.state.read().await?;
         // A quarantined mirror is terminal even while its unverified saved
@@ -479,20 +807,15 @@ impl Worker {
             && (state.running.contains_key(&task.id) || state.claimed.contains(&task.id))
         {
             return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "running".into(),
-                outcome: None,
+                worker_task_id: Some(task.id.clone()),
+                ..SyncItem::new(key, "running")
             });
         }
         // The caller's snapshot may predate the final state write. Reading
         // the task after the reservation disappeared observes post-processing.
         let latest = self.ctx.engine.tasks.get(&task.id).await?;
         let Some(task) = latest.as_ref() else {
-            return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "unknown".into(),
-                outcome: None,
-            });
+            return Ok(SyncItem::new(key, "unknown"));
         };
         let run = self
             .ctx
@@ -503,34 +826,67 @@ impl Worker {
             .into_iter()
             .max_by_key(|run| run.attempt);
         if run.is_none() && matches!(task.status, TaskStatus::Done | TaskStatus::Review) {
-            return Ok(SyncItem {
-                exec_key: key.into(),
-                state: "unknown".into(),
-                outcome: None,
-            });
+            return Ok(SyncItem::new(key, "unknown").with_reason("worker has no execution record"));
         }
         let outcome = derive_outcome(task, run.as_ref());
-        Ok(SyncItem {
-            exec_key: key.into(),
-            state: if outcome.is_some() {
-                "finished"
-            } else if matches!(
-                task.status,
-                TaskStatus::InProgress | TaskStatus::Review | TaskStatus::Done | TaskStatus::Failed
-            ) {
-                "running"
-            } else {
-                "queued"
-            }
-            .into(),
+        let state = if outcome.is_some() {
+            "finished"
+        } else if matches!(
+            task.status,
+            TaskStatus::InProgress | TaskStatus::Review | TaskStatus::Done | TaskStatus::Failed
+        ) {
+            "running"
+        } else {
+            "queued"
+        };
+        let item = SyncItem {
             outcome,
+            worker_task_id: Some(task.id.clone()),
+            ..SyncItem::new(key, state)
+        };
+        // Security F4 holds this mirror until the worker's owner approves it.
+        // Naming the command is the only way the controller's owner can tell
+        // this apart from a worker that is merely busy.
+        Ok(if task.awaits_approval() {
+            item.with_reason(format!(
+                "{AWAITING_APPROVAL_REASON} run `orch task approve {}` on this worker",
+                task.id
+            ))
+        } else {
+            item
         })
     }
 
     async fn handle(&self, controller: &str, name: &str, frame: Frame) -> Result<Vec<Frame>> {
         match frame {
             Frame::Sync { active } => {
-                let mirrors = self.mirrors(controller).await?;
+                // The controller's first post-handshake frame. It must always
+                // be answered: without a SyncState the controller cannot tell
+                // a degraded worker from a lost one.
+                let mirrors = match self.mirrors(controller).await {
+                    Ok(mirrors) => mirrors,
+                    Err(error) => {
+                        self.session_fault("read mirrors for sync", &error);
+                        let reason = format!("worker storage error: {}", fault_kind(&error));
+                        return Ok(vec![Frame::SyncState {
+                            items: active
+                                .iter()
+                                .map(|key| {
+                                    SyncItem::new(key, "unknown").with_reason(reason.clone())
+                                })
+                                .collect(),
+                        }]);
+                    }
+                };
+                // Cleanup never gates the reply: an orphan this instance
+                // cannot cancel is retried on the controller's next sync.
+                //
+                // A key the controller no longer lists is one it has already
+                // accounted for — a finished or failed execution — so the
+                // mirror is dead work. The *reason* goes on the task: this
+                // sweep used to cancel silently, and a mirror found cancelled
+                // with no explanation cannot be attributed afterwards.
+                let mut orphans = 0;
                 for task in &mirrors {
                     if let Some(key) = label(task, "exec:")
                         && !active.iter().any(|k| k == key)
@@ -538,25 +894,52 @@ impl Worker {
                             task.status,
                             TaskStatus::Todo | TaskStatus::InProgress | TaskStatus::Retrying
                         )
+                        && let Err(error) = self
+                            .cancel_mirror(
+                                task,
+                                format!(
+                                    "orphaned remote mirror: controller {controller} no longer tracks execution {key}"
+                                ),
+                            )
+                            .await
                     {
-                        self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
+                        orphans += 1;
+                        tracing::warn!(task_id = %task.id, exec_key = %key, %error, "Orphan mirror not cancelled; retrying on the next sync");
                     }
+                }
+                if orphans > 0 {
+                    self.report_fault(
+                        "orphan cleanup",
+                        &Error::other(format!("{orphans} orphan mirror(s) could not be cancelled")),
+                        format!(
+                            "Peer worker sync for controller {name}; the mirrors stay as they are \
+                             and cleanup retries on the next sync"
+                        ),
+                    );
                 }
                 let mut items = Vec::with_capacity(active.len());
                 for key in active {
                     // Re-read after cancellation and any concurrently completed run.
-                    let task = mirrors
+                    let mirror = mirrors
                         .iter()
                         .find(|t| label(t, "exec:") == Some(key.as_str()));
-                    let task = if let Some(task) = task {
-                        self.ctx.engine.tasks.get(&task.id).await?
-                    } else {
-                        None
+                    let task = match mirror {
+                        // A read failure is handed on rather than swallowed:
+                        // `item` meets the same fault and degrades this key
+                        // alone to `unknown` with a reason.
+                        Some(mirror) => self
+                            .ctx
+                            .engine
+                            .tasks
+                            .get(&mirror.id)
+                            .await
+                            .unwrap_or_else(|_| Some(mirror.clone())),
+                        None => None,
                     };
-                    items.push(self.item(&key, task.as_ref()).await?);
+                    items.push(self.item(&key, task.as_ref()).await);
                 }
                 let mut replies = vec![Frame::SyncState { items }];
-                replies.extend(self.updates(controller, &mut HashMap::new()).await?);
+                replies.extend(self.updates(controller, &mut HashMap::new()).await);
                 Ok(replies)
             }
             Frame::Submit {
@@ -569,7 +952,18 @@ impl Worker {
                 review_criteria,
                 goal_id,
             } => {
-                let tasks = self.ctx.engine.tasks.list(&TaskFilter::default()).await?;
+                // Rejected rather than skipped: without the duplicate check
+                // this request could create a second mirror for one key.
+                let tasks = match self.ctx.engine.tasks.list(&TaskFilter::default()).await {
+                    Ok(tasks) => tasks,
+                    Err(error) => {
+                        self.session_fault("read tasks for submit", &error);
+                        return Ok(vec![Frame::Rejected {
+                            exec_key,
+                            reason: format!("worker storage error: {}", fault_kind(&error)),
+                        }]);
+                    }
+                };
                 if let Some(task) = tasks
                     .iter()
                     .find(|t| label(t, "exec:") == Some(exec_key.as_str()))
@@ -589,7 +983,16 @@ impl Worker {
                 let agent = if agent_id.contains('@') {
                     None
                 } else {
-                    self.ctx.engine.agents.get(&agent_id).await?
+                    match self.ctx.engine.agents.get(&agent_id).await {
+                        Ok(agent) => agent,
+                        Err(error) => {
+                            self.session_fault("read agent for submit", &error);
+                            return Ok(vec![Frame::Rejected {
+                                exec_key,
+                                reason: format!("worker storage error: {}", fault_kind(&error)),
+                            }]);
+                        }
+                    }
                 };
                 if exec_key.is_empty()
                     || exec_key.len() > 256
@@ -635,49 +1038,95 @@ impl Worker {
                         if held {
                             tracing::info!(task_id = %task.id, "Remote task awaits approval: orch task approve");
                         }
+                        let worker_task_id = task.id;
                         Ok(vec![
                             Frame::Submitted {
                                 exec_key: exec_key.clone(),
-                                worker_task_id: task.id,
+                                worker_task_id: worker_task_id.clone(),
                             },
                             Frame::State {
                                 exec_key,
                                 state: "queued".into(),
+                                reason: held.then(|| {
+                                    format!(
+                                        "{AWAITING_APPROVAL_REASON} run `orch task approve {worker_task_id}` on this worker"
+                                    )
+                                }),
+                                worker_task_id: Some(worker_task_id),
                             },
                         ])
                     }
+                    // A class, never the error's own text: that can carry a
+                    // local path or an error chain, and neither belongs on
+                    // the wire (as for every other reason this worker sends).
                     Err(error) => Ok(vec![Frame::Rejected {
                         exec_key,
-                        reason: error.to_string(),
+                        reason: format!(
+                            "worker could not create the mirror: {}",
+                            fault_kind(&error)
+                        ),
                     }]),
                 }
             }
             Frame::Cancel { exec_key } => {
-                if let Some(task) = self
-                    .mirrors(controller)
-                    .await?
-                    .iter()
-                    .find(|t| label(t, "exec:") == Some(exec_key.as_str()))
-                    && !matches!(
-                        task.status,
-                        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
-                    )
-                {
-                    self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
+                // Unacknowledged on a fault: an ack the controller cannot
+                // trust would retire a cancellation key that never took. The
+                // key is kept instead and retried every tick, because nothing
+                // else clears a mirror inside a live session — the orphan
+                // sweep only runs on a `Sync`, i.e. after a reconnect.
+                if !valid_exec_key(&exec_key) {
+                    // Peer input, and the key reaches a log line and the
+                    // pending map: bound it exactly as `Submit` does.
+                    tracing::warn!("Ignoring a cancel with an invalid execution key");
+                    return Ok(vec![]);
                 }
-                Ok(vec![Frame::CancelAck { exec_key }])
+                let mirrors = match self.mirrors(controller).await {
+                    Ok(mirrors) => mirrors,
+                    Err(error) => {
+                        self.session_fault("read mirrors for cancel", &error);
+                        self.defer_cancel(&exec_key, &error);
+                        return Ok(vec![]);
+                    }
+                };
+                match self
+                    .cancel_key(
+                        &mirrors,
+                        &exec_key,
+                        format!("cancelled by controller {name}"),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.faults().unapplied_cancels.remove(&exec_key);
+                        Ok(vec![Frame::CancelAck { exec_key }])
+                    }
+                    Err(error) => {
+                        self.defer_cancel(&exec_key, &error);
+                        Ok(vec![])
+                    }
+                }
             }
             Frame::FinishedAck { exec_key } => {
-                if let Some(mut task) = self
-                    .mirrors(controller)
-                    .await?
+                // Not recording the ack costs one resend of the outcome on
+                // the next sync, so every fault here simply retries.
+                let mirrors = match self.mirrors(controller).await {
+                    Ok(mirrors) => mirrors,
+                    Err(error) => {
+                        self.session_fault("read mirrors for finished ack", &error);
+                        return Ok(vec![]);
+                    }
+                };
+                if let Some(mut task) = mirrors
                     .into_iter()
                     .find(|t| label(t, "exec:") == Some(exec_key.as_str()))
-                    && self.item(&exec_key, Some(&task)).await?.outcome.is_some()
+                    && self.item(&exec_key, Some(&task)).await.outcome.is_some()
                     && !task.labels.iter().any(|l| l == "remote-finished-ack")
                 {
                     task.labels.push("remote-finished-ack".into());
-                    self.ctx.engine.tasks.save(&task).await?;
+                    if let Err(error) = self.ctx.engine.tasks.save(&task).await {
+                        self.session_fault("record finished ack", &error);
+                        return Ok(vec![]);
+                    }
                     let mut tap = self.tap.lock().expect("worker event ring poisoned");
                     tap.rings.remove(&exec_key);
                     tap.tasks.remove(&task.id);
@@ -688,7 +1137,12 @@ impl Worker {
                 exec_key,
                 after_seq,
             } => {
-                let mirrors = self.mirrors(controller).await?;
+                // A Gap alone is a valid answer: the controller re-attaches
+                // and the live event stream is unaffected.
+                let mirrors = self.mirrors(controller).await.unwrap_or_else(|error| {
+                    self.session_fault("read mirrors for attach", &error);
+                    Vec::new()
+                });
                 let mut replay = Vec::new();
                 if mirrors
                     .iter()
@@ -709,10 +1163,19 @@ impl Worker {
                 Ok(replay)
             }
             Frame::Agents { agents } => {
+                // The snapshot itself is peer input, so an invalid one stays
+                // fatal; failing to *store* a valid one only costs staleness.
                 validate_snapshot(&agents)?;
-                if let Some(mut inbound) = self.ctx.store.read_inbound().await? {
-                    inbound.agents = agents;
-                    self.ctx.store.write_inbound(&inbound).await?;
+                if let Err(error) = async {
+                    if let Some(mut inbound) = self.ctx.store.read_inbound().await? {
+                        inbound.agents = agents;
+                        self.ctx.store.write_inbound(&inbound).await?;
+                    }
+                    Ok::<(), Error>(())
+                }
+                .await
+                {
+                    self.session_fault("record inbound agents", &error);
                 }
                 Ok(vec![])
             }
@@ -729,20 +1192,170 @@ impl Worker {
         }
     }
 
-    async fn updates(
-        &self,
-        controller: &str,
-        sent: &mut HashMap<String, String>,
-    ) -> Result<Vec<Frame>> {
+    /// Cancel one mirror and record **why** on the task.
+    ///
+    /// Every worker-side cancel goes through here. A mirror that simply turns
+    /// `cancelled` with no reason is unexplainable afterwards: the live
+    /// incident was a mirror cancelled at startup with no feedback and no log
+    /// line, which took an evening to attribute.
+    async fn cancel_mirror(&self, task: &Task, reason: String) -> Result<()> {
+        tracing::info!(
+            task_id = %task.id,
+            exec_key = label(task, "exec:").unwrap_or_default(),
+            status = %task.status,
+            %reason,
+            "Cancelling remote mirror"
+        );
+        // Feedback first: `cancel_task` re-reads the record, so writing it
+        // here survives the status change, and a failure below still leaves
+        // the explanation behind.
+        let mut fresh = self
+            .ctx
+            .engine
+            .tasks
+            .get(&task.id)
+            .await?
+            .unwrap_or_else(|| task.clone());
+        fresh.feedback = Some(reason);
+        self.ctx.engine.tasks.save(&fresh).await?;
+        self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
+        // `cancel_task` reports success even when its final status write
+        // failed, because a refused transition usually means the task was
+        // already terminal. Here it is the difference between a mirror that
+        // stopped and one still waiting for a local agent, so confirm it
+        // from the record instead of trusting the call.
+        match self.ctx.engine.tasks.get(&task.id).await? {
+            Some(fresh) if !terminal(fresh.status) => Err(Error::other(format!(
+                "mirror {} is still {}",
+                fresh.id, fresh.status
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Cancel the mirror of one execution key, from a mirror list this tick
+    /// has already read. Idempotent: a mirror that is gone or already
+    /// terminal is cancelled as far as the controller is concerned, so it is
+    /// acknowledged rather than retried.
+    async fn cancel_key(&self, mirrors: &[Task], exec_key: &str, reason: String) -> Result<()> {
+        let Some(task) = mirrors
+            .iter()
+            .find(|task| label(task, "exec:") == Some(exec_key))
+            .filter(|task| !terminal(task.status))
+        else {
+            return Ok(());
+        };
+        self.cancel_mirror(task, reason).await
+    }
+
+    /// Note a cancel this instance could not apply, warning once per key.
+    fn defer_cancel(&self, exec_key: &str, error: &Error) {
+        let now = Instant::now();
+        let mut faults = self.faults();
+        match faults.unapplied_cancels.get_mut(exec_key) {
+            Some(pending) => {
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.next_at = now + cancel_retry_delay(pending.attempts);
+                // A key that cannot be applied for an hour is said again:
+                // silence after the first warning hides a stuck mirror.
+                if pending.warned_at.elapsed() >= CANCEL_REWARN_EVERY {
+                    pending.warned_at = now;
+                    tracing::warn!(%exec_key, %error, attempts = pending.attempts, "Cancel still not applicable");
+                }
+                return;
+            }
+            None => {
+                if faults.unapplied_cancels.len() >= MAX_UNAPPLIED_CANCELS {
+                    // Bounded: peer input decides how many keys exist. The
+                    // one whose retry is furthest out makes way.
+                    if let Some(evicted) = faults
+                        .unapplied_cancels
+                        .iter()
+                        .max_by_key(|(_, pending)| pending.next_at)
+                        .map(|(key, _)| key.clone())
+                    {
+                        tracing::warn!(exec_key = %evicted, "Dropping a deferred cancel: too many pending");
+                        faults.unapplied_cancels.remove(&evicted);
+                    }
+                }
+                faults.unapplied_cancels.insert(
+                    exec_key.into(),
+                    PendingCancel {
+                        next_at: now + cancel_retry_delay(1),
+                        attempts: 1,
+                        warned_at: now,
+                    },
+                );
+            }
+        }
+        drop(faults);
+        self.session_fault("cancel mirror", error);
+    }
+
+    /// Retry the cancels this instance could not apply, once per tick, each
+    /// on its own backoff. A mirror is typically unreadable for as long as
+    /// its file is damaged; once it is readable again the next due attempt
+    /// retires the key.
+    async fn retry_cancels(&self, controller: &str, name: &str) -> Vec<Frame> {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .faults()
+            .unapplied_cancels
+            .iter()
+            .filter(|(_, pending)| pending.next_at <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        // One listing for the whole tick, not one per key.
+        let mirrors = match self.mirrors(controller).await {
+            Ok(mirrors) => mirrors,
+            Err(error) => {
+                self.session_fault("read mirrors for deferred cancel", &error);
+                return Vec::new();
+            }
+        };
         let mut replies = Vec::new();
-        for task in self.mirrors(controller).await? {
+        for exec_key in due {
+            match self
+                .cancel_key(
+                    &mirrors,
+                    &exec_key,
+                    format!("cancelled by controller {name}"),
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.faults().unapplied_cancels.remove(&exec_key);
+                    tracing::info!(%exec_key, "Deferred cancel applied");
+                    replies.push(Frame::CancelAck { exec_key });
+                }
+                Err(error) => self.defer_cancel(&exec_key, &error),
+            }
+        }
+        replies
+    }
+
+    async fn updates(&self, controller: &str, sent: &mut HashMap<String, String>) -> Vec<Frame> {
+        let mut replies = Vec::new();
+        // Nothing to send this tick rather than an ended session: the next
+        // tick, one second later, tries again.
+        let mirrors = match self.mirrors(controller).await {
+            Ok(mirrors) => mirrors,
+            Err(error) => {
+                self.session_fault("read mirrors for updates", &error);
+                return replies;
+            }
+        };
+        for task in mirrors {
             if task.labels.iter().any(|l| l == "remote-finished-ack") {
                 continue;
             }
             let Some(key) = label(&task, "exec:") else {
                 continue;
             };
-            let item = self.item(key, Some(&task)).await?;
+            let item = self.item(key, Some(&task)).await;
             if sent.get(key) == Some(&item.state) {
                 continue;
             }
@@ -758,10 +1371,27 @@ impl Worker {
                 replies.push(Frame::State {
                     exec_key: key.into(),
                     state: item.state,
+                    reason: item.reason,
+                    worker_task_id: item.worker_task_id,
                 });
             }
         }
-        Ok(replies)
+        replies
+    }
+}
+
+/// A coarse class for a storage fault, for the `reason` the controller shows
+/// its owner. Never the error's own text: that can carry a local path or an
+/// error chain, and neither belongs on the wire (see `Context::ingest`).
+fn fault_kind(error: &Error) -> &'static str {
+    match error {
+        Error::Io { .. } => "unreadable file",
+        Error::Serde { .. } => "corrupt record",
+        Error::Command { .. } => "command failed",
+        Error::Adapter(_) => "adapter failed",
+        // Everything else, including the YAML size and alias guards, which
+        // report through `Error::other`.
+        Error::Domain(_) => "read failed",
     }
 }
 
@@ -786,6 +1416,31 @@ impl RunEventTap for Worker {
             },
         ));
     }
+}
+
+/// Keep the map of remembered controllers bounded, dropping the ones seen
+/// longest ago. `keep` is never evicted: it is the controller connected now.
+fn evict_oldest_controllers(seen: &mut BTreeMap<String, String>, keep: &str) {
+    while seen.len() > MAX_REMEMBERED_CONTROLLERS {
+        let Some(oldest) = seen
+            .iter()
+            .filter(|(instance_id, _)| instance_id.as_str() != keep)
+            .min_by(|left, right| left.1.cmp(right.1))
+            .map(|(instance_id, _)| instance_id.clone())
+        else {
+            return;
+        };
+        tracing::warn!(instance_id = %oldest, "Forgetting the least recently seen controller");
+        seen.remove(&oldest);
+    }
+}
+
+/// A mirror in this state is finished as far as a controller's cancel goes.
+fn terminal(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+    )
 }
 
 fn label<'a>(task: &'a Task, prefix: &str) -> Option<&'a str> {
@@ -892,6 +1547,12 @@ mod tests {
             .await
             .unwrap(),
         );
+        // The tests drive `handle` directly, so nothing claims a session slot.
+        // A mirror only runs while its controller is connected, which here is
+        // the `"controller"` every test submits as.
+        engine
+            .orchestrator
+            .set_inbound_controller(Some("controller".into()));
         let agent = engine
             .agent_service
             .create(CreateAgentInput {
@@ -1053,6 +1714,7 @@ mod tests {
                 name: "w1".into(),
                 os: "test".into(),
                 agents: vec![],
+                version: None,
             },
         )
         .await
@@ -1117,6 +1779,7 @@ mod tests {
                 name: "C".into(),
                 os: "test".into(),
                 agents: vec![],
+                version: None,
             },
         )
         .await
@@ -1160,6 +1823,7 @@ mod tests {
                     name: name.into(),
                     os: "test".into(),
                     agents: vec![],
+                    version: None,
                 },
             )
             .await
@@ -1313,10 +1977,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, RunStatus::Succeeded);
         // The controller receives the outcome on its next update.
-        let frames = worker
-            .updates("controller", &mut HashMap::new())
-            .await
-            .unwrap();
+        let frames = worker.updates("controller", &mut HashMap::new()).await;
         assert!(
             frames.iter().any(|frame| matches!(
                 frame,
@@ -1351,13 +2012,45 @@ mod tests {
     async fn mirror_waits_for_owner_approval(policy: orch_domain::ApprovalPolicy) {
         let (temp, worker, agent_id) = fixture().await;
         let replies = submit_with_policy(&temp, &worker, &agent_id, policy).await;
-        assert!(matches!(&replies[0], Frame::Submitted { .. }));
-        assert!(
-            matches!(&replies[1], Frame::State { state, .. } if state == "queued"),
-            "{replies:?}"
-        );
+        let Frame::Submitted { worker_task_id, .. } = &replies[0] else {
+            panic!("{replies:?}")
+        };
         let task = mirror(&worker, "key").await;
+        assert_eq!(worker_task_id, &task.id);
         assert!(task.awaits_approval(), "{:?}", task.labels);
+        // The controller can only name the command its owner has to run here
+        // if this frame carries both the reason and the mirror's id.
+        let Frame::State {
+            state,
+            reason,
+            worker_task_id,
+            ..
+        } = &replies[1]
+        else {
+            panic!("{replies:?}")
+        };
+        assert_eq!(state, "queued");
+        assert_eq!(worker_task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                format!(
+                    "{AWAITING_APPROVAL_REASON} run `orch task approve {}` on this worker",
+                    task.id
+                )
+                .as_str()
+            )
+        );
+        // And so does every later sync of the same key.
+        let item = worker.item("key", Some(&task)).await;
+        assert_eq!(
+            (
+                item.state.as_str(),
+                item.reason.as_deref(),
+                item.worker_task_id.as_deref()
+            ),
+            ("queued", reason.as_deref(), Some(task.id.as_str()))
+        );
 
         dispatch_mirror(&worker, &task.id).await;
         let held = mirror(&worker, "key").await;
@@ -1373,7 +2066,7 @@ mod tests {
                 .is_empty(),
             "held mirror must not execute"
         );
-        let item = worker.item("key", Some(&held)).await.unwrap();
+        let item = worker.item("key", Some(&held)).await;
         assert_eq!((item.state.as_str(), item.outcome), ("queued", None));
 
         // `orch task approve <id>` on the worker.
@@ -1472,9 +2165,15 @@ mod tests {
         assert_eq!(items[0].state, "queued");
         assert_eq!(items[1].state, "unknown");
         assert_eq!(mirror(&worker, "tracked").await.status, TaskStatus::Todo);
+        let abandoned = mirror(&worker, "abandoned").await;
+        assert_eq!(abandoned.status, TaskStatus::Cancelled);
+        // The live incident: a mirror found `cancelled` with no feedback and
+        // no log line could not be attributed to any path afterwards.
         assert_eq!(
-            mirror(&worker, "abandoned").await.status,
-            TaskStatus::Cancelled
+            abandoned.feedback.as_deref(),
+            Some(
+                "orphaned remote mirror: controller controller no longer tracks execution abandoned"
+            )
         );
         assert_eq!(mirror(&worker, "foreign").await.status, TaskStatus::Todo);
         assert!(matches!(
@@ -1490,6 +2189,41 @@ mod tests {
                 .unwrap()[0],
             Frame::CancelAck { .. }
         ));
+        // An explicit cancel says so on the mirror as well.
+        assert!(matches!(
+            &worker
+                .handle(
+                    "controller",
+                    "C",
+                    Frame::Cancel {
+                        exec_key: "tracked".into()
+                    }
+                )
+                .await
+                .unwrap()[0],
+            Frame::CancelAck { .. }
+        ));
+        let cancelled = mirror(&worker, "tracked").await;
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(
+            cancelled.feedback.as_deref(),
+            Some("cancelled by controller C")
+        );
+        // A key no `Submit` would have accepted is not even recorded.
+        assert!(
+            worker
+                .handle(
+                    "controller",
+                    "C",
+                    Frame::Cancel {
+                        exec_key: "x".repeat(257)
+                    }
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(worker.faults().unapplied_cancels.is_empty());
     }
 
     #[tokio::test]
@@ -1662,18 +2396,15 @@ mod tests {
         task.status = TaskStatus::Failed;
         worker.ctx.engine.tasks.save(&task).await.unwrap();
         assert!(matches!(
-            worker.item("key", Some(&task)).await.unwrap().outcome,
+            worker.item("key", Some(&task)).await.outcome,
             Some(RemoteOutcome::Failed { .. })
         ));
         task.status = TaskStatus::Review;
         worker.ctx.engine.tasks.save(&task).await.unwrap();
-        let item = worker.item("key", Some(&task)).await.unwrap();
+        let item = worker.item("key", Some(&task)).await;
         assert_eq!(item.state, "unknown");
         assert!(item.outcome.is_none());
-        let updates = worker
-            .updates("controller", &mut HashMap::new())
-            .await
-            .unwrap();
+        let updates = worker.updates("controller", &mut HashMap::new()).await;
         assert!(matches!(&updates[0], Frame::SyncState { items } if items[0].state == "unknown"));
     }
 
@@ -1688,19 +2419,12 @@ mod tests {
         let mut state = worker.ctx.engine.state.read().await.unwrap();
         state.claimed.insert(task.id.clone());
         worker.ctx.engine.state.write(&state).await.unwrap();
-        let item = worker.item("key", Some(&task)).await.unwrap();
+        let item = worker.item("key", Some(&task)).await;
         assert_eq!(item.state, "running");
         assert!(item.outcome.is_none());
         state.claimed.clear();
         worker.ctx.engine.state.write(&state).await.unwrap();
-        assert!(
-            worker
-                .item("key", Some(&task))
-                .await
-                .unwrap()
-                .outcome
-                .is_some()
-        );
+        assert!(worker.item("key", Some(&task)).await.outcome.is_some());
     }
 
     include!("worker_hardening_tests.rs");

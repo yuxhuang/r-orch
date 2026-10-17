@@ -840,7 +840,15 @@ impl Orchestrator {
     /// Wall-clock runtime of a running entry. `None` when `started_at` does
     /// not parse, where JS would produce `NaN` and poison the counter.
     pub(super) fn runtime_ms(&self, entry: &RunningEntry) -> Option<u64> {
-        let started_at = epoch_ms_from_iso(&entry.started_at)?;
+        // A remote run's clock starts when the worker said it was running,
+        // so a mirror held for hours behind `orch task approve` does not bill
+        // that wait to the agent's runtime.
+        let started = entry
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.running_since.as_deref())
+            .unwrap_or(&entry.started_at);
+        let started_at = epoch_ms_from_iso(started)?;
         Some(self.deps().clock.now_ms().saturating_sub(started_at).max(0) as u64)
     }
 }

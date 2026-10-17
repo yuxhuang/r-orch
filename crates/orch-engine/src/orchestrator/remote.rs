@@ -6,12 +6,154 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use orch_core::error::Result;
-use orch_core::remote::{RemoteBridge, RemoteOutcome, RunEventTap};
+use orch_core::remote::{RemoteBridge, RemoteOutcome, RemotePhaseUpdate, RunEventTap};
 use orch_domain::{
-    OrchestratorEvent, OrchestratorState, RemoteRunRef, RunStatus, TaskProof, TaskStatus,
+    OrchestratorEvent, OrchestratorState, RemotePhase, RemoteRunRef, RunStatus, TaskProof,
+    TaskStatus,
 };
 
-use super::Orchestrator;
+use super::{
+    Orchestrator, REMOTE_CLOCK_MIN_SAMPLE_MS, REMOTE_QUEUED_WARN_MS, REMOTE_SUBMIT_DEADLINE_MS,
+};
+
+/// How long one remote entry has been in its current phase, for the two
+/// deadlines. `dispatched` counts only the time its peer was online; nothing
+/// else needs a wall clock that stops.
+#[derive(Debug)]
+pub(super) struct RemoteClock {
+    phase: RemotePhase,
+    /// Milliseconds spent in `phase`. Online-only while `dispatched`.
+    elapsed_ms: i64,
+    /// When this entry was last sampled, so a tick adds its own interval.
+    sampled_at_ms: i64,
+    /// When the queued warning was last emitted, to keep it hourly.
+    warned_at_ms: Option<i64>,
+}
+
+impl RemoteClock {
+    /// A phase observed for the first time, with its clock at zero. There is
+    /// no `Default`: an entry whose `sampled_at_ms` defaulted to the epoch
+    /// counted every millisecond since 1970 on its first sample, which failed
+    /// a freshly dispatched run instantly.
+    fn started(phase: RemotePhase, now_ms: i64) -> Self {
+        Self {
+            phase,
+            elapsed_ms: 0,
+            sampled_at_ms: now_ms,
+            warned_at_ms: None,
+        }
+    }
+
+    /// Fold one reconcile sample in and return the time spent in `phase`.
+    ///
+    /// A sample credits at most `max_sample_ms`, so a closed laptop lid or a
+    /// stalled tick cannot jump a deadline in one step: a wall clock that
+    /// skipped eight hours is not eight hours of a peer failing to answer.
+    fn sample(&mut self, phase: RemotePhase, now_ms: i64, counts: bool, max_sample_ms: i64) -> i64 {
+        if phase != self.phase {
+            *self = RemoteClock::started(phase, now_ms);
+            return 0;
+        }
+        let delta = now_ms
+            .saturating_sub(self.sampled_at_ms)
+            .clamp(0, max_sample_ms);
+        self.sampled_at_ms = now_ms;
+        if counts {
+            self.elapsed_ms = self.elapsed_ms.saturating_add(delta);
+        }
+        self.elapsed_ms
+    }
+
+    fn warn_due(&mut self, now_ms: i64) -> bool {
+        let due = self
+            .warned_at_ms
+            .is_none_or(|at| now_ms.saturating_sub(at) >= REMOTE_QUEUED_WARN_MS);
+        if due {
+            self.warned_at_ms = Some(now_ms);
+        }
+        due
+    }
+}
+
+impl Orchestrator {
+    /// The two phase deadlines, from inside reconcile's remote branch.
+    ///
+    /// A submit the worker never acknowledges is a real failure: nothing ran,
+    /// so the task can fail and be retried. A mirror that stays queued is
+    /// not — it is usually waiting for its worker owner's approval, which the
+    /// controller cannot grant and must not cancel work over. So that one
+    /// only ever warns, once an hour, naming the command that would clear it.
+    ///
+    /// Returns true when the entry was failed and is gone from `state`.
+    pub(super) async fn enforce_remote_deadlines(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        online: bool,
+    ) -> Result<bool> {
+        let Some(remote) = state
+            .running
+            .get(task_id)
+            .and_then(|entry| entry.remote.clone())
+        else {
+            return Ok(false);
+        };
+        let now = self.deps().clock.now_ms();
+        let (elapsed, warn_due) = {
+            let mut clocks = self.inner.remote_clocks.lock().await;
+            let clock = clocks
+                .entry(task_id.to_owned())
+                .or_insert_with(|| RemoteClock::started(remote.phase, now));
+            // Only `dispatched` stops counting while the peer is away: an
+            // offline worker has not failed to answer.
+            let counts = online || remote.phase != RemotePhase::Dispatched;
+            // Two ticks' worth of credit per sample, so the clock tracks
+            // reconciles that actually ran rather than wall time.
+            let max_sample = (self.config().scheduling.poll_interval_ms as i64)
+                .saturating_mul(2)
+                .max(REMOTE_CLOCK_MIN_SAMPLE_MS);
+            let elapsed = clock.sample(remote.phase, now, counts, max_sample);
+            let warn_due = remote.phase == RemotePhase::Queued
+                && elapsed >= REMOTE_QUEUED_WARN_MS
+                && clock.warn_due(now);
+            (elapsed, warn_due)
+        };
+        if remote.phase == RemotePhase::Dispatched && elapsed >= REMOTE_SUBMIT_DEADLINE_MS {
+            let error = format!("remote {} never acknowledged submit", remote.alias);
+            tracing::warn!(%task_id, alias = %remote.alias, online_ms = elapsed, "{error}");
+            // Cancel first: the worker may hold a mirror whose `Submitted`
+            // never reached us, and it must not run after this task fails.
+            self.cancel_remote(&remote).await;
+            self.fail_remote_unknown_locked(state, task_id, &error)
+                .await?;
+            return Ok(true);
+        }
+        if warn_due {
+            let hours = elapsed / 3_600_000;
+            self.emit(OrchestratorEvent::OrchestratorError {
+                error: format!("{task_id} has been queued on {} for {hours}h", remote.alias),
+                context: remote.hint().unwrap_or_else(|| {
+                    format!(
+                        "The mirror is waiting on {}; run `orch task list` there to see why",
+                        remote.alias
+                    )
+                }),
+                fatal: false,
+            });
+        }
+        Ok(false)
+    }
+
+    /// Forget the phase clocks of entries reconcile no longer holds, so a
+    /// long-lived owner does not accumulate one per completed remote run.
+    pub(super) async fn prune_remote_clocks(&self, state: &OrchestratorState) {
+        self.inner
+            .remote_clocks
+            .lock()
+            .await
+            .retain(|task_id, _| state.running.contains_key(task_id));
+    }
+}
 
 impl Orchestrator {
     /// Install before starting the owner. Light commands never create a link.
@@ -29,6 +171,26 @@ impl Orchestrator {
             .event_tap
             .write()
             .unwrap_or_else(|e| e.into_inner()) = Some(tap);
+    }
+
+    /// Publish the controller this instance's peer listener is serving, or
+    /// `None` once its session ends. Set by the peer worker on admission.
+    pub fn set_inbound_controller(&self, instance_id: Option<String>) {
+        *self
+            .inner
+            .inbound_controller
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = instance_id;
+    }
+
+    /// The controller this instance's listener is serving, if any. Public so
+    /// the peer runtime's own tests can see what it published.
+    pub fn inbound_controller(&self) -> Option<String> {
+        self.inner
+            .inbound_controller
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Release the owner's in-process tap when its peer runtime stops.
@@ -116,6 +278,203 @@ impl Orchestrator {
         self.save_remote_state(state).await
     }
 
+    /// Collect one remote execution on its own task, from a handle the bridge
+    /// has already registered. The entry in `state.running` is durable before
+    /// this is called, so a collector that never starts costs a sync, not an
+    /// outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn spawn_remote_collector(
+        &self,
+        handle: Result<orch_core::remote::RemoteExecuteHandle>,
+        run_id: &str,
+        task_id: &str,
+        agent_id: &str,
+        auto_approve: bool,
+        cancel: CancellationToken,
+    ) {
+        self.inner
+            .active_collectors
+            .lock()
+            .await
+            .insert(task_id.to_owned());
+        let orchestrator = self.clone();
+        let (run_id, task_id, agent_id) =
+            (run_id.to_owned(), task_id.to_owned(), agent_id.to_owned());
+        tokio::spawn(async move {
+            let result = match handle {
+                Ok(handle) => {
+                    orchestrator
+                        .collect_remote_events(
+                            handle.events,
+                            &run_id,
+                            &task_id,
+                            &agent_id,
+                            auto_approve,
+                            cancel,
+                        )
+                        .await
+                }
+                Err(err) => Err(err), // retain the durable entry pending sync
+            };
+            if let Err(err) = result {
+                orchestrator.emit_error(err, format!("remote execution for {task_id}"));
+            }
+            orchestrator
+                .inner
+                .active_collectors
+                .lock()
+                .await
+                .remove(&task_id);
+        });
+    }
+
+    /// Re-attach to the remote executions that outlived this controller.
+    ///
+    /// Startup recovery keeps a remote entry whose peer is still registered,
+    /// because the worker owns that execution and its outcome is still
+    /// coming. The peer runtime calls this before its first link exists, so
+    /// the request is never sent again, the key is in the first `Sync` — a
+    /// live mirror the controller forgot would be cancelled as an orphan —
+    /// and a collector is waiting when the sync answers.
+    pub async fn rehydrate_remote_runs(&self) -> Result<()> {
+        let entries: Vec<orch_domain::RunningEntry> = {
+            let slot = self.inner.state.lock().await;
+            match slot.as_ref() {
+                Some(state) => state
+                    .running
+                    .values()
+                    .filter(|entry| entry.remote.is_some())
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let directory = orch_infra::storage::remote::RemoteAgentDirectory::new(
+            orch_infra::storage::Paths::new(self.deps().project_root.clone()),
+        );
+        let agents = directory.list(Vec::new()).await.unwrap_or_default();
+        for entry in entries {
+            let remote = entry.remote.as_ref().expect("filtered on remote");
+            let handle = self
+                .remote_bridge()
+                .rehydrate(&remote.alias, &remote.exec_key);
+            if let Err(error) = &handle {
+                // Nothing is lost here: with no execution registered the next
+                // sync reports the key unknown and reconcile retires it.
+                self.emit_error(
+                    error.to_string(),
+                    format!("rehydrate remote execution {}", remote.exec_key),
+                );
+            }
+            // The worker's approval policy decides whether a successful
+            // outcome auto-approves, exactly as it did at dispatch. A read
+            // that fails here must not stop the owner from starting: the
+            // conservative answer leaves the outcome in review.
+            let autonomous = match self.deps().task_store.get(&entry.task_id).await {
+                Ok(task) => task.is_some_and(|task| task.is_autonomous()),
+                Err(error) => {
+                    self.emit_error(error, format!("rehydrate: read task {}", entry.task_id));
+                    false
+                }
+            };
+            let auto_approve = autonomous
+                || agents.iter().any(|agent| {
+                    agent.id == entry.agent_id
+                        && agent.config.approval_policy == Some(orch_domain::ApprovalPolicy::Auto)
+                });
+            tracing::info!(
+                task_id = %entry.task_id,
+                alias = %remote.alias,
+                exec_key = %remote.exec_key,
+                "Rehydrated remote execution; awaiting the worker's sync"
+            );
+            let cancel = self.register_cancel(&entry.task_id).await;
+            self.spawn_remote_collector(
+                handle,
+                &entry.run_id,
+                &entry.task_id,
+                &entry.agent_id,
+                auto_approve,
+                cancel,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Record what the worker says about an execution that has not finished,
+    /// and start its run record the moment the worker says it is running.
+    ///
+    /// Only the phase moves. The task stays `in_progress` and the run stays
+    /// `preparing` until then, so no view claims a peer is running work it
+    /// has merely been sent. Returns the phase the entry ended up in.
+    pub(super) async fn apply_remote_phase(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        update: &RemotePhaseUpdate,
+    ) -> Result<RemotePhase> {
+        let mut slot = self.inner.state.lock().await;
+        let Some(state) = slot.as_mut() else {
+            return Ok(update.phase);
+        };
+        let Some(remote) = state
+            .running
+            .get_mut(task_id)
+            .filter(|entry| entry.run_id == run_id)
+            .and_then(|entry| entry.remote.as_mut())
+        else {
+            // The entry has been retired; a phase never resurrects one.
+            return Ok(RemotePhase::Terminal);
+        };
+        let before = remote.phase;
+        if update.worker_task_id.is_some() {
+            remote.worker_task_id = update.worker_task_id.clone();
+        }
+        // A rejected transition keeps everything it already knew: the reason
+        // and the mirror id belong to the phase that is still in force.
+        if before == update.phase || before.advances_to(update.phase) {
+            remote.phase = update.phase;
+            remote.reason = update.reason.clone();
+        }
+        let phase = remote.phase;
+        // Gated on `running_since` rather than on the transition: a `start`
+        // that failed once would otherwise leave the run `preparing` for
+        // ever, because the transition never happens twice. Until a start has
+        // been accounted for, every later phase update — the next sync, the
+        // next worker event — retries it.
+        if phase == RemotePhase::Running && remote.running_since.is_none() {
+            let preparing = self
+                .deps()
+                .run_store
+                .get(run_id)
+                .await?
+                .is_some_and(|run| run.status == RunStatus::Preparing);
+            // Already `running` when a restart rehydrated this entry:
+            // starting it again would emit a second `agent:started`.
+            if preparing {
+                self.deps().run_service.start(run_id, 0).await?;
+            }
+            // Only now, so a failed start above is retried rather than lost.
+            // The run's own clock starts here, not at dispatch.
+            if let Some(remote) = state
+                .running
+                .get_mut(task_id)
+                .and_then(|entry| entry.remote.as_mut())
+            {
+                remote.running_since = Some(self.deps().clock.now_iso());
+            }
+        }
+        if phase != before {
+            tracing::debug!(%task_id, %run_id, from = before.as_str(), to = phase.as_str(), "Remote execution phase");
+        }
+        self.save_remote_state(state).await?;
+        Ok(phase)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn collect_remote_events(
         &self,
@@ -127,13 +486,55 @@ impl Orchestrator {
         cancel: CancellationToken,
     ) -> Result<()> {
         let mut collected = super::collect::Collected::default();
+        // Phase bookkeeping, so a long run does not take the state lock once
+        // per progress event just to re-assert what it already said.
+        let mut running = false;
         loop {
             let item = tokio::select! {
                 _ = cancel.cancelled() => break,
                 item = events.next() => item,
             };
             match item {
+                Some(RemoteRunEvent::Phase(update)) => {
+                    match self.apply_remote_phase(task_id, run_id, &update).await {
+                        Ok(phase) => {
+                            running = matches!(phase, RemotePhase::Running | RemotePhase::Terminal)
+                        }
+                        Err(err) => self.emit_error(err, format!("record remote phase {run_id}")),
+                    }
+                }
+                // The controller's own progress line about the link. It is
+                // logged, and it says nothing about what the worker is doing.
+                Some(RemoteRunEvent::Hint(event)) => {
+                    if let Err(err) = self
+                        .record_event(&mut collected, event, run_id, task_id, agent_id)
+                        .await
+                    {
+                        self.emit_error(err, format!("record remote progress {run_id}"));
+                    }
+                }
                 Some(RemoteRunEvent::Event(event)) => {
+                    // An agent emitting progress *is* the worker's run, so it
+                    // promotes the phase whatever frame the worker's
+                    // one-second tick has got round to sending.
+                    if !running {
+                        match self
+                            .apply_remote_phase(
+                                task_id,
+                                run_id,
+                                &RemotePhaseUpdate::new(RemotePhase::Running),
+                            )
+                            .await
+                        {
+                            Ok(phase) => {
+                                running =
+                                    matches!(phase, RemotePhase::Running | RemotePhase::Terminal)
+                            }
+                            Err(err) => {
+                                self.emit_error(err, format!("record remote phase {run_id}"))
+                            }
+                        }
+                    }
                     if let Err(err) = self
                         .record_event(&mut collected, event, run_id, task_id, agent_id)
                         .await
@@ -165,18 +566,34 @@ impl Orchestrator {
                     break;
                 }
                 Some(RemoteRunEvent::Unknown) => {
+                    // The worker has no execution record for this key, but it
+                    // may well still hold the mirror — an unreadable one is
+                    // reported unknown and then becomes readable again. This
+                    // task is about to fail here, so the mirror must go, and
+                    // only an explicit cancel clears one inside a session.
+                    if let Some(remote) = {
+                        let slot = self.inner.state.lock().await;
+                        slot.as_ref()
+                            .and_then(|state| state.running.get(task_id))
+                            .filter(|entry| entry.run_id == run_id)
+                            .and_then(|entry| entry.remote.clone())
+                    } {
+                        self.cancel_remote(&remote).await;
+                    }
                     // Sync is authoritative, but applying it still requires
                     // durable writes, exactly like a finished envelope.
                     loop {
                         let result = {
                             let mut slot = self.inner.state.lock().await;
                             if let Some(state) = slot.as_mut() {
-                                self.persist_remote_unknown_locked(
-                                    state,
-                                    task_id,
-                                    "remote lost execution record",
-                                )
-                                .await
+                                let error = remote_unknown_error(
+                                    state
+                                        .running
+                                        .get(task_id)
+                                        .and_then(|entry| entry.remote.as_ref()),
+                                );
+                                self.persist_remote_unknown_locked(state, task_id, &error)
+                                    .await
                             } else {
                                 Ok(())
                             }
@@ -397,5 +814,17 @@ impl Orchestrator {
         self.save_remote_state(state).await?;
         self.schedule_dispatch_after_run(task_id).await;
         Ok(())
+    }
+}
+
+/// Why a run with no outcome failed, including the worker's own explanation
+/// when it gave one. Without it a corrupt mirror on the worker reaches the
+/// operator as the bare "remote lost execution record", which says nothing
+/// about where to look or what to fix.
+fn remote_unknown_error(remote: Option<&RemoteRunRef>) -> String {
+    let base = "remote lost execution record";
+    match remote.and_then(|remote| remote.reason.as_deref().map(|r| (&remote.alias, r))) {
+        Some((alias, reason)) => format!("{base} ({alias}: {reason})"),
+        None => base.to_owned(),
     }
 }

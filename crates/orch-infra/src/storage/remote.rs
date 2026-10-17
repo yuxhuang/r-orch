@@ -18,7 +18,11 @@ use super::paths::{Paths, sanitize_id};
 /// Keep untrusted display metadata on one bounded line, including Unicode line
 /// separators that Rust does not classify as control characters. Limits are
 /// bytes, and truncation always preserves complete UTF-8 characters.
-fn metadata_text(text: &str, max_bytes: usize) -> String {
+///
+/// Public because every peer-supplied string that reaches a log line, a
+/// `state.json` field or a terminal has to pass through it, and the peer
+/// crate ingests several of those.
+pub fn metadata_text(text: &str, max_bytes: usize) -> String {
     let mut clean = String::with_capacity(text.len().min(max_bytes));
     for ch in text.chars() {
         if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
@@ -150,6 +154,14 @@ struct PublicRemoteStatus {
     os: Option<String>,
     #[serde(default, with = "public_snapshot")]
     agents: Vec<Agent>,
+    #[serde(default)]
+    peer_version: Option<String>,
+    #[serde(default)]
+    link_state: orch_domain::LinkState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_retry_at: Option<String>,
+    #[serde(default)]
+    attempts: u32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -163,6 +175,8 @@ struct PublicInboundStatus {
     connected_since: String,
     #[serde(default, with = "public_snapshot")]
     agents: Vec<Agent>,
+    #[serde(default)]
+    controller_version: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -680,7 +694,88 @@ mod tests {
             instance_id: None,
             os: Some("linux".into()),
             agents: vec![agent],
+            peer_version: None,
+            link_state: orch_domain::LinkState::Online,
+            next_retry_at: None,
+            attempts: 0,
         }
+    }
+
+    /// A `remotes/<alias>.json` written by 0.5.0 must still load, and the
+    /// fields this release added must survive a round trip through the public
+    /// projection — the directory is the only channel between the two sides,
+    /// and a status that fails to parse takes remote dispatch with it.
+    #[tokio::test]
+    async fn a_legacy_status_record_loads_and_the_link_fields_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        let store = FileRemoteStore::new(paths.clone());
+        store.add(config("w1")).await.unwrap();
+        write_json(
+            &paths.remotes_dir().join("w1.json"),
+            &serde_json::json!({
+                "alias": "w1",
+                "addr": "127.0.0.1:7690",
+                "online": true,
+                "last_seen": "2026-10-15T00:00:00Z",
+                "last_error": null,
+                "peer_name": "worker",
+                "instance_id": "worker-id",
+                "os": "linux",
+                "agents": []
+            }),
+        )
+        .await
+        .unwrap();
+        let legacy = store.read_status("w1").await.unwrap().unwrap();
+        assert_eq!(legacy.link_state, orch_domain::LinkState::Connecting);
+        assert_eq!(legacy.attempts, 0);
+        assert!(legacy.next_retry_at.is_none() && legacy.peer_version.is_none());
+        assert_eq!(legacy.peer_name.as_deref(), Some("worker"));
+
+        let written = RemoteStatus {
+            online: false,
+            link_state: orch_domain::LinkState::Backoff,
+            next_retry_at: Some("2026-10-15T00:00:12Z".into()),
+            attempts: 5,
+            peer_version: Some("0.5.0".into()),
+            last_error: Some("Peer closed connection".into()),
+            ..status("w1")
+        };
+        store.write_status(&written).await.unwrap();
+        let read = store.read_status("w1").await.unwrap().unwrap();
+        // The agent snapshot is deliberately projected; the link fields are
+        // what this test is about.
+        assert_eq!(
+            (
+                read.link_state,
+                read.next_retry_at,
+                read.attempts,
+                read.peer_version,
+                read.last_error
+            ),
+            (
+                written.link_state,
+                written.next_retry_at,
+                written.attempts,
+                written.peer_version,
+                written.last_error
+            )
+        );
+        // `next_retry_at` stays off disk while there is no retry pending.
+        store
+            .write_status(&RemoteStatus {
+                online: false,
+                ..status("w1")
+            })
+            .await
+            .unwrap();
+        let stored: serde_json::Value = read_json(&paths.remotes_dir().join("w1.json"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.get("next_retry_at").is_none());
+        assert_eq!(stored["attempts"], 0);
     }
 
     #[tokio::test]
@@ -748,6 +843,7 @@ mod tests {
             instance_id: "id".into(),
             connected_since: "now".into(),
             agents: hostile.agents.clone(),
+            controller_version: None,
         };
         write_json(&paths.remotes_dir().join("_inbound.json"), &inbound)
             .await
@@ -1010,6 +1106,7 @@ mod tests {
             instance_id: "controller-id".into(),
             connected_since: "now".into(),
             agents: status.agents.clone(),
+            controller_version: None,
         };
         let outbound_path = paths.remotes_dir().join("w1.json");
         let inbound_path = paths.remotes_dir().join("_inbound.json");
@@ -1195,6 +1292,7 @@ mod tests {
             instance_id: "id".into(),
             connected_since: "now".into(),
             agents: bad.agents.clone(),
+            controller_version: None,
         };
         assert!(store.write_inbound(&inbound).await.is_err());
         write_json(&paths.remotes_dir().join("w1.json"), &bad)
@@ -1219,6 +1317,7 @@ mod tests {
                 instance_id: "id".into(),
                 connected_since: "now".into(),
                 agents: vec![make_agent()],
+                controller_version: None,
             })
             .await
             .unwrap();
@@ -1271,6 +1370,7 @@ mod tests {
                 instance_id: "C".into(),
                 connected_since: "2026-10-15T00:00:00Z".into(),
                 agents: vec![make_agent()],
+                controller_version: None,
             })
             .await
             .unwrap();

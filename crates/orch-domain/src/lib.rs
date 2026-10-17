@@ -74,4 +74,7 @@ pub use transitions::{
     resolve_completion_status, resolve_failure_status,
 };
 
-pub use remote::{InboundStatus, RemoteConfig, RemoteRef, RemoteRunRef, RemoteStatus};
+pub use remote::{
+    AWAITING_APPROVAL_REASON, InboundStatus, LinkState, RemoteConfig, RemotePhase, RemoteRef,
+    RemoteRunRef, RemoteStatus,
+};

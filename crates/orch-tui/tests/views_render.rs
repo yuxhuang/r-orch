@@ -5,7 +5,10 @@
 mod common;
 
 use common::Harness;
-use orch_domain::{AgentLastError, AgentStatus, GoalStatus, RunningEntry, TaskProof, TaskStatus};
+use orch_domain::{
+    AgentLastError, AgentStatus, GoalStatus, RemotePhase, RemoteRunRef, RunningEntry, TaskProof,
+    TaskStatus,
+};
 use orch_tui::backend::{FakeBackend, make_agent, make_goal, make_task, make_team};
 use orch_tui::state::{ToastKind, ViewId};
 use ratatui::crossterm::event::KeyCode;
@@ -1063,4 +1066,87 @@ fn remote_agents_show_capabilities_location_and_offline_state() {
     harness.assert_text("OFFLINE");
     harness.assert_text("CAPS:linux");
     harness.assert_text("WHERE:w1 offline");
+}
+
+/// The detail panel shows the phase, in the phase's own colour, and the one
+/// thing the operator can do about it: the `orch task approve` that has to be
+/// run on the worker.
+#[test]
+fn the_task_detail_shows_the_remote_phase_and_its_approval_hint() {
+    let mut backend = FakeBackend::new().with_tasks(vec![make_task(
+        "tsk_1",
+        "Delegated",
+        TaskStatus::InProgress,
+    )]);
+    backend.state.running.insert(
+        "tsk_1".into(),
+        RunningEntry {
+            remote: Some(RemoteRunRef {
+                phase: RemotePhase::Queued,
+                worker_task_id: Some("tsk_mirror".into()),
+                reason: Some(format!(
+                    "{} run `orch task approve tsk_mirror` on this worker",
+                    orch_domain::AWAITING_APPROVAL_REASON
+                )),
+                ..RemoteRunRef::new("2com", "run_1")
+            }),
+            run_id: "run_1".into(),
+            agent_id: "agt_1@2com".into(),
+            task_id: "tsk_1".into(),
+            pid: 0,
+            started_at: "2026-10-13T11:59:00.000Z".into(),
+            last_event_at: "2026-10-13T11:59:30.000Z".into(),
+        },
+    );
+    let mut harness = harness_for(ViewId::Tasks, backend);
+    harness.press(KeyCode::Enter);
+    harness.assert_text("queued @2com");
+    harness.assert_text("awaiting approval: orch task approve tsk_mirror on 2com");
+    harness.refute_text("in_progress");
+}
+
+/// A task dispatched to a peer is `in_progress` here from the moment it is
+/// reserved, so the chip must come from the worker's phase and never claim
+/// `RUN` before the worker says so.
+#[test]
+fn remote_task_chips_come_from_the_worker_phase() {
+    let chip = |phase| {
+        let mut backend = FakeBackend::new().with_tasks(vec![make_task(
+            "tsk_1",
+            "Delegated",
+            TaskStatus::InProgress,
+        )]);
+        backend.state.running.insert(
+            "tsk_1".into(),
+            RunningEntry {
+                remote: Some(RemoteRunRef {
+                    phase,
+                    ..RemoteRunRef::new("2com", "run_1")
+                }),
+                run_id: "run_1".into(),
+                agent_id: "agt_1@2com".into(),
+                task_id: "tsk_1".into(),
+                pid: 0,
+                started_at: "2026-10-13T11:59:00.000Z".into(),
+                last_event_at: "2026-10-13T11:59:30.000Z".into(),
+            },
+        );
+        let mut harness = harness_for(ViewId::Tasks, backend);
+        harness
+            .text()
+            .lines()
+            .find(|line| line.contains("Delegated"))
+            .expect("the task row")
+            .to_owned()
+    };
+    assert!(chip(RemotePhase::Dispatched).contains("→ SENT"));
+    assert!(
+        !chip(RemotePhase::Dispatched).contains("RUN"),
+        "a dispatched task must never read as running"
+    );
+    assert!(chip(RemotePhase::Queued).contains("○ QUEUE"));
+    assert!(chip(RemotePhase::Running).contains("⠋ RUN"));
+    assert!(chip(RemotePhase::Unknown).contains("◈ RUN?"));
+    // An outcome has arrived: the task's own status is the truth again.
+    assert!(chip(RemotePhase::Terminal).contains("⠋ RUN"));
 }

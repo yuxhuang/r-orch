@@ -882,6 +882,10 @@ impl HealthLeaseFixture {
             instance_id: None,
             os: None,
             agents: vec![],
+            peer_version: None,
+            link_state: orch_domain::LinkState::Online,
+            next_retry_at: None,
+            attempts: 0,
         };
         publisher.write_status(&status).await.unwrap();
         Self {
@@ -1191,14 +1195,18 @@ fn s06_inflight_link_outage_beyond_stall_timeout_never_retries_or_duplicates_eff
     assert_eq!(text(worker.path("effect")), "effect\n");
 }
 
+/// A controller restart used to cancel the reservation, which discarded an
+/// outcome the worker was still computing — and left the worker computing it.
+/// The execution is rehydrated instead: the first sync of the new session must
+/// not read the live mirror as an orphan, and the outcome must still land.
 #[test]
-fn s07_controller_restart_cancels_without_retry_and_sync_cancels_worker_mirror() {
+fn s07_controller_restart_rehydrates_a_remote_run_without_cancelling_its_mirror() {
     let worker = Peer::new("worker-one");
     let controller = Peer::new("controller");
     let agent = worker.add_agent("executor", &gated_body(&worker), "shared");
     connect(&controller, &worker, "w1", port());
     let task = controller.task(
-        "cancel when controller restarts",
+        "survive a controller restart",
         Some(&remote_id(&agent, "w1")),
         &[],
     );
@@ -1207,39 +1215,44 @@ fn s07_controller_restart_cancels_without_retry_and_sync_cancels_worker_mirror()
         &[&controller, &worker],
         || worker.path("started").exists(),
     );
+    let mirror = worker.tasks()[0]["id"].as_str().unwrap().to_owned();
     controller.stop(Signal::SIGKILL);
     controller.start(None);
-    let value = controller.wait_task(&task, "cancelled", &[&controller, &worker]);
     controller.online("w1", &[&controller, &worker]);
-    wait(
-        "sync cancels untracked mirror",
-        &[&controller, &worker],
+    // The worker's mirror is still running, so the sync is not allowed to
+    // cancel it — and the shell is still waiting for its gate.
+    remains(
+        "the live mirror survives the first sync",
+        Duration::from_millis(500),
         || {
-            worker
-                .tasks()
-                .first()
-                .is_some_and(|t| t["status"] == "cancelled")
+            worker.tasks()[0]["status"] == "in_progress"
+                && controller.task_value(&task)["status"] == "in_progress"
         },
     );
+    assert_eq!(worker.tasks()[0]["id"], mirror);
+    release(&worker);
+    let value = controller.wait_task(&task, "done", &[&controller, &worker]);
     assert_eq!(value["attempts"], 1);
+    // One run, one effect: a rehydrated execution is never submitted again.
     let runs = controller.runs(&task);
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["status"], "cancelled");
-    assert!(!worker.path("effect").exists());
+    assert_eq!(runs[0]["status"], "succeeded");
+    assert_eq!(worker.tasks().len(), 1);
+    assert_eq!(text(worker.path("effect")), "effect\n");
 }
 
 #[test]
-fn s22_sigterm_serve_drains_connected_remote_cancellation_before_owner_exit() {
-    connected_shutdown_cancels_before_exit(false);
+fn s22_sigterm_serve_detaches_a_remote_run_and_the_restart_collects_it() {
+    connected_shutdown_detaches_the_remote_run(false);
 }
 
 #[test]
-fn s22b_sigterm_run_watch_drains_connected_remote_cancellation_before_owner_exit() {
-    connected_shutdown_cancels_before_exit(true);
+fn s22b_sigterm_run_watch_detaches_a_remote_run() {
+    connected_shutdown_detaches_the_remote_run(true);
 }
 
 #[test]
-fn s22c_sigterm_tui_drains_connected_remote_cancellation_before_owner_exit() {
+fn s22c_sigterm_tui_detaches_a_remote_run() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
     struct Dashboard {
@@ -1300,7 +1313,7 @@ fn s22c_sigterm_tui_drains_connected_remote_cancellation_before_owner_exit() {
     let peers = [&controller, &worker];
     controller.online("w1", &peers);
     let task = controller.task(
-        "TUI cancellation before exit",
+        "TUI exit detaches the remote run",
         Some(&remote_id(&agent, "w1")),
         &[],
     );
@@ -1308,6 +1321,9 @@ fn s22c_sigterm_tui_drains_connected_remote_cancellation_before_owner_exit() {
         worker.path("started").exists()
     });
     let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+    wait("the worker reported the run running", &peers, || {
+        controller.runs(&task)[0]["status"] == "running"
+    });
     let owner = dashboard.child.process_id().unwrap();
     kill(Pid::from_raw(owner as i32), Signal::SIGTERM).unwrap();
     let started = Instant::now();
@@ -1326,16 +1342,14 @@ fn s22c_sigterm_tui_drains_connected_remote_cancellation_before_owner_exit() {
     assert!(status.success(), "TUI exit {status:?}: {}", text(&capture));
     assert!(!controller.path(".orchestry/orchestry.lock").exists());
     assert!(
-        kill(Pid::from_raw(pid), None).is_err(),
-        "shell survived TUI exit"
+        kill(Pid::from_raw(pid), None).is_ok(),
+        "the worker's shell must survive the dashboard's exit"
     );
-    assert_eq!(worker.tasks()[0]["status"], "cancelled");
-    assert_eq!(controller.task_value(&task)["status"], "cancelled");
-    release(&worker);
-    remains(
-        "no effect after TUI shutdown",
-        Duration::from_millis(500),
-        || !worker.path("effect").exists(),
+    assert_eq!(worker.tasks()[0]["status"], "in_progress");
+    assert_eq!(controller.task_value(&task)["status"], "in_progress");
+    assert_eq!(
+        read_json(controller.path(".orchestry/state.json"))["running"][&task]["remote"]["phase"],
+        "unknown"
     );
     drop(TcpListener::bind(controller_addr).expect("TUI listener released"));
     dashboard.master.take();
@@ -1381,7 +1395,11 @@ fn sigterm_owner(peer: &Peer) -> Output {
     output
 }
 
-fn connected_shutdown_cancels_before_exit(watch: bool) {
+/// A graceful controller shutdown **detaches** a remote run: no cancel is
+/// sent, the worker keeps executing, and the reservation survives for the
+/// next start to rehydrate. The live failure: a SIGTERM mid-flight cancelled
+/// the task on the controller and the mirror on the worker.
+fn connected_shutdown_detaches_the_remote_run(watch: bool) {
     let worker = Peer::new("shutdown-worker");
     let controller = Peer::new("shutdown-controller");
     let agent = worker.add_agent("executor", &shutdown_gated_body(&worker), "shared");
@@ -1400,7 +1418,7 @@ fn connected_shutdown_cancels_before_exit(watch: bool) {
     let peers = [&controller, &worker];
     controller.online("w1", &peers);
     let task = controller.task(
-        "cancel before owner exits",
+        "survive the owner's exit",
         Some(&remote_id(&agent, "w1")),
         &[],
     );
@@ -1408,57 +1426,57 @@ fn connected_shutdown_cancels_before_exit(watch: bool) {
         worker.path("started").exists()
     });
     let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+    // The worker's own `running` signal is what starts the run record, and
+    // it arrives on the worker's tick: without it this is a `queued` run and
+    // the shutdown under test is not the one being described.
+    wait("the worker reported the run running", &peers, || {
+        controller.runs(&task)[0]["status"] == "running"
+    });
 
-    let output = sigterm_owner(&controller);
-    let worker_at_exit = worker.tasks();
-    let shell_alive_at_exit = kill(Pid::from_raw(pid), None).is_ok();
-    release(&worker);
-    remains(
-        "no effect after controller shutdown",
-        Duration::from_millis(500),
-        || !worker.path("effect").exists(),
-    );
+    sigterm_owner(&controller);
     assert!(
-        !shell_alive_at_exit,
-        "remote shell survived controller exit"
+        kill(Pid::from_raw(pid), None).is_ok(),
+        "the worker's shell must keep running after the controller exits"
     );
     assert_eq!(
-        worker_at_exit[0]["status"],
-        "cancelled",
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        worker.tasks()[0]["status"],
+        "in_progress",
+        "no cancel may reach the worker on a graceful exit"
     );
-    assert_eq!(controller.task_value(&task)["status"], "cancelled");
-    // An acknowledged cancel must not be recorded as an unknown outcome.
-    assert_eq!(
-        controller.runs(&task)[0]["error"],
-        Value::Null,
-        "acknowledged shutdown cancel"
-    );
-    assert!(
-        read_json(worker.path(".orchestry/state.json"))["running"]
-            .as_object()
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(controller.task_value(&task)["status"], "in_progress");
+    let detached = read_json(controller.path(".orchestry/state.json"));
+    let entry = &detached["running"][&task];
+    assert_eq!(entry["remote"]["phase"], "unknown", "{detached}");
+    assert_eq!(controller.runs(&task)[0]["status"], "running");
     drop(TcpListener::bind(controller_addr).expect("controller listener released"));
+
+    if !watch {
+        // And the restart picks the execution back up, with no resubmit.
+        controller.start(Some(controller_addr));
+        controller.online("w1", &peers);
+        release(&worker);
+        let value = controller.wait_task(&task, "done", &peers);
+        assert_eq!(value["attempts"], 1);
+        assert_eq!(controller.runs(&task).len(), 1);
+        assert_eq!(worker.tasks().len(), 1);
+        assert_eq!(text(worker.path("effect")), "effect\n");
+    }
     sigterm_owner(&worker);
-    drop(TcpListener::bind(worker_addr).expect("worker listener released"));
 }
 
 #[test]
-fn s23_sigterm_offline_cancellation_is_bounded_reports_pending_and_sync_cancels() {
-    offline_shutdown_discloses_unknown_cancellation(ShutdownMode::Serve);
+fn s23_sigterm_while_offline_keeps_the_remote_run_and_the_restart_resumes_it() {
+    offline_shutdown_keeps_the_remote_run(ShutdownMode::Serve);
 }
 
 #[test]
-fn s23b_sigterm_run_watch_offline_cancellation_is_printed_and_persisted_for_orch_logs() {
-    offline_shutdown_discloses_unknown_cancellation(ShutdownMode::Watch);
+fn s23b_sigterm_run_watch_while_offline_keeps_the_remote_run() {
+    offline_shutdown_keeps_the_remote_run(ShutdownMode::Watch);
 }
 
 #[test]
-fn s23c_sigterm_tui_offline_cancellation_is_persisted_for_orch_logs_after_exit() {
-    offline_shutdown_discloses_unknown_cancellation(ShutdownMode::Tui);
+fn s23c_sigterm_tui_while_offline_keeps_the_remote_run() {
+    offline_shutdown_keeps_the_remote_run(ShutdownMode::Tui);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1555,7 +1573,11 @@ impl Drop for PtyOwner {
 
 /// An unacknowledged shutdown cancel must stay retrievable after the owner
 /// exits, through `orch logs`, whichever surface owned the engine.
-fn offline_shutdown_discloses_unknown_cancellation(mode: ShutdownMode) {
+/// A shutdown while the link is down is still a detach, not a cancellation:
+/// the worker is unreachable, so nobody can even ask it to stop, and the
+/// execution it is running is still wanted. Nothing is cancelled here, and
+/// the restart reconnects and collects the outcome.
+fn offline_shutdown_keeps_the_remote_run(mode: ShutdownMode) {
     let worker = Peer::new("shutdown-worker");
     let controller = Peer::new("shutdown-controller");
     let agent = worker.add_agent("executor", &shutdown_gated_body(&worker), "shared");
@@ -1578,7 +1600,7 @@ fn offline_shutdown_discloses_unknown_cancellation(mode: ShutdownMode) {
     let peers = [&controller, &worker];
     controller.online("w1", &peers);
     let task = controller.task(
-        "cancel while disconnected",
+        "exit while disconnected",
         Some(&remote_id(&agent, "w1")),
         &[],
     );
@@ -1586,70 +1608,55 @@ fn offline_shutdown_discloses_unknown_cancellation(mode: ShutdownMode) {
         worker.path("started").exists()
     });
     let pid = text(worker.path("started")).trim().parse::<i32>().unwrap();
+    wait("the worker reported the run running", &peers, || {
+        controller.runs(&task)[0]["status"] == "running"
+    });
+    let exec_key = controller.runs(&task)[0]["id"].as_str().unwrap().to_owned();
     fs::write(controller.path("peer-block"), "blocked").unwrap();
     wait("worker link offline", &peers, || {
         controller.status("w1")["online"] == false
     });
 
-    let exec_key = controller.runs(&task)[0]["id"].as_str().unwrap().to_owned();
-    let discloses = |log: &str| {
-        log.contains("w1")
-            && log.contains(&exec_key)
-            && log.contains("outcome unknown")
-            && log.contains("next Sync")
-    };
     match pty {
         None => {
-            let output = sigterm_owner(&controller);
-            let log = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                discloses(&log),
-                "{mode:?} shutdown must print the unacknowledged cancellation: {log}",
-            );
+            sigterm_owner(&controller);
         }
         Some(pty) => {
             pty.sigterm(Duration::from_secs(5));
             assert!(!controller.path(".orchestry/orchestry.lock").exists());
         }
     }
-    assert_eq!(controller.task_value(&task)["status"], "cancelled");
+    assert_eq!(controller.task_value(&task)["status"], "in_progress");
     assert!(
         kill(Pid::from_raw(pid), None).is_ok(),
-        "disconnected worker should remain gated until Sync"
+        "the worker keeps executing while its controller is away"
     );
-
-    // Retrievable after exit through normal commands, not a terminal.
-    let run_logs = controller.ok(&["logs", &exec_key]);
-    assert!(discloses(&run_logs), "orch logs {exec_key}: {run_logs}");
-    let task_logs = controller.ok(&["logs", "--task", &task]);
-    assert!(
-        discloses(&task_logs),
-        "orch logs --task {task}: {task_logs}"
-    );
+    let detached = read_json(controller.path(".orchestry/state.json"));
+    assert_eq!(detached["running"][&task]["remote"]["phase"], "unknown");
     let run = &controller.runs(&task)[0];
-    assert_eq!(run["status"], "cancelled");
+    assert_eq!(run["status"], "running", "{run}");
+    assert_eq!(run["error"], Value::Null, "nothing was cancelled: {run}");
     assert!(
-        run["error"].as_str().is_some_and(discloses),
-        "persisted run record: {run}"
+        !controller
+            .ok(&["logs", &exec_key])
+            .contains("outcome unknown"),
+        "a detached run has no cancellation to disclose"
     );
 
+    // Reconnect: the rehydrated execution finishes where it left off.
     fs::remove_file(controller.path("peer-block")).unwrap();
     controller.start(None);
     controller.online("w1", &peers);
-    wait("Sync cancels disconnected mirror", &peers, || {
-        worker.tasks()[0]["status"] == "cancelled"
-    });
-    assert!(kill(Pid::from_raw(pid), None).is_err());
-    release(&worker);
     remains(
-        "no effect after reconnect cancellation",
-        Duration::from_millis(500),
-        || !worker.path("effect").exists(),
+        "the live mirror survives the first sync",
+        Duration::from_millis(400),
+        || worker.tasks()[0]["status"] == "in_progress",
     );
+    release(&worker);
+    let value = controller.wait_task(&task, "done", &peers);
+    assert_eq!(value["attempts"], 1);
+    assert_eq!(controller.runs(&task).len(), 1);
+    assert_eq!(text(worker.path("effect")), "effect\n");
 }
 
 #[test]

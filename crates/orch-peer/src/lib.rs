@@ -169,15 +169,12 @@ impl Context {
     pub async fn msg_ack(&self, peer: &str, id: &str, reason: Option<&str>) -> Result<()> {
         let result = async {
             if let Some(reason) = reason {
-                let mut end = reason.len().min(256);
-                while !reason.is_char_boundary(end) {
-                    end -= 1;
-                }
+                let reason = orch_infra::storage::remote::metadata_text(reason, 256);
                 orch_infra::storage::message::FileMessageStore::new(
                     self.engine.paths.clone(),
                     self.engine.clock.clone(),
                 )
-                .reject_remote_message(id, peer, &reason[..end])
+                .reject_remote_message(id, peer, &reason)
                 .await?;
             } else if let Some(message) = self.engine.messages.get(id).await?
                 && message
@@ -299,12 +296,17 @@ impl PeerRuntime {
         let worker = worker::Worker::new(ctx.clone());
         engine.orchestrator.set_remote_bridge(hub.clone());
         engine.orchestrator.set_run_event_tap(worker.clone());
-        let mut tasks = Vec::new();
-        tasks.push(AbortOnDrop(tokio::spawn(expire_messages(
-            engine.messages.clone(),
-            engine.events.clone(),
-        ))));
-        tasks.push(AbortOnDrop(tokio::spawn(link::manage(ctx, hub))));
+        // Before the first link: an execution this controller does not
+        // re-register is missing from the first `Sync`, and the worker reads
+        // a live mirror absent from that list as an orphan and cancels it.
+        engine.orchestrator.rehydrate_remote_runs().await?;
+        let tasks = vec![
+            AbortOnDrop(tokio::spawn(expire_messages(
+                engine.messages.clone(),
+                engine.events.clone(),
+            ))),
+            AbortOnDrop(tokio::spawn(link::manage(ctx, hub))),
+        ];
         Ok(Self {
             engine,
             tasks,
@@ -355,6 +357,10 @@ impl Drop for PeerRuntime {
             .orchestrator
             .set_remote_bridge(Arc::new(orch_core::remote::NoopRemoteBridge));
         self.engine.orchestrator.clear_run_event_tap();
+        // The listener is gone with this runtime, so no controller is served
+        // any more. Leaving the last one published would let its mirrors
+        // dispatch with no session to report them to (TUI `/pause`).
+        self.engine.orchestrator.set_inbound_controller(None);
     }
 }
 
