@@ -72,12 +72,20 @@
   const copyFallback = document.getElementById('copy-fallback');
   const MAX_COPY_BYTES = 64 * 1024;
   const MAX_COPY_BASE64 = 4 * Math.ceil(MAX_COPY_BYTES / 3);
+  // Matches the host clipboard's UI wait. Bounds what the page shows, not the
+  // browser's write, which cannot be cancelled.
+  const COPY_WAIT_MS = 3000;
   let pendingCopy = null;
   let copyGeneration = 0;
+  // At most one unresolved browser write, across requests: a second write
+  // could overtake the first and leave older text on the clipboard.
   let copyWriting = false;
+  let copyTimer = null;
 
   function clearCopy() {
     copyGeneration++;
+    clearTimeout(copyTimer);
+    copyTimer = null;
     pendingCopy = null;
     copyButton.disabled = true;
     copyFallback.value = '';
@@ -112,6 +120,8 @@
       copyStatus.textContent = 'Terminal copy requested; click Copy to clipboard.';
       if (!isSecureContext || !navigator.clipboard?.writeText) {
         copyFallbackMessage('Clipboard unavailable in this insecure or unsupported browser. Select and copy the text below.');
+      } else if (copyWriting) {
+        copyFallbackMessage('An earlier browser copy has not finished, so Copy to clipboard is unavailable. Select and copy the text below.');
       }
     } catch {
       pendingCopy = null;
@@ -121,7 +131,7 @@
   });
 
   copyButton.onclick = async () => {
-    if (pendingCopy === null || copyButton.disabled) return;
+    if (pendingCopy === null || copyButton.disabled || copyWriting) return;
     if (!isSecureContext || !navigator.clipboard?.writeText) {
       copyFallbackMessage('Clipboard unavailable in this insecure or unsupported browser. Select and copy the text below.');
       return;
@@ -129,19 +139,36 @@
     const generation = copyGeneration;
     copyWriting = true;
     copyButton.disabled = true;
+    copyStatus.textContent = 'Copying in browser\u2026';
+    // Stop waiting, not writing: the button stays disabled until the browser
+    // answers, and the exact text becomes selectable meanwhile.
+    copyTimer = setTimeout(() => {
+      copyTimer = null;
+      if (generation !== copyGeneration) return;
+      copyFallbackMessage('The browser clipboard did not answer within 3 seconds; it may or may not have changed. Select and copy the text below.');
+    }, COPY_WAIT_MS);
+    let copied = false;
     try {
       await navigator.clipboard.writeText(pendingCopy);
-      if (generation !== copyGeneration) return;
-      clearCopy();
-      copyPanel.hidden = false;
-      copyStatus.textContent = 'Copied in browser.';
-    } catch {
-      if (generation !== copyGeneration) return;
+      copied = true;
+    } catch {}
+    copyWriting = false;
+    if (generation === copyGeneration) {
+      clearTimeout(copyTimer);
+      copyTimer = null;
+      if (copied) {
+        clearCopy();
+        copyPanel.hidden = false;
+        copyStatus.textContent = 'Copied in browser.';
+      } else {
+        copyButton.disabled = false;
+        copyFallbackMessage('Clipboard permission denied or unavailable. Select and copy the text below.');
+      }
+    } else if (pendingCopy !== null) {
+      // An older request settled. Its outcome says nothing about this text;
+      // only the button becomes usable again.
       copyButton.disabled = false;
-      copyFallbackMessage('Clipboard permission denied or unavailable. Select and copy the text below.');
-    } finally {
-      copyWriting = false;
-      copyButton.disabled = pendingCopy === null;
+      copyStatus.textContent = 'Earlier browser copy finished. Click Copy to clipboard, or select the text below.';
     }
   };
   document.getElementById('copy-dismiss').onclick = clearCopy;
