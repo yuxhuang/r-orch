@@ -112,5 +112,8 @@ fake_value_after() {
 # JSON-escape a string for the JSONL formats: backslashes, quotes, newlines
 # and tabs. `printf '%s'` keeps it byte-exact otherwise.
 fake_json_string() {
-  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g'
+  # Join lines with a literal \n in awk: the sed `:a;N;$!ba` idiom is GNU-only,
+  # and BSD sed prints nothing for one-line input.
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' |
+    awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'
 }
