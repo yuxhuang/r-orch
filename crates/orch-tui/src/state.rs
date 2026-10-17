@@ -1173,6 +1173,7 @@ impl AppState {
     pub fn set_focus(&mut self, focus: Focus) {
         if self.focus != focus {
             self.text_anchor = None;
+            self.resume_feed_at_bottom(focus);
         }
         self.focus = focus;
         if !matches!(focus, Focus::MainList | Focus::Activity | Focus::TextViewer) {
@@ -1305,13 +1306,16 @@ impl AppState {
                 let selected = self
                     .pane_scroll(&self.pane_key(self.focus))
                     .selected
-                    .unwrap_or(0);
+                    .unwrap_or_else(|| rows.len().saturating_sub(1));
                 rows.get(selected).map(|m| ViewerSource::Message(m.id))
             }
             _ => None,
         }
     }
     pub fn selected_log(&self) -> Option<&Message> {
+        if self.log_selected_index < 0 {
+            return self.filtered_messages().last().map(|i| &self.messages[*i]);
+        }
         let index = usize::try_from(self.log_selected_index).ok()?;
         let filtered = self.filtered_messages();
         if let Some(id) = self.log_selected_id
@@ -1870,7 +1874,13 @@ impl AppState {
         self.reconcile_message_selection(log);
         self.restore_message_viewports(anchors);
     }
-    fn message_viewport_anchors(&self) -> (Option<u64>, Option<u64>) {
+    fn message_viewport_anchors(
+        &self,
+    ) -> (
+        Option<u64>,
+        Option<u64>,
+        Option<crate::follow::TaskActivityAnchor>,
+    ) {
         let logs = self.filtered_messages();
         let activity = self.activity_messages();
         (
@@ -1887,22 +1897,31 @@ impl AppState {
             } else {
                 None
             },
+            self.task_activity_anchor(),
         )
     }
-    fn restore_message_viewports(&mut self, (log, activity): (Option<u64>, Option<u64>)) {
-        if let Some(row) = log.and_then(|id| {
-            self.filtered_messages()
+    fn restore_message_viewports(
+        &mut self,
+        (log, activity, task): (
+            Option<u64>,
+            Option<u64>,
+            Option<crate::follow::TaskActivityAnchor>,
+        ),
+    ) {
+        self.restore_task_activity_anchor(task);
+        if let Some(id) = log {
+            self.log_scroll_offset = self
+                .filtered_messages()
                 .iter()
                 .position(|i| self.messages[*i].id == id)
-        }) {
-            self.log_scroll_offset = row;
+                .unwrap_or(0);
         }
-        if let Some(row) = activity.and_then(|id| {
-            self.activity_messages()
+        if let Some(id) = activity {
+            self.activity_scroll = self
+                .activity_messages()
                 .iter()
                 .position(|i| self.messages[*i].id == id)
-        }) {
-            self.activity_scroll = row;
+                .unwrap_or(0);
         }
     }
     fn record_retention(&mut self, report: crate::messages::retention::RetentionReport) {

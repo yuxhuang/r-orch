@@ -64,6 +64,18 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     // does off the logs view. `section_label` reports where it put the suffix
     // rather than this view re-deriving that layout.
     let suffix_width = filter_width;
+    suffix.push(Span::styled(
+        if state.activity_follow_tail {
+            " · following"
+        } else {
+            " · paused · End follows"
+        },
+        ctx.style(if state.activity_follow_tail {
+            Token::Green
+        } else {
+            Token::Amber
+        }),
+    ));
     let suffix_x = section_label(
         frame,
         Rect::new(area.x, area.y, area.width, 1),

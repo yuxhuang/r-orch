@@ -18,6 +18,7 @@ pub mod backend;
 pub mod clock;
 pub mod command_bar;
 pub mod commands;
+mod follow;
 pub mod format;
 pub mod hit;
 pub mod keys;

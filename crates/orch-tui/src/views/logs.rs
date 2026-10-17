@@ -210,12 +210,16 @@ fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 
     if state.log_selected_index < 0 {
         spans.push(Span::styled(
-            format!(" {} LIVE ", spinner_frame(state.tick)),
+            format!(" {} LIVE following ", spinner_frame(state.tick)),
             ctx.chip(Token::Green, Token::SuccessBg),
         ));
     } else {
         spans.push(Span::styled(
-            format!(" ↑↓ {}/{} ", state.log_selected_index + 1, filtered.len()),
+            format!(
+                " paused ↑↓ {}/{} · End follows ",
+                state.log_selected_index + 1,
+                filtered.len()
+            ),
             ctx.chip(Token::Amber, Token::WarnBg),
         ));
     }
