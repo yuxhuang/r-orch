@@ -168,6 +168,8 @@ Pure refactors, tests and CI need no entry.
   write into a temp dir. Fake agent scripts are in `fixtures/fake-agents/`.
 - **No real AI CLIs in tests.** Never exec `claude`, `codex`, `cursor-agent`, etc., and never read their config
   dirs. The gate's `no-real-cli` step puts shims on `PATH` and fails if any test reaches one.
+- **Cross-binary tests** (`orch-infra` `concurrent_index`, `cross_compat`) need the vendored oracle from
+  `./parity/setup.sh`; without it set `ORCH_SKIP_CROSS_BINARY=1` to skip them, as CI does.
 - **Differential parity harness** (`cargo xtask parity`, `fixtures/scenarios`): optional and historical. Keep
   the scenarios green where cheap; do not extend the harness for new features.
 - **Run one crate:** `cargo test -p orch-peer`; one test: `cargo test -p orch-cli --test remote_peers <name>`.
