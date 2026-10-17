@@ -127,15 +127,14 @@ fn l007_the_refresh_debounce_coalesces_to_one_refresh() {
 }
 
 #[test]
-fn l008_details_are_capped_at_two_kilobytes() {
+fn l008_details_preserve_the_complete_received_body() {
     let mut harness = event_harness();
-    let long = "x".repeat(5_000);
-    harness.app.handle_event(&output_event(&format!(
-        "{{\"type\":\"result\",\"result\":\"{long}\"}}"
-    )));
+    let body = format!("{}\nTrailing message: 尾部 🦀", "x".repeat(5_000));
+    let payload = serde_json::json!({ "type": "result", "result": body }).to_string();
+    harness.app.handle_event(&output_event(&payload));
     harness.advance(80);
     let detail = harness.app.state.messages[0].detail.as_deref().unwrap();
-    assert!(detail.chars().count() <= 2_048 + 12, "{}", detail.len());
+    assert_eq!(detail, payload);
 }
 
 #[test]
