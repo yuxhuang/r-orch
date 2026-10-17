@@ -35,7 +35,8 @@ done
 # A cold build of this workspace with --all-targets is a few GB. Refuse rather
 # than filling the disk and failing halfway through something unrelated.
 if [ "$WARM" -eq 0 ]; then
-  FREE_GB=$(df -BG --output=avail "$REPO" | tail -1 | tr -dc '0-9')
+  # POSIX `df -Pk` (1 KiB blocks, fixed columns) works with both GNU and BSD df.
+  FREE_GB=$(df -Pk "$REPO" | awk 'NR == 2 { print int($4 / 1048576) }')
   if [ "${FREE_GB:-0}" -lt 12 ]; then
     echo "refusing to run a cold gate: only ${FREE_GB}G free, and a fresh" >&2
     echo "target directory needs roughly 8-10G. Free some space, or use" >&2
@@ -107,7 +108,7 @@ write_result() {
     printf 'mode:      %s\n' "$MODE"
     printf 'started:   %s\n' "$STARTED_AT"
     printf 'finished:  %s\n' \
-      "$(if [ "$verdict" = "IN PROGRESS" ]; then echo "-"; else date -Is; fi)"
+      "$(if [ "$verdict" = "IN PROGRESS" ]; then echo "-"; else date -u +%Y-%m-%dT%H:%M:%SZ; fi)"
     if [ "${#NAMES[@]}" -gt 0 ]; then
       printf '\n'
       for i in "${!NAMES[@]}"; do
@@ -117,7 +118,7 @@ write_result() {
   } > "$RESULT_FILE"
 }
 
-STARTED_AT=$(date -Is)
+STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 START_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
 START_TREE=$(git -C "$REPO" rev-parse HEAD^{tree} 2>/dev/null || echo unknown)
 write_result "IN PROGRESS"
