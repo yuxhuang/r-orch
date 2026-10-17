@@ -17,7 +17,7 @@
 //! data, and history — which is older than anything live — is evicted before
 //! any live record. Budgets are enforced record by record while consuming
 //! input, not after collecting a batch, and records are moved, never cloned.
-//! The byte totals are recomputed by summing lengths over at most
+//! The byte totals are recomputed by summing capacities over at most
 //! `2 × MAX_MESSAGES` records per call; no string is copied to do it.
 //!
 //! Deduplication compares the **complete** body (text and detail): two events
@@ -45,7 +45,7 @@ pub struct RetentionReport {
     /// Incoming records dropped by the existing repeat policy: identical to
     /// the latest record from the same source, compared on the complete body.
     pub deduplicated: usize,
-    /// Owned text bytes of pending + live after the call.
+    /// Owned text allocation capacity of pending + live after the call.
     pub owned_bytes: usize,
 }
 
@@ -116,6 +116,15 @@ pub fn stage_message(
     let rejected = usize::from(admit_body(&mut incoming));
     let mut total = bytes_of_pending(pending).saturating_add(bytes_of_live(live));
     let size = incoming.owned_bytes();
+    if size > RETENTION_BUDGET_BYTES {
+        // Spare capacity or IDs can make even a bounded body unretainable.
+        // Refuse it whole without evicting records that still fit.
+        return RetentionReport {
+            rejected: 1,
+            owned_bytes: total,
+            ..RetentionReport::default()
+        };
+    }
     let mut evicted = make_room(pending, live, &mut total, size);
     pending.push(incoming);
     total = total.saturating_add(size);
@@ -302,6 +311,99 @@ mod tests {
 
     fn owned(pending: &[PendingMessage], live: &[Message]) -> usize {
         bytes_of_pending(pending) + bytes_of_live(live)
+    }
+
+    fn spare_capacity(value: &str, capacity: usize) -> String {
+        let mut text = String::with_capacity(capacity);
+        text.push_str(value);
+        text
+    }
+
+    #[test]
+    fn capacity_accounting_includes_empty_allocations_and_moves_them_on_flush() {
+        let incoming = PendingMessage {
+            text: spare_capacity("preview", 128),
+            detail: Some(spare_capacity("body", 256)),
+            agent_id: Some(spare_capacity("agent", 64)),
+            task_id: Some(spare_capacity("", 32)),
+            ..pending("")
+        };
+        let capacity = incoming.text.capacity()
+            + incoming.detail.as_ref().unwrap().capacity()
+            + incoming.agent_id.as_ref().unwrap().capacity()
+            + incoming.task_id.as_ref().unwrap().capacity();
+        let pointers = (
+            incoming.text.as_ptr(),
+            incoming.detail.as_ref().unwrap().as_ptr(),
+            incoming.agent_id.as_ref().unwrap().as_ptr(),
+            incoming.task_id.as_ref().unwrap().as_ptr(),
+        );
+        let mut staged = Vec::new();
+        let mut live = Vec::new();
+        let mut next_id = 1;
+        let report = stage_message(&mut staged, &mut live, incoming);
+        assert_eq!(report.owned_bytes, capacity);
+        let report = flush_messages(&mut staged, &mut live, &mut next_id, 1);
+        assert_eq!(report.owned_bytes, capacity);
+        let message = &live[0];
+        assert_eq!(
+            (
+                message.text.as_ptr(),
+                message.detail.as_ref().unwrap().as_ptr(),
+                message.agent_id.as_ref().unwrap().as_ptr(),
+                message.task_id.as_ref().unwrap().as_ptr(),
+            ),
+            pointers,
+        );
+    }
+
+    #[test]
+    fn capacity_pressure_evicts_oldest_live_before_pending_and_refuses_history() {
+        let mut staged = Vec::new();
+        let mut live = Vec::new();
+        let mut next_id = 1;
+        // Four tiny bodies each own a quarter of the budget in spare space.
+        for i in 0..4 {
+            let mut incoming = pending("");
+            incoming.text = spare_capacity(&i.to_string(), RETENTION_BUDGET_BYTES / 4);
+            stage_message(&mut staged, &mut live, incoming);
+        }
+        flush_messages(&mut staged, &mut live, &mut next_id, 1);
+        let mut newest = pending("");
+        newest.text = spare_capacity("newest", RETENTION_BUDGET_BYTES / 4);
+        let report = stage_message(&mut staged, &mut live, newest);
+        assert_eq!(report.evicted, 1);
+        assert_eq!(live[0].text, "1");
+        assert_eq!(staged[0].text, "newest");
+        assert_eq!(report.owned_bytes, RETENTION_BUDGET_BYTES);
+        let report = prepend_messages(
+            &mut staged,
+            &mut live,
+            [pending("history")],
+            &mut next_id,
+            2,
+        );
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.evicted, 0);
+        assert_eq!(live.len(), 3);
+        assert_eq!(staged.len(), 1);
+    }
+
+    #[test]
+    fn capacity_larger_than_the_budget_is_refused_without_displacing_live() {
+        let mut staged = Vec::new();
+        let mut live = Vec::new();
+        let mut next_id = 1;
+        stage_message(&mut staged, &mut live, pending("keep"));
+        flush_messages(&mut staged, &mut live, &mut next_id, 1);
+        let mut incoming = pending("tiny body");
+        incoming.agent_id = Some(spare_capacity("agent", RETENTION_BUDGET_BYTES + 1));
+        let report = stage_message(&mut staged, &mut live, incoming);
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.evicted, 0);
+        assert_eq!(report.owned_bytes, 4);
+        assert!(staged.is_empty());
+        assert_eq!(live[0].text, "keep");
     }
 
     /// R1: live records approaching and past 32 MiB. The budget holds after

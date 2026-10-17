@@ -244,14 +244,14 @@ impl Message {
             .ok()
     }
 
-    /// Owned text bytes this record holds, as charged against
+    /// Owned text allocation capacity this record holds, as charged against
     /// [`RETENTION_BUDGET_BYTES`]: body, detail, preview and ID strings.
     pub fn owned_bytes(&self) -> usize {
         record_bytes(
             &self.text,
-            self.detail.as_deref(),
-            self.agent_id.as_deref(),
-            self.task_id.as_deref(),
+            self.detail.as_ref(),
+            self.agent_id.as_ref(),
+            self.task_id.as_ref(),
         )
     }
 }
@@ -342,15 +342,15 @@ pub fn message_document(
 }
 
 pub(crate) fn record_bytes(
-    text: &str,
-    detail: Option<&str>,
-    agent: Option<&str>,
-    task: Option<&str>,
+    text: &String,
+    detail: Option<&String>,
+    agent: Option<&String>,
+    task: Option<&String>,
 ) -> usize {
-    text.len()
-        .saturating_add(detail.map_or(0, str::len))
-        .saturating_add(agent.map_or(0, str::len))
-        .saturating_add(task.map_or(0, str::len))
+    text.capacity()
+        .saturating_add(detail.map_or(0, String::capacity))
+        .saturating_add(agent.map_or(0, String::capacity))
+        .saturating_add(task.map_or(0, String::capacity))
 }
 
 /// Insertion-ordered `runId → value` map with an oldest-first prune, matching
@@ -415,13 +415,13 @@ pub struct PendingMessage {
 }
 
 impl PendingMessage {
-    /// Owned text bytes, charged exactly like [`Message::owned_bytes`].
+    /// Owned text allocation capacity, charged exactly like [`Message::owned_bytes`].
     pub fn owned_bytes(&self) -> usize {
         record_bytes(
             &self.text,
-            self.detail.as_deref(),
-            self.agent_id.as_deref(),
-            self.task_id.as_deref(),
+            self.detail.as_ref(),
+            self.agent_id.as_ref(),
+            self.task_id.as_ref(),
         )
     }
 }
