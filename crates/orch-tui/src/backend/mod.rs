@@ -17,6 +17,7 @@
 //!    they are `poll_*` methods drained once per frame, which is what makes the
 //!    TUI tests synchronous (ARCHITECTURE §8.4).
 
+pub mod copy;
 pub mod fake;
 
 pub use fake::{Call, FakeBackend, make_agent, make_goal, make_task, make_team};
