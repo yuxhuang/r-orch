@@ -24,10 +24,10 @@ Independent checklist items; each is its own small PR or a repository-settings c
       retained; the owner decides the copyright line for r-orch's own work.
 - [x] Fix `Cargo.toml` `repository`, which points at `oxgeneral/r-orch` (done in the agents/SDLC PR).
 - [ ] Add `SECURITY.md` with a private disclosure channel.
-- [ ] Make `ci / check` and `ci / test` required status checks on `master`, after their first green run (owner,
+- [x] Make `ci / check` and `ci / test` required status checks on `master`, after their first green run (owner,
       repository settings).
-- [ ] Fix the ruleset's include pattern: it is `refs/heads/releases/**/*` but release branches are
-      `release/vX.Y.Z`. Change the pattern to `release/**`; do not rename branches.
+- [x] Fix the ruleset's include pattern. It is now `refs/heads/release/**`. That pattern also makes
+      `release/vX.Y.Z` branches protected, so release PRs come from `chore/release-vX.Y.Z` instead (AGENTS.md).
 - [ ] Verify `require_extra_approval_for_unattributed_changes` does not deadlock a solo owner.
 - [ ] Decide on dependabot (cargo and github-actions, monthly) versus the weekly scheduled cargo-deny run.
       (The weekly schedule is added to `ci.yml` in the agents/SDLC PR; mark done once merged.)
