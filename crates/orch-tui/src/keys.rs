@@ -8,7 +8,7 @@
 //! keys. In the original the type picker did not, so `q` quit through it.
 
 use orch_domain::{GoalStatus, TaskStatus};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::app::App;
 use crate::backend::TuiBackend;
@@ -19,6 +19,18 @@ use crate::state::{DetailPanel, InputMode, ViewId, is_runnable};
 use crate::text::is_meta;
 use crate::theme::Token;
 use crate::wizard::engine::{WizardKind, WizardOutcome};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCause {
+    User,
+    Signal,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiEvent {
+    Terminal(Event),
+    Tick,
+    ExitRequested(ExitCause),
+}
 
 /// One clamped step within `0..total`.
 fn clamp_step(cursor: usize, delta: i32, total: usize) -> usize {
@@ -55,6 +67,43 @@ fn strip_args_hint(cmd: &str) -> &str {
 
 impl<B: TuiBackend, C: Clock> App<B, C> {
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.dispatch_ui_event(&UiEvent::Terminal(Event::Key(key)));
+    }
+    pub fn dispatch_ui_event(&mut self, event: &UiEvent) {
+        if let UiEvent::Terminal(Event::Key(key)) = event {
+            if key.kind != KeyEventKind::Press {
+                return;
+            }
+            if key.code == KeyCode::F(2) {
+                self.toggle_mouse_enabled();
+                return;
+            }
+        }
+        // B0 extends this prelude with modal/footer guards before consumers.
+        if matches!(event, UiEvent::Terminal(Event::Mouse(_)))
+            && (!self.state.mouse.enabled || !self.state.mouse.hits.is_valid())
+        {
+            return;
+        }
+        let viewer_handled = crate::widgets::text_viewer::handle_ui_event(self, event);
+        let session_handled = if !viewer_handled || matches!(event, UiEvent::Tick) {
+            crate::wizard::handle_session_event(self, event)
+        } else {
+            false
+        };
+        if viewer_handled || session_handled {
+            return;
+        }
+        match event {
+            UiEvent::Terminal(Event::Key(key)) => self.handle_key_internal(*key),
+            UiEvent::Terminal(Event::Mouse(mouse)) => self.handle_mouse_internal(*mouse),
+            UiEvent::Terminal(Event::Paste(text)) => self.handle_paste_internal(text),
+            UiEvent::Terminal(Event::Resize(w, h)) => self.resize(*w, *h),
+            UiEvent::ExitRequested(_) => self.state.should_exit = true,
+            UiEvent::Tick | UiEvent::Terminal(_) => {}
+        }
+    }
+    pub(crate) fn handle_key_internal(&mut self, key: KeyEvent) {
         // Key *release* and *repeat* events exist under the kitty protocol;
         // only presses drive the UI.
         if key.kind != KeyEventKind::Press {
@@ -390,7 +439,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     /// `q` / `Q`.
     pub(crate) fn request_quit(&mut self) {
-        self.state.should_exit = true;
+        self.request_exit(ExitCause::User);
+    }
+
+    pub fn request_exit(&mut self, cause: ExitCause) {
+        self.dispatch_ui_event(&UiEvent::ExitRequested(cause));
     }
 
     /// `Esc` in normal mode: close the detail panel, else leave the logs
@@ -427,6 +480,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// nothing downstream of here wants it (`MessageService` cuts a body at
     /// 4000 UTF-16 units, and a wizard field is one line).
     pub fn handle_paste(&mut self, text: &str) {
+        self.dispatch_ui_event(&UiEvent::Terminal(Event::Paste(text.to_owned())));
+    }
+    pub(crate) fn handle_paste_internal(&mut self, text: &str) {
         if text.is_empty() || self.state.show_agent_picker || self.state.show_type_picker {
             return;
         }

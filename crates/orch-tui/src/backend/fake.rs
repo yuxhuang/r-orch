@@ -126,10 +126,26 @@ pub struct FakeBackend {
     pub can_force_stop_agent: bool,
     pub can_paste_image: bool,
     pub can_send_message: bool,
+    pub copy_requests: Vec<(super::CopyTarget, String)>,
+    pub copy_fail_next: Option<String>,
+    copy_tickets: Vec<super::CopyTicket>,
+    copy_results: Vec<super::CopyResult>,
+    next_copy_ticket: u64,
     next_id: usize,
 }
 
 impl FakeBackend {
+    /// Queue a deterministic completion, retaining capacity until polled.
+    pub fn complete_copy(&mut self, result: super::CopyResult) -> bool {
+        if !self.copy_tickets.contains(&result.ticket)
+            || self.copy_results.iter().any(|r| r.ticket == result.ticket)
+        {
+            return false;
+        }
+        self.copy_results.push(result);
+        true
+    }
+
     pub fn new() -> Self {
         FakeBackend {
             context: LaunchContext::default(),
@@ -154,6 +170,11 @@ impl FakeBackend {
             can_force_stop_agent: true,
             can_paste_image: true,
             can_send_message: true,
+            copy_requests: Vec::new(),
+            copy_fail_next: None,
+            copy_tickets: Vec::new(),
+            copy_results: Vec::new(),
+            next_copy_ticket: 0,
             next_id: 1,
         }
     }
@@ -299,6 +320,33 @@ pub fn make_team(id: &str, name: &str, lead_agent_id: &str, members: &[&str]) ->
 // ── Trait impl ─────────────────────────────────────────────────────────────
 
 impl TuiBackend for FakeBackend {
+    fn copy_text_via(
+        &mut self,
+        text: &str,
+        target: super::CopyTarget,
+    ) -> BackendResult<super::CopyTicket> {
+        self.copy_requests.push((target, text.to_owned()));
+        if let Some(error) = self.copy_fail_next.take() {
+            return Err(error);
+        }
+        if self.copy_tickets.len() >= 2 {
+            return Err("Copy busy".into());
+        }
+        self.next_copy_ticket = self
+            .next_copy_ticket
+            .checked_add(1)
+            .ok_or("Copy ticket exhausted")?;
+        let ticket = super::CopyTicket(self.next_copy_ticket);
+        self.copy_tickets.push(ticket);
+        Ok(ticket)
+    }
+    fn poll_copy_results(&mut self) -> Vec<super::CopyResult> {
+        let results = std::mem::take(&mut self.copy_results);
+        self.copy_tickets
+            .retain(|ticket| !results.iter().any(|r| r.ticket == *ticket));
+        results
+    }
+
     fn context(&self) -> LaunchContext {
         self.context.clone()
     }

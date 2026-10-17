@@ -72,11 +72,13 @@ pub struct RenderCtx<'a> {
 impl<'a> RenderCtx<'a> {
     /// A ctx that records into a map for `area`.
     pub fn new(state: &'a AppState, caps: Caps, now_ms: i64, area: Rect) -> Self {
+        let mut hits = HitMap::new(area);
+        hits.metrics.generation = state.frame_generation.saturating_add(1);
         RenderCtx {
             state,
             caps,
             now_ms,
-            hits: RefCell::new(HitMap::new(area)),
+            hits: RefCell::new(hits),
         }
     }
 
@@ -87,6 +89,30 @@ impl<'a> RenderCtx<'a> {
         self.hits.borrow_mut().push(rect, area, kind, id);
     }
 
+    /// Publish actual inner-body geometry through the existing frame cell.
+    pub fn publish_pane_metrics(&self, metrics: crate::hit::PaneMetrics) {
+        self.hits.borrow_mut().metrics.panes.push(metrics);
+    }
+    /// B1/B2 supply the complete reserved footer row, including inert cells.
+    pub fn publish_text_footer(&self, origin: crate::state::CopyOrigin, rect: Rect) {
+        if !self.state.copy_origin_is_live(&origin) {
+            return;
+        }
+        let mut hits = self.hits.borrow_mut();
+        let rect = rect.intersection(hits.area());
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        let metrics = crate::hit::TextFooterMetrics {
+            rect,
+            origin: origin.clone(),
+        };
+        match origin {
+            crate::state::CopyOrigin::Viewer { .. } => hits.metrics.viewer_footer = Some(metrics),
+            crate::state::CopyOrigin::Editor { .. } => hits.metrics.editor_footer = Some(metrics),
+            crate::state::CopyOrigin::Field { .. } => {}
+        }
+    }
     /// A whole-row zone: `rect` spanning `area`'s width at row `y`.
     pub fn row_zone(&self, area: Rect, y: u16, kind: ZoneKind, id: ZoneId) {
         self.zone(Rect::new(area.x, y, area.width, 1), area, kind, id);

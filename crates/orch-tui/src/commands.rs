@@ -250,7 +250,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     .to_string();
                 self.cmd_msg(&tail);
             }
-            "quit" => self.state.should_exit = true,
+            "quit" => self.request_exit(crate::keys::ExitCause::User),
             other => {
                 let text = format!("Unknown: {other}. Type /help for commands");
                 self.refuse(&text);

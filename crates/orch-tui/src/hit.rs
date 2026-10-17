@@ -20,8 +20,10 @@
 
 use ratatui::layout::Rect;
 
-use crate::state::{EntityType, ViewId};
+use crate::state::{CopyOrigin, EntityType, Focus, PaneKey, ViewId};
+use crate::widgets::text_viewer::ViewerSource;
 use crate::wizard::engine::WizardKind;
+use crate::wizard::{DraftKey, LeaveChoice};
 
 /// Which part of a two-part row was hit. A checkbox toggles; a label moves
 /// the cursor and toggles on a double click.
@@ -126,6 +128,14 @@ pub enum PickerKind {
 /// which is deliberately **not** part of [`ZoneId`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZoneKind {
+    Pane(Focus),
+    DetailSection(Focus),
+    ActivityRow { message_id: u64 },
+    ExpandText,
+    ViewerText,
+    EditorText,
+    TextAction(TextAction),
+    LeaveChoice(LeaveChoice),
     Tab(ViewId),
     TaskRow { selection: usize },
     AgentRow { selection: usize },
@@ -152,6 +162,14 @@ pub enum ZoneKind {
 /// id — and never from a row position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZoneId {
+    Pane(PaneKey),
+    DetailSection(PaneKey),
+    ActivityMessage(u64),
+    ExpandText(ViewerSource),
+    ViewerText(ViewerSource),
+    EditorText(DraftKey, String),
+    TextAction(TextSurfaceId, TextAction),
+    LeaveChoice(LeaveChoice),
     Tab(ViewId),
     Entity(EntityType, String),
     LogMessage(u64),
@@ -184,6 +202,46 @@ pub struct Zone {
     pub id: ZoneId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAction {
+    CopyAll,
+    CopySelection,
+    CopyTerminal,
+    CopyNative,
+    ToggleRepresentation,
+    OpenCopyRail,
+    PreviousCopyAction,
+    NextCopyAction,
+    CloseCopyRail,
+    DismissCopyFeedback,
+    CloseViewer,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextSurfaceId {
+    Viewer(ViewerSource),
+    Editor(DraftKey, String),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextFooterMetrics {
+    pub rect: Rect,
+    pub origin: CopyOrigin,
+}
+#[derive(Debug, Clone)]
+pub struct PaneMetrics {
+    pub key: PaneKey,
+    pub body: Rect,
+    pub items: usize,
+    pub display_rows: usize,
+    pub selection_rows: Vec<usize>,
+}
+#[derive(Debug, Clone, Default)]
+pub struct FrameMetrics {
+    pub generation: u64,
+    pub panes: Vec<PaneMetrics>,
+    pub viewer_footer: Option<TextFooterMetrics>,
+    pub editor_footer: Option<TextFooterMetrics>,
+}
+
 /// Everything clickable in one frame.
 #[derive(Debug, Clone, Default)]
 pub struct HitMap {
@@ -193,6 +251,7 @@ pub struct HitMap {
     /// Draw order, back to front.
     zones: Vec<Zone>,
     valid: bool,
+    pub metrics: FrameMetrics,
 }
 
 impl HitMap {
@@ -202,9 +261,28 @@ impl HitMap {
             area,
             zones: Vec::new(),
             valid: true,
+            metrics: FrameMetrics::default(),
         }
     }
 
+    /// Absent or invalidated frame metrics never authorize a footer hit.
+    pub fn text_footer(&self, origin: &CopyOrigin) -> Option<&TextFooterMetrics> {
+        if !self.valid {
+            return None;
+        }
+        let metrics = match origin {
+            CopyOrigin::Viewer { .. } => self.metrics.viewer_footer.as_ref(),
+            CopyOrigin::Editor { .. } => self.metrics.editor_footer.as_ref(),
+            CopyOrigin::Field { .. } => None,
+        }?;
+        (&metrics.origin == origin).then_some(metrics)
+    }
+    pub fn pane_metrics(&self, key: &PaneKey) -> Option<&PaneMetrics> {
+        if !self.valid {
+            return None;
+        }
+        self.metrics.panes.iter().find(|pane| &pane.key == key)
+    }
     pub fn area(&self) -> Rect {
         self.area
     }

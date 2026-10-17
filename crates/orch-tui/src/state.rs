@@ -9,6 +9,7 @@ use orch_domain::{
     TaskStatus, Team, TeamStatus, default_state, goal_status_order,
 };
 
+use crate::backend::{BackendResult, CopyOutcome, CopyResult, CopyTarget, CopyTicket};
 use crate::command_bar::CommandHistory;
 use crate::hit::{HitMap, ZoneId, ZoneKind};
 use crate::messages::{
@@ -18,7 +19,174 @@ use crate::messages::{
 use crate::onboarding::OnboardingStep;
 use crate::text::TextInput;
 use crate::theme::{Palette, Token};
-use crate::wizard::Wizard;
+use crate::widgets::text_viewer::{TextViewer, ViewerDocument, ViewerSource};
+use crate::wizard::{DraftKey, Wizard, WizardSessionStore};
+/// Pane focus is separate from the selected entity. B0 wires the focus ring.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Focus {
+    #[default]
+    MainList,
+    Activity,
+    GoalDetail(GoalSection),
+    TaskDetail(TaskSection),
+    AgentDetail(AgentSection),
+    LogDetail(LogSection),
+    TextViewer,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalSection {
+    Overview,
+    Description,
+    Progress,
+    Tasks,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSection {
+    Overview,
+    Attachments,
+    Description,
+    Result,
+    Files,
+    Activity,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSection {
+    Overview,
+    Error,
+    Role,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSection {
+    Metadata,
+    Body,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneEntity {
+    Entity(String),
+    Message(u64),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneKey {
+    pub view: ViewId,
+    pub entity: Option<PaneEntity>,
+    pub section: Focus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyOrigin {
+    Viewer {
+        source: ViewerSource,
+        generation: u64,
+    },
+    Editor {
+        draft: DraftKey,
+        step_id: String,
+        generation: u64,
+    },
+    Field {
+        source: ViewerSource,
+        generation: u64,
+    },
+}
+impl CopyOrigin {
+    fn slot(&self) -> usize {
+        match self {
+            Self::Viewer { .. } => 0,
+            Self::Editor { .. } => 1,
+            Self::Field { .. } => 2,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyRequestMeta {
+    pub origin: CopyOrigin,
+    pub target: CopyTarget,
+    pub request_seq: u64,
+    pub at_ms: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyFeedback {
+    pub ticket: Option<CopyTicket>,
+    pub request: CopyRequestMeta,
+    pub outcome: CopyOutcome,
+    pub guidance: Option<String>,
+    pub completed_at_ms: i64,
+}
+#[derive(Debug, Clone, Default)]
+pub struct CopyFeedbackSlot {
+    pub latest: Option<CopyRequestMeta>,
+    pub feedback: Option<CopyFeedback>,
+    pub footer_hidden: bool,
+}
+#[derive(Debug, Clone, Default)]
+pub struct CopyFeedbackStore {
+    pub viewer: CopyFeedbackSlot,
+    pub editor: CopyFeedbackSlot,
+    pub field: CopyFeedbackSlot,
+    pending: [Option<(CopyTicket, CopyRequestMeta)>; 2],
+    request_seq: u64,
+    /// Broken facade contracts are observable, never an excuse to grow/drop.
+    pub contract_errors: usize,
+    pub unknown_results: usize,
+}
+impl CopyFeedbackStore {
+    fn slot(&self, origin: &CopyOrigin) -> &CopyFeedbackSlot {
+        match origin.slot() {
+            0 => &self.viewer,
+            1 => &self.editor,
+            _ => &self.field,
+        }
+    }
+    fn slot_mut(&mut self, origin: &CopyOrigin) -> &mut CopyFeedbackSlot {
+        match origin.slot() {
+            0 => &mut self.viewer,
+            1 => &mut self.editor,
+            _ => &mut self.field,
+        }
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending.iter().flatten().count()
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyHelpContext {
+    pub origin: CopyOrigin,
+    pub scroll_row: usize,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextFooterGuard {
+    pub origin: CopyOrigin,
+    pub until_ms: i64,
+}
+
+/// Copy feedback is untrusted display data; never retain terminal controls.
+/// Byte caps include the visible ellipsis, and end at UTF-8 boundaries.
+fn safe_copy_detail(text: &str, limit: usize) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let ch =
+            if ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                ' '
+            } else {
+                ch
+            };
+        if result.len()
+            + ch.len_utf8()
+            + if chars.peek().is_some() {
+                '…'.len_utf8()
+            } else {
+                0
+            }
+            > limit
+        {
+            result.push('…');
+            break;
+        }
+        result.push(ch);
+    }
+    result
+}
 
 /// `TABS` — the single source of truth for rendering and `Tab`-cycle order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -394,6 +562,7 @@ pub fn is_runnable(status: TaskStatus) -> bool {
 
 pub struct AppState {
     // ── Terminal ───────────────────────────────────────────────────────────
+    pub frame_generation: u64,
     pub width: u16,
     pub height: u16,
 
@@ -406,6 +575,15 @@ pub struct AppState {
     pub peer_status: String,
 
     // ── View ───────────────────────────────────────────────────────────────
+    pub focus: Focus,
+    pub viewer: Option<TextViewer>,
+    pub wizard_sessions: WizardSessionStore,
+    pub copy_feedback: CopyFeedbackStore,
+    pub copy_help: Option<CopyHelpContext>,
+    /// Fixed viewer/editor slots, keyed by complete origin and generation.
+    pub text_footer_guards: [Option<TextFooterGuard>; 2],
+    pub(crate) copy_origins: [Option<CopyOrigin>; 3],
+    pub(crate) next_copy_generation: u64,
     pub view: ViewId,
     pub goal_selected: usize,
     pub task_selected: usize,
@@ -488,6 +666,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         AppState {
+            frame_generation: 0,
             width: 80,
             height: 24,
             tasks: Vec::new(),
@@ -496,6 +675,14 @@ impl Default for AppState {
             goals: Vec::new(),
             teams: Vec::new(),
             orch_state: default_state(),
+            focus: Focus::default(),
+            viewer: None,
+            wizard_sessions: WizardSessionStore::default(),
+            copy_feedback: CopyFeedbackStore::default(),
+            copy_help: None,
+            text_footer_guards: [None, None],
+            copy_origins: [None, None, None],
+            next_copy_generation: 0,
             view: ViewId::Tasks,
             goal_selected: 0,
             task_selected: 0,
@@ -561,6 +748,291 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// Allocate a fresh opening epoch. Exhaustion retires all identities and
+    /// returns an error; no generation can silently alias a prior instance.
+    fn copy_generation(&mut self) -> BackendResult<u64> {
+        let Some(next) = self.next_copy_generation.checked_add(1) else {
+            self.copy_origins = [None, None, None];
+            self.text_footer_guards = [None, None];
+            self.copy_feedback.viewer = CopyFeedbackSlot::default();
+            self.copy_feedback.editor = CopyFeedbackSlot::default();
+            self.copy_feedback.field = CopyFeedbackSlot::default();
+            self.copy_help = None;
+            self.invalidate_copy_hits();
+            return Err("Copy generation exhausted".into());
+        };
+        self.next_copy_generation = next;
+        Ok(next)
+    }
+    fn invalidate_copy_hits(&mut self) {
+        self.mouse.hits.invalidate();
+        self.mouse.armed = None;
+        self.mouse.last_click = None;
+    }
+    fn install_copy_origin(&mut self, origin: CopyOrigin) -> CopyOrigin {
+        let index = origin.slot();
+        if let Some(old) = self.copy_origins[index].clone() {
+            self.retire_copy_origin(&old);
+        }
+        self.copy_origins[index] = Some(origin.clone());
+        self.invalidate_copy_hits();
+        origin
+    }
+    pub fn register_viewer_origin(&mut self, source: ViewerSource) -> BackendResult<CopyOrigin> {
+        let generation = self.copy_generation()?;
+        Ok(self.install_copy_origin(CopyOrigin::Viewer { source, generation }))
+    }
+    pub fn register_editor_origin(
+        &mut self,
+        draft: DraftKey,
+        step_id: String,
+    ) -> BackendResult<CopyOrigin> {
+        let generation = self.copy_generation()?;
+        Ok(self.install_copy_origin(CopyOrigin::Editor {
+            draft,
+            step_id,
+            generation,
+        }))
+    }
+    pub fn register_field_origin(&mut self, source: ViewerSource) -> BackendResult<CopyOrigin> {
+        let generation = self.copy_generation()?;
+        Ok(self.install_copy_origin(CopyOrigin::Field { source, generation }))
+    }
+    pub fn live_copy_origin(&self, surface: &crate::hit::TextSurfaceId) -> Option<&CopyOrigin> {
+        use crate::hit::TextSurfaceId;
+        let origin = self.copy_origins[match surface {
+            TextSurfaceId::Viewer(_) => 0,
+            TextSurfaceId::Editor(..) => 1,
+        }]
+        .as_ref()?;
+        match (surface, origin) {
+            (TextSurfaceId::Viewer(source), CopyOrigin::Viewer { source: live, .. })
+                if source == live =>
+            {
+                Some(origin)
+            }
+            (
+                TextSurfaceId::Editor(draft, step),
+                CopyOrigin::Editor {
+                    draft: live,
+                    step_id,
+                    ..
+                },
+            ) if draft == live && step == step_id => Some(origin),
+            _ => None,
+        }
+    }
+    pub fn copy_origin_is_live(&self, origin: &CopyOrigin) -> bool {
+        self.copy_origins[origin.slot()].as_ref() == Some(origin)
+    }
+    pub fn retire_copy_origin(&mut self, origin: &CopyOrigin) {
+        if !self.copy_origin_is_live(origin) {
+            return;
+        }
+        self.clear_copy_feedback(origin);
+        self.copy_origins[origin.slot()] = None;
+        if origin.slot() < 2 {
+            self.text_footer_guards[origin.slot()] = None;
+        }
+        if self
+            .copy_help
+            .as_ref()
+            .is_some_and(|help| &help.origin == origin)
+        {
+            self.copy_help = None;
+            self.show_help = false;
+        }
+        self.invalidate_copy_hits();
+    }
+    /// Identity only: no editor text or replacement session is cloned.
+    pub fn active_copy_origin(&self) -> Option<CopyOrigin> {
+        if self.show_help
+            || self.show_agent_picker
+            || self.show_type_picker
+            || self.input_mode == InputMode::Command
+            || self.wizard_sessions.pending_leave.is_some()
+        {
+            return None;
+        }
+        self.copy_origins.iter().flatten().next().cloned()
+    }
+    pub fn suppress_text_footer(&mut self, origin: &CopyOrigin, now_ms: i64) {
+        if origin.slot() >= 2 || !self.copy_origin_is_live(origin) {
+            return;
+        }
+        self.text_footer_guards[origin.slot()] = Some(TextFooterGuard {
+            origin: origin.clone(),
+            until_ms: now_ms.saturating_add(crate::mouse::DOUBLE_CLICK_MS),
+        });
+    }
+    pub fn text_footer_suppressed(&self, origin: &CopyOrigin, now_ms: i64) -> bool {
+        origin.slot() < 2
+            && self.copy_origin_is_live(origin)
+            && self.text_footer_guards[origin.slot()]
+                .as_ref()
+                .is_some_and(|guard| &guard.origin == origin && now_ms < guard.until_ms)
+    }
+    pub fn register_copy_request(
+        &mut self,
+        origin: CopyOrigin,
+        target: CopyTarget,
+        accepted: BackendResult<CopyTicket>,
+        now_ms: i64,
+    ) {
+        let Some(seq) = self.copy_feedback.request_seq.checked_add(1) else {
+            self.copy_feedback.viewer = CopyFeedbackSlot::default();
+            self.copy_feedback.editor = CopyFeedbackSlot::default();
+            self.copy_feedback.field = CopyFeedbackSlot::default();
+            self.copy_feedback.contract_errors =
+                self.copy_feedback.contract_errors.saturating_add(1);
+            return;
+        };
+        self.copy_feedback.request_seq = seq;
+        let meta = CopyRequestMeta {
+            origin: origin.clone(),
+            target,
+            request_seq: seq,
+            at_ms: now_ms,
+        };
+        let accepted = match accepted {
+            Ok(ticket)
+                if self
+                    .copy_feedback
+                    .pending
+                    .iter()
+                    .flatten()
+                    .any(|(id, _)| *id == ticket)
+                    || self.copy_feedback.pending_count() == 2 =>
+            {
+                self.copy_feedback.contract_errors =
+                    self.copy_feedback.contract_errors.saturating_add(1);
+                Err("Copy facade contract violation".into())
+            }
+            other => other,
+        };
+        let feedback = match accepted {
+            Ok(ticket) => {
+                if let Some(entry) = self
+                    .copy_feedback
+                    .pending
+                    .iter_mut()
+                    .find(|entry| entry.is_none())
+                {
+                    *entry = Some((ticket, meta.clone()));
+                }
+                None
+            }
+            Err(error) => {
+                let destination = match target {
+                    CopyTarget::Auto => "Auto",
+                    CopyTarget::Terminal => "Terminal",
+                    CopyTarget::Native => "Host",
+                };
+                Some(CopyFeedback {
+                    ticket: None,
+                    request: meta.clone(),
+                    outcome: CopyOutcome::Failed(safe_copy_detail(
+                        &format!("{destination}: {error}"),
+                        256,
+                    )),
+                    guidance: None,
+                    completed_at_ms: now_ms,
+                })
+            }
+        };
+        // A retired caller still drains accepted work but cannot resurrect UI.
+        if !self.copy_origin_is_live(&origin) {
+            return;
+        }
+        *self.copy_feedback.slot_mut(&origin) = CopyFeedbackSlot {
+            latest: Some(meta),
+            feedback,
+            footer_hidden: false,
+        };
+    }
+    pub fn apply_copy_result(&mut self, result: CopyResult, now_ms: i64) {
+        let Some(index) = self
+            .copy_feedback
+            .pending
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|(id, _)| *id == result.ticket))
+        else {
+            self.copy_feedback.unknown_results =
+                self.copy_feedback.unknown_results.saturating_add(1);
+            return;
+        };
+        let Some((_, meta)) = self.copy_feedback.pending[index].take() else {
+            return;
+        };
+        if !self.copy_origin_is_live(&meta.origin)
+            || self.copy_feedback.slot(&meta.origin).latest.as_ref() != Some(&meta)
+        {
+            return;
+        }
+        let outcome = match result.outcome {
+            CopyOutcome::Failed(error) => CopyOutcome::Failed(safe_copy_detail(&error, 256)),
+            other => other,
+        };
+        let slot = self.copy_feedback.slot_mut(&meta.origin);
+        slot.feedback = Some(CopyFeedback {
+            ticket: Some(result.ticket),
+            request: meta,
+            outcome,
+            guidance: result.guidance.as_deref().map(|s| safe_copy_detail(s, 512)),
+            completed_at_ms: now_ms,
+        });
+        slot.footer_hidden = false;
+    }
+    pub fn feedback_for(&self, origin: &CopyOrigin) -> Option<&CopyFeedback> {
+        let slot = self.copy_feedback.slot(origin);
+        slot.feedback
+            .as_ref()
+            .filter(|feedback| &feedback.request.origin == origin)
+    }
+    pub fn clear_copy_feedback(&mut self, origin: &CopyOrigin) {
+        if self
+            .copy_feedback
+            .slot(origin)
+            .latest
+            .as_ref()
+            .is_some_and(|meta| &meta.origin == origin)
+        {
+            *self.copy_feedback.slot_mut(origin) = CopyFeedbackSlot::default();
+        }
+    }
+    pub fn dismiss_copy_feedback(&mut self, origin: &CopyOrigin) {
+        if self
+            .copy_feedback
+            .slot(origin)
+            .latest
+            .as_ref()
+            .is_some_and(|meta| &meta.origin == origin)
+        {
+            self.copy_feedback.slot_mut(origin).footer_hidden = true;
+        }
+    }
+    pub fn copy_footer_visible(&self, origin: &CopyOrigin) -> bool {
+        let slot = self.copy_feedback.slot(origin);
+        !slot.footer_hidden
+            && slot
+                .latest
+                .as_ref()
+                .is_some_and(|meta| &meta.origin == origin)
+    }
+    /// I0 source-resolution seed. B0 resolves focused fields and stable hits.
+    pub fn focused_text(&self) -> Option<ViewerDocument> {
+        None
+    }
+    /// I0 source-resolution seed. Capture/anchor are supplied by B0 on open.
+    pub fn text_for_source(
+        &self,
+        _source: &ViewerSource,
+        _initial_anchor: usize,
+        _captured_at_ms: i64,
+    ) -> Option<ViewerDocument> {
+        None
+    }
+
     // ── Derived collections ────────────────────────────────────────────────
 
     /// `sortedGoals` — by status rank, stable within a rank.
@@ -1757,5 +2229,53 @@ mod tests {
         assert!(!is_runnable(TaskStatus::Review));
         assert!(!is_runnable(TaskStatus::Done));
         assert!(!is_runnable(TaskStatus::Retrying));
+    }
+}
+
+#[cfg(test)]
+mod copy_foundation_tests {
+    use super::*;
+    #[test]
+    fn exhausted_generation_retires_live_guards_and_does_not_reuse_ids() {
+        let mut state = AppState::default();
+        let origin = state
+            .register_viewer_origin(ViewerSource::Message(1))
+            .unwrap();
+        state.suppress_text_footer(&origin, 0);
+        state.next_copy_generation = u64::MAX;
+        assert!(
+            state
+                .register_viewer_origin(ViewerSource::Message(1))
+                .is_err()
+        );
+        assert!(!state.copy_origin_is_live(&origin));
+        assert!(!state.text_footer_suppressed(&origin, 1));
+        assert!(
+            state
+                .register_viewer_origin(ViewerSource::Message(1))
+                .is_err()
+        );
+    }
+    #[test]
+    fn exhausted_request_sequence_clears_presentation_and_drops_old_completions() {
+        let mut state = AppState::default();
+        let origin = state
+            .register_viewer_origin(ViewerSource::Message(1))
+            .unwrap();
+        state.register_copy_request(origin.clone(), CopyTarget::Auto, Ok(CopyTicket(1)), 0);
+        state.copy_feedback.request_seq = u64::MAX;
+        state.register_copy_request(origin.clone(), CopyTarget::Auto, Err("Busy".into()), 1);
+        state.apply_copy_result(
+            CopyResult {
+                ticket: CopyTicket(1),
+                outcome: CopyOutcome::NativeWritten,
+                guidance: None,
+            },
+            2,
+        );
+        assert!(state.feedback_for(&origin).is_none());
+        assert!(!state.copy_footer_visible(&origin));
+        assert_eq!(state.copy_feedback.pending_count(), 0);
+        assert_eq!(state.copy_feedback.contract_errors, 1);
     }
 }

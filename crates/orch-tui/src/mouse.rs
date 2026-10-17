@@ -49,6 +49,11 @@ pub const WHEEL_MAX_STEPS_PER_FRAME: u8 = 3;
 
 impl<B: TuiBackend, C: Clock> App<B, C> {
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        self.dispatch_ui_event(&crate::keys::UiEvent::Terminal(
+            ratatui::crossterm::event::Event::Mouse(event),
+        ));
+    }
+    pub(crate) fn handle_mouse_internal(&mut self, event: MouseEvent) {
         if !self.state.mouse.enabled {
             return;
         }
@@ -313,7 +318,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.invalidate_hits();
             }
             // Inside the overlay, and the wheel-only regions: nothing.
-            ZoneKind::Chrome(ChromeId::HelpOverlayInside) | ZoneKind::Scroll(_) => {}
+            ZoneKind::Chrome(ChromeId::HelpOverlayInside)
+            | ZoneKind::Scroll(_)
+            | ZoneKind::Pane(_)
+            | ZoneKind::DetailSection(_)
+            | ZoneKind::ActivityRow { .. }
+            | ZoneKind::ExpandText
+            | ZoneKind::ViewerText
+            | ZoneKind::EditorText
+            | ZoneKind::TextAction(_)
+            | ZoneKind::LeaveChoice(_) => {}
         }
     }
 
@@ -538,7 +552,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         let now = self.now();
         match self.state.mouse.quit_armed_at {
             Some(armed_at) if now - armed_at <= QUIT_ARM_MS => {
-                self.state.should_exit = true;
+                self.request_exit(crate::keys::ExitCause::User);
             }
             _ => self.state.mouse.quit_armed_at = Some(now),
         }
@@ -718,11 +732,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     fn execute_selected_suggestion(&mut self) {
-        self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        self.handle_key_internal(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     }
 
     fn accept_command_completion(&mut self) {
-        self.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        self.handle_key_internal(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     }
 
     // ── Wheel ──────────────────────────────────────────────────────────────

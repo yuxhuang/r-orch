@@ -150,6 +150,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// Drain the backend streams and fire every due timer. Called once per
     /// frame, and by the tests directly after advancing the clock.
     pub fn tick(&mut self) {
+        self.dispatch_ui_event(&crate::keys::UiEvent::Tick);
         let now = self.now();
 
         // Animation tick, used by spinners, the scanner bar and the tab flash.
@@ -451,6 +452,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// can deliver dozens of notches from one flick, and the frame is the
     /// only place the user sees a result.
     pub fn set_hits(&mut self, hits: crate::hit::HitMap) {
+        self.state.frame_generation = hits.metrics.generation;
         self.state.mouse.hits = hits;
         self.start_frame();
     }

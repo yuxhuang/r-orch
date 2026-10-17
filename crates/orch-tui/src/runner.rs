@@ -163,7 +163,10 @@ pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exi
         }
         guard.reconcile_mouse(app.state.mouse.enabled);
 
-        if app.state.should_exit || stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) {
+            app.request_exit(crate::keys::ExitCause::Signal);
+        }
+        if app.state.should_exit {
             return Ok(Exit::Requested);
         }
 

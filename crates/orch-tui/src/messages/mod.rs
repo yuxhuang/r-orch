@@ -4,6 +4,7 @@
 //! The caps here are OOM defences, not cosmetics (PARITY.md §12.6).
 
 pub mod format;
+pub mod retention;
 
 use indexmap::{IndexMap, IndexSet};
 use orch_domain::OrchestratorEvent;
