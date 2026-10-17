@@ -999,7 +999,7 @@ fn crate_origin(app: &TestApp) -> CopyOrigin {
 }
 
 #[test]
-fn c7_footer_click_arms_suppression_before_mode_change_and_invalidates_hits() {
+fn c7_footer_click_arms_suppression_and_invalidates_hits() {
     let mut app = app();
     app.open_wizard(field(StepKind::Text, "text"));
     let origin = origin(&app);

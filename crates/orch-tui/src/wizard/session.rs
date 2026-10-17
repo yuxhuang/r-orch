@@ -337,7 +337,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.invalidate_hits();
     }
 
-    fn editor_action(&mut self, action: TextAction, mouse: bool) {
+    fn with_editor_footer_guard(
+        &mut self,
+        action: TextAction,
+        mouse: bool,
+        transition: impl FnOnce(&mut Self, CopyOrigin),
+    ) {
         let Some(origin) = self.editor_origin() else {
             return;
         };
@@ -350,31 +355,39 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             self.state
                 .suppress_text_footer(&origin, self.clock.now_ms());
         }
-        let Some(w) = self.state.wizard.as_mut() else {
-            return;
-        };
-        match action {
-            TextAction::OpenCopyRail => w.copy_rail = Some(0),
-            TextAction::PreviousCopyAction => {
-                w.copy_rail = Some((w.copy_rail.unwrap_or(0) + 3) % 4)
-            }
-            TextAction::NextCopyAction => w.copy_rail = Some((w.copy_rail.unwrap_or(0) + 1) % 4),
-            TextAction::CloseCopyRail | TextAction::DismissCopyFeedback => {
-                w.copy_rail = None;
-                w.copy_notice = None;
-                w.suppress_validation_footer = true;
-                self.state.dismiss_copy_feedback(&origin);
-            }
-            TextAction::CopyAll
-            | TextAction::CopySelection
-            | TextAction::CopyTerminal
-            | TextAction::CopyNative => {
-                w.copy_rail = None;
-                self.copy_editor(action);
-            }
-            _ => return,
-        }
+        transition(self, origin);
         self.invalidate_hits();
+    }
+
+    fn editor_action(&mut self, action: TextAction, mouse: bool) {
+        self.with_editor_footer_guard(action, mouse, |app, origin| {
+            let Some(w) = app.state.wizard.as_mut() else {
+                return;
+            };
+            match action {
+                TextAction::OpenCopyRail => w.copy_rail = Some(0),
+                TextAction::PreviousCopyAction => {
+                    w.copy_rail = Some((w.copy_rail.unwrap_or(0) + 3) % 4)
+                }
+                TextAction::NextCopyAction => {
+                    w.copy_rail = Some((w.copy_rail.unwrap_or(0) + 1) % 4)
+                }
+                TextAction::CloseCopyRail | TextAction::DismissCopyFeedback => {
+                    w.copy_rail = None;
+                    w.copy_notice = None;
+                    w.suppress_validation_footer = true;
+                    app.state.dismiss_copy_feedback(&origin);
+                }
+                TextAction::CopyAll
+                | TextAction::CopySelection
+                | TextAction::CopyTerminal
+                | TextAction::CopyNative => {
+                    w.copy_rail = None;
+                    app.copy_editor(action);
+                }
+                _ => (),
+            }
+        });
     }
 }
 
@@ -862,5 +875,32 @@ fn handle_editor_mouse<B: TuiBackend, C: Clock>(
             false
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod footer_order_tests {
+    use super::*;
+    use crate::{TestClock, backend::fake::FakeBackend, wizard::WizardStep};
+
+    #[test]
+    fn mouse_guard_is_observable_before_any_editor_mode_or_copy_transition() {
+        let mut app = App::new(FakeBackend::new(), TestClock::new(1000));
+        app.open_wizard(Wizard::new(
+            WizardKind::Task,
+            "Task",
+            vec![WizardStep::new("field", "Field", StepKind::Text)],
+        ));
+        app.with_editor_footer_guard(TextAction::OpenCopyRail, true, |app, origin| {
+            // This runs at the production transition boundary, not after it.
+            assert_eq!(app.state.wizard.as_ref().unwrap().copy_rail, None);
+            assert!(app.state.text_footer_suppressed(&origin, 1000));
+            assert!(app.state.text_footer_suppressed(&origin, 1399));
+            assert!(!app.state.text_footer_suppressed(&origin, 1400));
+            app.state.wizard.as_mut().unwrap().copy_rail = Some(0);
+        });
+        assert_eq!(app.state.wizard.as_ref().unwrap().copy_rail, Some(0));
+        assert!(!app.state.mouse.hits.is_valid());
+        assert!(app.backend.copy_requests.is_empty());
     }
 }
