@@ -1229,8 +1229,16 @@ fn handle_key<B: TuiBackend, C: Clock>(app: &mut App<B, C>, key: KeyEvent) -> bo
     if key.code == KeyCode::F(1) {
         return false;
     }
-    // Every consumed key can change what is drawn where.
+    // Every consumed key can change what is drawn where. A held body press
+    // keeps its identity, so a drag can page by keyboard and then extend onto
+    // the newly drawn text (design V4); the invalid hit map still refuses any
+    // Drag until the next frame is adopted, and closing clears the press.
+    let press = app.state.mouse.armed.take().filter(|armed| {
+        armed.kind == ZoneKind::ViewerText
+            && app.state.viewer.as_ref().is_some_and(|v| v.drag.is_some())
+    });
     app.invalidate_hits();
+    app.state.mouse.armed = press;
     let Some(viewer) = app.state.viewer.as_mut() else {
         return false;
     };

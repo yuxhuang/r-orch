@@ -21,7 +21,7 @@ use orch_tui::backend::{
 use orch_tui::clock::TestClock;
 use orch_tui::hit::{HitMap, TextAction, ZoneKind};
 use orch_tui::navigation::{NavAction, ScrollMetrics, ScrollMode, ScrollState, navigate};
-use orch_tui::state::EntityType;
+use orch_tui::state::{EntityType, Focus, ViewId};
 use orch_tui::views::{self, Caps, RenderCtx};
 use orch_tui::widgets::text_viewer::{
     Completeness, LocalNotice, ROW_INDEX_MAX_BYTES, Representation, TextViewer, ViewerDocument,
@@ -564,6 +564,22 @@ fn v4_a_stale_frame_never_extends_or_creates_a_selection() {
     v.mouse(MouseEventKind::Drag(MouseButton::Left), b.x + 5, b.y);
     v.release(b.x + 5, b.y);
     assert_eq!(v.viewer().selection(), None);
+}
+
+#[test]
+fn v4_a_consumed_key_mid_drag_keeps_the_press_so_the_drag_still_extends() {
+    let mut v = V::sized(80, 24);
+    v.open(doc("abcdefghij"));
+    let b = v.body();
+    v.press(b.x, b.y);
+    v.mouse(MouseEventKind::Drag(MouseButton::Left), b.x + 2, b.y);
+    // Any key the viewer consumes invalidates the hit map; the held press
+    // must survive it so the drag continues on the next adopted frame.
+    v.key(KeyCode::Down);
+    let b = v.body();
+    v.mouse(MouseEventKind::Drag(MouseButton::Left), b.x + 5, b.y);
+    v.release(b.x + 5, b.y);
+    assert_eq!(v.viewer().selected_text(), Some("abcdef"));
 }
 
 #[test]
@@ -1329,6 +1345,18 @@ fn c8_a_late_result_after_close_drains_without_relabelling_a_reopened_viewer() {
 #[test]
 fn c8_tick_drains_completions_with_no_viewer_open() {
     let mut v = V::sized(40, 14);
+    // A real focused field: the selected Logs row, so B0's per-Tick focus
+    // normalisation keeps (rather than retires) this origin when composed.
+    v.app.state.messages.push(orch_tui::messages::Message::new(
+        3,
+        0,
+        "field body",
+        orch_tui::theme::Token::White,
+        orch_tui::messages::MsgType::Output,
+    ));
+    v.app.state.view = ViewId::Logs;
+    v.app.state.focus = Focus::MainList;
+    v.app.state.log_selected_index = 0;
     let field = v
         .app
         .state
