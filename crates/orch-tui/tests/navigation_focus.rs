@@ -917,3 +917,40 @@ fn v6_changed_source_uses_current_scrolled_top_instead_of_stale_click() {
         expected
     );
 }
+
+#[test]
+fn v6_shrinking_source_clamps_anchor_to_the_new_top_of_the_last_page() {
+    let mut task = make_task("t", "Task", TaskStatus::Todo);
+    task.description = (0..100).map(|i| format!("old line{i:02}\n")).collect();
+    let mut h = Harness::with(FakeBackend::new().with_tasks(vec![task]));
+    h.app.state.detail = DetailPanel::Entity;
+    h.app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Description));
+    h.draw().press(KeyCode::End).draw();
+    let key = h.app.state.pane_key(h.app.state.focus);
+    let body = h.hits().pane_metrics(&key).unwrap().body;
+    h.click(body.x, body.y + 1);
+    let updated = (0..20)
+        .map(|i| format!("new line{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let top = 20usize.saturating_sub(body.height as usize);
+    let expected = updated
+        .split_inclusive('\n')
+        .take(top)
+        .map(str::len)
+        .sum::<usize>();
+    h.app.state.tasks[0].description = updated;
+    h.press(KeyCode::Enter);
+    assert_eq!(
+        h.app
+            .state
+            .viewer
+            .as_ref()
+            .unwrap()
+            .document()
+            .initial_anchor,
+        expected
+    );
+}

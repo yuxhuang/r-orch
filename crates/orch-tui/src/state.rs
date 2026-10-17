@@ -1365,12 +1365,11 @@ impl AppState {
             ) {
                 let rows =
                     crate::views::detail::wrap_rows(&document.body, metrics.body.width as usize);
-                let offset = self.pane_scroll(&key).offset;
-                document.initial_anchor = rows
-                    .get(offset)
-                    .or_else(|| rows.last())
-                    .map(|(_, byte)| *byte)
-                    .unwrap_or(0);
+                let offset = self
+                    .pane_scroll(&key)
+                    .offset
+                    .min(rows.len().saturating_sub(metrics.body.height as usize));
+                document.initial_anchor = rows.get(offset).map(|(_, byte)| *byte).unwrap_or(0);
             }
         }
         Some(document)
