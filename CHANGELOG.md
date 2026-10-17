@@ -5,6 +5,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
+Dashboard (TUI) quality-of-life release. No peer-protocol or on-disk change, so 0.5.x and 0.6.0 peers can be
+mixed.
+
 ### Added
 - Inspect complete retained messages and fields in a snapshot viewer, select text, and copy through explicit host or terminal routes, with browser gesture and selectable fallback support.
 - Focus and page through lists, activity and detail sections with keyboard or mouse; Agents rows now align in a table.
@@ -100,7 +105,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/yuxhuang/r-orch/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/yuxhuang/r-orch/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/yuxhuang/r-orch/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/yuxhuang/r-orch/compare/v0.4.0...v0.5.0
