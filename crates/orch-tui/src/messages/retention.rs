@@ -244,7 +244,11 @@ fn repeats_latest(feed: &[Message], p: &PendingMessage) -> bool {
         .rev()
         .take(64)
         .find(|m| m.agent_id == p.agent_id && m.task_id == p.task_id)
-        .is_some_and(|m| m.msg_type == p.msg_type && m.text == p.text && m.detail == p.detail)
+        .is_some_and(|m| {
+            m.msg_type == p.msg_type
+                && m.text == p.text
+                && m.detail.as_deref() == p.detail.as_deref()
+        })
 }
 
 #[cfg(test)]

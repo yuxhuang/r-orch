@@ -1464,3 +1464,144 @@ fn r2_an_unavailable_body_says_why_and_never_copies() {
     assert!(v.requests().is_empty());
     assert_eq!(v.viewer().notice(), Some(LocalNotice::Unavailable));
 }
+
+// Retained-source ownership: exercise the resolver used by real viewer opens.
+#[test]
+fn retained_raw_viewers_share_source_bytes_after_live_and_history_admission() {
+    use orch_tui::messages::{Message, MsgType, PendingMessage, retention};
+    use orch_tui::theme::Token;
+    let mut state = orch_tui::state::AppState::default();
+    let mut next_id = 1;
+    for raw in [
+        "plain 中文\t\u{1b}\n",
+        r#"{"type":"mystery","text":"raw"}"#,
+        "{broken",
+    ] {
+        let pending = || PendingMessage {
+            text: "preview".into(),
+            color: Token::White,
+            msg_type: MsgType::Output,
+            agent_id: None,
+            task_id: None,
+            detail: Some(raw.into()),
+            ts_ms: None,
+        };
+        retention::stage_message(&mut state.pending_messages, &mut state.messages, pending());
+        retention::flush_messages(
+            &mut state.pending_messages,
+            &mut state.messages,
+            &mut next_id,
+            1,
+        );
+        retention::prepend_messages(
+            &mut state.pending_messages,
+            &mut state.messages,
+            [pending()],
+            &mut next_id,
+            0,
+        );
+    }
+    let documents: Vec<_> = state
+        .messages
+        .iter()
+        .map(|message: &Message| {
+            let document = state
+                .text_for_source(&ViewerSource::Message(message.id), 0, START_MS)
+                .unwrap();
+            let raw = message.detail.as_deref().unwrap();
+            assert_eq!(&*document.body, raw);
+            assert_eq!(document.representation, Representation::Raw);
+            assert_eq!(
+                document.body.as_ptr(),
+                raw.as_ptr(),
+                "Raw must share retained source"
+            );
+            document
+        })
+        .collect();
+    state.messages.clear();
+    assert_eq!(documents.len(), 6);
+    assert!(documents.iter().all(|document| !document.body.is_empty()));
+}
+
+#[test]
+fn retained_human_viewers_share_raw_and_preserve_exact_decoded_snapshots() {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    for (raw, human, kind) in [
+        (
+            r#"{"type":"agent_message","text":"  中文\t\n"}"#,
+            "  中文\t\n",
+            MsgType::Output,
+        ),
+        (
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a\n"},{"type":"text","text":"é"}]}}"#,
+            "a\n\né",
+            MsgType::Output,
+        ),
+        (
+            r#"{"error":{"message":"bad\n中文"}}"#,
+            "bad\n中文",
+            MsgType::Error,
+        ),
+    ] {
+        let mut state = orch_tui::state::AppState::default();
+        state
+            .messages
+            .push(Message::new(7, 0, "preview", Token::White, kind).with_detail(Some(raw.into())));
+        let document = state
+            .text_for_source(&ViewerSource::Message(7), 3, START_MS)
+            .unwrap();
+        assert_eq!(&*document.body, human);
+        assert_eq!(document.representation, Representation::Human);
+        let pinned_raw = document.raw_body.as_ref().unwrap();
+        assert_eq!(&**pinned_raw, raw);
+        assert_eq!(
+            pinned_raw.as_ptr(),
+            state.messages[0].detail.as_ref().unwrap().as_ptr()
+        );
+        let second = orch_tui::messages::message_document(&state.messages[0], 3, START_MS);
+        assert_eq!(&*second.body, human);
+        assert!(Arc::ptr_eq(second.raw_body.as_ref().unwrap(), pinned_raw));
+        let cloned = document.clone();
+        assert!(Arc::ptr_eq(&cloned.body, &document.body));
+        state.messages.clear();
+        assert_eq!(&*document.body, human);
+        assert_eq!(&**document.raw_body.as_ref().unwrap(), raw);
+    }
+}
+
+#[test]
+fn message_resolvers_preserve_active_command_bytes_and_unavailable_state() {
+    use orch_tui::messages::{Message, MsgType, unavailable_notice};
+    use orch_tui::theme::Token;
+    let mut state = orch_tui::state::AppState::default();
+    let command =
+        r#"{"type":"command_execution","command":"echo 中文","aggregated_output":"ok\n"}"#;
+    state.messages.push(
+        Message::new(7, 0, "preview", Token::White, MsgType::Tool)
+            .with_detail(Some(command.into())),
+    );
+    let direct = orch_tui::messages::message_document(&state.messages[0], 0, START_MS);
+    let active = state
+        .text_for_source(&ViewerSource::Message(7), 0, START_MS)
+        .unwrap();
+    assert_eq!(&*active.body, "echo 中文\nok\n");
+    assert_eq!(&*direct.body, "echo 中文\nok\n");
+    state.messages[0] = Message::new(
+        7,
+        0,
+        &unavailable_notice(1_048_577),
+        Token::White,
+        MsgType::Output,
+    )
+    .with_detail(Some(String::new()));
+    let unavailable = state
+        .text_for_source(&ViewerSource::Message(7), 0, START_MS)
+        .unwrap();
+    assert!(matches!(
+        unavailable.completeness,
+        Completeness::Unavailable { .. }
+    ));
+    assert_eq!(unavailable.original_bytes, 1_048_577);
+}

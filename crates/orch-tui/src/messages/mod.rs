@@ -6,6 +6,8 @@
 pub mod format;
 pub mod retention;
 
+use std::sync::Arc;
+
 use indexmap::{IndexMap, IndexSet};
 use orch_domain::OrchestratorEvent;
 
@@ -192,7 +194,8 @@ pub struct Message {
     pub msg_type: MsgType,
     pub agent_id: Option<String>,
     pub task_id: Option<String>,
-    pub detail: Option<String>,
+    /// Canonical immutable raw detail, shared with pinned viewer snapshots.
+    pub detail: Option<Arc<str>>,
 }
 
 impl Message {
@@ -222,7 +225,7 @@ impl Message {
     /// Store the complete detail. Size admission is the retention helpers'
     /// job (design D4); nothing here cuts a body.
     pub fn with_detail(mut self, detail: Option<String>) -> Self {
-        self.detail = detail;
+        self.detail = detail.map(Arc::from);
         self
     }
 
@@ -265,16 +268,15 @@ impl Message {
 /// document, never an empty "complete" body. A legacy record without a
 /// stored detail falls back to its full text and says so.
 ///
-/// Both representations are copied once here, on open, and then shared:
+/// Raw shares the immutable retained detail. Human is decoded once on open;
 /// switching never re-reads or re-decodes the (possibly evicted) record.
+/// Legacy records have no canonical detail, so their text fallback is copied.
 pub fn message_document(
     message: &Message,
     initial_anchor: usize,
     captured_at_ms: i64,
 ) -> crate::widgets::text_viewer::ViewerDocument {
     use crate::widgets::text_viewer::{Completeness, Representation, ViewerDocument, ViewerSource};
-    use format::{DecodedBody, human_error_text, human_text};
-    use std::sync::Arc;
 
     let source = ViewerSource::Message(message.id);
     let legacy = message.detail.is_none();
@@ -286,7 +288,11 @@ pub fn message_document(
     } else {
         format!("Message {}", message.id)
     };
-    if let Some(original_bytes) = message.unavailable_bytes() {
+    let raw = message.detail.as_deref().unwrap_or(&message.text);
+    if let Some(original_bytes) = message
+        .unavailable_bytes()
+        .or_else(|| (raw.len() > MAX_BODY_BYTES).then_some(raw.len()))
+    {
         return ViewerDocument {
             source,
             title: base_title,
@@ -301,29 +307,44 @@ pub fn message_document(
             initial_anchor: 0,
         };
     }
-    let raw = message.detail.as_deref().unwrap_or(&message.text);
-    let decoded = if message.msg_type == MsgType::Error {
-        human_error_text(raw)
-    } else {
-        human_text(raw)
-    };
-    let (body, representation, raw_body, title): (Arc<str>, _, _, _) = match decoded {
-        DecodedBody::Human(human) if human.text.len() <= MAX_BODY_BYTES => {
-            let title = if human.joined_blocks {
-                format!("{base_title} \u{b7} Human (text blocks joined)")
-            } else {
-                base_title
-            };
-            let raw: Arc<str> = Arc::from(raw);
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let human = parsed
+        .as_ref()
+        .and_then(|value| known_message_text(value, 0))
+        .or_else(|| {
+            let value = parsed.as_ref()?;
+            if message.msg_type != MsgType::Error
+                || !["error", "message", "detail", "reason"]
+                    .iter()
+                    .any(|key| value.get(key).is_some())
+            {
+                return None;
+            }
+            let decoded = orch_domain::extract_error_message(value);
+            // The domain helper falls back to serializing an unsupported
+            // object. That is not decoded human content: keep exact Raw.
+            let unchanged = serde_json::from_str::<serde_json::Value>(&decoded)
+                .ok()
+                .as_ref()
+                == Some(value);
+            (!decoded.is_empty() && decoded != raw && !unchanged).then_some((decoded, false))
+        });
+    let raw_body = || message.detail.clone().unwrap_or_else(|| Arc::from(raw));
+    let (body, representation, raw_body, title) =
+        if let Some((human, joined)) = human.filter(|(text, _)| text.len() <= MAX_BODY_BYTES) {
             (
-                Arc::from(human.text),
+                Arc::<str>::from(human),
                 Representation::Human,
-                Some(raw),
-                title,
+                Some(raw_body()),
+                if joined {
+                    format!("{base_title} · Human (text blocks joined)")
+                } else {
+                    base_title
+                },
             )
-        }
-        _ => (Arc::from(raw), Representation::Raw, None, base_title),
-    };
+        } else {
+            (raw_body(), Representation::Raw, None, base_title)
+        };
     let mut anchor = initial_anchor.min(body.len());
     while !body.is_char_boundary(anchor) {
         anchor -= 1;
@@ -339,6 +360,66 @@ pub fn message_document(
         captured_at_ms,
         initial_anchor: anchor,
     }
+}
+
+fn known_message_text(value: &serde_json::Value, depth: usize) -> Option<(String, bool)> {
+    use serde_json::Value;
+    if depth >= 8 {
+        return None;
+    }
+    let kind = value.get("type").and_then(Value::as_str);
+    if matches!(kind, Some("item.started" | "item.completed")) {
+        return known_message_text(value.get("item")?, depth + 1);
+    }
+    if (kind == Some("agent_message") || (kind.is_none() && value.get("role").is_none()))
+        && let Some(text) = value.get("text").and_then(Value::as_str)
+    {
+        return Some((text.into(), false));
+    }
+    let content = if matches!(kind, Some("message" | "assistant"))
+        || value.get("role").and_then(Value::as_str) == Some("assistant")
+        || value.get("subtype").is_some()
+    {
+        value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .filter(|content| !content.is_null())
+            .or_else(|| value.get("content"))
+            .or_else(|| value.get("subtype").and_then(|_| value.get("message")))
+    } else {
+        value.get("content")
+    };
+    if let Some(content) = content {
+        if let Some(text) = content.as_str() {
+            return Some((text.into(), false));
+        }
+        let blocks: Vec<_> = content
+            .as_array()?
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        if !blocks.is_empty() {
+            return Some((blocks.join("\n"), blocks.len() > 1));
+        }
+    }
+    if (kind == Some("result") || kind.is_none())
+        && let Some(result) = value.get("result").and_then(Value::as_str)
+    {
+        return Some((result.into(), false));
+    }
+    if kind == Some("command_execution") {
+        let command = value.get("command").and_then(Value::as_str)?;
+        let output = value
+            .get("aggregated_output")
+            .or_else(|| value.get("result"))
+            .and_then(Value::as_str);
+        return Some((
+            output.map_or_else(|| command.into(), |output| format!("{command}\n{output}")),
+            false,
+        ));
+    }
+    None
 }
 
 pub(crate) fn record_bytes(
