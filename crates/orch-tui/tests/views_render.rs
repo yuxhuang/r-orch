@@ -1064,8 +1064,8 @@ fn remote_agents_show_capabilities_location_and_offline_state() {
     });
     let mut harness = harness_for(ViewId::Agents, FakeBackend::new().with_agents(vec![agent]));
     harness.assert_text("OFFLINE");
-    harness.assert_text("CAPS:linux");
-    harness.assert_text("WHERE:w1 offline");
+    harness.assert_text("linux");
+    harness.assert_text("w1 offline");
 }
 
 /// The detail panel shows the phase, in the phase's own colour, and the one

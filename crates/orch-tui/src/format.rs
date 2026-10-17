@@ -29,7 +29,7 @@ pub fn cap_line(s: &str, max_len: usize) -> String {
 /// of the bar keeps counting `char`s (an accepted L2 divergence, PARITY §12.8
 /// (i)); this is used where a name is involved.
 pub fn cap_display(s: &str, max_cols: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
 
     if crate::text::text_display_width(s) <= max_cols {
         return s.to_owned();
@@ -37,17 +37,19 @@ pub fn cap_display(s: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
     }
-    // One column is reserved for the ellipsis, and a wide character that
-    // would straddle the cap is dropped rather than half-drawn.
+    // One column is reserved for the ellipsis, and a wide grapheme that would
+    // straddle the cap is dropped rather than half-drawn. Measured per
+    // grapheme, like the check above: per `char`, `❤` + VS16 counts one
+    // column but draws two.
     let mut out = String::new();
     let mut used = 0;
-    for ch in s.chars() {
-        let width = ch.width().unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let width = crate::text::display_width(grapheme);
         if used + width > max_cols - 1 {
             break;
         }
         used += width;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     out.push('…');
     out
@@ -233,6 +235,13 @@ mod tests {
                 "cap {cap}"
             );
         }
+        // An emoji presentation sequence is two columns as a whole, so it
+        // is kept or dropped whole.
+        assert_eq!(
+            cap_display("\u{2764}\u{FE0F}heart", 5),
+            "\u{2764}\u{FE0F}he…"
+        );
+        assert_eq!(cap_display("\u{2764}\u{FE0F}heart", 2), "…");
     }
 
     #[test]
