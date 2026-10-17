@@ -394,6 +394,245 @@ fn selected_single_line_ctrl_e_moves_without_deleting_text() {
 }
 
 #[test]
+fn f1_single_line_end_shift_right_backspace_clears_empty_selection() {
+    use orch_tui::text::TextInput;
+    let mut text = TextInput::new("abc");
+    for (code, mods) in [
+        (KeyCode::End, KeyModifiers::NONE),
+        (KeyCode::Right, KeyModifiers::SHIFT),
+        (KeyCode::Backspace, KeyModifiers::NONE),
+    ] {
+        text.handle_editor_key(KeyEvent::new(code, mods), 0);
+    }
+    assert_eq!(text.value(), "ab");
+    assert_eq!(text.selected_text(), None);
+}
+
+#[test]
+fn f1_wizard_end_shift_right_backspace_redraws_without_selection() {
+    for kind in [StepKind::Text, StepKind::Textarea] {
+        let mut app = app();
+        app.open_wizard(field(kind, "abc"));
+        key(&mut app, KeyCode::End);
+        modified(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Backspace);
+        draw(&mut app, Rect::new(1, 16, 78, 7));
+        let wizard = app.state.wizard.as_ref().unwrap();
+        assert_eq!(wizard.current_value(), "ab");
+        assert_eq!(wizard.selected_text(), None);
+    }
+}
+
+#[test]
+fn f1_single_line_click_backspace_redraws_without_selection() {
+    let mut app = app();
+    app.open_wizard(field(StepKind::Text, "abc"));
+    let area = Rect::new(1, 16, 78, 7);
+    draw(&mut app, area);
+    let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
+    click(&mut app, body.right() - 1, body.y);
+    assert_eq!(
+        app.state
+            .wizard
+            .as_ref()
+            .unwrap()
+            .text_input()
+            .cursor()
+            .pos(),
+        3
+    );
+    key(&mut app, KeyCode::Backspace);
+    draw(&mut app, area);
+    let wizard = app.state.wizard.as_ref().unwrap();
+    assert_eq!(wizard.current_value(), "ab");
+    assert_eq!(wizard.selected_text(), None);
+}
+
+#[test]
+fn f1_single_line_click_kill_keys_clear_empty_selection() {
+    for (code, expected) in [('u', ""), ('w', "one ")] {
+        let mut app = app();
+        app.open_wizard(field(StepKind::Text, "one 界👋🏽"));
+        let area = Rect::new(1, 16, 78, 7);
+        draw(&mut app, area);
+        let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
+        click(&mut app, body.right() - 1, body.y);
+        modified(&mut app, KeyCode::Char(code), KeyModifiers::CONTROL);
+        draw(&mut app, area);
+        let wizard = app.state.wizard.as_ref().unwrap();
+        assert_eq!(wizard.current_value(), expected, "Ctrl+{code}");
+        assert_eq!(wizard.selected_text(), None, "Ctrl+{code}");
+    }
+}
+
+#[test]
+fn f1_typing_after_shrinking_an_empty_selection_keeps_all_remaining_text() {
+    for kind in [StepKind::Text, StepKind::Textarea] {
+        let mut app = app();
+        app.open_wizard(field(kind, "a界😀"));
+        modified(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "!");
+        let wizard = app.state.wizard.as_ref().unwrap();
+        assert_eq!(wizard.current_value(), "a界!");
+        assert_eq!(wizard.selected_text(), None);
+    }
+}
+
+#[test]
+fn f1_paste_after_shrinking_an_empty_selection_keeps_all_remaining_text() {
+    for kind in [StepKind::Text, StepKind::Textarea] {
+        let mut app = app();
+        app.open_wizard(field(kind, "a界😀"));
+        modified(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Backspace);
+        app.state
+            .wizard
+            .as_mut()
+            .unwrap()
+            .insert_paste("paste", 1000);
+        let wizard = app.state.wizard.as_ref().unwrap();
+        assert_eq!(wizard.current_value(), "a界paste");
+        assert_eq!(wizard.selected_text(), None);
+    }
+}
+
+#[test]
+fn f1_undo_redo_after_shrinking_an_empty_selection_restore_text_without_selection() {
+    for kind in [StepKind::Text, StepKind::Textarea] {
+        let mut app = app();
+        app.open_wizard(field(kind, "abc"));
+        modified(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        key(&mut app, KeyCode::Backspace);
+        draw(&mut app, Rect::new(1, 16, 78, 7));
+        modified(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        let wizard = app.state.wizard.as_ref().unwrap();
+        assert_eq!(wizard.current_value(), "abc");
+        assert_eq!(wizard.selected_text(), None);
+        modified(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        modified(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        draw(&mut app, Rect::new(1, 16, 78, 7));
+        let wizard = app.state.wizard.as_ref().unwrap();
+        assert_eq!(wizard.current_value(), "ab");
+        assert_eq!(wizard.selected_text(), None);
+    }
+}
+
+#[test]
+fn f1_single_line_selection_positions_are_clamped_to_graphemes() {
+    use orch_tui::text::TextInput;
+    for value in ["", "a界👋🏽"] {
+        let mut text = TextInput::new(value);
+        text.select_to(usize::MAX, true);
+        assert_eq!(text.selection_range(), None);
+        text.select_to(1, false);
+        let expected = if value.is_empty() { None } else { Some((1, 3)) };
+        assert_eq!(text.selection_range(), expected);
+        assert_eq!(
+            text.selected_text().as_deref(),
+            if value.is_empty() {
+                None
+            } else {
+                Some("界👋🏽")
+            }
+        );
+    }
+}
+
+#[test]
+fn f1_single_line_edits_clear_in_bounds_empty_anchors_before_next_shift_move() {
+    use orch_tui::text::TextInput;
+    for (event, expected) in [
+        (
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            Some((4, 5)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            Some((2, 3)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            Some((2, 3)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            Some((2, 3)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Some((3, 4)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None,
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Some((0, 1)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            Some((0, 1)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+            Some((0, 1)),
+        ),
+        (
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::META),
+            Some((0, 1)),
+        ),
+    ] {
+        let mut text = TextInput::new("abcdef");
+        text.select_to(3, true);
+        text.handle_editor_key(event, 0);
+        assert_eq!(text.selected_text(), None, "{event:?}");
+        text.handle_editor_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT), 0);
+        assert_eq!(text.selection_range(), expected, "{event:?}");
+    }
+}
+
+#[test]
+fn f1_single_line_paste_clears_empty_anchor() {
+    use orch_tui::text::TextInput;
+    let mut text = TextInput::new("abc");
+    text.select_to(3, true);
+    text.insert_editor_str("!", 0);
+    assert_eq!(text.value(), "abc!");
+    assert_eq!(text.selected_text(), None);
+}
+
+#[test]
+fn f1_single_line_yank_retires_empty_anchor() {
+    use orch_tui::text::TextInput;
+    let mut text = TextInput::new("abc");
+    text.handle_editor_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), 0);
+    text.select_to(0, true);
+    text.handle_editor_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL), 0);
+    assert_eq!(text.value(), "abc");
+    assert_eq!(text.selected_text(), None);
+}
+
+#[test]
+fn f1_single_line_direct_mutations_retire_selection() {
+    use orch_tui::text::TextInput;
+    let mut text = TextInput::new("abc");
+    text.select_to(3, true);
+    text.cursor_mut().replace_all("x");
+    assert_eq!(text.selected_text(), None);
+    text.select_to(1, true);
+    text.insert_str("!", 0);
+    assert_eq!(text.selected_text(), None);
+    text.select_to(2, true);
+    text.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), 0);
+    assert_eq!(text.selected_text(), None);
+    text.select_to(1, true);
+    text.reset("");
+    assert_eq!(text.selected_text(), None);
+}
+
+#[test]
 fn single_line_navigation_after_undo_preserves_redo() {
     for event in [
         KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),

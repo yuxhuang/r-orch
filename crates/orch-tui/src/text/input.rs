@@ -68,6 +68,7 @@ impl TextInput {
     }
 
     pub fn cursor_mut(&mut self) -> &mut Cursor {
+        self.selection_anchor = None;
         self.generation += 1;
         &mut self.cursor
     }
@@ -86,8 +87,9 @@ impl TextInput {
     }
 
     pub fn selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.selection_anchor?;
-        let at = self.cursor.pos();
+        let len = self.cursor.len();
+        let anchor = self.selection_anchor?.min(len);
+        let at = self.cursor.pos().min(len);
         (anchor != at).then_some((anchor.min(at), anchor.max(at)))
     }
 
@@ -97,10 +99,10 @@ impl TextInput {
     }
 
     pub fn select_to(&mut self, at: usize, start: bool) {
-        if start {
-            self.selection_anchor = Some(at);
-        }
         self.cursor = Cursor::at(self.value(), at);
+        if start {
+            self.selection_anchor = Some(self.cursor.pos());
+        }
     }
 
     fn editor_snapshot(&mut self, before: Cursor) {
@@ -121,7 +123,10 @@ impl TextInput {
     }
 
     fn delete_selection(&mut self) -> bool {
-        let Some((start, end)) = self.selection_range() else {
+        let range = self.selection_range();
+        // Even an empty selection belongs to the text before this edit.
+        self.selection_anchor = None;
+        let Some((start, end)) = range else {
             return false;
         };
         let segments = super::grapheme_segments(self.value());
@@ -129,7 +134,6 @@ impl TextInput {
             &(segments[..start].concat() + &segments[end..].concat()),
             start,
         );
-        self.selection_anchor = None;
         true
     }
 
@@ -285,6 +289,7 @@ impl TextInput {
     /// `Ctrl+Z` — pop at most **one** snapshot matching the current text, then
     /// pop and apply the next.
     fn undo_once(&mut self) {
+        self.selection_anchor = None;
         if self
             .undo
             .last()
@@ -300,6 +305,7 @@ impl TextInput {
     /// `Cmd+Z` — pop **all** snapshots matching the current text, then apply
     /// the next.
     fn undo_all_matching(&mut self) {
+        self.selection_anchor = None;
         while self
             .undo
             .last()
@@ -317,7 +323,11 @@ impl TextInput {
     /// Never consumes `Enter`, `Esc`, `Tab`, `↑` or `↓` — those belong to the
     /// parent (command bar / wizard).
     pub fn handle_key(&mut self, key: KeyEvent, now_ms: i64) -> bool {
+        let selected_before = self.selection_anchor.map(|_| self.value().to_string());
         let consumed = self.dispatch_key(key, now_ms);
+        if selected_before.is_some_and(|before| before != self.value()) {
+            self.selection_anchor = None;
+        }
         if consumed {
             self.generation += 1;
         }
@@ -426,6 +436,7 @@ impl TextInput {
 
     /// Insert a (possibly multi-character) string as if typed — used by paste.
     pub fn insert_str(&mut self, text: &str, now_ms: i64) {
+        self.selection_anchor = None;
         self.snapshot_debounced(now_ms);
         self.cursor.insert(text);
         self.generation += 1;
