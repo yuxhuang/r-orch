@@ -522,6 +522,55 @@ fn agent_sel<'a>(root: &'a Path, agent: &'a str) -> Vec<&'a str> {
     vec!["--template-dir", path_arg(root), "--agent", agent]
 }
 
+#[test]
+fn adding_a_member_from_json_file_preserves_surrogate_pairs() {
+    assert_added_surrogate_pair(false);
+}
+
+#[test]
+fn adding_a_member_from_json_stdin_preserves_surrogate_pairs() {
+    assert_added_surrogate_pair(true);
+}
+
+fn assert_added_surrogate_pair(stdin: bool) {
+    let sb = sandbox();
+    for explicit_format in [false, true] {
+        let root = small_team(
+            &sb,
+            if explicit_format {
+                "explicit"
+            } else {
+                "inferred"
+            },
+        );
+        let input = br#"{"name":"extra","role":"\ud83e\udd80"}"#;
+        let file = sb.work().join("member.json");
+        fs::write(&file, input).unwrap();
+        let mut args = vec![
+            "org",
+            "template",
+            "agent",
+            "add",
+            "--template-dir",
+            path_arg(&root),
+            "--json",
+            "-f",
+            if stdin { "-" } else { path_arg(&file) },
+        ];
+        if explicit_format {
+            args.extend(["--input-format", "json"]);
+        }
+        let output = if stdin {
+            sb.run_stdin(&args, input)
+        } else {
+            sb.run(&args)
+        };
+        assert!(output.status.success(), "{}", transcript(&output));
+        assert_eq!(parse_json(&output)["role"], "🦀");
+        assert_eq!(stored(&member_path(&root, "extra"))["role"], "🦀");
+    }
+}
+
 fn patch_org(sb: &Sandbox, root: &Path, doc: &Value) -> Output {
     mutate(
         sb,

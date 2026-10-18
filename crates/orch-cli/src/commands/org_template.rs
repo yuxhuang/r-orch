@@ -171,14 +171,25 @@ impl DefinitionInput {
                 ),
             },
         };
-        // YAML's strict duplicate-key and depth checks run for JSON too. The
-        // selected JSON parser remains final; no parser fallback is attempted.
+        let bytes = if json {
+            let value = match crate::document_input::parse_json(&self.file, &bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    // Preserve add's existing diagnostics for invalid input;
+                    // this check can only reject, never accept invalid JSON.
+                    store::parse_document(&self.file, &bytes).await?;
+                    return Err(error);
+                }
+            };
+            // Preserve the JSON value, not its source spelling: UTF-16
+            // surrogate escapes are valid JSON but invalid YAML escapes.
+            serde_yaml_ng::to_string(&value)
+                .map_err(|e| Error::other(e.to_string()))?
+                .into_bytes()
+        } else {
+            bytes
+        };
         store::parse_document(&self.file, &bytes).await?;
-        if json {
-            serde_json::from_slice::<Value>(&bytes).map_err(|e| {
-                Error::invalid_arguments(format!("{}: invalid JSON: {e}", self.file.display()))
-            })?;
-        }
         Ok(bytes)
     }
 }
