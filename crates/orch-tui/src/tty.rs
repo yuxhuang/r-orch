@@ -2,9 +2,8 @@
 //! do (PARITY.md §14.39).
 //!
 //! crossterm 0.29 compiles one of two Unix event sources, and which one it is
-//! decides the shape of this bug. With the `use-dev-tty` feature **off** —
-//! which is this build; `cargo tree -e features` shows no `use-dev-tty`, and
-//! `mio` and `signal-hook-mio` are compiled in — the source is
+//! decides the shape of this bug. This module was written against the default,
+//! with the `use-dev-tty` feature **off**: the source is
 //! `src/event/source/unix/mio.rs`, and its `TTY_TOKEN` arm is:
 //!
 //! ```text
@@ -35,9 +34,12 @@
 //! sanctioned route to real POSIX semantics here (§4.8 keeps it for
 //! `kill(pid, 0)` liveness, the same class of check).
 //!
-//! (With `use-dev-tty` **on**, the other source spins for the requested
-//! timeout and returns `Ok(false)` — indistinguishable from idle. Owning the
-//! wait fixes that one too, so this module is correct under either source.)
+//! The build now turns `use-dev-tty` **on** (workspace `Cargo.toml`), because
+//! the mio source also leaves a key unread when it arrives in the same wakeup
+//! as SIGWINCH. On a hung-up tty that `poll(2)` source spins for the requested
+//! timeout and returns `Ok(false)` — indistinguishable from idle — so owning
+//! the wait is still what makes a hang-up visible. This module is correct
+//! under either source.
 
 use std::io;
 use std::time::Duration;

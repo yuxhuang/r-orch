@@ -2838,6 +2838,29 @@ struct Pty {
 /// loaded machine; a hang fails after this rather than hanging the suite.
 const PTY_WAIT: Duration = Duration::from_secs(20);
 
+/// macOS `stty -g` (`gfmt1:...`) with the `PENDIN` bit of `lflag` cleared.
+/// The kernel sets `PENDIN` whenever a tty returns to canonical mode and
+/// clears it on the next read, so it is driver state rather than a mode a
+/// program can restore: `tcsetattr` neither sets nor clears it. Other
+/// formats (Linux) are compared as is.
+fn without_pendin(stty: &str) -> String {
+    const PENDIN: u64 = 0x2000_0000;
+    if !stty.starts_with("gfmt1:") {
+        return stty.to_owned();
+    }
+    stty.trim_end()
+        .split(':')
+        .map(|field| match field.strip_prefix("lflag=") {
+            Some(hex) => match u64::from_str_radix(hex, 16) {
+                Ok(lflag) => format!("lflag={:x}", lflag & !PENDIN),
+                Err(_) => field.to_owned(),
+            },
+            None => field.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 const PTY_WRAPPER: &str = r#"stty -g > "$1"; after="$2"; orch="$3"; shift 3; "$orch" "$@"; code=$?; stty -g > "$after"; exit $code"#;
 
 fn pty_orch(sb: &Sandbox, args: &[&str], rows: u16, cols: u16) -> Pty {
@@ -2981,7 +3004,7 @@ impl Pty {
     fn terminal_restored(&self) -> bool {
         let before = fs::read_to_string(&self.tty_before).expect("recorded tty before");
         let after = fs::read_to_string(&self.tty_after).expect("recorded tty after");
-        !before.trim().is_empty() && before == after
+        !before.trim().is_empty() && without_pendin(&before) == without_pendin(&after)
     }
 
     fn resize(&self, rows: u16, cols: u16) {
@@ -3445,6 +3468,33 @@ fn a_grow_delivered_together_with_a_key_still_draws_the_next_frame_at_the_new_si
         "{widest} cells, {} lines:\n{frame:#?}",
         frame.len()
     );
+}
+
+/// A key that lands in the same wakeup as SIGWINCH is still read. crossterm's
+/// default (mio) source is edge-triggered and dropped the second readiness, so
+/// the key sat unread until the next one; on Linux about one round in five lost
+/// a key. Many rounds make that loss near-certain rather than occasional.
+#[test]
+fn a_key_sent_with_every_resize_is_never_left_unread() {
+    let sb = sandbox();
+    sb.init_project();
+    let root = crowded_template(&sb, 30);
+    let mut pty = pty_orch(
+        &sb,
+        &["agent", "shop", "--template-dir", path_arg(&root)],
+        10,
+        40,
+    );
+    pty.expect("AGENT SHOP");
+    for round in 0..12u16 {
+        let mark = pty.seen.len();
+        let (rows, cols) = if round % 2 == 0 { (24, 100) } else { (10, 40) };
+        pty.resize(rows, cols);
+        pty.send(DOWN);
+        pty.first_frame_after(mark, &format!("▸ w{round:02}"), "of 31");
+    }
+    pty.send(b"q");
+    assert_eq!(pty.finish(), 0);
 }
 
 #[test]
