@@ -8,10 +8,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ### Added
 - `--yaml`, a global flag beside `--json`: every command that prints JSON can print the same data as one YAML document with every key and string double-quoted. The two flags together are a usage error, and `--json` output is byte-for-byte unchanged.
 
+- `orch agent update|patch <id> -f FILE`, `orch task update|patch <id> -f FILE` and `orch config update|patch -f FILE`: replace a definition from a JSON or YAML file (or stdin), or apply an RFC 7396 merge patch to it, without an editor. `--input-format` overrides detection; identity and runtime state stay read-only, and nothing is written unless the whole result validates.
+
 ### Fixed
 - `orch agent shop` now draws a readable picker: every row starts at the left edge, rows are cut to the terminal width with an ellipsis instead of wrapping, the heading and the `n-m of total` footer stay on screen on short terminals, and compact headings keep movement, selection and cancellation keys visible at narrow widths.
 - Dashboard select lists, such as the Agent Shop opened with `Ctrl+S` in the New Agent wizard, with ten or more options keep the number apart from the label (`10 Content Creator`), mark a label or hint that was cut to the row with an ellipsis, and show `n of total` in the footer when the list is longer than its window.
-- `orch agent update|patch <id> -f FILE`, `orch task update|patch <id> -f FILE` and `orch config update|patch -f FILE`: replace a definition from a JSON or YAML file (or stdin), or apply an RFC 7396 merge patch to it, without an editor. `--input-format` overrides detection; identity and runtime state stay read-only, and nothing is written unless the whole result validates.
 
 ## [0.7.0] - 2026-10-17
 
