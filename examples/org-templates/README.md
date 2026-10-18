@@ -16,14 +16,15 @@ Run them in a disposable project with a disposable global config, so the user te
 
 ```bash
 EX=/path/to/r-orch/examples/org-templates                     # this directory
-export ORCHESTRY_GLOBAL_CONFIG_PATH="$PWD/home/global.yml"    # user templates then live in ./home/templates
+export ORCHESTRY_GLOBAL_CONFIG_PATH="$PWD/home/global.yml"    # user templates then live in $PWD/home/templates
 mkdir demo && cd demo && orch init
 
 orch org template show --template-dir "$EX/review-pair" --resolved    # preview what deploy would create
 orch org deploy --template-dir "$EX/review-pair" --goal "Review the open PR"
 orch agent shop --template-dir "$EX/review-pair" --list
 
-mkdir -p home/templates && cp -R "$EX/review-pair" home/templates/    # a user template must live in a directory named by its org name
+T="$(dirname "$ORCHESTRY_GLOBAL_CONFIG_PATH")/templates"       # the user template root, outside demo/
+mkdir -p "$T" && cp -R "$EX/review-pair" "$T/"    # a user template must live in a directory named by its org name
 orch org template update review-pair -f "$EX/mutations/org-update.json"
 orch org template patch  review-pair -f "$EX/mutations/org-patch.yaml"
 orch org template agent update review-pair --agent reviewer -f "$EX/mutations/agent-update.yaml"

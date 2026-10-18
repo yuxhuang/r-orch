@@ -51,5 +51,9 @@ What gets easier, what gets harder, what must change as a result.
 | [0002](0002-parity-is-no-longer-a-goal.md) | Parity with the TypeScript original is no longer a goal | accepted |
 | [0003](0003-tui-focus-viewer-and-clipboard-boundaries.md) | TUI focus, snapshot viewer and clipboard transport boundaries | accepted |
 | [0004](0004-spec-driven-development.md) | Spec-driven development with bounded design loops | accepted |
+| [0005](0005-file-mutations.md) | File-based update and patch: RFC 7396 via `json-patch` | accepted |
+| [0006](0006-org-templates.md) | Versioned directory org templates and portable rule expansion | accepted; Decision ¶3 YAML-output sentence superseded by 0008 |
+| [0007](0007-hand-written-yaml-output-emitter.md) | A hand-written emitter for `--yaml` output | proposed |
+| [0008](0008-yaml-output-has-no-stream-form.md) | `--yaml` output has no stream form | accepted |
 
 `docs/reviews/` holds historical gate reviews from the port; new material does not go there.
