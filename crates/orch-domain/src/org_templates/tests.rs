@@ -73,3 +73,182 @@ fn shorthand_and_unknown_references_fail_even_in_unselected_rules() {
     }
     assert!(rule_references("README.md", &registry).unwrap().is_empty());
 }
+
+fn bundle_with_role(role: &str) -> Bundle {
+    Bundle {
+        org: serde_json::from_value(json!({"schema_version":1,"name":"sample","lead":"lead"}))
+            .unwrap(),
+        agents: vec![serde_json::from_value(json!({"name":"lead","role":role})).unwrap()],
+        rules: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn empty_rule_registry_preserves_authored_role_bytes_including_header_and_whitespace() {
+    let authored = " \nRules (relative to your workspace root): README.md.\r\nKeep café 🦀.\t\n\n";
+    let mut bundle = bundle_with_role(authored);
+    for name in ["sample", "a-team"] {
+        bundle.org.name = name.into();
+        bundle.validate().unwrap();
+        assert_eq!(bundle.render_role(&bundle.agents[0]).unwrap(), authored);
+    }
+}
+
+#[test]
+fn registered_rules_selected_by_another_agent_do_not_rewrite_a_rule_free_role() {
+    let authored = "Rules (relative to your workspace root): keep this header.  \n";
+    let mut bundle = bundle_with_role(authored);
+    bundle.org.rules = vec!["first".into()];
+    bundle.rules.insert("first".into(), "First rule".into());
+    bundle.agents.push(
+        serde_json::from_value(json!({"name":"other","role":"Other","rules":["first"]})).unwrap(),
+    );
+    for name in ["sample", "a-team"] {
+        bundle.org.name = name.into();
+        bundle.validate().unwrap();
+        assert_eq!(bundle.render_role(&bundle.agents[0]).unwrap(), authored);
+    }
+}
+
+#[test]
+fn explicit_rules_in_other_orgs_get_only_the_generic_explanation_once() {
+    let mut bundle = bundle_with_role("Keep authored Pensieve instructions.");
+    bundle.org.rules = vec!["first".into(), "unused".into()];
+    bundle.rules = [
+        ("first".into(), "First rule".into()),
+        ("unused".into(), "Unused rule".into()),
+    ]
+    .into();
+    bundle.agents[0].rules = vec!["first".into(), "first".into()];
+    bundle.validate().unwrap();
+    for name in ["sample", "a-team-copy"] {
+        bundle.org.name = name.into();
+        assert_eq!(
+            bundle.render_role(&bundle.agents[0]).unwrap(),
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.\n\nKeep authored Pensieve instructions.\n\n## Shared rule: first\n\nFirst rule"
+        );
+    }
+}
+
+#[test]
+fn inferred_rules_include_the_ordered_transitive_cycle_once_without_a_team_context() {
+    let mut bundle = bundle_with_role(
+        "Rules (relative to your workspace root): `.claude/agent-rules/second.md`.",
+    );
+    bundle.org.rules = vec!["first".into(), "second".into(), "unused".into()];
+    bundle.rules = [
+        ("first".into(), "First .claude/agent-rules/second.md".into()),
+        (
+            "second".into(),
+            "Second .claude/agent-rules/first.md".into(),
+        ),
+        ("unused".into(), "Unused rule".into()),
+    ]
+    .into();
+    bundle.validate().unwrap();
+    assert_eq!(
+        bundle.render_role(&bundle.agents[0]).unwrap(),
+        "Embedded shared-rule sections are authoritative; no rule-file lookup is required.\n\nRules (embedded in this role): `embedded rule «second»`.\n\n## Shared rule: first\n\nFirst embedded rule «second»\n\n## Shared rule: second\n\nSecond embedded rule «first»"
+    );
+}
+
+fn a_team_bundle() -> Bundle {
+    let mut bundle = bundle_with_role("placeholder");
+    bundle.agents.clear();
+    for (path, text) in builtin::A_TEAM {
+        if *path == "org.yml" {
+            bundle.org = serde_yaml_ng::from_str(text).unwrap();
+        } else if path.starts_with("agents/") {
+            bundle.agents.push(serde_yaml_ng::from_str(text).unwrap());
+        } else if let Some(id) = path
+            .strip_prefix("rules/")
+            .and_then(|p| p.strip_suffix(".md"))
+        {
+            bundle.rules.insert(id.into(), (*text).into());
+        }
+    }
+    bundle.validate().unwrap();
+    bundle
+}
+
+#[test]
+fn a_team_members_with_rules_keep_their_frozen_ptt_role_bytes() {
+    let bundle = a_team_bundle();
+    // Frozen PTT preamble and fixture-only literal substitution form an oracle
+    // independent of render_role and its token-rewriting helper. These members
+    // declare their complete closure explicitly in the bundled assets.
+    let rewrite_fixture = |text: &str| {
+        let mut text = text.replace(
+            "Rules (relative to your workspace root):",
+            "Rules (embedded in this role):",
+        );
+        for id in &bundle.org.rules {
+            text = text.replace(
+                &format!(".claude/agent-rules/{id}.md"),
+                &format!("embedded rule «{id}»"),
+            );
+        }
+        text
+    };
+    let mut checked = 0;
+    for agent in bundle.agents.iter().filter(|a| !a.rules.is_empty()) {
+        let mut expected = String::from(
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required. <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.\n\n",
+        );
+        expected.push_str(&rewrite_fixture(&agent.role));
+        for id in bundle
+            .org
+            .rules
+            .iter()
+            .filter(|id| agent.rules.contains(id))
+        {
+            expected.push_str(&format!("\n\n## Shared rule: {id}\n\n"));
+            expected.push_str(&rewrite_fixture(&bundle.rules[id]));
+        }
+        assert_eq!(
+            bundle.render_role(agent).unwrap(),
+            expected,
+            "{}",
+            agent.name
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 25);
+}
+
+#[test]
+fn both_a_team_backend_stubs_resolve_to_the_exact_authored_role() {
+    let bundle = a_team_bundle();
+    for name in ["backend-eng", "backend-eng-2"] {
+        let agent = bundle.agents.iter().find(|a| a.name == name).unwrap();
+        assert_eq!(bundle.render_role(agent).unwrap(), "Backend developer");
+    }
+}
+
+#[test]
+fn a_team_canonical_references_infer_the_same_roles_as_explicit_selections() {
+    let bundle = a_team_bundle();
+    for agent in &bundle.agents {
+        let mut inferred = agent.clone();
+        inferred.rules.clear();
+        assert_eq!(
+            bundle.render_role(&inferred).unwrap(),
+            bundle.render_role(agent).unwrap(),
+            "{}",
+            agent.name
+        );
+    }
+}
+
+#[test]
+fn legacy_preset_roles_keep_their_authored_catalogue_bytes() {
+    for preset in &crate::ORG_TEMPLATES {
+        for entry in preset.agents {
+            let shop = crate::get_shop_template_by_key(entry.shop_key).unwrap();
+            let mut bundle = bundle_with_role(shop.role);
+            bundle.org.name = preset.key.into();
+            bundle.validate().unwrap();
+            assert_eq!(bundle.render_role(&bundle.agents[0]).unwrap(), shop.role);
+        }
+    }
+}

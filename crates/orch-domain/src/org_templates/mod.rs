@@ -363,9 +363,18 @@ impl Bundle {
                 .ok_or_else(|| format!("Missing rule {id}"))?;
             pending.extend(rule_references(text, &self.org.rules)?);
         }
+        if selected.is_empty() {
+            return Ok(agent.role.clone());
+        }
         let mut role = String::from(
-            "Embedded shared-rule sections are authoritative; no rule-file lookup is required. <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.\n\n",
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.",
         );
+        if self.org.name == "a-team" {
+            role.push_str(
+                " <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.",
+            );
+        }
+        role.push_str("\n\n");
         role.push_str(&rewrite_references(&agent.role, &self.org.rules));
         for id in &self.org.rules {
             if selected.contains(id) {
