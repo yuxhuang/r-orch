@@ -197,7 +197,7 @@ All three names are the same program, matching the npm `bin` map:
 | `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
-| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output`, `context`, `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
+| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
 
 ---
@@ -260,6 +260,13 @@ amplification class **before the parser is reached** — refusing the shape that
 of crate: `serde_norway` measures identically on the same inputs, so this is not a crate-specific weakness.
 **Revisit if `serde-saphyr` gains a `Value` API**, at which point the API-fit objection disappears and it
 becomes the better choice on both axes.
+
+**`--yaml` output does not go through `serde_yaml_ng`.** `orch-cli`'s `output::StructuredFormat` renders the
+`serde_json::Value` the JSON path would print with a small emitter of its own, so YAML and JSON carry the same
+data in the same key order. The emitter writes every key and string double-quoted (JSON string escaping, plus
+`\uXXXX` for characters YAML readers treat as line breaks or BOMs) so YAML 1.1 and 1.2 readers agree on types, and
+it never emits a tag. This is the §4.8 exemption "no maintained crate fits": the code comment records it and
+[ADR 0007](decisions/0007-hand-written-yaml-output-emitter.md) the reasoning. Parsing, including the guards above, is unchanged.
 
 ### 4.3 Templates — the highest-risk dependency
 

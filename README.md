@@ -103,6 +103,50 @@ clicks reach the dashboard at all.
 
 To start with the mouse off: `ORCH_TUI_MOUSE=0 orch`. `/mouse status` says which it is.
 
+### Machine-readable output: `--json` and `--yaml`
+
+Every command that can print JSON can print YAML instead. Both flags are global, so they work before or after the
+subcommand, and they are mutually exclusive.
+
+```bash
+orch --yaml task list          # same as: orch task list --yaml
+orch --json task list          # unchanged
+```
+
+```
+$ orch --yaml task list
+-
+  "id": "tsk_4OfOerS"
+  "title": "Add input validation"
+  "description": ""
+  "status": "todo"
+  "priority": 3
+  "assignee": "agt_s4OhRJP"
+  "labels": []
+  "depends_on": []
+  "created_at": "2026-10-18T12:49:54.405Z"
+  "updated_at": "2026-10-18T12:49:54.405Z"
+  "attempts": 0
+  "max_attempts": 3
+```
+
+- **Same data as `--json`.** The value is the one the JSON path prints, in the same key order, so `--yaml` parses
+  to exactly what `--json` parses to. The `--json` bytes did not change.
+- **One document, newline-terminated, no `---` marker.** Every key and every string is double-quoted, so a title
+  such as `null`, `on`, `1_000` or `2024-01-15` stays a string in YAML 1.1 readers as well as 1.2 readers.
+  Empty collections are `[]` and `{}`.
+- **Structured output wins over `--quiet`**, as `--json` does: `orch --yaml --quiet task add "x"` prints the whole
+  created task.
+- **Errors are not structured.** A failing command prints the same text on stderr, with the same exit code, under
+  `--yaml`, `--json` and neither; stdout stays empty. Passing both flags is a usage error (exit 1, nothing on
+  stdout): `error: the argument '--yaml' cannot be used with '--json'`.
+- **Commands that never printed JSON ignore `--yaml` too** (for example `agent shop`, which prints its table).
+  `logs --follow` still streams text and `serve` still writes JSON Lines; `serve --log-format` is unrelated to
+  `--yaml`, and persisted logs do not change format.
+- **`orch doctor` is the exception.** Inside a project it prints its human header line on stdout before the
+  structured document, under `--json` as well as `--yaml`, so the output does not parse as one document.
+  Outside a project it prints text only. See the [runbook](docs/RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve).
+
 ### Reading, navigating and editing in the dashboard
 
 `Left`/`Right` switch views; `Tab`/`Shift-Tab` move between the list, activity and available detail sections.
@@ -204,6 +248,44 @@ Two things that will bite you on first use, both covered in the [runbook](docs/R
   leaves finished tasks in `review` — and `serve --once` waits for `review` forever.
 - **Keep API keys in your environment, not in an agent's `env:` map.** Agent files are world-readable and
   are *not* gitignored by `init`.
+
+### The agent shop
+
+`orch agent shop` installs one agent from a built-in catalogue of 15 role templates (Backend Developer, QA
+Engineer, Architect, …). It needs an initialised project (`orch init`).
+
+```bash
+orch agent shop --list      # the catalogue as a table: Key, Name, Tier, Skills (first two)
+orch agent shop             # interactive picker
+```
+
+The picker draws only when both stdin and stdout are terminals. Keys: `↑`/`↓` (or `Ctrl-P`/`Ctrl-N`) move and
+wrap around the ends, `Enter` installs the highlighted template, `q`, `Esc` or `Ctrl-C` cancel. Each row is
+`Name — description [tier]`, cut to the terminal width with an ellipsis (description first, then the tier, then
+the name), and a list taller than the terminal shows its window as `1-7 of 15`. Resizing the terminal redraws
+the picker at the new size; a terminal too short for the blank lines drops them before it drops rows.
+The heading uses the full help when it fits, then `AGENT SHOP  ↑↓ move · enter select · q cancel`, then
+`AGENT SHOP  ↑↓ Enter q`. The compact heading keeps movement, selection and cancellation visible at
+30 and 40 columns; below its display width it is cut with an ellipsis. This is the picker at 80x12:
+
+```
+  AGENT SHOP  — arrow keys to navigate, enter to select, q to cancel
+
+  ▸ Backend Developer — APIs, databases, backend services [balanced]
+    Frontend Developer — React, UI components, CSS, responsive design [balanced]
+    QA Engineer — Test writing, coverage analysis, quality assurance… [balanced]
+    Code Reviewer — PR review with auto-fix, adversarial review, secu… [capable]
+    Architect — System design, architecture decisions, tech leadership [capable]
+    DevOps Engineer — CI/CD, infrastructure, deployment, monitoring [balanced]
+    Bug Hunter — Systematic debugging, root cause analysis, minimal … [balanced]
+
+  1-7 of 15
+```
+
+Choosing a template creates one agent and prints `✓ Added agent QA Engineer (claude) → agt_…`; cancelling
+prints `  Cancelled.` and exits 0 without writing anything. With stdout redirected the command prints the `--list`
+table; with stdin not a terminal (for example `echo | orch agent shop` in a terminal) it cancels at once.
+`--json` and `--quiet` do not change this command.
 
 ---
 
