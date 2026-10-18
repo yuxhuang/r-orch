@@ -14,8 +14,9 @@
 //!    the *parsed* values is the contract; the byte layout is not.
 //!
 //! Errors are part of the contract: `--yaml` must fail the way `--json` does
-//! (same exit code, same stdout, a parseable stderr), not print a half-built
-//! document.
+//! (same exit code, same stdout, byte-identical stderr). Existing failures
+//! print the same human text in every output mode; `--yaml` adds no error
+//! schema of its own.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -156,6 +157,33 @@ const TRICKY_TITLES: &[&str] = &[
     "emoji 🚀 ünï",
     "'single' \"double\"",
     "*star &anchor !tag",
+    // YAML 1.1 / 1.2 corners that different parsers read differently: merge
+    // key, value indicator, booleans, digit separators, sexagesimal, dates.
+    "<<",
+    "=",
+    "on",
+    "off",
+    "Yes",
+    "NO",
+    "1_000",
+    "1:20",
+    "2024-01-15",
+    "2024-01-15T10:20:30Z",
+];
+
+/// The subset of `TRICKY_TITLES` that is one plain line with no quote
+/// characters, so its raw spelling in the output is unambiguous to search for.
+const CROSS_PARSER_TITLES: &[&str] = &[
+    "<<",
+    "=",
+    "on",
+    "off",
+    "Yes",
+    "NO",
+    "1_000",
+    "1:20",
+    "2024-01-15",
+    "2024-01-15T10:20:30Z",
 ];
 
 struct Project {
@@ -448,6 +476,39 @@ fn tricky_task_titles_survive_a_yaml_round_trip_unchanged() {
 }
 
 #[test]
+fn cross_parser_ambiguous_titles_are_written_as_quoted_scalars() {
+    // Round-tripping through our own YAML parser cannot catch a scalar that
+    // other parsers read differently (`<<` as a merge key, `on` as a boolean,
+    // `1_000` as an integer, `2024-01-15` as a date). So check the raw
+    // spelling: no such title may appear as a plain (unquoted) value.
+    let p = project(false);
+    let out = success(p.orch().args(["task", "list", "--yaml"]));
+    let text = stdout(&out);
+    for want in CROSS_PARSER_TITLES {
+        let value_lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| {
+                l.strip_prefix("\"title\":")
+                    .or_else(|| l.strip_prefix("title:"))
+            })
+            .map(str::trim)
+            .filter(|v| {
+                let bare = v.trim_matches(|c| c == '"' || c == '\'');
+                bare == *want
+            })
+            .collect();
+        assert!(!value_lines.is_empty(), "{want:?} not found in:\n{text}");
+        for v in value_lines {
+            assert!(
+                v.starts_with('"') || v.starts_with('\''),
+                "{want:?} written as a plain scalar: {v}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_context_value_that_looks_like_null_stays_a_string_in_yaml() {
     let p = project(false);
     let entry = p.yaml(&["context", "get", "k"]);
@@ -547,42 +608,40 @@ fn write_commands_print_the_same_shape_in_yaml_as_in_json() {
 // ── Errors ─────────────────────────────────────────────────────────────────
 
 /// The failing invocation `args` behaves the same with `--yaml` as with
-/// `--json`: same exit code and same stdout, and `--yaml` is not rejected as
-/// an unknown flag.
-fn assert_error_parity(cwd: &Path, home: &Path, args: &[&str]) {
-    let json = orch_in(home, cwd)
-        .args(args)
-        .arg("--json")
-        .output()
-        .expect("run");
-    let yaml = orch_in(home, cwd)
-        .args(args)
-        .arg("--yaml")
-        .output()
-        .expect("run");
+/// `--json` and with neither flag: same exit code, same stdout bytes and the
+/// same stderr bytes. Returns the (shared) stderr for further assertions.
+fn assert_error_parity(cwd: &Path, home: &Path, args: &[&str]) -> Vec<u8> {
+    let run = |flag: Option<&str>| {
+        let mut command = orch_in(home, cwd);
+        command.args(args);
+        if let Some(flag) = flag {
+            command.arg(flag);
+        }
+        command.output().expect("run")
+    };
+    let human = run(None);
+    let json = run(Some("--json"));
+    let yaml = run(Some("--yaml"));
     assert!(!json.status.success(), "{args:?} should fail under --json");
     assert_eq!(yaml.status.code(), json.status.code(), "{args:?} exit code");
-    assert_eq!(stdout(&yaml), stdout(&json), "{args:?} stdout");
+    assert_eq!(yaml.stdout, json.stdout, "{args:?} stdout bytes");
+    assert_eq!(
+        String::from_utf8_lossy(&yaml.stderr),
+        String::from_utf8_lossy(&json.stderr),
+        "{args:?} stderr differs between --yaml and --json"
+    );
+    assert_eq!(yaml.stderr, json.stderr, "{args:?} stderr bytes");
+    assert_eq!(
+        human.stderr, json.stderr,
+        "{args:?} stderr differs between human and --json"
+    );
     let err = stderr(&yaml);
     assert!(!err.trim().is_empty(), "{args:?} failed silently");
     assert!(
         !err.contains("unknown option") && !err.contains("unexpected argument"),
         "--yaml was rejected as a flag:\n{err}"
     );
-}
-
-/// The error text a failing `--yaml` invocation prints is itself valid YAML,
-/// so a consumer piping the whole stream into a YAML parser never chokes.
-fn assert_stderr_is_yaml(cwd: &Path, home: &Path, args: &[&str]) {
-    let out = orch_in(home, cwd)
-        .args(args)
-        .arg("--yaml")
-        .output()
-        .expect("run");
-    assert!(!out.status.success(), "{args:?} should fail");
-    let err = stderr(&out);
-    serde_yaml_ng::from_str::<Value>(&err)
-        .unwrap_or_else(|e| panic!("{args:?} stderr is not valid YAML ({e}):\n{err}"));
+    yaml.stderr
 }
 
 #[test]
@@ -604,23 +663,76 @@ fn an_uninitialized_project_fails_under_yaml_like_under_json() {
 }
 
 #[test]
-fn a_missing_agent_prints_valid_yaml_on_stderr_under_yaml() {
+fn a_missing_agent_prints_identical_stderr_under_yaml_json_and_human() {
     let p = project(false);
-    assert_stderr_is_yaml(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
+    let err = assert_error_parity(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        "  \u{2715} Agent not found: agt_nope\n"
+    );
 }
 
 #[test]
-fn a_missing_task_prints_valid_yaml_on_stderr_under_yaml() {
+fn a_missing_task_prints_identical_stderr_under_yaml_json_and_human() {
     let p = project(false);
-    assert_stderr_is_yaml(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
+    let err = assert_error_parity(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        "  \u{2715} Task not found: tsk_nope\n"
+    );
 }
 
 #[test]
-fn an_uninitialized_project_prints_valid_yaml_on_stderr_under_yaml() {
-    // Its message spans two lines ("Not initialized" / "Run: orch init"),
-    // which is not a YAML document when printed bare.
+fn an_uninitialized_project_prints_identical_two_line_stderr_under_yaml_json_and_human() {
+    // The message spans two lines; it is not a YAML document and must not be
+    // reshaped into one under --yaml.
     let dir = scratch();
-    assert_stderr_is_yaml(&dir.path().join("p"), dir.path(), &["task", "list"]);
+    let err = assert_error_parity(&dir.path().join("p"), dir.path(), &["task", "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        "  \u{2715} Not initialized\n    Run: orch init\n"
+    );
+}
+
+#[test]
+fn a_usage_error_differs_between_yaml_and_json_only_by_the_flag_it_echoes() {
+    // clap's own failure text quotes the invocation in its `Usage:` line, so
+    // the flag name legitimately appears; nothing else may differ.
+    let p = project(false);
+    let run = |flag: &str| p.orch().args(["task", "show", flag]).output().expect("run");
+    let (json, yaml) = (run("--json"), run("--yaml"));
+    assert!(!json.status.success());
+    assert_eq!(yaml.status.code(), json.status.code());
+    assert_eq!(yaml.stdout, json.stdout);
+    let normalise = |out: &Output| {
+        stderr(out)
+            .replace("--yaml", "--FMT")
+            .replace("--json", "--FMT")
+    };
+    assert_eq!(normalise(&yaml), normalise(&json));
+    assert!(
+        stderr(&yaml).contains("required arguments"),
+        "{}",
+        stderr(&yaml)
+    );
+}
+
+#[test]
+fn error_stderr_stays_identical_with_debug_output_enabled() {
+    // ORCHESTRY_DEBUG changes how error chains are rendered; the mode must
+    // not matter there either.
+    let p = project(false);
+    let run = |flag: &str| {
+        p.orch()
+            .env("ORCHESTRY_DEBUG", "1")
+            .args(["agent", "show", "agt_nope", flag])
+            .output()
+            .expect("run")
+    };
+    let (json, yaml) = (run("--json"), run("--yaml"));
+    assert_eq!(yaml.status.code(), json.status.code());
+    assert_eq!(yaml.stdout, json.stdout);
+    assert_eq!(yaml.stderr, json.stderr);
 }
 
 #[test]
