@@ -461,7 +461,15 @@ fn write_yaml(value: &serde_json::Value, indent: usize, out: &mut String) {
         serde_json::Value::Object(map) if !map.is_empty() => {
             for (key, value) in map {
                 out.push_str(&" ".repeat(indent));
+                let key_start = out.len();
                 write_yaml_string(key, out);
+                // YAML limits implicit keys to 1024 characters. Bound the
+                // quoted/escaped bytes conservatively; explicit keys have no limit.
+                if out.len() - key_start > 128 {
+                    out.insert_str(key_start, "? ");
+                    out.push('\n');
+                    out.push_str(&" ".repeat(indent));
+                }
                 out.push(':');
                 write_yaml_entry(value, indent, out);
             }
@@ -901,6 +909,71 @@ mod tests {
                 value
             );
         }
+    }
+
+    #[test]
+    fn yaml_long_key_with_scalar_or_empty_container_parses_back_equal() {
+        let key = "k".repeat(1100);
+        for value in [
+            serde_json::json!("value"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ] {
+            let map = serde_json::json!({ &key: value });
+            let text = StructuredFormat::Yaml.render(&map).unwrap();
+            assert_eq!(
+                serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+                map
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_long_key_with_nested_mapping_parses_back_equal() {
+        let key = "k".repeat(1100);
+        let value = serde_json::json!({ &key: { "child": { "leaf": "value" } }, "short": 7 });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn yaml_long_key_with_sequence_parses_back_equal() {
+        let key = "k".repeat(1100);
+        let value = serde_json::json!({ &key: ["value", { "child": true }, []] });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn yaml_long_key_inside_sequence_item_parses_back_equal() {
+        let key = "k".repeat(1100);
+        let value = serde_json::json!({ "items": [{ &key: { "child": [1, 2] } }, "sibling"] });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn yaml_long_key_after_escaping_parses_back_equal() {
+        // Only 200 source characters, but 1202 characters once quoted/escaped.
+        let key = "\u{0085}".repeat(200);
+        let value = serde_json::json!({ key: "value" });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
     }
 
     #[test]
