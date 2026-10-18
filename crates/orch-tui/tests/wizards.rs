@@ -1578,3 +1578,101 @@ fn w093_the_real_app_renders_the_debounced_error_only_after_300ms_with_no_sleep(
     assert_eq!(harness.now(), before + VALIDATION_DEBOUNCE_MS);
     harness.assert_text(TITLE_REQUIRED);
 }
+
+// ── Select-list display (agent shop T0 F4/F5) ───────────────────────────────
+
+fn shop_at(width: u16, height: u16) -> Harness {
+    let mut harness = Harness::sized(orch_tui::backend::FakeBackend::new(), width, height);
+    harness.run_command("/agent shop");
+    harness.assert_text("Agent Shop — choose a template");
+    harness
+}
+
+/// The rendered row holding `needle`, without its trailing padding.
+fn row_with(harness: &mut Harness, needle: &str) -> String {
+    let text = harness.text();
+    text.lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{text}"))
+        .trim_end()
+        .to_string()
+}
+
+#[test]
+fn w094_two_digit_option_numbers_are_separated_from_their_labels() {
+    let mut harness = shop_at(120, 40);
+    let text = harness.text();
+    for (number, name) in [
+        (10, "Content Creator"),
+        (11, "Growth Hacker"),
+        (15, "Full-Stack Developer"),
+    ] {
+        assert!(
+            text.contains(&format!(" {number} {name}")),
+            "{number} {name}:\n{text}"
+        );
+        assert!(!text.contains(&format!("{number}{name}")), "{text}");
+    }
+    // One-digit numbers keep their column, aligned with the two-digit ones.
+    let one = row_with(&mut harness, "Frontend Developer");
+    let ten = row_with(&mut harness, "Content Creator");
+    assert_eq!(one.find("Frontend"), ten.find("Content"), "{one}\n{ten}");
+}
+
+#[test]
+fn w095_an_option_too_wide_for_the_row_ends_in_an_ellipsis() {
+    for width in [60, 80] {
+        let mut harness = shop_at(width, 24);
+        let qa = row_with(&mut harness, "QA Engineer");
+        assert!(qa.contains("QA Engineer ─ "), "{width}: {qa:?}");
+        assert!(qa.ends_with('…'), "{width}: cut silently: {qa:?}");
+    }
+    // Wide enough: nothing is cut.
+    let mut harness = shop_at(120, 40);
+    let qa = row_with(&mut harness, "QA Engineer");
+    assert!(!qa.contains('…'), "{qa:?}");
+}
+
+#[test]
+fn w096_long_and_unicode_option_labels_are_cut_on_cell_boundaries() {
+    let long = "A Very Long Role Name That Keeps Going Well Past Any Reasonable Column Budget";
+    let options = vec![
+        Choice::new("long", long, "never reached"),
+        Choice::new(
+            "cjk",
+            "研究员 👩‍👩‍👧 Café",
+            "分析市场数据并撰写报告，分析市场数据并撰写报告 עברית 👍🏽 résumé",
+        ),
+    ];
+    let wizard = Wizard::new(
+        WizardKind::AgentShop,
+        "AGENT SHOP",
+        vec![WizardStep::new("shop_template", "Pick", StepKind::Select).options(options)],
+    );
+    let mut harness = Harness::sized(orch_tui::backend::FakeBackend::new(), 60, 24);
+    harness.app.open_wizard(wizard);
+
+    let row = row_with(&mut harness, "A Very Long");
+    assert!(row.ends_with('…'), "{row:?}");
+    assert!(!row.contains("never reached"), "{row:?}");
+
+    // The buffer pads a wide glyph's second cell, so the label reads spaced.
+    let row = row_with(&mut harness, "研 究 员");
+    assert!(row.contains("Café ─ "), "{row:?}");
+    assert!(row.ends_with('…'), "{row:?}");
+    assert!(!row.contains("résumé"), "{row:?}");
+}
+
+#[test]
+fn w097_a_list_longer_than_its_window_shows_the_selection_position() {
+    let mut harness = shop_at(80, 24);
+    harness.assert_text("1 of 15");
+    for _ in 0..3 {
+        harness.press(KeyCode::Down);
+    }
+    harness.assert_text("4 of 15");
+
+    // When every option is on screen there is nothing to locate.
+    let mut harness = shop_at(120, 40);
+    harness.refute_text(" of 15");
+}

@@ -310,6 +310,21 @@ fn render_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard
             {
                 hint.push_str(scope);
             }
+            // A list longer than its window says where the selection is, so
+            // the rows below the fold are known to exist.
+            if wizard.step().kind == StepKind::Select
+                && wizard.options().len() > wizard.viewport_rows.get()
+            {
+                let position = format!(
+                    "  {} of {}",
+                    wizard.select_index() + 1,
+                    wizard.options().len()
+                );
+                if text_display_width(&hint) + text_display_width(&position) <= area.width as usize
+                {
+                    hint.push_str(&position);
+                }
+            }
             for extra in ["  Enter newline", "  arrows move", "  paste image"] {
                 let applicable = match extra {
                     "  Enter newline" => wizard.step().kind == StepKind::Textarea,
@@ -484,7 +499,10 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
     let visible = area.height as usize;
     let selected = wizard.select_index();
     let start = selected.saturating_sub(visible.saturating_sub(1));
-    let numbered = options.len() >= 10;
+    // Numbers are right-aligned in a column as wide as the largest, with a
+    // space after it, so `10 Content Creator` never runs together. Below ten
+    // options this is the familiar `  1 `.
+    let number_w = options.len().to_string().len().max(2);
 
     ctx.zone(
         area,
@@ -506,13 +524,20 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
             option_id(wizard, &choice.value),
         );
         let marker = if is_selected {
-            format!("  {CURSOR} ")
-        } else if numbered {
-            format!("  {:<2}", index + 1)
+            format!("  {CURSOR}{} ", " ".repeat(number_w - 2))
         } else {
-            format!("  {} ", index + 1)
+            format!(" {:>number_w$} ", index + 1)
         };
-        let hint = choice.hint.replace('\n', " ");
+        // The label and then the hint are cut to the row with a visible
+        // ellipsis; a one-row Paragraph would otherwise clip them silently.
+        let room = (area.width as usize).saturating_sub(text_display_width(&marker));
+        let label = fit(&choice.label, room);
+        let room = room.saturating_sub(text_display_width(&label));
+        let hint = if choice.hint.is_empty() || room == 0 {
+            String::new()
+        } else {
+            fit(&format!(" ─ {}", choice.hint.replace('\n', " ")), room)
+        };
         let spans = vec![
             Span::styled(
                 marker,
@@ -523,21 +548,14 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
                 }),
             ),
             Span::styled(
-                choice.label.clone(),
+                label,
                 if is_selected {
                     ctx.bold(Token::White)
                 } else {
                     ctx.style(Token::Silver)
                 },
             ),
-            Span::styled(
-                if hint.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ─ {hint}")
-                },
-                ctx.style(Token::Dim),
-            ),
+            Span::styled(hint, ctx.style(Token::Dim)),
         ];
         put_line(frame, area, area.y + row as u16, spans);
     }
