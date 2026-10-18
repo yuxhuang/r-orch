@@ -370,6 +370,11 @@ pub fn pick_index<T: ShopEntry>(templates: &[T], stdin_is_tty: bool) -> Option<u
 
     let _raw = RawMode::enable()?;
     loop {
+        // A key can arrive alongside a resize without a separate resize event.
+        // Use the terminal's current dimensions for every frame.
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            picker.resize(cols, rows);
+        }
         draw(&picker, templates);
 
         let Ok(event) = crossterm::event::read() else {

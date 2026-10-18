@@ -76,7 +76,20 @@ async fn parse_document_inner(path: &Path, bytes: &[u8], allow_null: bool) -> Re
             _ => {}
         }
     }
-    let yaml = parse_yaml_bytes(path, bytes).await?;
+    let yaml = parse_yaml_bytes(path, bytes)
+        .await
+        .map_err(|err| match err {
+            Error::Serde {
+                context,
+                path,
+                source,
+            } => Error::Serde {
+                context: format!("{context}: {source}"),
+                path,
+                source,
+            },
+            err => err,
+        })?;
     fn convert(value: serde_yaml_ng::Value, depth: usize, allow_null: bool) -> Result<Value> {
         use serde_yaml_ng::Value as Y;
         if depth > 64 {

@@ -1,5 +1,43 @@
 use super::*;
 
+async fn assert_parse_failure_reason(bytes: &[u8], reason: &str) {
+    let path = Path::new("input.yml");
+    let err = parse_document(path, bytes).await.unwrap_err();
+    assert_eq!(err.path(), Some(path));
+    assert_eq!(err.exit_code(), 1);
+    assert!(std::error::Error::source(&err).is_some());
+    let message = err.to_string();
+    assert!(message.contains("input.yml"), "{message}");
+    assert!(message.contains(reason), "{message}");
+}
+
+#[tokio::test]
+async fn duplicate_yaml_keys_report_the_input_path_and_reason() {
+    assert_parse_failure_reason(
+        b"name: extra\nrole: x\nrole: y\n",
+        "duplicate entry with key \"role\"",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_json_keys_report_the_input_path_and_reason() {
+    assert_parse_failure_reason(
+        br#"{"name":"extra","role":"x","role":"y"}"#,
+        "duplicate entry with key \"role\"",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn multiple_yaml_documents_report_the_input_path_and_reason() {
+    assert_parse_failure_reason(
+        b"name: extra\nrole: x\n---\nname: extra\nrole: y\n",
+        "more than one document",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn builtin_is_complete_self_contained_and_portable() {
     let bundle = builtin("a-team").await.unwrap();
