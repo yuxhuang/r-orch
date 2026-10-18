@@ -7,6 +7,15 @@
 //! when absent. The one exception is [`Message::to_agent_id`], whose TS type
 //! is `string | null` and which therefore emits `null`.
 
+// Stricter than the workspace lints, for library code only (integration tests are separate crates and
+// `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
+#![deny(
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 pub mod agent;
 pub mod config;
 pub mod error;

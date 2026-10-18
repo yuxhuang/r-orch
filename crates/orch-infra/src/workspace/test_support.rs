@@ -12,7 +12,7 @@ use orch_core::process::{
 use orch_core::{Error, Result};
 use std::time::Duration;
 
-pub enum Behavior {
+pub(super) enum Behavior {
     Real,
     Script {
         stdout: &'static str,
@@ -22,38 +22,40 @@ pub enum Behavior {
     SpawnError(&'static str),
 }
 
-pub type Handler = Box<dyn Fn(&str, &[String]) -> Behavior + Send + Sync>;
+pub(super) type Handler = Box<dyn Fn(&str, &[String]) -> Behavior + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Call {
+pub(super) struct Call {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
 }
 
-pub struct TestProcessManager {
+pub(super) struct TestProcessManager {
     handler: Handler,
     calls: Mutex<Vec<Call>>,
 }
 
 impl TestProcessManager {
-    pub fn real() -> Self {
+    pub(super) fn real() -> Self {
         Self::with(|_, _| Behavior::Real)
     }
 
-    pub fn with(handler: impl Fn(&str, &[String]) -> Behavior + Send + Sync + 'static) -> Self {
+    pub(super) fn with(
+        handler: impl Fn(&str, &[String]) -> Behavior + Send + Sync + 'static,
+    ) -> Self {
         Self {
             handler: Box::new(handler),
             calls: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn calls(&self) -> Vec<Call> {
+    pub(super) fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
     }
 
     /// `command arg arg` lines, for compact assertions.
-    pub fn lines(&self) -> Vec<String> {
+    pub(super) fn lines(&self) -> Vec<String> {
         self.calls()
             .iter()
             .map(|c| format!("{} {}", c.command, c.args.join(" ")))

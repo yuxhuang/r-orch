@@ -43,7 +43,7 @@ Authoritative docs:
 2. **Green before a PR:** the CI set, run locally (see Pre-PR check). A red PR is not reviewed or merged.
 3. **Stable sorts only.** `clippy.toml` bans `sort_unstable`, `sort_unstable_by`, `sort_unstable_by_key`. Index
    order decides which agent is picked, so stability is behaviour. Where a sort is provably not over index
-   order and speed matters, use `#[allow(clippy::disallowed_methods)]` with a one-line reason.
+   order and speed matters, use `#[allow(clippy::disallowed_methods, reason = "...")]`.
 4. **Library-first (ARCHITECTURE §4.8).** If a maintained crate covers a complex feature, use it; do not
    hand-roll. To hand-roll anyway, state in a code comment which exemption applies: no maintained crate fits, or
    a still-binding compatibility requirement rules it out. Adding a dependency: do the §4.8 check (maintenance,
@@ -231,6 +231,74 @@ Docs ship in the same PR as the change. The PR template asks which row applied.
 CHANGELOG entries are one line, user-voiced, under Added / Changed / Deprecated / Removed / Fixed / Security.
 Pure refactors, tests and CI need no entry.
 
+## Rust coding standards
+
+Rules a lint can check are enforced by lints. The rest are conventions that reviewers check.
+
+**Enforced.** Every crate opts in with `[lints] workspace = true`. Do not add per-crate `[lints]` tables.
+
+| Where | Lints | Configured in |
+|---|---|---|
+| Every crate and test target | `unsafe_code` forbidden; clippy `all`, `dbg_macro`, `todo`, `unimplemented` and `allow_attributes_without_reason` denied | `[workspace.lints]` in `Cargo.toml` |
+| Library code (`orch-domain`, `orch-core`, `orch-infra`, `orch-engine`, `orch-peer`, `orch-tui`) | `unreachable_pub`, `clippy::unwrap_used`, `clippy::print_stdout`, `clippy::print_stderr` denied | `#![deny(...)]` at the top of each `lib.rs` |
+| `orch-cli` library | `unreachable_pub` and `clippy::unwrap_used` denied; printing allowed, because it renders the CLI | `crates/orch-cli/src/lib.rs` |
+| `#[cfg(test)]` code | `unwrap`, `print` and `dbg!` allowed | `clippy.toml` |
+
+Integration tests (`crates/*/tests/`) and `xtask` get only the workspace lints. To allow a lint, write
+`#[allow(lint, reason = "...")]` on the smallest item that needs it. The reason states a fact, not "needed".
+Never allow a lint at a crate root.
+
+**Conventions.**
+- **Errors.** Follow ARCHITECTURE §5.7: libraries return typed `thiserror` enums and never `anyhow`, which is
+  for `orch-cli` (whose top-level handler is §5.7's single exit point) and `xtask` only. Add context where an error crosses a boundary (the path, the peer, the task
+  id), and propagate with `?`.
+- **No panics on input.** Data from disk, the network, a child process or the user is validated and bounded
+  (size, count, depth), never indexed or unwrapped. `expect("<why this cannot fail>")` is for local invariants
+  only. For a `Mutex` that guards plain data, recover from poisoning with
+  `.lock().unwrap_or_else(PoisonError::into_inner)`.
+- **Async.** No blocking calls inside `async` code: no `std::fs`, no `std::thread::sleep`, no sync lock held
+  across `.await`. Use tokio's equivalents or `spawn_blocking`. Every remote call has a timeout. Spawned tasks
+  are owned (a `JoinSet` or a kept handle) and stopped on shutdown, never fire-and-forget.
+- **Visibility.** Make items `pub(crate)` unless another crate uses them. The traits in `orch-core` change only
+  as `docs/TRAITS-FROZEN.md` says.
+- **Types over strings.** IDs, statuses and modes are enums or newtypes. Serialized field names that are part of
+  an on-disk or `--json` contract are pinned with `#[serde(rename = "...")]`, so a Rust rename cannot change
+  the contract.
+- **Comments** say why, not what. Public items in library crates should have a doc comment (a convention;
+  `missing_docs` is not enforced).
+- **Formatting** is `rustfmt` defaults (there is no `rustfmt.toml`); do not add style options.
+
+## Repository layout
+
+```
+crates/<crate>/
+  Cargo.toml          # [lints] workspace = true; dependencies only via [workspace.dependencies]
+  src/lib.rs          # crate docs, lint attributes, module declarations, re-exports; no logic
+  src/<feature>.rs    # a module ...
+  src/<feature>/      # ... and its children (not <feature>/mod.rs for new modules)
+  tests/<feature>.rs  # integration tests, one file per feature or scenario group
+  tests/common/mod.rs # shared test helpers (tests/<dir>/mod.rs is how Cargo shares code between test files)
+fixtures/<kind>/      # recorded and scripted inputs shared across crates
+skills/               # the skill library shipped with orch
+xtask/                # dev tooling, run as `cargo xtask <cmd>`
+docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, decisions/
+                      # (PARITY.md, parity/ and reviews/ are historical)
+parity/               # the historical TypeScript oracle setup (see Testing)
+```
+
+- The crate dependency direction is ARCHITECTURE §3.1, and `cargo xtask crate-graph` enforces it. The module
+  map is §3.3; update it when you add or move a top-level module.
+- Group modules by feature or domain (`peer/`, `messages/`, `wizard/`). Do not create kind-based grab-bags
+  (`utils.rs`, `helpers/`, `types.rs`).
+- Unit tests go in an inline `#[cfg(test)] mod tests` at the end of the file they test. Test-only helpers inside
+  `src/` go in a `#[cfg(test)]` module.
+- New modules use `<feature>.rs` plus `<feature>/`. Convert an existing `mod.rs` only in a PR that already
+  changes that module.
+- Scripts that will be run again are `xtask` subcommands in Rust, not shell scripts, so they behave the same on
+  macOS and Linux.
+- Documentation lives in `docs/` or in a crate's `//!` docs. Do not add new Markdown files inside `crates/`.
+  The existing ones (`TEST-MAP*.md`, `TEST-COVERAGE.md`, `BACKEND.md`) are left over from the port.
+
 ## Testing
 
 - **Unit tests:** inline `#[cfg(test)]` modules.
@@ -372,7 +440,7 @@ pushing a tag.
 - Don't add a dependency without the §4.8 check; add an ADR when it is load-bearing.
 - Don't edit `docs/TRAITS-FROZEN.md` without an ADR.
 - Don't push to `master`, force-push shared branches, or merge your own PR.
-- Don't skip hooks or silence clippy with `#[allow]` without a reason comment.
+- Don't silence a lint without `reason = "..."` on the `#[allow]` (clippy enforces this), and don't skip hooks.
 - Don't wrap a broken repo script in an external harness; fix the script (see Broken tooling).
 - Don't create `release/**` branches; the ruleset protects them.
 - Don't report a check as passed that did not run, ran only on another platform, or fails on the base commit too.

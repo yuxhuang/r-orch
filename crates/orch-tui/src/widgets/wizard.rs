@@ -279,7 +279,11 @@ fn render_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard
             ("Tab OK", VerbId::WizardConfirm),
             (back, VerbId::WizardBack),
         ] {
-            let offset = text_display_width(&hint[..hint.find(label).unwrap()]) as u16;
+            let offset = text_display_width(
+                &hint[..hint
+                    .find(label)
+                    .expect("the hint is built from these labels")],
+            ) as u16;
             ctx.zone(
                 Rect::new(area.x + offset, area.y, text_display_width(label) as u16, 1),
                 area,

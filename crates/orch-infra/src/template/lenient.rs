@@ -14,7 +14,10 @@
 // signatures, and `kstring` 2.0.3+ deprecates the whole crate. Implementing
 // the traits means spelling the type, so the warning cannot be fixed here;
 // it goes away when `liquid` moves off `kstring`.
-#![allow(deprecated)]
+#![allow(
+    deprecated,
+    reason = "liquid's trait signatures use the deprecated `kstring`; see above"
+)]
 
 use std::sync::LazyLock;
 

@@ -130,9 +130,15 @@ pub(crate) struct HarnessBuilder {
     clock: Arc<FixedClock>,
     review_outcome: crate::review_runner::CommandOutcome,
     adapter_impl: Option<Arc<dyn orch_core::adapter::Adapter>>,
-    #[allow(clippy::type_complexity)]
+    #[allow(
+        clippy::type_complexity,
+        reason = "test-only store wrappers; each signature is spelled out where it is used"
+    )]
     wrap_tasks: Option<Box<dyn FnOnce(Arc<FakeTaskStore>) -> Arc<dyn TaskStore>>>,
-    #[allow(clippy::type_complexity)]
+    #[allow(
+        clippy::type_complexity,
+        reason = "test-only store wrappers; each signature is spelled out where it is used"
+    )]
     wrap_agents: Option<Box<dyn FnOnce(Arc<FakeAgentStore>) -> Arc<dyn AgentStore>>>,
 }
 

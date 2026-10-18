@@ -511,7 +511,10 @@ impl CommandHistory {
     ///
     /// Named after the TS `CommandHistory.next()` it ports; it is not an
     /// iterator.
-    #[allow(clippy::should_implement_trait)]
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "moves the history cursor; it is not an iterator"
+    )]
     pub fn next(&mut self) -> Option<String> {
         if !self.entries.is_empty() && self.cursor + 1 < self.entries.len() {
             self.cursor += 1;

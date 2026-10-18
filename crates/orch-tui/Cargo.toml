@@ -30,8 +30,5 @@ unicode-width.workspace = true
 # this crate forbids `unsafe_code`, so raw `libc::poll` is not available.
 nix = { workspace = true, features = ["poll"] }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true

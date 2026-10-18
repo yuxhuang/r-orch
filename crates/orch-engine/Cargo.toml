@@ -42,8 +42,5 @@ orch-core = { workspace = true, features = ["test-support"] }
 insta.workspace = true
 tempfile.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true

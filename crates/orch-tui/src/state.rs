@@ -2333,7 +2333,10 @@ impl AppState {
 #[cfg(test)]
 // Fixtures build an `AppState` field by field; struct-update syntax would bury
 // what each test is actually setting.
-#[allow(clippy::field_reassign_with_default)]
+#[allow(
+    clippy::field_reassign_with_default,
+    reason = "fixtures set `AppState` field by field so each test shows what it changes"
+)]
 mod tests {
     use super::*;
     use crate::backend::{make_agent, make_goal, make_task, make_team};

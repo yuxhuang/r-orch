@@ -6,6 +6,15 @@
 //! `orch-core` port traits, which is what lets the whole layer be unit-tested
 //! against in-memory fakes.
 
+// Stricter than the workspace lints, for library code only (integration tests are separate crates and
+// `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
+#![deny(
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 pub mod agent_factory;
 pub mod agent_service;
 pub mod container;

@@ -327,7 +327,10 @@ impl Orchestrator {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a separate id or result of one run; no params struct exists yet"
+    )]
     pub(super) async fn handle_run_success_locked(
         &self,
         state: &mut OrchestratorState,
