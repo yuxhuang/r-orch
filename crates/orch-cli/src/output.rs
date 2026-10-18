@@ -180,33 +180,6 @@ pub fn print_error(styles: &Styles, message: &str, hint: Option<&str>) {
     }
 }
 
-/// YAML errors are a mapping on stderr; JSON and human errors retain their
-/// existing text rendering.
-pub fn print_error_with_format(
-    styles: &Styles,
-    format: Option<StructuredFormat>,
-    message: &str,
-    hint: Option<&str>,
-) {
-    if format == Some(StructuredFormat::Yaml) {
-        #[derive(serde::Serialize)]
-        struct ErrorOutput<'a> {
-            error: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            hint: Option<&'a str>,
-        }
-
-        let text = render_yaml(&ErrorOutput {
-            error: message,
-            hint,
-        })
-        .expect("error strings can be serialized as YAML");
-        let _ = std::io::stderr().lock().write_all(text.as_bytes());
-    } else {
-        print_error(styles, message, hint);
-    }
-}
-
 /// `  ✓ <message>` on stdout.
 pub fn print_success(styles: &Styles, message: &str) {
     let glyph = styles.paint(Color::Green, styles.icon(Icon::Done));

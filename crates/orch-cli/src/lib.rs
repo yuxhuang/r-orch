@@ -36,7 +36,7 @@ use orch_domain::{SUPPORTED_ADAPTERS, TaskStatus};
 use orch_infra::storage::FileRunStore;
 
 use crate::context::{CliContext, EnvFlags};
-use crate::output::{StructuredFormat, Styles, print_error_with_format};
+use crate::output::{Styles, print_error};
 use crate::routing::ArgvShape;
 use crate::tree::{
     AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
@@ -50,14 +50,6 @@ pub fn run() -> ExitCode {
     let env = EnvFlags::from_env();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let shape = ArgvShape::of(&argv);
-    // Initialization errors precede clap parsing. Honour the output flag here
-    // too, but not a positional argument after `--`.
-    let early_output = argv
-        .iter()
-        .skip(1)
-        .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "--yaml")
-        .then_some(StructuredFormat::Yaml);
 
     // `--version` prints the bare version string, where clap would prefix it
     // with the program name.
@@ -72,7 +64,7 @@ pub fn run() -> ExitCode {
         return match Cli::try_parse_from(&argv) {
             // `orch --json` alone parses: fall through to the normal path.
             Ok(cli) => dispatch_parsed(cli, env, shape),
-            Err(err) => ExitCode::from(routing::report_parse_error_with_format(&err, early_output)),
+            Err(err) => ExitCode::from(routing::report_parse_error(&err)),
         };
     }
 
@@ -86,19 +78,13 @@ pub fn run() -> ExitCode {
         match std::env::current_dir() {
             Ok(cwd) if !is_initialized(&cwd) => {
                 let err = Error::from(orch_domain::DomainError::NotInitialized);
-                print_error_with_format(
-                    &styles,
-                    early_output,
-                    &err.to_string(),
-                    err.hint().as_deref(),
-                );
+                print_error(&styles, &err.to_string(), err.hint().as_deref());
                 return ExitCode::from(3);
             }
             Ok(_) => {}
             Err(err) => {
-                print_error_with_format(
+                print_error(
                     &styles,
-                    early_output,
                     &format!("cannot read the working directory: {err}"),
                     None,
                 );
@@ -109,7 +95,7 @@ pub fn run() -> ExitCode {
 
     match Cli::try_parse_from(&argv) {
         Ok(cli) => dispatch_parsed(cli, env, shape),
-        Err(err) => ExitCode::from(routing::report_parse_error_with_format(&err, early_output)),
+        Err(err) => ExitCode::from(routing::report_parse_error(&err)),
     }
 }
 
@@ -126,9 +112,8 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            print_error_with_format(
+            print_error(
                 &styles,
-                cli.output(),
                 &format!("failed to start the async runtime: {err}"),
                 None,
             );
@@ -139,15 +124,8 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     match runtime.block_on(dispatch(&cli, env, &shape)) {
         Ok(code) => code,
         Err(err) => {
-            print_error_with_format(
-                &styles,
-                cli.output(),
-                &err.to_string(),
-                err.hint().as_deref(),
-            );
-            if cli.output() != Some(StructuredFormat::Yaml)
-                && std::env::var_os("ORCHESTRY_DEBUG").is_some()
-            {
+            print_error(&styles, &err.to_string(), err.hint().as_deref());
+            if std::env::var_os("ORCHESTRY_DEBUG").is_some() {
                 eprintln!("{err:?}");
                 let mut source = std::error::Error::source(&err);
                 while let Some(cause) = source {
@@ -585,9 +563,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             // The argument check is the command's own, and it exits 2 before
             // anything else happens (`docs/parity/cli.md` §13.1).
             if !*watch && !*all && task_id.is_none() {
-                print_error_with_format(
+                print_error(
                     &styles_for(cli, env),
-                    cli.output(),
                     "Specify a task ID, --all, or --watch",
                     None,
                 );
@@ -669,9 +646,8 @@ async fn run_init(
     if let Some(adapter) = &args.adapter
         && !orch_domain::is_adapter_kind(adapter)
     {
-        print_error_with_format(
+        print_error(
             &styles,
-            cli.output(),
             &format!("Unknown adapter \"{adapter}\""),
             Some(&format!(
                 "Supported: {}",
@@ -714,9 +690,8 @@ async fn run_serve(
     let styles = styles_for(cli, env);
 
     let Some(format) = serve::LogFormat::parse(&args.log_format) else {
-        print_error_with_format(
+        print_error(
             &styles,
-            cli.output(),
             &format!(
                 "Unknown --log-format \"{}\". Valid: json, text",
                 args.log_format
@@ -762,7 +737,7 @@ async fn run_web(
     }) {
         Ok(web_args) => web_args,
         Err(message) => {
-            print_error_with_format(&styles_for(cli, env), cli.output(), &message, None);
+            print_error(&styles_for(cli, env), &message, None);
             return Ok(ExitCode::from(2));
         }
     };

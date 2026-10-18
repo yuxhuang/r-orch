@@ -18,7 +18,7 @@ use orch_engine::agent_factory::template_to_agent_input;
 use serde::Serialize;
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_error_with_format, print_success, print_table};
+use crate::output::{Styles, print_error, print_success, print_table};
 
 /// `{ team, agentIds, goalId }` — camelCase among the snake_case entities,
 /// because it is an ad-hoc object rather than a stored one.
@@ -66,16 +66,15 @@ pub async fn deploy(
     goal: Option<&str>,
 ) -> Result<ExitCode> {
     let Some(template) = get_org_template_by_key(template_key) else {
-        print_error_with_format(
+        print_error(
             styles,
-            ctx.output,
             &format!("Unknown template \"{template_key}\""),
             Some("Run: orch org list — to see available templates"),
         );
         return Ok(ExitCode::from(1));
     };
 
-    let Some(agent_ids) = create_agents(engine, ctx, styles, template).await? else {
+    let Some(agent_ids) = create_agents(engine, styles, template).await? else {
         return Ok(ExitCode::from(1));
     };
 
@@ -168,7 +167,6 @@ pub async fn deploy(
 /// is what the hint tells the user to clean up.
 async fn create_agents(
     engine: &Engine,
-    ctx: &CliContext,
     styles: &Styles,
     template: &OrgTemplate,
 ) -> Result<Option<Vec<String>>> {
@@ -176,9 +174,8 @@ async fn create_agents(
 
     for entry in template.agents {
         let Some(shop_template) = get_shop_template_by_key(entry.shop_key) else {
-            print_error_with_format(
+            print_error(
                 styles,
-                ctx.output,
                 &format!("Agent shop template not found: {}", entry.shop_key),
                 None,
             );
@@ -197,9 +194,8 @@ async fn create_agents(
         match created {
             Ok(agent) => agent_ids.push(agent.id),
             Err(err) => {
-                print_error_with_format(
+                print_error(
                     styles,
-                    ctx.output,
                     &format!("Failed to create agent \"{}\": {err}", entry.name),
                     (!agent_ids.is_empty())
                         .then(|| {

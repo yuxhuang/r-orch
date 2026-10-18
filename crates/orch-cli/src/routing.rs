@@ -148,34 +148,6 @@ pub fn report_parse_error(err: &clap::Error) -> u8 {
     1
 }
 
-/// Preserve help and existing text errors, but wrap YAML usage errors in the
-/// same mapping as command failures.
-pub fn report_parse_error_with_format(
-    err: &clap::Error,
-    format: Option<crate::output::StructuredFormat>,
-) -> u8 {
-    let is_help = matches!(
-        err.kind(),
-        clap::error::ErrorKind::DisplayHelp
-            | clap::error::ErrorKind::DisplayVersion
-            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-    );
-    if format == Some(crate::output::StructuredFormat::Yaml) && !is_help {
-        crate::output::print_error_with_format(
-            &crate::output::Styles {
-                color: false,
-                ascii: false,
-            },
-            format,
-            &err.to_string(),
-            None,
-        );
-        1
-    } else {
-        report_parse_error(err)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
