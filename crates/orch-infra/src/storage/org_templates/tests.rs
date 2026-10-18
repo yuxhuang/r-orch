@@ -373,3 +373,41 @@ async fn equivalent_replacement_preserves_authored_bytes_and_timestamp() {
         modified
     );
 }
+
+#[test]
+fn snapshot_ignores_dot_entries_before_inspecting_their_type() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("org.yml"), "name: team\n").unwrap();
+    for member_dir in ["agents", "rules"] {
+        let path = dir.path().join(member_dir);
+        std::fs::create_dir_all(path.join(".worker.yml.0123abcd.tmp")).unwrap();
+    }
+    let snapshot = RawSnapshot::capture(dir.path()).unwrap();
+    assert_eq!(
+        snapshot
+            .files
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["org.yml"]
+    );
+}
+
+#[test]
+fn snapshot_ignores_members_removed_after_directory_listing() {
+    for (member_dir, name, ext) in [
+        ("agents", "worker.yml", "yml"),
+        ("rules", "shared.md", "md"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, "content").unwrap();
+        let entry = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(capture_member(member_dir, ext, entry).unwrap().is_none());
+    }
+}

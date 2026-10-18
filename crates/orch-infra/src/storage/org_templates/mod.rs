@@ -172,6 +172,55 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn capture_member(
+    dir: &str,
+    ext: &str,
+    entry: std::fs::DirEntry,
+) -> Result<Option<(String, Vec<u8>)>> {
+    let file = entry.path();
+    let name = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| invalid("Non-UTF-8 template filename"))?;
+    if name.starts_with('.') {
+        return Ok(None);
+    }
+    // Readers do not lock: a listed entry may disappear while a writer publishes.
+    let meta = match std::fs::symlink_metadata(&file) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io(&file, e)),
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(invalid(format!(
+            "{}: nested or nonregular template entry",
+            file.display()
+        )));
+    }
+    if dir == "agents" && file.extension().is_some_and(|e| e == "yaml") {
+        return Err(invalid(format!(
+            "{}: rename .yaml member to .yml",
+            file.display()
+        )));
+    }
+    if !file.extension().is_some_and(|e| e == ext) {
+        return Ok(None);
+    }
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("Invalid filename"))?;
+    validate_id(stem).map_err(invalid)?;
+    let bytes = match read_bounded(&file) {
+        Ok(bytes) => bytes,
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(Some((format!("{dir}/{name}"), bytes)))
+}
+
 #[derive(Debug, Clone)]
 pub struct RawSnapshot {
     pub files: BTreeMap<String, Vec<u8>>,
@@ -197,40 +246,14 @@ impl RawSnapshot {
             let mut count = 0;
             for entry in std::fs::read_dir(&path).map_err(|e| io(&path, e))? {
                 let entry = entry.map_err(|e| io(&path, e))?;
-                let file = entry.path();
-                let meta = std::fs::symlink_metadata(&file).map_err(|e| io(&file, e))?;
-                if !meta.is_file() || meta.file_type().is_symlink() {
-                    return Err(invalid(format!(
-                        "{}: nested or nonregular template entry",
-                        file.display()
-                    )));
-                }
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| invalid("Non-UTF-8 template filename"))?;
-                if name.starts_with('.') {
+                let Some((name, bytes)) = capture_member(dir, ext, entry)? else {
                     continue;
-                }
-                if dir == "agents" && file.extension().is_some_and(|e| e == "yaml") {
-                    return Err(invalid(format!(
-                        "{}: rename .yaml member to .yml",
-                        file.display()
-                    )));
-                }
-                if !file.extension().is_some_and(|e| e == ext) {
-                    continue;
-                }
-                let stem = file
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .ok_or_else(|| invalid("Invalid filename"))?;
-                validate_id(stem).map_err(invalid)?;
+                };
                 count += 1;
                 if count > max {
                     return Err(invalid(format!("Too many {dir}")));
                 }
-                files.insert(format!("{dir}/{name}"), read_bounded(&file)?);
+                files.insert(name, bytes);
                 check_budget(&files)?;
             }
         }
