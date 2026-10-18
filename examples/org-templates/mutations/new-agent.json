@@ -1,0 +1,6 @@
+{
+  "name": "tester",
+  "description": "Writes and runs the tests",
+  "adapter": "claude",
+  "role": "Test engineer. Write a failing test first, then run the suite and report the counts."
+}

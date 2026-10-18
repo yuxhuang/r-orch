@@ -13,6 +13,40 @@ use orch_domain::AgentShopTemplate;
 use orch_tui::format::cap_display;
 use orch_tui::text::text_display_width;
 
+/// Borrowed labels let authored entries reuse the exact legacy renderer.
+pub struct ShopEntryView<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub summary: &'a str,
+}
+pub trait ShopEntry {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn summary(&self) -> &str;
+}
+impl ShopEntry for AgentShopTemplate {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.description
+    }
+    fn summary(&self) -> &str {
+        self.tier.as_str()
+    }
+}
+impl ShopEntry for ShopEntryView<'_> {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.description
+    }
+    fn summary(&self) -> &str {
+        self.summary
+    }
+}
+
 /// The heading line, then the shorter lines used when it does not fit: the
 /// keys are the part a narrow terminal must not lose. The compact line keeps
 /// every key (move, select, cancel) and drops only the verbs.
@@ -204,7 +238,7 @@ impl Picker {
     /// The whole frame, one entry per terminal row: the heading, the
     /// visible templates and, when the list is paged, the `n-m of total`
     /// footer. Every line is at most `cols` display columns wide.
-    pub fn frame(&self, templates: &[AgentShopTemplate]) -> Vec<String> {
+    pub fn frame<T: ShopEntry>(&self, templates: &[T]) -> Vec<String> {
         let layout = self.layout();
         let width = usize::from(self.cols);
         let mut lines = Vec::with_capacity(layout.height());
@@ -244,11 +278,11 @@ impl Picker {
 /// The description gives way first, then the tier, then the name, so the
 /// part that tells two roles apart stays readable on a narrow terminal. Every
 /// cut is marked with an ellipsis; nothing wraps.
-fn entry_line(template: &AgentShopTemplate, selected: bool, width: usize) -> String {
+fn entry_line<T: ShopEntry>(template: &T, selected: bool, width: usize) -> String {
     let prefix = if selected { CURSOR } else { GUTTER };
-    let name = sanitize(template.name);
-    let description = sanitize(template.description);
-    let tier = format!(" [{}]", template.tier.as_str());
+    let name = sanitize(template.name());
+    let description = sanitize(template.description());
+    let tier = format!(" [{}]", sanitize(template.summary()));
 
     let budget = width.saturating_sub(text_display_width(prefix));
     let name_w = text_display_width(&name);
@@ -271,7 +305,7 @@ fn entry_line(template: &AgentShopTemplate, selected: bool, width: usize) -> Str
 /// Control characters (including ESC, CR and LF) and bidi overrides would
 /// move the cursor or restyle the terminal mid-frame; a template's name and
 /// description are data, never terminal input.
-fn sanitize(text: &str) -> String {
+pub(crate) fn sanitize(text: &str) -> String {
     text.chars()
         .map(|ch| {
             if ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
@@ -330,6 +364,10 @@ pub fn pick_from_shop(
     templates: &'static [AgentShopTemplate],
     stdin_is_tty: bool,
 ) -> Option<&'static AgentShopTemplate> {
+    pick_index(templates, stdin_is_tty).and_then(|index| templates.get(index))
+}
+
+pub fn pick_index<T: ShopEntry>(templates: &[T], stdin_is_tty: bool) -> Option<usize> {
     if !stdin_is_tty {
         return None;
     }
@@ -339,6 +377,11 @@ pub fn pick_from_shop(
 
     let _raw = RawMode::enable()?;
     loop {
+        // A key can arrive alongside a resize without a separate resize event.
+        // Use the terminal's current dimensions for every frame.
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            picker.resize(cols, rows);
+        }
         draw(&picker, templates);
 
         let Ok(event) = crossterm::event::read() else {
@@ -357,7 +400,7 @@ pub fn pick_from_shop(
         match picker.on_key(key) {
             PickerAction::Selected(index) => {
                 clear_screen();
-                return templates.get(index);
+                return Some(index);
             }
             PickerAction::Cancelled => {
                 clear_screen();
@@ -384,7 +427,7 @@ fn translate_key(key: crossterm::event::KeyEvent) -> PickerKey {
     }
 }
 
-fn draw(picker: &Picker, templates: &[AgentShopTemplate]) {
+fn draw<T: ShopEntry>(picker: &Picker, templates: &[T]) {
     print!("{}", encode_frame(&picker.frame(templates)));
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -414,6 +457,28 @@ impl Drop for RawMode {
 mod tests {
     use super::*;
     use orch_domain::AGENT_SHOP_TEMPLATES;
+
+    #[test]
+    fn owned_labels_share_width_control_and_resize_guards() {
+        let entries = [ShopEntryView {
+            name: "worker",
+            description: "long\n\x1b[2Jdescription界界界界界界界界界界界界界界",
+            summary: "codex\x1b[31m/model",
+        }];
+        let mut picker = Picker::new(1, 40, 12);
+        for width in [40, 20, 8] {
+            picker.resize(width, 12);
+            let frame = picker.frame(&entries);
+            assert!(frame.iter().all(|line| !line.contains('\x1b')
+                && !line.contains('\n')
+                && !line.contains('\r')));
+            assert!(
+                frame
+                    .iter()
+                    .all(|line| text_display_width(line) <= usize::from(width))
+            );
+        }
+    }
 
     #[test]
     fn the_page_size_leaves_room_for_the_heading_and_the_footer() {
@@ -724,6 +789,26 @@ mod tests {
         assert!(pick_from_shop(&AGENT_SHOP_TEMPLATES, false).is_none());
     }
 
+    /// Authored (template) entries reach the same renderer as the legacy
+    /// catalogue; three distinct roles with hostile descriptions.
+    const AUTHORED: [ShopEntryView<'static>; 3] = [
+        ShopEntryView {
+            name: "alpha",
+            description: "長い café 🦀\tCONTROL\x1b[31m alphaalphaalphaalphaalphaalpha",
+            summary: "shell",
+        },
+        ShopEntryView {
+            name: "beta",
+            description: "עברית טקסט 👩‍👩‍👧 betabetabetabetabetabetabeta",
+            summary: "shell",
+        },
+        ShopEntryView {
+            name: "gamma",
+            description: "gamma \u{202e}reversed gammagammagammagamma",
+            summary: "shell",
+        },
+    ];
+
     fn heading_row(frame: &[String]) -> &str {
         frame
             .iter()
@@ -761,7 +846,7 @@ mod tests {
         assert!(text_display_width(heading) <= width, "{width}: {heading:?}");
     }
 
-    fn assert_keys_survive(templates: &[AgentShopTemplate]) {
+    fn assert_keys_survive<T: ShopEntry>(templates: &[T]) {
         for cols in 30u16..=200 {
             for rows in [5u16, 10, 24] {
                 let picker = Picker::new(templates.len(), cols, rows);
@@ -788,8 +873,8 @@ mod tests {
     }
 
     #[test]
-    fn every_key_survives_from_thirty_columns_up_with_hostile_templates() {
-        assert_keys_survive(&HOSTILE);
+    fn every_key_survives_from_thirty_columns_up_in_a_template_shop() {
+        assert_keys_survive(&AUTHORED);
     }
 
     #[test]
@@ -823,13 +908,13 @@ mod tests {
         for cols in [0, 1, 20, 29, compact - 1, compact, compact + 1] {
             for rows in [0u16, 1, 5, 10] {
                 let cols16 = u16::try_from(cols).unwrap();
-                let frame = Picker::new(HOSTILE.len(), cols16, rows).frame(&HOSTILE);
+                let frame = Picker::new(AUTHORED.len(), cols16, rows).frame(&AUTHORED);
                 assert!(
                     frame.iter().all(|line| text_display_width(line) <= cols),
                     "{cols}x{rows}: {frame:#?}"
                 );
                 let heading =
-                    &frame[usize::from(Picker::new(HOSTILE.len(), cols16, rows).layout().blanks)];
+                    &frame[usize::from(Picker::new(AUTHORED.len(), cols16, rows).layout().blanks)];
                 if cols < compact {
                     assert_eq!(*heading, cap_display(HEADING_COMPACT, cols), "{cols}");
                 } else {

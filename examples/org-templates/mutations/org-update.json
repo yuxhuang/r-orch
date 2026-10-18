@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "name": "review-pair",
+  "description": "A lead who plans and a reviewer who checks the diff",
+  "lead": "lead",
+  "rules": ["house-style"],
+  "defaults": {"adapter": "claude", "approval_policy": "auto", "max_turns": 60}
+}

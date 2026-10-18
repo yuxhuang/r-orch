@@ -999,7 +999,11 @@ mod tests {
                 "--edit/-e",
             ],
         ),
-        ("agent shop", &[], &["--list"]),
+        (
+            "agent shop",
+            &[],
+            &["--list", "--template <TEMPLATE>", "--template-dir <PATH>"],
+        ),
         ("agent list", &[], &[]),
         ("agent status", &["<id>"], &[]),
         ("agent edit", &["<id>"], &[]),
@@ -1086,7 +1090,17 @@ mod tests {
         ("team set-lead", &["<team-id>", "<agent-id>"], &[]),
         ("team disband", &["<id>"], &[]),
         ("org list", &[], &[]),
-        ("org deploy", &["<template>"], &["--goal <goal>"]),
+        (
+            "org deploy",
+            &["[template]"],
+            &[
+                "--template <TEMPLATE_NAME>",
+                "--template-dir <PATH>",
+                "--adapter <ADAPTER>",
+                "--model <MODEL>",
+                "--goal <goal>",
+            ],
+        ),
         (
             "run",
             &["[task-id]"],
@@ -1306,7 +1320,7 @@ mod tests {
                     "create", "list", "show", "join", "leave", "add-task", "set-lead", "disband",
                 ],
             ),
-            ("org", &["list", "deploy"]),
+            ("org", &["list", "template", "deploy"]),
             ("remote", &["add", "remove", "list", "status", "listen"]),
         ];
 

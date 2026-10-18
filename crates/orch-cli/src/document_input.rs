@@ -77,24 +77,27 @@ pub async fn read_document(file: &Path, format: Option<InputFormat>) -> Result<V
         _ => InputFormat::Yaml,
     });
     let value = match format {
-        InputFormat::Json => {
-            let mut parser = serde_json::Deserializer::from_slice(&bytes);
-            let value = StrictValue(0).deserialize(&mut parser).map_err(|_| {
-                invalid(
-                    source,
-                    "invalid JSON (check types, duplicate keys and depth <= 64)",
-                )
-            })?;
-            parser
-                .end()
-                .map_err(|_| invalid(source, "expected exactly one JSON document"))?;
-            value
-        }
+        InputFormat::Json => parse_json(source, &bytes)?,
         InputFormat::Yaml => {
             orch_infra::storage::fs_utils::parse_definition_yaml_bytes(source, &bytes).await?
         }
     };
     require_object(&value).map_err(|_| invalid(source, "document root: expected an object"))?;
+    Ok(value)
+}
+
+/// Decode JSON with the same duplicate-key and depth checks as file mutations.
+pub(crate) fn parse_json(source: &Path, bytes: &[u8]) -> Result<Value> {
+    let mut parser = serde_json::Deserializer::from_slice(bytes);
+    let value = StrictValue(0).deserialize(&mut parser).map_err(|_| {
+        invalid(
+            source,
+            "invalid JSON (check types, duplicate keys and depth <= 64)",
+        )
+    })?;
+    parser
+        .end()
+        .map_err(|_| invalid(source, "expected exactly one JSON document"))?;
     Ok(value)
 }
 
