@@ -232,7 +232,9 @@ impl PeerRuntime {
         for config in store.list().await? {
             if let Some(mut status) = store.read_status(&config.alias).await? {
                 status.online = false;
-                if let Err(error) = store.write_status(&status).await {
+                // A `remote remove` racing this reset revokes it rather than
+                // seeing its snapshot recreated.
+                if let Err(error) = store.publish_registered_status(&config, &status).await {
                     // Old snapshots cannot grant health without a live lease.
                     // Keep local dispatch and reconnect alive during a disk fault.
                     engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
