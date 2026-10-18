@@ -29,6 +29,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | A peer is `offline` and you cannot tell why | [Reading a peer's link state](#reading-a-peers-link-state) |
 | A mirror on a worker sits `todo` for ever | [Mirrors left behind on a worker](#mirrors-left-behind-on-a-worker) |
 | Changing the peer protocol | [Peer protocol compatibility](#peer-protocol-compatibility) |
+| `orch agent shop` prints `Cancelled.` or a table instead of a picker | [The agent shop picker](#the-agent-shop-picker) |
 
 ---
 
@@ -561,6 +562,12 @@ different situations:
   `attempt` counter is what shows the rate.
 - **`(version unknown)`** beside an online peer means that peer predates the version field in the handshake.
   Nothing is wrong with the link; it is an older build.
+- **`Write peer status for 2com: Lock remote registry …: timed out after 5s`** means something held
+  `.orchestry/remotes.lock` for over five seconds, usually an `orch remote add` or `remove` that is stopped
+  or hung. A link records its status only under that lock, and only while its exact registry entry still
+  exists, so that a removal cannot be undone by a late write. Until it can, the remote reports `offline`.
+  Let the command finish or stop it; the next status write recovers. A registry that cannot be read
+  (`Duplicate remote alias`, `Invalid remote alias`) is reported the same way: fix `.orchestry/remotes.yml`.
 
 ---
 
@@ -657,3 +664,25 @@ the save visibly. Quitting with drafts asks for confirmation and discards them o
 an interactive prompt. Drafts do not survive crashes or restart, and wall-clock backsteps are not a durability
 mechanism. On a primary submit error, correct the retained form and retry. A partial post-create failure names
 the created entity; repair that entity rather than creating a duplicate.
+
+## The agent shop picker
+
+**Symptom.** `orch agent shop` prints `  Cancelled.` at once, or prints a table instead of the interactive picker.
+
+**Cause.** The picker draws only when stdin **and** stdout are terminals. With stdout redirected (a pipe, a file,
+a CI log) the command prints the same table as `--list`; with a terminal on stdout but stdin not a terminal
+(`echo | orch agent shop`) it cancels immediately. Both are exit 0 and neither creates an agent. The command
+needs an initialised project; elsewhere it prints `Not initialized` / `Run: orch init`. `--json` and `--quiet`
+are ignored here.
+
+**Fix.** Run it from an interactive terminal inside a project, or use `orch agent shop --list` and add the
+agent you want with `orch agent add`.
+
+**Display.** The picker fits every row to the terminal width and counts its heading, blank lines and footer
+against the terminal height, so it should never wrap or scroll the heading away. On a terminal narrower than
+the full help it chooses the widest heading that fits: `AGENT SHOP  ↑↓ move · enter select · q cancel`,
+then `AGENT SHOP  ↑↓ Enter q`. At 30 and 40 columns the compact heading keeps all three keys visible;
+below its display width it is cut with an ellipsis. The footer `n-m of total` appears only when the list is
+taller than the terminal. A resize redraws at the new size. In this display slice, a resize and keypress
+received together can leave the old frame until another redraw; the heading state-machine tests alone
+do not prove that event-loop case.

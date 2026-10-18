@@ -648,7 +648,7 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
         while blocked().await {
             status.online = false;
             status.last_error = Some("Peer link blocked by test hook".into());
-            persist_status(&ctx, &status).await;
+            persist_status(&ctx, &config, &status).await;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         // Published before the dial, not after it: a link that is failing is
@@ -657,7 +657,7 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
         status.link_state = LinkState::Connecting;
         status.next_retry_at = None;
         status.attempts = status.attempts.saturating_add(1);
-        persist_status(&ctx, &status).await;
+        persist_status(&ctx, &config, &status).await;
         let mut health = SessionHealth::default();
         let result = session(&ctx, &hub, &config, &mut status, &mut health).await;
         status.online = false;
@@ -702,21 +702,18 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
         status.next_retry_at = Some(orch_core::clock::iso_from_epoch_ms(
             ctx.engine.clock.now_ms() + delay.as_millis() as i64,
         ));
-        persist_status(&ctx, &status).await;
+        persist_status(&ctx, &config, &status).await;
         tracing::debug!(alias=%config.alias,error=?status.last_error,?delay,healthy=health.healthy(),attempts=status.attempts,"Peer reconnect pending");
         tokio::time::sleep(delay).await;
     }
 }
 
-async fn persist_status(ctx: &Context, status: &RemoteStatus) {
-    // A removal must not recreate its status file after the command deleted it.
-    if ctx
-        .store
-        .list()
-        .await
-        .is_ok_and(|configs| configs.iter().any(|c| c.alias == status.alias))
-        && let Err(error) = ctx.store.write_status(status).await
-    {
+async fn persist_status(ctx: &Context, config: &RemoteConfig, status: &RemoteStatus) {
+    // Only while `config` is still the alias's registration: a removal, or a
+    // re-add with another address, revokes this link's publication and its
+    // health, and the revocation is ordered against the command by the
+    // registry lock. Revocation is expected; only real failures are reported.
+    if let Err(error) = ctx.store.publish_registered_status(config, status).await {
         ctx.engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
             error: error.to_string(),
             context: format!("Write peer status for {}; remote dispatch unavailable. Check permissions and free space in {}", status.alias, ctx.engine.paths.remotes_dir().display()),
@@ -820,7 +817,7 @@ async fn session(
     status.next_retry_at = None;
     status.last_error = None;
     status.last_seen = Some(ctx.engine.clock.now_iso());
-    persist_status(ctx, status).await;
+    persist_status(ctx, config, status).await;
     let (tx, mut frames) = mpsc::channel(128);
     let _reader = AbortOnDrop(tokio::spawn(async move {
         loop {
@@ -887,7 +884,7 @@ async fn session(
                     for frame in ctx.outbox(&config.alias).await? {
                         write_frame(&mut writer, &frame).await.map_err(net_error)?;
                     }
-                    persist_status(ctx, status).await;
+                    persist_status(ctx, config, status).await;
                     last_poll = Instant::now();
                 }
             }
@@ -909,7 +906,7 @@ async fn handle_frame(
         Frame::Agents { agents } => {
             validate_snapshot(&agents)?;
             status.agents = agents;
-            persist_status(ctx, status).await;
+            persist_status(ctx, config, status).await;
         }
         Frame::SyncState { mut items } => {
             *synced = true;
@@ -1240,7 +1237,7 @@ mod tests {
     /// pin this link. Every write is bounded by the codec's own 5s budget and
     /// the session's 15s heartbeat ends it, so the alias goes offline and the
     /// supervisor can redial.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_silent_peer_ends_the_session_and_takes_the_alias_offline() {
         let (_temp, ctx) = controller().await;
         let hub = Arc::new(LinkHub::new(ctx.engine.messages.clone()));
@@ -1292,6 +1289,86 @@ mod tests {
             error.contains("timed out") || error.contains("Peer connection"),
             "unexpected session end: {error}"
         );
+    }
+
+    fn health_is_live(ctx: &Context, alias: &str) -> bool {
+        let path = ctx
+            .engine
+            .paths
+            .remotes_dir()
+            .join(format!("{alias}.health"));
+        let Ok(file) = std::fs::File::open(path) else {
+            return false;
+        };
+        match file.try_lock_shared() {
+            Ok(()) => {
+                file.unlock().unwrap();
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(error)) => panic!("probe health lease: {error}"),
+        }
+    }
+
+    /// S16 through the link's own publisher: after `remote remove`, or a
+    /// re-add with another address, a link still holding the old config
+    /// recreates nothing, loses its health, and says nothing about it.
+    #[tokio::test]
+    async fn a_link_never_republishes_a_removed_or_replaced_registration() {
+        let (_temp, ctx) = controller().await;
+        let mut events = ctx.engine.events.subscribe();
+        let config = RemoteConfig {
+            alias: "w1".into(),
+            addr: "127.0.0.1:9".into(),
+            added_at: "now".into(),
+        };
+        ctx.store.add(config.clone()).await.unwrap();
+        let status = RemoteStatus {
+            alias: "w1".into(),
+            addr: config.addr.clone(),
+            online: true,
+            last_seen: None,
+            last_error: None,
+            peer_name: None,
+            instance_id: None,
+            os: None,
+            agents: vec![],
+            peer_version: None,
+            link_state: LinkState::Online,
+            next_retry_at: None,
+            attempts: 1,
+        };
+        let snapshot = ctx.engine.paths.remotes_dir().join("w1.json");
+        persist_status(&ctx, &config, &status).await;
+        assert!(snapshot.exists() && health_is_live(&ctx, "w1"));
+        ctx.store.remove("w1").await.unwrap();
+        persist_status(&ctx, &config, &status).await;
+        assert!(!snapshot.exists(), "a removed link recreated its snapshot");
+        assert!(
+            !health_is_live(&ctx, "w1"),
+            "a removed link kept its health"
+        );
+        let replacement = RemoteConfig {
+            addr: "127.0.0.1:10".into(),
+            ..config.clone()
+        };
+        ctx.store.add(replacement.clone()).await.unwrap();
+        persist_status(&ctx, &config, &status).await;
+        assert!(
+            !snapshot.exists(),
+            "a link for the old address published into the new registration"
+        );
+        for event in events.try_drain() {
+            assert!(
+                !matches!(
+                    event.as_ref(),
+                    orch_domain::OrchestratorEvent::OrchestratorError { .. }
+                ),
+                "a revoked publication is expected, not an error: {event:?}"
+            );
+        }
+        persist_status(&ctx, &replacement, &status).await;
+        assert!(snapshot.exists() && health_is_live(&ctx, "w1"));
     }
 
     /// A simulated controller restart: the reservation survived, so the key
