@@ -342,7 +342,8 @@ Linux; unsupported capabilities leave the task waiting. The TUI header and `orch
 the effective listen address, connected controller, and each configured remote's online state.
 
 A controller can connect to several workers. Each worker accepts one controller at a time. Registry
-entries persist across restarts; links reconnect with backoff until `orch remote remove w1`. Offline
+entries persist across restarts; links reconnect with backoff until `orch remote remove w1`, which also
+deletes the cached status; a link still running for the removed entry cannot recreate it. Offline
 agents remain visible, and new tasks assigned to them wait in `todo`. During a link outage an active
 remote task waits for its outcome without a retry: the worker owns execution and stall detection.
 Cancelling the task or removing the remote ends that wait. A controller restart cancels its active
