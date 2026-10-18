@@ -305,8 +305,11 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
 ## Release
 
 1. Branch `chore/release-vX.Y.Z` from `master`. Do not use `release/vX.Y.Z`: the ruleset protects
-   `release/**`. Run the cold `./xtask/gate.sh` (after `./parity/setup.sh`) on a platform it supports (see
-   Pre-PR check); it must pass. Record the platform in the PR.
+   `release/**`. Run the cold gate on a platform it supports (see Pre-PR check). The TS oracle is optional
+   ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)): without `./parity/setup.sh`, run
+   `ORCH_SKIP_CROSS_BINARY=1 ./xtask/gate.sh`. The `lint-scenarios`, `parity` and `probes` steps need the
+   oracle and do not block a release; every other step must pass. Record the platform and the result of those
+   three steps in the PR.
 2. Set `workspace.package.version` in `Cargo.toml` (and let `Cargo.lock` update).
 3. In `CHANGELOG.md` rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh empty `## [Unreleased]`,
    and update the compare links at the bottom.

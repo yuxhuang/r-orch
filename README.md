@@ -45,14 +45,14 @@ cargo install --path crates/orch-cli
 
 Releases are tags on `master` (`vX.Y.Z`). v0.5.0 is the first release with
 [remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
-`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard; v0.7.0 adds Agents-list sorting and activity feeds that follow new entries. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
+`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard; v0.7.0 adds Agents-list sorting and activity feeds that follow new entries; v0.8.0 adds `--yaml` output, `update`/`patch` from JSON or YAML files, and organization templates with the built-in a-team. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
 `orch update` does not self-update: it only prints how to install. To build a specific release from source:
 
 ```bash
 git clone <this repo> r-orch && cd r-orch
-git checkout v0.7.0
+git checkout v0.8.0
 cargo install --locked --path crates/orch-cli
-orch --version      # 0.7.0
+orch --version      # 0.8.0
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
@@ -553,6 +553,15 @@ talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notic
 Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
 cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
 
+### Upgrading from v0.7.0
+
+v0.8.0 adds commands and output formats; `--json` output is byte-for-byte unchanged, and so is the peer
+protocol, so peers on 0.5.x through 0.8.0 interoperate. `orch remote add`, `remove` and peer
+links now order their writes through a new lock file, `.orchestry/remotes.lock`. Run one version per project
+directory: an older binary does not take that lock, so it can still race a removal. Roll back by installing
+v0.7.0; it ignores `remotes.lock`, which is safe to delete. Templates you create live under
+`~/.orchestry/templates/` and are not read by older versions.
+
 ### Upgrading from v0.6.0
 
 v0.7.0 changes only the dashboard, and peers on 0.5.x, 0.6.0 and 0.7.0 interoperate. The Agents list can be
@@ -568,7 +577,7 @@ while the main list has focus. Mouse capture now reports drags for text selectio
 back to the terminal. Roll back by installing v0.5.2: v0.6.0 writes nothing new to `.orchestry/` (editor
 drafts last only for the dashboard session).
 
-### Known gaps in v0.7.0
+### Known gaps in v0.8.0
 
 - Copy and mouse selection in a native terminal (Terminal.app, iTerm2) were not verified by hand before
   release; the automated tests cover the copy routing, and the web dashboard's browser copy.
