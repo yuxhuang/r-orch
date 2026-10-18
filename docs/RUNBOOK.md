@@ -29,6 +29,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | A peer is `offline` and you cannot tell why | [Reading a peer's link state](#reading-a-peers-link-state) |
 | A mirror on a worker sits `todo` for ever | [Mirrors left behind on a worker](#mirrors-left-behind-on-a-worker) |
 | Changing the peer protocol | [Peer protocol compatibility](#peer-protocol-compatibility) |
+| `orch --json doctor` or `--yaml doctor` output will not parse | [Structured output for `doctor`, `logs --follow` and `serve`](#structured-output-for-doctor-logs---follow-and-serve) |
 
 ---
 
@@ -657,3 +658,21 @@ the save visibly. Quitting with drafts asks for confirmation and discards them o
 an interactive prompt. Drafts do not survive crashes or restart, and wall-clock backsteps are not a durability
 mechanism. On a primary submit error, correct the retained form and retry. A partial post-create failure names
 the created entity; repair that entity rather than creating a duplicate.
+
+## Structured output for `doctor`, `logs --follow` and `serve`
+
+**Symptom.** `orch --json doctor` (or `--yaml doctor`) piped into a parser fails on the first line;
+`orch --yaml logs --follow` or `orch --yaml serve` prints text or JSON Lines, not YAML.
+
+**Cause.**
+- `doctor` prints its human header (`  orch doctor · checking adapters and dependencies`) to **stdout** before the
+  structured document, whichever of `--json` or `--yaml` is given. The header is older than `--yaml` (master
+  prints it under `--json` too), and `--yaml` does not change it. Outside a project, `doctor` ignores both flags
+  and prints the text report.
+- `logs --follow` prints a text banner and then live events; `serve` writes JSON Lines (`--log-format json`, the
+  default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl` logs.
+- A failing command prints its error as text on stderr under every output flag; stdout is empty.
+
+**Fix.** For `doctor`, drop the leading header lines before parsing: `orch --json doctor | sed '1,2d'`. For
+streams, parse the JSON Lines `serve` writes, or poll `orch --yaml logs --task <id>` for run metadata. To tell an
+error from output, check the exit code; never parse stderr as YAML or JSON.

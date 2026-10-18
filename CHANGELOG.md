@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- `--yaml`, a global flag beside `--json`: every command that prints JSON can print the same data as one YAML document with every key and string double-quoted. The two flags together are a usage error, and `--json` output is byte-for-byte unchanged.
+
 ## [0.7.0] - 2026-10-17
 
 Dashboard (TUI) release: agent sorting and live-following activity feeds. No peer-protocol or on-disk change, so
