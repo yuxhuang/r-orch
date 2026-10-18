@@ -198,6 +198,25 @@ terminal or multiplexer *without* bracketed paste (Windows legacy console, tmux 
 pasted body still arrives as raw keystrokes: the first newline submits and the rest is typed into the
 dashboard. Paste one line, or paste into `orch msg send` instead.
 
+### Updating definitions from files
+
+Besides `edit` (opens `$EDITOR`), agents, tasks and the project config can be replaced or patched from a JSON or
+YAML file or stdin, with no editor:
+
+```bash
+orch agent update <agent-id> -f agent.yaml            # replace: omitted optional fields are cleared
+echo '{"config": {"model": null}}' | orch agent patch <agent-id> -f -     # merge: null removes a member
+orch task patch <task-id> -f task-patch.yaml          # RFC 7396 merge patch
+orch --yaml config update -f config.json              # print the saved config as YAML
+```
+
+`update` needs the whole writable definition; `patch` merges a partial document (objects merge, arrays replace,
+`null` deletes). Identity and runtime state (`id`, `status`, `stats`, an assignee, …) are never writable, a
+running or remote agent or task cannot be changed, and nothing is written unless the whole result validates.
+`--input-format json|yaml` overrides detection from the extension or first byte. The full contract, the
+writable fields, every error and the locking limits are in [docs/file-mutations.md](docs/file-mutations.md);
+runnable inputs are in [examples/file-mutations/](examples/file-mutations/).
+
 Two things that will bite you on first use, both covered in the [runbook](docs/RUNBOOK.md):
 
 - **`approval_policy: auto`** above is deliberate. The default `agt_creator` agent uses `suggest`, which
@@ -461,6 +480,7 @@ drafts last only for the dashboard session).
 |---|---|
 | **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and the gotchas that are inherited rather than fixed — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
 | [docs/PARITY.md](docs/PARITY.md) | **Historical.** The contract the port was built to: every command, flag, exit code, `--json` shape and on-disk field, graded L0/L1/L2, plus known bugs of the original. No longer a goal ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)) |
+| [docs/file-mutations.md](docs/file-mutations.md) | `update` / `patch` from JSON or YAML files: input rules, writable fields, errors, locking |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |
 | [docs/parity/](docs/parity/) | Historical per-area appendices behind the contract — CLI, adapters, infrastructure, TUI, tests |
 | [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |

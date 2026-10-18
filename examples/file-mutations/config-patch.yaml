@@ -1,0 +1,6 @@
+# orch config patch -f config-patch.yaml
+# Lowers concurrency, adds an extension key and keeps everything else.
+scheduling:
+  max_concurrent_agents: 3
+plugin:
+  x: 1

@@ -71,6 +71,12 @@ provide. Two consequences:
   original**. It is written up for operators, with the one-command recovery, in
   [docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update).
 
+**`update` and `patch` add one narrow, new lock — not a fix for the above.** `orch agent|task|config update|patch`
+([guide](file-mutations.md)) take a stable advisory lock, `.orchestry/.definition.lock`, for at most 5 seconds
+(`fs_utils::mutation_lock`), so two of *those* commands cannot interleave their read-merge-write. `edit`, `agent add`,
+the orchestrator and the dashboard do not take it, and agent and task records are still saved through their stores
+and indexes, one write each, so the hazard in this section is unchanged for everything else.
+
 ---
 
 ## 3. Crate layout
@@ -197,7 +203,7 @@ All three names are the same program, matching the npm `bin` map:
 | `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
-| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output`, `context`, `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
+| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output`, `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
 
 ---
@@ -216,6 +222,7 @@ Pin minors in `[workspace.dependencies]`; let patches float.
 | `async-trait` | `0.1` | Async methods in the `orch-core` traits. Native AFIT cannot produce `dyn`-compatible traits, and the container stores `Arc<dyn ...>` — so `async-trait` is required, not stylistic. |
 | `serde` | `1.0` | derive. |
 | `serde_json` | `1.0` | JSON + JSONL. **Enable the `preserve_order` feature** so `Value` round-trips key order; and prefer typed structs over `json!` for anything persisted (see §5.2). |
+| `json-patch` | `4.2` (`default-features = false`) | RFC 7396 JSON Merge Patch for `orch {agent,task,config} patch -f`. Only `json_patch::merge` is used, in `orch-cli`'s `document_input`. Adoption checks in [ADR 0005](decisions/0005-file-mutations.md). |
 | `thiserror` | `2.0` | The error enum in `orch-domain`. |
 | `anyhow` | `1.0` | Only in `orch-cli`/`xtask` top-level glue, never in library error signatures. |
 | `clap` | `4.6` | derive. Matches Commander's surface: subcommands, aliases, `required`, defaults, global args. |

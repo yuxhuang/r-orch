@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- `orch agent update|patch <id> -f FILE`, `orch task update|patch <id> -f FILE` and `orch config update|patch -f FILE`: replace a definition from a JSON or YAML file (or stdin), or apply an RFC 7396 merge patch to it, without an editor. `--input-format` overrides detection; identity and runtime state stay read-only, and nothing is written unless the whole result validates.
+
 ## [0.7.0] - 2026-10-17
 
 Dashboard (TUI) release: agent sorting and live-following activity feeds. No peer-protocol or on-disk change, so
