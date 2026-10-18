@@ -1163,6 +1163,74 @@ fn task_mutation_rejects_non_string_labels() {
     assert_eq!(p.snapshot("tasks"), before);
 }
 
+fn assert_task_mutation_rejects_reserved_label(verb: &str, label: &str) {
+    let p = project();
+    let id = p.task("local task");
+    let before = p.snapshot("tasks");
+    let config_before = p.config_bytes();
+    let mut body = if verb == "update" {
+        json!({"title": "changed", "description": "changed body", "priority": 4})
+    } else {
+        json!({"title": "changed"})
+    };
+    body["labels"] = json!(["benign", label]);
+    let out = p.run_stdin(&["task", verb, &id, "-f", "-"], body.to_string().as_bytes());
+    assert_rejected(&out, "labels");
+    assert_eq!(p.snapshot("tasks"), before);
+    assert_eq!(p.config_bytes(), config_before);
+}
+
+#[test]
+fn task_patch_rejects_remote_control_labels_without_changing_the_store() {
+    for label in ["remote-ctl:x", "remote-ctl:"] {
+        assert_task_mutation_rejects_reserved_label("patch", label);
+    }
+}
+
+#[test]
+fn task_patch_rejects_execution_labels_without_changing_the_store() {
+    for label in ["exec:x", "exec:"] {
+        assert_task_mutation_rejects_reserved_label("patch", label);
+    }
+}
+
+#[test]
+fn task_update_rejects_remote_control_labels_without_changing_the_store() {
+    for label in ["remote-ctl:x", "remote-ctl:"] {
+        assert_task_mutation_rejects_reserved_label("update", label);
+    }
+}
+
+#[test]
+fn task_update_rejects_execution_labels_without_changing_the_store() {
+    for label in ["exec:x", "exec:"] {
+        assert_task_mutation_rejects_reserved_label("update", label);
+    }
+}
+
+#[test]
+fn task_mutations_accept_benign_labels_including_similar_names() {
+    let p = project();
+    let id = p.task("local task");
+    let labels = json!([
+        "ordinary",
+        "remote-ctl",
+        "exec",
+        "remote-ctl-other:x",
+        "my-exec:x"
+    ]);
+    let patch = p.file("patch.json", json!({"labels": labels}).to_string());
+    p.ok(&["task", "patch", &id, "-f", patch.to_str().unwrap()]);
+    assert_eq!(p.json(&["task", "show", &id])["labels"], labels);
+
+    let update = p.file(
+        "definition.yaml",
+        "title: updated\ndescription: body\npriority: 2\nlabels: [ordinary, remote-ctl, exec, remote-ctl-other:x, my-exec:x]\n",
+    );
+    p.ok(&["task", "update", &id, "-f", update.to_str().unwrap()]);
+    assert_eq!(p.json(&["task", "show", &id])["labels"], labels);
+}
+
 #[test]
 fn task_update_accepts_its_own_full_show_output() {
     let p = project();

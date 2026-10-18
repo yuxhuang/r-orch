@@ -334,6 +334,18 @@ impl TaskService {
         }
         if definition
             && fields
+                .labels
+                .as_ref()
+                .unwrap_or(&task.labels)
+                .iter()
+                .any(|label| label.starts_with("remote-ctl:") || label.starts_with("exec:"))
+        {
+            return Err(Error::invalid_arguments(
+                "labels: remote-ctl: and exec: prefixes are reserved for worker mirrors",
+            ));
+        }
+        if definition
+            && fields
                 .title
                 .as_ref()
                 .is_none_or(|value| value == &task.title)
