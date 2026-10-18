@@ -347,3 +347,29 @@ async fn legacy_owned_views_preserve_each_declared_approval_policy() {
         }
     }
 }
+
+#[tokio::test]
+async fn equivalent_replacement_preserves_authored_bytes_and_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("team");
+    init_bundle(&root, &builtin("a-team").await.unwrap())
+        .await
+        .unwrap();
+    let path = root.join("agents/backend-eng.yml");
+    let bytes = b"# Keep this comment\nname: backend-eng\nrole: Backend developer\n";
+    std::fs::write(&path, bytes).unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    mutate(
+        &root,
+        None,
+        Target::Agent("backend-eng".into()),
+        Mutation::Replace(br#"{"name":"backend-eng","role":"Backend developer"}"#.to_vec()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+}

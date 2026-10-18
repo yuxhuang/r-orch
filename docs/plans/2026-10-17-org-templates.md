@@ -33,7 +33,9 @@ Use schema_version: 1 in org.yml, agents/<name>.yml and rules/<id>.md. Strict sa
 |---|---|
 | S1 / Y1 / H0 | implemented and verified in prerequisites |
 | P1 | implemented; verification recorded in the implementation handoff |
-| U1 / P2 / W1 | separate owners or later pipeline; not certified by P1 |
+| U1 | integrated from the reviewed C1 lineage; independent integration gates remain |
+| P2 | implemented using document_input and the locked raw candidate overlay; focused mutation tests added; integration verification and independent review remain |
+| W1 | later documentation pipeline; not certified by P2 |
 
 ## Test plan
 Hermetic CLI integration tests cover names/path traversal/symlinks, duplicate/unknown keys, schema/lead/rules, source precedence, all CRUD and deploy partial failure, RFC 7396 null/array behavior, immutable fields, atomic failures, and JSON/YAML equivalence/conflicts/streams. Verify complete sanitized role content and rule expansion independently, including red-team/team-lead shorthand normalization, three-rule closure, omitted/empty/nonempty skills round trips with shop/deploy parity, and full replacement/deletion of malformed targets with unrelated corruption rejected. PTY tests cover the measured shop defect, selection/cancel, resize and terminal restoration. Run on macOS locally and Linux CI; report any unavailable platform explicitly. Run fmt --all --check, clippy --workspace --all-targets -- -D warnings, test --workspace, xtask crate-graph and cargo deny check when installed. Follow AGENTS.md cold-gate requirements for security-relevant changes and document missing oracle/tooling rather than claiming an unrun gate.

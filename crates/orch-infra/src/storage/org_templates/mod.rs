@@ -576,6 +576,30 @@ impl LockedTemplate {
                 }
             }
         }
+        if let Mutation::Replace(bytes) = &mutation
+            && let Some(old) = old
+        {
+            // Validate the entire overlaid bundle first, even for a no-op.
+            // Compare typed authoring documents so omitted ordinary defaults
+            // and show echoes preserve comments/formatting and file times.
+            let unchanged = if old == bytes {
+                true
+            } else if let Ok(value) = parse_document(Path::new(&path), old).await {
+                match &target {
+                    Target::Org => serde_json::from_value::<OrgDefinition>(value)
+                        .is_ok_and(|org| org == bundle.org),
+                    Target::Agent(name) => serde_json::from_value::<AgentDefinition>(value)
+                        .is_ok_and(|agent| {
+                            bundle.agents.iter().any(|a| a.name == *name && *a == agent)
+                        }),
+                }
+            } else {
+                false
+            };
+            if unchanged {
+                return Ok(bundle);
+            }
+        }
         let dest = self.root.join(&path);
         match mutation {
             Mutation::Delete => std::fs::remove_file(&dest).map_err(|e| io(&dest, e))?,

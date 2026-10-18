@@ -1,7 +1,8 @@
 //! Template authoring commands; runtime entities are owned by engine services.
 use crate::context::{CliContext, EnvFlags};
+use crate::document_input::{MutationKind, apply_mutation, read_document, reject_nulls};
 use crate::output::print_table;
-use crate::tree::Cli;
+use crate::tree::{Cli, DefinitionInput as FileDefinitionInput};
 use clap::{Args, Subcommand, ValueEnum};
 use orch_core::{Error, Result};
 use orch_domain::org_templates::{
@@ -44,6 +45,20 @@ pub enum TemplateSub {
     Edit {
         #[command(flatten)]
         selector: Selector,
+    },
+    /// Replace org.yml from a complete JSON or YAML definition
+    Update {
+        #[command(flatten)]
+        selector: Selector,
+        #[command(flatten)]
+        input: FileDefinitionInput,
+    },
+    /// Merge a partial JSON or YAML definition into org.yml
+    Patch {
+        #[command(flatten)]
+        selector: Selector,
+        #[command(flatten)]
+        input: FileDefinitionInput,
     },
     /// Manage individual member definitions
     Agent {
@@ -183,6 +198,18 @@ pub enum MemberSub {
         #[command(flatten)]
         selector: MemberSelector,
     },
+    Update {
+        #[command(flatten)]
+        selector: MemberSelector,
+        #[command(flatten)]
+        input: FileDefinitionInput,
+    },
+    Patch {
+        #[command(flatten)]
+        selector: MemberSelector,
+        #[command(flatten)]
+        input: FileDefinitionInput,
+    },
     Delete {
         #[command(flatten)]
         selector: MemberSelector,
@@ -252,9 +279,18 @@ pub(crate) async fn dispatch(
             let locked = LockedTemplate::open(&root, expected.as_deref()).await?;
             let old = locked.document(&Target::Org).await?;
             let edited = edit_bytes(&old).await?;
-            let bundle = locked
-                .publish(Target::Org, Mutation::Replace(edited))
-                .await?;
+            let input = store::parse_document(Path::new("<editor>"), &edited).await?;
+            let bundle =
+                publish_definition(locked, Target::Org, &input, MutationKind::Update).await?;
+            emit(&ctx, &bundle.org)?;
+        }
+        TemplateSub::Update { selector, input } | TemplateSub::Patch { selector, input } => {
+            let kind = if matches!(command, TemplateSub::Patch { .. }) {
+                MutationKind::Patch
+            } else {
+                MutationKind::Update
+            };
+            let bundle = mutate_definition(selector, Target::Org, input, kind).await?;
             emit(&ctx, &bundle.org)?;
         }
         TemplateSub::Agent { command } => match command {
@@ -280,9 +316,30 @@ pub(crate) async fn dispatch(
                 let locked = LockedTemplate::open(&root, expected.as_deref()).await?;
                 let old = locked.document(&target).await?;
                 let edited = edit_bytes(&old).await?;
-                let bundle = locked
-                    .publish(target.clone(), Mutation::Replace(edited))
-                    .await?;
+                let input = store::parse_document(Path::new("<editor>"), &edited).await?;
+                let bundle =
+                    publish_definition(locked, target.clone(), &input, MutationKind::Update)
+                        .await?;
+                if let Target::Agent(name) = target {
+                    emit(
+                        &ctx,
+                        bundle
+                            .agents
+                            .iter()
+                            .find(|a| a.name == name)
+                            .expect("validated target"),
+                    )?;
+                }
+            }
+            MemberSub::Update { selector, input } | MemberSub::Patch { selector, input } => {
+                let kind = if matches!(command, MemberSub::Patch { .. }) {
+                    MutationKind::Patch
+                } else {
+                    MutationKind::Update
+                };
+                let target = selector.target()?;
+                let bundle =
+                    mutate_definition(&selector.selector(), target.clone(), input, kind).await?;
                 if let Target::Agent(name) = target {
                     emit(
                         &ctx,
@@ -305,6 +362,102 @@ pub(crate) async fn dispatch(
         },
     }
     Ok(ExitCode::SUCCESS)
+}
+// Keep allowed paths explicit, as in live agent definitions. In particular an
+// unknown null must fail before RFC 7396 can erase it from the candidate.
+const DEFAULT_FIELDS: &[&str] = &[
+    "adapter",
+    "model",
+    "command",
+    "effort",
+    "approval_policy",
+    "max_turns",
+    "timeout_ms",
+    "stall_timeout_ms",
+    "env",
+    "system_prompt",
+    "workspace_mode",
+    "skills",
+];
+fn definition_candidate(
+    current: &Value,
+    input: &Value,
+    kind: MutationKind,
+    target: &Target,
+) -> Result<Value> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| Error::invalid_arguments("definition: expected an object"))?;
+    for (key, value) in object {
+        let allowed = match target {
+            Target::Org => [
+                "schema_version",
+                "name",
+                "lead",
+                "description",
+                "rules",
+                "defaults",
+            ]
+            .contains(&key.as_str()),
+            Target::Agent(_) => {
+                ["name", "role", "description", "rules"].contains(&key.as_str())
+                    || DEFAULT_FIELDS.contains(&key.as_str())
+            }
+        };
+        if !allowed {
+            return Err(Error::invalid_arguments(format!("{key}: unknown field")));
+        }
+        if matches!(target, Target::Org)
+            && key == "defaults"
+            && let Some(defaults) = value.as_object()
+        {
+            for field in defaults.keys() {
+                if !DEFAULT_FIELDS.contains(&field.as_str()) {
+                    return Err(Error::invalid_arguments(format!(
+                        "defaults.{field}: unknown field"
+                    )));
+                }
+            }
+        }
+    }
+    if kind == MutationKind::Update {
+        reject_nulls(input, "definition")?;
+    }
+    let candidate = apply_mutation(current, input, kind)?;
+    reject_nulls(&candidate, "definition")?;
+    Ok(candidate)
+}
+async fn publish_definition(
+    locked: LockedTemplate,
+    target: Target,
+    input: &Value,
+    kind: MutationKind,
+) -> Result<Bundle> {
+    // Only patch needs an old document. Full replacement repairs a bounded
+    // malformed target through the existing raw snapshot overlay.
+    let current = if kind == MutationKind::Patch {
+        locked.document(&target).await?
+    } else {
+        Value::Null
+    };
+    let candidate = definition_candidate(&current, input, kind, &target)?;
+    let bytes = serde_yaml_ng::to_string(&candidate).map_err(|e| Error::other(e.to_string()))?;
+    locked
+        .publish(target, Mutation::Replace(bytes.into_bytes()))
+        .await
+}
+async fn mutate_definition(
+    selector: &Selector,
+    target: Target,
+    input: &FileDefinitionInput,
+    kind: MutationKind,
+) -> Result<Bundle> {
+    let value = read_document(&input.file, input.input_format).await?;
+    let (root, expected) = selector.writable()?;
+    let locked = LockedTemplate::open(&root, expected.as_deref()).await?;
+    publish_definition(locked, target, &value, kind)
+        .await
+        .map_err(|e| crate::document_input::at_source(&input.file, e))
 }
 async fn edit_bytes(value: &Value) -> Result<Vec<u8>> {
     let initial = serde_yaml_ng::to_string(value).map_err(|e| Error::other(e.to_string()))?;
@@ -438,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn template_commands_parse_without_a_project_and_no_fake_patch_exists() {
+    fn template_commands_parse_without_a_project() {
         for args in [
             vec![
                 "orch",
@@ -473,7 +626,370 @@ mod tests {
                 "-f",
                 "patch.yml"
             ])
+            .is_ok()
+        );
+        for command in ["update", "patch"] {
+            assert!(
+                Cli::try_parse_from([
+                    "orch",
+                    "org",
+                    "template",
+                    "agent",
+                    command,
+                    "--template-dir",
+                    "./team",
+                    "--agent",
+                    "worker",
+                    "-f",
+                    "-",
+                    "--input-format",
+                    "yaml",
+                ])
+                .is_ok()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn template() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("team");
+        store::init_bundle(&root, &minimal("team").unwrap())
+            .await
+            .unwrap();
+        (dir, root)
+    }
+
+    async fn change(
+        root: &Path,
+        target: Target,
+        input: Value,
+        kind: MutationKind,
+    ) -> Result<Bundle> {
+        let locked = LockedTemplate::open(root, None).await?;
+        publish_definition(locked, target, &input, kind).await
+    }
+
+    #[test]
+    fn unknown_null_keys_are_rejected_before_merge() {
+        for (target, input, field) in [
+            (Target::Org, json!({"typo": null}), "typo"),
+            (
+                Target::Org,
+                json!({"defaults": {"typo": null}}),
+                "defaults.typo",
+            ),
+            (Target::Agent("lead".into()), json!({"typo": null}), "typo"),
+        ] {
+            let error =
+                definition_candidate(&json!({}), &input, MutationKind::Patch, &target).unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn full_replacement_rejects_null_at_every_declared_level() {
+        for (target, input) in [
+            (Target::Org, json!({"defaults": null})),
+            (Target::Org, json!({"defaults": {"model": null}})),
+            (Target::Agent("lead".into()), json!({"skills": null})),
+            (Target::Agent("lead".into()), json!({"env": {"KEY": null}})),
+        ] {
+            assert!(
+                definition_candidate(&Value::Null, &input, MutationKind::Update, &target).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_empty_overrides_and_patch_null_or_update_omission_inherits() {
+        let (_dir, root) = template().await;
+        change(
+            &root,
+            Target::Org,
+            json!({"defaults":{"skills":["shared"]}}),
+            MutationKind::Patch,
+        )
+        .await
+        .unwrap();
+        let member = Target::Agent("lead".into());
+        for skills in [json!([]), json!(["local"])] {
+            let bundle = change(
+                &root,
+                member.clone(),
+                json!({"skills":skills}),
+                MutationKind::Patch,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&bundle.agents[0]).unwrap()["skills"],
+                skills
+            );
+        }
+        let bundle = change(
+            &root,
+            member.clone(),
+            json!({"skills":null}),
+            MutationKind::Patch,
+        )
+        .await
+        .unwrap();
+        assert!(bundle.agents[0].skills.is_none());
+        assert_eq!(
+            bundle
+                .org
+                .defaults
+                .as_ref()
+                .unwrap()
+                .skills
+                .as_ref()
+                .unwrap(),
+            &["shared"]
+        );
+        change(
+            &root,
+            member.clone(),
+            json!({"skills":[]}),
+            MutationKind::Patch,
+        )
+        .await
+        .unwrap();
+        let bundle = change(
+            &root,
+            member,
+            json!({"name":"lead","role":"Replaced"}),
+            MutationKind::Update,
+        )
+        .await
+        .unwrap();
+        assert!(bundle.agents[0].skills.is_none());
+    }
+
+    #[tokio::test]
+    async fn patches_merge_nested_env_and_remove_defaults_without_storing_null() {
+        let (_dir, root) = template().await;
+        change(
+            &root,
+            Target::Org,
+            json!({"defaults":{"model":"old","env":{"A":"a","B":"b"}}}),
+            MutationKind::Patch,
+        )
+        .await
+        .unwrap();
+        let bundle = change(
+            &root,
+            Target::Org,
+            json!({"defaults":{"model":null,"env":{"A":null,"C":"c"}}}),
+            MutationKind::Patch,
+        )
+        .await
+        .unwrap();
+        let defaults = bundle.org.defaults.unwrap();
+        assert!(defaults.model.is_none());
+        assert_eq!(
+            serde_json::to_value(defaults.env.unwrap()).unwrap(),
+            json!({"B":"b","C":"c"})
+        );
+        let bundle = change(
+            &root,
+            Target::Org,
+            json!({"defaults":null}),
+            MutationKind::Patch,
+        )
+        .await
+        .unwrap();
+        assert!(bundle.org.defaults.is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_repairs_malformed_selected_member_but_not_unrelated_corruption() {
+        let (_dir, root) = template().await;
+        let path = root.join("agents/lead.yml");
+        std::fs::write(&path, "broken: [").unwrap();
+        let replacement = json!({"name":"lead","role":"Repaired"});
+        change(
+            &root,
+            Target::Agent("lead".into()),
+            replacement.clone(),
+            MutationKind::Update,
+        )
+        .await
+        .unwrap();
+        std::fs::write(root.join("agents/other.yml"), "broken: [").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            change(
+                &root,
+                Target::Agent("lead".into()),
+                replacement,
+                MutationKind::Update
+            )
+            .await
             .is_err()
         );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn malformed_root_repair_uses_the_selector_identity() {
+        let (_dir, root) = template().await;
+        let path = root.join("org.yml");
+        let invalid = b"broken: [";
+        std::fs::write(&path, invalid).unwrap();
+        let replacement = json!({"schema_version":1,"name":"renamed","lead":"lead"});
+        let locked = LockedTemplate::open(&root, Some("team")).await.unwrap();
+        assert!(
+            publish_definition(locked, Target::Org, &replacement, MutationKind::Update)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
+        let bundle = change(&root, Target::Org, replacement, MutationKind::Update)
+            .await
+            .unwrap();
+        assert_eq!(bundle.org.name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn patch_requires_a_parseable_base_and_names_full_update_repair() {
+        let (_dir, root) = template().await;
+        for (target, path) in [
+            (Target::Org, "org.yml"),
+            (Target::Agent("lead".into()), "agents/lead.yml"),
+        ] {
+            let path = root.join(path);
+            let old = std::fs::read(&path).unwrap();
+            std::fs::write(&path, "broken: [").unwrap();
+            let error = change(&root, target, json!({}), MutationKind::Patch)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("template update"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"broken: [");
+            std::fs::write(path, old).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_changes_and_required_removals_fail_without_writes() {
+        let (_dir, root) = template().await;
+        for (target, patch, path) in [
+            (Target::Org, json!({"name":"renamed"}), "org.yml"),
+            (Target::Org, json!({"schema_version":2}), "org.yml"),
+            (Target::Org, json!({"name":null}), "org.yml"),
+            (Target::Org, json!({"lead":null}), "org.yml"),
+            (
+                Target::Agent("lead".into()),
+                json!({"name":"renamed"}),
+                "agents/lead.yml",
+            ),
+            (
+                Target::Agent("lead".into()),
+                json!({"role":null}),
+                "agents/lead.yml",
+            ),
+        ] {
+            let path = root.join(path);
+            let old = std::fs::read(&path).unwrap();
+            assert!(
+                change(&root, target, patch, MutationKind::Patch)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(path).unwrap(), old);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_op_patch_preserves_comments_and_time_but_still_validates_other_members() {
+        let (_dir, root) = template().await;
+        let path = root.join("agents/lead.yml");
+        let bytes = b"# authored\nname: lead\nrole: Coordinate\n";
+        std::fs::write(&path, bytes).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        change(
+            &root,
+            Target::Agent("lead".into()),
+            json!({}),
+            MutationKind::Patch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        std::fs::write(root.join("agents/other.yml"), "broken: [").unwrap();
+        assert!(
+            change(
+                &root,
+                Target::Agent("lead".into()),
+                json!({}),
+                MutationKind::Patch
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn file_mutation_reuses_input_format_and_attaches_source_to_validation_errors() {
+        let (dir, root) = template().await;
+        let file = dir.path().join("patch.json");
+        std::fs::write(&file, "description: Changed\n").unwrap();
+        let selector = Selector {
+            name: None,
+            template_dir: Some(root.clone()),
+        };
+        let input = FileDefinitionInput {
+            file: file.clone(),
+            input_format: Some(crate::document_input::InputFormat::Yaml),
+        };
+        let bundle = mutate_definition(&selector, Target::Org, &input, MutationKind::Patch)
+            .await
+            .unwrap();
+        assert_eq!(bundle.org.description, "Changed");
+        let before = std::fs::read(root.join("org.yml")).unwrap();
+        std::fs::write(&file, "defaults: {typo: null}\n").unwrap();
+        let error = mutate_definition(&selector, Target::Org, &input, MutationKind::Patch)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(file.to_str().unwrap()) && error.contains("defaults.typo"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(root.join("org.yml")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn concurrent_patches_reread_the_base_after_acquiring_the_lock() {
+        let (_dir, root) = template().await;
+        let (first, second) = tokio::join!(
+            change(
+                &root,
+                Target::Org,
+                json!({"description":"Changed"}),
+                MutationKind::Patch
+            ),
+            change(
+                &root,
+                Target::Org,
+                json!({"defaults":{"skills":["shared"]}}),
+                MutationKind::Patch
+            ),
+        );
+        first.unwrap();
+        second.unwrap();
+        let bundle = store::load_directory(&root, None).await.unwrap();
+        assert_eq!(bundle.org.description, "Changed");
+        assert_eq!(bundle.org.defaults.unwrap().skills.unwrap(), ["shared"]);
     }
 }
