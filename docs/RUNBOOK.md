@@ -565,6 +565,12 @@ different situations:
   `attempt` counter is what shows the rate.
 - **`(version unknown)`** beside an online peer means that peer predates the version field in the handshake.
   Nothing is wrong with the link; it is an older build.
+- **`Write peer status for 2com: Lock remote registry …: timed out after 5s`** means something held
+  `.orchestry/remotes.lock` for over five seconds, usually an `orch remote add` or `remove` that is stopped
+  or hung. A link records its status only under that lock, and only while its exact registry entry still
+  exists, so that a removal cannot be undone by a late write. Until it can, the remote reports `offline`.
+  Let the command finish or stop it; the next status write recovers. A registry that cannot be read
+  (`Duplicate remote alias`, `Invalid remote alias`) is reported the same way: fix `.orchestry/remotes.yml`.
 
 ---
 
