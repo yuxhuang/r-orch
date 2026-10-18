@@ -205,6 +205,37 @@ Two things that will bite you on first use, both covered in the [runbook](docs/R
 - **Keep API keys in your environment, not in an agent's `env:` map.** Agent files are world-readable and
   are *not* gitignored by `init`.
 
+### The agent shop
+
+`orch agent shop` installs one agent from a built-in catalogue of 15 role templates (Backend Developer, QA
+Engineer, Architect, …). It needs an initialised project (`orch init`).
+
+```bash
+orch agent shop --list      # the catalogue as a table: Key, Name, Tier, Skills (first two)
+orch agent shop             # interactive picker
+```
+
+The picker draws only when both stdin and stdout are terminals. Keys: `↑`/`↓` (or `Ctrl-P`/`Ctrl-N`) move and
+wrap around the ends, `Enter` installs the highlighted template, `q`, `Esc` or `Ctrl-C` cancel. Each row is
+`Name — description [tier]`, cut to the terminal width with an ellipsis (description first, then the tier, then
+the name), and a list taller than the terminal shows its window as `1-7 of 15`. Resizing the terminal redraws
+the picker at the new size; a terminal too short for the blank lines drops them before it drops rows.
+
+```
+  AGENT SHOP  — arrow keys to navigate, enter to select, q to cancel
+
+  ▸ Backend Developer — APIs, databases, backend services [balanced]
+    Frontend Developer — React, UI components, CSS, respon… [balanced]
+    QA Engineer — Test writing, coverage analysis, quality… [balanced]
+
+  1-7 of 15
+```
+
+Choosing a template creates one agent and prints `✓ Added agent QA Engineer (claude) → agt_…`; cancelling
+prints `  Cancelled.` and exits 0 without writing anything. With stdout redirected the command prints the `--list`
+table; with stdin not a terminal (for example `echo | orch agent shop` in a terminal) it cancels at once.
+`--json` and `--quiet` do not change this command.
+
 ---
 
 ## Remote agents
