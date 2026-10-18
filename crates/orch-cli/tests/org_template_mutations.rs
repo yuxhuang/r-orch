@@ -3149,20 +3149,13 @@ fn concurrent_patches_of_the_same_key_leave_exactly_one_winners_value() {
     );
 }
 
-/// KNOWN DEFECT, found by this suite and handed to the template-store owner:
-/// `RawSnapshot::capture` stats every directory entry before it skips dotfiles,
-/// so a reader that lists `agents/` while a writer is publishing fails with
-/// `Template I/O at agents/.<name>.yml.<hex>.tmp: No such file or directory`
-/// when the writer's temporary file is renamed away between the listing and
-/// the stat. Readers take no lock (decision D11), so a read during a write must
-/// either succeed or see a consistent bundle; it must never error on the
-/// writer's own temp file. The race is probabilistic (about 1 in 30 runs of a
-/// 12-read loop; 10 of 20 runs with these counts), so it is `#[ignore]`d
-/// rather than left to turn the suite randomly red. Run it with
-/// `cargo test -p orch-cli --test org_template_mutations -- --ignored`.
-/// Remove the attribute together with the fix.
+/// Readers take no lock (decision D11), so a read during a write must either
+/// succeed or see a consistent bundle; it must never error on a writer's own
+/// temporary file. `RawSnapshot::capture` lists `agents/` and a writer may
+/// rename its `.<name>.yml.<hex>.tmp` away before the reader stats it, so this
+/// pins that a vanished member is tolerated instead of surfacing
+/// `Template I/O ...: No such file or directory`.
 #[test]
-#[ignore = "known defect: transient NotFound for a writer's temp file in RawSnapshot::capture"]
 fn a_reader_never_sees_a_truncated_member_while_writers_publish() {
     let sb = sandbox();
     let root = small_team(&sb, "atomic");
