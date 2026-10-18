@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_error, print_success};
+use crate::output::{Styles, print_error_with_format, print_success};
 
 /// `{ key, value }`, where an absent value drops the key.
 #[derive(Debug, Serialize)]
@@ -111,7 +111,7 @@ pub async fn global_get(
 /// An invalid value and an unknown key both print an error and **exit 0**.
 pub async fn global_set(
     engine: &Engine,
-    _ctx: &CliContext,
+    ctx: &CliContext,
     styles: &Styles,
     key: &str,
     value: &str,
@@ -121,8 +121,9 @@ pub async fn global_set(
     match key {
         "activity_filter" => {
             if !ACTIVITY_FILTER_PRESETS.contains(&value) {
-                print_error(
+                print_error_with_format(
                     styles,
+                    ctx.output,
                     &format!(
                         "Invalid value \"{value}\". Valid: {}",
                         ACTIVITY_FILTER_PRESETS.join(", ")
@@ -140,8 +141,9 @@ pub async fn global_set(
             // what gets stored and echoed.
             let palette = value.to_lowercase();
             let Ok(parsed) = palette.parse::<TuiPaletteName>() else {
-                print_error(
+                print_error_with_format(
                     styles,
+                    ctx.output,
                     &format!(
                         "Invalid value \"{value}\". Valid: {}",
                         TUI_PALETTE_NAMES
@@ -158,7 +160,12 @@ pub async fn global_set(
             engine.global_config_store.write(&config).await?;
             print_success(styles, &format!("{key} = {palette}"));
         }
-        _ => print_error(styles, &format!("Unknown global config key: {key}"), None),
+        _ => print_error_with_format(
+            styles,
+            ctx.output,
+            &format!("Unknown global config key: {key}"),
+            None,
+        ),
     }
     Ok(())
 }

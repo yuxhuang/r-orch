@@ -21,7 +21,7 @@ use orch_engine::goal_service::UpdateGoalFields;
 use serde_json::{Value, json};
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_error, print_key_value, print_success, print_table};
+use crate::output::{Styles, print_error_with_format, print_key_value, print_success, print_table};
 
 /// Goal status icons. Hard-coded in the original — unlike the task icons
 /// these have no ASCII fallback, so `--ascii` does not change them.
@@ -216,8 +216,9 @@ pub async fn status(
     force: bool,
 ) -> Result<ExitCode> {
     let Ok(status) = raw_status.parse::<GoalStatus>() else {
-        print_error(
+        print_error_with_format(
             styles,
+            ctx.output,
             &format!(
                 "Invalid status \"{raw_status}\". Valid: {}",
                 GOAL_STATUSES

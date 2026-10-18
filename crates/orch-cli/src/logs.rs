@@ -90,8 +90,9 @@ pub async fn run(
         return show_all_recent_logs(deps, ctx, styles, since_ms).await;
     }
 
-    crate::output::print_error(
+    crate::output::print_error_with_format(
         styles,
+        ctx.output,
         "Specify a run ID, --task, --agent, or --since <duration>",
         None,
     );
