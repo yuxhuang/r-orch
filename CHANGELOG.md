@@ -7,7 +7,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Fixed
 - `orch agent shop` now draws a readable picker: every row starts at the left edge, rows are cut to the terminal width with an ellipsis instead of wrapping, the heading and the `n-m of total` footer stay on screen on short terminals, and compact headings keep movement, selection and cancellation keys visible at narrow widths.
-- `orch remote remove` can no longer race a live peer link: a link still holding the removed registration, or one since replaced with a different address, cannot recreate `.orchestry/remotes/<alias>.json` or keep reporting the alias online.
+- `orch remote remove` can no longer race a live peer link: a link still holding the removed registration, or one since replaced with a different address, cannot recreate `.orchestry/remotes/<alias>.json` or keep reporting the alias online. A link that is stopped while it writes its status reports the remote offline at once, not when that write finishes.
 - Dashboard select lists, such as the Agent Shop opened with `Ctrl+S` in the New Agent wizard, with ten or more options keep the number apart from the label (`10 Content Creator`), mark a label or hint that was cut to the row with an ellipsis, and show `n of total` in the footer when the list is longer than its window.
 
 ## [0.7.0] - 2026-10-17
