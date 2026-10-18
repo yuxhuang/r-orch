@@ -236,13 +236,37 @@ pub fn validate_snapshot(agents: &[Agent]) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct HealthLease(File);
+struct HealthLease {
+    file: File,
+    /// The newest operation on this store that took or renewed the lease.
+    /// A cancelled or failed operation withdraws it only if it is that
+    /// operation or a newer one: see [`withdraw_owned`].
+    owner: u64,
+}
 
 impl Drop for HealthLease {
     fn drop(&mut self) {
         // A concurrent spawn can retain the open file description until exec.
         // Closing our descriptor alone would leave that inherited lease live.
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
+    }
+}
+
+type HealthMap = BTreeMap<String, HealthLease>;
+
+/// Orders the publications that share a store's health map. A process-wide
+/// counter is enough: only operations on the same map are ever compared.
+fn next_operation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Withdraw `alias`'s lease on behalf of operation `op`, which is being
+/// cancelled or has failed: the lease it found or took goes, but never one
+/// that a newer operation on this store has taken or renewed since.
+fn withdraw_owned(health: &mut HealthMap, alias: &str, op: u64) {
+    if health.get(alias).is_some_and(|lease| lease.owner <= op) {
+        health.remove(alias);
     }
 }
 
@@ -341,19 +365,21 @@ fn lock_registry_within(path: &std::path::Path, wait: std::time::Duration) -> Re
     }
 }
 
-/// Shared by a registered publication and its blocking commit. Both fields
-/// change only under the store's health mutex, which orders a cancellation
+/// Shared by a registered publication and its blocking commit. `abandoned`
+/// changes only under the store's health mutex, which orders a cancellation
 /// against the commit's health decision.
-#[derive(Default)]
 struct PublishCancel {
+    op: u64,
     abandoned: std::sync::atomic::AtomicBool,
-    acquired: std::sync::atomic::AtomicBool,
 }
 
-/// Marks the publication abandoned if its caller is dropped before the
-/// commit returns, and takes back any health the commit already acquired.
+/// Armed from before a registered publication's first wait until its result
+/// is back. If the caller is dropped first, the publication is abandoned and
+/// the link's lease is withdrawn at once, whether it held the lease before
+/// this publication or the commit took it, without waiting for blocking I/O
+/// still in flight. A lease a newer operation has taken since stays.
 struct AbandonOnDrop<'a> {
-    health: &'a Mutex<BTreeMap<String, HealthLease>>,
+    health: &'a Mutex<HealthMap>,
     alias: &'a str,
     cancel: Arc<PublishCancel>,
     armed: bool,
@@ -367,22 +393,22 @@ impl Drop for AbandonOnDrop<'_> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
         self.cancel.abandoned.store(true, Relaxed);
-        if self.cancel.acquired.load(Relaxed) {
-            health.remove(self.alias);
-        }
+        withdraw_owned(&mut health, self.alias, self.cancel.op);
     }
 }
 
 /// The part of a registered publication that runs to completion once
 /// started. It owns the registry lock, so no `add` or `remove` can
-/// interleave with its rename, whatever happens to the caller.
+/// interleave with its rename, whatever happens to the caller. It holds the
+/// health map only weakly: leases belong to the store's handles, and a
+/// commit that outlives all of them must not keep any lease alive.
 struct Commit {
     path: std::path::PathBuf,
     content: String,
     alias: String,
     online: bool,
     health_path: std::path::PathBuf,
-    health: Arc<Mutex<BTreeMap<String, HealthLease>>>,
+    health: std::sync::Weak<Mutex<HealthMap>>,
     cancel: Arc<PublishCancel>,
     #[cfg(test)]
     pause: Option<PublicationPause>,
@@ -391,11 +417,11 @@ struct Commit {
 impl Commit {
     fn run(self, registry: File) -> Result<Publication> {
         let result = self.publish();
-        if result.is_err() {
-            self.health
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.alias);
+        if result.is_err()
+            && let Some(health) = self.health.upgrade()
+        {
+            let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+            withdraw_owned(&mut health, &self.alias, self.cancel.op);
         }
         // Release the registry only after the snapshot and health are settled.
         drop(registry);
@@ -455,12 +481,22 @@ impl Commit {
     }
 
     /// Blocking counterpart of `mark_link_online`, with the same 50ms bound,
-    /// that never takes health for an abandoned publication.
+    /// that never takes health for an abandoned publication. A lease the
+    /// link already holds is renewed for this publication instead.
     fn take_health(&self) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
+        // Every store handle is gone, so this publication's caller is too.
+        let Some(health) = self.health.upgrade() else {
+            return Ok(());
+        };
+        let op = self.cancel.op;
         let file = {
-            let health = self.health.lock().unwrap_or_else(|e| e.into_inner());
-            if health.contains_key(&self.alias) || self.cancel.abandoned.load(Relaxed) {
+            let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+            if self.cancel.abandoned.load(Relaxed) {
+                return Ok(());
+            }
+            if let Some(lease) = health.get_mut(&self.alias) {
+                lease.owner = lease.owner.max(op);
                 return Ok(());
             }
             let mut options = std::fs::OpenOptions::new();
@@ -476,14 +512,17 @@ impl Commit {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
         loop {
             let error = {
-                let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
-                if health.contains_key(&self.alias) || self.cancel.abandoned.load(Relaxed) {
+                let mut health = health.lock().unwrap_or_else(|e| e.into_inner());
+                if self.cancel.abandoned.load(Relaxed) {
+                    return Ok(());
+                }
+                if let Some(lease) = health.get_mut(&self.alias) {
+                    lease.owner = lease.owner.max(op);
                     return Ok(());
                 }
                 match file.try_lock() {
                     Ok(()) => {
-                        health.insert(self.alias.clone(), HealthLease(file));
-                        self.cancel.acquired.store(true, Relaxed);
+                        health.insert(self.alias.clone(), HealthLease { file, owner: op });
                         return Ok(());
                     }
                     Err(error) => error,
@@ -530,7 +569,7 @@ fn write_synced(tmp: &std::path::Path, content: &str) -> std::io::Result<()> {
 pub struct FileRemoteStore {
     paths: Paths,
     // Locks belong to the publisher's lifetime, never to a cached snapshot.
-    health: Arc<Mutex<BTreeMap<String, HealthLease>>>,
+    health: Arc<Mutex<HealthMap>>,
     #[cfg(test)]
     pause: Arc<Mutex<Option<PublicationPause>>>,
 }
@@ -576,9 +615,11 @@ impl FileRemoteStore {
 
     async fn mark_link_online(&self, alias: &str) -> Result<()> {
         let path = self.health_path(alias);
+        let op = next_operation();
         let file = {
-            let health = self.health.lock().unwrap_or_else(|e| e.into_inner());
-            if health.contains_key(alias) {
+            let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lease) = health.get_mut(alias) {
+                lease.owner = lease.owner.max(op);
                 return Ok(());
             }
             let mut options = std::fs::OpenOptions::new();
@@ -603,12 +644,13 @@ impl FileRemoteStore {
             }
             let error = {
                 let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
-                if health.contains_key(alias) {
+                if let Some(lease) = health.get_mut(alias) {
+                    lease.owner = lease.owner.max(op);
                     return Ok(());
                 }
                 match file.try_lock() {
                     Ok(()) => {
-                        health.insert(alias.into(), HealthLease(file));
+                        health.insert(alias.into(), HealthLease { file, owner: op });
                         return Ok(());
                     }
                     Err(error) => error,
@@ -771,7 +813,14 @@ impl FileRemoteStore {
     /// the rename (and deletes the snapshot). The write runs on a blocking
     /// thread that owns the lock, because a cancelled caller must not release
     /// it while a rename can still land. A cancelled publication commits
-    /// nothing it has not started to rename, and keeps no health it took.
+    /// nothing it has not started to rename. Its link's health is withdrawn
+    /// the moment the caller is dropped, at any stage, whether the lease
+    /// predates the publication or not: it does not wait for I/O in flight.
+    ///
+    /// Health is per store and per alias: a link owns its store. When clones
+    /// of one store publish for the same alias, a cancelled, revoked or failed
+    /// publication withdraws the lease it found or took, but never one that a
+    /// newer operation on that store has taken or renewed since it started.
     ///
     /// Registrations compare by value. Removing and re-adding an identical
     /// config (same address and `added_at`) is the same registration: there
@@ -796,9 +845,24 @@ impl FileRemoteStore {
             .last_error
             .as_deref()
             .map(|error| metadata_text(error, 1024));
-        let result = self.publish_registered(expected, &status).await;
+        let cancel = Arc::new(PublishCancel {
+            op: next_operation(),
+            abandoned: Default::default(),
+        });
+        let op = cancel.op;
+        // Before the first wait, so that cancellation during the registry
+        // wait or read withdraws health as surely as during the commit.
+        let mut abandon = AbandonOnDrop {
+            health: &self.health,
+            alias: &status.alias,
+            cancel: cancel.clone(),
+            armed: true,
+        };
+        let result = self.publish_registered(expected, &status, cancel).await;
+        abandon.armed = false;
         if !matches!(result, Ok(Publication::Published)) {
-            self.mark_link_offline(&status.alias);
+            let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+            withdraw_owned(&mut health, &status.alias, op);
         }
         result
     }
@@ -807,6 +871,7 @@ impl FileRemoteStore {
         &self,
         expected: &RemoteConfig,
         status: &RemoteStatus,
+        cancel: Arc<PublishCancel>,
     ) -> Result<Publication> {
         let path = self
             .paths
@@ -826,31 +891,22 @@ impl FileRemoteStore {
         if !self.list().await?.contains(expected) {
             return Ok(Publication::Revoked);
         }
-        let cancel = Arc::new(PublishCancel::default());
-        let mut abandon = AbandonOnDrop {
-            health: &self.health,
-            alias: &status.alias,
-            cancel: cancel.clone(),
-            armed: true,
-        };
         let commit = Commit {
             path,
             content,
             alias: status.alias.clone(),
             online: status.online,
             health_path: self.health_path(&status.alias),
-            health: self.health.clone(),
+            health: Arc::downgrade(&self.health),
             cancel,
             #[cfg(test)]
             pause: self.pause.lock().unwrap_or_else(|e| e.into_inner()).take(),
         };
         // From here the blocking thread owns the registry lock until the
         // snapshot is renamed or abandoned. Dropping this future detaches it.
-        let result = tokio::task::spawn_blocking(move || commit.run(registry))
+        tokio::task::spawn_blocking(move || commit.run(registry))
             .await
-            .map_err(|e| Error::other(format!("Publish remote status: {e}")))?;
-        abandon.armed = false;
-        result
+            .map_err(|e| Error::other(format!("Publish remote status: {e}")))?
     }
 
     pub async fn read_inbound(&self) -> Result<Option<InboundStatus>> {
@@ -1424,7 +1480,7 @@ mod tests {
             let mut snapshot = status("w1");
             store.write_status(&snapshot).await.unwrap();
             // Model the inherited reference without depending on spawn timing.
-            let inherited = store.health.lock().unwrap()["w1"].0.try_clone().unwrap();
+            let inherited = store.health.lock().unwrap()["w1"].file.try_clone().unwrap();
             match withdrawal {
                 0 => store.mark_link_offline("w1"),
                 1 => {
@@ -2173,5 +2229,302 @@ mod tests {
         store.write_status(&status("w1")).await.unwrap();
         assert!(store.read_status("w1").await.unwrap().unwrap().online);
         assert!(store.list().await.unwrap().is_empty());
+    }
+
+    /// Poll `future` exactly once, so that it stops at its first wait.
+    /// True when it is still pending there.
+    async fn poll_once<F: Future>(mut future: std::pin::Pin<&mut F>) -> bool {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx).is_pending()))
+            .await
+    }
+
+    /// Publish `w1` online, then pause its next online publication at `at`
+    /// and cancel that caller, leaving the transaction paused.
+    async fn cancel_an_online_republication(
+        publisher: &FileRemoteStore,
+        at: PausePoint,
+    ) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+        assert_eq!(
+            publisher
+                .publish_registered_status(&config("w1"), &status("w1"))
+                .await
+                .unwrap(),
+            Publication::Published
+        );
+        assert!(publisher.link_is_live("w1"));
+        let (reached, release, finished) = publisher.pause_next_publication(at);
+        let task = tokio::spawn({
+            let publisher = publisher.clone();
+            async move {
+                publisher
+                    .publish_registered_status(&config("w1"), &status("w1"))
+                    .await
+            }
+        });
+        signalled(reached, "republication paused").await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        (release, finished)
+    }
+
+    /// S16-L1: cancelling an online link's next publication withdraws the
+    /// lease the link already held at once, while the paused commit still
+    /// owns the registry, whether or not the store outlives the caller.
+    async fn assert_a_cancelled_republication_withdraws_the_existing_lease(
+        at: PausePoint,
+        drop_publisher: bool,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        let publisher = FileRemoteStore::new(paths.clone());
+        publisher.add(config("w1")).await.unwrap();
+        let (release, finished) = cancel_an_online_republication(&publisher, at).await;
+        let publisher = (!drop_publisher).then_some(publisher);
+        let reader = FileRemoteStore::new(paths.clone());
+        assert!(
+            registry_is_locked(&paths),
+            "the commit released the registry early"
+        );
+        assert!(
+            !reader.link_is_live("w1"),
+            "the cancelled link kept its existing lease while its commit was paused"
+        );
+        assert!(
+            !reader.read_status("w1").await.unwrap().unwrap().online,
+            "the cancelled link still reads online"
+        );
+        if let Some(publisher) = &publisher {
+            assert!(!publisher.link_is_live("w1"));
+        }
+        release.send(()).unwrap();
+        signalled(finished, "cancelled republication finished").await;
+        assert!(
+            !reader.link_is_live("w1"),
+            "the abandoned commit took a late lease"
+        );
+        assert!(temp_files(&paths).is_empty(), "{:?}", temp_files(&paths));
+        drop(publisher);
+        reader.remove("w1").await.unwrap();
+        assert!(!paths.remotes_dir().join("w1.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_republication_cancelled_before_commit_withdraws_the_existing_lease_at_once() {
+        assert_a_cancelled_republication_withdraws_the_existing_lease(
+            PausePoint::BeforeCommit,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_republication_cancelled_before_commit_withdraws_the_existing_lease_with_its_store_dropped()
+     {
+        assert_a_cancelled_republication_withdraws_the_existing_lease(
+            PausePoint::BeforeCommit,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_republication_cancelled_at_its_rename_withdraws_the_existing_lease_at_once() {
+        assert_a_cancelled_republication_withdraws_the_existing_lease(PausePoint::Renaming, false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_republication_cancelled_at_its_rename_withdraws_the_existing_lease_with_its_store_dropped()
+     {
+        assert_a_cancelled_republication_withdraws_the_existing_lease(PausePoint::Renaming, true)
+            .await;
+    }
+
+    /// Cancelled before its transaction, while it still waits for the
+    /// registry: the existing lease is withdrawn just the same, and nothing
+    /// is written.
+    #[tokio::test]
+    async fn a_publication_cancelled_while_waiting_for_the_registry_withdraws_the_existing_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        let publisher = FileRemoteStore::new(paths.clone());
+        publisher.add(config("w1")).await.unwrap();
+        publisher
+            .publish_registered_status(&config("w1"), &status("w1"))
+            .await
+            .unwrap();
+        let snapshot = paths.remotes_dir().join("w1.json");
+        let published = std::fs::read(&snapshot).unwrap();
+        let holder = File::open(paths.remotes_path().with_extension("lock")).unwrap();
+        holder.lock().unwrap();
+        let (expected, online) = (config("w1"), status("w1"));
+        let mut publication = Box::pin(publisher.publish_registered_status(&expected, &online));
+        assert!(
+            poll_once(publication.as_mut()).await,
+            "a publication finished while the registry was held"
+        );
+        assert!(publisher.link_is_live("w1"));
+        drop(publication);
+        assert!(
+            !publisher.link_is_live("w1"),
+            "a publication cancelled before its transaction kept the existing lease"
+        );
+        holder.unlock().unwrap();
+        drop(holder);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), published);
+        assert!(temp_files(&paths).is_empty(), "{:?}", temp_files(&paths));
+        // The link reconnects normally once the registry is free again.
+        publisher
+            .publish_registered_status(&config("w1"), &status("w1"))
+            .await
+            .unwrap();
+        assert!(publisher.link_is_live("w1"));
+    }
+
+    /// An older publication's cancellation never withdraws a lease that a
+    /// newer operation on the same store took after it started, neither
+    /// while it waits for the registry nor at its rename.
+    #[tokio::test]
+    async fn an_older_cancelled_publication_keeps_a_newer_publishers_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        let publisher = FileRemoteStore::new(paths.clone());
+        publisher.add(config("w1")).await.unwrap();
+        let holder = File::open(paths.remotes_path().with_extension("lock")).unwrap();
+        holder.lock().unwrap();
+        let (expected, online) = (config("w1"), status("w1"));
+        let mut older = Box::pin(publisher.publish_registered_status(&expected, &online));
+        assert!(poll_once(older.as_mut()).await);
+        publisher.write_status(&status("w1")).await.unwrap();
+        drop(older);
+        assert!(
+            publisher.link_is_live("w1"),
+            "a publication cancelled in its registry wait withdrew a newer lease"
+        );
+        holder.unlock().unwrap();
+        drop(holder);
+
+        publisher.mark_link_offline("w1");
+        let (reached, release, finished) = publisher.pause_next_publication(PausePoint::Renaming);
+        let task = tokio::spawn({
+            let publisher = publisher.clone();
+            async move {
+                publisher
+                    .publish_registered_status(&config("w1"), &status("w1"))
+                    .await
+            }
+        });
+        signalled(reached, "older publication paused at its rename").await;
+        publisher.write_status(&status("w1")).await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            publisher.link_is_live("w1"),
+            "a publication cancelled at its rename withdrew a newer lease"
+        );
+        release.send(()).unwrap();
+        signalled(finished, "older publication finished").await;
+        assert!(publisher.link_is_live("w1"));
+    }
+
+    /// The same ownership holds for a revocation: a publication for a
+    /// replaced registration that ends after a newer operation took the
+    /// lease leaves that lease alone.
+    #[tokio::test]
+    async fn a_revoked_publication_keeps_a_lease_taken_after_it_started() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        let store = FileRemoteStore::new(paths.clone());
+        let old = config("w1");
+        store
+            .add(RemoteConfig {
+                addr: "127.0.0.1:7691".into(),
+                ..old.clone()
+            })
+            .await
+            .unwrap();
+        let holder = File::open(paths.remotes_path().with_extension("lock")).unwrap();
+        holder.lock().unwrap();
+        let online = status("w1");
+        let mut stale = Box::pin(store.publish_registered_status(&old, &online));
+        assert!(poll_once(stale.as_mut()).await);
+        store.write_status(&status("w1")).await.unwrap();
+        holder.unlock().unwrap();
+        drop(holder);
+        assert_eq!(stale.await.unwrap(), Publication::Revoked);
+        assert!(
+            store.link_is_live("w1"),
+            "a revoked older publication withdrew a newer lease"
+        );
+    }
+
+    /// A detached commit owns no lease: cancelling one link's publication
+    /// leaves the store's other links online, and dropping the last store
+    /// handle withdraws every lease even though that commit runs on.
+    #[tokio::test]
+    async fn a_detached_commit_neither_withdraws_nor_retains_another_links_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        let publisher = FileRemoteStore::new(paths.clone());
+        publisher.add(config("w1")).await.unwrap();
+        publisher.add(config("w2")).await.unwrap();
+        publisher
+            .publish_registered_status(&config("w2"), &status("w2"))
+            .await
+            .unwrap();
+        let (release, finished) =
+            cancel_an_online_republication(&publisher, PausePoint::Renaming).await;
+        let reader = FileRemoteStore::new(paths.clone());
+        assert!(!reader.link_is_live("w1"));
+        assert!(
+            reader.link_is_live("w2"),
+            "cancelling w1's publication withdrew w2's lease"
+        );
+        drop(publisher);
+        assert!(registry_is_locked(&paths));
+        assert!(
+            !reader.link_is_live("w2"),
+            "the detached commit kept a dropped store's leases alive"
+        );
+        release.send(()).unwrap();
+        signalled(finished, "detached commit finished").await;
+        assert!(!reader.link_is_live("w1") && !reader.link_is_live("w2"));
+    }
+
+    /// Code review I1: cancelled at its rename while its store lives on, the
+    /// committed snapshot lands, but the abandoned commit takes no lease.
+    #[tokio::test]
+    async fn a_publication_cancelled_at_its_rename_takes_no_late_lease_while_its_store_lives() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
+        let publisher = FileRemoteStore::new(paths.clone());
+        publisher.add(config("w1")).await.unwrap();
+        let (reached, release, finished) = publisher.pause_next_publication(PausePoint::Renaming);
+        let task = tokio::spawn({
+            let publisher = publisher.clone();
+            async move {
+                publisher
+                    .publish_registered_status(&config("w1"), &status("w1"))
+                    .await
+            }
+        });
+        signalled(reached, "publication paused at its rename").await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(registry_is_locked(&paths));
+        release.send(()).unwrap();
+        signalled(finished, "in-flight publication finished").await;
+        assert!(paths.remotes_dir().join("w1.json").exists());
+        assert!(
+            !publisher.link_is_live("w1"),
+            "a cancelled publication took a late lease while its store lived"
+        );
+        assert!(temp_files(&paths).is_empty(), "{:?}", temp_files(&paths));
     }
 }
