@@ -320,7 +320,9 @@ fn check_budget(files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
     Ok(())
 }
 fn directory(path: &Path) -> Result<()> {
-    let m = std::fs::symlink_metadata(path).map_err(|e| io(path, e))?;
+    // Trailing separators and dots must not make the no-follow check follow a link.
+    let normalized: PathBuf = path.components().collect();
+    let m = std::fs::symlink_metadata(&normalized).map_err(|e| io(path, e))?;
     if !m.is_dir() || m.file_type().is_symlink() {
         return Err(invalid(format!(
             "{}: expected directory without symlinks",

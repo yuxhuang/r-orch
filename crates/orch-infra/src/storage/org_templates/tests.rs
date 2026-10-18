@@ -411,3 +411,159 @@ fn snapshot_ignores_members_removed_after_directory_listing() {
         assert!(capture_member(member_dir, ext, entry).unwrap().is_none());
     }
 }
+
+#[cfg(unix)]
+fn write_root_fixture(root: &Path) {
+    std::fs::create_dir_all(root.join("agents")).unwrap();
+    std::fs::write(
+        root.join("org.yml"),
+        "schema_version: 1\nname: victim\nlead: lead\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("agents/lead.yml"),
+        "name: lead\nrole: Original instructions\n",
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn root_fixture_state(root: &Path) -> Vec<(Vec<u8>, std::time::SystemTime)> {
+    ["", "agents", "org.yml", "agents/lead.yml"]
+        .iter()
+        .map(|name| {
+            let path = root.join(name);
+            let metadata = std::fs::metadata(&path).unwrap();
+            let bytes = if metadata.is_file() {
+                std::fs::read(path).unwrap()
+            } else {
+                Vec::new()
+            };
+            (bytes, metadata.modified().unwrap())
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_symlink_root_suffixes_reject_reads_without_changing_victim() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    write_root_fixture(&victim);
+    let link = dir.path().join("root-link");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let before = root_fixture_state(&victim);
+    let mut results = Vec::new();
+    for suffix in ["", "/", "/.", "//", "/./"] {
+        let selected = PathBuf::from(format!("{}{suffix}", link.display()));
+        let result = load_directory(&selected, None).await;
+        results.push((
+            suffix,
+            result.is_err(),
+            root_fixture_state(&victim) == before,
+        ));
+    }
+    assert_eq!(
+        results,
+        vec![
+            ("", true, true),
+            ("/", true, true),
+            ("/.", true, true),
+            ("//", true, true),
+            ("/./", true, true)
+        ]
+    );
+    assert!(!victim.join(".template.lock").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_symlink_root_suffixes_reject_mutations_without_changing_victim() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    write_root_fixture(&victim);
+    let link = dir.path().join("root-link");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let before = root_fixture_state(&victim);
+    let mut results = Vec::new();
+    for suffix in ["", "/", "/.", "//", "/./"] {
+        let selected = PathBuf::from(format!("{}{suffix}", link.display()));
+        let result = mutate(
+            &selected,
+            None,
+            Target::Agent("lead".into()),
+            Mutation::Replace(b"name: lead\nrole: Changed via symlink\n".to_vec()),
+        )
+        .await;
+        results.push((
+            suffix,
+            result.is_err(),
+            root_fixture_state(&victim) == before,
+        ));
+    }
+    assert_eq!(
+        results,
+        vec![
+            ("", true, true),
+            ("/", true, true),
+            ("/.", true, true),
+            ("//", true, true),
+            ("/./", true, true)
+        ]
+    );
+    assert!(!victim.join(".template.lock").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn regular_root_suffixes_allow_reads_and_mutations_beneath_tmp_ancestor() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let root = dir.path().join("team");
+    write_root_fixture(&root);
+    for (index, suffix) in ["", "/", "/.", "//", "/./"].iter().enumerate() {
+        let selected = PathBuf::from(format!("{}{suffix}", root.display()));
+        assert_eq!(
+            load_directory(&selected, None).await.unwrap().org.name,
+            "victim"
+        );
+        let bytes = format!("name: lead\nrole: Revision {index}\n").into_bytes();
+        mutate(
+            &selected,
+            None,
+            Target::Agent("lead".into()),
+            Mutation::Replace(bytes.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(root.join("agents/lead.yml")).unwrap(), bytes);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_guard_preserves_parent_aliases_and_parent_components() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("team");
+    write_root_fixture(&root);
+    std::fs::create_dir(root.join("child")).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(root.join("child"), &alias).unwrap();
+    // Resolving alias/.. must reach team, not the lexical parent of alias.
+    let selected = alias.join("..").join(".");
+    assert_eq!(
+        load_directory(&selected, None).await.unwrap().org.name,
+        "victim"
+    );
+    mutate(
+        &selected,
+        None,
+        Target::Agent("lead".into()),
+        Mutation::Replace(b"name: lead\nrole: Via parent alias\n".to_vec()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(root.join("agents/lead.yml")).unwrap(),
+        b"name: lead\nrole: Via parent alias\n"
+    );
+}
