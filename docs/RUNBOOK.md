@@ -30,7 +30,6 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | A mirror on a worker sits `todo` for ever | [Mirrors left behind on a worker](#mirrors-left-behind-on-a-worker) |
 | Changing the peer protocol | [Peer protocol compatibility](#peer-protocol-compatibility) |
 | `orch agent shop` prints `Cancelled.` or a table instead of a picker | [The agent shop picker](#the-agent-shop-picker) |
-
 | `orch --json doctor` or `--yaml doctor` output will not parse | [Structured output for `doctor`, `logs --follow` and `serve`](#structured-output-for-doctor-logs---follow-and-serve) |
 
 ---
