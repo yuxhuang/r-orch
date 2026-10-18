@@ -61,6 +61,11 @@ serde_yaml_ng = "0.10"
 # handling. Safe Rust, no libyaml.
 saphyr-parser = "0.2"
 
+# ── Document mutation (ADR 0005) ───────────────────────────────────────────
+# RFC 7396 JSON Merge Patch for `orch ... patch --file` over serde_json::Value.
+# Default features (the RFC 6902 `diff` generator) are off: only `merge` is used.
+json-patch = { version = "4.2", default-features = false }
+
 # ── Templates (ARCHITECTURE §4.3) ──────────────────────────────────────────
 liquid = "0.26.11"
 

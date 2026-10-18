@@ -44,6 +44,8 @@ clap.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 indexmap.workspace = true
+# RFC 7396 merge for `patch --file` (ADR 0005); only `json_patch::merge` is used.
+json-patch.workspace = true
 # `logs` renders event times in the local zone, as `toLocaleTimeString` does.
 jiff.workspace = true
 nanoid.workspace = true
