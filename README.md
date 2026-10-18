@@ -219,14 +219,19 @@ The picker draws only when both stdin and stdout are terminals. Keys: `↑`/`↓
 wrap around the ends, `Enter` installs the highlighted template, `q`, `Esc` or `Ctrl-C` cancel. Each row is
 `Name — description [tier]`, cut to the terminal width with an ellipsis (description first, then the tier, then
 the name), and a list taller than the terminal shows its window as `1-7 of 15`. Resizing the terminal redraws
-the picker at the new size; a terminal too short for the blank lines drops them before it drops rows.
+the picker at the new size; a terminal too short for the blank lines drops them before it drops rows. This is
+the picker at 80x12:
 
 ```
   AGENT SHOP  — arrow keys to navigate, enter to select, q to cancel
 
   ▸ Backend Developer — APIs, databases, backend services [balanced]
-    Frontend Developer — React, UI components, CSS, respon… [balanced]
-    QA Engineer — Test writing, coverage analysis, quality… [balanced]
+    Frontend Developer — React, UI components, CSS, responsive design [balanced]
+    QA Engineer — Test writing, coverage analysis, quality assurance… [balanced]
+    Code Reviewer — PR review with auto-fix, adversarial review, secu… [capable]
+    Architect — System design, architecture decisions, tech leadership [capable]
+    DevOps Engineer — CI/CD, infrastructure, deployment, monitoring [balanced]
+    Bug Hunter — Systematic debugging, root cause analysis, minimal … [balanced]
 
   1-7 of 15
 ```
