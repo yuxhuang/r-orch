@@ -5,6 +5,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-18
+
+Command-line release: YAML output, file-based `update`/`patch`, and organization templates. No peer-protocol
+change, so 0.5.x through 0.8.0 peers can be mixed.
+
 ### Added
 - `--yaml`, a global flag beside `--json`: every command that prints JSON can print the same data as one YAML document with every key and string double-quoted. The two flags together are a usage error, and `--json` output is byte-for-byte unchanged.
 
@@ -134,7 +139,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/yuxhuang/r-orch/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/yuxhuang/r-orch/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/yuxhuang/r-orch/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/yuxhuang/r-orch/compare/v0.5.1...v0.5.2
