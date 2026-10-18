@@ -260,14 +260,14 @@ fn escape_at(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
     Some((code, at + 6))
 }
 
-/// Write data as YAML atomically, with the timestamp guard applied.
+/// Write owner-only YAML atomically, with the timestamp guard applied.
 ///
 /// `js-yaml.dump(data, { indent: 2, lineWidth: 120, noRefs: true,
 /// sortKeys: false })` is the reference. Emitted *bytes* are not contract
 /// (§1.4) — js-yaml folds long scalars with `>-` where `serde_yaml_ng` picks
 /// `|-` or a quoted style, and both round-trip to the same value (§6.4.1).
 pub async fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_yaml_with_mode(path, value, None).await
+    write_yaml_with_mode(path, value, owner_only()).await
 }
 
 /// `write_yaml`, with an explicit unix mode — see [`atomic_write_with_mode`].
@@ -584,6 +584,149 @@ pub async fn parse_yaml_bytes(path: &Path, content: &[u8]) -> Result<serde_yaml_
         Error::serde(format!("apply merge keys in {}", path.display()), path, err)
     })?;
     Ok(value)
+}
+
+/// Refuse definitions that the existing bounded entity reader could not reload.
+pub fn check_definition_write_size<T: serde::Serialize>(value: &T) -> Result<()> {
+    let raw = serde_yaml_ng::to_string(value)
+        .map_err(|_| Error::invalid_arguments("definition cannot be serialized"))?;
+    if quote_ambiguous_scalars(&raw).len() > MAX_YAML_READ_SIZE {
+        return Err(Error::invalid_arguments(
+            "persisted definition exceeds 1 MiB",
+        ));
+    }
+    Ok(())
+}
+
+/// Strict definition documents add JSON compatibility to the legacy guarded
+/// parser, without changing legacy config/entity reads.
+pub async fn parse_definition_yaml_bytes(path: &Path, content: &[u8]) -> Result<serde_json::Value> {
+    use saphyr_parser::{Event, Parser};
+    let invalid = |reason: &str| Error::invalid_arguments(format!("{}: {reason}", path.display()));
+    if content.len() > MAX_YAML_READ_SIZE {
+        return Err(invalid("document exceeds 1 MiB"));
+    }
+    let text = std::str::from_utf8(content).map_err(|_| invalid("expected UTF-8"))?;
+    let mut depth = 0usize;
+    let mut documents = 0usize;
+    for event in Parser::new_from_str(text) {
+        let (event, _) = event.map_err(|_| invalid("invalid YAML document"))?;
+        match event {
+            Event::DocumentStart(_) => {
+                documents += 1;
+                if documents > 1 {
+                    return Err(invalid("expected exactly one YAML document"));
+                }
+            }
+            Event::Scalar(_, _, _, Some(_)) => {
+                return Err(invalid("explicit YAML tags are not allowed"));
+            }
+            Event::SequenceStart(_, tag) | Event::MappingStart(_, tag) => {
+                if tag.is_some() {
+                    return Err(invalid("explicit YAML tags are not allowed"));
+                }
+                depth += 1;
+                if depth > 64 {
+                    return Err(invalid("document depth exceeds 64"));
+                }
+            }
+            Event::SequenceEnd | Event::MappingEnd => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let value = parse_yaml_bytes(path, content)
+        .await
+        .map_err(|_| invalid("invalid YAML (check duplicate keys and alias/node limits)"))?;
+    fn convert(
+        value: serde_yaml_ng::Value,
+        depth: usize,
+    ) -> std::result::Result<serde_json::Value, &'static str> {
+        use serde_json::Value as Json;
+        use serde_yaml_ng::Value as Yaml;
+        if depth > 64 {
+            return Err("document depth exceeds 64");
+        }
+        Ok(match value {
+            Yaml::Null => Json::Null,
+            Yaml::Bool(value) => Json::Bool(value),
+            Yaml::String(value) => Json::String(value),
+            Yaml::Number(value) => {
+                if let Some(n) = value.as_i64() {
+                    Json::from(n)
+                } else if let Some(n) = value.as_u64() {
+                    Json::from(n)
+                } else {
+                    Json::Number(
+                        serde_json::Number::from_f64(value.as_f64().ok_or("invalid number")?)
+                            .ok_or("nonfinite number")?,
+                    )
+                }
+            }
+            Yaml::Sequence(items) => Json::Array(
+                items
+                    .into_iter()
+                    .map(|v| convert(v, depth + 1))
+                    .collect::<std::result::Result<_, _>>()?,
+            ),
+            Yaml::Mapping(map) => {
+                let mut result = serde_json::Map::new();
+                for (key, value) in map {
+                    let Yaml::String(key) = key else {
+                        return Err("mapping keys must be strings");
+                    };
+                    result.insert(key, convert(value, depth + 1)?);
+                }
+                Json::Object(result)
+            }
+            Yaml::Tagged(_) => return Err("explicit YAML tags are not allowed"),
+        })
+    }
+    convert(value, 0).map_err(invalid)
+}
+
+/// Stable advisory lock for definition mutations. Old runtime/editor writers do
+/// not participate: this is serialization among the new mutation commands only.
+pub async fn mutation_lock(path: &Path) -> Result<std::fs::File> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|err| Error::io("open mutation lock", path, err))?;
+    if !file
+        .metadata()
+        .map_err(|err| Error::io("stat mutation lock", path, err))?
+        .is_file()
+    {
+        return Err(Error::invalid_arguments(
+            "mutation lock must be a regular file",
+        ));
+    }
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::io(
+                "mutation lock timed out after 5 s; retry",
+                path,
+                std::io::ErrorKind::TimedOut.into(),
+            ));
+        }
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(Error::io("acquire mutation lock", path, err));
+            }
+        }
+    }
 }
 
 async fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
@@ -2808,5 +2951,52 @@ mod worst_case_after_prepass {
                 t.elapsed()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod definition_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yaml_publication_is_owner_only_and_size_check_prevents_unreadable_entities() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.yml");
+        write_yaml(&path, &serde_json::json!({"title":"private"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            check_definition_write_size(&serde_json::json!({"role":"x".repeat(1024 * 1024)}))
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mutation_lock_times_out_and_is_released_by_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".definition.lock");
+        let first = mutation_lock(&path).await.unwrap();
+        let error = mutation_lock(&path).await.unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        drop(first);
+        let _next = mutation_lock(&path).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mutation_lock_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, "unchanged").unwrap();
+        let path = dir.path().join(".definition.lock");
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        assert!(mutation_lock(&path).await.is_err());
+        assert_eq!(std::fs::read_to_string(real).unwrap(), "unchanged");
     }
 }

@@ -78,6 +78,40 @@ pub async fn edit(engine: &Engine) -> Result<()> {
     crate::editor::edit_file(&engine.paths.config_path()).await
 }
 
+pub async fn mutate(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    args: &crate::tree::DefinitionInput,
+    kind: crate::document_input::MutationKind,
+) -> Result<()> {
+    use crate::document_input::{MutationKind, apply_mutation};
+    use orch_infra::storage::{FileConfigStore, fs_utils};
+    let input = crate::document_input::read_document(&args.file, args.input_format).await?;
+    let _lock = fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock"))
+        .await
+        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
+    let store = FileConfigStore::new(engine.paths.clone());
+    let current = store.read_raw().await?;
+    let candidate = apply_mutation(&current, &input, kind)
+        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
+    let complete = kind == MutationKind::Update;
+    orch_infra::storage::config::validate_raw_config(&candidate, complete)
+        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
+    if candidate != current {
+        store
+            .write_raw(&candidate, complete)
+            .await
+            .map_err(|err| crate::document_input::at_source(&args.file, err))?;
+    }
+    if let Some(format) = ctx.output {
+        format.print(&candidate)?;
+    } else {
+        print_success(styles, "Updated project configuration");
+    }
+    Ok(())
+}
+
 /// The two keys `config global get`/`set` understand.
 fn global_value(config: &GlobalConfig, key: &str) -> Option<Value> {
     match key {

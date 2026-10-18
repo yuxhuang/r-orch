@@ -342,6 +342,162 @@ pub async fn edit(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
     Ok(())
 }
 
+const WRITABLE: &[&str] = &["name", "adapter", "role", "config"];
+const READONLY: &[&str] = &[
+    "id",
+    "status",
+    "current_task",
+    "autonomous",
+    "stats",
+    "last_error",
+    "capabilities",
+    "remote",
+];
+const CONFIG_FIELDS: &[&str] = &[
+    "command",
+    "model",
+    "effort",
+    "approval_policy",
+    "max_turns",
+    "timeout_ms",
+    "stall_timeout_ms",
+    "env",
+    "system_prompt",
+    "workspace_mode",
+    "skills",
+];
+
+fn definition_candidate(
+    current: &serde_json::Value,
+    input: &serde_json::Value,
+    kind: crate::document_input::MutationKind,
+) -> Result<serde_json::Value> {
+    use crate::document_input::{MutationKind, apply_mutation, reject_nulls, writable_input};
+    use orch_core::Error;
+    let input = writable_input(input, current, WRITABLE, READONLY, kind)?;
+    // Check keys before merge: an unknown null would otherwise disappear.
+    if let Some(config) = input.get("config").and_then(|v| v.as_object()) {
+        for key in config.keys() {
+            if !CONFIG_FIELDS.contains(&key.as_str()) {
+                return Err(Error::invalid_arguments(format!(
+                    "config.{key}: unknown field"
+                )));
+            }
+        }
+    }
+    let base = serde_json::Value::Object(
+        current
+            .as_object()
+            .expect("serialized agent")
+            .iter()
+            .filter(|(key, _)| WRITABLE.contains(&key.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
+    if kind == MutationKind::Update {
+        reject_nulls(&input, "agent")?;
+    }
+    let candidate = apply_mutation(&base, &input, kind)?;
+    reject_nulls(&candidate, "agent")?;
+    for field in ["name", "adapter"] {
+        if !candidate
+            .get(field)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Err(Error::invalid_arguments(format!(
+                "{field}: required nonblank string"
+            )));
+        }
+    }
+    if candidate.get("role").is_some_and(|v| !v.is_string()) {
+        return Err(Error::invalid_arguments("role: expected a string"));
+    }
+    let config = candidate
+        .get("config")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| Error::invalid_arguments("config: required object"))?;
+    for (field, value) in config {
+        let mut single = serde_json::Map::new();
+        single.insert(field.clone(), value.clone());
+        serde_json::from_value::<orch_domain::AgentConfig>(single.into()).map_err(|_| {
+            Error::invalid_arguments(format!("config.{field}: invalid field type or enum"))
+        })?;
+    }
+    Ok(candidate)
+}
+
+pub async fn mutate(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    args: &crate::tree::EntityDefinitionInput,
+    kind: crate::document_input::MutationKind,
+) -> Result<()> {
+    use orch_core::Error;
+    use orch_infra::storage::fs_utils::mutation_lock;
+    let input =
+        crate::document_input::read_document(&args.input.file, args.input.input_format).await?;
+    if args.id.contains('@') {
+        return Err(crate::document_input::at_source(
+            &args.input.file,
+            Error::invalid_arguments("id: remote agents cannot be mutated"),
+        ));
+    }
+    // One stable project lock also serializes duplicate-name validation between
+    // new agent mutations. Existing edit/runtime writes retain their old race.
+    let _lock = mutation_lock(&engine.paths.root().join(".definition.lock"))
+        .await
+        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+    let current = engine.agent_service.get(&args.id).await?;
+    let value = serde_json::to_value(&current).map_err(|_| Error::other("serialize agent"))?;
+    let candidate = definition_candidate(&value, &input, kind)
+        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+    let config: orch_domain::AgentConfig = serde_json::from_value(candidate["config"].clone())
+        .map_err(|_| Error::invalid_arguments("config: invalid definition"))?;
+    let mut authored = current.clone();
+    authored.name = candidate["name"].as_str().expect("validated").to_owned();
+    authored.adapter = candidate["adapter"].as_str().expect("validated").to_owned();
+    authored.role = candidate
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    authored.config = config.clone();
+    // Serialization belongs to the CLI/infra boundary, not AgentService. The
+    // service re-reads runtime state before saving; legacy writers may still race.
+    orch_infra::storage::fs_utils::check_definition_write_size(&authored)
+        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+    let updated = engine
+        .agent_service
+        .replace_definition(
+            &args.id,
+            candidate["name"].as_str().expect("validated").to_owned(),
+            candidate["adapter"].as_str().expect("validated").to_owned(),
+            candidate
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            config,
+        )
+        .await
+        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+    if let Some(format) = ctx.output {
+        format.print(&updated)?;
+    } else if ctx.quiet {
+        println!("{}", updated.id);
+    } else {
+        print_success(
+            styles,
+            &format!(
+                "Updated agent {} ({})",
+                styles.agent_name(&updated.name),
+                updated.id
+            ),
+        );
+    }
+    Ok(())
+}
+
 /// `orch agent remove`. Ignores `--json` and `--quiet`.
 pub async fn remove(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
     engine.agent_service.remove(id).await?;
@@ -530,5 +686,45 @@ mod tests {
         .expect_err("rejected");
         assert_eq!(err.to_string(), "Shell agents require a command");
         assert_eq!(err.exit_code(), 2);
+    }
+}
+
+#[cfg(test)]
+mod definition_tests {
+    use super::*;
+    use crate::document_input::MutationKind;
+    use serde_json::json;
+    #[test]
+    fn definition_projection_checks_unknown_null_and_equal_readonly_echoes() {
+        let current = json!({"id":"agt_1", "status":"idle", "name":"old", "adapter":"codex", "config":{"model":"old"}, "role":"old"});
+        let update = json!({"id":"agt_1", "name":"new", "adapter":"codex", "config":{}});
+        let value = definition_candidate(&current, &update, MutationKind::Update).unwrap();
+        assert!(value.get("role").is_none());
+        assert!(value.get("id").is_none());
+        for bad in [
+            json!({"id":"agt_1"}),
+            json!({"config":{"typo":null}}),
+            json!({"typo":null}),
+        ] {
+            assert!(definition_candidate(&current, &bad, MutationKind::Patch).is_err());
+        }
+        assert!(
+            definition_candidate(
+                &current,
+                &json!({"config":{"model":null}}),
+                MutationKind::Patch
+            )
+            .unwrap()["config"]
+                .get("model")
+                .is_none()
+        );
+        assert!(
+            definition_candidate(
+                &current,
+                &json!({"name":"n", "adapter":"a", "config":{"model":null}}),
+                MutationKind::Update
+            )
+            .is_err()
+        );
     }
 }
