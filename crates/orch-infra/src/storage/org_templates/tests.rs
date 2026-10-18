@@ -216,6 +216,153 @@ async fn root_repair_preserves_parseable_identity_and_schema() {
 }
 
 #[tokio::test]
+async fn full_root_update_repairs_missing_name_with_user_key() {
+    assert_missing_root_identity_repaired("name", Some("a-team")).await;
+}
+
+#[tokio::test]
+async fn full_root_update_repairs_missing_name_with_explicit_directory() {
+    assert_missing_root_identity_repaired("name", None).await;
+}
+
+#[tokio::test]
+async fn full_root_update_repairs_missing_schema_with_user_key() {
+    assert_missing_root_identity_repaired("schema_version", Some("a-team")).await;
+}
+
+#[tokio::test]
+async fn full_root_update_repairs_missing_schema_with_explicit_directory() {
+    assert_missing_root_identity_repaired("schema_version", None).await;
+}
+
+async fn assert_missing_root_identity_repaired(field: &str, expected: Option<&str>) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("team");
+    let bundle = builtin("a-team").await.unwrap();
+    init_bundle(&root, &bundle).await.unwrap();
+    let path = root.join("org.yml");
+    let replacement = std::fs::read(&path).unwrap();
+    let mut old = serde_json::to_value(&bundle.org).unwrap();
+    old.as_object_mut().unwrap().remove(field);
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let mut retained = RawSnapshot::capture(&root).unwrap().files;
+    retained.remove("org.yml");
+    let modified: Vec<_> = retained
+        .keys()
+        .map(|file| {
+            std::fs::metadata(root.join(file))
+                .unwrap()
+                .modified()
+                .unwrap()
+        })
+        .collect();
+
+    mutate(
+        &root,
+        expected,
+        Target::Org,
+        Mutation::Replace(replacement.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+    let repaired = load_directory(&root, expected).await.unwrap();
+    assert_eq!(repaired.org.name, "a-team");
+    assert_eq!(repaired.org.schema_version, 1);
+    let mut after = RawSnapshot::capture(&root).unwrap().files;
+    after.remove("org.yml");
+    assert_eq!(after, retained);
+    for (file, before) in retained.keys().zip(modified) {
+        assert_eq!(
+            std::fs::metadata(root.join(file))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before,
+            "{file} was rewritten"
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_root_identity_does_not_allow_changing_present_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("team");
+    let bundle = builtin("a-team").await.unwrap();
+    init_bundle(&root, &bundle).await.unwrap();
+    let path = root.join("org.yml");
+    let replacement = std::fs::read(&path).unwrap();
+    for (missing, present, value) in [
+        ("name", "schema_version", serde_json::json!(2)),
+        ("name", "schema_version", Value::Null),
+        ("schema_version", "name", serde_json::json!("different")),
+        ("schema_version", "name", Value::Null),
+    ] {
+        let mut old = serde_json::to_value(&bundle.org).unwrap();
+        old.as_object_mut().unwrap().remove(missing);
+        old[present] = value;
+        let before = serde_json::to_vec(&old).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let err = mutate(
+            &root,
+            None,
+            Target::Org,
+            Mutation::Replace(replacement.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("is immutable"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn missing_root_name_repair_still_requires_user_directory_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("team");
+    let bundle = builtin("a-team").await.unwrap();
+    init_bundle(&root, &bundle).await.unwrap();
+    let path = root.join("org.yml");
+    let mut old = serde_json::to_value(&bundle.org).unwrap();
+    old.as_object_mut().unwrap().remove("name");
+    let before = serde_json::to_vec(&old).unwrap();
+    std::fs::write(&path, &before).unwrap();
+    let mut replacement = bundle.org;
+    replacement.name = "different".into();
+    let err = mutate(
+        &root,
+        Some("a-team"),
+        Target::Org,
+        Mutation::Replace(serde_json::to_vec(&replacement).unwrap()),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("user directory key"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn missing_root_schema_repair_rejects_retained_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("team");
+    let bundle = builtin("a-team").await.unwrap();
+    init_bundle(&root, &bundle).await.unwrap();
+    let path = root.join("org.yml");
+    let replacement = std::fs::read(&path).unwrap();
+    let mut old = serde_json::to_value(&bundle.org).unwrap();
+    old.as_object_mut().unwrap().remove("schema_version");
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    std::fs::write(root.join("agents/backend-eng.yml"), "broken: [").unwrap();
+    let before = RawSnapshot::capture(&root).unwrap().files;
+    let err = mutate(&root, None, Target::Org, Mutation::Replace(replacement))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("agents/backend-eng.yml"));
+    assert_eq!(RawSnapshot::capture(&root).unwrap().files, before);
+}
+
+#[tokio::test]
 async fn delete_refuses_lead_and_init_never_overwrites_an_existing_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("team");
