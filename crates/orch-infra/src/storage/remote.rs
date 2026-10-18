@@ -2384,8 +2384,8 @@ mod tests {
     }
 
     /// An older publication's cancellation never withdraws a lease that a
-    /// newer operation on the same store took after it started, neither
-    /// while it waits for the registry nor at its rename.
+    /// newer operation on the same store took or renewed after it started,
+    /// neither while it waits for the registry nor at its rename.
     #[tokio::test]
     async fn an_older_cancelled_publication_keeps_a_newer_publishers_lease() {
         let temp = tempfile::tempdir().unwrap();
@@ -2393,6 +2393,11 @@ mod tests {
         assert!(acquire_lock(&paths.lock_path()).await.unwrap().acquired);
         let publisher = FileRemoteStore::new(paths.clone());
         publisher.add(config("w1")).await.unwrap();
+        // A lease older than both, which the newer write renews.
+        publisher
+            .publish_registered_status(&config("w1"), &status("w1"))
+            .await
+            .unwrap();
         let holder = File::open(paths.remotes_path().with_extension("lock")).unwrap();
         holder.lock().unwrap();
         let (expected, online) = (config("w1"), status("w1"));
