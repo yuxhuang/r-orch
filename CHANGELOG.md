@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Fixed
+- A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
+
 ## [0.8.0] - 2026-10-18
 
 Command-line release: YAML output, file-based `update`/`patch`, and organization templates. No peer-protocol

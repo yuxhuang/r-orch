@@ -71,7 +71,10 @@ liquid = "0.26.11"
 
 # ── TUI (ARCHITECTURE §4.4) ────────────────────────────────────────────────
 ratatui = "0.30"
-crossterm = "0.29"
+# `use-dev-tty` selects crossterm's level-triggered `poll(2)` event source. The default mio source is
+# edge-triggered and, when one wakeup reports both the tty and SIGWINCH, returns the first event and drops
+# the other readiness, so a key pressed during a resize stays unread until the next key.
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 # ARCHITECTURE §4.8 library-first, for the multi-line wizard textarea step
 # (buffer, undo, word motions, soft wrapping, line numbers). This is the
 # maintained ratatui-0.30 fork of `tui-textarea`, whose own 0.7.0 is pinned to
