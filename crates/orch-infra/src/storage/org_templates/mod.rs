@@ -562,15 +562,18 @@ impl LockedTemplate {
         }
         let bundle = candidate.validate(self.expected.as_deref()).await?;
         if matches!(target, Target::Org) {
-            // Bounded malformed roots can be repaired. Parseable identity and
-            // schema, including an unsupported schema, are never changed.
+            // Bounded malformed roots can be repaired. Present identity and
+            // schema, including null or an unsupported schema, are never changed.
             if let Some(bytes) = old
                 && let Ok(value) = parse_document_inner(Path::new("org.yml"), bytes, true).await
             {
                 let next =
                     parse_document(Path::new("org.yml"), &candidate.files["org.yml"]).await?;
                 for field in ["name", "schema_version"] {
-                    if value.get(field) != next.get(field) {
+                    if value
+                        .get(field)
+                        .is_some_and(|old| next.get(field) != Some(old))
+                    {
                         return Err(invalid(format!("{field} is immutable")));
                     }
                 }
