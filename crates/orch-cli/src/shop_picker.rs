@@ -13,10 +13,22 @@ use orch_domain::AgentShopTemplate;
 use orch_tui::format::cap_display;
 use orch_tui::text::text_display_width;
 
-/// The heading line, and the one used when it does not fit: the keys are
-/// the part a narrow terminal must not lose.
+/// The heading line, then the shorter lines used when it does not fit: the
+/// keys are the part a narrow terminal must not lose. The compact line keeps
+/// every key (move, select, cancel) and drops only the verbs.
 const HEADING: &str = "  AGENT SHOP  — arrow keys to navigate, enter to select, q to cancel";
 const HEADING_SHORT: &str = "  AGENT SHOP  ↑↓ move · enter select · q cancel";
+const HEADING_COMPACT: &str = "  AGENT SHOP  ↑↓ Enter q";
+
+/// The widest heading that fits `width` columns. Below the compact line's
+/// width the compact line is cut with an ellipsis, like every other line.
+fn heading(width: usize) -> String {
+    let fitting = [HEADING, HEADING_SHORT]
+        .into_iter()
+        .find(|heading| text_display_width(heading) <= width)
+        .unwrap_or(HEADING_COMPACT);
+    cap_display(fitting, width)
+}
 
 /// The selection cursor and the blank gutter of the other rows; both four
 /// columns wide.
@@ -199,12 +211,7 @@ impl Picker {
         if layout.blanks {
             lines.push(String::new());
         }
-        let heading = if text_display_width(HEADING) <= width {
-            HEADING
-        } else {
-            HEADING_SHORT
-        };
-        lines.push(cap_display(heading, width));
+        lines.push(heading(width));
         if layout.blanks {
             lines.push(String::new());
         }
@@ -715,5 +722,148 @@ mod tests {
     #[test]
     fn a_non_tty_stdin_cancels_immediately() {
         assert!(pick_from_shop(&AGENT_SHOP_TEMPLATES, false).is_none());
+    }
+
+    fn heading_row(frame: &[String]) -> &str {
+        frame
+            .iter()
+            .find(|line| line.starts_with("  AGENT SHOP"))
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("heading missing: {frame:#?}"))
+    }
+
+    /// Every primary key is shown whole: both arrows, Enter and a separate
+    /// q, none of them replaced by an ellipsis. The full heading names the
+    /// arrows in words; every shorter heading draws them.
+    fn assert_every_key_visible(heading: &str, width: usize) {
+        let tokens: Vec<String> = heading
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '·' | '—'))
+            .filter(|token| !token.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        let glyphs = heading.contains('↑') && heading.contains('↓');
+        let arrows = if width < text_display_width(HEADING) {
+            glyphs
+        } else {
+            glyphs || heading.contains("arrow keys")
+        };
+        assert!(heading.starts_with("  AGENT SHOP"), "{width}: {heading:?}");
+        assert!(arrows, "{width}: arrows missing: {heading:?}");
+        assert!(
+            tokens.iter().any(|token| token == "enter"),
+            "{width}: Enter missing: {heading:?}"
+        );
+        assert!(
+            tokens.iter().any(|token| token == "q"),
+            "{width}: q missing: {heading:?}"
+        );
+        assert!(!heading.contains('…'), "{width}: cut: {heading:?}");
+        assert!(text_display_width(heading) <= width, "{width}: {heading:?}");
+    }
+
+    fn assert_keys_survive(templates: &[AgentShopTemplate]) {
+        for cols in 30u16..=200 {
+            for rows in [5u16, 10, 24] {
+                let picker = Picker::new(templates.len(), cols, rows);
+                let frame = picker.frame(templates);
+                assert_every_key_visible(heading_row(&frame), usize::from(cols));
+                assert_eq!(frame.len(), picker.layout().height());
+                assert!(
+                    frame.len() <= usize::from(rows),
+                    "{cols}x{rows}: {frame:#?}"
+                );
+                assert!(
+                    frame
+                        .iter()
+                        .all(|line| text_display_width(line) <= usize::from(cols)),
+                    "{cols}x{rows}: {frame:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_key_survives_from_thirty_columns_up_in_the_legacy_shop() {
+        assert_keys_survive(&AGENT_SHOP_TEMPLATES);
+    }
+
+    #[test]
+    fn every_key_survives_from_thirty_columns_up_with_hostile_templates() {
+        assert_keys_survive(&HOSTILE);
+    }
+
+    #[test]
+    fn the_widest_heading_that_fits_is_chosen_at_each_threshold() {
+        let full = text_display_width(HEADING);
+        let short = text_display_width(HEADING_SHORT);
+        let compact = text_display_width(HEADING_COMPACT);
+        assert!(compact <= 30 && compact < short && short < full);
+        for (cols, expected) in [
+            (120, HEADING),
+            (80, HEADING),
+            (full, HEADING),
+            (full - 1, HEADING_SHORT),
+            (60, HEADING_SHORT),
+            (short, HEADING_SHORT),
+            (short - 1, HEADING_COMPACT),
+            (40, HEADING_COMPACT),
+            (30, HEADING_COMPACT),
+            (compact, HEADING_COMPACT),
+        ] {
+            let cols = u16::try_from(cols).unwrap();
+            let frame =
+                Picker::new(AGENT_SHOP_TEMPLATES.len(), cols, 24).frame(&AGENT_SHOP_TEMPLATES);
+            assert_eq!(frame[1], expected, "{cols} columns");
+        }
+    }
+
+    #[test]
+    fn below_the_compact_width_the_heading_is_cut_and_never_wider() {
+        let compact = text_display_width(HEADING_COMPACT);
+        for cols in [0, 1, 20, 29, compact - 1, compact, compact + 1] {
+            for rows in [0u16, 1, 5, 10] {
+                let cols16 = u16::try_from(cols).unwrap();
+                let frame = Picker::new(HOSTILE.len(), cols16, rows).frame(&HOSTILE);
+                assert!(
+                    frame.iter().all(|line| text_display_width(line) <= cols),
+                    "{cols}x{rows}: {frame:#?}"
+                );
+                let heading =
+                    &frame[usize::from(Picker::new(HOSTILE.len(), cols16, rows).layout().blanks)];
+                if cols < compact {
+                    assert_eq!(*heading, cap_display(HEADING_COMPACT, cols), "{cols}");
+                } else {
+                    assert_eq!(heading, HEADING_COMPACT, "{cols}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_resize_with_a_keypress_redraws_the_heading_and_keeps_the_selection() {
+        let mut picker = Picker::new(AGENT_SHOP_TEMPLATES.len(), 80, 24);
+        assert_eq!(heading_row(&picker.frame(&AGENT_SHOP_TEMPLATES)), HEADING);
+
+        // The resize and Ctrl-N arrive together; the next frame uses both.
+        picker.resize(40, 10);
+        assert_eq!(picker.on_key(PickerKey::Down), PickerAction::Redraw);
+        let frame = picker.frame(&AGENT_SHOP_TEMPLATES);
+        assert_eq!(heading_row(&frame), HEADING_COMPACT);
+        assert_eq!(frame.len(), 10, "{frame:#?}");
+        assert_eq!(picker.selected(), 1);
+
+        picker.resize(30, 5);
+        let frame = picker.frame(&AGENT_SHOP_TEMPLATES);
+        assert_every_key_visible(heading_row(&frame), 30);
+        assert_eq!(frame.len(), 5, "{frame:#?}");
+        let marked = frame.iter().find(|line| line.starts_with(CURSOR)).unwrap();
+        assert!(
+            marked.contains(AGENT_SHOP_TEMPLATES[1].name.split(' ').next().unwrap()),
+            "{marked:?}"
+        );
+
+        picker.resize(80, 24);
+        assert_eq!(heading_row(&picker.frame(&AGENT_SHOP_TEMPLATES)), HEADING);
+        assert_eq!(picker.on_key(PickerKey::Enter), PickerAction::Selected(1));
     }
 }
