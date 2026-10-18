@@ -1240,7 +1240,7 @@ mod tests {
     /// pin this link. Every write is bounded by the codec's own 5s budget and
     /// the session's 15s heartbeat ends it, so the alias goes offline and the
     /// supervisor can redial.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_silent_peer_ends_the_session_and_takes_the_alias_offline() {
         let (_temp, ctx) = controller().await;
         let hub = Arc::new(LinkHub::new(ctx.engine.messages.clone()));
