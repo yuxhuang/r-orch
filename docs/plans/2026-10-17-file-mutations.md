@@ -51,7 +51,9 @@ Rejected: bespoke recursive patching, RFC 6902 operations, overwriting a deseria
 | Item | State (implemented / verified on platform / pending) |
 |---|---|
 | H0 | Mechanical seam implementation; exact verification and commit recorded in the engineering handoff |
-| H0D / U1 / UTT / P2 / W1 | Pending; no implementation is claimed by this plan |
+| H0D | Dependency pinned and verified on macOS; accepted adoption ADR 0005 |
+| U1 | Live definitions and shared input implemented; macOS verification recorded in the engineering handoff; independent UTT/reviews pending |
+| UTT / P2 / W1 | Pending; no completion is claimed by this plan |
 
 ## Test plan
 Use disposable projects and homes for test executables, isolated global config, shell/stub adapters and no real AI CLIs. Build tools retain their real HOME with an isolated CARGO_TARGET_DIR. Verify JSON/YAML input and stdin, parser budgets, malformed/duplicate/tagged/multiple documents, exact immutable fields, unknown-null rejection, optional clearing, null removal, array replacement, empty patches, raw extension preservation, running/remote guards, lock timeouts and write failures. Check existing JSON bytes, YAML equivalence, routing guards and legacy shop behavior. New behavior tests must fail when the change is reverted.

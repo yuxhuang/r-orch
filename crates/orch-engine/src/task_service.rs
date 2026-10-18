@@ -305,7 +305,51 @@ impl TaskService {
     }
 
     pub async fn update(&self, id: &str, fields: UpdateTaskFields) -> Result<Task> {
+        self.update_fields(id, fields, false).await
+    }
+
+    /// File mutations use the same validation/store path, with authority guards
+    /// and no-op detection at its final live read. Attachments are not writable.
+    pub async fn update_definition(&self, id: &str, fields: UpdateTaskFields) -> Result<Task> {
+        if fields.attachments.is_some() {
+            return Err(Error::invalid_arguments("attachments: read-only field"));
+        }
+        self.update_fields(id, fields, true).await
+    }
+
+    async fn update_fields(
+        &self,
+        id: &str,
+        fields: UpdateTaskFields,
+        definition: bool,
+    ) -> Result<Task> {
         let mut task = self.get(id).await?;
+        if definition
+            && (task.status == TaskStatus::InProgress
+                || task.labels.iter().any(|l| l.starts_with("remote-ctl:")))
+        {
+            return Err(Error::invalid_arguments(
+                "cannot mutate a running or remote-controlled task definition",
+            ));
+        }
+        if definition
+            && fields
+                .title
+                .as_ref()
+                .is_none_or(|value| value == &task.title)
+            && fields
+                .description
+                .as_ref()
+                .is_none_or(|value| value == &task.description)
+            && fields.priority.is_none_or(|value| value == task.priority)
+            && fields
+                .labels
+                .as_ref()
+                .is_none_or(|value| value == &task.labels)
+        {
+            return Ok(task);
+        }
+        let before = definition.then(|| task.clone());
 
         if let Some(title) = fields.title.as_deref() {
             if title.trim().is_empty() {
@@ -344,6 +388,12 @@ impl TaskService {
             task.attachments = Some(existing);
         }
 
+        if before.as_ref() == Some(&task) {
+            return Ok(task);
+        }
+        if definition {
+            fs_utils::check_definition_write_size(&task)?;
+        }
         task.updated_at = self.clock.now_iso();
         self.tasks.save(&task).await?;
         Ok(task)
@@ -533,6 +583,52 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         fs_utils::clear_ensured_dirs();
         build(vec![], vec![], Some(temp))
+    }
+
+    #[tokio::test]
+    async fn definition_update_refuses_running_and_remote_tasks_and_preserves_noop_timestamp() {
+        let mut before = make_task();
+        before.description = "  imported body  ".into();
+        let h = seeded(vec![before.clone()]);
+        let after = h
+            .service
+            .update_definition(
+                &before.id,
+                UpdateTaskFields {
+                    title: Some(before.title.clone()),
+                    description: Some(before.description.clone()),
+                    priority: Some(before.priority),
+                    labels: Some(before.labels.clone()),
+                    attachments: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        assert!(h.tasks.saved().is_empty(), "no-op must not save");
+        for remote in [false, true] {
+            let mut before = make_task();
+            if remote {
+                before.labels.push("remote-ctl:controller".into());
+            } else {
+                before.status = TaskStatus::InProgress;
+            }
+            let h = seeded(vec![before.clone()]);
+            assert!(
+                h.service
+                    .update_definition(
+                        &before.id,
+                        UpdateTaskFields {
+                            title: Some("changed".into()),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(h.service.get(&before.id).await.unwrap(), before);
+            assert!(h.tasks.saved().is_empty());
+        }
     }
 
     fn path_str(path: &Path) -> String {

@@ -49,11 +49,135 @@ impl FileConfigStore {
         Ok(deep_merge(&defaults, &on_disk))
     }
 
+    /// Exact authoring data, without materializing defaults or dropping extensions.
+    pub async fn read_raw(&self) -> Result<Value> {
+        use tokio::io::AsyncReadExt;
+        let path = self.paths.config_path();
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(serde_json::json!({}));
+            }
+            Err(err) => return Err(Error::io("read raw config", &path, err)),
+        };
+        let mut bytes = Vec::new();
+        file.take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|err| Error::io("read raw config", &path, err))?;
+        let value = super::fs_utils::parse_definition_yaml_bytes(&path, &bytes).await?;
+        if !value.is_object() {
+            return Err(Error::invalid_arguments("config: expected an object"));
+        }
+        Ok(value)
+    }
+
+    /// Validate the effective known configuration but persist the raw candidate.
+    /// The caller holds the definition lock across its read/merge/write operation.
+    pub async fn write_raw(&self, value: &Value, complete: bool) -> Result<()> {
+        validate_raw_config(value, complete)?;
+        super::fs_utils::check_definition_write_size(value)?;
+        self.write_merged(value).await
+    }
+
     async fn write_merged(&self, value: &Value) -> Result<()> {
         // Owner-only: this file carries adapter commands and the names of the
         // environment variables holding API keys (security review C3).
         write_yaml_with_mode(&self.paths.config_path(), value, owner_only()).await
     }
+}
+
+/// Present known fields must be well-typed, even where defaults or Option could
+/// otherwise hide nulls. Unknown extension keys (including literal nulls) survive.
+pub fn validate_raw_config(value: &Value, complete: bool) -> Result<()> {
+    if !value.is_object() {
+        return Err(Error::invalid_arguments("config: expected an object"));
+    }
+    let defaults =
+        serde_json::to_value(default_config()).map_err(|_| Error::other("serialize defaults"))?;
+    fn check_present(value: &Value, schema: &Value, path: &str, complete: bool) -> Result<()> {
+        if schema.is_object() {
+            let map = value
+                .as_object()
+                .ok_or_else(|| Error::invalid_arguments(format!("{path}: expected an object")))?;
+            for (key, expected) in schema.as_object().expect("object") {
+                if let Some(present) = map.get(key) {
+                    check_present(present, expected, &format!("{path}.{key}"), complete)?;
+                } else if complete {
+                    return Err(Error::invalid_arguments(format!(
+                        "{path}.{key}: required field"
+                    )));
+                }
+            }
+        } else {
+            let valid = match schema {
+                Value::String(_) => value.is_string(),
+                Value::Number(_) => value.as_u64().is_some(),
+                _ => false,
+            };
+            if !valid {
+                return Err(Error::invalid_arguments(format!(
+                    "{path}: invalid field type"
+                )));
+            }
+        }
+        Ok(())
+    }
+    check_present(value, &defaults, "config", complete)?;
+    for (section, fields) in [
+        ("project", &["description"][..]),
+        (
+            "prompt",
+            &["template", "system_template", "user_template"][..],
+        ),
+        ("peer", &["name", "listen"][..]),
+    ] {
+        if let Some(present) = value.get(section) {
+            let map = present.as_object().ok_or_else(|| {
+                Error::invalid_arguments(format!("config.{section}: expected an object"))
+            })?;
+            for field in fields {
+                if map.get(*field).is_some_and(|v| !v.is_string()) {
+                    return Err(Error::invalid_arguments(format!(
+                        "config.{section}.{field}: expected a string"
+                    )));
+                }
+            }
+        }
+    }
+    let effective = deep_merge(&defaults, value);
+    let config: OrchestratorConfig =
+        serde_json::from_value(if complete { value.clone() } else { effective }).map_err(|_| {
+            Error::invalid_arguments(
+                "config: missing required field or invalid known field type/enum",
+            )
+        })?;
+    if config.project.name.trim().is_empty() || config.defaults.agent.adapter.trim().is_empty() {
+        return Err(Error::invalid_arguments(
+            "config.project.name/defaults.agent.adapter: cannot be blank",
+        ));
+    }
+    let agent = &config.defaults.agent;
+    let scheduling = &config.scheduling;
+    if agent.max_turns == 0
+        || agent.timeout_ms == 0
+        || agent.stall_timeout_ms == 0
+        || config.defaults.task.max_attempts == 0
+        || scheduling.max_concurrent_agents == 0
+        || scheduling.poll_interval_ms == 0
+        || scheduling.retry_base_delay_ms == 0
+        || scheduling.retry_max_delay_ms == 0
+    {
+        return Err(Error::invalid_arguments(
+            "config: runtime limits and concurrency must be positive",
+        ));
+    }
+    if !(1..=4).contains(&config.defaults.task.priority) {
+        return Err(Error::invalid_arguments(
+            "config.defaults.task.priority: expected integer between 1 and 4",
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -88,6 +212,33 @@ mod tests {
     use crate::storage::fs_utils::{atomic_write, clear_ensured_dirs, ensure_dir};
     use orch_domain::{ApprovalPolicy, WorkspaceMode};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn raw_mutations_preserve_extensions_and_restore_deleted_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store(temp.path()).await;
+        let raw = json!({"project":{"name":"custom"}, "extension":{"null":null,"values":[1,2]}});
+        store.write_raw(&raw, false).await.unwrap();
+        assert_eq!(store.read_raw().await.unwrap(), raw);
+        assert_eq!(
+            store.read().await.unwrap().scheduling,
+            default_config().scheduling
+        );
+        assert!(
+            store
+                .write_raw(&json!({"scheduling":{"max_concurrent_agents":0}}), false)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .write_raw(&json!({"project":{"description":null}}), false)
+                .await
+                .is_err()
+        );
+        assert!(store.write_raw(&json!({}), true).await.is_err());
+        assert_eq!(store.read_raw().await.unwrap(), raw);
+    }
 
     async fn store(root: &std::path::Path) -> FileConfigStore {
         clear_ensured_dirs();

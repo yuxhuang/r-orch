@@ -249,6 +249,10 @@ pub enum TaskSub {
         #[arg(value_name = "id")]
         id: String,
     },
+    /// Replace an authored definition from JSON or YAML
+    Update(EntityDefinitionInput),
+    /// Apply an RFC 7396 merge patch from JSON or YAML
+    Patch(EntityDefinitionInput),
     /// Assign task to agent
     Assign {
         #[arg(value_name = "task-id")]
@@ -372,6 +376,10 @@ pub enum AgentSub {
         #[arg(value_name = "id")]
         id: String,
     },
+    /// Replace an authored definition from JSON or YAML
+    Update(EntityDefinitionInput),
+    /// Apply an RFC 7396 merge patch from JSON or YAML
+    Patch(EntityDefinitionInput),
     /// Remove an agent
     Remove {
         #[arg(value_name = "id")]
@@ -463,6 +471,23 @@ pub struct LogsCmd {
     pub since: Option<String>,
 }
 
+/// Input language is independent of the global output format.
+#[derive(Debug, Args)]
+pub struct DefinitionInput {
+    #[arg(short = 'f', long, value_name = "FILE_OR_DASH")]
+    pub file: std::path::PathBuf,
+    #[arg(long, value_enum)]
+    pub input_format: Option<crate::document_input::InputFormat>,
+}
+
+#[derive(Debug, Args)]
+pub struct EntityDefinitionInput {
+    #[arg(value_name = "id")]
+    pub id: String,
+    #[command(flatten)]
+    pub input: DefinitionInput,
+}
+
 // ── config ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Args)]
@@ -487,6 +512,10 @@ pub enum ConfigSub {
     },
     /// Open config.yml in $EDITOR
     Edit,
+    /// Replace raw project configuration from JSON or YAML
+    Update(DefinitionInput),
+    /// Apply an RFC 7396 merge patch to raw project configuration
+    Patch(DefinitionInput),
     /// Manage global settings (~/.orchestry/global.yml)
     Global(ConfigGlobalCmd),
 }
@@ -1240,7 +1269,8 @@ mod tests {
             (
                 "task",
                 &[
-                    "add", "list", "show", "edit", "assign", "cancel", "approve", "reject", "retry",
+                    "add", "list", "show", "edit", "update", "patch", "assign", "cancel",
+                    "approve", "reject", "retry",
                 ],
             ),
             (
@@ -1251,13 +1281,18 @@ mod tests {
                     "list",
                     "status",
                     "edit",
+                    "update",
+                    "patch",
                     "remove",
                     "disable",
                     "enable",
                     "autonomous",
                 ],
             ),
-            ("config", &["get", "set", "edit", "global"]),
+            (
+                "config",
+                &["get", "set", "edit", "update", "patch", "global"],
+            ),
             ("config global", &["get", "set", "show"]),
             ("context", &["set", "get", "list", "delete"]),
             ("msg", &["send", "broadcast", "inbox", "list"]),
@@ -1481,6 +1516,27 @@ mod tests {
             };
             let cli = Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(cli.command.expect("a command").name(), name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_mutation_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn live_mutations_require_file_and_accept_independent_formats() {
+        for target in ["agent", "task", "config"] {
+            for command in ["update", "patch"] {
+                let mut args = vec!["orch", target, command];
+                if target != "config" {
+                    args.push("id");
+                }
+                assert!(Cli::try_parse_from(&args).is_err());
+                args.extend(["-f", "-", "--input-format", "json", "--yaml"]);
+                assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+            }
         }
     }
 }
