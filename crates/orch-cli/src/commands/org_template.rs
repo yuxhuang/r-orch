@@ -159,6 +159,13 @@ impl DefinitionInput {
         } else {
             store::read_bounded(&self.file)?
         };
+        // Validate source bytes before JSON normalization can discard padding.
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            return Err(Error::invalid_arguments(format!(
+                "{}: expected 1–{MAX_DOCUMENT_BYTES} bytes",
+                self.file.display()
+            )));
+        }
         let json = match self.input_format {
             Some(DefinitionFormat::Json) => true,
             Some(DefinitionFormat::Yaml) => false,

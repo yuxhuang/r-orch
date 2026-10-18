@@ -571,6 +571,86 @@ fn assert_added_surrogate_pair(stdin: bool) {
     }
 }
 
+#[test]
+fn adding_a_member_from_json_stdin_accepts_the_original_byte_limit() {
+    let sb = sandbox();
+    for explicit in [false, true] {
+        for size in [1_048_575, 1_048_576] {
+            let root = small_team(&sb, &format!("boundary-{explicit}-{size}"));
+            let mut input = r#"{"name":"extra","role":"plain"}"#.to_owned();
+            input.extend(std::iter::repeat_n(' ', size - input.len()));
+            let extra = if explicit {
+                vec!["--input-format", "json", "--json"]
+            } else {
+                vec!["--json"]
+            };
+            let output = mutate(
+                &sb,
+                true,
+                "add",
+                &org_sel(&root),
+                &Doc::Stdin(&input),
+                &extra,
+            );
+            assert!(output.status.success(), "{}", transcript(&output));
+            assert_eq!(parse_json(&output)["role"], "plain");
+            assert_eq!(shown_member(&sb, &root, "extra")["role"], "plain");
+        }
+    }
+}
+
+#[test]
+fn adding_a_member_from_json_stdin_rejects_an_oversized_source_without_writes() {
+    assert_oversized_json_add_rejected(true, "");
+}
+
+#[test]
+fn adding_a_member_from_json_stdin_rejects_a_second_document_beyond_the_read_cap() {
+    assert_oversized_json_add_rejected(true, r#"{"role":0}"#);
+}
+
+#[test]
+fn adding_a_member_from_json_stdin_rejects_garbage_beyond_the_read_cap() {
+    assert_oversized_json_add_rejected(true, "garbage");
+}
+
+#[test]
+fn adding_a_member_from_json_file_rejects_an_oversized_source_without_writes() {
+    assert_oversized_json_add_rejected(false, "");
+}
+
+fn assert_oversized_json_add_rejected(stdin: bool, suffix: &str) {
+    let sb = sandbox();
+    for explicit in [false, true] {
+        let root = small_team(&sb, if explicit { "explicit" } else { "inferred" });
+        let frozen = freeze(&root);
+        let mut input = r#"{"name":"extra","role":"plain"}"#.to_owned();
+        input.extend(std::iter::repeat_n(' ', 1_048_577 - input.len()));
+        input.push_str(suffix);
+        let file = sb.work().join("oversized.json");
+        fs::write(&file, &input).unwrap();
+        let doc = if stdin {
+            Doc::Stdin(&input)
+        } else {
+            Doc::File(&file)
+        };
+        let extra = if explicit {
+            vec!["--input-format", "json"]
+        } else {
+            vec![]
+        };
+        let output = mutate(&sb, true, "add", &org_sel(&root), &doc, &extra);
+        assert_eq!(output.status.code(), Some(2), "{}", transcript(&output));
+        let diagnostic = if stdin {
+            "-: expected 1–1048576 bytes"
+        } else {
+            "exceeds 1 MiB"
+        };
+        assert_mentions(&output, diagnostic, "oversized JSON source");
+        assert_untouched(&root, &frozen, "oversized JSON source");
+    }
+}
+
 fn patch_org(sb: &Sandbox, root: &Path, doc: &Value) -> Output {
     mutate(
         sb,
