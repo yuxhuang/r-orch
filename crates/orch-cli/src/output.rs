@@ -196,7 +196,7 @@ pub fn print_error_with_format(
             hint: Option<&'a str>,
         }
 
-        let text = serde_yaml_ng::to_string(&ErrorOutput {
+        let text = render_yaml(&ErrorOutput {
             error: message,
             hint,
         })
@@ -474,8 +474,109 @@ fn json_error(err: serde_json::Error) -> orch_core::Error {
 
 fn render_yaml<T: serde::Serialize + ?Sized>(value: &T) -> orch_core::Result<String> {
     let value = serde_json::to_value(value).map_err(json_error)?;
-    serde_yaml_ng::to_string(&value)
-        .map_err(|err| orch_core::Error::other(format!("serialize YAML output: {err}")))
+    // Library-first exemption: no maintained crate fits the required scalar-style
+    // contract among our existing dependencies. serde_yaml_ng cannot force every
+    // string/key to be double-quoted, leaving YAML 1.1 resolvers free to retype it.
+    // Keep this emitter limited to JSON values; serde_json owns string escaping.
+    let mut text = String::new();
+    write_yaml(&value, 0, &mut text);
+    Ok(text)
+}
+
+fn write_yaml(value: &serde_json::Value, indent: usize, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (key, value) in map {
+                out.push_str(&" ".repeat(indent));
+                write_yaml_string(key, out);
+                out.push(':');
+                write_yaml_entry(value, indent, out);
+            }
+        }
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            for value in items {
+                out.push_str(&" ".repeat(indent));
+                out.push('-');
+                write_yaml_entry(value, indent, out);
+            }
+        }
+        _ => {
+            out.push_str(&" ".repeat(indent));
+            write_yaml_scalar(value, out);
+            out.push('\n');
+        }
+    }
+}
+
+fn write_yaml_entry(value: &serde_json::Value, indent: usize, out: &mut String) {
+    let nested = match value {
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        _ => false,
+    };
+    if nested {
+        out.push('\n');
+        write_yaml(value, indent + 2, out);
+    } else {
+        out.push(' ');
+        write_yaml_scalar(value, out);
+        out.push('\n');
+    }
+}
+
+fn write_yaml_scalar(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => {
+            let text = value.to_string();
+            if let Some((mantissa, exponent)) = text.split_once('e') {
+                // YAML 1.1 requires a decimal point and an explicit exponent sign
+                // to recognize a float (JSON's `1e20` would become a string).
+                out.push_str(mantissa);
+                if !mantissa.contains('.') {
+                    out.push_str(".0");
+                }
+                out.push('e');
+                if !exponent.starts_with(['+', '-']) {
+                    out.push('+');
+                }
+                out.push_str(exponent);
+            } else {
+                out.push_str(&text);
+            }
+        }
+        serde_json::Value::String(value) => write_yaml_string(value, out),
+        serde_json::Value::Array(items) => {
+            debug_assert!(items.is_empty());
+            out.push_str("[]");
+        }
+        serde_json::Value::Object(map) => {
+            debug_assert!(map.is_empty());
+            out.push_str("{}");
+        }
+    }
+}
+
+fn write_yaml_string(value: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let quoted = serde_json::to_string(value).expect("strings can be serialized as JSON");
+    for ch in quoted.chars() {
+        match ch {
+            // JSON permits characters YAML readers reject or normalize as line
+            // breaks/BOMs. Escapes preserve them as data in keys and values alike.
+            '\u{7f}'..='\u{9f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{feff}'
+            | '\u{fffe}'
+            | '\u{ffff}' => {
+                write!(out, "\\u{:04X}", ch as u32).expect("writing to a String cannot fail");
+            }
+            _ => out.push(ch),
+        }
+    }
 }
 
 /// `print!`, which panics on a closed pipe exactly as the `println!` the JSON
@@ -756,7 +857,7 @@ mod tests {
         // Serialized directly, serde_yaml_ng would write `tagged: !Pair`.
         let text = StructuredFormat::Yaml.render(&sample()).unwrap();
         assert!(!text.contains('!'), "{text}");
-        assert!(text.contains("Pair:"), "{text}");
+        assert!(text.contains("\"Pair\":"), "{text}");
     }
 
     #[test]
@@ -764,7 +865,7 @@ mod tests {
         let text = StructuredFormat::Yaml.render(&sample()).unwrap();
         assert!(text.ends_with('\n'));
         assert!(!text.starts_with("---"), "{text}");
-        assert_eq!(text.lines().next(), Some("id: tsk_1"));
+        assert_eq!(text.lines().next(), Some("\"id\": \"tsk_1\""));
     }
 
     #[test]
@@ -779,6 +880,139 @@ mod tests {
         let text = StructuredFormat::Yaml.render(&["007", "true"]).unwrap();
         let back: Vec<String> = serde_yaml_ng::from_str(&text).unwrap();
         assert_eq!(back, ["007", "true"]);
+    }
+
+    #[test]
+    fn yaml_quotes_strings_that_other_resolvers_would_retype() {
+        let cases = [
+            ("<<", "\"<<\"\n"),
+            ("=", "\"=\"\n"),
+            ("yes", "\"yes\"\n"),
+            ("Yes", "\"Yes\"\n"),
+            ("No", "\"No\"\n"),
+            ("NO", "\"NO\"\n"),
+            ("on", "\"on\"\n"),
+            ("off", "\"off\"\n"),
+            ("1_000", "\"1_000\"\n"),
+            ("1:20", "\"1:20\"\n"),
+            ("2026-10-18", "\"2026-10-18\"\n"),
+            ("2026-10-18T00:38:42.688Z", "\"2026-10-18T00:38:42.688Z\"\n"),
+            ("ordinary", "\"ordinary\"\n"),
+            ("", "\"\"\n"),
+        ];
+        for (value, expected) in cases {
+            let text = StructuredFormat::Yaml.render(value).unwrap();
+            assert_eq!(text, expected, "{value:?}");
+            assert_eq!(serde_yaml_ng::from_str::<String>(&text).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn yaml_quotes_every_mapping_key() {
+        for key in [
+            "<<",
+            "=",
+            "yes",
+            "on",
+            "1_000",
+            "1:20",
+            "2026-10-18",
+            "ordinary",
+            "",
+        ] {
+            let value = serde_json::json!({ key: "value" });
+            let text = StructuredFormat::Yaml.render(&value).unwrap();
+            assert_eq!(text, format!("\"{key}\": \"value\"\n"));
+            assert_eq!(
+                serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_escapes_characters_that_yaml_readers_reject_or_normalize() {
+        let mut cases = vec![
+            ("a\u{2028}b".to_owned(), "\"a\\u2028b\"\n".to_owned()),
+            ("a\u{2029}b".to_owned(), "\"a\\u2029b\"\n".to_owned()),
+            ("a\u{feff}b".to_owned(), "\"a\\uFEFFb\"\n".to_owned()),
+            ("a\u{fffe}b".to_owned(), "\"a\\uFFFEb\"\n".to_owned()),
+            ("a\u{ffff}b".to_owned(), "\"a\\uFFFFb\"\n".to_owned()),
+            (
+                "\"\\\n\r\t\0".to_owned(),
+                "\"\\\"\\\\\\n\\r\\t\\u0000\"\n".to_owned(),
+            ),
+            (" é 😀 ".to_owned(), "\" é 😀 \"\n".to_owned()),
+        ];
+        for ch in '\u{7f}'..='\u{9f}' {
+            cases.push((format!("a{ch}b"), format!("\"a\\u{:04X}b\"\n", ch as u32)));
+        }
+        for (value, expected) in cases {
+            let text = StructuredFormat::Yaml.render(&value).unwrap();
+            assert_eq!(text, expected, "{value:?}");
+            assert_eq!(serde_yaml_ng::from_str::<String>(&text).unwrap(), value);
+            let map = serde_json::json!({ value: "value" });
+            let text = StructuredFormat::Yaml.render(&map).unwrap();
+            assert_eq!(text, format!("{}: \"value\"\n", expected.trim_end()));
+            assert_eq!(
+                serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+                map
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_preserves_nested_containers_and_non_string_scalars() {
+        let value = serde_json::json!({ "items": [
+            { "nested": [[true, false, null, 42, -7], {}, []] }, "yes"
+        ] });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "\"items\":\n",
+                "  -\n",
+                "    \"nested\":\n",
+                "      -\n",
+                "        - true\n",
+                "        - false\n",
+                "        - null\n",
+                "        - 42\n",
+                "        - -7\n",
+                "      - {}\n",
+                "      - []\n",
+                "  - \"yes\"\n",
+            )
+        );
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+        assert_eq!(
+            StructuredFormat::Yaml
+                .render(&serde_json::json!({}))
+                .unwrap(),
+            "{}\n"
+        );
+        assert_eq!(
+            StructuredFormat::Yaml
+                .render(&serde_json::json!([]))
+                .unwrap(),
+            "[]\n"
+        );
+    }
+
+    #[test]
+    fn yaml_exponent_numbers_have_a_decimal_point_and_signed_exponent() {
+        for (value, expected) in [
+            (1e20, "1.0e+20\n"),
+            (1e-7, "1.0e-7\n"),
+            (-1e20, "-1.0e+20\n"),
+        ] {
+            let text = StructuredFormat::Yaml.render(&value).unwrap();
+            assert_eq!(text, expected);
+            assert_eq!(serde_yaml_ng::from_str::<f64>(&text).unwrap(), value);
+        }
     }
 
     fn rows_of(rows: &[&[&str]]) -> Vec<Vec<String>> {
