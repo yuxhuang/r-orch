@@ -32,6 +32,8 @@ pub struct ArgvShape {
     /// `process.argv.length <= 2` — no arguments at all, which is the
     /// first-run path rather than a guarded command.
     pub is_bare: bool,
+    /// Initialization policy delegated to the nested org command owner.
+    org_requires_initialized_project: bool,
 }
 
 impl ArgvShape {
@@ -44,6 +46,7 @@ impl ArgvShape {
         let mut is_help_or_version = false;
         let mut wants_version = false;
         let mut count = 0;
+        let mut org_args = Vec::new();
 
         // Skip argv[0]: the binary name is `orch`, `orchestry` or `ao`.
         for arg in args.into_iter().skip(1) {
@@ -55,6 +58,9 @@ impl ArgvShape {
             if matches!(arg.as_str(), "--version" | "-V") {
                 wants_version = true;
             }
+            if sub.as_deref() == Some("org") {
+                org_args.push(arg.clone());
+            }
             if sub.is_none() && !arg.starts_with('-') {
                 sub = Some(arg);
             }
@@ -65,6 +71,9 @@ impl ArgvShape {
             is_help_or_version,
             wants_version,
             is_bare: count == 0,
+            org_requires_initialized_project: crate::commands::org::requires_initialized_project(
+                &org_args,
+            ),
         }
     }
 
@@ -94,6 +103,7 @@ impl ArgvShape {
         }
         match self.sub.as_deref() {
             None => true,
+            Some("org") => self.org_requires_initialized_project,
             Some(sub) => !CONTAINER_LESS_COMMANDS.contains(&sub),
         }
     }

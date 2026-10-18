@@ -358,10 +358,7 @@ pub enum AgentSub {
     /// Add a new agent
     Add(Box<AgentAddFlags>),
     /// Browse and install pre-built agent templates
-    Shop {
-        #[arg(long, help = "Print all templates (non-interactive)")]
-        list: bool,
-    },
+    Shop(crate::template_shop::ShopArgs),
     /// List all agents
     List,
     /// Show agent details
@@ -739,25 +736,7 @@ pub enum TeamSub {
 
 // ── org ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Args)]
-pub struct OrgCmd {
-    #[command(subcommand)]
-    pub command: Option<OrgSub>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum OrgSub {
-    /// List available company templates
-    #[command(alias = "ls")]
-    List,
-    /// Deploy a pre-built AI company
-    Deploy {
-        #[arg(value_name = "template")]
-        template: String,
-        #[arg(long, value_name = "goal", help = "Set a goal for the team")]
-        goal: Option<String>,
-    },
-}
+pub use crate::commands::org::{OrgCmd, OrgSub};
 
 // ── run ────────────────────────────────────────────────────────────────────
 

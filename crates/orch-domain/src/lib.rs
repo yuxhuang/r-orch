@@ -15,6 +15,7 @@ pub mod global_config;
 pub mod goal;
 pub mod message;
 pub mod model_tiers;
+pub mod org_templates;
 pub mod remote;
 pub mod run;
 pub mod scope;

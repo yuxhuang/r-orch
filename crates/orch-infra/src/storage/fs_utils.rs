@@ -501,6 +501,12 @@ pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>
     let Some(content) = read_to_string_opt(path).await? else {
         return Ok(None);
     };
+    parse_yaml_bytes(path, content.as_bytes()).await.map(Some)
+}
+
+/// Parse an in-memory YAML document with the same size, alias and expanded-node
+/// guards as file reads, resolving merge keys. `path` labels errors; no file is read.
+pub async fn parse_yaml_bytes(path: &Path, content: &[u8]) -> Result<serde_yaml_ng::Value> {
     // Two steps before the value parse: cap the input size, then walk parser
     // events to enforce both the expanded-node budget and the exact alias cap.
     if content.len() > MAX_YAML_READ_SIZE {
@@ -510,6 +516,15 @@ pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>
             content.len()
         )));
     }
+    let content = std::str::from_utf8(content)
+        .map_err(|err| {
+            Error::io(
+                format!("read {}", path.display()),
+                path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+            )
+        })?
+        .to_owned();
     // **This single call is what makes the parse below safe.** The size and
     // alias caps are defence in depth, and there is no backstop behind it:
     // the deadline that used to be there was removed because it could not
@@ -568,7 +583,7 @@ pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>
     value.apply_merge().map_err(|err| {
         Error::serde(format!("apply merge keys in {}", path.display()), path, err)
     })?;
-    Ok(Some(value))
+    Ok(value)
 }
 
 async fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
@@ -1269,6 +1284,64 @@ mod tests {
             doc.push_str("  - *a\n");
         }
         doc
+    }
+
+    #[tokio::test]
+    async fn yaml_bytes_resolve_merge_keys_without_reading_a_file() {
+        let path = Path::new("buffer.yml");
+        let value = parse_yaml_bytes(path, b"defaults: &d {a: 1}\nchild: {<<: *d, b: 2}\n")
+            .await
+            .unwrap();
+        assert_eq!(value["child"]["a"].as_u64(), Some(1));
+        assert_eq!(value["child"]["b"].as_u64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn yaml_bytes_reject_oversized_input_before_parsing() {
+        let err = parse_yaml_bytes(Path::new("buffer.yml"), &vec![b'x'; MAX_YAML_READ_SIZE + 1])
+            .await
+            .expect_err("over the size cap");
+        assert!(err.to_string().contains("1048576-byte YAML limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn yaml_bytes_reject_invalid_utf8_with_the_source_name() {
+        let err = parse_yaml_bytes(Path::new("buffer.yml"), &[0xff])
+            .await
+            .expect_err("not UTF-8");
+        assert!(err.to_string().contains("read buffer.yml"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn yaml_bytes_enforce_the_alias_cap() {
+        let doc = format!(
+            "a: &a 1\nlist:\n{}",
+            "  - *a\n".repeat(MAX_YAML_ALIASES + 1)
+        );
+        let err = parse_yaml_bytes(Path::new("buffer.yml"), doc.as_bytes())
+            .await
+            .expect_err("over the alias cap");
+        assert!(
+            err.to_string()
+                .contains("YAML aliases, over the limit of 64"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn yaml_bytes_enforce_the_expanded_node_budget() {
+        // Just over the budget, so a break check remains safe without the guard.
+        let doc = format!(
+            "a: &a [{}]\nlist:\n{}",
+            vec!["1"; 3500].join(","),
+            "  - *a\n".repeat(60)
+        );
+        assert!(doc.len() < MAX_YAML_READ_SIZE);
+        assert!(alias_events(&doc) <= MAX_YAML_ALIASES);
+        let err = parse_yaml_bytes(Path::new("buffer.yml"), doc.as_bytes())
+            .await
+            .expect_err("over the node budget");
+        assert!(err.to_string().contains("expands to at least"), "{err}");
     }
 
     #[tokio::test]
