@@ -103,6 +103,50 @@ clicks reach the dashboard at all.
 
 To start with the mouse off: `ORCH_TUI_MOUSE=0 orch`. `/mouse status` says which it is.
 
+### Machine-readable output: `--json` and `--yaml`
+
+Every command that can print JSON can print YAML instead. Both flags are global, so they work before or after the
+subcommand, and they are mutually exclusive.
+
+```bash
+orch --yaml task list          # same as: orch task list --yaml
+orch --json task list          # unchanged
+```
+
+```
+$ orch --yaml task list
+-
+  "id": "tsk_4OfOerS"
+  "title": "Add input validation"
+  "description": ""
+  "status": "todo"
+  "priority": 3
+  "assignee": "agt_s4OhRJP"
+  "labels": []
+  "depends_on": []
+  "created_at": "2026-10-18T12:49:54.405Z"
+  "updated_at": "2026-10-18T12:49:54.405Z"
+  "attempts": 0
+  "max_attempts": 3
+```
+
+- **Same data as `--json`.** The value is the one the JSON path prints, in the same key order, so `--yaml` parses
+  to exactly what `--json` parses to. The `--json` bytes did not change.
+- **One document, newline-terminated, no `---` marker.** Every key and every string is double-quoted, so a title
+  such as `null`, `on`, `1_000` or `2024-01-15` stays a string in YAML 1.1 readers as well as 1.2 readers.
+  Empty collections are `[]` and `{}`.
+- **Structured output wins over `--quiet`**, as `--json` does: `orch --yaml --quiet task add "x"` prints the whole
+  created task.
+- **Errors are not structured.** A failing command prints the same text on stderr, with the same exit code, under
+  `--yaml`, `--json` and neither; stdout stays empty. Passing both flags is a usage error (exit 1, nothing on
+  stdout): `error: the argument '--yaml' cannot be used with '--json'`.
+- **Commands that never printed JSON ignore `--yaml` too** (for example `agent shop`, which prints its table).
+  `logs --follow` still streams text and `serve` still writes JSON Lines; `serve --log-format` is unrelated to
+  `--yaml`, and persisted logs do not change format.
+- **`orch doctor` is the exception.** Inside a project it prints its human header line on stdout before the
+  structured document, under `--json` as well as `--yaml`, so the output does not parse as one document.
+  Outside a project it prints text only. See the [runbook](docs/RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve).
+
 ### Reading, navigating and editing in the dashboard
 
 `Left`/`Right` switch views; `Tab`/`Shift-Tab` move between the list, activity and available detail sections.
@@ -198,12 +242,69 @@ terminal or multiplexer *without* bracketed paste (Windows legacy console, tmux 
 pasted body still arrives as raw keystrokes: the first newline submits and the rest is typed into the
 dashboard. Paste one line, or paste into `orch msg send` instead.
 
+### Updating definitions from files
+
+Besides `edit` (opens `$EDITOR`), agents, tasks and the project config can be replaced or patched from a JSON or
+YAML file or stdin, with no editor:
+
+```bash
+orch agent update <agent-id> -f agent.yaml            # replace: omitted optional fields are cleared
+echo '{"config": {"model": null}}' | orch agent patch <agent-id> -f -     # merge: null removes a member
+orch task patch <task-id> -f task-patch.yaml          # RFC 7396 merge patch
+orch --yaml config update -f config.json              # print the saved config as YAML
+```
+
+`update` needs the whole writable definition; `patch` merges a partial document (objects merge, arrays replace,
+`null` deletes). Identity and runtime state (`id`, `status`, `stats`, an assignee, …) are never writable, a
+running or remote agent or task cannot be changed, and nothing is written unless the whole result validates.
+`--input-format json|yaml` overrides detection from the extension or first byte. The full contract, the
+writable fields, every error and the locking limits are in [docs/file-mutations.md](docs/file-mutations.md);
+runnable inputs are in [examples/file-mutations/](examples/file-mutations/).
+
 Two things that will bite you on first use, both covered in the [runbook](docs/RUNBOOK.md):
 
 - **`approval_policy: auto`** above is deliberate. The default `agt_creator` agent uses `suggest`, which
   leaves finished tasks in `review` — and `serve --once` waits for `review` forever.
 - **Keep API keys in your environment, not in an agent's `env:` map.** Agent files are world-readable and
   are *not* gitignored by `init`.
+
+### The agent shop
+
+`orch agent shop` installs one agent from a built-in catalogue of 15 role templates (Backend Developer, QA
+Engineer, Architect, …). It needs an initialised project (`orch init`).
+
+```bash
+orch agent shop --list      # the catalogue as a table: Key, Name, Tier, Skills (first two)
+orch agent shop             # interactive picker
+```
+
+The picker draws only when both stdin and stdout are terminals. Keys: `↑`/`↓` (or `Ctrl-P`/`Ctrl-N`) move and
+wrap around the ends, `Enter` installs the highlighted template, `q`, `Esc` or `Ctrl-C` cancel. Each row is
+`Name — description [tier]`, cut to the terminal width with an ellipsis (description first, then the tier, then
+the name), and a list taller than the terminal shows its window as `1-7 of 15`. Resizing the terminal redraws
+the picker at the new size; a terminal too short for the blank lines drops them before it drops rows.
+The heading uses the full help when it fits, then `AGENT SHOP  ↑↓ move · enter select · q cancel`, then
+`AGENT SHOP  ↑↓ Enter q`. The compact heading keeps movement, selection and cancellation visible at
+30 and 40 columns; below its display width it is cut with an ellipsis. This is the picker at 80x12:
+
+```
+  AGENT SHOP  — arrow keys to navigate, enter to select, q to cancel
+
+  ▸ Backend Developer — APIs, databases, backend services [balanced]
+    Frontend Developer — React, UI components, CSS, responsive design [balanced]
+    QA Engineer — Test writing, coverage analysis, quality assurance… [balanced]
+    Code Reviewer — PR review with auto-fix, adversarial review, secu… [capable]
+    Architect — System design, architecture decisions, tech leadership [capable]
+    DevOps Engineer — CI/CD, infrastructure, deployment, monitoring [balanced]
+    Bug Hunter — Systematic debugging, root cause analysis, minimal … [balanced]
+
+  1-7 of 15
+```
+
+Choosing a template creates one agent and prints `✓ Added agent QA Engineer (claude) → agt_…`; cancelling
+prints `  Cancelled.` and exits 0 without writing anything. With stdout redirected the command prints the `--list`
+table; with stdin not a terminal (for example `echo | orch agent shop` in a terminal) it cancels at once.
+`--json` and `--quiet` do not change this command.
 
 ---
 
@@ -461,6 +562,7 @@ drafts last only for the dashboard session).
 |---|---|
 | **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and the gotchas that are inherited rather than fixed — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
 | [docs/PARITY.md](docs/PARITY.md) | **Historical.** The contract the port was built to: every command, flag, exit code, `--json` shape and on-disk field, graded L0/L1/L2, plus known bugs of the original. No longer a goal ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)) |
+| [docs/file-mutations.md](docs/file-mutations.md) | `update` / `patch` from JSON or YAML files: input rules, writable fields, errors, locking |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |
 | [docs/parity/](docs/parity/) | Historical per-area appendices behind the contract — CLI, adapters, infrastructure, TUI, tests |
 | [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |

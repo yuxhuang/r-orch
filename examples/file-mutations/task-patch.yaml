@@ -1,0 +1,4 @@
+# orch task patch <task-id> -f task-patch.yaml
+# Raises the priority and removes every label (null removes a member).
+priority: 1
+labels: null

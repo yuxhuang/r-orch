@@ -1,0 +1,11 @@
+# orch agent update <agent-id> -f agent-update.yaml
+# Replaces the agent's writable definition. Omitted optional fields (role, and every
+# config key you leave out) are cleared; id, status and stats are never touched.
+name: builder
+adapter: claude
+role: Builds and tests features.
+config:
+  model: claude-sonnet-4-6
+  approval_policy: auto
+  max_turns: 80
+  skills: [review, careful]

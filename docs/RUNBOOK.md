@@ -29,6 +29,9 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | A peer is `offline` and you cannot tell why | [Reading a peer's link state](#reading-a-peers-link-state) |
 | A mirror on a worker sits `todo` for ever | [Mirrors left behind on a worker](#mirrors-left-behind-on-a-worker) |
 | Changing the peer protocol | [Peer protocol compatibility](#peer-protocol-compatibility) |
+| `orch agent shop` prints `Cancelled.` or a table instead of a picker | [The agent shop picker](#the-agent-shop-picker) |
+| `orch --json doctor` or `--yaml doctor` output will not parse | [Structured output for `doctor`, `logs --follow` and `serve`](#structured-output-for-doctor-logs---follow-and-serve) |
+| `update`/`patch` fails with `mutation lock timed out`, `read mutation input` or a `<stdin>:` error | [File mutations: update and patch failures](#file-mutations-update-and-patch-failures) |
 
 ---
 
@@ -657,3 +660,62 @@ the save visibly. Quitting with drafts asks for confirmation and discards them o
 an interactive prompt. Drafts do not survive crashes or restart, and wall-clock backsteps are not a durability
 mechanism. On a primary submit error, correct the retained form and retry. A partial post-create failure names
 the created entity; repair that entity rather than creating a duplicate.
+
+## The agent shop picker
+
+**Symptom.** `orch agent shop` prints `  Cancelled.` at once, or prints a table instead of the interactive picker.
+
+**Cause.** The picker draws only when stdin **and** stdout are terminals. With stdout redirected (a pipe, a file,
+a CI log) the command prints the same table as `--list`; with a terminal on stdout but stdin not a terminal
+(`echo | orch agent shop`) it cancels immediately. Both are exit 0 and neither creates an agent. The command
+needs an initialised project; elsewhere it prints `Not initialized` / `Run: orch init`. `--json` and `--quiet`
+are ignored here.
+
+**Fix.** Run it from an interactive terminal inside a project, or use `orch agent shop --list` and add the
+agent you want with `orch agent add`.
+
+**Display.** The picker fits every row to the terminal width and counts its heading, blank lines and footer
+against the terminal height, so it should never wrap or scroll the heading away. On a terminal narrower than
+the full help it chooses the widest heading that fits: `AGENT SHOP  ↑↓ move · enter select · q cancel`,
+then `AGENT SHOP  ↑↓ Enter q`. At 30 and 40 columns the compact heading keeps all three keys visible;
+below its display width it is cut with an ellipsis. The footer `n-m of total` appears only when the list is
+taller than the terminal. A resize redraws at the new size. In this display slice, a resize and keypress
+received together can leave the old frame until another redraw; the heading state-machine tests alone
+do not prove that event-loop case.
+
+## Structured output for `doctor`, `logs --follow` and `serve`
+
+**Symptom.** `orch --json doctor` (or `--yaml doctor`) piped into a parser fails on the first line;
+`orch --yaml logs --follow` or `orch --yaml serve` prints text or JSON Lines, not YAML.
+
+**Cause.**
+- `doctor` prints its human header (`  orch doctor · checking adapters and dependencies`) to **stdout** before the
+  structured document, whichever of `--json` or `--yaml` is given. The header is older than `--yaml` (master
+  prints it under `--json` too), and `--yaml` does not change it. Outside a project, `doctor` ignores both flags
+  and prints the text report.
+- `logs --follow` prints a text banner and then live events; `serve` writes JSON Lines (`--log-format json`, the
+  default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl` logs.
+- A failing command prints its error as text on stderr under every output flag; stdout is empty.
+
+**Fix.** For `doctor`, drop the leading header lines before parsing: `orch --json doctor | sed '1,2d'`. For
+streams, parse the JSON Lines `serve` writes, or poll `orch --yaml logs --task <id>` for run metadata. To tell an
+error from output, check the exit code; never parse stderr as YAML or JSON.
+
+## File mutations: `update` and `patch` failures
+
+Applies to `orch agent|task|config update|patch -f FILE` ([guide](file-mutations.md)). Every failure leaves the
+definition unchanged, because parsing, merging and validation finish before anything is written.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `<source>: mutation lock timed out after 5 s; retry` (exit 1) | Another `update`/`patch` (or a hung one) holds `.orchestry/.definition.lock`. The lock is released when its process exits, however it exits. | Retry. If it persists, find the process (`lsof .orchestry/.definition.lock`) and stop it. Do not delete the file. |
+| `read mutation input` (exit 1) | The `-f` file cannot be read: missing, unreadable or a permission problem. The message does not name the path or the OS reason. | Check the path and permissions yourself (`ls -l FILE`). |
+| `<source>: <field>: read-only field` / `unknown field` / `required string` (exit 2) | The document names a field that cannot be written, does not exist or is missing. | Fix the document. `orch --yaml agent show <id>` shows the shape; read-only fields can be echoed back in `update` only when unchanged. |
+| `Agent not found: <name>` (exit 1) | `update`/`patch` take the id (`agt_…`), not the name. | `orch agent list` for the id. |
+| `cannot mutate a running or remote agent definition` (or task) | The target is running, `in_progress`, remote (`@` in the id) or mirrors a remote task. | Stop or cancel the run first, then retry; remote entities are changed on their own host. |
+| `labels: remote-ctl: and exec: prefixes are reserved for worker mirrors` | A label uses a reserved prefix. | Use another label. |
+| You are unsure whether a failed or interrupted command saved | The write is a temporary file renamed over the target; a crash after the rename but before the output has still saved. | `orch agent show <id>`, `orch task show <id>` or `orch config get <key>` before retrying. |
+
+Mutations cannot interlock with `edit`, `agent add`, a running orchestrator or the dashboard: those keep
+last-writer-wins behaviour. For bulk changes, stop the runner and use one writer. To roll back, run `update` with
+the definition you saved earlier (`orch --yaml agent show <id> > before.yaml`).
