@@ -1,0 +1,8 @@
+name: "backend-eng-2"
+description: "backend eng 2"
+adapter: "codex"
+effort: "high"
+skills: ["review", "careful", "feature-dev:feature-dev", "feature-dev:code-explorer"]
+rules: []
+role: |-
+  Backend developer
