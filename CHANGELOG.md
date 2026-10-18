@@ -9,10 +9,16 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - `--yaml`, a global flag beside `--json`: every command that prints JSON can print the same data as one YAML document with every key and string double-quoted. The two flags together are a usage error, and `--json` output is byte-for-byte unchanged.
 
 - `orch agent update|patch <id> -f FILE`, `orch task update|patch <id> -f FILE` and `orch config update|patch -f FILE`: replace a definition from a JSON or YAML file (or stdin), or apply an RFC 7396 merge patch to it, without an editor. `--input-format` overrides detection; identity and runtime state stay read-only, and nothing is written unless the whole result validates.
+- Deploy a team from a template directory: `orch org deploy --template-dir DIR` (or `--template NAME`) reads `org.yml`, one YAML file per member and optional shared rules, and creates the agents, a team and an optional goal. Your own templates live under `~/.orchestry/templates/`. See [docs/org-templates.md](docs/org-templates.md).
+- A built-in **a-team** template with 27 specialist roles: `orch org deploy a-team`. Shared rules are embedded into each role, so deployed agents need no rule files. The ten existing presets are unchanged.
+- `orch org template list|show|init|edit|update|patch` and `orch org template agent list|add|edit|update|patch|delete` manage templates without an editor: `update` replaces a file from a complete JSON or YAML document, `patch` applies an RFC 7396 merge patch, and a failed change leaves the template untouched. Builtins are read-only; copy one with `init --from`.
+- `orch agent shop --template NAME` and `--template-dir DIR` install a single member of a template, with the same role and settings `deploy` would give it.
 
 ### Fixed
+- `orch org template agent add` accepts valid JSON surrogate-pair escapes and checks the original stdin byte limit before normalization.
 - `orch agent shop` now draws a readable picker: every row starts at the left edge, rows are cut to the terminal width with an ellipsis instead of wrapping, the heading and the `n-m of total` footer stay on screen on short terminals, and compact headings keep movement, selection and cancellation keys visible at narrow widths.
 - Dashboard select lists, such as the Agent Shop opened with `Ctrl+S` in the New Agent wizard, with ten or more options keep the number apart from the label (`10 Content Creator`), mark a label or hint that was cut to the row with an ellipsis, and show `n of total` in the footer when the list is longer than its window.
+- The `orch agent shop` picker draws every frame at the terminal's current size, so a resize that arrives together with a keypress, without a separate resize event, still gets a frame that fits.
 
 ## [0.7.0] - 2026-10-17
 

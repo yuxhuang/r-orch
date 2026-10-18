@@ -32,6 +32,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `orch agent shop` prints `Cancelled.` or a table instead of a picker | [The agent shop picker](#the-agent-shop-picker) |
 | `orch --json doctor` or `--yaml doctor` output will not parse | [Structured output for `doctor`, `logs --follow` and `serve`](#structured-output-for-doctor-logs---follow-and-serve) |
 | `update`/`patch` fails with `mutation lock timed out`, `read mutation input` or a `<stdin>:` error | [File mutations: update and patch failures](#file-mutations-update-and-patch-failures) |
+| `org deploy` failed half way, or a template will not load or change | [Organization templates: failures and recovery](#organization-templates-failures-and-recovery) |
 
 ---
 
@@ -679,9 +680,8 @@ against the terminal height, so it should never wrap or scroll the heading away.
 the full help it chooses the widest heading that fits: `AGENT SHOP  ↑↓ move · enter select · q cancel`,
 then `AGENT SHOP  ↑↓ Enter q`. At 30 and 40 columns the compact heading keeps all three keys visible;
 below its display width it is cut with an ellipsis. The footer `n-m of total` appears only when the list is
-taller than the terminal. A resize redraws at the new size. In this display slice, a resize and keypress
-received together can leave the old frame until another redraw; the heading state-machine tests alone
-do not prove that event-loop case.
+taller than the terminal. The template slice reads the current size before each frame, retaining the event-loop
+correction for a resize received together with a keypress; heading state-machine tests alone do not prove that case.
 
 ## Structured output for `doctor`, `logs --follow` and `serve`
 
@@ -719,3 +719,27 @@ definition unchanged, because parsing, merging and validation finish before anyt
 Mutations cannot interlock with `edit`, `agent add`, a running orchestrator or the dashboard: those keep
 last-writer-wins behaviour. For bulk changes, stop the runner and use one writer. To roll back, run `update` with
 the definition you saved earlier (`orch --yaml agent show <id> > before.yaml`).
+
+## Organization templates: failures and recovery
+
+Applies to `orch org deploy`, `orch agent shop --template…` and `orch org template …`
+([guide](org-templates.md)). Template commands change one file at a time and validate the whole template first, so a
+refused command leaves the template unchanged; `deploy` is the only command that can leave work behind.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Template deployment failed at <stage>: … Surviving entities: {"agentIds":[…],"teamId":…,"goalId":…,"unverifiedIds":[…]}` (exit 1) | A step failed after earlier ones succeeded. Nothing is rolled back. | Fix the cause (a full disk, a bad `.orchestry/` file), then remove the survivors: `orch agent remove <id>` for each agent, `orch team disband <team>`, `orch goal delete <goal>`. `unverifiedIds` could not be checked: look for their files. |
+| After cleaning up, the same deploy fails at `team` with `Team "<name>" already exists` and leaves new agents | A disbanded team keeps its name, and deploy checks agent names but not team names before creating anything. | Remove the new agents again, then deploy a copy under another name (`orch org template init <new> --from user:<name>`), or delete the leftover `.orchestry/teams/<team-id>.yml` by hand (not a supported interface). |
+| `Agent "<name>" already exists; no agents created` (exit 2) | A member name is taken. Nothing was created. | Remove or rename the existing agent, or edit the member's name in a copy of the template. |
+| `Builtins are read-only; run orch org template init … --from builtin:…` | You tried to change `a-team` or a legacy preset. | Copy it with `init --from`, then change the copy. |
+| `<file>: <reason>` from `list`, `show`, `deploy` or the shop (exit 2) | A file in the template fails validation. `list` shows the reason for each user template. | Fix the named file. `org template update` with a complete definition repairs one broken `org.yml` or member; `patch` and `edit` need a file that parses. |
+| `name is immutable` / `schema_version is immutable` | `org.yml` has a present `name` or `schema_version` (even `null`, or an unsupported version) and the update changes it. | Edit the file by hand. An *absent* key can be repaired with `update`. |
+| `…/agents/<file>: exceeds 1 MiB` on every command | A file larger than 1 MiB blocks the whole template, `update` included. | Shrink or delete it by hand. |
+| `Timed out after 5 s locking …/.template.lock` (exit 2) | Another template command holds the lock. The lock is released when its process exits. | Retry. Do not delete the file. |
+| `expected directory without symlinks` | The selected template root, with or without a trailing `/` or `/.`, is a symlink. | Point `--template-dir` at the real directory. |
+| The shop refused a member and the screen shows nothing | The refusal (`Agent "<name>" already exists; no agents created`) goes to stderr and exit status 2; the picker may clear the screen. | Check `echo $?` and `orch agent list`. |
+| A deployed agent does not follow the template after you edited it | Deployed agents are snapshots; nothing synchronises them. | Remove the agent and deploy or shop again. |
+
+A change made while another tool writes the same template, or a hand edit during a command, is not covered by the
+lock: the last writer wins. If a command was interrupted, run `orch org template show` before repeating it, because
+a crash after the file was renamed has still saved the change.

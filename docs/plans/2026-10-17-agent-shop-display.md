@@ -25,8 +25,8 @@ clipped silently. No contract changes, so no ADR.
 width with a cell-aware ellipsis (description first, then tier, then name), control and bidi characters in
 template text are replaced, and the page size counts the heading, blank lines and footer. `encode_frame` joins the
 lines with `\r\n` and no trailing newline. The heading selects full, short or compact help to keep all keys visible when the compact form fits.
-A resize recomputes width and page; the inherited simultaneous resize/key event-loop gap remains in this
-display slice. In `orch-tui`, the select field
+A resize recomputes width and page. The later organization-template slice also reads the current terminal size
+before each frame to handle a simultaneous resize and keypress. In `orch-tui`, the select field
 right-aligns its numbers in a column as wide as the largest, cuts label then hint to the row with an ellipsis, and
 the wizard footer shows `n of total` for a list longer than its window.
 

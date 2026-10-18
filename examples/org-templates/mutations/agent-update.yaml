@@ -1,0 +1,6 @@
+name: reviewer
+description: Reviews the diff and reports findings
+adapter: codex
+rules: [house-style]
+role: |
+  Code reviewer. Read the diff and report each finding with its file and line.

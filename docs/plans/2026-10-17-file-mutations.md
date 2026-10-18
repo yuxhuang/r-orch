@@ -54,8 +54,8 @@ Rejected: bespoke recursive patching, RFC 6902 operations, overwriting a deseria
 | H0D | Dependency pinned and verified on macOS; accepted adoption ADR 0005 |
 | U1 | Live definitions and shared input implemented; macOS verification recorded in the engineering handoff |
 | UTT | Update/patch integration tests committed with U1 (`7426192`); independent reviews and the final stack gate pending |
-| P2 | Belongs to the organization-template slice (PR 4); not part of this slice |
-| W1 | Documented in this branch (`docs/file-mutations.md`, README, RUNBOOK, ARCHITECTURE, CHANGELOG) and every example run on macOS against a build of `29e89110`; local gates and publication pending. Nothing here is merged or released |
+| P2 | Implemented in the organization-template slice (PR 4) on the shared input module; see [the org-templates plan](2026-10-17-org-templates.md) |
+| W1 | Update/patch documented in PR 3 and template mutation in PR 4; local gates and publication pending, nothing merged or released |
 
 ## Test plan
 Use disposable projects and homes for test executables, isolated global config, shell/stub adapters and no real AI CLIs. Build tools retain their real HOME with an isolated CARGO_TARGET_DIR. Verify JSON/YAML input and stdin, parser budgets, malformed/duplicate/tagged/multiple documents, exact immutable fields, unknown-null rejection, optional clearing, null removal, array replacement, empty patches, raw extension preservation, running/remote guards, lock timeouts and write failures. Check existing JSON bytes, YAML equivalence, routing guards and legacy shop behavior. New behavior tests must fail when the change is reverted.
