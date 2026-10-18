@@ -379,21 +379,82 @@ fn js_to_fixed_1(x: f64) -> String {
     format!("{}.0", integer + 1)
 }
 
-/// `JSON.stringify(value, null, 2)` + newline, on stdout.
-pub fn print_json<T: serde::Serialize>(value: &T) -> orch_core::Result<()> {
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|err| orch_core::Error::other(format!("serialize JSON output: {err}")))?;
-    println!("{text}");
-    Ok(())
+/// The machine-readable format chosen by the global `--json` / `--yaml` flags.
+///
+/// Every structured site renders through here, so the two formats always
+/// carry the same value: YAML is produced from the `serde_json::Value` the
+/// JSON path would print, never from the type directly. That matters because
+/// `serde_yaml_ng` renders an externally tagged enum as a YAML `!Tag`, which
+/// would parse back to a different value than the JSON does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredFormat {
+    Json,
+    Yaml,
 }
 
-/// `JSON.stringify(value)` + newline — the compact form four commands use
-/// (PARITY.md §4.1).
-pub fn print_json_compact<T: serde::Serialize>(value: &T) -> orch_core::Result<()> {
-    let text = serde_json::to_string(value)
-        .map_err(|err| orch_core::Error::other(format!("serialize JSON output: {err}")))?;
-    println!("{text}");
-    Ok(())
+impl StructuredFormat {
+    /// From the two global flags. clap rejects both together, so `json` wins
+    /// only if a caller builds the flags by hand.
+    pub fn from_flags(json: bool, yaml: bool) -> Option<Self> {
+        if json {
+            Some(StructuredFormat::Json)
+        } else if yaml {
+            Some(StructuredFormat::Yaml)
+        } else {
+            None
+        }
+    }
+
+    /// The exact stdout bytes for `value`: pretty JSON (`JSON.stringify(v,
+    /// null, 2)`) plus a newline, or one YAML document.
+    pub fn render<T: serde::Serialize + ?Sized>(self, value: &T) -> orch_core::Result<String> {
+        match self {
+            StructuredFormat::Json => serde_json::to_string_pretty(value)
+                .map(|text| format!("{text}\n"))
+                .map_err(json_error),
+            StructuredFormat::Yaml => render_yaml(value),
+        }
+    }
+
+    /// As [`render`](Self::render), but JSON is the compact `JSON.stringify(v)`
+    /// form four commands use (PARITY.md §4.1). YAML has one form.
+    pub fn render_compact<T: serde::Serialize + ?Sized>(
+        self,
+        value: &T,
+    ) -> orch_core::Result<String> {
+        match self {
+            StructuredFormat::Json => serde_json::to_string(value)
+                .map(|text| format!("{text}\n"))
+                .map_err(json_error),
+            StructuredFormat::Yaml => render_yaml(value),
+        }
+    }
+
+    pub fn print<T: serde::Serialize + ?Sized>(self, value: &T) -> orch_core::Result<()> {
+        write_stdout(&self.render(value)?);
+        Ok(())
+    }
+
+    pub fn print_compact<T: serde::Serialize + ?Sized>(self, value: &T) -> orch_core::Result<()> {
+        write_stdout(&self.render_compact(value)?);
+        Ok(())
+    }
+}
+
+fn json_error(err: serde_json::Error) -> orch_core::Error {
+    orch_core::Error::other(format!("serialize JSON output: {err}"))
+}
+
+fn render_yaml<T: serde::Serialize + ?Sized>(value: &T) -> orch_core::Result<String> {
+    let value = serde_json::to_value(value).map_err(json_error)?;
+    serde_yaml_ng::to_string(&value)
+        .map_err(|err| orch_core::Error::other(format!("serialize YAML output: {err}")))
+}
+
+/// `print!`, which panics on a closed pipe exactly as the `println!` the JSON
+/// path always used did.
+fn write_stdout(text: &str) {
+    print!("{text}");
 }
 
 #[cfg(test)]
@@ -597,6 +658,100 @@ mod tests {
         assert_eq!(js_to_fixed_1(0.96), "1.0");
         assert_eq!(js_to_fixed_1(9.99), "10.0");
         assert_eq!(js_to_fixed_1(0.0), "0.0");
+    }
+
+    #[derive(serde::Serialize)]
+    enum Tagged {
+        Pair(u8, u8),
+    }
+
+    #[derive(serde::Serialize)]
+    struct Sample {
+        id: &'static str,
+        count: u64,
+        missing: Option<&'static str>,
+        tags: Vec<&'static str>,
+        tagged: Tagged,
+    }
+
+    fn sample() -> Sample {
+        Sample {
+            id: "tsk_1",
+            count: 3,
+            missing: None,
+            tags: vec!["a", "007"],
+            tagged: Tagged::Pair(1, 2),
+        }
+    }
+
+    #[test]
+    fn the_flags_choose_the_format_and_neither_means_human() {
+        assert_eq!(StructuredFormat::from_flags(false, false), None);
+        assert_eq!(
+            StructuredFormat::from_flags(true, false),
+            Some(StructuredFormat::Json)
+        );
+        assert_eq!(
+            StructuredFormat::from_flags(false, true),
+            Some(StructuredFormat::Yaml)
+        );
+    }
+
+    #[test]
+    fn json_rendering_is_byte_identical_to_the_old_print_json() {
+        let value = sample();
+        assert_eq!(
+            StructuredFormat::Json.render(&value).unwrap(),
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
+        );
+        assert_eq!(
+            StructuredFormat::Json.render_compact(&value).unwrap(),
+            format!("{}\n", serde_json::to_string(&value).unwrap())
+        );
+    }
+
+    #[test]
+    fn yaml_parses_back_to_the_same_value_as_the_json() {
+        let value = sample();
+        let from_json: serde_json::Value =
+            serde_json::from_str(&StructuredFormat::Json.render(&value).unwrap()).unwrap();
+        for text in [
+            StructuredFormat::Yaml.render(&value).unwrap(),
+            StructuredFormat::Yaml.render_compact(&value).unwrap(),
+        ] {
+            let from_yaml: serde_json::Value = serde_yaml_ng::from_str(&text).unwrap();
+            assert_eq!(from_yaml, from_json, "{text}");
+        }
+    }
+
+    #[test]
+    fn yaml_renders_an_enum_variant_as_a_map_not_a_yaml_tag() {
+        // Serialized directly, serde_yaml_ng would write `tagged: !Pair`.
+        let text = StructuredFormat::Yaml.render(&sample()).unwrap();
+        assert!(!text.contains('!'), "{text}");
+        assert!(text.contains("Pair:"), "{text}");
+    }
+
+    #[test]
+    fn yaml_is_one_document_with_a_trailing_newline_and_no_marker() {
+        let text = StructuredFormat::Yaml.render(&sample()).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(!text.starts_with("---"), "{text}");
+        assert_eq!(text.lines().next(), Some("id: tsk_1"));
+    }
+
+    #[test]
+    fn null_renders_as_null_in_both_formats() {
+        let null = serde_json::Value::Null;
+        assert_eq!(StructuredFormat::Json.render(&null).unwrap(), "null\n");
+        assert_eq!(StructuredFormat::Yaml.render(&null).unwrap(), "null\n");
+    }
+
+    #[test]
+    fn a_string_that_looks_like_a_number_stays_a_string_in_yaml() {
+        let text = StructuredFormat::Yaml.render(&["007", "true"]).unwrap();
+        let back: Vec<String> = serde_yaml_ng::from_str(&text).unwrap();
+        assert_eq!(back, ["007", "true"]);
     }
 
     fn rows_of(rows: &[&[&str]]) -> Vec<Vec<String>> {

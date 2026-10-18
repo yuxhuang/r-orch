@@ -21,7 +21,7 @@ use orch_engine::Engine;
 use serde::Serialize;
 
 use crate::context::CliContext;
-use crate::output::{Color, Styles, format_duration_since, format_tokens, print_json};
+use crate::output::{Color, Styles, format_duration_since, format_tokens};
 
 /// `{ tasks, agents, state }`, with `claimed` as an array.
 ///
@@ -39,10 +39,10 @@ pub async fn run(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<(
     let agents = engine.agent_service.list().await?;
     let state = engine.state.read().await?;
 
-    if ctx.json {
+    if let Some(format) = ctx.output {
         // `OrchestratorState` serializes `claimed` as the `IndexSet` it is,
         // i.e. a JSON array — §14.1's fix, and identical to `state.json`.
-        return print_json(&StatusJson {
+        return format.print(&StatusJson {
             tasks: &tasks,
             agents: &agents,
             state: &state,

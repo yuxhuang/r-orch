@@ -10,7 +10,7 @@ use orch_domain::{CreateTeamInput, PartialTeamConfig, Team};
 use orch_engine::Engine;
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_json, print_key_value, print_success, print_table};
+use crate::output::{Styles, print_key_value, print_success, print_table};
 
 pub struct TeamCreateArgs<'a> {
     pub name: &'a str,
@@ -44,8 +44,8 @@ pub async fn create(
         })
         .await?;
 
-    if ctx.json {
-        print_json(&team)?;
+    if let Some(format) = ctx.output {
+        format.print(&team)?;
     } else if ctx.quiet {
         println!("{}", team.id);
     } else {
@@ -60,8 +60,8 @@ pub async fn create(
 pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
     let teams = engine.team_service.list().await?;
 
-    if ctx.json {
-        return print_json(&teams);
+    if let Some(format) = ctx.output {
+        return format.print(&teams);
     }
     if teams.is_empty() {
         println!(
@@ -86,8 +86,8 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
 pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
     let team = engine.team_service.get(id).await?;
 
-    if ctx.json {
-        return print_json(&team);
+    if let Some(format) = ctx.output {
+        return format.print(&team);
     }
 
     println!();

@@ -39,6 +39,19 @@ pub const CONTAINER_LESS_COMMANDS: [&str; 3] = ["init", "update", "doctor"];
 /// printed, not its value).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The parsed command line. clap parses [`RawCli`]; this type adds the one
+/// check clap cannot express, so every parse path (`try_parse_from`,
+/// `parse`, the tests) gets it.
+#[derive(Debug)]
+pub struct Cli {
+    pub json: bool,
+    pub yaml: bool,
+    pub quiet: bool,
+    pub no_color: bool,
+    pub ascii: bool,
+    pub command: Option<Command>,
+}
+
 /// The clap program name stays `orchestry` so `--help` matches, whichever of
 /// the three binary names was invoked.
 #[derive(Debug, Parser)]
@@ -50,18 +63,79 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     // mapping lives in `run()`.
     disable_help_flag = false
 )]
-pub struct Cli {
+struct RawCli {
     #[arg(long, global = true, help = "Output as JSON")]
-    pub json: bool,
+    json: bool,
+    #[arg(long, global = true, conflicts_with = "json", help = "Output as YAML")]
+    yaml: bool,
     #[arg(long, global = true, help = "Minimal output (IDs only)")]
-    pub quiet: bool,
+    quiet: bool,
     #[arg(long = "no-color", global = true, help = "Disable colors")]
-    pub no_color: bool,
+    no_color: bool,
     #[arg(long, global = true, help = "ASCII-only output (no Unicode)")]
-    pub ascii: bool,
+    ascii: bool,
 
     #[command(subcommand)]
-    pub command: Option<Command>,
+    command: Option<Command>,
+}
+
+impl clap::CommandFactory for Cli {
+    fn command() -> clap::Command {
+        RawCli::command()
+    }
+
+    fn command_for_update() -> clap::Command {
+        RawCli::command_for_update()
+    }
+}
+
+impl clap::FromArgMatches for Cli {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    /// clap's `conflicts_with` on a global flag only fires when both flags
+    /// are given at the same subcommand level, so `orch --json task list
+    /// --yaml` would otherwise parse with both set. The propagated values are
+    /// all visible here, after parsing.
+    fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
+        let RawCli {
+            json,
+            yaml,
+            quiet,
+            no_color,
+            ascii,
+            command,
+        } = RawCli::from_arg_matches_mut(matches)?;
+        if json && yaml {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "the argument '--yaml' cannot be used with '--json'",
+            ));
+        }
+        Ok(Cli {
+            json,
+            yaml,
+            quiet,
+            no_color,
+            ascii,
+            command,
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches(matches)?;
+        Ok(())
+    }
+}
+
+impl Parser for Cli {}
+
+impl Cli {
+    /// The structured format the global flags ask for, if any.
+    pub fn output(&self) -> Option<crate::output::StructuredFormat> {
+        crate::output::StructuredFormat::from_flags(self.json, self.yaml)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1161,12 +1235,17 @@ mod tests {
                 assert_eq!(arg.is_required_set(), required, "{path} --{long}: required");
             }
 
-            // Nothing beyond the table, counting `--help` but not the four
+            // Nothing beyond the table, counting `--help` but not the five
             // global flags, which clap propagates to every subcommand.
             let declared: Vec<&str> = command
                 .get_arguments()
                 .filter_map(|arg| arg.get_long())
-                .filter(|long| !matches!(*long, "help" | "json" | "quiet" | "no-color" | "ascii"))
+                .filter(|long| {
+                    !matches!(
+                        *long,
+                        "help" | "json" | "yaml" | "quiet" | "no-color" | "ascii"
+                    )
+                })
                 .collect();
             assert_eq!(
                 declared.len(),
@@ -1281,7 +1360,7 @@ mod tests {
         expected.sort();
         assert_eq!(names, expected);
 
-        for flag in ["json", "quiet", "no-color", "ascii"] {
+        for flag in ["json", "yaml", "quiet", "no-color", "ascii"] {
             let arg = command
                 .get_arguments()
                 .find(|arg| arg.get_long() == Some(flag))
@@ -1320,6 +1399,40 @@ mod tests {
                 .unwrap()
                 .quiet
         );
+    }
+
+    #[test]
+    fn yaml_is_global_and_maps_to_the_yaml_format() {
+        use crate::output::StructuredFormat;
+        for argv in [
+            ["orch", "--yaml", "task", "list"],
+            ["orch", "task", "list", "--yaml"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.output(), Some(StructuredFormat::Yaml), "{argv:?}");
+        }
+        let json = Cli::try_parse_from(["orch", "task", "list", "--json"]).unwrap();
+        assert_eq!(json.output(), Some(StructuredFormat::Json));
+        let human = Cli::try_parse_from(["orch", "task", "list"]).unwrap();
+        assert_eq!(human.output(), None);
+    }
+
+    #[test]
+    fn json_and_yaml_together_are_a_usage_error() {
+        let cases: [&[&str]; 4] = [
+            &["orch", "--json", "task", "list", "--yaml"],
+            &["orch", "task", "list", "--yaml", "--json"],
+            &["orch", "--yaml", "--json", "status"],
+            &["orch", "task", "--json", "list", "--yaml"],
+        ];
+        for argv in cases {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

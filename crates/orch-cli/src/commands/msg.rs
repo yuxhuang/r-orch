@@ -12,7 +12,7 @@ use orch_domain::{CreateMessageInput, Message, MessageChannel};
 use orch_engine::Engine;
 
 use crate::context::CliContext;
-use crate::output::{Styles, format_duration_since, print_json, print_success, print_table};
+use crate::output::{Styles, format_duration_since, print_success, print_table};
 
 pub struct MsgSendArgs<'a> {
     pub to_agent_id: &'a str,
@@ -51,8 +51,8 @@ pub async fn send(
         })
         .await?;
 
-    if ctx.json {
-        return print_json(&messages);
+    if let Some(format) = ctx.output {
+        return format.print(&messages);
     }
     // `messages[0]?.id` — an empty fan-out prints the JS `undefined`.
     let id = first_id(&messages);
@@ -87,8 +87,8 @@ pub async fn broadcast(
         })
         .await?;
 
-    if ctx.json {
-        return print_json(&messages);
+    if let Some(format) = ctx.output {
+        return format.print(&messages);
     }
     if ctx.quiet {
         // `join('\n')` over the ids — nothing at all for an empty fan-out.
@@ -120,8 +120,8 @@ pub async fn inbox(
         .list_pending_for_agent(agent_id)
         .await?;
 
-    if ctx.json {
-        return print_json(&pending);
+    if let Some(format) = ctx.output {
+        return format.print(&pending);
     }
     if pending.is_empty() {
         println!("{}", styles.dim("\n  No pending messages.\n"));
@@ -157,8 +157,8 @@ pub async fn list(
         None => engine.message_service.list_all().await?,
     };
 
-    if ctx.json {
-        return print_json(&messages);
+    if let Some(format) = ctx.output {
+        return format.print(&messages);
     }
     if messages.is_empty() {
         println!("{}", styles.dim("\n  No messages.\n"));

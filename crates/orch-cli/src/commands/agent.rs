@@ -10,9 +10,7 @@ use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
 
 use crate::context::CliContext;
-use crate::output::{
-    Styles, format_tokens, print_json, print_key_value, print_success, print_table,
-};
+use crate::output::{Styles, format_tokens, print_key_value, print_success, print_table};
 use crate::shop_picker;
 
 #[derive(Debug, Clone, Default)]
@@ -60,8 +58,8 @@ pub async fn add(
         })
         .await?;
 
-    if ctx.json {
-        print_json(&agent)?;
+    if let Some(format) = ctx.output {
+        format.print(&agent)?;
     } else if ctx.quiet {
         println!("{}", agent.id);
     } else {
@@ -87,8 +85,8 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
         .list(engine.agent_service.list().await?)
         .await?;
 
-    if ctx.json {
-        return print_json(&agents);
+    if let Some(format) = ctx.output {
+        return format.print(&agents);
     }
     if ctx.quiet {
         for agent in &agents {
@@ -193,8 +191,8 @@ pub async fn status(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str
         .await?
         .ok_or_else(|| orch_core::Error::invalid_arguments(format!("Agent not found: {id}")))?;
 
-    if ctx.json {
-        return print_json(&agent);
+    if let Some(format) = ctx.output {
+        return format.print(&agent);
     }
 
     println!("\n  {}", agent.name);
@@ -327,8 +325,8 @@ pub async fn edit(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
         )
         .await?;
 
-    if ctx.json {
-        print_json(&updated)?;
+    if let Some(format) = ctx.output {
+        format.print(&updated)?;
     } else if ctx.quiet {
         println!("{}", updated.id);
     } else {
@@ -373,8 +371,8 @@ pub async fn autonomous(
 
     let agent = engine.agent_service.set_autonomous(id, enable).await?;
 
-    if ctx.json {
-        print_json(&agent)?;
+    if let Some(format) = ctx.output {
+        format.print(&agent)?;
     } else if ctx.quiet {
         println!("{}", agent.id);
     } else {
@@ -458,7 +456,7 @@ mod tests {
     fn ctx(root: &Path) -> CliContext {
         CliContext::new(
             root.to_path_buf(),
-            false,
+            None,
             false,
             true,
             false,

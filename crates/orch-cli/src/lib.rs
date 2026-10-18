@@ -158,7 +158,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             } else {
                 None
             };
-            doctor::run(&styles, &cwd, cli.json, project.as_ref()).await
+            doctor::run(&styles, &cwd, cli.output(), project.as_ref()).await
         }
 
         Some(Command::Task(TaskCmd { command })) => {
@@ -571,7 +571,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                 return Ok(ExitCode::from(2));
             }
             // The full tier: every mode drives the orchestrator.
-            let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+            let ctx =
+                CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
             let styles = ctx.styles(env);
             if peer.listen.is_some() && !*watch {
                 return Err(orch_core::Error::invalid_arguments(
@@ -595,7 +596,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             }
         }
         Some(Command::Tui(args)) => {
-            let ctx = CliContext::resolve(&cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+            let ctx =
+                CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
             // The dashboard needs the orchestrator, so this is the one command
             // that builds the full container up front.
             tui::run_with_peer(
@@ -700,7 +702,7 @@ async fn run_serve(
     };
 
     // The full tier: `serve` is the orchestrator.
-    let ctx = CliContext::resolve(cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+    let ctx = CliContext::resolve(cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
     let engine =
         orch_engine::build_full_with_peer(ctx.project_root.clone(), args.peer.config()).await?;
     if let Some(listen) = &engine.config.peer.listen {
@@ -800,7 +802,7 @@ async fn build(
     env: EnvFlags,
     cwd: &std::path::Path,
 ) -> Result<(CliContext, Styles, orch_engine::Engine)> {
-    let ctx = CliContext::resolve(cwd, cli.json, cli.quiet, cli.no_color, cli.ascii, env);
+    let ctx = CliContext::resolve(cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
     let styles = ctx.styles(env);
     let engine = orch_engine::build_light(ctx.project_root.clone()).await?;
     Ok((ctx, styles, engine))

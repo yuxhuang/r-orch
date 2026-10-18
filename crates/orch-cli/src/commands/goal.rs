@@ -21,10 +21,7 @@ use orch_engine::goal_service::UpdateGoalFields;
 use serde_json::{Value, json};
 
 use crate::context::CliContext;
-use crate::output::{
-    Styles, print_error, print_json, print_json_compact, print_key_value, print_success,
-    print_table,
-};
+use crate::output::{Styles, print_error, print_key_value, print_success, print_table};
 
 /// Goal status icons. Hard-coded in the original — unlike the task icons
 /// these have no ASCII fallback, so `--ascii` does not change them.
@@ -54,8 +51,8 @@ pub async fn add(
         })
         .await?;
 
-    if ctx.json {
-        return print_json(&goal);
+    if let Some(format) = ctx.output {
+        return format.print(&goal);
     }
     if ctx.quiet {
         println!("{}", goal.id);
@@ -109,8 +106,8 @@ pub async fn list(
         },
     };
 
-    if ctx.json {
-        return print_json(&goals);
+    if let Some(format) = ctx.output {
+        return format.print(&goals);
     }
     if goals.is_empty() {
         println!("{}", styles.dim("No goals found."));
@@ -127,7 +124,7 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
     let tasks = engine.goal_service.list_tasks_for_goal(id).await?;
     let progress = engine.goal_service.get_progress_report(id).await?;
 
-    if ctx.json {
+    if let Some(format) = ctx.output {
         let mut merged = serde_json::to_value(&goal).expect("a goal serializes");
         let object = merged
             .as_object_mut()
@@ -140,7 +137,7 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
         if let Some(progress) = &progress {
             object.insert("progress".to_owned(), Value::String(progress.clone()));
         }
-        return print_json(&merged);
+        return format.print(&merged);
     }
 
     print_key_value(
@@ -236,8 +233,8 @@ pub async fn status(
 
     let goal = engine.goal_service.update_status(id, status, force).await?;
 
-    if ctx.json {
-        print_json(&goal)?;
+    if let Some(format) = ctx.output {
+        format.print(&goal)?;
     } else if ctx.quiet {
         println!("{}", goal.id);
     } else {
@@ -258,8 +255,8 @@ pub async fn update(
 ) -> Result<()> {
     let goal = engine.goal_service.update(id, &fields).await?;
 
-    if ctx.json {
-        print_json(&goal)?;
+    if let Some(format) = ctx.output {
+        format.print(&goal)?;
     } else if ctx.quiet {
         println!("{}", goal.id);
     } else {
@@ -271,9 +268,9 @@ pub async fn update(
 pub async fn delete(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
     engine.goal_service.delete(id).await?;
 
-    if ctx.json {
+    if let Some(format) = ctx.output {
         // Compact, unlike every other goal `--json` site.
-        return print_json_compact(&json!({ "deleted": id }));
+        return format.print_compact(&json!({ "deleted": id }));
     }
     if !ctx.quiet {
         print_success(styles, &format!("Deleted goal {id}"));

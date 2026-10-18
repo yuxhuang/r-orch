@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_error, print_json_compact, print_success};
+use crate::output::{Styles, print_error, print_success};
 
 /// `{ key, value }`, where an absent value drops the key.
 #[derive(Debug, Serialize)]
@@ -42,8 +42,8 @@ fn render_value(value: Option<&Value>) -> String {
 pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
     let value = engine.config_store.get(key).await?;
 
-    if ctx.json {
-        return print_json_compact(&KeyValue {
+    if let Some(format) = ctx.output {
+        return format.print_compact(&KeyValue {
             key,
             value: value.as_ref(),
         });
@@ -98,8 +98,8 @@ pub async fn global_get(
     let config = engine.global_config_store.read().await?;
     let value = global_value(&config, key);
 
-    if ctx.json {
-        return print_json_compact(&KeyValue {
+    if let Some(format) = ctx.output {
+        return format.print_compact(&KeyValue {
             key,
             value: value.as_ref(),
         });
@@ -166,8 +166,8 @@ pub async fn global_set(
 pub async fn global_show(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
     let config = engine.global_config_store.read().await?;
 
-    if ctx.json {
-        return print_json_compact(&config);
+    if let Some(format) = ctx.output {
+        return format.print_compact(&config);
     }
     // Raw, not JSON-quoted — unlike `global get`.
     println!(

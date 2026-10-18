@@ -14,9 +14,7 @@ use orch_core::storage::ContextEntry;
 use orch_engine::Engine;
 
 use crate::context::CliContext;
-use crate::output::{
-    Styles, format_duration_since, print_error, print_json, print_success, print_table,
-};
+use crate::output::{Styles, format_duration_since, print_error, print_success, print_table};
 
 pub async fn set(
     engine: &Engine,
@@ -28,10 +26,10 @@ pub async fn set(
 ) -> Result<()> {
     engine.context.set(key, value, ttl_ms).await?;
 
-    if ctx.json {
+    if let Some(format) = ctx.output {
         // Re-read, so the printed entry carries the stored timestamps.
         let entry = engine.context.get(key).await?;
-        return print_json(&entry);
+        return format.print(&entry);
     }
     if ctx.quiet {
         println!("{key}");
@@ -43,8 +41,8 @@ pub async fn set(
 
 pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
     let Some(entry) = engine.context.get(key).await? else {
-        if ctx.json {
-            println!("null");
+        if let Some(format) = ctx.output {
+            format.print(&serde_json::Value::Null)?;
         } else {
             // Exit 0: a missing key is not an error condition here.
             print_error(styles, &format!("Context key \"{key}\" not found"), None);
@@ -52,8 +50,8 @@ pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) 
         return Ok(());
     };
 
-    if ctx.json {
-        return print_json(&entry);
+    if let Some(format) = ctx.output {
+        return format.print(&entry);
     }
     if ctx.quiet {
         println!("{}", entry.value);
@@ -72,8 +70,8 @@ pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) 
 pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
     let entries = engine.context.list().await?;
 
-    if ctx.json {
-        return print_json(&entries);
+    if let Some(format) = ctx.output {
+        return format.print(&entries);
     }
     if ctx.quiet {
         for entry in &entries {
@@ -99,7 +97,7 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
 
 pub async fn delete(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
     engine.context.delete(key).await?;
-    if !ctx.quiet && !ctx.json {
+    if !ctx.quiet && ctx.output.is_none() {
         print_success(styles, &format!("Deleted context \"{key}\""));
     }
     Ok(())

@@ -19,7 +19,7 @@ use orch_engine::Engine;
 
 use crate::context::CliContext;
 use crate::editor;
-use crate::output::{Styles, print_json, print_key_value, print_success, print_table};
+use crate::output::{Styles, print_key_value, print_success, print_table};
 
 /// Comma-separated list option: split, trim, keep empties out of the way the
 /// TS does **not** — `"a,,b".split(',').map(trim)` yields `["a", "", "b"]`, so
@@ -86,8 +86,8 @@ pub async fn add(
         })
         .await?;
 
-    if ctx.json {
-        print_json(&task)?;
+    if let Some(format) = ctx.output {
+        format.print(&task)?;
     } else if ctx.quiet {
         println!("{}", task.id);
     } else {
@@ -108,8 +108,8 @@ pub async fn list(
     };
     let tasks = engine.task_service.list(&filter).await?;
 
-    if ctx.json {
-        return print_json(&tasks);
+    if let Some(format) = ctx.output {
+        return format.print(&tasks);
     }
     if ctx.quiet {
         for task in &tasks {
@@ -257,8 +257,8 @@ pub async fn assign(
 ) -> Result<()> {
     let task = engine.task_service.assign(task_id, agent_id).await?;
 
-    if ctx.json {
-        return print_json(&task);
+    if let Some(format) = ctx.output {
+        return format.print(&task);
     }
     print_success(
         styles,
@@ -274,8 +274,8 @@ pub async fn assign(
 pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
     let task = engine.task_service.get(id).await?;
 
-    if ctx.json {
-        return print_json(&task);
+    if let Some(format) = ctx.output {
+        return format.print(&task);
     }
 
     println!("\n  {}", task.title);
