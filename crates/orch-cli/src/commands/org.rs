@@ -18,7 +18,7 @@ use orch_engine::agent_factory::template_to_agent_input;
 use serde::Serialize;
 
 use crate::context::CliContext;
-use crate::output::{Styles, print_error, print_json, print_success, print_table};
+use crate::output::{Styles, print_error, print_success, print_table};
 
 /// `{ team, agentIds, goalId }` — camelCase among the snake_case entities,
 /// because it is an ad-hoc object rather than a stored one.
@@ -32,8 +32,8 @@ struct DeployJson<'a> {
 }
 
 pub async fn list(ctx: &CliContext, styles: &Styles) -> Result<()> {
-    if ctx.json {
-        return print_json(&ORG_TEMPLATES);
+    if let Some(format) = ctx.output {
+        return format.print(&ORG_TEMPLATES);
     }
 
     println!();
@@ -113,8 +113,8 @@ pub async fn deploy(
         None => None,
     };
 
-    if ctx.json {
-        print_json(&DeployJson {
+    if let Some(format) = ctx.output {
+        format.print(&DeployJson {
             team: &team,
             agent_ids: &agent_ids,
             goal_id: goal_id.as_deref(),

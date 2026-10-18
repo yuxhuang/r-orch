@@ -781,7 +781,7 @@ async fn a_tui_sent_message_is_byte_identical_on_disk_to_a_cli_sent_one() {
         &engine,
         &CliContext::new(
             temp.path().to_path_buf(),
-            false,
+            None,
             true,
             true,
             false,

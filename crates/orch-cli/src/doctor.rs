@@ -32,7 +32,7 @@ use orch_infra::storage::Paths;
 use serde::Serialize;
 
 use crate::context::CliContext;
-use crate::output::{Color, Icon, Styles, print_json};
+use crate::output::{Color, Icon, StructuredFormat, Styles};
 
 /// The five adapters the container-less tier probes, in the order it
 /// registers them (§14.1) — note that codex, cursor and opencode are absent.
@@ -137,7 +137,7 @@ pub fn render_report(styles: &Styles, report: &DoctorReport, project: &ProjectLi
 pub async fn run(
     styles: &Styles,
     cwd: &std::path::Path,
-    json: bool,
+    output: Option<StructuredFormat>,
     project: Option<&(CliContext, orch_engine::Engine)>,
 ) -> Result<ExitCode> {
     print!("{}", render_header(styles));
@@ -153,10 +153,12 @@ pub async fn run(
         .run_all()
         .await;
 
-    // JSON mode is gated on a container existing, so a container-less
-    // `doctor --json` still prints text.
-    if json && project.is_some() {
-        print_json(&DoctorJson::from(&report))?;
+    // Structured mode is gated on a container existing, so a container-less
+    // `doctor --json` (or `--yaml`) still prints text.
+    if let Some(format) = output
+        && project.is_some()
+    {
+        format.print(&DoctorJson::from(&report))?;
         return Ok(ExitCode::SUCCESS);
     }
 

@@ -379,21 +379,191 @@ fn js_to_fixed_1(x: f64) -> String {
     format!("{}.0", integer + 1)
 }
 
-/// `JSON.stringify(value, null, 2)` + newline, on stdout.
-pub fn print_json<T: serde::Serialize>(value: &T) -> orch_core::Result<()> {
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|err| orch_core::Error::other(format!("serialize JSON output: {err}")))?;
-    println!("{text}");
-    Ok(())
+/// The machine-readable format chosen by the global `--json` / `--yaml` flags.
+///
+/// Every structured site renders through here, so the two formats always
+/// carry the same value: YAML is produced from the `serde_json::Value` the
+/// JSON path would print, never from the type directly. That matters because
+/// `serde_yaml_ng` renders an externally tagged enum as a YAML `!Tag`, which
+/// would parse back to a different value than the JSON does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredFormat {
+    Json,
+    Yaml,
 }
 
-/// `JSON.stringify(value)` + newline — the compact form four commands use
-/// (PARITY.md §4.1).
-pub fn print_json_compact<T: serde::Serialize>(value: &T) -> orch_core::Result<()> {
-    let text = serde_json::to_string(value)
-        .map_err(|err| orch_core::Error::other(format!("serialize JSON output: {err}")))?;
-    println!("{text}");
-    Ok(())
+impl StructuredFormat {
+    /// From the two global flags. clap rejects both together, so `json` wins
+    /// only if a caller builds the flags by hand.
+    pub fn from_flags(json: bool, yaml: bool) -> Option<Self> {
+        if json {
+            Some(StructuredFormat::Json)
+        } else if yaml {
+            Some(StructuredFormat::Yaml)
+        } else {
+            None
+        }
+    }
+
+    /// The exact stdout bytes for `value`: pretty JSON (`JSON.stringify(v,
+    /// null, 2)`) plus a newline, or one YAML document.
+    pub fn render<T: serde::Serialize + ?Sized>(self, value: &T) -> orch_core::Result<String> {
+        match self {
+            StructuredFormat::Json => serde_json::to_string_pretty(value)
+                .map(|text| format!("{text}\n"))
+                .map_err(json_error),
+            StructuredFormat::Yaml => render_yaml(value),
+        }
+    }
+
+    /// As [`render`](Self::render), but JSON is the compact `JSON.stringify(v)`
+    /// form four commands use (PARITY.md §4.1). YAML has one form.
+    pub fn render_compact<T: serde::Serialize + ?Sized>(
+        self,
+        value: &T,
+    ) -> orch_core::Result<String> {
+        match self {
+            StructuredFormat::Json => serde_json::to_string(value)
+                .map(|text| format!("{text}\n"))
+                .map_err(json_error),
+            StructuredFormat::Yaml => render_yaml(value),
+        }
+    }
+
+    pub fn print<T: serde::Serialize + ?Sized>(self, value: &T) -> orch_core::Result<()> {
+        write_stdout(&self.render(value)?);
+        Ok(())
+    }
+
+    pub fn print_compact<T: serde::Serialize + ?Sized>(self, value: &T) -> orch_core::Result<()> {
+        write_stdout(&self.render_compact(value)?);
+        Ok(())
+    }
+}
+
+fn json_error(err: serde_json::Error) -> orch_core::Error {
+    orch_core::Error::other(format!("serialize JSON output: {err}"))
+}
+
+fn render_yaml<T: serde::Serialize + ?Sized>(value: &T) -> orch_core::Result<String> {
+    let value = serde_json::to_value(value).map_err(json_error)?;
+    // Library-first exemption: no maintained crate fits the required scalar-style
+    // contract among our existing dependencies. serde_yaml_ng cannot force every
+    // string/key to be double-quoted, leaving YAML 1.1 resolvers free to retype it.
+    // Keep this emitter limited to JSON values; serde_json owns string escaping.
+    let mut text = String::new();
+    write_yaml(&value, 0, &mut text);
+    Ok(text)
+}
+
+fn write_yaml(value: &serde_json::Value, indent: usize, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (key, value) in map {
+                out.push_str(&" ".repeat(indent));
+                let key_start = out.len();
+                write_yaml_string(key, out);
+                // YAML limits implicit keys to 1024 characters. Bound the
+                // quoted/escaped bytes conservatively; explicit keys have no limit.
+                if out.len() - key_start > 128 {
+                    out.insert_str(key_start, "? ");
+                    out.push('\n');
+                    out.push_str(&" ".repeat(indent));
+                }
+                out.push(':');
+                write_yaml_entry(value, indent, out);
+            }
+        }
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            for value in items {
+                out.push_str(&" ".repeat(indent));
+                out.push('-');
+                write_yaml_entry(value, indent, out);
+            }
+        }
+        _ => {
+            out.push_str(&" ".repeat(indent));
+            write_yaml_scalar(value, out);
+            out.push('\n');
+        }
+    }
+}
+
+fn write_yaml_entry(value: &serde_json::Value, indent: usize, out: &mut String) {
+    let nested = match value {
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        _ => false,
+    };
+    if nested {
+        out.push('\n');
+        write_yaml(value, indent + 2, out);
+    } else {
+        out.push(' ');
+        write_yaml_scalar(value, out);
+        out.push('\n');
+    }
+}
+
+fn write_yaml_scalar(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => {
+            let text = value.to_string();
+            if let Some((mantissa, exponent)) = text.split_once('e') {
+                // YAML 1.1 requires a decimal point and an explicit exponent sign
+                // to recognize a float (JSON's `1e20` would become a string).
+                out.push_str(mantissa);
+                if !mantissa.contains('.') {
+                    out.push_str(".0");
+                }
+                out.push('e');
+                if !exponent.starts_with(['+', '-']) {
+                    out.push('+');
+                }
+                out.push_str(exponent);
+            } else {
+                out.push_str(&text);
+            }
+        }
+        serde_json::Value::String(value) => write_yaml_string(value, out),
+        serde_json::Value::Array(items) => {
+            debug_assert!(items.is_empty());
+            out.push_str("[]");
+        }
+        serde_json::Value::Object(map) => {
+            debug_assert!(map.is_empty());
+            out.push_str("{}");
+        }
+    }
+}
+
+fn write_yaml_string(value: &str, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let quoted = serde_json::to_string(value).expect("strings can be serialized as JSON");
+    for ch in quoted.chars() {
+        match ch {
+            // JSON permits characters YAML readers reject or normalize as line
+            // breaks/BOMs. Escapes preserve them as data in keys and values alike.
+            '\u{7f}'..='\u{9f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{feff}'
+            | '\u{fffe}'
+            | '\u{ffff}' => {
+                write!(out, "\\u{:04X}", ch as u32).expect("writing to a String cannot fail");
+            }
+            _ => out.push(ch),
+        }
+    }
+}
+
+/// `print!`, which panics on a closed pipe exactly as the `println!` the JSON
+/// path always used did.
+fn write_stdout(text: &str) {
+    print!("{text}");
 }
 
 #[cfg(test)]
@@ -597,6 +767,298 @@ mod tests {
         assert_eq!(js_to_fixed_1(0.96), "1.0");
         assert_eq!(js_to_fixed_1(9.99), "10.0");
         assert_eq!(js_to_fixed_1(0.0), "0.0");
+    }
+
+    #[derive(serde::Serialize)]
+    enum Tagged {
+        Pair(u8, u8),
+    }
+
+    #[derive(serde::Serialize)]
+    struct Sample {
+        id: &'static str,
+        count: u64,
+        missing: Option<&'static str>,
+        tags: Vec<&'static str>,
+        tagged: Tagged,
+    }
+
+    fn sample() -> Sample {
+        Sample {
+            id: "tsk_1",
+            count: 3,
+            missing: None,
+            tags: vec!["a", "007"],
+            tagged: Tagged::Pair(1, 2),
+        }
+    }
+
+    #[test]
+    fn the_flags_choose_the_format_and_neither_means_human() {
+        assert_eq!(StructuredFormat::from_flags(false, false), None);
+        assert_eq!(
+            StructuredFormat::from_flags(true, false),
+            Some(StructuredFormat::Json)
+        );
+        assert_eq!(
+            StructuredFormat::from_flags(false, true),
+            Some(StructuredFormat::Yaml)
+        );
+    }
+
+    #[test]
+    fn json_rendering_is_byte_identical_to_the_old_print_json() {
+        let value = sample();
+        assert_eq!(
+            StructuredFormat::Json.render(&value).unwrap(),
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
+        );
+        assert_eq!(
+            StructuredFormat::Json.render_compact(&value).unwrap(),
+            format!("{}\n", serde_json::to_string(&value).unwrap())
+        );
+    }
+
+    #[test]
+    fn yaml_parses_back_to_the_same_value_as_the_json() {
+        let value = sample();
+        let from_json: serde_json::Value =
+            serde_json::from_str(&StructuredFormat::Json.render(&value).unwrap()).unwrap();
+        for text in [
+            StructuredFormat::Yaml.render(&value).unwrap(),
+            StructuredFormat::Yaml.render_compact(&value).unwrap(),
+        ] {
+            let from_yaml: serde_json::Value = serde_yaml_ng::from_str(&text).unwrap();
+            assert_eq!(from_yaml, from_json, "{text}");
+        }
+    }
+
+    #[test]
+    fn yaml_renders_an_enum_variant_as_a_map_not_a_yaml_tag() {
+        // Serialized directly, serde_yaml_ng would write `tagged: !Pair`.
+        let text = StructuredFormat::Yaml.render(&sample()).unwrap();
+        assert!(!text.contains('!'), "{text}");
+        assert!(text.contains("\"Pair\":"), "{text}");
+    }
+
+    #[test]
+    fn yaml_is_one_document_with_a_trailing_newline_and_no_marker() {
+        let text = StructuredFormat::Yaml.render(&sample()).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(!text.starts_with("---"), "{text}");
+        assert_eq!(text.lines().next(), Some("\"id\": \"tsk_1\""));
+    }
+
+    #[test]
+    fn null_renders_as_null_in_both_formats() {
+        let null = serde_json::Value::Null;
+        assert_eq!(StructuredFormat::Json.render(&null).unwrap(), "null\n");
+        assert_eq!(StructuredFormat::Yaml.render(&null).unwrap(), "null\n");
+    }
+
+    #[test]
+    fn a_string_that_looks_like_a_number_stays_a_string_in_yaml() {
+        let text = StructuredFormat::Yaml.render(&["007", "true"]).unwrap();
+        let back: Vec<String> = serde_yaml_ng::from_str(&text).unwrap();
+        assert_eq!(back, ["007", "true"]);
+    }
+
+    #[test]
+    fn yaml_quotes_strings_that_other_resolvers_would_retype() {
+        let cases = [
+            ("<<", "\"<<\"\n"),
+            ("=", "\"=\"\n"),
+            ("yes", "\"yes\"\n"),
+            ("Yes", "\"Yes\"\n"),
+            ("No", "\"No\"\n"),
+            ("NO", "\"NO\"\n"),
+            ("on", "\"on\"\n"),
+            ("off", "\"off\"\n"),
+            ("1_000", "\"1_000\"\n"),
+            ("1:20", "\"1:20\"\n"),
+            ("2026-10-18", "\"2026-10-18\"\n"),
+            ("2026-10-18T00:38:42.688Z", "\"2026-10-18T00:38:42.688Z\"\n"),
+            ("ordinary", "\"ordinary\"\n"),
+            ("", "\"\"\n"),
+        ];
+        for (value, expected) in cases {
+            let text = StructuredFormat::Yaml.render(value).unwrap();
+            assert_eq!(text, expected, "{value:?}");
+            assert_eq!(serde_yaml_ng::from_str::<String>(&text).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn yaml_quotes_every_mapping_key() {
+        for key in [
+            "<<",
+            "=",
+            "yes",
+            "on",
+            "1_000",
+            "1:20",
+            "2026-10-18",
+            "ordinary",
+            "",
+        ] {
+            let value = serde_json::json!({ key: "value" });
+            let text = StructuredFormat::Yaml.render(&value).unwrap();
+            assert_eq!(text, format!("\"{key}\": \"value\"\n"));
+            assert_eq!(
+                serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_long_key_with_scalar_or_empty_container_parses_back_equal() {
+        let key = "k".repeat(1100);
+        for value in [
+            serde_json::json!("value"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!([]),
+        ] {
+            let map = serde_json::json!({ &key: value });
+            let text = StructuredFormat::Yaml.render(&map).unwrap();
+            assert_eq!(
+                serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+                map
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_long_key_with_nested_mapping_parses_back_equal() {
+        let key = "k".repeat(1100);
+        let value = serde_json::json!({ &key: { "child": { "leaf": "value" } }, "short": 7 });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn yaml_long_key_with_sequence_parses_back_equal() {
+        let key = "k".repeat(1100);
+        let value = serde_json::json!({ &key: ["value", { "child": true }, []] });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn yaml_long_key_inside_sequence_item_parses_back_equal() {
+        let key = "k".repeat(1100);
+        let value = serde_json::json!({ "items": [{ &key: { "child": [1, 2] } }, "sibling"] });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn yaml_long_key_after_escaping_parses_back_equal() {
+        // Only 200 source characters, but 1202 characters once quoted/escaped.
+        let key = "\u{0085}".repeat(200);
+        let value = serde_json::json!({ key: "value" });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn yaml_escapes_characters_that_yaml_readers_reject_or_normalize() {
+        let mut cases = vec![
+            ("a\u{2028}b".to_owned(), "\"a\\u2028b\"\n".to_owned()),
+            ("a\u{2029}b".to_owned(), "\"a\\u2029b\"\n".to_owned()),
+            ("a\u{feff}b".to_owned(), "\"a\\uFEFFb\"\n".to_owned()),
+            ("a\u{fffe}b".to_owned(), "\"a\\uFFFEb\"\n".to_owned()),
+            ("a\u{ffff}b".to_owned(), "\"a\\uFFFFb\"\n".to_owned()),
+            (
+                "\"\\\n\r\t\0".to_owned(),
+                "\"\\\"\\\\\\n\\r\\t\\u0000\"\n".to_owned(),
+            ),
+            (" é 😀 ".to_owned(), "\" é 😀 \"\n".to_owned()),
+        ];
+        for ch in '\u{7f}'..='\u{9f}' {
+            cases.push((format!("a{ch}b"), format!("\"a\\u{:04X}b\"\n", ch as u32)));
+        }
+        for (value, expected) in cases {
+            let text = StructuredFormat::Yaml.render(&value).unwrap();
+            assert_eq!(text, expected, "{value:?}");
+            assert_eq!(serde_yaml_ng::from_str::<String>(&text).unwrap(), value);
+            let map = serde_json::json!({ value: "value" });
+            let text = StructuredFormat::Yaml.render(&map).unwrap();
+            assert_eq!(text, format!("{}: \"value\"\n", expected.trim_end()));
+            assert_eq!(
+                serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+                map
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_preserves_nested_containers_and_non_string_scalars() {
+        let value = serde_json::json!({ "items": [
+            { "nested": [[true, false, null, 42, -7], {}, []] }, "yes"
+        ] });
+        let text = StructuredFormat::Yaml.render(&value).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "\"items\":\n",
+                "  -\n",
+                "    \"nested\":\n",
+                "      -\n",
+                "        - true\n",
+                "        - false\n",
+                "        - null\n",
+                "        - 42\n",
+                "        - -7\n",
+                "      - {}\n",
+                "      - []\n",
+                "  - \"yes\"\n",
+            )
+        );
+        assert_eq!(
+            serde_yaml_ng::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
+        assert_eq!(
+            StructuredFormat::Yaml
+                .render(&serde_json::json!({}))
+                .unwrap(),
+            "{}\n"
+        );
+        assert_eq!(
+            StructuredFormat::Yaml
+                .render(&serde_json::json!([]))
+                .unwrap(),
+            "[]\n"
+        );
+    }
+
+    #[test]
+    fn yaml_exponent_numbers_have_a_decimal_point_and_signed_exponent() {
+        for (value, expected) in [
+            (1e20, "1.0e+20\n"),
+            (1e-7, "1.0e-7\n"),
+            (-1e20, "-1.0e+20\n"),
+        ] {
+            let text = StructuredFormat::Yaml.render(&value).unwrap();
+            assert_eq!(text, expected);
+            assert_eq!(serde_yaml_ng::from_str::<f64>(&text).unwrap(), value);
+        }
     }
 
     fn rows_of(rows: &[&[&str]]) -> Vec<Vec<String>> {

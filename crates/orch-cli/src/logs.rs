@@ -22,7 +22,7 @@ use orch_domain::{OrchestratorEvent, Run, RunEvent, RunEventType};
 use orch_engine::{EventBus, EventSubscription};
 
 use crate::context::CliContext;
-use crate::output::{Icon, Styles, print_json};
+use crate::output::{Icon, Styles};
 
 /// What the command needs: runs to read and a bus to follow.
 pub struct LogsDeps {
@@ -111,8 +111,8 @@ async fn show_run_logs(
     let events = deps.runs.read_events_tail(run_id, count).await?;
     let events = filter_by_since(events, since_ms);
 
-    if ctx.json {
-        print_json(&events)?;
+    if let Some(format) = ctx.output {
+        format.print(&events)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -153,8 +153,8 @@ async fn show_task_logs(
         runs = last(runs, 20);
     }
 
-    if ctx.json {
-        print_json(&runs)?;
+    if let Some(format) = ctx.output {
+        format.print(&runs)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -192,8 +192,8 @@ async fn show_agent_logs(
 ) -> Result<ExitCode> {
     let runs = last(deps.runs.list_for_agent(agent_id).await?, 5);
 
-    if ctx.json {
-        print_json(&runs)?;
+    if let Some(format) = ctx.output {
+        format.print(&runs)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -236,8 +236,8 @@ async fn show_all_recent_logs(
     // `slice(0, 20)` — the **first** twenty, unlike every other route.
     let recent: Vec<Run> = matching.into_iter().take(20).collect();
 
-    if ctx.json {
-        print_json(&recent)?;
+    if let Some(format) = ctx.output {
+        format.print(&recent)?;
         return Ok(ExitCode::SUCCESS);
     }
 

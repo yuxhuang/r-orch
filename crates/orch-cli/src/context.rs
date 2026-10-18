@@ -5,12 +5,13 @@ use std::path::PathBuf;
 
 use orch_infra::storage::find_project_root;
 
-use crate::output::Styles;
+use crate::output::{StructuredFormat, Styles};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliContext {
     pub project_root: PathBuf,
-    pub json: bool,
+    /// `--json` or `--yaml`; `None` for human output.
+    pub output: Option<StructuredFormat>,
     pub quiet: bool,
     pub no_color: bool,
     pub ascii: bool,
@@ -48,7 +49,7 @@ impl EnvFlags {
 impl CliContext {
     pub fn new(
         project_root: PathBuf,
-        json: bool,
+        output: Option<StructuredFormat>,
         quiet: bool,
         no_color_flag: bool,
         ascii_flag: bool,
@@ -56,7 +57,7 @@ impl CliContext {
     ) -> Self {
         CliContext {
             project_root,
-            json,
+            output,
             quiet,
             no_color: no_color_flag || env.no_color_env,
             ascii: ascii_flag || env.dumb_term,
@@ -66,7 +67,7 @@ impl CliContext {
     /// Resolve the project root by walking up from `start_dir`.
     pub fn resolve(
         start_dir: &std::path::Path,
-        json: bool,
+        output: Option<StructuredFormat>,
         quiet: bool,
         no_color_flag: bool,
         ascii_flag: bool,
@@ -74,7 +75,7 @@ impl CliContext {
     ) -> Self {
         CliContext::new(
             find_project_root(start_dir),
-            json,
+            output,
             quiet,
             no_color_flag,
             ascii_flag,
@@ -106,7 +107,7 @@ mod tests {
     fn context(no_color_flag: bool, ascii_flag: bool, env: EnvFlags) -> CliContext {
         CliContext::new(
             PathBuf::from("/tmp/p"),
-            false,
+            None,
             false,
             no_color_flag,
             ascii_flag,
@@ -154,9 +155,16 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(root.join(".orchestry")).unwrap();
 
-        let ctx = CliContext::resolve(&nested, true, true, false, false, EnvFlags::default());
+        let ctx = CliContext::resolve(
+            &nested,
+            Some(StructuredFormat::Yaml),
+            true,
+            false,
+            false,
+            EnvFlags::default(),
+        );
         assert!(ctx.project_root.ends_with("proj"));
-        assert!(ctx.json);
+        assert_eq!(ctx.output, Some(StructuredFormat::Yaml));
         assert!(ctx.quiet);
     }
 }

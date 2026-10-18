@@ -6,7 +6,7 @@ use orch_infra::storage::{lock, remote::FileRemoteStore};
 
 use crate::{
     context::CliContext,
-    output::{Color, Icon, Styles, print_json, print_success, print_table},
+    output::{Color, Icon, Styles, print_success, print_table},
     tree::RemoteSub,
 };
 
@@ -54,8 +54,8 @@ pub async fn run(
         }
         RemoteSub::List => {
             let entries = store.list().await?;
-            if ctx.json {
-                return print_json(&entries);
+            if let Some(format) = ctx.output {
+                return format.print(&entries);
             }
             let now = engine.clock.now_ms();
             let mut rows = Vec::new();
@@ -100,8 +100,8 @@ pub async fn run(
                         }),
                 );
             }
-            if ctx.json {
-                return print_json(&serde_json::json!({
+            if let Some(format) = ctx.output {
+                return format.print(&serde_json::json!({
                     "listen": listener.addr,
                     "listen_configured": configured,
                     "controller": listener.controller,
@@ -398,7 +398,7 @@ mod tests {
         .unwrap();
         let ctx = CliContext::new(
             temp.path().to_path_buf(),
-            false,
+            None,
             false,
             true,
             false,
