@@ -61,7 +61,7 @@ pub(crate) struct LinkHub {
     changed: Notify,
 }
 impl LinkHub {
-    pub fn new(messages: Arc<dyn MessageStore>) -> Self {
+    pub(crate) fn new(messages: Arc<dyn MessageStore>) -> Self {
         Self {
             queues: Mutex::new(BTreeMap::new()),
             messages,

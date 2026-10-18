@@ -189,7 +189,7 @@ struct Faults {
     last_session_error: Option<(String, String)>,
 }
 
-pub struct Worker {
+pub(crate) struct Worker {
     ctx: Context,
     tap: Mutex<TapState>,
     events: broadcast::Sender<(String, Frame)>,
@@ -200,7 +200,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(ctx: Context) -> Arc<Self> {
+    pub(crate) fn new(ctx: Context) -> Arc<Self> {
         let (events, _) = broadcast::channel(RING_CAPACITY);
         Arc::new(Self {
             ctx,
@@ -405,7 +405,7 @@ impl Worker {
         );
     }
 
-    pub async fn listen(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+    pub(crate) async fn listen(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let addr = listener
             .local_addr()
             .map_err(|e| Error::other(format!("peer listener: {e}")))?

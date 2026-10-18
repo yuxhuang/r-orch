@@ -531,7 +531,7 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                         .wizard_sessions
                         .pending_leave
                         .as_ref()
-                        .unwrap()
+                        .expect("pending_leave was checked to be Some above")
                         .choice;
                     app.resolve_wizard_leave(choice);
                 } else if matches!(
@@ -544,7 +544,12 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                         | KeyCode::Right
                 ) {
                     let recovery = app.state.wizard_sessions.recovery;
-                    let pending = app.state.wizard_sessions.pending_leave.as_mut().unwrap();
+                    let pending = app
+                        .state
+                        .wizard_sessions
+                        .pending_leave
+                        .as_mut()
+                        .expect("pending_leave was checked to be Some above");
                     let choices: &[LeaveChoice] =
                         if matches!(pending.intent, LeaveIntent::Exit(_)) || recovery {
                             &[LeaveChoice::Continue, LeaveChoice::Discard]
@@ -628,11 +633,19 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                 match key.code {
                     KeyCode::Esc => app.editor_action(TextAction::CloseCopyRail, false),
                     KeyCode::Home => {
-                        app.state.wizard.as_mut().unwrap().copy_rail = Some(0);
+                        app.state
+                            .wizard
+                            .as_mut()
+                            .expect("the editor session handler runs only while a wizard is open")
+                            .copy_rail = Some(0);
                         app.invalidate_hits();
                     }
                     KeyCode::End => {
-                        app.state.wizard.as_mut().unwrap().copy_rail = Some(3);
+                        app.state
+                            .wizard
+                            .as_mut()
+                            .expect("the editor session handler runs only while a wizard is open")
+                            .copy_rail = Some(3);
                         app.invalidate_hits();
                     }
                     KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
@@ -659,7 +672,11 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                 app.open_shop_wizard();
                 return true;
             }
-            let w = app.state.wizard.as_ref().unwrap();
+            let w = app
+                .state
+                .wizard
+                .as_ref()
+                .expect("the editor session handler runs only while a wizard is open");
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('y' | 'Y'))
             {
@@ -690,7 +707,12 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                         || matches!(w.step().kind, StepKind::Select | StepKind::Multiselect)));
             if back {
                 if !app.guard_wizard_leave(LeaveIntent::Back) {
-                    let outcome = app.state.wizard.as_mut().unwrap().go_back();
+                    let outcome = app
+                        .state
+                        .wizard
+                        .as_mut()
+                        .expect("the editor session handler runs only while a wizard is open")
+                        .go_back();
                     if outcome == WizardOutcome::Cancelled {
                         app.close_wizard();
                     }
@@ -699,7 +721,12 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                 }
                 return true;
             }
-            let before = app.state.wizard.as_ref().unwrap().current_value();
+            let before = app
+                .state
+                .wizard
+                .as_ref()
+                .expect("the editor session handler runs only while a wizard is open")
+                .current_value();
             if let Some(w) = app.state.wizard.as_mut() {
                 w.suppress_validation_footer = false;
             }
@@ -709,7 +736,7 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                 .state
                 .wizard
                 .as_mut()
-                .unwrap()
+                .expect("the editor session handler runs only while a wizard is open")
                 .handle_key(*key, app.clock.now_ms());
             if app
                 .state
@@ -783,7 +810,7 @@ fn handle_editor_mouse<B: TuiBackend, C: Clock>(
                 app.state
                     .wizard
                     .as_mut()
-                    .unwrap()
+                    .expect("the editor session handler runs only while a wizard is open")
                     .pointer(position, z.rect, true);
                 return true;
             }
@@ -809,7 +836,7 @@ fn handle_editor_mouse<B: TuiBackend, C: Clock>(
                 app.state
                     .wizard
                     .as_mut()
-                    .unwrap()
+                    .expect("the editor session handler runs only while a wizard is open")
                     .pointer(position, *rect, false);
                 return true;
             }
@@ -834,7 +861,7 @@ fn handle_editor_mouse<B: TuiBackend, C: Clock>(
                     app.state
                         .wizard
                         .as_mut()
-                        .unwrap()
+                        .expect("the editor session handler runs only while a wizard is open")
                         .pointer(position, rect, false);
                 }
                 return true;
@@ -860,7 +887,14 @@ fn handle_editor_mouse<B: TuiBackend, C: Clock>(
                     (ZoneKind::Verb(VerbId::WizardBack), _) => {
                         app.state.mouse.armed = None;
                         if !app.guard_wizard_leave(LeaveIntent::Back) {
-                            let outcome = app.state.wizard.as_mut().unwrap().go_back();
+                            let outcome = app
+                                .state
+                                .wizard
+                                .as_mut()
+                                .expect(
+                                    "the editor session handler runs only while a wizard is open",
+                                )
+                                .go_back();
                             if outcome == WizardOutcome::Cancelled {
                                 app.close_wizard();
                             }

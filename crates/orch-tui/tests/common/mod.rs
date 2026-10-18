@@ -3,7 +3,10 @@
 //!
 //! Each test binary compiles this module separately and uses a subset of it,
 //! so the unused-method lint would fire in every one of them.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary uses a different subset of this module"
+)]
 
 use orch_tui::App;
 use orch_tui::backend::{Call, FakeBackend};

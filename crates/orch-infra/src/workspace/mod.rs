@@ -13,7 +13,7 @@ mod merge;
 mod test_support;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 pub use manager::GitWorkspaceManager;
 pub use merge::MergeStrategy;
@@ -48,7 +48,7 @@ async fn pump<R: AsyncRead + Unpin>(reader: Option<R>, buffers: &Mutex<Buffers>,
             Ok(0) | Err(_) => return,
             Ok(n) => {
                 let text = String::from_utf8_lossy(&chunk[..n]);
-                let mut b = buffers.lock().unwrap();
+                let mut b = buffers.lock().unwrap_or_else(PoisonError::into_inner);
                 if is_stdout {
                     b.stdout.push_str(&text);
                 }
@@ -84,7 +84,7 @@ pub(crate) async fn run(
         pump(child.stderr, &buffers, false),
     );
     let outcome = child.exit.wait().await;
-    let b = buffers.into_inner().unwrap();
+    let b = buffers.into_inner().unwrap_or_else(PoisonError::into_inner);
     Ok(Captured {
         stdout: b.stdout,
         combined: b.combined,

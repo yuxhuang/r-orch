@@ -1,4 +1,14 @@
 //! Engine-owner TCP peers. Socket loss never decides an execution's outcome.
+
+// Stricter than the workspace lints, for library code only (integration tests are separate crates and
+// `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
+#![deny(
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 pub mod codec;
 mod link;
 pub mod protocol;
@@ -45,13 +55,13 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    pub async fn local_agents(&self) -> Result<Vec<Agent>> {
+    pub(crate) async fn local_agents(&self) -> Result<Vec<Agent>> {
         let agents = self.engine.agents.list().await?;
         validate_snapshot(&agents)?;
         Ok(public_snapshot::project(&agents))
     }
 
-    pub async fn ingest(&self, peer: &str, frame: &Frame) -> Result<Option<Frame>> {
+    pub(crate) async fn ingest(&self, peer: &str, frame: &Frame) -> Result<Option<Frame>> {
         let Frame::Msg {
             id,
             from,
@@ -117,7 +127,7 @@ impl Context {
             });
     }
 
-    pub async fn outbox(&self, peer: &str) -> Result<Vec<Frame>> {
+    pub(crate) async fn outbox(&self, peer: &str) -> Result<Vec<Frame>> {
         if let Err(error) = self.engine.messages.purge_expired().await {
             self.message_error(peer, "expire outbox", &error);
             return Ok(vec![]);
@@ -166,7 +176,7 @@ impl Context {
         Ok(frames)
     }
 
-    pub async fn msg_ack(&self, peer: &str, id: &str, reason: Option<&str>) -> Result<()> {
+    pub(crate) async fn msg_ack(&self, peer: &str, id: &str, reason: Option<&str>) -> Result<()> {
         let result = async {
             if let Some(reason) = reason {
                 let reason = orch_infra::storage::remote::metadata_text(reason, 256);

@@ -23,6 +23,18 @@ repository = "https://github.com/yuxhuang/r-orch"
 # would reject the path and resolve it to any version.
 publish = false
 
+# Lints for every crate and test target. Library crates add stricter ones in their `lib.rs`
+# (see AGENTS.md, "Rust coding standards").
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+allow_attributes_without_reason = "deny"
+
 [workspace.dependencies]
 # ── Internal ───────────────────────────────────────────────────────────────
 orch-domain = { path = "crates/orch-domain" }

@@ -13,6 +13,15 @@
 //! Tests use `ratatui::backend::TestBackend`: push a key, draw, assert —
 //! synchronously, never with a sleep (ARCHITECTURE §8.4).
 
+// Stricter than the workspace lints, for library code only (integration tests are separate crates and
+// `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
+#![deny(
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 pub mod app;
 pub mod backend;
 pub mod clock;

@@ -195,7 +195,10 @@ pub fn flush_messages(
 /// record is displaced. Input is consumed one record at a time.
 // `&mut Vec` is the I0-seeded contract shared with B0's call site; history
 // never grows or shrinks the pending queue, so clippy sees only a slice use.
-#[allow(clippy::ptr_arg)]
+#[allow(
+    clippy::ptr_arg,
+    reason = "`&mut Vec` is the contract shared with the call site"
+)]
 pub fn prepend_messages(
     pending: &mut Vec<PendingMessage>,
     live: &mut Vec<Message>,

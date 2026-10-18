@@ -6,6 +6,15 @@
 //! `orch_core::{Clock, IdGenerator}` and were added by WP-0b because the
 //! walking skeleton needs them to mint ids and timestamps.
 
+// Stricter than the workspace lints, for library code only (integration tests are separate crates and
+// `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
+#![deny(
+    unreachable_pub,
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+
 pub mod adapters;
 pub mod clipboard;
 pub mod clock;

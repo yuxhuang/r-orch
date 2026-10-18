@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use orch_core::skills::{format_skills_block, is_mcp_skill, is_valid_skill_name};
@@ -67,6 +67,10 @@ impl FileSkillLoader {
         Self::build(Some(dir.into()))
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "the default sink for the user-facing missing-skill warning; callers can redirect it"
+    )]
     fn build(configured_dir: Option<PathBuf>) -> Self {
         Self {
             library_dir: OnceCell::new(),
@@ -94,7 +98,12 @@ impl FileSkillLoader {
     }
 
     async fn load_one(&self, name: &str) -> Option<String> {
-        if let Some(cached) = self.cache.lock().unwrap().get(name) {
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+        {
             return (!cached.is_empty()).then(|| cached.clone());
         }
         // Path-traversal guard: nothing touches the filesystem before this.
@@ -107,7 +116,7 @@ impl FileSkillLoader {
                 let content = String::from_utf8_lossy(&bytes).into_owned();
                 self.cache
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .insert(name.to_owned(), content.clone());
                 Some(content)
             }
@@ -119,7 +128,7 @@ impl FileSkillLoader {
                 ));
                 self.cache
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .insert(name.to_owned(), String::new());
                 None
             }
@@ -152,7 +161,12 @@ impl SkillLoader for FileSkillLoader {
     }
 
     async fn list_available(&self) -> Result<Vec<String>> {
-        if let Some(cached) = self.available.lock().unwrap().clone() {
+        if let Some(cached) = self
+            .available
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
             return Ok(cached);
         }
         let dir = self.dir().await;
@@ -176,7 +190,10 @@ impl SkillLoader for FileSkillLoader {
             }
         };
         names.sort();
-        *self.available.lock().unwrap() = Some(names.clone());
+        *self
+            .available
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(names.clone());
         Ok(names)
     }
 }

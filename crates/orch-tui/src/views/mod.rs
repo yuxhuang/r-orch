@@ -890,7 +890,7 @@ mod tests {
         );
     }
 
-    pub fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+    pub(super) fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buffer.area.height {

@@ -11,6 +11,11 @@
 //! they are not wired rather than pretending to work. [`not_wired`] is the one
 //! place that happens, and `crates/orch-cli/TEST-MAP.md` lists them.
 
+// Stricter than the workspace lints, for library code only (integration tests are separate crates and
+// `clippy.toml` allows unwrap inside `#[cfg(test)]`). This crate renders to the terminal, so printing is
+// allowed here. See AGENTS.md, "Rust coding standards".
+#![deny(unreachable_pub, clippy::unwrap_used)]
+
 pub mod commands;
 pub mod context;
 pub mod doctor;

@@ -282,7 +282,10 @@ impl Orchestrator {
     /// has already registered. The entry in `state.running` is durable before
     /// this is called, so a collector that never starts costs a sync, not an
     /// outcome.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a separate id, handle or flag of one run; no params struct exists yet"
+    )]
     pub(super) async fn spawn_remote_collector(
         &self,
         handle: Result<orch_core::remote::RemoteExecuteHandle>,
@@ -475,7 +478,10 @@ impl Orchestrator {
         Ok(phase)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a separate id, handle or flag of one run; no params struct exists yet"
+    )]
     pub(super) async fn collect_remote_events(
         &self,
         mut events: BoxStream<'static, RemoteRunEvent>,
@@ -726,7 +732,7 @@ impl Orchestrator {
                     && task.review_results.as_ref().is_some_and(|results| {
                         task.review_criteria
                             .as_ref()
-                            .unwrap()
+                            .expect("review_criteria was checked to be Some on the line above")
                             .iter()
                             .all(|criterion| {
                                 results

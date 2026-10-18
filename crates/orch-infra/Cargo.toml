@@ -55,8 +55,5 @@ tempfile.workspace = true
 # file wait and the lock's staleness window cost no wall-clock time.
 tokio = { workspace = true, features = ["test-util", "macros", "rt", "rt-multi-thread"] }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true
