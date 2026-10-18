@@ -5,6 +5,15 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- Deploy a team from a template directory: `orch org deploy --template-dir DIR` (or `--template NAME`) reads `org.yml`, one YAML file per member and optional shared rules, and creates the agents, a team and an optional goal. Your own templates live under `~/.orchestry/templates/`. See [docs/org-templates.md](docs/org-templates.md).
+- A built-in **a-team** template with 27 specialist roles: `orch org deploy a-team`. Shared rules are embedded into each role, so deployed agents need no rule files. The ten existing presets are unchanged.
+- `orch org template list|show|init|edit|update|patch` and `orch org template agent list|add|edit|update|patch|delete` manage templates without an editor: `update` replaces a file from a complete JSON or YAML document, `patch` applies an RFC 7396 merge patch, and a failed change leaves the template untouched. Builtins are read-only; copy one with `init --from`.
+- `orch agent shop --template NAME` and `--template-dir DIR` install a single member of a template, with the same role and settings `deploy` would give it.
+
+### Fixed
+- The `orch agent shop` picker draws every frame at the terminal's current size, so a resize that arrives together with a keypress, without a separate resize event, still gets a frame that fits.
+
 ## [0.7.0] - 2026-10-17
 
 Dashboard (TUI) release: agent sorting and live-following activity feeds. No peer-protocol or on-disk change, so

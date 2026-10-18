@@ -207,6 +207,33 @@ Two things that will bite you on first use, both covered in the [runbook](docs/R
 
 ---
 
+## Organization templates
+
+A template is a directory — `org.yml`, one YAML file per member in `agents/`, optional shared rules in `rules/` —
+that `orch org deploy` turns into agents, a team and an optional goal. The embedded **a-team** (27 specialist roles)
+is built in, the ten older presets still work, and you can keep your own templates under `~/.orchestry/templates/`.
+
+```bash
+orch org template list                                      # embedded, legacy and your own templates
+orch org template show a-team --resolved                    # exactly what deploy would create
+orch org deploy a-team --goal "Ship the release"            # 27 agents, a team, a goal
+orch org deploy --template-dir ./my-team                    # deploy a directory you wrote
+orch agent shop --template-dir ./my-team                    # install one member (--list for a table)
+orch org template init my-team --from builtin:a-team        # a writable copy of a builtin
+orch org template agent patch my-team --agent sre -f patch.yaml        # change one member, no editor
+orch org template update my-team -f org.json                # replace org.yml from JSON or YAML
+```
+
+`update` replaces a file from a complete JSON or YAML document and `patch` applies an RFC 7396 merge patch; both read
+a file or stdin, validate the whole template first and write one file atomically. `--yaml` works wherever `--json`
+does. Builtins are read-only (copy them with `init --from`). Deploying is **not transactional**: a failure part way
+names the agents and team that were already created. The a-team assumes agent CLIs, skills and a sibling `../pensieve`
+directory that `deploy` does not check. The format, precedence rules, error messages, repair of a broken template,
+limits and prerequisites are in [docs/org-templates.md](docs/org-templates.md); runnable templates and mutation
+inputs are in [examples/org-templates/](examples/org-templates/).
+
+---
+
 ## Remote agents
 
 Peers use plain TCP on a trusted LAN, **without authentication or encryption**. Listening is off by
@@ -461,6 +488,7 @@ drafts last only for the dashboard session).
 |---|---|
 | **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and the gotchas that are inherited rather than fixed — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
 | [docs/PARITY.md](docs/PARITY.md) | **Historical.** The contract the port was built to: every command, flag, exit code, `--json` shape and on-disk field, graded L0/L1/L2, plus known bugs of the original. No longer a goal ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)) |
+| [docs/org-templates.md](docs/org-templates.md) | Organization templates: directory format, rules, precedence, deploy, shop, `update`/`patch`, repair, the a-team and its prerequisites |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |
 | [docs/parity/](docs/parity/) | Historical per-area appendices behind the contract — CLI, adapters, infrastructure, TUI, tests |
 | [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |

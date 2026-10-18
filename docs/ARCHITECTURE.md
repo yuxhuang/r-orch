@@ -200,6 +200,29 @@ All three names are the same program, matching the npm `bin` map:
 | `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output`, `context`, `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
 
+### 3.4 Organization templates
+
+A template is data plus four small layers, each in the crate that already owns that kind of work:
+
+| Layer | Owns |
+|---|---|
+| `orch-domain::org_templates` | The authoring types (`OrgDefinition`, `AgentDefinition`, `Bundle`), identifier rules, the limits (1 MiB per document, 16 MiB, 128 agents, 64 rules), rule-reference parsing and role rendering (`Bundle::render_role`), and the embedded a-team files (`builtin`). Pure: no I/O. |
+| `orch-infra::storage::org_templates` | Reading a directory as a bounded no-follow snapshot (`RawSnapshot`), whole-bundle validation, resolution (`resolve`), the lock and atomic publication (`LockedTemplate`), `init`. The only layer that touches template files. |
+| `orch-engine::org_templates` | `resolve_inputs`: the one path from a `Bundle` to agent inputs, used by `deploy`, `show --resolved` and the shop; `preflight`; `deploy_bundle`, which drives the ordinary agent, team and goal services and reports survivors. |
+| `orch-cli` | `commands::org_template` (the `org template …` commands), `commands::org` (`deploy`), `template_shop`, and `document_input`, shared with the live-definition `update`/`patch` commands. |
+
+Data flows one way: directory or embedded files → `RawSnapshot` → `Bundle` (validated) → `resolve_inputs` →
+`CreateAgentInput` → the existing services. Because preview, deploy and shop share `resolve_inputs`, they cannot
+disagree about a role. A deployed agent is an ordinary record with the rules already embedded in its role; it keeps no
+reference to the template.
+
+Mutations take `.template.lock`, snapshot the files, build a candidate snapshot with one file replaced, added or
+removed, validate **all** of it, and only then write that one file (temporary file and rename). Nothing about this is
+transactional across files or against other writers, and `deploy` is deliberately not transactional either; see
+[org-templates.md](org-templates.md#concurrency-and-limits) and [ADR 0006](decisions/0006-org-templates.md). New
+parsing guards (explicit YAML tags, nesting depth) sit on top of the existing `parse_yaml_bytes` guard and
+`saphyr-parser`; `json-patch` ([ADR 0005](decisions/0005-file-mutations.md)) provides RFC 7396.
+
 ---
 
 ## 4. Dependencies

@@ -29,6 +29,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | A peer is `offline` and you cannot tell why | [Reading a peer's link state](#reading-a-peers-link-state) |
 | A mirror on a worker sits `todo` for ever | [Mirrors left behind on a worker](#mirrors-left-behind-on-a-worker) |
 | Changing the peer protocol | [Peer protocol compatibility](#peer-protocol-compatibility) |
+| `org deploy` failed half way, or a template will not load or change | [Organization templates: failures and recovery](#organization-templates-failures-and-recovery) |
 
 ---
 
@@ -657,3 +658,27 @@ the save visibly. Quitting with drafts asks for confirmation and discards them o
 an interactive prompt. Drafts do not survive crashes or restart, and wall-clock backsteps are not a durability
 mechanism. On a primary submit error, correct the retained form and retry. A partial post-create failure names
 the created entity; repair that entity rather than creating a duplicate.
+
+## Organization templates: failures and recovery
+
+Applies to `orch org deploy`, `orch agent shop --template…` and `orch org template …`
+([guide](org-templates.md)). Template commands change one file at a time and validate the whole template first, so a
+refused command leaves the template unchanged; `deploy` is the only command that can leave work behind.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Template deployment failed at <stage>: … Surviving entities: {"agentIds":[…],"teamId":…,"goalId":…,"unverifiedIds":[…]}` (exit 1) | A step failed after earlier ones succeeded. Nothing is rolled back. | Fix the cause (a full disk, a bad `.orchestry/` file), then remove the survivors: `orch agent remove <id>` for each agent, `orch team disband <team>`, `orch goal delete <goal>`. `unverifiedIds` could not be checked: look for their files. |
+| After cleaning up, the same deploy fails at `team` with `Team "<name>" already exists` and leaves new agents | A disbanded team keeps its name, and deploy checks agent names but not team names before creating anything. | Remove the new agents again, then deploy a copy under another name (`orch org template init <new> --from user:<name>`), or delete the leftover `.orchestry/teams/<team-id>.yml` by hand (not a supported interface). |
+| `Agent "<name>" already exists; no agents created` (exit 2) | A member name is taken. Nothing was created. | Remove or rename the existing agent, or edit the member's name in a copy of the template. |
+| `Builtins are read-only; run orch org template init … --from builtin:…` | You tried to change `a-team` or a legacy preset. | Copy it with `init --from`, then change the copy. |
+| `<file>: <reason>` from `list`, `show`, `deploy` or the shop (exit 2) | A file in the template fails validation. `list` shows the reason for each user template. | Fix the named file. `org template update` with a complete definition repairs one broken `org.yml` or member; `patch` and `edit` need a file that parses. |
+| `name is immutable` / `schema_version is immutable` | `org.yml` has a present `name` or `schema_version` (even `null`, or an unsupported version) and the update changes it. | Edit the file by hand. An *absent* key can be repaired with `update`. |
+| `…/agents/<file>: exceeds 1 MiB` on every command | A file larger than 1 MiB blocks the whole template, `update` included. | Shrink or delete it by hand. |
+| `Timed out after 5 s locking …/.template.lock` (exit 2) | Another template command holds the lock. The lock is released when its process exits. | Retry. Do not delete the file. |
+| `expected directory without symlinks` | The selected template root, with or without a trailing `/` or `/.`, is a symlink. | Point `--template-dir` at the real directory. |
+| The shop refused a member and the screen shows nothing | The refusal (`Agent "<name>" already exists; no agents created`) goes to stderr and exit status 2; the picker may clear the screen. | Check `echo $?` and `orch agent list`. |
+| A deployed agent does not follow the template after you edited it | Deployed agents are snapshots; nothing synchronises them. | Remove the agent and deploy or shop again. |
+
+A change made while another tool writes the same template, or a hand edit during a command, is not covered by the
+lock: the last writer wins. If a command was interrupted, run `orch org template show` before repeating it, because
+a crash after the file was renamed has still saved the change.
