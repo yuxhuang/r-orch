@@ -171,6 +171,115 @@ fn a_team_bundle() -> Bundle {
     bundle
 }
 
+const WORKSPACE_ROOT_CONTEXT: &str = " <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.";
+
+#[test]
+fn renamed_a_team_members_using_workspace_root_keep_its_definition() {
+    let mut bundle = a_team_bundle();
+    bundle.org.name = "my-team".into();
+    bundle.validate().unwrap();
+    for name in ["orchestrator", "tech-writer"] {
+        let agent = bundle.agents.iter().find(|a| a.name == name).unwrap();
+        assert!(agent.role.contains("<workspace root>/../pensieve/"));
+        let rendered = bundle.render_role(agent).unwrap();
+        assert!(rendered.starts_with(&format!(
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.{WORKSPACE_ROOT_CONTEXT}\n\n"
+        )), "{name}");
+        assert!(rendered.contains("<workspace root>/../pensieve/"));
+    }
+}
+
+#[test]
+fn authored_workspace_root_placeholder_defines_context_with_selected_rules() {
+    let mut bundle = bundle_with_role("Write <workspace root>/reports.");
+    bundle.org.rules = vec!["first".into()];
+    bundle.rules.insert("first".into(), "First rule".into());
+    bundle.agents[0].rules = vec!["first".into()];
+    bundle.validate().unwrap();
+    assert_eq!(
+        bundle.render_role(&bundle.agents[0]).unwrap(),
+        format!(
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.{WORKSPACE_ROOT_CONTEXT}\n\nWrite <workspace root>/reports.\n\n## Shared rule: first\n\nFirst rule"
+        )
+    );
+}
+
+#[test]
+fn selected_rule_workspace_root_placeholder_defines_context() {
+    let mut bundle = bundle_with_role("Lead");
+    bundle.org.rules = vec!["first".into()];
+    bundle
+        .rules
+        .insert("first".into(), "Write <workspace root>/reports.".into());
+    bundle.agents[0].rules = vec!["first".into()];
+    bundle.validate().unwrap();
+    assert_eq!(
+        bundle.render_role(&bundle.agents[0]).unwrap(),
+        format!(
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.{WORKSPACE_ROOT_CONTEXT}\n\nLead\n\n## Shared rule: first\n\nWrite <workspace root>/reports."
+        )
+    );
+}
+
+#[test]
+fn transitively_selected_workspace_root_placeholder_defines_context() {
+    let mut bundle = bundle_with_role("Read .claude/agent-rules/second.md.");
+    bundle.org.rules = vec!["first".into(), "second".into()];
+    bundle.rules = [
+        (
+            "first".into(),
+            "Write <workspace root>/reports. Read .claude/agent-rules/second.md.".into(),
+        ),
+        ("second".into(), "Read .claude/agent-rules/first.md.".into()),
+    ]
+    .into();
+    bundle.validate().unwrap();
+    assert_eq!(
+        bundle.render_role(&bundle.agents[0]).unwrap(),
+        format!(
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.{WORKSPACE_ROOT_CONTEXT}\n\nRead embedded rule «second».\n\n## Shared rule: first\n\nWrite <workspace root>/reports. Read embedded rule «second».\n\n## Shared rule: second\n\nRead embedded rule «first»."
+        )
+    );
+}
+
+#[test]
+fn unselected_workspace_root_placeholder_keeps_only_generic_context() {
+    let mut bundle = bundle_with_role("Lead");
+    bundle.org.rules = vec!["first".into(), "unused".into()];
+    bundle.rules = [
+        ("first".into(), "First rule".into()),
+        ("unused".into(), "Write <workspace root>/reports.".into()),
+    ]
+    .into();
+    bundle.agents[0].rules = vec!["first".into()];
+    bundle.validate().unwrap();
+    assert_eq!(
+        bundle.render_role(&bundle.agents[0]).unwrap(),
+        "Embedded shared-rule sections are authoritative; no rule-file lookup is required.\n\nLead\n\n## Shared rule: first\n\nFirst rule"
+    );
+}
+
+#[test]
+fn empty_closure_workspace_root_placeholder_preserves_authored_bytes() {
+    let authored = " \nRules (relative to your workspace root): <workspace root>/reports.\r\nKeep café 🦀.\t\n\n";
+    for name in ["sample", "a-team", "my-team"] {
+        let mut bundle = bundle_with_role(authored);
+        bundle.org.name = name.into();
+        bundle.validate().unwrap();
+        assert_eq!(bundle.render_role(&bundle.agents[0]).unwrap(), authored);
+        bundle.org.rules = vec!["first".into()];
+        bundle
+            .rules
+            .insert("first".into(), "Write <workspace root>/reports.".into());
+        bundle.agents.push(
+            serde_json::from_value(json!({"name":"other","role":"Other","rules":["first"]}))
+                .unwrap(),
+        );
+        bundle.validate().unwrap();
+        assert_eq!(bundle.render_role(&bundle.agents[0]).unwrap(), authored);
+    }
+}
+
 #[test]
 fn a_team_members_with_rules_keep_their_frozen_ptt_role_bytes() {
     let bundle = a_team_bundle();

@@ -369,7 +369,12 @@ impl Bundle {
         let mut role = String::from(
             "Embedded shared-rule sections are authoritative; no rule-file lookup is required.",
         );
-        if self.org.name == "a-team" {
+        if self.org.name == "a-team"
+            || agent.role.contains("<workspace root>")
+            || selected
+                .iter()
+                .any(|id| self.rules[id].contains("<workspace root>"))
+        {
             role.push_str(
                 " <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.",
             );
