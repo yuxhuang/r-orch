@@ -915,9 +915,7 @@ fn readme_and_dotfiles_beside_members_are_ignored_not_deployed() {
 
 /// Documents the guarded input path must refuse before anything is written,
 /// each with the fragment that proves it was refused for *that* reason (not
-/// merely because the document has a stray field). Duplicate keys and a second
-/// document are reported as a parse failure naming the input file; the library
-/// parser's reason is not surfaced for them.
+/// merely because the document has a stray field).
 fn hostile_documents() -> Vec<(&'static str, Vec<u8>, &'static str)> {
     let deep = format!("{}1{}", "[".repeat(80), "]".repeat(80));
     vec![
@@ -925,17 +923,17 @@ fn hostile_documents() -> Vec<(&'static str, Vec<u8>, &'static str)> {
         (
             "two YAML documents",
             b"name: extra\nrole: x\n---\nname: extra\nrole: y\n".to_vec(),
-            "input.yml",
+            "more than one document",
         ),
         (
             "duplicate YAML keys",
             b"name: extra\nrole: x\nrole: y\n".to_vec(),
-            "input.yml",
+            "duplicate entry with key \"role\"",
         ),
         (
             "duplicate JSON keys",
             br#"{"name":"extra","role":"x","role":"y"}"#.to_vec(),
-            "input.yml",
+            "duplicate entry with key \"role\"",
         ),
         (
             "explicit YAML tag",
@@ -1006,6 +1004,11 @@ fn hostile_member_documents_are_rejected_promptly_and_leave_the_template_unchang
             started.elapsed() < Duration::from_secs(30),
             "[{case}] took {:?}",
             started.elapsed()
+        );
+        assert!(
+            combined(&output).contains(path_arg(&input)),
+            "[{case}] did not name the input path\n{}",
+            transcript(&output)
         );
         assert!(
             combined(&output).contains(reason),
@@ -2947,6 +2950,34 @@ impl Pty {
         }
     }
 
+    /// The first complete picker frame drawn after `mark` bytes of output
+    /// that shows `selected` and `last_row` (the footer). A frame is complete once
+    /// its last row is on screen. Unlike `last_frame`, it ignores everything
+    /// drawn before `mark`, so it names the frame an input produced rather
+    /// than any frame that happens to look right later.
+    fn first_frame_after(&mut self, mark: usize, selected: &str, last_row: &str) -> Vec<String> {
+        let deadline = Instant::now() + PTY_WAIT;
+        loop {
+            let text =
+                String::from_utf8_lossy(&self.seen[mark.min(self.seen.len())..]).into_owned();
+            // The first piece is the tail of a frame drawn before `mark`.
+            for piece in text.split("\x1b[2J").skip(1) {
+                if piece.contains(selected) && piece.contains(last_row) {
+                    return piece
+                        .replace("\x1b[H", "")
+                        .split("\r\n")
+                        .map(str::to_owned)
+                        .collect();
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.chunks.recv_timeout(left) {
+                Ok(chunk) => self.seen.extend(chunk),
+                Err(_) => panic!("no frame showed {selected:?} after the input:\n{text:?}"),
+            }
+        }
+    }
+
     fn terminal_restored(&self) -> bool {
         let before = fs::read_to_string(&self.tty_before).expect("recorded tty before");
         let after = fs::read_to_string(&self.tty_after).expect("recorded tty after");
@@ -2988,6 +3019,7 @@ impl Drop for Pty {
 }
 
 const DOWN: &[u8] = b"\x1b[B";
+const UP: &[u8] = b"\x1b[A";
 const ENTER: &[u8] = b"\r";
 
 /// Terminal cells a string occupies, treating East Asian wide characters as
@@ -3338,6 +3370,78 @@ fn resizing_narrower_redraws_within_the_new_width() {
     let widest = frame.iter().map(|l| cells(l)).max().unwrap();
     assert!(
         widest <= 40 && frame.len() <= 10,
+        "{widest} cells, {} lines:\n{frame:#?}",
+        frame.len()
+    );
+}
+
+/// A lead with a 200-character description and `members` more agents, so the
+/// frame's width and its page length both depend on the terminal size.
+fn crowded_template(sb: &Sandbox, members: usize) -> PathBuf {
+    let root = sb.work().join("crowded");
+    let mut bundle =
+        Bundle::new("crowded", "lead").agent("lead", json!({"description": "x".repeat(200)}));
+    for n in 0..members {
+        bundle = bundle.agent(&format!("w{n:02}"), json!({}));
+    }
+    bundle.write(&root);
+    root
+}
+
+#[test]
+fn a_shrink_delivered_together_with_a_key_still_draws_the_next_frame_at_the_new_size() {
+    let sb = sandbox();
+    sb.init_project();
+    let root = crowded_template(&sb, 30);
+    let mut pty = pty_orch(
+        &sb,
+        &["agent", "shop", "--template-dir", path_arg(&root)],
+        24,
+        100,
+    );
+    pty.expect("AGENT SHOP");
+    // An answered key proves the picker is reading events.
+    pty.send(DOWN);
+    pty.expect("▸ w00");
+    let mark = pty.seen.len();
+    // Back to back, no wait between them: the resize and the key reach the
+    // picker in the same wakeup.
+    pty.resize(10, 40);
+    pty.send(UP);
+    let frame = pty.first_frame_after(mark, "▸ lead", "of 31");
+    pty.send(b"q");
+    pty.finish();
+    let widest = frame.iter().map(|l| cells(l)).max().unwrap();
+    assert!(
+        widest <= 40 && frame.len() <= 10,
+        "{widest} cells, {} lines:\n{frame:#?}",
+        frame.len()
+    );
+}
+
+#[test]
+fn a_grow_delivered_together_with_a_key_still_draws_the_next_frame_at_the_new_size() {
+    let sb = sandbox();
+    sb.init_project();
+    let root = crowded_template(&sb, 30);
+    let mut pty = pty_orch(
+        &sb,
+        &["agent", "shop", "--template-dir", path_arg(&root)],
+        10,
+        40,
+    );
+    pty.expect("AGENT SHOP");
+    pty.send(DOWN);
+    pty.expect("▸ w00");
+    let mark = pty.seen.len();
+    pty.resize(24, 100);
+    pty.send(UP);
+    let frame = pty.first_frame_after(mark, "▸ lead", "of 31");
+    pty.send(b"q");
+    pty.finish();
+    let widest = frame.iter().map(|l| cells(l)).max().unwrap();
+    assert!(
+        widest > 40 && widest <= 100 && frame.len() > 10 && frame.len() <= 24,
         "{widest} cells, {} lines:\n{frame:#?}",
         frame.len()
     );
