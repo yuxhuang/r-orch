@@ -262,6 +262,69 @@ impl AgentService {
         Ok(agent)
     }
 
+    /// Replace only authored fields, re-reading runtime state immediately before
+    /// the single store save. Legacy/runtime writers remain last-writer-wins.
+    pub async fn replace_definition(
+        &self,
+        id: &str,
+        name: String,
+        adapter: String,
+        role: Option<String>,
+        mut config: AgentConfig,
+    ) -> Result<Agent> {
+        reject_remote_id(id)?;
+        if name.trim().is_empty() || adapter.trim().is_empty() {
+            return Err(Error::invalid_arguments("name/adapter: cannot be empty"));
+        }
+        if let Some(existing) = self.agents.get_by_name(name.trim()).await?
+            && existing.id != id
+        {
+            return Err(Error::invalid_arguments(
+                "name: another agent already has this name",
+            ));
+        }
+        if adapter.trim() == "shell"
+            && !config
+                .command
+                .as_deref()
+                .is_some_and(|command| !command.trim().is_empty())
+        {
+            return Err(Error::invalid_arguments("Shell agents require a command"));
+        }
+        if config.max_turns == Some(0)
+            || config.timeout_ms == Some(0)
+            || config.stall_timeout_ms == Some(0)
+        {
+            return Err(Error::invalid_arguments(
+                "config: runtime limits must be positive",
+            ));
+        }
+        let mut agent = self.get(id).await?;
+        if agent.status == AgentStatus::Running || agent.remote.is_some() {
+            return Err(Error::invalid_arguments(
+                "cannot mutate a running or remote agent definition",
+            ));
+        }
+        if agent.name == name
+            && agent.adapter == adapter
+            && agent.role == role
+            && agent.config == config
+        {
+            return Ok(agent);
+        }
+        if adapter.trim() == "shell" {
+            config.command = config.command.map(|command| command.trim().to_owned());
+            config.model = None;
+            config.effort = None;
+        }
+        agent.name = name.trim().to_owned();
+        agent.adapter = adapter.trim().to_owned();
+        agent.role = role;
+        agent.config = config;
+        self.agents.save(&agent).await?;
+        Ok(agent)
+    }
+
     pub async fn disable(&self, id: &str) -> Result<Agent> {
         self.set_status(id, AgentStatus::Disabled).await
     }
@@ -460,6 +523,98 @@ mod tests {
             state,
             bus,
         }
+    }
+
+    #[tokio::test]
+    async fn definition_replacement_clears_options_preserves_runtime_and_skips_noop() {
+        let mut before = agent("agt_1");
+        before.role = Some("old".into());
+        before.stats.tasks_completed = 7;
+        let h = harness(vec![before.clone()]);
+        let after = h
+            .service
+            .replace_definition(
+                "agt_1",
+                "renamed".into(),
+                "codex".into(),
+                None,
+                AgentConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.stats, before.stats);
+        assert_eq!(after.config, AgentConfig::default());
+        assert_eq!(after.role, None);
+        assert_eq!(after.name, "renamed");
+        let again = h
+            .service
+            .replace_definition(
+                "agt_1",
+                after.name.clone(),
+                after.adapter.clone(),
+                None,
+                after.config.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again, after);
+        assert_eq!(h.agents.saved().len(), 1, "no-op must not save");
+    }
+
+    #[tokio::test]
+    async fn identical_imported_definition_does_not_normalize_or_write() {
+        let mut before = agent("agt_1");
+        before.name = "  imported name  ".into();
+        before.adapter = "shell".into();
+        before.config.command = Some("  printf stub  ".into());
+        let h = harness(vec![before.clone()]);
+        let after = h
+            .service
+            .replace_definition(
+                &before.id,
+                before.name.clone(),
+                before.adapter.clone(),
+                before.role.clone(),
+                before.config.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        assert!(h.agents.saved().is_empty());
+    }
+
+    #[tokio::test]
+    async fn definition_replacement_refuses_running_and_invalid_shell_without_writes() {
+        let mut before = agent("agt_1");
+        before.status = AgentStatus::Running;
+        let h = harness(vec![before.clone()]);
+        assert!(
+            h.service
+                .replace_definition(
+                    "agt_1",
+                    "renamed".into(),
+                    "codex".into(),
+                    None,
+                    AgentConfig::default()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(h.service.get("agt_1").await.unwrap(), before);
+        assert!(h.agents.saved().is_empty());
+        let h = harness(vec![agent("agt_2")]);
+        assert!(
+            h.service
+                .replace_definition(
+                    "agt_2",
+                    "test".into(),
+                    "shell".into(),
+                    None,
+                    AgentConfig::default()
+                )
+                .await
+                .is_err()
+        );
     }
 
     /// The local factory from `agent-service.test.ts`, which differs from the

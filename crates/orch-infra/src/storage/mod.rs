@@ -15,6 +15,7 @@ pub mod goal;
 pub mod index;
 pub mod lock;
 pub mod message;
+pub mod org_templates;
 pub mod paths;
 pub mod remote;
 pub mod run;

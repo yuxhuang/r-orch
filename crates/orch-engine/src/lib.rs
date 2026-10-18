@@ -15,6 +15,7 @@ pub mod goal_service;
 pub mod lock;
 pub mod message_service;
 pub mod orchestrator;
+pub mod org_templates;
 pub mod review_runner;
 pub mod run_service;
 pub mod task_service;

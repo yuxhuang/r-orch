@@ -539,6 +539,135 @@ fn summary_line(tasks: &[Task]) -> String {
     line
 }
 
+const WRITABLE: &[&str] = &["title", "description", "priority", "labels"];
+const READONLY: &[&str] = &[
+    "id",
+    "status",
+    "assignee",
+    "depends_on",
+    "created_at",
+    "updated_at",
+    "attempts",
+    "max_attempts",
+    "workspace_mode",
+    "workspace",
+    "proof",
+    "review_criteria",
+    "review_results",
+    "scope",
+    "feedback",
+    "goalId",
+    "attachments",
+];
+
+fn definition_candidate(
+    current: &serde_json::Value,
+    input: &serde_json::Value,
+    kind: crate::document_input::MutationKind,
+) -> Result<serde_json::Value> {
+    use crate::document_input::{MutationKind, apply_mutation, reject_nulls, writable_input};
+    use orch_core::Error;
+    let input = writable_input(input, current, WRITABLE, READONLY, kind)?;
+    if kind == MutationKind::Update {
+        reject_nulls(&input, "task")?;
+    }
+    let base = serde_json::Value::Object(
+        current
+            .as_object()
+            .expect("serialized task")
+            .iter()
+            .filter(|(key, _)| WRITABLE.contains(&key.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
+    let mut candidate = apply_mutation(&base, &input, kind)?;
+    for field in ["title", "description"] {
+        if candidate.get(field).and_then(|v| v.as_str()).is_none() {
+            return Err(Error::invalid_arguments(format!(
+                "{field}: required string"
+            )));
+        }
+    }
+    if candidate["title"]
+        .as_str()
+        .expect("validated")
+        .trim()
+        .is_empty()
+    {
+        return Err(Error::invalid_arguments("title: cannot be blank"));
+    }
+    if !candidate
+        .get("priority")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|v| (1..=4).contains(&v))
+    {
+        return Err(Error::invalid_arguments(
+            "priority: required integer between 1 and 4",
+        ));
+    }
+    if candidate.get("labels").is_none() {
+        candidate["labels"] = serde_json::json!([]);
+    }
+    if !candidate["labels"]
+        .as_array()
+        .is_some_and(|items| items.iter().all(|v| v.is_string()))
+    {
+        return Err(Error::invalid_arguments(
+            "labels: expected an array of strings",
+        ));
+    }
+    Ok(candidate)
+}
+
+pub async fn mutate(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    args: &crate::tree::EntityDefinitionInput,
+    kind: crate::document_input::MutationKind,
+) -> Result<()> {
+    use orch_core::Error;
+    let input =
+        crate::document_input::read_document(&args.input.file, args.input.input_format).await?;
+    let _lock =
+        orch_infra::storage::fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock"))
+            .await
+            .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+    let current = engine.task_service.get(&args.id).await?;
+    let value = serde_json::to_value(&current).map_err(|_| Error::other("serialize task"))?;
+    let candidate = definition_candidate(&value, &input, kind)
+        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+    let updated = engine
+        .task_service
+        .update_definition(
+            &args.id,
+            orch_engine::task_service::UpdateTaskFields {
+                title: Some(candidate["title"].as_str().expect("validated").to_owned()),
+                description: Some(
+                    candidate["description"]
+                        .as_str()
+                        .expect("validated")
+                        .to_owned(),
+                ),
+                priority: candidate["priority"].as_i64(),
+                labels: Some(
+                    serde_json::from_value(candidate["labels"].clone()).expect("validated"),
+                ),
+                attachments: None,
+            },
+        )
+        .await
+        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+    if let Some(format) = ctx.output {
+        format.print(&updated)?;
+    } else if ctx.quiet {
+        println!("{}", updated.id);
+    } else {
+        print_success(styles, &format!("Updated task {}", updated.id));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +863,40 @@ mod tests {
             ),
             "  STATUS  PRI  TASK       AGENT  TIME  \n  ○ todo  P3   Test task  —      —     \n"
         );
+    }
+}
+
+#[cfg(test)]
+mod definition_tests {
+    use super::*;
+    use crate::document_input::MutationKind;
+    use serde_json::json;
+    #[test]
+    fn definition_projection_requires_title_description_priority_and_replaces_labels() {
+        let current = json!({"id":"tsk_1", "title":"old", "description":"body", "priority":2, "labels":["a","b"], "status":"todo"});
+        let candidate =
+            definition_candidate(&current, &json!({"labels":["c"]}), MutationKind::Patch).unwrap();
+        assert_eq!(candidate["labels"], json!(["c"]));
+        assert!(
+            definition_candidate(&current, &json!({"priority":null}), MutationKind::Patch).is_err()
+        );
+        assert!(
+            definition_candidate(&current, &json!({"status":"todo"}), MutationKind::Patch).is_err()
+        );
+        assert!(
+            definition_candidate(
+                &current,
+                &json!({"title":"x", "description":"y"}),
+                MutationKind::Update
+            )
+            .is_err()
+        );
+        let candidate = definition_candidate(
+            &current,
+            &json!({"title":"x", "description":"y", "priority":1}),
+            MutationKind::Update,
+        )
+        .unwrap();
+        assert_eq!(candidate["labels"], json!([]));
     }
 }

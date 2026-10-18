@@ -6,7 +6,10 @@
 //! leaves the earlier ones behind, and the error says so by naming the count
 //! — replicated, because the half-built tree is observable.
 
+use std::path::Path;
 use std::process::ExitCode;
+
+use clap::{Args, Subcommand};
 
 use orch_core::error::Result;
 use orch_domain::{
@@ -17,8 +20,61 @@ use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
 use serde::Serialize;
 
-use crate::context::CliContext;
+use crate::context::{CliContext, EnvFlags};
 use crate::output::{Styles, print_error, print_success, print_table};
+use crate::tree::Cli;
+
+#[derive(Debug, Args)]
+pub struct OrgCmd {
+    #[command(subcommand)]
+    pub command: Option<OrgSub>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrgSub {
+    /// List available company templates
+    #[command(alias = "ls")]
+    List,
+    /// Deploy a pre-built AI company
+    Deploy {
+        #[arg(value_name = "template")]
+        template: String,
+        #[arg(long, value_name = "goal", help = "Set a goal for the team")]
+        goal: Option<String>,
+    },
+}
+
+/// Pre-parse initialization policy for the nested org command owner.
+/// Unknown org operations retain the existing project guard.
+pub(crate) fn requires_initialized_project(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("template") => super::org_template::requires_initialized_project(&args[1..]),
+        _ => true,
+    }
+}
+
+/// Keep nested dispatch here so template operations can choose whether they
+/// need an engine before the project container is built.
+pub(crate) async fn dispatch(
+    cli: &Cli,
+    env: EnvFlags,
+    cwd: &Path,
+    args: &OrgCmd,
+) -> Result<ExitCode> {
+    let Some(sub) = &args.command else {
+        return Ok(crate::print_group_help(&["org"]));
+    };
+    let (ctx, styles, engine) = crate::build(cli, env, cwd).await?;
+    match sub {
+        OrgSub::List => {
+            list(&ctx, &styles).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        OrgSub::Deploy { template, goal } => {
+            deploy(&engine, &ctx, &styles, template, goal.as_deref()).await
+        }
+    }
+}
 
 /// `{ team, agentIds, goalId }` — camelCase among the snake_case entities,
 /// because it is an ad-hoc object rather than a stored one.

@@ -1,0 +1,6 @@
+{
+  "title": "Add input validation to signup",
+  "description": "Validate email and password.",
+  "priority": 2,
+  "labels": ["backend"]
+}

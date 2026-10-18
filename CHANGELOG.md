@@ -8,6 +8,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ### Added
 - `--yaml`, a global flag beside `--json`: every command that prints JSON can print the same data as one YAML document with every key and string double-quoted. The two flags together are a usage error, and `--json` output is byte-for-byte unchanged.
 
+- `orch agent update|patch <id> -f FILE`, `orch task update|patch <id> -f FILE` and `orch config update|patch -f FILE`: replace a definition from a JSON or YAML file (or stdin), or apply an RFC 7396 merge patch to it, without an editor. `--input-format` overrides detection; identity and runtime state stay read-only, and nothing is written unless the whole result validates.
+
 ### Fixed
 - `orch agent shop` now draws a readable picker: every row starts at the left edge, rows are cut to the terminal width with an ellipsis instead of wrapping, the heading and the `n-m of total` footer stay on screen on short terminals, and compact headings keep movement, selection and cancellation keys visible at narrow widths.
 - `orch remote remove` can no longer race a live peer link: a link still holding the removed registration, or one since replaced with a different address, cannot recreate `.orchestry/remotes/<alias>.json` or keep reporting the alias online. A link that is stopped while it writes its status reports the remote offline at once, not when that write finishes.

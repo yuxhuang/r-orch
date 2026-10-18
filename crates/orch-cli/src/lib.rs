@@ -14,12 +14,14 @@
 pub mod commands;
 pub mod context;
 pub mod doctor;
+pub mod document_input;
 pub mod editor;
 pub mod logs;
 pub mod output;
 pub mod routing;
 pub mod serve;
 pub mod shop_picker;
+pub mod template_shop;
 pub mod tree;
 pub mod tui;
 pub mod update;
@@ -40,8 +42,8 @@ use crate::output::{Styles, print_error};
 use crate::routing::ArgvShape;
 use crate::tree::{
     AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
-    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, OrgCmd, OrgSub, RunCmd,
-    ServeCmd, TaskCmd, TaskSub, TeamCmd, TeamSub, WebCmd,
+    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, RunCmd, ServeCmd, TaskCmd,
+    TaskSub, TeamCmd, TeamSub, WebCmd,
 };
 
 /// The single entry point behind the `orch`, `orchestry` and `ao` binaries.
@@ -202,6 +204,26 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     commands::task::assign(&engine, &ctx, &styles, task_id, agent_id).await?;
                 }
                 TaskSub::Show { id } => commands::task::show(&engine, &ctx, &styles, id).await?,
+                TaskSub::Update(args) => {
+                    commands::task::mutate(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        args,
+                        document_input::MutationKind::Update,
+                    )
+                    .await?
+                }
+                TaskSub::Patch(args) => {
+                    commands::task::mutate(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        args,
+                        document_input::MutationKind::Patch,
+                    )
+                    .await?
+                }
                 TaskSub::Edit { id } => commands::task::edit(&engine, &styles, id).await?,
                 TaskSub::Cancel { id } => commands::task::cancel(&engine, &styles, id).await?,
                 TaskSub::Approve { id } => commands::task::approve(&engine, &styles, id).await?,
@@ -252,11 +274,12 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     )
                     .await?;
                 }
-                AgentSub::Shop { list } => {
-                    commands::agent::shop(
+                AgentSub::Shop(args) => {
+                    template_shop::run(
                         &engine,
+                        &ctx,
                         &styles,
-                        *list,
+                        args,
                         env.stdout_is_tty,
                         env.stdin_is_tty,
                     )
@@ -265,6 +288,26 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                 AgentSub::List => commands::agent::list(&engine, &ctx, &styles).await?,
                 AgentSub::Status { id } => {
                     commands::agent::status(&engine, &ctx, &styles, id).await?;
+                }
+                AgentSub::Update(args) => {
+                    commands::agent::mutate(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        args,
+                        document_input::MutationKind::Update,
+                    )
+                    .await?
+                }
+                AgentSub::Patch(args) => {
+                    commands::agent::mutate(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        args,
+                        document_input::MutationKind::Patch,
+                    )
+                    .await?
                 }
                 AgentSub::Edit { id } => {
                     commands::agent::edit(&engine, &ctx, &styles, id).await?;
@@ -335,6 +378,26 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                 }
                 ConfigSub::Set { key, value } => {
                     commands::config::set(&engine, &ctx, &styles, key, value).await?;
+                }
+                ConfigSub::Update(args) => {
+                    commands::config::mutate(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        args,
+                        document_input::MutationKind::Update,
+                    )
+                    .await?
+                }
+                ConfigSub::Patch(args) => {
+                    commands::config::mutate(
+                        &engine,
+                        &ctx,
+                        &styles,
+                        args,
+                        document_input::MutationKind::Patch,
+                    )
+                    .await?
                 }
                 ConfigSub::Edit => commands::config::edit(&engine).await?,
                 ConfigSub::Global(ConfigGlobalCmd { command }) => match command {
@@ -538,21 +601,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             }
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Org(OrgCmd { command })) => {
-            let Some(sub) = command else {
-                return Ok(print_group_help(&["org"]));
-            };
-            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
-            match sub {
-                OrgSub::List => {
-                    commands::org::list(&ctx, &styles).await?;
-                    Ok(ExitCode::SUCCESS)
-                }
-                OrgSub::Deploy { template, goal } => {
-                    commands::org::deploy(&engine, &ctx, &styles, template, goal.as_deref()).await
-                }
-            }
-        }
+        Some(Command::Org(args)) => commands::org::dispatch(cli, env, &cwd, args).await,
         Some(Command::Run(RunCmd {
             task_id,
             all,
