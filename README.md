@@ -597,6 +597,7 @@ drafts last only for the dashboard session).
 
 | Document | For |
 |---|---|
+| **[docs/manual/](docs/manual/README.md)** | **Users.** The user manual: installing, concepts, every command, the dashboard and web dashboard, templates, remote agents and troubleshooting, with screenshots |
 | **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and the gotchas that are inherited rather than fixed — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
 | [docs/PARITY.md](docs/PARITY.md) | **Historical.** The contract the port was built to: every command, flag, exit code, `--json` shape and on-disk field, graded L0/L1/L2, plus known bugs of the original. No longer a goal ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)) |
 | [docs/file-mutations.md](docs/file-mutations.md) | `update` / `patch` from JSON or YAML files: input rules, writable fields, errors, locking |
