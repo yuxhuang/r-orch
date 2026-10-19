@@ -157,6 +157,7 @@ The Activity panel, the Actions view and a task's Activity section follow new en
 
 - Scroll up to pause following. The feed label then says `paused`.
 - To resume, press `End`, scroll to the bottom with the wheel or `PageDown`, or click the last entry.
+- A goal's or an agent's Activity section lists entries newest first, so it follows new entries at the top instead. Move down to pause; the title then says `paused · Home follows`. To resume, press `Home`, scroll to the top with the wheel or `PageUp`, or click the first entry. The footer hint says the same.
 - In the Actions view, press `i` on an entry to open the inspector. It pins that entry, so new arrivals do not move it.
 - Press `f` or `F` in Tasks, Goals or Agents (with no detail open) to cycle the Activity filter between All, Text, Tools, Errors and Events. The choice is saved.
 - In the Actions view, `a` opens the agent picker, `f` opens the type picker, and `F` cycles the type presets. These work only while no detail is open.

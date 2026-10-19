@@ -9,10 +9,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::backend::CopyOutcome;
 use crate::format::{format_duration, parse_timestamp_ms};
 use crate::hit::{FooterAction, PaneMetrics, VerbId, ZoneId, ZoneKind};
+use crate::messages::Message;
 use crate::state::{
     AgentSection, AppState, CopyOrigin, EntityType, Focus, GoalSection, LogSection, TaskSection,
 };
 use crate::theme::{EM_DASH, Token};
+use crate::views::activity::{RowGroups, row_spans};
 use crate::views::{RenderCtx, fit_cells, put_line};
 use crate::widgets::text_viewer::ViewerSource;
 
@@ -28,7 +30,9 @@ pub fn section_name(focus: Focus) -> &'static str {
         Focus::TaskDetail(TaskSection::Attachments) => "Attachments",
         Focus::TaskDetail(TaskSection::Result) => "Result",
         Focus::TaskDetail(TaskSection::Files) => "Files",
-        Focus::TaskDetail(TaskSection::Activity) => "Activity",
+        Focus::TaskDetail(TaskSection::Activity)
+        | Focus::GoalDetail(GoalSection::Activity)
+        | Focus::AgentDetail(AgentSection::Activity) => "Activity",
         Focus::AgentDetail(AgentSection::Error) => "Error",
         Focus::AgentDetail(AgentSection::Role) => "Role",
         Focus::LogDetail(LogSection::Metadata) => "Metadata",
@@ -112,6 +116,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                         )
                     })
                     .collect(),
+                GoalSection::Activity => activity_lines(state, focus),
             }
         }
         Focus::TaskDetail(section) => {
@@ -181,12 +186,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     };
                     proof.files_changed.clone()
                 }
-                TaskSection::Activity => state
-                    .messages
-                    .iter()
-                    .filter(|m| m.task_id.as_deref() == Some(&task.id))
-                    .map(|m| m.text.clone())
-                    .collect(),
+                TaskSection::Activity => activity_lines(state, focus),
             }
         }
         Focus::AgentDetail(section) => {
@@ -263,6 +263,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     lines.push(error.timestamp.clone());
                     lines
                 }
+                AgentSection::Activity => activity_lines(state, focus),
             }
         }
         Focus::LogDetail(section) => {
@@ -292,6 +293,29 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+/// The messages an Activity section lists, in display order, or `None` for a
+/// section that is not an Activity section. Rows come from the state-owned
+/// `detail_activity_rows`, so order and membership match keys and mouse
+/// exactly; membership is structural (task, agent or goal-of-task id), never
+/// a text match.
+pub(crate) fn activity_messages(state: &AppState, focus: Focus) -> Option<Vec<&Message>> {
+    crate::follow::is_detail_activity(focus).then(|| {
+        state
+            .detail_activity_rows(&state.pane_key(focus))
+            .into_iter()
+            .map(|i| &state.messages[i])
+            .collect()
+    })
+}
+
+fn activity_lines(state: &AppState, focus: Focus) -> Vec<String> {
+    activity_messages(state, focus)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.text.clone())
+        .collect()
 }
 
 fn field_lines(text: &str, empty: &str) -> Vec<String> {
@@ -344,17 +368,11 @@ pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<View
                     .collect()
             })
             .unwrap_or_default(),
-        Focus::TaskDetail(TaskSection::Activity) => state
-            .selected_task()
-            .map(|t| {
-                state
-                    .messages
-                    .iter()
-                    .filter(|m| m.task_id.as_deref() == Some(&t.id))
-                    .map(|m| Some(ViewerSource::Message(m.id)))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        focus if crate::follow::is_detail_activity(focus) => activity_messages(state, focus)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| Some(ViewerSource::Message(m.id)))
+            .collect(),
         _ => {
             let source = match focus {
                 Focus::GoalDetail(section) => state.selected_goal().map(|g| {
@@ -401,13 +419,12 @@ pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<View
 }
 
 fn selectable(focus: Focus) -> bool {
-    matches!(
-        focus,
-        Focus::GoalDetail(GoalSection::Tasks)
-            | Focus::TaskDetail(
-                TaskSection::Attachments | TaskSection::Files | TaskSection::Activity
-            )
-    )
+    crate::follow::is_detail_activity(focus)
+        || matches!(
+            focus,
+            Focus::GoalDetail(GoalSection::Tasks)
+                | Focus::TaskDetail(TaskSection::Attachments | TaskSection::Files)
+        )
 }
 
 /// Visual rows and byte offsets refer to the unmodified source string.
@@ -526,10 +543,12 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     ctx.zone(area, area, ZoneKind::Pane(focus), ZoneId::Pane(key.clone()));
     let active = state.focus == focus;
     let name = match focus {
-        Focus::TaskDetail(TaskSection::Activity) => format!(
+        focus if crate::follow::is_detail_activity(focus) => format!(
             "Activity · {}",
-            if state.task_activity_following(&key) {
+            if state.detail_activity_following(&key) {
                 "following"
+            } else if crate::follow::detail_activity_newest_first(focus) {
+                "paused · Home follows"
             } else {
                 "paused · End follows"
             }
@@ -660,11 +679,17 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             }
         }
     }
+    let activity = activity_messages(state, focus);
     if rows.is_empty() {
-        rows.push(("No entries.".into(), None, 0));
+        let empty = if activity.is_some() {
+            "No activity."
+        } else {
+            "No entries."
+        };
+        rows.push((empty.into(), None, 0));
     }
-    let scroll = if focus == Focus::TaskDetail(TaskSection::Activity) {
-        state.task_activity_scroll(&key, body.height as usize)
+    let scroll = if crate::follow::is_detail_activity(focus) {
+        state.detail_activity_scroll(&key, body.height as usize)
     } else {
         state.pane_scroll(&key)
     };
@@ -685,6 +710,8 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         ZoneKind::Pane(focus),
         ZoneId::Pane(state.pane_key(focus)),
     );
+    // Activity rows group by agent from the top of the window, as the feed does.
+    let mut groups = RowGroups::default();
     for (screen_row, (text, source, byte)) in rows
         .iter()
         .skip(offset)
@@ -693,27 +720,35 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     {
         let row = Rect::new(body.x, body.y + screen_row as u16, body.width, 1);
         let selected = is_list && scroll.selected == Some(offset + screen_row);
-        let visible = if selected {
-            format!(
-                "> {}",
-                fit_cells(text, body.width.saturating_sub(2) as usize)
-            )
+        if let Some(message) = activity
+            .as_ref()
+            .and_then(|messages| messages.get(offset + screen_row))
+        {
+            let spans = row_spans(ctx, message, groups.next(message), selected, body.width);
+            put_line(frame, row, row.y, spans);
         } else {
-            fit_cells(text, body.width as usize)
-        };
-        put_line(
-            frame,
-            row,
-            row.y,
-            vec![Span::styled(
-                visible,
-                ctx.style(if selected {
-                    Token::Amber
-                } else {
-                    Token::Silver
-                }),
-            )],
-        );
+            let visible = if selected {
+                format!(
+                    "> {}",
+                    fit_cells(text, body.width.saturating_sub(2) as usize)
+                )
+            } else {
+                fit_cells(text, body.width as usize)
+            };
+            put_line(
+                frame,
+                row,
+                row.y,
+                vec![Span::styled(
+                    visible,
+                    ctx.style(if selected {
+                        Token::Amber
+                    } else {
+                        Token::Silver
+                    }),
+                )],
+            );
+        }
         if let Some(source) = source {
             ctx.zone(
                 row,
