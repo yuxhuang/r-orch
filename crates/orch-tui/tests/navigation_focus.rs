@@ -1193,3 +1193,81 @@ fn goal_and_agent_activity_end_the_rail_and_follow_newest_at_the_top() {
         h.app.state.messages.retain(|m| m.text != "newest");
     }
 }
+
+/// Shrinking the terminal under a paused detail Activity pane keeps the
+/// selected row in the window at once, not only after the next nav key, in
+/// both orientations (Goal: newest first; Task: chronological).
+#[test]
+fn paused_detail_activity_keeps_its_selection_in_view_after_a_shrink() {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    for (view, section, away) in [
+        (
+            ViewId::Goals,
+            Focus::GoalDetail(GoalSection::Activity),
+            KeyCode::Down,
+        ),
+        (
+            ViewId::Tasks,
+            Focus::TaskDetail(TaskSection::Activity),
+            KeyCode::Up,
+        ),
+    ] {
+        let mut t = make_task("t", "Task", TaskStatus::InProgress);
+        t.goal_id = Some("g".into());
+        let mut h = Harness::sized(
+            FakeBackend::new()
+                .with_tasks(vec![t])
+                .with_goals(vec![make_goal("g", "Goal", GoalStatus::Active)]),
+            120,
+            40,
+        );
+        h.app.state.messages = (1..=20)
+            .map(|id| {
+                Message::new(
+                    id,
+                    id as i64 * 1_000,
+                    &format!("m{id}"),
+                    Token::White,
+                    MsgType::Info,
+                )
+                .with_task(Some("t".into()))
+            })
+            .collect();
+        h.app.state.view = view;
+        h.app.state.detail = DetailPanel::Entity;
+        h.app.state.set_focus(section);
+        h.draw();
+        let key = h.app.state.pane_key(section);
+        let body_height = |h: &Harness| {
+            let pane = h.hits().metrics.panes.iter().find(|p| p.key == key);
+            usize::from(pane.expect("Activity pane published").body.height)
+        };
+        // Pause eight rows away from the live edge, inside the tall window.
+        for _ in 0..8 {
+            h.press(away).draw();
+        }
+        assert!(!h.app.state.detail_activity_following(&key), "{view:?}");
+        let tall = h.app.state.detail_activity_scroll(&key, body_height(&h));
+        let selected = tall.selected.expect("paused selection");
+
+        h.terminal.backend_mut().resize(40, 14);
+        h.terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 40, 14))
+            .unwrap();
+        h.app.state.width = 40;
+        h.app.state.height = 14;
+        h.draw();
+        let height = body_height(&h);
+        assert!(height > 0, "{view:?} has a body at 40x14");
+        let short = h.app.state.detail_activity_scroll(&key, height);
+        assert_eq!(short.selected, Some(selected), "{view:?} selection kept");
+        assert!(
+            short.offset <= selected && selected < short.offset + height,
+            "{view:?}: selection {selected} outside rows {}..{} (was offset {})",
+            short.offset,
+            short.offset + height,
+            tall.offset
+        );
+    }
+}
