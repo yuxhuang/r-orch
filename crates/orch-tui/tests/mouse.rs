@@ -2247,3 +2247,107 @@ fn m111_the_whole_confirm_label_is_clickable_from_its_first_cell() {
     );
     harness.assert_called(|c| matches!(c, Call::CreateGoal { .. }));
 }
+
+/// The NEW TASK wizard on its assignee step with a filter (`zz`) that lists
+/// no agent: only the Auto-assign sentinel is offered.
+fn assignee_step_matching_no_agent() -> Harness {
+    let mut harness = Harness::with(loaded());
+    harness.key('t');
+    harness.key('n');
+    harness.type_str("Ship it");
+    harness.press(KeyCode::Enter); // title
+    harness.press(KeyCode::Enter); // priority
+    harness.type_str("zz");
+    harness.draw();
+    let wizard = harness.app.state.wizard.as_ref().unwrap();
+    assert_eq!(wizard.step_id(), "assignee");
+    assert!(wizard.picker_blocked(), "the filter lists no agent");
+    assert_eq!(
+        wizard
+            .options()
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Auto-assign"]
+    );
+    harness
+}
+
+#[test]
+fn m112_a_double_click_on_the_offered_sentinel_picks_it_when_no_agent_matches() {
+    // Review N1 / DQ1 D3: the sentinel is a real row even when the filter
+    // matches nobody. Pointing at it twice is as explicit as its digit, so it
+    // is accepted; only a bare Enter on typed text is refused.
+    let mut harness = assignee_step_matching_no_agent();
+    let (x, y) = option_cell(&harness, 0, orch_tui::hit::RowPart::Label);
+
+    harness.double_click(x + 6, y);
+    let wizard = harness.app.state.wizard.as_ref().unwrap();
+    assert_eq!(
+        wizard.step_id(),
+        "description",
+        "the double click accepts the sentinel and advances"
+    );
+    assert_eq!(
+        wizard.values().get("assignee").map(String::as_str),
+        Some(""),
+        "the accepted value is Auto-assign's own id, the empty assignee"
+    );
+    harness.refute_called(|c| matches!(c, Call::CreateTask { .. }));
+}
+
+#[test]
+fn m113_with_no_agent_matching_a_single_click_or_a_bare_enter_still_does_not_pick() {
+    // The other half of N1: the fix is the pointer's explicit pick, not a
+    // weaker free-text guard.
+    let mut harness = assignee_step_matching_no_agent();
+    let (x, y) = option_cell(&harness, 0, orch_tui::hit::RowPart::Label);
+
+    harness.click(x + 6, y);
+    let wizard = harness.app.state.wizard.as_ref().unwrap();
+    assert_eq!(wizard.step_id(), "assignee", "a single click only selects");
+
+    harness.press(KeyCode::Enter);
+    let wizard = harness.app.state.wizard.as_ref().unwrap();
+    assert_eq!(
+        wizard.step_id(),
+        "assignee",
+        "a bare Enter is still refused"
+    );
+    assert_eq!(
+        wizard.visible_error(),
+        Some(orch_tui::wizard::engine::NO_AGENT_MATCHES)
+    );
+}
+
+#[test]
+fn m114_a_double_click_on_a_filtered_agent_row_accepts_that_agent_id() {
+    // The sentinel fix keeps the matching case on its own path: with a filter
+    // that lists agents, a double click on a displayed row accepts that row's
+    // exact id through the ordinary confirm, not the sentinel.
+    let mut harness = Harness::with(loaded());
+    harness.key('t');
+    harness.key('n');
+    harness.type_str("Ship it");
+    harness.press(KeyCode::Enter); // title
+    harness.press(KeyCode::Enter); // priority
+    // Letters only: a typed digit is a pick, not filter text.
+    harness.type_str("agent");
+    harness.draw();
+    let wizard = harness.app.state.wizard.as_ref().unwrap();
+    assert!(!wizard.picker_blocked());
+    assert_eq!(
+        wizard.options()[3].value,
+        "agt_2",
+        "agent2 is the fourth row"
+    );
+    let (x, y) = option_cell(&harness, 3, orch_tui::hit::RowPart::Label);
+
+    harness.double_click(x + 6, y);
+    let wizard = harness.app.state.wizard.as_ref().unwrap();
+    assert_eq!(wizard.step_id(), "description");
+    assert_eq!(
+        wizard.values().get("assignee").map(String::as_str),
+        Some("agt_2")
+    );
+}
