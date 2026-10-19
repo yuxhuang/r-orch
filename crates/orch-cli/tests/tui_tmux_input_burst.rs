@@ -153,9 +153,8 @@ fn orch(dir: &Path, args: &[&str]) {
     );
 }
 
-/// A shell project (no default AI agent) with three shell agents, so the
-/// wizard's Assignee step lists Auto-assign, alpha, bravo, charlie. There are
-/// no tasks, so the orchestrator the dashboard starts has nothing to run.
+/// A shell project (no default AI agent) with no tasks, so the orchestrator
+/// the dashboard starts has nothing to run.
 fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
@@ -163,20 +162,6 @@ fn project() -> tempfile::TempDir {
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
-    for name in ["alpha", "bravo", "charlie"] {
-        orch(
-            dir.path(),
-            &[
-                "agent",
-                "add",
-                name,
-                "--adapter",
-                "shell",
-                "--command",
-                "true",
-            ],
-        );
-    }
     dir
 }
 
@@ -252,16 +237,16 @@ fn every_key_of_a_burst_is_handled_without_another_keystroke() {
     tmux.burst("hello");
     tmux.wait_for("the whole title", |s| s.contains("> hello"));
 
-    // Select step: Enter twice (title, then the default priority) reaches the
-    // Assignee step with the cursor on Auto-assign; `jj` moves it two rows.
+    // Select step: Enter reaches the Priority step with the cursor on the
+    // default, P3 Medium; `kk` moves it two rows up, to P1 Critical. Priority,
+    // not Assignee: an agent step's type-ahead filter takes `j` and `k` as
+    // text, so a burst there would be typed rather than moved.
     tmux.keys(&["Enter"]);
-    tmux.wait_for("the priority step", |s| s.contains("P3 Medium"));
-    tmux.keys(&["Enter"]);
-    tmux.wait_for("the assignee step", |s| {
-        cursor_row(s).is_some_and(|row| row.contains("Auto-assign"))
+    tmux.wait_for("the priority step", |s| {
+        cursor_row(s).is_some_and(|row| row.contains("P3 Medium"))
     });
-    tmux.burst("jj");
-    tmux.wait_for("the cursor two rows down", |s| {
-        cursor_row(s).is_some_and(|row| row.contains("bravo"))
+    tmux.burst("kk");
+    tmux.wait_for("the cursor two rows up", |s| {
+        cursor_row(s).is_some_and(|row| row.contains("P1 Critical"))
     });
 }
