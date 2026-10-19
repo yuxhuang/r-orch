@@ -3,6 +3,8 @@
 //! order while focus moves (R2), the task, goal and agent details' Activity
 //! rows have the bottom feed's columns (R1, R12), and their Overview is an
 //! aligned label/value block under a `━` title rule, focused and pinned (R6).
+//! The new-task wizard's Assignee step filters its agents as you type and
+//! cycles their order with `Ctrl+O` (R7, R8).
 //!
 //! The real `orch` binary runs `orch tui` in a private tmux server over a
 //! temp project with one shell agent, `bot`, one unassigned goal, `Launch`,
@@ -533,4 +535,133 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
         tmux.wait_for("the detail closed", |s| !s.contains("Activity · following"));
     }
     tmux.keys(&["q"]);
+}
+
+/// Three shell agents and nothing to dispatch: no task exists, and the wizard
+/// below is never submitted.
+fn picker_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("home")).expect("home");
+    orch(
+        dir.path(),
+        &["init", "--name", "proj", "--adapter", "shell"],
+    );
+    for (name, role) in [
+        ("zeta-builder", "Builds the release"),
+        ("alpha-ops", "Keeps the lights on"),
+        ("mid-reviewer", "Code reviewer"),
+    ] {
+        orch(
+            dir.path(),
+            &[
+                "agent",
+                "add",
+                name,
+                "--adapter",
+                "shell",
+                "--command",
+                "true",
+                "--role",
+                role,
+            ],
+        );
+    }
+    dir
+}
+
+/// The Assignee step's numbered rows, in screen order: every line that
+/// names one of the project's agents or the sentinel.
+fn picker_rows(screen: &str) -> Vec<String> {
+    screen
+        .lines()
+        .filter(|line| {
+            ["Auto-assign", "zeta-builder", "alpha-ops", "mid-reviewer"]
+                .iter()
+                .any(|name| line.contains(&format!("{name} ─")))
+        })
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+/// Type into an agent step's filter one key at a time, waiting for each to
+/// show. A burst sent in one write only applies its first key on a `Select`
+/// step until the next keystroke arrives; that predates the picker and is
+/// tracked separately (tsk_kRn060L).
+fn type_filter(tmux: &Tmux, text: &str) -> String {
+    let mut typed = String::new();
+    let mut screen = String::new();
+    for ch in text.chars() {
+        typed.push(ch);
+        tmux.keys(&["-l", &ch.to_string()]);
+        let prompt = format!("> {typed}█");
+        screen = tmux.wait_for(&prompt, |s| s.contains(&prompt));
+    }
+    screen
+}
+
+/// R7, R8: on the new-task wizard's Assignee step, typing narrows the
+/// numbered agent list live, `Ctrl+O` cycles the order the hint names, the
+/// sentinel stays first, and Esc clears the filter. Checked at 120x40 and
+/// again at 80x24.
+#[test]
+fn wizard_agent_picker_filter_and_order() {
+    let dir = picker_project();
+    let tmux = launch(
+        dir.path(),
+        format!("orch-x4-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["t"]);
+    tmux.keys(&["n"]);
+    tmux.wait_for("the title step", |s| s.contains("Task title"));
+    tmux.keys(&["-l", "Ship it"]);
+    tmux.keys(&["Enter"]);
+    tmux.wait_for("the priority step", |s| s.contains("Priority"));
+    tmux.keys(&["Enter"]);
+    let screen = tmux.wait_for("the assignee step", |s| s.contains("> type to filter"));
+    let all = picker_rows(&screen);
+    assert_eq!(all.len(), 4, "{screen}");
+    assert!(all[0].contains("Auto-assign"), "{screen}");
+    assert!(screen.contains("order: Original · Ctrl+O"), "{screen}");
+
+    // Type a fragment of one agent's role: the list narrows to it.
+    let screen = type_filter(&tmux, "review");
+    let rows = picker_rows(&screen);
+    assert_eq!(rows.len(), 2, "{screen}");
+    assert!(rows[0].contains("Auto-assign"), "{screen}");
+    assert!(
+        rows[1].contains("mid-reviewer ─ idle · [shell] Code reviewer"),
+        "{screen}"
+    );
+
+    // Esc clears the filter; Ctrl+O orders by name, sentinel still first.
+    tmux.keys(&["Escape"]);
+    tmux.wait_for("the cleared filter", |s| s.contains("> type to filter"));
+    tmux.keys(&["C-o"]);
+    let screen = tmux.wait_for("the name order", |s| s.contains("order: Name · Ctrl+O"));
+    let rows = picker_rows(&screen);
+    let order: Vec<usize> = ["Auto-assign", "alpha-ops", "mid-reviewer", "zeta-builder"]
+        .iter()
+        .map(|name| {
+            rows.iter()
+                .position(|row| row.contains(&format!("{name} ─")))
+                .unwrap_or_else(|| panic!("no {name} row: {screen}"))
+        })
+        .collect();
+    assert_eq!(order, [0, 1, 2, 3], "{screen}");
+    assert!(
+        screen.contains("Ctrl+O order: Name"),
+        "the footer: {screen}"
+    );
+
+    // The smallest supported size keeps the filter row and its order.
+    tmux.run(&["resize-window", "-t", "dash", "-x", "80", "-y", "24"]);
+    tmux.wait_for("the 80-column redraw", |s| {
+        s.lines().all(|line| line.chars().count() <= 80)
+    });
+    let screen = type_filter(&tmux, "ops");
+    assert!(screen.contains("order: Name"), "{screen}");
+    let rows = picker_rows(&screen);
+    assert_eq!(rows.len(), 2, "{screen}");
+    assert!(rows[1].contains("alpha-ops"), "{screen}");
 }

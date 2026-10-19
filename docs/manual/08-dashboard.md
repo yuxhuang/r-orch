@@ -204,7 +204,7 @@ To fill in a wizard:
 3. Press `Esc`, or `Backspace` on an empty text field, to go back one step. `Esc` on the first step leaves the wizard.
 4. Accept the last step to create the item. If creation fails, the form stays open so you can fix it.
 
-On select steps the number keys `1` to `9` choose and accept an option at once. On multi-select steps `Space` toggles the option. In description fields, `Enter` adds a new line; press `Tab` or `Ctrl+Enter` to accept the field. The model step offers suggestions: press `Down` to browse them.
+On select steps the number keys `1` to `9` choose and accept an option at once. Steps that pick an agent (assignee, team lead, team members) filter as you type instead: letters, including `j` and `k`, narrow the list to agents whose name, adapter or role contains them (move with the arrow keys), `Backspace` edits the filter, `Esc` clears it, and `Ctrl+O` cycles the order through Original, Name, Adapter and Status. The numbers follow the filtered list, and typed text alone never assigns anyone: choose a listed agent, or Auto-assign/None. On multi-select steps `Space` toggles the option. In description fields, `Enter` adds a new line; press `Tab` or `Ctrl+Enter` to accept the field. The model step offers suggestions: press `Down` to browse them.
 
 ### Install from the agent shop
 

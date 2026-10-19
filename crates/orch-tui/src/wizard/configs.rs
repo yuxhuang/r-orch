@@ -17,6 +17,7 @@ use crate::format::cap_line;
 use crate::wizard::engine::{
     Choice, StepKind, SuggestionMode, Values, Wizard, WizardKind, WizardStep,
 };
+use crate::wizard::picker::AgentPicker;
 
 /// Role sentinel meaning "type your own".
 pub const CUSTOM_ROLE: &str = "__custom__";
@@ -757,6 +758,7 @@ pub fn task_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
             .validate(validate_priority),
         WizardStep::new("assignee", "Assignee", StepKind::Select)
             .options(options)
+            .agent_picker(AgentPicker::new(agents))
             .skip(move |_| options_len <= 1),
         WizardStep::new("description", "Description", StepKind::Textarea)
             .placeholder("Optional details, context, acceptance criteria..."),
@@ -778,6 +780,7 @@ pub fn edit_task_wizard_steps(task: &Task, agents: &[Agent]) -> Vec<WizardStep> 
             .validate(validate_priority),
         WizardStep::new("assignee", "Assignee", StepKind::Select)
             .options(options)
+            .agent_picker(AgentPicker::new(agents))
             .default_value(task.assignee.as_deref().unwrap_or(""))
             .skip(move |_| options_len <= 1),
         WizardStep::new("description", "Description", StepKind::Textarea)
@@ -825,8 +828,11 @@ pub fn team_wizard_steps(agents: &[Agent], teams: &[Team]) -> Vec<WizardStep> {
             .required()
             .validate(move |v| validate_team_name(v, &teams_owned)),
         // No empty sentinel — a team must have a lead.
-        WizardStep::new("lead", "Team lead", StepKind::Select).options(agent_opts),
+        WizardStep::new("lead", "Team lead", StepKind::Select)
+            .options(agent_opts)
+            .agent_picker(AgentPicker::new(agents)),
         WizardStep::new("members", "Team members", StepKind::Multiselect)
+            .agent_picker(AgentPicker::new(agents))
             .get_options(move |v| {
                 let lead = value_of(v, "lead");
                 for_members
@@ -886,6 +892,7 @@ pub fn goal_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
         WizardStep::new("assignee", "Assignee", StepKind::Select)
             .description(GOAL_ASSIGNEE_DESC)
             .options(options)
+            .agent_picker(AgentPicker::new(agents))
             .skip(move |_| options_len <= 1),
         WizardStep::new("description", "Description", StepKind::Textarea)
             .placeholder("Success criteria, constraints, technical context...")
@@ -907,6 +914,7 @@ pub fn edit_goal_wizard_steps(goal: &Goal, agents: &[Agent]) -> Vec<WizardStep> 
         WizardStep::new("assignee", "Assignee", StepKind::Select)
             .description(GOAL_ASSIGNEE_DESC)
             .options(options)
+            .agent_picker(AgentPicker::new(agents))
             .default_value(goal.assignee.as_deref().unwrap_or(""))
             .skip(move |_| options_len <= 1),
         WizardStep::new("description", "Description", StepKind::Textarea)
