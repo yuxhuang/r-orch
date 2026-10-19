@@ -56,6 +56,7 @@ pub enum VerbId {
     CycleAgentSort,
     ReverseAgentSort,
     ResetAgentSort,
+    ToggleAgentGroupBy,
     PickerToggle,
     PickerAll,
     PickerConfirm,

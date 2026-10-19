@@ -6,6 +6,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Added
+- The dashboard's Agents view can group agents By node as well as By team: press `b` or click the `b group:` chip for a Local section, then one section per remote alias marked online or offline. The sort applies within each section and the selected agent stays selected.
 - A user manual in [docs/manual/](docs/manual/README.md): installing, concepts, every command, the dashboard and web dashboard with screenshots, templates and the agent shop, remote agents, configuration and troubleshooting.
 - Dashboard goal and agent details end with an Activity section in the Activity panel's columns, newest first: a goal lists the entries of its tasks, an agent its own entries. It follows new entries at the top; moving down pauses it and `Home` resumes, as the footer hint and the help overlay say. An empty one reads "No activity.".
 
