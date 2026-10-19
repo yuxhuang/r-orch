@@ -991,3 +991,266 @@ fn k096_cmd_s_does_not_open_the_agent_shop_but_alt_s_does() {
     harness.press_mod(KeyCode::Char('s'), KeyModifiers::ALT);
     harness.assert_text("AGENT SHOP");
 }
+
+// ── List sort keys (R10, R16) and the sampled Elapsed order (R14) ──────────
+
+/// ISO-8601 for an instant on 1970-01-01, which is all these cases need:
+/// the harness clock starts at 1 000 000 ms.
+fn iso(ms: i64) -> String {
+    assert!((0..86_400_000).contains(&ms), "{ms} is not on day one");
+    format!(
+        "1970-01-01T{:02}:{:02}:{:02}.{:03}Z",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
+fn run(task_id: &str, started_ms: i64) -> orch_domain::Run {
+    orch_domain::Run {
+        id: format!("run_{task_id}_{started_ms}"),
+        task_id: task_id.into(),
+        agent_id: "agt".into(),
+        attempt: 1,
+        status: orch_domain::RunStatus::Succeeded,
+        started_at: iso(started_ms),
+        finished_at: None,
+        workspace_path: "/tmp/ws".into(),
+        prompt: "p".into(),
+        pid: None,
+        error: None,
+        error_kind: None,
+        tokens: None,
+    }
+}
+
+fn sorted_task_ids(h: &Harness) -> Vec<String> {
+    h.app
+        .state
+        .sorted_tasks()
+        .into_iter()
+        .map(|i| h.app.state.tasks[i].id.clone())
+        .collect()
+}
+
+fn three_tasks() -> Harness {
+    let mut tasks = vec![
+        make_task("tsk_b", "Bravo", TaskStatus::Todo),
+        make_task("tsk_c", "charlie", TaskStatus::InProgress),
+        make_task("tsk_a", "Alpha", TaskStatus::Done),
+    ];
+    tasks[0].priority = 1;
+    tasks[1].priority = 2;
+    tasks[2].priority = 1;
+    let mut h = Harness::with(FakeBackend::new().with_tasks(tasks));
+    h.app.state.view = ViewId::Tasks;
+    h
+}
+
+#[test]
+fn sort_keys_cycle_and_flip() {
+    use orch_tui::state::TaskSortField;
+    let mut h = three_tasks();
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Status);
+    // `o`: Priority; equal priorities keep source order.
+    h.key('o');
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Priority);
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a", "tsk_c"]);
+    // `O`: descending — and the tie still keeps source order.
+    h.key('O');
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    // `o` again: Title, still descending.
+    h.key('o');
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Title);
+    assert!(h.app.state.task_sort.descending);
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    h.assert_text("TITLE↓");
+}
+
+#[test]
+fn sort_keys_cycle_reverse_reset() {
+    let mut h = three_tasks();
+    h.key('o').key('o').key('O');
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    // `0` restores the default order and touches nothing else.
+    h.app.state.group_by_goal = true;
+    h.key('0');
+    assert_eq!(h.app.state.task_sort, Default::default());
+    assert!(h.app.state.group_by_goal);
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    h.assert_text("STATUS↑");
+
+    // The keys act on the visible list only.
+    let goal_sort = h.app.state.goal_sort;
+    let agent_sort = h.app.state.agent_sort;
+    h.key('o');
+    assert_eq!(h.app.state.goal_sort, goal_sort);
+    assert_eq!(h.app.state.agent_sort, agent_sort);
+}
+
+#[test]
+fn sort_cycle_preserves_direction() {
+    use orch_tui::state::{GoalSortField, TaskSortField};
+    let mut h = three_tasks();
+    h.key('O');
+    // A full cycle of seven Tasks fields comes back to Status, descending.
+    for _ in 0..7 {
+        h.key('o');
+        assert!(h.app.state.task_sort.descending);
+    }
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Status);
+
+    h.app.state.view = ViewId::Goals;
+    h.key('O');
+    for _ in 0..6 {
+        h.key('o');
+        assert!(h.app.state.goal_sort.descending);
+    }
+    assert_eq!(h.app.state.goal_sort.field, GoalSortField::Status);
+}
+
+#[test]
+fn sort_keys_keep_the_selected_task() {
+    let mut h = three_tasks();
+    h.press(KeyCode::Down);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_b");
+    h.key('o').key('o');
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b", "tsk_c"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_b");
+    h.key('0');
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_b");
+}
+
+/// R14's vector at the harness clock (`base` = 1 000 000): A is live and
+/// started 4 999 ms before the sort sampled; B ended with a 5 000 ms span.
+fn crossing_harness() -> Harness {
+    let base = 1_000_000;
+    let mut a = make_task("tsk_a", "Live A", TaskStatus::InProgress);
+    a.updated_at = iso(base - 4_999);
+    let mut b = make_task("tsk_b", "Ended B", TaskStatus::Done);
+    b.updated_at = iso(base - 5_000);
+    let backend = FakeBackend::new()
+        .with_tasks(vec![b, a])
+        .with_runs(vec![run("tsk_a", base - 4_999), run("tsk_b", base - 10_000)]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Tasks;
+    h.key('o').key('o').key('o').key('o').key('o').key('o');
+    assert_eq!(
+        h.app.state.task_sort.field,
+        orch_tui::state::TaskSortField::Elapsed
+    );
+    h
+}
+
+#[test]
+fn elapsed_tick_preserves_selection_and_enter_target() {
+    let mut h = crossing_harness();
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+
+    // Two milliseconds later A's live span (5 001) passes B's (5 000), but
+    // no refresh or control change happened: the text moves, the order and
+    // the action target do not.
+    h.advance(2).draw();
+    assert_eq!(
+        h.app.state.task_elapsed_ms(1, h.now()),
+        Some(5_001),
+        "the displayed span is live"
+    );
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    h.press(KeyCode::Esc);
+
+    // A refresh samples the clock again: B, A — and A stays selected.
+    h.app.refresh_all(false);
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    assert!(!h.app.state.entity_actions_deferred);
+    h.draw().press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+}
+
+/// Ten ended tasks with spans 1 000..10 000 ms, and live A at 9 500 ms when
+/// the sort samples — row 10, the last row under the cap.
+fn capped_harness() -> Harness {
+    let base = 1_000_000;
+    let mut tasks = Vec::new();
+    let mut runs = Vec::new();
+    for i in 1..=10 {
+        let id = format!("tsk_{i:02}");
+        let mut task = make_task(&id, &format!("Ended {i}"), TaskStatus::Done);
+        task.updated_at = iso(base - 20_000 + i * 1_000);
+        runs.push(run(&id, base - 20_000));
+        tasks.push(task);
+    }
+    tasks.push(make_task("tsk_a", "Live A", TaskStatus::InProgress));
+    runs.push(run("tsk_a", base - 9_500));
+    let mut h = Harness::sized(
+        FakeBackend::new().with_tasks(tasks).with_runs(runs),
+        120,
+        44,
+    );
+    h.app.state.view = ViewId::Tasks;
+    for _ in 0..6 {
+        h.key('o');
+    }
+    h
+}
+
+#[test]
+fn elapsed_crossing_task_limit() {
+    let mut h = capped_harness();
+    let ids = sorted_task_ids(&h);
+    assert_eq!(ids[9], "tsk_a", "{ids:?}");
+    for _ in 0..9 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+
+    // A tick takes A's span to 10 500 ms, past tsk_10's 10 000: it stays on
+    // row 10, still selected.
+    h.advance(1_000).draw();
+    assert_eq!(sorted_task_ids(&h)[9], "tsk_a");
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+
+    // A refresh pushes A to row 11, past the cap. The cursor stays on row
+    // 10 (now tsk_10), show-all stays off, and entity actions wait for the
+    // frame that shows the new selection.
+    h.app.refresh_all(false);
+    assert_eq!(sorted_task_ids(&h)[10], "tsk_a");
+    assert!(!h.app.state.show_all_tasks);
+    assert_eq!(h.app.state.task_selected, 9);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_10");
+    assert!(h.app.state.entity_actions_deferred);
+    h.press(KeyCode::Enter).key('d').key('c');
+    assert_eq!(h.app.state.detail, DetailPanel::None);
+    assert!(h.app.state.pending_deletions.is_empty());
+    h.refute_called(|c| matches!(c, Call::CancelTask(_)));
+    // Drawn: now Enter acts, on the row the user can see.
+    h.draw();
+    assert!(!h.app.state.entity_actions_deferred);
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_10");
+
+    // With show-all on, row 11 is visible and A keeps the cursor.
+    let mut h = capped_harness();
+    h.key('s');
+    for _ in 0..9 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    // The real loop draws after every key; that frame releases the deferral
+    // the Started step of the `o` cycle set when it pushed A past the cap.
+    h.draw();
+    h.advance(1_000);
+    h.app.refresh_all(false);
+    assert_eq!(h.app.state.task_selected, 10);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    assert!(!h.app.state.entity_actions_deferred);
+}
