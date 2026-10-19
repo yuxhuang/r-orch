@@ -1271,3 +1271,70 @@ fn paused_detail_activity_keeps_its_selection_in_view_after_a_shrink() {
         );
     }
 }
+
+/// Newest-first Goal Activity evicts from its bottom. A paused anchor on a
+/// message the retention cap evicts falls back to its old position bounded by
+/// the new length: the now-oldest row, still in range.
+#[test]
+fn paused_goal_activity_anchor_evicted_by_the_cap_lands_on_the_new_oldest_row() {
+    use orch_tui::messages::{MAX_MESSAGES, MsgType, PendingMessage};
+    use orch_tui::theme::Token;
+    let mut t = make_task("t", "Task", TaskStatus::InProgress);
+    t.goal_id = Some("g".into());
+    let mut h = Harness::with(
+        FakeBackend::new()
+            .with_tasks(vec![t, make_task("other", "Other", TaskStatus::Todo)])
+            .with_goals(vec![make_goal("g", "Goal", GoalStatus::Active)]),
+    );
+    h.app.state.messages.clear();
+    let post = |h: &mut Harness, n: usize, task: &str| {
+        let ts = 1_000 * (h.app.state.messages.len() as i64 + n as i64 + 1);
+        h.app.state.add_message(
+            PendingMessage {
+                text: format!("{task}-{n}"),
+                color: Token::White,
+                msg_type: MsgType::Info,
+                agent_id: None,
+                task_id: Some(task.into()),
+                detail: None,
+                ts_ms: Some(ts),
+            },
+            ts,
+            0,
+        );
+    };
+    // The goal's ten messages are the oldest in a full buffer.
+    for n in 0..10 {
+        post(&mut h, n, "t");
+    }
+    for n in 0..MAX_MESSAGES - 10 {
+        post(&mut h, n, "other");
+    }
+    assert_eq!(h.app.state.messages.len(), MAX_MESSAGES);
+    let section = Focus::GoalDetail(GoalSection::Activity);
+    h.app.state.view = ViewId::Goals;
+    h.app.state.detail = DetailPanel::Entity;
+    h.app.state.set_focus(section);
+    h.draw();
+    let key = h.app.state.pane_key(section);
+    // End pauses on the bottom row, the goal's oldest message.
+    h.press(KeyCode::End).draw();
+    assert!(!h.app.state.detail_activity_following(&key));
+    assert_eq!(h.app.state.pane_scroll(&key).selected, Some(9));
+
+    // Five arrivals evict the goal's five oldest messages, the anchor among them.
+    for n in 0..5 {
+        post(&mut h, MAX_MESSAGES + n, "other");
+    }
+    let rows = h.app.state.detail_activity_rows(&key);
+    assert_eq!(rows.len(), 5);
+    let scroll = h.app.state.pane_scroll(&key);
+    assert!(!h.app.state.detail_activity_following(&key));
+    assert_eq!(scroll.selected, Some(4), "old position 9 bounded by 5 rows");
+    assert!(
+        scroll.offset < rows.len(),
+        "offset {} in range",
+        scroll.offset
+    );
+    assert_eq!(h.app.state.messages[rows[4]].text, "t-5", "the new oldest");
+}
