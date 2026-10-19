@@ -1393,9 +1393,15 @@ impl TuiBackend for AssignmentFailure {
 
 #[test]
 fn e5_partial_assignment_failure_reports_committed_id_and_never_retains_retry_create() {
+    // The assignee is eligible, so the final-submit check (R7, D7) lets the
+    // primary write happen and the failure comes after it.
     let mut app = App::new(
         AssignmentFailure {
-            inner: FakeBackend::new(),
+            inner: FakeBackend::new().with_agents(vec![make_agent(
+                "agent_a",
+                "Agent A",
+                AgentStatus::Idle,
+            )]),
         },
         TestClock::new(0),
     );

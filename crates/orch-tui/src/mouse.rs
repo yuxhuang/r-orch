@@ -258,20 +258,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if let Some(pane) = pane {
             self.state.set_focus(pane.key.section);
             if pane.items > 0 {
-                let mut scroll =
-                    if pane.key.section == Focus::TaskDetail(crate::state::TaskSection::Activity) {
-                        self.state
-                            .task_activity_scroll(&pane.key, pane.body.height as usize)
-                    } else {
-                        self.state.pane_scroll(&pane.key)
-                    };
+                let activity = crate::follow::is_detail_activity(pane.key.section);
+                let mut scroll = if activity {
+                    self.state
+                        .detail_activity_scroll(&pane.key, pane.body.height as usize)
+                } else {
+                    self.state.pane_scroll(&pane.key)
+                };
                 scroll.selected = Some(
                     (scroll.offset + usize::from(y.saturating_sub(pane.body.y)))
                         .min(pane.items.saturating_sub(1)),
                 );
-                if pane.key.section == Focus::TaskDetail(crate::state::TaskSection::Activity)
-                    && scroll.selected == pane.items.checked_sub(1)
-                {
+                // Clicking the live-edge row resumes following.
+                let edge = if crate::follow::detail_activity_newest_first(pane.key.section) {
+                    Some(0)
+                } else {
+                    pane.items.checked_sub(1)
+                };
+                if activity && scroll.selected == edge {
                     scroll.selected = None;
                 }
                 self.state.set_pane_scroll(pane.key, scroll);
@@ -903,16 +907,25 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// click on it toggles. Making the second click a no-op (as this did)
     /// meant the same gesture on two visually identical checkboxes — a
     /// picker's and a wizard's — did different things.
+    ///
+    /// An agent picker whose filter lists no agent refuses `Enter`, so that
+    /// typed text never falls through to the sentinel. A double click is not
+    /// typed text: it names the row it lands on, as that row's digit does, so
+    /// there it confirms by the digit. Only the sentinel rows can be listed
+    /// then, so the digit always exists; past nine rows it falls back to the
+    /// refused `Enter` rather than guessing.
     fn wizard_option_secondary(&mut self, index: usize, part: RowPart) {
-        let multiselect = self
-            .state
-            .wizard
-            .as_ref()
-            .is_some_and(|w| w.step().kind == StepKind::Multiselect);
+        let (multiselect, blocked) = self.state.wizard.as_ref().map_or((false, false), |w| {
+            (w.step().kind == StepKind::Multiselect, w.picker_blocked())
+        });
+        let digit = (index < 9).then(|| char::from(b'1' + index as u8));
         match part {
             RowPart::Checkbox => self.wizard_option_primary(index, part),
             RowPart::Label if multiselect => self.wizard_select_then(index, KeyCode::Char(' ')),
-            RowPart::Label => self.wizard_select_then(index, KeyCode::Enter),
+            RowPart::Label => match digit {
+                Some(digit) if blocked => self.wizard_select_then(index, KeyCode::Char(digit)),
+                _ => self.wizard_select_then(index, KeyCode::Enter),
+            },
         }
     }
 

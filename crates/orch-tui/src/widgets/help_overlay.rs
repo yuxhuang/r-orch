@@ -89,9 +89,9 @@ pub const ELAPSED_ORDER: &str =
 /// top border, under the title, and under the column dividers.
 const SPACERS_ABOVE: usize = 3;
 /// Every row of the box: top border, spacer, title, spacer, dividers, spacer,
-/// the shortcut rows, spacer, dismiss, panes hint, lists hint, the
-/// [`ELAPSED_HELP`] lines, bottom border.
-pub const FULL_H: usize = SPACERS_ABOVE + 3 + MAX_ROWS + 1 + 3 + ELAPSED_HELP.len() + 1;
+/// the shortcut rows, spacer, dismiss, panes hint, detail Activity hint,
+/// lists hint, the [`ELAPSED_HELP`] lines, bottom border.
+pub const FULL_H: usize = SPACERS_ABOVE + 3 + MAX_ROWS + 1 + 4 + ELAPSED_HELP.len() + 1;
 /// [`FULL_H`] without its four spacer rows.
 pub const COMPACT_H: usize = FULL_H - SPACERS_ABOVE - 1;
 
@@ -229,6 +229,16 @@ pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
         y,
         vec![Span::styled(
             "Tab panes; ←→ views; Home/End edges. Feeds: End follows; Up pauses.",
+            ctx.style(Token::Dim),
+        )],
+    );
+    y += 1;
+    put_line(
+        frame,
+        inner,
+        y,
+        vec![Span::styled(
+            "Goal/agent Activity, newest first: Home follows; Down pauses.",
             ctx.style(Token::Dim),
         )],
     );

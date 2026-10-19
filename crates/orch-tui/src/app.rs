@@ -19,7 +19,7 @@ use crate::state::{
     AppState, DetailPanel, EntityType, InputMode, PendingDeletion, TabFlash, ToastKind, ViewId,
 };
 use crate::theme::{Palette, Token};
-use crate::wizard::engine::{Values, WizardKind};
+use crate::wizard::engine::{Choice, RefusedAgent, Values, WizardKind, WizardStep};
 use crate::wizard::session::{DraftKey, LeaveIntent, SubmitOutcome, WizardDraft};
 use crate::wizard::{Wizard, configs};
 
@@ -859,7 +859,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     /// Dispatch a completed wizard to the backend.
-    pub fn submit_wizard(&mut self, values: Values) {
+    pub fn submit_wizard(&mut self, mut values: Values) {
         if self.state.wizard_sessions.recovery {
             self.submission_failed("Stale draft is recovery only; explicitly discard and restart");
             return;
@@ -871,21 +871,41 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         let target = wizard.target_id.clone();
         let setting = wizard.setting.clone();
         let key = DraftKey::from_wizard(wizard);
+        if matches!(kind, WizardKind::EditTask | WizardKind::EditGoal) {
+            keep_unchanged_assignee(&mut values, &wizard.source_defaults);
+        }
         let surface = crate::hit::TextSurfaceId::Editor(key.clone(), wizard.step_id().into());
         if let Some(origin) = self.state.live_copy_origin(&surface).cloned() {
             self.state.clear_copy_feedback(&origin);
         }
-        let outcome = match kind {
-            WizardKind::Task => self.submit_task(&values),
-            WizardKind::EditTask => self.submit_edit_task(&values, target.as_deref()),
-            WizardKind::Agent | WizardKind::AgentFromShop => self.submit_agent(&values),
-            WizardKind::EditAgent => self.submit_edit_agent(&values, target.as_deref()),
-            WizardKind::AgentShop => self.submit_shop(&values),
-            WizardKind::Team => self.submit_team(&values),
-            WizardKind::Goal => self.submit_goal(&values),
-            WizardKind::EditGoal => self.submit_edit_goal(&values, target.as_deref()),
-            WizardKind::Config => self.submit_config(&values, setting.as_deref()),
+        let outcome = match self.refuse_ineligible_agents(&kind, &values, target.as_deref()) {
+            Some(refused) => refused,
+            None => self.dispatch_wizard(&kind, &values, target.as_deref(), setting.as_deref()),
         };
+        self.finish_submission(outcome, &key);
+    }
+
+    fn dispatch_wizard(
+        &mut self,
+        kind: &WizardKind,
+        values: &Values,
+        target: Option<&str>,
+        setting: Option<&str>,
+    ) -> SubmitOutcome {
+        match kind {
+            WizardKind::Task => self.submit_task(values),
+            WizardKind::EditTask => self.submit_edit_task(values, target),
+            WizardKind::Agent | WizardKind::AgentFromShop => self.submit_agent(values),
+            WizardKind::EditAgent => self.submit_edit_agent(values, target),
+            WizardKind::AgentShop => self.submit_shop(values),
+            WizardKind::Team => self.submit_team(values),
+            WizardKind::Goal => self.submit_goal(values),
+            WizardKind::EditGoal => self.submit_edit_goal(values, target),
+            WizardKind::Config => self.submit_config(values, setting),
+        }
+    }
+
+    fn finish_submission(&mut self, outcome: SubmitOutcome, key: &DraftKey) {
         match outcome {
             SubmitOutcome::Failed => {
                 if let Some(wizard) = self.state.wizard.as_ref() {
@@ -898,12 +918,106 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.state.input_mode = InputMode::Wizard;
             }
             SubmitOutcome::Committed => {
-                self.state.wizard_sessions.discard_draft(&key);
+                self.state.wizard_sessions.discard_draft(key);
                 self.close_wizard();
             }
-            SubmitOutcome::Advanced => self.state.wizard_sessions.discard_draft(&key),
+            SubmitOutcome::Advanced => self.state.wizard_sessions.discard_draft(key),
         }
         self.invalidate_hits();
+    }
+
+    /// The final-submit eligibility check (R7, D7): before the first write,
+    /// read the roster fresh and require every agent id the wizard would
+    /// submit to be listed and not disabled. The wizard's own lists are a
+    /// snapshot taken when it opened, so neither they nor `state.agents` can
+    /// answer this.
+    ///
+    /// `None` lets the submission proceed. Otherwise nothing has been
+    /// written and the wizard stays open with its draft: a failed read asks
+    /// for a retry, and a refused choice reopens on choices rebuilt from the
+    /// fresh roster with nothing chosen in its place. A refused agent is
+    /// never replaced by the sentinel or by another row, and a refused team
+    /// member stays ticked until it is unticked.
+    ///
+    /// Not a transaction: an agent disabled after this read and before the
+    /// write still lands, and the post-write failure reporting below is
+    /// unchanged. A wizard that submits no agent id skips the read, so an
+    /// unreadable roster never blocks an unassigned task.
+    fn refuse_ineligible_agents(
+        &mut self,
+        kind: &WizardKind,
+        values: &Values,
+        target: Option<&str>,
+    ) -> Option<SubmitOutcome> {
+        let submitted = configs::submitted_agent_ids(kind, values);
+        if submitted.is_empty() {
+            return None;
+        }
+        let roster = match self.backend.refresh_agents() {
+            Ok(roster) => roster,
+            Err(error) => {
+                return Some(self.submission_failed(&format!(
+                    "Nothing was saved: could not read the agent list to check the chosen agents ({error}). Submit again to retry"
+                )));
+            }
+        };
+        let mut refused = Vec::new();
+        let mut reasons = Vec::new();
+        for (step_id, ids) in &submitted {
+            for id in ids {
+                let listed = roster.iter().find(|a| a.id == *id);
+                let (reason, hint) = match listed {
+                    None => ("no longer exists", "no longer exists · untick to remove"),
+                    Some(agent) if !configs::is_eligible_agent(agent) => {
+                        ("is disabled", "untick to remove")
+                    }
+                    Some(_) => continue,
+                };
+                // The fresh roster names a disabled agent; a removed one is
+                // named from the snapshot, else by its id.
+                let name = listed
+                    .or_else(|| self.state.agents.iter().find(|a| a.id == *id))
+                    .map_or_else(|| id.clone(), |a| a.name.clone());
+                reasons.push(format!("{} {name} {reason}", agent_field_label(step_id)));
+                refused.push(RefusedAgent {
+                    step_id: (*step_id).to_string(),
+                    choice: Choice::new(id, &name, hint),
+                });
+            }
+        }
+        if refused.is_empty() {
+            return None;
+        }
+        let message = format!("Nothing was saved: {}. Choose again", reasons.join("; "));
+        let steps = self.agent_wizard_steps(kind, target, &roster);
+        if let Some(wizard) = self.state.wizard.as_mut() {
+            wizard.reject_agents(steps, &refused, &message);
+        }
+        self.fail(&message);
+        Some(SubmitOutcome::Failed)
+    }
+
+    /// An open agent-choosing wizard's steps, rebuilt against `roster`.
+    fn agent_wizard_steps(
+        &self,
+        kind: &WizardKind,
+        target: Option<&str>,
+        roster: &[Agent],
+    ) -> Vec<WizardStep> {
+        match kind {
+            WizardKind::Task => configs::task_wizard_steps(roster),
+            WizardKind::EditTask => target
+                .and_then(|id| self.state.tasks.iter().find(|t| t.id == id))
+                .map(|task| configs::edit_task_wizard_steps(task, roster))
+                .unwrap_or_default(),
+            WizardKind::Goal => configs::goal_wizard_steps(roster),
+            WizardKind::EditGoal => target
+                .and_then(|id| self.state.goals.iter().find(|g| g.id == id))
+                .map(|goal| configs::edit_goal_wizard_steps(goal, roster))
+                .unwrap_or_default(),
+            WizardKind::Team => configs::team_wizard_steps(roster, &self.state.teams),
+            _ => Vec::new(),
+        }
     }
 
     fn submission_failed(&mut self, error: &str) -> SubmitOutcome {
@@ -1576,6 +1690,27 @@ pub fn goals_changed(prev: &[Goal], next: &[Goal]) -> bool {
     prev.iter()
         .zip(next)
         .any(|(a, b)| a.id != b.id || a.updated_at != b.updated_at)
+}
+
+/// An edit wizard whose assignee answer is still the assignee it opened with
+/// submits no assignee: unchanged means omitted, so it is neither checked
+/// against the roster nor sent again (a persisted assignment may since have
+/// been disabled, and fixing a title must not need a reassignment).
+fn keep_unchanged_assignee(values: &mut Values, opened_with: &Values) {
+    if let (Some(answer), Some(opened)) = (values.get_mut("assignee"), opened_with.get("assignee"))
+        && answer == opened
+    {
+        answer.clear();
+    }
+}
+
+/// How the refusal message names an agent step.
+fn agent_field_label(step_id: &str) -> &'static str {
+    match step_id {
+        "lead" => "team lead",
+        "members" => "member",
+        _ => "assignee",
+    }
 }
 
 /// Agents have no `updated_at`, so the comparison must be **deep** — no

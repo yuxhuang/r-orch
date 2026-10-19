@@ -150,7 +150,12 @@ $ orch --yaml task list
 `Left`/`Right` switch views; `Tab`/`Shift-Tab` move between the list, activity and available detail sections.
 The Agents view aligns rows in a table. Arrows, PageUp/PageDown, Home/End and the wheel navigate the focused
 section. A click or wheel focuses the section under the pointer. Entity action letters act from the main list;
-return there to edit or delete. Opening a detail initially focuses its Overview section.
+return there to edit or delete. Opening a detail initially focuses its Overview section. The section titles
+above a detail keep their order as you move between them; only the focused one is marked. A task detail's
+Activity section shows that task's entries in the Activity panel's columns: time, agent, type icon and text,
+with errors highlighted. Goal and agent details end with an Activity section in the same columns, newest
+first: a goal's lists the entries of its tasks, an agent's its own. It follows new entries at the top; `Down`
+pauses it and `Home` resumes.
 
 The Goals, Tasks and Agents lists carry a column header row. `o` cycles the sort column, `O` reverses the
 direction and `0` restores that list's default order. Clicking an inactive header sorts by it ascending; clicking
@@ -174,6 +179,11 @@ case-insensitively, with raw agent name and ID breaking ties.
 section for this instance's agents, then one section per remote alias in alias order, each marked online or
 offline. The sort still applies within each section, `0` leaves the grouping alone, and the selected agent stays
 selected. Like the sort, the grouping lasts only for this dashboard session.
+
+Wizard steps that pick an agent (task and goal assignee, team lead and members) filter as you type: letters
+narrow the numbered list to agents whose name, adapter or role contains them, `Backspace` edits the filter and
+`Esc` clears it. `1`–`9` still pick a listed row, and `Ctrl+O` cycles the order through Original, Name, Adapter
+and Status, as the filter row shows. Auto-assign/None stays first; only a listed agent or that choice is submitted.
 
 The Activity panel, ACTIONS list and task-detail Activity follow new entries at the tail. Scrolling up pauses
 following so you can read older entries. Resume with `End`, scroll down to the bottom with the wheel or
