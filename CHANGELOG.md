@@ -7,7 +7,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Added
 - A user manual in [docs/manual/](docs/manual/README.md): installing, concepts, every command, the dashboard and web dashboard with screenshots, templates and the agent shop, remote agents, configuration and troubleshooting.
-- Dashboard goal and agent details end with an Activity section in the Activity panel's columns, newest first: a goal lists the entries of its tasks, an agent its own entries. It follows new entries at the top; moving down pauses it and `Home` resumes. An empty one reads "No activity.".
+- Dashboard goal and agent details end with an Activity section in the Activity panel's columns, newest first: a goal lists the entries of its tasks, an agent its own entries. It follows new entries at the top; moving down pauses it and `Home` resumes, as the footer hint and the help overlay say. An empty one reads "No activity.".
 
 ### Changed
 - The dashboard's task-detail Activity section shows each entry in the same columns and colours as the Activity panel (time, agent, type icon, text, error and agent-group highlighting) instead of bare text.
@@ -16,7 +16,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Parity validation against the TypeScript original: `docs/PARITY.md`, `cargo xtask parity` and `lint-scenarios`, the scenario corpus and the oracle setup are gone, and the docs no longer promise compatibility with the npm package. Compatibility with `.orchestry` data written by r-orch releases is unchanged ([ADR 0009](docs/decisions/0009-remove-parity-tooling.md)).
 
 ### Fixed
-- An Activity entry with no agent (a system entry) at the top of the Activity panel or a detail's Activity section now shows its time, like the first entry of any other group.
+- An Activity entry with no agent (a system entry) at the top of the Activity panel or a detail's Activity section now shows its time, like the first entry of any other group. It also counts as the first group, so when the top entry has no agent, the alternating group shading below it can swap.
 - Dashboard goal, task and agent details keep their section titles in the same order when you move between sections; only the focused title changes style, and a narrow rail drops the titles farthest from the focused one instead of moving it to the front.
 - A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
 

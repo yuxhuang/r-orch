@@ -329,6 +329,12 @@ fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
         "Overview │ Description │ > Activity · following",
         "{screen}"
     );
+    // Task Activity keeps the feed's chronology: its live edge is the bottom.
+    assert_eq!(
+        footer_hint(&screen),
+        "↑↓ scroll; End follows; Up pauses; Tab panes; Enter expands; F1 help",
+        "{screen}"
+    );
 
     // Feed columns: accent, a 5-cell time, a 9-cell agent badge, the type
     // icon, the text. The badge and time show once per agent group, and
@@ -383,9 +389,22 @@ fn activity_rows(screen: &str) -> Vec<String> {
         .collect()
 }
 
+/// The footer's follow hint for a newest-first detail Activity pane.
+const NEWEST_FIRST_HINT: &str =
+    "↑↓ scroll; Home follows; Down pauses; Tab panes; Enter expands; F1 help";
+
+/// The footer's follow hint line, trimmed.
+fn footer_hint(screen: &str) -> &str {
+    screen
+        .lines()
+        .find(|line| line.contains("↑↓ scroll;"))
+        .unwrap_or_else(|| panic!("no follow hint in the footer: {screen}"))
+        .trim()
+}
+
 /// R12: goal and agent details end their rail with Activity, which lists the
 /// same events in the feed's row format, newest first, following at the top;
-/// moving down pauses, and the title names Home as the way back.
+/// moving down pauses, and the title and the footer name Home as the way back.
 #[test]
 fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
     let dir = project();
@@ -428,6 +447,8 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
             "Activity ends the rail: {screen}"
         );
         assert_eq!(activity_rows(&screen), newest_first, "{view}: {screen}");
+        // The footer names the same live edge as the pane title.
+        assert_eq!(footer_hint(&screen), NEWEST_FIRST_HINT, "{view}: {screen}");
 
         tmux.keys(&["Down"]);
         let screen = tmux.wait_for("the paused title", |s| {
@@ -435,6 +456,7 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
         });
         let rows = activity_rows(&screen);
         assert!(rows[1].starts_with('>'), "{view}: {screen}");
+        assert_eq!(footer_hint(&screen), NEWEST_FIRST_HINT, "{view}: {screen}");
         tmux.keys(&["Home"]);
         tmux.wait_for("following again", |s| s.contains("> Activity · following"));
         tmux.keys(&["Escape"]);

@@ -330,7 +330,11 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let selected_goal = state.selected_goal();
 
     if state.focus != crate::state::Focus::MainList {
-        let text = if state.is_live_feed(state.focus) {
+        // The hint names the feed's live edge: newest-first detail Activity
+        // follows at the top (Home), every other feed at the bottom (End).
+        let text = if crate::follow::detail_activity_newest_first(state.focus) {
+            "↑↓ scroll; Home follows; Down pauses; Tab panes; Enter expands; F1 help"
+        } else if state.is_live_feed(state.focus) {
             "↑↓ scroll; End follows; Up pauses; Tab panes; Enter expands; F1 help"
         } else if state.detail_maximized {
             "M restores to act; Esc closes detail; Ctrl+Y copy; F1 help"

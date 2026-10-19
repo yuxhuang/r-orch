@@ -2055,3 +2055,59 @@ fn agent_detail_activity_rows() {
     assert!(rows.is_empty(), "{rows:?}");
     harness.assert_text("No activity.");
 }
+
+/// The footer's follow hint names the focused feed's live edge: Goal and
+/// Agent Activity list newest first, so Home follows and Down pauses; Task
+/// Activity and the bottom feed keep End and Up. The help overlay says both.
+#[test]
+fn detail_activity_footer_hint_follows_the_live_edge() {
+    let mut harness = goal_agent_activity_harness();
+    let footer = |harness: &mut Harness| -> String {
+        harness.draw();
+        let text = harness.text();
+        text.lines()
+            .find(|line| line.contains("↑↓ scroll;"))
+            .unwrap_or_else(|| panic!("no follow hint in the footer: {text}"))
+            .trim()
+            .to_owned()
+    };
+    let newest_first = "↑↓ scroll; Home follows; Down pauses; Tab panes; Enter expands; F1 help";
+    let oldest_first = "↑↓ scroll; End follows; Up pauses; Tab panes; Enter expands; F1 help";
+
+    select_goal(&mut harness, "g1");
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Activity));
+    assert_eq!(footer(&mut harness), newest_first, "goal Activity");
+    // Paused as well: the hint does not depend on the follow state.
+    harness.press(KeyCode::Down);
+    assert!(harness.text().contains("paused · Home follows"));
+    assert_eq!(footer(&mut harness), newest_first, "paused goal Activity");
+
+    select_agent(&mut harness, "alpha");
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Activity));
+    assert_eq!(footer(&mut harness), newest_first, "agent Activity");
+
+    harness.app.state.view = ViewId::Tasks;
+    harness.app.state.task_selected = 0;
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Activity));
+    assert_eq!(footer(&mut harness), oldest_first, "task Activity");
+
+    harness.app.state.detail = orch_tui::state::DetailPanel::None;
+    harness.app.state.set_focus(Focus::Activity);
+    assert_eq!(footer(&mut harness), oldest_first, "bottom feed");
+
+    // From the list: F1 on a focused entry opens its copy help instead.
+    harness.app.state.set_focus(Focus::MainList);
+    harness.press(KeyCode::F(1));
+    harness.assert_text("Feeds: End follows; Up pauses.");
+    harness.assert_text("Goal/agent Activity, newest first: Home follows; Down pauses.");
+}
