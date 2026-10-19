@@ -25,6 +25,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Keys that reach the dashboard together (typed fast over SSH or `orch web`, sent by tmux, or pasted without bracketed paste) are all handled at once. Only the first used to show, so `jj` in a wizard list moved one row and `hello` read `h` until the next key was pressed.
 - Dashboard task, goal and team wizards check the chosen assignee, lead and members against the current agent list when you submit. An agent disabled or removed after you picked it is refused with "Nothing was saved: …": nothing is written, your other answers stay, and the step reopens on the agents that can still be chosen (a refused team member stays listed until you untick it). Before, the stale agent was usually saved anyway, and a new task whose assignee had been removed was created unassigned. The edit wizards' first assignee row now reads "Keep current", which is what it always did.
 - `orch task add --attach` now saves the files: each one is copied into `.orchestry/attachments/<task id>/` and listed on the task. A missing file stops the command with `Attachment file not found` before anything is saved.
+- Task attachments reject duplicate names (including case variants), names already attached on append, and non-file sources before anything is written; copy errors name the source, destination and cause.
 
 ## [0.8.0] - 2026-10-18
 
