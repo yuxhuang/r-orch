@@ -2,17 +2,16 @@
 //!
 //! Every adapter goes through [`spawn_child`], which is where **stderr
 //! draining lives** — structurally, so an adapter cannot forget it
-//! (ARCHITECTURE §9 WP-2, PARITY.md §14.12). A child that writes past one
-//! pipe buffer (~64 KiB on Linux) to an unread stderr blocks forever; in the
-//! TS original `grok` and `antigravity` never attach a consumer and hang until
-//! stall detection fires ten minutes later.
+//! (ARCHITECTURE §9 WP-2). A child that writes past one
+//! pipe buffer (~64 KiB on Linux) to an unread stderr blocks forever, and the
+//! run hangs until stall detection fires ten minutes later.
 //!
 //! Three policies, and the difference between the first two is observable:
 //!
 //! | Policy | Adapters | Behaviour |
 //! |---|---|---|
 //! | [`StderrPolicy::Tail`] | claude, codex, cursor, opencode, pi | drain, keep a bounded 4096-byte tail that is appended to the error message and *then* classified |
-//! | [`StderrPolicy::Discard`] | grok, antigravity | drain and throw away — attaching the tail would change L0 error text, the `classifyAdapterError` result and the persisted `agent.last_error` |
+//! | [`StderrPolicy::Discard`] | grok, antigravity | drain and throw away — attaching the tail would change the error text, the `classifyAdapterError` result and the persisted `agent.last_error` |
 //! | [`StderrPolicy::Stream`] | shell | handed to the adapter, which turns each line into an `error` event |
 //!
 //! The streams themselves are `orch_core::process::{ChildReader, ChildWriter}`
@@ -27,7 +26,7 @@ use orch_core::process::{ExitSignal, ProcessManager, Signal, SpawnOptions};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-/// Bounded stderr retained for diagnostics (`utils.ts:15`).
+/// Bounded stderr retained for diagnostics.
 const STDERR_TAIL_BYTES: usize = 4096;
 
 pub use orch_core::process::{ChildReader, ChildWriter};
@@ -54,7 +53,7 @@ pub struct StderrTail {
 }
 
 impl StderrTail {
-    /// The captured tail, decoded and `trimEnd()`-ed as the TS getter is.
+    /// The captured tail, decoded and trailing-whitespace-trimmed.
     ///
     /// Awaits stderr EOF first. In node the `'data'` events are delivered on
     /// the same event loop that fires `'close'`, so a synchronous getter
@@ -105,10 +104,9 @@ impl std::fmt::Debug for ChildIo {
 /// Spawn through the process manager, install the stderr policy, and arrange
 /// for the child to be signalled if the run is cancelled.
 ///
-/// A spawn failure becomes an [`AdapterError`] carrying the TS message
-/// (`Failed to spawn process: <command>`) and its classification, because the
-/// TS `ProcessManager.spawn` throws synchronously out of `execute()` when node
-/// reports a child with no pid.
+/// A spawn failure becomes an [`AdapterError`] carrying the message
+/// (`Failed to spawn process: <command>`) and its classification, raised
+/// synchronously out of `execute()`.
 pub fn spawn_child(
     process_manager: &Arc<dyn ProcessManager>,
     command: &str,
@@ -135,14 +133,12 @@ pub fn spawn_child(
     Ok(io)
 }
 
-/// Every TS adapter passes `signal: params.signal` to `spawn`, which makes
-/// **node** signal the child when the `AbortController` fires — so cancelling
-/// a run reaps the agent process whether or not the orchestrator also calls
-/// `killWithGrace`. Nothing in a `CancellationToken` does that, so the shared
+/// Cancelling a run signals the child, so the agent process is reaped whether
+/// or not the orchestrator also calls `kill_with_grace`. Nothing in a `CancellationToken` does that, so the shared
 /// spawn path does it here, and every adapter inherits it.
 ///
 /// The signal goes through [`ProcessManager::kill`], which tries the process
-/// group before the bare pid. node kills only the pid; the group is what the
+/// group before the bare pid. The group is what the
 /// orchestrator's own `kill_with_grace` would reach a moment later anyway, and
 /// using the contract's kill rather than a weaker one keeps a cancelled run
 /// from leaving a subtree behind.
@@ -193,8 +189,7 @@ pub fn apply_stderr_policy(io: &mut ChildIo, stderr: Option<ChildReader>, policy
 }
 
 /// Read stderr to EOF, optionally retaining the trailing
-/// [`STDERR_TAIL_BYTES`]. Read errors are swallowed, mirroring the TS no-op
-/// `'error'` handler.
+/// [`STDERR_TAIL_BYTES`]. Read errors are swallowed.
 async fn drain(
     mut stderr: ChildReader,
     tail: Option<Arc<Mutex<Vec<u8>>>>,
@@ -326,7 +321,7 @@ mod tests {
             "Failed to spawn process: orch-definitely-not-a-binary"
         );
         // "Failed to spawn process" matches none of the classifier's
-        // substrings and there is no exit code, exactly as in the TS.
+        // substrings and there is no exit code.
         assert_eq!(err.kind, AdapterErrorKind::Unknown);
     }
 }

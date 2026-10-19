@@ -1,4 +1,4 @@
-# `fixtures/fake-agents/` — stand-in agent CLIs for the parity harness
+# `fixtures/fake-agents/` — stand-in agent CLIs
 
 Seven executables named exactly like the real CLIs the adapters spawn:
 
@@ -12,10 +12,8 @@ Seven executables named exactly like the real CLIs the adapters spawn:
 | `grok` | Grok | `-p <prompt> --output-format streaming-json` |
 | `agy` | Google Antigravity | `-p <prompt>`, plain text out |
 
-The harness puts this directory **first on `PATH`** and runs the TypeScript
-oracle and the Rust binary against the same scripts, so a scenario is
-reproducible and hermetic: POSIX `sh` only, no `node`, no `npm`, no network
-(PARITY.md V31). `--version` short-circuits every script, so `orch doctor`
+Tests put this directory **first on `PATH`**, so a run is reproducible and
+hermetic: POSIX `sh` only, no `node`, no `npm`, no network. `--version` short-circuits every script, so `orch doctor`
 probes cleanly.
 
 There is no fake for the `shell` adapter: it has no CLI of its own and runs
@@ -32,7 +30,7 @@ task behave differently, with nothing but the rendered prompt.
 | `success` (default) | — | one assistant message, then the adapter's terminal event |
 | `fail` | `ORCH_FAKE_FAIL` | a provider error and exit 1, with `fake-agent: the task failed` on stderr |
 | `rate_limit` | `ORCH_FAKE_RATE_LIMIT` | as `fail`, but worded so `classifyAdapterError` returns `rate_limit` |
-| `stderr_flood` | `ORCH_FAKE_STDERR_FLOOD` | 256 KiB on stderr *before* any stdout — deadlocks an adapter that fails to drain it (PARITY.md §14.12) |
+| `stderr_flood` | `ORCH_FAKE_STDERR_FLOOD` | 256 KiB on stderr *before* any stdout — deadlocks an adapter that fails to drain it |
 | `slow` | `ORCH_FAKE_SLOW` | sleeps `ORCH_FAKE_SLOW_SECONDS` (default 30) before emitting, for stall detection |
 | `crash` | `ORCH_FAKE_CRASH` | `kill -9` on itself: exit code null, killed by a signal |
 | `silent` | `ORCH_FAKE_SILENT` | terminal event only, no output events |

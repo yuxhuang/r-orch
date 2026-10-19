@@ -1,4 +1,4 @@
-//! The orchestrator half of `test/unit/application/defensive-validation.test.ts`.
+//! Defensive validation in the orchestrator.
 //!
 //! Fix #2 (the retry-queue bound and dedup) is covered in
 //! [`super::endurance`]; Fix #1 and Fix #4 are in `task_service` and
@@ -31,7 +31,7 @@ fn anything_that_is_not_the_canonical_form_is_rejected() {
         // A locale rendering.
         "1/1/2025, 12:00:00 AM",
         // Parses, but `toISOString` would add the milliseconds, so the
-        // round-trip comparison fails — the TS check is equality, not
+        // round-trip comparison fails — the check is equality, not
         // parseability.
         "2025-01-01T00:00:00Z",
         // An offset rather than `Z`: same instant, different text.
@@ -44,8 +44,7 @@ fn anything_that_is_not_the_canonical_form_is_rejected() {
     }
 }
 
-/// The TS cases that reject a non-string are unrepresentable here: the
-/// parameter is `&str`. Recorded in `TEST-MAP.md` rather than faked.
+/// Rejecting a non-string is unrepresentable here: the parameter is `&str`.
 #[test]
 fn a_non_string_timestamp_is_unrepresentable() {
     // `AgentEvent::timestamp` is a `String`, so the only degenerate input the

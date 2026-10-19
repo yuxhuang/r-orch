@@ -1,4 +1,4 @@
-//! Skill library loader — ported from `src/infrastructure/skills/skill-loader.ts`.
+//! Skill library loader.
 //!
 //! Library skills are Markdown files under `skills/library/`, injected into the
 //! system prompt verbatim (frontmatter included). Names containing `:` are
@@ -17,7 +17,7 @@ use tokio::sync::OnceCell;
 type WarnSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// How many directories the library search probes upward, executable first
-/// (the TS walk probes `thisDir` plus four parents).
+/// (the executable's directory plus four parents).
 const PROBE_DEPTH: usize = 5;
 
 /// Find `skills/library` for the Rust binary.
@@ -27,7 +27,7 @@ const PROBE_DEPTH: usize = 5;
 /// inside the repo), then the repository this crate was built from. If none
 /// exists the result is the unchecked executable-relative path, so the
 /// missing-skill warning names a meaningful location. There is deliberately no
-/// environment variable (the TS loader has none); embedders override with
+/// environment variable; embedders override with
 /// [`FileSkillLoader::with_library_dir`].
 pub fn resolve_library_dir() -> PathBuf {
     let exe_dir = std::env::current_exe()

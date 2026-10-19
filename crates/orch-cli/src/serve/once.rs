@@ -1,5 +1,4 @@
-//! `serve --once` — ported from `src/cli/serve/once-runner.ts`
-//! (`docs/parity/cli.md` §16.5).
+//! `serve --once`.
 //!
 //! Three rules decide when it stops and with what code:
 //!
@@ -9,9 +8,8 @@
 //! - any `failed` task makes the result `has_failed` and the exit code 1 —
 //!   `cancelled` does not;
 //! - and a signal arriving while work is **still outstanding** makes the
-//!   result `interrupted` with exit code 1 (PARITY.md §14.38, a deliberate
-//!   divergence: the oracle reports `all_done` and exits 0 here, claiming a
-//!   success it did not achieve).
+//!   result `interrupted` with exit code 1 (reporting `all_done` and exiting 0
+//!   here would claim a success it did not achieve).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,11 +45,10 @@ pub enum OnceResult {
     HasFailed,
     /// Stopped by a signal with tasks still unfinished.
     ///
-    /// §14.38, FIX rather than REPLICATE by user decision. The oracle returns
-    /// `all_done` and exit 0 for this — measured — because it computes the
-    /// verdict from the task list without asking why it stopped waiting. A run
-    /// that was killed mid-flight reporting success is the kind of wrong answer
-    /// that devalues every true one.
+    /// Computing the verdict from the task list without asking why the wait
+    /// stopped would report `all_done` and exit 0 here. A run that was killed
+    /// mid-flight reporting success is the kind of wrong answer that devalues
+    /// every true one.
     Interrupted,
 }
 
@@ -67,7 +64,7 @@ impl OnceResult {
     pub fn exit_code(self) -> u8 {
         match self {
             OnceResult::AllDone => 0,
-            // Every non-success `--once` outcome exits 1 (§3, §14.38).
+            // Every non-success `--once` outcome exits 1.
             OnceResult::HasFailed | OnceResult::Interrupted => 1,
         }
     }
@@ -99,7 +96,7 @@ pub async fn run_once(
     orchestrator.start_watch(true).await?;
     let (final_tasks, stop_reason) = wait_for_all_terminal(tasks, poll_interval, &stopped).await?;
     // Unconditional, and before the verdict: the wind-down releases the lock,
-    // so an interrupted run must not leave the project wedged (§14.15).
+    // so an interrupted run must not leave the project wedged.
     orchestrator.stop().await?;
     watcher.abort();
 
@@ -120,9 +117,8 @@ pub async fn run_once(
 
 /// Why `wait_for_all_terminal` stopped waiting.
 ///
-/// The distinction the oracle does not make. It computes the verdict from the
-/// task list alone, so a signal mid-run and a genuine completion are
-/// indistinguishable to it.
+/// The verdict cannot come from the task list alone, or a signal mid-run and a
+/// genuine completion would be indistinguishable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopReason {
     /// Nothing left to do: every task terminal, or no tasks at all.
@@ -131,7 +127,7 @@ enum StopReason {
     Interrupted,
 }
 
-/// `waitForAllTerminal` — the three exit conditions, checked in this order.
+/// The three exit conditions, checked in this order.
 async fn wait_for_all_terminal(
     tasks: &dyn TaskStore,
     poll_interval: Duration,
@@ -296,11 +292,9 @@ mod tests {
         .expect("the shutdown ends the wait")
         .expect("runs");
 
-        // §14.38. This asserted `AllDone` until the user ruled on it, which is
-        // what the oracle reports — measured: a planted unreadable task file
-        // makes `serve --once` tick forever, and on SIGTERM it emits
-        // `result="all_done" exit_code=0`. The task here never left `Todo`, so
-        // claiming success is a wrong answer, not a cosmetic one.
+        // A planted unreadable task file makes `serve --once` tick forever.
+        // The task here never left `Todo`, so claiming success on SIGTERM is a
+        // wrong answer, not a cosmetic one.
         assert_eq!(result, OnceResult::Interrupted);
         assert_eq!(result.exit_code(), 1);
         assert_eq!(result.as_str(), "interrupted");

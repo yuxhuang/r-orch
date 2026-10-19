@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-bugfixes-2026-03.test.ts`.
-//!
 //! Three regressions from the March 2026 debug report: file paths recovered
 //! from `tool_call` events, orphaned `preparing` runs finalized at startup, and
 //! the per-agent stall timeout actually being used.

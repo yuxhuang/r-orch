@@ -1,5 +1,4 @@
-//! Orchestrator runtime state, persisted in `.orchestry/state.json`
-//! (`src/domain/state.ts`).
+//! Orchestrator runtime state, persisted in `.orchestry/state.json`.
 
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
@@ -36,14 +35,14 @@ pub struct StateStats {
     pub total_runtime_ms: u64,
 }
 
-/// Field order mirrors the TS `OrchestratorState` interface (PARITY.md §6.6).
+/// Field order is the serialized field order.
 ///
 /// `claimed` is a JS `Set` in memory and a JSON **array** on disk. The `{}`
-/// form seen in `status --json` is a serialization bug in the original that is
-/// replicated by the CLI renderer, not by this type (PARITY.md §14.1).
+/// form seen in `status --json` is a serialization quirk that is
+/// kept by the CLI renderer, not by this type.
 ///
 /// `running` and `claimed` use insertion-ordered containers so that a
-/// read-modify-write round trip reproduces the TS iteration order exactly.
+/// read-modify-write round trip reproduces the iteration order exactly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorState {
     pub version: u32,
@@ -67,9 +66,8 @@ pub struct OrchestratorState {
     pub stats: StateStats,
 }
 
-/// The TS `DEFAULT_STATE` constant. A function rather than a `const` because
-/// the collections allocate; it is the direct equivalent of the
-/// `structuredClone(DEFAULT_STATE)` every TS caller performs.
+/// The default state. A function rather than a `const` because the
+/// collections allocate; each call returns a fresh value.
 pub fn default_state() -> OrchestratorState {
     OrchestratorState {
         version: 1,
@@ -92,12 +90,11 @@ impl Default for OrchestratorState {
 impl OrchestratorState {
     /// Field-by-field tolerant read of a raw `state.json` value.
     ///
-    /// The TS `StateStore.read` never fails on a malformed file: every field
+    /// The state read never fails on a malformed file: every field
     /// falls back to its default independently, `onboardingCompleted` is
     /// coerced to `false` unless it is strictly a boolean, `running` must be an
     /// object, `claimed` and `retry_queue` must be arrays, and
-    /// `stats.total_tokens` is merged field-wise over the zero default
-    /// (PARITY.md §6.6). A plain `serde` derive would reject all of those, so
+    /// `stats.total_tokens` is merged field-wise over the zero default. A plain `serde` derive would reject all of those, so
     /// the coercion is explicit here and shared by every caller.
     pub fn from_raw(raw: Option<&Value>) -> OrchestratorState {
         let defaults = default_state();
@@ -186,8 +183,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_state_matches_the_reference_bytes() {
-        // PARITY.md §6.6, with the stats of a fresh project.
+    fn default_state_has_the_expected_bytes() {
+        // With the stats of a fresh project.
         let state = default_state();
         assert_eq!(
             serde_json::to_string_pretty(&state).unwrap(),
@@ -273,9 +270,9 @@ mod tests {
 
     #[test]
     fn a_corrupt_running_entry_does_not_lose_the_whole_file() {
-        // One malformed entry makes `running` undeserializable, so TS's
-        // `typeof raw.running === 'object'` check passes but ours falls back —
-        // the important property is that the read still succeeds.
+        // One malformed entry makes `running` undeserializable, so it falls
+        // back to its default — the important property is that the read still
+        // succeeds.
         let value: Value = serde_json::from_str(
             r#"{"version":1,"running":{"tsk_1":{"run_id":"run_1"}},"stats":{"total_runs":9}}"#,
         )

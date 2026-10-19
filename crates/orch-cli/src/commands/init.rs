@@ -1,7 +1,7 @@
-//! `orch init` — ported from `src/cli/commands/init.ts`.
+//! `orch init`.
 //!
-//! Creates the `.orchestry/` scaffold. The set of files it writes is L0
-//! (PARITY.md §6.11): `config.yml`, `agents/agt_creator.yml`,
+//! Creates the `.orchestry/` scaffold. The set of files it writes is contract:
+//! `config.yml`, `agents/agt_creator.yml`,
 //! `templates/default.md`, `.gitignore`, `workspace-exclude` — and
 //! **nothing else**. `tasks/`, `runs/`, `logs/` and every `_index.json` are
 //! created lazily on first write, which is why a first `task list` on a fresh
@@ -27,13 +27,13 @@ use crate::output::{Styles, print_success, print_warning};
 ///
 /// WP-0b carried its own byte-exact copy while WP-3 was building in parallel;
 /// that copy is gone now the real module has landed, because two sources of
-/// truth for a prompt input is exactly the kind of drift PARITY.md §9.1 makes
+/// truth for a prompt input is exactly the kind of drift that is
 /// expensive. Verified byte-identical before the switch.
 fn default_prompt_template() -> String {
     orch_infra::template::default_prompt_template()
 }
 
-/// `.orchestry/.gitignore` (PARITY.md §6.11).
+/// `.orchestry/.gitignore`.
 const GITIGNORE: &str = "\
 # Runtime state
 state.json
@@ -48,7 +48,7 @@ workspaces/
 ";
 
 /// `.orchestry/workspace-exclude` — the rsync exclude list for `isolated`
-/// mode (PARITY.md §6.11).
+/// mode.
 const WORKSPACE_EXCLUDE: &str = "\
 .orchestry
 node_modules
@@ -67,8 +67,8 @@ pub struct InitArgs {
     pub name: Option<String>,
     pub adapter: Option<String>,
     /// Both stdout and stdin are a TTY, which is what gates the multi-adapter
-    /// prompt (`docs/parity/cli.md` §15.4). The parity harness runs every
-    /// scenario with stdin on `/dev/null`, so it never takes that branch.
+    /// prompt. Scripted runs have stdin on `/dev/null`, so they never take that
+    /// branch.
     pub interactive: bool,
 }
 
@@ -174,8 +174,7 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
 
 /// The `Next:` hint, keyed on the **`--adapter` flag** rather than the adapter
 /// `init` settled on, and printed even when the project was already
-/// initialized — both as the original does (`init.ts:264-268`, outside
-/// `runInit`).
+/// initialized.
 pub fn next_hint(adapter: Option<&str>) -> &'static str {
     if adapter == Some("shell") {
         "orch agent add \"Test Runner\" --adapter shell --command \"npm test\""
@@ -344,8 +343,7 @@ async fn ensure_root_gitignore(project_root: &Path) -> Result<()> {
             }
             let separator = if content.ends_with('\n') { "" } else { "\n" };
             let appended = format!("{content}{separator}\n# Orchestry state\n.orchestry\n");
-            // `fs.appendFile` in the original; a whole-file write is equivalent
-            // and keeps the atomic-write discipline.
+            // A whole-file write keeps the atomic-write discipline.
             atomic_write(&path, &appended).await
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -413,7 +411,7 @@ mod tests {
         init(temp.path(), shell_args()).await;
         let paths = Paths::new(temp.path());
 
-        // PARITY.md §6.11 — `init` creates only these.
+        // `init` creates only these.
         for path in [
             paths.config_path(),
             paths.gitignore_path(),
@@ -458,7 +456,7 @@ mod tests {
         let paths = Paths::new(temp.path());
         assert!(path_exists(&paths.agent_path("agt_creator").unwrap()).await);
 
-        // Security review C3 / §14: the *first* write is the one that matters.
+        // Security review C3: the *first* write is the one that matters.
         // These two files are created by `init`'s own path, not by the stores,
         // so routing the stores through OWNER_ONLY was not enough — the review
         // found both at 0664 after a fresh init.
@@ -500,7 +498,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(agent.role.as_deref(), Some(orch_domain::AGENT_CREATOR_ROLE));
-        // §6.11: 300000 here, not the 600000 project default.
+        // 300000 here, not the 600000 project default.
         assert_eq!(agent.config.stall_timeout_ms, Some(300_000));
         assert_eq!(agent.config.model.as_deref(), Some("claude-sonnet-4-6"));
     }
@@ -667,7 +665,7 @@ mod tests {
             "orch task add \"Create backend agent\" --assignee agt_creator"
         );
         // No `--adapter` at all takes the task hint, whatever `init`
-        // auto-detected: the original reads the flag, not the outcome.
+        // auto-detected: the flag is read, not the outcome.
         assert_eq!(
             next_hint(None),
             "orch task add \"Create backend agent\" --assignee agt_creator"

@@ -1,4 +1,4 @@
-//! V14 — PARITY.md §8.2: every adapter's argv, cwd, stdin mode and
+//! V14 — every adapter's argv, cwd, stdin mode and
 //! self-set environment, snapshotted over a config matrix.
 //!
 //! The per-adapter suites assert the individual rules ("`--model` is followed

@@ -1,4 +1,4 @@
-//! V37 / ARCHITECTURE A2: what happens when both binaries mutate
+//! ARCHITECTURE A2: what happens when several `orch` processes mutate
 //! `_index.json` at once.
 //!
 //! A2 claims **single writer**: the PID lock means one process mutates
@@ -32,7 +32,6 @@ struct Harness {
     project: tempfile::TempDir,
     home: PathBuf,
     rust: PathBuf,
-    oracle: PathBuf,
 }
 
 /// Where cargo put this build's binaries.
@@ -50,13 +49,10 @@ fn target_dir(repo_root: &Path) -> PathBuf {
 }
 
 impl Harness {
-    /// `None` only when the caller has explicitly opted out.
-    ///
-    /// A missing binary used to `return None` with an `eprintln`, which cargo
-    /// hides for a passing test — so the whole file reported green while
-    /// asserting nothing. That is the one outcome a cross-binary test must not
-    /// have, so a missing prerequisite now fails loudly and says what to run.
-    fn new() -> Option<Harness> {
+    /// A missing binary fails loudly rather than skipping: cargo hides an
+    /// `eprintln` for a passing test, so the whole file would report green
+    /// while asserting nothing.
+    fn new() -> Harness {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let profile = if cfg!(debug_assertions) {
             "debug"
@@ -64,23 +60,11 @@ impl Harness {
             "release"
         };
         let rust = target_dir(&repo_root).join(profile).join("orch");
-        let oracle = repo_root.join("parity/orch-ts/dist/cli.js");
 
-        if std::env::var_os("ORCH_SKIP_CROSS_BINARY").is_some() {
-            eprintln!("skipping: ORCH_SKIP_CROSS_BINARY is set");
-            return None;
-        }
         assert!(
             rust.exists(),
-            "{} is missing — run `cargo build -p orch-cli` (or set \
-             ORCH_SKIP_CROSS_BINARY=1 to skip the cross-binary tests)",
+            "{} is missing — run `cargo build -p orch-cli`",
             rust.display()
-        );
-        assert!(
-            oracle.exists(),
-            "{} is missing — run parity/setup.sh to build the vendored oracle (or set \
-             ORCH_SKIP_CROSS_BINARY=1 to skip the cross-binary tests)",
-            oracle.display()
         );
 
         let project = tempfile::Builder::new()
@@ -90,7 +74,7 @@ impl Harness {
         orch_core::test_support::assert_hermetic(project.path());
         let home = project.path().join(".harness-home");
         std::fs::create_dir_all(home.join(".orchestry")).expect("harness home");
-        // A warm update-check cache, so the oracle makes no network call.
+        // A warm update-check cache, so no update check goes to the network.
         std::fs::write(
             home.join(".orchestry/update-check.json"),
             format!(
@@ -107,14 +91,13 @@ impl Harness {
             project,
             home,
             rust,
-            oracle,
         };
         harness.git(&["init", "--initial-branch=main"]);
         harness.git(&["config", "user.email", "a2@r-orch.test"]);
         harness.git(&["config", "user.name", "A2"]);
         harness.git(&["commit", "--allow-empty", "-m", "Initial commit"]);
         harness.run_rust(&["init", "--name", "a2", "--adapter", "shell"]);
-        Some(harness)
+        harness
     }
 
     fn git(&self, args: &[&str]) {
@@ -126,14 +109,8 @@ impl Harness {
         assert!(status.status.success(), "git {args:?} failed");
     }
 
-    fn command(&self, rust: bool) -> Command {
-        let mut command = if rust {
-            Command::new(&self.rust)
-        } else {
-            let mut command = Command::new("node");
-            command.arg(&self.oracle);
-            command
-        };
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.rust);
         command
             .current_dir(self.project.path())
             .env("HOME", &self.home)
@@ -149,7 +126,7 @@ impl Harness {
     }
 
     fn run_rust(&self, args: &[&str]) -> std::process::Output {
-        self.command(true).args(args).output().expect("run orch")
+        self.command().args(args).output().expect("run orch")
     }
 
     fn tasks_dir(&self) -> PathBuf {
@@ -196,19 +173,17 @@ impl Harness {
     }
 }
 
-/// Fire `task add` from both binaries at once and check the three invariants.
+/// Fire `task add` from separate processes at once and check the three
+/// invariants. Separate processes, so the in-process mutex cannot help.
 #[test]
-fn concurrent_cross_binary_index_mutation_loses_updates_without_corrupting_anything() {
-    let Some(harness) = Harness::new() else {
-        return;
-    };
+fn concurrent_index_mutation_loses_updates_without_corrupting_anything() {
+    let harness = Harness::new();
 
-    // Alternate binaries so the writes genuinely interleave.
     let mut children = Vec::new();
     for n in 0..TASKS {
         let title = format!("task {n}");
         let child = harness
-            .command(n % 2 == 0)
+            .command()
             .args(["task", "add", &title, "--quiet"])
             .spawn()
             .expect("spawn task add");
@@ -263,19 +238,17 @@ fn concurrent_cross_binary_index_mutation_loses_updates_without_corrupting_anyth
     );
 }
 
-/// The same race run strictly sequentially, as the control: with one writer at
+/// The same adds run strictly sequentially, as the control: with one writer at
 /// a time nothing is lost, which is what makes the concurrent result
-/// attributable to the race rather than to a bug in either binary.
+/// attributable to the race rather than to a bug.
 #[test]
-fn sequential_cross_binary_adds_lose_nothing() {
-    let Some(harness) = Harness::new() else {
-        return;
-    };
+fn sequential_adds_lose_nothing() {
+    let harness = Harness::new();
 
     for n in 0..6 {
         let title = format!("task {n}");
         let output = harness
-            .command(n % 2 == 0)
+            .command()
             .args(["task", "add", &title, "--quiet"])
             .output()
             .expect("run task add");
@@ -284,60 +257,21 @@ fn sequential_cross_binary_adds_lose_nothing() {
 
     let files = harness.task_files();
     assert_eq!(files.len(), 6);
-    // Interleaved writers, one at a time: the index keeps up exactly.
     assert_eq!(harness.index_ids(), files);
     assert_eq!(harness.listed_ids(), files);
-}
-
-/// Many writers from the **same** binary, which is the case the in-process
-/// mutex does cover.
-#[test]
-fn concurrent_same_binary_adds_in_separate_processes_still_race() {
-    let Some(harness) = Harness::new() else {
-        return;
-    };
-
-    // Separate processes, so the in-process mutex cannot help: this is the
-    // same hazard as the cross-binary case and is included so the finding is
-    // not mistaken for a TypeScript-versus-Rust incompatibility.
-    let mut children = Vec::new();
-    for n in 0..TASKS {
-        let title = format!("task {n}");
-        children.push(
-            harness
-                .command(true)
-                .args(["task", "add", &title, "--quiet"])
-                .spawn()
-                .expect("spawn"),
-        );
-    }
-    for mut child in children {
-        assert!(child.wait().expect("wait").success());
-    }
-
-    let files = harness.task_files();
-    let indexed = harness.index_ids();
-    assert_eq!(files.len(), TASKS);
-    assert!(indexed.is_subset(&files));
-    eprintln!(
-        "A2 (same binary, {TASKS} processes): {} reached the index",
-        indexed.len()
-    );
 }
 
 /// A sanity check on the helpers themselves, so a green result above cannot
 /// come from reading the wrong directory.
 #[test]
 fn the_helpers_read_the_directory_they_claim_to() {
-    let Some(harness) = Harness::new() else {
-        return;
-    };
+    let harness = Harness::new();
     assert!(
         harness.task_files().is_empty(),
         "a fresh project has no tasks"
     );
 
-    // `init` deliberately creates no index (PARITY.md §6.11), so the first
+    // `init` deliberately creates no index, so the first
     // list builds one from an empty directory.
     assert!(!harness.tasks_dir().join("_index.json").exists());
     assert!(harness.listed_ids().is_empty());

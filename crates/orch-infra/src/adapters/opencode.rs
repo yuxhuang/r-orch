@@ -1,5 +1,4 @@
-//! OpenCode adapter — `src/infrastructure/adapters/opencode.ts`,
-//! `kind = "opencode"` (`docs/parity/adapters.md` §2.4).
+//! OpenCode adapter for `kind = "opencode"`.
 //!
 //! Spawns `opencode run --format json`. There is **no workspace flag**: the
 //! workspace reaches the child only through the spawn cwd.

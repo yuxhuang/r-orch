@@ -1,4 +1,4 @@
-//! `orch agent` — ported from `src/cli/commands/agent.ts`.
+//! `orch agent`.
 //!
 //! WP-0b covers `add`; WP-5a adds `shop`. The remaining subcommands
 //! (`list`, `status`, `edit`, `remove`, `disable`, `enable`, `autonomous`)
@@ -78,8 +78,8 @@ pub async fn add(
 
 /// `orch agent list`.
 ///
-/// The TIME column is **hard-coded** to a dim em dash: the reference never
-/// computes it (`docs/parity/cli.md` §22.7).
+/// The TIME column is **hard-coded** to a dim em dash: it is never
+/// computed.
 pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
     let agents = orch_infra::storage::remote::RemoteAgentDirectory::new(engine.paths.clone())
         .list(engine.agent_service.list().await?)
@@ -507,7 +507,7 @@ pub async fn remove(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
 
 /// `orch agent autonomous` — `--on`, `--off`, or neither to toggle.
 ///
-/// `--on` wins when both are given, as the TS ternary chain does.
+/// `--on` wins when both are given.
 pub async fn autonomous(
     engine: &Engine,
     ctx: &CliContext,
@@ -549,8 +549,7 @@ pub async fn autonomous(
 ///
 /// The table is printed when `--list` is given **or** stdout is not a TTY;
 /// otherwise the picker runs. A cancelled pick prints `  Cancelled.` and is
-/// still exit 0. No `--json`, and `--quiet` is ignored
-/// (`docs/parity/cli.md` §5.4, §21.6).
+/// still exit 0. No `--json`, and `--quiet` is ignored.
 pub async fn shop(
     engine: &Engine,
     styles: &Styles,

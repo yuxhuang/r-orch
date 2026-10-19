@@ -1,10 +1,10 @@
-//! The ported `test/unit/application/orchestrator*.test.ts` suites.
+//! The orchestrator test suites.
 //!
-//! One module per TS file, plus [`harness`], which is the Rust equivalent of
-//! the TS `buildDeps()` — complete `OrchestratorDeps` with **real** services,
+//! One module per suite, plus [`harness`], which builds complete
+//! `OrchestratorDeps` with **real** services,
 //! event bus and registry, and only the stores and I/O edges faked.
 //!
-//! Two deliberate differences from the TS helper, both from ARCHITECTURE §5.6:
+//! Two seams from ARCHITECTURE §5.6:
 //! the clock and the id generator are injected, so a test can age a run by
 //! exactly `n` milliseconds instead of sleeping, and ids are predictable.
 

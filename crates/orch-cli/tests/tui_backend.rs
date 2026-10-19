@@ -152,7 +152,7 @@ async fn launch_falls_back_to_observer_mode_when_the_lock_is_held() {
     assert!(context.observer_mode);
     assert!(!context.initial_watch_active);
     // Suppressed: observer mode is not a failure state, so the header shows
-    // the observer badge rather than an error (`tui.ts:314`).
+    // the observer badge rather than an error.
     assert_eq!(context.watch_error, None);
     assert!(!backend.is_watch_active());
     assert!(!engine.orchestrator.is_owner());
@@ -243,7 +243,7 @@ async fn the_task_lifecycle_round_trips_through_the_real_stores() {
     assert_eq!(edited.title, "Renamed");
     assert_eq!(edited.priority, 4);
 
-    // review → done, which is what the TS approve callback does directly.
+    // review → done, which is what the approve callback does directly.
     engine
         .task_service
         .update_status(&id, TaskStatus::InProgress)
@@ -354,7 +354,7 @@ async fn the_agent_lifecycle_round_trips_and_parses_its_stringly_typed_fields() 
                     effort: Some("high".into()),
                     role: Some("reviewer".into()),
                     approval_policy: Some("manual".into()),
-                    // Empty strings are absent, as in JS.
+                    // Empty strings are absent.
                     command: Some(String::new()),
                     skills: Some(vec!["review".into()]),
                 },
@@ -699,7 +699,7 @@ async fn a_broadcast_fans_out_to_every_enabled_agent() {
     // One id per recipient, and a disabled agent is not one. `cli` is not an
     // agent, so nothing is dropped as the sender either.
     assert_eq!(ids.len(), 2);
-    // Fan-out follows `AgentStore::list` order, which is observable (§6.10).
+    // Fan-out follows `AgentStore::list` order, which is observable.
     let stored = engine.message_service.list_all().await.expect("list");
     let addressed: Vec<&str> = ids
         .iter()
@@ -998,7 +998,7 @@ async fn the_settings_writes_persist_where_the_next_launch_will_read_them() {
     assert!(global.tui.notifications.bell);
 
     // The cap went to `config.yml`, so the *next* launch reports it; the
-    // running orchestrator keeps its own clone, as in the TS.
+    // running orchestrator keeps its own clone.
     assert_eq!(
         engine
             .config_store
@@ -1022,7 +1022,7 @@ async fn the_settings_writes_persist_where_the_next_launch_will_read_them() {
     assert_eq!(reopened.config.scheduling.max_concurrent_agents, 3);
 
     // An unrecognized preset is *stored*, not refused: the field is a plain
-    // string and the TS does not validate it either.
+    // string and is not validated.
     let (_backend, _) = on_draw_thread(backend, |backend| {
         backend
             .save_activity_filter("nonsense")
@@ -1094,7 +1094,7 @@ async fn poll_history_delivers_the_two_batches_newest_runs_first() {
     let (temp, engine) = project().await;
 
     // Twelve finished runs; only ten are read, three in the first batch and
-    // seven in the second (`tui.ts:144-148`).
+    // seven in the second.
     for index in 0..12u32 {
         let run = Run {
             id: format!("run_{index:02}"),
@@ -1132,7 +1132,7 @@ async fn poll_history_delivers_the_two_batches_newest_runs_first() {
             .await
             .expect("append event");
     }
-    // A `preparing` run is not history: the TS keeps only succeeded/failed.
+    // A `preparing` run is not history: only succeeded/failed are kept.
     engine
         .runs
         .save(&Run {
@@ -1221,8 +1221,8 @@ async fn poll_history_is_empty_for_a_project_with_no_finished_runs() {
 // real probe, which execs `claude --help`, `cursor-agent --list-models` and six
 // more, and reads the developer's `~/.codex`. No test may touch the real HOME,
 // and the property an earlier version of this test asserted — "not probed until
-// polled" — is not a contract: the reference loads the catalog in a mount
-// effect (`App.tsx:984`), and `App::tick` polls on the very first tick, so the
+// polled" — is not a contract: the dashboard loads the catalog on mount,
+// and `App::tick` polls on the very first tick, so the
 // deferral only spares a facade consumer that never polls at all.
 
 // ── watch mode ───────────────────────────────────────────────────────────
@@ -1240,9 +1240,8 @@ async fn stop_watch_waits_for_the_stop_and_releases_the_lock() {
     .await;
 
     // Awaited, not spawned: by the time the call returns the orchestrator has
-    // stopped and the lock is gone. The reference `await`s `onStopWatch` too,
-    // and spawning would mean a failed stop could only be reported as
-    // `orchestrator:error`, which nothing renders — so `/pause` would claim to
+    // stopped and the lock is gone. Spawning would mean a failed stop could only
+    // be reported as `orchestrator:error`, which nothing renders — so `/pause` would claim to
     // have paused a loop that is still running.
     assert!(
         !engine.orchestrator.is_owner(),
@@ -1355,8 +1354,7 @@ async fn in_observer_mode_a_refresh_sees_another_process_writing_state() {
 async fn in_observer_mode_the_disk_observer_feeds_the_event_queue() {
     // The wiring `tui::command::run` does when watch mode is refused. Without
     // it an observer-mode dashboard re-reads the stores on every refresh but
-    // never sees a live event, which is the half the TS gets from
-    // `onSubscribeEvents = handler => diskObserver.subscribe(handler)`.
+    // never sees a live event.
     let (temp, engine) = project().await;
     let held = orch_engine::FileLock::new(engine.paths.lock_path());
     assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);

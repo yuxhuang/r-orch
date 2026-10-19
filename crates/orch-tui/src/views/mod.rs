@@ -1,4 +1,4 @@
-//! Frame composition (docs/parity/tui.md §6).
+//! Frame composition.
 //!
 //! Regions, top to bottom: Header (5 rows), a blank spacer, the help overlay
 //! **or** the main content region, a blank spacer, the bottom panel, a flexible
@@ -32,8 +32,7 @@ use crate::state::{AppState, DetailPanel, InputMode, ViewId};
 use crate::theme::{HEAVY_RULE, Palette, Token};
 use crate::widgets;
 
-/// Which optional actions the backend supports — the Rust form of the TS
-/// "was this callback passed?" checks.
+/// Which optional actions the backend supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps {
     pub can_create_task: bool,
@@ -399,7 +398,6 @@ pub(crate) fn fit_cells(text: &str, width: usize) -> String {
 }
 
 fn render_too_small(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    // Deliberate addition, not parity (PARITY.md §12.2).
     let text = format!("terminal too small — need at least {MIN_WIDTH}×{MIN_HEIGHT}");
     let line = Line::from(Span::styled(text, ctx.bold(Token::Amber)));
     let y = area.y + area.height / 2;

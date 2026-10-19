@@ -1,7 +1,7 @@
 //! The tick loop: reconcile, autonomous seeding, and the reactive dispatch
 //! debounce.
 //!
-//! Phase order is contract (PARITY.md §7.3) and the whole tick runs under the
+//! Phase order is contract and the whole tick runs under the
 //! state lock.
 
 use std::sync::atomic::Ordering;
@@ -76,7 +76,7 @@ impl Orchestrator {
     }
 
     /// Check PID liveness, detect stalls, fix stale agents and orphaned tasks,
-    /// and dispatch anything whose retry has come due (PARITY.md §7.4).
+    /// and dispatch anything whose retry has come due.
     pub(super) async fn reconcile(&self, state: &mut OrchestratorState) -> Result<()> {
         let now = self.deps().clock.now_ms();
         let entries: Vec<(String, RunningEntry)> = state
@@ -85,7 +85,7 @@ impl Orchestrator {
             .map(|(task_id, entry)| (task_id.clone(), entry.clone()))
             .collect();
 
-        // Pre-fetch in parallel, as the TS `Promise.all` pair does: one round
+        // Pre-fetch in parallel: one round
         // trip per store rather than one per entry in sequence.
         let (tasks, agents) = futures::future::join(
             futures::future::join_all(
@@ -245,8 +245,7 @@ impl Orchestrator {
             //
             // The clock is per emitted `AgentEvent`, not per stdout line:
             // `collect_events` refreshes `last_event_at` inside its event
-            // loop, so a line the parser maps to nothing does not refresh it
-            // (PARITY.md §7.4, V34).
+            // loop, so a line the parser maps to nothing does not refresh it.
             let stall_timeout = agents
                 .get(index)
                 .and_then(|r| r.as_ref().ok())
@@ -319,11 +318,9 @@ impl Orchestrator {
         }
         // One failure fails the whole reconcile, where the orphaned-task sweep
         // below swallows per item. That asymmetry looks like an oversight and
-        // is not: the reference wraps these in a bare
-        // `await Promise.all(staleAgents.map(...))`
-        // (`orchestrator.ts:618-622`), so a rejection propagates out of
-        // reconcile and fails the tick, while the orphaned-task map has its
-        // own `try`/`catch` (`:630-637`). Reproduced rather than tidied, and
+        // is not: the stale-agent writes are joined without
+        // catching, so a rejection propagates out of reconcile and fails the
+        // tick, while the orphaned-task sweep catches per item. Kept as is, and
         // `a_stale_agent_write_failure_fails_the_tick_but_an_orphaned_task_one_does_not`
         // pins both halves.
         futures::future::join_all(stale.iter().map(|agent| {
@@ -339,7 +336,7 @@ impl Orchestrator {
 
     /// Tasks stuck in `in_progress` with no running entry. Force-written when
     /// the transition is rejected — this is one of the recovery paths that
-    /// deliberately bypasses the state machine (PARITY.md §7.1).
+    /// deliberately bypasses the state machine.
     async fn reconcile_orphaned_tasks(&self, state: &mut OrchestratorState) -> Result<()> {
         let tasks = self.inner.cached_tasks.list(&Default::default()).await?;
         let orphaned: Vec<orch_domain::Task> = tasks
@@ -422,7 +419,7 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Create work for idle autonomous agents (PARITY.md §7.12).
+    /// Create work for idle autonomous agents.
     ///
     /// Failures are per-agent and non-fatal: one agent whose task cannot be
     /// created must not stop the others from being seeded.
@@ -549,7 +546,7 @@ impl Orchestrator {
     /// flight when the timer fires it reschedules, up to 10 times (≈5 s), then
     /// gives up and lets the next poll handle it.
     ///
-    /// The debounce is observable — `orchestrator.test.ts` waits past it — so
+    /// The debounce is observable — tests wait past it — so
     /// it stays even though the `select!` arms already reduce the contention
     /// the retry loop was written for.
     pub(super) fn schedule_immediate_dispatch(&self, retries: u32) {
@@ -597,8 +594,8 @@ impl Orchestrator {
         self.fresh_dispatch_all().await
     }
 
-    /// Whether an immediate dispatch is currently scheduled. The TS suite
-    /// asserts on `immediateDispatchTimer` being cleared by `stop`.
+    /// Whether an immediate dispatch is currently scheduled; tests
+    /// assert that `stop` clears it.
     #[cfg(test)]
     pub(super) async fn has_pending_immediate_dispatch(&self) -> bool {
         self.inner.immediate_dispatch.lock().await.is_some()

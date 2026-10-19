@@ -9,7 +9,7 @@ use crate::template::{PromptContext, TemplateEngine};
 use crate::test_support::faults::Faults;
 use crate::test_support::recorder::Recorder;
 
-/// What the TS `createMockTemplateEngine` returns from every `render`.
+/// What the fake template engine returns from every `render`.
 pub const RENDERED_PROMPT: &str = "rendered prompt";
 
 /// A recorded render: the template source and the context it was given.
@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_the_ts_mock_constant() {
+    async fn returns_the_rendered_prompt_constant() {
         let engine = FakeTemplateEngine::new();
         assert_eq!(
             engine

@@ -7,9 +7,8 @@ machine, and keeps everything in plain files under `.orchestry/`.
 No database or daemon to install. One engine process per project, guarded by a PID lock file; optional
 peer connections let it delegate work to other installations.
 
-This is a **Rust reimplementation of [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH)** (npm
-`@oxgeneral/orch`), built to operate on the same projects as the original — see
-[Relationship to the TypeScript original](#relationship-to-the-typescript-original).
+r-orch was originally a port of [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH) and is developed
+independently; it makes no compatibility promise with that project or its npm package.
 
 ---
 
@@ -61,8 +60,7 @@ Before upgrading a project that runs v0.4.0, read
 
 ### The three binary names
 
-`orch`, `orchestry` and `ao` are **the same program** — three names for one binary, matching the original's
-npm `bin` map. Use whichever you prefer; `orch` is shortest and is what the docs use.
+`orch`, `orchestry` and `ao` are **the same program** — three names for one binary. Use whichever you prefer; `orch` is shortest and is what the docs use.
 
 ### Agent CLIs are not bundled
 
@@ -597,66 +595,17 @@ drafts last only for the dashboard session).
 
 | Document | For |
 |---|---|
-| **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and the gotchas that are inherited rather than fixed — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
-| [docs/PARITY.md](docs/PARITY.md) | **Historical.** The contract the port was built to: every command, flag, exit code, `--json` shape and on-disk field, graded L0/L1/L2, plus known bugs of the original. No longer a goal ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)) |
+| **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and known gotchas — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
 | [docs/file-mutations.md](docs/file-mutations.md) | `update` / `patch` from JSON or YAML files: input rules, writable fields, errors, locking |
 | [docs/org-templates.md](docs/org-templates.md) | Organization templates: directory format, rules, precedence, deploy, shop, `update`/`patch`, repair, the a-team and its prerequisites |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |
-| [docs/parity/](docs/parity/) | Historical per-area appendices behind the contract — CLI, adapters, infrastructure, TUI, tests |
 | [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release |
 | [docs/specs/](docs/specs/) | Specs: what goal-sized work must do and how it is accepted |
 | [docs/plans/](docs/plans/) | Plans for non-trivial work, before it is built: design, task split, status |
 | [docs/decisions/](docs/decisions/) | Decision records: why things are the way they are |
 
-Start with the **runbook** if something is wrong. PARITY.md can still explain why an inherited behaviour is the
-way it is, but it no longer binds new work.
-
----
-
-## Relationship to the TypeScript original
-
-r-orch is a reimplementation of ORCH at pinned commit `c066dc0` (v1.0.34), not a fork or a wrapper. No
-TypeScript is executed at runtime.
-
-### Cross-compatibility
-
-The remote-peer extension described above is specific to r-orch. The historical parity documentation
-and differential harness describe the original command set; they do not promise parity for remote
-agents, peer metadata, or the extended prompts.
-
-**Both binaries can operate on the same project directory, in either order.** That is a design goal, not a
-side effect, and it is enforced by a differential test harness that runs the same commands against both
-implementations in parallel temporary directories and compares stdout, stderr, exit codes and the entire
-resulting `.orchestry/` tree — including a step that re-parses every YAML file **in Node with js-yaml** to
-catch bytes that Rust writes and TypeScript would misread.
-
-What that buys you concretely:
-
-- the `.orchestry/` format is identical — field names, types, ID formats, timestamp format, JSON indentation;
-- the CLI surface is identical — command names, flags, exit codes and `--json` shapes;
-- prompts rendered from the default templates are **byte-identical**, so prompt caching and agent behaviour
-  carry over.
-
-What is deliberately *not* identical:
-
-- **internals** — tokio, trait-based adapters, no promise chains;
-- **the TUI** is a `ratatui` reimplementation matching views, keybindings and wizards rather than pixels;
-- **`--help` output** is clap's layout;
-- **no self-update.** The original updates itself via npm after almost every command. r-orch does not
-  update itself at all; `orch update` reports your version and how to upgrade.
-  This is a deliberate scope cut on security grounds, not an omission.
-
-A handful of original bugs are **replicated on purpose**, because `--json` output and on-disk format are a
-contract that something downstream may depend on. Each is listed in [PARITY.md §14](docs/PARITY.md) with the
-reasoning, and the operator-visible ones are in the [runbook](docs/RUNBOOK.md).
-
-### If you are migrating from the npm package
-
-Point r-orch at an existing project and it should just work. Before you rely on it: make sure no orchestrator
-is running under the old binary, then `orch status` and `orch task list` to confirm r-orch reads your state
-as expected. The two binaries must not dispatch simultaneously — the PID lock prevents two *orchestrators*,
-but one-shot commands do not take it.
+Start with the **runbook** if something is wrong.
 
 ---
 
@@ -671,18 +620,11 @@ cargo fmt --check
 cargo xtask crate-graph           # asserts the inter-crate dependency edges
 ```
 
-The differential harness needs the reference implementation built once:
-
-```bash
-./parity/setup.sh                 # clones the pinned TS reference, applies parity/patches/, builds it (needs Node and npm)
-cargo xtask parity                # runs every scenario against both binaries
-```
-
-`parity/orch-ts/` is gitignored. See [ARCHITECTURE.md §8](docs/ARCHITECTURE.md) for the test strategy and
+See [ARCHITECTURE.md §8](docs/ARCHITECTURE.md) for the test strategy and
 [§9](docs/ARCHITECTURE.md) for how the work is split across crates.
 
 ---
 
 ## License
 
-MIT, as the original.
+MIT.

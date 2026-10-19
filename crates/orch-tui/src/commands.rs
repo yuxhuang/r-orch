@@ -1,7 +1,7 @@
-//! `executeCommand` — the command-bar verb surface (docs/parity/tui.md §4.6).
+//! The command-bar verb surface.
 //!
-//! The verb and subcommand set is contract (PARITY.md §12.4), as are the
-//! confirmation and refusal strings, which the TS tests assert as substrings.
+//! The verb and subcommand set is contract, as are the
+//! confirmation and refusal strings, which tests assert as substrings.
 
 use orch_domain::{AgentStatus, GOAL_STATUSES, GoalStatus, TUI_PALETTE_NAMES, TaskStatus};
 
@@ -17,8 +17,8 @@ use crate::state::is_runnable;
 use crate::theme::Token;
 use crate::wizard::configs;
 
-/// `MessageService` cuts a body at this many UTF-16 units, silently
-/// (PARITY §14.14). The TUI only reports it.
+/// `MessageService` cuts a body at this many UTF-16 units, silently. The TUI only
+/// reports it.
 const MESSAGE_BODY_UNITS: usize = 4000;
 
 const NO_TASK_SELECTED: &str = "No task selected";
@@ -240,8 +240,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             },
             // The one verb whose argument can contain a space, so it takes the
             // **raw tail** rather than `parts`: `split_whitespace` is left
-            // exactly as it is for every existing verb, whose parsing is L1
-            // and position-sensitive (design-v2 §3.2, R1).
+            // exactly as it is for every existing verb, whose parsing is fixed
+            // and position-sensitive.
             "msg" => {
                 let tail = stripped
                     .split_once(char::is_whitespace)

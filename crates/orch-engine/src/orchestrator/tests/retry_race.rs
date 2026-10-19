@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-retry-race.test.ts`.
-//!
 //! Three guards against dispatching work that has already finished: the
 //! dispatchable check in `dispatch_task`, the re-read when a retry comes due,
 //! and the running-entry check at the top of the failure handler.

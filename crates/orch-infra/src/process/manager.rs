@@ -1,12 +1,11 @@
-//! [`SystemProcessManager`] — ported from `ProcessManager`
-//! (`src/infrastructure/process/process-manager.ts:22-81`).
+//! [`SystemProcessManager`].
 //!
 //! **Why this is hand-rolled rather than built on `process-wrap`**
-//! (ARCHITECTURE §4.8 exemption (b)): the parity contract needs a *pid-keyed*
+//! (ARCHITECTURE §4.8 exemption (b)): the contract needs a *pid-keyed*
 //! API — "there is no registry of spawned processes, the PID in
-//! `state.running` is the only handle" (PARITY.md §8.4) — so `kill`,
+//! `state.running` is the only handle" — so `kill`,
 //! `is_alive` and `kill_with_grace` cannot go through a child handle at all,
-//! and must keep the TS group-first/fallback/swallow-errors shape.
+//! and must keep the group-first/fallback/swallow-errors shape.
 //! `process-wrap` only covers the remaining piece, the process group, and its
 //! `ProcessGroupChild::wait()` additionally waits for the *whole group* to be
 //! reaped, which would delay our `ExitSignal` past node's `close` event
@@ -121,8 +120,8 @@ impl ProcessManager for SystemProcessManager {
             tokio::time::sleep(KILL_POLL_INTERVAL).await;
         }
 
-        // Force kill if still alive. Like the TS, death is not confirmed
-        // afterwards (PARITY.md §14.14).
+        // Force kill if still alive. Death is not confirmed
+        // afterwards.
         tracing::debug!(pid, "grace period expired; sending SIGKILL");
         self.kill(pid, Signal::Kill);
     }
@@ -155,8 +154,8 @@ impl ProcessManager for SystemProcessManager {
         cmd.process_group(0);
 
         let mut child = cmd.spawn().map_err(|source| spawn_error(command, source))?;
-        // The TS throws `Failed to spawn process: <command>` when node hands
-        // back a child with no pid; in Rust that case is the `Err` above, and
+        // A child with no pid is reported as `Failed to spawn process: <command>`;
+        // here that case is the `Err` above, and
         // a successfully spawned child always has one until it is reaped.
         let pid = child
             .id()
@@ -193,7 +192,7 @@ impl ProcessManager for SystemProcessManager {
 }
 
 fn spawn_error(command: &str, source: std::io::Error) -> Error {
-    // `Display` is exactly the TS message; the io error stays in the source
+    // `Display` is exactly the user-facing message; the io error stays in the source
     // chain for `ORCHESTRY_DEBUG`.
     tracing::warn!(command, error = %source, "spawn failed");
     Error::Io {
@@ -518,8 +517,8 @@ mod tests {
                 // between `kill(-pgid, SIGTERM)` and the shell's death inherits
                 // the group *without* having been signalled: `kill_with_grace`
                 // returns as soon as the direct child is gone and never sends
-                // the SIGKILL. That is faithful to the TS (`killWithGrace` has
-                // the same early return), so the implementation is right and
+                // the SIGKILL. That is how `kill_with_grace` behaves,
+                // so the implementation is right and
                 // the test's premise was wrong — it asserted a stronger
                 // property than a group kill actually provides.
                 //

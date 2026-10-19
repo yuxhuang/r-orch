@@ -1,8 +1,8 @@
 //! `cargo xtask crate-graph` — the layering invariant from ARCHITECTURE §3.1.
 //!
 //! The bold, normative rule is that **`orch-engine` has zero dependency on
-//! `orch-cli` or `orch-tui`**, mirroring the TS claim that "the core engine has
-//! zero dependencies on CLI/TUI layers". §8.5 asks for this as a CI step
+//! `orch-cli` or `orch-tui`**, so the core engine stays free of the CLI and TUI
+//! layers. §8.5 asks for this as a CI step
 //! precisely so it is checked rather than assumed.
 //!
 //! This asserts more than that one rule: the **whole** set of inter-crate edges
@@ -88,22 +88,22 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
     (
         "container.rs",
         "assembly — every concrete store, adapter and manager it builds; \
-         the TS `container.ts` in Rust form",
+         the composition root",
     ),
     (
         "orchestrator.rs",
-        "the tick-scoped cache wrappers, which `orchestrator.ts` likewise \
-         constructs itself (`new CachedTaskStore(deps.taskStore)`)",
+        "the tick-scoped cache wrappers, which the orchestrator \
+         constructs itself around the injected stores",
     ),
     (
         "orchestrator/dispatch.rs",
-        "the default templates and `build_prompt_context`, which \
-         `orchestrator.ts` imports from `template-engine.ts`",
+        "the default templates and `build_prompt_context` from the \
+         template engine",
     ),
     (
         "task_service.rs",
-        "`Paths` and `fs_utils`, for attachment paths — the TS \
-         `task-service.ts` imports `paths.ts` the same way",
+        "`Paths` and `fs_utils`, for attachment paths, which the task \
+         service resolves itself",
     ),
     (
         "lock.rs",
@@ -155,7 +155,7 @@ fn engine_infra_sites(repo_root: &Path) -> Result<Vec<String>> {
             problems.push(format!(
                 "`crates/orch-engine/src/{file}` names `orch_infra`, which \
                  ENGINE_INFRA_SITES does not allow. ARCHITECTURE §3.1 permits the edge at \
-                 assembly and where the TypeScript couples the same way — if this is one of \
+                 assembly and at the sites listed in ENGINE_INFRA_SITES — if this is one of \
                  those, add it with the reason; if it is a service, it should take an \
                  orch-core trait instead."
             ));

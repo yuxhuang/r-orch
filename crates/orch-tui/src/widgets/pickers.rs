@@ -1,4 +1,4 @@
-//! The two logs filter pickers (docs/parity/tui.md §3.3, §3.4).
+//! The two logs filter pickers.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

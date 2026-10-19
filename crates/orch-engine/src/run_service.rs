@@ -1,4 +1,4 @@
-//! Run service — ported from `src/application/run-service.ts`.
+//! Run service.
 //!
 //! Almost every method is a pass-through to [`RunStore`]; the service exists
 //! for the three that are not — `start` and `finish`, which mutate the record
@@ -15,14 +15,12 @@ use orch_domain::{OrchestratorEvent, Run, RunEvent, RunEventType, RunStatus, Tok
 
 use crate::events::EventBus;
 
-/// How many trailing events the retry context reads. The TS comment calls this
-/// out as OOM protection on a long run (`run-service.ts:126`), and the ported
-/// test asserts the cap, so it is observable rather than a tuning knob.
+/// How many trailing events the retry context reads. It is OOM protection
+/// on a long run, and a test asserts the cap, so it is observable rather than a tuning knob.
 const RETRY_CONTEXT_EVENTS: usize = 50;
 
 /// `create`'s parameters.
 ///
-/// The TS signature takes an inline object literal (`run-service.ts:16`) and
 /// `orch-domain` has no `CreateRunInput`, so it is declared next to its only
 /// caller. A struct rather than five positional arguments because three of
 /// them are strings and swapping two would type-check.
@@ -64,8 +62,8 @@ impl RunService {
         }
     }
 
-    /// Record a `preparing` run. **No event** — the TS version emits nothing
-    /// here either, and `agent:started` is `start`'s job, so a run that never
+    /// Record a `preparing` run. **No event** —
+    /// `agent:started` is `start`'s job, so a run that never
     /// launches leaves no trace on the bus.
     pub async fn create(&self, input: CreateRunInput) -> Result<Run> {
         let run = Run {
@@ -88,7 +86,7 @@ impl RunService {
         Ok(run)
     }
 
-    /// `None` for a missing run, matching the TS `Run | null`. The callers that
+    /// `None` for a missing run. The callers that
     /// need a hard failure go through `start`/`finish`.
     pub async fn get(&self, id: &str) -> Result<Option<Run>> {
         self.runs.get(id).await
@@ -110,9 +108,9 @@ impl RunService {
         Ok(run)
     }
 
-    /// `tokens` and `error` are **overwritten, not merged**: the TS assigns the
-    /// parameters straight onto the record (`run-service.ts:71-72`), so passing
-    /// `None` clears a value an earlier call set. Replicated — the orchestrator
+    /// `tokens` and `error` are **overwritten, not merged**: the parameters are
+    /// assigned straight onto the record, so passing
+    /// `None` clears a value an earlier call set. The orchestrator
     /// calls `finish` exactly once per run, so the clearing is unreachable, and
     /// a merge here would be a silent behaviour change if that ever stopped
     /// being true.
@@ -183,13 +181,11 @@ impl RunService {
     ///
     /// Two details are contract rather than taste. The ordering key is
     /// `finished_at` compared as a *string*, descending, with an absent value
-    /// sorting as `""` (`run-service.ts:119`) — so a run that failed before it
-    /// recorded a finish time always loses to one that recorded one. The TS
-    /// uses `localeCompare`, which agrees with code-unit order on the
-    /// fixed-width ISO-8601 timestamps the run store writes (PARITY.md §6.3).
+    /// sorting as `""` — so a run that failed before it
+    /// recorded a finish time always loses to one that recorded one. Code-unit order matches
+    /// chronological order on the fixed-width ISO-8601 timestamps the run store writes.
     /// And a failing event read degrades to empty output instead of failing
-    /// the retry: on disk the events file may simply not exist yet
-    /// (`run-service.ts:134`).
+    /// the retry: on disk the events file may simply not exist yet.
     pub async fn get_last_failed_run_context(&self, task_id: &str) -> Result<Option<RetryContext>> {
         let mut failed: Vec<Run> = self
             .runs
@@ -239,8 +235,8 @@ impl RunService {
         Ok(Some(RetryContext { error, output }))
     }
 
-    /// The TS throws a bare `Error`, not an `OrchestratorError`
-    /// (`run-service.ts:44`), so this is exit 1 and carries no hint.
+    /// Fails with a bare `Error`, not an `OrchestratorError`, so this is exit 1
+    /// and carries no hint.
     async fn require(&self, id: &str) -> Result<Run> {
         self.runs
             .get(id)
@@ -255,7 +251,7 @@ fn finished_at(run: &Run) -> &str {
 }
 
 /// `typeof e.data === 'string' ? e.data : JSON.stringify(e.data)`
-/// (`run-service.ts:132`). A structured payload is therefore re-serialized,
+/// A structured payload is therefore re-serialized,
 /// not pretty-printed, and `Value::to_string` is the same rendering.
 fn event_data(event: &RunEvent) -> String {
     match &event.data {
@@ -296,7 +292,7 @@ mod tests {
         Harness { service, runs, bus }
     }
 
-    /// `mockRejectedValueOnce` for a single method. [`orch_core::test_support`]
+    /// Fails a single method once. [`orch_core::test_support`]
     /// arms faults per store, not per method, and the path under test calls
     /// `list_for_task` first — so a store-wide fault would fail the wrong call.
     struct FailingTail(Arc<FakeRunStore>);
@@ -504,7 +500,7 @@ mod tests {
         assert_eq!(context.output, "visible output\nvisible error");
     }
 
-    // ── Beyond the TS suite: the lifecycle methods it never exercises ──────
+    // ── Lifecycle methods ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn create_records_a_preparing_run_and_emits_nothing() {

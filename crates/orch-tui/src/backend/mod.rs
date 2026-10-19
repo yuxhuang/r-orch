@@ -1,21 +1,20 @@
 //! [`TuiBackend`] — the narrow facade the dashboard needs from the engine.
 //!
-//! The TS App receives ~45 callbacks from `src/cli/commands/tui.ts`; this trait
-//! is the same surface, grouped and typed. `orch-tui` deliberately does **not**
+//! The dashboard needs about 45 operations and streams from the CLI; this
+//! trait groups and types them. `orch-tui` deliberately does **not**
 //! depend on `orch-engine`: the CLI implements this trait over the container,
 //! and the tests use [`FakeBackend`]. See `crates/orch-tui/BACKEND.md`.
 //!
-//! Two deliberate shape changes from the TS callbacks, both documented in
+//! Two deliberate shape choices, both documented in
 //! BACKEND.md:
 //!
 //! 1. **Synchronous.** Every method returns a value, not a future. A method is
 //!    a *request*: implementations must not block on long-running work
 //!    (dispatching an agent run, for example) — they kick it off and let the
 //!    outcome arrive through [`TuiBackend::poll_events`].
-//! 2. **Polled streams.** `onSubscribeEvents` / `onLoadHistory` /
-//!    `onLoadModelCatalog` / `onCheckUpdate` were callback registrations; here
-//!    they are `poll_*` methods drained once per frame, which is what makes the
-//!    TUI tests synchronous (ARCHITECTURE §8.4).
+//! 2. **Polled streams.** Events, history, the model catalog and the update
+//!    check are `poll_*` methods drained once per frame, which is what makes
+//!    the TUI tests synchronous (ARCHITECTURE §8.4).
 
 pub mod copy;
 pub mod fake;
@@ -53,7 +52,7 @@ pub struct CopyResult {
     pub guidance: Option<String>,
 }
 
-/// `onCreateTask(title, opts)`.
+/// Options for creating a task.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateTaskOpts {
     pub priority: Option<i64>,
@@ -61,7 +60,7 @@ pub struct CreateTaskOpts {
     pub attachments: Option<Vec<String>>,
 }
 
-/// `onUpdateTask(id, fields)`.
+/// Fields to change on a task.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskFields {
     pub title: Option<String>,
@@ -70,7 +69,7 @@ pub struct TaskFields {
     pub attachments: Option<Vec<String>>,
 }
 
-/// `onAddAgent(name, adapter, opts)`.
+/// Options for adding an agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentOpts {
     pub command: Option<String>,
@@ -81,10 +80,10 @@ pub struct AgentOpts {
     pub skills: Option<Vec<String>>,
 }
 
-/// `onUpdateAgent(id, fields)`.
+/// Fields to change on an agent.
 ///
 /// `Some(String::new())` means "clear this field" — the edit-agent mapper
-/// relies on it for `command` and `effort` (docs/parity/tui.md §5.2).
+/// relies on it for `command` and `effort`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentFields {
     pub name: Option<String>,
@@ -95,7 +94,7 @@ pub struct AgentFields {
     pub effort: Option<String>,
 }
 
-/// `onUpdateGoal(id, fields)`.
+/// Fields to change on a goal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoalFields {
     pub title: Option<String>,
@@ -129,7 +128,7 @@ pub struct ModelOption {
 /// the wizard renders them in arrival order.
 pub type ModelCatalog = IndexMap<String, Vec<ModelOption>>;
 
-/// One historical run event, as delivered by `onLoadHistory`.
+/// One historical run event, as delivered by the history stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub timestamp: String,
@@ -142,7 +141,7 @@ pub struct HistoryEntry {
     pub data: String,
 }
 
-/// Result of a clipboard read (`detectClipboardType` + `getClipboardImage`).
+/// Result of a clipboard read (text, an image, or nothing).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ClipboardPaste {
     /// Clipboard held text, not an image.
@@ -154,7 +153,7 @@ pub enum ClipboardPaste {
     Image { path: String, bytes: usize },
 }
 
-/// Immutable launch context — the non-callback props of the TS `App`.
+/// Immutable launch context — the non-callback launch properties.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchContext {
     pub project_name: String,
@@ -193,7 +192,7 @@ impl Default for LaunchContext {
 }
 
 /// The operations and streams the dashboard needs. Every method has a default
-/// "not available" implementation where the TS prop was optional, so a partial
+/// "not available" implementation where the operation is optional, so a partial
 /// backend (and the capability flags below) behave like a missing callback.
 pub trait TuiBackend {
     fn copy_text(&mut self, text: &str) -> BackendResult<CopyTicket> {
@@ -217,8 +216,8 @@ pub trait TuiBackend {
 
     // ── Capability flags ───────────────────────────────────────────────────
     //
-    // The TS App keys several bindings off "was this callback passed?"
-    // (`onCreateTask && ...`). These flags are that predicate.
+    // Several bindings are keyed off whether an operation is available.
+    // These flags are that predicate.
 
     fn can_create_task(&self) -> bool {
         true
@@ -327,7 +326,7 @@ pub trait TuiBackend {
     /// Orchestrator events since the last poll, oldest first.
     fn poll_events(&mut self) -> Vec<OrchestratorEvent>;
 
-    /// Run-history batches since the last poll (TS delivers two).
+    /// Run-history batches since the last poll.
     fn poll_history(&mut self) -> Vec<Vec<HistoryEntry>> {
         Vec::new()
     }

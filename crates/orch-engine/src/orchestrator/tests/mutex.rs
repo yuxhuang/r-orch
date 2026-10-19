@@ -1,10 +1,6 @@
-//! Ported from `test/unit/application/orchestrator-mutex.test.ts`.
-//!
-//! The TS suite extracts the promise-chain mutex and tests the algorithm in
-//! isolation, because the algorithm was hand-rolled. Here the mutex **is**
-//! `tokio::sync::Mutex`, so testing the library would prove nothing; these
-//! cases assert the four properties the TS suite was protecting, against the
-//! orchestrator's own state lock.
+//! The mutex **is** `tokio::sync::Mutex`, so testing the library would prove
+//! nothing; these cases assert the four properties the state lock must have,
+//! against the orchestrator's own state lock.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -112,8 +108,7 @@ async fn high_contention_does_not_deadlock() {
 
 #[tokio::test]
 async fn the_internal_phases_cannot_re_enter_the_state_lock() {
-    // The TS deadlock this replaces: `reconcile` runs inside the lock and must
-    // call the `_`-prefixed failure handler, not the locking one. Here the
+    // `reconcile` runs inside the lock and must not take it again. The
     // phases take `&mut OrchestratorState`, so re-entry is a type error — this
     // case pins the property that makes that true, namely that holding the
     // guard and then calling a phase is what the code actually does.

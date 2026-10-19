@@ -1,5 +1,4 @@
-//! `orch logs` — ported from `src/cli/commands/logs.ts`
-//! (`docs/parity/cli.md` §7).
+//! `orch logs`.
 //!
 //! Five routes with different fetch sizes, four different `--json` payloads,
 //! and a display slice applied *after* the fetch. The traps, in the order they
@@ -8,7 +7,7 @@
 //! - `--follow` wins over everything, and `--since` is still **parsed** (and
 //!   may fail) in follow mode before being ignored;
 //! - only a positional run-id emits `RunEvent[]`; `--task`, `--agent` and
-//!   `--since`-only emit **`Run[]`** — run metadata, not events (§22.5);
+//!   `--since`-only emit **`Run[]`** — run metadata, not events;
 //! - the fetch sizes differ per route *and* per `--since`, and the slice that
 //!   is printed is narrower than the fetch;
 //! - no route honours `--quiet`.
@@ -39,7 +38,7 @@ pub struct LogsArgs {
     pub since: Option<String>,
 }
 
-/// `parseDuration` — `^(\d+)(s|m|h|d)$`, in milliseconds.
+/// `^(\d+)(s|m|h|d)$`, in milliseconds.
 pub fn parse_duration(input: &str) -> Result<i64> {
     let invalid = || {
         Error::invalid_arguments(format!(
@@ -535,8 +534,8 @@ fn local_time(timestamp: &str) -> String {
     match timestamp.parse::<jiff::Timestamp>() {
         Ok(ts) => format_zoned(ts),
         // An unparseable stamp renders as-is rather than as `Invalid Date`,
-        // which is the one place this differs from node; a malformed stamp is
-        // a corrupt JSONL line either way.
+        // which differs from JavaScript's `Invalid Date`; a malformed stamp is a
+        // corrupt JSONL line either way.
         Err(_) => timestamp.to_owned(),
     }
 }
@@ -552,8 +551,8 @@ pub(crate) fn now_time() -> String {
 /// everything the pump has not processed yet, and the burst it is most likely
 /// to lose is the one emitted *during* shutdown — `orchestrator:shutdown`,
 /// then a run, task and agent event for each entry the wind-down finishes.
-/// The reference's handlers are synchronous and cannot lose any of it, and
-/// both callers' output is compared record by record.
+/// A synchronous handler could not lose any of it, and both callers' output
+/// has to be complete record by record.
 pub(crate) async fn pump_until_cancelled(
     mut subscription: EventSubscription,
     done: tokio_util::sync::CancellationToken,
@@ -583,11 +582,11 @@ pub(crate) async fn pump_until_cancelled(
 /// dropped some since the last call.
 ///
 /// The fan-out is lossy under load: a reader that falls behind by a whole
-/// channel's worth loses the oldest events, silently. The reference cannot do
-/// this — its handlers are synchronous, and a handler cannot lag — so there is
-/// no reference output to match and no honest way to pretend nothing happened.
+/// channel's worth loses the oldest events, silently. A synchronous handler cannot
+/// lag, but this one can, so there is no honest way to pretend nothing
+/// happened.
 /// Two rules follow: it goes to **stderr**, because stdout carries the record
-/// and log streams the differential harness compares byte for byte, and a
+/// and log streams, and a
 /// reader that was waiting for one specific event must treat `true` as "that
 /// event may be the one I lost".
 pub(crate) fn report_dropped_events(seen: &mut u64, subscription: &EventSubscription) -> bool {
@@ -603,8 +602,7 @@ pub(crate) fn report_dropped_events(seen: &mut u64, subscription: &EventSubscrip
     true
 }
 
-/// The same clock at minute precision, which is what `run --watch` prints —
-/// `toLocaleTimeString` there omits `second`.
+/// The same clock at minute precision, which is what `run --watch` prints.
 pub(crate) fn now_time_minutes() -> String {
     let zoned = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system());
     format!("{:02}:{:02}", zoned.hour(), zoned.minute())
@@ -733,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_duration_is_exit_two_with_the_reference_message() {
+    fn a_bad_duration_is_exit_two_with_the_fixed_message() {
         for bad in ["", "m", "5", "5x", "-5m", "5 m", "1.5h", "5M"] {
             let err = parse_duration(bad).expect_err(bad);
             assert_eq!(

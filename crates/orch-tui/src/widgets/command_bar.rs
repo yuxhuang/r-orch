@@ -1,5 +1,5 @@
 //! The bottom bar: navigate-mode hints, the command input line and the
-//! suggestion panel (docs/parity/tui.md §3.1, §4.4).
+//! suggestion panel.
 
 use orch_domain::{GoalStatus, TaskStatus};
 use ratatui::Frame;

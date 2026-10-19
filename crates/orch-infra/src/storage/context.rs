@@ -1,10 +1,8 @@
-//! File-based shared context store — ported from
-//! `src/infrastructure/storage/context-store.ts`.
+//! File-based shared context store.
 //!
 //! Entries are individual JSON files plus an `_index.json`. TTL is optional
 //! and expiry is **lazy**: `get` deletes the one entry it was asked for, and
-//! `list` purges every expired entry in a batch with a single index rewrite
-//! (PARITY.md §7.17).
+//! `list` purges every expired entry in a batch with a single index rewrite.
 //!
 //! The clock is injected rather than read from the wall, because expiry is
 //! otherwise untestable without sleeping (ARCHITECTURE §5.6).
@@ -87,7 +85,7 @@ impl ContextStore for FileContextStore {
         if let Some(ttl) = ttl_ms
             && (ttl == 0 || ttl > MAX_TTL_MS)
         {
-            // A plain `Error` in the original, so exit 1 rather than 2.
+            // A plain `Error`, so exit 1 rather than 2.
             return Err(Error::other(format!(
                 "TTL must be a positive number up to {MAX_TTL_MS}ms (30 days)"
             )));
@@ -199,7 +197,6 @@ mod tests {
         let (store, _clock) = store(temp.path());
         store.set("mykey", "myvalue", None).await.unwrap();
 
-        // PARITY.md §4.2 ContextEntry.
         let raw = tokio::fs::read_to_string(store.paths.context_path("mykey").unwrap())
             .await
             .unwrap();
@@ -326,7 +323,7 @@ mod tests {
                 err.to_string(),
                 "TTL must be a positive number up to 2592000000ms (30 days)"
             );
-            // A plain `Error` in the original, so exit 1.
+            // A plain `Error`, so exit 1.
             assert_eq!(err.exit_code(), 1);
         }
         // Nothing was written.

@@ -1,5 +1,5 @@
 //! Dispatch: candidate selection, scope gating, and the claim → assign →
-//! execute sequence (PARITY.md §7.5).
+//! execute sequence.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -78,7 +78,7 @@ impl Orchestrator {
             .cloned()
             .collect();
 
-        // The scheduling contract (PARITY.md §7.5 step 3): priority ascending,
+        // The scheduling contract: priority ascending,
         // then goal-linked first, then `updated_at` descending. Stable, so an
         // exact three-way tie keeps store order.
         candidates.sort_by(|a, b| {
@@ -814,7 +814,7 @@ impl Orchestrator {
     /// Breadth-first walk over the reverse-dependency graph, failing every
     /// task that depended — directly or transitively — on a permanently failed
     /// one. Each cascaded task emits **both** `task:status_changed` and
-    /// `task:cascade_failed` (PARITY.md §7.10).
+    /// `task:cascade_failed`.
     pub(super) async fn cascade_fail_dependents(
         &self,
         failed_task_id: &str,
@@ -859,17 +859,12 @@ impl Orchestrator {
             // Written through the store, not the service: a dependent in
             // `todo` has no legal transition to `failed`.
             //
-            // **Sequential, where the reference uses `Promise.all`.** Each
-            // save appends to `_index.json`, whose entry order is observable
-            // (PARITY.md §14.4) and is the order the saves *complete* in.
-            // Concurrent saves therefore race on a value the differential
-            // harness compares byte for byte: node's `Promise.all` over fs
-            // writes settles in map order in practice, so the oracle is
-            // stable, while `join_all` on a multi-threaded runtime genuinely
-            // interleaves — observed as `o7-cascade-failure` failing about one
-            // run in seven with `left` and `right` transposed. Awaiting in
-            // order reproduces the order the oracle prints. The cost is
-            // nothing: a cascade is a handful of tasks.
+            // **Sequential, not concurrent.** Each save appends to
+            // `_index.json`, whose entry order is observable and is the order
+            // the saves *complete* in. Concurrent saves would race on that
+            // order — `join_all` on a multi-threaded runtime genuinely
+            // interleaves — so awaiting in order keeps it deterministic. The
+            // cost is nothing: a cascade is a handful of tasks.
             for (task, _) in &to_fail {
                 let failed = Task {
                     status: TaskStatus::Failed,

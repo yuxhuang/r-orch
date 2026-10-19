@@ -1,7 +1,7 @@
 //! The command-bar **command surface**: every verb and subcommand in
 //! `COMMAND_REGISTRY`, their aliases, their confirmation/refusal strings, the
 //! command-bar keys (`/`, Tab, history, Enter-on-highlighted-sub), and the
-//! rendered command-bar frame (docs/parity/tui.md §3.1, §4; PARITY.md §12.4).
+//! rendered command-bar frame.
 //!
 //! `src/command_bar.rs`'s own unit tests already cover `resolve_completion` /
 //! `resolve_suggestions` / `CommandHistory` in isolation — this file does not
@@ -50,7 +50,7 @@ fn shell_default_adapter() -> FakeBackend {
     })
 }
 
-// ── Legacy bare shortcuts (docs/parity/tui.md §4.6) ────────────────────────
+// ── Legacy bare shortcuts ────────────────────────
 
 #[test]
 fn c001_bare_cancel_with_no_selection_refuses() {
@@ -865,7 +865,7 @@ fn c096_unknown_verb_refuses_with_a_help_pointer() {
     harness.assert_message("Unknown: zzz. Type /help for commands");
 }
 
-// ── Command-bar keys (docs/parity/tui.md §2.3, §3.1) ───────────────────────
+// ── Command-bar keys ───────────────────────
 
 #[test]
 fn c097_slash_seeds_the_buffer() {
@@ -912,7 +912,7 @@ fn c101_up_then_down_walks_history_then_clears() {
     // pushed to history (only the "Unknown: ..." message differs). Unlike a
     // real verb, "alphacmd"/"betacmd" never resolve to a suggestion, so a
     // recalled entry does not itself divert the next ↑/↓ into suggestion
-    // navigation (docs/parity/tui.md §2.3).
+    // navigation.
     harness.key('/');
     harness.type_str("alphacmd");
     harness.press(KeyCode::Enter);
@@ -964,7 +964,7 @@ fn c104_esc_leaves_command_mode_and_clears_the_buffer() {
     assert_eq!(harness.app.state.command_bar.input.value(), "");
 }
 
-// ── Rendered command-bar frame (docs/parity/tui.md §3.1, §4.4) ─────────────
+// ── Rendered command-bar frame ─────────────
 
 #[test]
 fn c105_suggestions_panel_shows_the_commands_label_and_cursor() {
@@ -993,8 +993,8 @@ fn c107_hint_is_arrow_select_with_suggestions_visible() {
 
 #[test]
 fn c108_key_release_events_are_ignored_in_command_mode_too() {
-    // The release/repeat guard at the very top of `handle_key` (docs/parity/
-    // tui.md §2.7) applies before the input-mode branch is even reached, so a
+    // The release/repeat guard at the very top of `handle_key`
+    // applies before the input-mode branch is even reached, so a
     // release event must not insert a character into the command buffer.
     let mut harness = Harness::new();
     harness.press_mod(KeyCode::Char('/'), KeyModifiers::NONE);

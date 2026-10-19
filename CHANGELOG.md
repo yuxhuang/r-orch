@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Removed
+- Parity validation against the TypeScript original: `docs/PARITY.md`, `cargo xtask parity` and `lint-scenarios`, the scenario corpus and the oracle setup are gone, and the docs no longer promise compatibility with the npm package. Compatibility with `.orchestry` data written by r-orch releases is unchanged ([ADR 0009](docs/decisions/0009-remove-parity-tooling.md)).
+
 ### Fixed
 - A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
 

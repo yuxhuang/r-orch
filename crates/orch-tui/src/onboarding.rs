@@ -1,5 +1,4 @@
-//! Onboarding state machine and per-tab empty states
-//! (`src/tui/onboarding-config.ts`, docs/parity/tui.md §8.3).
+//! Onboarding state machine and per-tab empty states.
 
 use orch_domain::{OrchestratorEvent, OrchestratorState, TaskStatus};
 
@@ -101,9 +100,8 @@ const GOALS: OnboardingConfig = OnboardingConfig {
     nudge: "Add more goals to keep your team focused.",
 };
 
-// PARITY.md §13: the advertised-but-unhandled `W start orchestrator` hint is
-// **dropped** rather than ported — no handler ever existed and watch mode is
-// reachable through `/watch`.
+// There is no `W start orchestrator` hint: no handler ever existed and watch
+// mode is reachable through `/watch`.
 const TASKS: OnboardingConfig = OnboardingConfig {
     title: "Tasks",
     description: [
@@ -280,7 +278,6 @@ mod tests {
 
     #[test]
     fn the_agents_description_names_every_supported_adapter() {
-        // onboarding-agents.test.ts.
         let text = AGENTS.description.join(" ");
         for adapter in SUPPORTED_ADAPTERS {
             assert!(text.contains(adapter.as_str()), "{}", adapter.as_str());

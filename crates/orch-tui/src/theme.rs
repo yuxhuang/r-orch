@@ -1,19 +1,16 @@
-//! Palettes, semantic colour roles and glyphs (`src/tui/colors.ts`).
+//! Palettes, semantic colour roles and glyphs.
 //!
-//! The TS module keeps one mutable `tuiColors` object so already-rendered rows
-//! observe a palette switch, and it has to re-map every colour *string* stored
-//! on a message when the palette changes ([`remap`]). Rust stores a semantic
-//! [`Token`] everywhere instead and resolves it against the live [`Palette`] at
-//! draw time, which makes the remap a no-op for app state; [`remap`] is still
-//! ported because it is part of the asserted surface
-//! (docs/parity/tui.md §9).
+//! Messages store a semantic [`Token`] rather than a colour string and resolve
+//! it against the live [`Palette`] at draw time, which makes the remap of
+//! stored colours ([`remap`]) a no-op for app state; [`remap`] is kept because
+//! it is part of the asserted surface.
 
 use orch_domain::{GoalStatus, TaskStatus, TuiPaletteName};
 use ratatui::style::Color;
 
-/// The 26 palette tokens, in TS declaration order. The order is load-bearing:
+/// The 26 palette tokens, in declaration order. The order is load-bearing:
 /// [`remap`] resolves a hex to the *first* matching token, and the `light`
-/// palette's `gray` / `ghost` must not collide (docs/parity/tui.md §9).
+/// palette's `gray` / `ghost` must not collide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Token {
     Amber,
@@ -78,7 +75,7 @@ impl Token {
         Token::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 
-    /// The TS property name — used by the palette-parity tests.
+    /// The camelCase token name — used by the palette tests.
     pub fn name(self) -> &'static str {
         match self {
             Token::Amber => "amber",
@@ -149,7 +146,7 @@ pub fn palette_hexes(name: TuiPaletteName) -> &'static [u32; 26] {
     }
 }
 
-/// The live palette. Swapping it is the Rust equivalent of `applyTuiPalette`:
+/// The live palette. Swapping it takes effect on the next draw:
 /// nothing stores resolved colours, so every row picks up the new values on the
 /// next draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +184,7 @@ impl Palette {
         )
     }
 
-    /// `getAgentColors()` — eight identity colours, assigned by the agent's
+    /// Eight identity colours, assigned by the agent's
     /// position in the live agent list (`index % 8`).
     pub const AGENT_TOKENS: [Token; 8] = [
         Token::Green,
@@ -205,7 +202,7 @@ impl Palette {
     }
 }
 
-/// `remapTuiColor(hex, from, to)` — resolve a stored hex back to its token in
+/// Resolve a stored hex back to its token in
 /// the `from` palette and return the `to` palette's value; an unknown hex
 /// passes through unchanged.
 pub fn remap(hex: u32, from: TuiPaletteName, to: TuiPaletteName) -> u32 {
@@ -216,7 +213,7 @@ pub fn remap(hex: u32, from: TuiPaletteName, to: TuiPaletteName) -> u32 {
     }
 }
 
-/// `getTaskStatusColor`.
+/// The colour token for a task status.
 pub fn task_status_token(status: TaskStatus) -> Token {
     match status {
         TaskStatus::InProgress | TaskStatus::Done => Token::Green,
@@ -240,7 +237,7 @@ pub fn remote_phase_token(phase: orch_domain::RemotePhase) -> Token {
     }
 }
 
-/// `getGoalStatusColor`.
+/// The colour token for a goal status.
 pub fn goal_status_token(status: GoalStatus) -> Token {
     match status {
         GoalStatus::Active => Token::Green,
@@ -250,7 +247,7 @@ pub fn goal_status_token(status: GoalStatus) -> Token {
     }
 }
 
-/// Agent-status colour (docs/parity/tui.md §9).
+/// Agent-status colour.
 pub fn agent_status_token(status: orch_domain::AgentStatus) -> Token {
     match status {
         orch_domain::AgentStatus::Idle => Token::Dim,
@@ -280,7 +277,7 @@ pub fn priority_pips(priority: i64) -> &'static str {
     }
 }
 
-// ── Glyphs (docs/parity/tui.md §9) ──────────────────────────────────────────
+// ── Glyphs ──────────────────────────────────────────
 
 pub const HEAVY_RULE: char = '━';
 pub const LIGHT_RULE: char = '─';
@@ -359,7 +356,6 @@ mod tests {
 
     #[test]
     fn light_palette_concrete_values() {
-        // docs/parity/tui.md §11.1 (colors.test.ts).
         let light = Palette::new(TuiPaletteName::Light);
         assert_eq!(light.hex_string(Token::White), "#1d2939");
         assert_eq!(light.hex_string(Token::Ghost), "#667085");
@@ -404,7 +400,7 @@ mod tests {
 
     #[test]
     fn solid_text_meets_wcag_contrast_in_the_light_palette() {
-        // colors.test.ts: solidText against amber/green/red/blue >= 4.5:1.
+        // solidText against amber/green/red/blue >= 4.5:1.
         fn luminance(hex: u32) -> f64 {
             let channel = |c: u32| {
                 let s = c as f64 / 255.0;

@@ -1,10 +1,9 @@
-//! Automatic review — ported from `src/application/review-runner.ts`.
+//! Automatic review.
 //!
 //! Runs a task's `review_criteria` as child processes and reports pass/fail.
 //! The commands are **hard-coded to npm/npx** and are wrong for a non-Node
 //! project; they are the documented meaning of the `review_criteria` values and
-//! are asserted by tests, so they are replicated rather than fixed
-//! (PARITY.md §14.5).
+//! are asserted by tests, so they are kept rather than fixed.
 //!
 //! Execution is staged — `typecheck`, `lint`, `test_pass`, fastest first,
 //! regardless of the order the task lists them in — and fail-fast by default.
@@ -15,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use orch_domain::{ReviewCriterion, ReviewResult};
 
-/// Per-criterion timeout. The TS `timeout_ms` default.
+/// Default per-criterion timeout.
 pub const DEFAULT_CRITERION_TIMEOUT_MS: u64 = 120_000;
 
 /// node's `execFile` `maxBuffer`. Exceeding it kills the child and surfaces as
@@ -23,8 +22,7 @@ pub const DEFAULT_CRITERION_TIMEOUT_MS: u64 = 120_000;
 /// rather than an OOM.
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
-/// `output` is truncated to this before it is stored on the task
-/// (PARITY.md §7.9).
+/// `output` is truncated to this before it is stored on the task.
 pub const MAX_RESULT_OUTPUT_CHARS: usize = 2000;
 
 /// Execution order: fastest checks first. An unknown criterion sorts last.
@@ -34,7 +32,7 @@ const CRITERION_ORDER: [ReviewCriterion; 3] = [
     ReviewCriterion::TestPass,
 ];
 
-/// argv per criterion (PARITY.md §7.9, L0).
+/// argv per criterion.
 fn criterion_command(criterion: ReviewCriterion) -> (&'static str, &'static [&'static str]) {
     match criterion {
         ReviewCriterion::TestPass => ("npm", &["test"]),
@@ -56,9 +54,8 @@ pub struct CommandOutcome {
 
 /// The child-process seam.
 ///
-/// A trait rather than a direct `tokio::process::Command` call because the TS
-/// suite mocks `execFile` wholesale, and because a unit test must not shell out
-/// to `npm` (PARITY.md V31 forbids the harness spawning it at all).
+/// A trait rather than a direct `tokio::process::Command` call because
+/// a unit test must not shell out to `npm`.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
     async fn run(
@@ -146,7 +143,7 @@ pub struct ReviewRunnerOptions {
     /// `task.workspace ?? projectRoot` — the orchestrator picks it.
     pub cwd: PathBuf,
     pub timeout_ms: u64,
-    /// Stop at the first failed criterion. The TS default is `true`.
+    /// Stop at the first failed criterion.
     pub fail_fast: bool,
 }
 
@@ -241,8 +238,7 @@ pub fn format_report(results: &[ReviewResult]) -> String {
 }
 
 /// Stable sort by [`CRITERION_ORDER`], unknown criteria last. Stable so that
-/// two criteria with the same rank keep the caller's order — the `Infinity`
-/// bucket in the TS comparator relies on it.
+/// two criteria with the same rank keep the caller's order.
 fn sort_criteria(criteria: &[ReviewCriterion]) -> Vec<ReviewCriterion> {
     let rank = |criterion: &ReviewCriterion| {
         CRITERION_ORDER
@@ -256,7 +252,7 @@ fn sort_criteria(criteria: &[ReviewCriterion]) -> Vec<ReviewCriterion> {
 }
 
 /// `String.prototype.slice(0, n)` counts UTF-16 code units; this counts
-/// `char`s. They differ only above the BMP, where the TS version can split a
+/// `char`s. They differ only above the BMP, where UTF-16 slicing can split a
 /// surrogate pair and produce a lone surrogate — something Rust cannot
 /// represent at all. Truncating on a `char` boundary is the nearest valid
 /// behaviour and the review output is human-facing text.
@@ -281,8 +277,7 @@ mod tests {
         timeout: Duration,
     }
 
-    /// Replays a scripted list of outcomes — the Rust equivalent of the TS
-    /// `simulateExecFile` queue.
+    /// Replays a scripted list of outcomes.
     struct ScriptedRunner {
         script: Mutex<std::collections::VecDeque<CommandOutcome>>,
         calls: Recorder<RecordedRun>,

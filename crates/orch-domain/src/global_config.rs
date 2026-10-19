@@ -1,14 +1,14 @@
 //! Global configuration — the shape of `~/.orchestry/global.yml`
-//! (`src/domain/global-config.ts`). Persists across projects.
+//! Persists across projects.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Activity feed filter preset name.
 ///
-/// Deliberately a plain `String` rather than an enum: the TS reader does
+/// Deliberately a plain `String` rather than an enum: the reader does
 /// **not** validate this field — any value passes straight through
-/// (PARITY.md §6.12) — and an enum would reject a file the TS binary accepts.
+/// — and an enum would reject a file that existing readers accept.
 pub type ActivityFilterPreset = String;
 
 /// The five known presets, in display order.
@@ -62,7 +62,7 @@ impl std::str::FromStr for TuiPaletteName {
     }
 }
 
-/// The TS `isTuiPaletteName` type guard, over an arbitrary parsed value.
+/// Type guard for a palette name, over an arbitrary parsed value.
 pub fn is_tui_palette_name(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_str)
@@ -88,7 +88,7 @@ pub struct GlobalConfig {
     pub tui: TuiPreferences,
 }
 
-/// The TS `DEFAULT_GLOBAL_CONFIG` constant (PARITY.md §6.12).
+/// The default global configuration.
 pub fn default_global_config() -> GlobalConfig {
     GlobalConfig {
         tui: TuiPreferences {
@@ -110,7 +110,7 @@ impl Default for GlobalConfig {
 
 impl GlobalConfig {
     /// Field-by-field tolerant read of a raw `global.yml` value, mirroring
-    /// `GlobalConfigStore.read` (PARITY.md §6.12):
+    /// `GlobalConfigStore.read`:
     ///
     /// - an unknown `tui.palette` falls back to `amber`;
     /// - `tui.activity_filter` is **not** validated and passes through;
@@ -195,8 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn default_file_matches_the_reference() {
-        // PARITY.md §6.12.
+    fn default_file_has_the_expected_content() {
         let value = serde_json::to_value(default_global_config()).unwrap();
         assert_eq!(
             value,

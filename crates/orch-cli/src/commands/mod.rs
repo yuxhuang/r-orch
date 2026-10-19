@@ -1,4 +1,4 @@
-//! One module per command group, matching PARITY.md §2.2.
+//! One module per command group.
 //!
 //! WP-0b implemented `init`, `agent add`, `task add` and `task list`. WP-5
 //! fills in the rest.

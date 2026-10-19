@@ -1,4 +1,4 @@
-//! Ported from `test/unit/infrastructure/grok-adapter.test.ts`.
+//! Grok adapter tests.
 
 mod support;
 
@@ -222,7 +222,7 @@ async fn a_non_zero_exit_without_a_done_event_fails_the_run() {
 
 #[tokio::test]
 async fn grok_never_appends_a_stderr_tail_to_its_error() {
-    // PARITY §14.12: stderr is drained and discarded, so a `rate limit` in
+    // Stderr is drained and discarded, so a `rate limit` in
     // stderr must not change the message or its classification.
     let collected = run(Script::new().stderr("rate limit exceeded\n").exit(1)).await;
     assert_eq!(collected.error_message(), "Grok process exited with code 1");

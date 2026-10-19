@@ -1,5 +1,4 @@
-//! Port of `test/unit/domain/agent-shop-skills.test.ts`: the shipped library
-//! is internally consistent and satisfies every shop template.
+//! The shipped skill library is internally consistent and satisfies every shop template.
 
 use std::fs;
 

@@ -1,5 +1,4 @@
-//! The agent shop picker — ported from `src/cli/shop-picker.ts`
-//! (`docs/parity/cli.md` §21.2).
+//! The agent shop picker.
 //!
 //! Reached only when `--list` is absent **and** stdout is a TTY; the picker
 //! itself returns `None` immediately when stdin is not a TTY, which is how

@@ -1,5 +1,4 @@
-//! Workspace manager port — ported from
-//! `src/infrastructure/workspace/interface.ts` and `merge-strategy.ts`.
+//! Workspace manager port.
 
 use std::path::Path;
 
@@ -17,13 +16,11 @@ pub struct PrepareResult {
     pub branch: Option<String>,
 }
 
-/// The TS `MergeResult` discriminated union
-/// (`{ success: true } | { success: false; conflictInfo: string }`).
+/// The outcome of a merge: success, or a conflict carrying the raw output.
 ///
 /// A non-conflict failure (missing branch, hook failure) also lands in
-/// `Conflict`, carrying the raw output — the TS code does not distinguish
-/// them in the result type, only in whether it runs `git merge --abort`
-/// (PARITY.md §10.4).
+/// `Conflict`; the two are not distinguished in the result type, only in
+/// whether `git merge --abort` runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeResult {
     Success,
@@ -59,8 +56,8 @@ pub trait WorkspaceManager: Send + Sync {
 
     async fn cleanup(&self, task_id: &str, branch: Option<&str>) -> Result<()>;
 
-    /// Path-containment check. Sync and fallible, mirroring the TS method that
-    /// returns `void` and throws (PARITY.md §10.7).
+    /// Path-containment check. Sync and fallible: returns `Ok(())` when the path
+    /// is contained, an error otherwise.
     fn validate(&self, workspace_path: &Path, project_root: &Path) -> Result<()>;
 
     /// Files changed on a worktree branch relative to its merge-base.

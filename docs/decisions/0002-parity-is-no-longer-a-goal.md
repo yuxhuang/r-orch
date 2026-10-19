@@ -1,6 +1,6 @@
 # 0002. Parity with the TypeScript original is no longer a goal
 
-- Status: accepted
+- Status: superseded by [0009](0009-remove-parity-tooling.md)
 - Date: 2026-10-16
 
 ## Context

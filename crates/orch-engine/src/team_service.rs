@@ -1,16 +1,15 @@
-//! Team service — ported from `src/application/team-service.ts`.
+//! Team service.
 //!
 //! Teams are a group of agents with one lead, plus a task pool. The pool and
 //! `TeamConfig` are stored and surfaced by the CLI but never read by the
 //! orchestrator, and `team:task_claimed` is never emitted by any code path —
-//! the data model is preserved and the absent behaviour is not invented
-//! (PARITY.md §7.18).
+//! the data model is preserved and the absent behaviour is not invented.
 //!
 //! Three membership errors are `InvalidArgumentsError` (exit **2**) even
 //! though an identically-worded `AgentNotFoundError` / `TaskNotFoundError`
 //! (exit **1**) exists in the domain: `Agent not found: …` and
-//! `Task not found: …` raised from here keep exit 2, because that is what the
-//! TS service throws and the exit code is contract (PARITY.md §3.1).
+//! `Task not found: …` raised from here keep exit 2, because the exit code is
+//! contract.
 
 use std::sync::Arc;
 
@@ -57,8 +56,7 @@ impl TeamService {
     ///
     /// Every validation happens before the first write, so a rejected create
     /// leaves no team behind. Additional members are de-duplicated against the
-    /// lead only — a repeated id inside `member_agent_ids` is appended twice,
-    /// as in the original.
+    /// lead only — a repeated id inside `member_agent_ids` is appended twice.
     pub async fn create(&self, input: CreateTeamInput) -> Result<Team> {
         let name = input.name.trim();
         if name.is_empty() {
@@ -75,7 +73,7 @@ impl TeamService {
         if self.teams.get_by_name(name).await?.is_some() {
             // The lookup is by the trimmed name but the message quotes the raw
             // input, so `orch team add "  squad  "` reports `"  squad  "`.
-            // Replicated rather than tidied: the string is contract.
+            // Kept as is: the string is contract.
             return Err(Error::invalid_arguments(format!(
                 "Team \"{}\" already exists",
                 input.name
@@ -189,7 +187,7 @@ impl TeamService {
     ///
     /// Removing an agent who is not a member is **not** an error: the team is
     /// still re-saved with a new `updated_at` and `team:member_left` is still
-    /// emitted, exactly as in the original.
+    /// emitted.
     pub async fn leave(&self, team_id: &str, agent_id: &str) -> Result<Team> {
         let mut team = self.get(team_id).await?;
         if agent_id == team.lead_agent_id {
@@ -252,7 +250,7 @@ impl TeamService {
         }
 
         // Demotion first: when the new lead *is* the current lead, the promotion
-        // below has to win, which is also the TS statement order.
+        // below has to win.
         for member in &mut team.members {
             if member.agent_id == team.lead_agent_id {
                 member.role = TeamMemberRole::Member;
@@ -271,7 +269,7 @@ impl TeamService {
     }
 
     /// Mark the team `disbanded`. The record is kept, not deleted, so history
-    /// and the task pool survive (PARITY.md §7.18).
+    /// and the task pool survive.
     pub async fn disband(&self, team_id: &str) -> Result<()> {
         let mut team = self.get(team_id).await?;
         team.status = TeamStatus::Disbanded;
@@ -325,7 +323,7 @@ mod tests {
         }
     }
 
-    /// The three agents and the one task every TS case gets from `beforeEach`.
+    /// The three agents and the one task every case starts with.
     fn harness() -> Harness {
         let teams = Arc::new(FakeTeamStore::new());
         let agents = Arc::new(FakeAgentStore::with_agents([
@@ -366,7 +364,7 @@ mod tests {
         }
     }
 
-    /// The TS `makeTeam()` fixture: `agt_lead` as lead plus `agt_m1`.
+    /// A team fixture: `agt_lead` as lead plus `agt_m1`.
     fn team() -> Team {
         Team {
             id: "team_t1".into(),
@@ -500,8 +498,7 @@ mod tests {
         }
     }
 
-    /// Not a ported case: PARITY.md §7.18 says members are de-duplicated
-    /// against the lead, and nothing in the TS suite covers it.
+    /// Members are de-duplicated against the lead.
     #[tokio::test]
     async fn create_skips_a_member_who_is_also_the_lead() {
         let h = harness();
@@ -527,7 +524,7 @@ mod tests {
         );
     }
 
-    /// Not a ported case: `member_agent_ids` is validated before the first
+    /// `member_agent_ids` is validated before the first
     /// write, so a bad member leaves nothing behind.
     #[tokio::test]
     async fn create_rejects_an_unknown_member_before_saving() {
@@ -545,7 +542,7 @@ mod tests {
         assert_eq!(h.saves(), 0);
     }
 
-    /// Not a ported case: `config` is a TS `Partial<TeamConfig>` overlaid on
+    /// `config` is a partial `TeamConfig` overlaid on
     /// the defaults, so an unset key keeps its default rather than becoming
     /// absent.
     #[tokio::test]
@@ -627,7 +624,7 @@ mod tests {
         );
     }
 
-    /// Not a ported case: an unknown agent cannot join, and the message is the
+    /// An unknown agent cannot join, and the message is the
     /// `AgentNotFoundError` wording at exit 2 (see the module docs).
     #[tokio::test]
     async fn join_rejects_an_unknown_agent_with_exit_2() {
@@ -694,8 +691,8 @@ mod tests {
         );
     }
 
-    /// Not a ported case: leaving a team the agent never joined still saves and
-    /// still emits. Replicated from the TS, which filters unconditionally.
+    /// Leaving a team the agent never joined still saves and
+    /// still emits, because the member list is filtered unconditionally.
     #[tokio::test]
     async fn leave_is_not_an_error_for_a_non_member() {
         let h = harness();
@@ -776,7 +773,7 @@ mod tests {
         assert!(sub.try_drain().is_empty());
     }
 
-    /// Not a ported case: `remove_task` has no TS test at all.
+    /// `remove_task` drops the task and emits nothing.
     #[tokio::test]
     async fn remove_task_drops_the_task_and_emits_nothing() {
         let h = harness();
@@ -834,7 +831,7 @@ mod tests {
         assert_eq!(h.saves(), 0);
     }
 
-    /// Not a ported case: re-electing the sitting lead must not demote them,
+    /// Re-electing the sitting lead must not demote them,
     /// which is why the demotion runs before the promotion.
     #[tokio::test]
     async fn set_lead_on_the_current_lead_keeps_the_role() {
@@ -859,7 +856,7 @@ mod tests {
         let saved = h.teams.saved();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].status, TeamStatus::Disbanded);
-        // The record survives — disband is not a delete (PARITY.md §7.18).
+        // The record survives — disband is not a delete.
         assert!(h.teams.peek("team_t1").is_some());
     }
 

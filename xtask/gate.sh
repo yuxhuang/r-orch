@@ -6,8 +6,8 @@
 # script is that it runs against a **cold target directory**, so nothing passes
 # because of a stale artifact. That matters more than usual in this repo: the
 # work packages shared one `CARGO_TARGET_DIR` across git worktrees for a while,
-# artifacts from two trees hash identically, and a parity run was once observed
-# grading a different branch's binary with entirely plausible diffs.
+# and artifacts from two trees hash identically, so a run could end up
+# exercising a different branch's binaries with entirely plausible results.
 #
 #   ./xtask/gate.sh              # the full gate
 #   ./xtask/gate.sh --warm       # reuse the normal target dir (fast, not a gate)
@@ -183,28 +183,6 @@ summarize() {
         printf '%s' "$counts"
       fi
       ;;
-    parity)
-      # Name the failures, not just the count: this gate runs with a standing
-      # red bar (a known contract gap the CLI has not closed yet), and the
-      # operator needs to tell that apart from a new regression without
-      # scrolling back through the log.
-      local counts failures
-      counts=$(grep -oE '[0-9]+ scenario\(s\): .*' "$log" | tail -1)
-      failures=$(sed -n 's/^  \([a-z0-9-]*\) \.\.\. FAILED.*/\1/p' "$log" | paste -sd' ' -)
-      if [ -n "$failures" ]; then
-        printf '%s — %s' "$counts" "$failures"
-      else
-        printf '%s' "$counts"
-      fi
-      ;;
-    lint-scenarios)
-      grep -oE 'all [0-9]+ scenario\(s\) well-formed|[0-9]+ of [0-9]+ scenario\(s\) are malformed' "$log" | tail -1
-      ;;
-    probes)
-      # The whole summary line, so "skipped on an uncommitted target file"
-      # reads as that rather than as a blind spot.
-      grep -oE '[0-9]+ detected, [0-9]+ missed.*' "$log" | tail -1
-      ;;
     no-real-cli)
       grep -oE "no test exec'd an agent CLI|a test exec'd a real agent CLI:" "$log" | tail -1
       ;;
@@ -284,7 +262,7 @@ sentinel_home_check() {
 #
 # `cargo test` should never exec a real agent CLI: the adapter tests drive a
 # scripted `FakeProcessManager`, and the fixtures under fixtures/fake-agents
-# are for `cargo xtask parity`. One test did anyway — it ran `claude --help`,
+# are for the process-level tests. One test did anyway — it ran `claude --help`,
 # `cursor-agent --list-models` and read the real `~/.codex` — which is both a
 # hermeticity hole (results depend on what is installed) and a privacy one.
 #
@@ -388,16 +366,9 @@ step clippy         cargo clippy --workspace --all-targets -- -D warnings
 step fmt            cargo fmt --all --check
 step advisories     advisories_check
 step crate-graph    cargo xtask crate-graph
-step lint-scenarios cargo xtask lint-scenarios
-step parity         cargo xtask parity
-# The probe suite rebuilds the CLI repeatedly as it mutates and reverts source,
-# so it goes last: on a cold gate it is by far the slowest step, and anything
-# it would catch is worth knowing about after the cheaper checks have run.
 step home-hygiene   sentinel_home_check
 step no-real-cli    no_real_cli_check
-step probes         ./xtask/probe-harness.sh
-# Last, so it covers every step above it — including the probe suite, which
-# rebuilds and re-runs the CLI repeatedly.
+# Last, so it covers every step above it.
 step real-home      real_home_untouched_check
 
 printf '\n'

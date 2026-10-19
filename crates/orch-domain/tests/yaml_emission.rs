@@ -3,13 +3,12 @@
 //! This is **not** WP-1's `write_yaml` — there is no timestamp guard here. The
 //! point is to pin down, with evidence rather than reasoning, exactly which
 //! scalars `serde_yaml_ng` leaves unquoted, because an unquoted
-//! `created_at: 2026-10-13T16:37:58.959Z` re-parses in the TypeScript binary as
-//! a JavaScript `Date` and makes `MessageStore.list()` throw
-//! (PARITY.md §6.4, ARCHITECTURE §5.3, R1).
+//! `created_at: 2026-10-13T16:37:58.959Z` re-parses as a timestamp rather than
+//! a string in YAML 1.1 readers, and existing `.orchestry` files must stay
+//! readable.
 //!
 //! WP-1 owns the fix: a post-emit pass inside `write_yaml` that force-quotes
-//! any plain scalar js-yaml's default schema would resolve as a YAML 1.1
-//! timestamp. These tests are the "before" half of that work.
+//! any plain scalar a YAML 1.1 reader would resolve as a timestamp. These tests are the "before" half of that work.
 
 use orch_domain::{
     Agent, AgentConfig, AgentStats, AgentStatus, ApprovalPolicy, Goal, GoalStatus, Message,
@@ -126,9 +125,9 @@ fn an_agent_env_map_round_trips_in_declaration_order() {
 }
 
 /// The hazard, pinned. Every one of these is a **string** in Rust and must
-/// come back as a string in the TypeScript binary.
+/// come back as a string in YAML 1.1 readers.
 #[test]
-fn timestamp_scalars_are_emitted_unquoted_which_is_the_cross_compat_hazard() {
+fn timestamp_scalars_are_emitted_unquoted_which_yaml_1_1_readers_resolve_to_a_date() {
     let yaml = serde_yaml_ng::to_string(&task()).expect("serializes");
     assert!(
         yaml.contains("created_at: 2026-10-13T16:37:33.426Z\n"),
@@ -140,11 +139,11 @@ fn timestamp_scalars_are_emitted_unquoted_which_is_the_cross_compat_hazard() {
 /// across every entity so none is forgotten.
 #[test]
 fn every_timestamp_field_across_the_entities_emits_unquoted() {
-    const TS: &str = "2026-10-13T16:37:33.426Z";
+    const TIMESTAMP: &str = "2026-10-13T16:37:33.426Z";
 
     let mut t = task();
-    t.created_at = TS.into();
-    t.updated_at = TS.into();
+    t.created_at = TIMESTAMP.into();
+    t.updated_at = TIMESTAMP.into();
 
     let goal = Goal {
         id: "goal_1".into(),
@@ -152,8 +151,8 @@ fn every_timestamp_field_across_the_entities_emits_unquoted() {
         description: String::new(),
         status: GoalStatus::Active,
         assignee: None,
-        created_at: TS.into(),
-        updated_at: Some(TS.into()),
+        created_at: TIMESTAMP.into(),
+        updated_at: Some(TIMESTAMP.into()),
     };
 
     let message = Message {
@@ -163,10 +162,10 @@ fn every_timestamp_field_across_the_entities_emits_unquoted() {
         to_agent_id: Some("agt_creator".into()),
         subject: "Hi".into(),
         body: "hello".into(),
-        created_at: TS.into(),
-        expires_at: Some(TS.into()),
+        created_at: TIMESTAMP.into(),
+        expires_at: Some(TIMESTAMP.into()),
         status: MessageStatus::Pending,
-        delivered_at: Some(TS.into()),
+        delivered_at: Some(TIMESTAMP.into()),
         team_id: None,
         reply_to: None,
     };
@@ -192,7 +191,7 @@ fn every_timestamp_field_across_the_entities_emits_unquoted() {
     for (entity, yaml, fields) in &documents {
         for field in fields {
             assert!(
-                yaml.contains(&format!("{field}: {TS}\n")),
+                yaml.contains(&format!("{field}: {TIMESTAMP}\n")),
                 "{entity}.{field} is not an unquoted timestamp — the guard's \
                  field coverage may have changed:\n{yaml}"
             );
@@ -201,7 +200,7 @@ fn every_timestamp_field_across_the_entities_emits_unquoted() {
 }
 
 /// Scalars that are safe either way, so WP-1's guard does not need to widen to
-/// them (PARITY.md §6.4).
+/// them.
 #[test]
 fn boolean_looking_and_numeric_looking_strings_are_already_quoted() {
     let mut t = task();
@@ -226,7 +225,7 @@ fn a_user_supplied_date_shaped_string_is_also_emitted_unquoted() {
     assert!(yaml.contains("description: 2026-10-13\n"), "{yaml}");
 }
 
-// ── Merge keys (PARITY.md §6.4.2, V38) ─────────────────────────────────────
+// ── Merge keys ─────────────────────────────────────
 
 /// A hand-authored `config.yml` using a merge key. This is reachable only
 /// here: nothing ORCH writes emits `<<`.
@@ -240,9 +239,9 @@ scheduling:
 ";
 
 /// The bifurcation, pinned: `serde_yaml_ng` leaves `<<` as a **literal key**
-/// where js-yaml resolves it. A reader that forgets `apply_merge()` sees
+/// where YAML 1.1 readers resolve it. A reader that forgets `apply_merge()` sees
 /// `scheduling.max_turns` as absent, falls back to `DEFAULT_CONFIG`, and runs
-/// the project with different scheduling than the TS binary — while both trees
+/// the project with different scheduling than other readers of the file — while both trees
 /// still compare equal under the Rust parser.
 #[test]
 fn merge_keys_are_not_resolved_by_default() {
@@ -257,11 +256,10 @@ fn merge_keys_are_not_resolved_by_default() {
     assert!(scheduling.get("adapter").is_none());
 }
 
-/// `apply_merge()` reproduces js-yaml's result. This is the shape WP-1's
-/// `read_yaml` must produce; key order differs from js-yaml's and §1.4
-/// excludes key order.
+/// `apply_merge()` resolves merge keys the YAML 1.1 way. This is the shape
+/// WP-1's `read_yaml` must produce; key order is not part of what is compared.
 #[test]
-fn apply_merge_reproduces_the_js_yaml_result() {
+fn apply_merge_resolves_merge_keys() {
     let mut value: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(MERGE_KEY_CONFIG).expect("parses");
     value.apply_merge().expect("merge applies");

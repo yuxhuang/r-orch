@@ -1,4 +1,4 @@
-//! Message domain model — inter-agent communication (`src/domain/message.ts`).
+//! Message domain model — inter-agent communication.
 
 use serde::{Deserialize, Serialize};
 
@@ -85,11 +85,11 @@ impl std::str::FromStr for MessageStatus {
     }
 }
 
-/// Field order mirrors the TS `Message` interface.
+/// Field order is the serialized field order.
 ///
 /// `to_agent_id` is the **one** field in the whole domain that must emit
-/// `null` rather than being omitted: its TS type is `string | null`, not
-/// `string?` (PARITY.md §6.4).
+/// `null` rather than being omitted: it is a nullable field, not an
+/// optional one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,

@@ -1,4 +1,4 @@
-//! `orch serve` — headless daemon mode (`docs/parity/cli.md` §16).
+//! `orch serve` — headless daemon mode.
 //!
 //! The three pieces are independent and all three are built: the structured
 //! [`logger`], the `--once` terminal rule in [`once`], and the
@@ -8,8 +8,8 @@
 //! What is **not** here is the orchestrator: [`run_with`] takes one through
 //! [`once::ServeOrchestrator`], and [`run`] reports that WP-4 has not wired it
 //! yet. The `--log-format` validation and its exit 2 happen before any of
-//! that, in the caller, because the reference validates before it builds
-//! anything either.
+//! that, in the caller, because validation comes before building
+//! anything.
 
 pub mod disk_observer;
 pub mod logger;
@@ -35,7 +35,7 @@ pub struct ServeArgs {
     pub verbose: bool,
 }
 
-/// `parseInt(opts.tickInterval, 10)`, applied only when it is a positive
+/// The tick interval, applied only when it is a positive
 /// number — `--tick-interval abc` is **silently ignored**.
 pub fn resolved_poll_interval(raw: Option<&str>, configured: u64) -> u64 {
     raw.and_then(|raw| raw.trim().parse::<i64>().ok())
@@ -81,9 +81,9 @@ pub async fn run_with(
     // Ended by a token rather than `abort()`, and drained afterwards: the
     // wind-down inside `stop()` emits a run, task and agent event per running
     // entry, plus an `orchestrator:error` record per sub-failure, and aborting
-    // the pump discards whatever it has not logged yet. The reference's logger
-    // is synchronous and cannot lose a record, and `serve --json`'s record
-    // stream is compared byte for byte.
+    // the pump discards whatever it has not logged yet. A synchronous
+    // logger could not lose a record, and `serve --json`'s record stream has
+    // to be complete.
     let done = tokio_util::sync::CancellationToken::new();
     let pump = tokio::spawn({
         let logger = Arc::clone(&logger);
@@ -262,7 +262,7 @@ mod tests {
         .expect("serve");
 
         let written = std::fs::read_to_string(&log_path).expect("read log");
-        // The reference's logger is synchronous, so none of these can be lost;
+        // A synchronous logger could not lose any of these;
         // aborting the pump instead of draining it loses all six.
         for n in 0..5 {
             assert!(

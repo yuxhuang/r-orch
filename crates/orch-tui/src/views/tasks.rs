@@ -1,4 +1,4 @@
-//! The tasks list (docs/parity/tui.md §1.2).
+//! The tasks list.
 
 use orch_domain::{RemotePhase, RemoteRunRef, TaskStatus};
 use ratatui::Frame;

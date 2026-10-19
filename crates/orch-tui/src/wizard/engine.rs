@@ -1,19 +1,15 @@
-//! The `FormWizard` engine (`src/tui/components/FormWizard.tsx`).
+//! The `FormWizard` engine.
 //!
 //! Step sequencing, skip predicates, per-step pre-fill, validation gating and
-//! the key map are L0/L1 (PARITY.md §12.5): a wrong skip predicate writes
-//! corrupt entity data through the UI.
+//! the key map are all contract: a wrong skip predicate writes corrupt entity
+//! data through the UI.
 //!
-//! Two deliberate decisions where the TS behaviour is an Ink accident
-//! (docs/parity/tui.md §5.1, §10):
+//! Two deliberate decisions:
 //!
-//! * **`Esc`** goes back one step and cancels only at step 0 — the documented
-//!   `FormWizard` design, and what its unit tests assert. In the shipped app
-//!   Ink delivered `Esc` to *both* the wizard and the App handler and the App
-//!   won, so `Esc` always closed the wizard. With a single dispatcher there is
-//!   no reason to reproduce the collision.
-//! * **Cancelling always clears pending attachments.** The TS App's `Esc` path
-//!   skipped `handleWizardCancel`, leaking them into the next wizard.
+//! * **`Esc`** goes back one step and cancels only at step 0. With a single
+//!   dispatcher the wizard and the App handler never both see `Esc`.
+//! * **Cancelling always clears pending attachments**, so none leak into the
+//!   next wizard.
 //!
 //! The `textarea` step delegates to `tui-textarea-2` (ARCHITECTURE §4.8) for
 //! the buffer, undo, word motions and soft wrapping.
@@ -27,7 +23,7 @@ use crate::text::{TextInput, is_meta};
 /// Collected wizard answers, keyed by step id, in step order.
 pub type Values = IndexMap<String, String>;
 
-/// `runValidation` debounce for text and textarea steps.
+/// Validation debounce for text and textarea steps.
 pub const VALIDATION_DEBOUNCE_MS: i64 = 300;
 /// How long `Fix the error above` stays up.
 pub const ENTER_BLOCK_HINT_MS: i64 = 2_000;
@@ -42,7 +38,7 @@ pub enum StepKind {
     Multiselect,
 }
 
-/// `suggestionMode` — `value` advances with the chosen value, `callback` hands
+/// `value` advances with the chosen value, `callback` hands
 /// it to the host (which opens the pre-filled shop wizard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SuggestionMode {
@@ -104,7 +100,7 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
-    /// `resolveDefaultValue(step, values)`.
+    /// The default value, resolved against the values entered so far.
     pub fn resolve(&self, values: &Values) -> String {
         match self {
             DefaultValue::Empty => String::new(),
@@ -268,7 +264,7 @@ pub struct Wizard {
     pub setting: Option<String>,
     /// Rendered in the footer — `📎{n}` for pending attachments.
     pub footer_extra: Option<String>,
-    /// `onPasteImage` was provided (task / edit_task only).
+    /// The backend can paste an image (task / edit_task only).
     pub paste_capable: bool,
 
     pub(crate) baseline: Values,
@@ -659,7 +655,7 @@ impl Wizard {
     }
 
     /// Replace the step list in place, keeping the answers and position — the
-    /// live model-catalog refresh (docs/parity/tui.md §5.2).
+    /// live model-catalog refresh.
     pub fn replace_steps(&mut self, steps: Vec<WizardStep>) {
         if steps.is_empty() {
             return;
@@ -749,7 +745,7 @@ impl Wizard {
         self.validate_deadline = Some(now_ms + VALIDATION_DEBOUNCE_MS);
     }
 
-    /// Fire due timers: the debounced validation and the `enterBlockHint`
+    /// Fire due timers: the debounced validation and the enter-block hint
     /// auto-clear. Called once per frame and before every key.
     pub fn poll(&mut self, now_ms: i64) {
         if let Some(deadline) = self.validate_deadline
@@ -838,10 +834,10 @@ impl Wizard {
         let meta = is_meta(key);
         let kind = self.step().kind;
 
-        // Paste image, text and textarea steps only. One condition, as in TS:
-        // `(key.ctrl || key.meta) && (input === 'v' || input === 'i')` — the
-        // `i` arm takes the modifier set the `v` arm does, so Alt/Option+I
-        // pastes too. `key.meta` is Alt, never Cmd — see `text::is_meta`.
+        // Paste image, text and textarea steps only. One condition for both
+        // keys, so the `i` arm takes the modifier set the `v` arm does and
+        // Alt/Option+I pastes too. Meta is Alt, never Cmd — see
+        // `text::is_meta`.
         if (ctrl || meta)
             && matches!(
                 key.code,
@@ -968,7 +964,7 @@ impl Wizard {
 
     fn handle_textarea_key(&mut self, key: KeyEvent, ctrl: bool, meta: bool) -> WizardOutcome {
         // Ctrl+Enter / Cmd+Enter / Tab confirm; plain and Shift+Enter insert a
-        // newline (docs/parity/tui.md §5.1).
+        // newline.
         if key.code == KeyCode::Tab || (key.code == KeyCode::Enter && (ctrl || meta)) {
             let value = self.textarea_value().trim().to_string();
             self.validate_deadline = None;
@@ -1715,10 +1711,9 @@ mod tests {
 
     #[test]
     fn paste_takes_the_same_modifier_set_for_v_and_i() {
-        // TS is one condition — `(key.ctrl || key.meta) && (input === 'v' ||
-        // input === 'i')` — so the `i` arm takes exactly the modifiers the `v`
-        // arm does. `key.meta` is Alt/Option (or the Kitty `meta` bit), never
-        // Cmd (PARITY §12.5).
+        // One condition for both keys, so the `i` arm takes exactly the
+        // modifiers the `v` arm does. Meta is Alt/Option (or the Kitty `meta`
+        // bit), never Cmd.
         let steps = vec![
             WizardStep::new("t", "T", StepKind::Text),
             WizardStep::new("body", "Body", StepKind::Textarea),
@@ -1750,8 +1745,8 @@ mod tests {
 
     #[test]
     fn cmd_is_not_meta_so_super_never_pastes() {
-        // Ink never maps the Kitty `super` bit to `key.meta`, so Cmd+V/Cmd+I
-        // cannot reach the paste handler in the original and must not here.
+        // The Kitty `super` bit is never mapped to meta, so Cmd+V/Cmd+I
+        // must not reach the paste handler.
         let steps = vec![WizardStep::new("t", "T", StepKind::Text)];
         for code in [KeyCode::Char('v'), KeyCode::Char('i')] {
             let mut wizard = Wizard::new(WizardKind::Task, "T", steps.clone()).with_paste(true);

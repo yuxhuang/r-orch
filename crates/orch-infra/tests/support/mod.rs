@@ -1,8 +1,7 @@
 //! The one shared harness for every adapter test.
 //!
-//! The TS suites mock `child_process` and drive a `PassThrough` per stream.
 //! `orch_core::process::SpawnedChild` carries real `tokio::process::Child*`
-//! handles, which cannot be fabricated, so the equivalent here is a **real**
+//! handles, which cannot be fabricated, so the harness is a **real**
 //! child running a generated `sh` script: scripted stdout, scripted stderr, a
 //! scripted exit, and an optional stdin capture. That costs a few
 //! milliseconds per case and in exchange every test exercises the real pipe,
@@ -420,7 +419,7 @@ pub async fn collect(handle: ExecuteHandle) -> Collected {
                 Ok(event) => events.push(event),
                 Err(err) => {
                     error = Some(err);
-                    // The TS generator throws once and ends.
+                    // The generator yields the error once and ends.
                     break;
                 }
             }
@@ -437,7 +436,7 @@ pub async fn collect(handle: ExecuteHandle) -> Collected {
     Collected { events, error }
 }
 
-/// `ExecuteParams` with the TS test defaults.
+/// `ExecuteParams` with test defaults.
 pub fn params(prompt: &str, workspace: &str) -> ExecuteParams {
     ExecuteParams {
         prompt: prompt.to_owned(),
@@ -467,7 +466,7 @@ pub fn fixed_clock() -> Arc<dyn Clock> {
 }
 
 /// 256 KiB of stderr — more than a pipe buffer, which is what deadlocks an
-/// adapter that never reads it (PARITY.md §14.12, V40).
+/// adapter that never reads it.
 pub fn stderr_flood() -> Vec<u8> {
     let mut flood = vec![b'E'; 256 * 1024];
     // Line-delimited, so the shell adapter (which streams stderr) does not

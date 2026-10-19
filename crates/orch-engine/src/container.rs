@@ -1,6 +1,6 @@
-//! Dependency wiring — ported from `src/container.ts`.
+//! Dependency wiring.
 //!
-//! Two tiers, as in TS: [`Engine`] (stores + services) for the read-only
+//! Two tiers: [`Engine`] (stores + services) for the read-only
 //! commands and [`FullEngine`] (+ orchestrator, adapters, process manager,
 //! template engine, skill loader, workspace manager, doctor) for `run`, `tui`,
 //! `doctor` and `serve`.
@@ -115,9 +115,8 @@ impl std::ops::Deref for FullEngine {
     }
 }
 
-/// Seams a caller may replace. Production passes [`Default`]; tests and the
-/// parity harness pin the clock and the id generator so output is exactly
-/// predictable (ARCHITECTURE §5.6).
+/// Seams a caller may replace. Production passes [`Default`]; tests pin the clock and the id
+/// generator so output is exactly predictable (ARCHITECTURE §5.6).
 pub struct EngineSeams {
     pub clock: Arc<dyn Clock>,
     pub ids: Arc<dyn IdGenerator>,
@@ -172,9 +171,9 @@ pub async fn build_light_with(
     if config.peer.name.is_none() {
         config.peer.name = Some(orch_infra::storage::remote::default_peer_name());
     }
-    // The light tier does not read `global.yml`: the TS container leaves
-    // `globalConfig` at its default until the full tier loads it, and no
-    // read-only command consults it.
+    // The light tier does not read `global.yml`: `globalConfig` stays at its
+    // default until the full tier loads it, and no read-only command
+    // consults it.
     let global_config = orch_domain::default_global_config();
 
     let tasks: Arc<dyn TaskStore> = Arc::new(FileTaskStore::new(paths.clone()));
@@ -319,7 +318,7 @@ async fn build_full_internal(
     let processes: Arc<dyn ProcessManager> = Arc::new(orch_infra::process::SystemProcessManager);
     // Adapters stamp the events they parse out of a child's stdout, so they
     // get the injected clock too — otherwise the seam would reach every
-    // timestamp except the ones a differential scenario actually reads.
+    // timestamp except the ones the adapters actually read.
     let adapters = Arc::new(build_registry_with_clock(
         Arc::clone(&processes),
         Arc::clone(&engine.clock),

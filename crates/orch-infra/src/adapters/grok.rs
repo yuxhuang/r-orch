@@ -1,14 +1,13 @@
-//! Grok CLI adapter — `src/infrastructure/adapters/grok.ts`,
-//! `kind = "grok"` (`docs/parity/adapters.md` §2.6).
+//! Grok CLI adapter for `kind = "grok"`.
 //!
 //! Grok streams text/thought deltas; this adapter aggregates text deltas into
 //! bounded output chunks and emits a terminal `done` at session end,
 //! synthesising one if the CLI exited cleanly without an `end` record.
 //!
-//! Its stderr is **drained and discarded** rather than tail-captured: the TS
-//! never reads it at all and deadlocks on a chatty child, and appending a tail
-//! here would change the error text, its classification and the persisted
-//! `agent.last_error` (PARITY.md §14.12).
+//! Its stderr is **drained and discarded** rather than tail-captured: it must
+//! be drained or a chatty child deadlocks, and appending a tail here would
+//! change the error text, its classification and the persisted
+//! `agent.last_error`.
 
 use std::sync::Arc;
 

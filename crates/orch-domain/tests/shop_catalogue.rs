@@ -1,10 +1,7 @@
-//! V28 — the agent-shop, org-shop and default-agent catalogues must match the
-//! TypeScript source exactly, role prompts included.
-//!
-//! The fixtures under `fixtures/shop/` are generated from
-//! `parity/orch-ts/src/domain/{agent-shop,org-shop,default-agents}.ts` by
-//! `fixtures/shop/generate.mjs` (see `fixtures/shop/README.md`). Comparing parsed values rather than bytes,
-//! because JSON object key order is not contract (PARITY.md §1.4).
+//! Regression test: the agent-shop, org-shop and default-agent catalogues must
+//! match the golden snapshots under `fixtures/shop/` exactly, role prompts
+//! included (see `fixtures/shop/README.md`). Parsed values are compared rather
+//! than bytes, because JSON object key order is not significant.
 
 use orch_domain::{AGENT_SHOP_TEMPLATES, ORG_TEMPLATES, default_agents};
 use serde_json::Value;
@@ -18,7 +15,7 @@ fn parse(fixture: &str) -> Value {
 }
 
 #[test]
-fn agent_shop_catalogue_matches_the_typescript_source() {
+fn agent_shop_catalogue_matches_the_golden_fixture() {
     let expected = parse(AGENT_SHOP_FIXTURE);
     let actual = serde_json::to_value(&AGENT_SHOP_TEMPLATES).expect("catalogue serializes");
 
@@ -61,7 +58,7 @@ fn agent_shop_catalogue_matches_the_typescript_source() {
                 .map(|((i, _), _)| i)
                 .unwrap_or(0);
             panic!(
-                "{key}.role diverges at byte {at}:\n  rust: {:?}\n  ts:   {:?}",
+                "{key}.role diverges at byte {at}:\n  actual:   {:?}\n  expected: {:?}",
                 &actual_role[at..actual_role.len().min(at + 60)],
                 &expected_role[at..expected_role.len().min(at + 60)],
             );
@@ -70,7 +67,7 @@ fn agent_shop_catalogue_matches_the_typescript_source() {
 }
 
 #[test]
-fn org_shop_catalogue_matches_the_typescript_source() {
+fn org_shop_catalogue_matches_the_golden_fixture() {
     assert_eq!(
         serde_json::to_value(&ORG_TEMPLATES).expect("catalogue serializes"),
         parse(ORG_SHOP_FIXTURE)
@@ -78,7 +75,7 @@ fn org_shop_catalogue_matches_the_typescript_source() {
 }
 
 #[test]
-fn default_agents_match_the_typescript_source_for_every_adapter_shape() {
+fn default_agents_match_the_golden_fixture_for_every_adapter_shape() {
     let expected = parse(DEFAULT_AGENTS_FIXTURE);
     // One representative per behaviour: claude (MCP skill + model), codex (no
     // MCP skills), antigravity (empty balanced model ⇒ no `model` key at all),
@@ -90,13 +87,13 @@ fn default_agents_match_the_typescript_source_for_every_adapter_shape() {
 }
 
 #[test]
-fn the_agent_creator_role_is_byte_identical_to_the_typescript_source() {
+fn the_agent_creator_role_is_byte_identical_to_the_golden_fixture() {
     let expected = parse(DEFAULT_AGENTS_FIXTURE);
     let expected_role = expected["claude"][0]["role"].as_str().expect("role");
     assert_eq!(orch_domain::AGENT_CREATOR_ROLE, expected_role);
 }
 
-// ── The catalogue keys as L0 data, enumerated in PARITY.md §9.6 ────────────
+// ── The catalogue keys ─────────────────────────────────────────────────────
 
 #[test]
 fn the_fifteen_agent_shop_keys_are_exactly_these_in_this_order() {
@@ -185,7 +182,6 @@ fn the_ten_org_shop_keys_are_exactly_these_and_all_lead_index_zero() {
 
 #[test]
 fn init_creates_exactly_one_default_agent() {
-    // PARITY.md §9.6: "Default agents: exactly one — agt_creator".
     let agents = default_agents("claude");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0].id, "agt_creator");

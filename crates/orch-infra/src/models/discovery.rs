@@ -1,12 +1,10 @@
-//! Runtime model discovery, ported from
-//! `src/infrastructure/models/model-discovery.ts` (PARITY.md §8.12).
+//! Runtime model discovery.
 //!
 //! Prefer the catalogue the installed CLI exposes; when a CLI has no listing
 //! command (Codex and Claude) use its own local cache or stable aliases. The
 //! fallbacks deliberately avoid pinned model versions so they cannot go stale.
 //!
-//! There is **no in-process cache** — every call re-probes
-//! (`docs/parity/adapters.md` §7.3). This feeds the TUI model picker only;
+//! There is **no in-process cache** — every call re-probes. This feeds the TUI model picker only;
 //! nothing in the engine depends on it.
 
 use std::collections::BTreeMap;
@@ -75,14 +73,12 @@ pub struct SystemDiscoveryRuntime;
 
 #[async_trait]
 impl DiscoveryRuntime for SystemDiscoveryRuntime {
-    /// Mirrors the TS `run()`: pipe both streams, 15 s timeout, and a non-zero
+    /// Pipe both streams, 15 s timeout, and a non-zero
     /// exit is a failure carrying the signal-or-code and stderr.
     async fn run_command(&self, command: &str, args: &[&str]) -> Result<CommandOutput> {
         let mut cmd = tokio::process::Command::new(command);
-        // The TS kills with SIGTERM on timeout and leaves the child behind;
-        // dropping the handle here SIGKILLs and reaps it instead. Both end the
-        // probe with the same error, and neither outcome is observable beyond
-        // this function.
+        // On timeout, dropping the handle SIGKILLs and reaps the child; the
+        // outcome is not observable beyond this function.
         cmd.args(args).kill_on_drop(true);
 
         let described = || format!("{command} {}", args.join(" "));
@@ -129,7 +125,7 @@ impl DiscoveryRuntime for SystemDiscoveryRuntime {
     }
 }
 
-/// `${signal ?? code}` — node reports a signal by name and otherwise the code.
+/// The signal name if the process was killed by one, otherwise the exit code.
 fn exit_reason(status: &std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
     match status.signal() {
@@ -170,8 +166,7 @@ impl ModelDiscovery {
         ModelDiscovery { runtime }
     }
 
-    /// Probe one adapter. **Every failure is an empty list**, as the TS
-    /// `try { … } catch { return [] }` is — the caller substitutes the
+    /// Probe one adapter. **Every failure is an empty list** — the caller substitutes the
     /// fallbacks.
     pub async fn discover(&self, adapter: AdapterKind) -> Vec<ModelOption> {
         match self.discover_inner(adapter).await {

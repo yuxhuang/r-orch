@@ -1,5 +1,4 @@
-//! Generic `_index.json` manager — ported from
-//! `src/infrastructure/storage/index-manager.ts`.
+//! Generic `_index.json` manager.
 //!
 //! Each store keeps individual entity files plus an `_index.json` cache of the
 //! **complete** entity objects (not a summary) so `list()` is one read.
@@ -8,7 +7,7 @@
 //!
 //! - `save` is remove-by-id then **push to the end**, so index order is
 //!   last-write order. That is observable through `findBestAgent`'s tie
-//!   breaking and r-orch replicates it (PARITY.md §6.10, §14.4).
+//!   breaking and it is preserved.
 //! - A missing, non-array or corrupt index triggers a **rebuild** from the
 //!   individual files rather than an error.
 
@@ -99,7 +98,7 @@ where
     /// Order comes from directory enumeration. Entity filenames embed random
     /// nanoids, so two trees can enumerate the same logical set differently —
     /// the one tie-order case that stays unverifiable, reachable only when the
-    /// index is missing **and** ≥2 entities exist (PARITY.md §14.4).
+    /// index is missing **and** ≥2 entities exist.
     pub async fn rebuild_index(&self) -> Result<Vec<T>> {
         let guard = self.lock_writer().await?;
         let items = self.scan_items().await?;
@@ -127,11 +126,8 @@ where
             // as well — so one corrupt entity file produced a *shortened*
             // index that `rebuild_index`'s caller then persisted, silently
             // dropping every entity in that file from `list()` with nothing
-            // logged. The comment claimed the TS "drops nulls the same way",
-            // which is true of nulls and untrue of errors: `readYaml` returns
-            // `null` **only** on ENOENT and rethrows everything else, and
-            // `rebuildIndex`'s `Promise.all` then rejects the whole rebuild.
-            // Propagating is both safer and the faithful behaviour.
+            // logged. A read returns `None` **only** for a missing file and
+            // errors on everything else, so propagating is the safer behaviour.
             match item? {
                 Some(item) => items.push(item),
                 None => continue,
@@ -418,9 +414,9 @@ mod tests {
         // Inverted deliberately (sre B1). Skipping the bad file produced an
         // index missing that entity, and `rebuild_index`'s callers *persist*
         // what it returns — so a single corrupt file silently removed an
-        // entity from every `list()` thereafter, with nothing logged. The TS
-        // propagates here: `readYaml` returns null only on ENOENT and
-        // rethrows a parse error, which rejects `rebuildIndex`'s `Promise.all`.
+        // entity from every `list()` thereafter, with nothing logged. A parse
+        // error now propagates, since a read returns `None` only for a missing
+        // file.
         let temp = tempfile::tempdir().unwrap();
         let index = manager(temp.path());
         write_yaml(&temp.path().join("a.yml"), &item("a", 1))
@@ -443,8 +439,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_entity_file_is_still_skipped() {
         // The other half of B1: `Ok(None)` — a file listed but gone by the
-        // time it is read — stays non-fatal, which is what the TS `null`
-        // branch does.
+        // time it is read — stays non-fatal.
         let temp = tempfile::tempdir().unwrap();
         let index = manager(temp.path());
         write_yaml(&temp.path().join("a.yml"), &item("a", 1))

@@ -1,5 +1,4 @@
-//! Task state machine — pure functions, no side effects
-//! (`src/domain/transitions.ts`).
+//! Task state machine — pure functions, no side effects.
 //!
 //! ```text
 //!   todo → in_progress → review → done
@@ -20,7 +19,7 @@ use indexmap::IndexMap;
 
 use crate::task::{Task, TaskStatus};
 
-/// The transition table (PARITY.md §7.1). This is contract.
+/// The transition table. This is contract.
 fn valid_transitions(from: TaskStatus) -> &'static [TaskStatus] {
     use TaskStatus::*;
     match from {
@@ -56,9 +55,8 @@ pub fn is_dispatchable(status: TaskStatus) -> bool {
 
 /// A collection a dependency id can be resolved against.
 ///
-/// The TS `isBlocked` is overloaded on `Task[] | Map<string, Task>`; this is
-/// the Rust equivalent, so callers keep one function name whether they hold a
-/// list or a pre-built lookup.
+/// `is_blocked` accepts either a list or a pre-built lookup, so callers keep
+/// one function name.
 pub trait TaskSource {
     fn find_task(&self, id: &str) -> Option<&Task>;
 }
@@ -136,8 +134,7 @@ pub fn resolve_completion_status(task: &Task, success: bool, _auto_approve: bool
 /// Retry delay with exponential backoff and a cap: `min(base * 2^attempt, max)`.
 ///
 /// The exponent is `attempt`, **not** `attempt - 1`; callers pass
-/// `task.attempts - 1`, so the first retry waits exactly `base`
-/// (PARITY.md §7.1).
+/// `task.attempts - 1`, so the first retry waits exactly `base`.
 pub fn calculate_retry_delay(attempt: u32, base_delay_ms: u64, max_delay_ms: u64) -> u64 {
     // saturating_pow/mul keeps a pathological attempt count from overflowing;
     // the result is capped immediately afterwards either way.
@@ -149,7 +146,7 @@ pub fn calculate_retry_delay(attempt: u32, base_delay_ms: u64, max_delay_ms: u64
 mod tests {
     use super::*;
 
-    /// The same minimal task the TS `transitions.test.ts` helper builds.
+    /// A minimal task for the tests.
     fn make_task(id: &str, status: TaskStatus, depends_on: &[&str]) -> Task {
         Task {
             id: id.into(),

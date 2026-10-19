@@ -18,7 +18,7 @@ use crate::process::{
 };
 use crate::test_support::recorder::Recorder;
 
-/// The pid the TS `createMockProcessManager` hands back.
+/// The pid the fake process manager hands back.
 pub const FAKE_PID: u32 = 12345;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub enum FakeProcessManagerCall {
     },
 }
 
-/// `is_alive` answers `true` for everything by default, like the TS mock.
+/// `is_alive` answers `true` for everything by default.
 /// Call [`FakeProcessManager::set_dead`] to make specific pids look exited, or
 /// [`FakeProcessManager::set_all_dead`] to flip the default.
 #[derive(Debug, Clone)]
@@ -154,7 +154,7 @@ impl FakeProcessManager {
     }
 
     /// Make one pid look exited — the crash-recovery and zombie-reconcile
-    /// tests turn on this (PARITY.md §7.4, §7.6).
+    /// tests turn on this.
     pub fn set_dead(&self, pid: u32) {
         self.dead_pids
             .lock()

@@ -1,6 +1,5 @@
-//! Ported from `test/unit/infrastructure/pi-adapter.test.ts`, plus the
-//! adapter-only half of `test/integration/pi-adapter.e2e.test.ts` (its
-//! orchestrator assertions belong to WP-4).
+//! Pi adapter tests, including the adapter-only half of the end-to-end suite
+//! (its orchestrator assertions belong to WP-4).
 
 mod support;
 
@@ -567,7 +566,7 @@ async fn an_unparseable_line_becomes_a_text_output() {
 
 #[tokio::test]
 async fn a_carriage_return_is_stripped_but_long_lines_are_not_capped() {
-    // pi's own reader, not the shared one (PARITY §14.13).
+    // pi's own reader, not the shared one.
     let frame = json!({
         "type": "agent_end",
         "messages": [{

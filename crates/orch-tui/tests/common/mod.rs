@@ -1,5 +1,5 @@
 //! The `TestBackend` harness: push a key, draw, assert — synchronously, never
-//! with a sleep (PARITY.md §14.9.3).
+//! with a sleep.
 //!
 //! Each test binary compiles this module separately and uses a subset of it,
 //! so the unused-method lint would fire in every one of them.

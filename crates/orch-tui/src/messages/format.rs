@@ -1,7 +1,6 @@
-//! `formatAgentOutput` and friends — the defensive JSON-shape dispatcher that
+//! Agent-output formatting — the defensive JSON-shape dispatcher that
 //! turns one agent event's `data` / `error` payload into an activity-feed
-//! summary plus the complete received detail (`src/tui/App.tsx`,
-//! docs/parity/tui.md §7).
+//! summary plus the complete received detail.
 //!
 //! The summary is a one-row *preview* and may be cut; the detail is the
 //! canonical body and never is (design D4). A payload over
@@ -13,13 +12,12 @@
 //! Every legacy adapter shape is accepted on purpose: run histories on disk
 //! predate adapter normalization, so a `.jsonl` replay still contains the flat
 //! Codex items, the Codex `item.started` / `item.completed` provider wrapper
-//! and the raw Claude stream envelopes handled below (docs/PARITY.md §12.6).
+//! and the raw Claude stream envelopes handled below.
 //!
-//! TS `.slice(0, n)` and `.length` count UTF-16 code units; the helpers here
-//! count `char`s. The two agree for everything except astral characters
-//! (emoji, CJK extensions), where a cut lands one `char` later than in TS —
-//! which can only shift where an already-truncated line ends, never which
-//! branch is taken.
+//! The helpers here count `char`s, not UTF-16 code units. The two agree for
+//! everything except astral characters (emoji, CJK extensions), where a cut
+//! lands one `char` later than a UTF-16 count would put it — which can only
+//! shift where an already-truncated line ends, never which branch is taken.
 
 use orch_domain::extract_error_message;
 use serde_json::Value;
@@ -80,9 +78,8 @@ pub fn format_agent_output(raw: &str) -> Formatted {
     let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
         return with_detail(extract_summary_from_truncated(raw), raw);
     };
-    // `JSON.parse("null")` succeeds, but the dispatcher's first property read
-    // then throws on `null`, so TS lands in the very same catch block as a
-    // parse failure.
+    // A JSON `null` parses, but the dispatcher cannot read properties from
+    // it, so it takes the same fallback as a parse failure.
     if parsed.is_null() {
         return with_detail(extract_summary_from_truncated(raw), raw);
     }
@@ -132,8 +129,8 @@ pub fn classify_agent_summary(summary: &str) -> Classification {
 /// Format a tool input into a concise hint (`Read` → file basename, `Bash` →
 /// command snippet).
 ///
-/// `_name` is accepted for signature parity with the TS helper, which also
-/// ignores it: the hint is derived entirely from the input shape.
+/// `_name` is accepted for the call sites' signature but ignored: the hint is
+/// derived entirely from the input shape.
 pub fn format_tool_input(_name: &str, input: &Value) -> String {
     // `!input || typeof input !== 'object'` — arrays are objects in JS and
     // fall through to the generic JSON branch below.
@@ -169,8 +166,8 @@ pub fn format_tool_input(_name: &str, input: &Value) -> String {
 /// Extract readable text from a Claude-API content array (or a bare string).
 ///
 /// `None` means "nothing renderable was found" and makes the caller skip the
-/// entry; an empty `Some("")` is falsy in TS and is treated the same way by
-/// every caller here.
+/// entry; an empty `Some("")` is treated the same way by every
+/// caller here.
 pub fn extract_text_from_content(content: &Value, max_len: usize) -> Option<String> {
     if let Value::String(s) = content {
         return Some(slice_chars(s, max_len));
@@ -189,7 +186,7 @@ pub fn extract_text_from_content(content: &Value, max_len: usize) -> Option<Stri
                     // Only the first meaningful line — skips file dumps.
                     let first_line = text.split('\n').find(|l| has_non_space(l)).unwrap_or("");
                     parts.push(slice_chars(first_line, max_len.saturating_sub(total_len)));
-                    // TS adds the *unsliced* length to the running total.
+                    // The *unsliced* length is added to the running total.
                     total_len += char_len(first_line);
                 }
             }
@@ -203,7 +200,7 @@ pub fn extract_text_from_content(content: &Value, max_len: usize) -> Option<Stri
             Some("tool_result") => {
                 // Tool result content is never inlined — just marked.
                 parts.push("\u{2190} (result)".to_owned());
-                // TS adds a hard-coded 10, not the marker's own length.
+                // A hard-coded 10 is added, not the marker's own length.
                 total_len += 10;
             }
             Some("thinking") => {
@@ -247,8 +244,6 @@ pub fn summarize_tool_result(content: &Value) -> String {
     for block in blocks {
         match str_field(block, "type") {
             Some("tool_result") => {
-                // TS also slices `tool_use_id` into a `toolId` local it never
-                // uses; omitted here.
                 let inner = str_field(block, "content").unwrap_or("");
                 let lines = inner.split('\n').count();
                 if truthy(field(block, "is_error")) {
@@ -299,8 +294,8 @@ fn dispatch(parsed: &Value, raw: &str) -> Formatted {
     // so existing .jsonl history benefits from the current item formatting.
     //
     // The item is re-serialized rather than dispatched directly so the nested
-    // call sees the same `raw` TS gives it (its lifecycle-tag check and its
-    // `raw.slice(0, 150)` fallback both read it). Recursion is bounded by
+    // call sees the same `raw` as a top-level call (its lifecycle-tag check and
+    // its 150-char fallback both read it). Recursion is bounded by
     // serde_json's own 128-level nesting limit, which rejects anything deeper
     // before we get here.
     if matches!(ty, Some("item.started") | Some("item.completed")) && truthy(field(parsed, "item"))
@@ -347,7 +342,7 @@ fn dispatch(parsed: &Value, raw: &str) -> Formatted {
         return with_detail(format!("\u{2699} web_search({query})"), raw);
     }
 
-    // ── Canonical AgentEvent data shapes — see adapters/interface.ts.
+    // ── Canonical AgentEvent data shapes.
     if let Some(text) = str_field(parsed, "text")
         && !text.is_empty()
         && !has_type
@@ -474,8 +469,8 @@ fn assistant_text(content: &Value, raw: &str) -> Formatted {
     }
 }
 
-/// `extractTextFromContent(content)` under TS truthiness: `""` is as good as
-/// `null` at every call site.
+/// `extract_text_from_content(content, 200)` where `""` is as good as `null`
+/// at every call site.
 fn renderable(content: &Value) -> Option<String> {
     extract_text_from_content(content, 200).filter(|t| !t.is_empty())
 }
@@ -490,7 +485,7 @@ fn resolve_content(parsed: &Value) -> &Value {
 /* ── Regex fallback for truncated / unparseable payloads ── */
 
 /// Extract a human-readable summary from truncated or unparseable JSON by
-/// scanning for the fields the TS version matches with regexes.
+/// scanning for the fields with regex-style matches.
 fn extract_summary_from_truncated(raw: &str) -> String {
     if let Some(subtype) = match_plain_field(raw, "subtype") {
         return format!("[{subtype}]");
@@ -546,7 +541,7 @@ fn match_plain_field<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
 /// `/"<key>"\s*:\s*"((?:[^"\\]|\\.)*)"/`, then `JSON.parse('"<body>"')`.
 ///
 /// `None` when the pattern does not match or the captured body is not a valid
-/// JSON string — a truncated escape, which TS swallows the same way.
+/// JSON string — a truncated escape, which is swallowed the same way.
 fn match_escaped_field(raw: &str, key: &str) -> Option<String> {
     let body = find_field_value(raw, key, scan_escaped_body)?;
     serde_json::from_str::<String>(&format!("\"{body}\"")).ok()
@@ -959,7 +954,6 @@ mod tests {
 
     #[test]
     fn dotted_codex_lifecycle_events_render_as_their_type() {
-        // app.test.tsx: "excludes dotted Codex lifecycle events".
         let raw = r#"{"type":"thread.started","thread_id":"thread_1"}"#;
         assert_eq!(summary(raw).as_deref(), Some("[thread.started]"));
     }
@@ -1002,7 +996,6 @@ mod tests {
 
     #[test]
     fn legacy_agent_message_renders_its_text() {
-        // app.test.tsx: "renders legacy Codex agent_message text".
         let raw = r#"{"id":"item_0","type":"agent_message","text":"Readable Codex response"}"#;
         assert_eq!(summary(raw).as_deref(), Some("Readable Codex response"));
     }
@@ -1326,7 +1319,8 @@ mod tests {
 
     #[test]
     fn a_json_null_payload_lands_in_the_regex_fallback() {
-        // `parsed.type` throws on `null` in TS, so this takes the catch path.
+        // A `null` payload has no properties to read, so this takes the
+        // fallback path.
         assert_eq!(summary("null").as_deref(), Some("null"));
     }
 
@@ -1374,7 +1368,8 @@ mod tests {
 
     #[test]
     fn a_truncated_assistant_with_a_broken_escape_says_assistant() {
-        // `JSON.parse('"...\\u00"')` throws; TS swallows it and falls through.
+        // A truncated `\u00` escape does not parse; it is swallowed and falls
+        // through.
         let raw = r#"{"type":"assistant","text":"bad \u00"}"#;
         assert_eq!(summary(raw).as_deref(), Some("\u{1F4AC} (assistant)"));
     }
@@ -1535,7 +1530,6 @@ mod tests {
 
     #[test]
     fn agent_error_unwraps_nested_provider_envelopes() {
-        // app.test.tsx: "unwraps nested provider JSON errors".
         let provider = serde_json::to_string(&json!({
             "type": "error",
             "status": 400,
@@ -1798,7 +1792,7 @@ mod tests {
         assert_eq!(first_line_trunc("   \n\tfoo\nbar", 10), "\tfoo");
         // No newline at all — the whitespace-only fast path just slices.
         assert_eq!(first_line_trunc("   ", 10), "   ");
-        // Multi-line but entirely blank — TS falls back to the whole string.
+        // Multi-line but entirely blank — falls back to the whole string.
         assert_eq!(first_line_trunc("\n   ", 10), "\n   ");
     }
 }

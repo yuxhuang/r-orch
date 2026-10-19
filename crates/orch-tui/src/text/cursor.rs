@@ -1,27 +1,22 @@
-//! Grapheme-aware text cursor (`src/tui/text-cursor.ts`).
+//! Grapheme-aware text cursor.
 //!
 //! ARCHITECTURE §4.8: `unicode-segmentation` replaces `Intl.Segmenter`,
 //! `unicode-normalization` replaces `String.normalize('NFC')` and
 //! `unicode-width` replaces the hand-written CJK/emoji width table.
 //!
-//! **[`display_width`] is not byte-equivalent to the TS table, deliberately.**
-//! The TS version tests a handful of explicit ranges (CJK, Hangul, CJK
-//! compatibility, fullwidth forms, `U+1F300..=U+1FAFF`) and answers 1 for
-//! everything else, so it reports 1 for BMP pictographs like `☀` and `✈`, for
-//! an emoji presentation sequence (`base + U+FE0F`), and for a regional-
-//! indicator flag pair — all of which real terminals render two cells wide.
-//! `unicode-width` gets those right, and this module keeps that answer: the
-//! width feeds our own truncation and viewport arithmetic, where being right
-//! about the terminal beats matching a table TS got wrong. Every vector
-//! `text-cursor.test.ts` asserts still matches (the tests below cover them),
-//! and the affected inputs are presentation only — L2 (PARITY §12). The clamp
-//! to `1..=2` stays, because a cell grid cannot render a cluster wider than 2.
+//! **[`display_width`] is deliberately not a hand-written range table.**
+//! A table of explicit ranges (CJK, Hangul, CJK compatibility, fullwidth
+//! forms, `U+1F300..=U+1FAFF`) that answers 1 for everything else would report
+//! 1 for BMP pictographs like `☀` and `✈`, for an emoji presentation sequence
+//! (`base + U+FE0F`), and for a regional-indicator flag pair — all of which
+//! real terminals render two cells wide. `unicode-width` gets those right, and
+//! this module keeps that answer: the width feeds our own truncation and
+//! viewport arithmetic, where being right about the terminal beats matching
+//! such a table. The affected inputs are presentation only. The clamp to
+//! `1..=2` stays, because a cell grid cannot render a cluster wider than 2.
 //!
-//! Unlike the TS class this is *not* immutable-with-shared-segments: the
-//! `_withPos` identity trick exists to avoid re-segmenting in React render, and
-//! the "returns the same instance at a boundary" assertions are JS identity
-//! details (docs/parity/tui.md §10). Rust mutates in place and no-ops at a
-//! boundary.
+//! The cursor is *not* an immutable value with shared segments: Rust mutates
+//! in place and no-ops at a boundary.
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
@@ -56,7 +51,7 @@ fn nfc(text: &str) -> String {
 }
 
 /// Word boundary backward from a grapheme position: skip spaces, then skip the
-/// word. Space-delimited, exactly as the TS helper.
+/// word. Space-delimited.
 fn word_boundary_back(segs: &[String], pos: usize) -> usize {
     if pos == 0 {
         return 0;

@@ -3,8 +3,7 @@
 //! The TUI talks to the engine through a narrow facade
 //! (`orch_tui::backend::TuiBackend`). This module implements the engine half of
 //! it: [`backend::EngineBackend`] wraps a [`orch_engine::FullEngine`] and turns
-//! each of the TS `registerTuiCommand` callbacks
-//! (`src/cli/commands/tui.ts`) into one method.
+//! each of the TUI's backend callbacks into one method.
 //!
 //! It lives in `orch-cli` rather than in either neighbour because that is the
 //! only placement that keeps the dependency graph honest: `orch-engine` must
@@ -28,8 +27,7 @@
 //!
 //! That last group looks like it wants to be fire-and-forget, and an earlier
 //! version of this module spawned it and reported failures as
-//! `orchestrator:error`. That is wrong, and docs/parity/tui.md §12.10 forbids
-//! it: **nothing renders `orchestrator:error`** — there is no such arm
+//! `orchestrator:error`. That is wrong: **nothing renders `orchestrator:error`** — there is no such arm
 //! anywhere in `orch-tui` — so an error delivered only through the event
 //! stream is invisible, and the dashboard would report a lock conflict as
 //! success. Awaiting costs little, because none of the four waits on an agent
@@ -45,13 +43,12 @@
 //!
 //! When `start_watch` fails because another process holds the lock, the
 //! dashboard becomes a read-only observer of *that* orchestrator: the error is
-//! suppressed in favour of the header badge (`tui.ts:314`), and
+//! suppressed in favour of the header badge, and
 //! [`command::attach_observer`] points `serve::disk_observer` at
 //! [`backend::EngineBackend::observer_sink`], so disk-derived events reach the
 //! same queue as in-process ones. Three differences are visible in that mode,
 //! all faithful: the `● OBSERVING` chip, a 3 s poll instead of 5 s, and stale
-//! teams — the periodic refresh passes `include_teams = false`
-//! (`App.tsx:826`).
+//! teams — the periodic refresh passes `include_teams = false`.
 
 pub mod backend;
 pub mod command;

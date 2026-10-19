@@ -1,11 +1,11 @@
-//! Agent service — ported from `src/application/agent-service.ts`.
+//! Agent service.
 //!
 //! CRUD, availability and the scoring that picks an agent for a task.
 //!
 //! The one piece worth reading the source for is [`AgentService::find_best_agent`]:
 //! its tie-breaking is `agentStore.list()` order, which is `_index.json` order,
-//! which is **last-write** order. r-orch **replicates** that rather than fixing
-//! it (PARITY.md §14.4), which is why the scoring sort must be stable — the
+//! which is **last-write** order. that order is kept rather than fixed,
+//! which is why the scoring sort must be stable — the
 //! workspace `clippy.toml` denies `sort_unstable*` to enforce it.
 
 use std::collections::HashSet;
@@ -23,10 +23,10 @@ use crate::events::EventBus;
 
 /// Fields `agent edit` may change.
 ///
-/// Three-state on purpose, mirroring the TS `fields.x !== undefined` checks:
+/// Three-state on purpose:
 /// `None` leaves the field alone, and for the string fields an empty value
 /// **clears** it (`fields.model || undefined`). `effort` needs the extra layer
-/// because its cleared form in TS is the literal `''`, which is not a valid
+/// because its cleared form is the literal `''`, which is not a valid
 /// `ReasoningEffort`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateAgentFields {
@@ -40,8 +40,7 @@ pub struct UpdateAgentFields {
 }
 
 /// A partial update to [`AgentStats`]. `None` leaves a counter untouched,
-/// which is what the TS `Object.assign(agent.stats, update)` does for an
-/// absent key.
+/// (an absent key merges nothing).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgentStatsUpdate {
     pub tasks_completed: Option<u64>,
@@ -76,7 +75,7 @@ impl AgentService {
         }
     }
 
-    /// `create` emits **no event** — the TS version does not either, which is
+    /// `create` emits **no event**, which is
     /// why `agent add` produces no `task:created`-style record.
     pub async fn create(&self, input: CreateAgentInput) -> Result<Agent> {
         let name = input.name.trim();
@@ -113,7 +112,7 @@ impl AgentService {
             config: AgentConfig {
                 command: command.map(str::to_owned),
                 // `model` and `effort` are forced absent for shell, whatever
-                // was passed (PARITY.md §4.2).
+                // was passed.
                 model: if is_shell { None } else { input.model },
                 effort: if is_shell { None } else { input.effort },
                 // Shell defaults to `auto` rather than the configured default.
@@ -219,7 +218,7 @@ impl AgentService {
                 return Err(Error::invalid_arguments("Agent name cannot be empty"));
             }
             // The duplicate check excludes self, so a no-op rename is allowed.
-            // The message interpolates the *untrimmed* input, as the TS does.
+            // The message interpolates the *untrimmed* input.
             if let Some(existing) = self.agents.get_by_name(trimmed).await?
                 && existing.id != id
             {
@@ -381,7 +380,7 @@ impl AgentService {
         Ok(agent)
     }
 
-    /// Pick the best idle agent for a task (PARITY.md §7.7).
+    /// Pick the best idle agent for a task.
     ///
     /// - An explicit `assignee` is a **hard constraint**: it is matched by id
     ///   or name across *all* agents and returned only if idle. Otherwise the
@@ -392,7 +391,7 @@ impl AgentService {
     ///   success rate.
     ///
     /// The final `sort_by` is **stable**, so equal scores keep
-    /// `AgentStore::list` order (PARITY.md §14.4).
+    /// `AgentStore::list` order.
     pub async fn find_best_agent(&self, task: &Task) -> Result<Option<Agent>> {
         let agents = self.agents.list().await?;
         Ok(Self::find_best_in(task, agents))
@@ -417,7 +416,7 @@ impl AgentService {
             return assigned.filter(|a| agent_eligible(task, a));
         }
 
-        // Lower-cased once, as the TS does, because the inner loops are O(n·m).
+        // Lower-cased once because the inner loops are O(n·m).
         let lower_labels: Vec<String> = task.labels.iter().map(|l| l.to_lowercase()).collect();
         let labels = (!lower_labels.is_empty()).then_some(lower_labels.as_slice());
 
@@ -452,7 +451,7 @@ pub fn agent_eligible(task: &Task, agent: &Agent) -> bool {
             .all(|cap| agent.capabilities.iter().any(|actual| actual == cap))
 }
 
-/// The scoring from PARITY.md §7.7. Split out so it is unit-testable without
+/// The agent scoring. Split out so it is unit-testable without
 /// a store, and so the weights sit in one place.
 fn score_agent(agent: &Agent, lower_labels: Option<&[String]>) -> i64 {
     let mut score = 0i64;
@@ -465,8 +464,8 @@ fn score_agent(agent: &Agent, lower_labels: Option<&[String]>) -> i64 {
     }
 
     // `contains`, not equality: a label of "end" matches both "frontend" and
-    // "backend". That is a known false-positive source the TS suite asserts on
-    // deliberately, so it is replicated.
+    // "backend". That is a known false-positive source that the tests assert on
+    // deliberately.
     if let (Some(labels), Some(role)) = (lower_labels, agent.role.as_deref()) {
         let lower_role = role.to_lowercase();
         if labels.iter().any(|l| lower_role.contains(l.as_str())) {
@@ -488,7 +487,7 @@ fn score_agent(agent: &Agent, lower_labels: Option<&[String]>) -> i64 {
 
 /// `Math.round`: half rounds **up** (towards +∞), unlike Rust's `f64::round`,
 /// which rounds half away from zero. The inputs here are non-negative so the
-/// two agree, but spelling it out keeps the parity claim checkable.
+/// two agree, but spelling it out keeps the intent checkable.
 fn js_round(value: f64) -> i64 {
     (value + 0.5).floor() as i64
 }
@@ -617,8 +616,7 @@ mod tests {
         );
     }
 
-    /// The local factory from `agent-service.test.ts`, which differs from the
-    /// shared one: adapter `claude`, approval policy `suggest`.
+    /// The local factory, which differs from the shared one: adapter `claude`, approval policy `suggest`.
     fn agent(id: &str) -> Agent {
         Agent {
             id: id.into(),
@@ -698,8 +696,7 @@ mod tests {
             .await
             .unwrap();
 
-        // PARITY.md §4.2 — shell forces approval_policy auto and drops
-        // model/effort.
+        // Shell forces approval_policy auto and drops model/effort.
         assert_eq!(agent.adapter, "shell");
         assert_eq!(agent.config.command.as_deref(), Some("echo hello"));
         assert_eq!(agent.config.approval_policy, Some(ApprovalPolicy::Auto));
@@ -1461,7 +1458,7 @@ mod tests {
 
     #[tokio::test]
     async fn role_matching_is_a_substring_test_and_can_false_positive() {
-        // Replicated deliberately: "end" is inside both "frontend" and
+        // Deliberate: "end" is inside both "frontend" and
         // "backend", so both score 50 and the earlier pool entry wins.
         let mut first = agent("agt_1");
         first.name = "agent-1".into();
@@ -1542,7 +1539,7 @@ mod tests {
         );
     }
 
-    /// `defensive-validation.test.ts` Fix #4: a task whose `labels` is absent
+    /// Defensive validation: a task whose `labels` is absent
     /// or `null` must not crash the scorer. Rust's `Vec<String>` with
     /// `#[serde(default)]` makes both deserialize to an empty vector, so the
     /// crash is unrepresentable — this pins the resulting score instead.

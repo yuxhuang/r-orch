@@ -1,4 +1,4 @@
-//! Task domain model — the unit of work (`src/domain/task.ts`).
+//! Task domain model — the unit of work.
 //!
 //! A task moves through `todo → in_progress → review → done`; see
 //! [`crate::transitions`] for the transition table.
@@ -168,7 +168,7 @@ pub struct TaskProof {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
     /// Required even when empty — a task that succeeded with no file changes
-    /// still writes `proof: { files_changed: [] }` (PARITY.md §6.8).
+    /// still writes `proof: { files_changed: [] }`.
     #[serde(default)]
     pub files_changed: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,8 +177,7 @@ pub struct TaskProof {
     pub agent_summary: Option<String>,
 }
 
-/// Field order mirrors the TS `Task` interface, which is the YAML emission
-/// order (PARITY.md §6.8).
+/// Field order is the YAML emission order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -211,7 +210,7 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
     /// camelCase among snake_case fields. This is the on-disk and `--json` key
-    /// name, so it is L0 and cannot be normalized (PARITY.md §14.2).
+    /// name, so it is part of the data contract and cannot be normalized.
     #[serde(rename = "goalId", default, skip_serializing_if = "Option::is_none")]
     pub goal_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,7 +273,7 @@ mod tests {
 
     #[test]
     fn minimal_task_omits_every_optional_field() {
-        // PARITY.md §4.2: the as-created shape.
+        // The as-created shape.
         let task = Task {
             id: "tsk_k3GVRqg".into(),
             title: "Second task".into(),

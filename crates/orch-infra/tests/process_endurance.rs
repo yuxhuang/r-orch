@@ -1,8 +1,7 @@
-//! Ported from `test/unit/infrastructure/process-endurance.test.ts` and the
-//! `process.kill failures` half of `error-paths.test.ts`.
+//! Process endurance and `process.kill` failure tests.
 //!
-//! These drive **real** processes. The TS suite skips them under `CI`; these
-//! run everywhere, because they cover the one part of the layer where a
+//! These drive **real** processes. They run everywhere,
+//! including `CI`, because they cover the one part of the layer where a
 //! mistake is invisible until production: reaping. A tokio child that is
 //! never waited on stays a zombie, and `kill(pid, 0)` keeps answering
 //! "alive" — so a dropped `is_alive` contract would show up here and nowhere
@@ -134,7 +133,7 @@ async fn the_group_kill_cleans_up_the_children_of_the_child() {
                 // trailing foreground `sleep` was a race: a child forked
                 // between the SIGTERM and the shell's death joins the group
                 // unsignalled, and `kill_with_grace` returns without ever
-                // sending SIGKILL — faithfully to the TS.
+                // sending SIGKILL.
                 "sleep 30 & sleep 30 & sleep 30 & sleep 30 & printf 'up\\n'; wait".to_owned(),
             ],
             SpawnOptions::default(),

@@ -2,12 +2,12 @@
 //!
 //! WP-0b wired the walking-skeleton slice — `init`, `agent add`, `task add`,
 //! `task list` — end to end. WP-5 extends the tree in place: [`tree`] now
-//! carries all seventeen commands, and [`routing`] holds the three L0 routing
-//! properties (container-before-parse, the help fast path, Commander's exit
-//! codes) that the parity harness exercises from its first scenario.
+//! carries all seventeen commands, and [`routing`] holds the three routing
+//! properties (container-before-parse, the help fast path, the usage exit
+//! codes).
 //!
 //! Commands whose behaviour needs WP-4's services land with those services;
-//! until then they parse (so V1's surface check is honest) and report that
+//! until then they parse (so the surface check is honest) and report that
 //! they are not wired rather than pretending to work. [`not_wired`] is the one
 //! place that happens, and `crates/orch-cli/TEST-MAP.md` lists them.
 
@@ -106,7 +106,7 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// `findProjectRoot` + `paths.isInitialized()`, synchronously: this runs
+/// Whether the project root is initialized, checked synchronously: this runs
 /// before the runtime exists.
 fn is_initialized(cwd: &std::path::Path) -> bool {
     let root = orch_infra::storage::find_project_root(cwd);
@@ -615,7 +615,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             peer,
         })) => {
             // The argument check is the command's own, and it exits 2 before
-            // anything else happens (`docs/parity/cli.md` §13.1).
+            // anything else happens.
             if !*watch && !*all && task_id.is_none() {
                 print_error(
                     &styles_for(cli, env),
@@ -664,10 +664,10 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             .await
         }
 
-        // Bare `orch` is the first-run experience (PARITY.md §2.3): it inits
+        // Bare `orch` is the first-run experience: it inits
         // if needed and launches the dashboard. `is_bare` is the routing
-        // guard's own answer to "no arguments at all", which is what the
-        // reference tests before appending `tui` (`cli.ts:206`) — the arm that
+        // guard's own answer to "no arguments at all", which is what
+        // decides whether to append `tui` — the arm that
         // landed on master guessed it from `args_os().count()` pending this.
         None if shape.is_bare => {
             tui::first_run(
@@ -683,7 +683,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             .await
         }
 
-        // Flags but no subcommand (`orch --json`): the reference appends `tui`
+        // Flags but no subcommand (`orch --json`): `tui` is appended
         // only for a bare argv, so this prints the root help instead.
         None => Ok(print_group_help_root()),
     }
@@ -712,7 +712,6 @@ async fn run_init(
                     .join(", ")
             )),
         );
-        // An explicit `process.exit(2)` guard in the original.
         return Ok(ExitCode::from(2));
     }
 
@@ -807,15 +806,14 @@ fn version() -> &'static str {
 ///
 /// Until now nothing installed a subscriber, so every `tracing::warn!` in the
 /// engine, the adapters and the stores went nowhere: the swallowed-error paths
-/// that are deliberate parity decisions (a corrupt lock, an unreadable entity
+/// that are deliberate decisions (a corrupt lock, an unreadable entity
 /// file, a dropped event) left no trace at all, and the first question in any
 /// incident — "what did it decide to ignore?" — had no answer.
 ///
 /// Three rules, in this order of importance:
 ///
-/// 1. **stderr, never stdout.** Stdout is the contract: the differential
-///    harness compares it byte for byte and `--json` output has to stay
-///    parseable, so a diagnostic there would corrupt both.
+/// 1. **stderr, never stdout.** Stdout is the contract: it is compared
+///    byte for byte and `--json` output has to stay parseable, so a diagnostic there would corrupt both.
 /// 2. **Silent by default**, so no invocation's output changes.
 /// 3. `RUST_LOG` takes an `EnvFilter` for anyone who knows what they want;
 ///    `ORCHESTRY_DEBUG` — which already exists, as the flag that prints an
@@ -863,7 +861,7 @@ async fn build(
 }
 
 /// A command group invoked with no subcommand prints its help to **stdout**
-/// and exits **1** (`docs/parity/cli.md` §3.6).
+/// and exits **1**.
 fn print_group_help(path: &[&str]) -> ExitCode {
     let mut command = Cli::command();
     for segment in path {
@@ -883,9 +881,8 @@ fn print_group_help_root() -> ExitCode {
     ExitCode::from(1)
 }
 
-/// `parseInt(value, 10)`: leading whitespace, an optional sign, then as many
-/// digits as there are — `"3abc"` is `3` and `"abc"` is `NaN`, which is `None`
-/// here.
+/// Leading whitespace, an optional sign, then as many digits as there are —
+/// `"3abc"` is `3` and `"abc"` is `None`.
 pub(crate) fn js_parse_int(raw: &str) -> Option<i64> {
     let text = raw.trim_start();
     let (sign, digits) = match text.strip_prefix('-') {
@@ -901,15 +898,9 @@ pub(crate) fn js_parse_int(raw: &str) -> Option<i64> {
     digits[..end].parse::<i64>().ok().map(|value| sign * value)
 }
 
-/// `parseInt(value, 10)` where the resulting `NaN` would be **stored** rather
-/// than validated.
-///
-/// The original writes `NaN` straight into the entity (and then into YAML as
-/// `.nan`) for `--max-attempts`, `--max-turns`, or kills the command with
-/// `Invalid time value` for `--ttl`. Neither is worth reproducing, so a
-/// non-numeric value is rejected here instead — a recorded divergence, and the
-/// only one in this file. `--priority`, which the contract *does* measure, is
-/// [`parse_priority`].
+/// A non-numeric value is rejected for `--max-attempts`, `--max-turns` and
+/// `--ttl` rather than stored as `NaN` in the entity. `--priority` is
+/// different: see [`parse_priority`].
 pub(crate) fn parse_int(raw: &str, flag: &str) -> Result<i64> {
     js_parse_int(raw)
         .ok_or_else(|| Error::invalid_arguments(format!("--{flag} must be an integer")))

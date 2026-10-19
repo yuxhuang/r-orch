@@ -1,9 +1,8 @@
-//! Counted wizard-catalogue cases (docs/parity/tui.md §5, docs/PARITY.md
-//! §12.5) — one case per spec item, numbered `w001..`, grouped to match the
-//! spec's own section order:
+//! Counted wizard-catalogue cases — one case per spec item, numbered
+//! `w001..`, grouped to match the spec's own section order:
 //!
 //! 1. NEW AGENT (steps, skips, options, mappers)
-//! 2. AGENT SHOP (templates, `applyShopTemplate`)
+//! 2. AGENT SHOP (templates)
 //! 3. NEW AGENT — {template} / EDIT AGENT
 //! 4. NEW TASK / EDIT TASK
 //! 5. NEW TEAM
@@ -504,11 +503,8 @@ fn w024_agent_from_shop_wizard_prefills_the_name_step() {
     assert_eq!(wizard.text_value(), "QA Engineer");
 }
 
-/// docs/PARITY.md §12.5 says "EDIT AGENT (9)" but the actual step list (and
-/// docs/parity/tui.md §5.2's own "minus skills and approval_policy" from the
-/// 10-step NEW AGENT catalogue) is 8. Documented as a discrepancy in the
-/// report rather than "fixed" here — this test asserts the implementation's
-/// actual, tui.md-consistent behaviour.
+/// EDIT AGENT has 8 steps: the 10-step NEW AGENT catalogue minus skills and
+/// approval_policy.
 #[test]
 fn w025_edit_agent_has_eight_steps_minus_skills_and_approval_policy() {
     let agent = make_agent("agt_1", "alpha", AgentStatus::Idle);

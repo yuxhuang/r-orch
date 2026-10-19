@@ -1,15 +1,14 @@
-//! Global config store — ported from
-//! `src/infrastructure/storage/global-config-store.ts`.
+//! Global config store.
 //!
 //! `~/.orchestry/global.yml`, shared across projects, with the path
 //! overridable by `ORCHESTRY_GLOBAL_CONFIG_PATH` (trimmed and resolved).
 //! Reads are **defensive**: an unknown palette falls back to `amber`,
 //! `activity_filter` is deliberately *not* validated, and a non-boolean
 //! notification flag falls back to its default
-//! ([`GlobalConfig::from_raw`], PARITY.md §6.12).
+//! ([`GlobalConfig::from_raw`]).
 //!
-//! The override is the only thing that keeps a test or the parity harness off
-//! the developer's real preferences, so it is read per call rather than
+//! The override is the only thing that keeps tests off the developer's real
+//! preferences, so it is read per call rather than
 //! cached.
 
 use std::path::PathBuf;
@@ -22,8 +21,8 @@ use orch_domain::{GlobalConfig, default_global_config};
 use super::fs_utils::{ensure_dir, read_yaml_value, write_yaml};
 
 /// `ORCHESTRY_GLOBAL_CONFIG_PATH` redirects `global.yml` **only** — the two
-/// update-check files have no override at all, which is why the harness sets
-/// `HOME` as well (PARITY.md §6.1).
+/// update-check files have no override at all, which is why tests that
+/// isolate it set `HOME` as well.
 pub const GLOBAL_CONFIG_PATH_ENV: &str = "ORCHESTRY_GLOBAL_CONFIG_PATH";
 
 #[derive(Debug, Clone, Default)]
@@ -93,9 +92,9 @@ impl GlobalConfigStore for FileGlobalConfigStore {
     async fn read(&self) -> Result<GlobalConfig> {
         let path = self.path();
         // A malformed file must not break every command that reads
-        // preferences, so a parse failure degrades to the defaults — the TS
-        // `readYaml` would throw, but its caller treats a missing file the
-        // same way and nothing downstream can act on the error.
+        // preferences, so a parse failure degrades to the defaults — a missing
+        // file is treated the same way and nothing downstream can act on the
+        // error.
         match read_yaml_value(&path).await {
             Ok(Some(value)) => {
                 let json = serde_json::to_value(&value).map_err(|err| {
@@ -158,12 +157,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_written_file_matches_the_reference_shape() {
+    async fn the_written_file_has_the_expected_shape() {
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path());
         store.write(&default_global_config()).await.unwrap();
 
-        // PARITY.md §6.12.
         assert_eq!(
             tokio::fs::read_to_string(store.path()).await.unwrap(),
             "tui:\n  palette: amber\n  activity_filter: all\n  notifications:\n    toast: true\n    bell: false\n"
@@ -200,7 +198,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Deliberately passes through (PARITY.md §6.12).
+        // Deliberately passes through.
         assert_eq!(
             store.read().await.unwrap().tui.activity_filter,
             "something-new"

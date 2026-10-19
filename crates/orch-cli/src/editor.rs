@@ -1,15 +1,14 @@
-//! `$EDITOR` round-trips — ported from `src/cli/editor.ts`
-//! (`docs/parity/cli.md` §21.1).
+//! `$EDITOR` round-trips.
 //!
 //! Used by `task add -e`, `task edit`, `agent add -e` and `agent edit`.
 //! `config edit` spawns the editor on the real config file instead.
 //!
-//! **There is no TTY check**, in the reference or here: in a non-TTY the
+//! **There is no TTY check**: in a non-TTY the
 //! editor is still spawned with inherited stdio and typically fails, which
 //! surfaces as `Editor exited with code <n>` and exit 1. There is no
 //! `--yes`/non-interactive fallback to reproduce.
 //!
-//! The two buffer formats are L0 — they are how a user's edit reaches a
+//! The two buffer formats are contract — they are how a user's edit reaches a
 //! `Task` or an `Agent` record — so the parsers are what the tests pin, not
 //! the spawning.
 
@@ -58,7 +57,7 @@ pub fn agent_buffer(name: &str, command: &str, model: &str, role: &str) -> Strin
     )
 }
 
-/// `fromEditorContent` — frontmatter, then a free-form body.
+/// Frontmatter, then a free-form body.
 ///
 /// With no frontmatter fence the **whole** buffer is the description, and an
 /// empty buffer changes nothing.
@@ -95,7 +94,7 @@ pub fn parse_task_content(content: &str) -> TaskEdit {
     edit
 }
 
-/// `fromAgentEditorContent`.
+/// Parse the agent editor buffer.
 ///
 /// Comment lines are stripped **only before the first fence**, so a `#` inside
 /// the role body survives — a role description full of markdown headings is
@@ -166,7 +165,7 @@ fn frontmatter_pairs(frontmatter: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The editor command, in the reference's precedence order.
+/// The editor command, in precedence order.
 pub fn editor_command() -> String {
     std::env::var("EDITOR")
         .ok()
@@ -183,7 +182,7 @@ pub fn editor_command() -> String {
 /// inherited stdio, and return what came back.
 ///
 /// The temporary file and its directory are removed afterwards, including on
-/// the error paths — the reference does the same in a `finally`.
+/// the error paths (a drop guard).
 pub async fn open_in_editor(initial_content: &str, extension: &str) -> Result<String> {
     let dir = tempfile::Builder::new()
         .prefix("orch-")
@@ -199,7 +198,7 @@ pub async fn open_in_editor(initial_content: &str, extension: &str) -> Result<St
     let edited = tokio::fs::read_to_string(&path)
         .await
         .map_err(|err| Error::io("read the editor buffer", &path, err))?;
-    // `dir` is removed when it drops, which is the `finally` in the original.
+    // `dir` is removed when it drops.
     Ok(edited)
 }
 

@@ -1,9 +1,8 @@
-//! Path resolution for `.orchestry/` — ported from
-//! `src/infrastructure/storage/paths.ts`.
+//! Path resolution for `.orchestry/`.
 //!
 //! All path construction goes through here, and every id embedded in a path
 //! goes through [`sanitize_id`]. That is the path-traversal defence and it
-//! **rejects** rather than sanitizes (PARITY.md §6.2).
+//! **rejects** rather than sanitizes.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -172,7 +171,7 @@ impl Paths {
 ///
 /// Rejects — never rewrites — anything else, so a context key containing `/`
 /// or `..` is an error rather than a silently different key. The message is
-/// contract: `Invalid identifier: "<id>"` (PARITY.md §6.2).
+/// contract: `Invalid identifier: "<id>"`.
 pub fn sanitize_id(id: &str) -> Result<&str> {
     let valid = !id.is_empty()
         && id
@@ -206,10 +205,10 @@ fn sanitize_path_segment(id: &str) -> Result<&str> {
     Ok(id)
 }
 
-/// Reject a workspace path outside the project root (PARITY.md §10.7).
+/// Reject a workspace path outside the project root.
 ///
-/// Uses lexical normalization rather than `canonicalize`, because the TS
-/// `path.resolve` does not touch the filesystem and the path may not exist yet.
+/// Uses lexical normalization rather than `canonicalize`, because it must
+/// not touch the filesystem and the path may not exist yet.
 pub fn validate_workspace_path(workspace_path: &Path, project_root: &Path) -> Result<()> {
     let resolved = lexically_resolve(workspace_path);
     let root = lexically_resolve(project_root);
@@ -251,9 +250,8 @@ fn lexically_resolve(path: &Path) -> PathBuf {
 /// Walk up from `start_dir` looking for `.orchestry/`; return `start_dir`
 /// resolved when none is found, which is what `init` needs.
 ///
-/// The TS version memoizes this per start directory. A Rust CLI process runs
-/// one command and exits, so the cache would never be hit a second time; it is
-/// deliberately omitted rather than ported.
+/// Not memoized: a CLI process runs one command and exits, so a cache would
+/// never be hit a second time.
 pub fn find_project_root(start_dir: &Path) -> PathBuf {
     let start = lexically_resolve(start_dir);
     let mut dir = start.as_path();
@@ -401,17 +399,16 @@ mod tests {
     }
 
     /// `..` passes `^[A-Za-z0-9._-]+$` — `.` is in the character class — so the
-    /// TypeScript `sanitizeId` **accepts** it, and so must we. Verified
-    /// against the reference regex rather than assumed.
+    /// id check **accepts** it. Verified against the regex rather than
+    /// assumed.
     ///
     /// It is harmless everywhere an extension is appended (`..` + `.yml` is
     /// the ordinary filename `...yml`). The one builder that appends nothing
     /// is `task_attachments_dir`, where `..` would resolve to the parent
-    /// directory — a latent traversal in the original, unreachable because
-    /// task ids are generated, never user-supplied. Recorded, not silently
-    /// diverged from.
+    /// directory — a latent traversal, unreachable because
+    /// task ids are generated, never user-supplied. Recorded here.
     #[test]
-    fn dot_dot_is_accepted_exactly_as_the_reference_regex_accepts_it() {
+    fn dot_dot_is_accepted_by_the_id_regex() {
         assert_eq!(sanitize_id("..").unwrap(), "..");
         let paths = paths();
         assert_eq!(
@@ -424,10 +421,10 @@ mod tests {
         );
         // The one builder with no extension to absorb it **used** to return
         // `attachments/..`, i.e. `.orchestry/` itself. The id-level
-        // acceptance above is still faithful to the reference regex — that is
-        // what this test exists to record — but the extension-less builder
-        // now refuses it (security C2). The parity fact and the guard are
-        // different things, and both are asserted.
+        // acceptance above still follows the regex — that is what this test
+        // exists to record — but the extension-less builder now refuses it
+        // (security C2). The acceptance and the guard are different things,
+        // and both are asserted.
         assert!(paths.task_attachments_dir("..").is_err());
     }
 

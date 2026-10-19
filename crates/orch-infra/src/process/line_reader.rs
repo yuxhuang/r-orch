@@ -1,17 +1,14 @@
-//! The stdout line splitters, ported from `readLines`
-//! (`src/infrastructure/process/process-manager.ts:104-141`) and pi's private
-//! `readPiRpcLines` (`src/infrastructure/adapters/pi.ts:589-625`).
+//! The stdout line splitters: the shared reader and pi's private reader.
 //!
 //! These are byte-level newline splitters, **not** text readers, and
-//! deliberately not `AsyncBufReadExt::lines()` (PARITY.md §8.5):
+//! deliberately not `AsyncBufReadExt::lines()`:
 //!
 //! 1. the delimiter is `0x0A` only — a trailing `\r` is **kept**;
 //! 2. zero-length lines are **dropped**;
 //! 3. a trailing fragment with no final newline **is** yielded;
 //! 4. each line is capped at [`MAX_LINE_LEN`] UTF-16 code units.
 //!
-//! Pi opts out of (1) and (4), which is a replicated divergence
-//! (PARITY.md §14.13).
+//! Pi opts out of (1) and (4).
 
 use std::io;
 
@@ -31,9 +28,8 @@ pub const MAX_LINE_LEN: usize = 16384;
 /// pipe.
 const READ_CHUNK: usize = 16384;
 
-/// Truncate to [`MAX_LINE_LEN`] **UTF-16 code units**, because the TS cap is
-/// `String.prototype.slice`, which counts code units rather than bytes or
-/// chars.
+/// Truncate to [`MAX_LINE_LEN`] **UTF-16 code units**, because the cap counts
+/// code units rather than bytes or chars.
 ///
 /// One unavoidable divergence: JS can slice *inside* a surrogate pair and keep
 /// the lone high surrogate, which a Rust `String` cannot hold, so a character
@@ -70,7 +66,7 @@ where
 
 /// Pi's reader: no 16 KB cap (its `agent_end` frame carries the whole
 /// transcript and truncating it would corrupt the terminal event) and a
-/// trailing `\r` is stripped (PARITY.md §14.13).
+/// trailing `\r` is stripped.
 pub fn read_pi_lines<R>(reader: R) -> impl Stream<Item = io::Result<String>> + Send
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -100,7 +96,7 @@ where
             let mut offset = 0;
             while let Some(found) = pending[offset..].iter().position(|b| *b == b'\n') {
                 let newline = offset + found;
-                // `newline > offset` is the TS empty-line drop.
+                // `newline > offset` drops empty lines.
                 if newline > offset {
                     yield decode(&pending[offset..newline], cap, strip_cr);
                 }

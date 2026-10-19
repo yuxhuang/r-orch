@@ -610,7 +610,7 @@ fn write_commands_print_the_same_shape_in_yaml_as_in_json() {
 /// The failing invocation `args` behaves the same with `--yaml` as with
 /// `--json` and with neither flag: same exit code, same stdout bytes and the
 /// same stderr bytes. Returns the (shared) stderr for further assertions.
-fn assert_error_parity(cwd: &Path, home: &Path, args: &[&str]) -> Vec<u8> {
+fn assert_same_error_across_formats(cwd: &Path, home: &Path, args: &[&str]) -> Vec<u8> {
     let run = |flag: Option<&str>| {
         let mut command = orch_in(home, cwd);
         command.args(args);
@@ -647,25 +647,26 @@ fn assert_error_parity(cwd: &Path, home: &Path, args: &[&str]) -> Vec<u8> {
 #[test]
 fn a_missing_agent_fails_under_yaml_like_under_json() {
     let p = project(false);
-    assert_error_parity(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
+    assert_same_error_across_formats(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
 }
 
 #[test]
 fn a_missing_task_fails_under_yaml_like_under_json() {
     let p = project(false);
-    assert_error_parity(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
+    assert_same_error_across_formats(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
 }
 
 #[test]
 fn an_uninitialized_project_fails_under_yaml_like_under_json() {
     let dir = scratch();
-    assert_error_parity(&dir.path().join("p"), dir.path(), &["task", "list"]);
+    assert_same_error_across_formats(&dir.path().join("p"), dir.path(), &["task", "list"]);
 }
 
 #[test]
 fn a_missing_agent_prints_identical_stderr_under_yaml_json_and_human() {
     let p = project(false);
-    let err = assert_error_parity(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
+    let err =
+        assert_same_error_across_formats(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
     assert_eq!(
         String::from_utf8_lossy(&err),
         "  \u{2715} Agent not found: agt_nope\n"
@@ -675,7 +676,8 @@ fn a_missing_agent_prints_identical_stderr_under_yaml_json_and_human() {
 #[test]
 fn a_missing_task_prints_identical_stderr_under_yaml_json_and_human() {
     let p = project(false);
-    let err = assert_error_parity(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
+    let err =
+        assert_same_error_across_formats(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
     assert_eq!(
         String::from_utf8_lossy(&err),
         "  \u{2715} Task not found: tsk_nope\n"
@@ -687,7 +689,8 @@ fn an_uninitialized_project_prints_identical_two_line_stderr_under_yaml_json_and
     // The message spans two lines; it is not a YAML document and must not be
     // reshaped into one under --yaml.
     let dir = scratch();
-    let err = assert_error_parity(&dir.path().join("p"), dir.path(), &["task", "list"]);
+    let err =
+        assert_same_error_across_formats(&dir.path().join("p"), dir.path(), &["task", "list"]);
     assert_eq!(
         String::from_utf8_lossy(&err),
         "  \u{2715} Not initialized\n    Run: orch init\n"

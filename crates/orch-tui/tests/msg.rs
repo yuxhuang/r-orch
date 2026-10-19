@@ -1,6 +1,6 @@
 //! Counted messaging cases: bracketed paste, the `/msg` verb, its grammar at
 //! the App level, autocomplete, the `m` binding and the recipient chip
-//! (design-v2 §3, PARITY.md §12.8 row (l)), numbered `msg001..`.
+//! (design-v2 §3), numbered `msg001..`.
 //!
 //! The safety properties live here rather than in `msg.rs`'s unit tests: that
 //! module cannot reach a selection or a backend, and these cases are what

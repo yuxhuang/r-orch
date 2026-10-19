@@ -1,4 +1,4 @@
-//! Event collection and completion handling (PARITY.md §7.8, §7.9, §7.20).
+//! Event collection and completion handling.
 //!
 //! `collect_events` runs detached, one task per run. It is the only place that
 //! touches state outside a phase, and it does so for one field —
@@ -29,9 +29,8 @@ use crate::review_runner::{ReviewRunner, ReviewRunnerOptions, all_passed, format
 
 /// Whether a string is a timestamp `Date.prototype.toISOString` would produce.
 ///
-/// The TS check is `new Date(v).toISOString() === v`, which accepts **only**
-/// the canonical form — so `2025-01-01T00:00:00Z` (no milliseconds) is
-/// *rejected* even though it parses. Replicated, because the fallback it
+/// Only the canonical form is accepted — so `2025-01-01T00:00:00Z` (no
+/// milliseconds) is *rejected* even though it parses. That is intended: the fallback it
 /// triggers (mint a fresh timestamp) is what the event stream records.
 pub(super) fn is_valid_iso_timestamp(value: &str) -> bool {
     epoch_ms_from_iso(value)
@@ -96,7 +95,7 @@ impl Orchestrator {
             let event = match item {
                 Ok(event) => event,
                 // The adapter's generator threw: the run failed. The stream
-                // ends here, as the TS generator does.
+                // ends here.
                 Err(err) => {
                     stream_error = Some(err);
                     break;
@@ -667,7 +666,7 @@ impl Orchestrator {
 
         if failure_status == TaskStatus::Retrying {
             // `attempts - 1` as the exponent, so the first retry waits exactly
-            // `retry_base_delay_ms` (PARITY.md §7.1).
+            // `retry_base_delay_ms`.
             let delay = orch_domain::calculate_retry_delay(
                 task.attempts.saturating_sub(1),
                 self.config().scheduling.retry_base_delay_ms,
@@ -713,7 +712,7 @@ impl Orchestrator {
     }
 
     /// Run the review criteria and, if they pass — or if auto-approve is set —
-    /// move the task to `done` (PARITY.md §7.9).
+    /// move the task to `done`.
     async fn run_auto_review(
         &self,
         task_id: &str,
@@ -869,7 +868,7 @@ fn file_change_paths(data: &serde_json::Value) -> Vec<String> {
 }
 
 /// The single path a `file_change` event names, for the `agent:file_changed`
-/// emit. `String(event.data)` is the last resort, as in TS — the field must
+/// emit. `String(event.data)` is the last resort — the field must
 /// never come out as the literal `"undefined"`, which was bug-dom-002.
 fn primary_file_change_path(data: &serde_json::Value) -> String {
     if let Some(path) = data.get("path").and_then(|v| v.as_str()) {

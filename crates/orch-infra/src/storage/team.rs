@@ -1,8 +1,7 @@
-//! File-based team store — ported from
-//! `src/infrastructure/storage/team-store.ts`.
+//! File-based team store.
 //!
 //! **No `_index.json`** — `list` scans the directory, so its order is
-//! filesystem enumeration order and is **not contract** (PARITY.md §6.10).
+//! filesystem enumeration order and is **not contract**.
 //! Nothing may rely on it.
 
 use async_trait::async_trait;
@@ -46,8 +45,7 @@ impl TeamStore for FileTeamStore {
         let mut teams = Vec::with_capacity(files.len());
         for file in files {
             let id = file.strip_suffix(".yml").unwrap_or(&file);
-            // An unreadable file drops out, as the TS `filter(t => t !== null)`
-            // does for a null read.
+            // An unreadable file drops out.
             if let Some(team) = read_yaml(&self.paths.team_path(id)?).await? {
                 teams.push(team);
             }
@@ -118,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn there_is_no_index_file() {
-        // PARITY.md §6.10: TeamStore scans its directory.
+        // TeamStore scans its directory.
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path());
         store.save(&team("team_1", "squad")).await.unwrap();

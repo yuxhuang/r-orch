@@ -1,6 +1,5 @@
 //! Counted rendering cases: sort orders, glyphs, caps, badges, the detail
-//! panels, the header, onboarding and the overlays
-//! (docs/parity/tui.md §1, §3.2, §6, §8.3, §8.4), numbered `v001..`.
+//! panels, the header, onboarding and the overlays, numbered `v001..`.
 
 mod common;
 

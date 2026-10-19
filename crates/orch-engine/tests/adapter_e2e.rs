@@ -1,6 +1,3 @@
-//! Ported from `test/integration/pi-adapter.e2e.test.ts` and
-//! `test/integration/new-adapters.e2e.test.ts`.
-//!
 //! Real adapter, real `AdapterRegistry`, real `Orchestrator`, real state
 //! machine and real run-event path; only the child process is scripted. Each
 //! case drives one task the whole way — `todo → in_progress → review → done`
@@ -346,11 +343,11 @@ async fn antigravity_drives_a_task_from_todo_to_done() {
 
 #[tokio::test]
 async fn a_grok_child_that_floods_stderr_still_completes_and_leaks_nothing_into_the_error() {
-    // PARITY.md §14.12: grok and antigravity spawn with `stderr: 'pipe'` and
-    // never attach a consumer, so a child writing past one pipe buffer blocks
-    // forever and only stall detection clears it. The ruled fix is to **drain
-    // and discard** — attaching a tail capture instead would change the L0
-    // error text, the classification and the persisted `agent.last_error`.
+    // grok and antigravity spawn with `stderr: 'pipe'` and never attach a
+    // consumer, so a child writing past one pipe buffer would block forever
+    // and only stall detection would clear it. The fix is to **drain and
+    // discard** — attaching a tail capture instead would change the error text, the
+    // classification and the persisted `agent.last_error`.
     //
     // So this asserts both halves: the flood does not deadlock, and the
     // stderr does not reach the error message.

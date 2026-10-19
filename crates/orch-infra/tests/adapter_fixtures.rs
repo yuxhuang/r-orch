@@ -2,11 +2,9 @@
 //! (ARCHITECTURE §8.3).
 //!
 //! Each case is a pair in `fixtures/adapters/<adapter>/`: a recorded stdout
-//! stream, and the events it must produce. The payloads come from
-//! `test/unit/infrastructure/*-adapter.test.ts` and
-//! `test/integration/*.e2e.test.ts`, so these pin the **whole** `data` shape
-//! rather than the single field each ported assertion looks at — which is what
-//! catches a renamed or reordered key.
+//! stream, and the events it must produce. These pin the **whole**
+//! `data` shape rather than the single field each assertion looks at — which
+//! is what catches a renamed or reordered key.
 //!
 //! Regenerate with `ORCH_BLESS_FIXTURES=1 cargo test -p orch-infra
 //! --test adapter_fixtures`, then read the diff: a change here is a change to

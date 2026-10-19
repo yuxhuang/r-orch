@@ -1,4 +1,4 @@
-//! Agent domain model — a configured AI tool (`src/domain/agent.ts`).
+//! Agent domain model — a configured AI tool.
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -151,7 +151,7 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_timeout_ms: Option<u64>,
     /// Insertion-ordered to mirror the JS object this came from; the spawn
-    /// environment is built from it in order (PARITY.md §8.3).
+    /// environment is built from it in order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<IndexMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,14 +174,14 @@ pub struct AgentStats {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentLastError {
-    /// Truncated to 500 characters by the writer (PARITY.md §6.8).
+    /// Truncated to 500 characters by the writer.
     pub message: String,
     /// An [`crate::error::AdapterErrorKind`] string value.
     pub kind: String,
     pub timestamp: String,
 }
 
-/// Field order mirrors the TS `Agent` interface (PARITY.md §6.8).
+/// Field order is the serialized field order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
@@ -239,8 +239,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_agent_matches_the_reference_shape() {
-        // PARITY.md §4.2 `Agent` (shell).
+    fn shell_agent_has_the_expected_shape() {
         let agent = Agent {
             id: "agt_veWG_kK".into(),
             name: "shelly".into(),

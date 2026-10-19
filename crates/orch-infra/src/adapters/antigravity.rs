@@ -1,15 +1,14 @@
-//! Antigravity CLI adapter — `src/infrastructure/adapters/antigravity.ts`,
-//! `kind = "antigravity"` (`docs/parity/adapters.md` §2.7).
+//! Antigravity CLI adapter for `kind = "antigravity"`.
 //!
 //! `agy`'s headless mode is plain-text oriented, so each stdout line becomes
 //! an `output` event and a terminal `done` carries the joined text.
 //!
-//! Two replicated quirks (`docs/parity/adapters.md` §10.4): the exit checks
+//! Two quirks: the exit checks
 //! have **no done-event guard**, so a non-zero exit always fails the run even
 //! when output was produced; and an exit with no code (killed by a signal)
 //! still yields a synthetic `done`.
 //!
-//! Like grok, its stderr is drained and **discarded** (PARITY.md §14.12).
+//! Like grok, its stderr is drained and **discarded**.
 
 use std::sync::Arc;
 

@@ -1,6 +1,5 @@
 //! Counted live-update cases: batching, caps, the run-id LRU, the soft-delete
-//! clock, notifications, history ingestion and endurance
-//! (docs/parity/tui.md §7, §8.1, §8.4; PARITY.md §12.6), numbered `l001..`.
+//! clock, notifications, history ingestion and endurance, numbered `l001..`.
 //!
 //! Every timer is driven by the injected clock — never a sleep.
 
@@ -882,7 +881,7 @@ fn l055_a_nameless_tool_call_payload_falls_back_to_tool() {
     harness.assert_message("⚙ tool()");
 }
 
-// ── Repeated lines collapse (PARITY.md §12.8 (k)) ──────────────────────────
+// ── Repeated lines collapse ────────────────────────────────────────────────
 
 fn tick(running: usize, queued: usize) -> OrchestratorEvent {
     OrchestratorEvent::OrchestratorTick { running, queued }

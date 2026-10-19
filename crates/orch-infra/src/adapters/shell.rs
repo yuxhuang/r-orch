@@ -1,12 +1,11 @@
-//! Shell adapter — `src/infrastructure/adapters/shell.ts`,
-//! `kind = "shell"` (`docs/parity/adapters.md` §2.8).
+//! Shell adapter for `kind = "shell"`.
 //!
 //! Runs an arbitrary command through `bash -lc` with the task prompt in
 //! `ORCHESTRY_TASK_PROMPT` — the only environment variable any adapter sets
 //! itself. It is also the only adapter that **streams** stderr: each stderr
 //! line becomes an `error` event. stdout and stderr are read **concurrently**
 //! into one [`EventBuffer`]; reading them in sequence would deadlock on a full
-//! pipe (PARITY.md §8.11).
+//! pipe.
 //!
 //! No quoting happens here: the single command string is handed to bash, which
 //! parses it. That is the adapter's contract — `config.command` comes from the
@@ -62,8 +61,7 @@ impl std::fmt::Debug for ShellAdapter {
     }
 }
 
-/// Aborts the task it holds when dropped — the TS
-/// `signal?.removeEventListener('abort', onAbort)` in its `finally`.
+/// Aborts the task it holds when dropped.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -112,7 +110,7 @@ async fn pump(
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                // The TS rejection also just ends this reader; the buffer is
+                // A read error just ends this reader; the buffer is
                 // closed either way, which is what keeps the run from hanging.
                 tracing::debug!(error = %err, ?kind, "shell stream read failed");
                 return;
@@ -283,9 +281,8 @@ mod tests {
     use orch_core::process::ExitSignal;
     use orch_core::test_support::FakeProcessManager;
 
-    /// A stdout that fails on first read. The TS equivalent is
-    /// `proc.stdout.destroy(new Error(...))`, and the test it guards is the
-    /// one that used to hang forever: if the buffer is never closed, the
+    /// A stdout that fails on first read. The test it guards is the one that
+    /// used to hang forever: if the buffer is never closed, the
     /// consumer waits for an event that will never arrive.
     struct FailingReader;
 

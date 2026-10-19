@@ -1,5 +1,5 @@
-//! The half of `test/unit/domain/agent-shop-skills.test.ts` that needs the
-//! shipped skill library on disk.
+//! Reference integrity of the shop templates against the shipped skill
+//! library on disk.
 //!
 //! Deferred during the first pass of WP-0 because `skills/library/` did not
 //! exist yet; it does now, so the reference-integrity check is live. The
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use orch_domain::AGENT_SHOP_TEMPLATES;
 
 /// `skills/library/` relative to this crate, which is where the binary ships
-/// it from in a debug build (PARITY.md §9.6).
+/// it from in a debug build.
 fn library_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills/library")
 }

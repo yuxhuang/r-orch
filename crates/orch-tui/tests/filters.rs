@@ -1,5 +1,4 @@
-//! Counted filter cases: both logs pickers and every filter predicate
-//! (docs/parity/tui.md §1.4, §2.5, §2.6, §3.3, §3.4, §8.6), numbered `f001..`.
+//! Counted filter cases: both logs pickers and every filter predicate, numbered `f001..`.
 
 mod common;
 
@@ -558,7 +557,7 @@ fn f044_opening_a_picker_shrinks_the_logs_list() {
     harness.assert_text("LIVE");
 }
 
-// ── Row → message-index mapping (PARITY.md §14.20) ─────────────────────────
+// ── Row → message-index mapping ─────────────────────────
 
 #[test]
 fn f045_the_visible_window_matches_the_rendered_rows_in_tail_mode() {

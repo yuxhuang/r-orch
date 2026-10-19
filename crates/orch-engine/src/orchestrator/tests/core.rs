@@ -1,4 +1,4 @@
-//! Ported from `test/unit/application/orchestrator.test.ts`.
+//! Core orchestrator behaviour.
 
 use std::sync::Arc;
 
@@ -265,8 +265,8 @@ async fn a_tick_emits_the_running_and_queued_counts() {
             // `running` is read from live state, so it already counts the
             // dispatch this tick performed. `queued` is read through the
             // tick-scoped task cache, which `dispatch_all` populated *before*
-            // dispatching — so the same task is counted in both. That is the
-            // TS behaviour and it is what the TUI shows.
+            // dispatching — so the same task is counted in both. That is
+            // what the TUI shows.
             assert_eq!(*running, 1);
             assert_eq!(*queued, 1);
         }
@@ -1134,7 +1134,7 @@ async fn collecting_events_logs_them_and_forwards_them_to_the_bus() {
     assert_eq!(file_events.len(), 1);
     match &file_events[0] {
         // Regression (bug-dom-002): the path must survive the serialization
-        // step that nulls `event.data` in the TS implementation.
+        // step that once nulled `event.data`.
         OrchestratorEvent::AgentFileChanged { path, .. } => assert_eq!(path, "src/foo.ts"),
         other => panic!("unexpected event: {other:?}"),
     }

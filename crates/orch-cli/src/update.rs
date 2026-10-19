@@ -1,21 +1,13 @@
-//! `orch update` — **amended**: no network, no self-replacement
-//! (PARITY.md §11.5, recorded in §13 as out of scope).
+//! `orch update` — **amended**: no network, no self-replacement.
 //!
-//! The reference queries npm for the latest version and, without `--check`,
-//! runs `npm install -g @oxgeneral/orch@<latest>` over itself; a
-//! cache-only variant of the same check also runs in the background after
-//! almost every other command and prints a notice to stderr.
+//! The command, its `--check` flag and its exit code exist; it reports the
+//! running version and how to install an update. There is no background
+//! update check, which is why nothing here reads or writes
+//! `~/.orchestry/update-check.json`.
 //!
-//! None of that is reproduced. The command, its `--check` flag and its exit
-//! code are preserved; it reports the running version and how to install an
-//! update. The post-command background check is **removed entirely** — which
-//! is also why nothing here reads or writes `~/.orchestry/update-check.json`.
-//!
-//! The reasoning is in PARITY.md §11.5: a CLI that silently downloads and
-//! overwrites its own executable as a side effect of `orch task list` is a new
-//! supply-chain surface with no channel, no signing and no atomic-replace
-//! story, and it is unverifiable by the harness by construction — the oracle
-//! queries npm and this would query nothing.
+//! A CLI that silently downloads and overwrites its own executable as a side
+//! effect of `orch task list` is a new supply-chain surface with no channel,
+//! no signing and no atomic-replace story.
 
 use crate::output::{Color, Styles};
 
@@ -36,8 +28,7 @@ pub fn render(styles: &Styles, check: bool) -> String {
         "  {}\n",
         styles.dim("This build does not update itself.")
     ));
-    // r-orch ships through Homebrew or a source build; the reference's
-    // `npm install -g` line would install the TypeScript original instead.
+    // r-orch ships through Homebrew or a source build, not npm.
     out.push_str("  To install the latest version:\n");
     out.push_str("    Homebrew:  brew upgrade r-orch\n");
     out.push_str("    Source:    git pull && cargo install --path crates/orch-cli\n");
@@ -79,8 +70,7 @@ mod tests {
 
     #[test]
     fn never_tells_the_user_to_use_npm() {
-        // r-orch is not an npm package; the reference's install line would
-        // install the TypeScript original instead.
+        // r-orch is not an npm package.
         for check in [false, true] {
             let out = render(&Styles::plain(), check);
             assert!(
@@ -100,8 +90,7 @@ mod tests {
 
     #[test]
     fn the_module_spawns_nothing_and_queries_nothing() {
-        // A regression guard for the scope cut (PARITY.md §11.5): if a future
-        // edit reintroduces a registry query or a self-install, it shows up
+        // A regression guard for the scope cut: if a future edit reintroduces a registry query or a self-install, it shows up
         // here rather than in a security review.
         let body = include_str!("update.rs")
             .split("#[cfg(test)]")

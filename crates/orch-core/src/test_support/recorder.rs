@@ -1,4 +1,4 @@
-//! Call recording — the replacement for `vi.fn()`'s call assertions.
+//! Call recording — records calls so tests can assert on them.
 
 use std::sync::{Arc, Mutex};
 

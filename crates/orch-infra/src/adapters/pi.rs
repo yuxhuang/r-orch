@@ -1,5 +1,4 @@
-//! Pi coding-agent adapter — `src/infrastructure/adapters/pi.ts`,
-//! `kind = "pi"` (`docs/parity/adapters.md` §2.5).
+//! Pi coding-agent adapter for `kind = "pi"`.
 //!
 //! Spawns `pi --mode rpc`, sends the ORCH prompt as one JSONL `prompt` frame
 //! on stdin and maps Pi's RPC events onto `AgentEvent`s. Three things make it
@@ -13,7 +12,7 @@
 //!    event arrives.
 //! 2. **Its own line reader** ([`read_pi_lines`]): no 16 KB cap, because
 //!    `agent_end` carries the whole transcript, and a trailing `\r` is
-//!    stripped. Both replicated (PARITY.md §14.13).
+//!    stripped.
 //! 3. **Unknown event types are dropped**, where every other adapter defaults
 //!    to an `output` event — raw RPC envelopes would only pollute the logs.
 
@@ -171,7 +170,7 @@ struct PiCompletion {
     tokens: Option<TokenUsage>,
     /// Current Pi emits `agent_settled` after `agent_end` and exposes
     /// `willRetry` on `agent_end`. Keyed off **presence**, not value, so
-    /// `willRetry: false` still waits (PARITY.md §14.13) — older Pi versions
+    /// `willRetry: false` still waits — older Pi versions
     /// have neither field, where `agent_end` is itself terminal.
     wait_for_settled: bool,
     failure: Option<PiFailure>,

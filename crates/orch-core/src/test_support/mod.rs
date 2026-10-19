@@ -1,19 +1,18 @@
 //! Test doubles and entity factories, behind the `test-support` feature so
 //! they never ship in a release binary.
 //!
-//! Ported from `test/unit/application/helpers.ts`. The factory defaults are
-//! **identical** to the TS ones, including the two that a lot of behaviour
-//! hangs off: [`factories::make_agent`] sets `approval_policy: auto` (which is
-//! why so many tests observe `review → done` with no explicit approve) and
+//! The factory defaults include two that a lot of behaviour hangs off:
+//! [`factories::make_agent`] sets `approval_policy: auto` (which is why so
+//! many tests observe `review → done` with no explicit approve) and
 //! `stall_timeout_ms: 300_000`.
 //!
 //! Three pieces are shared by every double and are worth knowing about before
 //! writing tests against them:
 //!
-//! - [`Recorder`] records calls, replacing `vi.fn()`'s call assertions.
-//! - [`Faults`] injects failures, replacing `mockRejectedValue`.
-//! - The store fakes **clone on both read and write**, exactly as the TS fakes
-//!   `structuredClone`, so a caller cannot mutate stored state by accident.
+//! - [`Recorder`] records calls for assertions.
+//! - [`Faults`] injects failures.
+//! - The store fakes **clone on both read and write**, like a deep copy,
+//!   so a caller cannot mutate stored state by accident.
 //!
 //! `build_deps`/`TestOrchestrator` are deliberately **not** here: they need
 //! `OrchestratorDeps`, which lives in `orch-engine`. Compose them there from

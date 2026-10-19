@@ -1,5 +1,5 @@
-//! V16 — the golden-prompt gate. Fixtures are generated from the TS engine by
-//! `fixtures/prompts/gen/generate.mts`; Rust must reproduce them byte for byte.
+//! V16 — the golden-prompt gate. The fixtures under `fixtures/prompts/` are
+//! hand-maintained golden files; Rust must reproduce them byte for byte.
 
 use std::fs;
 use std::path::PathBuf;
@@ -85,14 +85,14 @@ struct Templates {
 }
 
 #[test]
-fn default_templates_extend_the_reference_team_with_peer_metadata() {
+fn default_templates_extend_the_base_team_with_peer_metadata() {
     let t: Templates =
         serde_json::from_str(&fs::read_to_string(fixtures_dir().join("_templates.json")).unwrap())
             .unwrap();
     assert_eq!(DEFAULT_SYSTEM_TEMPLATE, t.system);
     // The peer capabilities/remote suffix and F5 remote-data marker intentionally
     // extend the old team display. The rest of both templates remains covered
-    // by the original reference fixtures.
+    // by the existing golden fixtures.
     let original = " · ID: `{{ a.id }}`";
     let peer = concat!(
         " · ID: `{{ a.id }}`",

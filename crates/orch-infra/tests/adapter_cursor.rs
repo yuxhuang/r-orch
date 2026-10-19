@@ -1,4 +1,4 @@
-//! Ported from `test/unit/infrastructure/cursor-adapter.test.ts`.
+//! Cursor adapter tests.
 
 mod support;
 
@@ -204,9 +204,8 @@ async fn a_done_event_suppresses_the_exit_error() {
 
 #[tokio::test]
 async fn stderr_written_before_the_stream_is_polled_still_reaches_the_error() {
-    // The TS relies on the lifecycle listeners being attached at execute()
-    // time; here the equivalent is that the stderr drain starts inside
-    // `spawn_child`, not when the stream is first polled.
+    // The stderr drain starts inside `spawn_child` at execute() time, not
+    // when the stream is first polled.
     let pm = ScriptedProcessManager::new(
         Script::new()
             .stderr("Error: No prompt provided for print mode\n")
@@ -258,7 +257,7 @@ async fn the_version_probe_falls_back_to_agent_and_execute_then_uses_it() {
 
 #[tokio::test]
 async fn execute_before_a_successful_test_still_spawns_cursor_agent() {
-    // Replicated quirk: `resolvedCommand` is only ever assigned by `test()`.
+    // Quirk: `resolvedCommand` is only ever assigned by `test()`.
     let pm = ScriptedProcessManager::silent();
     adapter(&pm).execute(run_params()).expect("execute");
     assert_eq!(pm.spawn_record().command, "cursor-agent");

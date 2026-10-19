@@ -185,8 +185,7 @@ fn m007_clicking_a_log_row_selects_the_message_drawn_on_it() {
 
 #[test]
 fn m008_a_log_row_click_under_a_filter_indexes_the_filtered_set() {
-    // PARITY §14.20's bug class: the selection indexes `filtered_messages`,
-    // never `messages`.
+    // The selection indexes `filtered_messages`, never `messages`.
     let mut harness = logs_with_messages();
     harness.app.state.log_type_filter = [MsgType::Error].into_iter().collect();
     harness.draw();

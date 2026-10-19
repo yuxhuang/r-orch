@@ -1,7 +1,7 @@
-//! Orchestrator event system (`src/domain/events.ts`).
+//! Orchestrator event system.
 //!
 //! All communication between layers goes through these typed events. The event
-//! names and payload field names are contract (PARITY.md §7.19) — serve mode's
+//! names and payload field names are contract — serve mode's
 //! structured logger flattens them straight into its log records, so the
 //! camelCase field names (and the one snake_case outlier, `delay_ms`) are
 //! reproduced exactly.
@@ -208,8 +208,8 @@ pub enum OrchestratorEvent {
         agent_id: String,
     },
 
-    /// Declared in the TS union but **never emitted** by any code path. Kept
-    /// for forward compatibility; nothing emits it (PARITY.md §7.18, §13).
+    /// Declared but **never emitted** by any code path. Kept
+    /// for forward compatibility; nothing emits it.
     #[serde(rename = "team:task_claimed")]
     TeamTaskClaimed {
         #[serde(rename = "teamId")]
@@ -340,7 +340,7 @@ pub enum OrchestratorEventType {
 }
 
 impl OrchestratorEventType {
-    /// All 32 event types, in TS union declaration order.
+    /// All 32 event types, in declaration order.
     pub const ALL: [OrchestratorEventType; 32] = {
         use OrchestratorEventType::*;
         [

@@ -1,5 +1,4 @@
-//! The undo banner — one row per pending soft deletion
-//! (docs/parity/tui.md §3.10).
+//! The undo banner — one row per pending soft deletion.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

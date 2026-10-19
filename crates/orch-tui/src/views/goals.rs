@@ -1,4 +1,4 @@
-//! The goals list (docs/parity/tui.md §1.1).
+//! The goals list.
 
 use orch_domain::{GoalStatus, TaskStatus};
 use ratatui::Frame;

@@ -1,5 +1,4 @@
-//! Shared adapter machinery, ported from
-//! `src/infrastructure/adapters/utils.ts` (`docs/parity/adapters.md` §1.3–1.6).
+//! Shared adapter machinery.
 
 use std::sync::Arc;
 
@@ -15,8 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::process::line_reader::read_lines;
 use crate::process::spawn::ChildIo;
 
-/// The real clock. Adapters mint `AgentEvent.timestamp` at parse time, exactly
-/// where the TS calls `new Date().toISOString()`.
+/// The real clock. Adapters mint `AgentEvent.timestamp` at parse time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -38,7 +36,7 @@ pub fn system_clock() -> Arc<dyn Clock> {
 /// system-prompt flag use this.
 ///
 /// The separator is **exactly** two newlines, and an empty system prompt is
-/// falsy in TS, so it returns the user prompt unchanged.
+/// treated as absent, so it returns the user prompt unchanged.
 pub fn build_full_prompt(system_prompt: Option<&str>, user_prompt: &str) -> String {
     match system_prompt {
         Some(system) if !system.is_empty() => format!("{system}\n\n{user_prompt}"),
@@ -83,14 +81,13 @@ pub fn number_field(value: &Value, key: &str) -> Option<u64> {
 ///
 /// `stats_fallback` also looks at `parsed.stats.usage`, and is claude-only.
 /// A `usage` object without a numeric `input_tokens`/`inputTokens` is
-/// **discarded whole** — the TS returns `undefined` rather than defaulting the
-/// input to 0 (`docs/parity/adapters.md` §10.7).
+/// **discarded whole** — `None` rather than defaulting the input to 0.
 pub fn extract_tokens(parsed: &Value, stats_fallback: bool) -> Option<TokenUsage> {
     let mut usage = parsed.get("usage");
     if usage.is_none() && stats_fallback {
         usage = parsed.get("stats").and_then(|stats| stats.get("usage"));
     }
-    // `!usage` in TS: `null` is falsy too.
+    // A `null` usage is treated as absent.
     let usage = usage.filter(|value| !value.is_null())?;
 
     let input = usage_number(usage, "input_tokens", "inputTokens")?;
@@ -107,8 +104,8 @@ pub fn extract_tokens(parsed: &Value, stats_fallback: bool) -> Option<TokenUsage
     ))
 }
 
-/// `JSON.stringify(value)` for the error-message paths, where the TS does
-/// exactly that to a non-string payload.
+/// `JSON.stringify(value)` for the error-message paths, applied to a
+/// non-string payload.
 pub fn stringify(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -122,14 +119,12 @@ pub fn error_message_of(value: &Value) -> String {
     stringify(value)
 }
 
-/// The stream used by claude, codex, cursor and opencode
-/// (`utils.ts:105-163`).
+/// The stream used by claude, codex, cursor and opencode.
 ///
 /// Lifecycle listeners are attached before this is called — the stderr drain
 /// in [`crate::process::spawn_child`] and the [`orch_core::process::ExitSignal`]
-/// in the process manager — which is the Rust form of the TS comment about
-/// eager `close`/`error`/stderr listeners: a fast-failing child must not be
-/// missed while the orchestrator has yet to poll the stream.
+/// in the process manager — so a fast-failing child is not missed while the
+/// orchestrator has yet to poll the stream.
 pub fn streaming_events<P>(
     io: ChildIo,
     mut parse: P,
@@ -171,11 +166,11 @@ where
                 }
             }
             // Release the fd immediately rather than waiting for the process
-            // to die — the TS `proc.stdout.destroy()` in its `finally`.
+            // to die.
             drop(lines);
 
             if let Some(err) = read_error {
-                // A stdout read error propagates straight out of the TS
+                // A stdout read error propagates straight out of the
                 // generator, with neither the stderr tail nor an `errorKind`;
                 // `AdapterError::new` classifies it from the message, which is
                 // what the orchestrator would otherwise do.
@@ -271,12 +266,10 @@ pub fn version_probe_failure(
 
 /// The `stream-json` line dispatch shared by claude and cursor.
 ///
-/// The TS duplicates `parseClaudeEvent` and `parseCursorEvent` verbatim except
-/// for claude's `statsFallback` (`cursor.ts:96`: "Cursor stream-json uses the
-/// same format as Claude stream-json"), so the two adapters share one
-/// implementation here. `data` keeps each adapter's existing shape — the whole
+/// Cursor stream-json uses the same format as Claude stream-json except for
+/// claude's `stats_fallback`, so the two adapters share one implementation. `data` keeps each adapter's existing shape — the whole
 /// `parsed.message`, not the canonical `{ text }` — because consumers are
-/// defensive about it and PARITY.md §8.6 says not to normalize.
+/// defensive about it and it is not normalized.
 pub fn parse_stream_json_line(
     line: &str,
     clock: &dyn Clock,
@@ -336,8 +329,7 @@ pub fn copy_present(
     }
 }
 
-/// `parsed.<key> ?? parsed` — the nullish coalescing the TS uses to fall back
-/// to the whole record.
+/// `parsed.<key> ?? parsed` — falls back to the whole record.
 pub fn coalesce(parsed: &Value, key: &str) -> Value {
     match parsed.get(key) {
         Some(value) if !value.is_null() => value.clone(),

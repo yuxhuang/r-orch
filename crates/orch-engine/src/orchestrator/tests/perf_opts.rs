@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-perf-opts.test.ts`.
-//!
 //! Two optimizations with observable contracts: `state.claimed` is a **set**
 //! that round-trips through a JSON array (and recovers from a corrupt one),
 //! and reconcile pre-fetches its running tasks and agents **concurrently**.
@@ -213,8 +211,8 @@ async fn reconcile_issues_all_of_its_pre_fetches_before_processing_any_of_them()
 
 /// Records save order, holding up one task's save.
 ///
-/// `_index.json` keeps entries in the order their saves complete
-/// (PARITY.md §14.4), so the delay is what turns "are these writes
+/// `_index.json` keeps entries in the order their saves complete,
+/// so the delay is what turns "are these writes
 /// concurrent?" into a deterministic assertion: awaited in order, the slow one
 /// still lands first; issued together, it lands last.
 struct OrderedSaveProbe {
@@ -251,12 +249,8 @@ impl TaskStore for OrderedSaveProbe {
 }
 
 /// A cascade must write its dependents in order, because the order they land
-/// in `_index.json` is compared byte for byte against the oracle.
-///
-/// The reference uses `Promise.all` here, and node settles those writes in map
-/// order in practice; `join_all` on a multi-threaded runtime does not, which
-/// showed up as `o7-cascade-failure` transposing two tasks about one run in
-/// seven.
+/// in `_index.json` is observable, and `join_all` on a multi-threaded runtime
+/// does not preserve it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cascade_saves_its_dependents_in_order() {
     let probe: Arc<std::sync::Mutex<Option<Arc<OrderedSaveProbe>>>> =

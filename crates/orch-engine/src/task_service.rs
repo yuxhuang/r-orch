@@ -1,9 +1,9 @@
-//! Task service — ported from `src/application/task-service.ts`.
+//! Task service.
 //!
 //! Every state change a user can ask for goes through here, which is where the
-//! transition table is enforced (PARITY.md §7.1). The orchestrator deliberately
+//! transition table is enforced. The orchestrator deliberately
 //! bypasses it on recovery paths by writing through the store instead — see
-//! §7.4 and `crate::orchestrator`.
+//! `crate::orchestrator`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,8 +42,8 @@ pub struct TaskService {
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
     /// `None` disables attachment handling, exactly as the optional `paths`
-    /// constructor argument does in TS. `buildDeps` in the TS test helper
-    /// leaves it out, which is why so many tests never touch the filesystem.
+    /// constructor argument does. Tests leave it out, which is why so many
+    /// never touch the filesystem.
     paths: Option<Paths>,
 }
 
@@ -144,7 +144,7 @@ impl TaskService {
         };
 
         // An empty list leaves `attachments` absent rather than `[]`, which
-        // keeps the as-created record at its minimal §4.2 shape.
+        // keeps the as-created record at its minimal shape.
         if let Some(sources) = input.attachments.as_deref().filter(|s| !s.is_empty()) {
             let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
             if let Some(names) = self.copy_attachments(&task.id, &sources).await? {
@@ -171,7 +171,7 @@ impl TaskService {
             .ok_or_else(|| Error::Domain(DomainError::TaskNotFound(id.to_owned())))
     }
 
-    /// Move a task through the state machine (PARITY.md §7.1). A transition
+    /// Move a task through the state machine. A transition
     /// outside the table is `InvalidTransitionError` (exit 1) and nothing is
     /// written.
     pub async fn update_status(&self, id: &str, new_status: TaskStatus) -> Result<Task> {
@@ -214,8 +214,8 @@ impl TaskService {
     }
 
     /// Assign a task. `agent_id` may be an id or an exact agent name; the
-    /// **event carries the raw input**, not the resolved id, which is what the
-    /// TS emits.
+    /// **event carries the raw input**, not the resolved id, which is what
+    /// subscribers see.
     pub async fn assign(&self, task_id: &str, agent_id: &str) -> Result<Task> {
         let mut task = self.get(task_id).await?;
         task.assignee = self.resolve_assignee(Some(agent_id)).await?;
@@ -422,7 +422,7 @@ impl TaskService {
 
         if let Some(paths) = &self.paths {
             let dir = paths.task_attachments_dir(id)?;
-            // `force: true` in TS — a missing directory is not an error.
+            // A missing directory is not an error.
             if let Err(err) = tokio::fs::remove_dir_all(&dir).await
                 && err.kind() != std::io::ErrorKind::NotFound
             {
@@ -498,7 +498,7 @@ impl TaskService {
     }
 
     /// Resolve an assignee to an agent **id**, accepting either an id or an
-    /// exact name. The two error messages are contract (PARITY.md §3.1).
+    /// exact name. The two error messages are contract.
     async fn resolve_assignee(&self, assignee: Option<&str>) -> Result<Option<String>> {
         let Some(assignee) = assignee.filter(|a| !a.is_empty()) else {
             return Ok(None);
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(task.created_at, task.updated_at);
         assert_eq!(task.assignee, None);
 
-        // Every optional is absent, so the record is the minimal §4.2 shape.
+        // Every optional is absent, so the record is the minimal shape.
         let value = serde_json::to_value(&task).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 11);
     }
@@ -1156,7 +1156,7 @@ mod tests {
         let task = h.service.assign("tsk_test1", "TestAgent").await.unwrap();
         assert_eq!(task.assignee.as_deref(), Some("agt_test1"));
 
-        // The event carries what the caller passed — a TS quirk, replicated.
+        // The event carries what the caller passed.
         match sub.try_drain()[0].as_ref() {
             OrchestratorEvent::TaskAssigned { agent_id, .. } => assert_eq!(agent_id, "TestAgent"),
             other => panic!("unexpected event: {other:?}"),
@@ -1374,8 +1374,7 @@ mod tests {
         }
     }
 
-    /// `defensive-validation.test.ts` rejects `NaN`, `Infinity` and fractional
-    /// priorities. A fractional or non-finite `i64` is unrepresentable in
+    /// Priorities that are `NaN`, `Infinity` or fractional must be rejected. A fractional or non-finite `i64` is unrepresentable in
     /// Rust, so the range check is the whole of the surviving contract.
     #[tokio::test]
     async fn a_non_integral_priority_is_unrepresentable() {

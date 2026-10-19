@@ -1,11 +1,10 @@
-//! V40 / PARITY.md §14.12: every adapter completes a run in which the child
+//! V40: every adapter completes a run in which the child
 //! writes 256 KiB to stderr.
 //!
 //! A child that writes past one pipe buffer (~64 KiB on Linux) to an unread
-//! stderr blocks forever. In the TS original `grok` and `antigravity` never
-//! attach a consumer, so such a run hangs until stall detection fires ten
-//! minutes later. Draining lives in the shared spawn path here, so these are
-//! regression tests for all eight adapters rather than for two.
+//! stderr blocks forever, so such a run hangs until stall detection fires ten
+//! minutes later. Draining lives in the shared spawn path, so these are
+//! regression tests for all eight adapters.
 //!
 //! The flood is written **before** the terminal stdout line, so an adapter
 //! that only drained stderr after reading stdout would deadlock and the

@@ -1,11 +1,9 @@
-//! [`EventBuffer`] — ported from `src/infrastructure/adapters/event-buffer.ts`
-//! (`docs/parity/adapters.md` §4.3).
+//! [`EventBuffer`].
 //!
 //! A bounded FIFO queue with backpressure, used by the shell adapter to merge
-//! its two concurrently-read streams. PARITY.md §8.11 asks for the
-//! *concurrency*, not the data structure, so the TS hand-rolled ring with
-//! explicit head/tail indices is a `VecDeque` here; every observable is
-//! preserved:
+//! its two concurrently-read streams. What matters is the *concurrency*, not
+//! the data structure, so it is a `VecDeque` rather than a hand-rolled ring
+//! with explicit head/tail indices; every observable is preserved:
 //!
 //! - capacity 1024 by default;
 //! - `push` waits for space rather than dropping or growing;
@@ -139,8 +137,7 @@ impl EventBuffer {
     }
 }
 
-/// Drain the buffer until it is closed and empty — the TS
-/// `[Symbol.asyncIterator]`.
+/// Drain the buffer until it is closed and empty.
 pub fn drain(buffer: Arc<EventBuffer>) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
         while let Some(event) = buffer.take().await {
@@ -232,8 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_order_across_a_full_cycle() {
-        // The TS version asserts its ring indices wrap; the observable is that
-        // order survives draining and refilling.
+        // The observable is that order survives draining and refilling.
         let buffer = EventBuffer::with_capacity(3);
         buffer.push(event("a")).await;
         buffer.push(event("b")).await;

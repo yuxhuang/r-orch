@@ -1,11 +1,9 @@
-//! Clipboard access for TUI image paste — replaces
-//! `src/infrastructure/clipboard-service.ts`.
+//! Clipboard access for TUI image paste.
 //!
-//! The TS service shells out to osascript / xclip / PowerShell; here `arboard`
-//! does the platform work (ARCHITECTURE §4.8). The TUI is L2, so the mechanism
-//! may differ, but the contract is kept: **no failure ever escapes**. An
+//! `arboard` does the platform work (ARCHITECTURE §4.8). The contract is that
+//! **no failure ever escapes**. An
 //! unusable clipboard reads as [`ClipboardContentType::Empty`] / `None`, and
-//! every OS call is bounded by the same 3 s as the TS `EXEC_TIMEOUT_MS`.
+//! every OS call is bounded by 3 s.
 //!
 //! Writing is the other direction and has its own shape:
 //! [`NativeCopyWorker`] below. Reads are one-shot and can be abandoned, but a
@@ -70,7 +68,7 @@ impl ClipboardBackend for SystemClipboard {
     }
 }
 
-/// Whether a clipboard can be opened at all (TS `isClipboardToolAvailable`).
+/// Whether a clipboard can be opened at all.
 pub fn is_clipboard_available() -> bool {
     Clipboard::new().is_ok()
 }
@@ -305,7 +303,7 @@ fn read_image(backend: &dyn ClipboardBackend) -> Option<ClipboardImage> {
     Some(ClipboardImage { data, ext: "png" })
 }
 
-/// Run a blocking clipboard call with the TS 3 s bound. A hung call keeps its
+/// Run a blocking clipboard call with a 3 s bound. A hung call keeps its
 /// thread but the caller gets the fallback.
 async fn bounded<T: Send + 'static>(fallback: T, job: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::time::timeout(EXEC_TIMEOUT, tokio::task::spawn_blocking(job)).await {

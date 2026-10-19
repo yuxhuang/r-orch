@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-force-review.test.ts`.
-//!
 //! A failed merge-back must still release the agent. The bug was that the
 //! `force_task_to_review` early return skipped the `current_task` clear, so the
 //! TUI showed an idle agent as busy forever.

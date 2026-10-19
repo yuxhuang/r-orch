@@ -1,8 +1,8 @@
-//! Diagnostics — ported from `src/application/doctor-service.ts`.
+//! Diagnostics.
 //!
 //! Probes every registered adapter, then git, then whether the project is a git
 //! repository, then whether `.orchestry` is git-ignored, then the toolchain.
-//! The order is contract (PARITY.md §11.2) because the CLI prints the rows as
+//! The order is contract because the CLI prints the rows as
 //! it receives them.
 //!
 //! `doctor` **reports, it does not gate**: the CLI exits 0 even when every
@@ -17,15 +17,11 @@ use orch_core::adapter::AdapterRegistry;
 use crate::review_runner::{CommandRunner, ProcessCommandRunner};
 
 /// `git --version` and friends are fast; a hang here would block `doctor`
-/// indefinitely, which the TS version is exposed to and we are not.
+/// indefinitely.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The row that replaces the TS `node` check.
-///
-/// PARITY.md §13 names this a deliberate divergence: the row keeps its
-/// position and format, only the label and value change, and the differential
-/// harness masks it. Both halves are compile-time constants, so the row is
-/// deterministic.
+/// The toolchain row. Both halves (label and value) are compile-time
+/// constants, so the row is deterministic.
 const TOOLCHAIN_LABEL: &str = "toolchain";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -75,8 +71,6 @@ pub struct DoctorService<R: CommandRunner = ProcessCommandRunner> {
 }
 
 impl DoctorService<ProcessCommandRunner> {
-    /// The TS constructor also takes an `IProcessManager`; it is stored and
-    /// never read, so it is not carried here.
     pub fn new(adapters: Arc<AdapterRegistry>, cwd: impl Into<PathBuf>) -> Self {
         DoctorService {
             adapters,
@@ -101,7 +95,7 @@ impl<R: CommandRunner> DoctorService<R> {
         let mut checks = Vec::with_capacity(adapters_total + 4);
         let mut adapters_ready = 0;
 
-        // Sequential, not concurrent: the probe order is L0 and each probe
+        // Sequential, not concurrent: the probe order is contract and each probe
         // spawns a child, so running eight at once would also be eight CLIs
         // competing for the terminal.
         for adapter in adapters {

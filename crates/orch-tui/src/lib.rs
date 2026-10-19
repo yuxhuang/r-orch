@@ -1,4 +1,4 @@
-//! WP-6 — the ratatui dashboard (`src/tui/**`, `src/cli/commands/tui.ts`).
+//! WP-6 — the ratatui dashboard.
 //!
 //! Layering:
 //! * [`backend`] is the narrow facade the TUI needs from the engine. The TUI
@@ -6,7 +6,7 @@
 //!   tests use [`backend::FakeBackend`]. See `BACKEND.md`.
 //! * [`state`] owns every piece of app state and all the arithmetic; it is
 //!   pure, synchronous and independent of ratatui.
-//! * [`keys`] is the ordered dispatch chain (docs/parity/tui.md §2.1) and
+//! * [`keys`] is the ordered dispatch chain and
 //!   [`commands`] the command-bar verb surface.
 //! * [`views`] and [`widgets`] draw [`state`] into a ratatui frame.
 //!

@@ -1,12 +1,12 @@
 //! The per-frame hit map: what was drawn where, recorded by the code that
-//! drew it (design §3.2, PARITY.md §12.11).
+//! drew it (design §3.2).
 //!
 //! Every zone is pushed by the widget that rendered the cells it covers, so
 //! the map cannot disagree with the frame. The alternative — recomputing the
 //! layout at click time — would need a second copy of the brand-bar
 //! arithmetic that positions the tab pills (`widgets/header.rs:45-162`), of
 //! the pickers' two draw sites (`views/mod.rs:143` vs `:239`), and of the logs
-//! visible-window math that PARITY.md §14.20 was a bug in.
+//! visible-window math.
 //!
 //! Two separate things are recorded per zone, and keeping them apart is the
 //! point:

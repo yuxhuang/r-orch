@@ -1,16 +1,15 @@
-//! Low-level filesystem utilities — ported from
-//! `src/infrastructure/storage/fs-utils.ts`.
+//! Low-level filesystem utilities.
 //!
-//! All file persistence goes through here. Two things in this module are the
-//! cross-compat crux (PARITY.md §6.4):
+//! All file persistence goes through here. Two things in this module exist for
+//! YAML 1.1 compatibility:
 //!
 //! - [`write_yaml`] runs every emitted document through
 //!   [`quote_ambiguous_scalars`], because an **unquoted**
-//!   `created_at: 2026-10-13T16:37:58.959Z` re-parses in the TypeScript binary
-//!   as a JavaScript `Date`, and `MessageStore.list()` then calls
-//!   `.localeCompare()` on it and **throws**.
-//! - [`read_yaml`] calls `apply_merge()`, because js-yaml resolves `<<` and
-//!   `serde_yaml_ng` leaves it as a literal key (§6.4.2, V38).
+//!   `created_at: 2026-10-13T16:37:58.959Z` re-parses as a timestamp rather
+//!   than a string in YAML 1.1 readers, and a string comparison on it then
+//!   **throws**.
+//! - [`read_yaml`] calls `apply_merge()`, because YAML 1.1 readers resolve `<<`
+//!   and `serde_yaml_ng` leaves it as a literal key.
 //!
 //! Neither is optional and neither has a caller-visible switch, so no caller
 //! can forget.
@@ -54,8 +53,8 @@ pub fn owner_only() -> Option<u32> {
 
 /// Write atomically: temp file in the same directory, then rename.
 ///
-/// Temp name is `.{basename}.{8 hex}.tmp`, matching the TS layout so a crashed
-/// write leaves a file the other binary also recognizes as debris.
+/// Temp name is `.{basename}.{8 hex}.tmp`, so a crashed write leaves a
+/// recognizable piece of debris.
 pub async fn atomic_write(path: &Path, content: &str) -> Result<()> {
     atomic_write_with_mode(path, content, None).await
 }
@@ -130,7 +129,7 @@ pub async fn atomic_write_with_mode(path: &Path, content: &str, mode: Option<u32
     Ok(())
 }
 
-/// 8 hex characters, matching the TS `randomBytes(4).toString('hex')`.
+/// 8 hex characters.
 ///
 /// Uses `nanoid` rather than pulling in a second RNG — the only requirement is
 /// that two concurrent writers to the same path pick different temp names.
@@ -143,7 +142,7 @@ fn random_hex8() -> String {
 
 /// `JSON.stringify(data, null, 2) + "\n"` — 2-space indent, **trailing
 /// newline**. `serde_json::to_string_pretty` matches the indentation but omits
-/// the newline (PARITY.md §6.4).
+/// the newline.
 pub async fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_json_with_mode(path, value, None).await
 }
@@ -161,7 +160,7 @@ pub async fn write_json_with_mode<T: Serialize>(
 }
 
 /// Read and parse a JSON file. `None` when the file does not exist; a parse
-/// error is an error, exactly like the TS version.
+/// error is an error.
 pub async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let Some(content) = read_to_string_opt(path).await? else {
         return Ok(None);
@@ -170,8 +169,8 @@ pub async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         .map(Some)
         .map_err(|err| Error::serde(format!("parse {}", path.display()), path, err))
 }
-/// Replace unpaired surrogate escapes with `U+FFFD`, so a TS-written file
-/// stays readable (PARITY.md §14, docs/TRAITS-FROZEN.md §11).
+/// Replace unpaired surrogate escapes with `U+FFFD`, so a file written with a lone
+/// surrogate stays readable.
 ///
 /// `JSON.stringify` will happily emit a lone surrogate as the six-character
 /// escape `\ud83d`, and `serde_json` rejects that outright — "unexpected end
@@ -182,8 +181,8 @@ pub async fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 /// rather than show one slightly mangled body.
 ///
 /// Per the ruling: decode to U+FFFD, never fail the listing, and leave the
-/// file alone. This is read-side only, so the bytes on disk stay as the oracle
-/// wrote them until something re-saves the record for its own reasons — at
+/// file alone. This is read-side only, so the bytes on disk stay as they were
+/// written until something re-saves the record for its own reasons — at
 /// which point the replacement character is what gets written, which is
 /// accepted.
 ///
@@ -262,10 +261,9 @@ fn escape_at(bytes: &[u8], at: usize) -> Option<(u32, usize)> {
 
 /// Write owner-only YAML atomically, with the timestamp guard applied.
 ///
-/// `js-yaml.dump(data, { indent: 2, lineWidth: 120, noRefs: true,
-/// sortKeys: false })` is the reference. Emitted *bytes* are not contract
-/// (§1.4) — js-yaml folds long scalars with `>-` where `serde_yaml_ng` picks
-/// `|-` or a quoted style, and both round-trip to the same value (§6.4.1).
+/// Emitted *bytes* are not contract: other emitters fold long scalars with
+/// `>-` where `serde_yaml_ng` picks `|-` or a quoted style, and both
+/// round-trip to the same value.
 pub async fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_yaml_with_mode(path, value, owner_only()).await
 }
@@ -495,7 +493,7 @@ pub async fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 /// Read a YAML file as an untyped value, resolving merge keys. `None` when
 /// absent.
 ///
-/// Config reading needs the untyped form: the TS store deep-merges the raw
+/// Config reading needs the untyped form: the store deep-merges the raw
 /// parsed object over `DEFAULT_CONFIG`, so unknown keys survive.
 pub async fn read_yaml_value(path: &Path) -> Result<Option<serde_yaml_ng::Value>> {
     let Some(content) = read_to_string_opt(path).await? else {
@@ -577,8 +575,8 @@ pub async fn parse_yaml_bytes(path: &Path, content: &[u8]) -> Result<serde_yaml_
             )));
         }
     };
-    // js-yaml's default schema resolves `<<`; serde_yaml_ng does not until
-    // asked (PARITY.md §6.4.2). Unconditional: it is a no-op on every document
+    // YAML 1.1 resolves `<<`; serde_yaml_ng does not until
+    // asked. Unconditional: it is a no-op on every document
     // ORCH itself writes.
     value.apply_merge().map_err(|err| {
         Error::serde(format!("apply merge keys in {}", path.display()), path, err)
@@ -738,7 +736,7 @@ async fn read_to_string_opt(path: &Path) -> Result<Option<String>> {
 }
 
 /// Force single-quoting on any **plain** scalar in value position that
-/// js-yaml's default schema would resolve as a YAML 1.1 timestamp or date.
+/// a YAML 1.1 reader would resolve as a timestamp or date.
 ///
 /// Keyed off the scalar grammar, not off field names, so a user-supplied
 /// `description: 2026-10-13` is protected too (ARCHITECTURE §5.3).
@@ -868,8 +866,8 @@ fn is_plain_scalar(value: &str) -> bool {
     !value.is_empty() && !value.starts_with(['\'', '"', '[', '{', '|', '>', '&', '*', '!', '#'])
 }
 
-/// js-yaml's `DEFAULT_SCHEMA` timestamp and date grammars, which resolve a
-/// plain scalar to a JavaScript `Date`:
+/// The YAML 1.1 timestamp and date grammars, which resolve a plain scalar to
+/// a timestamp:
 ///
 /// ```text
 /// date:      ^\d{4}-\d{2}-\d{2}$
@@ -993,7 +991,7 @@ const HANDLE_IDLE: Duration = Duration::from_secs(10);
 /// Append a record as one compact JSON line through a cached `O_APPEND`
 /// handle.
 ///
-/// `JSON.stringify(record) + "\n"` — compact, no spaces (PARITY.md §6.4).
+/// `JSON.stringify(record) + "\n"` — compact, no spaces.
 ///
 /// When the line exceeds [`PIPE_BUF`] and the record is an object with a
 /// non-empty string `data`, `data` is re-truncated so the whole line fits:
@@ -1005,7 +1003,7 @@ const HANDLE_IDLE: Duration = Duration::from_secs(10);
 ///
 /// The `- 3` is the UTF-8 width of the `…`, and the slice counts **characters,
 /// not bytes**, so multi-byte data can still push the line past `PIPE_BUF`.
-/// That is a known bug in the original (PARITY.md §14.10) and is replicated:
+/// That is a known limitation:
 /// the truncation is a best-effort interleaving defence, not a guarantee, and
 /// local filesystems hold the inode lock anyway. A `budget <= 0` writes the
 /// line over-length, unchanged.
@@ -1089,11 +1087,9 @@ fn slice_utf16_units(text: &str, units: usize) -> String {
 /// One `O_APPEND` handle per path, so a chatty run does not open and close a
 /// file per event.
 ///
-/// The TS version arms a per-path 10 s timer and re-arms it past the midpoint.
-/// Here eviction is a sweep performed on each append plus the explicit
-/// [`close_append_handle`] the run store calls on completion. The observable
-/// property — handles do not accumulate — is the same, and it avoids a
-/// detached timer task per open file; the trade is that a process which
+/// Eviction is a sweep performed on each append plus the explicit
+/// [`close_append_handle`] the run store calls on completion. Handles do not
+/// accumulate, and it avoids a detached timer task per open file; the trade is that a process which
 /// appends nothing further holds one handle until it exits or closes it.
 static APPEND_HANDLES: OnceLock<AsyncMutex<HashMap<PathBuf, HandleEntry>>> = OnceLock::new();
 
@@ -1258,9 +1254,9 @@ fn parse_jsonl_lines<'l, T: DeserializeOwned>(lines: impl Iterator<Item = &'l st
 
 /// Directories already created in this process.
 ///
-/// The TS version keeps the same cache to skip ~50 redundant `mkdir` syscalls
-/// per tick. It means a directory deleted underneath a long-running process is
-/// not recreated — faithful, and the reason `clear_ensured_dirs` exists.
+/// The cache skips ~50 redundant `mkdir` syscalls per tick. It means a
+/// directory deleted underneath a long-running process is not recreated, which
+/// is why `clear_ensured_dirs` exists.
 fn ensured_dirs() -> &'static Mutex<HashSet<PathBuf>> {
     static ENSURED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     ENSURED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -1296,7 +1292,7 @@ pub async fn path_exists(path: &Path) -> bool {
 }
 
 /// Directory entry names, optionally filtered by extension. An absent
-/// directory lists as empty, like the TS version.
+/// directory lists as empty.
 pub async fn list_files(dir: &Path, ext: Option<&str>) -> Result<Vec<String>> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -1704,7 +1700,7 @@ mod tests {
     #[tokio::test]
     async fn a_document_with_a_few_merge_keys_still_reads() {
         // The guard must not break the thing it exists to allow: a
-        // hand-written config using merge keys (§6.4.2).
+        // hand-written config using merge keys.
         let temp = tempfile::tempdir().unwrap();
         clear_ensured_dirs();
         let path = temp.path().join("merged.yml");
@@ -2040,9 +2036,9 @@ mod tests {
     }
 
     /// Every expectation below was produced by
-    /// `node -e "yaml.load('k: ' + v).k instanceof Date"` against the
-    /// vendored js-yaml, not by reading its regex.
-    const JS_YAML_RESOLVES_AS_DATE: &[(&str, bool)] = &[
+    /// `node -e "yaml.load('k: ' + v).k instanceof Date"` against a YAML 1.1
+    /// reader, not by reading its regex.
+    const YAML11_RESOLVES_AS_DATE: &[(&str, bool)] = &[
         ("2026-10-13T16:37:58.959Z", true),
         ("2026-10-13T16:37:58Z", true),
         ("2026-10-13T16:37:58", true),
@@ -2052,7 +2048,7 @@ mod tests {
         ("2026-10-13T16:37:58.959+02:00", true),
         ("2026-10-13T16:37:58.959 Z", true),
         ("2026-10-13", true),
-        // A timezone without the colon is *not* a js-yaml timestamp: its
+        // A timezone without the colon is *not* a YAML 1.1 timestamp: its
         // grammar is `([-+])(\d{1,2})(?::(\d{2}))?$`, so `-0200` cannot match.
         ("2026-10-13T16:37:58.959-0200", false),
         // The date-only form requires two-digit month and day.
@@ -2071,20 +2067,20 @@ mod tests {
     ];
 
     #[test]
-    fn the_grammar_agrees_with_js_yaml_on_every_measured_case() {
-        for (value, is_date) in JS_YAML_RESOLVES_AS_DATE {
+    fn the_grammar_agrees_with_yaml_1_1_on_every_measured_case() {
+        for (value, is_date) in YAML11_RESOLVES_AS_DATE {
             assert_eq!(
                 is_yaml11_timestamp(value),
                 *is_date,
-                "{value:?}: js-yaml resolves it as {}",
+                "{value:?}: YAML 1.1 resolves it as {}",
                 if *is_date { "a Date" } else { "a string" }
             );
         }
     }
 
     #[test]
-    fn the_guard_quotes_exactly_the_scalars_js_yaml_would_misread() {
-        for (value, is_date) in JS_YAML_RESOLVES_AS_DATE {
+    fn the_guard_quotes_exactly_the_scalars_a_yaml_1_1_reader_would_misread() {
+        for (value, is_date) in YAML11_RESOLVES_AS_DATE {
             if value.is_empty() {
                 continue;
             }
@@ -2236,10 +2232,10 @@ mod tests {
         })
     }
 
-    /// Byte and character counts measured by running the TS `appendJsonl`
+    /// Byte and character counts measured by running the same
     /// arithmetic under node, not derived from reading it.
     #[test]
-    fn the_pipe_buf_truncation_matches_the_reference_arithmetic() {
+    fn the_pipe_buf_truncation_matches_the_measured_arithmetic() {
         // A short line is untouched and compact — no spaces.
         let short = jsonl_line(&serde_json::json!({
             "timestamp": "t", "type": "agent_output", "data": "hi"
@@ -2252,17 +2248,17 @@ mod tests {
 
         // ASCII data is truncated to land exactly on PIPE_BUF.
         let ascii = jsonl_line(&event(&"x".repeat(8000))).unwrap();
-        assert_eq!(ascii.len(), 4096, "node measures 4096 bytes");
-        assert_eq!(ascii.chars().count(), 4094, "node measures 4094 chars");
+        assert_eq!(ascii.len(), 4096, "the line is 4096 bytes");
+        assert_eq!(ascii.chars().count(), 4094, "the line is 4094 chars");
         assert!(ascii.ends_with("…\"}\n"));
 
-        // PARITY.md §14.10: the slice counts characters, so multi-byte data
-        // still overshoots PIPE_BUF. Replicated, including the exact size.
+        // The slice counts characters, so multi-byte data still overshoots
+        // PIPE_BUF. The exact size is pinned.
         let multibyte = jsonl_line(&event(&"é".repeat(8000))).unwrap();
         assert_eq!(
             multibyte.len(),
             8116,
-            "node measures 8116 bytes — the §14.10 overshoot"
+            "multi-byte data overshoots PIPE_BUF at 8116 bytes"
         );
         assert_eq!(multibyte.chars().count(), 4094);
         assert!(multibyte.ends_with("…\"}\n"));
@@ -2276,7 +2272,7 @@ mod tests {
         assert_eq!(
             jsonl_line(&no_data).unwrap().len(),
             8040,
-            "node measures 8040"
+            "the line is 8040 bytes"
         );
 
         let empty_data = serde_json::json!({
@@ -2285,7 +2281,7 @@ mod tests {
         assert_eq!(
             jsonl_line(&empty_data).unwrap().len(),
             8048,
-            "node measures 8048"
+            "the line is 8048 bytes"
         );
 
         // A non-object record is left alone too.
@@ -2375,7 +2371,7 @@ mod tests {
 
     #[test]
     fn a_lone_surrogate_escape_becomes_the_replacement_character() {
-        // The exact shape the oracle writes when `.slice(0, 4000)` cuts
+        // The exact shape an existing writer produces when `.slice(0, 4000)` cuts
         // between the surrogates of an emoji — measured, not constructed.
         let written = r#"{"body":"aaa\ud83d","subject":"bbb\ud83d"}"#;
         let repaired = repair_lone_surrogates(written);
@@ -2460,9 +2456,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_json_tolerates_a_ts_written_lone_surrogate() {
-        // The end-to-end guarantee from the ruling: a file the oracle wrote
-        // must not fail the read.
+    async fn read_json_tolerates_an_externally_written_lone_surrogate() {
+        // The end-to-end guarantee from the ruling: a file written by an
+        // existing writer must not fail the read.
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("msg_lonely.json");
         std::fs::write(&path, "{\"id\":\"msg_abc1234\",\"body\":\"aaa\\ud83d\"}\n").unwrap();

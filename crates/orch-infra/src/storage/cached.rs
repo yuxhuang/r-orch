@@ -1,5 +1,4 @@
-//! Tick-scoped caching wrappers — ported from
-//! `src/infrastructure/storage/cached-stores.ts`.
+//! Tick-scoped caching wrappers.
 //!
 //! Each wrapper memoizes `list()` (and `get_by_name` for agents) for the
 //! duration of one tick, and clears the whole cache on any `save` or `delete`.
@@ -43,7 +42,7 @@ use tokio::sync::Mutex;
 
 pub struct CachedTaskStore {
     inner: Arc<dyn TaskStore>,
-    /// Keyed exactly as the TS does — `"<status>:<goalId>"`, with an empty
+    /// Keyed `"<status>:<goalId>"`, with an empty
     /// segment for an unset dimension — so two filters that differ only in an
     /// unset field share one entry.
     cache: Mutex<std::collections::HashMap<String, Vec<Task>>>,
@@ -64,10 +63,8 @@ impl CachedTaskStore {
     }
 
     fn key(filter: &TaskFilter) -> String {
-        // The TS distinguishes "no filter at all" from "a filter with nothing
-        // set"; here `TaskFilter::default()` is the only way to express the
-        // former, and both map to the same key, which is what the TS
-        // `__all__` / `":"` pair effectively does once both are empty.
+        // `TaskFilter::default()` is the only way to express "no filter at
+        // all"; it maps to the same key as a filter with nothing set.
         format!(
             "{}:{}",
             filter.status.map(|s| s.as_str()).unwrap_or(""),
@@ -126,8 +123,8 @@ pub struct CachedAgentStore {
 #[derive(Default)]
 struct AgentCache {
     list: Option<Vec<Agent>>,
-    /// A negative lookup is cached too: the TS `nameCache.has(name)` check
-    /// treats a cached `null` as a hit, so a miss is not re-read either.
+    /// A negative lookup is cached too: a cached `None` counts
+    /// as a hit, so a miss is not re-read either.
     by_name: std::collections::HashMap<String, Option<Agent>>,
 }
 
@@ -360,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_cache_key_matches_the_reference_shape() {
+    async fn the_cache_key_has_the_expected_shape() {
         assert_eq!(CachedTaskStore::key(&TaskFilter::default()), ":");
         assert_eq!(
             CachedTaskStore::key(&TaskFilter::with_status(TaskStatus::Todo)),
@@ -507,7 +504,7 @@ mod tests {
         for _ in 0..3 {
             assert!(cached.get_by_name("nope").await.unwrap().is_none());
         }
-        // The TS `nameCache.has(name)` treats a cached null as a hit.
+        // A cached `None` counts as a hit.
         assert_eq!(
             inner
                 .calls
@@ -557,8 +554,8 @@ mod tests {
 
     #[tokio::test]
     async fn agent_list_order_survives_the_cache() {
-        // Last-write order decides tie-broken agent selection (§14.4), so the
-        // cache must not reorder it.
+        // Last-write order decides tie-broken agent selection, so the cache
+        // must not reorder it.
         let inner = Arc::new(FakeAgentStore::new());
         let cached = CachedAgentStore::new(Arc::clone(&inner) as Arc<dyn AgentStore>);
         for id in ["agt_c", "agt_a", "agt_b"] {
@@ -611,7 +608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_goal_cache_key_matches_the_reference_shape() {
+    async fn the_goal_cache_key_has_the_expected_shape() {
         assert_eq!(CachedGoalStore::key(&GoalFilter::default()), "__all__");
         assert_eq!(
             CachedGoalStore::key(&GoalFilter::with_status(GoalStatus::Active)),

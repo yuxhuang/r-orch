@@ -1,9 +1,8 @@
-//! Typed error hierarchy (`src/domain/errors.ts`).
+//! Typed error hierarchy.
 //!
-//! The TS `OrchestryError` carries `(message, exitCode, hint?)` and each
-//! subclass specializes it. Here it is one enum: the `#[error(...)]` strings
-//! **are** the user-facing messages from PARITY.md §3.1, so the contract is
-//! hard to drift from, and [`DomainError::exit_code`] / [`DomainError::hint`]
+//! Each error carries `(message, exit code, hint?)`. It is one enum: the
+//! `#[error(...)]` strings **are** the user-facing messages, so the contract
+//! is hard to drift from, and [`DomainError::exit_code`] / [`DomainError::hint`]
 //! are the only two things the CLI error boundary needs.
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +12,7 @@ use crate::task::TaskStatus;
 
 pub type Result<T> = std::result::Result<T, DomainError>;
 
-/// Exit codes (PARITY.md §3):
+/// Exit codes:
 /// `1` general, `2` invalid arguments, `3` not initialized, `4` lock conflict,
 /// `5` agent adapter unavailable, `6` workspace error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -24,13 +23,11 @@ pub enum DomainError {
     #[error("{0}")]
     InvalidArguments(String),
 
-    /// `None` renders as the literal `undefined`, which is what the TS
-    /// prints: `withTemporaryLock` and `startWatch` throw
-    /// `LockConflictError(lockResult.pid!)` on **any** failed acquisition, and
-    /// a lock file holding garbage yields no PID — so the template
-    /// interpolates `undefined`. Measured against the oracle: a garbage or
-    /// empty lock file makes `serve --once` and `run <id>` exit 4 with
-    /// `Orchestrator already running (PID: undefined)` (PARITY.md §14).
+    /// `None` renders as the literal `undefined`: any failed acquisition
+    /// raises this error, and a lock file holding garbage yields no PID — so
+    /// the template interpolates `undefined`. A garbage or empty lock file
+    /// makes `serve --once` and `run <id>` exit 4 with
+    /// `Orchestrator already running (PID: undefined)`.
     #[error("Orchestrator already running (PID: {})", DomainError::render_pid(*_0))]
     LockConflict(Option<u32>),
 
@@ -54,8 +51,7 @@ pub enum DomainError {
     },
 
     /// The arrow is U+2192 and is **not** ASCII-folded under `--ascii`: it is
-    /// produced in the domain layer, which has no knowledge of the flag
-    /// (PARITY.md §3.1).
+    /// produced in the domain layer, which has no knowledge of the flag.
     #[error("Invalid transition for {task_id}: {from} → {to}")]
     InvalidTransition {
         task_id: String,
@@ -85,14 +81,14 @@ pub enum DomainError {
         hint: Option<String>,
     },
 
-    /// Anything that is a plain `throw new Error(...)` in the original, and
+    /// Any generic error, and
     /// every infrastructure error converted at a service boundary. Exit 1.
     #[error("{0}")]
     Other(String),
 }
 
 impl DomainError {
-    /// A lock holder's PID as the TS renders it — the number, or the literal
+    /// A lock holder's PID as rendered — the number, or the literal
     /// `undefined` when the lock file held nothing parseable.
     fn render_pid(pid: Option<u32>) -> String {
         match pid {
@@ -121,7 +117,7 @@ impl DomainError {
         }
     }
 
-    /// The second line of the error block (PARITY.md §3.1), or `None` when the
+    /// The second line of the error block, or `None` when the
     /// error has no hint.
     pub fn hint(&self) -> Option<String> {
         match self {
@@ -147,8 +143,7 @@ impl DomainError {
         }
     }
 
-    /// The `name` of the corresponding TS error class. Asserted by the ported
-    /// `errors.test.ts` and used by serve-mode structured logging.
+    /// The error's `name`, used by serve-mode structured logging.
     pub fn name(&self) -> &'static str {
         match self {
             DomainError::NotInitialized => "NotInitializedError",
@@ -185,7 +180,7 @@ pub enum AdapterErrorKind {
 }
 
 impl AdapterErrorKind {
-    /// All seven variants, in TS enum declaration order.
+    /// All seven variants, in declaration order.
     pub const ALL: [AdapterErrorKind; 7] = [
         AdapterErrorKind::AdapterNotFound,
         AdapterErrorKind::AuthFailed,
@@ -230,8 +225,8 @@ impl std::str::FromStr for AdapterErrorKind {
 pub struct AdapterErrorHint {
     pub message: &'static str,
     pub fix: &'static str,
-    /// `None` rather than `Some(false)` where the TS object omits the key —
-    /// `adapter-error-kind.test.ts` asserts `toBeUndefined()` for `auth_failed`.
+    /// `None` rather than `Some(false)` so the key is omitted from the
+    /// serialized form (e.g. for `auth_failed`).
     #[serde(
         rename = "doctorHint",
         default,
@@ -240,11 +235,11 @@ pub struct AdapterErrorHint {
     pub doctor_hint: Option<bool>,
 }
 
-/// `ERROR_HINTS` (PARITY.md §8.9), in TS key order.
+/// Fix hints per adapter error kind.
 ///
 /// `timeout.fix` names `agent_timeout`, which is not a real config key — the
 /// real path is `defaults.agent.timeout_ms`. The text is user-visible output
-/// asserted by tests, so it is replicated verbatim (PARITY.md §14.3).
+/// asserted by tests, so it is kept verbatim.
 pub const ERROR_HINTS: [(AdapterErrorKind, AdapterErrorHint); 7] = [
     (
         AdapterErrorKind::AdapterNotFound,
@@ -304,7 +299,7 @@ pub const ERROR_HINTS: [(AdapterErrorKind, AdapterErrorHint); 7] = [
     ),
 ];
 
-/// `ERROR_HINTS[kind]` — total, like the TS `Record`.
+/// Hint lookup by kind — total.
 pub fn error_hint(kind: AdapterErrorKind) -> &'static AdapterErrorHint {
     ERROR_HINTS
         .iter()
@@ -315,7 +310,7 @@ pub fn error_hint(kind: AdapterErrorKind) -> &'static AdapterErrorHint {
 
 /// Classify an adapter failure from its message and (optional) exit code.
 ///
-/// The check order is contract (PARITY.md §8.8): the first matching rule wins,
+/// The check order is contract: the first matching rule wins,
 /// so `ENOENT` beats a non-zero exit code and an auth keyword beats a crash.
 pub fn classify_adapter_error(error: &str, exit_code: Option<i32>) -> AdapterErrorKind {
     let lower = error.to_lowercase();
@@ -353,7 +348,7 @@ pub fn classify_adapter_error(error: &str, exit_code: Option<i32>) -> AdapterErr
 /// Some CLIs wrap an API error several times, including a JSON document
 /// serialized inside a `message` string, so a string that parses as JSON is
 /// re-entered. Keyed off `error`, `message`, `detail`, `reason` in that order
-/// and bounded at depth 6, exactly like the TS original.
+/// and bounded at depth 6.
 pub fn extract_error_message(value: &Value) -> String {
     extract_at_depth(value, 0)
 }
@@ -372,13 +367,13 @@ fn extract_at_depth(value: &Value, depth: u32) -> String {
         }
         return match serde_json::from_str::<Value>(trimmed) {
             Ok(parsed) => extract_at_depth(&parsed, depth + 1),
-            // Not JSON — the original (untrimmed) string is the message.
+            // Not JSON — the untrimmed input string is the message.
             Err(_) => s.clone(),
         };
     }
 
     // Arrays are objects in JS, but they carry none of the keys below, so they
-    // fall through to the stringify at the end exactly as in the original.
+    // fall through to the stringify at the end.
     if let Value::Object(map) = value {
         for key in EXTRACT_KEYS {
             match map.get(key) {
@@ -492,11 +487,10 @@ mod tests {
 
     #[test]
     fn a_lock_conflict_without_a_pid_renders_the_literal_undefined() {
-        // Measured against the oracle: a garbage or empty lock file makes
-        // `serve --once` and `run <id>` exit 4 with this exact text, because
-        // the TS throws `LockConflictError(lockResult.pid!)` on **any** failed
-        // acquisition and the template interpolates `undefined`. Collapsing it
-        // to 0 was a silent L0 divergence (PARITY.md §14).
+        // A garbage or empty lock file makes `serve --once` and `run <id>`
+        // exit 4 with this exact text, because any failed acquisition raises
+        // the error and the template interpolates `undefined`. Collapsing it
+        // to 0 would change the message.
         let err = DomainError::LockConflict(None);
         assert_eq!(
             err.to_string(),
@@ -686,14 +680,14 @@ mod tests {
     #[test]
     fn auth_failed_has_no_doctor_hint() {
         assert_eq!(error_hint(AdapterErrorKind::AuthFailed).doctor_hint, None);
-        // Serialized, the key is absent — as in the TS object.
+        // Serialized, the key is absent.
         let json = serde_json::to_value(error_hint(AdapterErrorKind::AuthFailed)).unwrap();
         assert!(json.get("doctorHint").is_none());
     }
 
     #[test]
     fn timeout_fix_keeps_the_wrong_config_key() {
-        // PARITY.md §14.3 — replicated verbatim.
+        // The fix text is kept verbatim, wrong key included.
         assert_eq!(
             error_hint(AdapterErrorKind::Timeout).fix,
             "Increase the timeout with: orch config set agent_timeout <ms>"

@@ -1,4 +1,4 @@
-//! The logs view, labelled `ACTIONS` (docs/parity/tui.md §1.4).
+//! The logs view, labelled `ACTIONS`.
 //!
 //! Occupies the whole content height: line 1 is the status bar, line 2 the
 //! agent chips, and the rest are message rows.
@@ -188,7 +188,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 
         put_line(frame, rows_area, rows_area.y + row as u16, spans);
         // From the same vector the row was drawn from, so the row → message
-        // mapping has one implementation (PARITY.md §14.20, §3.2.2). The
+        // mapping has one implementation. The
         // filtered index is what the action needs; the message id is what
         // identifies the row across frames.
         if let Some(filtered_index) = filtered.iter().position(|i| i == message_index) {

@@ -1,4 +1,4 @@
-//! Agent adapter port — ported from `src/infrastructure/adapters/interface.ts`.
+//! Agent adapter port.
 //!
 //! Every AI tool (Claude, Codex, Shell, …) implements [`Adapter`].
 
@@ -46,8 +46,7 @@ impl AdapterTestResult {
 }
 
 /// The adapter-level event kind. **Distinct from [`RunEventType`]** — the
-/// orchestrator maps between them with [`AgentEventKind::to_run_event_type`]
-/// (PARITY.md §8.1).
+/// orchestrator maps between them with [`AgentEventKind::to_run_event_type`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentEventKind {
@@ -82,7 +81,7 @@ impl AgentEventKind {
 
     /// `output → agent_output`, `file_change → file_changed`,
     /// `command → command_run`, `tool_call → tool_call`, `error → error`,
-    /// anything else → `done` (PARITY.md §8.1, L0).
+    /// anything else → `done`.
     pub fn to_run_event_type(self) -> RunEventType {
         match self {
             AgentEventKind::Output => RunEventType::AgentOutput,
@@ -178,14 +177,14 @@ pub struct ExecuteParams {
     pub workspace: PathBuf,
     /// Overlaid on the inherited parent environment. Assembled by the
     /// orchestrator as `{ ...agent.config.env, ORCH_AGENT_ID, ORCH_AGENT_NAME,
-    /// ORCH_TASK_ID }` — the three `ORCH_*` keys win (PARITY.md §8.3).
+    /// ORCH_TASK_ID }` — the three `ORCH_*` keys win.
     pub env: BTreeMap<String, String>,
     /// Filter on the inherited parent environment, passed to
     /// [`SpawnOptions::inherit_env`](crate::process::SpawnOptions). Remote
     /// mirror runs use `WithoutSecrets` (security review F2).
     pub inherit_env: crate::process::EnvInheritance,
     pub config: AgentConfig,
-    /// Replaces the TS `AbortSignal`.
+    /// Cancels the run.
     pub cancel: CancellationToken,
 }
 
@@ -195,7 +194,7 @@ pub struct ExecuteParams {
 pub struct ExecuteHandle {
     pub pid: u32,
     /// Stream errors are `Err` *items* rather than a terminated stream,
-    /// because the TS generator distinguishes "an `error` event occurred"
+    /// because the stream distinguishes "an `error` event occurred"
     /// (continue) from "the generator threw" (run failed). The thrown case is
     /// the stream yielding `Err` and then ending.
     pub events: BoxStream<'static, std::result::Result<AgentEvent, AdapterError>>,
@@ -252,10 +251,9 @@ pub trait Adapter: Send + Sync {
 
     async fn test(&self) -> AdapterTestResult;
 
-    /// **Not async**, mirroring the TS contract where `execute()` returns
-    /// `{ pid, events }` synchronously. Lifecycle listeners (close, error,
-    /// stderr) must be attached before the stream is polled, so a fast-failing
-    /// child is never missed. Spawning is itself non-blocking, so sync costs
+    /// **Not async**: `execute()` returns `{ pid, events }` synchronously.
+    /// Lifecycle listeners (close, error, stderr) must be attached before the
+    /// stream is polled, so a fast-failing child is never missed. Spawning is itself non-blocking, so sync costs
     /// nothing.
     fn execute(&self, params: ExecuteParams) -> std::result::Result<ExecuteHandle, AdapterError>;
 
@@ -265,10 +263,9 @@ pub trait Adapter: Send + Sync {
 /// Adapter lookup by kind.
 ///
 /// Backed by an insertion-ordered map rather than ARCHITECTURE §5.4's `Vec`:
-/// the TS `AdapterRegistry` is a `Map` keyed by `kind`, so re-registering a
-/// kind **replaces** it, while `listKinds()` still yields registration order.
-/// A `Vec` would duplicate instead of replacing. Registration order is L0 —
-/// `doctor` probes adapters in it (PARITY.md §5.4).
+/// the registry is keyed by `kind`, so re-registering a kind **replaces** it,
+/// while `kinds()` still yields registration order. A `Vec` would duplicate instead of replacing. Registration order is contract —
+/// `doctor` probes adapters in it.
 #[derive(Default, Clone)]
 pub struct AdapterRegistry {
     adapters: IndexMap<&'static str, Arc<dyn Adapter>>,
@@ -287,7 +284,7 @@ impl AdapterRegistry {
         self.adapters.get(kind)
     }
 
-    /// The TS `require` throws
+    /// Fails with
     /// `Unknown adapter: "<kind>". Available: <kinds joined with ", ">`,
     /// a plain `Error` — so exit 1.
     pub fn require(&self, kind: &str) -> std::result::Result<&Arc<dyn Adapter>, DomainError> {
@@ -303,12 +300,12 @@ impl AdapterRegistry {
         self.adapters.contains_key(kind)
     }
 
-    /// Registration order — L0.
+    /// Registration order.
     pub fn list(&self) -> Vec<&Arc<dyn Adapter>> {
         self.adapters.values().collect()
     }
 
-    /// Registration order — L0.
+    /// Registration order.
     pub fn kinds(&self) -> Vec<&'static str> {
         self.adapters.keys().copied().collect()
     }
@@ -368,7 +365,7 @@ mod tests {
 
     #[test]
     fn registration_order_is_preserved() {
-        // The doctor probe order from PARITY.md §5.4.
+        // The doctor probe order.
         let order = [
             "claude",
             "codex",
@@ -432,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_strings_are_the_ts_values() {
+    fn event_kind_strings_are_the_wire_values() {
         let names: Vec<&str> = AgentEventKind::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(
             names,
@@ -455,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_event_serializes_with_the_ts_key_names() {
+    fn agent_event_serializes_with_the_wire_key_names() {
         let event = AgentEvent::new(
             AgentEventKind::Output,
             "2026-10-13T16:37:59.169Z",

@@ -1,5 +1,4 @@
-//! File-based goal store — ported from
-//! `src/infrastructure/storage/goal-store.ts`.
+//! File-based goal store.
 
 use async_trait::async_trait;
 use orch_core::error::{Error, Result};
@@ -30,7 +29,7 @@ impl GoalStore for FileGoalStore {
     /// **descending**.
     ///
     /// `sort_by`, never `sort_unstable_by`: ties keep index order, which is
-    /// last-write order (PARITY.md §14.4).
+    /// last-write order.
     async fn list(&self, filter: &GoalFilter) -> Result<Vec<Goal>> {
         let mut goals: Vec<Goal> = self
             .index
