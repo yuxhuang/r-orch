@@ -32,6 +32,17 @@ pub const ENTER_BLOCK_HINT_MS: i64 = 2_000;
 pub const FIX_THE_ERROR_ABOVE: &str = "Fix the error above";
 /// Confirming an agent step whose filter hides every agent.
 pub const NO_AGENT_MATCHES: &str = "No agent matches the filter";
+/// Confirming a members step that still ticks a refused agent.
+pub const UNTICK_UNAVAILABLE: &str = "Untick the unavailable agents to continue";
+
+/// One agent choice the final-submit check refused (R7, D7): the step that
+/// holds it, the agent id, and the row to list it as while it is still
+/// ticked on a `Multiselect` step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedAgent {
+    pub step_id: String,
+    pub choice: Choice,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
@@ -314,6 +325,10 @@ pub struct Wizard {
     picker_query: String,
     /// The agent steps' order; kept for the wizard's lifetime.
     picker_order: PickerOrder,
+    /// Ticked members the final-submit check refused, by step id. Each is
+    /// listed first on its step while still ticked, so it can be seen and
+    /// unticked whatever the filter; it cannot be ticked again.
+    refused: IndexMap<String, Vec<Choice>>,
 }
 
 #[derive(Clone)]
@@ -361,6 +376,7 @@ impl Wizard {
             enter_block_until: None,
             picker_query: String::new(),
             picker_order: PickerOrder::default(),
+            refused: IndexMap::new(),
         };
         wizard.index = wizard.first_active_index();
         wizard.prefill();
@@ -487,10 +503,92 @@ impl Wizard {
     /// Row numbers, digit picks, clicks and the cursor all index this list.
     pub fn options(&self) -> Vec<Choice> {
         let options = self.step().options.resolve(&self.values);
-        match &self.step().picker {
+        let arranged = match &self.step().picker {
             Some(picker) => picker.arrange(options, &self.picker_query, self.picker_order),
             None => options,
+        };
+        let refused = self.refused_ticked();
+        if refused.is_empty() {
+            return arranged;
         }
+        refused.into_iter().chain(arranged).collect()
+    }
+
+    /// The refused agents this `Multiselect` step still ticks.
+    fn refused_ticked(&self) -> Vec<Choice> {
+        if self.step().kind != StepKind::Multiselect {
+            return Vec::new();
+        }
+        self.refused
+            .get(self.step_id())
+            .map(|rows| {
+                rows.iter()
+                    .filter(|c| self.multi_selected.contains(&c.value))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A refused single choice is waiting to be replaced: no row is chosen
+    /// and confirming is refused until one is.
+    pub fn selection_missing(&self) -> bool {
+        self.missing_selection.is_some()
+    }
+
+    /// Mark the current `Select` step's answer as no longer offered. The
+    /// cursor parks past the last row, so no row is drawn as the answer and
+    /// a click on any row moves onto it (the mouse moves by `Up`/`Down`).
+    fn mark_missing(&mut self, value: String, error: &str) {
+        self.missing_selection = Some(value);
+        self.session_error = Some(error.into());
+        self.select_index = self.options().len();
+    }
+
+    /// The final-submit check refused some agent choices (R7, D7).
+    ///
+    /// `steps` are rebuilt from the roster that check read, so they offer
+    /// only agents eligible now. Each refused single choice is reopened with
+    /// nothing chosen; it never becomes the sentinel or another row. Each
+    /// refused member stays ticked and is listed on its step until it is
+    /// unticked. The wizard opens the earliest refused step with the filter
+    /// cleared and `message` shown; every other answer is kept.
+    ///
+    /// With no `steps` (an edited entity no longer listed) only `message` is
+    /// shown; the next submission is checked again all the same.
+    pub fn reject_agents(
+        &mut self,
+        steps: Vec<WizardStep>,
+        refused: &[RefusedAgent],
+        message: &str,
+    ) {
+        if steps.is_empty() {
+            self.session_error = Some(message.into());
+            return;
+        }
+        self.save_step();
+        self.steps = steps;
+        self.refused.clear();
+        for agent in refused {
+            if self
+                .steps
+                .iter()
+                .any(|s| s.id == agent.step_id && s.kind == StepKind::Multiselect)
+            {
+                self.refused
+                    .entry(agent.step_id.clone())
+                    .or_default()
+                    .push(agent.choice.clone());
+            }
+        }
+        let target = self
+            .steps
+            .iter()
+            .position(|s| refused.iter().any(|r| r.step_id == s.id))
+            .unwrap_or_else(|| self.first_active_index());
+        self.index = target;
+        self.prefill();
+        self.session_error = Some(message.into());
     }
 
     /// The current step's agent picker, if it is an agent step.
@@ -576,9 +674,10 @@ impl Wizard {
                 if let Some(at) = self.options().iter().position(|o| o.value == saved.value) {
                     self.select_index = at;
                 } else {
-                    self.missing_selection = Some(saved.value);
-                    self.session_error =
-                        Some("Saved option is no longer available; choose again".into());
+                    self.mark_missing(
+                        saved.value,
+                        "Saved option is no longer available; choose again",
+                    );
                 }
             }
             self.multi_selected = saved.multi_selected;
@@ -586,6 +685,16 @@ impl Wizard {
             self.set_current_value(&value);
         }
         self.reset_step_state();
+        self.flag_refused_ticked();
+    }
+
+    /// Say why a members step will not confirm while it ticks a refused
+    /// agent, before the user tries.
+    fn flag_refused_ticked(&mut self) {
+        if !self.refused_ticked().is_empty() {
+            self.dirty = true;
+            self.validated = Some((self.current_value(), Some(UNTICK_UNAVAILABLE.into())));
+        }
     }
 
     pub(crate) fn save_step(&mut self) {
@@ -696,6 +805,17 @@ impl Wizard {
                         + f.multi_selected.iter().map(String::len).sum::<usize>()
                 })
                 .sum::<usize>()
+            + self
+                .refused
+                .iter()
+                .map(|(k, rows)| {
+                    k.len()
+                        + rows
+                            .iter()
+                            .map(|c| c.value.len() + c.label.len() + c.hint.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     /// Everything that resets on both forward and backward navigation.
@@ -725,9 +845,12 @@ impl Wizard {
             self.index = index;
             // Catalog reordering must not select a different value by index.
             if self.step().kind == StepKind::Select {
+                // An agent that is no longer offered is never swapped for the
+                // default, which on an agent step is the sentinel (R7, D7).
+                let lost_agent = self.step().picker.is_some() && !current.is_empty();
                 if let Some(at) = self.options().iter().position(|c| c.value == current) {
                     self.select_index = at;
-                } else if untouched {
+                } else if untouched && !lost_agent {
                     let default = self.step().default_value.resolve(&self.values);
                     self.select_index = self
                         .options()
@@ -736,9 +859,9 @@ impl Wizard {
                         .unwrap_or(0);
                     self.baseline.insert(current_id, self.current_value());
                 } else {
-                    self.missing_selection = Some(current);
-                    self.session_error = Some(
-                        "Selected option is no longer available; choose an option again".into(),
+                    self.mark_missing(
+                        current,
+                        "Selected option is no longer available; choose an option again",
                     );
                 }
                 self.save_step();
@@ -1387,7 +1510,11 @@ impl Wizard {
                 WizardOutcome::Consumed
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if !options.is_empty() {
+                // From the parked cursor of a missing selection, Down enters
+                // the list at the top.
+                if self.select_index >= options.len() {
+                    self.select_index = 0;
+                } else {
                     self.select_index = (self.select_index + 1).min(options.len() - 1);
                 }
                 WizardOutcome::Consumed
@@ -1460,7 +1587,15 @@ impl Wizard {
                         self.multi_selected.insert(choice.value.clone());
                     }
                     self.dirty = true;
+                    // An unticked refused row leaves the list.
+                    let len = self.options().len();
+                    self.select_index = self.select_index.min(len.saturating_sub(1));
                 }
+                WizardOutcome::Consumed
+            }
+            KeyCode::Enter | KeyCode::Tab if !self.refused_ticked().is_empty() => {
+                self.dirty = true;
+                self.validated = Some((self.current_value(), Some(UNTICK_UNAVAILABLE.into())));
                 WizardOutcome::Consumed
             }
             KeyCode::Enter | KeyCode::Tab => {

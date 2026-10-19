@@ -13,5 +13,6 @@ pub use session::{
 pub use picker::{AgentPicker, PickerOrder};
 
 pub use engine::{
-    Choice, StepKind, SuggestionMode, Values, Wizard, WizardKind, WizardOutcome, WizardStep,
+    Choice, RefusedAgent, StepKind, SuggestionMode, Values, Wizard, WizardKind, WizardOutcome,
+    WizardStep,
 };

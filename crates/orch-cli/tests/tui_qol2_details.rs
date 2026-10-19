@@ -4,7 +4,8 @@
 //! rows have the bottom feed's columns (R1, R12), and their Overview is an
 //! aligned label/value block under a `━` title rule, focused and pinned (R6).
 //! The new-task wizard's Assignee step filters its agents as you type and
-//! cycles their order with `Ctrl+O` (R7, R8).
+//! cycles their order with `Ctrl+O` (R7, R8), and its final submit refuses an
+//! agent another process disabled after it was picked (R7, D7).
 //!
 //! The real `orch` binary runs `orch tui` in a private tmux server over a
 //! temp project with one shell agent, `bot`, one unassigned goal, `Launch`,
@@ -664,4 +665,94 @@ fn wizard_agent_picker_filter_and_order() {
     let rows = picker_rows(&screen);
     assert_eq!(rows.len(), 2, "{screen}");
     assert!(rows[1].contains("alpha-ops"), "{screen}");
+}
+
+/// The project's agents by name, read back through the CLI.
+fn agent_ids(dir: &Path) -> std::collections::HashMap<String, String> {
+    let list: serde_json::Value =
+        serde_json::from_str(&orch(dir, &["--json", "agent", "list"])).expect("--json output");
+    list.as_array()
+        .expect("an agent array")
+        .iter()
+        .map(|a| {
+            (
+                a["name"].as_str().expect("a name").to_owned(),
+                a["id"].as_str().expect("an id").to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn tasks(dir: &Path) -> Vec<serde_json::Value> {
+    let list: serde_json::Value =
+        serde_json::from_str(&orch(dir, &["--json", "task", "list"])).expect("--json output");
+    list.as_array().expect("a task array").clone()
+}
+
+/// R7, D7: the new-task wizard checks its chosen agent against the store at
+/// final submit. alpha-ops is picked, then disabled by a separate `orch agent
+/// disable` process; the submit writes nothing, says why on screen, and
+/// reopens the Assignee step on fresh rows with no row marked chosen.
+/// Choosing mid-reviewer then creates exactly one task with the kept
+/// description.
+#[test]
+fn wizard_final_submit_refuses_an_agent_disabled_by_another_process() {
+    let dir = picker_project();
+    let ids = agent_ids(dir.path());
+    let tmux = launch(
+        dir.path(),
+        format!("orch-r7-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["t"]);
+    tmux.keys(&["n"]);
+    tmux.wait_for("the title step", |s| s.contains("Task title"));
+    tmux.keys(&["-l", "Ship it"]);
+    tmux.keys(&["Enter"]);
+    tmux.wait_for("the priority step", |s| s.contains("Priority"));
+    tmux.keys(&["Enter"]);
+    tmux.wait_for("the assignee step", |s| s.contains("> type to filter"));
+    type_filter(&tmux, "ops");
+    tmux.keys(&["2"]);
+    tmux.wait_for("the description step", |s| {
+        s.contains("NEW TASK · Description")
+    });
+    // One key at a time, as `type_filter` does: this stack predates the
+    // input-burst fix, so a burst would only apply its first key.
+    let mut typed = String::new();
+    for ch in "keep-this".chars() {
+        typed.push(ch);
+        tmux.keys(&["-l", &ch.to_string()]);
+        tmux.wait_for("the description", |s| s.contains(&typed));
+    }
+
+    orch(dir.path(), &["agent", "disable", &ids["alpha-ops"]]);
+    tmux.keys(&["Tab"]);
+    let screen = tmux.wait_for("the refusal", |s| {
+        s.contains("Nothing was saved: assignee alpha-ops is disabled")
+    });
+    assert!(tasks(dir.path()).is_empty(), "nothing written:\n{screen}");
+    let rows = picker_rows(&screen);
+    assert_eq!(rows.len(), 3, "fresh rows, alpha-ops gone:\n{screen}");
+    assert!(
+        rows.iter()
+            .all(|row| !row.contains("alpha-ops") && !row.starts_with('▸')),
+        "no row is marked chosen:\n{screen}"
+    );
+
+    type_filter(&tmux, "mid");
+    tmux.keys(&["2"]);
+    let screen = tmux.wait_for("the kept description", |s| {
+        s.contains("NEW TASK · Description") && s.contains("keep-this")
+    });
+    tmux.keys(&["Tab"]);
+    tmux.wait_for("the wizard to close", |s| !s.contains("keep-this"));
+    let tasks = tasks(dir.path());
+    assert_eq!(tasks.len(), 1, "one write after the correction:\n{screen}");
+    assert_eq!(
+        tasks[0]["assignee"].as_str(),
+        Some(ids["mid-reviewer"].as_str())
+    );
+    assert_eq!(tasks[0]["description"].as_str(), Some("keep-this"));
+    tmux.keys(&["q"]);
 }

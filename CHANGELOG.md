@@ -21,6 +21,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - An Activity entry with no agent (a system entry) at the top of the Activity panel or a detail's Activity section now shows its time, like the first entry of any other group. It also counts as the first group, so when the top entry has no agent, the alternating group shading below it can swap.
 - Dashboard goal, task and agent details keep their section titles in the same order when you move between sections; only the focused title changes style, and a narrow rail drops the titles farthest from the focused one instead of moving it to the front.
 - A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
+- Dashboard task, goal and team wizards check the chosen assignee, lead and members against the current agent list when you submit. An agent disabled or removed after you picked it is refused with "Nothing was saved: …": nothing is written, your other answers stay, and the step reopens on the agents that can still be chosen (a refused team member stays listed until you untick it). Before, the stale agent was usually saved anyway, and a new task whose assignee had been removed was created unassigned. The edit wizards' first assignee row now reads "Keep current", which is what it always did.
 
 ## [0.8.0] - 2026-10-18
 

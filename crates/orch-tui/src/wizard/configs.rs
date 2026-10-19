@@ -221,12 +221,19 @@ pub fn is_mcp_skill(skill: &str) -> bool {
     skill.contains(':')
 }
 
+/// Whether an agent may be chosen on an agent step: listed and not
+/// disabled. The pickers offer exactly these, and the final-submit check
+/// (R7, D7) accepts exactly these from a fresh roster.
+pub fn is_eligible_agent(agent: &Agent) -> bool {
+    agent.status != AgentStatus::Disabled
+}
+
 /// Non-disabled agents, hint `[{adapter}] {first role line}`
 /// capped at 60 chars.
 pub fn agent_choices(agents: &[Agent]) -> Vec<Choice> {
     agents
         .iter()
-        .filter(|a| a.status != AgentStatus::Disabled)
+        .filter(|a| is_eligible_agent(a))
         .map(|a| {
             let role_line = a
                 .role
@@ -344,6 +351,53 @@ pub fn validate_shell_command(value: &str) -> Option<String> {
 
 fn value_of(values: &Values, key: &str) -> String {
     values.get(key).cloned().unwrap_or_default()
+}
+
+/// Whether `key` already holds a non-empty answer. An agent step that holds
+/// one is never skipped, so a refused answer can always be reopened and
+/// replaced, even when no other agent is left to offer.
+fn holds_answer(values: &Values, key: &str) -> bool {
+    values.get(key).is_some_and(|v| !v.is_empty())
+}
+
+/// The edit wizards' assignee sentinel. It submits nothing, and an omitted
+/// assignee leaves the current one in place (`TaskFields` has no assignee and
+/// `GoalFields.assignee: None` means unchanged), so it is labelled as what
+/// it does rather than as removing or auto-assigning.
+pub const KEEP_CURRENT: &str = "Keep current";
+pub const KEEP_CURRENT_HINT: &str = "leave the assignee unchanged";
+
+/// The agent ids a completed wizard would submit, by step id, sentinels
+/// excluded: the ids the final-submit check (R7, D7) must find eligible in a
+/// fresh roster before anything is written. Empty for wizards without agent
+/// steps and for an answer that chose the sentinel.
+pub fn submitted_agent_ids(kind: &WizardKind, values: &Values) -> Vec<(&'static str, Vec<String>)> {
+    let single = |key: &'static str| {
+        let id = value_of(values, key);
+        if id.is_empty() {
+            Vec::new()
+        } else {
+            vec![(key, vec![id])]
+        }
+    };
+    match kind {
+        WizardKind::Task | WizardKind::EditTask | WizardKind::Goal | WizardKind::EditGoal => {
+            single("assignee")
+        }
+        WizardKind::Team => {
+            let mut out = single("lead");
+            let members: Vec<String> = value_of(values, "members")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !members.is_empty() {
+                out.push(("members", members));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 // ── NEW AGENT ──────────────────────────────────────────────────────────────
@@ -759,7 +813,7 @@ pub fn task_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
         WizardStep::new("assignee", "Assignee", StepKind::Select)
             .options(options)
             .agent_picker(AgentPicker::new(agents))
-            .skip(move |_| options_len <= 1),
+            .skip(move |v| options_len <= 1 && !holds_answer(v, "assignee")),
         WizardStep::new("description", "Description", StepKind::Textarea)
             .placeholder("Optional details, context, acceptance criteria..."),
     ]
@@ -767,7 +821,7 @@ pub fn task_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
 
 /// The EDIT TASK steps.
 pub fn edit_task_wizard_steps(task: &Task, agents: &[Agent]) -> Vec<WizardStep> {
-    let options = agent_options_with_sentinel(agents, "None / Auto", "remove assignee");
+    let options = agent_options_with_sentinel(agents, KEEP_CURRENT, KEEP_CURRENT_HINT);
     let options_len = options.len();
     vec![
         WizardStep::new("title", "Task title", StepKind::Text)
@@ -782,7 +836,7 @@ pub fn edit_task_wizard_steps(task: &Task, agents: &[Agent]) -> Vec<WizardStep> 
             .options(options)
             .agent_picker(AgentPicker::new(agents))
             .default_value(task.assignee.as_deref().unwrap_or(""))
-            .skip(move |_| options_len <= 1),
+            .skip(move |v| options_len <= 1 && !holds_answer(v, "assignee")),
         WizardStep::new("description", "Description", StepKind::Textarea)
             .default_value(&task.description)
             .placeholder("Optional details..."),
@@ -843,7 +897,7 @@ pub fn team_wizard_steps(agents: &[Agent], teams: &[Team]) -> Vec<WizardStep> {
             })
             .skip(move |v| {
                 let lead = value_of(v, "lead");
-                !for_skip.iter().any(|a| a.value != lead)
+                !for_skip.iter().any(|a| a.value != lead) && !holds_answer(v, "members")
             }),
         WizardStep::new("description", "Description", StepKind::Textarea)
             .placeholder("Optional team purpose..."),
@@ -893,17 +947,16 @@ pub fn goal_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
             .description(GOAL_ASSIGNEE_DESC)
             .options(options)
             .agent_picker(AgentPicker::new(agents))
-            .skip(move |_| options_len <= 1),
+            .skip(move |v| options_len <= 1 && !holds_answer(v, "assignee")),
         WizardStep::new("description", "Description", StepKind::Textarea)
             .placeholder("Success criteria, constraints, technical context...")
             .description(GOAL_DESCRIPTION_DESC),
     ]
 }
 
-/// The EDIT GOAL steps — the sentinel hint becomes
-/// `auto-assign`.
+/// The EDIT GOAL steps — the sentinel keeps the current assignee.
 pub fn edit_goal_wizard_steps(goal: &Goal, agents: &[Agent]) -> Vec<WizardStep> {
-    let options = agent_options_with_sentinel(agents, "Any agent", "auto-assign");
+    let options = agent_options_with_sentinel(agents, KEEP_CURRENT, KEEP_CURRENT_HINT);
     let options_len = options.len();
     vec![
         WizardStep::new("title", "Goal title", StepKind::Text)
@@ -916,7 +969,7 @@ pub fn edit_goal_wizard_steps(goal: &Goal, agents: &[Agent]) -> Vec<WizardStep> 
             .options(options)
             .agent_picker(AgentPicker::new(agents))
             .default_value(goal.assignee.as_deref().unwrap_or(""))
-            .skip(move |_| options_len <= 1),
+            .skip(move |v| options_len <= 1 && !holds_answer(v, "assignee")),
         WizardStep::new("description", "Description", StepKind::Textarea)
             .default_value(&goal.description)
             .placeholder("Success criteria, constraints, technical context...")

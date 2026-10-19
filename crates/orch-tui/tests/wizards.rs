@@ -770,14 +770,14 @@ fn w040_new_task_assignee_sentinel_is_auto_assign() {
 }
 
 #[test]
-fn w041_edit_task_assignee_sentinel_is_none_auto() {
+fn w041_edit_task_assignee_sentinel_keeps_the_current_assignee() {
     let agents = vec![make_agent("agt_1", "a", AgentStatus::Idle)];
     let task = make_task("tsk_1", "T", TaskStatus::Todo);
     let steps = configs::edit_task_wizard_steps(&task, &agents);
     let options = steps_options(find(&steps, "assignee"));
     assert_eq!(
         options[0],
-        Choice::new("", "None / Auto", "remove assignee")
+        Choice::new("", "Keep current", "leave the assignee unchanged")
     );
 }
 
@@ -1005,12 +1005,15 @@ fn w059_new_goal_sentinel_hint_mentions_autonomous_agents() {
 }
 
 #[test]
-fn w060_edit_goal_sentinel_hint_is_the_shorter_auto_assign() {
+fn w060_edit_goal_sentinel_keeps_the_current_assignee() {
     let agents = vec![make_agent("agt_1", "a", AgentStatus::Idle)];
     let goal = make_goal("goal_1", "G", orch_domain::GoalStatus::Active);
     let steps = configs::edit_goal_wizard_steps(&goal, &agents);
     let options = steps_options(find(&steps, "assignee"));
-    assert_eq!(options[0], Choice::new("", "Any agent", "auto-assign"));
+    assert_eq!(
+        options[0],
+        Choice::new("", "Keep current", "leave the assignee unchanged")
+    );
 }
 
 #[test]
