@@ -1,7 +1,8 @@
 //! End to end in tmux: detail views as an operator sees them in a real
 //! terminal (AGENTS.md, "TUI end-to-end tests"): the section rail keeps its
-//! order while focus moves (R2), and the task, goal and agent details' Activity
-//! rows have the bottom feed's columns (R1, R12).
+//! order while focus moves (R2), the task, goal and agent details' Activity
+//! rows have the bottom feed's columns (R1, R12), and their Overview is an
+//! aligned label/value block under a `━` title rule, focused and pinned (R6).
 //!
 //! The real `orch` binary runs `orch tui` in a private tmux server over a
 //! temp project with one shell agent, `bot`, one unassigned goal, `Launch`,
@@ -287,6 +288,43 @@ fn marker(rail: &str) -> Option<String> {
         .map(|title| title.split(" · ").next().unwrap_or(title).to_owned())
 }
 
+/// The character column `needle` starts at in `line`. Every glyph these
+/// screens put left of an Overview label is one cell wide.
+fn column(line: &str, needle: &str) -> Option<usize> {
+    line.find(needle).map(|byte| line[..byte].chars().count())
+}
+
+/// R6: the Overview block on screen. Its `━━━ KIND: title ━` rule sits on
+/// the block's left edge; each `(left, right)` label pair shares a row, every
+/// left label starts at that edge and every right label in one shared
+/// column, which is returned.
+#[track_caller]
+fn overview_columns(screen: &str, title: &str, pairs: &[(&str, &str)]) -> usize {
+    let rule = format!("━━━ {title} ━");
+    let lines: Vec<&str> = screen.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains(&rule))
+        .unwrap_or_else(|| panic!("no {rule:?} title rule:\n{screen}"));
+    let edge = column(lines[top], &rule).unwrap();
+    let mut right_column = None;
+    for (left, right) in pairs {
+        let line = lines[top + 1..]
+            .iter()
+            .find(|line| column(line, &format!("{left} ")) == Some(edge))
+            .unwrap_or_else(|| panic!("no {left:?} label at column {edge}:\n{screen}"));
+        let at = column(line, &format!(" {right} "))
+            .unwrap_or_else(|| panic!("no {right:?} beside {left:?}: {line}"))
+            + 1;
+        assert_eq!(
+            *right_column.get_or_insert(at),
+            at,
+            "{right:?} out of column:\n{screen}"
+        );
+    }
+    right_column.expect("at least one pair")
+}
+
 #[test]
 fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
     let dir = project();
@@ -304,6 +342,17 @@ fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
     });
     let ring = ["Overview", "Description", "Activity"];
     assert_eq!(titles(rail(&screen)), ring, "{screen}");
+    // The focused Overview: Amber labels in two aligned columns (R6).
+    let task_pairs = [
+        ("status", "assignee"),
+        ("priority", "attempts"),
+        ("labels", "depends"),
+    ];
+    let right = overview_columns(&screen, "DETAIL: Ship it", &task_pairs);
+    assert!(
+        screen.contains("status    cancelled"),
+        "same status: {screen}"
+    );
 
     // Tab through the sections: the titles never move; only the marker does.
     let mut marked = marker(rail(&screen));
@@ -328,6 +377,17 @@ fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
         rail(&screen).trim_end(),
         "Overview │ Description │ > Activity · following",
         "{screen}"
+    );
+    // Pinned above another section: the title rule and the identity row, in
+    // the focused block's columns.
+    assert_eq!(
+        overview_columns(&screen, "DETAIL: Ship it", &task_pairs[..1]),
+        right,
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("priority  "),
+        "the pin is two rows: {screen}"
     );
     // Task Activity keeps the feed's chronology: its live edge is the bottom.
     assert_eq!(
@@ -427,7 +487,17 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
         // Wait for the run history: the feed shows its newest event.
         tmux.wait_for("the feed", |s| s.contains("▶ Completed"));
         tmux.keys(&["Enter"]);
-        tmux.wait_for("the detail", |s| s.contains("Overview"));
+        let screen = tmux.wait_for("the detail", |s| s.contains("> Overview"));
+        // R6: the focused Overview block keeps its columns.
+        let (title, pairs): (&str, &[(&str, &str)]) = if view == "a" {
+            (
+                "AGENT: bot",
+                &[("status", "adapter"), ("task", "command"), ("runs", "team")],
+            )
+        } else {
+            ("GOAL: Launch", &[("status", "assignee"), ("id", "created")])
+        };
+        overview_columns(&screen, title, pairs);
         // Tab through the detail sections to Activity, the ring's last entry.
         let mut tabs = 0;
         while !tmux.screen().contains("> Activity · following") {
