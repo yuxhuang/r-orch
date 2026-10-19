@@ -1545,6 +1545,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_directory_attachment_is_rejected_before_any_copy_or_directory_creation() {
+        let h = with_paths();
+        let sources = tempfile::tempdir().unwrap();
+        let present = sources.path().join("present.txt");
+        tokio::fs::write(&present, b"keep").await.unwrap();
+
+        let err = h
+            .service
+            .create(CreateTaskInput {
+                attachments: Some(vec![path_str(&present), path_str(sources.path())]),
+                ..input("t")
+            })
+            .await
+            .expect_err("directories are not attachment files");
+
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains(&path_str(sources.path())), "{err}");
+        assert!(h.tasks.is_empty());
+        assert!(
+            !h.service
+                .attachment_path("tsk_0000001", "")
+                .unwrap()
+                .exists(),
+            "validation must precede attachment directory creation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_attachment_is_rejected_as_invalid_arguments_before_copying() {
+        let h = with_paths();
+        let sources = tempfile::tempdir().unwrap();
+        let socket = sources.path().join("source.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let err = h
+            .service
+            .create(CreateTaskInput {
+                attachments: Some(vec![path_str(&socket)]),
+                ..input("t")
+            })
+            .await
+            .expect_err("sockets are not attachment files");
+
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains(&path_str(&socket)), "{err}");
+        assert!(h.tasks.is_empty());
+        assert!(
+            !h.service
+                .attachment_path("tsk_0000001", "")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_attachment_basenames_are_rejected_before_any_copy() {
+        let h = with_paths();
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = first_dir.path().join("same.txt");
+        let second = second_dir.path().join("same.txt");
+        tokio::fs::write(&first, b"first").await.unwrap();
+        tokio::fs::write(&second, b"second").await.unwrap();
+
+        let err = h
+            .service
+            .create(CreateTaskInput {
+                attachments: Some(vec![path_str(&first), path_str(&second)]),
+                ..input("t")
+            })
+            .await
+            .expect_err("duplicate basenames must not silently overwrite files");
+
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("same.txt"), "{err}");
+        assert!(h.tasks.is_empty());
+        assert!(
+            !h.service
+                .attachment_path("tsk_0000001", "")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn appending_an_existing_attachment_basename_preserves_the_task_and_bytes() {
+        let h = with_paths();
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let original = first_dir.path().join("same.txt");
+        let replacement = second_dir.path().join("same.txt");
+        let fresh = second_dir.path().join("fresh.txt");
+        tokio::fs::write(&original, b"original").await.unwrap();
+        tokio::fs::write(&replacement, b"replacement")
+            .await
+            .unwrap();
+        tokio::fs::write(&fresh, b"fresh").await.unwrap();
+        let task = h
+            .service
+            .create(CreateTaskInput {
+                attachments: Some(vec![path_str(&original)]),
+                ..input("t")
+            })
+            .await
+            .unwrap();
+
+        let err = h
+            .service
+            .update(
+                &task.id,
+                UpdateTaskFields {
+                    title: Some("must not be saved".into()),
+                    attachments: Some(vec![fresh, replacement]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an append must not replace existing attachment bytes");
+
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("same.txt"), "{err}");
+        assert_eq!(h.service.get(&task.id).await.unwrap(), task);
+        assert_eq!(
+            tokio::fs::read(h.service.attachment_path(&task.id, "same.txt").unwrap())
+                .await
+                .unwrap(),
+            b"original"
+        );
+        assert!(
+            !h.service
+                .attachment_path(&task.id, "fresh.txt")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn appending_a_recorded_basename_is_rejected_even_if_the_stored_copy_is_missing() {
+        let h = with_paths();
+        let sources = tempfile::tempdir().unwrap();
+        let source = sources.path().join("same.txt");
+        tokio::fs::write(&source, b"original").await.unwrap();
+        let task = h
+            .service
+            .create(CreateTaskInput {
+                attachments: Some(vec![path_str(&source)]),
+                ..input("t")
+            })
+            .await
+            .unwrap();
+        let stored = h.service.attachment_path(&task.id, "same.txt").unwrap();
+        tokio::fs::remove_file(&stored).await.unwrap();
+
+        let err = h
+            .service
+            .update(
+                &task.id,
+                UpdateTaskFields {
+                    attachments: Some(vec![source]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a missing copy must not allow duplicate attachment references");
+
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("same.txt"), "{err}");
+        assert_eq!(h.service.get(&task.id).await.unwrap(), task);
+        assert!(!stored.exists());
+    }
+
+    #[tokio::test]
     async fn update_appends_attachments_rather_than_replacing_them() {
         let h = with_paths();
         let source_dir = tempfile::tempdir().unwrap();

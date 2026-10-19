@@ -213,6 +213,102 @@ fn a_missing_file_fails_with_exit_2_and_creates_no_task() {
 }
 
 #[test]
+fn a_directory_source_fails_with_exit_2_without_saving_or_copying_anything() {
+    let project = Project::new();
+    let present = project.source("present.txt", b"present");
+    let directory = project.dir.path().join("files/directory");
+    std::fs::create_dir(&directory).unwrap();
+
+    let output = project
+        .orch()
+        .args([
+            "task",
+            "add",
+            "not a regular file",
+            "--attach",
+            &format!("{},{}", arg(&present), arg(&directory)),
+        ])
+        .output()
+        .expect("run orch");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(arg(&directory)), "stderr: {stderr}");
+    assert_eq!(project.task_count(), 0);
+    let attachments = project.root().join(".orchestry/attachments");
+    assert!(
+        !attachments.exists() || std::fs::read_dir(&attachments).unwrap().next().is_none(),
+        "validation must not leave attachment files or task directories"
+    );
+}
+
+#[test]
+fn duplicate_basenames_fail_with_exit_2_without_saving_or_overwriting_files() {
+    let project = Project::new();
+    let first = project.source("same.txt", b"first");
+    let other = project.dir.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let second = other.join("same.txt");
+    std::fs::write(&second, b"second").unwrap();
+
+    let output = project
+        .orch()
+        .args([
+            "task",
+            "add",
+            "colliding names",
+            "--attach",
+            &format!("{},{}", arg(&first), arg(&second)),
+        ])
+        .output()
+        .expect("run orch");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("same.txt"), "stderr: {stderr}");
+    assert_eq!(project.task_count(), 0);
+    let attachments = project.root().join(".orchestry/attachments");
+    assert!(
+        !attachments.exists() || std::fs::read_dir(&attachments).unwrap().next().is_none(),
+        "a duplicate must be rejected before any files are stored"
+    );
+    assert_eq!(std::fs::read(&first).unwrap(), b"first");
+    assert_eq!(std::fs::read(&second).unwrap(), b"second");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_fifo_source_is_rejected_with_exit_2_without_waiting_for_a_writer() {
+    let project = Project::new();
+    let fifo = project.dir.path().join("files/source.fifo");
+    success(
+        Command::new("/usr/bin/mkfifo")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg(&fifo),
+    );
+
+    let mut command = assert_cmd::Command::from_std(project.orch());
+    // Kill and reap the child if regular-file validation regresses: opening
+    // this FIFO for copying would otherwise wait forever for a writer.
+    let output = command
+        .timeout(std::time::Duration::from_secs(5))
+        .args(["task", "add", "fifo", "--attach", arg(&fifo)])
+        .output()
+        .expect("run bounded orch");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(arg(&fifo)), "stderr: {stderr}");
+    assert_eq!(project.task_count(), 0);
+    let attachments = project.root().join(".orchestry/attachments");
+    assert!(
+        !attachments.exists() || std::fs::read_dir(&attachments).unwrap().next().is_none(),
+        "a FIFO must be rejected before creating an attachment directory"
+    );
+}
+
+#[test]
 fn without_attach_the_task_has_no_attachments_field() {
     let project = Project::new();
     let created = project.json(&["task", "add", "plain"]);
