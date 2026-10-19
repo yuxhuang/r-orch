@@ -1939,9 +1939,10 @@ impl AppState {
                     AgentGroupKey::Remote { alias } => {
                         // Every agent of one alias carries the same link
                         // state when it is loaded; if a snapshot ever mixes
-                        // them, one reachable agent makes the node online.
+                        // them, the node is offline unless all of its agents
+                        // are reachable, so the marker never overstates it.
                         let online = members()
-                            .any(|i| self.agents[*i].remote.as_ref().is_some_and(|r| r.online));
+                            .all(|i| self.agents[*i].remote.as_ref().is_some_and(|r| r.online));
                         rows.push(AgentRow::NodeSection {
                             alias: Some(alias.clone()),
                             online,

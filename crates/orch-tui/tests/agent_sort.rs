@@ -424,6 +424,66 @@ fn group_by_node_orders_remote_sections_by_alias_not_by_agent() {
 }
 
 #[test]
+fn group_by_node_mixed_link_state_is_offline() {
+    use orch_tui::state::AgentRow;
+    // The loader stamps one link state per alias; if a snapshot ever mixes
+    // them, the header must not claim the node is reachable.
+    let agents = [("up", true), ("down", false)]
+        .into_iter()
+        .map(|(id, online)| {
+            let mut agent = make_agent(id, id, AgentStatus::Idle);
+            agent.remote = Some(RemoteRef {
+                alias: "w1".into(),
+                online,
+            });
+            agent
+        })
+        .collect();
+    let mut h = Harness::with(FakeBackend::new().with_agents(agents));
+    h.app.state.view = ViewId::Agents;
+    h.key('b');
+    let rows = h.app.state.agent_rows(false);
+    assert_eq!(
+        rows[0],
+        AgentRow::NodeSection {
+            alias: Some("w1".into()),
+            online: false,
+            count: 2
+        }
+    );
+    let text = h.draw().text();
+    assert!(text.contains("◈ w1 ○ offline · 2 agents"), "{text}");
+}
+
+#[test]
+fn group_by_team_keeps_two_teams_of_one_name_apart() {
+    use orch_tui::state::AgentRow;
+    // Members of two same-named teams, interleaved in source order.
+    let agents = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|id| make_agent(id, id, AgentStatus::Idle))
+        .collect();
+    let mut h = Harness::with(FakeBackend::new().with_agents(agents));
+    h.app.state.view = ViewId::Agents;
+    h.app.state.teams = vec![
+        make_team("t1", "Core", "a", &["a", "c"]),
+        make_team("t2", "Core", "b", &["b", "d"]),
+    ];
+    assert_eq!(ids(&h), ["a", "c", "b", "d"]);
+    let headers: Vec<(String, usize)> = h
+        .app
+        .state
+        .agent_rows(false)
+        .into_iter()
+        .filter_map(|row| match row {
+            AgentRow::TeamSection { team_id, count, .. } => Some((team_id, count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headers, [("t1".to_string(), 2), ("t2".to_string(), 2)]);
+}
+
+#[test]
 fn group_by_node_preserves_selection() {
     let mut h = node_harness();
     h.app.state.agent_selected = 2; // a2 in original team order: z, b, a2, a1.
