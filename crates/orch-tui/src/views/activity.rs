@@ -170,7 +170,9 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 /// shows the time and badge once, and alternate runs get the stripe.
 #[derive(Debug, Default)]
 pub(crate) struct RowGroups {
-    previous_agent: Option<String>,
+    /// `None` before the first row, so the window's top row always starts a
+    /// group (and shows its time) even when it has no agent.
+    previous_agent: Option<Option<String>>,
     index: usize,
 }
 
@@ -185,10 +187,10 @@ pub(crate) struct RowGroup {
 
 impl RowGroups {
     pub(crate) fn next(&mut self, message: &Message) -> RowGroup {
-        let first = message.agent_id != self.previous_agent;
+        let first = self.previous_agent.as_ref() != Some(&message.agent_id);
         if first {
             self.index += 1;
-            self.previous_agent = message.agent_id.clone();
+            self.previous_agent = Some(message.agent_id.clone());
         }
         RowGroup {
             first,
