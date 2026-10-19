@@ -197,6 +197,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                             review_criteria: flags.review_criteria.clone(),
                             scope: flags.scope.clone(),
                             goal_id: flags.goal_id.clone(),
+                            attach: flags.attach.clone(),
                         },
                     )
                     .await?;

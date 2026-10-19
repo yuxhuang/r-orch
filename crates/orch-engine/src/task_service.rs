@@ -465,8 +465,6 @@ impl TaskService {
         };
 
         let dir = paths.task_attachments_dir(task_id)?;
-        fs_utils::ensure_dir(&dir).await?;
-
         for source in sources {
             if !fs_utils::path_exists(source).await {
                 return Err(Error::invalid_arguments(format!(
@@ -475,6 +473,9 @@ impl TaskService {
                 )));
             }
         }
+        // Only after validation, so a rejected create leaves no empty
+        // directory behind for a task that was never saved.
+        fs_utils::ensure_dir(&dir).await?;
 
         let mut names = Vec::with_capacity(sources.len());
         for source in sources {
@@ -1537,6 +1538,10 @@ mod tests {
             .attachment_path("tsk_0000001", "present.txt")
             .unwrap();
         assert!(!copied.exists());
+        assert!(
+            !copied.parent().unwrap().exists(),
+            "no empty task directory"
+        );
     }
 
     #[tokio::test]
