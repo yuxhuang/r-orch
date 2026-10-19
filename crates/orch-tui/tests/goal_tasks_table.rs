@@ -443,8 +443,8 @@ fn the_attachment_mark_moves_right_by_the_reclaimed_goal_width_and_keeps_its_sty
         assert_eq!(sm, rm + layout.shift, "mark column at width {width}");
         assert_eq!(cells(&sec, s)[sm], cells(&reference, r)[rm], "mark style");
         assert!(
-            sec.line(s).contains(&format!("{PAPERCLIP}1")),
-            "{:?}",
+            cells(&sec, s)[sm..sm + 4].iter().any(|c| c.0 == "1"),
+            "the mark carries the attachment count: {:?}",
             sec.line(s)
         );
         // Nothing else sits between the title text and the assignee column.
