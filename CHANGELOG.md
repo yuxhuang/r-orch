@@ -19,6 +19,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Changed
 - On the dashboard's Tasks list, showing all tasks or collapsing back to ten (`S`, the `Show all` row or the footer's `S show all`) keeps the selected task selected instead of jumping to the first row. If collapsing hides the selected task, the cursor stays on the last row still listed.
+- On the dashboard's Tasks list, grouping tasks by goal or ungrouping them (`G`) keeps the selected task selected instead of jumping to the first row.
 
 ### Removed
 - Parity validation against the TypeScript original: `docs/PARITY.md`, `cargo xtask parity` and `lint-scenarios`, the scenario corpus and the oracle setup are gone, and the docs no longer promise compatibility with the npm package. Compatibility with `.orchestry` data written by r-orch releases is unchanged ([ADR 0009](docs/decisions/0009-remove-parity-tooling.md)).

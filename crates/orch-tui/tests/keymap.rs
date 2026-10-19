@@ -1258,6 +1258,128 @@ fn elapsed_crossing_task_limit() {
     assert!(!h.app.state.entity_actions_deferred);
 }
 
+// ── Goal grouping keeps the selection (D1) ────────────────────────────────
+
+/// QA-Y2's fixture: three cancelled tasks, each in its own goal. Alpha ran
+/// for 12 s, Zebra for 6 s, Middle never ran (unknown Elapsed), so grouping
+/// orders the sections differently from the flat Elapsed order.
+fn grouping_harness(width: u16, height: u16) -> Harness {
+    let base = 1_000_000;
+    let cancelled = |id: &str, title: &str, goal: &str| {
+        let mut task = make_task(id, title, TaskStatus::Cancelled);
+        task.goal_id = Some(goal.into());
+        task
+    };
+    let mut middle = cancelled("tsk_middle", "Middle task", "gol_m");
+    middle.updated_at = iso(base - 1_000);
+    let mut alpha = cancelled("tsk_alpha", "Alpha task", "gol_a");
+    alpha.updated_at = iso(base - 8_000);
+    let mut zebra = cancelled("tsk_zebra", "Zebra task", "gol_z");
+    zebra.updated_at = iso(base - 14_000);
+    let backend = FakeBackend::new()
+        .with_goals(vec![
+            make_goal("gol_m", "Middle goal", GoalStatus::Active),
+            make_goal("gol_a", "Alpha goal", GoalStatus::Active),
+            make_goal("gol_z", "Zebra goal", GoalStatus::Active),
+        ])
+        .with_tasks(vec![middle, alpha, zebra])
+        .with_runs(vec![
+            run("tsk_alpha", base - 20_000),
+            run("tsk_zebra", base - 20_000),
+        ]);
+    let mut h = Harness::sized(backend, width, height);
+    h.app.state.view = ViewId::Tasks;
+    for _ in 0..6 {
+        h.key('o');
+    }
+    assert_eq!(
+        h.app.state.task_sort.field,
+        orch_tui::state::TaskSortField::Elapsed
+    );
+    h.draw();
+    h
+}
+
+#[test]
+fn goal_grouping_toggle_keeps_the_selected_task() {
+    for (width, height) in [(120, 40), (40, 20)] {
+        for descending in [false, true] {
+            let mut h = grouping_harness(width, height);
+            if descending {
+                h.key('O');
+            }
+            let expected = if descending {
+                ["tsk_alpha", "tsk_zebra", "tsk_middle"]
+            } else {
+                ["tsk_zebra", "tsk_alpha", "tsk_middle"]
+            };
+            assert_eq!(sorted_task_ids(&h), expected, "unknown sorts last");
+            // Start from the top row so the cursor reaches Middle by keys.
+            h.press(KeyCode::Up).press(KeyCode::Up);
+            assert_eq!(h.app.state.selected_task().unwrap().id, expected[0]);
+            h.press(KeyCode::Down).press(KeyCode::Down).draw();
+            assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_middle");
+
+            for grouped in [true, false, true, false] {
+                h.key('g');
+                assert_eq!(h.app.state.group_by_goal, grouped);
+                assert_eq!(
+                    h.app.state.selected_task().unwrap().id,
+                    "tsk_middle",
+                    "{width}x{height} descending={descending} grouped={grouped}"
+                );
+                assert!(!h.app.state.entity_actions_deferred);
+                h.assert_text("Middle task");
+            }
+            h.key('g');
+            h.press(KeyCode::Enter);
+            assert_eq!(h.app.state.detail, DetailPanel::Entity);
+            assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_middle");
+        }
+    }
+}
+
+#[test]
+fn grouping_past_the_task_cap_clamps_and_defers() {
+    // tsk_02 is the only task of goal B and second in the flat order;
+    // grouping puts goal A's eleven tasks first, so tsk_02 lands at row 12.
+    let tasks: Vec<_> = (1..=12)
+        .map(|i| {
+            let id = format!("tsk_{i:02}");
+            let mut task = make_task(&id, &format!("Task {i}"), TaskStatus::Todo);
+            task.goal_id = Some(if i == 2 { "gol_b" } else { "gol_a" }.into());
+            task
+        })
+        .collect();
+    let backend = FakeBackend::new()
+        .with_goals(vec![
+            make_goal("gol_a", "Goal A", GoalStatus::Active),
+            make_goal("gol_b", "Goal B", GoalStatus::Active),
+        ])
+        .with_tasks(tasks);
+    let mut h = Harness::sized(backend, 120, 44);
+    h.app.state.view = ViewId::Tasks;
+    h.draw().press(KeyCode::Down).draw();
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_02");
+
+    h.key('g');
+    assert_eq!(sorted_task_ids(&h)[11], "tsk_02");
+    assert!(!h.app.state.show_all_tasks);
+    assert_eq!(h.app.state.task_selected, 1);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_03");
+    assert!(h.app.state.entity_actions_deferred);
+    h.key('d');
+    assert!(h.app.state.pending_deletions.is_empty());
+
+    // With show-all on, tsk_02 stays listed and keeps the cursor.
+    h.draw().key('g').key('s').press(KeyCode::Up).draw();
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_02");
+    h.key('g');
+    assert_eq!(h.app.state.task_selected, 11);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_02");
+    assert!(!h.app.state.entity_actions_deferred);
+}
+
 // ── Show-all keeps the selection (D1) ─────────────────────────────────────
 
 /// Twelve open tasks: ten under the cap, two behind the show-all row.
