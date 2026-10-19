@@ -345,6 +345,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.reset_agent_sort();
                     return;
                 }
+                // `b`: group *by*. Free in every view; `g`, the Tasks
+                // grouping key, means "goals tab" here.
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    self.toggle_agent_group_by();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -761,6 +767,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     fn change_agent_sort(&mut self, sort: crate::state::AgentSort) {
         self.state.set_agent_sort(sort);
+        self.state.clamp_all(self.backend.can_add_agent());
+    }
+
+    /// `b` — By team ⇄ By node. The sort is left as it is: it applies inside
+    /// whichever sections are drawn.
+    pub(crate) fn toggle_agent_group_by(&mut self) {
+        let next = self.state.agent_group_by.next();
+        self.state.set_agent_group_by(next);
         self.state.clamp_all(self.backend.can_add_agent());
     }
 

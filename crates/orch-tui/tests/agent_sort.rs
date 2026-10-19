@@ -316,3 +316,321 @@ fn name_and_location_sort_ignore_case_then_break_ties_by_raw_name_and_id() {
         assert_eq!(ids(&h), ["z", "b", "upper", "a1", "a2"], "{field:?}");
     }
 }
+
+// ── Group by team | node ───────────────────────────────────────────────────
+
+/// [`agents`] with one link state per alias, as the loader writes it, plus a
+/// team that By node must ignore.
+fn node_harness() -> Harness {
+    let mut h = harness();
+    // z is on remote-z, offline; a1/a2 are on remote-a, online; b is local.
+    h.app.state.agents[0].remote.as_mut().unwrap().online = false;
+    h.app.state.agents[2].remote.as_mut().unwrap().online = true;
+    h.app.state.teams = vec![make_team("t1", "Alpha team", "z", &["z"])];
+    h
+}
+
+#[test]
+fn group_by_node_sections() {
+    use orch_tui::state::{AgentGroupBy, AgentRow};
+    let mut h = node_harness();
+    h.key('o'); // Name ascending.
+    // By team: the team section leads.
+    assert_eq!(ids(&h), ["z", "a1", "a2", "b"]);
+
+    h.key('b');
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Node);
+    // Local first, then the aliases in alias order; the sort applies inside
+    // each section, and the team no longer groups anything.
+    assert_eq!(ids(&h), ["b", "a1", "a2", "z"]);
+    let rows = h.app.state.agent_rows(true);
+    let node = |alias: Option<&str>, online: bool, count: usize| AgentRow::NodeSection {
+        alias: alias.map(str::to_string),
+        online,
+        count,
+    };
+    assert_eq!(rows[0], node(None, true, 1));
+    assert!(matches!(rows[1], AgentRow::Agent { selection: 0, .. }));
+    assert_eq!(rows[2], node(Some("remote-a"), true, 2));
+    assert!(matches!(rows[3], AgentRow::Agent { selection: 1, .. }));
+    assert!(matches!(rows[4], AgentRow::Agent { selection: 2, .. }));
+    assert_eq!(rows[5], node(Some("remote-z"), false, 1));
+    assert!(matches!(rows[6], AgentRow::Agent { selection: 3, .. }));
+    assert!(matches!(rows[7], AgentRow::AddAgent { selection: 4 }));
+    assert_eq!(rows.len(), 8);
+    assert_eq!(h.app.state.agent_section_rows(), 3);
+
+    // Descending reverses inside the sections, never the sections.
+    h.key('0');
+    assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
+    h.key('O');
+    assert_eq!(ids(&h), ["b", "a1", "a2", "z"]);
+
+    // The headers on screen, each node marked online or offline.
+    let text = h.draw().text();
+    for needle in [
+        "◈ LOCAL · 1 agent ",
+        "◈ remote-a ● online · 2 agents",
+        "◈ remote-z ○ offline · 1 agent ",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing:\n{text}");
+    }
+    assert!(!text.contains("ALPHA TEAM"), "{text}");
+    let local = text.find("LOCAL").unwrap();
+    let a = text.find("remote-a ●").unwrap();
+    let z = text.find("remote-z ○").unwrap();
+    assert!(local < a && a < z, "{text}");
+}
+
+#[test]
+fn group_by_node_with_only_local_agents_has_one_local_section() {
+    use orch_tui::state::AgentRow;
+    let agents = vec![
+        make_agent("x", "x", AgentStatus::Idle),
+        make_agent("y", "y", AgentStatus::Running),
+    ];
+    let mut h = Harness::with(FakeBackend::new().with_agents(agents));
+    h.app.state.view = ViewId::Agents;
+    h.key('b');
+    let rows = h.app.state.agent_rows(false);
+    assert_eq!(
+        rows[0],
+        AgentRow::NodeSection {
+            alias: None,
+            online: true,
+            count: 2
+        }
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(h.app.state.agent_section_rows(), 1);
+}
+
+#[test]
+fn group_by_node_orders_remote_sections_by_alias_not_by_agent() {
+    let mut agents = Vec::new();
+    for (id, alias) in [("1", "w2"), ("2", "a-peer"), ("3", "w10"), ("4", "w2")] {
+        let mut agent = make_agent(id, id, AgentStatus::Idle);
+        agent.remote = Some(RemoteRef {
+            alias: alias.into(),
+            online: true,
+        });
+        agents.push(agent);
+    }
+    let mut h = Harness::with(FakeBackend::new().with_agents(agents));
+    h.app.state.view = ViewId::Agents;
+    h.key('b');
+    assert_eq!(ids(&h), ["2", "3", "1", "4"]);
+    assert_eq!(h.app.state.agent_section_rows(), 3);
+}
+
+#[test]
+fn group_by_node_mixed_link_state_is_offline() {
+    use orch_tui::state::AgentRow;
+    // The loader stamps one link state per alias; if a snapshot ever mixes
+    // them, the header must not claim the node is reachable.
+    let agents = [("up", true), ("down", false)]
+        .into_iter()
+        .map(|(id, online)| {
+            let mut agent = make_agent(id, id, AgentStatus::Idle);
+            agent.remote = Some(RemoteRef {
+                alias: "w1".into(),
+                online,
+            });
+            agent
+        })
+        .collect();
+    let mut h = Harness::with(FakeBackend::new().with_agents(agents));
+    h.app.state.view = ViewId::Agents;
+    h.key('b');
+    let rows = h.app.state.agent_rows(false);
+    assert_eq!(
+        rows[0],
+        AgentRow::NodeSection {
+            alias: Some("w1".into()),
+            online: false,
+            count: 2
+        }
+    );
+    let text = h.draw().text();
+    assert!(text.contains("◈ w1 ○ offline · 2 agents"), "{text}");
+}
+
+#[test]
+fn group_by_team_keeps_two_teams_of_one_name_apart() {
+    use orch_tui::state::AgentRow;
+    // Members of two same-named teams, interleaved in source order.
+    let agents = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|id| make_agent(id, id, AgentStatus::Idle))
+        .collect();
+    let mut h = Harness::with(FakeBackend::new().with_agents(agents));
+    h.app.state.view = ViewId::Agents;
+    h.app.state.teams = vec![
+        make_team("t1", "Core", "a", &["a", "c"]),
+        make_team("t2", "Core", "b", &["b", "d"]),
+    ];
+    assert_eq!(ids(&h), ["a", "c", "b", "d"]);
+    let headers: Vec<(String, usize)> = h
+        .app
+        .state
+        .agent_rows(false)
+        .into_iter()
+        .filter_map(|row| match row {
+            AgentRow::TeamSection { team_id, count, .. } => Some((team_id, count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headers, [("t1".to_string(), 2), ("t2".to_string(), 2)]);
+}
+
+#[test]
+fn group_by_node_preserves_selection() {
+    let mut h = node_harness();
+    h.app.state.agent_selected = 2; // a2 in original team order: z, b, a2, a1.
+    assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
+    h.key('o').key('O'); // Name descending.
+    assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
+    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
+    assert_eq!(h.app.state.agent_selected, 3);
+    h.key('b');
+    assert_eq!(ids(&h), ["b", "a1", "a2", "z"]);
+    assert_eq!(h.app.state.agent_selected, 2);
+    assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
+    h.key('b');
+    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
+    assert_eq!(h.app.state.agent_selected, 3);
+    assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
+
+    // The add-agent row stays selected across both directions.
+    h.app.state.agent_selected = h.app.state.agents.len();
+    h.key('b');
+    assert!(h.app.state.selected_agent().is_none());
+    assert_eq!(h.app.state.agent_selected, h.app.state.agents.len());
+    h.key('b');
+    assert_eq!(h.app.state.agent_selected, h.app.state.agents.len());
+}
+
+#[test]
+fn group_by_node_reveals_the_preserved_selection() {
+    // 30 local agents and one remote: By node moves the remote agent from
+    // the top (its team leads By team) to the bottom, below the fold.
+    let mut agents: Vec<Agent> = (0..30)
+        .map(|i| {
+            make_agent(
+                &format!("id{i:02}"),
+                &format!("Agent{i:02}"),
+                AgentStatus::Idle,
+            )
+        })
+        .collect();
+    let mut far = make_agent("far", "Faraway", AgentStatus::Idle);
+    far.remote = Some(RemoteRef {
+        alias: "w1".into(),
+        online: true,
+    });
+    agents.push(far);
+    let mut h = Harness::sized(FakeBackend::new().with_agents(agents), 80, 24);
+    h.app.state.view = ViewId::Agents;
+    h.app.state.teams = vec![make_team("t1", "Away", "far", &["far"])];
+    h.draw();
+    assert_eq!(h.app.state.selected_agent().unwrap().id, "far");
+    h.key('b').draw();
+    assert_eq!(h.app.state.selected_agent().unwrap().id, "far");
+    let screen = h.text();
+    assert!(screen.contains("Faraway"), "{screen}");
+    assert!(screen.contains("◈ w1 ● online"), "{screen}");
+}
+
+#[test]
+fn group_by_toggle_key() {
+    use orch_tui::state::AgentGroupBy;
+    let mut h = node_harness();
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+    h.key('b');
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Node);
+    h.key('B');
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+
+    // `0` resets the sort, not the grouping, and `b` leaves the sort alone.
+    h.key('b').key('o').key('O');
+    let sort = h.app.state.agent_sort;
+    h.key('b').key('b');
+    assert_eq!(h.app.state.agent_sort, sort);
+    h.key('0');
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Node);
+
+    // The chip toggles it and names the current mode.
+    let text = h.draw().text();
+    assert!(text.contains("b group:Node"), "{text}");
+    h.click_text("b group:Node");
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+    let text = h.draw().text();
+    assert!(text.contains("b group:Team"), "{text}");
+
+    // Help names the key.
+    h.key('?');
+    let text = h.text();
+    assert!(text.contains("b group by team/node"), "{text}");
+    h.key('x');
+
+    // Inert outside the Agents view and while typing a command.
+    h.app.state.view = ViewId::Tasks;
+    h.key('b');
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+    h.app.state.view = ViewId::Agents;
+    h.key('/').type_str("bB");
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+}
+
+#[test]
+fn group_chip_is_visible_and_clickable_at_minimum_width() {
+    use orch_tui::state::AgentGroupBy;
+    let mut h = Harness::sized(FakeBackend::new().with_agents(agents()), 40, 14);
+    h.app.state.view = ViewId::Agents;
+    let mut compact_seen = false;
+    for mode in [AgentGroupBy::Team, AgentGroupBy::Node] {
+        assert_eq!(h.app.state.agent_group_by, mode);
+        let full = format!("b group:{}", mode.label());
+        let compact = format!("b {}", mode.label().to_lowercase());
+        for _ in 0..5 {
+            for _ in 0..2 {
+                let text = h.text();
+                let direction = if h.app.state.agent_sort.descending {
+                    "O desc"
+                } else {
+                    "O asc"
+                };
+                // Full labels where they fit, the compact form where not;
+                // either way every chip is whole and clickable.
+                let group = if text.contains(&full) {
+                    full.clone()
+                } else {
+                    compact_seen = true;
+                    compact.clone()
+                };
+                for needle in ["o sort", direction, "0 reset", group.as_str()] {
+                    let Some((x, y)) = h.find_text(needle) else {
+                        panic!("{needle:?} missing:\n{text}");
+                    };
+                    assert!(
+                        matches!(
+                            h.zone_at(x, y).unwrap().kind,
+                            orch_tui::hit::ZoneKind::Verb(_)
+                        ),
+                        "{needle:?} is not a chip:\n{text}"
+                    );
+                }
+                h.key('O');
+            }
+            h.key('o');
+        }
+        let chip = if h.text().contains(&full) {
+            full
+        } else {
+            compact
+        };
+        h.click_text(&chip);
+    }
+    assert!(compact_seen, "40 columns never needed the compact bar");
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+}
