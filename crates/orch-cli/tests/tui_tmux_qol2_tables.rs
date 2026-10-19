@@ -560,3 +560,73 @@ fn keyword_sort_group_and_reset() {
 
     tmux.keys(&["q"]);
 }
+
+/// Eleven cancelled tasks: `Item 01`..`Item 10`, then `Zulu shipit`, which
+/// sorts last by Title and so starts behind the ten-row cap.
+fn capped_keyword_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("home")).expect("home");
+    orch(
+        dir.path(),
+        &["init", "--name", "proj", "--adapter", "shell"],
+    );
+    let titles = (1..=10)
+        .map(|i| format!("Item {i:02}"))
+        .chain(["Zulu shipit".to_string()]);
+    for title in titles {
+        let id = orch_out(dir.path(), &["task", "add", &title, "--quiet"]);
+        orch(dir.path(), &["task", "cancel", &id]);
+    }
+    dir
+}
+
+/// The keyword filters before the ten-row cap (R3, D1): a match that was
+/// behind `Show all` is listed as soon as it is typed, without show-all.
+#[test]
+fn keyword_finds_a_match_behind_the_ten_row_cap() {
+    let dir = capped_keyword_project();
+    let tmux = launch(
+        dir.path(),
+        format!("orch-y3-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["t"]);
+    // Newest first: `Zulu shipit` leads and `Item 01` is behind the cap.
+    let screen = tmux.wait_for("the task list", |s| s.contains("Item 02"));
+
+    // Title ascending puts `Zulu shipit` eleventh: behind the cap.
+    let (x, y) = locate(&screen, "TITLE");
+    tmux.click(x, y);
+    let screen = tmux.wait_for("Title ascending", |s| {
+        s.contains("TITLE↑") && s.contains("Show all (1 more)")
+    });
+    assert!(screen.contains("Item 10"), "{screen}");
+    assert!(!screen.contains("Zulu shipit"), "{screen}");
+
+    // Typed one key at a time, the list narrows to the hidden match.
+    tmux.keys(&["C-k"]);
+    tmux.wait_for("the keyword prompt", |s| s.contains("Filter tasks ›"));
+    type_keyword(&tmux, "shipit");
+    let screen = tmux.wait_for("the match behind the cap", |s| {
+        s.contains("Zulu shipit") && s.contains("1/11")
+    });
+    assert!(!screen.contains("Item 01"), "{screen}");
+    assert!(!screen.contains("Show all"), "{screen}");
+
+    // Kept, the chip counts it against the whole list.
+    tmux.keys(&["Enter"]);
+    let screen = tmux.wait_for("the keyword chip", |s| {
+        s.contains("filter: shipit · 1/11") && !s.contains("Filter tasks ›")
+    });
+    assert!(screen.contains("Zulu shipit"), "{screen}");
+
+    // Cleared, the cap applies again and the match goes back behind it.
+    tmux.keys(&["C-u"]);
+    let screen = tmux.wait_for("the capped list", |s| {
+        s.contains("Item 01") && s.contains("Show all (1 more)")
+    });
+    assert!(!screen.contains("filter:"), "{screen}");
+    assert!(!screen.contains("Zulu shipit"), "{screen}");
+
+    tmux.keys(&["q"]);
+}
