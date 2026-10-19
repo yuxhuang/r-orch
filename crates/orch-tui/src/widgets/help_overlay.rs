@@ -183,7 +183,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         inner,
         y,
         vec![Span::styled(
-            "Agents: o sort; O reverse; 0 original (team/status/source order).",
+            "Agents: o sort; O reverse; 0 original order; b group by team/node.",
             ctx.style(Token::Dim),
         )],
     );

@@ -159,6 +159,11 @@ exactly the previous team/status/source order: agents have no created/updated ti
 reverses that order within each section while keeping the sections in place. Name and Location compare
 case-insensitively, with raw agent name and ID breaking ties.
 
+`b` (or the `b group:` chip) switches the Agents sections between By team (the default) and By node: a Local
+section for this instance's agents, then one section per remote alias in alias order, each marked online or
+offline. The sort still applies within each section, `0` leaves the grouping alone, and the selected agent stays
+selected. Like the sort, the grouping lasts only for this dashboard session.
+
 The Activity panel, ACTIONS list and task-detail Activity follow new entries at the tail. Scrolling up pauses
 following so you can read older entries. Resume with `End`, scroll down to the bottom with the wheel or
 PageDown, click the final entry, or focus a feed whose viewport is already at the bottom. The feed shows
