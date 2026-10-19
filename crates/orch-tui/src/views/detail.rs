@@ -59,48 +59,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
             };
             let linked = state.tasks_of_goal(&goal.id);
             match section {
-                GoalSection::Overview => {
-                    let mut lines = vec![
-                        format!("GOAL: {}", goal.title),
-                        format!(
-                            "status    {}    assignee  {}",
-                            goal.status.to_string().to_uppercase(),
-                            goal.assignee
-                                .as_deref()
-                                .map(|id| state.agent_name(id))
-                                .unwrap_or_else(|| EM_DASH.into())
-                        ),
-                        format!(
-                            "id        {}    created   {}",
-                            goal.id,
-                            goal.created_at.chars().take(10).collect::<String>()
-                        ),
-                    ];
-                    if let Some(updated) =
-                        goal.updated_at.as_ref().filter(|u| *u != &goal.created_at)
-                    {
-                        lines.push(format!(
-                            "Updated   {}",
-                            updated.chars().take(10).collect::<String>()
-                        ));
-                    }
-                    let breakdown: Vec<_> = TaskStatus::ALL
-                        .into_iter()
-                        .filter_map(|status| {
-                            let count = linked
-                                .iter()
-                                .filter(|i| state.tasks[**i].status == status)
-                                .count();
-                            (count > 0).then(|| format!("{count} {}", status.as_str()))
-                        })
-                        .collect();
-                    lines.push(format!(
-                        "tasks     {}    {}",
-                        linked.len(),
-                        breakdown.join(" · ")
-                    ));
-                    lines
-                }
+                GoalSection::Overview => overview_text(state, focus),
                 GoalSection::Description => field_lines(&goal.description, "No description."),
                 GoalSection::Progress => field_lines(
                     state.goal_progress_report.as_deref().unwrap_or(""),
@@ -124,53 +83,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                 return Vec::new();
             };
             match section {
-                TaskSection::Overview => {
-                    let status = state
-                        .remote_run(&task.id)
-                        .and_then(|r| r.status_label())
-                        .unwrap_or_else(|| task.status.to_string());
-                    let depends: Vec<_> = task
-                        .depends_on
-                        .iter()
-                        .map(|id| {
-                            state
-                                .task_by_id(id)
-                                .map(|t| t.title.clone())
-                                .unwrap_or_else(|| id.clone())
-                        })
-                        .collect();
-                    let mut lines = vec![
-                        format!("DETAIL: {}", task.title),
-                        format!(
-                            "status    {status}    assignee  {}",
-                            task.assignee
-                                .as_deref()
-                                .map(|id| state.agent_name(id))
-                                .unwrap_or_else(|| EM_DASH.into())
-                        ),
-                        format!(
-                            "priority  P{}    attempts  {}/{}",
-                            task.priority, task.attempts, task.max_attempts
-                        ),
-                        format!(
-                            "labels    {}    depends   {}",
-                            if task.labels.is_empty() {
-                                EM_DASH.into()
-                            } else {
-                                task.labels.join(", ")
-                            },
-                            if depends.is_empty() {
-                                EM_DASH.into()
-                            } else {
-                                depends.join(", ")
-                            }
-                        ),
-                    ];
-                    if let Some(hint) = state.remote_run(&task.id).and_then(|r| r.hint()) {
-                        lines.push(format!("remote    {hint}"));
-                    }
-                    lines
-                }
+                TaskSection::Overview => overview_text(state, focus),
                 TaskSection::Attachments => task.attachments.clone().unwrap_or_default(),
                 TaskSection::Description => field_lines(&task.description, "No description."),
                 TaskSection::Result => field_lines(
@@ -194,48 +107,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                 return Vec::new();
             };
             match section {
-                AgentSection::Overview => {
-                    let task = agent
-                        .current_task
-                        .as_deref()
-                        .and_then(|id| state.task_by_id(id))
-                        .map(|t| t.title.as_str())
-                        .unwrap_or(EM_DASH);
-                    let team = state
-                        .teams
-                        .iter()
-                        .find(|t| t.members.iter().any(|m| m.agent_id == agent.id))
-                        .map(|t| t.name.as_str())
-                        .unwrap_or(EM_DASH);
-                    let mut lines = vec![
-                        format!("AGENT: {}", agent.name),
-                        format!("status    {}    adapter   {}", agent.status, agent.adapter),
-                    ];
-                    if agent.adapter == "shell" {
-                        lines.push(format!(
-                            "task      {task}    command   {}",
-                            agent.config.command.as_deref().unwrap_or(EM_DASH)
-                        ));
-                    } else {
-                        lines.push(format!(
-                            "model     {}    task      {task}",
-                            agent.config.model.as_deref().unwrap_or(EM_DASH)
-                        ));
-                    }
-                    lines.push(format!(
-                        "runs      {} ({}/{})    team      {team}",
-                        agent.stats.total_runs,
-                        agent.stats.tasks_completed,
-                        agent.stats.tasks_failed
-                    ));
-                    if agent.autonomous == Some(true) {
-                        lines.push("auto      ↻ ON".into());
-                    }
-                    if let Some(skills) = agent.config.skills.as_ref().filter(|s| !s.is_empty()) {
-                        lines.push(format!("skills    {}", skills.join(", ")));
-                    }
-                    lines
-                }
+                AgentSection::Overview => overview_text(state, focus),
                 AgentSection::Role => {
                     field_lines(agent.role.as_deref().unwrap_or(""), "No role description.")
                 }
@@ -293,6 +165,570 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+// ── Overview block (R6) ─────────────────────────────────────────────
+//
+// One model feeds both the styled block and the plain text that navigation
+// and copy read, so the two cannot disagree about what the Overview shows:
+//
+//   entity -> OverviewBlock (title + rows of label/value fields)
+//          -> overview_text   plain lines (section_text, key-side row counts)
+//          -> overview_lines  styled rows for the focused body and the pin
+
+/// Cells between a label and its value, past the widest label.
+const LABEL_GAP: usize = 2;
+/// Cells between a row's left value and its right label.
+const COLUMN_GAP: usize = 3;
+/// The fewest value cells a column keeps before the block goes single-column:
+/// room for every local status word (`in_progress` is the longest).
+const MIN_VALUE: usize = 12;
+
+/// A label and its value. The value is a run of coloured segments so a
+/// status, a priority or a per-status task count keeps its own token.
+struct OverviewField {
+    label: &'static str,
+    value: Vec<(String, Token)>,
+}
+
+impl OverviewField {
+    fn new(label: &'static str, value: impl Into<String>, token: Token) -> Self {
+        let value = value.into();
+        let token = if value == EM_DASH { Token::Dim } else { token };
+        OverviewField {
+            label,
+            value: vec![(value, token)],
+        }
+    }
+
+    fn plain(&self) -> String {
+        self.value.iter().map(|(text, _)| text.as_str()).collect()
+    }
+}
+
+/// An entity's Overview: `KIND: title` over rows of one or two fields. The
+/// first row is the identity line the two-row pin keeps.
+struct OverviewBlock {
+    kind: &'static str,
+    title: String,
+    rows: Vec<Vec<OverviewField>>,
+}
+
+fn dash_or(text: String) -> String {
+    if text.is_empty() {
+        EM_DASH.into()
+    } else {
+        text
+    }
+}
+
+fn overview_block(state: &AppState, focus: Focus) -> Option<OverviewBlock> {
+    use crate::theme::{
+        agent_status_token, goal_status_token, priority_token, remote_phase_token,
+        task_status_token,
+    };
+    let assignee = |id: Option<&str>| id.map(|id| state.agent_name(id)).unwrap_or(EM_DASH.into());
+    let date = |ts: &str| ts.chars().take(10).collect::<String>();
+    match focus {
+        Focus::GoalDetail(GoalSection::Overview) => {
+            let goal = state.selected_goal()?;
+            let linked = state.tasks_of_goal(&goal.id);
+            let mut rows = vec![
+                vec![
+                    OverviewField::new(
+                        "status",
+                        goal.status.to_string().to_uppercase(),
+                        goal_status_token(goal.status),
+                    ),
+                    OverviewField::new(
+                        "assignee",
+                        assignee(goal.assignee.as_deref()),
+                        Token::Silver,
+                    ),
+                ],
+                vec![
+                    OverviewField::new("id", goal.id.clone(), Token::Silver),
+                    OverviewField::new("created", date(&goal.created_at), Token::Silver),
+                ],
+            ];
+            if let Some(updated) = goal.updated_at.as_ref().filter(|u| *u != &goal.created_at) {
+                rows.push(vec![OverviewField::new(
+                    "updated",
+                    date(updated),
+                    Token::Silver,
+                )]);
+            }
+            let mut tasks = OverviewField::new("tasks", linked.len().to_string(), Token::Silver);
+            let breakdown: Vec<_> = TaskStatus::ALL
+                .into_iter()
+                .filter_map(|status| {
+                    let count = linked
+                        .iter()
+                        .filter(|i| state.tasks[**i].status == status)
+                        .count();
+                    (count > 0).then(|| (format!("{count} {}", status.as_str()), status))
+                })
+                .collect();
+            if !breakdown.is_empty() {
+                tasks.value.push((" (".into(), Token::Dim));
+                for (n, (text, status)) in breakdown.into_iter().enumerate() {
+                    if n > 0 {
+                        tasks.value.push((" · ".into(), Token::Dim));
+                    }
+                    tasks.value.push((text, task_status_token(status)));
+                }
+                tasks.value.push((")".into(), Token::Dim));
+            }
+            rows.push(vec![tasks]);
+            Some(OverviewBlock {
+                kind: "GOAL",
+                title: goal.title.clone(),
+                rows,
+            })
+        }
+        Focus::TaskDetail(TaskSection::Overview) => {
+            let task = state.selected_task()?;
+            let remote = state.remote_run(&task.id);
+            let status = match remote.and_then(|r| r.status_label().map(|l| (l, r.phase))) {
+                Some((label, phase)) => {
+                    OverviewField::new("status", label, remote_phase_token(phase))
+                }
+                None => OverviewField::new(
+                    "status",
+                    task.status.to_string(),
+                    task_status_token(task.status),
+                ),
+            };
+            let depends: Vec<_> = task
+                .depends_on
+                .iter()
+                .map(|id| {
+                    state
+                        .task_by_id(id)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect();
+            let mut rows = vec![
+                vec![
+                    status,
+                    OverviewField::new(
+                        "assignee",
+                        assignee(task.assignee.as_deref()),
+                        Token::Silver,
+                    ),
+                ],
+                vec![
+                    OverviewField::new(
+                        "priority",
+                        format!("P{}", task.priority),
+                        priority_token(task.priority),
+                    ),
+                    OverviewField::new(
+                        "attempts",
+                        format!("{}/{}", task.attempts, task.max_attempts),
+                        Token::Silver,
+                    ),
+                ],
+                vec![
+                    OverviewField::new("labels", dash_or(task.labels.join(", ")), Token::Silver),
+                    OverviewField::new("depends", dash_or(depends.join(", ")), Token::Silver),
+                ],
+            ];
+            if let Some(hint) = remote.and_then(|r| r.hint()) {
+                rows.push(vec![OverviewField::new("remote", hint, Token::Yellow)]);
+            }
+            Some(OverviewBlock {
+                kind: "DETAIL",
+                title: task.title.clone(),
+                rows,
+            })
+        }
+        Focus::AgentDetail(AgentSection::Overview) => {
+            let agent = state.selected_agent()?;
+            let task = agent
+                .current_task
+                .as_deref()
+                .and_then(|id| state.task_by_id(id))
+                .map(|t| t.title.as_str())
+                .unwrap_or(EM_DASH);
+            let team = state
+                .teams
+                .iter()
+                .find(|t| t.members.iter().any(|m| m.agent_id == agent.id))
+                .map(|t| t.name.as_str())
+                .unwrap_or(EM_DASH);
+            let task = OverviewField::new("task", task, Token::Silver);
+            let mut rows = vec![vec![
+                OverviewField::new(
+                    "status",
+                    agent.status.to_string(),
+                    agent_status_token(agent.status),
+                ),
+                OverviewField::new("adapter", agent.adapter.clone(), Token::Silver),
+            ]];
+            if agent.adapter == "shell" {
+                rows.push(vec![
+                    task,
+                    OverviewField::new(
+                        "command",
+                        agent.config.command.as_deref().unwrap_or(EM_DASH),
+                        Token::Silver,
+                    ),
+                ]);
+            } else {
+                rows.push(vec![
+                    OverviewField::new(
+                        "model",
+                        agent.config.model.as_deref().unwrap_or(EM_DASH),
+                        Token::Silver,
+                    ),
+                    task,
+                ]);
+            }
+            rows.push(vec![
+                OverviewField::new(
+                    "runs",
+                    format!(
+                        "{} ({}/{})",
+                        agent.stats.total_runs,
+                        agent.stats.tasks_completed,
+                        agent.stats.tasks_failed
+                    ),
+                    Token::Silver,
+                ),
+                OverviewField::new("team", team, Token::Silver),
+            ]);
+            if agent.autonomous == Some(true) {
+                rows.push(vec![OverviewField::new("auto", "↻ ON", Token::Green)]);
+            }
+            if let Some(skills) = agent.config.skills.as_ref().filter(|s| !s.is_empty()) {
+                rows.push(vec![OverviewField::new(
+                    "skills",
+                    skills.join(", "),
+                    Token::Silver,
+                )]);
+            }
+            Some(OverviewBlock {
+                kind: "AGENT",
+                title: agent.name.clone(),
+                rows,
+            })
+        }
+        _ => None,
+    }
+}
+
+impl OverviewBlock {
+    /// Label column width: the widest label plus the gap to its value.
+    fn label_cells(&self) -> usize {
+        self.rows
+            .iter()
+            .flatten()
+            .map(|f| f.label.width())
+            .max()
+            .unwrap_or(0)
+            + LABEL_GAP
+    }
+
+    /// Where a two-field row's right label starts, as an offset from the
+    /// block's left edge, or `None` when `width` cannot give both columns a
+    /// label and [`MIN_VALUE`] cells. The left values take their widest
+    /// entry's cells, but never more than half the width, so one long value
+    /// cannot push every right field to the edge. A left value wider than
+    /// that cap does not set the column at all: its row is laid out one
+    /// field a row instead (see [`overview_lines`]).
+    fn right_column(&self, width: usize) -> Option<usize> {
+        let label = self.label_cells();
+        let lefts: Vec<usize> = self
+            .rows
+            .iter()
+            .filter(|row| row.len() == 2)
+            .map(|row| row[0].plain().width())
+            .collect();
+        if lefts.is_empty() {
+            return None;
+        }
+        let half = width.saturating_sub(COLUMN_GAP) / 2;
+        let cap = half.checked_sub(label).filter(|cap| *cap >= MIN_VALUE)?;
+        let widest = lefts.into_iter().filter(|w| *w <= cap).max().unwrap_or(cap);
+        Some(label + widest + COLUMN_GAP)
+    }
+}
+
+/// Plain lines for `section_text`: what the block says, without styling.
+fn overview_text(state: &AppState, focus: Focus) -> Vec<String> {
+    let Some(block) = overview_block(state, focus) else {
+        return Vec::new();
+    };
+    let label = block.label_cells();
+    let mut lines = vec![format!("{}: {}", block.kind, block.title)];
+    for row in &block.rows {
+        let line: Vec<_> = row
+            .iter()
+            .map(|f| format!("{:<label$}{}", f.label, f.plain()))
+            .collect();
+        lines.push(line.join("    "));
+    }
+    lines
+}
+
+/// Clip a segmented value to `width` cells by display width, ending in `…`
+/// when anything was cut, and pad it to exactly `width` when `pad` is set so
+/// the next column always starts on the same cell.
+fn clip_value(value: &[(String, Token)], width: usize, pad: bool) -> Vec<(String, Token)> {
+    let total: usize = value.iter().map(|(text, _)| text.width()).sum();
+    let mut out: Vec<(String, Token)> = Vec::new();
+    let mut used = 0;
+    if total <= width {
+        out.extend(value.iter().cloned());
+        used = total;
+    } else if width > 0 {
+        let budget = width - 1;
+        let mut last = value.first().map_or(Token::Silver, |(_, t)| *t);
+        'segments: for (text, token) in value {
+            let mut kept = String::new();
+            for grapheme in text.graphemes(true) {
+                let cells = grapheme.width();
+                if used + cells > budget {
+                    if !kept.is_empty() {
+                        out.push((kept, *token));
+                    }
+                    last = *token;
+                    break 'segments;
+                }
+                used += cells;
+                kept.push_str(grapheme);
+            }
+            if !kept.is_empty() {
+                out.push((kept, *token));
+            }
+        }
+        out.push(("…".into(), last));
+        used += 1;
+    }
+    if pad && used < width {
+        out.push((" ".repeat(width - used), Token::Silver));
+    }
+    out
+}
+
+/// Wrap a segmented value into rows of at most `first` cells, then `rest`
+/// cells, by display width and on grapheme boundaries, keeping each
+/// segment's token. A row breaks after the last whitespace that fits; a word
+/// wider than a whole row is split where the row ends instead. A newline
+/// always breaks.
+/// Continuation rows drop the whitespace they would start with. Control and
+/// bidi characters display as a space, as in [`wrap_rows`].
+///
+/// Hand-rolled (ARCHITECTURE §4.8, no maintained crate fits): ratatui's word
+/// wrapper is private and reports no row count, and `textwrap` is not in the
+/// graph and wraps plain strings, losing the per-segment tokens.
+fn wrap_value(value: &[(String, Token)], first: usize, rest: usize) -> Vec<Vec<(String, Token)>> {
+    // One displayed grapheme: its text, token and cells; `None` is a newline.
+    type Cell = (String, Token, usize);
+    let blank = |cell: &Cell| cell.0.trim().is_empty();
+    let cells: Vec<Option<Cell>> = value
+        .iter()
+        .flat_map(|(text, token)| text.graphemes(true).map(move |g| (g, *token)))
+        .map(|(grapheme, token)| {
+            if grapheme == "\n" || grapheme == "\r\n" {
+                return None;
+            }
+            let displayed: String = grapheme
+                .chars()
+                .map(|ch| {
+                    if ch.is_control()
+                        || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                    {
+                        ' '
+                    } else {
+                        ch
+                    }
+                })
+                .collect();
+            let width = displayed.width();
+            Some((displayed, token, width))
+        })
+        .collect();
+    let rest = rest.max(1);
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut row: Vec<Cell> = Vec::new();
+    let mut used = 0;
+    // Index in `row` just past its last whitespace: where it may break.
+    let mut breakable: Option<usize> = None;
+    // Whether the current row continues a wrapped one (not a new line).
+    let mut soft = false;
+    for (index, cell) in cells.iter().enumerate() {
+        let Some(cell) = cell else {
+            rows.push(std::mem::take(&mut row));
+            (used, breakable, soft) = (0, None, false);
+            continue;
+        };
+        let limit = if rows.is_empty() { first.max(1) } else { rest };
+        if used + cell.2 > limit && !row.is_empty() && blank(cell) {
+            // The overflowing space is itself the break.
+            rows.push(std::mem::take(&mut row));
+            (used, breakable, soft) = (0, None, true);
+            continue;
+        }
+        if used + cell.2 > limit && !row.is_empty() {
+            // The word this cell belongs to, from the row's last space to
+            // the next space or newline, moves to the next row whole if it
+            // fits there; otherwise it is split where this row ends.
+            let word = |at: usize| {
+                row[at..].iter().map(|c| c.2).sum::<usize>()
+                    + cells[index..]
+                        .iter()
+                        .map_while(|c| c.as_ref().filter(|c| !blank(c)))
+                        .map(|c| c.2)
+                        .sum::<usize>()
+            };
+            let carry = match breakable.filter(|at| *at < row.len() && word(*at) <= rest) {
+                Some(at) => row.split_off(at),
+                None => Vec::new(),
+            };
+            rows.push(std::mem::replace(&mut row, carry));
+            used = row.iter().map(|c| c.2).sum();
+            (breakable, soft) = (None, true);
+        }
+        if blank(cell) && soft && row.is_empty() {
+            continue;
+        }
+        row.push(cell.clone());
+        used += cell.2;
+        if blank(cell) {
+            breakable = Some(row.len());
+        }
+    }
+    rows.push(row);
+    rows.into_iter()
+        .map(|row| {
+            let mut segments: Vec<(String, Token)> = Vec::new();
+            for (text, token, _) in row {
+                match segments.last_mut() {
+                    Some((run, last)) if *last == token => run.push_str(&text),
+                    _ => segments.push((text, token)),
+                }
+            }
+            segments
+        })
+        .collect()
+}
+
+/// The block as styled rows at `width` cells: a `━` rule carrying the
+/// Amber `KIND: title` chip, then Amber labels over status-coloured values,
+/// two fields a row when both fit their columns and one a row otherwise.
+///
+/// With `wrap` set (the focused Overview, which has no viewer to expand
+/// into), nothing is clipped: the title continues on rows under the chip,
+/// and a value too long for its row continues on rows indented to the
+/// value column. Without it (the two-row pin), values are clipped with `…`.
+fn overview_lines(
+    ctx: &RenderCtx,
+    block: &OverviewBlock,
+    width: usize,
+    wrap: bool,
+) -> Vec<Vec<Span<'static>>> {
+    use crate::theme::HEAVY_RULE;
+    let rule = |cells: usize| HEAVY_RULE.to_string().repeat(cells);
+    let chip_style = ctx
+        .chip(Token::Amber, Token::AccentBg)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let mut lines = Vec::new();
+    let chip = format!("{}: {}", block.kind, block.title);
+    // `━━━` + ` chip ` + at least one trailing `━`; continuation rows sit
+    // under the chip, past the leading rule.
+    let first = width.saturating_sub(3 + 2 + 1);
+    let mut chip_rows = if wrap {
+        wrap_value(&[(chip, Token::Amber)], first, width.saturating_sub(3 + 2))
+            .into_iter()
+            .map(|row| row.into_iter().map(|(text, _)| text).collect::<String>())
+            .collect()
+    } else {
+        vec![fit_cells(&chip, first)]
+    }
+    .into_iter();
+    let head = chip_rows.next().unwrap_or_default();
+    let used = 3 + head.width() + 2;
+    lines.push(vec![
+        Span::styled(rule(3), ctx.style(Token::Ghost)),
+        Span::styled(format!(" {head} "), chip_style),
+        Span::styled(rule(width.saturating_sub(used)), ctx.style(Token::Ghost)),
+    ]);
+    for text in chip_rows {
+        lines.push(vec![
+            Span::raw("   "),
+            Span::styled(format!(" {text} "), chip_style),
+        ]);
+    }
+    let label = block.label_cells();
+    let label_spans = |f: &OverviewField, cells: usize| {
+        Span::styled(
+            fit_cells(&format!("{:<label$}", f.label), cells.min(label)),
+            ctx.style(Token::Amber),
+        )
+    };
+    let styled = |segments: Vec<(String, Token)>| {
+        segments
+            .into_iter()
+            .map(|(text, token)| Span::styled(text, ctx.style(token)))
+    };
+    let field = |f: &OverviewField, cells: usize, pad: bool| {
+        let mut spans = vec![label_spans(f, cells)];
+        spans.extend(styled(clip_value(
+            &f.value,
+            cells.saturating_sub(label),
+            pad,
+        )));
+        spans
+    };
+    // A one-field row that wraps: the label, then the value from the value
+    // column, continuing on rows indented to it. At least one value cell
+    // stays, even if the label has to give way.
+    let wrapped = |f: &OverviewField| -> Vec<Vec<Span<'static>>> {
+        let indent = label.min(width.saturating_sub(1));
+        let cells = width.saturating_sub(indent);
+        wrap_value(&f.value, cells, cells)
+            .into_iter()
+            .enumerate()
+            .map(|(n, segments)| {
+                let mut spans = vec![if n == 0 {
+                    label_spans(f, indent)
+                } else {
+                    Span::raw(" ".repeat(indent))
+                }];
+                spans.extend(styled(segments));
+                spans
+            })
+            .collect()
+    };
+    let fits = |f: &OverviewField, cells: usize| f.plain().width() <= cells.saturating_sub(label);
+    let right = block.right_column(width);
+    for row in &block.rows {
+        match (row.as_slice(), right) {
+            ([left, second], Some(right))
+                if !wrap || (fits(left, right - COLUMN_GAP) && fits(second, width - right)) =>
+            {
+                let mut spans = field(left, right - COLUMN_GAP, true);
+                spans.push(Span::raw(" ".repeat(COLUMN_GAP)));
+                spans.extend(field(second, width - right, false));
+                lines.push(spans);
+            }
+            _ if wrap => lines.extend(row.iter().flat_map(wrapped)),
+            _ => lines.extend(row.iter().map(|f| field(f, width, false))),
+        }
+    }
+    lines
+}
+
+fn is_overview(focus: Focus) -> bool {
+    matches!(
+        focus,
+        Focus::GoalDetail(GoalSection::Overview)
+            | Focus::TaskDetail(TaskSection::Overview)
+            | Focus::AgentDetail(AgentSection::Overview)
+    )
 }
 
 /// The messages an Activity section lists, in display order, or `None` for a
@@ -618,16 +1054,22 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         )
     });
     if let Some(overview) = overview.filter(|o| *o != focus && body.height >= 6) {
-        for (row, line) in section_text(state, overview).iter().take(2).enumerate() {
-            put_line(
-                frame,
-                body,
-                body.y + row as u16,
-                vec![Span::styled(
-                    fit_cells(line, body.width as usize),
-                    ctx.style(Token::Dim),
-                )],
-            );
+        // The pin is the block's first two rows: the title rule and the
+        // identity row, styled as in the focused block.
+        let pinned = match overview_block(state, overview) {
+            Some(block) => overview_lines(ctx, &block, body.width as usize, false),
+            None => section_text(state, overview)
+                .iter()
+                .map(|line| {
+                    vec![Span::styled(
+                        fit_cells(line, body.width as usize),
+                        ctx.style(Token::Dim),
+                    )]
+                })
+                .collect(),
+        };
+        for (row, spans) in pinned.into_iter().take(2).enumerate() {
+            put_line(frame, body, body.y + row as u16, spans);
         }
         let pin = Rect::new(body.x, body.y, body.width, 2);
         ctx.zone(
@@ -653,9 +1095,15 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
     let sources = section_sources(state, focus);
     let is_list = selectable(focus);
+    // The focused Overview draws its own wrapped block; its rows below are
+    // placeholders, so scrolling counts exactly the rows drawn.
+    let styled = is_overview(focus)
+        .then(|| overview_block(state, focus))
+        .flatten()
+        .map(|block| overview_lines(ctx, &block, body.width as usize, true));
     let mut rows = Vec::new();
     let mut byte_offset = 0;
-    for (index, line) in lines.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate().filter(|_| styled.is_none()) {
         let source = sources.get(index).cloned().flatten();
         if is_list {
             let continuous = matches!(
@@ -680,6 +1128,9 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         }
     }
     let activity = activity_messages(state, focus);
+    if let Some(styled) = &styled {
+        rows = vec![(String::new(), None, 0); styled.len()];
+    }
     if rows.is_empty() {
         let empty = if activity.is_some() {
             "No activity."
@@ -720,7 +1171,12 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     {
         let row = Rect::new(body.x, body.y + screen_row as u16, body.width, 1);
         let selected = is_list && scroll.selected == Some(offset + screen_row);
-        if let Some(message) = activity
+        if let Some(spans) = styled
+            .as_ref()
+            .and_then(|lines| lines.get(offset + screen_row))
+        {
+            put_line(frame, row, row.y, spans.clone());
+        } else if let Some(message) = activity
             .as_ref()
             .and_then(|messages| messages.get(offset + screen_row))
         {
@@ -862,5 +1318,66 @@ mod tests {
         assert_eq!(alone.len(), 1);
         assert_eq!(alone[0].0, focus);
         assert!(alone[0].1.width() <= 6, "{:?}", alone[0].1);
+    }
+
+    fn plain_rows(value: &str, first: usize, rest: usize) -> Vec<String> {
+        wrap_value(&[(value.into(), Token::Silver)], first, rest)
+            .into_iter()
+            .map(|row| row.into_iter().map(|(text, _)| text).collect())
+            .collect()
+    }
+
+    #[test]
+    fn wrap_value_breaks_after_whitespace_and_drops_the_continuation_space() {
+        assert_eq!(
+            plain_rows("alpha, beta, gamma", 12, 12),
+            ["alpha, beta,", "gamma"]
+        );
+        assert_eq!(
+            plain_rows("alpha, beta, gamma", 10, 10),
+            ["alpha, ", "beta, ", "gamma"]
+        );
+        assert_eq!(plain_rows("short", 12, 12), ["short"]);
+        assert_eq!(plain_rows("", 12, 12), [""]);
+    }
+
+    #[test]
+    fn wrap_value_splits_a_word_wider_than_the_row_by_display_width() {
+        assert_eq!(plain_rows("abcdefgh", 3, 3), ["abc", "def", "gh"]);
+        // Two cells a glyph: a row never ends half way through one.
+        assert_eq!(plain_rows("界面界面界", 5, 4), ["界面", "界面", "界"]);
+        assert_eq!(plain_rows("👩‍👩‍👧 ok", 1, 1), ["👩‍👩‍👧", "o", "k"]);
+        // A word too long for any row fills the current one, so a short
+        // prefix is never left alone on its row.
+        assert_eq!(
+            plain_rows("AGENT: builder-with-a-long-name", 12, 12),
+            ["AGENT: build", "er-with-a-lo", "ng-name"]
+        );
+        assert_eq!(plain_rows("ab cdefgh", 5, 5), ["ab cd", "efgh"]);
+        assert_eq!(plain_rows("ab cdef", 5, 5), ["ab ", "cdef"]);
+    }
+
+    #[test]
+    fn wrap_value_keeps_newlines_and_indentation_and_blanks_controls() {
+        assert_eq!(plain_rows("a\n  b\x1b\u{202e}c", 20, 20), ["a", "  b  c"]);
+    }
+
+    #[test]
+    fn wrap_value_keeps_each_segment_token_across_rows() {
+        let value = vec![
+            ("3 done".to_owned(), Token::Green),
+            (" · ".to_owned(), Token::Dim),
+            ("1 failed".to_owned(), Token::Red),
+        ];
+        assert_eq!(
+            wrap_value(&value, 9, 9),
+            [
+                vec![
+                    ("3 done".to_owned(), Token::Green),
+                    (" · ".to_owned(), Token::Dim)
+                ],
+                vec![("1 failed".to_owned(), Token::Red)],
+            ]
+        );
     }
 }

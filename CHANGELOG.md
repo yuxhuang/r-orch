@@ -11,6 +11,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Dashboard goal and agent details end with an Activity section in the Activity panel's columns, newest first: a goal lists the entries of its tasks, an agent its own entries. It follows new entries at the top; moving down pauses it and `Home` resumes, as the footer hint and the help overlay say. An empty one reads "No activity.".
 
 ### Changed
+- Dashboard goal, task and agent details show their Overview as an aligned block: the title on a `━` rule, then Amber labels with values in two columns (one column on narrow terminals) and statuses, priorities and per-status task counts in their list colours. A value or title too long for its row wraps onto the rows below it, indented to its column, so nothing is cut off; only the two-row summary pinned above other sections, which uses the same style, still shortens them with `…`. The fields are unchanged; the goal's `Updated` label is now lower case like the others.
 - The dashboard's task-detail Activity section shows each entry in the same columns and colours as the Activity panel (time, agent, type icon, text, error and agent-group highlighting) instead of bare text.
 
 ### Removed

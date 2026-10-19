@@ -1,7 +1,8 @@
 //! End to end in tmux: detail views as an operator sees them in a real
 //! terminal (AGENTS.md, "TUI end-to-end tests"): the section rail keeps its
-//! order while focus moves (R2), and the task, goal and agent details' Activity
-//! rows have the bottom feed's columns (R1, R12).
+//! order while focus moves (R2), the task, goal and agent details' Activity
+//! rows have the bottom feed's columns (R1, R12), and their Overview is an
+//! aligned label/value block under a `━` title rule, focused and pinned (R6).
 //!
 //! The real `orch` binary runs `orch tui` in a private tmux server over a
 //! temp project with one shell agent, `bot`, one unassigned goal, `Launch`,
@@ -287,6 +288,43 @@ fn marker(rail: &str) -> Option<String> {
         .map(|title| title.split(" · ").next().unwrap_or(title).to_owned())
 }
 
+/// The character column `needle` starts at in `line`. Every glyph these
+/// screens put left of an Overview label is one cell wide.
+fn column(line: &str, needle: &str) -> Option<usize> {
+    line.find(needle).map(|byte| line[..byte].chars().count())
+}
+
+/// R6: the Overview block on screen. Its `━━━ KIND: title ━` rule sits on
+/// the block's left edge; each `(left, right)` label pair shares a row, every
+/// left label starts at that edge and every right label in one shared
+/// column, which is returned.
+#[track_caller]
+fn overview_columns(screen: &str, title: &str, pairs: &[(&str, &str)]) -> usize {
+    let rule = format!("━━━ {title} ━");
+    let lines: Vec<&str> = screen.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains(&rule))
+        .unwrap_or_else(|| panic!("no {rule:?} title rule:\n{screen}"));
+    let edge = column(lines[top], &rule).unwrap();
+    let mut right_column = None;
+    for (left, right) in pairs {
+        let line = lines[top + 1..]
+            .iter()
+            .find(|line| column(line, &format!("{left} ")) == Some(edge))
+            .unwrap_or_else(|| panic!("no {left:?} label at column {edge}:\n{screen}"));
+        let at = column(line, &format!(" {right} "))
+            .unwrap_or_else(|| panic!("no {right:?} beside {left:?}: {line}"))
+            + 1;
+        assert_eq!(
+            *right_column.get_or_insert(at),
+            at,
+            "{right:?} out of column:\n{screen}"
+        );
+    }
+    right_column.expect("at least one pair")
+}
+
 #[test]
 fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
     let dir = project();
@@ -304,6 +342,17 @@ fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
     });
     let ring = ["Overview", "Description", "Activity"];
     assert_eq!(titles(rail(&screen)), ring, "{screen}");
+    // The focused Overview: Amber labels in two aligned columns (R6).
+    let task_pairs = [
+        ("status", "assignee"),
+        ("priority", "attempts"),
+        ("labels", "depends"),
+    ];
+    let right = overview_columns(&screen, "DETAIL: Ship it", &task_pairs);
+    assert!(
+        screen.contains("status    cancelled"),
+        "same status: {screen}"
+    );
 
     // Tab through the sections: the titles never move; only the marker does.
     let mut marked = marker(rail(&screen));
@@ -328,6 +377,17 @@ fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
         rail(&screen).trim_end(),
         "Overview │ Description │ > Activity · following",
         "{screen}"
+    );
+    // Pinned above another section: the title rule and the identity row, in
+    // the focused block's columns.
+    assert_eq!(
+        overview_columns(&screen, "DETAIL: Ship it", &task_pairs[..1]),
+        right,
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("priority  "),
+        "the pin is two rows: {screen}"
     );
     // Task Activity keeps the feed's chronology: its live edge is the bottom.
     assert_eq!(
@@ -427,7 +487,17 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
         // Wait for the run history: the feed shows its newest event.
         tmux.wait_for("the feed", |s| s.contains("▶ Completed"));
         tmux.keys(&["Enter"]);
-        tmux.wait_for("the detail", |s| s.contains("Overview"));
+        let screen = tmux.wait_for("the detail", |s| s.contains("> Overview"));
+        // R6: the focused Overview block keeps its columns.
+        let (title, pairs): (&str, &[(&str, &str)]) = if view == "a" {
+            (
+                "AGENT: bot",
+                &[("status", "adapter"), ("task", "command"), ("runs", "team")],
+            )
+        } else {
+            ("GOAL: Launch", &[("status", "assignee"), ("id", "created")])
+        };
+        overview_columns(&screen, title, pairs);
         // Tab through the detail sections to Activity, the ring's last entry.
         let mut tabs = 0;
         while !tmux.screen().contains("> Activity · following") {
@@ -462,5 +532,90 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
         tmux.keys(&["Escape"]);
         tmux.wait_for("the detail closed", |s| !s.contains("Activity · following"));
     }
+    tmux.keys(&["q"]);
+}
+
+/// R6 / review I1: an Overview value too long for its row wraps onto
+/// continuation rows that start at the value column, so nothing is clipped
+/// away. `bot` here has 14 skills, about two rows' worth at 120 columns.
+#[test]
+fn agent_overview_wraps_a_long_skills_list_onto_value_column_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("home")).expect("home");
+    orch(
+        dir.path(),
+        &["init", "--name", "proj", "--adapter", "shell"],
+    );
+    let skills: Vec<String> = (0..14).map(|n| format!("skill-number-{n}")).collect();
+    orch(
+        dir.path(),
+        &[
+            "agent",
+            "add",
+            "bot",
+            "--adapter",
+            "shell",
+            "--command",
+            "true",
+            "--skills",
+            &skills.join(","),
+        ],
+    );
+    let tmux = launch(
+        dir.path(),
+        format!("orch-x3-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["a"]);
+    tmux.wait_for("bot", |s| s.contains("bot"));
+    tmux.keys(&["Enter"]);
+    let screen = tmux.wait_for("the skills row", |s| {
+        s.contains("> Overview") && s.contains("skill-number-0")
+    });
+    let lines: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
+    let rule: Vec<char> = "━━━ AGENT: bot ━".chars().collect();
+    let find =
+        |line: &[char], needle: &[char]| line.windows(needle.len()).position(|w| w == needle);
+    let (top, edge) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(y, line)| find(line, &rule).map(|x| (y, x)))
+        .unwrap_or_else(|| panic!("no Overview title rule:\n{screen}"));
+    let first: Vec<char> = "skill-number-0".chars().collect();
+    let (at, column) = lines[top..]
+        .iter()
+        .enumerate()
+        .find_map(|(y, line)| find(line, &first).map(|x| (top + y, x)))
+        .unwrap();
+    let label: String = lines[at][edge..column].iter().collect();
+    assert_eq!(label.trim_end(), "skills", "{screen}");
+    let mut shown = Vec::new();
+    let mut rows = 0;
+    for line in &lines[at..] {
+        let indent: String = line.get(edge..column).unwrap_or_default().iter().collect();
+        let value: String = line.get(column..).unwrap_or_default().iter().collect();
+        // The value ends at the pane's border, if it has one.
+        let value = value.split('│').next().unwrap_or_default().trim_end();
+        if rows > 0 && (!indent.trim().is_empty() || value.is_empty()) {
+            break;
+        }
+        assert!(
+            !value.starts_with(' ') && !value.contains('…'),
+            "row {rows} starts at the value column, unclipped:\n{screen}"
+        );
+        shown.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+        rows += 1;
+    }
+    assert!(
+        rows >= 2,
+        "14 skills wrap onto more than one row:\n{screen}"
+    );
+    assert_eq!(shown, skills, "every skill on screen, in order:\n{screen}");
     tmux.keys(&["q"]);
 }
