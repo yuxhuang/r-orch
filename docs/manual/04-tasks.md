@@ -64,7 +64,7 @@ orch checks the values before it saves anything:
   ✕ Attachment file not found: missing.png
 ```
 
-Attachments must be regular files (symlinks to regular files are accepted) with distinct basenames. If any file is missing, is not a regular file, or repeats a basename, orch copies none of them and creates no task. Appending attachments to an existing task also rejects names already listed on the task or present in its attachment directory; choose a fresh name and retry. `task update` keeps the `attachments` field read-only.
+Attachments must be regular files (symlinks to regular files are accepted) with distinct basenames when compared using Unicode lowercase (for example, `Report.txt` and `report.txt` collide). Stored names keep their original case. If any file is missing, is not a regular file, or repeats a basename, orch copies none of them and creates no task. Appending attachments to an existing task also rejects names already listed on the task (including case variants) or present in its attachment directory; choose a fresh name and retry. `task update` keeps the `attachments` field read-only.
 
 ```text
 $ orch task add duplicate --attach first/same.txt,second/same.txt

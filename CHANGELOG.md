@@ -13,7 +13,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Fixed
 - `orch task add --attach` now saves the files: each one is copied into `.orchestry/attachments/<task id>/` and listed on the task. A missing file stops the command with `Attachment file not found` before anything is saved.
-- Task attachments reject duplicate names, names already attached on append, and non-file sources before anything is written; copy errors name the source, destination and cause.
+- Task attachments reject duplicate names (including case variants), names already attached on append, and non-file sources before anything is written; copy errors name the source, destination and cause.
 - A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
 
 ## [0.8.0] - 2026-10-18

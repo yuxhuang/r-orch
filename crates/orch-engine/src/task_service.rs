@@ -5,7 +5,7 @@
 //! bypasses it on recovery paths by writing through the store instead — see
 //! `crate::orchestrator`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -504,9 +504,10 @@ impl TaskService {
                 )));
             }
         }
+        // Compare lowercase keys for portable collision checks; keep source names.
         let mut seen = HashMap::with_capacity(names.len());
         for (name, source) in names.iter().zip(sources) {
-            if let Some(first) = seen.insert(name, source) {
+            if let Some(first) = seen.insert(name.to_lowercase(), source) {
                 return Err(Error::invalid_arguments(format!(
                     "Duplicate attachment name: {name} ({}, {})",
                     first.display(),
@@ -515,8 +516,11 @@ impl TaskService {
             }
         }
         if let Some(existing) = existing {
+            let existing: HashSet<_> = existing.iter().map(|name| name.to_lowercase()).collect();
             for name in &names {
-                if existing.contains(name) || fs_utils::path_exists(&dir.join(name)).await {
+                if existing.contains(&name.to_lowercase())
+                    || fs_utils::path_exists(&dir.join(name)).await
+                {
                     return Err(Error::invalid_arguments(format!(
                         "Attachment already exists: {name}"
                     )));
@@ -1689,6 +1693,113 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn case_variant_attachment_basenames_are_rejected_before_any_copy() {
+        for (first_name, second_name) in [("Report.txt", "report.txt"), ("Ä.txt", "ä.txt")] {
+            let h = with_paths();
+            let first_dir = tempfile::tempdir().unwrap();
+            let second_dir = tempfile::tempdir().unwrap();
+            let first = first_dir.path().join(first_name);
+            let second = second_dir.path().join(second_name);
+            tokio::fs::write(&first, b"first").await.unwrap();
+            tokio::fs::write(&second, b"second").await.unwrap();
+
+            let err = h
+                .service
+                .create(CreateTaskInput {
+                    attachments: Some(vec![path_str(&first), path_str(&second)]),
+                    ..input("t")
+                })
+                .await
+                .expect_err("case variants must not silently overwrite attachment bytes");
+
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Duplicate attachment name: {second_name} ({}, {})",
+                    first.display(),
+                    second.display()
+                )
+            );
+            assert!(h.tasks.is_empty());
+            assert!(
+                !h.service
+                    .attachment_path("tsk_0000001", "")
+                    .unwrap()
+                    .exists()
+            );
+            assert_eq!(tokio::fs::read(&first).await.unwrap(), b"first");
+            assert_eq!(tokio::fs::read(&second).await.unwrap(), b"second");
+        }
+    }
+
+    #[tokio::test]
+    async fn appending_case_variant_attachment_basenames_preserves_the_task_and_stored_state() {
+        // Missing stored copies exercise recorded-name validation even on a
+        // case-insensitive filesystem, where path_exists would catch the clash.
+        for keep_stored in [false, true] {
+            let h = with_paths();
+            let first_dir = tempfile::tempdir().unwrap();
+            let second_dir = tempfile::tempdir().unwrap();
+            let original = first_dir.path().join("Report.txt");
+            let replacement = second_dir.path().join("report.txt");
+            let fresh = second_dir.path().join("fresh.txt");
+            tokio::fs::write(&original, b"original").await.unwrap();
+            tokio::fs::write(&replacement, b"replacement")
+                .await
+                .unwrap();
+            tokio::fs::write(&fresh, b"fresh").await.unwrap();
+            let task = h
+                .service
+                .create(CreateTaskInput {
+                    attachments: Some(vec![path_str(&original)]),
+                    ..input("t")
+                })
+                .await
+                .unwrap();
+            assert_eq!(task.attachments.as_ref().unwrap(), &["Report.txt"]);
+            let stored = h.service.attachment_path(&task.id, "Report.txt").unwrap();
+            if !keep_stored {
+                tokio::fs::remove_file(&stored).await.unwrap();
+            }
+
+            let err = h
+                .service
+                .update(
+                    &task.id,
+                    UpdateTaskFields {
+                        title: Some("must not be saved".into()),
+                        attachments: Some(vec![fresh, replacement]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("case variants must not append duplicate attachment references");
+
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert_eq!(err.to_string(), "Attachment already exists: report.txt");
+            assert_eq!(h.service.get(&task.id).await.unwrap(), task);
+            if keep_stored {
+                assert_eq!(tokio::fs::read(&stored).await.unwrap(), b"original");
+            } else {
+                assert!(!stored.exists());
+                assert!(
+                    !h.service
+                        .attachment_path(&task.id, "report.txt")
+                        .unwrap()
+                        .exists()
+                );
+            }
+            assert!(
+                !h.service
+                    .attachment_path(&task.id, "fresh.txt")
+                    .unwrap()
+                    .exists()
+            );
+        }
     }
 
     #[tokio::test]

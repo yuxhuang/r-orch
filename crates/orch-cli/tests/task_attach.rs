@@ -277,6 +277,46 @@ fn duplicate_basenames_fail_with_exit_2_without_saving_or_overwriting_files() {
 }
 
 #[test]
+fn case_variant_basenames_fail_with_exit_2_without_saving_or_copying_anything() {
+    let project = Project::new();
+    let first = project.source("Report.txt", b"first");
+    let other = project.dir.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let second = other.join("report.txt");
+    std::fs::write(&second, b"second").unwrap();
+
+    let output = project
+        .orch()
+        .args([
+            "task",
+            "add",
+            "case variant names",
+            "--attach",
+            &format!("{},{}", arg(&first), arg(&second)),
+        ])
+        .output()
+        .expect("run orch");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "Duplicate attachment name: report.txt ({}, {})",
+            first.display(),
+            second.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert_eq!(project.task_count(), 0);
+    assert!(
+        !project.root().join(".orchestry/attachments").exists(),
+        "case variants must be rejected before creating the attachment directory"
+    );
+    assert_eq!(std::fs::read(&first).unwrap(), b"first");
+    assert_eq!(std::fs::read(&second).unwrap(), b"second");
+}
+
+#[test]
 #[cfg(unix)]
 fn a_fifo_source_is_rejected_with_exit_2_without_waiting_for_a_writer() {
     let project = Project::new();
