@@ -5,6 +5,12 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-19
+
+Dashboard (TUI) release: sortable, filterable lists, newest-first Activity in goal and agent details, and agent
+pickers that filter as you type; `orch task add --attach` now saves its files. No peer-protocol change, so 0.5.x
+through 0.9.0 peers can be mixed.
+
 ### Added
 - The dashboard's Goals, Tasks and Agents lists have sortable column headers: `o` moves the sort to the next column, `O` reverses it, `0` restores the default order, and clicking a header sorts by it (ascending when it was inactive, flipped when it was already active). Goals and Tasks gain Started and Elapsed* columns, where Elapsed* runs from the start to now and stops at the last update once the row is terminal.
 - The dashboard's Goals, Tasks and Agents lists can be filtered by keyword: press `Ctrl+K` and type to narrow the list as you go. It works with sorting, grouping and show all; `Esc`, `Ctrl+U` or the `filter:` chip clears it. `/` still opens the command bar.
@@ -16,8 +22,6 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ### Changed
 - Dashboard goal, task and agent details show their Overview as an aligned block: the title on a `━` rule, then Amber labels with values in two columns (one column on narrow terminals) and statuses, priorities and per-status task counts in their list colours. A value or title too long for its row wraps onto the rows below it, indented to its column, so nothing is cut off; only the two-row summary pinned above other sections, which uses the same style, still shortens them with `…`. The fields are unchanged; the goal's `Updated` label is now lower case like the others.
 - The dashboard's task-detail Activity section shows each entry in the same columns and colours as the Activity panel (time, agent, type icon, text, error and agent-group highlighting) instead of bare text.
-
-### Changed
 - On the dashboard's Tasks list, showing all tasks or collapsing back to ten (`S`, the `Show all` row or the footer's `S show all`) keeps the selected task selected instead of jumping to the first row. If collapsing hides the selected task, the cursor stays on the last row still listed.
 - On the dashboard's Tasks list, grouping tasks by goal or ungrouping them (`G`) keeps the selected task selected instead of jumping to the first row.
 
@@ -168,7 +172,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/yuxhuang/r-orch/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/yuxhuang/r-orch/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/yuxhuang/r-orch/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/yuxhuang/r-orch/compare/v0.5.2...v0.6.0
