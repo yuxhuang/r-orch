@@ -136,17 +136,20 @@ Letters that act on an item (`E`, `D`, `R`, `C` and so on) work only while the m
 | `-` | Gives the list more room. |
 | `M` | Maximizes the detail panel, or restores the split. Upper case only. |
 
-## Sort agents
+## Sort and group agents
 
-In the Agents view you can sort the table for this session. The sort chips above the list offer the same controls.
+In the Agents view you can sort and group the table for this session. The chips above the list offer the same controls.
 
 | Key | What it does |
 |---|---|
 | `o` | Cycles the sort field: Original, Name, Status, Adapter/Model, Location. |
 | `O` | Switches between ascending and descending. |
-| `0` | Resets to Original, ascending. |
+| `0` | Resets the sort to Original, ascending. The grouping is not changed. |
+| `b` | Switches the sections between By team (the default) and By node. |
 
-Sorting keeps team sections and the selected agent. It lasts only until you close the dashboard. Original is the default order (team, then status, then source).
+By team shows each active team, then the unassigned agents. By node shows a Local section for this instance's agents, then one section per remote alias in alias order, each marked online or offline.
+
+Sorting applies within each section and keeps the selected agent, and so does switching the grouping. Both last only until you close the dashboard. Original is the default order (section, then status, then source).
 
 ## Follow activity feeds
 
@@ -154,6 +157,7 @@ The Activity panel, the Actions view and a task's Activity section follow new en
 
 - Scroll up to pause following. The feed label then says `paused`.
 - To resume, press `End`, scroll to the bottom with the wheel or `PageDown`, or click the last entry.
+- A goal's or an agent's Activity section lists entries newest first, so it follows new entries at the top instead. Move down to pause; the title then says `paused · Home follows`. To resume, press `Home`, scroll to the top with the wheel or `PageUp`, or click the first entry. The footer hint says the same.
 - In the Actions view, press `i` on an entry to open the inspector. It pins that entry, so new arrivals do not move it.
 - Press `f` or `F` in Tasks, Goals or Agents (with no detail open) to cycle the Activity filter between All, Text, Tools, Errors and Events. The choice is saved.
 - In the Actions view, `a` opens the agent picker, `f` opens the type picker, and `F` cycles the type presets. These work only while no detail is open.
@@ -203,7 +207,7 @@ To fill in a wizard:
 3. Press `Esc`, or `Backspace` on an empty text field, to go back one step. `Esc` on the first step leaves the wizard.
 4. Accept the last step to create the item. If creation fails, the form stays open so you can fix it.
 
-On select steps the number keys `1` to `9` choose and accept an option at once. On multi-select steps `Space` toggles the option. In description fields, `Enter` adds a new line; press `Tab` or `Ctrl+Enter` to accept the field. The model step offers suggestions: press `Down` to browse them.
+On select steps the number keys `1` to `9` choose and accept an option at once. Steps that pick an agent (assignee, team lead, team members) filter as you type instead: letters, including `j` and `k`, narrow the list to agents whose name, adapter or role contains them (move with the arrow keys), `Backspace` edits the filter, `Esc` clears it, and `Ctrl+O` cycles the order through Original, Name, Adapter and Status. The numbers follow the filtered list, and typed text alone never assigns anyone: choose a listed agent, or Auto-assign/None. On multi-select steps `Space` toggles the option. In description fields, `Enter` adds a new line; press `Tab` or `Ctrl+Enter` to accept the field. The model step offers suggestions: press `Down` to browse them.
 
 ### Install from the agent shop
 

@@ -345,6 +345,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.reset_agent_sort();
                     return;
                 }
+                // `b`: group *by*. Free in every view; `g`, the Tasks
+                // grouping key, means "goals tab" here.
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    self.toggle_agent_group_by();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -764,6 +770,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.state.clamp_all(self.backend.can_add_agent());
     }
 
+    /// `b` — By team ⇄ By node. The sort is left as it is: it applies inside
+    /// whichever sections are drawn.
+    pub(crate) fn toggle_agent_group_by(&mut self) {
+        let next = self.state.agent_group_by.next();
+        self.state.set_agent_group_by(next);
+        self.state.clamp_all(self.backend.can_add_agent());
+    }
+
     /// Logs `a` — the agent filter picker, drafting the live filter.
     pub(crate) fn open_agent_picker(&mut self) {
         self.state.show_agent_picker = true;
@@ -1119,14 +1133,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     ScrollMode::Selectable,
                 )
             }
+            focus if crate::follow::is_detail_activity(focus) => {
+                // Counted from the state-owned rows, not the rendered text, so
+                // an empty-state line is never a navigable item.
+                let n = self.state.detail_activity_rows(&key).len();
+                (
+                    self.state.detail_activity_scroll(&key, h),
+                    n,
+                    n,
+                    Vec::new(),
+                    ScrollMode::Selectable,
+                )
+            }
             _ => {
                 let text = crate::views::detail::section_text(&self.state, focus);
                 let list = matches!(
                     focus,
                     Focus::GoalDetail(GoalSection::Tasks)
-                        | Focus::TaskDetail(
-                            TaskSection::Activity | TaskSection::Attachments | TaskSection::Files
-                        )
+                        | Focus::TaskDetail(TaskSection::Attachments | TaskSection::Files)
                 );
                 let rows = published.as_ref().map_or_else(
                     || {
@@ -1139,11 +1163,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     |m| m.display_rows,
                 );
                 (
-                    if focus == Focus::TaskDetail(TaskSection::Activity) {
-                        self.state.task_activity_scroll(&key, h)
-                    } else {
-                        self.state.pane_scroll(&key)
-                    },
+                    self.state.pane_scroll(&key),
                     text.len(),
                     rows,
                     Vec::new(),
@@ -1206,8 +1226,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.state.activity_last_position = scroll.selected.unwrap_or(0);
             }
             _ => {
-                if focus == Focus::TaskDetail(TaskSection::Activity)
-                    && crate::follow::resumes_tail(action, &scroll, items, h, wheel)
+                if crate::follow::is_detail_activity(focus)
+                    && crate::follow::resumes_detail_activity(
+                        focus, action, &scroll, items, h, wheel,
+                    )
                 {
                     scroll.selected = None;
                 }
