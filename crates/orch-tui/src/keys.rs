@@ -512,9 +512,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
                 // `g` toggles grouping — overrides "G = goals tab" here.
                 (KeyCode::Char('g') | KeyCode::Char('G'), _) if !detail_open => {
-                    self.state.group_by_goal = !self.state.group_by_goal;
-                    self.state.task_selected = 0;
-                    self.state.task_scroll = 0;
+                    self.toggle_group_by_goal();
                     return;
                 }
                 (KeyCode::Char('d') | KeyCode::Char('D'), Some(task))
@@ -1035,6 +1033,19 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         let can_create = self.can_create_task();
         let prior = self.state.capture_list_selection(can_create);
         self.state.show_all_tasks = !self.state.show_all_tasks;
+        self.state.reconcile_list_selection(&prior, now, can_create);
+        self.state.clamp_all(can_create);
+    }
+
+    /// Tasks `g`: group the list by goal or flatten it, keeping the cursor
+    /// on its task (D1). Grouping only reorders, so the task stays listed
+    /// unless the new order pushes it past the ten-row cap; then the cursor
+    /// stays on the last row under it, as for a sort change.
+    pub(crate) fn toggle_group_by_goal(&mut self) {
+        let now = self.now();
+        let can_create = self.can_create_task();
+        let prior = self.state.capture_list_selection(can_create);
+        self.state.group_by_goal = !self.state.group_by_goal;
         self.state.reconcile_list_selection(&prior, now, can_create);
         self.state.clamp_all(can_create);
     }
