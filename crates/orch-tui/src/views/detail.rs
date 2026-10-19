@@ -435,18 +435,24 @@ impl OverviewBlock {
     /// block's left edge, or `None` when `width` cannot give both columns a
     /// label and [`MIN_VALUE`] cells. The left values take their widest
     /// entry's cells, but never more than half the width, so one long value
-    /// cannot push every right field to the edge.
+    /// cannot push every right field to the edge. A left value wider than
+    /// that cap does not set the column at all: its row is laid out one
+    /// field a row instead (see [`overview_lines`]).
     fn right_column(&self, width: usize) -> Option<usize> {
         let label = self.label_cells();
-        let widest = self
+        let lefts: Vec<usize> = self
             .rows
             .iter()
             .filter(|row| row.len() == 2)
             .map(|row| row[0].plain().width())
-            .max()?;
+            .collect();
+        if lefts.is_empty() {
+            return None;
+        }
         let half = width.saturating_sub(COLUMN_GAP) / 2;
         let cap = half.checked_sub(label).filter(|cap| *cap >= MIN_VALUE)?;
-        Some(label + widest.min(cap) + COLUMN_GAP)
+        let widest = lefts.into_iter().filter(|w| *w <= cap).max().unwrap_or(cap);
+        Some(label + widest + COLUMN_GAP)
     }
 }
 
@@ -507,48 +513,209 @@ fn clip_value(value: &[(String, Token)], width: usize, pad: bool) -> Vec<(String
     out
 }
 
+/// Wrap a segmented value into rows of at most `first` cells, then `rest`
+/// cells, by display width and on grapheme boundaries, keeping each
+/// segment's token. A row breaks after the last whitespace that fits; a word
+/// wider than a whole row is split where the row ends instead. A newline
+/// always breaks.
+/// Continuation rows drop the whitespace they would start with. Control and
+/// bidi characters display as a space, as in [`wrap_rows`].
+///
+/// Hand-rolled (ARCHITECTURE §4.8, no maintained crate fits): ratatui's word
+/// wrapper is private and reports no row count, and `textwrap` is not in the
+/// graph and wraps plain strings, losing the per-segment tokens.
+fn wrap_value(value: &[(String, Token)], first: usize, rest: usize) -> Vec<Vec<(String, Token)>> {
+    // One displayed grapheme: its text, token and cells; `None` is a newline.
+    type Cell = (String, Token, usize);
+    let blank = |cell: &Cell| cell.0.trim().is_empty();
+    let cells: Vec<Option<Cell>> = value
+        .iter()
+        .flat_map(|(text, token)| text.graphemes(true).map(move |g| (g, *token)))
+        .map(|(grapheme, token)| {
+            if grapheme == "\n" || grapheme == "\r\n" {
+                return None;
+            }
+            let displayed: String = grapheme
+                .chars()
+                .map(|ch| {
+                    if ch.is_control()
+                        || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                    {
+                        ' '
+                    } else {
+                        ch
+                    }
+                })
+                .collect();
+            let width = displayed.width();
+            Some((displayed, token, width))
+        })
+        .collect();
+    let rest = rest.max(1);
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut row: Vec<Cell> = Vec::new();
+    let mut used = 0;
+    // Index in `row` just past its last whitespace: where it may break.
+    let mut breakable: Option<usize> = None;
+    // Whether the current row continues a wrapped one (not a new line).
+    let mut soft = false;
+    for (index, cell) in cells.iter().enumerate() {
+        let Some(cell) = cell else {
+            rows.push(std::mem::take(&mut row));
+            (used, breakable, soft) = (0, None, false);
+            continue;
+        };
+        let limit = if rows.is_empty() { first.max(1) } else { rest };
+        if used + cell.2 > limit && !row.is_empty() && blank(cell) {
+            // The overflowing space is itself the break.
+            rows.push(std::mem::take(&mut row));
+            (used, breakable, soft) = (0, None, true);
+            continue;
+        }
+        if used + cell.2 > limit && !row.is_empty() {
+            // The word this cell belongs to, from the row's last space to
+            // the next space or newline, moves to the next row whole if it
+            // fits there; otherwise it is split where this row ends.
+            let word = |at: usize| {
+                row[at..].iter().map(|c| c.2).sum::<usize>()
+                    + cells[index..]
+                        .iter()
+                        .map_while(|c| c.as_ref().filter(|c| !blank(c)))
+                        .map(|c| c.2)
+                        .sum::<usize>()
+            };
+            let carry = match breakable.filter(|at| *at < row.len() && word(*at) <= rest) {
+                Some(at) => row.split_off(at),
+                None => Vec::new(),
+            };
+            rows.push(std::mem::replace(&mut row, carry));
+            used = row.iter().map(|c| c.2).sum();
+            (breakable, soft) = (None, true);
+        }
+        if blank(cell) && soft && row.is_empty() {
+            continue;
+        }
+        row.push(cell.clone());
+        used += cell.2;
+        if blank(cell) {
+            breakable = Some(row.len());
+        }
+    }
+    rows.push(row);
+    rows.into_iter()
+        .map(|row| {
+            let mut segments: Vec<(String, Token)> = Vec::new();
+            for (text, token, _) in row {
+                match segments.last_mut() {
+                    Some((run, last)) if *last == token => run.push_str(&text),
+                    _ => segments.push((text, token)),
+                }
+            }
+            segments
+        })
+        .collect()
+}
+
 /// The block as styled rows at `width` cells: a `━` rule carrying the
 /// Amber `KIND: title` chip, then Amber labels over status-coloured values,
-/// two fields a row when they fit and one a row when they do not.
-fn overview_lines(ctx: &RenderCtx, block: &OverviewBlock, width: usize) -> Vec<Vec<Span<'static>>> {
+/// two fields a row when both fit their columns and one a row otherwise.
+///
+/// With `wrap` set (the focused Overview, which has no viewer to expand
+/// into), nothing is clipped: the title continues on rows under the chip,
+/// and a value too long for its row continues on rows indented to the
+/// value column. Without it (the two-row pin), values are clipped with `…`.
+fn overview_lines(
+    ctx: &RenderCtx,
+    block: &OverviewBlock,
+    width: usize,
+    wrap: bool,
+) -> Vec<Vec<Span<'static>>> {
     use crate::theme::HEAVY_RULE;
     let rule = |cells: usize| HEAVY_RULE.to_string().repeat(cells);
+    let chip_style = ctx
+        .chip(Token::Amber, Token::AccentBg)
+        .add_modifier(ratatui::style::Modifier::BOLD);
     let mut lines = Vec::new();
     let chip = format!("{}: {}", block.kind, block.title);
-    // `━━━` + ` chip ` + at least one trailing `━`.
-    let chip = fit_cells(&chip, width.saturating_sub(3 + 2 + 1));
-    let used = 3 + chip.width() + 2;
+    // `━━━` + ` chip ` + at least one trailing `━`; continuation rows sit
+    // under the chip, past the leading rule.
+    let first = width.saturating_sub(3 + 2 + 1);
+    let mut chip_rows = if wrap {
+        wrap_value(&[(chip, Token::Amber)], first, width.saturating_sub(3 + 2))
+            .into_iter()
+            .map(|row| row.into_iter().map(|(text, _)| text).collect::<String>())
+            .collect()
+    } else {
+        vec![fit_cells(&chip, first)]
+    }
+    .into_iter();
+    let head = chip_rows.next().unwrap_or_default();
+    let used = 3 + head.width() + 2;
     lines.push(vec![
         Span::styled(rule(3), ctx.style(Token::Ghost)),
-        Span::styled(
-            format!(" {chip} "),
-            ctx.chip(Token::Amber, Token::AccentBg)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        ),
+        Span::styled(format!(" {head} "), chip_style),
         Span::styled(rule(width.saturating_sub(used)), ctx.style(Token::Ghost)),
     ]);
+    for text in chip_rows {
+        lines.push(vec![
+            Span::raw("   "),
+            Span::styled(format!(" {text} "), chip_style),
+        ]);
+    }
     let label = block.label_cells();
-    let field = |f: &OverviewField, cells: usize, pad: bool| {
-        let mut spans = vec![Span::styled(
+    let label_spans = |f: &OverviewField, cells: usize| {
+        Span::styled(
             fit_cells(&format!("{:<label$}", f.label), cells.min(label)),
             ctx.style(Token::Amber),
-        )];
-        spans.extend(
-            clip_value(&f.value, cells.saturating_sub(label), pad)
-                .into_iter()
-                .map(|(text, token)| Span::styled(text, ctx.style(token))),
-        );
+        )
+    };
+    let styled = |segments: Vec<(String, Token)>| {
+        segments
+            .into_iter()
+            .map(|(text, token)| Span::styled(text, ctx.style(token)))
+    };
+    let field = |f: &OverviewField, cells: usize, pad: bool| {
+        let mut spans = vec![label_spans(f, cells)];
+        spans.extend(styled(clip_value(
+            &f.value,
+            cells.saturating_sub(label),
+            pad,
+        )));
         spans
     };
+    // A one-field row that wraps: the label, then the value from the value
+    // column, continuing on rows indented to it. At least one value cell
+    // stays, even if the label has to give way.
+    let wrapped = |f: &OverviewField| -> Vec<Vec<Span<'static>>> {
+        let indent = label.min(width.saturating_sub(1));
+        let cells = width.saturating_sub(indent);
+        wrap_value(&f.value, cells, cells)
+            .into_iter()
+            .enumerate()
+            .map(|(n, segments)| {
+                let mut spans = vec![if n == 0 {
+                    label_spans(f, indent)
+                } else {
+                    Span::raw(" ".repeat(indent))
+                }];
+                spans.extend(styled(segments));
+                spans
+            })
+            .collect()
+    };
+    let fits = |f: &OverviewField, cells: usize| f.plain().width() <= cells.saturating_sub(label);
     let right = block.right_column(width);
     for row in &block.rows {
         match (row.as_slice(), right) {
-            ([left, second], Some(right)) => {
+            ([left, second], Some(right))
+                if !wrap || (fits(left, right - COLUMN_GAP) && fits(second, width - right)) =>
+            {
                 let mut spans = field(left, right - COLUMN_GAP, true);
                 spans.push(Span::raw(" ".repeat(COLUMN_GAP)));
                 spans.extend(field(second, width - right, false));
                 lines.push(spans);
             }
+            _ if wrap => lines.extend(row.iter().flat_map(wrapped)),
             _ => lines.extend(row.iter().map(|f| field(f, width, false))),
         }
     }
@@ -890,7 +1057,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         // The pin is the block's first two rows: the title rule and the
         // identity row, styled as in the focused block.
         let pinned = match overview_block(state, overview) {
-            Some(block) => overview_lines(ctx, &block, body.width as usize),
+            Some(block) => overview_lines(ctx, &block, body.width as usize, false),
             None => section_text(state, overview)
                 .iter()
                 .map(|line| {
@@ -928,9 +1095,15 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
     let sources = section_sources(state, focus);
     let is_list = selectable(focus);
+    // The focused Overview draws its own wrapped block; its rows below are
+    // placeholders, so scrolling counts exactly the rows drawn.
+    let styled = is_overview(focus)
+        .then(|| overview_block(state, focus))
+        .flatten()
+        .map(|block| overview_lines(ctx, &block, body.width as usize, true));
     let mut rows = Vec::new();
     let mut byte_offset = 0;
-    for (index, line) in lines.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate().filter(|_| styled.is_none()) {
         let source = sources.get(index).cloned().flatten();
         if is_list {
             let continuous = matches!(
@@ -955,10 +1128,6 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         }
     }
     let activity = activity_messages(state, focus);
-    let styled = is_overview(focus)
-        .then(|| overview_block(state, focus))
-        .flatten()
-        .map(|block| overview_lines(ctx, &block, body.width as usize));
     if let Some(styled) = &styled {
         rows = vec![(String::new(), None, 0); styled.len()];
     }
@@ -1149,5 +1318,66 @@ mod tests {
         assert_eq!(alone.len(), 1);
         assert_eq!(alone[0].0, focus);
         assert!(alone[0].1.width() <= 6, "{:?}", alone[0].1);
+    }
+
+    fn plain_rows(value: &str, first: usize, rest: usize) -> Vec<String> {
+        wrap_value(&[(value.into(), Token::Silver)], first, rest)
+            .into_iter()
+            .map(|row| row.into_iter().map(|(text, _)| text).collect())
+            .collect()
+    }
+
+    #[test]
+    fn wrap_value_breaks_after_whitespace_and_drops_the_continuation_space() {
+        assert_eq!(
+            plain_rows("alpha, beta, gamma", 12, 12),
+            ["alpha, beta,", "gamma"]
+        );
+        assert_eq!(
+            plain_rows("alpha, beta, gamma", 10, 10),
+            ["alpha, ", "beta, ", "gamma"]
+        );
+        assert_eq!(plain_rows("short", 12, 12), ["short"]);
+        assert_eq!(plain_rows("", 12, 12), [""]);
+    }
+
+    #[test]
+    fn wrap_value_splits_a_word_wider_than_the_row_by_display_width() {
+        assert_eq!(plain_rows("abcdefgh", 3, 3), ["abc", "def", "gh"]);
+        // Two cells a glyph: a row never ends half way through one.
+        assert_eq!(plain_rows("界面界面界", 5, 4), ["界面", "界面", "界"]);
+        assert_eq!(plain_rows("👩‍👩‍👧 ok", 1, 1), ["👩‍👩‍👧", "o", "k"]);
+        // A word too long for any row fills the current one, so a short
+        // prefix is never left alone on its row.
+        assert_eq!(
+            plain_rows("AGENT: builder-with-a-long-name", 12, 12),
+            ["AGENT: build", "er-with-a-lo", "ng-name"]
+        );
+        assert_eq!(plain_rows("ab cdefgh", 5, 5), ["ab cd", "efgh"]);
+        assert_eq!(plain_rows("ab cdef", 5, 5), ["ab ", "cdef"]);
+    }
+
+    #[test]
+    fn wrap_value_keeps_newlines_and_indentation_and_blanks_controls() {
+        assert_eq!(plain_rows("a\n  b\x1b\u{202e}c", 20, 20), ["a", "  b  c"]);
+    }
+
+    #[test]
+    fn wrap_value_keeps_each_segment_token_across_rows() {
+        let value = vec![
+            ("3 done".to_owned(), Token::Green),
+            (" · ".to_owned(), Token::Dim),
+            ("1 failed".to_owned(), Token::Red),
+        ];
+        assert_eq!(
+            wrap_value(&value, 9, 9),
+            [
+                vec![
+                    ("3 done".to_owned(), Token::Green),
+                    (" · ".to_owned(), Token::Dim)
+                ],
+                vec![("1 failed".to_owned(), Token::Red)],
+            ]
+        );
     }
 }

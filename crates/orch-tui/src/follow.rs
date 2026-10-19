@@ -158,6 +158,16 @@ impl AppState {
         } else {
             scroll.selected = scroll.selected.map(|i| i.min(count.saturating_sub(1)));
             scroll.offset = scroll.offset.min(count.saturating_sub(height));
+            // A resize must not strand a paused selection outside the window
+            // until the next nav key. `selected < count` keeps the result
+            // within the count clamp above.
+            if let Some(selected) = scroll.selected
+                && height > 0
+            {
+                scroll.offset = scroll
+                    .offset
+                    .clamp((selected + 1).saturating_sub(height), selected);
+            }
         }
         scroll
     }
