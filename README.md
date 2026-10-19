@@ -595,6 +595,7 @@ drafts last only for the dashboard session).
 
 | Document | For |
 |---|---|
+| **[docs/manual/](docs/manual/README.md)** | **Users.** The user manual: installing, concepts, every command, the dashboard and web dashboard, templates, remote agents and troubleshooting, with screenshots |
 | **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and known gotchas — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
 | [docs/file-mutations.md](docs/file-mutations.md) | `update` / `patch` from JSON or YAML files: input rules, writable fields, errors, locking |
 | [docs/org-templates.md](docs/org-templates.md) | Organization templates: directory format, rules, precedence, deploy, shop, `update`/`patch`, repair, the a-team and its prerequisites |

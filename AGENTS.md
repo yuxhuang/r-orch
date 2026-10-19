@@ -28,6 +28,7 @@ Authoritative docs:
 | How is it built, which crate owns what, which traits | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Something is broken at runtime | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | What users see and how they install | [README.md](README.md) |
+| How to use every feature, step by step | [docs/manual/](docs/manual/README.md) (regenerate the command reference and screenshots with `docs/manual/tools/`) |
 | What changed per release | [CHANGELOG.md](CHANGELOG.md) |
 | Why we chose X | [docs/decisions/](docs/decisions/) |
 | What a piece of work must do, and how we check it | [docs/specs/](docs/specs/) |
