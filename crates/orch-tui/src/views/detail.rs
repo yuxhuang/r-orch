@@ -456,6 +456,56 @@ pub(crate) fn wrap_rows(text: &str, width: usize) -> Vec<(String, usize)> {
     rows
 }
 
+/// Rail entries in `focus_ring` order, so moving focus never reorders the
+/// sections; only the focused entry's label and style change. When the rail
+/// is too narrow, the entries farthest from the focused one are dropped
+/// first, and the focused label itself is clipped last.
+fn rail_labels(
+    ring: &[Focus],
+    focus: Focus,
+    focused_name: &str,
+    active: bool,
+    width: usize,
+) -> Vec<(Focus, String)> {
+    let label = |section: Focus| {
+        if section == focus {
+            format!("{}{focused_name}", if active { "> " } else { "" })
+        } else {
+            section_name(section).to_owned()
+        }
+    };
+    let mut kept: Vec<Focus> = ring.to_vec();
+    let Some(at) = kept.iter().position(|f| *f == focus) else {
+        return vec![(focus, fit_cells(&label(focus), width))];
+    };
+    let mut at = at;
+    let total = |kept: &[Focus]| -> usize {
+        kept.iter().map(|f| label(*f).width()).sum::<usize>() + 3 * kept.len().saturating_sub(1)
+    };
+    while kept.len() > 1 && total(&kept) > width {
+        // Farthest from the focused entry; on a tie the later one goes.
+        let drop = if kept.len() - 1 - at >= at {
+            kept.len() - 1
+        } else {
+            0
+        };
+        kept.remove(drop);
+        if drop < at {
+            at -= 1;
+        }
+    }
+    kept.into_iter()
+        .map(|section| {
+            let text = label(section);
+            if section == focus {
+                (section, fit_cells(&text, width))
+            } else {
+                (section, text)
+            }
+        })
+        .collect()
+}
+
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let state = ctx.state;
     let ring: Vec<_> = state
@@ -501,47 +551,34 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             .unwrap_or_else(|| "Files".into()),
         _ => section_name(focus).into(),
     };
-    let label = fit_cells(
-        &format!("{}{}", if active { "> " } else { "" }, name),
-        area.width as usize,
-    );
-    let mut x = area.x;
     let rail = Rect::new(area.x, area.y, area.width, 1);
-    let width =
-        unicode_width::UnicodeWidthStr::width(label.as_str()).min(area.width as usize) as u16;
-    put_line(
-        frame,
-        rail,
-        rail.y,
-        vec![Span::styled(
-            label,
-            ctx.bold(if active { Token::Amber } else { Token::Dim }),
-        )],
-    );
-    ctx.zone(
-        Rect::new(x, rail.y, width, 1),
-        rail,
-        ZoneKind::DetailSection(focus),
-        ZoneId::DetailSection(key.clone()),
-    );
-    x += width;
-    for other in ring.iter().copied().filter(|f| *f != focus) {
-        let text = format!(" │ {}", section_name(other));
-        let width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
-        if x + width > area.right() {
-            continue;
-        }
+    let mut x = area.x;
+    for (index, (section, text)) in rail_labels(&ring, focus, &name, active, area.width as usize)
+        .into_iter()
+        .enumerate()
+    {
+        let text = if index == 0 {
+            text
+        } else {
+            format!(" │ {text}")
+        };
+        let width = (text.width() as u16).min(area.right().saturating_sub(x));
+        let style = if section == focus {
+            ctx.bold(if active { Token::Amber } else { Token::Dim })
+        } else {
+            ctx.style(Token::Dim)
+        };
         put_line(
             frame,
             Rect::new(x, rail.y, width, 1),
             rail.y,
-            vec![Span::styled(text, ctx.style(Token::Dim))],
+            vec![Span::styled(text, style)],
         );
         ctx.zone(
             Rect::new(x, rail.y, width, 1),
             rail,
-            ZoneKind::DetailSection(other),
-            ZoneId::DetailSection(state.pane_key(other)),
+            ZoneKind::DetailSection(section),
+            ZoneId::DetailSection(state.pane_key(section)),
         );
         x += width;
     }
@@ -750,5 +787,45 @@ pub(crate) fn field_feedback(ctx: &RenderCtx, origin: &CopyOrigin) -> String {
         Some(CopyOutcome::NativeWritten) => "Copied on this host; F1 help".into(),
         Some(CopyOutcome::TerminalRequested) => "Requested from terminal; F1 help".into(),
         Some(CopyOutcome::Failed(_)) => "Copy failed; Ctrl+Y retry; F1 help".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(section: TaskSection) -> Focus {
+        Focus::TaskDetail(section)
+    }
+
+    #[test]
+    fn a_narrow_rail_drops_the_entries_farthest_from_focus_and_keeps_order() {
+        let ring = [
+            task(TaskSection::Overview),
+            task(TaskSection::Description),
+            task(TaskSection::Result),
+            task(TaskSection::Files),
+            task(TaskSection::Activity),
+        ];
+        let focus = task(TaskSection::Files);
+        let wide: Vec<_> = rail_labels(&ring, focus, "Files", true, 200)
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(wide, ring);
+        // "Result │ > Files │ Activity" is 27 cells.
+        let narrow = rail_labels(&ring, focus, "Files", true, 27);
+        assert_eq!(
+            narrow,
+            [
+                (task(TaskSection::Result), "Result".to_owned()),
+                (focus, "> Files".to_owned()),
+                (task(TaskSection::Activity), "Activity".to_owned()),
+            ]
+        );
+        let alone = rail_labels(&ring, focus, "Files (3 changed · main)", false, 6);
+        assert_eq!(alone.len(), 1);
+        assert_eq!(alone[0].0, focus);
+        assert!(alone[0].1.width() <= 6, "{:?}", alone[0].1);
     }
 }
