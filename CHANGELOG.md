@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- A user manual in [docs/manual/](docs/manual/README.md): installing, concepts, every command, the dashboard and web dashboard with screenshots, templates and the agent shop, remote agents, configuration and troubleshooting.
+
 ### Fixed
 - A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
 
