@@ -536,7 +536,22 @@ fn keyword_sort_group_and_reset() {
         paste.to_str().expect("utf-8 temp path"),
     ]);
     // `-S`: hand the raw bytes over, not tmux's own `^[` rendering of them.
-    tmux.run(&["paste-buffer", "-p", "-S", "-b", "kw", "-t", "dash"]);
+    // A tmux without `-S` (CI's Ubuntu package) predates that rendering and
+    // already pastes the raw bytes.
+    let raw = tmux
+        .command()
+        .args(["paste-buffer", "-p", "-S", "-b", "kw", "-t", "dash"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("tmux runs");
+    if !raw.status.success() {
+        let stderr = String::from_utf8_lossy(&raw.stderr);
+        assert!(
+            stderr.contains("unknown flag"),
+            "paste-buffer failed: {stderr}"
+        );
+        tmux.run(&["paste-buffer", "-p", "-b", "kw", "-t", "dash"]);
+    }
     let screen = tmux.wait_for("the sanitized paste", |s| {
         s.contains("Filter tasks › charlie█")
     });
