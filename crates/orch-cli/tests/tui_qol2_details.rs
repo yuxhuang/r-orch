@@ -534,3 +534,88 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
     }
     tmux.keys(&["q"]);
 }
+
+/// R6 / review I1: an Overview value too long for its row wraps onto
+/// continuation rows that start at the value column, so nothing is clipped
+/// away. `bot` here has 14 skills, about two rows' worth at 120 columns.
+#[test]
+fn agent_overview_wraps_a_long_skills_list_onto_value_column_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("home")).expect("home");
+    orch(
+        dir.path(),
+        &["init", "--name", "proj", "--adapter", "shell"],
+    );
+    let skills: Vec<String> = (0..14).map(|n| format!("skill-number-{n}")).collect();
+    orch(
+        dir.path(),
+        &[
+            "agent",
+            "add",
+            "bot",
+            "--adapter",
+            "shell",
+            "--command",
+            "true",
+            "--skills",
+            &skills.join(","),
+        ],
+    );
+    let tmux = launch(
+        dir.path(),
+        format!("orch-x3-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["a"]);
+    tmux.wait_for("bot", |s| s.contains("bot"));
+    tmux.keys(&["Enter"]);
+    let screen = tmux.wait_for("the skills row", |s| {
+        s.contains("> Overview") && s.contains("skill-number-0")
+    });
+    let lines: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
+    let rule: Vec<char> = "━━━ AGENT: bot ━".chars().collect();
+    let find =
+        |line: &[char], needle: &[char]| line.windows(needle.len()).position(|w| w == needle);
+    let (top, edge) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(y, line)| find(line, &rule).map(|x| (y, x)))
+        .unwrap_or_else(|| panic!("no Overview title rule:\n{screen}"));
+    let first: Vec<char> = "skill-number-0".chars().collect();
+    let (at, column) = lines[top..]
+        .iter()
+        .enumerate()
+        .find_map(|(y, line)| find(line, &first).map(|x| (top + y, x)))
+        .unwrap();
+    let label: String = lines[at][edge..column].iter().collect();
+    assert_eq!(label.trim_end(), "skills", "{screen}");
+    let mut shown = Vec::new();
+    let mut rows = 0;
+    for line in &lines[at..] {
+        let indent: String = line.get(edge..column).unwrap_or_default().iter().collect();
+        let value: String = line.get(column..).unwrap_or_default().iter().collect();
+        // The value ends at the pane's border, if it has one.
+        let value = value.split('│').next().unwrap_or_default().trim_end();
+        if rows > 0 && (!indent.trim().is_empty() || value.is_empty()) {
+            break;
+        }
+        assert!(
+            !value.starts_with(' ') && !value.contains('…'),
+            "row {rows} starts at the value column, unclipped:\n{screen}"
+        );
+        shown.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+        rows += 1;
+    }
+    assert!(
+        rows >= 2,
+        "14 skills wrap onto more than one row:\n{screen}"
+    );
+    assert_eq!(shown, skills, "every skill on screen, in order:\n{screen}");
+    tmux.keys(&["q"]);
+}
