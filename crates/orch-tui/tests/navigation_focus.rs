@@ -635,8 +635,8 @@ fn f2_every_optional_detail_section_cycles_once_and_maximize_skips_main_at_all_s
         ];
         for (view, sections) in [
             (ViewId::Tasks, 6),
-            (ViewId::Goals, 4),
-            (ViewId::Agents, 3),
+            (ViewId::Goals, 5),
+            (ViewId::Agents, 4),
             (ViewId::Logs, 2),
         ] {
             h.app.state.view = view;
@@ -1060,4 +1060,136 @@ fn n5_agents_permission_and_unassigned_boundaries_recompute_the_actual_rows() {
         (h.app.state.agent_selected, h.app.state.agent_scroll),
         (0, 0)
     );
+}
+
+/// Goal and Agent Activity (R12): last in the rail, reachable when empty, and
+/// following at their newest edge (the top: they list newest first) with the
+/// same pause/resume policy as Task Activity, orientation mapped.
+#[test]
+fn goal_and_agent_activity_end_the_rail_and_follow_newest_at_the_top() {
+    use orch_domain::AgentStatus;
+    use orch_tui::backend::make_agent;
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::state::AgentSection;
+    use orch_tui::theme::Token;
+    let mut t = make_task("t", "Task", TaskStatus::InProgress);
+    t.goal_id = Some("g".into());
+    let mut h = Harness::with(
+        FakeBackend::new()
+            .with_tasks(vec![t, make_task("other", "Other", TaskStatus::Todo)])
+            .with_goals(vec![make_goal("g", "Goal", GoalStatus::Active)])
+            .with_agents(vec![make_agent("a", "Agent", AgentStatus::Idle)]),
+    );
+    h.app.state.messages.clear();
+    for (view, section) in [
+        (ViewId::Goals, Focus::GoalDetail(GoalSection::Activity)),
+        (ViewId::Agents, Focus::AgentDetail(AgentSection::Activity)),
+    ] {
+        h.app.state.view = view;
+        h.app.state.detail = DetailPanel::Entity;
+        h.app.state.set_focus(Focus::MainList);
+        let ring = h.app.state.focus_ring();
+        assert_eq!(ring.last(), Some(&section), "{view:?} ring {ring:?}");
+        // Empty sections stay reachable from the keyboard.
+        h.press(KeyCode::BackTab);
+        assert_eq!(h.app.state.focus, section, "{view:?}");
+        assert_eq!(h.app.state.pane_key(section).section, section);
+    }
+
+    // Membership is structural; the newest message is row 0.
+    let message = |id: u64, ts: i64, task: Option<&str>, agent: Option<&str>| {
+        Message::new(id, ts, &format!("m{id}"), Token::White, MsgType::Info)
+            .with_task(task.map(Into::into))
+            .with_agent(agent.map(Into::into))
+    };
+    h.app.state.messages = vec![
+        message(1, 1_000, Some("t"), Some("a")),
+        message(2, 2_000, Some("other"), None),
+        message(3, 3_000, None, Some("a")),
+        message(4, 4_000, Some("t"), None),
+        message(5, 5_000, Some("t"), Some("a")),
+    ];
+    for (view, section, ids) in [
+        (
+            ViewId::Goals,
+            Focus::GoalDetail(GoalSection::Activity),
+            vec![5, 4, 1],
+        ),
+        (
+            ViewId::Agents,
+            Focus::AgentDetail(AgentSection::Activity),
+            vec![5, 3, 1],
+        ),
+    ] {
+        h.app.state.view = view;
+        h.app.state.detail = DetailPanel::Entity;
+        h.app.state.set_focus(section);
+        h.draw();
+        let key = h.app.state.pane_key(section);
+        let rows: Vec<u64> = h
+            .app
+            .state
+            .detail_activity_rows(&key)
+            .iter()
+            .map(|i| h.app.state.messages[*i].id)
+            .collect();
+        assert_eq!(rows, ids, "{view:?}");
+        assert!(h.app.state.detail_activity_following(&key), "{view:?}");
+        assert_eq!(
+            h.app.state.detail_activity_scroll(&key, 10).selected,
+            Some(0),
+            "{view:?} follows the top"
+        );
+
+        // Browsing away from the newest edge pauses; Home resumes.
+        h.press(KeyCode::Down);
+        assert!(!h.app.state.detail_activity_following(&key), "{view:?}");
+        assert_eq!(
+            h.app.state.detail_activity_scroll(&key, 10).selected,
+            Some(1)
+        );
+        h.press(KeyCode::Home);
+        assert!(h.app.state.detail_activity_following(&key), "{view:?}");
+
+        // A paused pane keeps its message when a newer one arrives on top.
+        h.press(KeyCode::Down);
+        let paused = h.app.state.detail_activity_scroll(&key, 10).selected;
+        let selected_id = |h: &Harness| {
+            let rows = h.app.state.detail_activity_rows(&key);
+            let at = h
+                .app
+                .state
+                .detail_activity_scroll(&key, 10)
+                .selected
+                .unwrap();
+            h.app.state.messages[rows[at]].id
+        };
+        let before = selected_id(&h);
+        h.app.state.add_message(
+            orch_tui::messages::PendingMessage {
+                text: "newest".into(),
+                color: Token::White,
+                msg_type: MsgType::Info,
+                agent_id: Some("a".into()),
+                task_id: Some("t".into()),
+                detail: None,
+                ts_ms: Some(9_000),
+            },
+            9_000,
+            0,
+        );
+        assert!(!h.app.state.detail_activity_following(&key), "{view:?}");
+        assert_eq!(selected_id(&h), before, "{view:?} anchor by id");
+        assert_ne!(
+            h.app.state.detail_activity_scroll(&key, 10).selected,
+            paused,
+            "{view:?} index moved with the content"
+        );
+
+        // Reaching the newest edge again resumes following, as Task Activity does.
+        h.press(KeyCode::Up);
+        h.press(KeyCode::Up);
+        assert!(h.app.state.detail_activity_following(&key), "{view:?}");
+        h.app.state.messages.retain(|m| m.text != "newest");
+    }
 }
