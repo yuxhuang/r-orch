@@ -730,3 +730,121 @@ fn h021_a_footer_hint_the_frame_clips_is_only_clickable_where_it_was_painted() {
     }
     assert!(h.zone_at(100, footer).is_none());
 }
+
+// ── Column headers (R10, R16) ──────────────────────────────────────────────
+
+fn task_ids(h: &Harness) -> Vec<String> {
+    h.app
+        .state
+        .sorted_tasks()
+        .into_iter()
+        .map(|i| h.app.state.tasks[i].id.clone())
+        .collect()
+}
+
+fn header_harness() -> Harness {
+    let mut h = Harness::with(FakeBackend::new().with_tasks(vec![
+        make_task("tsk_b", "Bravo", TaskStatus::Todo),
+        make_task("tsk_c", "charlie", TaskStatus::InProgress),
+        make_task("tsk_a", "Alpha", TaskStatus::Done),
+    ]));
+    h.app.state.view = ViewId::Tasks;
+    h
+}
+
+#[test]
+fn header_click_sorts() {
+    let mut h = header_harness();
+    assert_eq!(task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"], "status order");
+
+    // The label is a header zone for its column, drawn where it reads.
+    let (x, y) = h.find_text("TITLE").expect("the TITLE header");
+    assert_eq!(
+        h.zone_at(x, y).map(|z| z.kind.clone()),
+        Some(ZoneKind::SortHeader(orch_tui::state::SortColumn::Task(
+            orch_tui::state::TaskSortField::Title
+        )))
+    );
+
+    // An inactive header sorts ascending and marks itself; the active one
+    // flips.
+    h.click_text("TITLE");
+    assert_eq!(task_ids(&h), ["tsk_a", "tsk_b", "tsk_c"]);
+    h.assert_text("TITLE↑");
+    h.click_text("TITLE");
+    assert_eq!(task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    h.assert_text("TITLE↓");
+
+    // The header is chrome: clicking it never moves the cursor onto a row.
+    assert_eq!(h.app.state.task_selected, 0);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_c");
+
+    // Goals and Agents headers drive their own lists only.
+    let mut g = Harness::with(FakeBackend::new().with_goals(vec![
+        make_goal("g_z", "Zulu goal", GoalStatus::Active),
+        make_goal("g_a", "Alpha goal", GoalStatus::Achieved),
+    ]));
+    g.app.state.view = ViewId::Goals;
+    g.click_text("TITLE");
+    let goals: Vec<_> = g
+        .app
+        .state
+        .sorted_goals()
+        .into_iter()
+        .map(|i| g.app.state.goals[i].id.clone())
+        .collect();
+    assert_eq!(goals, ["g_a", "g_z"]);
+    assert_eq!(g.app.state.task_sort, Default::default());
+
+    let mut a = Harness::with(FakeBackend::new().with_agents(vec![
+        make_agent("z", "Zed", AgentStatus::Idle),
+        make_agent("b", "bob", AgentStatus::Running),
+    ]));
+    a.app.state.view = ViewId::Agents;
+    a.click_text("NAME");
+    let agents: Vec<_> = a
+        .app
+        .state
+        .sorted_agents()
+        .into_iter()
+        .map(|i| a.app.state.agents[i].id.clone())
+        .collect();
+    assert_eq!(agents, ["b", "z"]);
+    a.assert_text("NAME↑");
+    a.assert_text("o sort:Name");
+}
+
+#[test]
+fn inactive_header_starts_ascending() {
+    let mut h = header_harness();
+    // Status descending, then a click on another column: ascending, not
+    // the inherited direction.
+    h.key('O');
+    assert!(h.app.state.task_sort.descending);
+    h.click_text("TITLE");
+    assert_eq!(task_ids(&h), ["tsk_a", "tsk_b", "tsk_c"]);
+    assert!(!h.app.state.task_sort.descending);
+    // And clicking the now-active column again flips it.
+    h.click_text("TITLE");
+    assert!(h.app.state.task_sort.descending);
+}
+
+#[test]
+fn a_header_press_released_on_another_header_does_nothing() {
+    let mut h = header_harness();
+    h.draw();
+    let (title_x, y) = h.find_text("TITLE").unwrap();
+    let (pri_x, _) = h.find_text("PRI").unwrap();
+    h.press_at(title_x, y).release_at(pri_x, y);
+    assert_eq!(h.app.state.task_sort, Default::default());
+
+    // A resize between press and release moves the columns; the release
+    // lands on a different header and cancels the click.
+    let (assignee_x, _) = h.find_text("ASSIGNEE").unwrap();
+    h.press_at(assignee_x, y);
+    h.app.state.width = 60;
+    h.terminal.backend_mut().resize(60, 30);
+    h.draw();
+    h.release_at(assignee_x, y);
+    assert_eq!(h.app.state.task_sort, Default::default());
+}

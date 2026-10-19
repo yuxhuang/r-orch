@@ -46,6 +46,14 @@ static GLOBAL_CONFIG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 
 /// A project with a written `config.yml`, which is what `require_init` wants.
 async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
+    let temp = project_tree().await;
+    let engine = Arc::new(build_isolated(temp.path()).await.expect("build_full"));
+    (temp, engine)
+}
+
+/// [`project`]'s tree, so a test that needs its own engine seams can build one
+/// over it.
+async fn project_tree() -> tempfile::TempDir {
     let temp = tempfile::tempdir().expect("tempdir");
     orch_core::test_support::assert_hermetic(temp.path());
     orch_infra::storage::fs_utils::clear_ensured_dirs();
@@ -63,8 +71,7 @@ async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
         .await
         .expect("write config.yml");
 
-    let engine = Arc::new(build_isolated(temp.path()).await.expect("build_full"));
-    (temp, engine)
+    temp
 }
 
 /// `build_full`, with `global.yml` kept inside the project directory.
@@ -77,11 +84,21 @@ async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
 /// workspace, and the writer came straight back for any other cwd (verified).
 /// A seam passed explicitly cannot be bypassed.
 async fn build_isolated(root: &std::path::Path) -> orch_core::error::Result<FullEngine> {
+    build_isolated_with(root, EngineSeams::default()).await
+}
+
+/// [`build_isolated`] with the rest of the seams chosen by the caller — a
+/// [`FixedClock`](orch_core::test_support::FixedClock), for a test that
+/// asserts the exact `updated_at` a service writes.
+async fn build_isolated_with(
+    root: &std::path::Path,
+    seams: EngineSeams,
+) -> orch_core::error::Result<FullEngine> {
     build_full_with(
         root,
         EngineSeams {
             global_config_path: Some(root.join(".orchestry/global.yml")),
-            ..EngineSeams::default()
+            ..seams
         },
     )
     .await
@@ -1418,5 +1435,340 @@ async fn in_observer_mode_the_disk_observer_feeds_the_event_queue() {
     );
 
     orch_engine::ProjectLock::release(&held).await;
+    drop(temp);
+}
+
+// ── Timings (R11, R15) ───────────────────────────────────────────────────
+
+/// A round instant with room either side; every number below is an offset
+/// from it, so the assertions read as the durations they are.
+const TIMING_BASE: i64 = 1_700_000_000_000;
+
+fn at(offset_ms: i64) -> String {
+    orch_core::clock::iso_from_epoch_ms(TIMING_BASE + offset_ms)
+}
+
+/// A run record for `task_id` started at `started_at`, which is the only
+/// field the timings read. The id is a counter because a run id is a
+/// filename: an ISO timestamp in it is rejected as an identifier.
+fn timing_run(task_id: &str, started_at: &str) -> Run {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Run {
+        id: format!("run_{seq:04}"),
+        task_id: task_id.to_owned(),
+        started_at: started_at.to_owned(),
+        ..orch_core::test_support::make_run()
+    }
+}
+
+/// A task whose status and last update the timings read; the store never
+/// sees it, because `refresh_timings` is told which entities a refresh
+/// committed.
+fn timing_task(id: &str, status: TaskStatus, updated_at: &str) -> orch_domain::Task {
+    orch_domain::Task {
+        id: id.to_owned(),
+        status,
+        updated_at: updated_at.to_owned(),
+        ..orch_core::test_support::make_task()
+    }
+}
+
+fn running_entry(task_id: &str, started_at: &str) -> orch_domain::RunningEntry {
+    orch_domain::RunningEntry {
+        run_id: format!("run_live_{task_id}"),
+        agent_id: "agt_1".to_owned(),
+        task_id: task_id.to_owned(),
+        pid: 4242,
+        started_at: started_at.to_owned(),
+        last_event_at: started_at.to_owned(),
+        remote: None,
+    }
+}
+
+/// Task Started is the earliest **retained** run start, from every run record
+/// on disk plus the live `running` entry — never the ten-run history sample,
+/// which cannot see an old first attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn task_start_times() {
+    let (temp, engine) = project().await;
+
+    // A retried task: two runs, and a third attempt live in state.json.
+    for offset in [1_000, 3_000] {
+        engine
+            .runs
+            .save(&timing_run("tsk_retry", &at(offset)))
+            .await
+            .expect("save run");
+    }
+    // The oldest run in the project, plus a much later retry. Ten newer runs
+    // follow, so this first start is outside any ten-run sample.
+    for offset in [500, 40_000] {
+        engine
+            .runs
+            .save(&timing_run("tsk_old", &at(offset)))
+            .await
+            .expect("save run");
+    }
+    for index in 0..10 {
+        engine
+            .runs
+            .save(&timing_run("tsk_fill", &at(10_000 + index * 1_000)))
+            .await
+            .expect("save run");
+    }
+    engine
+        .runs
+        .save(&timing_run("tsk_bad", "not-a-timestamp"))
+        .await
+        .expect("save run");
+    engine
+        .runs
+        .save(&timing_run("tsk_unended", &at(2_000)))
+        .await
+        .expect("save run");
+    engine
+        .runs
+        .save(&timing_run("tsk_future", &at(9_500)))
+        .await
+        .expect("save run");
+
+    let tasks = vec![
+        timing_task("tsk_retry", TaskStatus::InProgress, &at(3_000)),
+        // Dispatched, no run record written yet.
+        timing_task("tsk_live", TaskStatus::InProgress, &at(4_000)),
+        timing_task("tsk_cold", TaskStatus::Todo, &at(0)),
+        timing_task("tsk_old", TaskStatus::Done, &at(60_500)),
+        timing_task("tsk_bad", TaskStatus::InProgress, &at(3_000)),
+        timing_task("tsk_unended", TaskStatus::Cancelled, "whenever"),
+        timing_task("tsk_future", TaskStatus::InProgress, &at(9_500)),
+    ];
+    let mut state = orch_domain::default_state();
+    state
+        .running
+        .insert("tsk_retry".into(), running_entry("tsk_retry", &at(4_000)));
+    state
+        .running
+        .insert("tsk_live".into(), running_entry("tsk_live", &at(4_000)));
+
+    let backend = launch(Arc::clone(&engine)).await;
+    let (_backend, (near, far)) = on_draw_thread(backend, move |backend| {
+        let near = backend
+            .refresh_timings(&tasks, &[], Some(&state), TIMING_BASE + 9_000)
+            .expect("timings");
+        let far = backend
+            .refresh_timings(&tasks, &[], Some(&state), TIMING_BASE + 9_000_000)
+            .expect("timings");
+        (near, far)
+    })
+    .await;
+    assert_eq!(near.sampled_at_ms, TIMING_BASE + 9_000);
+
+    let timing = |snapshot: &orch_tui::backend::TimingSnapshot, id: &str| {
+        let timing = snapshot.tasks[id];
+        (
+            timing.started_at_ms.map(|ms| ms - TIMING_BASE),
+            timing.elapsed_ms,
+        )
+    };
+
+    // The earliest run wins over the later retry and over the live entry.
+    assert_eq!(timing(&near, "tsk_retry"), (Some(1_000), Some(8_000)));
+    // Live only: the `running` entry is the start.
+    assert_eq!(timing(&near, "tsk_live"), (Some(4_000), Some(5_000)));
+    // Never started is blank, not a zero-length run.
+    assert_eq!(timing(&near, "tsk_cold"), (None, None));
+    // Outside any ten-run sample, and still the start.
+    assert_eq!(timing(&near, "tsk_old"), (Some(500), Some(60_000)));
+    // A terminal span ends at the last update, so `now` cannot move it.
+    assert_eq!(timing(&far, "tsk_old"), (Some(500), Some(60_000)));
+    // A malformed run start is unknown, never "never started at all".
+    assert_eq!(timing(&near, "tsk_bad"), (None, None));
+    // Terminal with no readable last update: no fabricated endpoint.
+    assert_eq!(timing(&near, "tsk_unended"), (Some(2_000), None));
+    // A start in the future clamps to zero rather than going negative.
+    assert_eq!(timing(&near, "tsk_future"), (Some(9_500), Some(0)));
+    assert_eq!(timing(&far, "tsk_future"), (Some(9_500), Some(8_990_500)));
+
+    engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+/// The `Elapsed*` contract (R15): a terminal row's span ends at its **last
+/// update**, so `now` never moves it and a later metadata edit does — through
+/// the real `TaskService`/`GoalService` update paths, on a clock the test
+/// holds, and the same after a fresh backend reopens the project.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_elapsed_follows_last_update_edits() {
+    const START: i64 = TIMING_BASE;
+    const ENDED: i64 = TIMING_BASE + 6_000;
+    const EDITED: i64 = TIMING_BASE + 86_407_000;
+
+    let temp = project_tree().await;
+    let clock = Arc::new(orch_core::test_support::FixedClock::at(START));
+    let engine = Arc::new(
+        build_isolated_with(
+            temp.path(),
+            EngineSeams {
+                clock: Arc::clone(&clock) as Arc<dyn orch_core::clock::Clock>,
+                ..EngineSeams::default()
+            },
+        )
+        .await
+        .expect("build_full"),
+    );
+
+    // Created at START, so the goal starts there; the task's start is its run
+    // record, written at the same instant.
+    let task = engine
+        .task_service
+        .create(orch_domain::CreateTaskInput {
+            title: "Terminal task".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create task");
+    let goal = engine
+        .goal_service
+        .create(CreateGoalInput {
+            title: "Terminal goal".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create goal");
+    engine
+        .runs
+        .save(&timing_run(
+            &task.id,
+            &orch_core::clock::iso_from_epoch_ms(START),
+        ))
+        .await
+        .expect("save run");
+
+    // Both end 6 000 ms in, through the real status transitions.
+    clock.set_ms(ENDED);
+    engine
+        .task_service
+        .cancel(&task.id)
+        .await
+        .expect("cancel task");
+    engine
+        .goal_service
+        .update_status(&goal.id, GoalStatus::Abandoned, false)
+        .await
+        .expect("abandon goal");
+
+    let backend = launch(Arc::clone(&engine)).await;
+    let (backend, spans) = on_draw_thread(backend, move |backend| {
+        let ended = timing_spans(backend, ENDED);
+        // `now` alone, a tick and a whole day later: a terminal span is
+        // frozen against the clock.
+        let later = timing_spans(backend, ENDED + 2_000);
+        let much_later = timing_spans(backend, START + 86_400_000);
+        (ended, later, much_later)
+    })
+    .await;
+    assert_eq!(spans.0, (Some(6_000), Some(6_000)), "at the last update");
+    assert_eq!(spans.1, (Some(6_000), Some(6_000)), "two seconds later");
+    assert_eq!(spans.2, (Some(6_000), Some(6_000)), "a day later");
+
+    // A title edit a day later moves `updated_at`, and with it the span. That
+    // is the disclosed behaviour, not a completion duration.
+    clock.set_ms(EDITED);
+    let (task_id, goal_id) = (task.id.clone(), goal.id.clone());
+    let (backend, edited) = on_draw_thread(backend, move |backend| {
+        backend
+            .update_task(
+                &task_id,
+                TaskFields {
+                    title: Some("Terminal task, retitled".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("edit task");
+        backend
+            .update_goal(
+                &goal_id,
+                GoalFields {
+                    title: Some("Terminal goal, retitled".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("edit goal");
+        timing_spans(backend, EDITED)
+    })
+    .await;
+    assert_eq!(
+        edited,
+        (Some(86_407_000), Some(86_407_000)),
+        "the edit moved the last update, so the span follows it"
+    );
+    drop(backend);
+    engine.orchestrator.stop().await.expect("stop");
+
+    // A fresh dashboard over the same files reads the same spans: the value
+    // comes from `updated_at` on disk, not from anything the session held.
+    let reopened = Arc::new(
+        build_isolated_with(
+            temp.path(),
+            EngineSeams {
+                clock: Arc::clone(&clock) as Arc<dyn orch_core::clock::Clock>,
+                ..EngineSeams::default()
+            },
+        )
+        .await
+        .expect("rebuild"),
+    );
+    let backend = launch(Arc::clone(&reopened)).await;
+    let (_backend, reread) =
+        on_draw_thread(backend, move |backend| timing_spans(backend, EDITED)).await;
+    assert_eq!(reread, edited, "a fresh backend over the same store");
+
+    reopened.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+/// The one task's and the one goal's `Elapsed*` span at `now_ms`, read the way
+/// a refresh does: entities first, then the timings for them.
+fn timing_spans(backend: &mut EngineBackend, now_ms: i64) -> (Option<i64>, Option<i64>) {
+    let tasks = backend.refresh_tasks().expect("tasks");
+    let goals = backend.refresh_goals().expect("goals");
+    let state = backend.refresh_state().expect("state");
+    let snapshot = backend
+        .refresh_timings(&tasks, &goals, Some(&state), now_ms)
+        .expect("timings");
+    (
+        snapshot.tasks[&tasks[0].id].elapsed_ms,
+        snapshot.goals[&goals[0].id].elapsed_ms,
+    )
+}
+
+/// An unreadable run record fails the refresh. The dashboard then shows
+/// "Task timings unavailable" and leaves every span unknown, rather than
+/// asserting that nothing ever started.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_timings_reports_an_unreadable_run_store() {
+    let (temp, engine) = project().await;
+    engine
+        .runs
+        .save(&timing_run("tsk_1", &at(0)))
+        .await
+        .expect("save run");
+    tokio::fs::write(engine.paths.runs_dir().join("broken.json"), "{not json")
+        .await
+        .expect("write a corrupt run");
+
+    let backend = launch(Arc::clone(&engine)).await;
+    let (_backend, error) = on_draw_thread(backend, |backend| {
+        let tasks = backend.refresh_tasks().expect("tasks");
+        backend
+            .refresh_timings(&tasks, &[], None, TIMING_BASE)
+            .err()
+    })
+    .await;
+    let error = error.expect("an unreadable run store is an error");
+    assert!(error.contains("broken.json"), "{error}");
+
+    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }

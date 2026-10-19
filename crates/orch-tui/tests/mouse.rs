@@ -263,7 +263,8 @@ fn m014_clicking_add_goal_opens_the_goal_wizard() {
 
 #[test]
 fn m015_clicking_show_all_expands_the_task_list() {
-    let mut harness = Harness::with(FakeBackend::new().with_tasks(tasks(40)));
+    // Tall enough for the column header, ten rows and the Show all row.
+    let mut harness = Harness::sized(FakeBackend::new().with_tasks(tasks(40)), 120, 44);
     harness.app.state.view = ViewId::Tasks;
     harness.draw();
     assert!(!harness.app.state.show_all_tasks);

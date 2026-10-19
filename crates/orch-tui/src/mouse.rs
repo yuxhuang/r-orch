@@ -503,6 +503,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             ZoneKind::CommandGhost => self.accept_command_completion(),
             ZoneKind::Pseudo(row) => self.fire_pseudo(*row),
             ZoneKind::Verb(verb) => self.fire_verb(*verb),
+            ZoneKind::SortHeader(column) => self.click_sort_header(*column),
             ZoneKind::FooterHint(action) => self.fire_footer(*action),
             ZoneKind::UndoRow { index } => self.undo_deletion_at(*index),
             ZoneKind::Chrome(ChromeId::HelpOverlayOutside) => {

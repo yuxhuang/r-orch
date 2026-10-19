@@ -6,6 +6,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Added
+- The dashboard's Goals, Tasks and Agents lists have sortable column headers: `o` moves the sort to the next column, `O` reverses it, `0` restores the default order, and clicking a header sorts by it (ascending when it was inactive, flipped when it was already active). Goals and Tasks gain Started and Elapsed* columns, where Elapsed* runs from the start to now and stops at the last update once the row is terminal.
 - The dashboard's Agents view can group agents By node as well as By team: press `b` or click the `b group:` chip for a Local section, then one section per remote alias marked online or offline. The sort applies within each section and the selected agent stays selected.
 - A user manual in [docs/manual/](docs/manual/README.md): installing, concepts, every command, the dashboard and web dashboard with screenshots, templates and the agent shop, remote agents, configuration and troubleshooting.
 - Dashboard goal and agent details end with an Activity section in the Activity panel's columns, newest first: a goal lists the entries of its tasks, an agent its own entries. It follows new entries at the top; moving down pauses it and `Home` resumes, as the footer hint and the help overlay say. An empty one reads "No activity.".
@@ -26,6 +27,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Dashboard task, goal and team wizards check the chosen assignee, lead and members against the current agent list when you submit. An agent disabled or removed after you picked it is refused with "Nothing was saved: …": nothing is written, your other answers stay, and the step reopens on the agents that can still be chosen (a refused team member stays listed until you untick it). Before, the stale agent was usually saved anyway, and a new task whose assignee had been removed was created unassigned. The edit wizards' first assignee row now reads "Keep current", which is what it always did.
 - `orch task add --attach` now saves the files: each one is copied into `.orchestry/attachments/<task id>/` and listed on the task. A missing file stops the command with `Attachment file not found` before anything is saved.
 - Task attachments reject duplicate names (including case variants), names already attached on append, and non-file sources before anything is written; copy errors name the source, destination and cause.
+- The dashboard's `?` help overlay fits an 80×24 terminal: its last rows, including the dismiss hint and the Elapsed* explanation, were cut off below the shortcut columns. On a short terminal the box drops its blank rows and may cover the header.
 
 ## [0.8.0] - 2026-10-18
 

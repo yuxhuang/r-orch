@@ -991,3 +991,426 @@ fn k096_cmd_s_does_not_open_the_agent_shop_but_alt_s_does() {
     harness.press_mod(KeyCode::Char('s'), KeyModifiers::ALT);
     harness.assert_text("AGENT SHOP");
 }
+
+// ── List sort keys (R10, R16) and the sampled Elapsed order (R14) ──────────
+
+/// ISO-8601 for an instant on 1970-01-01, which is all these cases need:
+/// the harness clock starts at 1 000 000 ms.
+fn iso(ms: i64) -> String {
+    assert!((0..86_400_000).contains(&ms), "{ms} is not on day one");
+    format!(
+        "1970-01-01T{:02}:{:02}:{:02}.{:03}Z",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
+fn run(task_id: &str, started_ms: i64) -> orch_domain::Run {
+    orch_domain::Run {
+        id: format!("run_{task_id}_{started_ms}"),
+        task_id: task_id.into(),
+        agent_id: "agt".into(),
+        attempt: 1,
+        status: orch_domain::RunStatus::Succeeded,
+        started_at: iso(started_ms),
+        finished_at: None,
+        workspace_path: "/tmp/ws".into(),
+        prompt: "p".into(),
+        pid: None,
+        error: None,
+        error_kind: None,
+        tokens: None,
+    }
+}
+
+fn sorted_task_ids(h: &Harness) -> Vec<String> {
+    h.app
+        .state
+        .sorted_tasks()
+        .into_iter()
+        .map(|i| h.app.state.tasks[i].id.clone())
+        .collect()
+}
+
+fn three_tasks() -> Harness {
+    let mut tasks = vec![
+        make_task("tsk_b", "Bravo", TaskStatus::Todo),
+        make_task("tsk_c", "charlie", TaskStatus::InProgress),
+        make_task("tsk_a", "Alpha", TaskStatus::Done),
+    ];
+    tasks[0].priority = 1;
+    tasks[1].priority = 2;
+    tasks[2].priority = 1;
+    let mut h = Harness::with(FakeBackend::new().with_tasks(tasks));
+    h.app.state.view = ViewId::Tasks;
+    h
+}
+
+#[test]
+fn sort_keys_cycle_and_flip() {
+    use orch_tui::state::TaskSortField;
+    let mut h = three_tasks();
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Status);
+    // `o`: Priority; equal priorities keep source order.
+    h.key('o');
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Priority);
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a", "tsk_c"]);
+    // `O`: descending — and the tie still keeps source order.
+    h.key('O');
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    // `o` again: Title, still descending.
+    h.key('o');
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Title);
+    assert!(h.app.state.task_sort.descending);
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    h.assert_text("TITLE↓");
+}
+
+#[test]
+fn sort_keys_cycle_reverse_reset() {
+    let mut h = three_tasks();
+    h.key('o').key('o').key('O');
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    // `0` restores the default order and touches nothing else.
+    h.app.state.group_by_goal = true;
+    h.key('0');
+    assert_eq!(h.app.state.task_sort, Default::default());
+    assert!(h.app.state.group_by_goal);
+    assert_eq!(sorted_task_ids(&h), ["tsk_c", "tsk_b", "tsk_a"]);
+    h.assert_text("STATUS↑");
+
+    // The keys act on the visible list only.
+    let goal_sort = h.app.state.goal_sort;
+    let agent_sort = h.app.state.agent_sort;
+    h.key('o');
+    assert_eq!(h.app.state.goal_sort, goal_sort);
+    assert_eq!(h.app.state.agent_sort, agent_sort);
+}
+
+#[test]
+fn sort_cycle_preserves_direction() {
+    use orch_tui::state::{GoalSortField, TaskSortField};
+    let mut h = three_tasks();
+    h.key('O');
+    // A full cycle of seven Tasks fields comes back to Status, descending.
+    for _ in 0..7 {
+        h.key('o');
+        assert!(h.app.state.task_sort.descending);
+    }
+    assert_eq!(h.app.state.task_sort.field, TaskSortField::Status);
+
+    h.app.state.view = ViewId::Goals;
+    h.key('O');
+    for _ in 0..6 {
+        h.key('o');
+        assert!(h.app.state.goal_sort.descending);
+    }
+    assert_eq!(h.app.state.goal_sort.field, GoalSortField::Status);
+}
+
+#[test]
+fn sort_keys_keep_the_selected_task() {
+    let mut h = three_tasks();
+    h.press(KeyCode::Down);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_b");
+    h.key('o').key('o');
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b", "tsk_c"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_b");
+    h.key('0');
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_b");
+}
+
+/// R14's vector at the harness clock (`base` = 1 000 000): A is live and
+/// started 4 999 ms before the sort sampled; B ended with a 5 000 ms span.
+fn crossing_harness() -> Harness {
+    let base = 1_000_000;
+    let mut a = make_task("tsk_a", "Live A", TaskStatus::InProgress);
+    a.updated_at = iso(base - 4_999);
+    let mut b = make_task("tsk_b", "Ended B", TaskStatus::Done);
+    b.updated_at = iso(base - 5_000);
+    let backend = FakeBackend::new().with_tasks(vec![b, a]).with_runs(vec![
+        run("tsk_a", base - 4_999),
+        run("tsk_b", base - 10_000),
+    ]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Tasks;
+    h.key('o').key('o').key('o').key('o').key('o').key('o');
+    assert_eq!(
+        h.app.state.task_sort.field,
+        orch_tui::state::TaskSortField::Elapsed
+    );
+    h
+}
+
+#[test]
+fn elapsed_tick_preserves_selection_and_enter_target() {
+    let mut h = crossing_harness();
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+
+    // Two milliseconds later A's live span (5 001) passes B's (5 000), but
+    // no refresh or control change happened: the text moves, the order and
+    // the action target do not.
+    h.advance(2).draw();
+    assert_eq!(
+        h.app.state.task_elapsed_ms(1, h.now()),
+        Some(5_001),
+        "the displayed span is live"
+    );
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    h.press(KeyCode::Esc);
+
+    // A refresh samples the clock again: B, A — and A stays selected.
+    h.app.refresh_all(false);
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a"]);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    assert!(!h.app.state.entity_actions_deferred);
+    h.draw().press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+}
+
+/// Ten ended tasks with spans 1 000..10 000 ms, and live A at 9 500 ms when
+/// the sort samples — row 10, the last row under the cap.
+fn capped_harness() -> Harness {
+    let base = 1_000_000;
+    let mut tasks = Vec::new();
+    let mut runs = Vec::new();
+    for i in 1..=10 {
+        let id = format!("tsk_{i:02}");
+        let mut task = make_task(&id, &format!("Ended {i}"), TaskStatus::Done);
+        task.updated_at = iso(base - 20_000 + i * 1_000);
+        runs.push(run(&id, base - 20_000));
+        tasks.push(task);
+    }
+    tasks.push(make_task("tsk_a", "Live A", TaskStatus::InProgress));
+    runs.push(run("tsk_a", base - 9_500));
+    let mut h = Harness::sized(
+        FakeBackend::new().with_tasks(tasks).with_runs(runs),
+        120,
+        44,
+    );
+    h.app.state.view = ViewId::Tasks;
+    for _ in 0..6 {
+        h.key('o');
+    }
+    h
+}
+
+#[test]
+fn elapsed_crossing_task_limit() {
+    let mut h = capped_harness();
+    let ids = sorted_task_ids(&h);
+    assert_eq!(ids[9], "tsk_a", "{ids:?}");
+    for _ in 0..9 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+
+    // A tick takes A's span to 10 500 ms, past tsk_10's 10 000: it stays on
+    // row 10, still selected.
+    h.advance(1_000).draw();
+    assert_eq!(sorted_task_ids(&h)[9], "tsk_a");
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+
+    // A refresh pushes A to row 11, past the cap. The cursor stays on row
+    // 10 (now tsk_10), show-all stays off, and entity actions wait for the
+    // frame that shows the new selection.
+    h.app.refresh_all(false);
+    assert_eq!(sorted_task_ids(&h)[10], "tsk_a");
+    assert!(!h.app.state.show_all_tasks);
+    assert_eq!(h.app.state.task_selected, 9);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_10");
+    assert!(h.app.state.entity_actions_deferred);
+    h.press(KeyCode::Enter).key('d').key('c');
+    assert_eq!(h.app.state.detail, DetailPanel::None);
+    assert!(h.app.state.pending_deletions.is_empty());
+    h.refute_called(|c| matches!(c, Call::CancelTask(_)));
+    // Drawn: now Enter acts, on the row the user can see.
+    h.draw();
+    assert!(!h.app.state.entity_actions_deferred);
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_10");
+
+    // With show-all on, row 11 is visible and A keeps the cursor.
+    let mut h = capped_harness();
+    h.key('s');
+    for _ in 0..9 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    // The real loop draws after every key; that frame releases the deferral
+    // the Started step of the `o` cycle set when it pushed A past the cap.
+    h.draw();
+    h.advance(1_000);
+    h.app.refresh_all(false);
+    assert_eq!(h.app.state.task_selected, 10);
+    assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
+    assert!(!h.app.state.entity_actions_deferred);
+}
+
+// ── Unknown values sort last in either direction (D2) ──────────────────────
+//
+// The row without a value sits in the middle of the source order, so neither
+// "unknown first" nor "reverse the ascending list" can pass by accident.
+
+fn sorted_goal_ids(h: &Harness) -> Vec<String> {
+    h.app
+        .state
+        .sorted_goals()
+        .into_iter()
+        .map(|i| h.app.state.goals[i].id.clone())
+        .collect()
+}
+
+fn assigned(id: &str, assignee: Option<&str>, goal_id: Option<&str>) -> orch_domain::Task {
+    let mut task = make_task(id, id, TaskStatus::Todo);
+    task.assignee = assignee.map(Into::into);
+    task.goal_id = goal_id.map(Into::into);
+    task
+}
+
+/// `tsk_b` → bravo and goal "Bravo goal", `tsk_none` → neither, `tsk_a` →
+/// alpha and goal "Alpha goal".
+fn tasks_with_an_unassigned_one() -> Harness {
+    let backend = FakeBackend::new()
+        .with_agents(vec![
+            make_agent("agt_a", "alpha", AgentStatus::Idle),
+            make_agent("agt_b", "bravo", AgentStatus::Idle),
+        ])
+        .with_goals(vec![
+            make_goal("gol_a", "Alpha goal", GoalStatus::Active),
+            make_goal("gol_b", "Bravo goal", GoalStatus::Active),
+        ])
+        .with_tasks(vec![
+            assigned("tsk_b", Some("agt_b"), Some("gol_b")),
+            assigned("tsk_none", None, None),
+            assigned("tsk_a", Some("agt_a"), Some("gol_a")),
+        ]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Tasks;
+    h.draw();
+    h
+}
+
+#[test]
+fn unassigned_task_sorts_last_by_assignee_in_both_directions() {
+    use orch_tui::state::{TaskSort, TaskSortField::Assignee};
+    let mut h = tasks_with_an_unassigned_one();
+    h.app.state.task_sort = TaskSort {
+        field: Assignee,
+        descending: false,
+    };
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b", "tsk_none"]);
+    h.app.state.task_sort.descending = true;
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a", "tsk_none"]);
+}
+
+#[test]
+fn ungrouped_task_sorts_last_by_goal_in_both_directions() {
+    use orch_tui::state::{TaskSort, TaskSortField::Goal};
+    let mut h = tasks_with_an_unassigned_one();
+    h.app.state.task_sort = TaskSort {
+        field: Goal,
+        descending: false,
+    };
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b", "tsk_none"]);
+    h.app.state.task_sort.descending = true;
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a", "tsk_none"]);
+}
+
+#[test]
+fn unassigned_goal_sorts_last_by_assignee_in_both_directions() {
+    use orch_tui::state::{GoalSort, GoalSortField::Assignee};
+    let mut bravo = make_goal("gol_b", "B", GoalStatus::Active);
+    bravo.assignee = Some("agt_b".into());
+    let mut alpha = make_goal("gol_a", "A", GoalStatus::Active);
+    alpha.assignee = Some("agt_a".into());
+    let backend = FakeBackend::new()
+        .with_agents(vec![
+            make_agent("agt_a", "alpha", AgentStatus::Idle),
+            make_agent("agt_b", "bravo", AgentStatus::Idle),
+        ])
+        .with_goals(vec![
+            bravo,
+            make_goal("gol_none", "None", GoalStatus::Active),
+            alpha,
+        ]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Goals;
+    h.draw();
+    h.app.state.goal_sort = GoalSort {
+        field: Assignee,
+        descending: false,
+    };
+    assert_eq!(sorted_goal_ids(&h), ["gol_a", "gol_b", "gol_none"]);
+    h.app.state.goal_sort.descending = true;
+    assert_eq!(sorted_goal_ids(&h), ["gol_b", "gol_a", "gol_none"]);
+}
+
+#[test]
+fn goal_without_tasks_sorts_last_by_progress_in_both_directions() {
+    use orch_tui::state::{GoalSort, GoalSortField::Progress};
+    let mut done = make_task("tsk_done", "done", TaskStatus::Done);
+    done.goal_id = Some("gol_half".into());
+    let mut todo = make_task("tsk_todo", "todo", TaskStatus::Todo);
+    todo.goal_id = Some("gol_half".into());
+    let mut full = make_task("tsk_full", "full", TaskStatus::Done);
+    full.goal_id = Some("gol_full".into());
+    let backend = FakeBackend::new()
+        .with_goals(vec![
+            make_goal("gol_half", "Half", GoalStatus::Active),
+            make_goal("gol_empty", "Empty", GoalStatus::Active),
+            make_goal("gol_full", "Full", GoalStatus::Active),
+        ])
+        .with_tasks(vec![done, todo, full]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Goals;
+    h.draw();
+    h.app.state.goal_sort = GoalSort {
+        field: Progress,
+        descending: false,
+    };
+    assert_eq!(sorted_goal_ids(&h), ["gol_half", "gol_full", "gol_empty"]);
+    h.app.state.goal_sort.descending = true;
+    assert_eq!(sorted_goal_ids(&h), ["gol_full", "gol_half", "gol_empty"]);
+}
+
+// ── The Goals column header takes a viewport row (D2) ──────────────────────
+
+#[test]
+fn selected_last_goal_stays_drawn_under_the_column_header() {
+    let goals = (0..40)
+        .map(|i| {
+            make_goal(
+                &format!("gol_{i:02}"),
+                &format!("Goal {i:02}"),
+                GoalStatus::Active,
+            )
+        })
+        .collect();
+    let mut h = Harness::with(FakeBackend::new().with_goals(goals));
+    h.app.state.view = ViewId::Goals;
+    h.draw();
+    // Walk down one key at a time: each step past the bottom scrolls just
+    // enough to put the selection on the viewport's last row, which only
+    // exists on screen if the header was counted out of the viewport.
+    for _ in 0..39 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.goal_selected, 39, "the last goal is selected");
+    assert!(h.app.state.goal_scroll > 0, "the list scrolled");
+    h.assert_text("Goal 39");
+
+    // One more: the `+ add goal` row below it, the list's last row.
+    h.press(KeyCode::Down);
+    assert_eq!(h.app.state.goal_selected, 40);
+    h.assert_text("add goal");
+}

@@ -2,6 +2,11 @@
 //!
 //! A centred amber rounded box: title, three column dividers, ten shortcut
 //! rows in three 22-column columns, and the dismiss footer.
+//!
+//! The box is [`FULL_H`] rows tall. Where the overlay area below the header is
+//! shorter than that (an 80×24 terminal), it first drops its four spacer rows,
+//! then draws over the whole frame, so the footer lines (the dismiss hint and
+//! the R15 Elapsed* disclosure) stay on screen at the default terminal size.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -63,14 +68,62 @@ pub const COMMANDS: [(&str, &str); 8] = [
     ("/quit", "Exit"),
 ];
 
-pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+/// The Elapsed* disclosure, exactly as R15 words it, then when the order
+/// catches up, exactly as D1 words it, then the Agents grouping key. Both
+/// sentences are wrapped at word boundaries to fit the box.
+pub const ELAPSED_HELP: [&str; 3] = [
+    "Elapsed*: start to now; terminal rows end at last update (edits change it).",
+    "Includes waiting/retries. Elapsed order updates on refresh or",
+    "list-control changes; displayed time is live. b group by team/node.",
+];
+
+/// [`ELAPSED_HELP`]'s first sentence, the one the README carries too.
+pub const ELAPSED_DISCLOSURE: &str = "Elapsed*: start to now; terminal rows end at last update (edits change it). Includes waiting/retries.";
+
+/// [`ELAPSED_HELP`]'s second sentence: D1's rule for when the Elapsed order
+/// moves, against a time that is drawn live.
+pub const ELAPSED_ORDER: &str =
+    "Elapsed order updates on refresh or list-control changes; displayed time is live.";
+
+/// Rows above the shortcut columns that are only spacing: the one under the
+/// top border, under the title, and under the column dividers.
+const SPACERS_ABOVE: usize = 3;
+/// Every row of the box: top border, spacer, title, spacer, dividers, spacer,
+/// the shortcut rows, spacer, dismiss, panes hint, detail Activity hint,
+/// lists hint, the [`ELAPSED_HELP`] lines, bottom border.
+pub const FULL_H: usize = SPACERS_ABOVE + 3 + MAX_ROWS + 1 + 4 + ELAPSED_HELP.len() + 1;
+/// [`FULL_H`] without its four spacer rows.
+pub const COMPACT_H: usize = FULL_H - SPACERS_ABOVE - 1;
+
+/// Where the box goes and whether it keeps its spacers: the overlay area
+/// below the header if the box fits there (spacers first), else the whole
+/// frame, which a modal overlay may cover.
+fn placement(overlay: Rect, frame: Rect) -> (Rect, bool) {
+    let fits = |area: Rect, rows: usize| area.height as usize >= rows;
+    if fits(overlay, FULL_H) {
+        (overlay, true)
+    } else if fits(overlay, COMPACT_H) {
+        (overlay, false)
+    } else if fits(frame, FULL_H) {
+        (frame, true)
+    } else {
+        (frame, false)
+    }
+}
+
+/// Draws the overlay in `overlay`, the area below the header, or over all of
+/// `frame` when the box does not fit there (see [`placement`]).
+pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
     if ctx.state.copy_help.is_some() {
-        render_contextual(frame, area, ctx);
+        render_contextual(frame, overlay, ctx);
         return;
     }
+    let (area, spaced) = placement(overlay, full);
+    let spacer = u16::from(spaced);
+    let box_h = if spaced { FULL_H } else { COMPACT_H };
     Clear.render(area, frame.buffer_mut());
     let pad_x = ((area.width as usize).saturating_sub(OUTER_W)) / 2;
-    let margin_top = ((area.height as usize).saturating_sub(MAX_ROWS + 12)) / 2;
+    let margin_top = ((area.height as usize).saturating_sub(box_h)) / 2;
     let x = area.x + pad_x as u16;
     let width = OUTER_W.min(area.width as usize) as u16;
     let inner = Rect::new(x, area.y, width, area.height);
@@ -100,8 +153,10 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         vec![Span::styled(format!("╭{}╮", "─".repeat(INNER_W)), border)],
     );
     y += 1;
-    put_line(frame, inner, y, vec![Span::styled("│", border)]);
-    y += 1;
+    if spaced {
+        put_line(frame, inner, y, vec![Span::styled("│", border)]);
+        y += 1;
+    }
     put_line(
         frame,
         inner,
@@ -111,7 +166,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx.bold(Token::Amber),
         )],
     );
-    y += 2;
+    y += 1 + spacer;
 
     let dividers = ["NAVIGATION", "ACTIONS", "COMMANDS"];
     let mut header = String::new();
@@ -131,7 +186,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx.style(Token::Dim).add_modifier(Modifier::BOLD),
         )],
     );
-    y += 2;
+    y += 1 + spacer;
 
     for row in 0..MAX_ROWS {
         let mut spans = Vec::new();
@@ -157,7 +212,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         y += 1;
     }
 
-    y += 1;
+    y += spacer;
     put_line(
         frame,
         inner,
@@ -193,11 +248,23 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         inner,
         y,
         vec![Span::styled(
-            "Agents: o sort; O reverse; 0 original order; b group by team/node.",
+            "Lists: o sort; O reverse; 0 original order; click a header to sort.",
             ctx.style(Token::Dim),
         )],
     );
     y += 1;
+    // R15's disclosure and D1's ordering rule, word-wrapped at the box: the
+    // sentences are too long for one 74-cell row, and every word of them must
+    // stay on screen.
+    for line in ELAPSED_HELP {
+        put_line(
+            frame,
+            inner,
+            y,
+            vec![Span::styled(line, ctx.style(Token::Dim))],
+        );
+        y += 1;
+    }
     put_line(
         frame,
         inner,

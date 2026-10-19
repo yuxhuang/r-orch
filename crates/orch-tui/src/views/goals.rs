@@ -6,11 +6,14 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Span;
 
-use crate::format::{cap_line, format_age_days, parse_timestamp_ms};
+use crate::format::{cap_display, format_duration, format_started};
 use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
-use crate::state::EntityType;
+use crate::state::{EntityType, GoalSortField, SortColumn};
+use crate::text::text_display_width;
 use crate::theme::{BLOCK, BULLSEYE, CHECK, CROSS, CURSOR, EM_DASH, PAUSE_BARS, SHADE, Token};
-use crate::views::{RenderCtx, put_line};
+use crate::views::{
+    HeaderCell, RenderCtx, cell, cell_right, put_line, render_header_row, sanitize,
+};
 
 const PROGRESS_W: usize = 14;
 const PROGRESS_CELLS: usize = 6;
@@ -44,8 +47,98 @@ fn status_chip(status: GoalStatus) -> (String, Token, Token, bool) {
     }
 }
 
+// ── Column layout ─────────────────────────────────────────────────────────
+//
+//   cursor │ status chip │ title │ progress │ assignee │ started │ elapsed*
+//
+// One width per column per frame, shared by the header and every row, so the
+// labels sit over their values. Title is elastic; on a narrow terminal the
+// optional columns drop lowest-priority first (progress, assignee, started)
+// rather than squeezing.
+
+/// Cursor (2) + status chip (11).
+const LEAD_W: usize = 2 + 11;
+const TITLE_MIN: usize = 10;
+const ASSIGNEE_W: usize = 14;
+const STARTED_W: usize = 8;
+/// `ELAPSED*↓` fits exactly.
+const ELAPSED_W: usize = 9;
+
+/// Column widths for one frame's goal rows; `0` hides a column. Each optional
+/// column is preceded by a one-cell gap that is not counted here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalColumns {
+    pub title: usize,
+    pub progress: usize,
+    pub assignee: usize,
+    pub started: usize,
+    pub elapsed: usize,
+}
+
+impl GoalColumns {
+    pub fn for_width(width: usize) -> Self {
+        let mut avail = width.saturating_sub(LEAD_W);
+        let title = TITLE_MIN.min(avail);
+        avail -= title;
+        let mut take = |w: usize| {
+            if avail > w {
+                avail -= w + 1;
+                w
+            } else {
+                0
+            }
+        };
+        let elapsed = take(ELAPSED_W);
+        let started = take(STARTED_W);
+        let assignee = take(ASSIGNEE_W);
+        let progress = take(PROGRESS_W);
+        GoalColumns {
+            title: title + avail,
+            progress,
+            assignee,
+            started,
+            elapsed,
+        }
+    }
+
+    fn header(self) -> Vec<HeaderCell> {
+        let goal = SortColumn::Goal;
+        vec![
+            HeaderCell::gap(2),
+            HeaderCell::sort("STATUS", 11, goal(GoalSortField::Status)),
+            HeaderCell::sort("TITLE", self.title, goal(GoalSortField::Title)),
+            HeaderCell::gap(usize::from(self.progress > 0)),
+            HeaderCell::sort("PROGRESS", self.progress, goal(GoalSortField::Progress)),
+            HeaderCell::gap(usize::from(self.assignee > 0)),
+            HeaderCell::sort("ASSIGNEE", self.assignee, goal(GoalSortField::Assignee)),
+            HeaderCell::gap(usize::from(self.started > 0)),
+            HeaderCell::sort("STARTED", self.started, goal(GoalSortField::Started)).right(),
+            HeaderCell::gap(usize::from(self.elapsed > 0)),
+            HeaderCell::sort("ELAPSED*", self.elapsed, goal(GoalSortField::Elapsed)).right(),
+        ]
+    }
+}
+
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let state = ctx.state;
+    let cols = GoalColumns::for_width(area.width as usize);
+    render_header_row(
+        frame,
+        area,
+        area.y,
+        ctx,
+        &cols.header(),
+        (
+            SortColumn::Goal(state.goal_sort.field),
+            state.goal_sort.descending,
+        ),
+    );
+    let area = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
     let order = state.sorted_goals();
     let mut y = area.y;
 
@@ -73,9 +166,6 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             .iter()
             .filter(|i| state.tasks[**i].status == TaskStatus::Done)
             .count();
-        let progress_w = if linked.is_empty() { 0 } else { PROGRESS_W };
-        let fixed_cols = 2 + 11 + progress_w + 14 + 7;
-        let title_w = (area.width as usize).saturating_sub(fixed_cols).max(10);
 
         let (chip_text, chip_fg, chip_bg, chip_bold) = status_chip(goal.status);
         let mut spans = vec![
@@ -87,7 +177,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 },
                 ctx.style(Token::Amber),
             ),
-            Span::styled(format!("{chip_text:<11}"), {
+            Span::styled(cell(&chip_text, 11), {
                 let style = ctx.chip(chip_fg, chip_bg);
                 if chip_bold {
                     style.add_modifier(Modifier::BOLD)
@@ -95,67 +185,83 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                     style
                 }
             }),
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    cap_line(&goal.title, title_w),
-                    width = title_w
-                ),
-                {
-                    let token = if selected {
-                        Token::White
-                    } else {
-                        Token::Silver
-                    };
-                    let style = ctx.style(token);
-                    if selected || goal.status == GoalStatus::Active {
-                        style.add_modifier(Modifier::BOLD)
-                    } else {
-                        style
-                    }
-                },
-            ),
+            Span::styled(cell(&goal.title, cols.title), {
+                let token = if selected {
+                    Token::White
+                } else {
+                    Token::Silver
+                };
+                let style = ctx.style(token);
+                if selected || goal.status == GoalStatus::Active {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                }
+            }),
         ];
 
-        // The progress bar is hidden entirely at zero linked tasks — no `0/0`.
-        if !linked.is_empty() {
-            let filled =
-                ((done as f64 / linked.len() as f64) * PROGRESS_CELLS as f64).round() as usize;
-            let bar = format!(
-                "{}{}",
-                BLOCK.repeat(filled.min(PROGRESS_CELLS)),
-                SHADE.repeat(PROGRESS_CELLS.saturating_sub(filled))
-            );
-            spans.push(Span::styled(bar, ctx.style(Token::Green)));
+        // The progress cell is blank at zero linked tasks — no `0/0`.
+        if cols.progress > 0 {
+            spans.push(Span::raw(" "));
+            if linked.is_empty() {
+                spans.push(Span::raw(" ".repeat(cols.progress)));
+            } else {
+                let filled =
+                    ((done as f64 / linked.len() as f64) * PROGRESS_CELLS as f64).round() as usize;
+                let bar = format!(
+                    "{}{}",
+                    BLOCK.repeat(filled.min(PROGRESS_CELLS)),
+                    SHADE.repeat(PROGRESS_CELLS.saturating_sub(filled))
+                );
+                let count = format!(" {done}/{}", linked.len());
+                let count = cell(&count, cols.progress.saturating_sub(PROGRESS_CELLS));
+                spans.push(Span::styled(bar, ctx.style(Token::Green)));
+                spans.push(Span::styled(count, ctx.style(Token::Dim)));
+            }
+        }
+
+        if cols.assignee > 0 {
+            spans.push(Span::raw(" "));
+            match goal.assignee.as_deref() {
+                Some(agent_id) => {
+                    let name = cap_display(&sanitize(&state.agent_name(agent_id)), cols.assignee);
+                    let pad = cols.assignee.saturating_sub(text_display_width(&name));
+                    spans.push(Span::styled(name, ctx.chip(Token::Green, Token::SuccessBg)));
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                None => spans.push(Span::styled(
+                    cell(EM_DASH, cols.assignee),
+                    ctx.style(Token::Ghost),
+                )),
+            }
+        }
+
+        let unknown = state.timing_error.is_some();
+        if cols.started > 0 {
+            let text = match state.goal_started_ms(*goal_index) {
+                Some(start) => format_started(start, ctx.now_ms),
+                None if unknown => "?".to_string(),
+                None => String::new(),
+            };
+            spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                format!(" {done}/{}", linked.len()),
+                cell_right(&text, cols.started),
                 ctx.style(Token::Dim),
             ));
         }
-
-        match goal.assignee.as_deref() {
-            Some(agent_id) => spans.push(Span::styled(
-                format!("{:<14}", cap_line(&state.agent_name(agent_id), 13)),
-                ctx.chip(Token::Green, Token::SuccessBg),
-            )),
-            None => spans.push(Span::styled(
-                format!("{EM_DASH:<14}"),
-                ctx.style(Token::Ghost),
-            )),
+        if cols.elapsed > 0 {
+            let (text, token) = match state.goal_elapsed_ms(*goal_index, ctx.now_ms) {
+                Some(ms) if goal.status == GoalStatus::Active => (format_duration(ms), Token::Cyan),
+                Some(ms) => (format_duration(ms), Token::Dim),
+                None if unknown => ("?".to_string(), Token::Dim),
+                None => (String::new(), Token::Dim),
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                cell_right(&text, cols.elapsed),
+                ctx.style(token),
+            ));
         }
-
-        let (time_text, time_token) = match goal.status {
-            GoalStatus::Achieved => (CHECK.to_string(), Token::Amber),
-            GoalStatus::Abandoned => (CROSS.to_string(), Token::Ghost),
-            _ => {
-                let created = parse_timestamp_ms(&goal.created_at).unwrap_or(ctx.now_ms);
-                (format_age_days(created, ctx.now_ms), Token::Dim)
-            }
-        };
-        spans.push(Span::styled(
-            format!("{time_text:>7}"),
-            ctx.style(time_token),
-        ));
 
         put_line(frame, area, y, spans);
         y += 1;

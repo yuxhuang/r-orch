@@ -102,6 +102,17 @@ pub fn relative_time(ts_ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// The Started column: [`relative_time`] under a day, then whole days
+/// (`3d`), so an old start never reads as `120h`.
+pub fn format_started(ts_ms: i64, now_ms: i64) -> String {
+    let diff = now_ms.saturating_sub(ts_ms).max(0);
+    if diff < 86_400_000 {
+        relative_time(ts_ms, now_ms)
+    } else {
+        format!("{}d", diff / 86_400_000)
+    }
+}
+
 /// Goal-row age column: `{n}d`, or `<1d` under a day.
 pub fn format_age_days(created_ms: i64, now_ms: i64) -> String {
     let days = (now_ms - created_ms).max(0) / 86_400_000;

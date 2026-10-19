@@ -21,11 +21,15 @@ pub mod fake;
 
 pub use fake::{Call, FakeBackend, make_agent, make_goal, make_task, make_team};
 
+use std::collections::HashMap;
+
 use indexmap::IndexMap;
 use orch_domain::{
     Agent, CreateGoalInput, CreateTeamInput, Goal, GoalStatus, NotificationPreferences,
-    OrchestratorEvent, OrchestratorState, Task, Team, TuiPaletteName,
+    OrchestratorEvent, OrchestratorState, Run, Task, Team, TuiPaletteName,
 };
+
+use crate::format::parse_timestamp_ms;
 
 /// Every fallible facade call reports a human message — the TUI only ever
 /// renders `Failed: {err}`.
@@ -50,6 +54,110 @@ pub struct CopyResult {
     pub ticket: CopyTicket,
     pub outcome: CopyOutcome,
     pub guidance: Option<String>,
+}
+
+/// When a goal or task started, and how long it has run (D3). Derived, never
+/// stored: the domain types are unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntityTiming {
+    /// UTC epoch milliseconds. `None`: never started, or the timestamp is
+    /// missing or malformed.
+    pub started_at_ms: Option<i64>,
+    /// Nonnegative milliseconds, start to the sample time while live and
+    /// start to the last update once terminal. `None` when there is no
+    /// start, or a terminal entity has no valid last update — never a
+    /// fabricated zero.
+    pub elapsed_ms: Option<i64>,
+}
+
+/// Every goal's and task's [`EntityTiming`] from one refresh, keyed by id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimingSnapshot {
+    pub tasks: HashMap<String, EntityTiming>,
+    pub goals: HashMap<String, EntityTiming>,
+    /// The `now_ms` the live spans were computed at.
+    pub sampled_at_ms: i64,
+}
+
+/// Derive task and goal timings from every retained run record plus the
+/// same refresh's tasks, goals and orchestrator state.
+///
+/// * A task starts at its earliest valid run `started_at`, including the
+///   live `orch_state.running` entry, which covers a first run whose record
+///   is not written yet. A run's start is recorded while it is still
+///   Preparing, so this is not the process launch. No run: no start.
+/// * A goal starts at its `created_at`.
+/// * Elapsed runs to `now_ms` while the entity is live and to its
+///   `updated_at` once it is terminal (Done/Failed/Cancelled,
+///   Achieved/Abandoned), clamped at zero. A later metadata edit moves
+///   `updated_at`, and so the span; that is the disclosed `Elapsed*`
+///   contract, not a completion duration.
+///
+/// One pass over `runs`; nothing here reads a file.
+pub fn derive_timings(
+    runs: &[Run],
+    tasks: &[Task],
+    goals: &[Goal],
+    orch_state: Option<&OrchestratorState>,
+    now_ms: i64,
+) -> TimingSnapshot {
+    fn note<'a>(earliest: &mut HashMap<&'a str, i64>, task_id: &'a str, started_at: &str) {
+        if let Some(ms) = parse_timestamp_ms(started_at) {
+            earliest
+                .entry(task_id)
+                .and_modify(|current| *current = (*current).min(ms))
+                .or_insert(ms);
+        }
+    }
+    let mut earliest: HashMap<&str, i64> = HashMap::new();
+    for run in runs {
+        note(&mut earliest, &run.task_id, &run.started_at);
+    }
+    if let Some(state) = orch_state {
+        for (task_id, entry) in &state.running {
+            note(&mut earliest, task_id, &entry.started_at);
+        }
+    }
+
+    let span = |start: Option<i64>, terminal: bool, updated_at: Option<&str>| {
+        let start = start?;
+        let end = if terminal {
+            parse_timestamp_ms(updated_at?)?
+        } else {
+            now_ms
+        };
+        Some(end.saturating_sub(start).max(0))
+    };
+
+    let tasks = tasks
+        .iter()
+        .map(|task| {
+            let started_at_ms = earliest.get(task.id.as_str()).copied();
+            let terminal = crate::state::is_terminal_task(task.status);
+            let timing = EntityTiming {
+                started_at_ms,
+                elapsed_ms: span(started_at_ms, terminal, Some(&task.updated_at)),
+            };
+            (task.id.clone(), timing)
+        })
+        .collect();
+    let goals = goals
+        .iter()
+        .map(|goal| {
+            let started_at_ms = parse_timestamp_ms(&goal.created_at);
+            let terminal = crate::state::is_terminal_goal(goal.status);
+            let timing = EntityTiming {
+                started_at_ms,
+                elapsed_ms: span(started_at_ms, terminal, goal.updated_at.as_deref()),
+            };
+            (goal.id.clone(), timing)
+        })
+        .collect();
+    TimingSnapshot {
+        tasks,
+        goals,
+        sampled_at_ms: now_ms,
+    }
 }
 
 /// Options for creating a task.
@@ -245,6 +353,22 @@ pub trait TuiBackend {
     fn refresh_goals(&mut self) -> BackendResult<Vec<Goal>>;
     fn refresh_state(&mut self) -> BackendResult<OrchestratorState>;
     fn list_teams(&mut self) -> BackendResult<Vec<Team>>;
+    /// Started/Elapsed for the entities this refresh just returned (D3).
+    /// `orch_state` is this refresh's state, or `None` when it could not be
+    /// read — never an older snapshot. Called once per refresh, never per
+    /// frame. A backend without run history reports nothing.
+    fn refresh_timings(
+        &mut self,
+        _tasks: &[Task],
+        _goals: &[Goal],
+        _orch_state: Option<&OrchestratorState>,
+        now_ms: i64,
+    ) -> BackendResult<TimingSnapshot> {
+        Ok(TimingSnapshot {
+            sampled_at_ms: now_ms,
+            ..TimingSnapshot::default()
+        })
+    }
 
     // ── Tasks ──────────────────────────────────────────────────────────────
 

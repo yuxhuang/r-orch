@@ -331,20 +331,37 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             _ => {}
         }
 
-        if view == ViewId::Agents {
+        // The list sort: `o` next field, `O` other direction, `0` default
+        // order. Each list has its own; none of them touches grouping.
+        if matches!(view, ViewId::Goals | ViewId::Tasks | ViewId::Agents) {
             match key.code {
                 KeyCode::Char('o') => {
-                    self.cycle_agent_sort();
+                    self.cycle_sort();
                     return;
                 }
                 KeyCode::Char('O') => {
-                    self.reverse_agent_sort();
+                    self.reverse_sort();
                     return;
                 }
                 KeyCode::Char('0') => {
-                    self.reset_agent_sort();
+                    self.reset_sort();
                     return;
                 }
+                _ => {}
+            }
+        }
+
+        // A refresh moved the cursor off a vanished entity onto one that is
+        // not on screen yet: entity actions wait for that frame (D1).
+        if self.state.entity_actions_deferred
+            && self.state.focus == Focus::MainList
+            && is_entity_action_key(view, key.code)
+        {
+            return;
+        }
+
+        if view == ViewId::Agents {
+            match key.code {
                 // `b`: group *by*. Free in every view; `g`, the Tasks
                 // grouping key, means "goals tab" here.
                 KeyCode::Char('b') | KeyCode::Char('B') => {
@@ -749,6 +766,63 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.retain_command_bar = false;
     }
 
+    /// `o` in the active list.
+    pub(crate) fn cycle_sort(&mut self) {
+        match self.state.view {
+            ViewId::Goals => self.change_goal_sort(self.state.goal_sort.cycled()),
+            ViewId::Tasks => self.change_task_sort(self.state.task_sort.cycled()),
+            ViewId::Agents => self.cycle_agent_sort(),
+            ViewId::Logs => {}
+        }
+    }
+
+    /// `O` in the active list.
+    pub(crate) fn reverse_sort(&mut self) {
+        match self.state.view {
+            ViewId::Goals => self.change_goal_sort(self.state.goal_sort.reversed()),
+            ViewId::Tasks => self.change_task_sort(self.state.task_sort.reversed()),
+            ViewId::Agents => self.reverse_agent_sort(),
+            ViewId::Logs => {}
+        }
+    }
+
+    /// `0` in the active list: its default order, and nothing else.
+    pub(crate) fn reset_sort(&mut self) {
+        match self.state.view {
+            ViewId::Goals => self.change_goal_sort(crate::state::GoalSort::default()),
+            ViewId::Tasks => self.change_task_sort(crate::state::TaskSort::default()),
+            ViewId::Agents => self.reset_agent_sort(),
+            ViewId::Logs => {}
+        }
+    }
+
+    /// A column header click: that field ascending, or the other direction
+    /// if it is the active field already.
+    pub(crate) fn click_sort_header(&mut self, column: crate::state::SortColumn) {
+        use crate::state::SortColumn;
+        match column {
+            SortColumn::Goal(field) => self.change_goal_sort(self.state.goal_sort.clicked(field)),
+            SortColumn::Task(field) => self.change_task_sort(self.state.task_sort.clicked(field)),
+            SortColumn::Agent(field) => {
+                self.change_agent_sort(self.state.agent_sort.clicked(field));
+            }
+        }
+    }
+
+    fn change_goal_sort(&mut self, sort: crate::state::GoalSort) {
+        let now = self.now();
+        let can_create = self.can_create_task();
+        self.state.set_goal_sort(sort, now, can_create);
+        self.state.clamp_all(can_create);
+    }
+
+    fn change_task_sort(&mut self, sort: crate::state::TaskSort) {
+        let now = self.now();
+        let can_create = self.can_create_task();
+        self.state.set_task_sort(sort, now, can_create);
+        self.state.clamp_all(can_create);
+    }
+
     pub(crate) fn cycle_agent_sort(&mut self) {
         let mut sort = self.state.agent_sort;
         sort.field = sort.field.next();
@@ -834,6 +908,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     pub(crate) fn handle_enter(&mut self) {
+        if self.state.entity_actions_deferred {
+            return;
+        }
         let can_create_task = self.backend.can_create_task();
         let can_add_agent = self.backend.can_add_agent();
         let can_create_goal = self.backend.can_create_goal();
@@ -1888,6 +1965,20 @@ impl crate::state::AppState {
     /// Goals view: is the selection the `+ add goal...` pseudo-row?
     pub fn task_selected_is_goal_add_row(&self) -> bool {
         self.goal_selected == self.sorted_goals().len()
+    }
+}
+
+/// The single-key entity actions of each list, as dispatched in normal mode.
+/// Navigation, sorting, grouping and show-all are not entity actions.
+fn is_entity_action_key(view: ViewId, code: KeyCode) -> bool {
+    let KeyCode::Char(ch) = code else {
+        return false;
+    };
+    match view {
+        ViewId::Goals => matches!(ch.to_ascii_lowercase(), 'e' | 'd' | 'c' | 'x' | 'p'),
+        ViewId::Tasks => matches!(ch.to_ascii_lowercase(), 'a' | 'x' | 'c' | 'e' | 'd' | 'r'),
+        ViewId::Agents => matches!(ch.to_ascii_lowercase(), 'e' | 's' | 'd' | 'u' | 'm'),
+        ViewId::Logs => false,
     }
 }
 

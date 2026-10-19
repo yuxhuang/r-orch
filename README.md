@@ -157,6 +157,17 @@ with errors highlighted. Goal and agent details end with an Activity section in 
 first: a goal's lists the entries of its tasks, an agent's its own. It follows new entries at the top; `Down`
 pauses it and `Home` resumes.
 
+The Goals, Tasks and Agents lists carry a column header row. `o` cycles the sort column, `O` reverses the
+direction and `0` restores that list's default order. Clicking an inactive header sorts by it ascending; clicking
+the active header flips its direction. The active column is marked `↑` or `↓`. Each list keeps its own sort, and
+none of these keys touch grouping.
+
+Goals and Tasks also show a Started and an Elapsed* column, both blank for an entity that never started.
+Elapsed*: start to now; terminal rows end at last update (edits change it). Includes waiting/retries.
+A task's Started is its earliest retained run record, which is written while the run is still Preparing — not the
+moment an agent process launched; a goal's Started is its creation time. Ordering by Elapsed re-sorts on a refresh
+or a list-control change, while the time the column shows stays live between those.
+
 In Agents, `o` cycles the sort field through Original, Name, Status, Adapter/Model and Location; `O` switches
 ascending/descending, and `0` resets to Original ascending. The sort chips above the list offer the same controls.
 Sorting preserves team sections and the selected agent, and lasts only for this dashboard session. Original is

@@ -89,6 +89,20 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         state.onboarding = OnboardingStep::initial(&state.orch_state, state.tasks.len());
 
         let now = clock.now_ms();
+        // The first frame shows timings too; the sort clock starts here.
+        let timing =
+            backend.refresh_timings(&state.tasks, &state.goals, Some(&state.orch_state), now);
+        state.sort_clock_ms = now;
+        let timing_failure = match timing {
+            Ok(snapshot) => {
+                state.timings = snapshot;
+                None
+            }
+            Err(error) => {
+                state.timing_error = Some(error.clone());
+                Some(error)
+            }
+        };
         let mut app = App {
             state,
             backend,
@@ -101,6 +115,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             last_anim_at: now,
             last_refresh_at: now,
         };
+
+        if let Some(error) = timing_failure {
+            app.emit(
+                &format!("Task timings unavailable: {error}"),
+                Token::Red,
+                MsgType::Error,
+            );
+        }
 
         // Launch banner.
         if app.state.observer_mode {
@@ -142,7 +164,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         );
     }
 
-    fn can_create_task(&self) -> bool {
+    pub(crate) fn can_create_task(&self) -> bool {
         self.backend.can_create_task()
     }
 
@@ -413,8 +435,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     // ── Refresh ────────────────────────────────────────────────────────────
 
     /// Commit only what actually changed.
+    ///
+    /// Every list keeps its selected entity across the refresh (D1): the
+    /// selection is captured from the order on screen before anything is
+    /// committed, then found again in the new order, sorted at a freshly
+    /// sampled clock.
     pub fn refresh_all(&mut self, include_teams: bool) {
-        self.last_refresh_at = self.now();
+        let now = self.now();
+        self.last_refresh_at = now;
+        let can_create = self.can_create_task();
+        let prior = self.state.capture_list_selection(can_create);
         if let Ok(status) = self.backend.peer_status() {
             self.state.peer_status = status;
         }
@@ -437,11 +467,46 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             self.state.teams = teams;
         }
         // State is always committed.
-        if let Ok(orch_state) = self.backend.refresh_state() {
-            self.state.orch_state = orch_state;
-        }
-        let can_create = self.can_create_task();
+        let state_read = match self.backend.refresh_state() {
+            Ok(orch_state) => {
+                self.state.orch_state = orch_state;
+                true
+            }
+            Err(_) => false,
+        };
+        self.refresh_timings(state_read, now);
+        self.state.reconcile_list_selection(&prior, now, can_create);
         self.state.clamp_all(can_create);
+    }
+
+    /// Started/Elapsed for what this refresh committed. A failure is shown
+    /// once per distinct error and leaves every timing unknown rather than
+    /// claiming nothing started.
+    fn refresh_timings(&mut self, state_read: bool, now: i64) {
+        let orch_state = state_read.then_some(&self.state.orch_state);
+        match self
+            .backend
+            .refresh_timings(&self.state.tasks, &self.state.goals, orch_state, now)
+        {
+            Ok(snapshot) => {
+                self.state.timings = snapshot;
+                self.state.timing_error = None;
+            }
+            Err(error) => {
+                self.state.timings = crate::backend::TimingSnapshot {
+                    sampled_at_ms: now,
+                    ..Default::default()
+                };
+                if self.state.timing_error.as_deref() != Some(error.as_str()) {
+                    self.emit(
+                        &format!("Task timings unavailable: {error}"),
+                        Token::Red,
+                        MsgType::Error,
+                    );
+                }
+                self.state.timing_error = Some(error);
+            }
+        }
     }
 
     // ── Mouse ──────────────────────────────────────────────────────────────
@@ -452,6 +517,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// can deliver dozens of notches from one flick, and the frame is the
     /// only place the user sees a result.
     pub fn set_hits(&mut self, hits: crate::hit::HitMap) {
+        // The reconciled selection is on screen now; entity actions may use it.
+        self.state.entity_actions_deferred = false;
         self.state.frame_generation = hits.metrics.generation;
         self.state.mouse.hits = hits;
         self.start_frame();
