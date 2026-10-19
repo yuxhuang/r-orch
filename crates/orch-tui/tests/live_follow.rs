@@ -59,7 +59,7 @@ fn following(h: &Harness) -> bool {
         focus => h
             .app
             .state
-            .task_activity_following(&h.app.state.pane_key(focus)),
+            .detail_activity_following(&h.app.state.pane_key(focus)),
     }
 }
 

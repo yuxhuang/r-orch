@@ -29,6 +29,16 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// `--attach` paths. Unlike [`split_list`], empty elements are dropped: a
+/// trailing comma names no file, and an empty path would only surface as a
+/// confusing "Attachment file not found: " with nothing after it.
+fn attachment_list(value: &str) -> Vec<String> {
+    split_list(value)
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskAddArgs {
     pub title: String,
@@ -42,6 +52,8 @@ pub struct TaskAddArgs {
     pub review_criteria: Option<String>,
     pub scope: Option<String>,
     pub goal_id: Option<String>,
+    /// `--attach`: comma-separated source paths, copied by the task service.
+    pub attach: Option<String>,
 }
 
 pub async fn add(
@@ -80,7 +92,7 @@ pub async fn add(
             review_criteria,
             scope: args.scope.as_deref().map(split_list),
             goal_id: args.goal_id,
-            attachments: None,
+            attachments: args.attach.as_deref().map(attachment_list),
         })
         .await?;
 
@@ -736,6 +748,15 @@ mod tests {
                 .as_deref(),
             Some("awaiting approval: orch task approve tsk_mirror on w1")
         );
+    }
+
+    #[test]
+    fn attachment_list_trims_and_drops_empty_elements() {
+        assert_eq!(
+            attachment_list(" /a/b.png , c.md,"),
+            vec!["/a/b.png".to_owned(), "c.md".to_owned()]
+        );
+        assert!(attachment_list(" , ").is_empty());
     }
 
     #[test]

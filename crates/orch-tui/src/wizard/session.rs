@@ -696,15 +696,19 @@ pub(crate) fn handle_session_event<B: TuiBackend, C: Clock>(
                 }
                 return true;
             }
-            let back = key.code == KeyCode::Esc
-                || (matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
-                    && !key.modifiers.intersects(
-                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META,
-                    )
-                    && ((w.step().kind == StepKind::Text
-                        && w.text_value().is_empty()
-                        && w.active_index() > 0)
-                        || matches!(w.step().kind, StepKind::Select | StepKind::Multiselect)));
+            // An agent step's Esc and Backspace edit its filter first; only
+            // with the filter empty do they leave the step.
+            let filtering = w.picker().is_some() && !w.picker_query().is_empty();
+            let back = !filtering
+                && (key.code == KeyCode::Esc
+                    || (matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+                        && !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META,
+                        )
+                        && ((w.step().kind == StepKind::Text
+                            && w.text_value().is_empty()
+                            && w.active_index() > 0)
+                            || matches!(w.step().kind, StepKind::Select | StepKind::Multiselect))));
             if back {
                 if !app.guard_wizard_leave(LeaveIntent::Back) {
                     let outcome = app

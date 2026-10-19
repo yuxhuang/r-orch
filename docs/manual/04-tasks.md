@@ -53,7 +53,7 @@ Starting a task is a separate step: `orch run <task-id>`, or the orchestrator in
 | `--review-criteria <list>` | Comma-separated checks: `test_pass`, `typecheck`, `lint`. See [Add review checks to a task](#add-review-checks-to-a-task). | None |
 | `--scope <patterns>` | Comma-separated file patterns the task works on, such as `src/auth/**,src/session/**`. | None |
 | `--goal-id <goalId>` | Links the task to a goal. See [Goals](05-teams-and-goals.md#goals). | None |
-| `--attach <paths>` | Comma-separated files to attach. See the note below. | None |
+| `--attach <paths>` | Comma-separated files to attach, such as screenshots or docs. orch copies each file into `.orchestry/attachments/<task id>/` and lists its name on the task. Relative paths are read from the current directory. | None |
 
 orch checks the values before it saves anything:
 
@@ -61,9 +61,20 @@ orch checks the values before it saves anything:
   ✕ Priority must be an integer between 1 and 4
   ✕ Unknown depends_on task ID(s): tsk_nope
   ✕ Unknown review criterion: "nope". Use test_pass, typecheck or lint.
+  ✕ Attachment file not found: missing.png
 ```
 
-> **Note:** In orch 0.8.0, `orch task add --attach` accepts a path but does not save the attachment: the new task has none. Put the file's path in the description instead.
+Attachments must be regular files (symlinks to regular files are accepted) with distinct basenames when compared using Unicode lowercase (for example, `Report.txt` and `report.txt` collide). Stored names keep their original case. If any file is missing, is not a regular file, or repeats a basename, orch copies none of them and creates no task. Appending attachments to an existing task also rejects names already listed on the task (including case variants) or present in its attachment directory; choose a fresh name and retry. `task update` keeps the `attachments` field read-only.
+
+```text
+$ orch task add duplicate --attach first/same.txt,second/same.txt
+  ✕ Duplicate attachment name: same.txt (first/same.txt, second/same.txt)
+
+$ orch task add directory --attach directory
+  ✕ Attachment is not a regular file: directory
+```
+
+> **Note:** In orch 0.8.0 and earlier, `orch task add --attach` accepted a path but did not save the attachment. Upgrade, or put the file's path in the description instead.
 
 Two output options help in scripts. `--quiet` prints only the new ID, and `--json` or `--yaml` prints the whole task.
 

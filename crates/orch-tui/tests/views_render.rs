@@ -648,13 +648,13 @@ fn v054_the_updated_row_appears_only_when_it_differs_from_created() {
         FakeBackend::new().with_goals(vec![make_goal("goal_1", "G", GoalStatus::Active)]),
     );
     harness.press(KeyCode::Enter);
-    harness.refute_text("Updated");
+    harness.refute_text("updated");
 
     let mut goal = make_goal("goal_2", "Changed", GoalStatus::Active);
     goal.updated_at = Some("2026-10-14T09:00:00.000Z".into());
     let mut harness = harness_for(ViewId::Goals, FakeBackend::new().with_goals(vec![goal]));
     harness.press(KeyCode::Enter);
-    harness.assert_text("Updated");
+    harness.assert_text("updated");
     harness.assert_text("2026-10-14");
 }
 
@@ -1632,4 +1632,992 @@ fn activity_header_keeps_recovery_hint_with_three_digit_retention_counts() {
             }
         }
     }
+}
+
+/// The detail rail's sections in screen order, read from the hit map.
+fn rail_order(harness: &mut Harness) -> Vec<Focus> {
+    harness.draw();
+    let mut rail: Vec<_> = harness
+        .hits()
+        .zones()
+        .iter()
+        .filter_map(|zone| match zone.kind {
+            orch_tui::hit::ZoneKind::DetailSection(section) if zone.rect.height == 1 => {
+                Some((zone.rect.x, section))
+            }
+            _ => None,
+        })
+        .collect();
+    rail.sort_by_key(|(x, _)| *x);
+    rail.into_iter().map(|(_, section)| section).collect()
+}
+
+/// R2: moving focus between sections restyles the focused entry but never
+/// moves it; the rail stays in `focus_ring()` order.
+#[test]
+fn detail_rail_order_is_stable_across_focus() {
+    let mut harness = harness_for(ViewId::Goals, linked_backend());
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    let ring: Vec<Focus> = harness
+        .app
+        .state
+        .focus_ring()
+        .into_iter()
+        .filter(|f| matches!(f, Focus::GoalDetail(_)))
+        .collect();
+    assert_eq!(
+        ring,
+        [
+            Focus::GoalDetail(GoalSection::Overview),
+            Focus::GoalDetail(GoalSection::Description),
+            Focus::GoalDetail(GoalSection::Tasks),
+            Focus::GoalDetail(GoalSection::Activity),
+        ]
+    );
+    for focus in ring.iter().copied() {
+        harness.app.state.set_focus(focus);
+        assert_eq!(rail_order(&mut harness), ring, "focused {focus:?}");
+        let text = harness.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("Overview │"))
+            .expect("rail row");
+        let marked = format!("> {}", orch_tui::views::detail::section_name(focus));
+        assert_eq!(line.matches("> ").count(), 1, "{line}");
+        assert!(line.contains(&marked), "{line}");
+    }
+    // At the minimum width the rail drops entries but never reorders them,
+    // and the focused entry is always on it.
+    let mut narrow = Harness::sized(linked_backend(), 40, 14);
+    narrow.app.state.view = ViewId::Goals;
+    narrow.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    for focus in ring.iter().copied() {
+        narrow.app.state.set_focus(focus);
+        let shown = rail_order(&mut narrow);
+        assert!(shown.contains(&focus), "focused {focus:?}: {shown:?}");
+        let mut expected = ring.iter().filter(|f| shown.contains(f));
+        assert!(
+            shown.iter().all(|f| expected.next() == Some(f)),
+            "{shown:?} is not in ring order"
+        );
+    }
+}
+
+/// Messages for `tsk_1`: two from alpha, an error from beta, one system row.
+fn activity_backend_and_messages() -> (FakeBackend, Vec<orch_tui::messages::Message>) {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let backend = FakeBackend::new()
+        .with_tasks(vec![make_task("tsk_1", "Ship it", TaskStatus::InProgress)])
+        .with_agents(vec![
+            make_agent("alpha", "alpha", AgentStatus::Running),
+            make_agent("beta", "beta", AgentStatus::Idle),
+        ]);
+    let task = |m: Message| m.with_task(Some("tsk_1".into()));
+    let messages = vec![
+        task(Message::new(
+            1,
+            880_000,
+            "plan ok",
+            Token::White,
+            MsgType::Output,
+        ))
+        .with_agent(Some("alpha".into())),
+        task(Message::new(
+            2,
+            900_000,
+            "edit main",
+            Token::Cyan,
+            MsgType::Tool,
+        ))
+        .with_agent(Some("alpha".into())),
+        task(Message::new(3, 940_000, "boom", Token::Red, MsgType::Error))
+            .with_agent(Some("beta".into())),
+        task(Message::new(
+            4,
+            1_000_000,
+            "settled",
+            Token::Green,
+            MsgType::Lifecycle,
+        )),
+    ];
+    (backend, messages)
+}
+
+/// The screen cells of the row whose zone matches `pick`, left to right.
+fn row_cells(
+    harness: &mut Harness,
+    pick: impl Fn(&orch_tui::hit::Zone) -> bool,
+) -> Vec<(String, ratatui::style::Style)> {
+    harness.draw();
+    let rect = harness
+        .hits()
+        .zones()
+        .iter()
+        .find(|zone| pick(zone))
+        .map(|zone| zone.rect)
+        .expect("row zone");
+    let buffer = harness.terminal.backend().buffer();
+    (rect.x..rect.right())
+        .map(|x| {
+            let cell = &buffer[(x, rect.y)];
+            (cell.symbol().to_owned(), cell.style())
+        })
+        .collect()
+}
+
+/// R1: the task detail's Activity rows have the bottom feed's columns and
+/// styling: marker, relative time, agent badge, icon, capped text, error and
+/// group backgrounds.
+#[test]
+fn task_detail_activity_rows_match_feed() {
+    use orch_tui::hit::{ZoneId, ZoneKind};
+    use orch_tui::widgets::text_viewer::ViewerSource;
+    let (backend, messages) = activity_backend_and_messages();
+    let mut harness = Harness::sized(backend, 120, 40);
+    harness.app.state.view = ViewId::Tasks;
+    harness.app.state.messages = messages;
+    harness.draw();
+
+    let feed: Vec<_> = (1..=4)
+        .map(|id| {
+            row_cells(&mut harness, |zone| {
+                zone.kind == ZoneKind::ActivityRow { message_id: id }
+            })
+        })
+        .collect();
+
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Activity));
+    let detail: Vec<_> = (1..=4)
+        .map(|id| {
+            row_cells(&mut harness, |zone| {
+                zone.id == ZoneId::ExpandText(ViewerSource::Message(id))
+                    && zone.kind == ZoneKind::ExpandText
+            })
+        })
+        .collect();
+
+    for (id, (feed, detail)) in feed.iter().zip(&detail).enumerate() {
+        // Time, badge, icon and the (short, uncapped) text: 17 + 10 cells.
+        let width = 27;
+        let feed_row: String = feed.iter().map(|(s, _)| s.as_str()).collect();
+        let detail_row: String = detail.iter().map(|(s, _)| s.as_str()).collect();
+        // The first cell is the accent bar, or `>` on the selected row.
+        let from = usize::from(feed[0].0 == ">" || detail[0].0 == ">");
+        assert_eq!(
+            feed[from..width],
+            detail[from..width],
+            "message {}: feed {feed_row:?} detail {detail_row:?}",
+            id + 1
+        );
+    }
+    let first: String = detail[0].iter().map(|(s, _)| s.as_str()).collect();
+    assert!(first.contains("2m") && first.contains("alpha"), "{first:?}");
+    let second: String = detail[1].iter().map(|(s, _)| s.as_str()).collect();
+    assert!(
+        !second.contains("alpha"),
+        "a group shows its badge once: {second:?}"
+    );
+}
+
+/// `activity_backend_and_messages` plus a second task outside any goal, an
+/// alpha message on it, a beta message with no task whose text names the goal
+/// and task ids, an empty goal and an agent with no messages. Feed order:
+/// 1 alpha, 2 alpha, 3 beta, 5 alpha, 6 beta, 4 system.
+fn goal_agent_activity_harness() -> Harness {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let mut member = make_task("tsk_1", "Ship it", TaskStatus::InProgress);
+    member.goal_id = Some("g1".into());
+    let backend = FakeBackend::new()
+        .with_tasks(vec![
+            member,
+            make_task("tsk_2", "Elsewhere", TaskStatus::Todo),
+        ])
+        .with_goals(vec![
+            make_goal("g1", "Launch", GoalStatus::Active),
+            make_goal("g2", "Empty goal", GoalStatus::Active),
+        ])
+        .with_agents(vec![
+            make_agent("alpha", "alpha", AgentStatus::Running),
+            make_agent("beta", "beta", AgentStatus::Idle),
+            make_agent("gamma", "gamma", AgentStatus::Idle),
+        ]);
+    let (_, mut messages) = activity_backend_and_messages();
+    let settled = messages.pop().expect("message 4");
+    messages.push(
+        Message::new(5, 960_000, "other edit", Token::Cyan, MsgType::Tool)
+            .with_task(Some("tsk_2".into()))
+            .with_agent(Some("alpha".into())),
+    );
+    messages.push(
+        Message::new(6, 970_000, "see g1 tsk_1", Token::White, MsgType::Info)
+            .with_agent(Some("beta".into())),
+    );
+    messages.push(settled);
+    let mut harness = Harness::sized(backend, 120, 40);
+    harness.app.state.messages = messages;
+    harness
+}
+
+fn select_goal(harness: &mut Harness, id: &str) {
+    harness.app.state.view = ViewId::Goals;
+    harness.app.state.goal_selected = (0..harness.app.state.goals.len())
+        .find(|i| {
+            harness.app.state.goal_selected = *i;
+            harness
+                .app
+                .state
+                .selected_goal()
+                .is_some_and(|g| g.id == id)
+        })
+        .expect("goal row");
+}
+
+fn select_agent(harness: &mut Harness, id: &str) {
+    harness.app.state.view = ViewId::Agents;
+    harness.app.state.agent_selected = (0..harness.app.state.agents.len())
+        .find(|i| {
+            harness.app.state.agent_selected = *i;
+            harness
+                .app
+                .state
+                .selected_agent()
+                .is_some_and(|a| a.id == id)
+        })
+        .expect("agent row");
+}
+
+/// Bottom-feed row cells for each message id, captured before a detail opens.
+fn feed_rows(
+    harness: &mut Harness,
+    ids: &[u64],
+) -> Vec<(u64, Vec<(String, ratatui::style::Style)>)> {
+    use orch_tui::hit::ZoneKind;
+    ids.iter()
+        .map(|&id| {
+            (
+                id,
+                row_cells(harness, |zone| {
+                    zone.kind == ZoneKind::ActivityRow { message_id: id }
+                }),
+            )
+        })
+        .collect()
+}
+
+/// The detail Activity rows on screen: message id and cells, top to bottom.
+fn detail_activity_screen(
+    harness: &mut Harness,
+) -> Vec<(u64, Vec<(String, ratatui::style::Style)>)> {
+    use orch_tui::hit::{ZoneId, ZoneKind};
+    use orch_tui::widgets::text_viewer::ViewerSource;
+    harness.draw();
+    let mut rows: Vec<_> = harness
+        .hits()
+        .zones()
+        .iter()
+        .filter(|zone| zone.kind == ZoneKind::ExpandText)
+        .filter_map(|zone| match &zone.id {
+            ZoneId::ExpandText(ViewerSource::Message(id)) => Some((*id, zone.rect)),
+            _ => None,
+        })
+        .collect();
+    rows.sort_by_key(|(_, rect)| rect.y);
+    let buffer = harness.terminal.backend().buffer();
+    rows.into_iter()
+        .map(|(id, rect)| {
+            let cells = (rect.x..rect.right())
+                .map(|x| {
+                    let cell = &buffer[(x, rect.y)];
+                    (cell.symbol().to_owned(), cell.style())
+                })
+                .collect();
+            (id, cells)
+        })
+        .collect()
+}
+
+fn joined(cells: &[(String, ratatui::style::Style)]) -> String {
+    cells.iter().map(|(s, _)| s.as_str()).collect()
+}
+
+/// Time, badge, icon and short text match the feed cell for cell; the first
+/// cell is the accent bar, or `>` on the selected row.
+fn assert_matches_feed(
+    feed: &[(String, ratatui::style::Style)],
+    detail: &[(String, ratatui::style::Style)],
+    id: u64,
+) {
+    let width = 27;
+    let from = usize::from(feed[0].0 == ">" || detail[0].0 == ">");
+    assert_eq!(
+        feed[from..width],
+        detail[from..width],
+        "message {id}: feed {:?} detail {:?}",
+        joined(feed),
+        joined(detail)
+    );
+}
+
+/// R1/R12: a goal's Activity lists the messages of its tasks (structured
+/// task_id → goal_id only, never a text match), newest first, in the bottom
+/// feed's row format; an empty goal says "No activity."; pausing names Home.
+#[test]
+fn goal_detail_activity_rows() {
+    let mut harness = goal_agent_activity_harness();
+    harness.app.state.view = ViewId::Tasks;
+    let feed = feed_rows(&mut harness, &[3, 4]);
+
+    select_goal(&mut harness, "g1");
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Activity));
+    let rows = detail_activity_screen(&mut harness);
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![4, 3, 2, 1], "newest first, members only");
+    for (id, feed) in &feed {
+        let (_, detail) = rows.iter().find(|(r, _)| r == id).unwrap();
+        assert_matches_feed(feed, detail, *id);
+    }
+    let first = joined(&rows[0].1);
+    assert!(first.starts_with('>'), "following selects row 0: {first:?}");
+    assert!(
+        first.contains("now"),
+        "the top system row shows its time: {first:?}"
+    );
+    let alpha_top = joined(&rows[2].1);
+    let alpha_next = joined(&rows[3].1);
+    assert!(alpha_top.contains("alpha"), "{alpha_top:?}");
+    assert!(
+        !alpha_next.contains("alpha"),
+        "a group shows its badge once: {alpha_next:?}"
+    );
+    let text = harness.text();
+    assert!(text.contains("Activity · following"), "{text}");
+    assert!(!text.contains("see g1 tsk_1"), "no text matching: {text}");
+
+    harness.press(KeyCode::Down);
+    let text = harness.text();
+    assert!(text.contains("paused · Home follows"), "{text}");
+    harness.press(KeyCode::Home);
+    assert!(harness.text().contains("Activity · following"));
+
+    select_goal(&mut harness, "g2");
+    let rows = detail_activity_screen(&mut harness);
+    assert!(rows.is_empty(), "{rows:?}");
+    harness.assert_text("No activity.");
+}
+
+/// R1/R12: an agent's Activity lists exactly its own messages across tasks,
+/// newest first, in the bottom feed's row format; clicking a row selects it;
+/// an agent with no messages says "No activity.".
+#[test]
+fn agent_detail_activity_rows() {
+    let mut harness = goal_agent_activity_harness();
+    harness.app.state.view = ViewId::Tasks;
+    let feed = feed_rows(&mut harness, &[5]);
+
+    select_agent(&mut harness, "alpha");
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Activity));
+    let rows = detail_activity_screen(&mut harness);
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![5, 2, 1], "newest first, agent_id only");
+    assert_matches_feed(&feed[0].1, &rows[0].1, 5);
+    // One agent, one group: the badge shows once, on the newest row.
+    for (_, cells) in &rows[1..] {
+        let row = joined(cells);
+        assert!(!row.contains("alpha"), "{row:?}");
+    }
+
+    // Rows are selectable items: a click pauses on the clicked message.
+    let (x, y) = harness.find_text("plan ok").expect("row on screen");
+    harness.click(x, y);
+    let key = harness
+        .app
+        .state
+        .pane_key(Focus::AgentDetail(AgentSection::Activity));
+    assert_eq!(
+        harness.app.state.detail_activity_scroll(&key, 10).selected,
+        Some(2)
+    );
+    assert!(harness.text().contains("paused · Home follows"));
+
+    select_agent(&mut harness, "gamma");
+    let rows = detail_activity_screen(&mut harness);
+    assert!(rows.is_empty(), "{rows:?}");
+    harness.assert_text("No activity.");
+}
+
+/// The footer's follow hint names the focused feed's live edge: Goal and
+/// Agent Activity list newest first, so Home follows and Down pauses; Task
+/// Activity and the bottom feed keep End and Up. The help overlay says both.
+#[test]
+fn detail_activity_footer_hint_follows_the_live_edge() {
+    let mut harness = goal_agent_activity_harness();
+    let footer = |harness: &mut Harness| -> String {
+        harness.draw();
+        let text = harness.text();
+        text.lines()
+            .find(|line| line.contains("↑↓ scroll;"))
+            .unwrap_or_else(|| panic!("no follow hint in the footer: {text}"))
+            .trim()
+            .to_owned()
+    };
+    let newest_first = "↑↓ scroll; Home follows; Down pauses; Tab panes; Enter expands; F1 help";
+    let oldest_first = "↑↓ scroll; End follows; Up pauses; Tab panes; Enter expands; F1 help";
+
+    select_goal(&mut harness, "g1");
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Activity));
+    assert_eq!(footer(&mut harness), newest_first, "goal Activity");
+    // Paused as well: the hint does not depend on the follow state.
+    harness.press(KeyCode::Down);
+    assert!(harness.text().contains("paused · Home follows"));
+    assert_eq!(footer(&mut harness), newest_first, "paused goal Activity");
+
+    select_agent(&mut harness, "alpha");
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Activity));
+    assert_eq!(footer(&mut harness), newest_first, "agent Activity");
+
+    harness.app.state.view = ViewId::Tasks;
+    harness.app.state.task_selected = 0;
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Activity));
+    assert_eq!(footer(&mut harness), oldest_first, "task Activity");
+
+    harness.app.state.detail = orch_tui::state::DetailPanel::None;
+    harness.app.state.set_focus(Focus::Activity);
+    assert_eq!(footer(&mut harness), oldest_first, "bottom feed");
+
+    // From the list: F1 on a focused entry opens its copy help instead.
+    harness.app.state.set_focus(Focus::MainList);
+    harness.press(KeyCode::F(1));
+    harness.assert_text("Feeds: End follows; Up pauses.");
+    harness.assert_text("Goal/agent Activity, newest first: Home follows; Down pauses.");
+}
+
+// ── Overview block (R6) ────────────────────────────────────────────────────
+
+/// The first column of row `y` where the cells spell `needle`, compared cell
+/// by cell so a wide glyph earlier in the row cannot shift the answer.
+fn cell_column(harness: &Harness, y: u16, needle: &str) -> Option<u16> {
+    let buffer = harness.terminal.backend().buffer();
+    let chars: Vec<String> = needle.chars().map(String::from).collect();
+    let width = buffer.area.width;
+    (0..width).find(|x| {
+        chars.iter().enumerate().all(|(i, ch)| {
+            let at = x + i as u16;
+            at < width && buffer[(at, y)].symbol() == ch
+        })
+    })
+}
+
+fn fg(harness: &Harness, x: u16, y: u16) -> ratatui::style::Color {
+    harness.terminal.backend().buffer()[(x, y)].fg
+}
+
+fn color(harness: &Harness, token: orch_tui::theme::Token) -> ratatui::style::Color {
+    harness.app.state.palette.get(token)
+}
+
+/// The row whose cells spell `needle`, at or below `from`.
+fn row_with(harness: &Harness, from: u16, needle: &str) -> u16 {
+    let height = harness.terminal.backend().buffer().area.height;
+    (from..height)
+        .find(|y| cell_column(harness, *y, needle).is_some())
+        .unwrap_or_else(|| panic!("{needle:?} not drawn at or below row {from}"))
+}
+
+/// Overview geometry read off the frame: the title rule's row and the
+/// block's left edge.
+fn overview_title(harness: &mut Harness, kind: &str, title: &str) -> (u16, u16) {
+    harness.draw();
+    let needle = format!("━━━ {kind}: {title} ━");
+    let y = row_with(harness, 0, &needle);
+    let x = cell_column(harness, y, &needle).unwrap();
+    assert_eq!(
+        fg(harness, x, y),
+        color(harness, orch_tui::theme::Token::Ghost),
+        "the rule is chrome"
+    );
+    assert_eq!(
+        fg(harness, x + 4, y),
+        color(harness, orch_tui::theme::Token::Amber),
+        "the title chip is Amber"
+    );
+    (x, y)
+}
+
+/// Each `(left, right)` label pair sits on one row: every left label at the
+/// block's edge, every right label in one shared column, all Amber. Returns
+/// the right column.
+#[track_caller]
+fn assert_aligned_pairs(harness: &Harness, x0: u16, from: u16, pairs: &[(&str, &str)]) -> u16 {
+    let amber = color(harness, orch_tui::theme::Token::Amber);
+    let mut right_column = None;
+    for (left, right) in pairs {
+        let y = row_with(harness, from, &format!("{left} "));
+        assert_eq!(
+            cell_column(harness, y, left),
+            Some(x0),
+            "{left} at the edge"
+        );
+        assert_eq!(fg(harness, x0, y), amber, "{left} label is Amber");
+        let x = cell_column(harness, y, &format!(" {right} "))
+            .map(|x| x + 1)
+            .unwrap_or_else(|| panic!("{right} beside {left}"));
+        assert_eq!(fg(harness, x, y), amber, "{right} label is Amber");
+        assert_eq!(
+            harness.terminal.backend().buffer()[(x - 1, y)].symbol(),
+            " ",
+            "{right}: the left value never runs into the right column"
+        );
+        assert_eq!(*right_column.get_or_insert(x), x, "{right} column");
+    }
+    right_column.unwrap()
+}
+
+fn overview_goal_backend() -> FakeBackend {
+    let mut goal = make_goal("goal_1", "Ship v2", GoalStatus::Active);
+    goal.assignee = Some("agt_1".into());
+    goal.updated_at = Some("2026-10-19T00:00:00.000Z".into());
+    let mut done = make_task("tsk_1", "Done one", TaskStatus::Done);
+    done.goal_id = Some("goal_1".into());
+    let mut failed = make_task("tsk_2", "Failed one", TaskStatus::Failed);
+    failed.goal_id = Some("goal_1".into());
+    FakeBackend::new()
+        .with_goals(vec![goal])
+        .with_tasks(vec![done, failed])
+        .with_agents(vec![make_agent("agt_1", "lead", AgentStatus::Idle)])
+}
+
+#[test]
+fn overview_block_goal() {
+    use orch_tui::theme::{Token, goal_status_token, task_status_token};
+    let mut harness = Harness::sized(overview_goal_backend(), 120, 40);
+    harness.app.state.view = ViewId::Goals;
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Overview));
+    let (x0, title) = overview_title(&mut harness, "GOAL", "Ship v2");
+    let right = assert_aligned_pairs(
+        &harness,
+        x0,
+        title + 1,
+        &[("status", "assignee"), ("id", "created")],
+    );
+    let status = title + 1;
+    assert_eq!(
+        row_with(&harness, title + 1, "status "),
+        status,
+        "status first"
+    );
+    let value = cell_column(&harness, status, "ACTIVE").expect("status value");
+    assert_eq!(
+        fg(&harness, value, status),
+        color(&harness, goal_status_token(GoalStatus::Active))
+    );
+    let lead = cell_column(&harness, status, "lead").expect("assignee value");
+    assert!(lead > right);
+    assert_eq!(fg(&harness, lead, status), color(&harness, Token::Silver));
+    // Every value starts in one column too, right of the widest label.
+    let id_row = row_with(&harness, title + 1, "id ");
+    assert_eq!(cell_column(&harness, id_row, "goal_1"), Some(value));
+    let tasks = row_with(&harness, title + 1, "tasks ");
+    assert_eq!(cell_column(&harness, tasks, "tasks"), Some(x0));
+    let done = cell_column(&harness, tasks, "1 done").expect("breakdown");
+    assert_eq!(
+        fg(&harness, done + 2, tasks),
+        color(&harness, task_status_token(TaskStatus::Done))
+    );
+    let failed = cell_column(&harness, tasks, "1 failed").expect("breakdown");
+    assert_eq!(
+        fg(&harness, failed + 2, tasks),
+        color(&harness, task_status_token(TaskStatus::Failed))
+    );
+    assert!(row_with(&harness, title + 1, "updated ") > id_row);
+
+    // Pinned above another section: the same two rows, styled the same way.
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Description));
+    let (pin_x, pin_title) = overview_title(&mut harness, "GOAL", "Ship v2");
+    assert_eq!(pin_x, x0);
+    assert_eq!(row_with(&harness, pin_title + 1, "status "), pin_title + 1);
+    let pin_right = assert_aligned_pairs(&harness, x0, pin_title + 1, &[("status", "assignee")]);
+    assert_eq!(pin_right, right, "pinned and focused blocks share columns");
+    assert_eq!(
+        fg(&harness, value, pin_title + 1),
+        color(&harness, goal_status_token(GoalStatus::Active))
+    );
+    harness.refute_text("created");
+}
+
+#[test]
+fn overview_block_task() {
+    use orch_tui::theme::{priority_token, task_status_token};
+    let mut task = make_task("tsk_2", "Blocked work", TaskStatus::Retrying);
+    task.priority = 1;
+    task.attempts = 2;
+    task.assignee = Some("agt_1".into());
+    task.labels = vec!["ui".into(), "tui".into()];
+    task.depends_on = vec!["tsk_1".into()];
+    let backend = FakeBackend::new()
+        .with_tasks(vec![
+            make_task("tsk_1", "Blocker title", TaskStatus::Done),
+            task,
+        ])
+        .with_agents(vec![make_agent("agt_1", "builder", AgentStatus::Idle)]);
+    let mut harness = Harness::sized(backend, 120, 40);
+    harness.app.state.view = ViewId::Tasks;
+    harness.app.state.task_selected = (0..2)
+        .find(|i| {
+            harness.app.state.task_selected = *i;
+            harness.app.state.selected_task().unwrap().title == "Blocked work"
+        })
+        .unwrap();
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Overview));
+    let (x0, top) = overview_title(&mut harness, "DETAIL", "Blocked work");
+    let right = assert_aligned_pairs(
+        &harness,
+        x0,
+        top + 1,
+        &[
+            ("status", "assignee"),
+            ("priority", "attempts"),
+            ("labels", "depends"),
+        ],
+    );
+    let status = row_with(&harness, top + 1, "status ");
+    assert_eq!(status, top + 1);
+    let value = cell_column(&harness, status, "retrying").expect("status value");
+    assert_eq!(
+        fg(&harness, value, status),
+        color(&harness, task_status_token(TaskStatus::Retrying))
+    );
+    let priority = row_with(&harness, top + 1, "priority ");
+    assert_eq!(cell_column(&harness, priority, "P1"), Some(value));
+    assert_eq!(
+        fg(&harness, value, priority),
+        color(&harness, priority_token(1))
+    );
+    let labels = row_with(&harness, top + 1, "labels ");
+    assert!(cell_column(&harness, labels, "ui, tui").is_some());
+    assert!(cell_column(&harness, labels, "Blocker title").unwrap() > right);
+    assert!(cell_column(&harness, priority, "2/3").unwrap() > right);
+}
+
+#[test]
+fn overview_block_agent() {
+    use orch_tui::theme::agent_status_token;
+    let mut agent = make_agent("agt_1", "alpha", AgentStatus::Running);
+    agent.config.model = Some("opus".into());
+    agent.config.skills = Some(vec!["review".into(), "docs".into()]);
+    agent.autonomous = Some(true);
+    let backend = FakeBackend::new()
+        .with_agents(vec![agent])
+        .with_teams(vec![make_team("team_1", "core", "agt_1", &["agt_1"])]);
+    let mut harness = Harness::sized(backend, 120, 40);
+    harness.app.state.view = ViewId::Agents;
+    harness.press(KeyCode::Enter);
+    assert_eq!(
+        harness.app.state.focus,
+        Focus::AgentDetail(AgentSection::Overview)
+    );
+    let (x0, top) = overview_title(&mut harness, "AGENT", "alpha");
+    let right = assert_aligned_pairs(
+        &harness,
+        x0,
+        top + 1,
+        &[("status", "adapter"), ("model", "task"), ("runs", "team")],
+    );
+    let status = row_with(&harness, top + 1, "status ");
+    assert_eq!(status, top + 1);
+    let value = cell_column(&harness, status, "running").expect("status value");
+    assert_eq!(
+        fg(&harness, value, status),
+        color(&harness, agent_status_token(AgentStatus::Running))
+    );
+    let runs = row_with(&harness, top + 1, "runs ");
+    assert!(cell_column(&harness, runs, "core").unwrap() > right);
+    let skills = row_with(&harness, top + 1, "skills ");
+    assert_eq!(cell_column(&harness, skills, "review, docs"), Some(value));
+    let auto = row_with(&harness, top + 1, "auto ");
+    assert_eq!(cell_column(&harness, auto, "auto"), Some(x0));
+}
+
+/// Every row of the focused Overview block, top to bottom, as the cells
+/// drawn in its body: scrolls the pane with Down until the last row has
+/// been on screen, and checks the published row count is what was drawn.
+fn overview_rows(harness: &mut Harness, focus: Focus) -> Vec<String> {
+    let key = harness.app.state.pane_key(focus);
+    let mut rows: Vec<Option<String>> = Vec::new();
+    loop {
+        harness.draw();
+        let metrics = harness
+            .hits()
+            .pane_metrics(&key)
+            .expect("overview geometry")
+            .clone();
+        rows.resize(metrics.display_rows, None);
+        let offset = harness.app.state.pane_scroll(&key).offset;
+        let buffer = harness.terminal.backend().buffer();
+        for screen in 0..metrics.body.height {
+            let Some(slot) = rows.get_mut(offset + screen as usize) else {
+                break;
+            };
+            let y = metrics.body.y + screen;
+            // A wide glyph covers the cell after it on a terminal; the test
+            // backend keeps whatever an earlier frame left there.
+            let mut row = String::new();
+            let mut covered = 0;
+            for x in metrics.body.x..metrics.body.right() {
+                if covered > 0 {
+                    covered -= 1;
+                    row.push(' ');
+                    continue;
+                }
+                let symbol = buffer[(x, y)].symbol();
+                covered = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+                row.push_str(symbol);
+            }
+            *slot = Some(row);
+        }
+        if offset + metrics.body.height as usize >= metrics.display_rows {
+            break;
+        }
+        harness.press(KeyCode::Down);
+        assert!(
+            harness.app.state.pane_scroll(&key).offset > offset,
+            "Down scrolls the Overview towards its last row"
+        );
+    }
+    rows.into_iter()
+        .map(|row| row.expect("every published row is reachable by scrolling"))
+        .collect()
+}
+
+/// The block's text with whitespace and rule glyphs removed, so a value
+/// that wraps reads as one run however its rows were broken.
+fn squeezed(rows: &[String]) -> String {
+    rows.concat()
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '━')
+        .collect()
+}
+
+/// D6 vectors: CJK and emoji in the title and in the values never push the
+/// right column or overflow the pane, at any size. Nothing is clipped: a
+/// value too long for its column wraps (its row goes one field a row), the
+/// title wraps under the chip, and below the two-column width each field
+/// takes its own rows. Every value's full text is reachable by scrolling.
+#[test]
+fn overview_block_keeps_columns_with_wide_glyphs() {
+    let title = "发布 🚀 版本二的界面改进以及更多非常长的标题文字";
+    let long_label = "界面".repeat(30);
+    for (width, height) in [(120, 40), (80, 24), (40, 14)] {
+        let mut task = make_task("tsk_1", title, TaskStatus::InProgress);
+        task.assignee = Some("agt_1".into());
+        task.labels = vec![long_label.clone(), "🧪".into()];
+        task.depends_on = vec!["missing_dependency_🚧".into()];
+        let backend = FakeBackend::new()
+            .with_tasks(vec![task])
+            .with_agents(vec![make_agent(
+                "agt_1",
+                "构建者 🤖 \"Bob\"",
+                AgentStatus::Idle,
+            )]);
+        let mut harness = Harness::sized(backend, width, height);
+        harness.app.state.view = ViewId::Tasks;
+        harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+        // At the minimum size only a maximized detail has rows to spare.
+        harness.app.state.detail_maximized = width < 80;
+        let focus = Focus::TaskDetail(TaskSection::Overview);
+        harness.app.state.set_focus(focus);
+        let rows = overview_rows(&mut harness, focus);
+        let all = rows.join("\n");
+        assert!(
+            !all.contains('…'),
+            "{width}x{height}: nothing is clipped:\n{all}"
+        );
+        let text = squeezed(&rows);
+        for value in [
+            format!("DETAIL: {title}"),
+            "in_progress".into(),
+            "构建者 🤖 \"Bob\"".into(),
+            "P3".into(),
+            "0/3".into(),
+            format!("{long_label}, 🧪"),
+            "missing_dependency_🚧".into(),
+        ] {
+            let value: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(
+                text.contains(&value),
+                "{width}x{height}: {value:?} in full:\n{all}"
+            );
+        }
+        // Every label starts a row at the block's edge, in model order.
+        let labels = [
+            "status", "assignee", "priority", "attempts", "labels", "depends",
+        ];
+        let starts: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| labels.iter().find(|l| row.starts_with(&format!("{l} "))))
+            .copied()
+            .collect();
+        harness.press(KeyCode::Home).draw();
+        let top = row_with(&harness, 0, "━━━ DETAIL: ");
+        let x0 = cell_column(&harness, top, "━━━ DETAIL: ").unwrap();
+        if width >= 80 {
+            // The rows that fit keep their aligned columns; the labels row
+            // is too long for its column, so labels and depends go one a row.
+            assert_aligned_pairs(
+                &harness,
+                x0,
+                top + 1,
+                &[("status", "assignee"), ("priority", "attempts")],
+            );
+            assert_eq!(starts, ["status", "priority", "labels", "depends"]);
+            let labels_row = row_with(&harness, top + 1, "labels ");
+            assert!(
+                cell_column(&harness, labels_row, "depends").is_none(),
+                "{width}: depends gets its own row"
+            );
+            assert_eq!(
+                rows.len(),
+                6,
+                "{width}: title, two pairs, labels over two rows, depends"
+            );
+        } else {
+            assert_eq!(starts, labels, "{width}: one field a row");
+        }
+        // Continuation rows of the wrapped labels start at the value column.
+        let at = rows
+            .iter()
+            .position(|row| row.starts_with("labels "))
+            .expect("labels row");
+        let value_column = rows[at]["labels".len()..].len()
+            - rows[at]["labels".len()..].trim_start().len()
+            + "labels".len();
+        let next = &rows[at + 1];
+        assert_eq!(
+            next.len() - next.trim_start().len(),
+            value_column,
+            "{width}: continuation indented to the value column:\n{all}"
+        );
+    }
+}
+
+/// I1: values that do not fit wrap onto continuation rows instead of being
+/// clipped. 14 skills are all on screen at 120x40, the skills continuation
+/// rows start at the value column, and a long title wraps under its chip.
+#[test]
+fn overview_block_wraps_long_values() {
+    let skills: Vec<String> = (0..14).map(|n| format!("skill-number-{n}")).collect();
+    let name = format!("alpha {}", "agent-with-a-very-long-name ".repeat(5));
+    let name = name.trim_end().to_owned();
+    let mut agent = make_agent("agt_1", &name, AgentStatus::Idle);
+    agent.config.model = Some(format!("provider/{}", "model-id-segment-".repeat(6)));
+    agent.config.skills = Some(skills.clone());
+    let mut harness = Harness::sized(FakeBackend::new().with_agents(vec![agent]), 120, 40);
+    harness.app.state.view = ViewId::Agents;
+    harness.press(KeyCode::Enter);
+    let focus = Focus::AgentDetail(AgentSection::Overview);
+    assert_eq!(harness.app.state.focus, focus);
+    let rows = overview_rows(&mut harness, focus);
+    let all = rows.join("\n");
+    assert!(!all.contains('…'), "nothing is clipped:\n{all}");
+
+    // Skills: every name on screen, over continuation rows indented to the
+    // value column.
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with("skills "))
+        .expect("skills row");
+    let column = rows[at].find("skill-number-0").expect("first skill");
+    let mut shown = Vec::new();
+    for (n, row) in rows[at..].iter().enumerate() {
+        if n > 0 && !row[..column].trim().is_empty() {
+            break;
+        }
+        let value = &row[column..];
+        if value.trim().is_empty() {
+            break;
+        }
+        if n > 0 {
+            assert!(
+                !value.starts_with(' '),
+                "continuation row {n} starts at the value column:\n{all}"
+            );
+        }
+        shown.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    assert_eq!(shown, skills, "all 14 skills, in order:\n{all}");
+    assert!(
+        rows[at + 1..]
+            .iter()
+            .take_while(|r| r[..column].trim().is_empty())
+            .count()
+            >= 1,
+        "14 skills need more than one row at 120 columns:\n{all}"
+    );
+
+    // The title wraps under the chip, past the leading rule.
+    let title = squeezed(&rows);
+    let expected: String = format!("AGENT: {name}")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert!(title.contains(&expected), "full title:\n{all}");
+    assert!(rows[0].starts_with("━━━ AGENT: alpha"));
+    assert!(
+        rows[1].starts_with("    ") && !rows[1].starts_with("     "),
+        "the title continues under the chip text:\n{all}"
+    );
+
+    // The model is too long for the left column: it takes its own rows and
+    // wraps; task follows on its own row.
+    let model: String = format!("provider/{}", "model-id-segment-".repeat(6));
+    assert!(title.contains(&model), "full model id:\n{all}");
+    let model_row = rows
+        .iter()
+        .position(|row| row.starts_with("model "))
+        .expect("model row");
+    assert!(!rows[model_row].contains(" task "), "{all}");
+    assert!(
+        rows.iter().any(|row| row.starts_with("task ")),
+        "task keeps its row:\n{all}"
+    );
 }

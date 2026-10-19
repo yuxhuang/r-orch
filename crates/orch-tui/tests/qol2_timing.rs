@@ -234,6 +234,7 @@ fn help_overlay_keeps_every_shortcut_and_the_dismiss_hint_at_80x24() {
         "Undo delete",
         "/quit",
         "Press any key to dismiss",
+        "Goal/agent Activity, newest first",
         "Lists: o sort",
     ]
     .into_iter()

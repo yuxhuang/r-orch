@@ -31,6 +31,11 @@ use crate::views;
 const MAX_EVENTS_PER_FRAME: usize = 64;
 const MAX_DRAIN: Duration = Duration::from_millis(40);
 
+/// How long [`has_parsed_event`] lets crossterm look. Not a wait for input:
+/// any non-zero value gets crossterm to check what it has already parsed, and
+/// this is the most a check can add before the next frame when it has nothing.
+const PARSED_EVENT_PROBE: Duration = Duration::from_millis(1);
+
 /// Set to `0`, `off`, `false` or `no` to start with mouse capture off.
 ///
 /// `ORCH_*` is the user-facing runtime prefix (`ORCH_WEB_PASSWORD`,
@@ -191,7 +196,7 @@ pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exi
         // spin this module exists to avoid.
         let queued = match input.wait(Duration::ZERO)? {
             Ready::HungUp => return hung_up(),
-            _ => event::poll(Duration::ZERO)?,
+            _ => has_parsed_event()?,
         };
         // Never wait longer than one animation tick, so spinners and the
         // scanner bar keep moving while the user is idle.
@@ -250,18 +255,41 @@ pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exi
                 break;
             }
             // Check for a hangup before every re-entry into crossterm, which
-            // is where a dead terminal spins. The `event::poll` that follows
-            // is still crossterm's, because it is the only thing that can see
-            // events crossterm has already parsed but not handed over — they
-            // are no longer on the wire for `wait` to find.
+            // is where a dead terminal spins. The check that follows is still
+            // crossterm's, because it is the only thing that can see events
+            // crossterm has already parsed but not handed over — they are no
+            // longer on the wire for `wait` to find.
             if input.wait(Duration::ZERO)? == Ready::HungUp {
                 return hung_up();
             }
-            if !event::poll(Duration::ZERO)? {
+            if !has_parsed_event()? {
                 break;
             }
         }
     }
+}
+
+/// Whether `event::read` would return without blocking: crossterm holds an
+/// event it has parsed but not handed over, or the terminal has bytes.
+///
+/// This cannot be `event::poll(Duration::ZERO)`. crossterm 0.29's
+/// `use-dev-tty` source (`src/event/source/unix/tty.rs`, `try_read`) only
+/// looks at its parser inside `while timeout.leftover() is not zero`, so a
+/// zero timeout skips the loop and reports nothing. Its parser holds every
+/// event from the last read, so a burst read in one go — `hello` from
+/// `tmux send-keys -l`, `jj` over SSH or `orch web` — handed over its first
+/// key, and the rest stayed parsed and unreported until new bytes arrived:
+/// the screen showed `h` until the operator pressed something else.
+///
+/// Any non-zero timeout enters the loop, whose first step returns a parsed
+/// event. With nothing parsed it waits up to [`PARSED_EVENT_PROBE`] on the
+/// terminal, which bounds what this costs a frame. On a hung-up terminal that
+/// source spins for the timeout and returns `false` (see `crate::tty`), so the
+/// callers still check for a hang-up first. Residual: a thread descheduled
+/// for longer than the probe between crossterm's start of the timeout and that
+/// first check would miss the parsed event, as every check did before.
+fn has_parsed_event() -> io::Result<bool> {
+    event::poll(PARSED_EVENT_PROBE)
 }
 
 /// A terminal that went away ends the loop the way `q` does: the guard's

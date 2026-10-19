@@ -41,6 +41,8 @@ pub enum GoalSection {
     Description,
     Progress,
     Tasks,
+    /// Always last in the rail; reachable even when empty.
+    Activity,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskSection {
@@ -56,6 +58,8 @@ pub enum AgentSection {
     Overview,
     Error,
     Role,
+    /// Always last in the rail; reachable even when empty.
+    Activity,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSection {
@@ -1569,6 +1573,7 @@ impl AppState {
                     if !self.tasks_of_goal(&g.id).is_empty() {
                         ring.push(Focus::GoalDetail(GoalSection::Tasks));
                     }
+                    ring.push(Focus::GoalDetail(GoalSection::Activity));
                 }
             }
             ViewId::Tasks => {
@@ -1607,6 +1612,7 @@ impl AppState {
                         ring.push(Focus::AgentDetail(AgentSection::Error));
                     }
                     ring.push(Focus::AgentDetail(AgentSection::Role));
+                    ring.push(Focus::AgentDetail(AgentSection::Activity));
                 }
             }
             ViewId::Logs => {
@@ -1749,18 +1755,13 @@ impl AppState {
             Focus::TaskDetail(TaskSection::Files) => {
                 entity(EntityType::Task, self.selected_task()?.id.clone(), "files")
             }
-            Focus::TaskDetail(TaskSection::Activity) => {
-                let task = self.selected_task()?;
-                let rows: Vec<_> = self
-                    .messages
-                    .iter()
-                    .filter(|m| m.task_id.as_deref() == Some(task.id.as_str()))
-                    .collect();
-                let selected = self
-                    .pane_scroll(&self.pane_key(self.focus))
-                    .selected
-                    .unwrap_or_else(|| rows.len().saturating_sub(1));
-                rows.get(selected).map(|m| ViewerSource::Message(m.id))
+            focus if crate::follow::is_detail_activity(focus) => {
+                let key = self.pane_key(focus);
+                let rows = self.detail_activity_rows(&key);
+                // The live edge does not depend on the viewport height.
+                let selected = self.detail_activity_scroll(&key, 0).selected?;
+                rows.get(selected)
+                    .map(|i| ViewerSource::Message(self.messages[*i].id))
             }
             _ => None,
         }
@@ -2856,7 +2857,7 @@ impl AppState {
     ) -> (
         Option<u64>,
         Option<u64>,
-        Option<crate::follow::TaskActivityAnchor>,
+        Vec<crate::follow::DetailActivityAnchor>,
     ) {
         let logs = self.filtered_messages();
         let activity = self.activity_messages();
@@ -2874,18 +2875,18 @@ impl AppState {
             } else {
                 None
             },
-            self.task_activity_anchor(),
+            self.detail_activity_anchors(),
         )
     }
     fn restore_message_viewports(
         &mut self,
-        (log, activity, task): (
+        (log, activity, detail): (
             Option<u64>,
             Option<u64>,
-            Option<crate::follow::TaskActivityAnchor>,
+            Vec<crate::follow::DetailActivityAnchor>,
         ),
     ) {
-        self.restore_task_activity_anchor(task);
+        self.restore_detail_activity_anchors(detail);
         if let Some(id) = log {
             self.log_scroll_offset = self
                 .filtered_messages()
