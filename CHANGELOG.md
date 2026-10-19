@@ -16,6 +16,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Fixed
 - A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
+- The dashboard's `?` help overlay fits an 80×24 terminal: its last rows, including the dismiss hint and the Elapsed* explanation, were cut off below the shortcut columns. On a short terminal the box drops its blank rows and may cover the header.
 
 ## [0.8.0] - 2026-10-18
 

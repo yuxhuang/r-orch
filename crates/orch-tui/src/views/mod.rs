@@ -344,7 +344,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ZoneKind::Chrome(ChromeId::HelpOverlayOutside),
             ZoneId::Chrome(ChromeId::HelpOverlayOutside),
         );
-        widgets::help_overlay::render(frame, overlay, ctx);
+        widgets::help_overlay::render(frame, overlay, area, ctx);
     }
     mark_zwj_trailing_cells(frame.buffer_mut());
 }
