@@ -22,6 +22,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - An Activity entry with no agent (a system entry) at the top of the Activity panel or a detail's Activity section now shows its time, like the first entry of any other group. It also counts as the first group, so when the top entry has no agent, the alternating group shading below it can swap.
 - Dashboard goal, task and agent details keep their section titles in the same order when you move between sections; only the focused title changes style, and a narrow rail drops the titles farthest from the focused one instead of moving it to the front.
 - A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
+- Keys that reach the dashboard together (typed fast over SSH or `orch web`, sent by tmux, or pasted without bracketed paste) are all handled at once. Only the first used to show, so `jj` in a wizard list moved one row and `hello` read `h` until the next key was pressed.
 
 ## [0.8.0] - 2026-10-18
 
