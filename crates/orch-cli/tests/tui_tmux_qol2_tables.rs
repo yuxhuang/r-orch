@@ -371,6 +371,23 @@ fn tables_headers_sort_and_elapsed_in_tmux() {
     assert!(screen.contains("Includes waiting/retries."), "{screen}");
     tmux.keys(&["Escape"]);
 
+    // At 80x24, the default terminal size, the overlay is taller than the
+    // area under the header, and the disclosure must still be on screen.
+    tmux.run(&["resize-window", "-t", "dash", "-x", "80", "-y", "24"]);
+    tmux.keys(&["?"]);
+    let help = [
+        "Elapsed*: start to now; terminal rows end at last update (edits change it).",
+        "Includes waiting/retries. Elapsed order updates on refresh or",
+        "list-control changes; displayed time is live. b group by team/node.",
+        "Press any key to dismiss",
+    ];
+    let screen = tmux.wait_for("the help overlay at 80x24", |s| {
+        s.lines().all(|line| line.chars().count() <= 80) && help.iter().all(|line| s.contains(line))
+    });
+    assert!(screen.contains("KEYBOARD SHORTCUTS"), "{screen}");
+    tmux.keys(&["Escape"]);
+    tmux.run(&["resize-window", "-t", "dash", "-x", "120", "-y", "40"]);
+
     // The Goals table has the same two columns, over the goal's creation time.
     tmux.keys(&["Left"]);
     let screen = tmux.wait_for("the Goals view", |s| s.contains("Shipping goal"));

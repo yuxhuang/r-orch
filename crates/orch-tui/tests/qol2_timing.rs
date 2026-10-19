@@ -12,7 +12,7 @@ use common::Harness;
 use orch_domain::{GoalStatus, Run, RunStatus, TaskStatus};
 use orch_tui::backend::{FakeBackend, make_goal, make_task};
 use orch_tui::state::ViewId;
-use orch_tui::widgets::help_overlay::{ELAPSED_DISCLOSURE, ELAPSED_HELP};
+use orch_tui::widgets::help_overlay::{ELAPSED_DISCLOSURE, ELAPSED_HELP, ELAPSED_ORDER};
 
 /// The instant [`Harness`] starts its clock at.
 const BASE: i64 = 1_000_000;
@@ -171,29 +171,84 @@ fn a_timing_failure_is_visible_and_leaves_the_spans_unknown() {
 
 // ── The disclosure (R15) ───────────────────────────────────────────────────
 
-#[test]
-fn help_overlay_carries_the_elapsed_disclosure() {
-    let mut h = Harness::new();
+/// The screen rows of the help overlay's [`ELAPSED_HELP`] block, which must
+/// sit on consecutive rows, at `width`×`height`.
+#[track_caller]
+fn elapsed_help_rows(width: u16, height: u16) -> (String, Vec<String>) {
+    let mut h = Harness::sized(FakeBackend::new(), width, height);
     h.key('?');
     let screen = h.text();
     let rows: Vec<&str> = screen.lines().collect();
     let first = rows
         .iter()
         .position(|line| line.contains(ELAPSED_HELP[0]))
-        .unwrap_or_else(|| panic!("the first Elapsed* help line is not on screen:\n{screen}"));
-    assert!(
-        rows[first + 1].contains(ELAPSED_HELP[1]),
-        "the second Elapsed* help line does not follow the first:\n{screen}"
-    );
+        .unwrap_or_else(|| {
+            panic!("at {width}x{height} the first Elapsed* help line is not on screen:\n{screen}")
+        });
+    let block: Vec<String> = rows[first..]
+        .iter()
+        .take(ELAPSED_HELP.len())
+        .map(|line| line.trim().to_owned())
+        .collect();
+    (screen, block)
+}
 
-    // Wrapped over two rows, the sentence R15 words must still read exactly
-    // once, word for word.
-    let wrapped = format!("{} {}", rows[first].trim(), rows[first + 1].trim());
+#[test]
+fn help_overlay_carries_the_elapsed_disclosure() {
+    let (screen, block) = elapsed_help_rows(100, 30);
+    assert_eq!(block, ELAPSED_HELP, "{screen}");
+}
+
+#[test]
+fn help_overlay_words_the_disclosure_and_the_order_rule_verbatim() {
+    // Wrapped over three rows, the sentences R15 and D1 word must each still
+    // read exactly once, word for word.
+    let wrapped = ELAPSED_HELP.join(" ");
     assert_eq!(
-        wrapped.matches(ELAPSED_DISCLOSURE).count(),
-        1,
-        "the disclosure is not in {wrapped:?}"
+        (
+            wrapped.matches(ELAPSED_DISCLOSURE).count(),
+            wrapped.matches(ELAPSED_ORDER).count()
+        ),
+        (1, 1),
+        "{wrapped:?}"
     );
+}
+
+// R15 makes the help line part of the minimum discoverability of `Elapsed*`,
+// so it must be on screen at the default terminal size, not only on a tall one.
+#[test]
+fn help_overlay_shows_the_elapsed_disclosure_at_80x24() {
+    let (screen, block) = elapsed_help_rows(80, 24);
+    assert_eq!(block, ELAPSED_HELP, "{screen}");
+}
+
+#[test]
+fn help_overlay_keeps_every_shortcut_and_the_dismiss_hint_at_80x24() {
+    let mut h = Harness::sized(FakeBackend::new(), 80, 24);
+    h.key('?');
+    let screen = h.text();
+    let missing: Vec<&str> = [
+        "KEYBOARD SHORTCUTS",
+        "NAVIGATION",
+        "Inspector",
+        "Undo delete",
+        "/quit",
+        "Press any key to dismiss",
+        "Lists: o sort",
+    ]
+    .into_iter()
+    .filter(|needle| !screen.contains(needle))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "missing {missing:?} at 80x24:\n{screen}"
+    );
+}
+
+#[test]
+fn help_overlay_shows_the_elapsed_disclosure_at_120x40() {
+    let (screen, block) = elapsed_help_rows(120, 40);
+    assert_eq!(block, ELAPSED_HELP, "{screen}");
 }
 
 // ── The Elapsed sort (R14/R15) ─────────────────────────────────────────────
@@ -281,4 +336,96 @@ fn elapsed_sort_orders_goals_by_the_displayed_span() {
     h.advance(2);
     h.key('O');
     assert_eq!(sorted_goal_ids(&h), ["gol_done", "gol_live"], "ascending");
+}
+
+// ── Unknown values sort last in either direction (D2) ──────────────────────
+//
+// The never-started (or unreadable) row sits in the middle of the source
+// order, so neither "unknown first" nor "reverse the ascending list" can pass
+// by accident.
+
+/// Started oldest → newest is `tsk_old`, `tsk_new`; `tsk_never` has no run.
+fn tasks_with_a_never_started_one() -> Harness {
+    let mut h = Harness::sized(
+        FakeBackend::new()
+            .with_tasks(vec![
+                make_task("tsk_old", "Old", TaskStatus::InProgress),
+                make_task("tsk_never", "Never", TaskStatus::Todo),
+                make_task("tsk_new", "New", TaskStatus::InProgress),
+            ])
+            .with_runs(vec![
+                run("tsk_old", BASE - 9_000),
+                run("tsk_new", BASE - 1_000),
+            ]),
+        120,
+        40,
+    );
+    h.app.state.view = ViewId::Tasks;
+    h.draw();
+    assert_eq!(h.app.state.task_started_ms(1), None, "tsk_never never ran");
+    h
+}
+
+fn sort_tasks(h: &mut Harness, field: orch_tui::state::TaskSortField, descending: bool) {
+    h.app.state.task_sort = orch_tui::state::TaskSort { field, descending };
+}
+
+fn sort_goals(h: &mut Harness, field: orch_tui::state::GoalSortField, descending: bool) {
+    h.app.state.goal_sort = orch_tui::state::GoalSort { field, descending };
+}
+
+#[test]
+fn never_started_task_sorts_last_by_started_in_both_directions() {
+    use orch_tui::state::TaskSortField::Started;
+    let mut h = tasks_with_a_never_started_one();
+    sort_tasks(&mut h, Started, false);
+    assert_eq!(sorted_task_ids(&h), ["tsk_old", "tsk_new", "tsk_never"]);
+    sort_tasks(&mut h, Started, true);
+    assert_eq!(sorted_task_ids(&h), ["tsk_new", "tsk_old", "tsk_never"]);
+}
+
+#[test]
+fn never_started_task_sorts_last_by_elapsed_in_both_directions() {
+    use orch_tui::state::TaskSortField::Elapsed;
+    let mut h = tasks_with_a_never_started_one();
+    sort_tasks(&mut h, Elapsed, false);
+    assert_eq!(sorted_task_ids(&h), ["tsk_new", "tsk_old", "tsk_never"]);
+    sort_tasks(&mut h, Elapsed, true);
+    assert_eq!(sorted_task_ids(&h), ["tsk_old", "tsk_new", "tsk_never"]);
+}
+
+/// Goals start at creation; `gol_bad`'s creation time does not parse, so its
+/// Started and Elapsed are unknown.
+fn goals_with_an_unknown_start() -> Harness {
+    let mut old = make_goal("gol_old", "Old", GoalStatus::Active);
+    old.created_at = iso(BASE - 9_000);
+    let mut bad = make_goal("gol_bad", "Bad", GoalStatus::Active);
+    bad.created_at = "not a timestamp".into();
+    let mut new = make_goal("gol_new", "New", GoalStatus::Active);
+    new.created_at = iso(BASE - 1_000);
+    let mut h = Harness::sized(FakeBackend::new().with_goals(vec![old, bad, new]), 120, 40);
+    h.app.state.view = ViewId::Goals;
+    h.draw();
+    assert_eq!(h.app.state.goal_started_ms(1), None, "gol_bad is unknown");
+    h
+}
+
+#[test]
+fn unknown_goal_start_sorts_last_by_started_in_both_directions() {
+    use orch_tui::state::GoalSortField::Started;
+    let mut h = goals_with_an_unknown_start();
+    sort_goals(&mut h, Started, false);
+    assert_eq!(sorted_goal_ids(&h), ["gol_old", "gol_new", "gol_bad"]);
+    sort_goals(&mut h, Started, true);
+    assert_eq!(sorted_goal_ids(&h), ["gol_new", "gol_old", "gol_bad"]);
+}
+
+#[test]
+fn unknown_goal_start_sorts_last_by_elapsed_in_both_directions() {
+    use orch_tui::state::GoalSortField::Elapsed;
+    let mut h = goals_with_an_unknown_start();
+    sort_goals(&mut h, Elapsed, false);
+    assert_eq!(sorted_goal_ids(&h), ["gol_new", "gol_old", "gol_bad"]);
+    sort_goals(&mut h, Elapsed, true);
+    assert_eq!(sorted_goal_ids(&h), ["gol_old", "gol_new", "gol_bad"]);
 }
