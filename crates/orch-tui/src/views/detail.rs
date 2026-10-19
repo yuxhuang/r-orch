@@ -9,10 +9,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::backend::CopyOutcome;
 use crate::format::{format_duration, parse_timestamp_ms};
 use crate::hit::{FooterAction, PaneMetrics, VerbId, ZoneId, ZoneKind};
+use crate::messages::Message;
 use crate::state::{
     AgentSection, AppState, CopyOrigin, EntityType, Focus, GoalSection, LogSection, TaskSection,
 };
 use crate::theme::{EM_DASH, Token};
+use crate::views::activity::{RowGroups, row_spans};
 use crate::views::{RenderCtx, fit_cells, put_line};
 use crate::widgets::text_viewer::ViewerSource;
 
@@ -181,10 +183,9 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     };
                     proof.files_changed.clone()
                 }
-                TaskSection::Activity => state
-                    .messages
-                    .iter()
-                    .filter(|m| m.task_id.as_deref() == Some(&task.id))
+                TaskSection::Activity => activity_messages(state, focus)
+                    .unwrap_or_default()
+                    .into_iter()
                     .map(|m| m.text.clone())
                     .collect(),
             }
@@ -294,6 +295,25 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
     }
 }
 
+/// The messages an Activity section lists, in display order, or `None` for a
+/// section that is not an Activity section. Membership is structural (the
+/// message's own task id), never a text match.
+pub(crate) fn activity_messages(state: &AppState, focus: Focus) -> Option<Vec<&Message>> {
+    match focus {
+        Focus::TaskDetail(TaskSection::Activity) => {
+            let task = state.selected_task();
+            Some(
+                state
+                    .messages
+                    .iter()
+                    .filter(|m| task.is_some_and(|t| m.task_id.as_deref() == Some(t.id.as_str())))
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
 fn field_lines(text: &str, empty: &str) -> Vec<String> {
     if text.is_empty() {
         vec![empty.into()]
@@ -344,17 +364,11 @@ pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<View
                     .collect()
             })
             .unwrap_or_default(),
-        Focus::TaskDetail(TaskSection::Activity) => state
-            .selected_task()
-            .map(|t| {
-                state
-                    .messages
-                    .iter()
-                    .filter(|m| m.task_id.as_deref() == Some(&t.id))
-                    .map(|m| Some(ViewerSource::Message(m.id)))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        Focus::TaskDetail(TaskSection::Activity) => activity_messages(state, focus)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| Some(ViewerSource::Message(m.id)))
+            .collect(),
         _ => {
             let source = match focus {
                 Focus::GoalDetail(section) => state.selected_goal().map(|g| {
@@ -660,8 +674,14 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             }
         }
     }
+    let activity = activity_messages(state, focus);
     if rows.is_empty() {
-        rows.push(("No entries.".into(), None, 0));
+        let empty = if activity.is_some() {
+            "No activity."
+        } else {
+            "No entries."
+        };
+        rows.push((empty.into(), None, 0));
     }
     let scroll = if focus == Focus::TaskDetail(TaskSection::Activity) {
         state.task_activity_scroll(&key, body.height as usize)
@@ -685,6 +705,8 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         ZoneKind::Pane(focus),
         ZoneId::Pane(state.pane_key(focus)),
     );
+    // Activity rows group by agent from the top of the window, as the feed does.
+    let mut groups = RowGroups::default();
     for (screen_row, (text, source, byte)) in rows
         .iter()
         .skip(offset)
@@ -693,27 +715,35 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     {
         let row = Rect::new(body.x, body.y + screen_row as u16, body.width, 1);
         let selected = is_list && scroll.selected == Some(offset + screen_row);
-        let visible = if selected {
-            format!(
-                "> {}",
-                fit_cells(text, body.width.saturating_sub(2) as usize)
-            )
+        if let Some(message) = activity
+            .as_ref()
+            .and_then(|messages| messages.get(offset + screen_row))
+        {
+            let spans = row_spans(ctx, message, groups.next(message), selected, body.width);
+            put_line(frame, row, row.y, spans);
         } else {
-            fit_cells(text, body.width as usize)
-        };
-        put_line(
-            frame,
-            row,
-            row.y,
-            vec![Span::styled(
-                visible,
-                ctx.style(if selected {
-                    Token::Amber
-                } else {
-                    Token::Silver
-                }),
-            )],
-        );
+            let visible = if selected {
+                format!(
+                    "> {}",
+                    fit_cells(text, body.width.saturating_sub(2) as usize)
+                )
+            } else {
+                fit_cells(text, body.width as usize)
+            };
+            put_line(
+                frame,
+                row,
+                row.y,
+                vec![Span::styled(
+                    visible,
+                    ctx.style(if selected {
+                        Token::Amber
+                    } else {
+                        Token::Silver
+                    }),
+                )],
+            );
+        }
         if let Some(source) = source {
             ctx.zone(
                 row,

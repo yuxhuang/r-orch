@@ -1698,3 +1698,124 @@ fn detail_rail_order_is_stable_across_focus() {
         );
     }
 }
+
+/// Messages for `tsk_1`: two from alpha, an error from beta, one system row.
+fn activity_backend_and_messages() -> (FakeBackend, Vec<orch_tui::messages::Message>) {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let backend = FakeBackend::new()
+        .with_tasks(vec![make_task("tsk_1", "Ship it", TaskStatus::InProgress)])
+        .with_agents(vec![
+            make_agent("alpha", "alpha", AgentStatus::Running),
+            make_agent("beta", "beta", AgentStatus::Idle),
+        ]);
+    let task = |m: Message| m.with_task(Some("tsk_1".into()));
+    let messages = vec![
+        task(Message::new(
+            1,
+            880_000,
+            "plan ok",
+            Token::White,
+            MsgType::Output,
+        ))
+        .with_agent(Some("alpha".into())),
+        task(Message::new(
+            2,
+            900_000,
+            "edit main",
+            Token::Cyan,
+            MsgType::Tool,
+        ))
+        .with_agent(Some("alpha".into())),
+        task(Message::new(3, 940_000, "boom", Token::Red, MsgType::Error))
+            .with_agent(Some("beta".into())),
+        task(Message::new(
+            4,
+            1_000_000,
+            "settled",
+            Token::Green,
+            MsgType::Lifecycle,
+        )),
+    ];
+    (backend, messages)
+}
+
+/// The screen cells of the row whose zone matches `pick`, left to right.
+fn row_cells(
+    harness: &mut Harness,
+    pick: impl Fn(&orch_tui::hit::Zone) -> bool,
+) -> Vec<(String, ratatui::style::Style)> {
+    harness.draw();
+    let rect = harness
+        .hits()
+        .zones()
+        .iter()
+        .find(|zone| pick(zone))
+        .map(|zone| zone.rect)
+        .expect("row zone");
+    let buffer = harness.terminal.backend().buffer();
+    (rect.x..rect.right())
+        .map(|x| {
+            let cell = &buffer[(x, rect.y)];
+            (cell.symbol().to_owned(), cell.style())
+        })
+        .collect()
+}
+
+/// R1: the task detail's Activity rows have the bottom feed's columns and
+/// styling: marker, relative time, agent badge, icon, capped text, error and
+/// group backgrounds.
+#[test]
+fn task_detail_activity_rows_match_feed() {
+    use orch_tui::hit::{ZoneId, ZoneKind};
+    use orch_tui::widgets::text_viewer::ViewerSource;
+    let (backend, messages) = activity_backend_and_messages();
+    let mut harness = Harness::sized(backend, 120, 40);
+    harness.app.state.view = ViewId::Tasks;
+    harness.app.state.messages = messages;
+    harness.draw();
+
+    let feed: Vec<_> = (1..=4)
+        .map(|id| {
+            row_cells(&mut harness, |zone| {
+                zone.kind == ZoneKind::ActivityRow { message_id: id }
+            })
+        })
+        .collect();
+
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::TaskDetail(TaskSection::Activity));
+    let detail: Vec<_> = (1..=4)
+        .map(|id| {
+            row_cells(&mut harness, |zone| {
+                zone.id == ZoneId::ExpandText(ViewerSource::Message(id))
+                    && zone.kind == ZoneKind::ExpandText
+            })
+        })
+        .collect();
+
+    for (id, (feed, detail)) in feed.iter().zip(&detail).enumerate() {
+        // Time, badge, icon and the (short, uncapped) text: 17 + 10 cells.
+        let width = 27;
+        let feed_row: String = feed.iter().map(|(s, _)| s.as_str()).collect();
+        let detail_row: String = detail.iter().map(|(s, _)| s.as_str()).collect();
+        // The first cell is the accent bar, or `>` on the selected row.
+        let from = usize::from(feed[0].0 == ">" || detail[0].0 == ">");
+        assert_eq!(
+            feed[from..width],
+            detail[from..width],
+            "message {}: feed {feed_row:?} detail {detail_row:?}",
+            id + 1
+        );
+    }
+    let first: String = detail[0].iter().map(|(s, _)| s.as_str()).collect();
+    assert!(first.contains("2m") && first.contains("alpha"), "{first:?}");
+    let second: String = detail[1].iter().map(|(s, _)| s.as_str()).collect();
+    assert!(
+        !second.contains("alpha"),
+        "a group shows its badge once: {second:?}"
+    );
+}

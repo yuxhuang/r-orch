@@ -10,7 +10,7 @@ use ratatui::text::Span;
 
 use crate::format::{cap_line, relative_time};
 use crate::hit::{PaneMetrics, VerbId, ZoneId, ZoneKind};
-use crate::messages::{MsgType, preset_label};
+use crate::messages::{Message, MsgType, preset_label};
 use crate::state::Focus;
 use crate::theme::{ACCENT_BAR, THIN_BAR, Token};
 use crate::views::{RenderCtx, put_line, section_label, spans_width};
@@ -138,84 +138,16 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     // Top padding keeps the feed bottom-aligned.
     let pad = height.saturating_sub(visible.len());
 
-    let text_w = (area.width as usize).saturating_sub(2 + 17).max(10);
-    let mut previous_agent: Option<String> = None;
-    let mut group_index = 0usize;
-
+    let mut groups = RowGroups::default();
     for (row, message_index) in visible.iter().enumerate() {
         let message = &state.messages[*message_index];
-        let new_group = message.agent_id != previous_agent;
-        if new_group {
-            group_index += 1;
-            previous_agent = message.agent_id.clone();
-        }
-        let agent_token = message
-            .agent_id
-            .as_deref()
-            .map(|id| state.agent_color(id))
-            .unwrap_or(Token::Dim);
-
-        let accent = match (&message.agent_id, new_group) {
-            (Some(_), true) => ACCENT_BAR,
-            (Some(_), false) => THIN_BAR,
-            (None, _) => " ",
-        };
-        let rel = if new_group {
-            relative_time(message.ts_ms, ctx.now_ms)
-        } else {
-            String::new()
-        };
-        let badge = match (&message.agent_id, new_group) {
-            (Some(id), true) => {
-                let name = state.agent_name(id);
-                format!("{:<9}", name.chars().take(8).collect::<String>())
-            }
-            _ => AGENT_INDENT.to_string(),
-        };
-
-        // Zebra striping: odd agent groups get the alternating background;
-        // error rows always get the error background and override the stripe.
-        let background = if message.msg_type == MsgType::Error {
-            Some(Token::ErrorBg)
-        } else if group_index % 2 == 1 {
-            Some(Token::AlternatingRowBg)
-        } else {
-            None
-        };
-        let text_token = message.msg_type.text_token().unwrap_or(message.color);
-        let text_style = match background {
-            Some(bg) => ctx.chip(text_token, bg),
-            None => ctx.style(text_token),
-        };
-
-        let spans = vec![
-            Span::styled(
-                if state.activity_selected == Some(message.id) {
-                    ">".into()
-                } else {
-                    accent.to_string()
-                },
-                ctx.style(if state.activity_selected == Some(message.id) {
-                    Token::Amber
-                } else {
-                    agent_token
-                }),
-            ),
-            Span::styled(
-                format!("{rel:>5}"),
-                ctx.style(if rel == "now" {
-                    Token::Green
-                } else {
-                    Token::Dim
-                }),
-            ),
-            Span::styled(badge, ctx.style(agent_token).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("{} ", message.msg_type.icon()),
-                ctx.style(agent_token),
-            ),
-            Span::styled(cap_line(&message.text, text_w), text_style),
-        ];
+        let spans = row_spans(
+            ctx,
+            message,
+            groups.next(message),
+            state.activity_selected == Some(message.id),
+            area.width,
+        );
         let y = rows_area.y + (pad + row) as u16;
         put_line(frame, rows_area, y, spans);
         ctx.row_zone(
@@ -232,4 +164,112 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             0,
         );
     }
+}
+
+/// Agent grouping across consecutive rows: a run of messages from one agent
+/// shows the time and badge once, and alternate runs get the stripe.
+#[derive(Debug, Default)]
+pub(crate) struct RowGroups {
+    previous_agent: Option<String>,
+    index: usize,
+}
+
+/// Where a row sits in its agent group, from [`RowGroups::next`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowGroup {
+    /// First row of its group: carries the time and the agent badge.
+    first: bool,
+    /// Odd groups are striped.
+    striped: bool,
+}
+
+impl RowGroups {
+    pub(crate) fn next(&mut self, message: &Message) -> RowGroup {
+        let first = message.agent_id != self.previous_agent;
+        if first {
+            self.index += 1;
+            self.previous_agent = message.agent_id.clone();
+        }
+        RowGroup {
+            first,
+            striped: self.index % 2 == 1,
+        }
+    }
+}
+
+/// One activity row, shared by the bottom feed and the detail Activity
+/// sections so they cannot drift: accent or selection marker, relative time,
+/// agent badge, type icon and the text capped to `width`, with error and
+/// group-stripe backgrounds. Callers own the row's zones and anchors.
+pub(crate) fn row_spans(
+    ctx: &RenderCtx,
+    message: &Message,
+    group: RowGroup,
+    selected: bool,
+    width: u16,
+) -> Vec<Span<'static>> {
+    let state = ctx.state;
+    let text_w = (width as usize).saturating_sub(2 + 17).max(10);
+    let agent_token = message
+        .agent_id
+        .as_deref()
+        .map(|id| state.agent_color(id))
+        .unwrap_or(Token::Dim);
+    let accent = match (&message.agent_id, group.first) {
+        (Some(_), true) => ACCENT_BAR,
+        (Some(_), false) => THIN_BAR,
+        (None, _) => " ",
+    };
+    let rel = if group.first {
+        relative_time(message.ts_ms, ctx.now_ms)
+    } else {
+        String::new()
+    };
+    let badge = match (&message.agent_id, group.first) {
+        (Some(id), true) => {
+            let name = state.agent_name(id);
+            format!("{:<9}", name.chars().take(8).collect::<String>())
+        }
+        _ => AGENT_INDENT.to_string(),
+    };
+
+    // Zebra striping: odd agent groups get the alternating background;
+    // error rows always get the error background and override the stripe.
+    let background = if message.msg_type == MsgType::Error {
+        Some(Token::ErrorBg)
+    } else if group.striped {
+        Some(Token::AlternatingRowBg)
+    } else {
+        None
+    };
+    let text_token = message.msg_type.text_token().unwrap_or(message.color);
+    let text_style = match background {
+        Some(bg) => ctx.chip(text_token, bg),
+        None => ctx.style(text_token),
+    };
+
+    vec![
+        Span::styled(
+            if selected {
+                ">".into()
+            } else {
+                accent.to_string()
+            },
+            ctx.style(if selected { Token::Amber } else { agent_token }),
+        ),
+        Span::styled(
+            format!("{rel:>5}"),
+            ctx.style(if rel == "now" {
+                Token::Green
+            } else {
+                Token::Dim
+            }),
+        ),
+        Span::styled(badge, ctx.style(agent_token).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ", message.msg_type.icon()),
+            ctx.style(agent_token),
+        ),
+        Span::styled(cap_line(&message.text, text_w), text_style),
+    ]
 }
