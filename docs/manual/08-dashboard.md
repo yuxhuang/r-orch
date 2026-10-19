@@ -10,6 +10,7 @@ The dashboard (`orch tui`) is the terminal screen where you watch agents work an
 - [Open and resize details](#open-and-resize-details)
 - [Sort the lists](#sort-the-lists)
 - [Sort and group agents](#sort-and-group-agents)
+- [Filter a list by keyword](#filter-a-list-by-keyword)
 - [Follow activity feeds](#follow-activity-feeds)
 - [Read long text in the viewer](#read-long-text-in-the-viewer)
 - [Create and edit with wizards](#create-and-edit-with-wizards)
@@ -170,6 +171,23 @@ In the Agents view you can sort and group the table for this session. The chips 
 By team shows each active team, then the unassigned agents. By node shows a Local section for this instance's agents, then one section per remote alias in alias order, each marked online or offline.
 
 Sorting applies within each section and keeps the selected agent, and so does switching the grouping. Both last only until you close the dashboard. Original is the default order (section, then status, then source).
+
+## Filter a list by keyword
+
+On the Goals, Tasks or Agents list, press `Ctrl+K` (or click `^K filter` in the footer) to filter it by a keyword. The list narrows as you type; the prompt shows how many rows match, such as `2/5`.
+
+| Key | What it does |
+|---|---|
+| `Ctrl+K` | Open the keyword prompt of this list, on its current keyword. |
+| Typing, `Backspace`, `Left`, `Right` | Edit the keyword. The list follows at once. |
+| `Up`, `Down` | Move the list's selection without leaving the prompt. |
+| `Enter` | Keep the keyword and close the prompt. |
+| `Esc` | Clear the keyword and close the prompt. |
+| `Ctrl+U` | On the list: clear the keyword. |
+
+Matching ignores case and looks at each field on its own: the ID, the title or name, the status (both `in_progress` and the `RUN` the row shows), the assignee's or agent's name and ID, a task's goal, and an agent's team, adapter, model and node (`local` or the remote alias). Descriptions and the Started and Elapsed times are not searched.
+
+A kept keyword shows as a `filter: … · matches/total` chip on the list's title rule; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so `show all` never hides a match, empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard. `/` still opens the command bar.
 
 ## Follow activity feeds
 
@@ -433,6 +451,8 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | `Z` | Undo the last pending deletion. |
 | `f`, `F` | Cycle the Activity filter (not in Actions). |
 | `/` | Open the command bar (no detail open). |
+| `Ctrl+K` | Filter the Goals, Tasks or Agents list by keyword (main list focus). |
+| `Ctrl+U` | Clear that list's keyword (main list focus). |
 | `?` | Open help. |
 | `q` | Quit. |
 | `Ctrl+Y` | Copy the focused text. |

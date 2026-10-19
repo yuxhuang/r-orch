@@ -8,7 +8,7 @@ use ratatui::text::Span;
 
 use crate::format::{cap_display, cap_line, format_duration, parse_timestamp_ms};
 use crate::hit::{PseudoRow, ScrollRegion, VerbId, ZoneId, ZoneKind};
-use crate::state::{AgentRow, AgentSortField, AppState, EntityType, SortColumn};
+use crate::state::{AgentRow, AgentSortField, AppState, EntityType, SortColumn, agent_status_word};
 use crate::text::text_display_width;
 use crate::theme::{
     CHECK, CIRCLE, CIRCLE_FILLED, CROSS, CURSOR, DIAMOND_OUTLINE, EM_DASH, LOOP, LOZENGE, STAR,
@@ -26,26 +26,31 @@ const ROW_ERROR_CAP: usize = 30;
 fn status_chip(status: AgentStatus, tick: u64) -> (String, Token, Token, bool) {
     match status {
         AgentStatus::Running => (
-            format!("{} ACTIVE", spinner_frame(tick)),
+            format!("{} {}", spinner_frame(tick), agent_status_word(status)),
             Token::Green,
             Token::SuccessBg,
             true,
         ),
         AgentStatus::Idle => (
-            format!("{CIRCLE} IDLE"),
+            format!("{CIRCLE} {}", agent_status_word(status)),
             Token::Dim,
             Token::NeutralBg,
             false,
         ),
-        AgentStatus::Error => (format!("{CROSS} ERROR"), Token::Red, Token::ErrorBg, true),
+        AgentStatus::Error => (
+            format!("{CROSS} {}", agent_status_word(status)),
+            Token::Red,
+            Token::ErrorBg,
+            true,
+        ),
         AgentStatus::Offline => (
-            format!("{CIRCLE} OFFLINE"),
+            format!("{CIRCLE} {}", agent_status_word(status)),
             Token::Ghost,
             Token::NeutralBg,
             false,
         ),
         AgentStatus::Disabled => (
-            format!("{CIRCLE} OFF"),
+            format!("{CIRCLE} {}", agent_status_word(status)),
             Token::Ghost,
             Token::NeutralBg,
             false,
@@ -93,6 +98,13 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         ZoneId::ScrollRegion(ScrollRegion::MainList),
     );
 
+    let drawn = rows.len().saturating_sub(state.agent_scroll);
+    super::render_no_match_at(
+        frame,
+        area,
+        area.y.saturating_add(drawn.min(u16::MAX as usize) as u16),
+        ctx,
+    );
     for (y, row) in (area.y..).zip(rows.iter().skip(state.agent_scroll)) {
         if y >= area.bottom() {
             return;

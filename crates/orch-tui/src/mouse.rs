@@ -382,6 +382,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     )
                 )
             }
+            // Modal like the command bar: only the prompt's own verbs (and
+            // the chip, which clears the same keyword) answer a click.
+            InputMode::Keyword => matches!(
+                kind,
+                ZoneKind::Verb(VerbId::KeywordKeep | VerbId::KeywordClear)
+            ),
             InputMode::Wizard => {
                 matches!(
                     kind,
@@ -679,6 +685,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             // to clear the bar while leaving a broadcast armed behind it, so
             // the UI said cancelled and the next Enter sent (gate S2).
             VerbId::CommandCancel => self.leave_command_mode(),
+            VerbId::KeywordKeep => self.close_keyword_prompt(),
+            VerbId::KeywordClear => self.clear_keyword(),
             VerbId::DetailGrow => self.state.grow_detail(),
             VerbId::DetailShrink => self.state.grow_list(),
             VerbId::DetailMax => self.toggle_detail_maximized(),
@@ -723,6 +731,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
         match action {
             FooterAction::CommandMode => self.enter_command_mode(),
+            FooterAction::Filter => self.open_keyword_prompt(),
             FooterAction::New => self.open_new_wizard_for_view(),
             FooterAction::Run => {
                 if let Some(task) = self.state.selected_task().cloned() {
@@ -1053,6 +1062,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
         match self.state.input_mode {
             InputMode::Command => region == ScrollRegion::CommandSuggestions,
+            // The list being filtered can be scrolled while typing.
+            InputMode::Keyword => region == ScrollRegion::MainList,
             InputMode::Wizard => matches!(
                 region,
                 ScrollRegion::WizardOptions | ScrollRegion::WizardTextarea

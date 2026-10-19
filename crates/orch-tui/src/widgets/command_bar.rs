@@ -27,7 +27,7 @@ const HINT_CHIP: &str = "  Esc ✕";
 /// The rows for the current input. `/msg` needs the agent list, so the widget
 /// cannot use the `&'static` shim.
 fn suggestions_for(ctx: &RenderCtx, value: &str) -> Vec<Suggestion> {
-    let order = ctx.state.sorted_agents();
+    let order = ctx.state.sorted_agents_unfiltered();
     resolve_suggestions_in(
         value,
         &SuggestionCtx {
@@ -38,11 +38,76 @@ fn suggestions_for(ctx: &RenderCtx, value: &str) -> Vec<Suggestion> {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    if ctx.state.input_mode == InputMode::Command {
-        render_input(frame, area, ctx);
-    } else {
-        render_navigate(frame, area, ctx);
+    match ctx.state.input_mode {
+        InputMode::Command => render_input(frame, area, ctx),
+        InputMode::Keyword => render_keyword_input(frame, area, ctx),
+        _ => render_navigate(frame, area, ctx),
     }
+}
+
+const HINT_KEYWORD: &str = "  Enter keep  Esc clear";
+
+/// The keyword prompt (Ctrl+K): `Filter tasks › ship█  2/5  Enter keep  Esc
+/// clear`. The list above narrows as it is typed; the count says by how
+/// much, including to `0/5`. Drawn with the command bar's own window, so a
+/// long keyword scrolls around the cursor instead of pushing it off screen.
+fn render_keyword_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    let view = ctx.state.view;
+    let Some(input) = ctx.state.keyword_input(view) else {
+        return;
+    };
+    let label = format!("Filter {} › ", view.item_label());
+    let (matches, total) = ctx.state.keyword_counts(view);
+    let count = format!("  {matches}/{total}");
+    let mut hint = HINT_KEYWORD;
+    let fixed =
+        |hint: &str| label.chars().count() + 1 + count.chars().count() + hint.chars().count();
+    // The hint goes before the value's window does; the clickable `Esc
+    // clear` then goes with it, but the key still works.
+    if (area.width as usize).saturating_sub(fixed(hint)) < MIN_VALUE_COLUMNS {
+        hint = "";
+    }
+    let value_cols = (area.width as usize).saturating_sub(fixed(hint)).max(4);
+    let window = value_window(input.cursor(), value_cols);
+    let at_end = input.cursor().pos() == input.cursor().len();
+
+    let mut spans = vec![Span::styled(label, ctx.style(Token::Amber))];
+    if window.clipped_left {
+        spans.push(Span::styled("…".to_string(), ctx.style(Token::Ghost)));
+    }
+    spans.extend(value_spans(&window.before, ctx));
+    spans.push(Span::styled(BLOCK, ctx.style(Token::Amber)));
+    if !at_end {
+        spans.extend(value_spans(&window.after, ctx));
+    }
+    spans.push(Span::styled(
+        count,
+        ctx.style(if matches == 0 {
+            Token::Red
+        } else {
+            Token::Ghost
+        }),
+    ));
+    let hint_at = spans.len();
+    spans.push(Span::styled(hint.to_string(), ctx.style(Token::Gray)));
+
+    let hint_x = area.x + spans_width(&spans[..hint_at]);
+    for (needle, verb) in [
+        ("Enter keep", VerbId::KeywordKeep),
+        ("Esc clear", VerbId::KeywordClear),
+    ] {
+        if let Some(byte_offset) = hint.find(needle) {
+            let offset = hint[..byte_offset].chars().count() as u16;
+            let width = unicode_width::UnicodeWidthStr::width(needle) as u16;
+            ctx.zone(
+                Rect::new(hint_x + offset, area.y, width, 1),
+                area,
+                ZoneKind::Verb(verb),
+                ZoneId::Verb(verb),
+            );
+        }
+    }
+    put_line(frame, area, area.y, spans);
 }
 
 /// Columns the editable value keeps even on a narrow terminal. Below this the
@@ -427,6 +492,15 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         Token::Gray,
         Some(FooterAction::CommandMode),
     );
+    if matches!(view, ViewId::Goals | ViewId::Tasks | ViewId::Agents) {
+        hint(
+            &mut spans,
+            "^K",
+            "filter",
+            Token::Gray,
+            Some(FooterAction::Filter),
+        );
+    }
     if can_new {
         hint(&mut spans, "N", "new", Token::Gray, Some(FooterAction::New));
     }
@@ -594,15 +668,16 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         Some(FooterAction::Help),
     );
 
-    let count = match view {
-        ViewId::Goals => state.goals.len(),
-        ViewId::Tasks => state.tasks.len(),
-        ViewId::Agents => state.agents.len(),
-        ViewId::Logs => state.messages.len(),
-    };
+    // A filtered list counts its matches against the whole: `2/5 tasks`.
+    let (matches, count) = state.keyword_counts(view);
     if count > 0 {
+        let shown = if state.keyword(view).is_empty() {
+            count.to_string()
+        } else {
+            format!("{matches}/{count}")
+        };
         spans.push(Span::styled(
-            format!("{count} {}", view.item_label()),
+            format!("{shown} {}", view.item_label()),
             ctx.style(Token::Ghost),
         ));
     }

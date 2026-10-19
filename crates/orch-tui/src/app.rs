@@ -252,6 +252,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if self.state.input_mode == InputMode::Command {
             self.state.command_bar.input.poll(now);
         }
+        if self.state.input_mode == InputMode::Keyword {
+            let view = self.state.view;
+            if let Some(input) = self.state.keyword_input_mut(view) {
+                input.poll(now);
+            }
+        }
     }
 
     /// The 150 ms debounce.

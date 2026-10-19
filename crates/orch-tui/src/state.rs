@@ -5,8 +5,8 @@
 
 use indexmap::IndexSet;
 use orch_domain::{
-    Agent, AgentStatus, Goal, NotificationPreferences, OrchestratorState, RemoteRunRef, Task,
-    TaskStatus, Team, TeamStatus, default_state, goal_status_order,
+    Agent, AgentStatus, Goal, GoalStatus, NotificationPreferences, OrchestratorState, RemoteRunRef,
+    Task, TaskStatus, Team, TeamStatus, default_state, goal_status_order,
 };
 
 use crate::backend::{
@@ -250,7 +250,14 @@ pub enum InputMode {
     None,
     Command,
     Wizard,
+    /// The keyword prompt (Ctrl+K) of the visible entity list. Every key
+    /// edits that list's keyword, which filters the list as it is typed.
+    Keyword,
 }
+
+/// The most a list keyword may hold, in Unicode scalar values (D1). Typed
+/// keys past it are ignored and a paste is cut to fit.
+pub const KEYWORD_MAX_CHARS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityType {
@@ -498,6 +505,10 @@ pub enum TaskRow {
         title: String,
         total: usize,
         done: usize,
+        /// How many of the goal's tasks the Tasks keyword matched, while
+        /// one is set; `None` when the list is unfiltered. `total` and
+        /// `done` stay the goal's progress either way.
+        matched: Option<usize>,
     },
     UngroupedSection {
         total: usize,
@@ -793,6 +804,59 @@ pub struct ListSelection {
     agent: (ListPick, usize),
 }
 
+/// Does `field` contain `needle`, case-insensitively? `needle` is already
+/// lowercased; `to_lowercase` is Unicode-aware, so `É` finds `é`.
+fn contains_folded(needle: &str, field: &str) -> bool {
+    field.to_lowercase().contains(needle)
+}
+
+/// A typed or pasted keyword fragment made safe to insert: every control
+/// character (newline, tab, `ESC`, `DEL`, C1) is dropped — none can be
+/// typed into a single-line filter on purpose, and an `ESC` must never reach
+/// the screen — and the rest is cut to the `room` scalar values left under
+/// [`KEYWORD_MAX_CHARS`].
+pub fn sanitize_keyword(text: &str, room: usize) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control())
+        .take(room)
+        .collect()
+}
+
+/// The word a task's status chip shows, which a keyword can match as well
+/// as the stored status (`RUN` as well as `in_progress`).
+pub fn task_status_word(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::InProgress => "RUN",
+        TaskStatus::Retrying => "RETRY",
+        TaskStatus::Review => "REVIEW",
+        TaskStatus::Todo => "TODO",
+        TaskStatus::Done => "DONE",
+        TaskStatus::Failed => "FAIL",
+        TaskStatus::Cancelled => "OFF",
+    }
+}
+
+/// The word a goal's status chip shows.
+pub fn goal_status_word(status: GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Active => "ACTIVE",
+        GoalStatus::Paused => "PAUSED",
+        GoalStatus::Achieved => "DONE",
+        GoalStatus::Abandoned => "DROP",
+    }
+}
+
+/// The word an agent's status chip shows.
+pub fn agent_status_word(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Running => "ACTIVE",
+        AgentStatus::Idle => "IDLE",
+        AgentStatus::Error => "ERROR",
+        AgentStatus::Offline => "OFFLINE",
+        AgentStatus::Disabled => "OFF",
+    }
+}
+
 /// A task that ended: its Elapsed stops at its last update.
 pub fn is_terminal_task(status: TaskStatus) -> bool {
     matches!(
@@ -965,6 +1029,12 @@ pub struct AppState {
     pub agent_group_by: AgentGroupBy,
     pub goal_sort: GoalSort,
     pub task_sort: TaskSort,
+    /// Each entity list's keyword filter (D1, R3), edited in place by the
+    /// Ctrl+K prompt. Session-only; empty matches everything. Read it with
+    /// [`AppState::keyword`].
+    pub goal_keyword: TextInput,
+    pub task_keyword: TextInput,
+    pub agent_keyword: TextInput,
     /// Started/Elapsed for goals and tasks, derived by the backend at the
     /// last refresh. Never persisted.
     pub timings: TimingSnapshot,
@@ -1097,6 +1167,9 @@ impl Default for AppState {
             goal_sort: GoalSort::default(),
             task_sort: TaskSort::default(),
             timings: TimingSnapshot::default(),
+            goal_keyword: TextInput::new(""),
+            task_keyword: TextInput::new(""),
+            agent_keyword: TextInput::new(""),
             timing_error: None,
             sort_clock_ms: 0,
             entity_actions_deferred: false,
@@ -1263,6 +1336,7 @@ impl AppState {
             || self.show_agent_picker
             || self.show_type_picker
             || self.input_mode == InputMode::Command
+            || self.input_mode == InputMode::Keyword
             || self.wizard_sessions.pending_leave.is_some()
         {
             return None;
@@ -1854,10 +1928,24 @@ impl AppState {
     /// equal keys keep source order in both directions and unknown values
     /// sort last. Elapsed is compared at [`AppState::sort_clock_ms`], never
     /// at the frame clock, so a tick cannot move a row.
+    ///
+    /// Only goals matching the Goals keyword are listed: the filter runs
+    /// before the sort, so every later stage sees matches only (D1).
     pub fn sorted_goals(&self) -> Vec<usize> {
+        self.order_goals(self.keyword_candidates(ViewId::Goals))
+    }
+
+    /// [`AppState::sorted_goals`] ignoring the keyword, for surfaces that
+    /// are not the list (`/goals list`).
+    pub fn sorted_goals_unfiltered(&self) -> Vec<usize> {
+        self.order_goals((0..self.goals.len()).collect())
+    }
+
+    fn order_goals(&self, candidates: Vec<usize>) -> Vec<usize> {
         let at = self.sort_clock_ms;
-        let keys: Vec<SortKey> = (0..self.goals.len())
-            .map(|i| {
+        let keys: Vec<SortKey> = candidates
+            .iter()
+            .map(|&i| {
                 let goal = &self.goals[i];
                 match self.goal_sort.field {
                     GoalSortField::Status => {
@@ -1885,16 +1973,34 @@ impl AppState {
             })
             .collect();
         order_by_keys(&keys, self.goal_sort.descending)
+            .into_iter()
+            .map(|position| candidates[position])
+            .collect()
     }
 
     /// By the session [`TaskSort`] (status ascending by default, stable as
     /// [`AppState::sorted_goals`] is), then re-grouped by goal when
     /// `groupByGoal` is on: groups in first-appearance order of the sorted
     /// list, the sort preserved inside each group, ungrouped tasks last.
+    ///
+    /// Only tasks matching the Tasks keyword are listed, filtered before the
+    /// sort, the grouping and the ten-row cap, so a match is never lost
+    /// behind the cap and empty goal groups disappear (D1).
     pub fn sorted_tasks(&self) -> Vec<usize> {
+        self.order_tasks(self.keyword_candidates(ViewId::Tasks))
+    }
+
+    /// [`AppState::sorted_tasks`] ignoring the keyword, for surfaces that
+    /// are not the list (`/tasks list`).
+    pub fn sorted_tasks_unfiltered(&self) -> Vec<usize> {
+        self.order_tasks((0..self.tasks.len()).collect())
+    }
+
+    fn order_tasks(&self, candidates: Vec<usize>) -> Vec<usize> {
         let at = self.sort_clock_ms;
-        let keys: Vec<SortKey> = (0..self.tasks.len())
-            .map(|i| {
+        let keys: Vec<SortKey> = candidates
+            .iter()
+            .map(|&i| {
                 let task = &self.tasks[i];
                 match self.task_sort.field {
                     TaskSortField::Status => {
@@ -1915,7 +2021,10 @@ impl AppState {
                 }
             })
             .collect();
-        let order = order_by_keys(&keys, self.task_sort.descending);
+        let order: Vec<usize> = order_by_keys(&keys, self.task_sort.descending)
+            .into_iter()
+            .map(|position| candidates[position])
+            .collect();
         if !self.group_by_goal {
             return order;
         }
@@ -1942,6 +2051,144 @@ impl AppState {
             }
         }
         grouped
+    }
+
+    // ── Keyword filter (D1, R3–R5) ─────────────────────────────────────────
+
+    /// The keyword input of an entity list; `None` for the Logs view, which
+    /// has filters of its own.
+    pub fn keyword_input(&self, view: ViewId) -> Option<&TextInput> {
+        match view {
+            ViewId::Goals => Some(&self.goal_keyword),
+            ViewId::Tasks => Some(&self.task_keyword),
+            ViewId::Agents => Some(&self.agent_keyword),
+            ViewId::Logs => None,
+        }
+    }
+
+    pub fn keyword_input_mut(&mut self, view: ViewId) -> Option<&mut TextInput> {
+        match view {
+            ViewId::Goals => Some(&mut self.goal_keyword),
+            ViewId::Tasks => Some(&mut self.task_keyword),
+            ViewId::Agents => Some(&mut self.agent_keyword),
+            ViewId::Logs => None,
+        }
+    }
+
+    /// The list's keyword, or `""` when it is unfiltered (or not a list).
+    pub fn keyword(&self, view: ViewId) -> &str {
+        self.keyword_input(view).map_or("", TextInput::value)
+    }
+
+    /// The entity count of `view` before and after its keyword:
+    /// `(matches, total)`.
+    pub fn keyword_counts(&self, view: ViewId) -> (usize, usize) {
+        match view {
+            ViewId::Goals => (self.sorted_goals().len(), self.goals.len()),
+            ViewId::Tasks => (self.sorted_tasks().len(), self.tasks.len()),
+            ViewId::Agents => (self.sorted_agents().len(), self.agents.len()),
+            ViewId::Logs => (self.messages.len(), self.messages.len()),
+        }
+    }
+
+    /// The source indices of `view`'s entities that match its keyword, in
+    /// source order: the first stage of each list pipeline, before sort,
+    /// grouping and the show-all cap.
+    fn keyword_candidates(&self, view: ViewId) -> Vec<usize> {
+        let len = match view {
+            ViewId::Goals => self.goals.len(),
+            ViewId::Tasks => self.tasks.len(),
+            ViewId::Agents => self.agents.len(),
+            ViewId::Logs => 0,
+        };
+        let keyword = self.keyword(view);
+        if keyword.is_empty() {
+            return (0..len).collect();
+        }
+        // Lowercased once per derivation, never inside a comparison.
+        let needle = keyword.to_lowercase();
+        (0..len)
+            .filter(|i| self.matches_needle(view, *i, &needle))
+            .collect()
+    }
+
+    /// Does the entity at source index `index` of `view` match that list's
+    /// keyword? Everything matches an empty keyword.
+    fn keyword_matches(&self, view: ViewId, index: usize) -> bool {
+        let keyword = self.keyword(view);
+        keyword.is_empty() || self.matches_needle(view, index, &keyword.to_lowercase())
+    }
+
+    fn matches_needle(&self, view: ViewId, index: usize, needle: &str) -> bool {
+        match view {
+            ViewId::Goals => self.goal_matches(index, needle),
+            ViewId::Tasks => self.task_matches(index, needle),
+            ViewId::Agents => self.agent_matches(index, needle),
+            ViewId::Logs => true,
+        }
+    }
+
+    /// Does any of the goal's listed fields contain `needle` (already
+    /// lowercased)? Each field is matched whole and on its own, never the
+    /// truncated cell and never a join of two fields: id, title, status
+    /// (stored and shown), assignee id and name. Not the description, which
+    /// the row does not show, and not the live Started/Elapsed text.
+    fn goal_matches(&self, goal_index: usize, needle: &str) -> bool {
+        let goal = &self.goals[goal_index];
+        let assignee = goal.assignee.as_deref();
+        contains_folded(needle, &goal.id)
+            || contains_folded(needle, &goal.title)
+            || contains_folded(needle, goal.status.as_str())
+            || contains_folded(needle, goal_status_word(goal.status))
+            || assignee.is_some_and(|id| {
+                contains_folded(needle, id) || contains_folded(needle, &self.agent_name(id))
+            })
+    }
+
+    /// As [`AppState::goal_matches`], over a task's id, title, status
+    /// (stored and shown), assignee id and name, and its goal's id and
+    /// title — the goal column shows the title, cut short.
+    fn task_matches(&self, task_index: usize, needle: &str) -> bool {
+        let task = &self.tasks[task_index];
+        let assignee = task.assignee.as_deref();
+        let goal = self
+            .resolved_goal_id(task_index)
+            .and_then(|id| self.goal_by_id(&id));
+        contains_folded(needle, &task.id)
+            || contains_folded(needle, &task.title)
+            || contains_folded(needle, task.status.as_str())
+            || contains_folded(needle, task_status_word(task.status))
+            || assignee.is_some_and(|id| {
+                contains_folded(needle, id) || contains_folded(needle, &self.agent_name(id))
+            })
+            || goal.is_some_and(|goal| {
+                contains_folded(needle, &goal.id) || contains_folded(needle, &goal.title)
+            })
+    }
+
+    /// As [`AppState::goal_matches`], over an agent's id, name, status
+    /// (stored and shown), adapter, model, node (`local` or the remote
+    /// alias) and active team id and name.
+    fn agent_matches(&self, agent_index: usize, needle: &str) -> bool {
+        let agent = &self.agents[agent_index];
+        let node = agent
+            .remote
+            .as_ref()
+            .map_or("local", |remote| remote.alias.as_str());
+        contains_folded(needle, &agent.id)
+            || contains_folded(needle, &agent.name)
+            || contains_folded(needle, agent.status.as_str())
+            || contains_folded(needle, agent_status_word(agent.status))
+            || contains_folded(needle, &agent.adapter)
+            || agent
+                .config
+                .model
+                .as_deref()
+                .is_some_and(|model| contains_folded(needle, model.trim()))
+            || contains_folded(needle, node)
+            || self.team_of(agent_index).is_some_and(|team| {
+                contains_folded(needle, &team.id) || contains_folded(needle, &team.name)
+            })
     }
 
     // ── Timings (D3) ───────────────────────────────────────────────────────
@@ -2113,11 +2360,24 @@ impl AppState {
     /// each section, so a descending sort never moves a section.
     /// Original is the existing status/source order, not a timestamp order:
     /// Agent carries neither created nor updated timestamps.
+    ///
+    /// Only agents matching the Agents keyword are listed, filtered before
+    /// sections and sort, so a section with no match disappears (D1).
     pub fn sorted_agents(&self) -> Vec<usize> {
+        self.order_agents(self.keyword_candidates(ViewId::Agents))
+    }
+
+    /// [`AppState::sorted_agents`] ignoring the keyword: the `/msg`
+    /// recipient list and `/agents list` are not the Agents list, and a
+    /// list filter must not hide a recipient there.
+    pub fn sorted_agents_unfiltered(&self) -> Vec<usize> {
+        self.order_agents((0..self.agents.len()).collect())
+    }
+
+    fn order_agents(&self, mut order: Vec<usize>) -> Vec<usize> {
         let keys: Vec<AgentGroupKey> = (0..self.agents.len())
             .map(|i| self.agent_group_key(i))
             .collect();
-        let mut order: Vec<usize> = (0..self.agents.len()).collect();
         order.sort_by(|a, b| {
             keys[*a].cmp(&keys[*b]).then_with(|| {
                 let (left, right) = (&self.agents[*a], &self.agents[*b]);
@@ -2330,12 +2590,19 @@ impl AppState {
                                 .iter()
                                 .filter(|i| self.tasks[**i].status == TaskStatus::Done)
                                 .count();
+                            let matched = (!self.task_keyword.value().is_empty()).then(|| {
+                                linked
+                                    .iter()
+                                    .filter(|i| self.keyword_matches(ViewId::Tasks, **i))
+                                    .count()
+                            });
                             if let Some(goal) = self.goal_by_id(id) {
                                 rows.push(TaskRow::GoalSection {
                                     goal_id: id.clone(),
                                     title: goal.title.clone(),
                                     total: linked.len(),
                                     done,
+                                    matched,
                                 });
                             }
                         }
@@ -2437,21 +2704,23 @@ impl AppState {
     }
 
     /// The section headers the agent list draws: team headers plus the
-    /// unassigned header, or one header per node.
+    /// unassigned header, or one header per node — over the agents the
+    /// keyword leaves, so a section it emptied is not counted.
     pub fn agent_section_rows(&self) -> usize {
+        let order = self.sorted_agents();
         if self.agent_group_by == AgentGroupBy::Node {
-            let nodes: IndexSet<AgentGroupKey> = (0..self.agents.len())
-                .map(|i| self.agent_group_key(i))
-                .collect();
+            let nodes: IndexSet<AgentGroupKey> =
+                order.iter().map(|i| self.agent_group_key(*i)).collect();
             return nodes.len();
         }
-        let active_teams: IndexSet<String> = (0..self.agents.len())
-            .filter_map(|i| self.team_of(i).map(|t| t.id.clone()))
+        let active_teams: IndexSet<String> = order
+            .iter()
+            .filter_map(|i| self.team_of(*i).map(|t| t.id.clone()))
             .collect();
         if active_teams.is_empty() {
             return 0;
         }
-        let has_unassigned = (0..self.agents.len()).any(|i| self.team_of(i).is_none());
+        let has_unassigned = order.iter().any(|i| self.team_of(*i).is_none());
         active_teams.len() + usize::from(has_unassigned)
     }
 
@@ -2490,7 +2759,7 @@ impl AppState {
     pub fn list_item_count(&self, _can_create: bool) -> usize {
         match self.view {
             // The `+ add` row and the column header.
-            ViewId::Goals => self.sorted_goals().len() + 2,
+            ViewId::Goals => self.sorted_goals().len() + 2 + self.no_match_rows(),
             // The welcome screen replaces the list, and the onboarding nudge
             // sits under it; both need rows of their own.
             ViewId::Tasks if self.onboarding == OnboardingStep::Welcome => 6,
@@ -2498,6 +2767,7 @@ impl AppState {
                 // The `+ add` row and the column header.
                 self.visible_tasks().len()
                     + 2
+                    + self.no_match_rows()
                     + usize::from(self.hidden_task_count() > 0)
                     + self.task_group_section_rows()
                     + usize::from(matches!(
@@ -2508,9 +2778,17 @@ impl AppState {
                     ))
             }
             // The `+ add` row, the sort bar and the column header.
-            ViewId::Agents => self.agents.len() + 3 + self.agent_section_rows(),
+            ViewId::Agents => {
+                self.sorted_agents().len() + 3 + self.agent_section_rows() + self.no_match_rows()
+            }
             ViewId::Logs => 0,
         }
+    }
+
+    /// The "No tasks match" line a filtered-out list draws under its rows.
+    fn no_match_rows(&self) -> usize {
+        let view = self.view;
+        usize::from(!self.keyword(view).is_empty() && self.keyword_counts(view).0 == 0)
     }
 
     pub fn regions(&self, can_create: bool) -> crate::layout::Regions {
@@ -2872,22 +3150,33 @@ impl AppState {
             }
             offset
         }
-        let viewport = |view: ViewId| {
+        let task_display_rows = self.task_rows(can_create).len();
+        let agent_display_rows = self.agent_rows(can_create).len();
+        // The last frame's pane height, while that frame drew this list. The
+        // list pane is sized to its rows, so once the rows changed (a
+        // keyword, a refresh) the old height is stale and the layout's own
+        // height for the new rows is used instead.
+        let viewport = |view: ViewId, items: usize, display_rows: usize| {
             let chrome = self.list_chrome_rows_for(view);
             self.mouse
                 .hits
                 .metrics
                 .panes
                 .iter()
-                .find(|m| m.key.view == view && m.key.section == Focus::MainList)
+                .find(|m| {
+                    m.key.view == view
+                        && m.key.section == Focus::MainList
+                        && m.items == items
+                        && m.display_rows == display_rows
+                })
                 .map_or(regions.main_h.saturating_sub(chrome) as usize, |m| {
                     m.body.height as usize
                 })
         };
         let (goal_h, task_h, agent_h) = (
-            viewport(ViewId::Goals),
-            viewport(ViewId::Tasks),
-            viewport(ViewId::Agents),
+            viewport(ViewId::Goals, goal_rows.len(), goal_rows.len()),
+            viewport(ViewId::Tasks, task_rows.len(), task_display_rows),
+            viewport(ViewId::Agents, agent_rows.len(), agent_display_rows),
         );
         self.goal_scroll = reveal(
             self.goal_selected,
@@ -2900,14 +3189,14 @@ impl AppState {
             self.task_selected,
             self.task_scroll,
             &task_rows,
-            self.task_rows(can_create).len(),
+            task_display_rows,
             task_h,
         );
         self.agent_scroll = reveal(
             self.agent_selected,
             self.agent_scroll,
             &agent_rows,
-            self.agent_rows(can_create).len(),
+            agent_display_rows,
             agent_h,
         );
         self.reconcile_message_selection(self.log_selected_id);

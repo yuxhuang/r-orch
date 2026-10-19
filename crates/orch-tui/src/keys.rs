@@ -18,7 +18,7 @@ use crate::messages::{MsgType, cycle_preset, preset_types};
 use crate::navigation::{NavAction, ScrollMetrics, ScrollMode, ScrollState, navigate};
 use crate::state::{
     AgentSection, CopyHelpContext, CopyOrigin, DetailPanel, Focus, GoalSection, InputMode,
-    LogSection, TaskSection, ViewId, is_runnable,
+    KEYWORD_MAX_CHARS, LogSection, TaskSection, ViewId, is_runnable, sanitize_keyword,
 };
 use crate::text::is_meta;
 use crate::theme::Token;
@@ -215,6 +215,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 self.handle_wizard_key(key, now);
                 return;
             }
+            InputMode::Keyword => {
+                self.handle_keyword_key(key);
+                return;
+            }
             InputMode::None => {}
         }
 
@@ -230,6 +234,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
         if self.copy_focused_key(key) {
             return;
+        }
+        // The keyword filter (D1): Ctrl+K opens the prompt and Ctrl+U clears
+        // the keyword, on an entity list only. `/` stays the command bar.
+        if key.modifiers == KeyModifiers::CONTROL
+            && matches!(view, ViewId::Goals | ViewId::Tasks | ViewId::Agents)
+            && self.state.focus == Focus::MainList
+        {
+            match key.code {
+                KeyCode::Char('k' | 'K') => {
+                    self.open_keyword_prompt();
+                    return;
+                }
+                KeyCode::Char('u' | 'U') => {
+                    self.clear_keyword();
+                    return;
+                }
+                _ => {}
+            }
         }
         // Letters are entity actions only with plain/Shift modifiers. Copy
         // shortcuts were handled above; Ctrl+C is deliberately unbound.
@@ -677,6 +699,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     wizard.insert_paste(&normalized, now);
                 }
             }
+            // Control characters (the newline of a multi-line paste, an
+            // `ESC`) are dropped and the rest cut to the keyword's bound.
+            InputMode::Keyword => {
+                let room = KEYWORD_MAX_CHARS
+                    .saturating_sub(self.state.keyword(self.state.view).chars().count());
+                let text = sanitize_keyword(&normalized, room);
+                if !text.is_empty() {
+                    self.edit_keyword(|input, now| input.insert_str(&text, now));
+                }
+            }
             InputMode::None => {}
         }
     }
@@ -721,7 +753,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// The borrow is a statement-scoped temporary, so `&mut self.state` uses
     /// after it still compile.
     pub(crate) fn suggestions(&self, value: &str) -> Vec<crate::command_bar::Suggestion> {
-        let order = self.state.sorted_agents();
+        let order = self.state.sorted_agents_unfiltered();
         resolve_suggestions_in(
             value,
             &SuggestionCtx {
@@ -729,6 +761,104 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 order: &order,
             },
         )
+    }
+
+    // ── Keyword filter (D1, R3–R5) ─────────────────────────────────────────
+
+    /// Ctrl+K: the visible entity list's keyword prompt, over its current
+    /// keyword with the cursor at the end, so a second Ctrl+K refines rather
+    /// than retypes.
+    pub(crate) fn open_keyword_prompt(&mut self) {
+        let view = self.state.view;
+        let Some(input) = self.state.keyword_input_mut(view) else {
+            return;
+        };
+        input.cursor_mut().move_to_end();
+        self.state.input_mode = InputMode::Keyword;
+    }
+
+    /// `Enter` in the prompt: close it and keep filtering.
+    pub(crate) fn close_keyword_prompt(&mut self) {
+        if self.state.input_mode == InputMode::Keyword {
+            self.state.input_mode = InputMode::None;
+        }
+    }
+
+    /// `Esc` in the prompt, Ctrl+U on the list, or a click on the keyword
+    /// chip: drop the visible list's keyword and close the prompt.
+    pub(crate) fn clear_keyword(&mut self) {
+        if !self.state.keyword(self.state.view).is_empty() {
+            self.edit_keyword(|input, _| input.reset(""));
+        }
+        self.close_keyword_prompt();
+    }
+
+    /// Edit the visible list's keyword, keeping every cursor on its entity.
+    ///
+    /// The selection is captured from the order on screen before the edit
+    /// and found again after it (D1), so a row that still matches keeps the
+    /// cursor; one the keyword hid leaves it at the nearest surviving row,
+    /// and entity actions wait until that row has been drawn. The bound is
+    /// enforced here too, because a yank (`Ctrl+Y`) inserts text no key
+    /// check saw.
+    fn edit_keyword(&mut self, edit: impl FnOnce(&mut crate::text::TextInput, i64)) {
+        let view = self.state.view;
+        let now = self.now();
+        let can_create = self.can_create_task();
+        let prior = self.state.capture_list_selection(can_create);
+        let Some(input) = self.state.keyword_input_mut(view) else {
+            return;
+        };
+        let before = input.value().to_string();
+        edit(input, now);
+        if input.value().chars().count() > KEYWORD_MAX_CHARS {
+            let bounded = sanitize_keyword(input.value(), KEYWORD_MAX_CHARS);
+            input.reset(&bounded);
+        }
+        // A cursor move is not a filter change: it must not resample the
+        // Elapsed order (D1).
+        if input.value() == before {
+            return;
+        }
+        self.state.reconcile_list_selection(&prior, now, can_create);
+        self.state.clamp_all(can_create);
+    }
+
+    /// Every key in the prompt. Typing filters live; `Enter` keeps the
+    /// keyword, `Esc` clears it; `↑↓` move the list's cursor so a match can
+    /// be picked without leaving. Nothing here reaches a list or global
+    /// binding — `q` is a letter of the keyword, not quit.
+    fn handle_keyword_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_keyword();
+                return;
+            }
+            KeyCode::Enter => {
+                self.close_keyword_prompt();
+                return;
+            }
+            KeyCode::Up => {
+                self.navigate_focus(NavAction::Up, false);
+                return;
+            }
+            KeyCode::Down => {
+                self.navigate_focus(NavAction::Down, false);
+                return;
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !is_meta(key) =>
+            {
+                let full = self.state.keyword(self.state.view).chars().count() >= KEYWORD_MAX_CHARS;
+                if ch.is_control() || full {
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.edit_keyword(|input, now| {
+            input.handle_key(key, now);
+        });
     }
 
     /// `/` — the command bar, pre-filled with its own prefix.

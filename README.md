@@ -175,6 +175,15 @@ section for this instance's agents, then one section per remote alias in alias o
 offline. The sort still applies within each section, `0` leaves the grouping alone, and the selected agent stays
 selected. Like the sort, the grouping lasts only for this dashboard session.
 
+`Ctrl+K` on the Goals, Tasks or Agents list opens a keyword filter (`/` stays the command bar). The list narrows
+as you type, case-insensitively, on each row's ID, title or name, status (stored and shown: `in_progress` or
+`RUN`), assignee or agent name and ID, and the task's goal or the agent's team, adapter, model and node; never on
+descriptions or the Started/Elapsed text. It filters before the sort, grouping and the ten-task limit, so a match
+is never hidden behind `show all`, a section with no match disappears, and counts read `matches/total`.
+`Enter` keeps the keyword, shown as a `filter:` chip on the list's title rule; `Esc` in the prompt, `Ctrl+U` on
+the list or a click on the chip clears it. The selected row stays selected while it still matches. Each list keeps
+its own keyword, up to 256 characters, for this dashboard session; control characters in pasted text are dropped.
+
 The Activity panel, ACTIONS list and task-detail Activity follow new entries at the tail. Scrolling up pauses
 following so you can read older entries. Resume with `End`, scroll down to the bottom with the wheel or
 PageDown, click the final entry, or focus a feed whose viewport is already at the bottom. The feed shows

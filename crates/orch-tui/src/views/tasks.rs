@@ -9,7 +9,7 @@ use ratatui::text::Span;
 use crate::format::{cap_display, cap_line, format_duration, format_started};
 use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
 use crate::onboarding::OnboardingStep;
-use crate::state::{EntityType, SortColumn, TaskRow, TaskSortField};
+use crate::state::{EntityType, SortColumn, TaskRow, TaskSortField, task_status_word};
 use crate::text::text_display_width;
 use crate::theme::{
     ARROW_RIGHT, CHECK, CIRCLE, CROSS, CURSOR, DIAMOND, EM_DASH, LOZENGE, PAPERCLIP, PLUS_CIRCLE,
@@ -61,37 +61,47 @@ fn status_chip(
 fn local_status_chip(status: TaskStatus, tick: u64) -> (String, Token, Token, bool) {
     match status {
         TaskStatus::InProgress => (
-            format!("{} RUN", spinner_frame(tick)),
+            format!("{} {}", spinner_frame(tick), task_status_word(status)),
             Token::Green,
             Token::SuccessBg,
             true,
         ),
         TaskStatus::Retrying => (
-            format!("{} RETRY", spinner_frame(tick)),
+            format!("{} {}", spinner_frame(tick), task_status_word(status)),
             Token::Yellow,
             Token::WarnBg,
             false,
         ),
         TaskStatus::Review => (
-            format!("{LOZENGE} REVIEW"),
+            format!("{LOZENGE} {}", task_status_word(status)),
             Token::Blue,
             Token::ToolBg,
             false,
         ),
         TaskStatus::Todo => (
-            format!("{CIRCLE} TODO"),
+            format!("{CIRCLE} {}", task_status_word(status)),
             Token::Dim,
             Token::NeutralBg,
             false,
         ),
         TaskStatus::Done => (
-            format!("{CHECK} DONE"),
+            format!("{CHECK} {}", task_status_word(status)),
             Token::Green,
             Token::SuccessBg,
             false,
         ),
-        TaskStatus::Failed => (format!("{CROSS} FAIL"), Token::Red, Token::ErrorBg, true),
-        TaskStatus::Cancelled => ("─ OFF".to_string(), Token::Dim, Token::NeutralBg, false),
+        TaskStatus::Failed => (
+            format!("{CROSS} {}", task_status_word(status)),
+            Token::Red,
+            Token::ErrorBg,
+            true,
+        ),
+        TaskStatus::Cancelled => (
+            format!("─ {}", task_status_word(status)),
+            Token::Dim,
+            Token::NeutralBg,
+            false,
+        ),
     }
 }
 
@@ -141,7 +151,11 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         }
         match row {
             TaskRow::GoalSection {
-                title, total, done, ..
+                title,
+                total,
+                done,
+                matched,
+                ..
             } => {
                 let percent = if *total > 0 {
                     ((*done as f64 / *total as f64) * 100.0).round() as i64
@@ -149,8 +163,14 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                     0
                 };
                 let noun = if *total == 1 { "task" } else { "tasks" };
+                // Filtered, the count says how many of the goal's tasks are
+                // listed (`1/2 tasks`); the percentage stays the goal's.
+                let count = match matched {
+                    Some(matched) => format!("{matched}/{total}"),
+                    None => total.to_string(),
+                };
                 let label = format!(
-                    " {PLUS_CIRCLE} {} · {total} {noun} · {percent}% done ",
+                    " {PLUS_CIRCLE} {} · {count} {noun} · {percent}% done ",
                     title.to_uppercase()
                 );
                 let rule = (area.width as usize).saturating_sub(label.chars().count() + 3);
@@ -249,6 +269,9 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 );
             }
         }
+        y += 1;
+    }
+    if y < area.bottom() && super::render_no_match_at(frame, area, y, ctx) {
         y += 1;
     }
 

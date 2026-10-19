@@ -1255,3 +1255,64 @@ fn elapsed_crossing_task_limit() {
     assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
     assert!(!h.app.state.entity_actions_deferred);
 }
+
+// ── `/` and Ctrl+K (R5) ────────────────────────────────────────────────────
+
+#[test]
+fn command_mode_key_unchanged() {
+    for view in [ViewId::Goals, ViewId::Tasks, ViewId::Agents] {
+        let mut h = Harness::with(FakeBackend::new().with_tasks(vec![make_task(
+            "tsk_a",
+            "Alpha",
+            TaskStatus::Todo,
+        )]));
+        h.app.state.view = view;
+        h.key('/');
+        assert_eq!(h.app.state.input_mode, InputMode::Command, "{view:?}");
+        assert_eq!(h.app.state.command_bar.input.value(), "/");
+        // What is typed goes to the command bar, never to a list keyword.
+        h.type_str("task");
+        assert_eq!(h.app.state.keyword(view), "");
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.state.input_mode, InputMode::None);
+    }
+}
+
+#[test]
+fn ctrl_k_opens_filter() {
+    for view in [ViewId::Goals, ViewId::Tasks, ViewId::Agents] {
+        let mut h = Harness::sized(
+            FakeBackend::new().with_tasks(vec![make_task("tsk_a", "Alpha", TaskStatus::Todo)]),
+            120,
+            30,
+        );
+        h.app.state.view = view;
+        h.draw();
+        // The footer advertises it on every entity list.
+        h.assert_text("^K filter");
+        h.press_mod(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(h.app.state.input_mode, InputMode::Keyword, "{view:?}");
+        h.draw();
+        h.assert_text(&format!("Filter {} ›", view.item_label()));
+        h.press(KeyCode::Esc);
+        assert_eq!(h.app.state.input_mode, InputMode::None);
+    }
+
+    // Not on the Logs view, which has filters of its own, and not from a
+    // detail pane.
+    let mut h = Harness::new();
+    h.app.state.view = ViewId::Logs;
+    h.press_mod(KeyCode::Char('k'), KeyModifiers::CONTROL);
+    assert_eq!(h.app.state.input_mode, InputMode::None);
+    h.draw();
+    h.refute_text("^K filter");
+
+    // The help overlay lists both keys beside `/`.
+    let mut h = Harness::sized(FakeBackend::new(), 120, 40);
+    h.app.state.view = ViewId::Tasks;
+    h.key('?').draw();
+    h.assert_text("Ctrl+K");
+    h.assert_text("Filter list");
+    h.assert_text("Ctrl+U");
+    h.assert_text("Clear filter");
+}

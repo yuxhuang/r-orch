@@ -416,7 +416,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
             }
             Some("list") => {
-                let order = self.state.sorted_tasks();
+                let order = self.state.sorted_tasks_unfiltered();
                 if order.is_empty() {
                     self.dim("No tasks");
                     return;
@@ -610,7 +610,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
             }
             Some("list") => {
-                let order = self.state.sorted_agents();
+                let order = self.state.sorted_agents_unfiltered();
                 if order.is_empty() {
                     self.dim("No agents");
                     return;
@@ -803,7 +803,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 }
             }
             Some("list") => {
-                let order = self.state.sorted_goals();
+                let order = self.state.sorted_goals_unfiltered();
                 if order.is_empty() {
                     self.dim("No goals");
                     return;
