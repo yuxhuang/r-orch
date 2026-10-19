@@ -621,7 +621,14 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
     let options = wizard.options();
     let visible = area.height as usize;
     let selected = wizard.select_index();
-    let start = selected.saturating_sub(visible.saturating_sub(1));
+    // A missing selection parks the cursor past the list: no row is drawn as
+    // chosen, and the list is shown from the top.
+    let anchor = if selected < options.len() {
+        selected
+    } else {
+        0
+    };
+    let start = anchor.saturating_sub(visible.saturating_sub(1));
     // Numbers are right-aligned in a column as wide as the largest, with a
     // space after it, so `10 Content Creator` never runs together. Below ten
     // options this is the familiar `  1 `.
