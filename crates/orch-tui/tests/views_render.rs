@@ -1630,3 +1630,71 @@ fn activity_header_keeps_recovery_hint_with_three_digit_retention_counts() {
         }
     }
 }
+
+/// The detail rail's sections in screen order, read from the hit map.
+fn rail_order(harness: &mut Harness) -> Vec<Focus> {
+    harness.draw();
+    let mut rail: Vec<_> = harness
+        .hits()
+        .zones()
+        .iter()
+        .filter_map(|zone| match zone.kind {
+            orch_tui::hit::ZoneKind::DetailSection(section) if zone.rect.height == 1 => {
+                Some((zone.rect.x, section))
+            }
+            _ => None,
+        })
+        .collect();
+    rail.sort_by_key(|(x, _)| *x);
+    rail.into_iter().map(|(_, section)| section).collect()
+}
+
+/// R2: moving focus between sections restyles the focused entry but never
+/// moves it; the rail stays in `focus_ring()` order.
+#[test]
+fn detail_rail_order_is_stable_across_focus() {
+    let mut harness = harness_for(ViewId::Goals, linked_backend());
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    let ring: Vec<Focus> = harness
+        .app
+        .state
+        .focus_ring()
+        .into_iter()
+        .filter(|f| matches!(f, Focus::GoalDetail(_)))
+        .collect();
+    assert_eq!(
+        ring,
+        [
+            Focus::GoalDetail(GoalSection::Overview),
+            Focus::GoalDetail(GoalSection::Description),
+            Focus::GoalDetail(GoalSection::Tasks),
+        ]
+    );
+    for focus in ring.iter().copied() {
+        harness.app.state.set_focus(focus);
+        assert_eq!(rail_order(&mut harness), ring, "focused {focus:?}");
+        let text = harness.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("Overview │"))
+            .expect("rail row");
+        let marked = format!("> {}", orch_tui::views::detail::section_name(focus));
+        assert_eq!(line.matches("> ").count(), 1, "{line}");
+        assert!(line.contains(&marked), "{line}");
+    }
+    // At the minimum width the rail drops entries but never reorders them,
+    // and the focused entry is always on it.
+    let mut narrow = Harness::sized(linked_backend(), 40, 14);
+    narrow.app.state.view = ViewId::Goals;
+    narrow.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    for focus in ring.iter().copied() {
+        narrow.app.state.set_focus(focus);
+        let shown = rail_order(&mut narrow);
+        assert!(shown.contains(&focus), "focused {focus:?}: {shown:?}");
+        let mut expected = ring.iter().filter(|f| shown.contains(f));
+        assert!(
+            shown.iter().all(|f| expected.next() == Some(f)),
+            "{shown:?} is not in ring order"
+        );
+    }
+}
