@@ -1255,3 +1255,162 @@ fn elapsed_crossing_task_limit() {
     assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
     assert!(!h.app.state.entity_actions_deferred);
 }
+
+// ── Unknown values sort last in either direction (D2) ──────────────────────
+//
+// The row without a value sits in the middle of the source order, so neither
+// "unknown first" nor "reverse the ascending list" can pass by accident.
+
+fn sorted_goal_ids(h: &Harness) -> Vec<String> {
+    h.app
+        .state
+        .sorted_goals()
+        .into_iter()
+        .map(|i| h.app.state.goals[i].id.clone())
+        .collect()
+}
+
+fn assigned(id: &str, assignee: Option<&str>, goal_id: Option<&str>) -> orch_domain::Task {
+    let mut task = make_task(id, id, TaskStatus::Todo);
+    task.assignee = assignee.map(Into::into);
+    task.goal_id = goal_id.map(Into::into);
+    task
+}
+
+/// `tsk_b` → bravo and goal "Bravo goal", `tsk_none` → neither, `tsk_a` →
+/// alpha and goal "Alpha goal".
+fn tasks_with_an_unassigned_one() -> Harness {
+    let backend = FakeBackend::new()
+        .with_agents(vec![
+            make_agent("agt_a", "alpha", AgentStatus::Idle),
+            make_agent("agt_b", "bravo", AgentStatus::Idle),
+        ])
+        .with_goals(vec![
+            make_goal("gol_a", "Alpha goal", GoalStatus::Active),
+            make_goal("gol_b", "Bravo goal", GoalStatus::Active),
+        ])
+        .with_tasks(vec![
+            assigned("tsk_b", Some("agt_b"), Some("gol_b")),
+            assigned("tsk_none", None, None),
+            assigned("tsk_a", Some("agt_a"), Some("gol_a")),
+        ]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Tasks;
+    h.draw();
+    h
+}
+
+#[test]
+fn unassigned_task_sorts_last_by_assignee_in_both_directions() {
+    use orch_tui::state::{TaskSort, TaskSortField::Assignee};
+    let mut h = tasks_with_an_unassigned_one();
+    h.app.state.task_sort = TaskSort {
+        field: Assignee,
+        descending: false,
+    };
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b", "tsk_none"]);
+    h.app.state.task_sort.descending = true;
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a", "tsk_none"]);
+}
+
+#[test]
+fn ungrouped_task_sorts_last_by_goal_in_both_directions() {
+    use orch_tui::state::{TaskSort, TaskSortField::Goal};
+    let mut h = tasks_with_an_unassigned_one();
+    h.app.state.task_sort = TaskSort {
+        field: Goal,
+        descending: false,
+    };
+    assert_eq!(sorted_task_ids(&h), ["tsk_a", "tsk_b", "tsk_none"]);
+    h.app.state.task_sort.descending = true;
+    assert_eq!(sorted_task_ids(&h), ["tsk_b", "tsk_a", "tsk_none"]);
+}
+
+#[test]
+fn unassigned_goal_sorts_last_by_assignee_in_both_directions() {
+    use orch_tui::state::{GoalSort, GoalSortField::Assignee};
+    let mut bravo = make_goal("gol_b", "B", GoalStatus::Active);
+    bravo.assignee = Some("agt_b".into());
+    let mut alpha = make_goal("gol_a", "A", GoalStatus::Active);
+    alpha.assignee = Some("agt_a".into());
+    let backend = FakeBackend::new()
+        .with_agents(vec![
+            make_agent("agt_a", "alpha", AgentStatus::Idle),
+            make_agent("agt_b", "bravo", AgentStatus::Idle),
+        ])
+        .with_goals(vec![
+            bravo,
+            make_goal("gol_none", "None", GoalStatus::Active),
+            alpha,
+        ]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Goals;
+    h.draw();
+    h.app.state.goal_sort = GoalSort {
+        field: Assignee,
+        descending: false,
+    };
+    assert_eq!(sorted_goal_ids(&h), ["gol_a", "gol_b", "gol_none"]);
+    h.app.state.goal_sort.descending = true;
+    assert_eq!(sorted_goal_ids(&h), ["gol_b", "gol_a", "gol_none"]);
+}
+
+#[test]
+fn goal_without_tasks_sorts_last_by_progress_in_both_directions() {
+    use orch_tui::state::{GoalSort, GoalSortField::Progress};
+    let mut done = make_task("tsk_done", "done", TaskStatus::Done);
+    done.goal_id = Some("gol_half".into());
+    let mut todo = make_task("tsk_todo", "todo", TaskStatus::Todo);
+    todo.goal_id = Some("gol_half".into());
+    let mut full = make_task("tsk_full", "full", TaskStatus::Done);
+    full.goal_id = Some("gol_full".into());
+    let backend = FakeBackend::new()
+        .with_goals(vec![
+            make_goal("gol_half", "Half", GoalStatus::Active),
+            make_goal("gol_empty", "Empty", GoalStatus::Active),
+            make_goal("gol_full", "Full", GoalStatus::Active),
+        ])
+        .with_tasks(vec![done, todo, full]);
+    let mut h = Harness::with(backend);
+    h.app.state.view = ViewId::Goals;
+    h.draw();
+    h.app.state.goal_sort = GoalSort {
+        field: Progress,
+        descending: false,
+    };
+    assert_eq!(sorted_goal_ids(&h), ["gol_half", "gol_full", "gol_empty"]);
+    h.app.state.goal_sort.descending = true;
+    assert_eq!(sorted_goal_ids(&h), ["gol_full", "gol_half", "gol_empty"]);
+}
+
+// ── The Goals column header takes a viewport row (D2) ──────────────────────
+
+#[test]
+fn selected_last_goal_stays_drawn_under_the_column_header() {
+    let goals = (0..40)
+        .map(|i| {
+            make_goal(
+                &format!("gol_{i:02}"),
+                &format!("Goal {i:02}"),
+                GoalStatus::Active,
+            )
+        })
+        .collect();
+    let mut h = Harness::with(FakeBackend::new().with_goals(goals));
+    h.app.state.view = ViewId::Goals;
+    h.draw();
+    // Walk down one key at a time: each step past the bottom scrolls just
+    // enough to put the selection on the viewport's last row, which only
+    // exists on screen if the header was counted out of the viewport.
+    for _ in 0..39 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.goal_selected, 39, "the last goal is selected");
+    assert!(h.app.state.goal_scroll > 0, "the list scrolled");
+    h.assert_text("Goal 39");
+
+    // One more: the `+ add goal` row below it, the list's last row.
+    h.press(KeyCode::Down);
+    assert_eq!(h.app.state.goal_selected, 40);
+    h.assert_text("add goal");
+}
