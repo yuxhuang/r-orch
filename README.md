@@ -164,6 +164,11 @@ exactly the previous team/status/source order: agents have no created/updated ti
 reverses that order within each section while keeping the sections in place. Name and Location compare
 case-insensitively, with raw agent name and ID breaking ties.
 
+`b` (or the `b group:` chip) switches the Agents sections between By team (the default) and By node: a Local
+section for this instance's agents, then one section per remote alias in alias order, each marked online or
+offline. The sort still applies within each section, `0` leaves the grouping alone, and the selected agent stays
+selected. Like the sort, the grouping lasts only for this dashboard session.
+
 Wizard steps that pick an agent (task and goal assignee, team lead and members) filter as you type: letters
 narrow the numbered list to agents whose name, adapter or role contains them, `Backspace` edits the filter and
 `Esc` clears it. `1`–`9` still pick a listed row, and `Ctrl+O` cycles the order through Original, Name, Adapter
