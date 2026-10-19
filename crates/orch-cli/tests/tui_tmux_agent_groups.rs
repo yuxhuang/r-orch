@@ -234,6 +234,14 @@ fn launch(dir: &Path, socket: String) -> Tmux {
     tmux
 }
 
+/// Whether every needle is on the screen. A wait predicate names every string
+/// the assertions after it read: ratatui writes a frame as a diff, top to
+/// bottom, so a capture can catch the section header painted and the row under
+/// it not yet, and a weaker predicate hands that half frame to the asserts.
+fn shows_all(screen: &str, needles: &[&str]) -> bool {
+    needles.iter().all(|needle| screen.contains(needle))
+}
+
 /// The 0-based (column, row) of `needle` on a captured screen, in cells.
 /// Every glyph left of the chips is one cell wide.
 fn locate(screen: &str, needle: &str) -> Option<(usize, usize)> {
@@ -255,7 +263,7 @@ fn agents_group_by_node_shows_local_then_remote_sections() {
 
     // By team (the default): no teams, so one unassigned section.
     let screen = tmux.wait_for("the Agents view By team", |s| {
-        s.contains("b group:Team") && s.contains("rover@w1")
+        shows_all(s, &["b group:Team", "rover@w1", "UNASSIGNED · 3 agents"])
     });
     assert!(screen.contains("UNASSIGNED · 3 agents"), "{screen}");
     assert!(!screen.contains("◈ LOCAL"), "{screen}");
@@ -263,7 +271,16 @@ fn agents_group_by_node_shows_local_then_remote_sections() {
     // `b`: By node — Local first, then w1, marked offline.
     tmux.keys(&["b"]);
     let screen = tmux.wait_for("the By node sections", |s| {
-        s.contains("b group:Node") && s.contains("◈ w1")
+        shows_all(
+            s,
+            &[
+                "b group:Node",
+                "◈ LOCAL · 2 agents",
+                "◈ w1 ○ offline · 1 agent",
+                "rover@w1",
+                "local-bot",
+            ],
+        )
     });
     let local = locate(&screen, "◈ LOCAL · 2 agents").expect(&screen);
     let remote = locate(&screen, "◈ w1 ○ offline · 1 agent").expect(&screen);
@@ -278,14 +295,26 @@ fn agents_group_by_node_shows_local_then_remote_sections() {
     // The chip is the mouse path back to By team.
     let (x, y) = locate(&screen, "b group:Node").expect(&screen);
     tmux.click(x, y);
-    let screen = tmux.wait_for("By team again", |s| s.contains("b group:Team"));
+    let screen = tmux.wait_for("By team again", |s| {
+        shows_all(s, &["b group:Team", "UNASSIGNED · 3 agents"])
+    });
     assert!(screen.contains("UNASSIGNED · 3 agents"), "{screen}");
     assert!(!screen.contains("◈ LOCAL"), "{screen}");
 
     // At the minimum width the bar goes compact and the headers still fit.
     tmux.keys(&["b"]);
     tmux.run(&["resize-window", "-t", "dash", "-x", "40", "-y", "20"]);
-    let screen = tmux.wait_for("the 40-column bar", |s| s.contains("b node"));
+    let screen = tmux.wait_for("the 40-column bar", |s| {
+        shows_all(
+            s,
+            &[
+                "b node",
+                "0 reset",
+                "◈ LOCAL · 2 agents",
+                "◈ w1 ○ offline · 1 agent",
+            ],
+        )
+    });
     assert!(screen.contains("0 reset"), "{screen}");
     assert!(screen.contains("◈ LOCAL · 2 agents"), "{screen}");
     assert!(screen.contains("◈ w1 ○ offline · 1 agent"), "{screen}");
