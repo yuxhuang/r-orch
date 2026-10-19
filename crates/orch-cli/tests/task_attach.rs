@@ -308,6 +308,42 @@ fn a_fifo_source_is_rejected_with_exit_2_without_waiting_for_a_writer() {
     );
 }
 
+// The CLI deliberately exposes attachments as read-only on task update.
+// Exercise append through the engine, with real CLI creation and observation.
+#[tokio::test]
+async fn an_append_collision_returns_exit_2_and_preserves_cli_visible_task_and_bytes() {
+    let project = Project::new();
+    let original = project.source("same.txt", b"original");
+    let created = project.json(&["task", "add", "original", "--attach", arg(&original)]);
+    let id = created["id"].as_str().unwrap();
+    let before = std::fs::read(project.root().join(format!(".orchestry/tasks/{id}.yml"))).unwrap();
+    std::fs::write(&original, b"replacement").unwrap();
+    let engine = orch_engine::build_light(project.root()).await.unwrap();
+    let err = engine
+        .task_service
+        .update(
+            id,
+            orch_engine::task_service::UpdateTaskFields {
+                title: Some("must not be saved".into()),
+                attachments: Some(vec![original]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("append collision must be rejected");
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.to_string(), "Attachment already exists: same.txt");
+    assert_eq!(
+        std::fs::read(project.stored_attachment(id, "same.txt")).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        std::fs::read(project.root().join(format!(".orchestry/tasks/{id}.yml"))).unwrap(),
+        before
+    );
+    assert_eq!(project.json(&["task", "show", id]), created);
+}
+
 #[test]
 fn without_attach_the_task_has_no_attachments_field() {
     let project = Project::new();
