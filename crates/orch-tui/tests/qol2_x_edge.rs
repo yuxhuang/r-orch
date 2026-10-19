@@ -923,7 +923,6 @@ fn team_lead_picker_with_no_agent_draws_at_the_minimum_size() {
 /// Enter on the team lead step reports "No agent matches the filter", though
 /// no filter exists. The step stays open (correct); the wording misleads.
 #[test]
-#[ignore = "known defect, fix task tsk_q24lZkG: error blames a filter when no agent exists"]
 fn team_lead_picker_with_no_agent_does_not_blame_a_filter() {
     let mut wizard = lead_wizard(&[]);
     wizard.handle_key(key(KeyCode::Enter), 0);
@@ -1031,7 +1030,6 @@ fn unicode_filter_is_case_insensitive_across_scripts() {
 /// Known defect, found by this suite: `İ` lowercases to `i` plus a combining
 /// dot (U+0307), so a plain `istanbul` query misses an agent named `İstanbul`.
 #[test]
-#[ignore = "known defect, fix task tsk_q24lZkG: dotted capital I name is missed by a plain i query"]
 fn unicode_filter_matches_a_dotted_capital_i_name_with_a_plain_i_query() {
     let turkish = [agent("agt_1", "İstanbul", "codex", "", AgentStatus::Idle)];
     let mut wizard = assignee_wizard(&turkish);

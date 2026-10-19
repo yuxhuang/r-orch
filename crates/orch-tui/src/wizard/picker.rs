@@ -60,7 +60,19 @@ impl PickerOrder {
     }
 }
 
-/// What the picker knows about one listed agent, lowercased once at build
+/// The case fold both the agent text and the query go through: lowercase,
+/// then drop the combining dot above (U+0307). `İ` lowercases to `i` plus
+/// that dot, so without the drop a plain `istanbul` query would miss an agent
+/// named `İstanbul`. Hand-rolled (AGENTS.md, library-first): this one-code-point
+/// rule is the whole need, and no full case-folding crate is in the graph.
+fn fold(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|&c| c != '\u{0307}')
+        .collect()
+}
+
+/// What the picker knows about one listed agent, folded once at build
 /// time so filtering and sorting never allocate per comparison.
 #[derive(Debug, Clone)]
 struct Entry {
@@ -89,9 +101,9 @@ impl AgentPicker {
                 (
                     a.id.clone(),
                     Entry {
-                        name: a.name.to_lowercase(),
-                        adapter: a.adapter.to_lowercase(),
-                        role: a.role.as_deref().unwrap_or("").to_lowercase(),
+                        name: fold(&a.name),
+                        adapter: fold(&a.adapter),
+                        role: fold(a.role.as_deref().unwrap_or("")),
                         status: a.status,
                         status_rank: AgentStatus::ALL
                             .iter()
@@ -117,10 +129,10 @@ impl AgentPicker {
     }
 
     /// The rows to show for `query` in `order`: sentinels first, then the
-    /// matching agents. Matching is a case-insensitive substring test on the
+    /// matching agents. Matching is a case-insensitive ([`fold`]) substring test on the
     /// name, the adapter and the role; an empty query matches every agent.
     pub fn arrange(&self, choices: Vec<Choice>, query: &str, order: PickerOrder) -> Vec<Choice> {
-        let query = query.trim().to_lowercase();
+        let query = fold(query.trim());
         let (sentinels, agents): (Vec<Choice>, Vec<Choice>) =
             choices.into_iter().partition(|c| !self.is_agent(&c.value));
         let mut agents: Vec<(&Entry, Choice)> = agents
