@@ -1025,10 +1025,18 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     /// Tasks `s` — show every task or collapse back, from the top.
+    /// `s`, the show-all row or the footer chip: list every task or only
+    /// the first ten, keeping the cursor on its task (D1). Collapsing past
+    /// the selected task leaves the cursor on the last row under the cap,
+    /// and entity actions wait until that row has been drawn; expanding
+    /// from the show-all row lands on the first task it revealed.
     pub(crate) fn toggle_show_all_tasks(&mut self) {
+        let now = self.now();
+        let can_create = self.can_create_task();
+        let prior = self.state.capture_list_selection(can_create);
         self.state.show_all_tasks = !self.state.show_all_tasks;
-        self.state.task_selected = 0;
-        self.state.task_scroll = 0;
+        self.state.reconcile_list_selection(&prior, now, can_create);
+        self.state.clamp_all(can_create);
     }
 
     pub(crate) fn switch_view(&mut self, view: ViewId) {

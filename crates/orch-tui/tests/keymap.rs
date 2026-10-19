@@ -420,14 +420,16 @@ fn k043_e_opens_the_edit_task_wizard() {
 }
 
 #[test]
-fn k044_s_toggles_show_all_and_resets_the_selection() {
+fn k044_s_toggles_show_all_and_keeps_the_selected_task() {
     let mut harness = tasks_harness();
     harness.app.state.task_selected = 1;
+    let id = harness.app.state.selected_task().unwrap().id.clone();
     harness.key('s');
     assert!(harness.app.state.show_all_tasks);
-    assert_eq!(harness.app.state.task_selected, 0);
+    assert_eq!(harness.app.state.selected_task().unwrap().id, id);
     harness.key('S');
     assert!(!harness.app.state.show_all_tasks);
+    assert_eq!(harness.app.state.selected_task().unwrap().id, id);
 }
 
 #[test]
@@ -1254,6 +1256,90 @@ fn elapsed_crossing_task_limit() {
     assert_eq!(h.app.state.task_selected, 10);
     assert_eq!(h.app.state.selected_task().unwrap().id, "tsk_a");
     assert!(!h.app.state.entity_actions_deferred);
+}
+
+// ── Show-all keeps the selection (D1) ─────────────────────────────────────
+
+/// Twelve open tasks: ten under the cap, two behind the show-all row.
+fn twelve_tasks_harness() -> Harness {
+    let tasks: Vec<_> = (1..=12)
+        .map(|i| {
+            make_task(
+                &format!("tsk_{i:02}"),
+                &format!("Task {i}"),
+                TaskStatus::Todo,
+            )
+        })
+        .collect();
+    let mut h = Harness::sized(FakeBackend::new().with_tasks(tasks), 120, 44);
+    h.app.state.view = ViewId::Tasks;
+    h.draw();
+    h
+}
+
+#[test]
+fn show_all_toggle_keeps_the_selected_task() {
+    let mut h = twelve_tasks_harness();
+    let ids = sorted_task_ids(&h);
+    for _ in 0..4 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.selected_task().unwrap().id, ids[4]);
+
+    // Expanding and collapsing again: the cursor never leaves the task.
+    for show_all in [true, false] {
+        h.key('s');
+        assert_eq!(h.app.state.show_all_tasks, show_all);
+        assert_eq!(h.app.state.task_selected, 4);
+        assert_eq!(h.app.state.selected_task().unwrap().id, ids[4]);
+        assert!(!h.app.state.entity_actions_deferred);
+        h.draw();
+    }
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, ids[4]);
+}
+
+#[test]
+fn collapsing_show_all_past_the_selected_task_clamps_and_defers() {
+    let mut h = twelve_tasks_harness();
+    let ids = sorted_task_ids(&h);
+    h.key('s');
+    for _ in 0..11 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.selected_task().unwrap().id, ids[11]);
+    h.draw();
+
+    // The twelfth task goes behind the cap: the cursor stays on the last
+    // row under it, and entity actions wait for the frame that shows that.
+    h.key('s');
+    assert!(!h.app.state.show_all_tasks);
+    assert_eq!(h.app.state.task_selected, 9);
+    assert_eq!(h.app.state.selected_task().unwrap().id, ids[9]);
+    assert!(h.app.state.entity_actions_deferred);
+    h.press(KeyCode::Enter).key('d');
+    assert_eq!(h.app.state.detail, DetailPanel::None);
+    assert!(h.app.state.pending_deletions.is_empty());
+
+    h.draw();
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.state.detail, DetailPanel::Entity);
+    assert_eq!(h.app.state.selected_task().unwrap().id, ids[9]);
+}
+
+#[test]
+fn expanding_from_the_show_all_row_lands_on_the_first_revealed_task() {
+    let mut h = twelve_tasks_harness();
+    let ids = sorted_task_ids(&h);
+    for _ in 0..10 {
+        h.press(KeyCode::Down);
+    }
+    assert_eq!(h.app.state.show_all_row_index(), Some(10));
+    assert_eq!(h.app.state.task_selected, 10);
+    h.press(KeyCode::Enter);
+    assert!(h.app.state.show_all_tasks);
+    assert_eq!(h.app.state.selected_task().unwrap().id, ids[10]);
 }
 
 // ── `/` and Ctrl+K (R5) ────────────────────────────────────────────────────

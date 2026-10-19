@@ -468,7 +468,7 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | `X` | Reject a task in `review`. |
 | `E` | Edit the task. |
 | `D` | Delete the task (not while it is running). |
-| `S` | Show all tasks, or collapse the list. |
+| `S` | Show all tasks, or collapse the list. The selected task stays selected while it is still listed. |
 | `G` | Group tasks by goal, or ungroup. |
 | `o`, `O`, `0` | Move the sort to the next column, reverse the direction, reset. |
 
