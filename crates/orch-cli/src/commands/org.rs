@@ -1,10 +1,9 @@
-//! `orch org` — ported from `src/cli/commands/org.ts`
-//! (`docs/parity/cli.md` §18).
+//! `orch org`.
 //!
 //! `deploy` is a sequence of ordinary service calls with one unusual
 //! property: it is **not** transactional. An agent that fails to create
 //! leaves the earlier ones behind, and the error says so by naming the count
-//! — replicated, because the half-built tree is observable.
+//! — the half-built tree is observable.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -608,7 +607,7 @@ mod measurement_tests {
 }
 
 #[cfg(test)]
-mod selector_parity_tests {
+mod selector_tests {
     use super::*;
     use clap::Parser;
     #[tokio::test]

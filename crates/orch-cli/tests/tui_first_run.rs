@@ -1,4 +1,4 @@
-//! Bare `orch` — the first-run experience (PARITY.md §2.3).
+//! Bare `orch` — the first-run experience.
 //!
 //! Driven through the real binary, because what is under test is partly the
 //! argv shape: everything except the terminal itself, which no test can own.
@@ -54,8 +54,8 @@ fn bare_orch_initializes_the_current_directory_and_opens_the_dashboard() {
         "bare `orch` must init the cwd; stdout was {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    // The init half must not suggest a next command: the reference prints the
-    // `Next:` line from `init`'s own action, not from the first-run path.
+    // The init half must not suggest a next command: the `Next:` line
+    // belongs to `init`'s own action, not the first-run path.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("Next:"), "{stdout}");
     // It got as far as opening the terminal, which is as far as this can go.
@@ -77,7 +77,7 @@ fn bare_orch_in_a_subdirectory_does_not_adopt_the_ancestor_project() {
 
     orch(&nested).output().expect("run orch");
 
-    // The subtle half of §2.3: the probe and the init are `cwd`-local, and
+    // The subtle half: the probe and the init are `cwd`-local, and
     // root resolution happens afterwards. Resolving first would adopt the
     // ancestor and leave the user's new directory un-initialized.
     assert!(
@@ -109,14 +109,12 @@ fn bare_orch_in_an_initialized_project_does_not_re_init() {
 
 #[test]
 fn flags_without_a_subcommand_do_not_initialize() {
-    // `cli.ts:206` appends `tui` only for a *bare* argv, so `orch --json` is
+    // `tui` is appended only for a *bare* argv, so `orch --json` is
     // not the first-run path. What it *is* depends on the directory, and both
-    // halves are measured against the oracle:
+    // halves are pinned here:
     //
-    //   - uninitialized: the container is built before Commander parses, so
-    //     this is `Not initialized`, exit **3** — not the root help. Measured:
-    //     `node dist/cli.js --json` in an empty directory exits 3 and prints
-    //     `✕ Not initialized`.
+    //   - uninitialized: the container is built before argument parsing, so
+    //     this is `Not initialized`, exit **3** — not the root help.
     //   - initialized: no subcommand to run, so the root help and exit 1.
     let temp = tempfile::tempdir().expect("tempdir");
     let output = orch(temp.path()).arg("--json").output().expect("run orch");

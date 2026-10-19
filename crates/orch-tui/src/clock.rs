@@ -3,7 +3,7 @@
 //! Every timer in the TUI — toasts, the soft-delete undo window, the tab flash,
 //! message batching, the animation tick — is expressed as a deadline in
 //! milliseconds read from this trait, so the tests advance time instead of
-//! sleeping (PARITY.md §14.9.3).
+//! sleeping.
 
 use std::cell::Cell;
 use std::rc::Rc;

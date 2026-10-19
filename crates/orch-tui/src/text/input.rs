@@ -1,9 +1,9 @@
-//! Single-line text editing (`src/tui/hooks/useTextInput.ts`).
+//! Single-line text editing.
 //!
 //! Hand-written rather than delegated to `tui-input` (ARCHITECTURE §4.8): the
-//! parity surface here is a kill ring (`Ctrl+K/U/W` → `Ctrl+Y`) plus an undo
+//! surface here is a kill ring (`Ctrl+K/U/W` → `Ctrl+Y`) plus an undo
 //! stack with a 500 ms snapshot debounce, a 50-entry cap and two *different*
-//! undo semantics for `Ctrl+Z` and `Cmd+Z` (docs/parity/tui.md §2.4).
+//! undo semantics for `Ctrl+Z` and `Cmd+Z`.
 //! `tui-input` models none of those, so adopting it would mean reimplementing
 //! every asserted behaviour on top of a foreign buffer. The grapheme and width
 //! logic that *is* library work lives in [`super::cursor`].
@@ -18,7 +18,7 @@ use super::cursor::Cursor;
 
 /// `UNDO_SNAPSHOT_DEBOUNCE_MS`.
 pub const UNDO_SNAPSHOT_DEBOUNCE_MS: i64 = 500;
-/// Default `maxUndoDepth`.
+/// Default undo depth.
 pub const MAX_UNDO_DEPTH: usize = 50;
 
 #[derive(Debug, Clone, Default)]
@@ -417,8 +417,7 @@ impl TextInput {
             KeyCode::End => self.cursor.move_to_end(),
             KeyCode::Left => self.cursor.move_left(),
             KeyCode::Right => self.cursor.move_right(),
-            // Ink 6.8 maps the physical Backspace to `key.delete`; both delete
-            // backward, forward delete is Ctrl+D only.
+            // Both delete backward, forward delete is Ctrl+D only.
             KeyCode::Backspace | KeyCode::Delete => {
                 if self.cursor.pos() > 0 {
                     self.snapshot_debounced(now_ms);
@@ -443,17 +442,15 @@ impl TextInput {
     }
 }
 
-/// Ink's `key.meta`, which is **Alt/Option — never Cmd**.
+/// The meta modifier, which is **Alt/Option — never Cmd**.
 ///
-/// Verified in Ink 6.8.0 `parse-keypress.js` (PARITY §12.5): on the legacy path
-/// `key.meta` comes from an ESC-prefixed sequence, which is how terminals
-/// encode Option-as-Meta; on the xterm path it is the Alt/Meta modifier bits;
-/// and under the Kitty protocol `meta` (bit 32) is a *distinct* bit from
-/// `super` (bit 8), where Cmd arrives. Ink never maps `super` to `key.meta`,
-/// and on terminals without the protocol the emulator swallows Cmd before the
-/// application sees it. So `SUPER` must not satisfy a meta binding: the keymap
-/// is L1, and treating Cmd as Meta would make bindings fire here that cannot
-/// fire in the original.
+/// On the legacy path meta comes from an ESC-prefixed sequence, which is how
+/// terminals encode Option-as-Meta; on the xterm path it is the Alt/Meta
+/// modifier bits; and under the Kitty protocol `meta` (bit 32) is a *distinct*
+/// bit from `super` (bit 8), where Cmd arrives. On terminals without the
+/// protocol the emulator swallows Cmd before the application sees it. So
+/// `SUPER` must not satisfy a meta binding: treating Cmd as Meta would make
+/// Cmd trigger Alt bindings.
 pub fn is_meta(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::META)
 }
@@ -702,8 +699,7 @@ mod tests {
 
     #[test]
     fn cmd_is_not_meta_so_super_bindings_do_not_fire() {
-        // `key.meta` in Ink is Alt/Option or the Kitty `meta` bit, never Cmd
-        // (PARITY §12.5). Cmd+A must not jump to the start the way Alt+A does;
+        // Meta is Alt/Option or the Kitty `meta` bit, never Cmd. Cmd+A must not jump to the start the way Alt+A does;
         // it falls through and inserts the character.
         let mut alt = TextInput::new("hello");
         alt.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT), 0);

@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-skills.test.ts`.
-//!
 //! Library skills are appended to the **system** prompt, which is the half
 //! that stays cacheable between runs. MCP skills are the Claude CLI's job, so
 //! the loader resolves nothing for them — and the orchestrator still hands it

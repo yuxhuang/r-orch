@@ -1,5 +1,5 @@
-//! Run domain model — one execution attempt of a task by an agent
-//! (`src/domain/run.ts`). Events live in a sibling `.jsonl` file, never in the
+//! Run domain model — one execution attempt of a task by an agent.
+//! Events live in a sibling `.jsonl` file, never in the
 //! `Run` record.
 
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ impl std::str::FromStr for RunStatus {
     }
 }
 
-/// Field order mirrors the TS `Run` interface (PARITY.md §6.9).
+/// Field order is the serialized field order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
     pub id: String,
@@ -78,7 +78,7 @@ pub struct Run {
 }
 
 /// `total == input + output + reasoning`. The cache counters are informational
-/// and are deliberately *not* part of the total (PARITY.md §6.9).
+/// and are deliberately *not* part of the total.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input: u64,
@@ -90,7 +90,7 @@ pub struct TokenUsage {
     pub cache_write: u64,
 }
 
-/// Optional arguments of [`create_token_usage`], mirroring the TS `opts` bag.
+/// Optional arguments of [`create_token_usage`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsageOpts {
     pub reasoning: Option<u64>,
@@ -170,9 +170,9 @@ impl std::str::FromStr for RunEventType {
 }
 
 /// One line of a `<run-id>.jsonl` file. Key order `timestamp, type, data` is
-/// the emitted order (PARITY.md §6.9).
+/// the emitted order.
 ///
-/// `data` is typed as a JSON value because the on-disk type is TS `unknown`,
+/// `data` is typed as a JSON value because the on-disk type is untyped JSON,
 /// but the orchestrator pre-serializes it: every line it writes carries a
 /// **string** `data`, truncated to 8192 characters with a trailing `…`.
 /// Reads must stay tolerant of non-strings because older files and the
@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn run_event_line_matches_the_reference_bytes() {
+    fn run_event_line_has_the_expected_bytes() {
         let event = RunEvent {
             timestamp: "2026-10-13T16:37:59.169Z".into(),
             event_type: RunEventType::AgentOutput,

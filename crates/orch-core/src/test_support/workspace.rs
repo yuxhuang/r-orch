@@ -11,7 +11,7 @@ use crate::test_support::faults::Faults;
 use crate::test_support::recorder::Recorder;
 use crate::workspace::{MergeResult, PrepareResult, WorkspaceManager};
 
-/// The path the TS `createMockWorkspaceManager` returns from `prepare`.
+/// The path the fake workspace manager returns from `prepare`.
 pub const FAKE_WORKSPACE: &str = "/tmp/ws";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +49,7 @@ impl Default for FakeWorkspaceManager {
 
 impl FakeWorkspaceManager {
     /// `prepare → { path: "/tmp/ws" }`, `merge_back → success`,
-    /// `get_changed_files → []` — the TS mock's defaults.
+    /// `get_changed_files → []`.
     pub fn new() -> Self {
         FakeWorkspaceManager {
             prepare_result: Arc::new(Mutex::new(PrepareResult {
@@ -171,7 +171,7 @@ mod tests {
     use orch_domain::default_config;
 
     #[tokio::test]
-    async fn defaults_match_the_ts_mock() {
+    async fn a_new_fake_workspace_manager_has_its_documented_defaults() {
         let ws = FakeWorkspaceManager::new();
         let result = ws
             .prepare(&make_task(), &make_agent(), &default_config())

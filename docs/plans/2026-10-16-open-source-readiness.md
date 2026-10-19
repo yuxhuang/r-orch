@@ -32,7 +32,7 @@ Independent checklist items; each is its own small PR or a repository-settings c
 - [ ] Decide on dependabot (cargo and github-actions, monthly) versus the weekly scheduled cargo-deny run.
       (The weekly schedule is added to `ci.yml` in the agents/SDLC PR; mark done once merged.)
 - [ ] Optional, deferred: a `release.yml` workflow on `v*` tags.
-- [ ] Check the README "Relationship to the TypeScript original" wording.
+- [x] README "Relationship to the TypeScript original" replaced by a one-sentence provenance note ([ADR 0009](../decisions/0009-remove-parity-tooling.md)).
 
 ## Test plan
 Each item is verifiable by inspection: file present, setting visible in the ruleset, workflow run green.

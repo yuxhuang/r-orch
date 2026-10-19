@@ -1,7 +1,7 @@
-//! The wizard catalogue (`src/tui/wizardConfigs.ts`) — step definitions, skip
+//! The wizard catalogue — step definitions, skip
 //! predicates, validators and the value → entity mappers.
 //!
-//! **This module is L0** (PARITY.md §12): an inverted skip predicate or a
+//! **Correctness is critical here**: an inverted skip predicate or a
 //! wrong default writes corrupt `Task` / `Agent` / `Goal` / `Team` records
 //! through the UI.
 
@@ -33,7 +33,7 @@ fn choices(rows: &[(&str, &str, &str)]) -> Vec<Choice> {
 }
 
 /// `ADAPTERS` — the provider select, in order. Shell is 8th, so `7 × j` reaches
-/// it (docs/parity/tui.md §5.2).
+/// it.
 pub fn adapter_options() -> Vec<Choice> {
     choices(&[
         ("claude", "Claude", "Claude Code CLI"),
@@ -155,7 +155,7 @@ pub fn toggle_options() -> Vec<Choice> {
     choices(&[("true", "On", ""), ("false", "Off", "")])
 }
 
-/// `getFallbackModelOptions(adapter)`.
+/// The built-in model options for an adapter, used when no catalog was discovered.
 pub fn fallback_model_options(adapter: &str) -> Vec<ModelOption> {
     let rows: &[(&str, &str, &str)] = match adapter {
         "claude" => &[
@@ -189,7 +189,7 @@ pub fn fallback_model_options(adapter: &str) -> Vec<ModelOption> {
         .collect()
 }
 
-/// `getModelOptions(adapter, catalog)` — the discovered catalog when non-empty,
+/// The discovered catalog when non-empty,
 /// otherwise the per-adapter fallback.
 pub fn model_options(adapter: Option<&str>, catalog: &ModelCatalog) -> Vec<ModelOption> {
     let resolved = adapter.unwrap_or("claude");
@@ -215,12 +215,12 @@ fn to_choices(options: Vec<ModelOption>) -> Vec<Choice> {
 
 /// MCP skills use the `pack:skill` form and only work with the Claude CLI.
 /// Inlined rather than taken from `orch-engine::agent_factory`: `orch-tui` must
-/// not depend on the engine (PARITY.md §13.1).
+/// not depend on the engine.
 pub fn is_mcp_skill(skill: &str) -> bool {
     skill.contains(':')
 }
 
-/// `mapAgentOptions` — non-disabled agents, hint `[{adapter}] {first role line}`
+/// Non-disabled agents, hint `[{adapter}] {first role line}`
 /// capped at 60 chars.
 pub fn agent_choices(agents: &[Agent]) -> Vec<Choice> {
     agents
@@ -251,7 +251,7 @@ pub fn agent_choices(agents: &[Agent]) -> Vec<Choice> {
         .collect()
 }
 
-/// `buildAgentOptions` — the sentinel plus the agent list.
+/// The sentinel plus the agent list.
 pub fn agent_options_with_sentinel(
     agents: &[Agent],
     empty_label: &str,
@@ -262,7 +262,7 @@ pub fn agent_options_with_sentinel(
     out
 }
 
-/// `buildTeamOptions` — `None` plus every **active** team.
+/// `None` plus every **active** team.
 pub fn team_options(teams: &[Team]) -> Vec<Choice> {
     let mut out = vec![Choice::new("", "None", "no team")];
     out.extend(
@@ -278,7 +278,7 @@ pub fn team_options(teams: &[Team]) -> Vec<Choice> {
     out
 }
 
-// ── Validators (docs/parity/tui.md §5.3) ───────────────────────────────────
+// ── Validators ───────────────────────────────────
 
 pub const TITLE_REQUIRED: &str = "Title is required";
 pub const PRIORITY_RANGE: &str = "Priority must be 1-4";
@@ -347,7 +347,7 @@ fn value_of(values: &Values, key: &str) -> String {
 
 // ── NEW AGENT ──────────────────────────────────────────────────────────────
 
-/// `getAgentWizardSteps(agents, teams, modelCatalog, defaultAdapter)` — ten
+/// Ten
 /// steps, six conditional.
 pub fn agent_wizard_steps(
     agents: &[Agent],
@@ -414,7 +414,7 @@ pub fn shop_template_choices() -> Vec<Choice> {
         .collect()
 }
 
-/// `agentWizardToInput(vals, defaultAdapter)`.
+/// The NEW AGENT wizard's values mapped to an agent input.
 pub struct AgentWizardInput {
     pub name: String,
     pub adapter: String,
@@ -501,7 +501,7 @@ fn non_empty(s: String) -> Option<String> {
 
 // ── AGENT SHOP ─────────────────────────────────────────────────────────────
 
-/// `getShopWizardSteps()` — one select step over the 15 templates.
+/// One select step over the 15 templates.
 pub fn shop_wizard_steps() -> Vec<WizardStep> {
     vec![
         WizardStep::new(
@@ -513,7 +513,7 @@ pub fn shop_wizard_steps() -> Vec<WizardStep> {
     ]
 }
 
-/// `applyShopTemplate(baseSteps, template, defaultAdapter)`.
+/// Pre-fill the NEW AGENT steps from an agent-shop template.
 pub fn apply_shop_template(
     base_steps: Vec<WizardStep>,
     template: &AgentShopTemplate,
@@ -575,9 +575,8 @@ pub fn apply_shop_template(
 
 // ── EDIT AGENT ─────────────────────────────────────────────────────────────
 
-/// `getEditAgentWizardSteps(agent, agents, teams, modelCatalog)` — eight steps
-/// (`wizardConfigs.ts:463`: the NEW AGENT ids minus `skills` and
-/// `approval_policy`).
+/// The EDIT AGENT steps: eight, being the NEW AGENT ids minus `skills` and
+/// `approval_policy`.
 ///
 /// Every skip predicate falls back to `agent.adapter` when the user has not
 /// (yet) chosen one.
@@ -692,16 +691,14 @@ pub fn edit_agent_wizard_steps(
     ]
 }
 
-/// `editAgentWizardToFields(vals)`.
+/// The EDIT AGENT wizard's values mapped to the fields to change.
 ///
 /// `effort` is preserved as `""` so the field can be *cleared* — deliberately
 /// different from the create mapper, which drops empties.
 ///
-/// `role` is **not** clearable, by parity: the `Skip` preset maps to `None`
-/// ("unchanged"), exactly as `vals.role || undefined` does in TS. The engine
-/// would accept a clear, but this mapping is L0 (PARITY §12) — making `Skip`
-/// erase a stored role would write different data than the TS binary for the
-/// same keystrokes, so it needs a PARITY §14 entry first.
+/// `role` is **not** clearable: the `Skip` preset maps to `None`
+/// ("unchanged"). The engine would accept a clear, but making `Skip` erase a
+/// stored role would change what the same keystrokes write to existing data.
 pub fn edit_agent_wizard_to_fields(values: &Values) -> (AgentFields, Option<String>) {
     let adapter = values.get("adapter").cloned();
     let is_shell = adapter.as_deref() == Some("shell");
@@ -744,7 +741,7 @@ pub fn edit_agent_wizard_to_fields(values: &Values) -> (AgentFields, Option<Stri
 
 // ── NEW / EDIT TASK ────────────────────────────────────────────────────────
 
-/// `getTaskWizardSteps(agents)`.
+/// The NEW TASK steps.
 pub fn task_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
     let options =
         agent_options_with_sentinel(agents, "Auto-assign", "orchestrator picks the best agent");
@@ -766,7 +763,7 @@ pub fn task_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
     ]
 }
 
-/// `getEditTaskWizardSteps(task, agents)`.
+/// The EDIT TASK steps.
 pub fn edit_task_wizard_steps(task: &Task, agents: &[Agent]) -> Vec<WizardStep> {
     let options = agent_options_with_sentinel(agents, "None / Auto", "remove assignee");
     let options_len = options.len();
@@ -789,7 +786,7 @@ pub fn edit_task_wizard_steps(task: &Task, agents: &[Agent]) -> Vec<WizardStep> 
     ]
 }
 
-/// `taskWizardToInput(vals)` — plus the chosen assignee, which the submit path
+/// Plus the chosen assignee, which the submit path
 /// applies with a second call.
 pub fn task_wizard_to_input(values: &Values) -> (String, CreateTaskOpts, Option<String>) {
     let title = value_of(values, "title");
@@ -801,7 +798,7 @@ pub fn task_wizard_to_input(values: &Values) -> (String, CreateTaskOpts, Option<
     (title, opts, non_empty(value_of(values, "assignee")))
 }
 
-/// `editTaskWizardToFields(vals)` — `description` is always written (`?? ''`)
+/// `description` is always written (`?? ''`)
 /// so it can be cleared.
 pub fn edit_task_wizard_to_fields(values: &Values) -> (TaskFields, Option<String>) {
     let fields = TaskFields {
@@ -815,7 +812,7 @@ pub fn edit_task_wizard_to_fields(values: &Values) -> (TaskFields, Option<String
 
 // ── NEW TEAM ───────────────────────────────────────────────────────────────
 
-/// `getTeamWizardSteps(agents, teams)`.
+/// The NEW TEAM steps.
 pub fn team_wizard_steps(agents: &[Agent], teams: &[Team]) -> Vec<WizardStep> {
     let agent_opts = agent_choices(agents);
     let teams_owned = teams.to_vec();
@@ -847,7 +844,7 @@ pub fn team_wizard_steps(agents: &[Agent], teams: &[Team]) -> Vec<WizardStep> {
     ]
 }
 
-/// `teamWizardToInput(vals)`.
+/// The NEW TEAM wizard's values mapped to a team input.
 pub fn team_wizard_to_input(values: &Values) -> orch_domain::CreateTeamInput {
     let members: Vec<String> = value_of(values, "members")
         .split(',')
@@ -875,7 +872,7 @@ const GOAL_ASSIGNEE_DESC: &str =
 const GOAL_DESCRIPTION_DESC: &str =
     "Context matters — include tech stack, constraints, and what \"done\" looks like";
 
-/// `getGoalWizardSteps(agents)`.
+/// The NEW GOAL steps.
 pub fn goal_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
     let options =
         agent_options_with_sentinel(agents, "Any agent", "auto-assign to autonomous agents");
@@ -896,7 +893,7 @@ pub fn goal_wizard_steps(agents: &[Agent]) -> Vec<WizardStep> {
     ]
 }
 
-/// `getEditGoalWizardSteps(goal, agents)` — the sentinel hint becomes
+/// The EDIT GOAL steps — the sentinel hint becomes
 /// `auto-assign`.
 pub fn edit_goal_wizard_steps(goal: &Goal, agents: &[Agent]) -> Vec<WizardStep> {
     let options = agent_options_with_sentinel(agents, "Any agent", "auto-assign");
@@ -919,7 +916,7 @@ pub fn edit_goal_wizard_steps(goal: &Goal, agents: &[Agent]) -> Vec<WizardStep> 
     ]
 }
 
-/// `goalWizardToInput(vals)`.
+/// The NEW GOAL wizard's values mapped to a goal input.
 pub fn goal_wizard_to_input(values: &Values) -> orch_domain::CreateGoalInput {
     orch_domain::CreateGoalInput {
         title: value_of(values, "title"),
@@ -928,7 +925,7 @@ pub fn goal_wizard_to_input(values: &Values) -> orch_domain::CreateGoalInput {
     }
 }
 
-/// `editGoalWizardToFields(vals)` — `description` is always written.
+/// `description` is always written.
 pub fn edit_goal_wizard_to_fields(values: &Values) -> GoalFields {
     GoalFields {
         title: values.get("title").cloned(),
@@ -939,7 +936,7 @@ pub fn edit_goal_wizard_to_fields(values: &Values) -> GoalFields {
 
 // ── SETTINGS ───────────────────────────────────────────────────────────────
 
-/// `getConfigWizardSteps(setting, …)` — always exactly one step. The step id is
+/// Always exactly one step. The step id is
 /// the setting with hyphens replaced by underscores.
 pub fn config_wizard_steps(
     setting: &str,
@@ -1091,7 +1088,7 @@ pub fn config_wizard(
     .with_setting(setting)
 }
 
-/// `resolveModel` wrapper used by the shop path, kept here so the tier → model
+/// `resolve_model` wrapper used by the shop path, kept here so the tier → model
 /// mapping has one call site.
 pub fn model_for_tier(adapter: &str, tier: ModelTier) -> &'static str {
     resolve_model(adapter, tier)

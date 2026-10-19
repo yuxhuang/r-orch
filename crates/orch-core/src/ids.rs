@@ -1,9 +1,9 @@
-//! The id-generator seam — a deliberate addition over the TS original
-//! (ARCHITECTURE §5.6). TS tests assert id *prefixes* because they cannot
-//! control the generator; with this seam the harness can assert exact values.
+//! The id-generator seam (ARCHITECTURE §5.6). Tests cannot control a random
+//! generator, so without this seam they could only assert id *prefixes*; with
+//! it they can assert exact values.
 
 /// The 64-character URL-safe alphabet shared by JS `nanoid`'s `urlAlphabet`
-/// and Rust `nanoid::alphabet::SAFE` (PARITY.md §6.2).
+/// and Rust `nanoid::alphabet::SAFE`.
 pub const ID_ALPHABET_LEN: usize = 64;
 
 /// nanoid length used for every generated id.
@@ -19,7 +19,7 @@ pub trait IdGenerator: Send + Sync {
 /// characters from the URL-safe alphabet (V29).
 ///
 /// `agt_creator` is the one id `init` writes as a fixed string rather than
-/// generating (PARITY.md §6.2). It coincidentally has the contract shape —
+/// generating. It coincidentally has the contract shape —
 /// `"creator"` is 7 alphanumeric characters — so this check cannot be used to
 /// tell a generated id from the bootstrap one.
 pub fn is_well_formed_id(id: &str, prefix: &str) -> bool {
@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn accepts_the_reference_ids() {
-        // The examples from PARITY.md §6.2.
+        // Representative well-formed ids.
         assert!(is_well_formed_id("tsk_O5WBXtX", "tsk"));
         assert!(is_well_formed_id("agt_veWG_kK", "agt"));
         assert!(is_well_formed_id("run_rKQA8ah", "run"));

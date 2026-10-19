@@ -1,8 +1,7 @@
 //! Services, the orchestrator, the event bus and the container.
 //!
 //! The engine is the application layer: it owns every behaviour that is not
-//! persistence, process management or presentation. Each service is a direct
-//! port of its `src/application/*.ts` counterpart and depends only on
+//! persistence, process management or presentation. Each service depends only on
 //! `orch-core` port traits, which is what lets the whole layer be unit-tested
 //! against in-memory fakes.
 

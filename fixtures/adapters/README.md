@@ -13,8 +13,8 @@ and decoding path runs) and compares the result.
 
 ## Provenance
 
-The stdout payloads are taken from the TypeScript suites, so the expectations
-are anchored to the original rather than to this port:
+The stdout payloads were originally taken from the upstream TypeScript test
+suites listed below (recorded for provenance only; nothing reads them):
 
 | fixture | source |
 |---|---|
@@ -28,9 +28,9 @@ are anchored to the original rather than to this port:
 | `grok/session`, `antigravity/session` | `test/integration/new-adapters.e2e.test.ts` |
 | `shell/session` | `test/unit/infrastructure/shell-adapter.test.ts` |
 
-## What they pin that the ported unit tests do not
+## What they pin that the per-adapter unit tests do not
 
-The ported assertions check the field each TS test checked (`data.command`,
+The per-adapter unit tests check individual fields (`data.command`,
 `tokens.total`, …). These fixtures compare the **whole** event — every key of
 `data`, its order, `tokens`, `errorKind` — which is what catches a renamed or
 reordered key in a payload the orchestrator writes verbatim into
@@ -46,4 +46,4 @@ ORCH_BLESS_FIXTURES=1 cargo test -p orch-infra --test adapter_fixtures
 ```
 
 Then **read the diff**. A change here is a change to the event wire contract
-(PARITY.md §8.6), not a test detail.
+not a test detail.

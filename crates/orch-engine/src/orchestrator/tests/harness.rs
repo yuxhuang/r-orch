@@ -28,7 +28,7 @@ use crate::run_service::RunService;
 use crate::task_service::TaskService;
 
 /// A command runner that answers every review criterion from one scripted
-/// outcome, so no unit test shells out to `npm` (PARITY.md V31).
+/// outcome, so no unit test shells out to `npm`.
 pub(crate) struct ScriptedCommandRunner {
     outcome: Mutex<crate::review_runner::CommandOutcome>,
     calls: Mutex<Vec<(String, Vec<String>, std::path::PathBuf)>>,
@@ -112,7 +112,7 @@ pub(crate) struct Harness {
     _recorder: Option<crate::events::Unsubscribe>,
 }
 
-/// Builder, standing in for the TS `buildDeps(overrides)` spread.
+/// Builder for the harness, with per-test overrides.
 pub(crate) struct HarnessBuilder {
     project_root: Option<std::path::PathBuf>,
     tasks: Vec<Task>,
@@ -241,8 +241,7 @@ impl HarnessBuilder {
         self
     }
 
-    /// Leave the registry empty, so `require()` fails — the TS default, since
-    /// `buildDeps` hands over a bare `new AdapterRegistry()`.
+    /// Leave the registry empty, so `require()` fails.
     pub(crate) fn without_adapter(mut self) -> Self {
         self.register_adapter = false;
         self
@@ -420,8 +419,8 @@ impl Harness {
     }
 
     /// Start watch mode with signal handling off — a real `SIGINT` would hit
-    /// the test process, not a child. Seeding is **on**, which is the TS
-    /// default for `startWatch()` with no options.
+    /// the test process, not a child. Seeding is **on**, which is the
+    /// default for watch options.
     pub(crate) async fn start_watch(&self) -> orch_core::error::Result<()> {
         self.orchestrator
             .start_watch(WatchOptions {
@@ -460,8 +459,7 @@ impl Harness {
         self.orchestrator.reconcile(state).await
     }
 
-    /// Pretend the lock is held, as the TS tests do with
-    /// `(orch as any).lockAcquired = true`.
+    /// Pretend the lock is held.
     pub(crate) fn own_lock(&self) {
         self.orchestrator
             .inner
@@ -469,8 +467,7 @@ impl Harness {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Load state into the orchestrator without running a tick — the TS
-    /// `await (orch as any).loadState()`.
+    /// Load state into the orchestrator without running a tick.
     pub(crate) async fn load_state(&self) -> orch_core::error::Result<()> {
         let mut slot = self.orchestrator.inner.state.lock().await;
         self.orchestrator.load_state(&mut slot).await
@@ -546,8 +543,7 @@ impl Harness {
             .contains(&TaskStatus::InProgress)
     }
 
-    /// Wait until `predicate` holds, polling the way the TS `waitFor` helper
-    /// does. Bounded so a regression fails rather than hangs.
+    /// Wait until `predicate` holds, polling. Bounded so a regression fails rather than hangs.
     pub(crate) async fn wait_for<F>(&self, mut predicate: F)
     where
         F: FnMut(&Harness) -> bool,
@@ -598,8 +594,7 @@ pub(crate) fn config_with_concurrency(max: usize) -> OrchestratorConfig {
     config
 }
 
-/// A running entry for `task_id`, as the TS tests hand-build in
-/// `createMockStateStore({ running: { … } })`.
+/// A running entry for `task_id`.
 pub(crate) fn running_entry(
     task_id: &str,
     agent_id: &str,

@@ -1,7 +1,6 @@
 # Shared helpers for the fake agent CLIs. Sourced, never executed.
 #
-# POSIX sh only: the differential harness must spawn no `npm` and make no
-# network call (PARITY.md V31), and both binaries have to run these.
+# POSIX sh only: these must spawn no `node`/`npm` and make no network call.
 
 set -u
 
@@ -24,8 +23,8 @@ fake_scenario() {
   printf '%s' "$scenario"
 }
 
-# The reply text an agent "produces". Deterministic, so the differential
-# harness can compare run artefacts byte for byte.
+# The reply text an agent "produces". Deterministic, so tests can
+# compare run artefacts byte for byte.
 fake_reply() {
   printf '%s' "${ORCH_FAKE_REPLY:-ORCH_FAKE_OK}"
 }
@@ -33,7 +32,7 @@ fake_reply() {
 # ── Scenario effects, shared by every adapter ───────────────────────────────
 
 # 256 KiB on stderr: more than one pipe buffer, so an adapter that fails to
-# drain it deadlocks (PARITY.md §14.12).
+# drain it deadlocks.
 fake_flood_stderr() {
   i=0
   while [ "$i" -lt 2048 ]; do

@@ -40,7 +40,7 @@ ignore = [
   # What the acceptance now rests on, in order:
   #   1. No API-compatible replacement. serde_yaml_ng is the only maintained
   #      crate offering a dynamic `Value` model plus `apply_merge()`, and
-  #      js-yaml merge-key parity (PARITY.md §6.4.2) is a wire contract, not a
+  #      YAML merge-key (`<<`) support is a wire contract, not a
   #      convenience. serde-saphyr was evaluated as the advisory's suggested
   #      replacement and deserializes into typed structs only — adopting it
   #      means hand-writing merge resolution, the timestamp guard and surrogate

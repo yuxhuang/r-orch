@@ -1,18 +1,17 @@
-//! The pre-parse routing guard and the Commander-compatible failure mapping
-//! (`docs/parity/cli.md` §1.5, §1.6, §3.5, §3.6).
+//! The pre-parse routing guard and the usage-failure mapping (exit `1`, fixed wording).
 //!
-//! Three properties here are L0 and none of them is something clap does on its
+//! Three properties here are contract and none of them is something clap does on its
 //! own:
 //!
 //! 1. **The container is built before argument parsing.** In an uninitialized
 //!    directory every command exits `3` — including `orch <sub> --help`, an
 //!    unknown command and an unknown global option — because
 //!    `NotInitializedError` is thrown while the container is constructed, which
-//!    happens before Commander parses. Only `init`, `doctor` and `update` are
+//!    happens before clap parses. Only `init`, `doctor` and `update` are
 //!    exempt.
 //! 2. **`--help`/`--version` with no real subcommand** never builds a
 //!    container, so `orch --help` works in an empty directory.
-//! 3. **Usage errors exit `1`**, not clap's `2`, and carry Commander's wording.
+//! 3. **Usage errors exit `1`**, not clap's `2`, and carry fixed wording.
 
 use std::ffi::OsStr;
 
@@ -26,8 +25,8 @@ pub struct ArgvShape {
     pub sub: Option<String>,
     /// `--help`, `-h`, `--version` or `-V` appears anywhere.
     pub is_help_or_version: bool,
-    /// `--version` or `-V` specifically: Commander prints the bare version
-    /// string, where clap prefixes it with the program name.
+    /// `--version` or `-V` specifically: the bare version string is printed,
+    /// where clap prefixes it with the program name.
     pub wants_version: bool,
     /// `process.argv.length <= 2` — no arguments at all, which is the
     /// first-run path rather than a guarded command.
@@ -77,7 +76,7 @@ impl ArgvShape {
         }
     }
 
-    /// Whether the first non-flag token names a command the reference knows.
+    /// Whether the first non-flag token names a known command.
     pub fn has_real_sub(&self) -> bool {
         self.sub
             .as_deref()
@@ -92,11 +91,11 @@ impl ArgvShape {
     /// Whether an uninitialized project is fatal for this invocation.
     ///
     /// `init`, `doctor` and `update` are the exemptions. A **bare** `orch` is
-    /// also not fatal: the reference treats it as the first-run experience
+    /// also not fatal: it is the first-run experience
     /// (init, then the TUI), which is WP-6's surface — until that lands the
     /// root help is printed instead. `orch --nope`, though, is *not* bare:
-    /// it has no subcommand, so the reference builds the full container and
-    /// reports `Not initialized` before the usage error (verified in §3.5).
+    /// it has no subcommand, so the full container is built and
+    /// reports `Not initialized` before the usage error.
     pub fn requires_initialized_project(&self) -> bool {
         if self.is_bare {
             return false;
@@ -109,13 +108,12 @@ impl ArgvShape {
     }
 }
 
-/// Map a clap parse failure onto Commander's message and exit code.
+/// Map a clap parse failure onto the CLI's fixed message and exit code.
 ///
-/// Returns the exit code; the message is already printed. Commander exits `1`
-/// for every usage error, where clap exits `2`, and its three documented
-/// messages (`docs/parity/cli.md` §3.6) are reproduced verbatim because the
-/// harness compares stderr byte for byte. Anything else keeps clap's own
-/// rendering, which is help-shaped and therefore L2.
+/// Returns the exit code; the message is already printed. Every usage error exits `1`, where clap exits `2`, and its three documented
+/// messages are reproduced verbatim so
+/// stderr stays byte for byte stable. Anything else keeps clap's own
+/// rendering, which is help-shaped and may differ.
 pub fn report_parse_error(err: &clap::Error) -> u8 {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
 
@@ -140,7 +138,7 @@ pub fn report_parse_error(err: &clap::Error) -> u8 {
         }
         ErrorKind::MissingRequiredArgument => {
             if let Some(ContextValue::Strings(args)) = err.get(ContextKind::InvalidArg) {
-                // Commander reports the first missing option, formatted as it
+                // The first missing option is reported, formatted as it
                 // was declared: `required option '--adapter <adapter>' not
                 // specified`.
                 for arg in args {
@@ -182,8 +180,8 @@ mod tests {
     }
 
     #[test]
-    fn a_flag_value_can_be_mistaken_for_the_subcommand_exactly_as_in_the_reference() {
-        // `--name proj` puts `proj` first. The reference finds the same token
+    fn a_flag_value_can_be_mistaken_for_the_subcommand_even_though_it_is_not_a_command() {
+        // `--name proj` puts `proj` first. The same token is found
         // and routes nowhere, so an unknown command is reported either way.
         assert_eq!(
             shape(&["orch", "--name", "proj", "init"]).sub.as_deref(),
@@ -217,8 +215,8 @@ mod tests {
         assert!(shape(&["orch"]).is_bare);
         assert!(!shape(&["orch"]).requires_initialized_project());
 
-        // `orch --nope` has no subcommand but is not bare: the reference
-        // builds the container and reports `Not initialized` (verified).
+        // `orch --nope` has no subcommand but is not bare: the
+        // container is built and reports `Not initialized`.
         assert!(!shape(&["orch", "--nope"]).is_bare);
         assert!(shape(&["orch", "--nope"]).requires_initialized_project());
         assert!(shape(&["orch", "--json"]).requires_initialized_project());

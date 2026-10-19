@@ -1,11 +1,10 @@
-//! Region sizing (docs/parity/tui.md §6).
+//! Region sizing.
 //!
-//! Ported verbatim from the TS arithmetic — the "three consecutive `+`" and
-//! "two consecutive `-`" clamp tests exist because this math is fragile.
+//! The "three consecutive `+`" and "two consecutive `-`" clamp tests exist because this math is fragile.
 
 use crate::state::ViewId;
 
-/// `fixedRows` — Header(5) + gap(1) + SectionLabel(1) + gap(1) + CommandBar(1).
+/// Header(5) + gap(1) + SectionLabel(1) + gap(1) + CommandBar(1).
 pub const FIXED_ROWS: u16 = 9;
 
 /// Resize step for `+` / `-`.
@@ -13,9 +12,8 @@ pub const SPLIT_STEP: i32 = 3;
 
 /// Minimum terminal size.
 ///
-/// **Deliberate addition, not parity** (PARITY.md §12.2): the original has no
-/// guard at all and produces negative heights below roughly `FIXED_ROWS` plus a
-/// usable split. Below this we render a single centred message instead.
+/// Without a guard the layout produces negative heights below roughly
+/// `FIXED_ROWS` plus a usable split. Below this we render a single centred message instead.
 pub const MIN_WIDTH: u16 = 40;
 pub const MIN_HEIGHT: u16 = 14;
 
@@ -80,7 +78,7 @@ pub fn regions(
     }
 }
 
-/// Re-clamp `splitOffset` to ±`maxSplitOffset`, as every `contentH` change does.
+/// Re-clamp the split offset to ±the maximum, as every content-height change does.
 pub fn clamp_split_offset(offset: i32, content_h: u16) -> i32 {
     let max = max_split_offset(content_h).max(0);
     offset.clamp(-max, max)

@@ -2,9 +2,8 @@
 //!
 //! Nothing installed a `tracing` subscriber before, so every deliberate
 //! swallowed error in the engine, the adapters and the stores was invisible.
-//! Installing one risks the opposite problem: stdout is the contract the
-//! differential harness compares byte for byte, and `--json` has to stay
-//! parseable, so a diagnostic must never land there.
+//! Installing one risks the opposite problem: stdout is the contract,
+//! and `--json` has to stay parseable, so a diagnostic must never land there.
 
 use std::path::Path;
 use std::process::Command;

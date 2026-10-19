@@ -1,4 +1,4 @@
-//! The toast banner (docs/parity/tui.md §8.4).
+//! The toast banner.
 //!
 //! At most two rows — the **first** two of the queue, not the newest.
 

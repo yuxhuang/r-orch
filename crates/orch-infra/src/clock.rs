@@ -1,5 +1,5 @@
 //! The real [`Clock`]: wall time, formatted exactly as
-//! `new Date().toISOString()` (PARITY.md §6.3).
+//! `new Date().toISOString()`.
 
 use jiff::Timestamp;
 use orch_core::clock::{Clock, iso_from_epoch_ms};
@@ -20,8 +20,7 @@ impl Clock for SystemClock {
 
     /// Formatted through [`iso_from_epoch_ms`] rather than `jiff`'s own
     /// printer: millisecond precision with exactly three fractional digits is
-    /// the contract, and that formatter is the one with the test vector
-    /// generated from node.
+    /// the contract, and that formatter is the one pinned by test vectors.
     fn now_iso(&self) -> String {
         iso_from_epoch_ms(self.now_ms())
     }

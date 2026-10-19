@@ -6,7 +6,7 @@ Read this first, whatever your role. Reasons live in the linked docs.
 
 r-orch is a Rust AI-agent orchestrator: a CLI (`orch`), a terminal dashboard and a runtime that drives external
 AI coding CLIs as child processes and keeps all state as plain files under `.orchestry/`. It began as a port of
-the TypeScript `oxgeneral/ORCH` and has since diverged (see [ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)).
+`oxgeneral/ORCH` and is developed on its own terms.
 The repo is **private**, being prepared for open source.
 
 | Crate | Role |
@@ -18,7 +18,7 @@ The repo is **private**, being prepared for open source.
 | `orch-peer` | Remote-peer protocol: links, mirrors, reconnect. |
 | `orch-cli` | clap command tree, human and `--json` rendering, serve mode, `orch web`. Binaries live here. |
 | `orch-tui` | ratatui dashboard. |
-| `xtask` | Dev tooling: crate-graph, lint-scenarios, parity harness. Run as `cargo xtask <cmd>`. |
+| `xtask` | Dev tooling: crate-graph. Run as `cargo xtask <cmd>`. |
 
 Dependency direction is asserted by `cargo xtask crate-graph` (ARCHITECTURE §3.1).
 Authoritative docs:
@@ -34,7 +34,7 @@ Authoritative docs:
 | What a piece of work must do, and how we check it | [docs/specs/](docs/specs/) |
 | How and in what order we will build it | [docs/plans/](docs/plans/) |
 | Frozen trait signatures | [docs/TRAITS-FROZEN.md](docs/TRAITS-FROZEN.md) |
-| Historical: the old parity contract and port reviews | `docs/PARITY.md`, `docs/parity/`, `docs/reviews/` |
+| Historical: the port-era gate reviews | `docs/reviews/` |
 
 ## Non-negotiables
 
@@ -58,8 +58,8 @@ Authoritative docs:
    private Homebrew tap names, private hostnames and IPs. Use placeholders (`<tap>`, `<host>`).
 7. **The repo stays private.** Do not change visibility, publish crates (`publish = false` is deliberate), or
    push to any other remote. Open-sourcing is the owner's decision.
-8. **Parity is not a constraint.** New behaviour may diverge from the TypeScript original. See
-   [ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md).
+8. **Parity validation is gone.** There is no oracle, parity contract or differential harness; behaviour is
+   specified by r-orch's own docs and tests. See [ADR 0009](docs/decisions/0009-remove-parity-tooling.md).
 9. **Advisories go to the owner.** A new RUSTSEC advisory that reddens CI (the weekly scheduled run exists to
    surface this) is escalated, never silenced by the agent. A `deny.toml` `ignore` entry needs owner sign-off
    and the reasoned-comment format of the two existing entries: why no replacement, what bounds the exposure.
@@ -109,10 +109,7 @@ cargo deny check          # only if cargo-deny is installed; CI always runs it
 
 `./xtask/gate.sh` (cold, needs ~12 GB free) is for releases and for changes to layering, process handling or
 security-relevant code. It is not a superset of CI: its `advisories` step silently passes when cargo-deny is
-missing. It also runs `parity`, `lint-scenarios` and `probes`, which need the TS oracle (`./parity/setup.sh`,
-Node) and fail without it (every probe reports HARNESS BROKE); `probes` also fails on a dirty tree. Without the
-oracle, expect those steps to fail and say so in the PR; do not contort code (ADR 0002). `--warm` reuses your
-`target/` and is not a gate. Its verdict is written to `target/gate-result.txt`. It runs on macOS and Linux.
+missing. `--warm` reuses your `target/` and is not a gate. Its verdict is written to `target/gate-result.txt`. It runs on macOS and Linux.
 
 Say in the PR which platform each check ran on (macOS, Linux CI, both). A failure that also occurs on the base
 commit is still a failure. Report it as one; it is not a pass.
@@ -211,7 +208,7 @@ to an on-disk, CLI, `--json` or peer-protocol contract; any edit to `docs/TRAITS
 requirement. Sections: Status / Context / Decision / Consequences. Accepted ADRs are not rewritten; supersede
 them with a new one and mark the old `superseded by NNNN`. See [docs/decisions/README.md](docs/decisions/README.md).
 
-`docs/reviews/` holds historical gate reviews from the port. Do not add new material there.
+`docs/reviews/` holds historical gate reviews from the early port-era work. Do not add new material there.
 
 ## Documentation duties
 
@@ -283,8 +280,7 @@ fixtures/<kind>/      # recorded and scripted inputs shared across crates
 skills/               # the skill library shipped with orch
 xtask/                # dev tooling, run as `cargo xtask <cmd>`
 docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, decisions/
-                      # (PARITY.md, parity/ and reviews/ are historical)
-parity/               # the historical TypeScript oracle setup (see Testing)
+                      # (reviews/ is historical)
 ```
 
 - The crate dependency direction is ARCHITECTURE §3.1, and `cargo xtask crate-graph` enforces it. The module
@@ -298,7 +294,7 @@ parity/               # the historical TypeScript oracle setup (see Testing)
 - Scripts that will be run again are `xtask` subcommands in Rust, not shell scripts, so they behave the same on
   macOS and Linux.
 - Documentation lives in `docs/` or in a crate's `//!` docs. Do not add new Markdown files inside `crates/`.
-  The existing ones (`TEST-MAP*.md`, `TEST-COVERAGE.md`, `BACKEND.md`) are left over from the port.
+  The existing ones (`TEST-MAP.md`, `TEST-COVERAGE.md`, `BACKEND.md`) predate this rule.
 
 ## Testing
 
@@ -314,10 +310,6 @@ parity/               # the historical TypeScript oracle setup (see Testing)
   write into a temp dir. Fake agent scripts are in `fixtures/fake-agents/`.
 - **No real AI CLIs in tests.** Never exec `claude`, `codex`, `cursor-agent`, etc., and never read their config
   dirs. The gate's `no-real-cli` step puts shims on `PATH` and fails if any test reaches one.
-- **Cross-binary tests** (`orch-infra` `concurrent_index`, `cross_compat`) need the vendored oracle from
-  `./parity/setup.sh`; without it set `ORCH_SKIP_CROSS_BINARY=1` to skip them, as CI does.
-- **Differential parity harness** (`cargo xtask parity`, `fixtures/scenarios`): optional and historical. Keep
-  the scenarios green where cheap; do not extend the harness for new features.
 - **Run one crate:** `cargo test -p orch-peer`; one test: `cargo test -p orch-cli --test remote_peers <name>`.
 - **Portable by default.** Tests, fixtures and scripts run on macOS and Linux, or are marked Linux-only (and
   then CI runs them). No GNU-only flags (`sed -i` without a suffix argument, `df -BG`, `date -Is`); no
@@ -374,11 +366,8 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
 ## Release
 
 1. Branch `chore/release-vX.Y.Z` from `master`. Do not use `release/vX.Y.Z`: the ruleset protects
-   `release/**`. Run the cold gate on a platform it supports (see Pre-PR check). The TS oracle is optional
-   ([ADR 0002](docs/decisions/0002-parity-is-no-longer-a-goal.md)): without `./parity/setup.sh`, run
-   `ORCH_SKIP_CROSS_BINARY=1 ./xtask/gate.sh`. The `lint-scenarios`, `parity` and `probes` steps need the
-   oracle and do not block a release; every other step must pass. Record the platform and the result of those
-   three steps in the PR.
+   `release/**`. Run the cold gate on a platform it supports (see Pre-PR check). Every gate step must pass. Record the platform
+   and the result in the PR.
 2. Set `workspace.package.version` in `Cargo.toml` (and let `Cargo.lock` update).
 3. In `CHANGELOG.md` rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh empty `## [Unreleased]`,
    and update the compare links at the bottom.
@@ -419,7 +408,7 @@ CHANGELOG line, a test that fails without the change, the commit and verify resu
 and ADRs it cites. Owns: a findings list with severity (blocker / should-fix / nit). Must not skip: stating
 what was checked (commands run, files read, platform, what was not checked); checking the Don'ts below; checking
 that the spec and plan status lines are correct. A finding that is a missing requirement goes into the spec as a
-new row. Do not reject for parity divergence.
+new row.
 
 **Tech writer.** Reads: the code and tests being documented, existing docs. Owns: README, RUNBOOK, ARCHITECTURE,
 CHANGELOG wording, plans and ADR clarity. Must not skip: verifying every command and message against the code.
@@ -431,8 +420,6 @@ pushing a tag.
 
 ## Don'ts
 
-- Don't commit `parity/orch-ts/`; it is gitignored and re-created by `./parity/setup.sh`.
-- Don't add PARITY.md §14 entries or extend the contract; leave existing `PARITY` code comments alone.
 - Don't use `sort_unstable*`; clippy will fail.
 - Don't bump `rust-toolchain.toml` without bumping `rust-version` in `Cargo.toml` to match and running the CI set
   under the new toolchain; new clippy lints are fixed in the same PR, not allowed.

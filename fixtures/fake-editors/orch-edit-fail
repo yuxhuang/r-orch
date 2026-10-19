@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# A failed editor: the command must surface the failure, not save a partial
-# edit. The oracle rejects any non-zero exit with `Editor exited with code N`.
-set -euo pipefail
-exit 1

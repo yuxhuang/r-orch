@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Dev tooling for r-orch: the differential parity harness."
+description = "Dev tooling for r-orch: crate-graph checks."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,14 +12,7 @@ publish = false
 # anyhow is allowed in xtask and orch-cli only — never in a library signature.
 anyhow.workspace = true
 clap.workspace = true
-indexmap.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-serde_yaml_ng.workspace = true
-shell-words.workspace = true
-similar.workspace = true
-tempfile.workspace = true
-toml.workspace = true
 
 [lints]
 workspace = true

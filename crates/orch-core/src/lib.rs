@@ -1,9 +1,8 @@
 //! The port traits every other crate compiles against.
 //!
 //! `orch-core` holds **only** trait definitions and the types that appear in
-//! their signatures. It exists as its own crate because the TS code puts the
-//! storage and adapter interfaces under `src/infrastructure/` while
-//! `src/application/orchestrator.ts` imports them — a cycle in Rust unless the
+//! their signatures. It exists as its own crate because the storage and adapter
+//! interfaces are imported by the orchestrator — a cycle in Rust unless the
 //! traits live apart. That separation is what lets `orch-engine` be unit-tested
 //! with in-memory fakes and `orch-infra` be swapped wholesale.
 //!

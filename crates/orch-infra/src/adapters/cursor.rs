@@ -1,5 +1,4 @@
-//! Cursor Agent adapter — `src/infrastructure/adapters/cursor.ts`,
-//! `kind = "cursor"` (`docs/parity/adapters.md` §2.3).
+//! Cursor Agent adapter for `kind = "cursor"`.
 //!
 //! Spawns Cursor's headless agent CLI with `--output-format stream-json`,
 //! which emits the same format as Claude's, so the line dispatch is shared
@@ -26,8 +25,7 @@ pub struct CursorAdapter {
     process_manager: Arc<dyn ProcessManager>,
     clock: Arc<dyn Clock>,
     /// Per-instance state assigned **only** by `test()`. An `execute()` before
-    /// a successful `test()` always spawns `cursor-agent`
-    /// (`docs/parity/adapters.md` §10.3) — replicated.
+    /// a successful `test()` always spawns `cursor-agent`.
     resolved_command: Mutex<&'static str>,
 }
 
@@ -80,7 +78,7 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
         args.push(model.clone());
     }
 
-    // `config.system_prompt` is deliberately ignored here, as in the TS.
+    // `config.system_prompt` is deliberately ignored here.
     args.push(build_full_prompt(
         params.system_prompt.as_deref(),
         &params.prompt,

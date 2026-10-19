@@ -200,7 +200,7 @@ fn refusing_a_bomb_leaves_no_lock_behind() {
     assert_eq!(code, Some(1));
     assert!(
         !dir.path().join(".orchestry/orchestry.lock").exists(),
-        "a refused read must not strand the lock (§14.15)"
+        "a refused read must not strand the lock"
     );
 }
 

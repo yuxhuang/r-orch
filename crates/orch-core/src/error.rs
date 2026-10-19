@@ -1,12 +1,11 @@
 //! The error type every port trait returns.
 //!
 //! [`DomainError`] is the user-facing contract (its `Display` strings are
-//! PARITY.md §3.1 verbatim). `Error` wraps it and adds the infrastructure
+//! part of the CLI contract). `Error` wraps it and adds the infrastructure
 //! cases, keeping a `source` chain so `ORCHESTRY_DEBUG` can print it.
 //!
 //! Exit-code mapping is preserved: a wrapped [`DomainError`] keeps its code,
-//! and everything else is exit 1 — which is exactly what the TS CLI does with
-//! a `throw` that is not an `OrchestryError` (PARITY.md §3).
+//! and everything else is exit 1.
 
 use std::path::{Path, PathBuf};
 
@@ -50,8 +49,7 @@ pub enum Error {
 }
 
 impl Error {
-    /// Process exit code (PARITY.md §3). Anything that is not a domain error
-    /// exits 1, matching the TS catch-all.
+    /// Process exit code. Anything that is not a domain error exits 1.
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Domain(err) => err.exit_code(),
@@ -59,7 +57,7 @@ impl Error {
         }
     }
 
-    /// The hint line, if any (PARITY.md §3.1).
+    /// The hint line, if any.
     pub fn hint(&self) -> Option<String> {
         match self {
             Error::Domain(err) => err.hint(),
@@ -87,7 +85,7 @@ impl Error {
         }
     }
 
-    /// Shorthand for the TS `throw new Error(msg)` case: exit 1, no hint.
+    /// Shorthand for a plain message error: exit 1, no hint.
     pub fn other(message: impl Into<String>) -> Error {
         Error::Domain(DomainError::Other(message.into()))
     }

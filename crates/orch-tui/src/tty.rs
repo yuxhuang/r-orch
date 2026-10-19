@@ -1,5 +1,5 @@
 //! Waiting for terminal input, with the hang-up detection crossterm does not
-//! do (PARITY.md §14.39).
+//! do.
 //!
 //! crossterm 0.29 compiles one of two Unix event sources, and which one it is
 //! decides the shape of this bug. This module was written against the default,

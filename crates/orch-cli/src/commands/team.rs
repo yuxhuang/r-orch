@@ -1,9 +1,8 @@
-//! `orch team` — ported from `src/cli/commands/team.ts`
-//! (`docs/parity/cli.md` §11).
+//! `orch team`.
 //!
 //! The membership subcommands (`join`, `leave`, `add-task`, `set-lead`,
 //! `disband`) ignore `--json` and `--quiet` entirely: they always print their
-//! success line, which is the original's behaviour and not an oversight here.
+//! success line, which is intended and not an oversight.
 
 use orch_core::error::Result;
 use orch_domain::{CreateTeamInput, PartialTeamConfig, Team};

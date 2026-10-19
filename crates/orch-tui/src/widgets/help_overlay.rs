@@ -1,4 +1,4 @@
-//! The help overlay (docs/parity/tui.md §3.2).
+//! The help overlay.
 //!
 //! A centred amber rounded box: title, three column dividers, ten shortcut
 //! rows in three 22-column columns, and the dismiss footer.

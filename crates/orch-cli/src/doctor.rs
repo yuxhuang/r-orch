@@ -1,10 +1,9 @@
-//! `orch doctor` — ported from `src/cli/commands/doctor.ts` and
-//! `DoctorService.runAll` (`docs/parity/cli.md` §14).
+//! `orch doctor`.
 //!
 //! Three things here are easy to get wrong and all three are observable:
 //!
 //! - **the two header lines are printed before the JSON**, so `doctor --json`
-//!   stdout is not pure JSON (§22.2);
+//!   stdout is not pure JSON;
 //! - the adapter count depends on the tier: **8** adapters with a project,
 //!   **5** without (claude, shell, pi, grok, antigravity) — and the trailing
 //!   `N of M adapters ready` line changes with it;
@@ -35,7 +34,7 @@ use crate::context::CliContext;
 use crate::output::{Color, Icon, StructuredFormat, Styles};
 
 /// The five adapters the container-less tier probes, in the order it
-/// registers them (§14.1) — note that codex, cursor and opencode are absent.
+/// registers them — note that codex, cursor and opencode are absent.
 pub fn container_less_registry(process_manager: Arc<dyn ProcessManager>) -> AdapterRegistry {
     let mut registry = AdapterRegistry::new();
     registry.register(Arc::new(ClaudeAdapter::new(Arc::clone(&process_manager))));
@@ -46,7 +45,7 @@ pub fn container_less_registry(process_manager: Arc<dyn ProcessManager>) -> Adap
     registry
 }
 
-/// The printed shape of a report: the TS interface is camelCase here, unlike
+/// The printed shape of a report: camelCase here, unlike
 /// every stored entity, and this is the only place that matters.
 #[derive(Debug, Serialize)]
 struct DoctorJson<'a> {
@@ -268,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn the_json_shape_is_the_reference_one() {
+    fn the_json_shape_is_stable() {
         let report = report();
         let json = serde_json::to_value(DoctorJson::from(&report)).expect("serialize");
         assert_eq!(json["adaptersReady"], 5);
@@ -336,7 +335,7 @@ mod tests {
                 "git",
                 "git repo",
                 ".gitignore",
-                // PARITY §13: the `node` row's replacement, same position.
+                // The `toolchain` row replaces the former `node` row, in the same position.
                 "toolchain"
             ]
         );

@@ -1,6 +1,4 @@
-//! The per-CLI model-listing parsers, ported one regex at a time from
-//! `src/infrastructure/models/model-discovery.ts:170-303` (PARITY.md §8.12,
-//! `docs/parity/adapters.md` §7.5–7.6).
+//! The per-CLI model-listing parsers.
 
 use std::sync::LazyLock;
 

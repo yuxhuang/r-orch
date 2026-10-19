@@ -44,7 +44,7 @@ pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     pub backend: B,
     pub clock: C,
     pub model_catalog: ModelCatalog,
-    /// `messageBatchMs`; `0` flushes synchronously.
+    /// Message batch window; `0` flushes synchronously.
     pub batch_ms: i64,
     /// Set by `cmd_msg` on a refusal or when a broadcast arms: the Enter
     /// handler then restores command mode with the text intact instead of
@@ -102,7 +102,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             last_refresh_at: now,
         };
 
-        // Launch banner (docs/parity/tui.md §8.6).
+        // Launch banner.
         if app.state.observer_mode {
             app.emit(
                 "Observer mode: watching external orchestrator via disk polling.",
@@ -191,8 +191,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
 
         // Periodic disk poll — 3 s in observer mode (where no events arrive at
-        // all), 5 s otherwise, skipped while a refresh is already recent
-        // (docs/parity/tui.md §7).
+        // all), 5 s otherwise, skipped while a refresh is already recent.
         let poll_interval = if self.state.observer_mode {
             OBSERVER_POLL_MS
         } else {
@@ -233,7 +232,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
     }
 
-    /// `scheduleRefresh` — the 150 ms debounce.
+    /// The 150 ms debounce.
     pub fn schedule_refresh(&mut self) {
         if self.state.refresh_at.is_none() {
             self.state.refresh_at = Some(self.now() + REFRESH_DEBOUNCE_MS);
@@ -254,7 +253,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
 
         // (b) feed message. A tick whose counts have not changed adds no line;
-        // the existing one's timestamp keeps counting (PARITY.md §12.8 (k)).
+        // the existing one's timestamp keeps counting.
         let repeated_tick = match event {
             OrchestratorEvent::OrchestratorTick { running, queued } => {
                 let counts = (*running, *queued);
@@ -318,7 +317,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
     }
 
-    /// `onLoadHistory` mapping (docs/parity/tui.md §7).
+    /// Map a history batch onto feed messages.
     fn ingest_history(&mut self, batch: Vec<HistoryEntry>) {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut messages = Vec::new();
@@ -413,7 +412,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     // ── Refresh ────────────────────────────────────────────────────────────
 
-    /// `refreshAll({ includeTeams })` — commit only what actually changed.
+    /// Commit only what actually changed.
     pub fn refresh_all(&mut self, include_teams: bool) {
         self.last_refresh_at = self.now();
         if let Ok(status) = self.backend.peer_status() {
@@ -725,10 +724,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// A `callback`-mode suggestion was chosen on the agent-name step: open the
     /// pre-filled shop wizard for that template.
     pub fn apply_name_suggestion(&mut self, template_key: &str) {
-        // The guard precedes the template lookup, as in TS, so an unknown key
-        // still refuses rather than silently doing nothing. The wording differs
-        // from the `/agent shop` refusal — both strings are verbatim from
-        // `App.tsx` (`handleSuggestionSelected` vs `launchShopWizard`).
+        // The guard precedes the template lookup, so an unknown key still
+        // refuses rather than silently doing nothing. The wording differs from
+        // the `/agent shop` refusal.
         if self.state.default_adapter == "shell" {
             self.emit(
                 "Agent Shop requires an AI provider. Choose Shell and enter a command instead.",
@@ -793,7 +791,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
     }
 
-    /// Dispatch a completed wizard to the backend (docs/parity/tui.md §5.2).
+    /// Dispatch a completed wizard to the backend.
     pub fn submit_wizard(&mut self, values: Values) {
         if self.state.wizard_sessions.recovery {
             self.submission_failed("Stale draft is recovery only; explicitly discard and restart");
@@ -1195,7 +1193,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     // ── Clipboard ──────────────────────────────────────────────────────────
 
-    /// `handlePasteImage`.
+    /// Paste an image from the clipboard.
     pub fn paste_image(&mut self) {
         match self.backend.paste_image() {
             Ok(ClipboardPaste::Text) => {
@@ -1494,7 +1492,7 @@ fn refresh_triggering(event: &OrchestratorEvent) -> bool {
     )
 }
 
-/// `entityListChanged` for entities that carry `updated_at`.
+/// Whether the list changed, for entities that carry `updated_at`.
 pub fn tasks_changed(prev: &[Task], next: &[Task]) -> bool {
     if prev.len() != next.len() {
         return true;
@@ -1514,7 +1512,7 @@ pub fn goals_changed(prev: &[Goal], next: &[Goal]) -> bool {
 }
 
 /// Agents have no `updated_at`, so the comparison must be **deep** — no
-/// reference-equality shortcut (entity-list-changed.test.ts).
+/// reference-equality shortcut.
 pub fn agents_changed(prev: &[Agent], next: &[Agent]) -> bool {
     prev.len() != next.len() || prev != next
 }

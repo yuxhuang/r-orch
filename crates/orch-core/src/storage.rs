@@ -1,4 +1,4 @@
-//! Storage port traits — ported from `src/infrastructure/storage/interfaces.ts`.
+//! Storage port traits.
 //!
 //! All persistence goes through these contracts. Implementations use atomic
 //! writes (temp file + rename); services depend on the traits, never on a
@@ -6,19 +6,19 @@
 //!
 //! Every method takes `&self`, not `&mut self`: stores are shared as
 //! `Arc<dyn …>` and own their interior mutability (the index mutex), exactly
-//! like the TS classes, which are shared instances.
+//! as the shared store instances always have.
 //!
 //! # Three rules every implementation owes the contract
 //!
 //! These are not implementation taste. Each is observable, each is invisible
-//! in review, and the test fakes in [`crate::test_support`] already replicate
+//! in review, and the test fakes in [`crate::test_support`] already implement
 //! all three — so a fake-backed test will not catch a store that skips one.
 //!
 //! 1. **`save` pushes to the end of `_index.json`.** Remove the entity by id,
-//!    then append (PARITY.md §6.10). Index order is therefore *last-write*
+//!    then append. Index order is therefore *last-write*
 //!    order, not creation order, and it is observable: `findBestAgent`
 //!    resolves equal-scoring agents by position in [`AgentStore::list`], and
-//!    r-orch **replicates** that rather than fixing it (PARITY.md §14.4).
+//!    that order is kept rather than fixed.
 //!    An in-place update that preserves position silently changes which agent
 //!    runs a task.
 //!
@@ -27,12 +27,12 @@
 //!    workspace `clippy.toml` denies those three methods for this reason —
 //!    see rule 1 for what breaks.
 //!
-//! 3. **Every YAML read must apply merge keys.** js-yaml's default schema
-//!    resolves `<<` and `serde_yaml_ng` leaves it as a literal `"<<"` key, so
-//!    a reader that forgets `Value::apply_merge()` silently falls back to
+//! 3. **Every YAML read must apply merge keys.** YAML merge keys (`<<`)
+//!    are part of the `config.yml` format, and `serde_yaml_ng` leaves them as a
+//!    literal `"<<"` key, so a reader that forgets `Value::apply_merge()` silently falls back to
 //!    `DEFAULT_CONFIG` for everything a hand-authored `config.yml` supplied
 //!    through a merge — while both trees still compare equal under the Rust
-//!    parser (PARITY.md §6.4.2, V38).
+//!    parser.
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -71,7 +71,7 @@ impl TaskFilter {
     }
 
     /// Whether this task passes the filter. Both dimensions are AND-ed and an
-    /// unset dimension matches everything, as in the TS predicate.
+    /// unset dimension matches everything.
     pub fn matches(&self, task: &Task) -> bool {
         self.status.is_none_or(|status| task.status == status)
             && self
@@ -127,21 +127,15 @@ pub trait RunStore: Send + Sync {
     async fn read_events_tail(&self, run_id: &str, count: usize) -> Result<Vec<RunEvent>>;
     /// Read the events file once, from the beginning, **to EOF**.
     ///
-    /// Despite the name this does **not** tail-follow: the TS version opens a
-    /// `createReadStream` and its generator ends at EOF. `logs --follow`
-    /// re-invokes it. The token only lets a consumer stop early, mirroring the
-    /// `AbortSignal` parameter.
-    ///
-    /// *(Doc-only amendment. The signature is unchanged; the original comment
-    /// said "tail-follow", which would have had WP-5 build `logs --follow` on
-    /// a guarantee the implementation never made.)*
+    /// Despite the name this does **not** tail-follow: the stream ends at EOF.
+    /// `logs --follow` re-invokes it. The token only lets a consumer stop early.
     fn stream_events(
         &self,
         run_id: &str,
         token: CancellationToken,
     ) -> BoxStream<'static, Result<RunEvent>>;
-    /// Release the cached `O_APPEND` handle for this run. Sync, like the TS
-    /// method — it is a cache eviction, not I/O.
+    /// Release the cached `O_APPEND` handle for this run. Sync — it is a
+    /// cache eviction, not I/O.
     fn close_run_events(&self, run_id: &str);
 }
 
@@ -155,13 +149,13 @@ pub trait StateStore: Send + Sync {
 pub trait ConfigStore: Send + Sync {
     async fn read(&self) -> Result<OrchestratorConfig>;
     async fn write(&self, config: &OrchestratorConfig) -> Result<()>;
-    /// Dot-path read. `None` is the TS `undefined` — a missing key, or a path
+    /// Dot-path read. `None` is a missing key, or a path
     /// that runs through a non-object.
     async fn get(&self, key_path: &str) -> Result<Option<serde_json::Value>>;
     /// Dot-path write, creating missing intermediate objects.
     ///
     /// Implementations must round-trip through the **raw merged value**, not
-    /// through [`OrchestratorConfig`]: the TS store deep-merges plain objects,
+    /// through [`OrchestratorConfig`]: the store deep-merges plain objects,
     /// so unknown keys in `config.yml` survive a `config set`
     /// ([`orch_domain::deep_merge`]). `config.yml` is also the one file a user
     /// hand-authors, so it is the one place YAML merge keys are reachable —
@@ -169,8 +163,8 @@ pub trait ConfigStore: Send + Sync {
     async fn set(&self, key_path: &str, value: serde_json::Value) -> Result<()>;
 }
 
-/// A shared-context entry. Declared here rather than in `orch-domain` to
-/// mirror its TS home (`storage/interfaces.ts`).
+/// A shared-context entry. Declared here, next to the store that owns it,
+/// rather than in `orch-domain`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextEntry {
     pub key: String,
@@ -227,8 +221,7 @@ pub trait TeamStore: Send + Sync {
 
 /// `~/.orchestry/global.yml`.
 ///
-/// The TS original has a concrete `GlobalConfigStore` class and no interface;
-/// this trait is an addition so the TUI — which persists the palette and the
+/// This trait exists so the TUI — which persists the palette and the
 /// activity filter — can be tested without touching the real home directory.
 #[async_trait]
 pub trait GlobalConfigStore: Send + Sync {

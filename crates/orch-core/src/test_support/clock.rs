@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::clock::{Clock, iso_from_epoch_ms};
 
-/// `2025-10-13T16:37:33.426Z` — the instant the PARITY.md reference capture
-/// was taken, so fixtures read naturally.
+/// `2025-10-13T16:37:33.426Z` — a fixed instant, so fixtures read
+/// naturally.
 pub const FIXED_NOW_MS: i64 = 1_760_373_453_426;
 
 /// [`FIXED_NOW_MS`] rendered.

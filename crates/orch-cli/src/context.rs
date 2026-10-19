@@ -1,5 +1,4 @@
-//! CLI context — resolved project root and global flags
-//! (`src/cli/context.ts`).
+//! CLI context — resolved project root and global flags.
 
 use std::path::PathBuf;
 
@@ -30,8 +29,7 @@ pub struct EnvFlags {
     pub stdout_is_tty: bool,
     /// stdin is a terminal. The interactive surfaces — `init`'s adapter
     /// prompt and the agent shop picker — require **both** to be a TTY and
-    /// silently take the non-interactive path otherwise
-    /// (`docs/parity/cli.md` §21.2, §21.3).
+    /// silently take the non-interactive path otherwise.
     pub stdin_is_tty: bool,
 }
 
@@ -131,8 +129,7 @@ mod tests {
 
     #[test]
     fn colour_is_off_whenever_stdout_is_not_a_terminal() {
-        // This is what makes piped output byte-identical to the TS binary's,
-        // which `chalk` strips for the same reason.
+        // Piped output carries no colour codes.
         let piped = env(false, false, false);
         assert!(!context(false, false, piped).styles(piped).color);
 

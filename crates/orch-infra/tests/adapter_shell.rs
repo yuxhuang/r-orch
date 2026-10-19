@@ -1,4 +1,4 @@
-//! Ported from `test/unit/infrastructure/shell-adapter.test.ts`.
+//! Shell adapter tests.
 
 mod support;
 

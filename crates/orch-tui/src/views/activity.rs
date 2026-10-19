@@ -1,5 +1,4 @@
-//! The activity feed in the bottom panel (docs/parity/tui.md §6
-//! "`ActivityFeed`").
+//! The activity feed in the bottom panel.
 //!
 //! Rows are **top-padded** with blanks so the region always renders exactly
 //! `height` rows.

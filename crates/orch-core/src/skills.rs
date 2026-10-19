@@ -1,5 +1,4 @@
-//! Skill library port — ported from
-//! `src/infrastructure/skills/skill-loader.ts` (the interface only).
+//! Skill library port (the interface only).
 
 use async_trait::async_trait;
 
@@ -12,7 +11,7 @@ pub trait SkillLoader: Send + Sync {
     /// MCP skills (those containing `:`) are silently skipped — the Claude CLI
     /// handles them natively. Returns `## Skills\n\n` followed by one
     /// `### <name>\n\n<content>` section per resolved skill, joined by
-    /// `\n\n`, or an empty string when nothing resolved (PARITY.md §9.6).
+    /// `\n\n`, or an empty string when nothing resolved.
     async fn load_skills(&self, skill_names: &[String]) -> Result<String>;
 
     /// Every available library skill name, sorted ascending.
@@ -34,15 +33,14 @@ pub fn is_mcp_skill(name: &str) -> bool {
     name.contains(':')
 }
 
-/// Assemble the skill block that gets appended to the system prompt
-/// (PARITY.md §9.6, L0).
+/// Assemble the skill block that gets appended to the system prompt.
 ///
 /// `resolved` carries one `(name, content)` pair per skill that actually
 /// loaded, **in `agent.config.skills` order**. Returns `""` for an empty
 /// input, so the caller appends nothing.
 ///
 /// Shared by the real loader and the test fake so there is exactly one
-/// implementation of an L0 format.
+/// implementation of a contract format.
 pub fn format_skills_block(resolved: &[(String, String)]) -> String {
     if resolved.is_empty() {
         return String::new();

@@ -1,5 +1,4 @@
-//! `orch msg` — ported from `src/cli/commands/msg.ts`
-//! (`docs/parity/cli.md` §12).
+//! `orch msg`.
 //!
 //! `send` and `broadcast` share the service's fan-out signature, so **both**
 //! print a JSON *array* even though a direct send is always one message. A
@@ -54,7 +53,7 @@ pub async fn send(
     if let Some(format) = ctx.output {
         return format.print(&messages);
     }
-    // `messages[0]?.id` — an empty fan-out prints the JS `undefined`.
+    // An empty fan-out prints `undefined` as the id.
     let id = first_id(&messages);
     if ctx.quiet {
         println!("{id}");
@@ -178,7 +177,7 @@ pub async fn list(
 }
 
 /// `messages[0]?.id` — `undefined` when the fan-out produced nothing, which
-/// is what the original interpolates into its success line.
+/// is what the success line interpolates.
 fn first_id(messages: &[Message]) -> &str {
     messages
         .first()

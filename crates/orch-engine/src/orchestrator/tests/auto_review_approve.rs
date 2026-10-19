@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-auto-review-approve.test.ts`.
-//!
 //! The interaction between `review_criteria` and auto-approve: criteria that
 //! pass promote the task, criteria that fail are *overridden* by auto-approve
 //! but leave a record, and no criteria at all means auto-approve promotes the

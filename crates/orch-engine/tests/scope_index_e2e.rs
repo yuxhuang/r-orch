@@ -1,10 +1,7 @@
-//! Ported from `test/integration/scope-index.e2e.test.ts`.
-//!
 //! Scope scheduling through the **whole real stack**: file stores, the real
 //! `AdapterRegistry` and `ShellAdapter`, the real `SystemProcessManager`, the
 //! PID lock, and real child processes. The only external dependency is
-//! `bash`, used as a deterministic short-lived workload — the TS version uses
-//! node for the same reason.
+//! `bash`, used as a deterministic short-lived workload.
 //!
 //! What it proves that a unit test cannot: the tick-scoped `ScopeIndex` is
 //! rebuilt from what is genuinely `in_progress` on disk each tick, so an

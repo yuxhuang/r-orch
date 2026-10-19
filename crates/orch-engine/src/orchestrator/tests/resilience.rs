@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-resilience.test.ts`.
-//!
 //! The four resilience fixes: the tick circuit breaker, agent-stats failures
 //! being reported rather than swallowed, signal-driven shutdown, and every
 //! former `console.error` becoming an `orchestrator:error` event.
@@ -236,8 +234,7 @@ async fn a_failing_agent_stats_update_is_reported_and_does_not_abort_completion(
 
 #[tokio::test]
 async fn the_watch_loop_installs_both_signal_arms() {
-    // The TS equivalent asserts `signalHandlers.length === 2`; here the arms
-    // are `select!` branches, so what is observable is that both streams were
+    // The arms are `select!` branches, so what is observable is that both streams were
     // created.
     let arms = super::super::SignalArms::install();
     assert!(arms.interrupt.is_some(), "no SIGINT arm");
@@ -454,7 +451,7 @@ async fn a_dispatch_failure_is_reported_as_a_non_fatal_orchestrator_error() {
     assert!(h.persisted_state().claimed.is_empty());
 }
 
-/// An adapter whose stream throws immediately — the TS `failAdapter`.
+/// An adapter whose stream throws immediately.
 struct ThrowingAdapter;
 
 #[async_trait::async_trait]
@@ -746,9 +743,8 @@ async fn a_failed_startup_releases_the_lock_it_acquired() {
 
 // ── Gate Q1: reconcile's two sweeps fail differently, on purpose ─────────
 
-/// The reference wraps the stale-agent writes in a bare `Promise.all`
-/// (`orchestrator.ts:618-622`), so one rejection fails the tick, while the
-/// orphaned-task map carries its own `try`/`catch` (`:630-637`). Both halves
+/// The stale-agent writes are joined without catching, so one rejection fails
+/// the tick, while the orphaned-task sweep catches per item. Both halves
 /// are pinned here so the asymmetry is not tidied away into consistency.
 #[tokio::test]
 async fn a_stale_agent_write_failure_fails_the_tick_but_an_orphaned_task_one_does_not() {

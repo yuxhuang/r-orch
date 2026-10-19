@@ -4,8 +4,7 @@
 //! `start_watch`, `stop`) against real adapters and, where it matters, real
 //! file stores. The only thing faked is the child process, because the point
 //! is to exercise the adapter's own parser and the orchestrator's collection
-//! path, not to require a live AI CLI — which is also why the reference suite
-//! mocks `spawn` in exactly these tests.
+//! path, not to require a live AI CLI.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,8 +60,7 @@ struct Child {
 
 /// A process manager that hands out in-memory pipes instead of children.
 ///
-/// The test writes the agent's stdout **after** dispatch, exactly as the TS
-/// mock writes to its `PassThrough` once the tick has returned.
+/// The test writes the agent's stdout **after** dispatch, once the tick has returned.
 pub struct ScriptedProcessManager {
     pid: u32,
     children: Mutex<Vec<Child>>,
@@ -240,7 +238,7 @@ pub fn adapter_fixture(kind: &str, name: &str) -> String {
 }
 
 /// A command runner that answers every auto-review criterion as passing, so
-/// no integration test shells out to `npm` (PARITY.md V31).
+/// no integration test shells out to `npm`.
 pub struct PassingCommandRunner;
 
 #[async_trait]
@@ -401,7 +399,7 @@ impl Rig {
             .unwrap_or_else(|| panic!("no agent {id}"))
     }
 
-    /// Poll until `predicate` holds, as the TS `waitFor` helper does.
+    /// Poll until `predicate` holds.
     pub async fn wait_for(&self, label: &str, mut predicate: impl FnMut(&Rig) -> bool) {
         for _ in 0..2000 {
             if predicate(self) {

@@ -1,10 +1,8 @@
-//! Scope overlap detection — pure functions, no side effects
-//! (`src/domain/scope.ts`).
+//! Scope overlap detection — pure functions, no side effects.
 //!
 //! A scope is an array of glob patterns (e.g. `["src/auth/**"]`). Two tasks
 //! overlap when any pattern pair shares a common path prefix. The matching is
-//! deliberately **raw string-prefix logic**, not real glob matching
-//! (PARITY.md §7.11): conservative, so it may produce false positives but
+//! deliberately **raw string-prefix logic**, not real glob matching: conservative, so it may produce false positives but
 //! never false negatives.
 
 use std::collections::{HashMap, HashSet};
@@ -68,7 +66,7 @@ fn compute_pattern_info(pattern: &str) -> PatternInfo<'_> {
     }
 }
 
-/// Node's POSIX `path.dirname`, which the TS original uses. Reimplemented
+/// Node's POSIX `path.dirname`. Reimplemented
 /// rather than approximated because its edge cases are load-bearing: `""` and
 /// a bare filename both yield `"."`, which is the value the sibling-directory
 /// rule explicitly excludes.
@@ -101,14 +99,13 @@ fn dirname(path: &str) -> &str {
     }
 }
 
-/// A radix trie node. Edge labels are UTF-16 code units, exactly like the TS
-/// original, so a split can land between the two halves of a surrogate pair.
+/// A radix trie node. Edge labels are UTF-16 code units, so a split can land between the two halves of a surrogate pair.
 /// That is deliberate: the overlap contract is defined in terms of JavaScript
 /// string prefixes.
 struct RadixTrieNode {
     /// The non-empty UTF-16 edge label from the parent to this node.
     label: Vec<u16>,
-    /// Keyed by the label's first code unit, mirroring the TS sparse array.
+    /// Keyed by the label's first code unit.
     children: HashMap<u16, RadixTrieNode>,
     /// Whether an indexed base ends exactly at this node.
     terminal: bool,
@@ -350,7 +347,7 @@ mod tests {
         patterns.iter().map(|p| (*p).to_owned()).collect()
     }
 
-    /// `ScopeIndex::new` over a list of scopes, like the TS constructor.
+    /// `ScopeIndex::new` over a list of scopes.
     fn index(scopes: &[Option<Vec<String>>]) -> ScopeIndex {
         ScopeIndex::new(scopes.iter().map(|o| o.as_deref()))
     }
@@ -523,9 +520,9 @@ mod tests {
     fn handles_a_radix_split_between_surrogate_pair_code_units() {
         // U+1F600 and U+1F601 share the high surrogate 0xD83D and differ only
         // in the low one, so the split lands *inside* a surrogate pair — the
-        // case the TS comment calls out. (The TS test uses lone surrogates,
-        // which a Rust `String` cannot represent; these two emoji exercise the
-        // same code path with valid UTF-8.)
+        // case worth covering. (Lone surrogates cannot be represented in a
+        // Rust `String`; these two emoji exercise the same code path with valid
+        // UTF-8.)
         let grin = '\u{1F600}';
         let beam = '\u{1F601}';
         assert_eq!(grin.encode_utf16(&mut [0u16; 2]).len(), 2);

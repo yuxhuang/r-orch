@@ -1,24 +1,20 @@
 # r-orch Architecture
 
-Design for the Rust rewrite of ORCH. Read [PARITY.md](PARITY.md) first — it is the specification; this
-document is how we build to it.
+Design of r-orch: crate boundaries, traits, concurrency and error model, and test strategy. The README says
+what users see; this document says how it is built.
 
 ---
 
 ## 1. Context
 
-ORCH is an AI-agent orchestrator: a CLI, a TUI, and a long-running engine that spawns external AI coding CLIs
+r-orch is an AI-agent orchestrator: a CLI, a TUI, and a long-running engine that spawns external AI coding CLIs
 (`claude`, `codex`, `cursor`, …) as child processes, streams their JSONL output, drives a task state machine,
-and persists everything as plain files under `.orchestry/`. ~26k LOC of TypeScript, layered DDD with hand-rolled
-dependency injection, ~2085 tests.
+and persists everything as plain files under `.orchestry/`. It is a layered Rust workspace with trait seams for
+every external effect, so the engine is testable deterministically without real processes, clocks or AI CLIs.
 
-The rewrite target: a Rust implementation that is **drop-in compatible at the `.orchestry/` and CLI boundary**
-(either binary can operate on the same project, in either order), idiomatic inside, and better tested —
-specifically, deterministic where the original is timing-dependent.
-
-**No distributed system here.** One process per project, guarded by a PID lock file, with a filesystem as the
-database. The hard problems are (a) child-process lifecycle and cancellation, (b) exact serialization
-compatibility, and (c) not regressing a state machine that has had many bug fixes layered into it.
+**No distributed system here.** (Optional peer links delegate work between installations; each project still has one engine.) One process per project, guarded by a PID lock file, with a filesystem as the
+database. The hard problems are (a) child-process lifecycle and cancellation, (b) exact, stable
+serialization of the on-disk and `--json` formats, and (c) not regressing a state machine that has had many bug fixes layered into it.
 
 ---
 
@@ -28,48 +24,35 @@ Load-bearing, stated so they can be challenged:
 
 | # | Assumption | If wrong |
 |---|---|---|
-| A1 | **Scale is small.** Tens of agents, hundreds of tasks, thousands of run events per run. The TS code's caps (16 KB lines, 8 KB events, 1024-event buffer, 500-entry LRU) are generous. | Nothing in the design changes; the file-per-entity store would need an index rework only at ~10⁵ tasks. |
-| A2 | **Single *orchestrator*, multiple concurrent mutators.** The PID lock serializes *orchestrators* only. One-shot commands never take it, and some "reads" write. See A2-detail below. | This is **already true in the reference implementation** — not a hypothetical. The exposure is now advertised, so it must be documented rather than assumed away. Verified by V37. |
-| A3 | **POSIX only.** The TS code uses process groups (`kill(-pid)`), `bash -lc`, `rsync`, and `O_APPEND` atomicity. Windows support is already partial at best. | Windows would need a separate process-group strategy (job objects) and no `bash`. Out of scope; keep platform code behind a `cfg` boundary so it can be added. |
-| A4 | **The TS binary is available as a test oracle** at `parity/orch-ts/dist/cli.js` with node 24. | The differential harness is the main parity guarantee; without it we fall back to the written spec alone, which is materially weaker. |
-| A5 | **Latency budget is human-scale.** Tick interval 10 s; CLI commands should feel instant (<100 ms). The TS container tiering exists purely to keep read-only commands fast. | Rust startup is ~1 ms either way, so the tiering becomes an optional optimization rather than a requirement. |
-| A6 | **Prompt text must be byte-exact** because agents are prompt-sensitive and the system prompt is a cache key. | If approximate were acceptable, the Liquid risk (§4.3) would mostly evaporate. It is not acceptable. |
-| A7 | **No external Rust consumer of the library crates yet.** | Public API stability is not a constraint; we are free to pick idiomatic signatures. |
+| A1 | **Scale is small.** Tens of agents, hundreds of tasks, thousands of run events per run. The caps (16 KB lines, 8 KB events, 1024-event buffer, 500-entry LRU) are generous. | Nothing in the design changes; the file-per-entity store would need an index rework only at ~10⁵ tasks. |
+| A2 | **Single *orchestrator*, multiple concurrent mutators.** The PID lock serializes *orchestrators* only. One-shot commands never take it, and some "reads" write. See A2-detail below. | Not a hypothetical: it is true today, so it is documented rather than assumed away. |
+| A3 | **POSIX only.** r-orch uses process groups (`kill(-pid)`), `bash -lc`, `rsync`, and `O_APPEND` atomicity. Windows support is already partial at best. | Windows would need a separate process-group strategy (job objects) and no `bash`. Out of scope; keep platform code behind a `cfg` boundary so it can be added. |
+| A4 | **Latency budget is human-scale.** Tick interval 10 s; CLI commands should feel instant (<100 ms). The container tiering exists purely to keep read-only commands fast. | Rust startup is ~1 ms either way, so the tiering becomes an optional optimization rather than a requirement. |
+| A5 | **Prompt text must be byte-exact** because agents are prompt-sensitive and the system prompt is a cache key. | If approximate were acceptable, the Liquid risk (§4.3) would mostly evaporate. It is not acceptable. |
+| A6 | **No external Rust consumer of the library crates yet.** | Public API stability is not a constraint; we are free to pick idiomatic signatures. |
 
 ### 2.1 A2 in detail — the concurrency story is weaker than "single writer"
 
-An earlier revision of this document asserted "single writer … this is a pre-existing property, not a
-regression." That was wrong on both counts, and [PARITY.md §1.1](PARITY.md)'s promise that "both binaries must
-operate on the same project directory interchangeably, in either order" converts an accident into an
-**advertised feature**, multiplying the exposure. Three facts from the source:
+The PID lock serializes *orchestrators*, not every writer. Interchangeable use of several processes on one
+project directory is a normal workflow, which multiplies the exposure. Three facts:
 
-1. **One-shot commands never take the lock.** `src/infrastructure/storage/lock.ts`'s own header: "Only one
-   `orch run --watch` can run at a time. One-shot commands do not acquire the lock." So `orch task add` while
+1. **One-shot commands never take the lock.** Only one
+   `orch run --watch` can run at a time; one-shot commands do not acquire the lock. So `orch task add` while
    the orchestrator runs is a second mutator — and that is the *normal* workflow, not an edge case.
-2. **Some reads write.** `IndexManager.readIndex` falls through to `rebuildIndex` when the index is missing or
-   corrupt, and `rebuildIndex` calls `ensureDir` and **writes `_index.json`**
-   (`index-manager.ts:79-124`). `orch task list` on a fresh project therefore creates directories and writes
+2. **Some reads write.** Reading an index that is missing or corrupt rebuilds it and **writes `_index.json`**.
+   `orch task list` on a fresh project therefore creates directories and writes
    a file.
-3. **The mutex is in-process only.** It is a JavaScript promise chain — invisible to a second node process,
-   and certainly to a Rust one.
+3. **The mutex is in-process only.** It is invisible to a second r-orch process.
 
 **Lost-update mechanism, stated plainly.** Two processes interleaving the `_index.json` read-modify-write can
 drop entries: `tasks/tsk_X.yml` exists on disk but is absent from the index, so `task list`, `status` and
 **dispatch** do not see the task, while `task show tsk_X` does. It self-heals only when the index is deleted or
 corrupted into a rebuild.
 
-**This cannot be fixed unilaterally.** Any lock r-orch takes around its index writes is invisible to the TS
-binary, so serialization is unachievable while interchangeable operation is a goal. The honest response is to
-**document the behaviour and verify that it is what we documented** (V37), not to claim a guarantee we cannot
-provide. Two consequences:
-
-- **There is no `--allow-foreign-project` valve.** An earlier revision had one staying default-on until V32
-  went green; it is **retired** — a default-on refusal would break the interchangeable-operation promise it
-  was meant to protect, and V7/V8/V32 cover the failure mode on every commit instead. Reasoning in §11,
-  Rollback.
-- Concurrent mutation while an orchestrator is running is a **known, documented hazard inherited from the
-  original**. It is written up for operators, with the one-command recovery, in
-  [docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update).
+**This is not fixed by locking today.** Index writes take no cross-process lock, so the honest response is to
+**document the behaviour and verify that it is what we documented**, not to claim a guarantee we cannot provide.
+Concurrent mutation while an orchestrator is running is a **known, documented hazard**, written up for
+operators, with the one-command recovery, in [docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update).
 
 **`update` and `patch` add one narrow, new lock — not a fix for the above.** `orch agent|task|config update|patch`
 ([guide](file-mutations.md)) take a stable advisory lock, `.orchestry/.definition.lock`, for at most 5 seconds
@@ -93,11 +76,9 @@ r-orch/
 │   ├── orch-peer/             # remote-peer protocol: links, mirrors, reconnect (core, domain, engine, infra)
 │   ├── orch-cli/              # clap command tree, human + JSON rendering, serve mode. bins live here.
 │   └── orch-tui/              # ratatui dashboard
-├── xtask/                     # dev tooling: crate-graph, lint-scenarios, parity harness
-├── tests/                     # workspace-level differential + cross-compat harness
-├── fixtures/                  # golden prompts, adapter stdout recordings, scenario definitions
-├── skills/library/            # shipped skill markdown (byte-identical to the TS package)
-└── parity/orch-ts/            # vendored reference, gitignored
+├── xtask/                     # dev tooling: crate-graph, gate.sh, mouse-e2e
+├── fixtures/                  # golden prompts, adapter stdout recordings, shop catalogue, fake agents
+└── skills/library/            # shipped skill markdown
 ```
 
 ### 3.1 Dependency direction
@@ -128,24 +109,24 @@ infra". The edge is real, and it is **five** non-test sites:
 
 | Site | What it names | Why it is acceptable |
 |---|---|---|
-| `container.rs` | every concrete infra type it assembles — stores, adapters, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `FileSkillLoader`, `NanoIdGenerator`, `SystemClock`, `REGISTRATION_ORDER` | Assembly has to name implementations somewhere. The TS `container.ts` in Rust form. |
-| `orchestrator.rs` | `CachedTaskStore`, `CachedAgentStore`, `CachedGoalStore` | Faithful: `orchestrator.ts` likewise constructs the tick-scoped cache wrappers itself (`new CachedTaskStore(deps.taskStore)`). |
-| `orchestrator/dispatch.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE`, `build_prompt_context`, `BuildPromptOptions` | Faithful: `orchestrator.ts` imports exactly these from `template-engine.ts`. |
-| `task_service.rs` | `Paths`, `fs_utils` — for attachment paths | Faithful: `task-service.ts` imports `paths.ts` for the same reason. |
+| `container.rs` | every concrete infra type it assembles — stores, adapters, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `FileSkillLoader`, `NanoIdGenerator`, `SystemClock`, `REGISTRATION_ORDER` | Assembly has to name implementations somewhere. The composition root. |
+| `orchestrator.rs` | `CachedTaskStore`, `CachedAgentStore`, `CachedGoalStore` | The orchestrator constructs the tick-scoped cache wrappers itself. |
+| `orchestrator/dispatch.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE`, `build_prompt_context`, `BuildPromptOptions` | The orchestrator builds the default prompt from exactly these. |
+| `task_service.rs` | `Paths`, `fs_utils` — for attachment paths | Attachment paths need the project layout. |
 | `lock.rs` | `storage::lock`, re-exporting `LOCK_STALE` and `LockResult` | The lock *mechanism* is infra; `ProjectLock` is a thin wrapper over it. |
 
 **What actually holds is the narrower, more useful property: every *service* takes only `orch-core` traits.**
-Concrete types appear at assembly and in the four modules where the TypeScript couples the same way. So
+Concrete types appear at assembly and in the four modules above. So
 `orch-engine` remains unit-testable against `test_support` fakes, and `orch-infra` is still swappable
 wholesale — which is what the boundary was for.
 
 If the edge ever needs severing, the moves are known: lift `storage::cached` into `orch-core` (already
 generic over the traits) and the two template constants into `orch-domain`. Neither is worth doing — both
-would diverge from the TS layering for no behavioural gain.
+would add churn for no behavioural gain.
 
 **2. `orch-tui` depends on `orch-domain` alone — not on the engine.** An earlier revision of this diagram had
 the TUI depending on `orch-engine`. WP-6 **inverted** it: everything the dashboard needs crosses a single
-trait, `orch_tui::backend::TuiBackend` (§12 of PARITY.md, `crates/orch-tui/BACKEND.md`), so the TUI names only
+trait, `orch_tui::backend::TuiBackend` (`crates/orch-tui/BACKEND.md`), so the TUI names only
 the domain types that pass through it. `orch-cli` implements that trait over the DI container
 (`crates/orch-cli/src/tui/backend.rs`), and the TUI's own tests use an in-crate `FakeBackend`. **The real
 layering is tighter than this document originally specified** — a genuine improvement, recorded rather than
@@ -158,18 +139,16 @@ stale-entry half is what caught the TUI inversion above — it turned "someone q
 into a failure somebody had to look at, rather than a diff nobody read. The table above keeps the *rationale*;
 the check keeps the *list*. If they disagree, the check is right.
 
-**Enforced invariant: `orch-engine` has zero dependency on `orch-cli` or `orch-tui`.** This mirrors the TS
-layering ("the core engine has zero dependencies on CLI/TUI layers").
+**Enforced invariant: `orch-engine` has zero dependency on `orch-cli` or `orch-tui`.** The core engine has no
+knowledge of the CLI or TUI layers.
 
 `xtask crate-graph` asserts the **whole edge set** against a table, not just that one forbidden edge —
 including build- and dev-dependencies, since a test-only edge still compiles the crate. A single
 forbidden-edge check would pass a workspace in which `orch-infra` had started depending on `orch-engine`,
 inverting the layering while satisfying the letter of the rule.
 
-**Why `orch-core` exists as a separate crate from `orch-domain`.** The TS code puts storage interfaces under
-`src/infrastructure/storage/interfaces.ts` and the adapter interface under
-`src/infrastructure/adapters/interface.ts`, yet `src/application/orchestrator.ts` imports both — so
-"application depends on infrastructure interfaces". In Rust that is a dependency cycle unless the traits live
+**Why `orch-core` exists as a separate crate from `orch-domain`.** The orchestrator depends on the storage and
+adapter interfaces, which are implemented in infrastructure. That is a dependency cycle unless the traits live
 in their own crate. `orch-core` holds **only** trait definitions and the types that appear in their
 signatures. It is what lets `orch-engine` be unit-testable with in-memory fakes and lets `orch-infra` be
 swapped wholesale.
@@ -177,12 +156,12 @@ swapped wholesale.
 **Why `orch-infra` is one crate, not five.** Splitting storage / adapters / process / workspace / templates
 into separate crates would add five `Cargo.toml` files and compile-graph edges to buy an isolation we already
 get from the `orch-core` traits. One crate with clear modules (`storage`, `adapters`, `process`, `workspace`,
-`template`, `skills`, `clipboard`, `models`) is the right granularity at 26k LOC. If adapter development
+`template`, `skills`, `clipboard`, `models`) is the right granularity at this size. If adapter development
 becomes a bottleneck we can extract `orch-adapters` later — the trait boundary makes that a mechanical move.
 
 ### 3.2 Binaries
 
-All three names are the same program, matching the npm `bin` map:
+All three names are the same program:
 
 ```toml
 # crates/orch-cli/Cargo.toml
@@ -192,8 +171,7 @@ All three names are the same program, matching the npm `bin` map:
 ```
 
 (A single `main.rs` shared by three `[[bin]]` targets compiles three times. If that becomes annoying, make
-`orchestry` and `ao` thin shims that `pub use orch_cli::main`.) The clap program name stays `orchestry` so
-`--help` matches.
+`orchestry` and `ao` thin shims that `pub use orch_cli::main`.) The clap program name is `orchestry`.
 
 ### 3.3 Module map per crate
 
@@ -240,7 +218,7 @@ Pin minors in `[workspace.dependencies]`; let patches float.
 
 | Crate | Version | Why |
 |---|---|---|
-| `tokio` | `1.53` | The async runtime. Needed for: concurrent child-process stdout/stderr draining (the TS shell adapter deadlocks without it), `select!` for cancellation, and timers. Features: `rt-multi-thread`, `macros`, `fs`, `io-util`, `process`, `signal`, `sync`, `time`. |
+| `tokio` | `1.53` | The async runtime. Needed for: concurrent child-process stdout/stderr draining (the shell adapter deadlocks without it), `select!` for cancellation, and timers. Features: `rt-multi-thread`, `macros`, `fs`, `io-util`, `process`, `signal`, `sync`, `time`. |
 | `futures` | `0.3` | `Stream`/`StreamExt` for the adapter event streams. |
 | `async-trait` | `0.1` | Async methods in the `orch-core` traits. Native AFIT cannot produce `dyn`-compatible traits, and the container stores `Arc<dyn ...>` — so `async-trait` is required, not stylistic. |
 | `serde` | `1.0` | derive. |
@@ -248,8 +226,8 @@ Pin minors in `[workspace.dependencies]`; let patches float.
 | `json-patch` | `4.2` (`default-features = false`) | RFC 7396 JSON Merge Patch for `orch {agent,task,config} patch -f`. Only `json_patch::merge` is used, in `orch-cli`'s `document_input`. Adoption checks in [ADR 0005](decisions/0005-file-mutations.md). |
 | `thiserror` | `2.0` | The error enum in `orch-domain`. |
 | `anyhow` | `1.0` | Only in `orch-cli`/`xtask` top-level glue, never in library error signatures. |
-| `clap` | `4.6` | derive. Matches Commander's surface: subcommands, aliases, `required`, defaults, global args. |
-| `nanoid` | `0.5` | `nanoid::alphabet::SAFE` is the **same 64-character set** as JS nanoid's `urlAlphabet` (verified), so IDs are format-compatible with no custom alphabet. |
+| `clap` | `4.6` | derive. Subcommands, aliases, `required`, defaults, global args. |
+| `nanoid` | `0.5` | `nanoid::alphabet::SAFE` is the URL-safe 64-character set the ID format uses, so no custom alphabet is needed. |
 
 ### 4.2 YAML — the one genuinely awkward choice
 
@@ -259,7 +237,7 @@ Three maintained options:
 | Candidate | Version | Assessment |
 |---|---|---|
 | **`serde_yaml_ng`** | `0.10.0` | A direct, actively maintained continuation of `serde_yaml` with the same API. **Chosen.** |
-| **`saphyr-parser`** | `0.2` | **Also adopted**, for a different job: the event-streaming parser behind the §14.31 expanded-node pre-pass. Not a `serde_yaml_ng` replacement — see below. |
+| **`saphyr-parser`** | `0.2` | **Also adopted**, for a different job: the event-streaming parser behind the expanded-node pre-pass. Not a `serde_yaml_ng` replacement — see below. |
 | `serde_norway` | `0.9.42` | Also a maintained `serde_yaml` fork, same API. Verified to read and emit identically to `serde_yaml_ng` on our data. A drop-in fallback if `_ng` stalls. |
 | `saphyr` / `yaml-rust2` | `0.2.1` / `0.13.0` | Full YAML 1.2 engines, but **no serde integration** — we would hand-write (de)serialization for 7 entity types. Rejected as a default; see §5.3 for where a raw emitter would be needed anyway. |
 
@@ -270,21 +248,21 @@ left as a first-pass choice:
 
 | Candidate | DoS behaviour on the C0 bombs | Why not |
 |---|---|---|
-| **`serde_yaml_ng` 0.10** — chosen | 5 s / 65 s *unguarded*; **refused in 18 ms** with the §14.31 expanded-node pre-pass in front of it | — |
-| `serde-saphyr` | **excellent — ~80 ms refusal** unaided | **No dynamic `Value` model and no `apply_merge`.** Adopting it would mean hand-writing merge-key resolution ([PARITY.md §6.4.2](PARITY.md)), the timestamp quoting guard (§5.3) and surrogate repair ([PARITY.md §14.14](PARITY.md)) — three wire-contract behaviours — on top of a parser that cannot express them. Rejected on **API fit**, not performance |
+| **`serde_yaml_ng` 0.10** — chosen | 5 s / 65 s *unguarded*; **refused in 18 ms** with the expanded-node pre-pass in front of it | — |
+| `serde-saphyr` | **excellent — ~80 ms refusal** unaided | **No dynamic `Value` model and no `apply_merge`.** Adopting it would mean hand-writing merge-key resolution, the timestamp quoting guard (§5.3) and surrogate repair — three wire-contract behaviours — on top of a parser that cannot express them. Rejected on **API fit**, not performance |
 | `serde_norway` 0.9 | 5 s / 65 s — same libyaml design | No advantage; retained only as a drop-in if `_ng` stalls |
 
-Both chosen and fallback were tested against real TS-written YAML (including the folded-scalar `>-` 3 KB
+Both chosen and fallback were tested against real YAML files (including the folded-scalar `>-` 3 KB
 `agt_creator` role) and read it correctly.
 
 **`saphyr-parser` 0.2 is a direct dependency** — and note which half of the saphyr family we took.
 `serde-saphyr` was rejected above for having no `Value` model, but `saphyr-parser`, the **event-streaming
-parser underneath it**, is exactly the right tool for the §14.31 pre-pass: it streams events without
+parser underneath it**, is exactly the right tool for the expanded-node pre-pass: it streams events without
 resolving aliases, which is what makes an exact expansion count O(input) instead of O(expansion). So the
 family is split by job — `serde_yaml_ng` for serde deserialisation, `saphyr-parser` for the guard in front of
 it.
 
-**`unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is accepted**, because the §14.31 pre-pass closes the
+**`unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is accepted**, because the expanded-node pre-pass closes the
 amplification class **before the parser is reached** — refusing the shape that defeated every prior guard in
 **18 ms**, while the worst legitimate 1 MiB document still parses in 161 ms. The guard is needed regardless
 of crate: `serde_norway` measures identically on the same inputs, so this is not a crate-specific weakness.
@@ -304,13 +282,13 @@ it never emits a tag. This is the §4.8 exemption "no maintained crate fits": th
 |---|---|---|
 | `liquid` | `0.26.11` | The only maintained Liquid implementation for Rust. `kstring` floats (the 2.0.2 MSRV pin went with the 1.99 toolchain); its 2.0.3+ crate-wide deprecation is allowed in `template/lenient.rs`, whose trait impls must name `KStringCow`. |
 
-I measured `liquid` 0.26.11 against `liquidjs` 10.27.2 on the exact constructs ORCH uses
-([PARITY.md §9.5](PARITY.md)). Summary:
+`liquid` 0.26.11 was measured on the exact constructs the default templates use. Summary:
 
-- **Whitespace handling is byte-identical**, including the `\n\n\n` runs the real prompts produce. This was
-  the biggest unknown and it came out in our favour.
-- Truthiness, `.size`, `!=`, `>`, `default:`, inline `if`, and `for`-over-objects all match.
-- Two real divergences, both mitigable in the *context builder* rather than the engine:
+- **Whitespace handling is exact**, including the `\n\n\n` runs the real prompts produce. This was the biggest
+  unknown and it came out in our favour.
+- Truthiness, `.size`, `!=`, `>`, `default:`, inline `if`, and `for`-over-objects all behave as the templates
+  expect.
+- Two real quirks, both mitigable in the *context builder* rather than the engine:
   1. Missing keys error instead of rendering empty → **always emit every documented variable, using explicit
      `nil` for absent optionals.** Verified identical once done.
   2. Object iteration order is unspecified → **pass `shared_context` as an ordered array of `[k, v]` pairs**,
@@ -318,8 +296,8 @@ I measured `liquid` 0.26.11 against `liquidjs` 10.27.2 on the exact constructs O
 - One accepted divergence: unknown filters fail at parse time instead of passing through. Only reachable via
   user-supplied templates in `config.prompt.*`.
 
-**The gate is golden fixtures, not reasoning.** Before WP-3 is accepted, the Rust renderer must reproduce
-TS-generated prompt output byte for byte across the full branch matrix (§8.3). If it cannot, the contingency is
+**The gate is golden fixtures, not reasoning.** The renderer must reproduce the golden prompts in
+`fixtures/prompts/` byte for byte across the full branch matrix (§8.3). If it cannot, the contingency is
 a ~400-line purpose-built renderer for the 7 constructs actually used — a bounded, well-specified fallback,
 not open-ended work.
 
@@ -339,10 +317,9 @@ not open-ended work.
 | `tempfile` | `3.27` | Atomic writes (temp + rename) and test temp dirs. |
 | `dirs` | `7.0` | `~/.orchestry/`. |
 | `which` | `8.0` | Adapter binary probing (`cursor-agent` → `agent` fallback). |
-| `shell-words` | `1.1` | Parsing/quoting in diagnostics only — **never** for building adapter argv (we pass argv vectors directly, no shell). |
-| `globset` | `0.4` | Available if scope matching ever becomes real glob matching. **Not used for `scopesOverlap`**, which is deliberately raw string-prefix logic ([PARITY.md §7.11](PARITY.md)) and must be ported as such. |
+| `globset` | `0.4` | Available if scope matching ever becomes real glob matching. **Not used for `scopesOverlap`**, which is deliberately raw string-prefix logic and must stay that way. |
 | `tracing` + `tracing-subscriber` | `0.1` / `0.3` | Internal diagnostics. **Must not** write to stdout — stdout is the CLI contract. Default to stderr at `warn`, controlled by `ORCHESTRY_DEBUG`/`RUST_LOG`. |
-| `indexmap` | `2.14` | Insertion-ordered maps where TS object order matters. |
+| `indexmap` | `2.14` | Insertion-ordered maps where key order is part of the format. |
 | `toml` | `1.1` | Only for our own tooling/config, not for `.orchestry/`. |
 
 ### 4.5.1 `orch web` (`orch-cli` only)
@@ -368,17 +345,17 @@ Windows-only crates the gate never resolves.
 | `assert_cmd` | `2.2` | Running our own binary in integration tests. |
 | `predicates` | `3.1` | Assertions on command output. |
 | `tempfile` | `3.27` | Isolated project dirs per test. |
-| `proptest` | *(add when needed)* | For the scope-overlap equivalence property (V12) and the ID-format property (V29). |
+| `proptest` | *(add when needed)* | For the scope-overlap equivalence property and the ID-format property. |
 
 ### 4.7 Deliberately not used
 
-- **`git2`** (`0.21`) — binds libgit2. [PARITY.md §10](PARITY.md) specifies *exact git command lines*
+- **`git2`** (`0.21`) — binds libgit2. The workspace manager uses *exact git command lines*
   (`git worktree add … -b …`, `git worktree prune`, `git merge --no-ff … -m …`, `git merge --abort`), and
-  parity depends on their exact behaviour and exit codes, including `worktree prune` semantics libgit2 models
+  depends on their exact behaviour and exit codes, including `worktree prune` semantics libgit2 models
   differently. **Shelling out to `git` is the correct choice here** and it also removes a C dependency from
   the build. Decision recorded because it looks backwards at first glance.
-- **`notify`** (`9.0.0-rc.5`) — only a release candidate, and the serve-mode disk observer polls in the
-  original. Keep polling; parity first.
+- **`notify`** (`9.0.0-rc.5`) — only a release candidate, and the serve-mode disk observer polls.
+  Keep polling.
 - **`sysinfo`** — overkill. PID liveness is `kill(pid, 0)` via `nix`.
 - **`libc` 1.0** — still alpha (`1.0.0-alpha.5`). `nix` 0.31 pulls a stable `libc` 0.2; let it.
 
@@ -387,7 +364,7 @@ Windows-only crates the gate never resolves.
 ### 4.8 Library-first policy (user directive, 2026-10-13)
 
 **Where a well-supported third-party crate covers a complex feature, use it instead of hand-rolling.**
-Hand-roll only when (a) no maintained crate fits, or (b) a parity requirement in PARITY.md rules the crate
+Hand-roll only when (a) no maintained crate fits, or (b) a documented format or behaviour requirement rules the crate
 out — and say which in a code comment. Candidates for areas that would otherwise be hand-written (verify
 version compatibility with `ratatui` 0.30 / the pinned toolchain before adopting; record the choice in
 `[workspace.dependencies]`):
@@ -395,16 +372,16 @@ version compatibility with `ratatui` 0.30 / the pinned toolchain before adopting
 | Area | Crate(s) | Note |
 |---|---|---|
 | Process groups / session spawn + group kill (tokio) | `process-wrap` 10 (tokio feature) | Prefer over hand-rolled `setsid` + `kill(-pid)`; keep `nix` for `kill(pid, 0)` liveness if `process-wrap` lacks it |
-| TUI multi-line/single-line text editing (wizards, command bar, undo) | `tui-textarea` / `tui-input` (or a maintained ratatui-0.30-compatible fork) | Parity of key semantics is L1 — wrap the widget, don't rewrite an editor |
-| Grapheme segmentation / display width (`text-cursor` parity) | `unicode-segmentation`, `unicode-width` | Replaces `Intl.Segmenter` + width logic |
-| Clipboard text/image (TUI paste) | `arboard` (with image support) | TS shells out to osascript/xclip/PowerShell; TUI is L2 here, so the mechanism may differ — degrade to "empty" on any failure, as TS does |
-| Diffs in the parity harness / test failures | `similar`, `pretty_assertions` | |
+| TUI multi-line/single-line text editing (wizards, command bar, undo) | `tui-textarea` / `tui-input` (or a maintained ratatui-0.30-compatible fork) | Wrap the widget, don't rewrite an editor |
+| Grapheme segmentation / display width  | `unicode-segmentation`, `unicode-width` | Cursor movement and column layout |
+| Clipboard text/image (TUI paste) | `arboard` (with image support) | Degrade to "empty" on any failure |
+| Diffs in test failures | `pretty_assertions` | |
 | Version comparison (update check) | `semver` | |
 | Templates | `liquid` (already chosen) | The ~400-line fallback renderer is a last resort only, after escalation |
 
-Things that **stay hand-written because parity requires it**: the PID lock-file format, `scopesOverlap`'s raw
-string-prefix logic, the line reader's 16 KB cap/empty-line semantics, the retry backoff formula, the
-`--since` duration regex, the table renderer's exact padding, and the TS-compatible atomic-write temp naming.
+Things that **stay hand-written because the format or behaviour is pinned**: the PID lock-file format,
+`scopesOverlap`'s raw string-prefix logic, the line reader's 16 KB cap/empty-line semantics, the retry backoff
+formula, the `--since` duration regex, the table renderer's exact padding, and the atomic-write temp naming.
 
 ---
 
@@ -448,7 +425,7 @@ pub trait RunStore: Send + Sync {
     async fn read_events_tail(&self, run_id: &str, count: usize) -> Result<Vec<RunEvent>>;
     /// Reads the JSONL file to EOF and ends — **not** a tail-follow. Waits up to 30 s
     /// for the file to appear. Cancellable. Has no production caller (tests only);
-    /// `logs --follow` subscribes to the EventBus instead. See PARITY.md §6.9.
+    /// `logs --follow` subscribes to the EventBus instead.
     fn stream_events(&self, run_id: &str, token: CancellationToken)
         -> BoxStream<'static, Result<RunEvent>>;
     /// Release the cached O_APPEND handle for this run.
@@ -456,17 +433,17 @@ pub trait RunStore: Send + Sync {
 }
 
 // Plus: StateStore, ConfigStore, ContextStore, MessageStore, GoalStore, TeamStore
-// — same shapes as the TS interfaces in src/infrastructure/storage/interfaces.ts.
+// — same style: `&self`, async, `Result` return.
 ```
 
 Notes:
 - `&self`, not `&mut self`: stores are shared as `Arc<dyn TaskStore>` and own their interior mutability
-  (the index mutex). This matches the TS classes, which are shared instances.
+  (the index mutex).
 - `TaskFilter` as a struct rather than two `Option` parameters, so adding a filter dimension is not a
   signature break.
-- `close_run_events` is **not** async in TS and should stay sync — it is a cache eviction.
+- `close_run_events` is **not** async and should stay sync — it is a cache eviction.
 
-### 5.2 Serialization helpers (the cross-compat crux)
+### 5.2 Serialization helpers (the on-disk format)
 
 ```rust
 // orch-infra/src/storage/fs_utils.rs
@@ -479,23 +456,21 @@ Notes:
 /// against *process* crashes, not machine crashes (sre C5).
 pub async fn atomic_write(path: &Path, content: &str) -> Result<()>;
 
-/// `serde_json::to_string_pretty` + '\n'. 2-space indent, trailing newline — matches
-/// `JSON.stringify(v, null, 2)` + console.log.
+/// `serde_json::to_string_pretty` + '\n'. 2-space indent, trailing newline.
 pub async fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()>;
 
-/// js-yaml-compatible emission. See `quote_ambiguous_scalars`.
+/// YAML emission that YAML 1.1 readers parse back to the same types. See `quote_ambiguous_scalars`.
 pub async fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()>;
 
 /// Compact JSON + '\n' appended through a cached O_APPEND handle, with the
-/// PIPE_BUF truncation rule from PARITY.md §6.9.
+/// PIPE_BUF truncation rule: a record over the limit is truncated so one write stays atomic.
 pub async fn append_jsonl<T: Serialize>(path: &Path, record: &T) -> Result<()>;
 ```
 
-Two rules every entity struct must follow, or cross-compat breaks silently:
+Two rules every entity struct must follow, or the on-disk format drifts silently:
 
-1. **Every `Option` field** that the TS type marks `?` carries
-   `#[serde(skip_serializing_if = "Option::is_none")]`. TS `undefined` is *omitted*, not null. The sole
-   exception is `Message::to_agent_id`, which is `string | null` and must emit `null`.
+1. **Every optional field** carries `#[serde(skip_serializing_if = "Option::is_none")]`: absent is *omitted*,
+   not null. The sole exception is `Message::to_agent_id`, which must emit `null`.
 2. **Never use `serde_json::json!` for a persisted record.** `serde_json::Map` defaults to `BTreeMap`, so
    `json!` **alphabetizes** keys — a JSONL event came out `{"data":…,"timestamp":…,"type":…}` in testing
    instead of `{"timestamp":…,"type":…,"data":…}`. Derived structs emit declaration order. Use typed structs,
@@ -503,22 +478,23 @@ Two rules every entity struct must follow, or cross-compat breaks silently:
 
 ### 5.3 The YAML timestamp guard
 
-This is the one place where correctness required measurement. js-yaml's default schema includes the YAML 1.1
-`timestamp` type, so an **unquoted** `created_at: 2026-10-13T16:37:58.959Z` deserializes in TypeScript to a
-JavaScript `Date`, not a `String` — and `MessageStore.list()` then calls `.localeCompare()` on it and
-**throws**. Both `serde_yaml_ng` and `serde_norway` emit such scalars unquoted.
+This is the one place where correctness required measurement. The YAML 1.1 schema includes a `timestamp`
+type, so an **unquoted** `created_at: 2026-10-13T16:37:58.959Z` is read by a YAML 1.1 reader as a date, not a
+string — and any consumer that then treats it as text fails. Both `serde_yaml_ng` and `serde_norway` emit such scalars unquoted.
 
 ```rust
 /// Post-emit pass over serialized YAML: force single-quoting on any plain scalar that
-/// js-yaml's DEFAULT_SCHEMA would resolve as a YAML 1.1 timestamp or date.
+/// a YAML 1.1 reader would resolve as a timestamp or date.
 /// Operates on the emitted document, keyed off the scalar grammar — not on field names,
 /// so a user-supplied `description` that happens to look like a date is also protected.
 fn quote_ambiguous_scalars(yaml: &str) -> String;
 ```
 
-Implemented inside `write_yaml` so no caller can forget it. **Mandatory test (V8):** write every entity type
-from Rust, then read it back *in the TS process* and assert `typeof value === 'string'` for every timestamp
-field. If the post-emit pass proves leaky in practice, the escalation is a hand-written emitter over
+Implemented inside `write_yaml` so no caller can forget it. **Tests:** `crates/orch-domain/tests/yaml_emission.rs`
+pins which scalars `serde_yaml_ng` emits unquoted (the hazard the guard exists for) and that the domain types
+round-trip through `serde_yaml_ng`; the `fs_utils` unit tests pin the quoting guard against a hand-measured
+YAML 1.1 date table; `crates/orch-infra/tests/store_round_trip.rs` writes every entity through the real stores
+and checks the written bytes for any timestamp-shaped scalar left unquoted. No YAML 1.1 parser is involved. If the post-emit pass proves leaky in practice, the escalation is a hand-written emitter over
 `serde_norway::Value` with explicit scalar styles (~150 lines) — which is also where `saphyr` would earn its
 place.
 
@@ -558,19 +534,19 @@ pub struct ExecuteHandle {
 pub trait Adapter: Send + Sync {
     fn kind(&self) -> &'static str;
     async fn test(&self) -> AdapterTestResult;
-    /// NOT async: mirrors the TS contract where execute() returns { pid, events }
-    /// synchronously. Lifecycle listeners must be attached before the stream is polled.
+    /// NOT async: returns { pid, events } synchronously.
+    /// Lifecycle listeners must be attached before the stream is polled.
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError>;
     async fn stop(&self, pid: u32) -> Result<()>;
 }
 ```
 
-`execute` being sync is a deliberate contract choice, not an oversight: the TS code attaches `close`/`error`
-and stderr listeners *eagerly* precisely so a fast-failing child is not missed, and the orchestrator needs the
+`execute` being sync is a deliberate contract choice, not an oversight: the lifecycle and stderr listeners
+are attached *eagerly* precisely so a fast-failing child is not missed, and the orchestrator needs the
 PID to write `state.running` before it starts consuming events. Spawning is itself non-blocking, so sync costs
 nothing.
 
-Stream errors are modelled as `Result` items rather than terminating the stream, because the TS generator
+Stream errors are modelled as `Result` items rather than terminating the stream, because the stream
 distinguishes "an `error` event occurred" (continue) from "the generator threw" (run failed). The thrown case
 is the stream yielding `Err` and then ending.
 
@@ -579,7 +555,7 @@ pub struct AdapterRegistry { adapters: Vec<Arc<dyn Adapter>> }  // Vec, not Hash
 impl AdapterRegistry {
     pub fn get(&self, kind: &str) -> Option<&Arc<dyn Adapter>>;
     pub fn require(&self, kind: &str) -> Result<&Arc<dyn Adapter>, DomainError>;
-    pub fn kinds(&self) -> Vec<&'static str>;   // registration order — L0
+    pub fn kinds(&self) -> Vec<&'static str>;   // registration order is part of the contract
 }
 ```
 
@@ -609,10 +585,10 @@ pub struct SpawnedChild {
 }
 ```
 
-Implementation requirements ([PARITY.md §8.4](PARITY.md)):
+Implementation requirements:
 
-- `pre_exec(|| { setsid(); Ok(()) })` to create a new process group — the Rust equivalent of node's
-  `detached: true`. This is what makes `kill(-pid)` reap the whole tree.
+- `pre_exec(|| { setsid(); Ok(()) })` to create a new process group — the child leads its own session
+  and group. This is what makes `kill(-pid)` reap the whole tree.
 - `kill` tries the **group first** (`nix::sys::signal::kill(Pid::from_raw(-(pid as i32)), sig)`), falling back
   to the direct PID, swallowing errors.
 - `kill_with_grace`: return if dead; `SIGTERM`; poll `is_alive` every **200 ms** to the deadline; `SIGKILL`.
@@ -622,14 +598,13 @@ Implementation requirements ([PARITY.md §8.4](PARITY.md)):
 
 ### 5.6 Injected seams for determinism — a deliberate addition
 
-The TS test suite has **no clock seam and no ID-generator seam**: timestamps come from real `new Date()` and
-tests assert ID *prefixes* rather than values. That is a large part of why ~500 TUI/timing cases are flaky
-([PARITY.md §14.9](PARITY.md)).
+Time and ID generation are injected, so tests can assert exact values instead of prefixes and timing-dependent
+cases do not flake.
 
 ```rust
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
-    /// ISO-8601 UTC, exactly 3 fractional digits, 'Z' — PARITY.md §6.3
+    /// ISO-8601 UTC, exactly 3 fractional digits, 'Z'
     fn now_iso(&self) -> String;
 }
 pub trait IdGenerator: Send + Sync {
@@ -638,14 +613,13 @@ pub trait IdGenerator: Send + Sync {
 ```
 
 Real implementations in `orch-infra`; `FixedClock`/`SeqIdGenerator` in a `test-support` module. Both are
-threaded through the container and reachable by every service. This is **not** parity-neutral bookkeeping — it
-is what lets the differential harness assert on exact values, lets retry/backoff and stall-detection tests run
-instantly instead of sleeping, and removes a whole class of flake. It is the one place where I am deliberately
-going beyond a transliteration of the original.
+threaded through the container and reachable by every service. This is what lets tests assert on exact values,
+lets retry/backoff and stall-detection tests run instantly instead of sleeping, and removes a whole class of
+flake.
 
 ### 5.7 Error model
 
-TS `OrchestryError` carries `(message, exitCode, hint?)` and subclasses specialize it.
+`DomainError` carries a message, an exit code and an optional hint.
 
 ```rust
 // orch-domain/src/error.rs
@@ -671,13 +645,13 @@ pub enum DomainError {
 }
 
 impl DomainError {
-    pub fn exit_code(&self) -> i32 { /* PARITY.md §3 */ }
-    pub fn hint(&self) -> Option<String> { /* PARITY.md §3.1 — exact strings */ }
+    pub fn exit_code(&self) -> i32 { /* per-variant exit code */ }
+    pub fn hint(&self) -> Option<String> { /* per-variant hint, exact strings */ }
 }
 ```
 
-The `Display` strings **are** the user-facing messages from [PARITY.md §3.1](PARITY.md) — writing them in
-`#[error(...)]` makes the contract hard to drift from. `exit_code()` and `hint()` are the only two places the
+The `Display` strings **are** the user-facing messages — writing them in `#[error(...)]` makes them hard to
+drift. `exit_code()` and `hint()` are the only two places the
 CLI needs. `orch-cli`'s top-level handler is the single exit point: downcast to `DomainError` → print
 `  ✕ <msg>` (+ hint) to stderr → exit with `exit_code()`; anything else → exit 1, and dump the chain when
 `ORCHESTRY_DEBUG` is set.
@@ -689,28 +663,26 @@ Infrastructure errors (`std::io::Error`, YAML, JSON) get their own enums per mod
 
 ## 6. Concurrency model
 
-### 6.1 Replacing the promise-chain mutex
+### 6.1 State mutex
 
-The TS orchestrator serializes state mutation with a hand-rolled promise chain (`withStateLock`), and
-`IndexManager` has its own. The faithful and simpler Rust equivalent is `tokio::sync::Mutex`:
+The orchestrator serializes state mutation with a `tokio::sync::Mutex`, and the index manager has its own:
 
 ```rust
 pub struct Orchestrator {
-    state: Arc<Mutex<OrchestratorState>>,       // replaces stateMutex + this.state
+    state: Arc<Mutex<OrchestratorState>>,
     active_collectors: Arc<Mutex<HashSet<String>>>,
-    cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,   // replaces abortControllers
+    cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /* deps: Arc<dyn …> */
 }
 ```
 
-`tokio::sync::Mutex` (not `std::sync::Mutex`) because the critical sections `await` on store I/O — exactly as
-the TS code does. Two properties of the original must be preserved:
+`tokio::sync::Mutex` (not `std::sync::Mutex`) because the critical sections `await` on store I/O . Two properties must be preserved:
 
 1. **The lock is held across awaits**, including file writes. This is intentional: it is what makes
-   tick/stop/completion mutually exclusive. Do not "optimize" it into fine-grained locking — the TS bug
-   history (the `activeCollectors` guard, the early `delete state.running[taskId]`, the re-read-before-save
-   patterns) is all about this serialization.
-2. **`std::sync::Mutex` is correct for `IndexManager`**'s *in-memory* guard only if no await happens inside;
+   tick/stop/completion mutually exclusive. Do not "optimize" it into fine-grained locking — the bug
+   history (the `active_collectors` guard, the early removal of `state.running[task_id]`, the
+   re-read-before-save patterns) is all about this serialization.
+2. **`std::sync::Mutex` would be correct for the index manager**'s *in-memory* guard only if no await happens inside;
    it does (file I/O), so use `tokio::sync::Mutex` there too.
 
 `Orchestrator` is `Clone`-able over `Arc`s so background tasks can hold it. One `Arc<Mutex<_>>` per concern
@@ -739,14 +711,13 @@ pub async fn start_watch(&self, opts: WatchOptions) -> Result<()> {
 }
 ```
 
-- **`MissedTickBehavior::Delay`** matters. `setInterval` in node does not catch up on missed ticks; tokio's
+- **`MissedTickBehavior::Delay`** matters. The tick loop must not catch up on missed ticks; tokio's
   default `Burst` would fire several ticks back-to-back after a slow one, changing dispatch timing.
 - The reactive-dispatch debounce (500 ms, max 10 retries while a tick is in flight) becomes a
   `tokio::sync::Notify` plus a debounce task — the retry loop exists to avoid contending with a tick, which
   `select!` arms already partly solve, but the **observable** 500 ms delay must be preserved because tests
   depend on it.
-- Signal handling moves from process-global handlers to a `select!` arm, which removes the TS
-  add/remove-listener dance entirely.
+- Signal handling moves from process-global handlers to a `select!` arm, which keeps handler registration out of the global state.
 
 ### 6.3 Child process I/O
 
@@ -762,18 +733,18 @@ loop {
 }
 ```
 
-- **stdout and stderr must be drained concurrently.** The TS shell adapter explicitly notes that reading them
+- **stdout and stderr must be drained concurrently.** Reading them
   sequentially deadlocks on a full pipe. Two tasks, or two `select!` arms — never sequential.
 - The stderr tail is a bounded **4096-byte** ring, attached before the stream is polled, used only to enrich
   an error message.
-- `readLines` semantics are specified in [PARITY.md §8.5](PARITY.md) and are **not** what
+- The line reader's semantics are **not** what
   `tokio::io::AsyncBufReadExt::lines()` does: it splits on `0x0A` only (keeping `\r`), **skips empty lines**,
   yields a trailing fragment, and caps each line at 16384 characters. Write our own `line_reader`; do not
   reach for the convenience method.
 
 ### 6.4 Cancellation
 
-`tokio_util::sync::CancellationToken` replaces `AbortController`, one per running task, stored in
+`tokio_util::sync::CancellationToken`, one per running task, stored in
 `Orchestrator::cancels`. Cancelling it both stops the collector loop and triggers `kill_with_grace`.
 Grace periods by call site: `cancel_task`/`force_stop_agent` 3 s, stall/abort 5 s, `stop()` 10 s.
 
@@ -782,8 +753,7 @@ A `Drop` guard on the orchestrator is **not** sufficient for process cleanup (as
 
 ### 6.5 Event bus
 
-TS `EventBus` is synchronous: `emit()` runs every handler inline and swallows their exceptions. The Rust
-equivalent:
+The event bus is a broadcast channel:
 
 ```rust
 pub struct EventBus { tx: tokio::sync::broadcast::Sender<Arc<OrchestratorEvent>> }
@@ -794,11 +764,11 @@ impl EventBus {
 ```
 
 `broadcast` with `Arc` payloads gives cheap fan-out to the TUI, the structured logger and the run store. One
-behaviour change to be explicit about: `broadcast` **drops** messages for a lagging receiver instead of
-blocking, whereas synchronous TS emission cannot lose an event. Mitigation: size the channel generously
+behaviour to be explicit about: `broadcast` **drops** messages for a lagging receiver instead of
+blocking. Mitigation: size the channel generously
 (4096), and have subscribers that must not miss events (the run-store writer) consume on a dedicated task
 that does nothing else. `RecvError::Lagged` is surfaced as a `tracing::warn`, never silently ignored. The TUI
-*may* lose high-frequency `agent:output` events under load — which is exactly what the TS TUI's 80 ms batching
+*may* lose high-frequency `agent:output` events under load — which the TUI's 80 ms batching
 and 2 KB caps already accept.
 
 ---
@@ -806,7 +776,7 @@ and 2 KB caps already accept.
 ## 7. Container and wiring
 
 ```rust
-pub struct Engine {                       // the TS LightContainer
+pub struct Engine {                       // light tier: read-only commands
     pub paths: Paths,
     pub config: OrchestratorConfig,
     pub global_config: GlobalConfig,
@@ -817,7 +787,7 @@ pub struct Engine {                       // the TS LightContainer
     pub task_service: Arc<TaskService>,  /* … the other services … */
 }
 
-pub struct FullEngine {                   // the TS Container
+pub struct FullEngine {                   // full tier: adds adapters, processes, orchestrator
     pub engine: Engine,
     pub processes: Arc<dyn ProcessManager>,
     pub adapters: Arc<AdapterRegistry>,
@@ -832,8 +802,7 @@ pub async fn build_light(ctx: &CliContext) -> Result<Engine>;
 pub async fn build_full(ctx: &CliContext) -> Result<FullEngine>;
 ```
 
-The two-tier split is kept for structural fidelity and because it documents which commands may mutate state.
-In Rust it buys little startup time (there are no dynamic imports to avoid), so **do not** add lazy
+The two-tier split documents which commands may mutate state. It buys little startup time (there are no dynamic imports to avoid), so **do not** add lazy
 initialization machinery for it — just construct what each tier needs.
 
 ---
@@ -842,169 +811,74 @@ initialization machinery for it — just construct what each tier needs.
 
 Four layers. Layers 1 and 2 are the acceptance gates; 3 and 4 are how individual packages prove themselves.
 
-### 8.1 Layer 1 — ported unit and integration tests
+### 8.1 Layer 1 — unit and integration tests
 
-Mapping of the TS suite (counts from [docs/parity/tests.md](parity/tests.md)):
+Unit tests are inline `#[cfg(test)]` modules; integration tests live in each crate's `tests/`.
 
-| TS directory | Files | Cases | Rust destination | Notes |
-|---|---|---|---|---|
-| `test/unit/domain` | 10 | ~183 | `orch-domain` `#[cfg(test)]` modules | Pure. Ports almost mechanically. |
-| `test/unit/application` | 25 + helper | ~429 | `orch-engine/tests/` + inline | Needs the in-memory fake stores (WP-0 deliverable). |
-| `test/unit/infrastructure` | 38 | ~562 | `orch-infra/tests/` + inline | Mix of pure (fs-utils, index, scope) and PROCESS/IO (tempdirs, real `bash`). |
-| `test/unit/cli` | 18 + helper | ~224 | `orch-cli/tests/` | Output formatting, flag parsing, serve logger, disk observer. |
-| `test/unit/tui` | 30 | ~681 | `orch-tui/tests/` via `TestBackend` | **Re-expressed, not ported** — see §8.4. |
-| `test/integration` | 4 | 6 | `tests/` workspace-level | |
-| `test/smoke-*.ts`, `test/battle/`, `test/e2e/*.pty.ts` | 6 | — | `xtask` subcommands | Not part of `cargo test`; deliberately outside the suite in the original too. |
+| Crate | Where | Notes |
+|---|---|---|
+| `orch-domain` | inline modules, `tests/` | Pure. |
+| `orch-engine` | `tests/` + inline | Uses the in-memory fake stores from `test_support`. |
+| `orch-infra` | `tests/` + inline | Mix of pure (fs-utils, index, scope) and process/IO (tempdirs, real `bash`). |
+| `orch-cli` | `tests/` | Output formatting, flag parsing, serve logger, disk observer; the real binary on temp projects. |
+| `orch-tui` | `tests/` via `TestBackend` | See §8.4. |
 
-**No test in the reference suite requires a real AI CLI.** Verified: there are no `which` / `command -v` /
-binary-presence skip guards anywhere in `test/`. Every adapter test injects a fake `IProcessManager` whose
-`spawn()` returns a hand-built `EventEmitter` with `PassThrough` streams, and drives it from outside (write
-bytes, emit `exit`/`error`), asserting exact argv and exact stdin writes. **No fake shell scripts are written
-to disk anywhere in the TS suite.** So there is no AI-CLI boundary to stub at the unit level, and the Rust
-ports inject `FakeProcessManager` the same way.
+**No test requires a real AI CLI.** Every adapter test injects a fake `ProcessManager` whose `spawn()` returns
+in-memory pipes and drives it from outside (write bytes, signal exit), asserting exact argv and exact stdin
+writes. Integration tests that need an agent that really runs use the `shell` adapter or a fake agent script
+(§8.2).
 
-The **fake agent scripts** in §8.2 are therefore a *new* requirement specific to the differential harness, not
-a port of anything: the harness drives both binaries as subprocesses, so it cannot inject a trait object
-across that boundary and must instead put a replay script named `claude`/`codex`/… on `PATH`. Keep the two
-mechanisms distinct — unit tests inject, the harness shims `PATH`.
+The shared helper infrastructure is a `test-support` module in `orch-core` (behind a feature flag so it does
+not ship):
 
-**Port the helper infrastructure first** (WP-0). The TS suite rests on exactly two shared helpers; the Rust
-equivalent is a `test-support` module in `orch-core` (behind a feature flag so it does not ship):
-
-- `make_task()`, `make_agent()`, `make_run()` with the **same hard-coded defaults** as the TS factories —
-  including `make_agent()`'s `approval_policy: auto`, which is why so many tests observe `review → done`
-  without an explicit approve, and `stall_timeout_ms: 300_000`.
-- In-memory `Mutex<HashMap<_>>`-backed fakes for all 9 stores, cloning on read and write to prevent aliasing
-  (the TS fakes `structuredClone` for exactly this reason).
+- `make_task()`, `make_agent()`, `make_run()` with fixed defaults — including `make_agent()`'s
+  `approval_policy: auto`, which is why so many tests observe `review → done` without an explicit approve, and
+  `stall_timeout_ms: 300_000`.
+- In-memory `Mutex<HashMap<_>>`-backed fakes for all 9 stores, cloning on read and write to prevent aliasing.
 - `FakeProcessManager` (fixed pid 12345), `FakeAdapter` (takes a `Vec<AgentEvent>` to replay),
   `FakeWorkspaceManager`, `FakeTemplateEngine` (returns a constant), `FixedClock`, `SeqIdGenerator`.
 - `build_deps(overrides)` assembling complete `OrchestratorDeps` with **real** services, event bus and
   registry — only the stores and I/O edges faked. Default `poll_interval_ms` of 100_000 so the tick loop never
   self-fires and tests drive ticks explicitly.
 
-Rust needs a `TestOrchestrator` builder rather than the TS `overrides`-spread trick; that is WP-0's job to get
-ergonomic, because five other packages will build on it.
+### 8.2 Layer 2 — binary-level tests
 
-### 8.2 Layer 2 — the differential parity harness
+`crates/orch-cli/tests/` run the real `orch` binary (`assert_cmd`) against temporary projects and assert on
+stdout, stderr, exit code and the resulting `.orchestry/` tree.
 
-The primary guarantee. Lives in `tests/parity/`, driven by `cargo xtask parity`.
-
-```
-fixtures/scenarios/*.toml
-  ┌─────────────────────────────────────────────────────────┐
-  │ name = "task-lifecycle-shell-agent"                      │
-  │ steps = [                                                │
-  │   "init --name proj",                                    │
-  │   "agent add shelly --adapter shell --command 'echo hi'", │
-  │   "task add 'Do it' --assignee shelly --json",            │
-  │   "config set defaults.agent.workspace_mode shared",      │
-  │   "run ${task.0}",                                        │
-  │   "task list --json",                                     │
-  │   "status --json",                                        │
-  │ ]                                                        │
-  └─────────────────────────────────────────────────────────┘
-                │                                  │
-      ┌─────────▼──────────┐           ┌───────────▼───────────┐
-      │ tmpdir A (TS)       │           │ tmpdir B (Rust)        │
-      │ node parity/orch-ts │           │ target/debug/orch      │
-      │   /dist/cli.js      │           │                        │
-      └─────────┬──────────┘           └───────────┬───────────┘
-                │   stdout, stderr, exit code,      │
-                │   full .orchestry/ tree           │
-                └────────────┬──────────────────────┘
-                             ▼
-                  normalize (PARITY.md §1.4)
-                  then assert deep equality
-```
-
-Rules:
-
-- **Both tmpdirs are `git init`ed identically** with one commit, because worktree mode requires a repo.
-- **Hermeticity — the harness must isolate the home directory, not just the global config.**
-  `ORCHESTRY_GLOBAL_CONFIG_PATH` redirects `global.yml` **alone**; `src/cli/update-check.ts:15-16,125`
-  hard-codes its cache to `path.join(os.homedir(), '.orchestry')` with **no override**, and
-  `src/bin/cli.ts:210-231` runs the check after every command except `tui`/`update`/`serve`, writes a
-  notification to **stderr**, and spawns `npm install -g` when an update exists. Since the harness compares
-  stderr and is a required merge gate, that makes the gate non-deterministic *and* gives it a side effect on
-  the host. So every scenario:
-  1. sets **`HOME` and `USERPROFILE`** per tmpdir,
-  2. sets `ORCHESTRY_GLOBAL_CONFIG_PATH` inside it,
-  3. **pre-seeds `$HOME/.orchestry/update-check.json`** with a fresh `checked_at` so the SWR cache is warm and
-     no registry query happens,
-  4. **asserts the oracle spawned no `npm` and opened no socket** (V31). CI runs the parity job with
-     networking disabled.
-  **The `HOME` override belongs on the `node .../dist/cli.js` invocation and nowhere else.** This is a real
-  trap and it has already cost 670 MB: `RUSTUP_HOME` and `CARGO_HOME` default to paths **under `HOME`**, so
-  exporting a sandbox `HOME` around a `cargo` command makes rustup re-download the entire toolchain into the
-  tmpdir — and the same shape of mistake once produced a run that passed by executing **zero tests**. So:
-
-  - **do** sandbox `HOME` for each direct oracle invocation (`node .../dist/cli.js …`, with `CI=1`);
-  - **do not** sandbox `HOME` for `cargo`, `cargo run -p xtask -- parity`, or anything that shells out to
-    cargo. The harness sandboxes per project *internally*; wrapping it from outside breaks the toolchain
-    without making anything more hermetic.
-
-  **And there is no read-only oracle invocation to exempt.** Measured: the oracle writes
-  `~/.orchestry/update-check.json` on an ordinary `orch task list`, not only on an update path. So the
-  natural shortcut — *"it's only a list, it can't write anything"* — is false. Every `node` invocation of the
-  oracle gets the sandbox, without exception.
-
-  Without step 3 the gate is green in an offline container and red on a laptop — or the reverse — with no code
-  change, and a parity run can leave the developer's real TUI claiming a restart is needed.
+- **Each project is `git init`ed** with one commit, because worktree mode requires a repo.
+- **Hermeticity.** Each test gets its own temp root, a cleared or explicit environment, and
+  `ORCHESTRY_GLOBAL_CONFIG_PATH` inside it; `.cargo/config.toml` points the variable at `target/test-global/`
+  for every cargo command so no test touches the developer's real `~/.orchestry`. Runner variables
+  (`CARGO_TARGET_DIR`, `TMPDIR`, wrapper `PATH`s) must not leak in. Do not sandbox `HOME` around `cargo`
+  itself: `RUSTUP_HOME` and `CARGO_HOME` default to paths under `HOME`, so a sandbox `HOME` makes rustup
+  re-download the toolchain.
 - **No real AI CLI is ever needed.** Agents use the `shell` adapter, or a **fake agent script** — a small
   `bash`/Rust binary on `PATH` under the name `claude`/`codex`/… that replays a recorded JSONL stream from a
-  fixture file. This is how adapter-level behaviour (token accounting, `done` events, file-change extraction)
-  gets exercised end to end.
-- Comparison covers: **stdout**, **stderr**, **exit code**, and a **recursive walk of `.orchestry/`** —
-  every file, parsed according to its extension (YAML/JSON/JSONL), normalized, deep-compared. Files present
-  in one tree and absent in the other are failures.
-- **Every YAML artifact is additionally re-parsed in the TS process with js-yaml** and deep-compared against
-  the Rust parse (V32). This is a harness *step*, not a hand-written test. Without it, both trees are verified
-  by a single parser that shares the writer's assumptions, and **every bug of the form "js-yaml reads r-orch's
-  bytes differently" is invisible by construction** — which is precisely the failure class R1 and the
-  cross-compat tests exist to prevent (§11 records why no opt-in valve accompanies them). It is ~50 lines of
-Node glue, it subsumes V8's timestamp
-  assertion as a special case, and it catches the schema deltas in [PARITY.md §6.4.2](PARITY.md) (merge keys,
-  `!!binary`, `!!timestamp` tags, complex keys) without anyone having to enumerate them correctly in advance.
-- **Cross-compat scenarios** are a separate scenario kind, and they are the part that actually proves the
-  shared-format claim:
-  - `ts_then_rust`: TS runs steps 1..k, Rust runs k+1..n in the *same* directory.
-  - `rust_then_ts`: the reverse.
-  - `interleaved`: alternate per step.
-  Each is run for the lifecycle scenarios, which is what catches the timestamp-quoting class of bug (§5.3) —
-  it is invisible to a same-binary test.
-- Scenario failures print a unified diff of the normalized artifacts, not a boolean.
-
-**Run the TS oracle with `CI=1`** (⇒ `maxWorkers=2`) whenever the reference *suite* is invoked, per
-[PARITY.md §14.9](PARITY.md).
-
-**Every scenario needs a timeout, and this is not hypothetical.** A `serve --once` step in our own probe
-script **hung for three hours** before anyone noticed, on the `review` trap: `review` is not terminal, so the
-poll loop waits forever and there is no built-in timeout
-([PARITY.md §11.1](PARITY.md), [docs/RUNBOOK.md](RUNBOOK.md#serve---once-hangs-on-a-task-in-review)). It
-burned a slot and produced no signal — strictly worse than a red test, because nothing failed.
-
-Two requirements follow:
-
-1. **The harness imposes a per-step wall-clock timeout** and reports a timeout as a **failure**, naming the
-   step. A hung step must never be able to look like a slow one.
-2. **A `--once` scenario must drive every task it creates to a terminal status** — `approval_policy: auto`,
-   or `review_criteria`, or an explicit `task approve` step. A scenario that can reach `review` and stop is
-   malformed, and `cargo xtask lint-scenarios` is the right place to reject it.
-
-This is also the concrete evidence behind the runbook entry: the trap caught the people who wrote the spec
-for it, which is about as strong a case as a runbook entry gets. The oracle *binary* is unaffected, but the habit should be in the tooling.
+  fixture file (`fixtures/fake-agents/`). This is how adapter-level behaviour (token accounting, `done`
+  events, file-change extraction) gets exercised end to end. Unit tests inject a trait object; binary-level
+  tests shim `PATH`. Keep the two mechanisms distinct.
+- **Every YAML artifact the store round-trip test writes is read back** and compared, and its raw bytes are
+  checked against the YAML 1.1 date grammar, so a bug of the form "a YAML 1.1 reader reads r-orch's bytes
+  differently" is caught without a second parser (§5.3). The grammar check is only as good as the hand-measured
+  table behind `is_yaml11_timestamp`.
+- **Every `--once` test needs a bound.** A `serve --once` step can hang forever on the `review` trap: `review`
+  is not terminal, so the poll loop waits for ever and there is no built-in timeout
+  ([docs/RUNBOOK.md](RUNBOOK.md#serve---once-hangs-on-a-task-in-review)). A test that runs `--once` must drive
+  every task it creates to a terminal status (`approval_policy: auto`, `review_criteria`, or an explicit
+  `task approve` step) and run under a wall-clock timeout that reports a hang as a failure, not as a slow test.
 
 ### 8.3 Layer 3 — fixtures
 
-| Fixture set | Generated by | Asserts |
+| Fixture set | Contents | Asserts |
 |---|---|---|
-| `fixtures/prompts/*.txt` | `xtask gen-prompts` — drives the TS engine over the full branch matrix of the two default templates (with/without role, autonomous, goal_id, attempt>1, retry output empty/non-empty, feedback, shared_context, messages 0/1/n, goal description/tasks/progress) | Rust template rendering, **byte-exact**. The gate for §4.3. |
-| `fixtures/adapters/<adapter>/*.jsonl` + `.expected.json` | Hand-written from `test/unit/infrastructure/*-adapter.test.ts` | Each adapter's stdout → `AgentEvent` sequence mapping, token extraction, error classification. |
-| `fixtures/yaml/*.yml` | Copied from TS-written artifacts, plus Rust-written ones fed back to TS | Round-trip compatibility both directions (V8). |
-| `fixtures/shop/*.json` | Extracted from `src/domain/agent-shop.ts`, `org-shop.ts`, `default-agents.ts` | The catalogue data, byte-exact (V28). |
+| `fixtures/prompts/*.txt` | Golden rendered prompts over the full branch matrix of the two default templates (with/without role, autonomous, goal_id, attempt>1, retry output empty/non-empty, feedback, shared_context, messages 0/1/n, goal description/tasks/progress) | Template rendering, **byte-exact**. The gate for §4.3. |
+| `fixtures/adapters/<adapter>/*.jsonl` + `.expected.json` | Recorded or hand-written adapter output | Each adapter's stdout → `AgentEvent` sequence mapping, token extraction, error classification. |
+| `fixtures/yaml/*.yml` | Representative and hazardous YAML documents | Round-trip stability of the on-disk format (§5.3). |
+| `fixtures/shop/*.json` | Golden agent-shop and org-shop catalogue data | The catalogue data, byte-exact (`crates/orch-domain/tests/shop_catalogue.rs`). |
 
-Fixture generation is a committed `xtask`, not a one-off script, so fixtures can be regenerated when the
-reference commit is bumped.
+Golden fixtures change only in a reviewed commit that says why; a test failing against one is a regression until
+shown otherwise.
 
 ### 8.4 Layer 4 — TUI tests
 
@@ -1019,34 +893,29 @@ term.draw(|f| app.render(f))?;
 assert_buffer_contains(term.backend().buffer(), "Agent name");
 ```
 
-**Push the key, draw, assert — synchronously.** No sleeps. This is the structural fix for the ~500 cases whose
-TS equivalents are flaky ([PARITY.md §14.9](PARITY.md)), and it means the two F1 tests that
-`ink-testing-library` could not express (`KeyCode::F(1)`) become ordinary passing tests.
+**Push the key, draw, assert — synchronously.** No sleeps. This keeps TUI tests deterministic, and
+function keys (`KeyCode::F(1)`) are ordinary inputs.
 
 What to test: the key-dispatch chain order; view switching and its blocked-while-detail-open rule; wizard step
 sequencing, skip predicates and validation messages; command-bar completion vectors; filter pickers. What
-**not** to test: exact glyphs, colours, or pixel layout — those are L2.
+**not** to test: exact glyphs, colours, or pixel layout.
 
 ### 8.5 CI shape
 
 ```
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                       # layers 1, 3, 4
+cargo test --workspace                       # layers 1 to 4
 cargo deny check                             # supply chain — advisories, licences, bans
 cargo xtask crate-graph                      # asserts the whole inter-crate edge set (§3.1)
-cargo xtask parity                           # layer 2 — needs node + the vendored TS build
 ```
-
-**`cargo deny` runs before the parity job**, deliberately: it is fast and needs no oracle, so a supply-chain
-regression should not wait behind a job that requires node and a vendored build.
 
 `deny.toml` carries **two accepted advisories**, both *unmaintained* rather than vulnerable, and both
 transitive with no alternative:
 
 | Advisory | Crate | Via | Why accepted |
 |---|---|---|---|
-| RUSTSEC-2024-0449 | `unsafe-libyaml` | `serde_yaml_ng` | No API-compatible replacement (`serde-saphyr` has no `Value` model), and the amplification class is closed by the exact expanded-node pre-pass at the `read_yaml_value` chokepoint — §14.31, measured refusing the worst known shape in 18 ms. Revisit if `serde-saphyr` gains a `Value` API (§4.2) |
+| RUSTSEC-2024-0449 | `unsafe-libyaml` | `serde_yaml_ng` | No API-compatible replacement (`serde-saphyr` has no `Value` model), and the amplification class is closed by the exact expanded-node pre-pass at the `read_yaml_value` chokepoint, measured refusing the worst known shape in 18 ms. Revisit if `serde-saphyr` gains a `Value` API (§4.2) |
 | RUSTSEC-2026-0319 | `anymap2` | `liquid-core` | No alternative; `liquid` is the only maintained Liquid implementation for Rust (§4.3) and prompt rendering is byte-contract |
 
 Each accepted advisory must name its mitigation and its revisit condition. An advisory accepted with neither
@@ -1056,309 +925,131 @@ is a silent waiver, which is the failure mode an allowlist invites.
 **per-file** and the crate is used **unmodified**, so it imposes no obligation on our sources. Every
 workspace member is `publish = false`, so none of this is a distribution question for the crates themselves.
 
-`cargo xtask parity` is gated on `parity/orch-ts/dist/` existing; `parity/setup.sh` clones the pinned
-commit `c066dc0`, **applies every patch in `parity/patches/` in order**, then builds the TypeScript reference with `npm ci --ignore-scripts && npm run build`.
-The parity job is **required** for merge — the whole design rests on it.
-
-**Patching the oracle is a last resort, and the bar is high.** It is for surfaces where the reference is too
-broken to compare against at all, never for making it agree with us. Each patch must be minimal, carry its
-rationale in the patch header, and be referenced from the §14 entry that justifies it
-([PARITY.md §14.0](PARITY.md) `oracle patched`). Today there is exactly one:
-`0001-…`, because the TS `run`/`serve --once` commands dispatch nothing in the **default** workspace mode
-([PARITY.md §14.21](PARITY.md)) — without it, the project's central behaviour has no oracle in its default
-configuration. Reviewers should treat a second patch as a signal to re-examine, not as precedent.
-
 ---
 
-## 9. Work breakdown
+## 9. Package ownership
 
-Sized so one engineer agent completes a package in one session (~3–6k LOC Rust including tests).
+The workspace was built as seven packages, WP-0 to WP-6. The names survive in code comments, ADRs and
+`docs/TRAITS-FROZEN.md`; each owns a fixed set of directories.
 
-### WP-0 — Foundation (one engineer, blocking, must land before anything else)
+### WP-0 — Foundation
 
-**Owns:** `crates/orch-domain/**`, `crates/orch-core/**`, workspace `Cargo.toml`, `rust-toolchain.toml`,
-`crates/orch-core/src/test_support/**`.
+**Owns:** `crates/orch-domain/**`, `crates/orch-core/**` (including `crates/orch-core/src/test_support/**`),
+workspace `Cargo.toml`, `rust-toolchain.toml`.
 
-**Port from:** `src/domain/*.ts` (all of it), `src/infrastructure/storage/interfaces.ts`,
-`src/infrastructure/adapters/interface.ts`, `src/infrastructure/process/process-manager.ts` (trait only),
-`src/infrastructure/workspace/interface.ts`, `src/infrastructure/template/template-engine.ts` (trait +
-`PromptContext` only), `src/infrastructure/skills/skill-loader.ts` (trait only),
-`test/unit/application/helpers.ts`, `test/unit/domain/**`.
-
-**Delivers:**
-1. Every domain type with final serde attributes — field order matching the TS interfaces,
-   `skip_serializing_if` on every optional, `Message::to_agent_id` emitting `null`.
+**Holds:**
+1. Every domain type with final serde attributes — declaration-order fields, `skip_serializing_if` on every
+   optional, `Message::to_agent_id` emitting `null`.
 2. `transitions`, `scope` (including `ScopeIndex`), `model_tiers`, and the `shop`/`default_agents` catalogue
-   data, all with their ported unit tests.
-3. `DomainError` with `exit_code()` and `hint()` returning the exact [PARITY.md §3.1](PARITY.md) strings.
-4. **All `orch-core` traits, frozen** — §5 is the brief.
+   data.
+3. `DomainError` with `exit_code()` and `hint()`.
+4. **All `orch-core` traits, frozen** — §5 is the brief and `docs/TRAITS-FROZEN.md` the index.
 5. `test_support`: entity factories, in-memory store fakes, `FakeProcessManager`, `FakeAdapter`,
-   `FakeWorkspaceManager`, `FakeTemplateEngine`, `FixedClock`, `SeqIdGenerator`, and a `TestOrchestrator`
-   builder stub.
+   `FakeWorkspaceManager`, `FakeTemplateEngine`, `FixedClock`, `SeqIdGenerator`.
 
-**Acceptance:** `test/unit/domain/**` (~183 cases) ported and green; V9, V10, V12, V13, V28, V29 pass;
-`cargo clippy -D warnings` clean. **The trait surface is then frozen** — later changes need an explicit
-amendment, because five packages compile against it.
+**Standing rule:** any package that finds itself **working around** a trait **files an amendment instead**.
+Against a frozen surface the cheap local move is always to work around it — and the result is two caches with
+different lifetimes over the same store, or duplicated invalidation logic, surfacing as an intermittent
+invalid-transition error that no unit test reproduces (because `test_support`'s fakes clone on every read).
+Working around a trait is a **defect**, not a shortcut.
 
-**Standing rule from the freeze onward:** any package that finds itself **working around** a trait **files an
-amendment instead**. With six agents building in parallel against a frozen surface, the cheap local move is
-always to work around it — and the result is two caches with different lifetimes over the same store, or
-duplicated invalidation logic, surfacing as an intermittent invalid-transition error that no unit test
-reproduces (because `test_support`'s fakes clone on every read). Working around a trait is a **defect**, not a
-shortcut.
-
----
-
-### WP-0b — Walking skeleton *(hard gate: WP-4 and WP-5 may not begin until this is green)*
-
-**Owner:** the WP-0 engineer. **Cost:** days, not weeks.
-
-**Why it exists.** An earlier revision of this plan ordered WP-5 (CLI) last and claimed "the differential
-harness becomes meaningful the moment this package lands." That built the **measuring instrument** early and
-the **measurable surface** last: a scenario step is an argv line executed against a binary, so until
-`orch init` and `orch task list` exist end to end, *every* scenario fails at step 1 and zero rows of V1–V8,
-V20, V21 can run. Six packages would ship individually green against six readings of PARITY.md, and integrate
-in one week through a harness that had never been green, with no last-known-good to bisect against. The
-schedule response to that is to relax the normalizers until green — which is how an L0 contract quietly
-becomes an L1 one.
-
-**Delivers:** a thin vertical slice — `orch init`, `orch agent add`, `orch task add`, `orch task list` **only**
-— cutting through domain → storage → services → CLI, plus the harness skeleton (`cargo xtask parity`, the
-scenario format, the normalizers of [PARITY.md §1.4](PARITY.md), the hermeticity setup of §8.2).
-
-**Acceptance (V39):** **≥1 green differential scenario** and **≥1 green `rust_then_ts` cross-compat
-scenario** over those four commands. Nothing else counts as done.
-
-This converts the harness from a final exam into a **ratchet**: from here on, every package lands against a
-gate that is already green and must stay green.
-
----
-
-### WP-1 — Storage and serialization *(riskiest package — assign the strongest engineer)*
+### WP-1 — Storage and serialization
 
 **Owns:** `crates/orch-infra/src/storage/**`.
-**Port from:** `src/infrastructure/storage/*.ts` (all 14 files).
 
-**Delivers:** `Paths` + `sanitize_id` + `find_project_root`; `fs_utils` (`atomic_write`, `write_json`,
-`write_yaml` **with the timestamp guard**, `append_jsonl` with the PIPE_BUF rule, `read_jsonl`,
-`read_jsonl_tail`, the cached `O_APPEND` handle map with its 10 s idle eviction); `IndexManager`; all 9 store
-implementations; the tick-scoped cached wrappers; `lock.rs`.
-
-**Acceptance:** `test/unit/infrastructure/{fs-utils,fs-endurance,indexed-store,task-store,agent-store,goal-store,state-store,context-store,message-store-index,cached-stores,concurrent-access}.test.ts` ported;
-**V6, V7 and V8 pass** — including the cross-compat round trip executed through the real TS binary.
+**Holds:** `Paths` + `sanitize_id` + `find_project_root`; `fs_utils` (`atomic_write`, `write_json`, `write_yaml`
+**with the timestamp guard**, `append_jsonl` with the PIPE_BUF rule, `read_jsonl`, `read_jsonl_tail`, the cached
+`O_APPEND` handle map with its 10 s idle eviction); the index manager; all 9 store implementations; the
+tick-scoped cached wrappers; `lock.rs`.
 
 **Why riskiest:** it is the one package where being *subtly* wrong is invisible in-tree and only shows up as
-corruption in a user's project. The timestamp-quoting hazard (§5.3) alone can silently break the TS binary's
-message sorting. Ship V8 before anything else in this package.
-
----
+corruption in a user's project. The timestamp-quoting hazard (§5.3) alone can silently break any other YAML
+reader's message sorting.
 
 ### WP-2 — Adapters and process management
 
 **Owns:** `crates/orch-infra/src/{adapters,process,models}/**`.
-**Port from:** `src/infrastructure/adapters/*.ts` (12 files), `src/infrastructure/process/process-manager.ts`,
-`src/infrastructure/models/model-discovery.ts`.
 
-**Delivers:** `ProcessManager` (setsid process groups, group-first kill, graceful kill, `is_alive`); the
-`line_reader` with [PARITY.md §8.5](PARITY.md) semantics; the bounded stderr tail; the event buffer with
-backpressure; all 8 adapters with exact argv and parsing; `AdapterRegistry` preserving order; model discovery
-with its parsers and fallback lists.
+**Holds:** `ProcessManager` (setsid process groups, group-first kill, graceful kill, `is_alive`); the
+`line_reader`; the bounded stderr tail; the event buffer with backpressure; all 8 adapters with exact argv and
+parsing; `AdapterRegistry` preserving order; model discovery with its parsers and fallback lists.
 
-**Stderr draining is structural, not per-adapter.** `grok` and `antigravity` in the original never attach a
-stderr consumer, so a child writing past one pipe buffer blocks forever ([PARITY.md §14.12](PARITY.md)).
-Put draining in the **shared spawn path** so an adapter *cannot* forget it. Two distinct behaviours, and the
-difference is observable:
+**Stderr draining is structural, not per-adapter.** A child writing past one pipe buffer blocks forever if
+nothing drains stderr. Draining lives in the **shared spawn path** so an adapter *cannot* forget it. Two
+distinct behaviours, and the difference is observable:
 
 - claude / codex / cursor / opencode / pi → drain **and keep** the bounded 4096-byte tail, which is appended
   to the error message and then classified.
-- grok / antigravity → drain and **discard**. Do *not* attach the tail capture: appending it would change L0
-  error message text, the `classifyAdapterError` result, and the persisted `agent.last_error`, diverging from
-  the oracle on a change we intended to be invisible.
-
-**Acceptance:** all 8 `*-adapter.test.ts` files plus `adapter-error-kind`, `error-paths`,
-`process-endurance`, `model-discovery` ported; **V14, V15 and V40 pass**; the fake-agent scripts used by the
-parity harness exist and work.
-
----
+- grok / antigravity → drain and **discard**. Do *not* attach the tail capture: appending it would change the
+  error message text, the `classifyAdapterError` result, and the persisted `agent.last_error`.
 
 ### WP-3 — Templates, skills, workspace
 
-**Owns:** `crates/orch-infra/src/{template,skills,workspace,clipboard}/**`, `fixtures/prompts/**`,
-`xtask gen-prompts`.
-**Port from:** `src/infrastructure/template/template-engine.ts`,
-`src/infrastructure/skills/skill-loader.ts`, `src/infrastructure/workspace/*.ts`,
-`src/infrastructure/clipboard-service.ts`.
+**Owns:** `crates/orch-infra/src/{template,skills,workspace,clipboard}/**`, `fixtures/prompts/**`.
 
-**Delivers:** the Liquid-backed template engine with the §4.3 mitigations (always-present globals with
-explicit nils; `shared_context` as an ordered pair array); both default templates copied byte-exact;
-`build_prompt_context` and `filter_relevant_context`; the skill loader; the workspace manager (worktree,
-isolated, cleanup, `get_changed_files`) and the merge strategy; the clipboard service.
-
-**Acceptance:** `template-engine`, `skill-loader`, `workspace-manager`, `merge-strategy`,
-`clipboard-service` tests ported; **V16, V17, V18, V19 pass** — V16 being the golden-prompt gate.
-
-**Do first:** generate the golden prompts and get one rendering through `liquid` byte-exact. If that fails
-after the §4.3 mitigations, escalate immediately rather than working around it — the fallback (a small
-purpose-built renderer) is a day of work, but only if discovered early.
-
----
+**Holds:** the Liquid-backed template engine with the §4.3 mitigations (always-present globals with explicit
+nils; `shared_context` as an ordered pair array); both default templates; `build_prompt_context` and
+`filter_relevant_context`; the skill loader; the workspace manager (worktree, isolated, cleanup,
+`get_changed_files`) and the merge strategy; the clipboard service.
 
 ### WP-4 — Engine: services and orchestrator
 
 **Owns:** `crates/orch-engine/**`.
-**Port from:** `src/application/*.ts` (all 12 files), `src/container.ts`.
 
-**Delivers:** `EventBus`; `TaskService`, `AgentService`, `RunService`, `GoalService`, `TeamService`,
+**Holds:** `EventBus`; `TaskService`, `AgentService`, `RunService`, `GoalService`, `TeamService`,
 `MessageService`, `AgentFactory`, `ReviewRunner`, `DoctorService`; the `Orchestrator` (tick loop, reconcile,
 dispatch, collect, completion/failure handling, cascade failure, autonomous seeding, startup recovery,
-shutdown); `build_light` / `build_full`.
-
-**Acceptance:** all 25 `test/unit/application/**` files (~429 cases) ported and green; **V11, V21, V22, V23,
-V24, V25, V26 pass**. This is the largest package by behaviour density — `orchestrator.ts` alone is 1949 lines
-with a long bug-fix history (`orchestrator-bugfixes-2026-03.test.ts`, `-resilience`, `-retry-race`,
-`-parallel-race`, `-perf-opts`, `-endurance`). **Port those regression tests before the code they cover.**
-
-If this proves too large in practice, the clean split is WP-4a (the six services + event bus + container) and
-WP-4b (the orchestrator), with 4b depending on 4a. Prefer the split if the engineer's first-session estimate
-exceeds ~6k LOC.
-
----
+shutdown); `build_light` / `build_full`. It is the largest package by behaviour density, with a long bug-fix
+history; its regression tests are institutional memory, so add the test before changing the code it covers.
 
 ### WP-5 — CLI and serve mode
 
 **Owns:** `crates/orch-cli/**`.
-**Port from:** `src/bin/cli.ts`, `src/cli/**` (all of it).
 
-**Delivers:** the full clap command tree matching [PARITY.md §2.2](PARITY.md); `output` (glyphs, ASCII
-fallback, `print_table` with its exact padding, `print_key_value`, the formatters); every command module with
-both human and `--json` rendering; the error boundary and exit codes; `init`; `doctor`; `serve` with the
-structured logger, `--once` runner and disk observer; `update`/update-check against the r-orch channel;
-`editor` and `shop_picker`.
-
-**Acceptance:** all 18 `test/unit/cli/**` files ported; **V1, V2, V3, V4, V5, V20 pass**. The differential
-harness becomes meaningful the moment this package lands — it is the integration point.
-
----
+**Holds:** the clap command tree; `output` (glyphs, ASCII fallback, `print_table` with its exact padding,
+`print_key_value`, the formatters); every command module with human, `--json` and `--yaml` rendering; the error
+boundary and exit codes; `init`; `doctor`; `serve` with the structured logger, `--once` runner and disk
+observer; `update`/update-check; `editor` and `shop_picker`. It implements `TuiBackend` over the container
+(§3.1).
 
 ### WP-6 — TUI
 
 **Owns:** `crates/orch-tui/**`.
-**Port from:** `src/tui/**` (10k LOC of Ink/React), `src/cli/commands/tui.ts`.
-**Spec:** [docs/parity/tui.md](parity/tui.md) is the detailed brief; [PARITY.md §12](PARITY.md) is the
-acceptance checklist.
 
-**Delivers:** the four views with their lists and detail panels; the ordered key-dispatch chain; the command
-bar with completion, suggestions and history; all wizards with their skip predicates and validation messages;
-help overlay; both filter pickers; onboarding; toasts/bell/tab-flash; soft delete with undo; the five palettes;
-the 80 ms batching, 2 KB detail caps and 500-entry LRU.
+**Holds:** the four views with their lists and detail panels; the ordered key-dispatch chain; the command bar
+with completion, suggestions and history; all wizards with their skip predicates and validation messages; help
+overlay; both filter pickers; onboarding; toasts/bell/tab-flash; soft delete with undo; the five palettes; the
+80 ms batching, 2 KB detail caps and 500-entry LRU. Its tests use the in-crate `FakeBackend`.
 
-**Acceptance:** [PARITY.md §12](PARITY.md) checklist complete; **V27 passes**; the two F1 tests that were
-unskippable in Ink are green.
-
-**Risk: medium** — on **schedule** grounds (7k LOC), with its **correctness risk unmeasured rather than low.**
-
-An earlier revision rated this the lowest-risk package because "it is L2, has no on-disk or wire contract, and
-failures are visible immediately." All three clauses were wrong in the same way. The TUI is the **default
-command** (bare `orch` launches it), so it is most users' entire experience; "no wire contract" is not "no
-contract" — the **wizard → entity field mapping is L0** ([PARITY.md §12](PARITY.md)) because a wizard with an
-inverted skip predicate writes corrupt L0 data; and "visible immediately" means visible *to a user*, which is
-the argument for catching it first, not for relaxing the gate. A shipped inverted `skip` predicate or a
-no-op filter picker would leave `cargo test`, `cargo xtask parity` and every V-row green, because none of them
-would look.
-
-Hence V33: the checklist is not the gate — the **counted `TestBackend` case inventory** is.
-
-Do **not** port the dead code listed in [PARITY.md §13](PARITY.md).
-
----
-
-### Integration order and parallelism
-
-```
-WP-0  foundation — freezes the trait surface
-  │
-  ▼
-WP-0b walking skeleton + harness  ◄── HARD GATE (V39)
-  │
-  ├──► WP-1 storage  ────────┐
-  ├──► WP-2 adapters ────────┤
-  ├──► WP-3 templates ───────┤
-  └──► WP-6 TUI ─────────────┤
-                             │
-                   ╔═════════▼═══════════════════════════╗
-                   ║ TRAIT RE-SYNC CHECKPOINT             ║
-                   ║ owner: WP-0 engineer                 ║
-                   ║ trigger: WP-1, WP-2, WP-3 each have  ║
-                   ║   one vertical slice                 ║
-                   ║ one amendment round, then re-freeze  ║
-                   ╚═════════┬═══════════════════════════╝
-                             │
-                             ├──► WP-4 engine ──► WP-5 CLI
-                             │
-                             └──► WP-5 implements TuiBackend over the container,
-                                  replacing WP-6's FakeBackend (§3.1)
-```
-
-- **WP-0b is a hard gate**: WP-4 and WP-5 may not begin until V39 is green. WP-1/2/3/6 may begin in parallel
-  right after it.
-- **WP-1, WP-2, WP-3 and WP-6 are fully parallel**, over disjoint directories, because none of their
-  acceptance oracles depends on CLI integration:
-  - WP-2's oracle is argv snapshots + stream-parsing fixtures, both derived from the TS **unit tests**.
-  - WP-6's oracle is `TestBackend` cases written from `docs/parity/tui.md`; there is no TS oracle at all.
-  - WP-3's oracle is golden prompts from the TS engine — **but only if generated the right way.**
-    `src/index.ts` does **not** export the template engine or the default templates, so they are unreachable
-    through the package entry point, and generating prompts via `orch run` + `run.prompt` would make WP-3
-    depend on the skeleton. **They are generated by `fixtures/prompts/gen/generate.mts`**, which imports
-    `parity/orch-ts/src/infrastructure/template/template-engine.ts` directly and runs under the reference's own
-    `./node_modules/.bin/tsx` (a devDependency of the TypeScript project). The exact command is in
-    `fixtures/prompts/README.md`. There is no `xtask` subcommand for this.
-- **The trait re-sync checkpoint is a scheduled slot, not a risk-register aspiration.** One amendment round,
-  owned by the WP-0 engineer, triggered when WP-1/2/3 each have a vertical slice. Then the surface re-freezes.
-- WP-4 compiles against the WP-0 traits and tests against `test_support` fakes, so it needs WP-1/2/3 only at
-  *integration* time. WP-5 needs WP-4's service surface.
-
-| Package | Est. LOC (impl + test) | Risk |
-|---|---|---|
-| WP-0 foundation | 3.5k + 1.5k | Medium — a wrong trait costs five packages a rework |
-| WP-0b walking skeleton | 0.8k + 0.6k | Low effort, **highest leverage** — it turns the gate into a ratchet |
-| WP-1 storage | 2.5k + 2k | **Highest** — silent cross-compat corruption |
-| WP-2 adapters | 3.5k + 2.5k | Medium-high — eight external CLI formats, plus the stderr deadlock fix |
-| WP-3 templates | 2k + 1.5k | Medium-high — the Liquid gate |
-| WP-4 engine | 5k + 4k | High — largest behaviour surface, long bug-fix history |
-| WP-5 CLI | 5k + 2k | Medium — wide but shallow |
-| WP-6 TUI | 7k + 3k | **Medium** — on schedule grounds; correctness risk **unmeasured** until V33 |
+The TUI is the **default command** (bare `orch` launches it), so it is most users' entire experience, and the
+**wizard → entity field mapping is on-disk contract**: a wizard with an inverted skip predicate writes corrupt
+data. The gate is therefore the counted `TestBackend` case inventory (`crates/orch-tui/TEST-COVERAGE.md`), not a
+checklist: a shipped inverted `skip` predicate or a no-op filter picker would leave every other test green.
 
 ---
 
 ## 10. Trade-offs
 
-**Optimizes for:** exact external compatibility, and determinism in testing. Every significant decision —
-the trait crate, the injected clock/ID seams, the differential harness as a merge gate, the post-emit YAML
-quoting pass — buys one of those two.
+**Optimizes for:** stable on-disk and CLI contracts, and determinism in testing. Every significant decision —
+the trait crate, the injected clock/ID seams, the golden fixtures, the post-emit YAML quoting pass — buys one of
+those two.
 
 **Gives up:**
 
 - **Some idiomatic purity.** `async-trait` and `Arc<dyn _>` everywhere instead of generics and static
   dispatch. The cost is a vtable call on I/O paths, which is free relative to the syscall; the benefit is a
-  container that can be assembled at runtime and faked wholesale, exactly as the TS one is.
+  container that can be assembled at runtime and faked wholesale.
 - **Coarse locking.** Holding a `tokio::sync::Mutex` across file I/O is not what you would design from
-  scratch. It *is* what the original does, and its bug history is specifically about that serialization. At
+  scratch. It is long-standing behaviour, and its bug history is specifically about that serialization. At
   this scale (one process, tens of agents) there is no throughput argument for changing it, and a real one for
   not changing it.
-- **Bug-for-bug compatibility in five places** ([PARITY.md §14](PARITY.md)) — including
-  `status --json`'s `"claimed": {}`. Each is individually defensible and collectively a little
-  embarrassing. They are all documented and reversible.
-- **A node dependency in CI.** The parity harness needs the TS binary. Without it the written spec is the only
-  guarantee, which is a materially weaker position.
-- **Self-update, deliberately.** The TS binary updates itself via npm after almost every command; r-orch does
-  not update itself at all ([PARITY.md §11.5](PARITY.md)). This is the one place the project **declines**
-  functional parity outright, on security grounds: a CLI overwriting its own executable as a side effect of
-  `orch task list` is a supply-chain surface, not a feature, and it is unverifiable by the harness by
-  construction. Users must update r-orch the way they installed it.
-- **Interchangeable concurrent operation is documented, not guaranteed.** §2.1 — the index read-modify-write
-  can lose updates across binaries, and no lock r-orch takes is visible to the TS binary.
-- **Shelling out to `git`** rather than linking libgit2 — slower per call, but it is the only way to match
-  exact command behaviour and exit codes, and it drops a C dependency.
+- **Self-update, deliberately.** r-orch does not update itself at all; `orch update` reports the version and how
+  to upgrade. A CLI overwriting its own executable as a side effect of `orch task list` is a supply-chain
+  surface, not a feature. Users update r-orch the way they installed it.
+- **Concurrent operation is documented, not guaranteed.** §2.1 — the index read-modify-write can lose updates
+  across processes.
+- **Shelling out to `git`** rather than linking libgit2 — slower per call, but it keeps exact command
+  behaviour and exit codes, and it drops a C dependency.
 
 ---
 
@@ -1366,47 +1057,24 @@ quoting pass — buys one of those two.
 
 | # | Risk | Severity | Mitigation / trigger |
 |---|---|---|---|
-| R1 | **YAML divergence** — timestamp quoting, merge keys, or a schema construct — silently bifurcating a project between the two binaries | **High** | **V32 (generalized js-yaml cross-parse) is the real mitigation**, not V8; V8 is one special case of it. Build V32 in WP-0b alongside the harness skeleton, not in WP-1. Merge keys are already a confirmed divergence — `apply_merge()` on every read ([PARITY.md §6.4.2](PARITY.md)). Escalation trigger for a hand-written emitter: any artifact where V32 reports a parse mismatch that quoting cannot fix. |
-| R1b | **The harness itself is non-hermetic** — the TS oracle queries npm and writes to the real `$HOME`, making a required gate environment-dependent and host-mutating | **High** | V31: per-tmpdir `HOME`/`USERPROFILE`, pre-seeded `update-check.json`, assert no `npm` spawn and no socket; CI runs the parity job with networking disabled. |
-| R2 | **`liquid` cannot reproduce prompt bytes** despite the mitigations | Medium-high | Golden fixtures first in WP-3. Measured evidence says whitespace and truthiness already match, so the residual risk is a construct I did not enumerate. Fallback: a ~400-line renderer for 7 constructs. |
-| R3 | **Orchestrator behaviour regression** — a race the TS code already fixed and I did not transcribe | **High** | Port `orchestrator-bugfixes-2026-03`, `-resilience`, `-retry-race`, `-parallel-race`, `-endurance` **before** the orchestrator code. They are the encoded institutional memory. |
+| R1 | **YAML divergence** — timestamp quoting, merge keys, or a schema construct — making a file written by r-orch read differently by another YAML reader | **High** | Mitigated by the quoting guard, the hand-measured YAML 1.1 date table with its `fs_utils` unit tests, and the byte-level check in `store_round_trip.rs` (§5.3, §8.2); there is no independent YAML 1.1 reader in the test suite. Merge keys are resolved with `apply_merge()` on every read. Escalation trigger for a hand-written emitter: any artifact where the byte-level check finds a timestamp-shaped scalar that quoting cannot fix. |
+| R2 | **`liquid` cannot reproduce prompt bytes** despite the mitigations | Medium-high | The golden prompts in `fixtures/prompts/` are the gate. Whitespace and truthiness already match, so the residual risk is a construct not enumerated. Fallback: a ~400-line renderer for 7 constructs. |
+| R3 | **Orchestrator behaviour regression** — a race that was already fixed and is reintroduced | **High** | The orchestrator regression tests (`bugfixes`, `resilience`, `retry-race`, `parallel-race`, `endurance`) are the encoded institutional memory; add the test before changing the code it covers. |
 | R4 | **`broadcast` event loss** under high adapter output | Medium | Dedicated consumer task for the run-store writer; 4096 capacity; `Lagged` logged as a warning, never swallowed. If a *correctness* consumer ever needs lossless delivery, give it an `mpsc` instead. |
-| R5 | **WP-0's trait surface is wrong**, forcing a cross-package rework | Medium | §5 is deliberately detailed so the freeze is informed. Mitigation if it happens: the trait crate is small, and `cargo` will point at every break. Budget one re-sync checkpoint after WP-1/2/3 each have a vertical slice. |
-| R6 | **Differential harness built late**, so parity is asserted only by prose | Medium | **WP-0b is the mitigation** — a hard gate requiring one green differential and one green `rust_then_ts` scenario before WP-4/WP-5 begin (V39). Building the *harness* early without the *measurable surface* satisfies this risk's letter and none of its intent. `cargo xtask parity` is required for merge from that point on. |
-| R6b | **Live/streaming behaviour is prose-verified only** — `tui`, watch-mode `serve`, `run --watch` and `logs --follow` cannot be expressed as differential scenarios, so §7's timing constants rest on this document's reading of `orchestrator.ts` | Medium-high | V34–V36 pull the highest-density parts back into oracle-verified territory via `serve --once` (stall past timeout, killed mid-run, concurrency saturation). The residual gap is **stated explicitly** in [PARITY.md §15.1](PARITY.md) rather than implied. Port the regression tests named in R3 before the code. |
-| R7 | **Adapter argv drift** — an external CLI changes its flags | Low (for parity) | Parity is against the pinned commit, not against the live CLIs. Snapshot tests pin our argv; real-CLI breakage is a separate, post-parity concern. |
+| R5 | **The trait surface is wrong**, forcing a cross-package rework | Medium | §5 is deliberately detailed so the freeze is informed. The trait crate is small, and `cargo` points at every break; changes go through an amendment (`docs/TRAITS-FROZEN.md`). |
+| R6 | **Live/streaming behaviour is under-tested** — `tui`, watch-mode `serve`, `run --watch` and `logs --follow` cannot be fully expressed as one-shot binary tests | Medium-high | `serve --once` tests cover stall past timeout, killed mid-run and concurrency saturation; PTY-based tests cover the watch-mode shutdown paths. |
+| R7 | **Adapter argv drift** — an external CLI changes its flags | Low | Snapshot tests pin our argv; real-CLI breakage is found by `orch doctor` and by users, not by the suite. |
 | R8 | **`kstring` MSRV and similar toolchain friction** recurs as dependencies move | Low | `rust-toolchain.toml` pins the toolchain; `Cargo.lock` is committed; the `kstring = "2.0.2"` pin is commented with its reason. |
-| R9 | **TUI scope creep** — 10k LOC of React, much of it dead | Medium (schedule) | [PARITY.md §13](PARITY.md) lists exactly what is not ported. WP-6 is checklist-driven; it is also the most deferrable package. |
-| R10 | **Process-group kill behaves differently** than node's `detached` on some platform | Low | `process-endurance` tests spawn real `bash`/`sleep` and assert the tree dies. These are skipped under CI in the original; **run them everywhere** in Rust. |
-| R11 | **An adapter that does not drain stderr deadlocks** on a chatty child once the pipe fills (~64 KB) | Medium | This is a live bug in the original's `grok` and `antigravity` adapters ([PARITY.md §14.12](PARITY.md)) — fixed, not replicated. Structural mitigation: make the stderr tail capture part of the **shared** spawn path in WP-2 so an adapter cannot forget it, rather than per-adapter opt-in. Add a test per adapter that writes 256 KB to stderr and asserts completion. |
+| R9 | **Process-group kill misbehaves** on some platform | Low | `process-endurance` tests spawn real `bash`/`sleep` and assert the tree dies; run them everywhere. |
+| R10 | **An adapter that does not drain stderr deadlocks** on a chatty child once the pipe fills (~64 KB) | Medium | Structural mitigation: stderr draining is part of the **shared** spawn path (WP-2), so an adapter cannot forget it. Each adapter has a test that writes 256 KB to stderr and asserts completion. |
 
 ### Rollback
 
-There is nothing to roll back *to* — this is a greenfield reimplementation, and the TS binary continues to
-exist and work. The meaningful failure mode is shipping something that corrupts a project a user also opens
-with the TS binary, which is what R1/V7/V8/V32 exist to prevent.
-
-**`--allow-foreign-project` is retired, not deferred. It was never built, and it should not be.** Earlier
-revisions of this document specified it as default-on until V32 went green, and called it "the only real
-safety valve". Both the code and SRE gate reviews found zero implementation (code M2, sre F6). The team lead's
-ruling, which I agree with:
-
-- **A default-on refusal contradicts the product's central promise.** [PARITY.md §1.1](PARITY.md) states that
-  both binaries must operate on the same project directory interchangeably, in either order, and the
-  [README](../README.md) tells users exactly that. A flag that refuses to write to a `.orchestry/` r-orch did
-  not create would make the common case — pointing r-orch at a project the npm package created — fail by
-  default. The valve would break the thing it was meant to protect.
-- **Its job is done, and done better, by the cross-compat tests.** V7 (`ts_then_rust` / `rust_then_ts` /
-  interleaved), V8 (Rust-written YAML re-read in the TS process with string timestamps asserted) and V32
-  (every YAML artifact re-parsed in Node with js-yaml and deep-compared) all exercise the real failure mode
-  on every commit, rather than asking the user to opt in to safety at the point of use. V32's machinery is
-  implemented and green.
-- **The one hole is being closed.** `cross_compat.rs` passed green when the oracle was absent (code M5), which
-  would have let the guarantee lapse silently. WP-0 is making a missing oracle a **hard failure**. The valve's
-  retirement depends on that, and on nothing else.
-
-What remains is documentation, not a flag: the concurrent-index hazard (§2.1) and the recovery for it are in
-[docs/RUNBOOK.md](RUNBOOK.md), which is where an operator will look.
+A release is rolled back by reinstalling the previous version (README, "Upgrading from v0.4.0 and rolling
+back"). The meaningful failure mode is shipping something that corrupts a project's `.orchestry/` data, which
+the YAML round-trip and format tests exist to prevent. What remains is documentation, not a flag: the
+concurrent-index hazard (§2.1) and the recovery for it are in [docs/RUNBOOK.md](RUNBOOK.md), which is where an
+operator will look.
 
 ---
 
@@ -1433,29 +1101,19 @@ which is what R1 needs. **Rejected as the default:** it means hand-writing seria
 types and reimplementing quoting rules we would then have to get right from scratch. The post-emit quoting
 pass is ~20 lines in one function with a direct test. Kept as the documented escalation.
 
-**Write our own Liquid subset renderer immediately.** Removes R2 entirely and is genuinely small — ORCH uses
-seven constructs and zero custom filters. **Rejected as the default:** measurement showed `liquid` already
-matches on whitespace and truthiness, which were the hard parts, and a maintained crate handles the
+**Write our own Liquid subset renderer immediately.** Removes R2 entirely and is genuinely small — the default
+templates use seven constructs and zero custom filters. **Rejected as the default:** measurement showed `liquid`
+already handles whitespace and truthiness, which were the hard parts, and a maintained crate handles the
 constructs we have not thought of in user-supplied templates. Kept as the WP-3 contingency with a defined
 trigger.
 
-**`git2`/libgit2 instead of shelling out.** Faster, no subprocess, typed errors. **Rejected:** parity is
-specified in terms of exact `git` command lines and their exit codes, including `git worktree prune` and
-`git merge --abort` semantics that libgit2 models differently. Shelling out is both more faithful and one
-fewer C dependency.
+**`git2`/libgit2 instead of shelling out.** Faster, no subprocess, typed errors. **Rejected:** the workspace
+manager depends on exact `git` command lines and their exit codes, including `git worktree prune` and
+`git merge --abort` semantics that libgit2 models differently. Shelling out is one fewer C dependency.
 
 **`chrono` over `jiff`.** More ubiquitous, more examples. **Rejected narrowly:** we need exactly one format
 (RFC 3339, millisecond precision, `Z`) and `jiff` expresses that without timezone-database coupling. This is
 the decision I hold most loosely — `chrono` is a one-file change if `jiff` creates friction.
-
-**Reuse the TS test suite via a node bridge** instead of porting ~2085 cases. Enormous effort saving.
-**Rejected:** it would test the Rust code only through whatever surface the bridge exposes, give up unit-level
-coverage of pure functions entirely, and leave the flakiness in place. The differential harness captures the
-genuine cross-implementation value of the TS suite; the unit tests are worth porting properly.
-
-**Port the TUI tests as-is, sleeps included.** Cheapest path through 681 cases. **Rejected:** those sleeps are
-the direct cause of the 5–6 flaky failures in the reference suite. `TestBackend` makes them synchronous, which
-is strictly better and no more work.
 
 ### TUI focus, snapshots and copy ownership
 

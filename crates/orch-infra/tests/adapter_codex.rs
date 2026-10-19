@@ -1,4 +1,4 @@
-//! Ported from `test/unit/infrastructure/codex-adapter.test.ts`.
+//! Codex adapter tests.
 
 mod support;
 

@@ -1,7 +1,7 @@
-//! Prompt templating — ported from `src/infrastructure/template/template-engine.ts`.
+//! Prompt templating.
 //!
-//! Rendering goes through the `liquid` crate (ARCHITECTURE §4.3, §4.8). Parity
-//! with liquidjs depends on the context builder, not the engine: every
+//! Rendering goes through the `liquid` crate (ARCHITECTURE §4.3, §4.8). Rendered
+//! output depends on the context builder, not the engine: every
 //! documented variable is always present (absent optionals are explicit `nil`)
 //! and `shared_context` is an ordered `[k, v]` pair array. The golden fixtures
 //! in `fixtures/prompts/` (V16) are the gate.

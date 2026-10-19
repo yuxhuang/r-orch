@@ -1,13 +1,11 @@
 //! The project-lock seam.
 //!
 //! The lock *mechanism* lives in [`orch_infra::storage::lock`] — the PID file
-//! format is L0 (PARITY.md §6.7) and belongs with the other on-disk formats.
+//! format belongs with the other on-disk formats.
 //! What lives here is the **seam**: a trait the orchestrator depends on, so a
 //! unit test can run `start_watch`/`stop` without touching the filesystem.
-//! Every orchestrator test in the reference suite does the equivalent with
-//! `vi.mock('…/storage/lock.js')`.
 //!
-//! Who takes the lock (PARITY.md §7.13):
+//! Who takes the lock:
 //!
 //! | Caller | Behaviour |
 //! |---|---|
@@ -63,9 +61,9 @@ impl ProjectLock for FileLock {
             // An I/O failure is not "someone else holds it", but the caller's
             // only move is the same either way. Reporting no PID yields
             // `Orchestrator already running (PID: undefined)`, which is
-            // exactly what the TS prints when the lock file holds no readable
-            // PID — measured, and the reason `LockConflict` carries an
-            // `Option` rather than collapsing to 0 (PARITY.md §14).
+            // what is printed when the lock file holds no readable PID, and
+            // the reason `LockConflict` carries an `Option` rather than
+            // collapsing to 0.
             Err(err) => {
                 tracing::warn!(path = %self.path.display(), %err, "could not acquire the project lock");
                 LockResult {

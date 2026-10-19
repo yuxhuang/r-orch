@@ -1,4 +1,4 @@
-//! The mouse dispatch chain (design §3.3, PARITY.md §12.11).
+//! The mouse dispatch chain (design §3.3).
 //!
 //! Written to be diffed against [`crate::keys`]'s five ordered stages, because
 //! the same hazard applies: a click on a target labelled `A` must do what

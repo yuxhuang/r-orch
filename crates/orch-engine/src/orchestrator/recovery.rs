@@ -1,4 +1,4 @@
-//! Startup recovery and graceful shutdown (PARITY.md §7.6, §7.14).
+//! Startup recovery and graceful shutdown.
 
 use orch_core::error::Result;
 use orch_core::storage::TaskStore;
@@ -425,7 +425,7 @@ impl Orchestrator {
     /// failed — writing, committing, burning tokens, parented to nothing.
     ///
     /// Worker mirrors have already been quarantined by startup recovery.
-    /// For local runs the pid is the only handle (PARITY.md §8.4), and it
+    /// For local runs the pid is the only handle, and it
     /// is on the run record, so the existing local path kills then finalizes.
     pub(super) async fn cleanup_orphaned_running_runs(
         &self,
@@ -486,7 +486,7 @@ impl Orchestrator {
 
     /// Cancel a task, falling back to a direct store write when the
     /// transition is rejected. One of the recovery paths that deliberately
-    /// bypasses the state machine (PARITY.md §7.1).
+    /// bypasses the state machine.
     pub(super) async fn force_task_cancelled(&self, task_id: &str) {
         if self
             .deps()
@@ -555,12 +555,11 @@ impl Orchestrator {
     /// Each task goes to `resolve_failure_status`, so one with attempts left
     /// comes back as `retrying` on the next start rather than being lost.
     ///
-    /// **Divergence worth naming:** the TS loop `await`s without catching, so
-    /// one failing store call aborts `stop()` before it releases the lock —
-    /// which leaves the project wedged for every later invocation. Here each
-    /// entry's failures are reported as `orchestrator:error` and the wind-down
-    /// continues, so the lock is always released. No ported test distinguishes
-    /// the two (nothing throws with the in-memory fakes).
+    /// Each entry's failures are reported as `orchestrator:error` and the
+    /// wind-down continues, so the lock is always released: one failing store
+    /// call must not abort `stop()` before it releases the lock, which would
+    /// leave the project wedged for every later invocation. No test
+    /// distinguishes the two (nothing throws with the in-memory fakes).
     ///
     /// A **remote** execution is not wound down at all: it is detached. The
     /// worker owns it, so cancelling the reservation here would discard an

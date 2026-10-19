@@ -1,6 +1,4 @@
-//! Template engine port — ported from
-//! `src/infrastructure/template/template-engine.ts` (the interface and
-//! `PromptContext` only).
+//! Template engine port (the interface and `PromptContext` only).
 //!
 //! **Nothing here uses `skip_serializing_if`.** That is deliberate and is the
 //! first of the two ARCHITECTURE §4.3 mitigations: the Rust `liquid` crate
@@ -43,7 +41,7 @@ pub struct AgentContext {
 }
 
 /// An entry of `agents[]`. The **current** agent's own `role` is set to `nil`
-/// here, because it is already in the system prompt (PARITY.md §9.2).
+/// here, because it is already in the system prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
@@ -94,8 +92,8 @@ pub struct GoalContext {
 /// order to `ContextStore::list`'s (key-ascending).
 pub type SharedContextEntry = (String, String);
 
-/// The variables the prompt templates see (PARITY.md §9.2). Names and nesting
-/// are L0.
+/// The variables the prompt templates see. Names and nesting
+/// are contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptContext {
     pub project: ProjectContext,
@@ -103,7 +101,7 @@ pub struct PromptContext {
     pub agent: AgentContext,
     pub agents: Vec<AgentInfo>,
     /// `None` for the first attempt — **never `Some(0)`**, because `0` is
-    /// truthy in Liquid (PARITY.md §9.2).
+    /// truthy in Liquid.
     pub attempt: Option<i64>,
     pub workspace_path: String,
     /// Populated only when `attempt > 1`, even if a retry context is supplied.
@@ -121,11 +119,11 @@ pub trait TemplateEngine: Send + Sync {
     async fn render(&self, template: &str, context: &PromptContext) -> Result<String>;
 }
 
-/// The TS `LiquidTemplateEngine` default render timeout.
+/// Default render timeout.
 pub const DEFAULT_RENDER_TIMEOUT_MS: u64 = 5_000;
 
 /// Max shared-context entries injected into a single prompt
-/// (`MAX_CONTEXT_ENTRIES`, PARITY.md §9.3).
+/// (`MAX_CONTEXT_ENTRIES`).
 pub const MAX_CONTEXT_ENTRIES: usize = 15;
 
 #[cfg(test)]

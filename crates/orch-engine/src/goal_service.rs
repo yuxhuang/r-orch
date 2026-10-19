@@ -1,16 +1,15 @@
-//! Goal service — ported from `src/application/goal-service.ts`.
+//! Goal service.
 //!
 //! Goals are persistent objectives that drive autonomous agent work. The state
-//! machine lives in [`orch_domain::GoalStatus`] (PARITY.md §7.2); what is here
+//! machine lives in [`orch_domain::GoalStatus`]; what is here
 //! is the achieved guard and the autonomous side effects, both of which are
 //! normative and both of which are deliberately **silent** on failure.
 //!
 //! # Optional dependencies
 //!
-//! `agent_service`, `task_service` and `context_store` are `agentService?`,
-//! `taskService?` and `contextStore?` in the TS constructor, and the CLI really
-//! does construct a `GoalService` without them (`orch goal list` does not need
-//! a task service). Every path that uses one degrades to a no-op rather than
+//! `agent_service`, `task_service` and `context_store` are optional,
+//! and the CLI really does construct a `GoalService` without them (`orch goal
+//! list` does not need a task service). Every path that uses one degrades to a no-op rather than
 //! erroring, so `None` is a supported configuration and not a half-built
 //! service.
 //!
@@ -18,8 +17,9 @@
 //!
 //! A goal outlives its assignee: the agent can be deleted while the goal
 //! stays. Toggling autonomous mode is therefore best-effort — an "agent not
-//! found" must not fail `goal update`, and PARITY.md §7.2 states this as
-//! contract ("All of these swallow 'agent not found' silently").
+//! found" must not fail `goal update`, so every such toggle swallows the error
+//! (including "agent not found") and carries on. The
+//! `*_swallows_a_set_autonomous_failure` tests pin this.
 
 use std::sync::Arc;
 
@@ -38,9 +38,8 @@ use crate::task_service::TaskService;
 
 /// The fields `goal update` can change.
 ///
-/// `None` means "not supplied" (the TS `undefined`), so only the fields the
-/// user named are touched. For `assignee`, `Some("")` is the TS
-/// `fields.assignee || undefined` and **clears** the assignee.
+/// `None` means "not supplied", so only the fields the user named are touched.
+/// For `assignee`, `Some("")` **clears** the assignee.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateGoalFields {
     pub title: Option<String>,
@@ -60,8 +59,7 @@ pub struct GoalService {
 }
 
 impl GoalService {
-    /// The three `Option` dependencies mirror the optional TS constructor
-    /// parameters — see the module docs.
+    /// The three `Option` dependencies are optional — see the module docs.
     pub fn new(
         goals: Arc<dyn GoalStore>,
         events: Arc<EventBus>,
@@ -83,7 +81,7 @@ impl GoalService {
     }
 
     /// Create an `active` goal. An `assignee` switches that agent into
-    /// autonomous mode (PARITY.md §7.2).
+    /// autonomous mode.
     pub async fn create(&self, input: CreateGoalInput) -> Result<Goal> {
         if input.title.trim().is_empty() {
             return Err(Error::invalid_arguments("Goal title is required"));
@@ -95,8 +93,8 @@ impl GoalService {
             title: input.title.trim().to_owned(),
             description: input.description.as_deref().unwrap_or("").trim().to_owned(),
             status: GoalStatus::Active,
-            // Not trimmed and not validated against the agent store: the TS
-            // takes the id as given, and an unknown one simply means the
+            // Not trimmed and not validated against the agent store: the id
+            // is taken as given, and an unknown one simply means the
             // autonomous toggle below finds nothing.
             assignee: input.assignee,
             created_at: now.clone(),
@@ -128,7 +126,7 @@ impl GoalService {
     }
 
     /// Move a goal through the state machine, running the achieved guard and
-    /// the autonomous side effects (PARITY.md §7.2).
+    /// the autonomous side effects.
     ///
     /// `force` only affects the `achieved` guard; it is the `--force` flag of
     /// `orch goal achieve`.
@@ -203,8 +201,8 @@ impl GoalService {
             goal_id: id.to_owned(),
         });
 
-        // The TS runs the two toggles with `Promise.all`; they concern
-        // different agents, so sequencing them changes nothing observable.
+        // The two toggles concern different agents, so running them in
+        // sequence changes nothing observable.
         if goal.assignee != old_assignee {
             if let Some(new_assignee) = assignee_of(&goal) {
                 self.enable_autonomous(new_assignee).await;
@@ -217,8 +215,8 @@ impl GoalService {
         Ok(goal)
     }
 
-    /// Delete a goal. Child tasks keep their now-dangling `goalId`, exactly as
-    /// in the original — deletion is not cascading.
+    /// Delete a goal. Child tasks keep their now-dangling `goalId`; deletion is not
+    /// cascading.
     pub async fn delete(&self, id: &str) -> Result<()> {
         let goal = self.get(id).await?;
         let assignee = goal.assignee.clone();
@@ -256,7 +254,7 @@ impl GoalService {
             .map(|entry| entry.value))
     }
 
-    /// The achieved guard (PARITY.md §7.2).
+    /// The achieved guard.
     ///
     /// Tasks labelled `autonomous` are excluded: they are the *mechanism* for
     /// achieving the goal, and the side effects below cancel them afterwards,
@@ -286,7 +284,7 @@ impl GoalService {
             .filter(|t| t.status != TaskStatus::InProgress)
         {
             // A task that refuses to cancel must not abort the whole force, so
-            // per-task failures are dropped (TS `.catch(() => {})`).
+            // per-task failures are dropped.
             let _ = tasks.cancel(&task.id).await;
         }
 
@@ -333,7 +331,7 @@ impl GoalService {
     /// pausing a goal does not leave work queued that would start the moment
     /// autonomous mode came back.
     ///
-    /// Best-effort: the TS wraps the whole thing in one `try`, so a failed
+    /// Best-effort: a failed
     /// listing cancels nothing at all rather than cancelling part of the set.
     async fn cancel_pending_autonomous_tasks(&self, agent_id: &str) {
         let Some(tasks) = &self.task_service else {
@@ -360,15 +358,16 @@ impl GoalService {
 
 /// The assignee, treating `Some("")` as unassigned.
 ///
-/// Every side effect in the TS is guarded by `if (goal.assignee)`, which is
-/// falsy for the empty string; a stored `assignee: ""` must therefore toggle
+/// Every side effect is guarded on the assignee being non-empty;
+/// a stored `assignee: ""` must therefore toggle
 /// nothing.
 fn assignee_of(goal: &Goal) -> Option<&str> {
     goal.assignee.as_deref().filter(|a| !a.is_empty())
 }
 
-/// `GoalHasPendingTasksError` with the `<id> (<status>), …` summary that
-/// PARITY.md §7.2 specifies.
+/// `GoalHasPendingTasksError` with a `<id> (<status>), …` summary of every
+/// pending task; `the_pending_task_error_names_every_task_and_status` pins the
+/// text.
 fn pending_tasks_error(goal_id: &str, pending: &[Task]) -> Error {
     let summary = pending
         .iter()
@@ -500,7 +499,7 @@ mod tests {
         }
     }
 
-    /// The TS `makeGoal()` fixture.
+    /// A goal fixture.
     fn goal(id: &str) -> Goal {
         Goal {
             id: id.to_owned(),
@@ -520,7 +519,7 @@ mod tests {
         }
     }
 
-    /// The TS `makeTask()` fixture of this suite: `description: ''`, no labels.
+    /// A task fixture for this suite: `description: ''`, no labels.
     fn child_task(id: &str, status: TaskStatus, goal_id: &str) -> Task {
         Task {
             id: id.to_owned(),
@@ -572,7 +571,7 @@ mod tests {
         assert_eq!(h.autonomous_of("agt_001"), Some(false));
     }
 
-    /// Not a ported case: the created record's shape and its event.
+    /// The created record's shape and its event.
     #[tokio::test]
     async fn create_trims_and_emits_goal_created() {
         let h = Harness::bare();
@@ -606,7 +605,7 @@ mod tests {
         );
     }
 
-    /// Not a ported case: the message and exit code are contract.
+    /// The message ("Goal title is required") and exit code 2 are asserted below.
     #[tokio::test]
     async fn create_rejects_an_empty_title() {
         let h = Harness::bare();
@@ -653,7 +652,7 @@ mod tests {
         assert_eq!(h.autonomous_of("agt_002"), Some(true));
     }
 
-    /// Not a ported case: the deletion itself and its event.
+    /// The deletion itself and its event.
     #[tokio::test]
     async fn delete_removes_the_goal_and_emits_goal_deleted() {
         let h = Harness::bare();
@@ -673,7 +672,7 @@ mod tests {
         );
     }
 
-    /// Not a ported case: `GoalNotFoundError` is exit 1, not exit 2.
+    /// `GoalNotFoundError` is exit 1, not exit 2.
     #[tokio::test]
     async fn get_reports_goal_not_found_with_exit_1() {
         let h = Harness::bare();
@@ -743,8 +742,8 @@ mod tests {
         assert_eq!(h.autonomous_of("agt_005"), Some(true));
     }
 
-    /// Not a ported case: the state machine's rejection message and exit code
-    /// are contract (PARITY.md §7.2).
+    /// The state machine rejects the transition with its message and exit code 2,
+    /// and nothing is written.
     #[tokio::test]
     async fn an_invalid_transition_is_rejected_with_exit_2() {
         let h = Harness::bare();
@@ -767,8 +766,8 @@ mod tests {
         assert_eq!(h.goals.saved().len(), 0);
     }
 
-    /// Not a ported case: the `goal:status_changed` payload is contract
-    /// (PARITY.md §7.19).
+    /// A status change is saved and announced as exactly one
+    /// `goal:status_changed` event carrying the goal id and both statuses.
     #[tokio::test]
     async fn a_status_change_is_persisted_and_announced() {
         let h = Harness::bare();
@@ -799,8 +798,8 @@ mod tests {
         );
     }
 
-    /// Not a ported case: `paused → active` re-enables autonomous mode, which
-    /// is the other half of the §7.2 side-effect table.
+    /// `paused → active` re-enables autonomous mode, which
+    /// is the other half of the autonomous side effects.
     #[tokio::test]
     async fn resuming_a_paused_goal_re_enables_autonomous() {
         let h = Harness::with_agent_service();
@@ -819,8 +818,7 @@ mod tests {
         assert_eq!(h.autonomous_of("agt_r"), Some(true));
     }
 
-    /// Not a ported case: pausing also cancels the agent's queued autonomous
-    /// tasks (PARITY.md §7.2) — the TS suite never covers this branch.
+    /// Pausing also cancels the agent's queued autonomous tasks.
     #[tokio::test]
     async fn pausing_cancels_the_agents_dispatchable_autonomous_tasks() {
         let h = Harness::full();
@@ -953,7 +951,7 @@ mod tests {
         assert_eq!(h.autonomous_of("agt_same"), Some(true));
     }
 
-    /// Not a ported case: the field-level behaviour of `update` — trimming,
+    /// The field-level behaviour of `update` — trimming,
     /// the empty-title guard, and the `goal:updated` event.
     #[tokio::test]
     async fn update_trims_supplied_fields_and_leaves_the_rest() {
@@ -1008,7 +1006,7 @@ mod tests {
         assert_eq!(h.goals.saved().len(), 0);
     }
 
-    // ── no agent service (the TS `undefined` dependency) ───────────────────
+    // ── no agent service (an absent dependency) ───────────────────
 
     #[tokio::test]
     async fn create_without_an_agent_service_is_a_no_op() {
@@ -1077,7 +1075,7 @@ mod tests {
     async fn create_swallows_a_set_autonomous_failure() {
         let h = Harness::with_agent_service();
         // No `agt_missing` in the store, so `set_autonomous` raises
-        // `AgentNotFoundError` — the exact TS scenario.
+        // `AgentNotFoundError`.
         let goal = h
             .service
             .create(CreateGoalInput {
@@ -1490,7 +1488,7 @@ mod tests {
 
     // ── list / list_tasks_for_goal / get_progress_report ───────────────────
 
-    /// Not a ported case: the filter reaches the store.
+    /// The filter reaches the store.
     #[tokio::test]
     async fn list_passes_the_filter_through_to_the_store() {
         let h = Harness::bare();
@@ -1513,7 +1511,7 @@ mod tests {
         assert_eq!(active[0].id, "goal_a");
     }
 
-    /// Not a ported case: `listTasksForGoal` degrades to an empty list.
+    /// `listTasksForGoal` degrades to an empty list.
     #[tokio::test]
     async fn list_tasks_for_goal_is_empty_without_a_task_service() {
         let h = Harness::bare();
@@ -1539,7 +1537,7 @@ mod tests {
         assert_eq!(listed[0].id, "tsk_1");
     }
 
-    /// Not a ported case: the progress report is a context entry keyed
+    /// The progress report is a context entry keyed
     /// `<goalId>-progress`, and is `None` with no context store.
     #[tokio::test]
     async fn get_progress_report_reads_the_goal_progress_context_key() {
@@ -1560,7 +1558,7 @@ mod tests {
         );
     }
 
-    /// Not a ported case: a `Some("")` assignee is JS-falsy, so it toggles
+    /// A `Some("")` assignee is JS-falsy, so it toggles
     /// nothing on any path.
     #[tokio::test]
     async fn an_empty_assignee_string_toggles_nothing() {
@@ -1579,7 +1577,7 @@ mod tests {
         assert_eq!(h.autonomous_calls(), 0);
     }
 
-    /// Not a ported case: `create` with an assignee emits `goal:created`
+    /// `create` with an assignee emits `goal:created`
     /// before the autonomous toggle, so a subscriber sees the goal first.
     #[tokio::test]
     async fn goal_created_is_emitted_before_the_autonomous_toggle() {

@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
-# RunEvent.data / AgentEvent.data are `unknown` in TS; config deep-merge and the
+# RunEvent.data / AgentEvent.data are untyped JSON; config deep-merge and the
 # tolerant state read both operate on a JSON value tree.
 serde_json.workspace = true
 thiserror.workspace = true

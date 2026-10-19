@@ -1,5 +1,4 @@
-//! Process management port — ported from
-//! `src/infrastructure/process/process-manager.ts` (the interface only; the
+//! Process management port (the interface only; the
 //! `readLines` implementation and POSIX details belong to `orch-infra`).
 
 use std::collections::BTreeMap;
@@ -45,8 +44,7 @@ impl std::fmt::Display for Signal {
 
 /// How a child's stdin is wired. `stdio: ['ignore', 'pipe', 'pipe']` is the
 /// default — stdin is ignored, which is why every adapter passes a
-/// permission-bypass flag. `codex` and `pi` override it to a pipe
-/// (PARITY.md §8.4).
+/// permission-bypass flag. `codex` and `pi` override it to a pipe.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StdioMode {
     #[default]
@@ -56,7 +54,7 @@ pub enum StdioMode {
 
 /// Which part of the orch process's own environment a child inherits.
 ///
-/// Local runs inherit everything (PARITY.md §8.3). Work submitted by a remote
+/// Local runs inherit everything. Work submitted by a remote
 /// peer must not receive the worker user's credentials, so it inherits
 /// [`EnvInheritance::WithoutSecrets`] (security review F2). The explicit
 /// overlay ([`SpawnOptions::env`]: the agent's own `config.env` plus the
@@ -319,18 +317,17 @@ pub trait ProcessManager: Send + Sync {
     /// Spawns in a new process group (`setsid`), so the group kill above
     /// reaches the whole tree.
     ///
-    /// Cancellation is **not** handled here. The TS passes an `AbortSignal` to
-    /// `spawn`, which makes node signal the child itself; the Rust equivalent
+    /// Cancellation is **not** handled here; it
     /// lives in `orch-infra`'s shared adapter spawn path, which every adapter
     /// goes through. The orchestrator's own grace-period kills are still
     /// required — see the spec issue in `docs/TRAITS-FROZEN.md`.
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild>;
 }
 
-/// The default grace period of the TS `killWithGrace(pid, graceMs = 10_000)`.
+/// The default grace period of `kill_with_grace`.
 pub const DEFAULT_KILL_GRACE: Duration = Duration::from_millis(10_000);
 
-/// The interval at which `kill_with_grace` re-checks liveness (PARITY.md §8.4).
+/// The interval at which `kill_with_grace` re-checks liveness.
 pub const KILL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[cfg(test)]

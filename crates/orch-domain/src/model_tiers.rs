@@ -1,9 +1,10 @@
 //! Model tier system — the single source of truth for adapter → tier → model
-//! resolution (`src/domain/model-tiers.ts`).
+//! resolution.
 //!
 //! Agent Shop templates reference semantic tiers rather than hard-coded model
 //! strings; the concrete model is resolved at instantiation time from the
-//! user's chosen adapter. This table is L0 data (PARITY.md §8.13).
+//! user's chosen adapter. This table is contract data: the resolved model names reach adapters
+//! unchanged.
 
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +108,7 @@ impl std::str::FromStr for ModelTier {
     }
 }
 
-/// Tier → model mapping per adapter, in TS key order.
+/// Tier → model mapping per adapter.
 ///
 /// Conventions:
 /// - `shell`: `""` for all tiers (model irrelevant)

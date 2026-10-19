@@ -1,8 +1,6 @@
-//! Entity factories with the **same defaults** as the TS
-//! `test/unit/application/helpers.ts`.
+//! Entity factories with fixed defaults.
 //!
-//! The TS factories take a `Partial<T>` of overrides; the Rust equivalent is
-//! struct-update syntax, which reads the same way and is checked:
+//! Overrides are applied with struct-update syntax, which reads the same way and is checked:
 //!
 //! ```
 //! # use orch_core::test_support::make_task;
@@ -15,7 +13,7 @@ use orch_domain::{
     Agent, AgentConfig, AgentStats, AgentStatus, ApprovalPolicy, Run, RunStatus, Task, TaskStatus,
 };
 
-/// The timestamp both TS factories hard-code.
+/// The timestamp the task and run factories hard-code.
 pub const FACTORY_TIMESTAMP: &str = "2025-01-01T00:00:00Z";
 
 pub fn make_task() -> Task {
@@ -45,7 +43,7 @@ pub fn make_task() -> Task {
 }
 
 /// Note `approval_policy: auto` and `stall_timeout_ms: 300_000` — both are
-/// load-bearing for the ported orchestrator tests, and neither matches the
+/// load-bearing for the orchestrator tests, and neither matches the
 /// project config default.
 pub fn make_agent() -> Agent {
     Agent {
@@ -105,7 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_defaults_match_the_ts_factory() {
+    fn the_task_factory_uses_its_fixed_defaults() {
         let task = make_task();
         assert_eq!(task.id, "tsk_test1");
         assert_eq!(task.title, "Test task");
@@ -124,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_defaults_match_the_ts_factory() {
+    fn the_agent_factory_uses_its_fixed_defaults() {
         let agent = make_agent();
         assert_eq!(agent.id, "agt_test1");
         assert_eq!(agent.name, "TestAgent");
@@ -139,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn run_defaults_match_the_ts_factory() {
+    fn the_run_factory_uses_its_fixed_defaults() {
         let run = make_run();
         assert_eq!(run.id, "run_test1");
         assert_eq!(run.task_id, "tsk_test1");
@@ -164,7 +162,7 @@ mod tests {
 
     #[test]
     fn the_default_run_and_task_ids_line_up() {
-        // The TS factories are wired this way on purpose: a default run points
+        // The factories are wired this way on purpose: a default run points
         // at the default task and the default agent.
         assert_eq!(make_run().task_id, make_task().id);
         assert_eq!(make_run().agent_id, make_agent().id);

@@ -1,7 +1,7 @@
-//! Failure injection — the replacement for `mockRejectedValue`.
+//! Failure injection — turning store calls into errors on demand.
 //!
 //! The orchestrator resilience tests turn store calls into rejections to check
-//! that a tick survives them (PARITY.md §7.3). Every fake runs its calls
+//! that a tick survives them. Every fake runs its calls
 //! through a [`Faults`] so those tests have one way to do it.
 
 use std::collections::VecDeque;

@@ -1,8 +1,6 @@
 //! [`EngineBackend`] — [`TuiBackend`] over [`FullEngine`].
 //!
-//! Every method here is the Rust of a closure in
-//! `parity/orch-ts/src/cli/commands/tui.ts`; the line references in the
-//! doc comments point at it. The trait and its option structs belong to
+//! The trait and its option structs belong to
 //! `orch-tui` (`crates/orch-tui/BACKEND.md`) — this is the only
 //! implementation outside that crate's `FakeBackend`.
 //!
@@ -11,8 +9,9 @@
 //! 1. **Errors are strings.** The TUI renders `Failed: {err}`, so every
 //!    fallible call collapses to [`BackendResult`]. Exit codes are a CLI
 //!    concept and have no meaning in a dashboard.
-//! 2. **An empty option string means "absent".** The TS writes
-//!    `opts?.command || undefined`, and JS treats `""` as falsy. The one
+//! 2. **An empty option string means "absent".** `non_empty` and
+//!    `parse_optional` drop `""`, and a wizard field the user left blank reads
+//!    back as an empty string (`value_of` in `orch-tui`'s wizard configs). The one
 //!    exception is [`AgentFields`], where `Some("")` means *clear the stored
 //!    value* — the engine's `UpdateAgentFields` has the same three states.
 
@@ -42,16 +41,16 @@ use orch_tui::backend::{
 use tokio::runtime::Handle;
 
 /// Runs whose events the history loader reads, and the size of the first
-/// batch (`tui.ts:145-146`).
+/// batch.
 const HISTORY_FIRST_BATCH: usize = 3;
 const HISTORY_TOTAL_RUNS: usize = 10;
-/// Trailing events read per run (`tui.ts:151`).
+/// Trailing events read per run.
 const HISTORY_EVENTS_PER_RUN: usize = 30;
-/// Each delivered batch is capped at its last N entries (`tui.ts:166`).
+/// Each delivered batch is capped at its last N entries.
 const HISTORY_BATCH_CAP: usize = 200;
 
 /// The sender a message from a human carries, matching `orch msg send`'s
-/// default (`commands/msg.rs`, `message-service.ts:37`). It is the one sender
+/// default (`commands/msg.rs`). It is the one sender
 /// id the service accepts without a registered agent behind it.
 const CLI_SENDER_ID: &str = "cli";
 
@@ -124,8 +123,7 @@ impl std::fmt::Debug for EngineBackend {
 }
 
 impl EngineBackend {
-    /// Launch, following `tui.ts:239-268`: try watch mode, and on refusal fall
-    /// back to observer mode.
+    /// Launch: try watch mode, and on refusal fall back to observer mode.
     ///
     /// Must be called from the runtime. `version` is the CLI's own version
     /// string, which the dashboard shows in its header.
@@ -166,7 +164,7 @@ impl EngineBackend {
         };
 
         // Watch mode auto-starts so the orchestrator is live, with seeding on —
-        // `startWatch()` with no options (`tui.ts:254`).
+        // `start_watch` with no options.
         let started = if observe {
             Err(None)
         } else {
@@ -188,10 +186,8 @@ impl EngineBackend {
             Err(Some(err)) => {
                 // Another process holds the lock. The dashboard becomes a
                 // read-only observer of *their* orchestrator, and the message
-                // is **suppressed** in the UI: the TS passes
-                // `observerMode ? undefined : watchError` (`tui.ts:314`), so
-                // the header shows the observer badge rather than an error,
-                // and matching that is the reason this is not rendered.
+                // is **suppressed** in the UI: the
+                // header shows the observer badge rather than an error.
                 //
                 // The holder's pid therefore survives only in this record,
                 // which reaches a terminal only when diagnostics are on
@@ -231,8 +227,7 @@ impl EngineBackend {
         // History is loaded eagerly because the dashboard's activity view
         // wants it on the first frame. The model catalog starts on the first
         // `poll_model_catalog` instead — which, since `App::tick` polls every
-        // tick, is the first frame anyway. That matches the reference, which
-        // loads it in a mount effect (`App.tsx:984`); the deferral is not a
+        // tick, is the first frame anyway. The deferral is not a
         // behavioural difference, it only spares a facade consumer that never
         // polls the eight adapter spawns a probe costs.
         backend.spawn_history_load();
@@ -282,11 +277,10 @@ impl EngineBackend {
     // There was a `report` helper here that put a background failure on the
     // bus as `orchestrator:error`. Nothing is left to call it, which is the
     // point: every method that can fail is awaited now, because the dashboard
-    // has no renderer for that event (docs/parity/tui.md §12.10) and a failure
-    // reported only there is a failure nobody sees.
+    // has no renderer for that event and a failure reported only there is a
+    // failure nobody sees.
 
-    /// Read-modify-write: the engine's `GlobalConfigStore` is whole-document,
-    /// where the TS store has a per-key `set`.
+    /// Read-modify-write: the engine's `GlobalConfigStore` is whole-document.
     fn mutate_global(
         &self,
         apply: impl FnOnce(&mut orch_domain::GlobalConfig),
@@ -301,7 +295,7 @@ impl EngineBackend {
 
     // ── Background loads ─────────────────────────────────────────────────
 
-    /// `onLoadHistory` (`tui.ts:133-175`): all runs, newest first, keeping only
+    /// All runs, newest first, keeping only
     /// the succeeded and failed ones; the first three are delivered as one
     /// batch and the next seven as a second, each sorted oldest-first and
     /// capped at its last 200 entries.
@@ -343,7 +337,7 @@ impl EngineBackend {
         });
     }
 
-    /// `onLoadModelCatalog` (`tui.ts:227`): probe every supported adapter and
+    /// Probe every supported adapter and
     /// publish the catalog once they have all answered.
     fn spawn_catalog_load(&self) {
         let catalog = Arc::clone(&self.catalog);
@@ -376,11 +370,9 @@ impl EngineBackend {
 }
 
 impl TuiBackend for EngineBackend {
-    // Every `can_*` flag stays at its `true` default: the TS host passes
-    // all ~45 callbacks unconditionally, and the one conditional prop
-    // (`onPasteImage`) is gated on the open wizard's kind, which is the
-    // dashboard's own state rather than anything the engine knows
-    // (`App.tsx:2526`).
+    // Every `can_*` flag stays at its `true` default: the one conditional
+    // capability (image paste) is gated on the open wizard's kind, which is
+    // the dashboard's own state rather than anything the engine knows.
     //
     // `can_send_message` stays at its `true` default too; overriding it to
     // `false` here is the kill switch if messaging has to be disabled without
@@ -432,7 +424,7 @@ impl TuiBackend for EngineBackend {
         .map_err(to_message)
     }
 
-    // ── Refresh (`tui.ts:72-82`, `203`, `181`) ───────────────────────────
+    // ── Refresh ──────────────────────────────────────────────────────────
 
     fn refresh_tasks(&mut self) -> BackendResult<Vec<Task>> {
         self.block_on(self.engine.task_service.list(&TaskFilter::default()))
@@ -503,8 +495,7 @@ impl TuiBackend for EngineBackend {
             .map_err(to_message)
     }
 
-    /// `review → done` directly, not through an approval service — the TS
-    /// calls `updateStatus(taskId, 'done')` (`tui.ts:106`).
+    /// `review → done` directly, not through an approval service.
     fn approve_task(&mut self, id: &str) -> BackendResult<()> {
         self.block_on(self.engine.task_service.update_status(id, TaskStatus::Done))
             .map(|_| ())
@@ -563,8 +554,7 @@ impl TuiBackend for EngineBackend {
     // ── Agents ───────────────────────────────────────────────────────────
 
     /// An empty `adapter` falls through to `defaults.agent.adapter`, which the
-    /// engine's `AgentService::create` already does — the TS spells it out at
-    /// the call site instead (`tui.ts:87`).
+    /// engine's `AgentService::create` already does.
     fn add_agent(&mut self, name: &str, adapter: &str, opts: AgentOpts) -> BackendResult<Agent> {
         let effort = parse_optional(opts.effort.as_deref(), "effort")?;
         let approval_policy = parse_optional(opts.approval_policy.as_deref(), "approval policy")?;
@@ -598,9 +588,8 @@ impl TuiBackend for EngineBackend {
                 command: fields.command,
                 model: fields.model,
                 effort,
-                // The TS *prop type* carries `approval_policy`, but the only
-                // caller — the edit-agent wizard — never sends it
-                // (`App.tsx:1242`), so the trait leaves it out. Editing it is
+                // The only caller — the edit-agent wizard — never sends an
+                // approval policy, so the trait leaves it out. Editing it is
                 // `orch agent edit`'s job.
                 approval_policy: None,
             },
@@ -731,7 +720,7 @@ impl TuiBackend for EngineBackend {
                 // CLI-sent message are identical on disk for the same intent.
                 subject: String::new(),
                 // Raw: the service's `truncate_utf16` is the single place the
-                // 4000-unit cut happens (PARITY §14.14).
+                // 4000-unit cut happens.
                 body: body.to_owned(),
                 ttl_ms: None,
                 team_id: None,
@@ -774,8 +763,7 @@ impl TuiBackend for EngineBackend {
     }
 
     /// Awaited, like its siblings. `stop` can take up to the kill grace, so
-    /// this holds a frame for that long — which is what the reference does
-    /// too (`await onStopWatch()`), and the alternative is worse: spawned, a
+    /// this holds a frame for that long. The alternative is worse: spawned, a
     /// failure could only be reported as `orchestrator:error`, which the
     /// dashboard has no renderer for, so `/pause` would claim to have paused a
     /// watch loop that is still running.
@@ -792,15 +780,14 @@ impl TuiBackend for EngineBackend {
         Ok(())
     }
 
-    // ── Settings (`tui.ts:330-350`) ──────────────────────────────────────
+    // ── Settings ─────────────────────────────────────────────────────────
 
     fn save_palette(&mut self, palette: TuiPaletteName) -> BackendResult<()> {
         self.mutate_global(|global| global.tui.palette = palette)
     }
 
-    /// Stored **as given**. `ActivityFilterPreset` is a plain string and the
-    /// TS writes `globalConfigStore.set('activity_filter', preset)` without
-    /// validating, so a preset r-orch does not know is persisted rather than
+    /// Stored **as given**. `ActivityFilterPreset` is a plain string and is not
+    /// validated on write, so a preset r-orch does not know is persisted rather than
     /// refused — the dashboard only ever sends one of its own five. An unknown
     /// one is logged so it is not silently invisible.
     fn save_activity_filter(&mut self, preset: &str) -> BackendResult<()> {
@@ -819,8 +806,7 @@ impl TuiBackend for EngineBackend {
     /// which deep-merges and so preserves keys r-orch does not model.
     ///
     /// A **running** orchestrator keeps its own clone of the config, so the new
-    /// cap applies from the next `start_watch` — which is the TS behaviour too
-    /// (it mutates only the container's copy).
+    /// cap applies from the next `start_watch`.
     fn save_max_concurrent(&mut self, value: u32) -> BackendResult<()> {
         self.block_on(
             self.engine
@@ -845,9 +831,8 @@ impl TuiBackend for EngineBackend {
     ///
     /// Lossy by design: the bus is a 4096-slot broadcast channel, so a
     /// dashboard that stalls under a flood of `agent:output` drops the oldest
-    /// rather than growing without bound. The TS accepts the same trade-off
-    /// through its 80 ms batching and 2 KB caps (ARCHITECTURE §6.5). A drop is
-    /// logged, never silent.
+    /// rather than growing without bound (ARCHITECTURE §6.5). A drop is logged,
+    /// never silent.
     fn poll_events(&mut self) -> Vec<OrchestratorEvent> {
         if let Some(subscription) = self.subscription.as_mut() {
             for event in subscription.try_drain() {
@@ -870,8 +855,8 @@ impl TuiBackend for EngineBackend {
     ///
     /// The first call **starts** the discovery and returns `None`; later calls
     /// return the catalog once, then `None` again. That keeps the eight
-    /// adapter probes off the startup path, where the TS does not pay them
-    /// either — it only calls `onLoadModelCatalog` when a wizard needs models.
+    /// adapter probes off the startup path; they are only needed when a wizard
+    /// needs models.
     fn poll_model_catalog(&mut self) -> Option<ModelCatalog> {
         let mut state = self
             .catalog
@@ -909,8 +894,7 @@ impl TuiBackend for EngineBackend {
         self.copy.poll_copy_results()
     }
 
-    /// Read the clipboard, writing any image to a temp file
-    /// (`docs/parity/tui.md` §8.2).
+    /// Read the clipboard, writing any image to a temp file.
     ///
     /// The directory is `mkdtemp`-style with an `orch-paste-` prefix and the
     /// file is `clipboard-{now}.{ext}`; the timestamp comes from the injected
@@ -1335,7 +1319,7 @@ fn to_message(err: orch_core::error::Error) -> String {
     err.to_string()
 }
 
-/// JS `value || undefined`: an empty string is absent.
+/// An empty string is absent.
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|text| !text.is_empty())
 }

@@ -27,13 +27,13 @@ pub struct FakeExecuteCall {
     pub config: AgentConfig,
 }
 
-/// The pid the TS `createMockAdapter` hands back.
+/// The pid the fake adapter hands back.
 const FAKE_PID: u32 = 99999;
 
 /// Replays a scripted event sequence.
 ///
-/// An `Err` item ends the stream after it is yielded, which is how the TS
-/// generator's "threw" case appears to the orchestrator.
+/// An `Err` item ends the stream after it is yielded, which is how a generator
+/// that "threw" appears to the orchestrator.
 #[derive(Clone)]
 pub struct FakeAdapter {
     kind: &'static str,
@@ -52,8 +52,7 @@ impl Default for FakeAdapter {
 }
 
 impl FakeAdapter {
-    /// `kind: "shell"`, `pid: 99999`, `test() → ok`, an empty event stream —
-    /// the TS `createMockAdapter()` defaults.
+    /// `kind: "shell"`, `pid: 99999`, `test() → ok`, an empty event stream.
     pub fn new() -> Self {
         FakeAdapter {
             kind: "shell",
@@ -86,7 +85,7 @@ impl FakeAdapter {
         self
     }
 
-    /// Replay these events, then yield `Err` and end — the TS "generator
+    /// Replay these events, then yield `Err` and end — the "generator
     /// threw" case, which fails the run.
     pub fn failing_after(
         events: impl IntoIterator<Item = AgentEvent>,
@@ -221,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defaults_match_the_ts_mock() {
+    async fn a_new_fake_adapter_has_its_documented_defaults() {
         let adapter = FakeAdapter::new();
         assert_eq!(adapter.kind(), "shell");
         assert!(adapter.test().await.ok);

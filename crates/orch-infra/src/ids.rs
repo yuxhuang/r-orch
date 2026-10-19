@@ -1,10 +1,10 @@
-//! The real [`IdGenerator`]: `<prefix>_<nanoid(7)>` (PARITY.md §6.2).
+//! The real [`IdGenerator`]: `<prefix>_<nanoid(7)>`.
 
 use orch_core::ids::{ID_LENGTH, IdGenerator};
 
 /// `nanoid::alphabet::SAFE` is the **same 64 characters** as JS nanoid's
 /// `urlAlphabet`, so no custom alphabet is needed — only the length and the
-/// prefix. Ids are therefore format-compatible with the TypeScript binary's.
+/// prefix. Ids are therefore format-compatible with existing `.orchestry` data.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NanoIdGenerator;
 

@@ -1,4 +1,4 @@
-//! Team domain model — a group of agents with a lead (`src/domain/team.ts`).
+//! Team domain model — a group of agents with a lead.
 
 use serde::{Deserialize, Serialize};
 
@@ -72,7 +72,7 @@ pub struct TeamMember {
     pub joined_at: String,
 }
 
-/// Field order mirrors the TS `Team` interface (PARITY.md §6.8).
+/// Field order is the serialized field order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Team {
     pub id: String,
@@ -89,7 +89,7 @@ pub struct Team {
 }
 
 /// `auto_claim` and `max_concurrent_tasks` are stored and surfaced by the CLI
-/// but never read by the orchestrator (PARITY.md §7.18). The data model is
+/// but never read by the orchestrator. The data model is
 /// preserved; the absent behaviour is not invented.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamConfig {
@@ -113,7 +113,7 @@ impl Default for TeamConfig {
     }
 }
 
-/// `config` here is TS `Partial<TeamConfig>`: every field independently
+/// `config` here is a partial [`TeamConfig`]: every field independently
 /// optional, overlaid on [`DEFAULT_TEAM_CONFIG`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialTeamConfig {
@@ -126,8 +126,7 @@ pub struct PartialTeamConfig {
 }
 
 impl PartialTeamConfig {
-    /// Overlay these fields on [`DEFAULT_TEAM_CONFIG`], mirroring the TS
-    /// `{ ...DEFAULT_TEAM_CONFIG, ...input.config }` spread.
+    /// Overlay these fields on [`DEFAULT_TEAM_CONFIG`].
     pub fn resolve(&self) -> TeamConfig {
         TeamConfig {
             max_concurrent_tasks: self
@@ -177,8 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_shape() {
-        // PARITY.md §4.2.
+    fn serialized_shape() {
         let team = Team {
             id: "team_tmmAHja".into(),
             name: "squad".into(),

@@ -1,5 +1,3 @@
-//! Ported from `test/unit/application/error-kind-propagation.test.ts`.
-//!
 //! An adapter's classification has to survive the whole path: the `error`
 //! event carries it to the bus, the collector remembers the last one, and the
 //! failure handler persists it on the agent so `orch agent list` and the TUI
@@ -232,7 +230,7 @@ async fn a_reconcile_pid_crash_records_the_crash_message_and_a_derived_kind() {
     assert_eq!(last_error.message, "Process crashed unexpectedly");
     // The reconcile crash path passes no kind and no exit code, and
     // `classify_adapter_error` only reaches `process_crash` through a non-zero
-    // exit code — so a reaped PID classifies as `unknown`. Replicated; the
+    // exit code — so a reaped PID classifies as `unknown`. The
     // crash is identified by the message, not the kind.
     assert_eq!(last_error.kind, "unknown");
     assert_eq!(

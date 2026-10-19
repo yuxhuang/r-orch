@@ -1,14 +1,14 @@
-//! The event bus — ported from `src/application/event-bus.ts`.
+//! The event bus.
 //!
-//! The TS bus is **synchronous**: `emit()` runs every handler inline and
+//! The bus is **synchronous**: `emit()` runs every handler inline and
 //! swallows their exceptions. Two layers serve that contract here, because two
 //! different consumers need two different things:
 //!
 //! 1. **Synchronous handlers** ([`EventBus::on`], [`EventBus::once`],
-//!    [`EventBus::on_any`]) — a direct port, used by the orchestrator's own
+//!    [`EventBus::on_any`]) — used by the orchestrator's own
 //!    reactive-dispatch subscription and by every test that asserts on event
 //!    payloads. Handler panics are caught so one bad subscriber cannot break
-//!    the chain, exactly as the TS `try`/`catch` around each handler does.
+//!    the chain, as a `catch` around each handler would.
 //! 2. **A `broadcast` channel** ([`EventBus::subscribe`]) — cheap fan-out to
 //!    the TUI, the structured logger and the run-store writer, which consume on
 //!    their own tasks (ARCHITECTURE §6.5).
@@ -36,7 +36,7 @@ use tokio::sync::broadcast;
 /// (ARCHITECTURE §6.5).
 pub const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
-/// The TS `maxListeners` default — the threshold above which a repeated
+/// The default `max_listeners` — the threshold above which a repeated
 /// subscription is reported as a probable leak.
 pub const DEFAULT_MAX_LISTENERS: usize = 10;
 
@@ -44,7 +44,7 @@ pub const DEFAULT_MAX_LISTENERS: usize = 10;
 ///
 /// `Fn`, not `FnMut`: handlers are shared and run from `&self`, so any state
 /// they need lives behind their own interior mutability — which is also how
-/// the TS closures capture it.
+/// closures capture it.
 pub type EventHandler = Arc<dyn Fn(&OrchestratorEvent) + Send + Sync>;
 
 #[derive(Default)]
@@ -54,7 +54,7 @@ struct Registry {
     next_id: u64,
     max_listeners: usize,
     /// Which event types have already produced a leak warning. `"*"` stands
-    /// for the wildcard bucket, as in the TS code.
+    /// for the wildcard bucket.
     warned: HashSet<String>,
 }
 
@@ -72,7 +72,7 @@ impl Registry {
     }
 
     /// Warn at most once per bucket, and never when `max_listeners` is 0 —
-    /// which the TS code treats as "unlimited".
+    /// which means "unlimited".
     fn maybe_warn(&mut self, bucket: &str, count: usize) -> Option<String> {
         if self.max_listeners == 0 || count <= self.max_listeners {
             return None;
@@ -90,7 +90,7 @@ impl Registry {
 /// The single communication channel between all layers.
 ///
 /// `Clone` shares one registry and one channel, so cloning behaves like
-/// passing the TS object reference around. The container nonetheless hands out
+/// passing one shared bus reference around. The container nonetheless hands out
 /// `Arc<EventBus>`, which is what every service holds.
 #[derive(Clone)]
 pub struct EventBus {
@@ -143,9 +143,8 @@ impl EventBus {
     ///
     /// The channel send happens **first** so that the channel's order is emit
     /// order even when a handler emits a follow-up event; the typed handlers
-    /// then run before the wildcard ones, which is the TS dispatch order.
-    /// An event emitted with no subscribers is dropped, exactly as the TS bus
-    /// drops one with no handlers.
+    /// then run before the wildcard ones, which is the dispatch order.
+    /// An event emitted with no subscribers is dropped.
     pub fn emit(&self, event: OrchestratorEvent) {
         let event = Arc::new(event);
         let _ = self.tx.send(Arc::clone(&event));
@@ -175,7 +174,7 @@ impl EventBus {
 
     /// Subscribe to one event type. Call [`Unsubscribe::unsubscribe`] on the
     /// returned handle to detach; dropping it leaves the handler attached,
-    /// mirroring the TS contract where the returned function must be called.
+    /// so the returned handle must be used explicitly.
     pub fn on(
         &self,
         event_type: OrchestratorEventType,
@@ -202,8 +201,7 @@ impl EventBus {
     /// Subscribe to one event type and detach after the first delivery.
     ///
     /// The wrapper unsubscribes **before** invoking the inner handler, so a
-    /// handler that re-emits the same type does not re-enter itself — the TS
-    /// wrapper does the same.
+    /// handler that re-emits the same type does not re-enter itself.
     pub fn once(
         &self,
         event_type: OrchestratorEventType,
@@ -256,7 +254,7 @@ impl EventBus {
     }
 
     /// Detach a handler. Equivalent to [`Unsubscribe::unsubscribe`] and
-    /// present because the TS bus exposes `off`.
+    /// present as the conventional `off` spelling.
     pub fn off(&self, handle: Unsubscribe) {
         handle.unsubscribe();
     }
@@ -271,7 +269,7 @@ impl EventBus {
     }
 
     /// Listeners attached to one event type. Wildcard handlers are **not**
-    /// counted, matching the TS `listenerCount`.
+    /// counted.
     pub fn listener_count(&self, event_type: OrchestratorEventType) -> usize {
         lock(&self.registry)
             .typed
@@ -294,7 +292,7 @@ impl EventBus {
 
     /// How many distinct buckets have produced a leak warning.
     ///
-    /// This is the size of the TS `warnedTypes` set, exposed because "warn
+    /// This is the size of the warned set, exposed because "warn
     /// once per type" is the asserted behaviour and a `tracing` subscriber is
     /// a heavier way to observe the same fact.
     pub fn warned_type_count(&self) -> usize {
@@ -315,9 +313,8 @@ impl EventBus {
     }
 }
 
-/// Run one handler, containing a panic so it cannot break the chain. The TS
-/// bus catches handler exceptions and logs them; a panic is the closest
-/// equivalent, and swallowing it silently would hide a real defect.
+/// Run one handler, containing a panic so it cannot break the chain. The
+/// panic is logged, because swallowing it silently would hide a real defect.
 fn dispatch(handler: &EventHandler, event: &OrchestratorEvent, label: &str) {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| handler(event)));
     if result.is_err() {
@@ -351,8 +348,7 @@ fn remove(registry: &Arc<Mutex<Registry>>, target: &Target, id: u64) {
 /// A handle that detaches one synchronous handler.
 ///
 /// Deliberately **not** a `Drop` guard: `let _ = bus.on(…)` would then
-/// unsubscribe immediately, and the TS semantics are that the returned
-/// unsubscribe function is called explicitly.
+/// unsubscribe immediately; the handle's `unsubscribe` is called explicitly.
 #[must_use = "the handler stays attached until `unsubscribe` is called"]
 pub struct Unsubscribe {
     registry: Arc<Mutex<Registry>>,
@@ -416,10 +412,9 @@ impl EventSubscription {
     /// A lossy fan-out is fine for a dashboard feed, but a caller that waits
     /// for *one specific* event — `run <id>` waiting for its own
     /// `agent:completed` — would wait forever if that event were among the
-    /// dropped ones. The TS cannot hit this, because its handlers are
-    /// synchronous and a handler cannot lag; in Rust it is a real hazard, so
-    /// the count is exposed rather than only logged. A caller that must not
-    /// miss an event compares this across calls and falls back to the store
+    /// dropped ones. The synchronous handlers cannot hit this because
+    /// a handler cannot lag, but this channel can, so the count is exposed
+    /// rather than only logged. A caller that must not miss an event compares this across calls and falls back to the store
     /// when it grows.
     pub fn skipped(&self) -> u64 {
         self.skipped
@@ -622,8 +617,8 @@ mod tests {
 
     #[test]
     fn on_any_subscribes_to_orchestrator_error_and_shutdown() {
-        // orchestrator-resilience.test.ts asserts both reach a wildcard
-        // subscriber, because that is how `serve --json` logs them.
+        // Both reach a wildcard subscriber, because that is how `serve --json`
+        // logs them.
         let bus = EventBus::new();
         let seen: Arc<Mutex<Vec<OrchestratorEventType>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
@@ -771,7 +766,7 @@ mod tests {
         assert_eq!(bus.warned_type_count(), 1);
     }
 
-    // ── leak bounds (orchestrator-endurance.test.ts) ──────────────────────
+    // ── leak bounds ───────────────────────────────────────────────────────
 
     #[test]
     fn a_thousand_subscribe_unsubscribe_cycles_leave_no_listeners() {

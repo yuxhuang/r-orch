@@ -1,8 +1,8 @@
-//! PID lock file — ported from `src/infrastructure/storage/lock.ts`.
+//! PID lock file.
 //!
 //! Only one `orch run --watch` may hold the lock; one-shot commands never take
 //! it. The file holds the holder's PID as a decimal string with **no trailing
-//! newline** (PARITY.md §6.7).
+//! newline**.
 //!
 //! Three properties are load-bearing and easy to lose:
 //!
@@ -159,19 +159,17 @@ pub async fn check_lock(lock_path: &Path) -> LockResult {
 
 /// Acquire or fail with `LockConflictError` (exit 4).
 ///
-/// A faithful port of the TS `requireLock`, which throws **only when a holder
-/// PID is known**: an acquisition that fails without one — the file exists but
-/// holds garbage — returns without error.
+/// Errors **only when a holder PID is known**: an acquisition that fails
+/// without one — the file exists but holds garbage — returns without error.
 ///
-/// **`requireLock` has no callers in the TypeScript.** It is dead code there,
-/// so this quirk describes nothing ORCH actually does, and it must not be read
-/// as "ORCH proceeds without the lock on a corrupt lock file" — it does not.
-/// The live path is `Orchestrator::with_temporary_lock` / `start_watch`, which
-/// call `acquire` and reject **any** failed acquisition. Measured against the
-/// oracle: a garbage or empty lock file makes `serve --once` and `run <id>`
-/// exit 4 with `Orchestrator already running (PID: undefined)`, leaving the
-/// lock file untouched. Kept in step with the TS only so that a future caller
-/// there has a matching counterpart here.
+/// **`require_lock` has no callers.** It is dead code, so this quirk describes
+/// nothing ORCH actually does, and it must not be read as "ORCH proceeds
+/// without the lock on a corrupt lock file" — it does not. The live path is
+/// `Orchestrator::with_temporary_lock` / `start_watch`, which call `acquire`
+/// and reject **any** failed acquisition: a garbage or empty lock file makes
+/// `serve --once` and `run <id>` exit 4 with
+/// `Orchestrator already running (PID: undefined)`, leaving the lock file
+/// untouched. Kept only so that a future caller has it available.
 pub async fn require_lock(lock_path: &Path) -> Result<()> {
     let result = acquire_lock(lock_path).await?;
     match (result.acquired, result.pid) {
@@ -188,7 +186,7 @@ async fn read_lock_pid(lock_path: &Path) -> Option<u32> {
 
 pub(crate) async fn is_stale_by_age(lock_path: &Path) -> bool {
     let Ok(meta) = tokio::fs::metadata(lock_path).await else {
-        // Unreadable: treat as stale, as the TS `catch` does.
+        // Unreadable: treat as stale.
         return true;
     };
     let Ok(modified) = meta.modified() else {
@@ -214,10 +212,9 @@ pub fn is_process_alive(pid: u32) -> bool {
     // would report "alive" because some unrelated group exists. Pid 0 is the
     // same hazard: it means the caller's own group, which is always alive.
     //
-    // Treating both as dead is a deliberate, narrow divergence: the TS does
-    // `process.kill(0, 0)`, which succeeds, so a lock file containing `0`
-    // makes the oracle report a conflict while r-orch treats the lock as
-    // stale. Needs a §14 entry; reachable only by hand-editing the lock file.
+    // Treating both as dead is deliberate: `kill(0, 0)` succeeds, so a lock
+    // file containing `0` would otherwise read as a live holder. Reachable
+    // only by hand-editing the lock file.
     let Some(target) = crate::process::manager::signal_target(pid) else {
         return false;
     };
@@ -281,7 +278,7 @@ mod tests {
         assert!(result.acquired);
         assert_eq!(result.pid, Some(std::process::id()));
 
-        // PARITY.md §6.7: decimal PID, no trailing newline.
+        // Decimal PID, no trailing newline.
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(raw, std::process::id().to_string());
         assert!(!raw.ends_with('\n'));
@@ -416,14 +413,13 @@ mod tests {
     /// A corrupt lock file blocks acquisition **and** reports no holder, so
     /// `require_lock` returns `Ok` without the lock being held.
     ///
-    /// That is the original's behaviour, replicated: `readLockPid` yields
-    /// `null`, so the stale-removal branch is skipped; `open(path, 'wx')` then
-    /// fails `EEXIST` and the result carries no PID; and `requireLock` only
-    /// throws when a PID is known. The orchestrator proceeds without mutual
-    /// exclusion and says nothing.
+    /// No PID is readable, so the stale-removal branch is skipped; creating
+    /// the file then fails `EEXIST` and the result carries no PID; and
+    /// `require_lock` only errors when a PID is known, so a caller of it would
+    /// proceed without mutual exclusion and say nothing.
     ///
-    /// Recorded rather than fixed: diverging here would change `run --watch`
-    /// behaviour against the oracle, and the file is only ever corrupt after a
+    /// Recorded rather than fixed: changing it would change `run --watch`
+    /// behaviour, and the file is only ever corrupt after a
     /// crash mid-write — which `O_CREAT|O_EXCL` plus a single small write
     /// makes very unlikely.
     #[tokio::test]
@@ -474,7 +470,7 @@ mod tests {
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        // The TS `parseInt(content.trim())` tolerates a trailing newline, so a
+        // Parsing trims the content, so a trailing newline is tolerated and a
         // lock written by an older build still reads.
         atomic_write(&path, &format!("{}\n", std::process::id()))
             .await

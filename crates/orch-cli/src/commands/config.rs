@@ -1,11 +1,10 @@
-//! `orch config` — ported from `src/cli/commands/config.ts`
-//! (`docs/parity/cli.md` §8).
+//! `orch config`.
 //!
 //! Four things here are easy to get wrong:
 //!
-//! - **all three `--json` sites are compact**, with no indent (§22.4), and
+//! - **all three `--json` sites are compact**, with no indent, and
 //!   `config get` on a missing key **drops the `value` key entirely** rather
-//!   than emitting `null` (§22.3);
+//!   than emitting `null`;
 //! - `config set` tries `JSON.parse` first and falls back to the raw string,
 //!   so `5000` is a number and `nope` is a string;
 //! - `config global set` with a bad value or an unknown key prints an error
@@ -31,7 +30,7 @@ struct KeyValue<'a> {
 }
 
 /// `JSON.stringify(value)` for the human line: a string keeps its quotes, and
-/// an absent value prints `undefined` as JS does.
+/// an absent value prints `undefined`.
 fn render_value(value: Option<&Value>) -> String {
     match value {
         Some(value) => serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_owned()),

@@ -1,15 +1,14 @@
 //! WP-2 — the eight adapters plus their shared plumbing.
 //!
-//! Each module is one `src/infrastructure/adapters/*.ts` file. The shared
+//! Each module is one adapter. The shared
 //! pieces live in [`util`] (prompt assembly, token extraction, the
 //! stream-json dispatch, the streaming generator) and [`buffer`] (the
 //! backpressured queue the shell adapter merges its two streams through).
 //!
-//! `data` shapes are **not** uniform across adapters: `interface.ts` declares
-//! a canonical shape but claude and cursor emit the whole `parsed.message`,
+//! `data` shapes are **not** uniform across adapters: there is a canonical
+//! shape but claude and cursor emit the whole `parsed.message`,
 //! codex emits `{ text, raw }`, opencode bare strings and shell bare line
-//! strings. PARITY.md §8.6 requires reproducing them as they are rather than
-//! normalizing, so consumers stay defensive.
+//! strings. They are kept as they are rather than normalized, so consumers stay defensive.
 
 pub mod antigravity;
 pub mod buffer;

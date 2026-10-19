@@ -1,11 +1,10 @@
 //! `serve --once` interrupted by a signal reports `interrupted`, not success.
 //!
-//! PARITY.md §14.38, a deliberate divergence decided by the user. The oracle
-//! computes its verdict from the task list without asking why it stopped
-//! waiting, so a run killed mid-flight reports `result="all_done"` and exits 0.
-//! Measured on the oracle with a planted unreadable task file: it ticks
-//! forever, logging `orchestrator:error` on each dispatch, and on SIGTERM
-//! emits `{"event":"serve:finished","result":"all_done","exit_code":0}`.
+//! The verdict must not come from the task list alone: a run killed mid-flight
+//! would then report `result="all_done"` and exit 0. With a planted unreadable
+//! task file, `serve --once` ticks forever, logging `orchestrator:error` on
+//! each dispatch, and on SIGTERM it must not emit
+//! `{"event":"serve:finished","result":"all_done","exit_code":0}`.
 //!
 //! This goes through the real binary rather than `run_once` directly, because
 //! the three things that matter here are process-level: the exit code the shell
@@ -90,25 +89,24 @@ fn a_signal_with_work_outstanding_reports_interrupted_and_exits_one() {
     assert!(
         stdout.contains(r#""result":"interrupted""#),
         "serve:finished must report `interrupted`, not a success it did not \
-         achieve (§14.38). stdout:\n{stdout}\nstderr:\n{}",
+         achieve. stdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         output.status.code(),
         Some(1),
-        "every non-success --once outcome exits 1 (§3)"
+        "every non-success --once outcome exits 1"
     );
     // The lock is the reason the wind-down runs on this path at all: an
-    // interrupted run must not wedge the project (§14.15).
+    // interrupted run must not wedge the project.
     assert!(
         !dir.path().join(".orchestry/orchestry.lock").exists(),
         "orchestry.lock was left behind by an interrupted run"
     );
 }
 
-/// The other half of §14.38, and the part that must *not* change: once every
-/// task is terminal, a stop is an ordinary completion and the output stays
-/// byte-identical to the oracle's.
+/// The other half, and the part that must *not* change: once every task is
+/// terminal, a stop is an ordinary completion and the output is unchanged.
 #[test]
 fn a_finished_project_still_reports_all_done_and_exits_zero() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -1,4 +1,4 @@
-//! Agent factory — ported from `src/application/agent-factory.ts`.
+//! Agent factory.
 //!
 //! Turns an Agent Shop template into a [`CreateAgentInput`]: resolves the
 //! template's semantic tier to a concrete model string for the chosen adapter,
@@ -10,9 +10,8 @@ use orch_domain::{AgentShopTemplate, CreateAgentInput, resolve_model};
 
 /// MCP skills use colon-separated names (e.g. `feature-dev:code-explorer`).
 ///
-/// Re-exported here because the TS module exports it and the CLI imports it
-/// from this module; the canonical implementation is
-/// [`orch_core::skills::is_mcp_skill`].
+/// Re-exported here because the CLI imports it from this module; the canonical
+/// implementation is [`orch_core::skills::is_mcp_skill`].
 pub fn is_mcp_skill(skill: &str) -> bool {
     orch_core::skills::is_mcp_skill(skill)
 }
@@ -23,7 +22,7 @@ pub fn is_mcp_skill(skill: &str) -> bool {
 /// an executable command, so a shell agent built from one could never run.
 /// An **unknown** adapter is *not* refused — `resolve_model` yields `""` for
 /// it, which becomes an absent `model`, and the agent is created with the
-/// adapter string as given. That asymmetry is the TS behaviour and the suite
+/// adapter string as given. That asymmetry is intended and the suite
 /// asserts it.
 pub fn template_to_agent_input(
     template: &AgentShopTemplate,
@@ -59,8 +58,7 @@ mod tests {
     use super::*;
     use orch_domain::{ApprovalPolicy, ModelTier};
 
-    /// The `baseTemplate` from `agent-factory.test.ts`, which is deliberately
-    /// not one of the shipped catalogue entries.
+    /// The base template, which is deliberately not one of the shipped catalogue entries.
     const BASE: AgentShopTemplate = AgentShopTemplate {
         key: "test",
         name: "Test Agent",

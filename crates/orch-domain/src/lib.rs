@@ -1,11 +1,11 @@
-//! Pure domain types and functions, ported from `src/domain/*.ts`.
+//! Pure domain types and functions.
 //!
 //! No I/O and no async: every item here is either a serializable record or a
 //! pure function. The serde attributes on the records are the on-disk and
-//! `--json` wire contract (PARITY.md §6.4, §4.2) — field order mirrors the
-//! TypeScript interface declaration order and every TS `?` field is skipped
-//! when absent. The one exception is [`Message::to_agent_id`], whose TS type
-//! is `string | null` and which therefore emits `null`.
+//! `--json` wire contract — field order is the
+//! declaration order and every optional field is skipped when absent. The one
+//! exception is [`Message::to_agent_id`], which is nullable and therefore
+//! emits `null`.
 
 // Stricter than the workspace lints, for library code only (integration tests are separate crates and
 // `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".

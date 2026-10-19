@@ -1,7 +1,6 @@
 # Lean CI: Linux only, the cheap hermetic steps of xtask/gate.sh (plus an
 # unconditional cargo-deny, which gate.sh skips when not installed). Not run here:
-# parity, probes, scenario lint (need Node / the gitignored TS oracle) and the
-# cold-target, no-real-cli and real-home gate steps (see gate.sh for those).
+# the cold-target, no-real-cli and home-hygiene gate steps (see gate.sh for those).
 name: ci
 
 on:
@@ -68,10 +67,4 @@ jobs:
       # Build and run in one step; --no-fail-fast reports every failing binary,
       # as gate.sh does. Some orch-cli tests need python3 (preinstalled) and
       # open their own pty/localhost sockets, which work without a TTY.
-      # The cross-binary tests (orch-infra concurrent_index, cross_compat)
-      # need the vendored TypeScript oracle under parity/orch-ts, which needs
-      # Node and is not built here; they skip themselves when this is set
-      # (ADR 0002: parity is optional).
       - run: cargo test --workspace --no-fail-fast
-        env:
-          ORCH_SKIP_CROSS_BINARY: "1"

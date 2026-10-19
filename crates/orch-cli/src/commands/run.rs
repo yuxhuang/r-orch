@@ -1,14 +1,12 @@
-//! `orch run` — ported from `src/cli/commands/run.ts`
-//! (`docs/parity/cli.md` §15).
+//! `orch run`.
 //!
 //! # Why this waits explicitly
 //!
-//! The original `await`s `runTask`/`runAll`, which return as soon as the
-//! dispatch is done, and then simply *returns* — node keeps the process alive
-//! because the agent's child process and the reactive-dispatch timer are open
-//! handles. The run therefore finishes, its collector writes the task and run
-//! records, and `process.exitCode` set from the `agent:completed` handler is
-//! what the shell sees.
+//! The dispatch calls return as soon as the dispatch is done, while the
+//! agent's child process and the reactive-dispatch timer keep working. The run
+//! has to finish, its collector has to write the task and run records, and
+//! the exit code set from the `agent:completed` handler is what the shell
+//! sees.
 //!
 //! Rust has no such implicit lifetime: returning here would drop the runtime
 //! and kill the agent mid-run. So the wait is explicit and reproduces exactly
@@ -36,7 +34,7 @@ const REACTIVE_DISPATCH_WINDOW: Duration = Duration::from_millis(1_500);
 ///
 /// Deliberately far longer than any agent's gap between events: the check is a
 /// backstop for a *lost* completion, not a poll loop, and ending the wait
-/// early would truncate the stream the reference prints in full.
+/// early would truncate the stream.
 const LOST_COMPLETION_POLL: Duration = Duration::from_secs(60);
 
 /// `run <task-id>` — dispatch one task and stream its events.
@@ -171,7 +169,7 @@ fn handle_single(
                 *target_run = Some(run_id.clone());
             }
         }
-        // Printed for every run, not just this task's — as in the original.
+        // Printed for every run, not just this task's.
         OrchestratorEvent::AgentOutput { data, .. } => {
             println!(
                 "  {time}  {} {}",
@@ -227,7 +225,7 @@ pub async fn all(engine: &FullEngine, styles: &Styles) -> Result<ExitCode> {
 
 /// Wait until no run is in flight and no reactive dispatch starts another.
 ///
-/// `--all` prints nothing per event — the original registers no listener in
+/// `--all` prints nothing per event — no listener is registered in
 /// this mode — so this only tracks the set of live runs.
 async fn drain_runs(events: &mut EventSubscription) {
     let mut in_flight: HashSet<String> = HashSet::new();
@@ -243,7 +241,7 @@ async fn drain_runs(events: &mut EventSubscription) {
             Ok(None) => return,
             // Nothing happened for a whole debounce window. With a run still
             // in flight that is just a quiet agent; with none, the queue has
-            // drained and node would have exited here too.
+            // drained, so there is nothing left to wait for.
             Err(_elapsed) => {
                 if in_flight.is_empty() {
                     return;
@@ -274,7 +272,7 @@ pub async fn watch(
     println!(
         "{} · watching · poll interval {}s",
         styles.paint(Color::Amber, "orch"),
-        // Integer division in the original too: `/ 1000` on a round number.
+        // Integer division: `/ 1000` on a round number.
         engine.config.scheduling.poll_interval_ms / 1000
     );
     println!("{}", "━".repeat(43));
@@ -284,9 +282,8 @@ pub async fn watch(
     // Ended by a token rather than `abort()`, and drained afterwards. The
     // shutdown emits a burst — `orchestrator:shutdown`, then a run, task and
     // agent event per entry the wind-down finishes — and aborting the pump
-    // discards whatever it has not printed yet, including the reference's last
-    // line (`Shutting down...`). The original's handler is synchronous and
-    // cannot lose any of it.
+    // discards whatever it has not printed yet, including the last line
+    // (`Shutting down...`).
     let done = tokio_util::sync::CancellationToken::new();
     let pump = tokio::spawn({
         let styles = *styles;
@@ -477,8 +474,7 @@ mod tests {
         let styles = Styles::plain();
         let (_temp, engine, run_id) = engine_with_run(orch_domain::RunStatus::Preparing).await;
         let mut failed = false;
-        // Still in flight: ending here would truncate the stream the
-        // reference prints in full.
+        // Still in flight: ending here would truncate the stream.
         assert!(!finish_from_record(&engine, &styles, &Some(run_id), &mut failed).await);
         // And an id with no record at all is not evidence of anything.
         assert!(

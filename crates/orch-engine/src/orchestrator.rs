@@ -1,30 +1,28 @@
-//! The orchestrator — ported from `src/application/orchestrator.ts`.
+//! The orchestrator.
 //!
 //! Conceptually **reconcile → dispatch → collect**, but only the first two are
 //! tick phases: collection runs as a detached task per run and completion is
 //! handled by [`Orchestrator::handle_run_success`] /
-//! [`Orchestrator::handle_run_failure`], each of which takes the state lock
-//! (PARITY.md §7.3).
+//! [`Orchestrator::handle_run_failure`], each of which takes the state lock.
 //!
 //! # Concurrency
 //!
-//! The TS code keeps two things that must stay coupled: a promise-chain mutex
-//! (`withStateLock`) and the state object it guards (`this.state`). Here they
-//! are **one** `tokio::sync::Mutex<Option<OrchestratorState>>`:
+//! A state lock and the state object it guards must stay coupled, so they are
+//! **one** `tokio::sync::Mutex<Option<OrchestratorState>>`:
 //!
-//! - Every public entry point that the TS wraps in `withStateLock` — `tick`,
+//! - Every public entry point that takes the state lock — `tick`,
 //!   `stop`, `cancel_task`, `force_stop_agent`, `fresh_dispatch`,
 //!   `handle_run_success`, `handle_run_failure` — acquires the guard and holds
-//!   it across its store I/O, exactly as the TS does. That serialization is
+//!   it across its store I/O. That serialization is
 //!   load-bearing: the whole `activeCollectors` / early-`delete running[id]` /
 //!   re-read-before-save bug history is about it.
 //! - Every internal phase takes `&mut OrchestratorState` as a parameter rather
-//!   than re-locking, so the compiler *proves* the TS deadlock that
-//!   `_handleRunFailure` exists to avoid cannot be reintroduced.
+//!   than re-locking, so the compiler *proves* a re-entrant-lock deadlock
+//!   cannot be reintroduced.
 //!
 //! One consequence is worth stating: `collect_events` updates
 //! `running[task].last_event_at` under the same guard, so that write waits for
-//! an in-flight phase instead of interleaving with it as it does in TS. The
+//! an in-flight phase instead of interleaving with it. The
 //! write is already debounced by [`Orchestrator::save_state_lazy`] and
 //! reconcile skips stall checks for tasks with an active collector, so no
 //! observable behaviour depends on the interleaving — and a torn read is
@@ -70,7 +68,7 @@ use crate::message_service::MessageService;
 use crate::run_service::RunService;
 use crate::task_service::TaskService;
 
-/// Max serialized event data written to JSONL (8 KB) — PARITY.md §7.20 layer 2.
+/// Max serialized event data written to JSONL (8 KB) — layer 2.
 const MAX_EVENT_DATA_LEN: usize = 8192;
 /// Max event data forwarded to the bus for TUI consumption (4 KB) — layer 3.
 const MAX_BUS_DATA_LEN: usize = 4096;
@@ -110,9 +108,8 @@ const REMOTE_QUEUED_WARN_MS: i64 = 60 * 60_000;
 /// current cycle intact; callers may retry once startup/cleanup has progressed.
 const WATCH_LIFECYCLE_WAIT: Duration = Duration::from_secs(3);
 
-/// Everything the orchestrator needs. Mirrors the TS `OrchestratorDeps`, with
-/// `lockPath: string` replaced by an injected [`ProjectLock`] and the two
-/// determinism seams added (ARCHITECTURE §5.6).
+/// Everything the orchestrator needs: the project lock is an injected
+/// [`ProjectLock`], and there are two determinism seams (ARCHITECTURE §5.6).
 pub struct OrchestratorDeps {
     pub task_store: Arc<dyn TaskStore>,
     pub agent_store: Arc<dyn AgentStore>,
@@ -129,12 +126,11 @@ pub struct OrchestratorDeps {
     pub clock: Arc<dyn Clock>,
     pub lock: Arc<dyn ProjectLock>,
     /// How auto-review criteria are executed. A seam because a unit test must
-    /// not shell out to `npm`, and because the differential harness forbids
-    /// the oracle spawning it at all (PARITY.md V31).
+    /// not shell out to `npm`.
     pub command_runner: Arc<dyn crate::review_runner::CommandRunner>,
     pub config: OrchestratorConfig,
     pub project_root: PathBuf,
-    /// Optional in TS, and the test helper leaves several of them out.
+    /// Optional; tests leave several of them out.
     pub context_store: Option<Arc<dyn orch_core::storage::ContextStore>>,
     pub message_service: Option<Arc<MessageService>>,
     pub goal_store: Option<Arc<dyn GoalStore>>,
@@ -158,7 +154,7 @@ pub struct WatchOptions {
 
 impl WatchOptions {
     /// Long-running watch mode (`orch serve`, `orch run --watch`, the TUI):
-    /// TS `startWatch()` with no options.
+    /// The default watch options.
     pub fn watching() -> Self {
         WatchOptions {
             skip_autonomous_seeding: false,
@@ -167,7 +163,7 @@ impl WatchOptions {
     }
 
     /// `serve --once`: drain the queue and exit, seeding nothing new.
-    /// TS `startWatch({ skipAutonomousSeeding: true })`.
+    /// Skips autonomous seeding.
     pub fn once() -> Self {
         WatchOptions {
             skip_autonomous_seeding: true,
@@ -207,7 +203,7 @@ struct Inner {
     /// Task ids started by `run <id>`; these must not trigger a reactive
     /// dispatch of anything else.
     single_task_runs: Mutex<HashSet<String>>,
-    /// Per-agent auto-seed cooldown. In-memory, as in TS — a restart reseeds.
+    /// Per-agent auto-seed cooldown. In-memory — a restart reseeds.
     last_auto_seed_at: Mutex<HashMap<String, i64>>,
 
     remote_state_dirty: AtomicBool,
@@ -320,7 +316,7 @@ impl Orchestrator {
         self.inner.deps.events.emit(event);
     }
 
-    /// `orchestrator:error { fatal: false }` — the TS code's universal
+    /// `orchestrator:error { fatal: false }` — the universal
     /// "something went wrong but the loop continues" channel. Every call site
     /// names its context, because that string is how `serve --json` and the
     /// TUI tell the failures apart.
@@ -470,8 +466,7 @@ impl Orchestrator {
     /// Start watch mode: acquire the lock, recover from a previous process,
     /// run one tick immediately, then poll.
     ///
-    /// Returns once the loop is running — like the TS method, which sets an
-    /// interval and resolves. Use [`Orchestrator::wait_for_stop`] to block.
+    /// Returns once the loop is running. Use [`Orchestrator::wait_for_stop`] to block.
     pub async fn start_watch(&self, options: WatchOptions) -> Result<()> {
         self.start_watch_with(options, || async { Ok(()) }).await
     }
@@ -558,9 +553,8 @@ impl Orchestrator {
         // `state.running` so the next startup's staleness filter skips them.
         // The first tick reconciles and dispatches everything ready (worktree
         // creation, agent spawns), so that window is seconds to minutes, and
-        // `systemctl restart` during startup walks straight into it. The
-        // reference registers both handlers before `await this.tick()`
-        // (`orchestrator.ts:224` vs `:232`); this now does the same.
+        // `systemctl restart` during startup walks straight into it. Both
+        // handlers are therefore registered before the first tick.
         //
         // Creating the arm is what replaces the disposition — a signal that
         // arrives during the first tick is held by tokio's signal driver and
@@ -620,7 +614,7 @@ impl Orchestrator {
             let state = slot.as_mut().expect("state loaded");
             // A previous process may have died mid-run: drop its running
             // entries and cancel the work rather than retrying it, so agents
-            // do not redo already-committed work (PARITY.md §7.6).
+            // do not redo already-committed work.
             self.cleanup_stale_running_entries(state).await?;
             // A crash between `adapter.execute` and `save_state` leaves a run
             // `running` with no entry here and an unparented child; nothing
@@ -713,7 +707,7 @@ impl Orchestrator {
     ///
     /// Every running agent is aborted, killed with a 10 s grace, its run
     /// finished as `cancelled` and its task sent to `resolve_failure_status` so
-    /// it retries if budget remains (PARITY.md §7.14).
+    /// it retries if budget remains.
     ///
     /// The in-engine callers — the signal arm and the tick circuit breaker —
     /// may be non-owners and then wait inside the watch task. That cannot
@@ -750,9 +744,8 @@ impl Orchestrator {
         //
         // Aborting it also cancels whatever the *tick* is doing, and a tick
         // cancelled between `atomic_write`'s temp file and its rename leaves
-        // `.orchestry/.state.json.<hash>.tmp` behind — litter the reference
-        // cannot produce, because `clearInterval` cannot interrupt a running
-        // callback.
+        // `.orchestry/.state.json.<hash>.tmp` behind — litter
+        // nobody wants.
         self.inner
             .shutdown
             .lock()
@@ -766,8 +759,8 @@ impl Orchestrator {
         self.cancel_lazy_save().await;
 
         // The save is allowed to fail without aborting the rest of the
-        // shutdown. The TS code `await`s it inside the critical section and
-        // lets a rejection propagate, which skips the lock release and wedges
+        // shutdown. Letting a rejection propagate out of the critical section
+        // would skip the lock release and wedge
         // the project for every later invocation — reachable here because the
         // tick circuit breaker calls `stop()` precisely when the state store
         // is the thing that is broken. The error is still returned, so a
@@ -948,8 +941,7 @@ impl Orchestrator {
         token
     }
 
-    /// Remove the token and cancel it if there was one — the TS
-    /// `abortControllers.get(id)?.abort(); abortControllers.delete(id)` pair.
+    /// Remove the token and cancel it if there was one.
     async fn take_cancel(&self, task_id: &str) {
         if let Some(token) = self.inner.cancels.lock().await.remove(task_id) {
             token.cancel();
@@ -1027,7 +1019,7 @@ impl Orchestrator {
 
     /// The circuit breaker: five consecutive rejections shut the orchestrator
     /// down, and every failure reports its running count so a watcher can see
-    /// the breaker approaching (PARITY.md §7.3).
+    /// the breaker approaching.
     async fn on_tick_failure(&self, err: Error) {
         let count = self
             .inner
@@ -1051,8 +1043,7 @@ impl Orchestrator {
     }
 }
 
-/// The `SIGINT`/`SIGTERM` arms of the watch loop, replacing the TS
-/// add/remove-listener dance. Dropping it removes the handlers.
+/// The `SIGINT`/`SIGTERM` arms of the watch loop. Dropping it removes the handlers.
 struct SignalArms {
     interrupt: Option<tokio::signal::unix::Signal>,
     terminate: Option<tokio::signal::unix::Signal>,

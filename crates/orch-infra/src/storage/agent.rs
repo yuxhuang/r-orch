@@ -1,5 +1,4 @@
-//! File-based agent store — ported from
-//! `src/infrastructure/storage/agent-store.ts`.
+//! File-based agent store.
 
 use async_trait::async_trait;
 use orch_core::error::{Error, Result};
@@ -26,7 +25,7 @@ impl FileAgentStore {
 #[async_trait]
 impl AgentStore for FileAgentStore {
     /// The index **unsorted** — so the order is last-write order, which is
-    /// what `findBestAgent` breaks score ties on (PARITY.md §14.4). Do not add
+    /// what `findBestAgent` breaks score ties on. Do not add
     /// a sort here.
     async fn list(&self) -> Result<Vec<Agent>> {
         self.index

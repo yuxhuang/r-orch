@@ -1,6 +1,5 @@
-//! Project configuration — the shape of `.orchestry/config.yml`
-//! (`src/domain/config.ts`), plus the pure value operations `ConfigStore`
-//! builds on.
+//! Project configuration — the shape of `.orchestry/config.yml`,
+//! plus the pure value operations `ConfigStore` builds on.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -78,7 +77,7 @@ pub struct OrchestratorConfig {
     pub peer: PeerConfig,
 }
 
-/// The TS `DEFAULT_CONFIG` constant (PARITY.md §6.5).
+/// The default project configuration.
 pub fn default_config() -> OrchestratorConfig {
     OrchestratorConfig {
         project: ProjectConfig {
@@ -120,7 +119,7 @@ impl Default for OrchestratorConfig {
 /// scalars, `null`) replaces.
 ///
 /// This is `ConfigStore`'s `deepMerge`. It operates on a value tree rather
-/// than on [`OrchestratorConfig`] because the TS store merges the raw parsed
+/// than on [`OrchestratorConfig`] because the store merges the raw parsed
 /// YAML over `DEFAULT_CONFIG` as plain objects — which means **unknown keys in
 /// `config.yml` survive a `config set` round trip**. `ConfigStore` must
 /// therefore keep the merged value for write-back and deserialize a typed
@@ -145,7 +144,7 @@ pub fn deep_merge(target: &Value, source: &Value) -> Value {
 }
 
 /// Read a `.`-separated dot path. Returns `None` for a missing key or when the
-/// path runs through a non-object (TS `undefined`).
+/// path runs through a non-object.
 pub fn get_by_path<'v>(obj: &'v Value, key_path: &str) -> Option<&'v Value> {
     let mut current = obj;
     for key in key_path.split('.') {
@@ -188,7 +187,7 @@ mod tests {
 
     #[test]
     fn default_config_matches_the_init_file() {
-        // PARITY.md §6.5, as written by `init` (with the default project name).
+        // As written by `init` (with the default project name).
         let value = serde_json::to_value(default_config()).unwrap();
         assert_eq!(
             value,
@@ -244,7 +243,7 @@ mod tests {
 
     #[test]
     fn null_in_the_source_replaces() {
-        // TS: `sourceVal !== null` fails the object test, so it is assigned.
+        // A null source is not an object, so it is assigned.
         assert_eq!(
             deep_merge(&json!({ "a": { "b": 1 } }), &json!({ "a": null })),
             json!({ "a": null })

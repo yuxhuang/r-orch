@@ -1,9 +1,7 @@
-//! Workspace preparation, cleanup and the merge strategy — ported from
-//! `src/infrastructure/workspace/*.ts`.
+//! Workspace preparation, cleanup and the merge strategy.
 //!
-//! Everything shells out to `git` (and `rsync`) with the exact argv from
-//! PARITY §10, through the [`ProcessManager`] port, with the project root as
-//! the working directory. Spawn failures, spawn errors and signal exits all
+//! Everything shells out to `git` (and `rsync`) with an exact argv, through the
+//! [`ProcessManager`] port, with the project root as the working directory. Spawn failures, spawn errors and signal exits all
 //! surface as exit code 1 and nothing here throws on them.
 
 mod manager;
@@ -22,7 +20,7 @@ use orch_core::process::{ProcessManager, SpawnOptions};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Cap on the interleaved stdout+stderr buffer (checked before each append, so
-/// it can overshoot by one chunk — as in the TS).
+/// it can overshoot by one chunk).
 const MAX_COMBINED_LEN: usize = 2000;
 
 /// What a finished process produced.

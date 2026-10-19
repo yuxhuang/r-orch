@@ -1,10 +1,9 @@
-//! File-based orchestrator state store — ported from
-//! `src/infrastructure/storage/state-store.ts`.
+//! File-based orchestrator state store.
 //!
 //! Reads are **tolerant**: a missing, malformed or wrong-typed field falls
 //! back to its default rather than failing the command
-//! ([`OrchestratorState::from_raw`], PARITY.md §6.6). Writes emit `claimed` as
-//! a JSON array; the `{}` form belongs to `status --json` alone (§14.1).
+//! ([`OrchestratorState::from_raw`]). Writes emit `claimed` as
+//! a JSON array; the `{}` form belongs to `status --json` alone.
 
 use async_trait::async_trait;
 use orch_core::error::Result;
@@ -29,12 +28,11 @@ impl FileStateStore {
 impl StateStore for FileStateStore {
     async fn read(&self) -> Result<OrchestratorState> {
         // Read as an untyped value: a strict deserialize would reject exactly
-        // the malformed files the TS reader tolerates.
+        // the malformed files that must still be tolerated.
         match read_json::<serde_json::Value>(&self.paths.state_path()).await {
             Ok(Some(raw)) => Ok(OrchestratorState::from_raw(Some(&raw))),
             Ok(None) => Ok(default_state()),
-            // Unparseable JSON is not recoverable field-by-field; the TS
-            // `readJson` throws here too.
+            // Unparseable JSON is not recoverable field-by-field.
             Err(err) => Err(err),
         }
     }
@@ -65,12 +63,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn written_state_matches_the_reference_bytes() {
+    async fn written_state_has_the_expected_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path()).await;
         store.write(&default_state()).await.unwrap();
 
-        // PARITY.md §6.6 — note `claimed` is an array on disk.
+        // Note `claimed` is an array on disk.
         assert_eq!(
             tokio::fs::read_to_string(store.paths.state_path())
                 .await

@@ -1,5 +1,4 @@
-//! File-based task store — ported from
-//! `src/infrastructure/storage/task-store.ts`.
+//! File-based task store.
 
 use async_trait::async_trait;
 use orch_core::error::Result;
@@ -43,7 +42,7 @@ impl TaskStore for FileTaskStore {
     /// (newest first).
     ///
     /// `sort_by`, never `sort_unstable_by`: ties must keep index order, which
-    /// is last-write order (PARITY.md §14.4). The workspace `clippy.toml`
+    /// is last-write order. The workspace `clippy.toml`
     /// enforces that.
     async fn list(&self, filter: &TaskFilter) -> Result<Vec<Task>> {
         let mut tasks: Vec<Task> = self

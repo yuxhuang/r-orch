@@ -1,11 +1,11 @@
 //! The fake agent CLIs in `fixtures/fake-agents/`, driven through the real
 //! adapters.
 //!
-//! The differential harness puts that directory first on `PATH` and runs both
-//! binaries against it, so these scripts are as load-bearing as a fixture:
-//! if one emits a shape an adapter mis-parses, every scenario built on it is
-//! quietly wrong. This suite is what keeps them honest, and it exercises the
-//! adapters against a genuine CLI-shaped child rather than a scripted one.
+//! Other tests (for example `orch-cli`'s `tui_first_run`) put that directory
+//! first on `PATH`, so these scripts are as load-bearing as a fixture: if one
+//! emits a shape an adapter mis-parses, every test built on it is quietly
+//! wrong. This suite is what keeps them honest, and it exercises the adapters
+//! against a genuine CLI-shaped child rather than a scripted one.
 //!
 //! The command is resolved here rather than through `PATH`, because the
 //! resolution a `PATH` override gets is platform-dependent and the crate
@@ -247,7 +247,7 @@ async fn the_stderr_flood_scenario_does_not_deadlock_any_adapter() {
 
 #[tokio::test]
 async fn the_prompt_can_select_a_scenario_on_its_own() {
-    // This is how one differential scenario makes a single task fail.
+    // This is how a test makes a single task fail.
     let pm = FakeAgentProcessManager::new();
     let adapter = adapter_for("claude", pm as Arc<dyn ProcessManager>);
     let mut execute_params = params("please ORCH_FAKE_FAIL now", "/ws");

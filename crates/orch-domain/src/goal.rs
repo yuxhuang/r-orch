@@ -1,8 +1,8 @@
 //! Goal domain model — a persistent objective that drives autonomous agent
-//! work (`src/domain/goal.ts`).
+//! work.
 //!
 //! State machine: `active → achieved | abandoned | paused`,
-//! `paused → active | achieved | abandoned` (PARITY.md §7.2).
+//! `paused → active | achieved | abandoned`.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +35,7 @@ impl GoalStatus {
         }
     }
 
-    /// Allowed outgoing transitions (PARITY.md §7.2).
+    /// Allowed outgoing transitions.
     pub fn allowed_transitions(&self) -> &'static [GoalStatus] {
         match self {
             GoalStatus::Active => &[
@@ -89,7 +89,7 @@ pub fn goal_status_order(status: GoalStatus) -> u8 {
     }
 }
 
-/// Field order mirrors the TS `Goal` interface (PARITY.md §6.8).
+/// Field order is the serialized field order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Goal {
     pub id: String,
@@ -152,8 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_shape() {
-        // PARITY.md §4.2.
+    fn serialized_shape() {
         let goal = Goal {
             id: "goal_717sF1B".into(),
             title: "Ship v2".into(),

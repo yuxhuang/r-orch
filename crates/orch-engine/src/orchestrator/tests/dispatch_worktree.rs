@@ -1,5 +1,4 @@
-//! Ported from `test/unit/application/orchestrator-dispatch-worktree.test.ts`
-//! (bug-dom-001).
+//! Regression test for bug-dom-001.
 //!
 //! Dispatch persists `proof.branch` immediately so a later failure cannot lose
 //! the branch. The bug was that it wrote a **stale local copy** of the task,
@@ -191,7 +190,6 @@ async fn a_non_worktree_dispatch_writes_no_branch_at_all() {
 
 /// Returns `None` from `get` once the call count passes a threshold, so the
 /// post-dispatch re-read sees a task that has been deleted underneath it.
-/// The TS test does the same with a counting `mockImplementation`.
 struct VanishingTaskStore {
     inner: Arc<FakeTaskStore>,
     gets: std::sync::atomic::AtomicUsize,

@@ -59,5 +59,5 @@ Each check gets a fresh project (`orch init --adapter shell`, 2 agents with `--c
 1 goal, 2 named tasks plus `FILLERS` unnamed ones so the list is long enough for `wheel.cap`) and a throwaway `HOME`/`XDG_*`, set only on `orch` processes. `orch tui` runs
 with `--observe` so no orchestrator starts and nothing is dispatched. tmux uses socket
 `-L orch-e2e` with `-f /dev/null`; the server, the web process and the browser are torn down at exit.
-`orch tui` exits on pty hangup (PARITY §14.39 — a defect this harness found), so `kill-session`
+`orch tui` exits on pty hangup (a defect this harness found), so `kill-session`
 suffices; the harness also SIGKILLs the pane process as a belt against a check that wedged it.

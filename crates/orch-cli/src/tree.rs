@@ -1,42 +1,37 @@
 //! The clap command tree — every command, subcommand, alias, positional and
-//! flag of the TypeScript CLI (PARITY.md §2.2, `docs/parity/cli.md` §4–§19).
+//! flag of the `orch` CLI.
 //!
-//! This is the surface V1 checks, so it is exhaustive on purpose: a flag that
-//! exists here but nowhere in the reference, or an arity that differs, is a
+//! The surface test checks this, so it is exhaustive on purpose: a flag that
+//! is missing or extra, or an arity that differs, is a
 //! defect even when no behaviour hangs off it yet.
 //!
-//! Two deliberate differences from Commander, both **L2** (PARITY.md §5 lists
-//! `--help` layout and wording as "may differ"):
+//! Two deliberate choices, both limited to `--help` layout and wording:
 //!
-//! - help is rendered by clap, not re-implemented in Commander's layout;
-//! - where Commander shows one description in the lazy "stub" tree and
-//!   another once a container exists (`docs/parity/cli.md` §1.6), there is one
-//!   clap tree and it carries the **registered** (longer) description.
+//! - help is rendered by clap, not hand-laid-out;
+//! - there is one clap tree, and it carries the **registered** (longer)
+//!   description of each command.
 //!
 //! Everything else here — names, aliases, value names, shorts, defaults,
 //! `required`, and which flags are global — is contract.
 
 use clap::{Args, Parser, Subcommand};
 
-/// The commands the reference knows about, in the order
-/// `src/bin/cli.ts`'s `COMMAND_STUBS` lists them.
+/// The known commands, in registration order.
 ///
 /// Used by the pre-parse routing guard, which has to decide whether the first
-/// non-flag token is a real subcommand *before* clap sees the argv
-/// (`docs/parity/cli.md` §1.6).
+/// non-flag token is a real subcommand *before* clap sees the argv.
 pub const ALL_KNOWN_COMMANDS: [&str; 18] = [
     "task", "agent", "status", "logs", "config", "context", "msg", "goal", "team", "org", "run",
     "doctor", "tui", "serve", "web", "init", "update", "remote",
 ];
 
 /// The three commands that run without a container, and so without
-/// `requireInit()` (PARITY.md §2.1). `doctor` additionally runs in either
+/// an initialized project. `doctor` additionally runs in either
 /// tier, which is why it is here *and* takes a container when one exists.
 pub const CONTAINER_LESS_COMMANDS: [&str; 3] = ["init", "update", "doctor"];
 
 /// The version `--version` prints and the dashboard reports: this crate's own
-/// release version (PARITY.md §2 — the harness checks that a version is
-/// printed, not its value).
+/// release version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The parsed command line. clap parses [`RawCli`]; this type adds the one
@@ -59,7 +54,7 @@ pub struct Cli {
     name = "orchestry",
     about = "Agents Organizations — CLI orchestrator for AI agents",
     version = VERSION,
-    // Commander renders usage errors and exits 1; clap's default is 2, and the
+    // Usage errors exit 1; clap's default is 2, and the
     // mapping lives in `run()`.
     disable_help_flag = false
 )]
@@ -948,7 +943,7 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// V1: every command, subcommand, alias, positional and flag of §2.2
+    /// Every command, subcommand, alias, positional and flag
     /// exists with the same arity.
     ///
     /// The table is the spec transcribed, so a drift fails here rather than in
@@ -1195,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn the_command_surface_matches_the_parity_table() {
+    fn the_command_surface_matches_the_surface_table() {
         for (path, positionals, options) in SURFACE {
             let command = find(path);
 
@@ -1498,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_match_the_reference() {
+    fn the_defaults_are_stable() {
         let cli = Cli::try_parse_from(["orch", "task", "add", "t"]).expect("parses");
         let Some(Command::Task(TaskCmd {
             command: Some(TaskSub::Add(flags)),

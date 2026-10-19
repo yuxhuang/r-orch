@@ -276,7 +276,7 @@ fn ctrl() -> KeyModifiers {
 // ── D10.3 geometry and O3 provenance ────────────────────────────────────
 
 #[test]
-fn tv01_geometry_matches_the_d10_oracle_at_minimum_and_default_sizes() {
+fn tv01_geometry_at_minimum_and_default_sizes() {
     for (w, h, body_rows, footer_row) in [(40, 14, 4, 12), (80, 24, 14, 22), (120, 40, 30, 38)] {
         let mut v = V::sized(w, h);
         v.open(doc("hello"));
@@ -604,7 +604,7 @@ fn v4_scrolling_during_a_drag_extends_onto_newly_visible_text() {
 // ── N3/N8: text paging and wheel ────────────────────────────────────────
 
 #[test]
-fn n3_text_paging_follows_the_d2_oracle() {
+fn n3_text_paging_follows_shared_navigation() {
     needs_shared_navigation!();
     // 23 visual rows in a 10-row body: 80x17 gives H-7-3 = 7… so size it.
     let body: String = (0..22).map(|i| format!("r{i}\n")).collect::<String>() + "r22";

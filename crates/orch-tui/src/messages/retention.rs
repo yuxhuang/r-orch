@@ -166,7 +166,7 @@ pub fn flush_messages(
     for mut p in std::mem::take(pending) {
         // A line identical to the latest one from the same source adds
         // nothing: keep the first, whose timestamp then reads as how long
-        // the state has lasted (PARITY.md §12.8 (k)).
+        // the state has lasted.
         if repeats_latest(live, &p) {
             report.deduplicated += 1;
             continue;

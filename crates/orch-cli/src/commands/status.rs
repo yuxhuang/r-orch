@@ -1,15 +1,10 @@
-//! `orch status` — ported from `src/cli/commands/status.ts`
-//! (`docs/parity/cli.md` §6).
+//! `orch status`.
 //!
-//! The one place where r-orch deliberately differs from the oracle's `--json`:
 //! **`state.claimed` is emitted as an array** of claimed task ids, the same
-//! shape `state.json` holds on disk. The reference serializes its in-memory
-//! JS `Set`, which `JSON.stringify` renders as `{}` for any contents. That is
-//! PARITY.md §14.1, decided as a **fix** by the user; the harness masks the
-//! field in `status --json` comparisons and asserts our value against
-//! `state.json` instead.
+//! shape `state.json` holds on disk, so `status --json` consumers see the real
+//! ids rather than an empty `{}`.
 //!
-//! Everything else is the reference's: the un-indented header line, the status
+//! Everything else: the un-indented header line, the status
 //! counts in first-seen order over the task list, `RUNNING` counted from
 //! `state.running` rather than from the tasks, and no `--quiet` handling.
 
@@ -26,7 +21,7 @@ use crate::output::{Color, Styles, format_duration_since, format_tokens};
 /// `{ tasks, agents, state }`, with `claimed` as an array.
 ///
 /// A dedicated struct rather than an ad-hoc `json!`, so the field order is
-/// the reference's and the `claimed` shape is visible in one place.
+/// fixed and the `claimed` shape is visible in one place.
 #[derive(Debug, Serialize)]
 struct StatusJson<'a> {
     tasks: &'a [Task],
@@ -41,7 +36,7 @@ pub async fn run(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<(
 
     if let Some(format) = ctx.output {
         // `OrchestratorState` serializes `claimed` as the `IndexSet` it is,
-        // i.e. a JSON array — §14.1's fix, and identical to `state.json`.
+        // i.e. a JSON array, identical to `state.json`.
         return format.print(&StatusJson {
             tasks: &tasks,
             agents: &agents,
@@ -178,8 +173,8 @@ mod tests {
 
     #[test]
     fn claimed_is_emitted_as_an_array_not_an_empty_object() {
-        // PARITY.md §14.1, the fix: `status --json` must carry the claimed
-        // task ids, which the reference loses by stringifying a JS `Set`.
+        // `status --json` must carry the claimed task ids, not an empty
+        // object.
         let mut state = default_state();
         state.claimed.insert("tsk_AAAAAAA".to_owned());
         state.claimed.insert("tsk_BBBBBBB".to_owned());
@@ -216,9 +211,7 @@ mod tests {
 
     #[test]
     fn the_claimed_array_matches_what_state_json_would_hold() {
-        // The harness asserts exactly this equality in place of the masked
-        // comparison, so it is worth pinning here too: both sides serialize
-        // the same `OrchestratorState`.
+        // Both sides serialize the same `OrchestratorState`.
         let mut state = default_state();
         state.claimed.insert("tsk_AAAAAAA".to_owned());
 

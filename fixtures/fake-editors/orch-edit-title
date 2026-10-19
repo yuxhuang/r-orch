@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Rewrite the frontmatter `title:` (task) or `name:` (agent). The body, and
-# every other frontmatter key, must come back untouched.
-set -euo pipefail
-file="$1"
-sed -i 's/^title: .*/title: Edited by the fake editor/; s/^name: .*/name: edited-agent/' "$file"

@@ -1,12 +1,11 @@
-//! `orch goal` — ported from `src/cli/commands/goal.ts`
-//! (`docs/parity/cli.md` §10).
+//! `orch goal`.
 //!
 //! Three things here are measured behaviour rather than taste:
 //!
 //! - `goal status` splits its failures across two exit codes — an unknown
 //!   *status name* prints an error and exits **1**, while a known name that is
 //!   not a legal transition comes out of the service as exit **2**;
-//! - `goal delete --json` prints the **compact** `{"deleted":"…"}` (§22.4);
+//! - `goal delete --json` prints the **compact** `{"deleted":"…"}`;
 //! - `goal show --json` is the goal object *spread* with `tasks` and
 //!   `progress` appended, and `progress` is dropped entirely when there is no
 //!   progress entry (`undefined`, not `null`).
@@ -23,7 +22,7 @@ use serde_json::{Value, json};
 use crate::context::CliContext;
 use crate::output::{Styles, print_error, print_key_value, print_success, print_table};
 
-/// Goal status icons. Hard-coded in the original — unlike the task icons
+/// Goal status icons. Hard-coded — unlike the task icons
 /// these have no ASCII fallback, so `--ascii` does not change them.
 fn status_icon(status: GoalStatus) -> &'static str {
     match status {
@@ -90,8 +89,8 @@ pub async fn list(
     status: Option<&str>,
 ) -> Result<()> {
     let goals = match status {
-        // `!filter?.status` in the original, so an empty `--status` is no
-        // filter at all rather than a filter nothing matches.
+        // An empty `--status` is no filter at all rather than a filter
+        // nothing matches.
         None | Some("") => engine.goal_service.list(&GoalFilter::default()).await?,
         Some(raw) => match raw.parse::<GoalStatus>() {
             Ok(status) => {
@@ -100,7 +99,7 @@ pub async fn list(
                     .list(&GoalFilter::with_status(status))
                     .await?
             }
-            // An unknown status is not rejected: the original compares it by
+            // An unknown status is not rejected: it is compared by
             // equality, so nothing matches and the list comes back empty.
             Err(()) => Vec::new(),
         },
@@ -133,7 +132,7 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
             "tasks".to_owned(),
             serde_json::to_value(&tasks).expect("tasks serialize"),
         );
-        // `undefined` in the original, so the key is absent rather than null.
+        // The key is absent rather than null when there is no progress.
         if let Some(progress) = &progress {
             object.insert("progress".to_owned(), Value::String(progress.clone()));
         }

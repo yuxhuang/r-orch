@@ -2,17 +2,15 @@
 //!
 //! Each fake:
 //! - **clones on read and on write**, so a caller cannot mutate stored state
-//!   by holding on to a returned value (the TS fakes `structuredClone` for
-//!   exactly this reason);
+//!   by holding on to a returned value;
 //! - records every trait call in a public [`Recorder`];
 //! - runs every trait call through a public [`Faults`] first;
 //! - offers non-recording `seed_*` / `peek_*` helpers for arranging and
 //!   inspecting state without polluting the call log.
 //!
-//! Where the TS mock was a bare stub returning `[]` (`listForTask`,
-//! `listForAgent`, `readEventsTail`, `streamEvents`), these fakes implement
-//! the real filtering instead — a fake that lies is worse than one that works,
-//! and nothing in the TS suite depended on the stub.
+//! Where a bare stub returning `[]` would do (`listForTask`, `listForAgent`,
+//! `readEventsTail`, `streamEvents`), these fakes implement the real filtering
+//! instead — a fake that lies is worse than one that works.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -40,11 +38,11 @@ fn lock<T>(cell: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// `IndexManager::save` semantics: **remove the entity by id, then push it to
-/// the end** (PARITY.md §6.10).
+/// the end**.
 ///
 /// Index order is therefore *last-write* order, not creation order, and that
 /// is observable — `findBestAgent` resolves equal-scoring agents by position
-/// in `AgentStore::list()` and r-orch replicates it (PARITY.md §14.4). A plain
+/// in `AgentStore::list()`. A plain
 /// `IndexMap::insert` keeps the existing position and would silently change
 /// which agent gets picked.
 fn save_at_end<V>(map: &mut IndexMap<String, V>, id: String, value: V) {
@@ -937,8 +935,8 @@ pub enum TeamStoreCall {
 }
 
 /// `TeamStore` has **no `_index.json`** — the real store scans its directory,
-/// so list order is filesystem enumeration order and is not contract
-/// (PARITY.md §6.10). This fake keeps insertion order for determinism; do not
+/// so list order is filesystem enumeration order and is not contract.
+/// This fake keeps insertion order for determinism; do not
 /// write a test that depends on it.
 #[derive(Debug, Clone, Default)]
 pub struct FakeTeamStore {
@@ -1129,9 +1127,9 @@ mod tests {
 
     #[tokio::test]
     async fn save_moves_the_entity_to_the_end_of_the_index() {
-        // PARITY.md §6.10: IndexManager::save removes by id then pushes. Index
-        // order is last-write order, which §14.4 makes observable through
-        // findBestAgent tie-breaking.
+        // IndexManager::save removes by id then pushes. Index order is
+        // last-write order, which is observable through findBestAgent
+        // tie-breaking.
         let store = FakeTaskStore::with_tasks([
             Task {
                 id: "tsk_a".into(),
@@ -1177,7 +1175,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_list_order_is_last_write_order() {
-        // This is the ordering findBestAgent ties fall back to (§14.4).
+        // This is the ordering findBestAgent ties fall back to.
         let store = FakeAgentStore::with_agents([
             Agent {
                 id: "agt_a".into(),
@@ -1314,7 +1312,7 @@ mod tests {
             "disk full"
         );
         assert!(store.is_empty());
-        // The call is still recorded, as a `vi.fn()` mock would.
+        // The call is still recorded.
         assert_eq!(store.calls.len(), 1);
         store.save(&make_task()).await.unwrap();
         assert_eq!(store.len(), 1);

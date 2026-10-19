@@ -191,8 +191,8 @@ class TmuxBase:
         return out == ["1", "1"], "tmux pane mouse_any/mouse_sgr flags = %s" % " ".join(out)
 
     def stop(self):
-        # `orch tui` now exits on its own when the pty hangs up (PARITY §14.39,
-        # which this harness found), so `kill-session` is enough. The explicit
+        # `orch tui` now exits on its own when the pty hangs up (a defect
+        # this harness found), so `kill-session` is enough. The explicit
         # kill stays as a belt: a check that wedged the app mid-wizard should
         # not leave a pane behind for the next one.
         pids = self.tmux("list-panes", "-s", "-t", self.sess, "-F", "#{pane_pid}", check=False).split()

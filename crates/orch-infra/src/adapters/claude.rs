@@ -1,5 +1,4 @@
-//! Claude Code adapter — `src/infrastructure/adapters/claude.ts`,
-//! `kind = "claude"` (`docs/parity/adapters.md` §2.1).
+//! Claude Code adapter for `kind = "claude"`.
 //!
 //! Spawns `claude --print --output-format stream-json` in headless mode and
 //! parses JSON lines from stdout.

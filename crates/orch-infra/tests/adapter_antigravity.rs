@@ -1,4 +1,4 @@
-//! Ported from `test/unit/infrastructure/antigravity-adapter.test.ts`.
+//! Antigravity adapter tests.
 
 mod support;
 
@@ -127,7 +127,7 @@ async fn an_empty_run_still_emits_done() {
 
 #[tokio::test]
 async fn a_non_zero_exit_fails_the_run_even_after_output() {
-    // Replicated quirk: antigravity's exit check has no done-event guard, so
+    // Quirk: antigravity's exit check has no done-event guard, so
     // output does not rescue a non-zero exit.
     let collected = run(Script::new().stdout("some output\n").exit(1)).await;
     assert_eq!(collected.kinds(), [AgentEventKind::Output]);
@@ -143,7 +143,7 @@ async fn a_non_zero_exit_fails_the_run_even_after_output() {
 
 #[tokio::test]
 async fn a_signal_kill_still_yields_a_synthetic_done() {
-    // The other replicated quirk: `exitCode === null` skips the error check
+    // The other quirk: `exitCode === null` skips the error check
     // and falls through to the terminal event.
     let collected = run(Script::new().stdout("partial\n").killed_by(9)).await;
     collected.expect_ok();

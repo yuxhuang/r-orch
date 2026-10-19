@@ -1,7 +1,7 @@
 //! The activity-message model: types, icons, colours, the event formatter and
-//! the run-id maps (`src/tui/App.tsx`).
+//! the run-id maps.
 //!
-//! The caps here are OOM defences, not cosmetics (PARITY.md §12.6).
+//! The caps here are OOM defences, not cosmetics.
 
 pub mod format;
 pub mod retention;
@@ -166,7 +166,7 @@ impl MsgType {
         }
     }
 
-    /// `getMsgTextColor` — `None` means "use the message's own colour".
+    /// `None` means "use the message's own colour".
     pub fn text_token(self) -> Option<Token> {
         match self {
             MsgType::Output => Some(Token::White),
@@ -179,7 +179,7 @@ impl MsgType {
         }
     }
 
-    /// `getMsgBg` — only errors get a row background; the feed is deliberately
+    /// Only errors get a row background; the feed is deliberately
     /// calm.
     pub fn background_token(self) -> Option<Token> {
         match self {
@@ -439,8 +439,8 @@ pub(crate) fn record_bytes(
         .saturating_add(task.map_or(0, String::capacity))
 }
 
-/// Insertion-ordered `runId → value` map with an oldest-first prune, matching
-/// the TS `Map` used as a poor man's LRU.
+/// Insertion-ordered `runId → value` map with an oldest-first prune, used as
+/// a poor man's LRU.
 #[derive(Debug, Clone, Default)]
 pub struct RunMap {
     inner: IndexMap<String, String>,
@@ -493,8 +493,7 @@ pub struct PendingMessage {
     pub task_id: Option<String>,
     pub detail: Option<String>,
     /// The message's own instant, when it has one: history entries carry the
-    /// time the event was recorded (`ts: new Date(entry.timestamp).getTime()`
-    /// in `historyEntryToMsg`), so a backfilled run keeps reading `2h` rather
+    /// time the event was recorded, so a backfilled run keeps reading `2h` rather
     /// than `now`. `None` means "stamp it with the flush time", which is what
     /// every live event wants.
     pub ts_ms: Option<i64>,
@@ -540,7 +539,7 @@ fn classification_tokens(classification: Classification) -> (MsgType, Token) {
     (msg_type, color)
 }
 
-/// `formatEvent` — the event → message mapping (docs/parity/tui.md §7).
+/// The event → message mapping.
 ///
 /// Returns `None` for events that produce no feed entry (an idle
 /// `orchestrator:tick`, an `agent:output` whose summary is skipped, and every
@@ -714,7 +713,7 @@ pub fn preset_types(preset: &str) -> IndexSet<MsgType> {
     }
 }
 
-/// `cyclePreset` — find the current preset by **exact set equality** and
+/// Find the current preset by **exact set equality** and
 /// advance with wrap; an unrecognised set starts from `all`.
 pub fn cycle_preset(current: &IndexSet<MsgType>) -> &'static str {
     let index = ACTIVITY_PRESETS
@@ -739,7 +738,7 @@ fn sets_equal(a: &IndexSet<MsgType>, b: &IndexSet<MsgType>) -> bool {
     a.len() == b.len() && a.iter().all(|t| b.contains(t))
 }
 
-/// The logs status-bar `f:` label (docs/parity/tui.md §1.4).
+/// The logs status-bar `f:` label.
 pub fn type_filter_label(filter: &IndexSet<MsgType>) -> String {
     if filter.len() >= 8 {
         return "all".into();

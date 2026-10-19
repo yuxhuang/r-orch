@@ -1,4 +1,4 @@
-//! `orch task` — ported from `src/cli/commands/task.ts`.
+//! `orch task`.
 //!
 //! Four details that are easy to lose:
 //!
@@ -9,8 +9,7 @@
 //! - `cancel` builds the **full** container only when the task is
 //!   `in_progress`, because only then is there a process to kill;
 //! - none of `cancel`/`approve`/`reject`/`retry` honours `--json` or
-//!   `--quiet`: they always print their success line
-//!   (`docs/parity/cli.md` §21.6).
+//!   `--quiet`: they always print their success line.
 
 use orch_core::error::Result;
 use orch_core::storage::TaskFilter;
@@ -21,9 +20,8 @@ use crate::context::CliContext;
 use crate::editor;
 use crate::output::{Styles, print_key_value, print_success, print_table};
 
-/// Comma-separated list option: split, trim, keep empties out of the way the
-/// TS does **not** — `"a,,b".split(',').map(trim)` yields `["a", "", "b"]`, so
-/// an empty element survives. Replicated.
+/// Comma-separated list option: split and trim, keeping empty elements:
+/// `"a,,b"` yields `["a", "", "b"]`.
 fn split_list(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -246,8 +244,7 @@ fn task_row(styles: &Styles, task: &Task, remote: Option<&RemoteRunRef>) -> Vec<
 ///
 /// Prints `Assigned <id> → <resolved assignee>`, falling back to the argument
 /// when the task ended up with no assignee at all. **Not** `--quiet`-aware:
-/// `task assign` is in the ignored half of the matrix
-/// (`docs/parity/cli.md` §21.6).
+/// `task assign` is in the ignored half of the matrix.
 pub async fn assign(
     engine: &Engine,
     ctx: &CliContext,
@@ -746,7 +743,7 @@ mod tests {
         assert_eq!(split_list("a,b"), vec!["a".to_owned(), "b".to_owned()]);
         assert_eq!(split_list(" a , b "), vec!["a".to_owned(), "b".to_owned()]);
         assert_eq!(split_list("a"), vec!["a".to_owned()]);
-        // The TS `split(',').map(trim)` keeps the empty element; replicated.
+        // The empty element is kept.
         assert_eq!(
             split_list("a,,b"),
             vec!["a".to_owned(), String::new(), "b".to_owned()]

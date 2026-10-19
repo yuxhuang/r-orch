@@ -1,5 +1,4 @@
-//! The terminal event loop (`src/cli/commands/tui.ts`'s `render(...)` plus
-//! `waitUntilExit()`).
+//! The terminal event loop.
 //!
 //! Lives here rather than in the CLI so `orch tui` is one call: build a
 //! [`TuiBackend`] and hand it to [`run`]. Nothing in this module is reachable
@@ -41,8 +40,8 @@ const MAX_DRAIN: Duration = Duration::from_millis(40);
 /// environment and removes only the password variable (`web/pty.rs`).
 ///
 /// An env var rather than a flag or a config key on purpose: the flag surface
-/// is **L0** (PARITY.md §1.1 item 2, asserted by `tree.rs`'s `SURFACE` table)
-/// and `config.yml` is a closed **L0** schema both binaries read (§6.5).
+/// is fixed (asserted by `tree.rs`'s `SURFACE` table) and `config.yml` is a
+/// closed schema both binaries read.
 pub const MOUSE_ENV: &str = "ORCH_TUI_MOUSE";
 
 /// The DEC private modes mouse capture turns on: normal tracking (1000),
@@ -120,9 +119,9 @@ pub enum Exit {
     /// `q`, or the `stop` flag: someone asked to leave, and there is still a
     /// terminal to show the shutdown on.
     Requested,
-    /// The terminal went away mid-session (PARITY.md §14.39). Nobody is
+    /// The terminal went away mid-session. Nobody is
     /// watching the shutdown and nobody is waiting out an agent's stop grace,
-    /// which is what lets the caller bound the wind-down (§14.40).
+    /// which is what lets the caller bound the wind-down.
     TerminalGone,
 }
 
@@ -213,8 +212,8 @@ pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exi
         loop {
             handled += 1;
             // Residual window, considered and accepted: `read()` blocks inside
-            // crossterm's own loop — the one whose `Ok(0)`-forever behaviour
-            // §14.39 is about — so if the terminal hangs up *after* our wait
+            // crossterm's own loop — the one that spins on `Ok(0)` forever once
+            // the terminal hangs up — so if the terminal hangs up *after* our wait
             // said `Input` but before crossterm has an event, the spin is back
             // and the hang-up check below is unreachable. It needs the last
             // bytes on the wire to be a truncated sequence, and every other
@@ -330,7 +329,7 @@ impl TerminalGuard {
         execute!(stdout, EnterAlternateScreen)?;
         // `Ctrl+Enter` is only distinguishable from `Enter` under the Kitty
         // keyboard protocol; the wizard keeps its `Tab` confirm fallback for
-        // terminals without it (docs/parity/tui.md §2.7).
+        // terminals without it.
         //
         // Ask the terminal rather than inferring support from a successful
         // write: the push is just bytes on a pipe, so it "succeeds" against a

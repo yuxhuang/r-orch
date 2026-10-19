@@ -2,14 +2,13 @@
 
 `orch-tui` does **not** depend on `orch-engine`. Everything the dashboard needs
 from the rest of the system goes through one trait, `orch_tui::backend::TuiBackend`
-(`src/backend/mod.rs`), implemented in the TS original by the ~45 callbacks that
-`src/cli/commands/tui.ts` passes to `App`. The CLI (WP-5) implements this trait
-over the DI container; the tests use the in-crate `FakeBackend`.
+(`src/backend/mod.rs`). The CLI implements this trait over the DI container
+(`crates/orch-cli/src/tui/backend.rs`); the tests use the in-crate `FakeBackend`.
 
 Everything below is the contract. If you need a shape changed, say so rather than
-widening it locally — the TUI's parity tests are written against this surface.
+widening it locally — the TUI's tests are written against this surface.
 
-## Two shape changes from the TS callbacks
+## Shape of the facade
 
 1. **Synchronous.** Every method returns a value, not a future. A call is a
    *request*: an implementation must not block on long-running work. `run_task`
@@ -17,16 +16,15 @@ widening it locally — the TUI's parity tests are written against this surface.
    `poll_events`. Use `tokio::runtime::Handle::block_on` for the short
    store reads/writes (`refresh_*`, `create_task`, …) and `spawn` for anything
    that waits on an agent.
-2. **Polled streams.** `onSubscribeEvents`, `onLoadHistory`,
-   `onLoadModelCatalog` and `onCheckUpdate` were callback registrations. Here
-   they are `poll_*` methods that the TUI drains **once per frame**:
+2. **Polled streams.** Events, history, the model catalog and update checks are
+   `poll_*` methods that the TUI drains **once per frame**, not callback registrations:
 
-   | TS callback | Facade method | Contract |
+   | Stream | Facade method | Contract |
    |---|---|---|
-   | `onSubscribeEvents(handler)` | `poll_events() -> Vec<OrchestratorEvent>` | Events since the last poll, oldest first. Drain a `broadcast::Receiver` without blocking; drop nothing silently — the feed's caps are the TUI's job. |
-   | `onLoadHistory(onBatch)` | `poll_history() -> Vec<Vec<HistoryEntry>>` | Zero or more batches since the last poll. The TS host delivers two (the 3 newest runs, then the next 7, 30 tail events each, sliced to the last 200). |
-   | `onLoadModelCatalog(onUpdate)` | `poll_model_catalog() -> Option<ModelCatalog>` | The newest catalog, if one arrived. The TUI rebuilds an open agent wizard in place when it does. |
-   | `onCheckUpdate` | `poll_update() -> Option<String>` | A newer version, once known. The TUI starts `background_install` exactly once and then reads `installed_version()`. |
+   | Events | `poll_events() -> Vec<OrchestratorEvent>` | Events since the last poll, oldest first. Drain a `broadcast::Receiver` without blocking; drop nothing silently — the feed's caps are the TUI's job. |
+   | History | `poll_history() -> Vec<Vec<HistoryEntry>>` | Zero or more batches since the last poll. The host delivers two (the 3 newest runs, then the next 7, 30 tail events each, sliced to the last 200). |
+   | Model catalog | `poll_model_catalog() -> Option<ModelCatalog>` | The newest catalog, if one arrived. The TUI rebuilds an open agent wizard in place when it does. |
+   | Update check | `poll_update() -> Option<String>` | A newer version, once known. The TUI starts `background_install` exactly once and then reads `installed_version()`. |
 
    This is what makes the TUI tests synchronous: push a key, `tick()`, draw,
    assert (ARCHITECTURE §8.4).
@@ -39,9 +37,8 @@ CLI would print for that failure.
 
 ## Capability flags
 
-The TS App keys several bindings off "was this callback passed?"
-(`onCreateTask && …`). Those predicates are the `can_*` methods, all defaulting
-to `true`:
+Several bindings depend on whether the backend supports an operation. Those
+predicates are the `can_*` methods, all defaulting to `true`:
 
 | Method | Gates |
 |---|---|
@@ -54,16 +51,15 @@ to `true`:
 
 ## Launch context
 
-`context() -> LaunchContext` carries the non-callback props of the TS `App`:
+`context() -> LaunchContext` carries the static launch facts:
 project name, version, default adapter, the persisted palette / activity filter
 / notification preferences / max-concurrent value, and the watch-mode outcome
 (`initial_watch_active`, `observer_mode`, `watch_error`). The TUI emits the
-observer-mode banner or the watch-failure banner from these on launch, exactly
-as `App.tsx` does.
+observer-mode banner or the watch-failure banner from these on launch.
 
 ## Operations
 
-Grouped as in the trait; names map 1:1 onto the TS callbacks.
+Grouped as in the trait.
 
 * **Refresh** — `refresh_tasks`, `refresh_agents`, `refresh_goals`,
   `refresh_state`, `list_teams`. Called on launch and after every mutation, plus
@@ -117,16 +113,16 @@ Grouped as in the trait; names map 1:1 onto the TS callbacks.
 
 * `AgentFields::command` / `effort`: `Some(String::new())` means **clear the
   field**, `None` means **leave it unchanged**. The edit-agent wizard relies on
-  this (docs/parity/tui.md §5.2) — switching an agent away from `shell` sends
+  this — switching an agent away from `shell` sends
   `command: Some("")`.
-* `TaskFields::description`: always sent by the edit-task wizard (`?? ''`), so
+* `TaskFields::description`: always sent by the edit-task wizard, so
   an emptied description clears it.
 * `update_goal_status(.., force = true)` is only used by `C` on the goals view
   (achieve, cancelling cancellable tasks).
 * `CreateTaskOpts::attachments` / `TaskFields::attachments` carry the pasted
   image paths; the TUI clears its pending list once the call returns.
 
-## Wiring sketch (for WP-5)
+## Wiring sketch
 
 ```rust
 struct EngineBackend {
@@ -160,7 +156,7 @@ longer than the 120 ms animation tick), call `app.handle_key(key)` or
 `app.state.width/height = …` on a resize, then `app.tick()` and
 `terminal.draw(|f| orch_tui::views::draw(f, &app))`. Exit when
 `app.state.should_exit` is set, then stop watch mode / the disk observer and
-clear the event bus, as `tui.ts` does.
+clear the event bus.
 
 Enable the Kitty keyboard protocol at startup
 (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) so `Ctrl+Enter` is
@@ -180,7 +176,7 @@ orch_tui::run(backend)?;
 // then: stop watch mode or the disk observer, and clear the event bus.
 ```
 
-## Implementer answers (asked by WP-4, settled here)
+## Implementer answers
 
 1. **`goal_progress` with no report.** Map "absent" to `Ok(String::new())`, not
    `Err` — `Err` renders `Failed: …` and "nothing recorded yet" is not a
@@ -192,24 +188,21 @@ orch_tui::run(backend)?;
    `Some(String::new())` means *clear* and `None` means *unchanged* for
    `command`, `effort` and `model`. The TUI never sends `Some("")` for `role`:
    choosing the `Skip` preset maps to `None`, so a role cannot be cleared from
-   the UI — that is TS behaviour (`vals.role || undefined`), not an oversight.
+   the UI — that is deliberate, not an oversight.
    The engine accepts a clear for all four, so **`role` is the one place where
    the backend is more capable than the UI on purpose.** Do not "fix" the
-   mapper: the wizard → entity field mapping is **L0** (PARITY §12), so making
-   `Skip` clear a stored role would write different data than the TS binary for
-   the same keystrokes. If we ever want that behaviour it goes through a
-   PARITY §14 entry first; `edit_agent_wizard_to_fields` carries the same note.
+   mapper: the wizard → entity field mapping is on-disk data, so making `Skip`
+   clear a stored role would change what the same keystrokes write for existing
+   users. If we ever want that behaviour it is a contract change (a plan and an
+   ADR); `edit_agent_wizard_to_fields` carries the same note.
 
-   `approval_policy` is deliberately absent from `AgentFields`: the TS prop type
-   declares it but the edit-agent wizard never passes it (`App.tsx:1242`), and
-   its step is `skip: () => true`, so no edit path can produce one.
+   `approval_policy` is deliberately absent from `AgentFields`: the edit-agent
+   wizard never passes it and its step is always skipped, so no edit path can produce one.
 3. **Fire-and-forget is about *dispatch*, not validation.** `run_task`,
    `run_all` and `start_watch` must return `Err` for anything knowable before an
    agent starts — a lock conflict, an unknown id, no eligible agent — because
-   that is the TS behaviour (the promise rejected and the TUI printed
-   `Failed: {err}`), and because **the TUI does not render
-   `orchestrator:error`**: `formatEvent` has no case for it in the TS original
-   and none here, so an error delivered only through the event stream is
+   the TUI prints `Failed: {err}` for them, and because **the TUI does not render
+   `orchestrator:error`**: the event formatter has no case for it, so an error delivered only through the event stream is
    invisible. Everything that happens *after* the run starts belongs in
    `poll_events`.
 4. **`stop_watch`** may spawn and return `Ok(())` — the TUI only needs the
@@ -217,7 +210,7 @@ orch_tui::run(backend)?;
    `✓ Watch mode paused` on `Ok`; the header chip follows that flag.
 5. **The update facade is intentionally inert.** Leave `poll_update`,
    `background_install` and `installed_version` at their trait defaults
-   (PARITY §13: no self-update, no network). No test requires a real version —
+   (there is no self-update and no network access). No test requires a real version —
    case `v070` scripts one through `FakeBackend`. The header update chip then
    simply never appears.
 6. **`refresh_state`** re-reads `state.json` on every call; no caching. The TUI
@@ -225,24 +218,23 @@ orch_tui::run(backend)?;
    and on the periodic poll (3 s observer / 5 s watch), and always commits the
    result — unlike the entity lists, which it commits only when
    `entityListChanged`.
-7. **`poll_history` — the exact two batches** (`src/cli/commands/tui.ts`,
-   `onLoadHistory`):
+7. **`poll_history` — the exact two batches:**
    * list **all** runs once (not per task), sort by `started_at` **descending**,
      keep only `succeeded` and `failed`;
    * batch 1 = runs `[0..3)`, batch 2 = runs `[3..10)`;
-   * per run, read the **last 30** events (`readEventsTail(run.id, 30)`) and map
+   * per run, read the **last 30** events (`read_events_tail(run.id, 30)`) and map
      each to `HistoryEntry { timestamp: event.timestamp, run_id: run.id,
      agent_id: run.agent_id, task_id: run.task_id, event_type: event.type,
      data: event.data }`;
    * flatten each batch, sort **ascending** by timestamp, keep the **last 200**;
-   * deliver batch 1 as soon as it is ready and batch 2 afterwards (the TS host
+   * deliver batch 1 as soon as it is ready and batch 2 afterwards (the host
      loads it in the background). Failures go to stderr and must never bubble
      into the UI.
    The TUI prepends each batch and re-truncates to 500 messages, de-duplicates
    repeated nested provider errors per `run_id`, and skips entries whose
    formatter yields no summary.
 8. **`save_max_concurrent`** writing `scheduling.max_concurrent_agents` with
-   silent-until-restart semantics is correct — it is what the TS does. The TUI
+   silent-until-restart semantics is correct. The TUI
    prints `Settings saved` and shows the new value in the wizard default.
 9. **Capability flags in observer mode** all stay `true`; let
    `run_task`/`run_all`/`start_watch` fail with the lock holder's PID (see #3).

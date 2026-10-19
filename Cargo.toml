@@ -49,9 +49,8 @@ tokio = { version = "1.53", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 futures = "0.3"
 async-trait = "0.1"
-# Lets the adapter event generators be written as straight-line async code, so
-# they map onto the TS async generators one statement at a time and keep their
-# pull-based semantics (ARCHITECTURE §4.8, PARITY.md §8.1).
+# Lets the adapter event generators be written as straight-line async code and
+# keep pull-based semantics (ARCHITECTURE §4.8).
 async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 # preserve_order keeps Value key order on round-trip (ARCHITECTURE §5.2 rule 2).
@@ -102,7 +101,6 @@ jiff = "0.2"
 nix = { version = "0.31", default-features = false }
 tempfile = "3.27"
 dirs = "7.0"
-shell-words = "1.1"
 globset = "0.4"
 # Model-discovery parsers. `fancy-regex` is needed for the one Claude `--help`
 # pattern that uses a lookahead, which the `regex` crate cannot express.
@@ -111,7 +109,6 @@ fancy-regex = "0.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = { version = "2.14", features = ["serde"] }
-toml = "1.1"
 
 # ── Library-first candidates (ARCHITECTURE §4.8) ───────────────────────────
 # All verified on 2026-10-13 to resolve on rustc 1.94.1 *and* alongside
@@ -119,9 +116,9 @@ toml = "1.1"
 # `unicode-width`, `arboard` and `png` are in use; the rest are declared here
 # so the owning package does not have to touch this manifest.
 #
-# `process-wrap` is declared but NOT adopted: the parity contract needs a
+# `process-wrap` is declared but NOT adopted: r-orch needs a
 # pid-keyed kill/is_alive API with no child handle, and its group `wait()`
-# would delay `ExitSignal` past node's `close`. The full reason is at the head
+# would delay `ExitSignal`. The full reason is at the head
 # of orch-infra/src/process/manager.rs (ARCHITECTURE §4.8 exemption (b)).
 #
 # `tui-textarea` is deliberately ABSENT: 0.7.0 (its latest) hard-depends on
@@ -131,7 +128,7 @@ toml = "1.1"
 # fork, declared in the TUI block above) for the multi-line wizard steps.
 #
 # `tui-input` is unused: WP-6's single-line editor needs a kill ring, two undo
-# flavours and a 500 ms snapshot debounce (docs/parity/tui.md §2.4), none of
+# flavours and a 500 ms snapshot debounce, none of
 # which `tui-input` models, so it is hand-written over the crates below.
 #
 # Process groups: prefer this over a hand-rolled setsid + kill(-pid); keep
@@ -139,10 +136,10 @@ toml = "1.1"
 process-wrap = { version = "10", features = ["tokio1"] }
 # Single-line text editing for the TUI command bar and `text` wizard steps.
 tui-input = "0.15"
-# Replaces Intl.Segmenter + width logic for `text-cursor` parity.
+# Grapheme segmentation and display width for `text-cursor`.
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
-# Clipboard. Degrade to "empty" on any failure, exactly as the TS does.
+# Clipboard. Degrade to "empty" on any failure.
 arboard = "3.6"
 # PNG-encodes clipboard images (already in the tree via arboard).
 png = "0.18"
@@ -167,8 +164,6 @@ assert_cmd = "2.2"
 # Not used yet. Declared so WP-2/WP-5 can reach for it without touching the
 # root manifest (ARCHITECTURE §4.6).
 proptest = "1.12"
-# Diffs in the parity harness and in test failures (ARCHITECTURE §4.8).
-similar = "3.2"
 pretty_assertions = "1.4"
 # Websocket client for the `orch web` bridge test.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }

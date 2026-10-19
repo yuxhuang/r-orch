@@ -1,4 +1,4 @@
-//! The agents list (docs/parity/tui.md §1.3).
+//! The agents list.
 
 use orch_domain::{AdapterErrorKind, Agent, AgentStatus, RemoteRef, error_hint};
 use ratatui::Frame;
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(cols.task, ROW_ERROR_CAP, "{cols:?}");
     }
 
-    /// The table in docs/parity/tui.md §1.3; change both together.
+    /// Pins the column-width table.
     #[test]
     fn the_documented_column_widths_hold() {
         // (width, name, model, task, caps, where, time)

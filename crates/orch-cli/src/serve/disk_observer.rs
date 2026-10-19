@@ -1,7 +1,6 @@
-//! The disk observer — ported from `src/cli/serve/disk-observer.ts`
-//! (`docs/parity/cli.md` §16.6).
+//! The disk observer.
 //!
-//! `serve` never uses it. `tui` falls back to it when `startWatch()` throws
+//! `serve` never uses it. `tui` falls back to it when starting watch mode fails
 //! because another process holds the lock: instead of orchestrating, it polls
 //! `state.json` and tails each running run's JSONL, synthesising the bus
 //! events a live orchestrator would have emitted.
@@ -81,7 +80,7 @@ impl DiskObserver {
     ///
     /// Returning them rather than invoking a callback is what makes the
     /// accounting testable; [`DiskObserver::observe`] is the callback form.
-    /// Every error is swallowed, exactly as `doPoll`'s are: a half-written
+    /// Every error is swallowed, like every poll error: a half-written
     /// `state.json` must not take down the TUI.
     pub async fn poll(&mut self) -> Vec<OrchestratorEvent> {
         let Ok(state) = self.state.read().await else {
@@ -226,20 +225,16 @@ impl DiskObserver {
         // The offset always advances by everything that was read, and the
         // partial tail is carried in `remainder`.
         //
-        // **Deliberate divergence from the reference**, which advances the
-        // offset by `bytesRead - remainderBytes` *and* keeps the remainder: it
-        // therefore re-reads the partial bytes on the next tick and prepends
-        // them again, producing `partial + partial + rest`, which fails to
-        // parse — so an event whose write straddles a tick is **lost**. Fixed
-        // here rather than replicated, on the same grounds as PARITY.md
-        // §14.12: the disk observer is reachable only from the TUI, no
-        // differential scenario can observe either behaviour, and silently
-        // dropping an event is a correctness bug rather than a cosmetic one.
+        // Advancing the offset by `bytesRead - remainderBytes` *and* keeping
+        // the remainder would re-read the partial bytes on the next tick and
+        // prepend them again, producing `partial + partial + rest`, which
+        // fails to parse — so an event whose write straddles a tick would be
+        // **lost**. Silently dropping an event is a correctness bug rather
+        // than a cosmetic one.
         let (remainder, offset) = if chunk.ends_with('\n') {
             (String::new(), tracked.offset + read as u64)
         } else if last_line.len() > MAX_REMAINDER_LEN {
-            // A pathologically long partial line is discarded, as in the
-            // reference.
+            // A pathologically long partial line is discarded.
             (String::new(), tracked.offset + read as u64)
         } else {
             (last_line.to_owned(), tracked.offset + read as u64)
@@ -279,8 +274,7 @@ impl DiskObserver {
     }
 }
 
-/// Stops the polling loop when dropped, which is the `unsubscribe` the TS
-/// `subscribe` returns.
+/// Stops the polling loop when dropped.
 pub struct ObserverHandle(tokio::task::JoinHandle<()>);
 
 impl Drop for ObserverHandle {
@@ -289,7 +283,7 @@ impl Drop for ObserverHandle {
     }
 }
 
-/// `translateEvent` — five of the six run-event types become bus events;
+/// Five of the six run-event types become bus events;
 /// `done` and anything unknown are dropped.
 pub fn translate_event(
     event: &RunEvent,

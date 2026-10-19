@@ -1,13 +1,12 @@
-//! `orch context` — ported from `src/cli/commands/context.ts`
-//! (`docs/parity/cli.md` §9).
+//! `orch context`.
 //!
 //! The shared key/value store agents exchange data through. Three quirks:
 //!
 //! - `context get` on a missing key prints an error but **exits 0**, and in
 //!   JSON mode prints the bare literal `null`;
 //! - `context delete --json` prints **nothing at all**;
-//! - the TTL column is `formatDurationSince(expires_at)`, which is unclamped,
-//!   so a live TTL shows as a **negative** duration (§22.6).
+//! - the TTL column is the duration since `expires_at`, which is unclamped,
+//!   so a live TTL shows as a **negative** duration.
 
 use orch_core::error::Result;
 use orch_core::storage::ContextEntry;
@@ -90,7 +89,7 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
     println!();
     let rows: Vec<Vec<String>> = entries.iter().map(|entry| row(styles, entry)).collect();
     print_table(styles, &["KEY", "VALUE", "UPDATED", "TTL"], &rows, 2);
-    // `entries` even for one — the reference does not pluralize (§14.7).
+    // `entries` even for one — it is not pluralized.
     println!("\n  {} entries\n", entries.len());
     Ok(())
 }
@@ -182,7 +181,7 @@ mod tests {
         assert_eq!(without[3], "—");
 
         // A live TTL is in the future, and `formatDurationSince` is
-        // unclamped — the `-60s` of §22.6.
+        // unclamped — the `-60s`.
         let future = (jiff::Timestamp::now() + std::time::Duration::from_secs(60)).to_string();
         let with = row(&styles, &entry("k2", "v2", Some(&future)));
         assert!(with[3].starts_with('-'), "{}", with[3]);

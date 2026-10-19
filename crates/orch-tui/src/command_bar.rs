@@ -1,8 +1,7 @@
-//! Command registry, tab completion, suggestions and history
-//! (`src/tui/commandBar.ts`).
+//! Command registry, tab completion, suggestions and history.
 //!
 //! Registry **insertion order** is contract: it drives suggestion order and the
-//! first-match semantics of [`resolve_completion`] (PARITY.md §12.4). `msg` is
+//! first-match semantics of [`resolve_completion`]. `msg` is
 //! registered **after** `mouse` for exactly that reason: `/m` + Tab must keep
 //! ghost-completing `mouse`, the text-selection escape hatch users reach for
 //! when clicks stop working (design-v2 §3.5.2, C8).
@@ -54,7 +53,7 @@ pub struct CommandSpec {
     ///
     /// `true` only for `msg`: giving it to the other argument-taking verbs
     /// would change what Enter does on rows that have always executed, and
-    /// those are **L1** (`/run` with no id runs the selected task).
+    /// those are existing behaviour (`/run` with no id runs the selected task).
     pub insert_trailing_space: bool,
 }
 
@@ -167,8 +166,7 @@ pub const COMMAND_REGISTRY: [CommandSpec; 14] = [
         insert_trailing_space: false,
     },
     // After `mouse`, so `resolve_completion("/m")` still yields `ouse`.
-    // `/msg` is an addition to this **L1** verb set, recorded in PARITY.md
-    // §12.8 row (l): the Ink original cannot message an agent at all.
+    // `/msg` lets the command bar message an agent.
     CommandSpec {
         verb: "msg",
         sub: &[],
@@ -252,7 +250,7 @@ fn subs_hint(spec: &CommandSpec) -> Option<String> {
     }
 }
 
-/// `resolveCompletion(input)` — the ghost **suffix** only.
+/// The ghost **suffix** only.
 pub fn resolve_completion(input: &str) -> Option<String> {
     let body = input.strip_prefix('/')?;
     match body.find(' ') {
@@ -302,13 +300,13 @@ impl SuggestionCtx<'_> {
     };
 }
 
-/// `resolveSuggestions(input)` — for every verb but `msg`, which needs the
+/// For every verb but `msg`, which needs the
 /// agent list ([`resolve_suggestions_in`]).
 pub fn resolve_suggestions(input: &str) -> Vec<Suggestion> {
     resolve_suggestions_in(input, &SuggestionCtx::EMPTY)
 }
 
-/// `resolveSuggestions(input)`, with the state `/msg` needs.
+/// Suggestions for `input`, with the state `/msg` needs.
 pub fn resolve_suggestions_in(input: &str, ctx: &SuggestionCtx<'_>) -> Vec<Suggestion> {
     let Some(body) = input.strip_prefix('/') else {
         return Vec::new();
@@ -509,8 +507,7 @@ impl CommandHistory {
 
     /// `↓` — the next entry, or `None` past the end (meaning "clear the input").
     ///
-    /// Named after the TS `CommandHistory.next()` it ports; it is not an
-    /// iterator.
+    /// Named `next` for the history cursor; it is not an iterator.
     #[allow(
         clippy::should_implement_trait,
         reason = "moves the history cursor; it is not an iterator"
@@ -538,11 +535,9 @@ mod tests {
         let verbs: Vec<&str> = COMMAND_REGISTRY.iter().map(|s| s.verb).collect();
         assert_eq!(
             verbs,
-            // `mouse` is a deliberate addition to this **L1** verb set
-            // (PARITY.md §12.4), recorded in §12.8 row (j): `F2` alone is a
-            // weak escape hatch for mouse capture, and a verb is the TUI's
-            // own discovery surface. Harness effect `none` — the TUI is
-            // outside the differential harness (§15.1).
+            // `mouse` is a deliberate addition to this verb set: `F2` alone is
+            // a weak escape hatch for mouse capture, and a verb is the TUI's
+            // own discovery surface.
             [
                 "task", "agent", "team", "goal", "run", "run-all", "watch", "pause", "status",
                 "config", "help", "mouse", "msg", "quit"
@@ -590,7 +585,6 @@ mod tests {
 
     #[test]
     fn resolve_completion_pinned_vectors() {
-        // PARITY.md §12.4.
         assert_eq!(resolve_completion("task"), None);
         assert_eq!(resolve_completion("/"), None);
         assert_eq!(resolve_completion("/ta").as_deref(), Some("sk"));

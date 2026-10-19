@@ -334,7 +334,7 @@ async fn ensure_parent(workspace: &Path) -> Result<()> {
 }
 
 /// Strip `.orchestry/` from the new workspace so nested state and workspaces
-/// cannot recurse. Best effort, like the TS `.catch(() => {})`.
+/// cannot recurse. Best effort.
 async fn remove_nested_orchestry(workspace: &Path) {
     let nested = workspace.join(".orchestry");
     if let Err(error) = tokio::fs::remove_dir_all(&nested).await

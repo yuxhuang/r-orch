@@ -1,11 +1,11 @@
-//! The ordered key-dispatch chain (docs/parity/tui.md §2, PARITY.md §12.2).
+//! The ordered key-dispatch chain.
 //!
 //! The order is load-bearing and the per-view overloads (`a` `g` `s` `c` `x`
 //! `f`) are resolved here explicitly — getting one wrong destroys the wrong
 //! entity.
 //!
-//! One deliberate fix (PARITY.md §14.8): **both** filter pickers swallow global
-//! keys. In the original the type picker did not, so `q` quit through it.
+//! One deliberate fix: **both** filter pickers swallow global
+//! keys, so `q` does not quit through either.
 
 use orch_domain::{GoalStatus, TaskStatus};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -191,8 +191,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
 
         // 3. Ctrl+S / Alt+S inside the NEW AGENT wizard opens the Agent Shop.
-        // TS is `(key.ctrl || key.meta) && input === 's'`; see [`is_meta`] for
-        // why `key.meta` excludes Cmd.
+        // See [`is_meta`] for why meta excludes Cmd.
         if (key.modifiers.contains(KeyModifiers::CONTROL) || is_meta(key))
             && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
             && self.state.input_mode == InputMode::Wizard

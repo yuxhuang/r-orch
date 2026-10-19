@@ -1,4 +1,4 @@
-//! Registry construction — the registration order from `container.ts:201-208`.
+//! Registry construction and the registration order.
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use super::{
 };
 
 /// Registration order, which is also `listKinds()` order and the `doctor`
-/// probe order. **L0** (PARITY.md §8) — note it differs from
+/// probe order. The order is exact and observable — note it differs from
 /// [`orch_domain::SUPPORTED_ADAPTERS`], which is the display order.
 pub const REGISTRATION_ORDER: [&str; 8] = [
     "claude",
@@ -36,11 +36,11 @@ pub fn build_registry(process_manager: Arc<dyn ProcessManager>) -> AdapterRegist
 ///
 /// Adapters stamp the `AgentEvent`s they parse out of a child's stdout, so
 /// without this the container could inject a clock everywhere *except* the one
-/// place a differential scenario reads timestamps from. Each adapter already
+/// place a test reads event timestamps from. Each adapter already
 /// takes `with_clock`; what this adds is a single place that applies it to all
 /// eight, so a caller wanting the seam does not have to re-spell the
-/// registration order — which is L0 (PARITY.md §8) and would be a silent
-/// divergence if a second copy of it drifted.
+/// registration order — which is observable (`doctor` probes in it) and
+/// would silently change if a second copy of it drifted.
 pub fn build_registry_with_clock(
     process_manager: Arc<dyn ProcessManager>,
     clock: Arc<dyn Clock>,

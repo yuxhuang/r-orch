@@ -1,8 +1,7 @@
 //! `orch tui` — build the engine, hand it to the dashboard, clean up after.
 //!
-//! The port of `tui.ts`'s `.action(...)` tail: render, `waitUntilExit()`, then
-//! stop watch mode or the observer and clear the event bus. [`first_run`] is
-//! the bare-`orch` path from `src/bin/cli.ts` on top of it.
+//! Render, wait for exit, then stop watch mode or the observer and clear the
+//! event bus. [`first_run`] is the bare-`orch` path on top of it.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,25 +19,22 @@ use crate::output::Styles;
 /// How long the wind-down gets when the terminal is already gone.
 ///
 /// `Orchestrator::stop()` is unbounded, and nothing enforces a run timeout
-/// except `stall_timeout_ms`, which fires only from the watch loop (PARITY.md
-/// §6.5) — so one hung agent can hold the shutdown, and the lock, for as long
+/// except `stall_timeout_ms`, which fires only from the watch loop — so one hung agent can hold the shutdown, and the lock, for as long
 /// as it likes. With a terminal there that is the right trade: the user is
 /// watching and the agents get their full grace. With the terminal gone nobody
 /// is watching, and a process that will not exit is worse than a lock released
 /// a moment late — `acquire_lock` deletes a lock whose PID is not alive
 /// (`orch-infra/src/storage/lock.rs:51-62`), so the next `orch` reclaims it as
-/// soon as this process is gone. See PARITY.md §14.40.
+/// soon as this process is gone.
 const DEAD_TTY_WIND_DOWN: Duration = Duration::from_secs(5);
 
-/// Bare `orch`: the first-run experience (PARITY.md §2.3, `src/bin/cli.ts`
-/// `isBareOrch`).
+/// Bare `orch`: the first-run experience.
 ///
 /// With no `.orchestry/` in this directory, initialize one and launch the
 /// dashboard on it; in an initialized project, launch straight into it.
 ///
 /// The probe is deliberately **`cwd`-local**, and project-root resolution
-/// happens **after** the init, for the same reason the reference spells out at
-/// `cli.ts:112`: `find_project_root` walks up, so checking or resolving first
+/// happens **after** the init, because `find_project_root` walks up, so checking or resolving first
 /// would silently adopt an ancestor project and leave the user's new directory
 /// un-initialized. A developer running `orch` in a fresh subdirectory of a
 /// project they already have is the common case, not an edge one.
@@ -49,10 +45,8 @@ pub async fn first_run(
     version: &str,
 ) -> Result<ExitCode> {
     if !cwd.join(ORCHESTRY_DIR).is_dir() {
-        // No `Next:` line here: the reference prints that from the `init`
-        // command's own action rather than from `runInit`
-        // (`src/cli/commands/init.ts:262-271`), so the first-run path does not
-        // suggest a command the dashboard is about to make unnecessary.
+        // No `Next:` line here: that hint belongs to the `init` command's own
+        // action, so the first-run path does not suggest a command the dashboard is about to make unnecessary.
         init::run(styles, cwd, init_args).await?;
     }
     run(find_project_root(cwd), version, false).await
@@ -132,21 +126,18 @@ pub async fn run_with_peer(
 
     // Observer mode: another process holds the lock, so there is no in-process
     // bus traffic to subscribe to and the live events have to come off disk.
-    // The TS does the same thing at the same point —
-    // `onSubscribeEvents = handler => diskObserver.subscribe(handler)`
-    // (`tui.ts:261-267`) — and constructs the observer with no interval, so
-    // both poll at the default 1 s.
+    // The observer is constructed with no interval, so both poll at the
+    // default 1 s.
     //
-    // Dropped in the cleanup below, which is the `unsubscribe` the TS
-    // `subscribe` returns.
+    // Dropped in the cleanup below, which unsubscribes it.
     //
-    // Three visible differences remain in observer mode, all TS-faithful: the
+    // Three visible differences from owner mode (this process holding the lock
+    // and running the engine) remain in observer mode: the
     // `● OBSERVING` header chip, a 3 s dashboard refresh instead of 5 s, and
-    // **stale teams** — the periodic refresh passes `include_teams = false`
-    // (`App.tsx:826`), so a team another process creates or disbands does not
-    // appear until something team-related happens locally. Changing that would
-    // need a PARITY §14 entry: which collections the poll re-reads is
-    // observable.
+    // **stale teams** — the periodic refresh passes `include_teams = false`,
+    // so a team another process creates or disbands does not appear until
+    // something team-related happens locally. Which collections the poll
+    // re-reads is observable, so changing that is a behaviour change.
     let observer = (!watch_active).then(|| attach_observer(&engine, backend.observer_sink()));
 
     // The draw loop must not run on a runtime thread: `TuiBackend` is
@@ -176,8 +167,7 @@ pub async fn run_with_peer(
     // reading the project after the window is gone.
     drop(observer);
     if engine.orchestrator.is_owner() {
-        // `stop()` already reports its own failures on the bus; the TS
-        // swallows this rejection outright (`.catch(() => {})`).
+        // `stop()` already reports its own failures on the bus.
         let stopping = engine.orchestrator.stop();
         if bound_wind_down(
             outcome.as_ref().ok().and_then(|r| r.as_ref().ok().copied()),
@@ -244,7 +234,7 @@ fn bound_wind_down(exit: Option<orch_tui::Exit>, hungup: bool) -> bool {
 /// situation from SIGTERM however similar the shutdown looks: SIGHUP means the
 /// terminal went away, so nobody is watching and nobody is waiting out an
 /// agent's stop grace — exactly the condition that bounds the wind-down for a
-/// dead tty (PARITY.md §14.40). SIGTERM and SIGINT come from a service manager
+/// dead tty. SIGTERM and SIGINT come from a service manager
 /// or the user, who *are* waiting, and keep the unbounded wait.
 #[cfg(unix)]
 fn watch_termination(stop: Arc<AtomicBool>, hungup: Arc<AtomicBool>) {
@@ -299,10 +289,10 @@ mod tests {
     use super::*;
     use orch_tui::Exit;
 
-    /// PARITY.md §14.40 bounds the wind-down only when the terminal is gone.
+    /// The wind-down is bounded only when the terminal is gone.
     /// A SIGHUP *is* that, but it arrives as `Requested`, so the flag is what
     /// carries it — and getting this wrong means a hung agent holds the lock
-    /// after the terminal has closed, which is the case §14.40 exists for.
+    /// after the terminal has closed, which is the case the bound exists for.
     #[test]
     fn only_a_vanished_terminal_bounds_the_wind_down() {
         assert!(

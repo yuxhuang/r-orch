@@ -10,7 +10,7 @@ use super::lenient;
 /// Liquid-backed [`TemplateEngine`].
 ///
 /// `liquid` is synchronous, so the render runs on the blocking pool and is
-/// raced against the timeout. As in the TS engine the timeout only abandons the
+/// raced against the timeout. The timeout only abandons the
 /// result; it cannot interrupt the render itself.
 ///
 /// Known divergence (ARCHITECTURE §4.3): an unknown filter fails at parse time

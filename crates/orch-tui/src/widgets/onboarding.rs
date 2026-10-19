@@ -1,4 +1,4 @@
-//! The per-tab empty state (`OnboardingBox`, docs/parity/tui.md §8.3).
+//! The per-tab empty state.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

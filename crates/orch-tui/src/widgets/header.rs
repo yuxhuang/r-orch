@@ -1,4 +1,4 @@
-//! The five-row header (docs/parity/tui.md §6 "Header contents").
+//! The five-row header.
 //!
 //! Row 0 blank · row 1 BrandBar · row 2 blank · row 3 StatsBar · row 4
 //! ScannerBar.

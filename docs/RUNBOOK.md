@@ -1,8 +1,7 @@
 # r-orch operator runbook
 
-Recovery and gotcha reference for running r-orch. Everything here is **inherited behaviour replicated
-deliberately** from the TypeScript original unless marked otherwise — the parity contract
-([PARITY.md](PARITY.md)) explains why each was kept rather than fixed, and each entry below names its section.
+Recovery and gotcha reference for running r-orch. Entries describe current behaviour that is known, not yet
+changed, and has a documented remedy.
 
 If you are looking for *what r-orch is* and how to build it, start at the [README](../README.md).
 
@@ -50,8 +49,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 **Cause.** `.orchestry/orchestry.lock` holds something that is not a decimal PID — empty, truncated, or
 garbage. A lock whose PID parses is handled correctly (a dead PID is replaced, a live one is reported with its
 number); a lock whose PID does **not** parse is refused and **never cleaned up**. The 60-second staleness
-escape hatch does not apply, because reaching it requires a parseable PID. See
-[PARITY.md §6.7 and §14.17](PARITY.md).
+escape hatch does not apply, because reaching it requires a parseable PID.
 
 **The suggested command will not help you, and neither will the dashboard.** This is the part worth knowing:
 
@@ -63,7 +61,7 @@ escape hatch does not apply, because reaching it requires a parseable PID. See
 - in the **TUI**, a refused lock becomes **silent observer mode** — a badge, no message. You get a dashboard
   that appears to be watching someone else's orchestrator, forever.
 
-All three are faithful to the original, which is why the remedy lives here rather than in the code.
+The remedy lives here rather than in the code.
 
 **Recovery.**
 
@@ -91,7 +89,7 @@ or external editing.
 
 **Cause.** `--once` polls until **every** task is terminal, and the terminal statuses are
 `done`, `failed`, `cancelled` — **`review` is not among them**. A task that lands in `review` and has nothing
-to approve it blocks the loop forever. See [PARITY.md §11.1](PARITY.md).
+to approve it blocks the loop forever.
 
 **This is reachable out of the box.** The `agt_creator` agent that `orch init` creates ships with
 `approval_policy: suggest`, so a task assigned to the default agent will sit in `review` and hang `--once`.
@@ -126,10 +124,9 @@ and the orchestrator never dispatches it. The entity's `.yml` file exists on dis
 **Cause.** Each store keeps an `_index.json` cache alongside the individual entity files, maintained by a
 read-modify-write that is serialised **only within one process**. Two processes writing concurrently — the
 normal case, since one-shot commands never take the orchestrator lock — can drop an entry. See
-[ARCHITECTURE.md §2.1](ARCHITECTURE.md) and [PARITY.md §6.10](PARITY.md).
+[ARCHITECTURE.md §2.1](ARCHITECTURE.md).
 
-This cannot be fixed by locking: any lock r-orch takes is invisible to the TypeScript binary, and
-interchangeable operation is a goal. So it is a documented hazard with a one-command recovery.
+Index writes are not locked across processes, so this is a documented hazard with a one-command recovery.
 
 **Recovery.** Delete the index; the next read rebuilds it from the entity files, which are the source of
 truth:
@@ -214,8 +211,7 @@ the lock, so a `serve` that is about to exit 4 on a lock conflict still logs exa
 no error record — the failure leaves by a path that bypasses the log pump.
 
 For monitoring, treat the daemon as up only once you see a record that implies the loop is running — an
-`orchestrator:tick`, or any `agent:*` record. Faithful to the original
-([PARITY.md §11.1](PARITY.md)); the shape of the log contract is the reason it was not changed.
+`orchestrator:tick`, or any `agent:*` record. The shape of the log contract is the reason this was not changed.
 
 ---
 
@@ -261,7 +257,6 @@ agent started is still running — often reparented to init (`ppid 1`).
 child** to exit and returns. The final `SIGKILL` sweep of the group never happens. A process forked in the
 window between the group signal and the child's death **inherits the group without having been signalled**,
 survives, and is reparented. Load-dependent, so it shows up under contention rather than reliably.
-Faithful to the original — its `killWithGrace` returns the same way ([PARITY.md §8.4](PARITY.md)).
 
 **Spotting it.** Agents are spawned into their own process group whose **group id is the child's pid**, and
 that pid is in the run record:
@@ -299,8 +294,7 @@ tree.
 ## `timeout_ms` is not a timeout
 
 **It is accepted, stored, displayed — and never enforced.** `orch agent add --timeout <ms>` and
-`defaults.agent.timeout_ms` (default `3600000`) write a field that **no code reads**. The same is true in the
-TypeScript original. If you set it expecting a run to be killed after an hour, nothing will kill it.
+`defaults.agent.timeout_ms` (default `3600000`) write a field that **no code reads**. If you set it expecting a run to be killed after an hour, nothing will kill it.
 
 **What actually bounds a run** is `stall_timeout_ms` (default `600000`), and only partly:
 
@@ -326,8 +320,8 @@ the one-shot commands have none of it.
 - **To stop a wedged run by hand:** `orch task cancel <task-id>`, then check for survivors as
   [above](#stray-agent-subprocesses-after-a-cancel).
 
-Both the inert field and the one-shot gap are replicated from the original rather than fixed, because the
-field name and shape are part of the `--json` contract ([PARITY.md §6.5](PARITY.md)).
+The inert field and the one-shot gap are not fixed: the field name and shape are part of the `--json`
+contract.
 
 ---
 
@@ -340,8 +334,7 @@ limits, produce interleaved output, and are hard to attribute.
 
 **r-orch itself does not prevent it.** It sets exactly three environment variables on every child —
 `ORCH_AGENT_ID`, `ORCH_AGENT_NAME`, `ORCH_TASK_ID` — and inspects **no** session marker. There is no
-`CLAUDECODE` check in r-orch or in the TypeScript original, and no guard is planned in either. Do not expect
-one.
+`CLAUDECODE` check in r-orch, and no guard is planned. Do not expect one.
 
 **In practice the `claude` CLI usually stops it for you — by failing.** Recent Claude Code versions set
 `CLAUDECODE=1` in the session environment, and the `claude` CLI refuses to start a *nested* session when it
@@ -373,7 +366,7 @@ dashboard's selection instead of highlighting, and your terminal's own copy-on-d
 
 **Why.** The dashboard asks the terminal for mouse reports (DEC 1000 + 1002 + 1006), so button events are
 routed to the application instead of to the terminal's selection handling. That is the trade mouse
-support makes; PARITY.md §12.11 records it.
+support makes.
 
 **Fix**, in increasing order of permanence:
 
@@ -409,7 +402,7 @@ the shell receives it as input. Or a paste into that terminal arrives wrapped in
 
 **Why.** Mouse reporting and bracketed paste are terminal modes the application turns on and is
 responsible for turning off. Every normal exit does: `q`, a signal, a panic, and a terminal that hangs
-up all run the same restore (PARITY.md §14.39), and the disables are written *first*, before leaving
+up all run the same restore, and the disables are written *first*, before leaving
 the alternate screen. `SIGKILL` and an abort cannot be covered — nothing runs on the way out.
 
 **Fix.**
@@ -436,8 +429,7 @@ config:
 
 **r-orch protects the file locally.** `.orchestry/agents/<id>.yml` and `.orchestry/config.yml` are written
 **`0600`**, owner-only — and the mode is set when the temp file is created, so the file is never even briefly
-world-readable. The TypeScript original writes them at the process umask (typically `0644`), so this is one
-of the few places r-orch is deliberately stricter ([PARITY.md §14.35](PARITY.md)).
+world-readable. A file written at the process umask would typically be `0644`; r-orch is deliberately stricter.
 
 **And git ignores the whole directory by default.** `orch init` appends `.orchestry` to your project's
 **root** `.gitignore` (creating it if absent), so no entity file is committed unless you go out of your way.

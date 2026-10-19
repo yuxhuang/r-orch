@@ -1,9 +1,7 @@
-//! File-based run store — ported from
-//! `src/infrastructure/storage/run-store.ts`.
+//! File-based run store.
 //!
 //! Metadata is `runs/<id>.json` (atomic write); events are `runs/<id>.jsonl`
-//! (append-only). There is **no `_index.json`** — `list*` scans the directory
-//! (PARITY.md §6.10).
+//! (append-only). There is **no `_index.json`** — `list*` scans the directory.
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,9 +19,9 @@ use super::fs_utils::{
 };
 use super::paths::Paths;
 
-/// How many run files are read at once. The TS code batches for the same
-/// reason: macOS defaults to a 256-descriptor limit and an unbounded
-/// `Promise.all` over a long run history hits `EMFILE`.
+/// How many run files are read at once: macOS defaults to a
+/// 256-descriptor limit and an unbounded concurrent read over a long run
+/// history hits `EMFILE`.
 const READ_BATCH: usize = 64;
 
 /// `streamEvents` waits this long for the events file to appear before giving
@@ -31,7 +29,7 @@ const READ_BATCH: usize = 64;
 const STREAM_WAIT: Duration = Duration::from_secs(30);
 const STREAM_POLL: Duration = Duration::from_millis(100);
 
-/// Max characters per line, matching the shared line reader (PARITY.md §8.5).
+/// Max characters per line, matching the shared line reader.
 const MAX_LINE_LEN: usize = 16_384;
 
 #[derive(Debug)]
@@ -67,7 +65,7 @@ impl FileRunStore {
 
         // `new Date(b.started_at) - new Date(a.started_at)` — descending.
         // Comparing the ISO strings is equivalent for the fixed-width,
-        // always-UTC format the clock produces (PARITY.md §6.3), and does not
+        // always-UTC format the clock produces, and does not
         // need a date parser.
         runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         Ok(runs)
@@ -116,9 +114,8 @@ impl RunStore for FileRunStore {
 
     /// Read the events file once, from the beginning, to EOF.
     ///
-    /// **This does not tail-follow**, despite what the name suggests: the TS
-    /// version opens a `createReadStream` and the generator ends at EOF. The
-    /// token only lets a consumer stop early. `logs --follow` re-invokes it.
+    /// **This does not tail-follow**, despite what the name suggests: the
+    /// stream ends at EOF. The token only lets a consumer stop early. `logs --follow` re-invokes it.
     ///
     /// Waits up to 30 s for the file to appear, because a run can be
     /// dispatched before its first event lands.
@@ -211,8 +208,7 @@ async fn read_events_tail_bytes(path: &Path, size: u64) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// Parse the events file with the shared line-reading semantics
-/// (PARITY.md §8.5): split on `0x0A` only — `\r` is retained — skip empty
+/// Parse the events file with the shared line-reading semantics: split on `0x0A` only — `\r` is retained — skip empty
 /// lines, and cap each line at 16384 characters.
 ///
 /// WP-2 owns the pipe-reading equivalent in `orch_infra::process`. The two
@@ -225,7 +221,7 @@ async fn read_events_file(path: &Path) -> Result<Vec<RunEvent>> {
     // much we allocate.
     //
     // This cannot delegate to `read_jsonl`, whose `lines()` strips `\r`;
-    // §8.5 requires splitting on `0x0A` only and retaining `\r`. So the cap
+    // The contract is splitting on `0x0A` only and retaining `\r`. So the cap
     // is applied here with the same threshold, and the oversize path reads a
     // bounded tail rather than the whole file.
     let size = match tokio::fs::metadata(path).await {
@@ -361,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn there_is_no_index_file() {
-        // PARITY.md §6.10: RunStore scans its directory.
+        // RunStore scans its directory.
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path());
         store.save(&make_run()).await.unwrap();
@@ -414,8 +410,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The TS `readJson` throws on malformed JSON too; only ENOENT is
-        // tolerated.
+        // Malformed JSON is an error; only a missing file is tolerated.
         assert!(store.list_all().await.is_err());
     }
 
@@ -460,7 +455,7 @@ mod tests {
         let raw = tokio::fs::read_to_string(store.paths.run_events_path("run_test1").unwrap())
             .await
             .unwrap();
-        // PARITY.md §6.9, keys in this order.
+        // Keys in this order.
         assert_eq!(
             raw,
             "{\"timestamp\":\"2026-10-13T16:37:50.000Z\",\"type\":\"agent_output\",\"data\":\"line 0\"}\n"
@@ -557,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_events_retains_carriage_returns_and_skips_empty_lines() {
-        // PARITY.md §8.5: split on 0x0A only, `\r` kept, empty lines skipped.
+        // Split on 0x0A only, `\r` kept, empty lines skipped.
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path());
         let path = store.paths.run_events_path("run_cr").unwrap();

@@ -1,8 +1,7 @@
-//! File-based config store — ported from
-//! `src/infrastructure/storage/config-store.ts`.
+//! File-based config store.
 //!
 //! Everything goes through the **raw merged value**, never through a typed
-//! `OrchestratorConfig`: the TS store deep-merges the parsed YAML over
+//! `OrchestratorConfig`: the store deep-merges the parsed YAML over
 //! `DEFAULT_CONFIG` as plain objects, so unknown keys in a hand-authored
 //! `config.yml` survive a `config set` round trip. Deserializing to the typed
 //! struct and writing it back would silently delete them.
@@ -40,9 +39,9 @@ impl FileConfigStore {
         let on_disk: Value = serde_json::to_value(&on_disk)
             .map_err(|err| Error::serde(format!("convert {}", path.display()), &path, err))?;
 
-        // An empty file parses as `null`, and js-yaml returns `undefined` for
-        // it; the TS store then merges `{}`. Anything that is not a mapping
-        // gets the same treatment rather than replacing the whole tree.
+        // An empty file parses as `null` and is merged as `{}`. Anything that
+        // is not a mapping gets the same treatment rather than replacing the
+        // whole tree.
         if !on_disk.is_object() {
             return Ok(defaults);
         }
@@ -306,7 +305,7 @@ mod tests {
         config.project.name = "proj".into();
         store.write(&config).await.unwrap();
 
-        // PARITY.md §6.5, as written by `init`.
+        // As written by `init`.
         assert_eq!(
             tokio::fs::read_to_string(store.paths.config_path())
                 .await
@@ -392,8 +391,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_keys_resolve_the_way_js_yaml_resolves_them() {
-        // PARITY.md §6.4.2, V38. Reachable only in a hand-authored file.
+    async fn merge_keys_resolve_as_yaml_1_1_defines_them() {
+        // Reachable only in a hand-authored file.
         let temp = tempfile::tempdir().unwrap();
         let store = store(temp.path()).await;
         atomic_write(

@@ -1,5 +1,5 @@
 //! Counted key-dispatch cases — one per binding, including every overloaded
-//! per-view key (PARITY.md §12.2, V33).
+//! per-view key.
 
 mod common;
 
@@ -799,7 +799,7 @@ fn k080_the_agent_picker_swallows_global_keys() {
 
 #[test]
 fn k081_the_type_picker_also_swallows_global_keys() {
-    // PARITY.md §14.8 — fixed: in the original `q` quit through this picker.
+    // `q` must not quit through this picker.
     let mut harness = logs_harness();
     harness.key('f');
     harness.key('q');
@@ -931,7 +931,7 @@ fn k092_the_command_bar_consumes_navigation_keys() {
 #[test]
 fn k093_ctrl_s_is_refused_when_the_default_adapter_is_shell() {
     // The Agent Shop needs an AI provider; the shortcut must refuse rather
-    // than open an unusable wizard (docs/parity/tui.md §5.2).
+    // than open an unusable wizard.
     let mut backend = FakeBackend::new();
     backend.context.default_adapter = "shell".into();
     let mut harness = Harness::with(backend);
@@ -944,8 +944,8 @@ fn k093_ctrl_s_is_refused_when_the_default_adapter_is_shell() {
 
 #[test]
 fn k094_a_name_step_template_suggestion_is_refused_for_a_shell_default() {
-    // `handleSuggestionSelected` guards before resolving the template, with a
-    // different string from the `/agent shop` refusal (App.tsx:1320-1323).
+    // The guard comes before resolving the template, with a different string
+    // from the `/agent shop` refusal.
     let mut backend = FakeBackend::new();
     backend.context.default_adapter = "shell".into();
     let mut harness = Harness::with(backend);
@@ -978,9 +978,9 @@ fn k095_a_name_step_template_suggestion_opens_the_prefilled_wizard_otherwise() {
 
 #[test]
 fn k096_cmd_s_does_not_open_the_agent_shop_but_alt_s_does() {
-    // `(key.ctrl || key.meta) && input === 's'`, and Ink's `key.meta` is
-    // Alt/Option — Cmd arrives as the Kitty `super` bit, which Ink never maps
-    // to meta, so it cannot reach this binding (PARITY §12.5).
+    // Only Ctrl or Alt/Option opens the shop. Cmd arrives as the Kitty
+    // `super` bit, which is never mapped to meta, so it cannot reach this
+    // binding.
     let mut harness = agents_harness();
     harness.key('n');
     harness.press_mod(KeyCode::Char('s'), KeyModifiers::SUPER);

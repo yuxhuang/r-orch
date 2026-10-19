@@ -1,9 +1,7 @@
-//! The `serve` structured logger — ported from
-//! `src/cli/serve/structured-logger.ts` (`docs/parity/cli.md` §16.3, §16.4).
+//! The `serve` structured logger.
 //!
-//! Every record is `{ ts, level, event, …fields }` in that order, which is L0
-//! in JSON mode because the key order is the object-literal order in the
-//! reference. Four things are easy to get wrong:
+//! Every record is `{ ts, level, event, …fields }` in that order, which is part of the
+//! contract in JSON mode. Four things are easy to get wrong:
 //!
 //! - **`ts` is minted at transform time**, not taken from the event;
 //! - **idle ticks are throttled**: one in six, unless `--verbose`;
@@ -42,7 +40,7 @@ fn resident_mb() -> f64 {
         .and_then(|value| value.split_whitespace().next())
         .and_then(|number| number.parse::<f64>().ok())
         .unwrap_or(0.0);
-    // `toFixed(1)`, which rounds half away from zero — as `f64::round` does.
+    // One decimal, rounding half away from zero — as `f64::round` does.
     (kb / 1024.0 * 10.0).round() / 10.0
 }
 
@@ -109,7 +107,7 @@ impl LogSink {
                 .and_then(|()| writer.flush()),
         };
         if let Err(err) = result {
-            // The reference writes `Log file error: <msg>` to stderr and keeps
+            // Write `Log file error: <msg>` to stderr and keep
             // going, because losing the daemon over a full disk is worse.
             eprintln!("Log file error: {err}");
         }
@@ -176,17 +174,12 @@ impl StructuredLogger {
                     vec![
                         ("running", Value::from(*running)),
                         ("queued", Value::from(*queued)),
-                        // The reference reports V8's heap
-                        // (`+(heapUsed / 1_048_576).toFixed(1)`), which has no
-                        // Rust counterpart, so this is the closest honest
-                        // equivalent: the process's own resident set, in MiB,
-                        // to one decimal. It is a *different* metric under the
-                        // same name — but the field has to be a real number,
-                        // because an operator watching `heap_mb` for a leak is
-                        // the reason it exists, and a hard 0.0 would quietly
-                        // tell them everything is fine forever. The harness
-                        // masks the value the way it masks pids and durations
-                        // (PARITY.md §1.4), so the difference costs no parity.
+                        // There is no V8 heap here, so this reports the
+                        // process's own resident set, in MiB, to one decimal.
+                        // The field has to be a real number, because an
+                        // operator watching `heap_mb` for a leak is the reason
+                        // it exists, and a hard 0.0 would quietly tell them
+                        // everything is fine forever.
                         ("heap_mb", Value::from(resident_mb())),
                     ],
                 )
@@ -452,7 +445,7 @@ impl StructuredLogger {
 /// `${time} ${level} ${event}  ${fields}` — note the two spaces.
 fn format_text(record: &Map<String, Value>) -> String {
     let ts = record.get("ts").and_then(Value::as_str).unwrap_or_default();
-    // `entry.ts.slice(11, 23)` — HH:MM:SS.mmm, still UTC.
+    // Characters 11..23 of the timestamp — HH:MM:SS.mmm, still UTC.
     let time: String = ts.chars().skip(11).take(12).collect();
     let level = record
         .get("level")
@@ -601,7 +594,7 @@ mod tests {
         // kilobyte, and a hard 0.0 is what this field used to report.
         assert!(mb > 0.5, "implausible RSS: {mb}");
         assert!(mb < 100_000.0, "implausible RSS: {mb}");
-        // `toFixed(1)`: at most one decimal place survives.
+        // At most one decimal place survives.
         assert_eq!(mb, (mb * 10.0).round() / 10.0, "more than one decimal");
 
         // And it reaches the record, rather than only existing as a helper.

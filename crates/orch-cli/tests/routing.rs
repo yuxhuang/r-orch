@@ -1,8 +1,6 @@
 //! The routing contract, exercised through the real binary.
 //!
-//! Ported from `test/unit/cli/cli-lazy-routing.test.ts` plus the verified
-//! tables in `docs/parity/cli.md` §3.5–§3.7. The TS suite asserts these by
-//! mocking the container builders; here the binary is run, because the
+//! The binary is run rather than mocking the container builders, because the
 //! property under test is *what happens before parsing*, and that is only
 //! observable from outside.
 
@@ -12,7 +10,7 @@ use std::process::Command;
 use assert_cmd::prelude::*;
 
 /// A directory with no `.orchestry` anywhere above it, which is what makes
-/// the exit-3 assertions mean anything — `findProjectRoot` walks up.
+/// the exit-3 assertions mean anything — the project-root lookup walks up.
 fn empty_project() -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
         .prefix("orch-routing-")
@@ -184,7 +182,7 @@ fn help_and_version_work_without_a_project() {
     assert_eq!(stdout_of(&output).trim(), env!("CARGO_PKG_VERSION"));
 }
 
-// ── Initialized: Commander's own failures ──────────────────────────────────
+// ── Initialized: usage failures ──────────────────────────────────
 
 #[test]
 fn a_group_with_no_subcommand_prints_help_to_stdout_and_exits_one() {
@@ -308,7 +306,7 @@ fn remote_help_describes_every_subcommand_and_argument() {
     }
 }
 
-// ── Per-command exit codes from §3.7 ───────────────────────────────────────
+// ── Per-command exit codes ───────────────────────────────────────
 
 #[test]
 fn logs_with_no_selector_exits_two() {
@@ -487,7 +485,7 @@ fn every_declared_command_is_wired() {
 
 #[test]
 fn status_reports_the_project_and_emits_claimed_as_an_array() {
-    // PARITY §14.1's fix, from outside: the oracle emits `claimed: {}`.
+    // From outside: `claimed` must be an array, not `{}`.
     let dir = initialized_project();
 
     let output = orch(dir.path()).arg("status").output().expect("run");

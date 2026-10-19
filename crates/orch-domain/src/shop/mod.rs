@@ -1,10 +1,9 @@
-//! The shop catalogues and the bootstrap agent
-//! (`src/domain/{agent-shop,org-shop,default-agents}.ts`).
+//! The shop catalogues and the bootstrap agent.
 //!
-//! Role prompts live as `roles/*.md` files extracted byte-for-byte from the TS
-//! source and pulled in with `include_str!`. They are injected into agent
-//! system prompts, so they are L0 (PARITY.md §15 V28) and must never be
-//! reflowed, re-indented or retyped.
+//! Role prompts live as `roles/*.md` files, pulled in with `include_str!`. They
+//! are injected into agent system prompts, so their bytes are contract: they
+//! must never be reflowed, re-indented or retyped. `tests/shop_catalogue.rs`
+//! pins them against the golden snapshots under `fixtures/shop/`.
 
 mod catalogue;
 
@@ -68,7 +67,7 @@ pub const AGENT_CREATOR_ROLE: &str = include_str!("roles/agent-creator.md");
 /// Adapter and model are resolved from the chosen default adapter. Shell
 /// agents need an explicit command, so `init` cannot create a useful generic
 /// one and the list is empty for `shell`. Note `stall_timeout_ms` is 300000
-/// here, **not** the 600000 project default (PARITY.md §6.11).
+/// here, **not** the 600000 project default.
 pub fn default_agents(adapter: &str) -> Vec<Agent> {
     if adapter == "shell" {
         return Vec::new();
@@ -83,7 +82,7 @@ pub fn default_agents(adapter: &str) -> Vec<Agent> {
     };
 
     vec![Agent {
-        // A fixed id, not a nanoid (PARITY.md §6.2).
+        // A fixed id, not a nanoid.
         id: "agt_creator".into(),
         name: "Agent Creator".into(),
         adapter: adapter.to_owned(),
@@ -203,7 +202,7 @@ mod tests {
 
     #[test]
     fn role_prompts_have_no_trailing_newline() {
-        // They come from TS template literals ending in `.`; a stray newline
+        // They end in `.`; a stray newline
         // would change every prompt that embeds them.
         for t in &AGENT_SHOP_TEMPLATES {
             assert!(!t.role.ends_with('\n'), "{}", t.key);
@@ -329,7 +328,7 @@ mod tests {
 
     #[test]
     fn an_adapter_with_an_empty_balanced_model_omits_the_model_field() {
-        // `model: model || undefined` in the TS factory.
+        // An empty model string is omitted rather than serialized.
         let agents = default_agents("antigravity");
         assert_eq!(agents[0].config.model, None);
         let value = serde_json::to_value(&agents[0]).unwrap();

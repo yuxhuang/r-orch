@@ -1,8 +1,5 @@
 //! WP-2 — process spawning, the line readers, and the shared adapter spawn
 //! path.
-//!
-//! Ported from `src/infrastructure/process/process-manager.ts`
-//! (PARITY.md §8.4, §8.5).
 
 pub mod line_reader;
 pub mod manager;

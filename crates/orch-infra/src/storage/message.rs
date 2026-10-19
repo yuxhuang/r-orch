@@ -1,12 +1,11 @@
-//! File-based message store — ported from
-//! `src/infrastructure/storage/message-store.ts`.
+//! File-based message store.
 //!
 //! One JSON file per message plus an `_index.json`. `list` sorts by
 //! `created_at` ascending, which is the one place the YAML timestamp hazard
-//! would have bitten: the TS implementation calls `.localeCompare()` on that
-//! field, and an unquoted timestamp read back as a `Date` makes it **throw**
-//! (PARITY.md §6.4). Messages are JSON, so the hazard reaches them only
-//! through a cross-binary write of a *task* or *agent* — the guard lives in
+//! would have bitten: an unquoted timestamp read back by a YAML 1.1 reader is
+//! a `Date` rather than a string, which makes a string comparison on that
+//! field **throw**. Messages are JSON, so the hazard reaches them only through
+//! a write of a *task* or *agent* by another binary — the guard lives in
 //! `write_yaml` either way.
 
 use std::sync::Arc;
@@ -510,7 +509,7 @@ mod tests {
             .await
             .unwrap();
         // The one field in the domain that emits null rather than being
-        // omitted (PARITY.md §6.4).
+        // omitted.
         assert!(raw.contains("\"to_agent_id\": null"), "{raw}");
         assert_eq!(store.get("msg_1").await.unwrap().unwrap().to_agent_id, None);
     }
@@ -942,8 +941,8 @@ mod tests {
         assert_eq!(parse_epoch_ms("not a date"), None);
         assert_eq!(parse_epoch_ms(""), None);
         assert_eq!(parse_epoch_ms("2026-10-13"), None);
-        // The no-fraction form the TS can also produce. `node -e
-        // "Date.parse('2026-10-13T16:37:33Z')"` is 1791909453000.
+        // The no-fraction form: 2026-10-13T16:37:33Z is 1791909453000 ms
+        // since the epoch.
         assert_eq!(
             parse_epoch_ms("2026-10-13T16:37:33Z"),
             Some(1_791_909_453_000)

@@ -1,4 +1,4 @@
-//! Form-wizard rendering (docs/parity/tui.md §5.1).
+//! Form-wizard rendering.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -384,8 +384,8 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
             ctx.style(Token::Ghost),
         ));
     } else {
-        // A display-width-aware sliding viewport that keeps the cursor visible
-        // (docs/parity/tui.md §5.1); CJK and emoji count as two cells, so the
+        // A display-width-aware sliding viewport that keeps the cursor visible;
+        // CJK and emoji count as two cells, so the
         // window is measured in cells, not characters.
         let cursor = wizard.text_input().cursor();
         let field_w = max_w.max(1);

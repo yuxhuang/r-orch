@@ -1,12 +1,9 @@
-//! Ported from `test/unit/application/orchestrator-endurance.test.ts`.
-//!
 //! Bounds that only show up under load: the state maps, the retry queue cap,
 //! stats arithmetic over hundreds of completions, the debounce under pressure,
 //! and shutdown with several agents in flight.
 //!
-//! Several TS cases in this file assert on a hand-built object rather than on
-//! the orchestrator (they predate the code being reachable from a test). The
-//! ports below drive the real code path instead, which is strictly stronger.
+//! Several of these cases drive the real code path rather than a hand-built
+//! object, which is strictly stronger.
 
 use orch_core::test_support::{make_agent, make_run, make_task};
 use orch_domain::{
@@ -163,8 +160,7 @@ fn five_hundred_token_increments_stay_exact() {
     );
     assert_eq!(stats.total_runs, 500);
     assert_eq!(stats.total_tasks_completed, 500);
-    // Integers, so there is no `NaN`/`Infinity` class of failure to check for
-    // the way the TS version has to.
+    // Integers, so there is no `NaN`/`Infinity` class of failure to check for.
 }
 
 #[test]

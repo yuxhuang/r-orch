@@ -1,16 +1,16 @@
-//! Terminal output primitives — ported from `src/cli/output.ts`.
+//! Terminal output primitives.
 //!
-//! Human output is split: **structural text is L0, decoration is L2**
-//! (PARITY.md §5). Every literal word, column header, count line and the
+//! Human output is split: **structural text is exact, decoration is free**.
+//! Every literal word, column header, count line and the
 //! *padding* of table cells must match exactly; colours and the ANSI codes
 //! around them may differ.
 //!
-//! The glyph set and its `--ascii` fallback are L0 in both directions,
-//! because `--ascii` is a documented flag (§5.2).
+//! The glyph set and its `--ascii` fallback are exact in both directions,
+//! because `--ascii` is a documented flag.
 
 use std::io::Write;
 
-/// Status / role glyphs and their `--ascii` fallbacks (PARITY.md §5.2).
+/// Status / role glyphs and their `--ascii` fallbacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Running,
@@ -60,7 +60,7 @@ impl Icon {
     }
 }
 
-/// ANSI 256 colour codes from the reference `output.ts`.
+/// ANSI 256 colour codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     Amber,
@@ -98,8 +98,8 @@ pub struct Styles {
 }
 
 impl Styles {
-    /// Plain text: no colour, Unicode glyphs. What a pipe or the parity
-    /// harness sees, because `chalk` disables colour on a non-TTY.
+    /// Plain text: no colour, Unicode glyphs. What a pipe sees,
+    /// because colour is disabled on a non-TTY.
     pub fn plain() -> Self {
         Styles {
             color: false,
@@ -133,7 +133,7 @@ impl Styles {
         self.paint(Color::Green, name)
     }
 
-    /// A workspace or attachment path, purple as `filePath` paints it.
+    /// A workspace or attachment path, purple.
     pub fn file_path(&self, path: &str) -> String {
         self.paint(Color::Purple, path)
     }
@@ -151,7 +151,7 @@ impl Styles {
             "idle" => (Icon::Idle, Color::Dim),
             "error" => (Icon::Error, Color::Red),
             "disabled" => (Icon::Disabled, Color::Ghost),
-            // An unknown status renders uncoloured, like the TS `default`.
+            // An unknown status renders uncoloured.
             _ => return status.to_owned(),
         };
         self.paint(color, self.icon(icon))
@@ -170,7 +170,7 @@ impl Styles {
 }
 
 /// `  ✕ <message>` plus an optional four-space-indented hint, both on
-/// **stderr** (PARITY.md §3.1).
+/// **stderr**.
 pub fn print_error(styles: &Styles, message: &str, hint: Option<&str>) {
     let glyph = styles.paint(Color::Red, styles.icon(Icon::Failed));
     let mut err = std::io::stderr().lock();
@@ -194,9 +194,9 @@ pub fn print_warning(styles: &Styles, message: &str) {
 
 /// Column width is `max(header, widest ANSI-stripped cell)`; **every** cell,
 /// including the last in a row, is padded to `width + padding`, so rows carry
-/// trailing spaces. Do not trim them — they are L0 (PARITY.md §5.1).
+/// trailing spaces. Do not trim them — they are part of the output contract.
 ///
-/// Returns the exact bytes the TS `printTable` writes, including the single
+/// Returns the exact bytes written, including the single
 /// trailing newline, so the format can be asserted without capturing stdout.
 pub fn render_table(
     styles: &Styles,
@@ -260,9 +260,9 @@ pub fn print_key_value(styles: &Styles, pairs: &[(String, String)]) {
 }
 
 /// `String.prototype.length`: UTF-16 code units, so an astral character (an
-/// emoji, say) counts 2. Every width and pad in this module is a `.length` in
-/// the TS, and a cell can hold a user-supplied title or agent name, so the
-/// count has to be the UTF-16 one to pad identically (PARITY.md §5.1).
+/// emoji, say) counts 2. Every width and pad in this module is a
+/// UTF-16 length, and a cell can hold a user-supplied title or agent name, so
+/// the count has to be the UTF-16 one to pad stably.
 fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
@@ -277,12 +277,12 @@ fn pad_end(text: &str, width: usize) -> String {
     }
 }
 
-/// Cell width as the TS computes it: ANSI stripped, then `.length`.
+/// Cell width: ANSI stripped, then the UTF-16 length.
 fn display_width(cell: &str) -> usize {
     utf16_len(&strip_ansi(cell))
 }
 
-/// The TS `stripAnsi` is `/\x1b\[[0-9;]*m/g` — SGR sequences only.
+/// Strips SGR sequences (`/\x1b\[[0-9;]*m/g`) only.
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
@@ -321,10 +321,10 @@ pub fn format_duration(ms: i64) -> String {
     format!("{hours}h{mins:02}m")
 }
 
-/// `formatDurationSince(iso)` = `formatDuration(Date.now() - t)`.
+/// The duration since an ISO timestamp.
 ///
 /// **Unclamped**, so a future timestamp renders negative — which is how
-/// `context list` shows a live TTL as `-60s` (PARITY.md §22.6).
+/// `context list` shows a live TTL as `-60s`.
 pub fn format_duration_since(timestamp: &str) -> String {
     let now = jiff::Timestamp::now().as_millisecond();
     let then = timestamp
@@ -337,25 +337,23 @@ pub fn format_duration_since(timestamp: &str) -> String {
 /// `1.2k` at or above 1000, the plain integer below.
 pub fn format_tokens(n: u64) -> String {
     if n >= 1000 {
-        format!("{}k", js_to_fixed_1(n as f64 / 1000.0))
+        format!("{}k", to_fixed_1(n as f64 / 1000.0))
     } else {
         n.to_string()
     }
 }
 
-/// `Number.prototype.toFixed(1)`.
+/// One decimal place, rounding half **away from zero**.
 ///
-/// **Not** `format!("{:.1}")`: Rust rounds half-to-even and JavaScript rounds
-/// half **away from zero**, so an exact tie diverges — `(1250/1000).toFixed(1)`
-/// is `"1.3"` in node and `{:.1}` gives `1.2`. Ties are reachable here
-/// (`x.25` and `x.75` are exactly representable), and this is L0 human output.
+/// **Not** `format!("{:.1}")`: Rust rounds half-to-even, so an exact tie
+/// diverges — 1.25 must give `"1.3"` and `{:.1}` gives `1.2`. Ties are reachable here
+/// (`x.25` and `x.75` are exactly representable), and this is exact human output.
 ///
-/// Decides on the *binary* value rather than the decimal, which is what
-/// `toFixed` does: `(1150/1000).toFixed(1)` is `"1.1"`, because 1.15 as a
-/// double is just below the tie.
+/// Decides on the *binary* value rather than the decimal: 1.15 gives
+/// `"1.1"`, because 1.15 as a double is just below the tie.
 ///
 /// Positive, finite inputs only — token counts are unsigned.
-fn js_to_fixed_1(x: f64) -> String {
+fn to_fixed_1(x: f64) -> String {
     debug_assert!(x.is_finite() && x >= 0.0);
     // 25 decimals is far more than enough to separate "below the tie" from
     // "exactly the tie" for values of this magnitude.
@@ -417,7 +415,7 @@ impl StructuredFormat {
     }
 
     /// As [`render`](Self::render), but JSON is the compact `JSON.stringify(v)`
-    /// form four commands use (PARITY.md §4.1). YAML has one form.
+    /// form four commands use. YAML has one form.
     pub fn render_compact<T: serde::Serialize + ?Sized>(
         self,
         value: &T,
@@ -572,7 +570,6 @@ mod tests {
 
     #[test]
     fn the_glyph_set_and_its_ascii_fallback_match_the_contract() {
-        // PARITY.md §5.2.
         let table: &[(Icon, &str, &str)] = &[
             (Icon::Running, "●", "*"),
             (Icon::Todo, "○", "o"),
@@ -619,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn colour_uses_the_reference_ansi_256_codes() {
+    fn colour_uses_the_fixed_ansi_256_codes() {
         let styles = Styles {
             color: true,
             ascii: false,
@@ -649,8 +646,8 @@ mod tests {
 
     #[test]
     fn table_cells_are_all_padded_including_the_last() {
-        // PARITY.md §5.1: every cell padded to width + padding, so rows carry
-        // trailing spaces.
+        // Every cell is padded to width + padding, so rows carry trailing
+        // spaces.
         assert_eq!(
             render_table(
                 &Styles::plain(),
@@ -681,9 +678,8 @@ mod tests {
 
     #[test]
     fn an_astral_character_in_a_cell_counts_two_columns_like_string_length() {
-        // The TS widths and pads are `.length`, i.e. UTF-16 code units, so a
-        // rocket counts 2 and the TITLE column is 7 + 2 wide — not 6 + 2.
-        // Measured against node: see PARITY.md §5.1.
+        // Widths and pads are UTF-16 code units, so a rocket counts 2 and the
+        // TITLE column is 7 + 2 wide — not 6 + 2.
         assert_eq!(
             render_table(
                 &Styles::plain(),
@@ -722,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn duration_formatting_matches_the_reference() {
+    fn duration_formatting_is_stable() {
         assert_eq!(format_duration(0), "0s");
         assert_eq!(format_duration(999), "0s");
         assert_eq!(format_duration(1_000), "1s");
@@ -735,20 +731,21 @@ mod tests {
         assert_eq!(format_duration(90_000_000), "25h00m");
     }
 
-    /// Every expectation produced by
-    /// `node -e "console.log((n/1000).toFixed(1))"`.
+    /// Each expectation is `n / 1000` rounded half away from zero to one
+    /// decimal, on the binary `f64` value rather than the decimal one (see the
+    /// 1.15 case).
     #[test]
-    fn token_formatting_matches_the_reference() {
+    fn token_formatting_rounds_half_away_from_zero() {
         let cases: &[(u64, &str)] = &[
             (0, "0"),
             (1, "1"),
             (999, "999"),
             (1_000, "1.0k"),
             (1_050, "1.1k"),
-            // 1.15 as a double is below the tie, so node rounds *down*.
+            // 1.15 as a double is below the tie, so it rounds *down*.
             (1_150, "1.1k"),
             (1_234, "1.2k"),
-            // 1.25 is exactly representable, so node rounds half away from
+            // 1.25 is exactly representable, so it rounds half away from
             // zero — where Rust's `{:.1}` would round half to even and give
             // "1.2k".
             (1_250, "1.3k"),
@@ -764,9 +761,9 @@ mod tests {
 
     #[test]
     fn to_fixed_1_carries_into_the_integer_part() {
-        assert_eq!(js_to_fixed_1(0.96), "1.0");
-        assert_eq!(js_to_fixed_1(9.99), "10.0");
-        assert_eq!(js_to_fixed_1(0.0), "0.0");
+        assert_eq!(to_fixed_1(0.96), "1.0");
+        assert_eq!(to_fixed_1(9.99), "10.0");
+        assert_eq!(to_fixed_1(0.0), "0.0");
     }
 
     #[derive(serde::Serialize)]

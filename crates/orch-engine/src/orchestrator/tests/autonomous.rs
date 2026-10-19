@@ -1,11 +1,9 @@
 //! Autonomous task seeding and the prompt-context assembly that dispatch
-//! performs — PARITY.md §7.12 and §7.5 steps 6–8.
+//! performs.
 //!
-//! The TS suite has no orchestrator-level file for either: seeding is only
-//! exercised indirectly through `goal-service-autonomous.test.ts`, and the
-//! context assembly only through the golden prompt fixtures. Both are L1
-//! contract behaviour that the differential harness depends on, so they get
-//! direct cases here.
+//! Seeding is otherwise only exercised indirectly through the goal-service
+//! tests, and the context assembly only through the golden prompt fixtures.
+//! Both are contract behaviour, so they get direct cases here.
 
 use std::sync::Arc;
 
@@ -329,7 +327,7 @@ async fn the_cooldown_stops_a_second_seed_inside_thirty_seconds() {
 #[tokio::test]
 async fn a_seeding_failure_is_reported_per_agent_and_does_not_stop_the_pass() {
     // An unknown assignee makes `TaskService::create` refuse, which is the
-    // shape of failure the TS error path is written for.
+    // shape of failure the error path is written for.
     // The pass reads the task list once and then creates one task per agent,
     // so failing the *first save* targets the first agent's create precisely —
     // a shared fault flag would take the list down and abort the whole pass.
@@ -394,7 +392,7 @@ async fn seeding_runs_during_a_normal_watch() {
 #[tokio::test]
 async fn a_seeded_task_is_auto_approved_on_completion() {
     // The `autonomous` label is one of the two things that imply auto-approve
-    // (PARITY.md §7.8 step 5), independently of the agent's policy.
+    // independently of the agent's policy.
     let mut agent = autonomous_agent("agt_1", "Scout", None);
     agent.config.approval_policy = Some(orch_domain::ApprovalPolicy::Manual);
 
@@ -411,7 +409,7 @@ async fn a_seeded_task_is_auto_approved_on_completion() {
     h.orchestrator.stop().await.unwrap();
 }
 
-// ── dispatch-time context assembly (§7.5 steps 6–8) ──────────────────────
+// ── dispatch-time context assembly ─────────────────────────────
 
 #[tokio::test]
 async fn dispatch_drains_the_agents_mailbox_and_announces_each_delivery() {

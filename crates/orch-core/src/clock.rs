@@ -1,9 +1,7 @@
-//! The clock seam — a deliberate addition over the TS original
-//! (ARCHITECTURE §5.6).
+//! The clock seam (ARCHITECTURE §5.6).
 //!
-//! The TS test suite has no clock seam: timestamps come from real `new Date()`,
-//! which is a large part of why its timing tests are flaky. Threading a
-//! `Clock` through the container lets the differential harness assert exact
+//! Timestamps from a real clock make timing tests flaky. Threading a
+//! `Clock` through the container lets tests assert exact
 //! values and lets retry/backoff and stall-detection tests run instantly.
 
 pub trait Clock: Send + Sync {
@@ -11,13 +9,13 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
 
     /// `new Date().toISOString()`: ISO-8601 UTC, **exactly 3 fractional
-    /// digits**, `Z` suffix (PARITY.md §6.3).
+    /// digits**, `Z` suffix.
     fn now_iso(&self) -> String;
 }
 
 /// Format epoch milliseconds the way `Date.prototype.toISOString` does:
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ`, always UTC, always exactly three fractional
-/// digits (PARITY.md §6.3).
+/// digits.
 ///
 /// Implemented here rather than in `orch-infra` so the real clock and the
 /// test clock share one tested formatter, and so `orch-core` needs no date
@@ -42,7 +40,7 @@ pub fn iso_from_epoch_ms(ms: i64) -> String {
 /// `None` stands for JS's `NaN`, which matters because every `NaN` comparison
 /// is false: a stall check against an unparseable `last_event_at` must come out
 /// "not stalled", not "stalled forever", and an `Option` forces the caller to
-/// decide (PARITY.md §7.3).
+/// decide.
 ///
 /// Accepts what `Date.prototype.toISOString` produces and the neighbouring
 /// spec forms, all measured against node:

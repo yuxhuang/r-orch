@@ -19,7 +19,7 @@ against it. Changing anything here needs an explicit amendment — it breaks
 Everything returns `orch_core::Result<T>` = `Result<T, orch_core::Error>` unless
 stated otherwise. Every trait is `Send + Sync` and takes `&self`, never
 `&mut self`: stores are shared as `Arc<dyn …>` and own their interior
-mutability, exactly like the shared TS class instances.
+mutability.
 
 ---
 
@@ -56,11 +56,11 @@ domain functions and adapter calls.
 amendments and all replicated by the fakes — so a fake-backed test will *not*
 catch a store that skips one:
 
-1. **`save` removes by id, then pushes to the end of `_index.json`**
-   (PARITY.md §6.10). Index order is *last-write* order. It is observable:
-   `findBestAgent` breaks score ties by position in `AgentStore::list()`, and
-   §14.4 was **reversed to REPLICATE**, so an in-place update that preserves
-   position silently changes which agent runs a task. Applies to the five
+1. **`save` removes by id, then pushes to the end of `_index.json`.**
+   Index order is *last-write* order. It is observable:
+   `findBestAgent` breaks score ties by position in `AgentStore::list()`, so an
+   in-place update that preserves position silently changes which agent runs a
+   task. Applies to the five
    index-backed stores (task, agent, goal, context, message); `TeamStore` and
    `RunStore` have no index and scan their directories, so their order is
    filesystem enumeration order and is **not** contract.
@@ -68,11 +68,12 @@ catch a store that skips one:
    `sort_unstable_by` and `sort_unstable_by_key` are **denied workspace-wide**
    in `clippy.toml` with that reason attached; the lint is verified to fire.
    Override only with an `#[allow]` and a one-line justification.
-3. **Every YAML read must call `Value::apply_merge()`.** js-yaml resolves `<<`;
-   `serde_yaml_ng` leaves it as a literal `"<<"` key (PARITY.md §6.4.2, V38).
+3. **Every YAML read must call `Value::apply_merge()`.** YAML merge keys (`<<`)
+   are part of the config format, but `serde_yaml_ng` leaves `<<` as a literal
+   `"<<"` key.
    Forgetting it makes a hand-authored `config.yml` silently fall back to
    `DEFAULT_CONFIG` for everything the merge supplied — while both trees still
-   compare equal under the Rust parser. See §Evidence below for the
+   compare equal under the Rust parser. See "YAML emission evidence" below for the
    ready-made regression tests.
 
 ```rust
@@ -99,7 +100,7 @@ pub struct ContextEntry { key, value, created_at, updated_at, ttl_ms?, expires_a
 | `GlobalConfigStore` | `read() -> GlobalConfig`, `write(&GlobalConfig)` |
 
 **WP-1, read this:** `ConfigStore::get`/`set`/`write` must round-trip through the
-**raw merged value**, not through `OrchestratorConfig`. The TS store deep-merges
+**raw merged value**, not through `OrchestratorConfig`. The store deep-merges
 plain objects, so unknown keys in `config.yml` survive a `config set`. Use
 `orch_domain::{deep_merge, get_by_path, set_by_path}` on a
 `serde_json::Value`, and deserialize the typed struct only for consumers.
@@ -109,7 +110,7 @@ plain objects, so unknown keys in `config.yml` survive a `config set`. Use
 
 ```rust
 pub enum AgentEventKind { Output, FileChange, Command, ToolCall, Error, Done }
-impl AgentEventKind { fn as_str(); fn to_run_event_type(self) -> RunEventType }  // L0 mapping
+impl AgentEventKind { fn as_str(); fn to_run_event_type(self) -> RunEventType }  // exact mapping
 
 pub struct AgentEvent { kind, timestamp: String, data: Value, tokens: Option<TokenUsage>, error_kind: Option<AdapterErrorKind> }
 pub struct AdapterTestResult { ok: bool, version?, error?, error_kind?, details? }
@@ -130,8 +131,8 @@ impl AdapterRegistry {
     fn get(&self, &str) -> Option<&Arc<dyn Adapter>>;
     fn require(&self, &str) -> Result<&Arc<dyn Adapter>, DomainError>;
     fn has(&self, &str) -> bool;
-    fn list(&self) -> Vec<&Arc<dyn Adapter>>;  // registration order — L0
-    fn kinds(&self) -> Vec<&'static str>;      // registration order — L0
+    fn list(&self) -> Vec<&Arc<dyn Adapter>>;  // registration order (exact)
+    fn kinds(&self) -> Vec<&'static str>;      // registration order (exact)
     fn len(&self) -> usize;  fn is_empty(&self) -> bool;
 }
 ```
@@ -139,8 +140,8 @@ impl AdapterRegistry {
 `execute` is sync on purpose: the orchestrator needs the PID to write
 `state.running` before it consumes events, and the lifecycle listeners must be
 attached before the stream is polled. Stream errors are `Err` **items**, so the
-TS distinction between "an `error` event occurred" (continue) and "the
-generator threw" (run failed) survives — the thrown case is one `Err` item
+distinction between "an `error` event occurred" (continue) and "the
+generator threw" (run failed) is kept — the thrown case is one `Err` item
 followed by the end of the stream.
 
 ## 4. `orch_core::process`
@@ -167,7 +168,7 @@ pub trait ProcessManager {
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild>;
 }
 
-pub const DEFAULT_KILL_GRACE: Duration;   // 10 s, the TS default
+pub const DEFAULT_KILL_GRACE: Duration;   // 10 s
 pub const KILL_POLL_INTERVAL: Duration;   // 200 ms
 ```
 
@@ -226,7 +227,7 @@ pub trait SkillLoader {
 
 pub fn is_valid_skill_name(&str) -> bool;                  // ^[a-z0-9-]+$ — traversal defence
 pub fn is_mcp_skill(&str) -> bool;                         // contains ':'
-pub fn format_skills_block(&[(String, String)]) -> String; // the L0 output format, §9.6
+pub fn format_skills_block(&[(String, String)]) -> String; // the exact output format, §9.6
 ```
 
 ## 8. `orch_core::clock` / `orch_core::ids`
@@ -248,7 +249,7 @@ Take it as `orch-core = { workspace = true, features = ["test-support"] }` under
 
 | Item | Notes |
 |---|---|
-| `make_task()`, `make_agent()`, `make_run()` | The TS `helpers.ts` defaults exactly. Override with struct-update syntax: `Task { status: Done, ..make_task() }`. `make_agent()` is `approval_policy: auto`, `stall_timeout_ms: 300_000`. |
+| `make_task()`, `make_agent()`, `make_run()` | Stock defaults. Override with struct-update syntax: `Task { status: Done, ..make_task() }`. `make_agent()` is `approval_policy: auto`, `stall_timeout_ms: 300_000`. |
 | `Recorder<C>` | Replaces `vi.fn()` call assertions: `calls()`, `first()`, `last()`, `len()`, `matching(pred)`, `count_matching(pred)`, `contains(&c)`, `count_of(&c)`, `clear()`. Cloning shares the log. |
 | `Faults` | Replaces `mockRejectedValue`: `fail_once`, `fail_next(n, msg)`, `fail_always`, `fail_once_with(DomainError)`, `clear()`, `is_armed()`. Queued failures beat the persistent one. |
 | `FakeTaskStore`, `FakeAgentStore`, `FakeRunStore`, `FakeStateStore`, `FakeConfigStore`, `FakeContextStore`, `FakeMessageStore`, `FakeGoalStore`, `FakeTeamStore`, `FakeGlobalConfigStore` | Clone on read **and** write. Public `calls` + `faults`. `seed_*`/`peek_*`/`snapshot()` do not record. `saved()`/`written()` give the write history, which is what the orchestrator tests assert on. |
@@ -282,9 +283,9 @@ unused, so the owning package does not have to touch the root manifest.
 | `tui-input` | `0.15` | single-line editing: command bar, `text` wizard steps (WP-6) |
 | `unicode-segmentation` | `1.13` | grapheme segmentation, replacing `Intl.Segmenter` (WP-6) |
 | `unicode-width` | `0.2` | display width (WP-6) |
-| `arboard` | `3.6` | clipboard (WP-3); degrade to "empty" on any failure, as the TS does |
+| `arboard` | `3.6` | clipboard (WP-3); degrade to "empty" on any failure |
 | `semver` | `1.0` | version comparison in the update check (WP-5) |
-| `similar`, `pretty_assertions` | `3.2`, `1.4` | diffs in the harness and test failures (dev-only) |
+| `pretty_assertions` | `1.4` | diffs in test failures (dev-only) |
 | `proptest` | `1.12` | property tests, if a package wants them (dev-only) |
 
 ### `tui-textarea` is rejected — **WP-6 read this**
@@ -357,12 +358,12 @@ WP-4 should copy.
 1. **One `Error` type across the trait surface** instead of a per-module
    infrastructure enum (§5.7). Five packages share one `Result`, so nobody
    invents conversions, and the exit-code semantics are unchanged (`Domain`
-   keeps its code, everything else is 1 — which is what the TS catch-all does).
+   keeps its code, everything else is 1).
    The `source` chain is kept for `ORCHESTRY_DEBUG`.
-2. **`AdapterRegistry` is an `IndexMap`, not a `Vec`** (§5.4). The TS registry
-   is a `Map` keyed by `kind`: re-registering a kind **replaces** it while
-   `listKinds()` still yields registration order. A `Vec` would duplicate.
-   Order is still L0 — `doctor` probes in it.
+2. **`AdapterRegistry` is an `IndexMap`, not a `Vec`** (§5.4). It is keyed by
+   `kind`: re-registering a kind **replaces** it while `kinds()` still yields
+   registration order. A `Vec` would duplicate.
+   Order is still exact — `doctor` probes in it.
 3. **`ProcessManager::kill` takes `orch_core::process::Signal`, not
    `nix::sys::signal::Signal`** (§5.5). Keeps `orch-core` platform-free;
    `orch-infra` maps it behind a `cfg(unix)` boundary (A3).
@@ -370,33 +371,30 @@ WP-4 should copy.
    itself requires an outcome that can be awaited more than once; a
    `BoxFuture` is consumed on first poll. `ExitSignal` is a `watch` receiver
    with `wait()`/`try_get()`.
-5. **A 10th storage trait, `GlobalConfigStore`.** The TS has a concrete class
-   and no interface, but the TUI persists the palette and the activity filter;
+5. **A 10th storage trait, `GlobalConfigStore`.** The TUI persists the palette and the activity filter;
    without a seam, WP-6's tests would write to the developer's real
    `~/.orchestry/`.
 6. **`orch-domain` depends on `indexmap` and `serde_json`**, not only
    serde/thiserror (§3.1). `serde_json::Value` is unavoidable —
-   `RunEvent.data` is TS `unknown`, and the tolerant `state.json` read and the
-   config deep-merge are value-tree operations. `indexmap` gives JS `Set`/object
-   iteration order for `OrchestratorState.{claimed,running}` and
+   `RunEvent.data` is free-form JSON, and the tolerant `state.json` read and the
+   config deep-merge are value-tree operations. `indexmap` gives insertion
+   order for `OrchestratorState.{claimed,running}` and
    `AgentConfig.env`; both are pure, dependency-light and no-I/O, so the
    "trivially testable, fast to compile" property is intact.
 7. **`iso_from_epoch_ms` and `format_skills_block` live in `orch-core`**, not in
-   `orch-infra`. Both are L0 formats with a test vector; one implementation
+   `orch-infra`. Both are exact formats with a test vector; one implementation
    shared by the real component and the fake beats two.
 8. **The three binaries are three one-line shims over `orch_cli::run()`**, not
    three `[[bin]]` targets sharing one `main.rs` (§3.2). Cargo warns on every
    build about the shared path and compiles it three times; §3.2 already
    offered this as the fallback.
-9. **`ContextEntry` lives in `orch_core::storage`**, mirroring its TS home
-   (`storage/interfaces.ts`) rather than moving into `orch-domain`, whose
-   module list in §3.3 has no `context`.
+9. **`ContextEntry` lives in `orch_core::storage`** rather than in
+   `orch-domain`, whose module list in §3.3 has no `context`.
 
-## Fakes that are better than their TS counterparts
+## Fakes implement real behaviour
 
-The TS mocks stub these to `[]`; the Rust fakes implement the real behaviour,
-because a fake that lies costs more than it saves. **WP-4: do not assert on the
-old empty returns.**
+The fakes do not stub these to empty returns, because a fake that lies costs
+more than it saves. Do not assert on empty returns.
 
 - `FakeRunStore::list_for_task` / `list_for_agent` — real filtering.
 - `FakeRunStore::read_events_tail` — real tail of the stored events.
@@ -409,282 +407,79 @@ old empty returns.**
   preservation across overwrites; entries never expire.
 - `FakeProcessManager` — since Amendment 1, real in-memory pipes: scripted
   stdout/stderr and a captured stdin, so a real adapter can be driven by a
-  fake process. The TS mock passes `{} as any` for the child and can drive
-  nothing.
+  fake process.
 
-## Evidence handed to WP-1
+## YAML emission evidence
 
 `crates/orch-domain/tests/yaml_emission.rs` pins what the frozen types actually
-emit through `serde_yaml_ng` — the "before" half of V8/R1:
+emit through `serde_yaml_ng`:
 
 - **Every** timestamp field across `Task`, `Goal` and `Message` (`created_at`,
-  `updated_at`, `expires_at`, `delivered_at`) comes out **unquoted**, so the
-  TypeScript binary re-parses it as a `Date` and `MessageStore.list()` throws.
-  The guard is genuinely required, and the test names the exact field set it
+  `updated_at`, `expires_at`, `delivered_at`) comes out **unquoted**, so a YAML 1.1
+  reader re-parses it as a date and `MessageStore.list()` fails. The guard is
+  genuinely required, and the test names the exact field set it
   must cover.
 - A user-supplied `description: 2026-10-13` is the same hazard, which is why
   the guard keys off the scalar grammar, not field names.
 - `yes`/`no`/`on`/`off`/`true`/`false`/`null`/`123`/`1.5` as string values
   already round-trip correctly; the guard does **not** need to widen to them.
 - `AgentConfig.env` round-trips in insertion order, and YAML key order matches
-  the TS interface declaration order.
+  struct declaration order.
 
 `crates/orch-domain/tests/yaml_emission.rs` also pins the **merge-key
-bifurcation** (PARITY.md §6.4.2, V38), measured not assumed:
+bifurcation**, measured not assumed:
 
 - `serde_yaml_ng` leaves `<<` as a **literal key**: `scheduling.max_turns` and
   `scheduling.adapter` are simply **absent** from the parse.
-- `Value::apply_merge()` reproduces js-yaml's result exactly (99 / `codex` / 5).
-- `apply_merge()` is a **no-op** on every document ORCH itself writes, so WP-1
+- `Value::apply_merge()` resolves them (99 / `codex` / 5).
+- `apply_merge()` is a **no-op** on every document r-orch itself writes, so WP-1
   can call it unconditionally on every read rather than sniffing for `<<`.
 
-## Test port status for `test/unit/domain/**`
 
-`cargo test -p orch-domain -p orch-core` is green: **204** domain + **136**
-core unit cases, plus 12 integration cases (4 catalogue-parity, 8 YAML
-emission).
+## Behaviour notes
 
-Everything in `test/unit/domain/**` that is domain-pure is ported. The
-remainder belongs to other packages, because the TS file reaches outside the
-domain layer:
+Findings from the early work that still shape the code. Each is pinned by a test.
 
-| TS file | Not ported here | Owner |
-|---|---|---|
-| `run-token-usage.test.ts` | the `extractTokens` half (`infrastructure/adapters/utils.ts`) | WP-2 |
-| `agent-shop.test.ts` | `getShopWizardSteps`, `applyShopTemplate`, `agentWizardToInput` (`src/tui/wizardConfigs.ts`) | WP-6 |
-| `agent-shop-skills.test.ts` | *(nothing — now ported in full)* | — |
-
-V9 (exhaustive 7×7 transition table), V10 (retry arithmetic, overflow
-included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
-(`classifyAdapterError` vectors), V28 (catalogue vs the TS source, via
-`fixtures/shop/`) and V29 (id shape) all have tests.
-
-## Spec issues found while porting
-
-1. **`PARITY.md §4.3` points at "the `state.json` schema in §6.5"**; the state
-   schema is **§6.6** (§6.5 is `config.yml`). Cosmetic.
-2. **`PARITY.md §6.4` says every `?` field needs
-   `skip_serializing_if`, with `Message.to_agent_id` as the sole exception.**
-   True for persisted records, but it must **not** apply to `PromptContext`,
-   where ARCHITECTURE §4.3 requires the opposite. The two documents do not
-   contradict each other, but the rule reads as universal. Flagged so WP-3 does
-   not "fix" `PromptContext`.
-3. **`scope.test.ts` has one case that cannot be ported as written.** It builds
-   strings containing a **lone UTF-16 high surrogate** (`'\ud83d' + 'x'`),
-   which a Rust `String` cannot hold. The ported test exercises the same
-   radix-split-inside-a-surrogate-pair path with U+1F600 / U+1F601, which share
-   the high surrogate `0xD83D` and are valid UTF-8. The trie is implemented
-   over UTF-16 code units as the TS one is, so behaviour is identical for every
-   input Rust can represent.
-4. **`ARCHITECTURE §5.4`'s `AgentEventKind` naming differs from
-   `RunEventType`** and the doc does not say so. The mapping is in PARITY §8.1
-   and is now `AgentEventKind::to_run_event_type`.
-5. ~~**Nobody owns `skills/library/`.**~~ **Closed** — the team lead shipped
-   the 26 `.md` files in `60a259f`, verified byte-identical to
-   `parity/orch-ts/skills/library/`.
-   `crates/orch-domain/tests/shop_skill_references.rs` now runs the
-   reference-integrity half of `agent-shop-skills.test.ts`, and additionally
-   cross-checks that the `agt_creator` role prompt advertises exactly the 26
-   skills that exist — a check the TS suite does not have.
-6. **`fixtures/shop/` was unassigned**, so WP-0 created it (plus the two
-   generator scripts and a README) to make V28 a real test rather than a
-   transcription. `fixtures/{prompts,adapters,yaml}` remain WP-2/WP-3's.
-7. **Cancellation is missing from the adapter spawn contract — WP-4 read
-   this.** Every TS adapter passes `signal: params.signal` to
-   `ProcessManager.spawn`, which makes **node itself** send the child a
-   `SIGTERM` when the `AbortController` fires. Neither PARITY.md §8.2 nor
-   §8.4 mentions it, and `docs/parity/adapters.md` §4.1's table of kill call
-   sites omits it too — it is only visible in the `spawn` options of all eight
-   adapters. It matters twice over:
-
-   - a `CancellationToken` does nothing of the kind, so a cancelled run whose
-     child is still alive would await `ExitSignal` **forever**; and
-   - it means cancelling reaps the agent process even on a path where the
-     orchestrator does not itself call `kill_with_grace`.
-
-   Reproduced in `orch-infra`'s shared adapter spawn path
-   (`process/spawn.rs::kill_on_cancel`), so every adapter inherits it and a
-   new adapter cannot forget it. The signal goes through
-   `ProcessManager::kill`, which tries the process **group** first; node kills
-   only the pid, and the group is what the orchestrator's own grace kill would
-   reach a moment later anyway. **The orchestrator's grace-period kills are
-   still required** — this path sends one `SIGTERM` and never escalates to
+1. **`AgentEventKind` is not `RunEventType`.** The mapping is `AgentEventKind::to_run_event_type`.
+2. **Not every `?` field is `skip_serializing_if`.** The rule holds for persisted records (with
+   `Message.to_agent_id` as the sole exception) but must **not** apply to `PromptContext`, where ARCHITECTURE §4.3
+   requires the opposite.
+3. **`scope` is implemented over UTF-16 code units.** A Rust `String` cannot hold a lone surrogate, so its test
+   exercises the radix-split-inside-a-surrogate-pair path with U+1F600 / U+1F601, which share the high surrogate
+   `0xD83D`.
+4. **`crates/orch-domain/tests/shop_skill_references.rs`** checks that every skill a shop role names exists in
+   `skills/library/`, and that the `agt_creator` role prompt advertises exactly the skills that exist.
+5. **Cancellation is part of the adapter spawn contract.** A cancelled run whose child is still alive would
+   await `ExitSignal` **forever** unless something signals the child. `process/spawn.rs::kill_on_cancel` in
+   `orch-infra`'s shared adapter spawn path sends it, so every adapter inherits it and a new adapter cannot
+   forget it. The signal goes through `ProcessManager::kill`, which tries the process **group** first. **The
+   orchestrator's grace-period kills are still required:** this path sends one `SIGTERM` and never escalates to
    `SIGKILL`.
+6. **`task edit` and `agent edit` take no options.** Each serializes the entity into a `---` frontmatter temp
+   file, spawns `$EDITOR` (then `$VISUAL`, then `vi`) on it, and parses what comes back, writing only the fields
+   that changed. Nothing edited prints "No changes."; a non-zero editor exit reports `Editor exited with code N`.
+   Tests reach both by setting `$EDITOR` to a script they write into a temp directory.
+7. **`msg send` truncates by UTF-16 code units, and the file stays readable.** Subject is capped at 200 and body
+   at 4000 code units. A two-unit character cut between its surrogates would store a lone surrogate, which
+   `serde_json` cannot parse. The write side therefore truncates at the last whole character within the cap, so
+   a message may be one unit shorter than the cap. The read side, `fs_utils::read_json`, repairs unpaired
+   surrogate escapes to U+FFFD for **every** `.json` store, never fails a listing, and leaves the file alone; a
+   re-save for another reason (drain marks delivered) may write the replacement character. A valid pair is
+   passed through untouched. Pinned by the `message_service.rs` truncation tests and the
+   `fs_utils::repair_lone_surrogates` unit tests, including a lone surrogate preceding a valid pair and the
+   escaped-backslash case `\\ud83d`, which must not be read as an escape.
+8. **`msg broadcast --team <nonexistent>` fans out to every agent** and persists the unknown `team_id` on each
+   message. An implementation that validates the team id sends strictly fewer messages; changing this is a
+   contract change.
+9. **A message body is validated trimmed and stored untrimmed.** `'   '` is an error while `' padded '` is
+   accepted and keeps both spaces on disk. The subject is neither trimmed nor validated: empty becomes the
+   literal `(no subject)`.
+10. **`review` is not terminal.** `serve --once` waits for every task to be terminal, and a task in `review` is
+    not, because a task without `review_criteria` is auto-approved only when its agent's `approval_policy` is
+    `auto`. A test that dispatches to agents without that policy needs `task approve` steps or auto-policy
+    agents.
 
-8. **`PARITY.md §3` says a bare command group prints its help to stdout — it
-   prints to stderr.** Measured against the vendored oracle in a hermetic
-   tmpdir, for three groups:
-
-   | argv | stdout | stderr | exit |
-   |---|---|---|---|
-   | `orch task` | 0 B | 735 B | 1 |
-   | `orch agent` | 0 B | 654 B | 1 |
-   | `orch config` | 0 B | 407 B | 1 |
-
-   The first stderr line is `Usage: orchestry task [options] [command]`. This
-   is Commander's `help({ error: true })` path, which is what a subcommand
-   without an `.action()` falls into. The exit code in §3 is right; only the
-   stream is wrong. `fixtures/scenarios/cmd-exit-codes-groups.toml` encodes the
-   measured behaviour, and `harness.rs::is_group_help` documents it where the
-   lint needs to recognise it. **WP-5: write to stderr.**
-
-9. **`config global get` cannot read a nested key, and that is L0.** In the
-   same tree, `config global show --json` prints
-   `{"tui":{"palette":"amber",…}}` while `config global get tui.palette --json`
-   prints `{"key":"tui.palette"}` — no `value` at all, exit 0. `config global
-   get tui` is likewise empty. The project-level `config get` *does* walk dot
-   paths (`config get defaults.agent.max_turns` → `{"key":…,"value":50}`), so
-   the two commands differ. Replicated as measured in
-   `fixtures/scenarios/cmd-config.toml`: the CLI contract is byte parity, not
-   sanity. **WP-5: do not "fix" this.**
-
-10. **`task edit` and `agent edit` take no options whatsoever.** §2.2 lists
-    them beside flag-taking verbs, which invites the assumption that they
-    accept `--title`/`--description`/`--model`. They do not: each serializes
-    the entity into a `---` frontmatter temp file, spawns `$EDITOR` (then
-    `$VISUAL`, then `vi`) on it, and parses what comes back, writing only the
-    fields that changed. Four scenarios were originally written with invented
-    flags and would have asserted nothing; `cargo xtask lint-scenarios` now
-    catches that class of mistake, and `fixtures/fake-editors/` makes the two
-    commands reachable from a scenario at all. The editor protocol itself is
-    L0 surface nobody had enumerated: the frontmatter keys per entity, the
-    "No changes." path when nothing is edited, and `Editor exited with code N`
-    on a non-zero editor exit — all four are now scenarios.
-
-11. **One `msg send` can write a message file that `serde_json` cannot parse —
-    this needs an architect decision.** Measured, and reachable from the CLI
-    with a single command.
-
-    `MessageService.send` truncates with JS `.slice()`, which counts **UTF-16
-    code units**: `subject.slice(0, 200)` and `body.slice(0, 4000)`. A non-BMP
-    character is two code units, so a body of 3999 ASCII characters followed by
-    `😀` (4001 code units) is cut **between the surrogates**, and the stored
-    value ends in a **lone high surrogate**. What the oracle then does with it
-    differs by output path:
-
-    | path | bytes | valid UTF-8 |
-    |---|---|---|
-    | `.orchestry/messages/<id>.json` | `…aaa\ud83d` (the 6-byte escape) | yes |
-    | `msg list --json` on stdout | `…aaa\ud83d` (same escape) | yes |
-    | `msg inbox` human output | `…aaa` + `ef bf bd` (U+FFFD) | yes |
-
-    Both renderings are byte-reproducible from Rust only deliberately, because
-    a Rust `String` cannot hold a lone surrogate at all. The **read** path is
-    the harder half: `serde_json` rejects a lone surrogate escape outright —
-    `from_str(r#"{"body":"aaa\ud83d"}"#)` fails with `unexpected end of hex
-    escape`, whatever follows it — so our storage layer cannot read back a
-    file the oracle wrote. `msg list` would fail entirely rather than diverge
-    in one field.
-
-    Three options, none free, hence the escalation:
-
-    - **Model the body as UTF-16.** Byte-exact in every path, and poisons the
-      domain type for every consumer.
-    - **Replace lone surrogates with U+FFFD on read.** Keeps `String`, matches
-      the human path, and breaks byte parity on re-save (the escape becomes
-      `ef bf bd`), so a round-trip through r-orch silently rewrites the file.
-    - **Declare it L2 above the limit** and record the deviation. Honest, and
-      concedes a documented L0 field.
-
-    Not a hypothetical about hostile input: it needs one `msg send` with a long
-    body ending in an emoji. The harness now reports a file only one side can
-    parse as a failure instead of aborting the run, which it previously did.
-
-    **Ruled 2026-10-13 (option 3, plus a read-side repair).** Write side:
-    truncate at the last whole character within the cap — which WP-4's
-    `truncate_utf16` already did, so no behaviour changed, and it is now
-    covered over every alignment of a two-unit character against both caps.
-    L2 above the limit. Read side: `fs_utils::read_json` repairs unpaired
-    surrogate escapes to U+FFFD for **every** `.json` store, never failing a
-    listing, and leaves the file alone — a re-save for another reason (drain
-    marks delivered) may then write the replacement character, which is
-    accepted. A valid pair is passed through untouched, so no well-formed file
-    changes value.
-
-    Pinned by: `message_service.rs` truncation tests;
-    `fs_utils::repair_lone_surrogates` unit tests, including the adjacency
-    case where a lone surrogate precedes a valid pair and the escaped-backslash
-    case `\\ud83d`, which must not be read as an escape; and
-    `cross_compat.rs::ts_written_lone_surrogate_does_not_break_the_rust_listing`,
-    where the **oracle's own `MessageStore`** writes the record and r-orch
-    lists it. That last one is the real guarantee and was verified to fail
-    without the repair — before it, one such message made `msg list` return
-    nothing at all rather than one mangled body.
-
-    Scenario split accordingly: `cmd-msg-truncation` keeps the cases that cut
-    between characters and is fully compared; `cmd-msg-truncation-mid-pair`
-    carries the licensed divergence, with `@exit-only:parity-14-lone-surrogate`
-    on its steps and `excluded_tree_paths = ["messages/"]`. Both exclusions are
-    named in the file, and a tree exclusion that matches nothing is a failure.
-
-12. **`msg broadcast --team <nonexistent>` fans out to every agent.**
-    `message-service.ts` resolves the team and filters only `if (team)`, with
-    no else branch, so an unknown team id leaves the recipient list unfiltered.
-    Measured in a four-agent tree: `--team <real two-member team>` → 2
-    messages, `--team team_nosuch` → 4, and `team_id: "team_nosuch"` is
-    persisted on all four, leaving a dangling reference in the store. An
-    implementation that validates the team id sends strictly fewer messages
-    than the oracle. Replicated in `cmd-msg-broadcast-unknown-team.toml`.
-
-13. **A message body is validated trimmed and stored untrimmed.**
-    `send` rejects on `!input.body.trim()` and then stores
-    `input.body.slice(0, 4000)` — the original. So `'   '` is an error while
-    `' padded '` is accepted and keeps both spaces on disk. The subject is
-    neither trimmed nor validated: empty becomes the literal `(no subject)`.
-    Trimming before storing passes every rejection test and diverges on every
-    message anyone sends with a trailing newline.
-    Covered by `cmd-msg-body-trimming.toml`.
-
-14. **The oracle's `run` and `serve --once` do not dispatch anything from the
-    CLI — the process exits first.** `orch run <id>` and
-    `orch serve --once` print their header and exit **0** having done nothing:
-    the task stays `todo`, no run record is written, and
-    `.orchestry/orchestry.lock` plus a stale `claimed` entry are left behind.
-    Reproduced outside the harness, inside a git repo and outside one, in
-    `worktree` and `shared` workspace modes, on node 24.21.0. The same
-    invocation under a `node -r <preload>` that holds the event loop open with
-    an interval timer completes the task correctly, so every await does
-    resolve — the process simply exits before they do.
-
-    The mechanism is `ProcessManager.spawn` (`process-manager.ts:63-77`),
-    which `unref()`s every child on the stated assumption that "pipes
-    (stdout/stderr) still hold refs while being read", plus the callers that
-    never read them —`WorkspaceManager.spawnAndWait`
-    (`workspace-manager.ts:171-181`) awaits `close` with no `data` listener.
-    Seven lines reproduce it with no ORCH code at all:
-
-    ```js
-    const p = spawn('sh', ['-c', 'sleep 1'],
-      { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
-    p.unref();
-    new Promise((r) => p.on('close', r)).then((c) => console.log('close', c));
-    // → node exits 0 immediately; `close` never fires
-    ```
-
-    The oracle's own vitest suite cannot see this: it drives the orchestrator
-    in-process, where vitest keeps the loop alive. `unref()` has these
-    semantics on every supported node, so an older runtime is unlikely to
-    change it.
-
-    Consequence for the corpus: `v7-run-single-task` and all nine `o7-*`
-    scenarios cannot be compared against the oracle as written —
-    r-orch does the work and the oracle does nothing, so every artifact
-    differs. `v7-run-cross-compat` is unaffected, because there the oracle
-    only *reads* what r-orch wrote. Needs a decision: patch the vendored
-    oracle (recorded as such), convert those ten to rust-only snapshots, or
-    leave them red. Not something r-orch can or should reproduce.
-
-15. **`review` is not terminal, so `serve --once` waits forever for a task
-    that lands there.** Both implementations' `waitForAllTerminal` poll until
-    every task `isTerminal`, and `review` is not — by design, since a task
-    without `review_criteria` is auto-approved only when its agent's
-    `approval_policy` is `auto`. `o7-concurrency-cap` dispatches six tasks to
-    agents that mostly lack that policy, so it cannot terminate in either
-    implementation; it needs `task approve` steps or auto-policy agents. The
-    harness now reports a timed-out step as a scenario failure rather than
-    aborting the whole run.
-
-16. **`Orchestrator::stop()` aborted the task it was running in, so `serve`
+11. **`Orchestrator::stop()` aborted the task it was running in, so `serve`
     and `run --watch` ignored Ctrl+C.** `stop()` takes the stored watch-loop
     `JoinHandle` and aborts it — but both the signal arms and the tick circuit
     breaker call `stop()` **from inside that very task**, so it cancelled
@@ -700,49 +495,24 @@ included), V12 (`ScopeIndex` ≡ pairwise over a fixed corpus), V13
     `handle_signal` from the *test* task rather than from the loop.
 
     Fixed by not aborting the watch task at all: `shutdown.cancel()` already
-    stops future ticks, which is exactly what `clearInterval(this.timer)`
-    does in the reference, and the arm that called `stop()` breaks
+    stops future ticks, and the arm that called `stop()` breaks
     immediately after. The abort was cancelling the *tick* as well, and a
     tick cancelled between `atomic_write`'s temp file and its rename left
-    `.orchestry/.state.json.<hash>.tmp` behind — litter the reference cannot
-    produce, since `clearInterval` cannot interrupt a running callback. That
-    one surfaced as a flaky tree difference in `o7-serve-once-exit-codes`.
+    `.orchestry/.state.json.<hash>.tmp` behind.
 
     Covered end to end by `crates/orch-cli/tests/watch_shutdown.rs`, at the
     only level where it is real: SIGINT to `run --watch`, SIGTERM to `serve`,
     both asserting the process exits and the lock file is gone.
 
-17. **`heap_mb` has no Rust counterpart.** The `orchestrator:tick` log record
-    carries `heap_mb = +(process.memoryUsage().heapUsed / 1_048_576)
-    .toFixed(1)` (PARITY §16.4). A Rust process has no V8 heap, and reporting
-    RSS under that name would be a different metric wearing this one's label,
-    so r-orch emits `0.0` — the field stays, because the record *shape* is
-    contract — and the harness masks the value the way it masks pids and
-    durations (§1.4). Decide in §14 whether the honest zero or an RSS figure
-    is wanted; nothing downstream reads it.
-
-18. **The tick stream is a wall-clock heartbeat, not a sequence.** How many
-    `orchestrator:tick` records appear before a run finishes, and which tasks
-    are running when one fires, differ between two independently-timed
-    processes: measured as a `running: 2` tick on one side against
-    `running: 1` on the other (`o7-concurrency-cap`), and one extra tick
-    before a stall was detected (`o7-stall-detection`). The scenarios that
-    compare records therefore carry `@ticks-vary:<reason>`, which drops tick
-    records and keeps every other one — dispatch, completion, retries,
-    stalls, shutdown. Separately, human output stamped with
-    `toLocaleTimeString` (`run`, `run --watch`, `logs`) normalizes to
-    `<TIME>`: the two binaries start seconds apart.
-
-19. **`kill(pid 0)` signals the caller's own process group.** Both
+12. **`kill(pid 0)` signals the caller's own process group.** Both
     `kill(-0)` and `kill(0)` do, in C and in node, so a stale or absent pid
     in `state.json` would have had the orchestrator SIGTERM itself along with
     every agent it started. `SystemProcessManager::kill` refuses pid 0 and
-    `is_alive(0)` is false. Not replicated from the reference, which has the
-    same hazard: a process that kills itself because a pid field was missing
+    `is_alive(0)` is false. A process that kills itself because a pid field was missing
     is not behaviour, and nothing observable depends on it. The test can only
     fail by killing the test runner.
 
-20. **`orch tui` outlived its own terminal, at 100 % of a core.** Closing the
+13. **`orch tui` outlived its own terminal, at 100 % of a core.** Closing the
     terminal sends SIGHUP, which `crates/orch-cli/src/tui/command.rs` catches
     and turns into the `stop` flag the draw loop checks once a frame — so
     far, correct. But the loop was waiting for input in

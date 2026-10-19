@@ -1,9 +1,7 @@
-//! Truncation and duration formatters (`src/tui/colors.ts`, `src/cli/output.ts`).
+//! Truncation and duration formatters.
 //!
-//! `capLine` counts **characters** in TS (UTF-16 code units, but every call
-//! site is plain text), so these count `char`s, not bytes and not graphemes —
-//! matching the arithmetic that the layout widths are derived from
-//! (docs/parity/tui.md §6).
+//! Line caps count **characters** (every call site is plain text), so these count `char`s, not bytes and not graphemes —
+//! matching the arithmetic that the layout widths are derived from.
 
 /// Max chars for goal descriptions / progress reports rendered in panels.
 pub const MAX_PANEL_TEXT: usize = 10_000;
@@ -26,8 +24,8 @@ pub fn cap_line(s: &str, max_len: usize) -> String {
 ///
 /// For text whose width is not its length: agent names may be CJK or emoji,
 /// where a `char` cap of 32 is 64 columns and overflows its budget. The rest
-/// of the bar keeps counting `char`s (an accepted L2 divergence, PARITY §12.8
-/// (i)); this is used where a name is involved.
+/// of the bar keeps counting `char`s;
+/// this is used where a name is involved.
 pub fn cap_display(s: &str, max_cols: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
 
@@ -55,7 +53,7 @@ pub fn cap_display(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// `capText(s, max)` — appends `"\n…[truncated]"` past the cap.
+/// Appends `"\n…[truncated]"` past the cap.
 pub fn cap_text(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let head: String = s.chars().take(max).collect();
@@ -65,7 +63,7 @@ pub fn cap_text(s: &str, max: usize) -> String {
     }
 }
 
-/// `formatDuration(ms)` — `{s}s`, `{m}:{ss}`, `{h}h{mm}m`.
+/// `{s}s`, `{m}:{ss}`, `{h}h{mm}m`.
 pub fn format_duration(ms: i64) -> String {
     let seconds = ms.div_euclid(1000).max(0);
     if seconds < 60 {
@@ -81,7 +79,7 @@ pub fn format_duration(ms: i64) -> String {
     format!("{hours}h{mins:02}m")
 }
 
-/// `formatTokens(n)` — `1.2k` past a thousand.
+/// `1.2k` past a thousand.
 pub fn format_tokens(n: u64) -> String {
     if n >= 1000 {
         format!("{:.1}k", n as f64 / 1000.0)
@@ -90,7 +88,7 @@ pub fn format_tokens(n: u64) -> String {
     }
 }
 
-/// `relativeTime(ts, now)` — `now` / `{n}s` / `{n}m` / `{n}h`.
+/// `now` / `{n}s` / `{n}m` / `{n}h`.
 pub fn relative_time(ts_ms: i64, now_ms: i64) -> String {
     let diff = (now_ms - ts_ms).max(0);
     if diff < 3_000 {
@@ -117,8 +115,8 @@ pub fn format_age_days(created_ms: i64, now_ms: i64) -> String {
 /// Parse an RFC 3339 / ISO-8601 timestamp to epoch milliseconds.
 ///
 /// Hand-rolled rather than pulled from `jiff`: the TUI only ever consumes
-/// timestamps this crate also writes (`YYYY-MM-DDTHH:MM:SS.mmmZ`,
-/// PARITY.md §6.3) and only needs a millisecond delta, so a date-library
+/// timestamps this crate also writes (`YYYY-MM-DDTHH:MM:SS.mmmZ`)
+/// and only needs a millisecond delta, so a date-library
 /// dependency here would buy nothing. Unparseable input yields `None`, which
 /// every call site renders as `—`.
 pub fn parse_timestamp_ms(ts: &str) -> Option<i64> {
@@ -162,8 +160,7 @@ mod tests {
         assert_eq!(cap_line("hello", 5), "hello");
         assert_eq!(cap_line("hello", 4), "hel…");
         assert_eq!(cap_line("hello", 1), "…");
-        // 60 chars exactly is not truncated; 61 becomes 59 + '…'
-        // (wizard-agent-hint.test.ts).
+        // 60 chars exactly is not truncated; 61 becomes 59 + '…'.
         let sixty = "x".repeat(60);
         assert_eq!(cap_line(&sixty, 60), sixty);
         let sixty_one = "x".repeat(61);

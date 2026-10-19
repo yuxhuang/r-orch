@@ -1,6 +1,3 @@
-//! Ported from `test/unit/application/orchestrator-parallel-race.test.ts`
-//! (upstream issue #8).
-//!
 //! When a child exits cleanly there is a window between PID death and the
 //! success handler taking the state lock. Reconcile firing inside that window
 //! used to read the dead PID as a crash and fail a run that had just

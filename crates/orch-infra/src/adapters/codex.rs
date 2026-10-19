@@ -1,5 +1,4 @@
-//! Codex CLI adapter — `src/infrastructure/adapters/codex.ts`,
-//! `kind = "codex"` (`docs/parity/adapters.md` §2.2).
+//! Codex CLI adapter for `kind = "codex"`.
 //!
 //! Spawns `codex exec --json -` and pipes the prompt on stdin, which avoids
 //! `ARG_MAX` limits on long prompts.
@@ -272,7 +271,7 @@ fn parse_item(timestamp: String, item: Value) -> Option<AgentEvent> {
     }
 }
 
-/// `{ …fields, raw }` — `raw` last, matching the TS object literals.
+/// `{ …fields, raw }` — `raw` last.
 fn json_with_raw<I>(fields: I, raw: &Value) -> Value
 where
     I: IntoIterator<Item = (&'static str, Value)>,

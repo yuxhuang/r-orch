@@ -1,4 +1,4 @@
-//! Ported from `test/unit/infrastructure/opencode-adapter.test.ts`.
+//! OpenCode adapter tests.
 
 mod support;
 

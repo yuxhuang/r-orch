@@ -1,4 +1,4 @@
-//! All dashboard state and the arithmetic over it (`src/tui/App.tsx`).
+//! All dashboard state and the arithmetic over it.
 //!
 //! Pure and synchronous: no backend calls, no ratatui. [`crate::app::App`] owns
 //! an `AppState` plus a backend and a clock; [`crate::keys`] mutates it.
@@ -244,7 +244,7 @@ impl ViewId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// Normal mode. (`'new_task'` is not ported — PARITY.md §13.)
+    /// Normal mode.
     None,
     Command,
     Wizard,
@@ -383,7 +383,7 @@ impl ToastKind {
         }
     }
 
-    /// Auto-dismiss delay; `onDismiss` fires at `delay + 360`.
+    /// Auto-dismiss delay; the dismissal fires at `delay + 360`.
     pub fn delay_ms(self) -> i64 {
         match self {
             ToastKind::Done => 4_000,
@@ -684,7 +684,7 @@ pub struct AppState {
     pub runs: RunMaps,
     pub(crate) next_message_id: u64,
     /// `(running, queued)` from the last `orchestrator:tick`, so an unchanged
-    /// count does not add a feed line every tick (PARITY.md §12.8 (k)).
+    /// count does not add a feed line every tick.
     pub(crate) last_tick: Option<(usize, usize)>,
 
     // ── Mouse ──────────────────────────────────────────────────────────────
@@ -1512,14 +1512,14 @@ impl AppState {
 
     // ── Derived collections ────────────────────────────────────────────────
 
-    /// `sortedGoals` — by status rank, stable within a rank.
+    /// By status rank, stable within a rank.
     pub fn sorted_goals(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.goals.len()).collect();
         order.sort_by_key(|i| goal_status_order(self.goals[*i].status));
         order
     }
 
-    /// `sortedTasks` — by status rank, then re-grouped by goal when
+    /// By status rank, then re-grouped by goal when
     /// `groupByGoal` is on (groups in first-appearance order, status sort
     /// preserved inside each group, ungrouped tasks last).
     pub fn sorted_tasks(&self) -> Vec<usize> {
@@ -1567,7 +1567,7 @@ impl AppState {
         self.goals.iter().find(|g| g.id == goal_id)
     }
 
-    /// `visibleTasks` — the first 10 unless "show all".
+    /// The first 10 unless "show all".
     pub fn visible_tasks(&self) -> Vec<usize> {
         let sorted = self.sorted_tasks();
         if self.show_all_tasks {
@@ -1864,7 +1864,7 @@ impl AppState {
         rows
     }
 
-    /// `agentSectionRows` — team headers plus the unassigned header.
+    /// Team headers plus the unassigned header.
     pub fn agent_section_rows(&self) -> usize {
         let active_teams: IndexSet<String> = (0..self.agents.len())
             .filter_map(|i| self.team_of(i).map(|t| t.id.clone()))
@@ -1891,7 +1891,7 @@ impl AppState {
             .count()
     }
 
-    /// `listItemCount` — feeds the layout's 50 % list cap.
+    /// Feeds the layout's 50 % list cap.
     pub fn list_item_count(&self, _can_create: bool) -> usize {
         match self.view {
             ViewId::Goals => self.sorted_goals().len() + 1,
@@ -1928,7 +1928,7 @@ impl AppState {
 
     // ── Messages ───────────────────────────────────────────────────────────
 
-    /// `addMessage` — stage a message and arm the 80 ms batch flush. The
+    /// Stage a message and arm the 80 ms batch flush. The
     /// staging buffer is itself truncated to `MAX_MESSAGES`.
     pub fn add_message(&mut self, message: PendingMessage, now_ms: i64, batch_ms: i64) {
         let anchors = self.message_viewport_anchors();
@@ -2083,7 +2083,7 @@ impl AppState {
     /// (`log_selected_index < 0`) pins it to the end of the *filtered* list,
     /// a selection scrolls it by `log_scroll_offset` — and both of them index
     /// into `filtered_messages`, not into `messages`. Confusing the two is
-    /// the bug PARITY.md §14.20 records, so this is the only implementation:
+    /// a bug, so this is the only implementation:
     /// `views/logs.rs` draws from it, and anything that has to turn a row
     /// back into a message reads the same vector.
     pub fn visible_log_indices(&self, view_h: usize) -> Vec<usize> {
@@ -2112,7 +2112,7 @@ impl AppState {
 
     // ── Soft delete ────────────────────────────────────────────────────────
 
-    /// `scheduleDeletion` — returns the banner message to emit.
+    /// Returns the banner message to emit.
     pub fn schedule_deletion(
         &mut self,
         entity_type: EntityType,

@@ -1,9 +1,8 @@
-//! Message service — ported from `src/application/message-service.ts`.
+//! Message service.
 //!
 //! Inter-agent messaging: creation, routing (direct/broadcast/lead), draining
 //! an agent's mailbox into its prompt, and purging expired messages. The
-//! normative rules are PARITY.md §7.16 and the `message:sent` /
-//! `message:delivered` payloads are contract (§7.19).
+//! `message:sent` / `message:delivered` payloads are contract.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,10 +20,10 @@ use crate::events::EventBus;
 use orch_infra::storage::remote::RemoteAgentDirectory;
 
 /// The one sender that need not be a registered agent: a message sent by the
-/// human through the CLI (`message-service.ts:37`, PARITY.md §7.16).
+/// human through the CLI.
 const CLI_SENDER_ID: &str = "cli";
 
-/// `message-service.ts:45` — the subject default and its cap.
+/// The subject default and its cap.
 const NO_SUBJECT: &str = "(no subject)";
 const SUBJECT_MAX_UNITS: usize = 200;
 const BODY_MAX_UNITS: usize = 4000;
@@ -115,7 +114,7 @@ impl MessageService {
     ///
     /// Validation order is contract, because the errors differ: empty body,
     /// then TTL range, then sender existence, and only then anything
-    /// channel-specific (`message-service.ts:28-39`).
+    /// channel-specific.
     pub async fn send(&self, input: CreateMessageInput) -> Result<Vec<Message>> {
         if input.body.trim().is_empty() {
             return Err(Error::invalid_arguments("Message body is required"));
@@ -139,9 +138,8 @@ impl MessageService {
             )));
         }
 
-        // One clock read, like the single `new Date()` the TS derives both
-        // timestamps from: `created_at` and `expires_at` must not straddle a
-        // millisecond boundary (PARITY.md §7.16, `expires_at = created_at + ttl`).
+        // One clock read: `created_at` and `expires_at` must not straddle a
+        // millisecond boundary (`expires_at = created_at + ttl`).
         let now_ms = self.clock.now_ms();
         let subject = if input.subject.is_empty() {
             NO_SUBJECT
@@ -149,7 +147,7 @@ impl MessageService {
             &input.subject
         };
 
-        // The TS `baseMessage` spread: every field the channels share, with
+        // Every field the channels share, with
         // `id` and `to_agent_id` filled in per recipient by `addressed`.
         let template = Message {
             id: String::new(),
@@ -158,7 +156,7 @@ impl MessageService {
             to_agent_id: None,
             subject: truncate_utf16(subject, SUBJECT_MAX_UNITS),
             // Deliberately the raw body, not the trimmed one the check above
-            // used: the TS stores `input.body.slice(0, 4000)` verbatim.
+            // used: the body is stored truncated but otherwise verbatim.
             body: truncate_utf16(&input.body, BODY_MAX_UNITS),
             created_at: iso_from_epoch_ms(now_ms),
             expires_at: Some(iso_from_epoch_ms(now_ms + ttl_ms as i64)),
@@ -179,10 +177,9 @@ impl MessageService {
     ///
     /// A `team_id` narrows the pool to that team's members first, and a
     /// `team_id` naming no team **silently degrades to all agents** rather than
-    /// erroring (`message-service.ts:62`) — unlike the `lead` channel, which
-    /// rejects it. Replicated: a CLI `message send --broadcast --team` typo
-    /// therefore messages the whole fleet, and the differential harness pins
-    /// that behaviour.
+    /// erroring — unlike the `lead` channel, which
+    /// rejects it. A CLI `message send --broadcast --team` typo
+    /// therefore messages the whole fleet, and tests pin that behaviour.
     async fn broadcast(
         &self,
         input: &CreateMessageInput,
@@ -202,8 +199,8 @@ impl MessageService {
         }
 
         // Ids are handed out in recipient order, then every message is saved,
-        // then every message emits — the three phases the TS runs in sequence
-        // (`message-service.ts:70-79`). Store order is observable (§6.10), so
+        // then every message emits — the three phases run in sequence. Store
+        // order is observable, so
         // the recipient order from `AgentStore::list` is preserved throughout.
         let messages: Vec<Message> = agents
             .iter()
@@ -241,9 +238,8 @@ impl MessageService {
             )));
         };
 
-        // No check that the lead still exists as an agent — the TS does not
-        // make one either, so a team whose lead was deleted yields a message
-        // nobody can drain rather than an error.
+        // No check that the lead still exists as an agent, so a team whose lead was deleted yields a
+        // message nobody can drain rather than an error.
         Ok(vec![self.save_one(template, &team.lead_agent_id).await?])
     }
 
@@ -272,8 +268,7 @@ impl MessageService {
     ///
     /// Called by the orchestrator during `dispatchTask`, which injects the
     /// returned messages into the prompt — so draining is destructive and a
-    /// failure between `mark_delivered` and the prompt loses the message. The
-    /// TS has the same window.
+    /// failure between `mark_delivered` and the prompt loses the message.
     pub async fn drain_mailbox(&self, agent_id: &str, task_id: &str) -> Result<Vec<Message>> {
         if agent_id.contains('@') {
             return Ok(Vec::new());
@@ -286,8 +281,8 @@ impl MessageService {
         for message in &pending {
             self.events.emit(OrchestratorEvent::MessageDelivered {
                 message_id: message.id.clone(),
-                // The *parameter*, not `message.to_agent_id`
-                // (`message-service.ts:124`). They agree for anything
+                // The *parameter*, not `message.to_agent_id`.
+                // They agree for anything
                 // `list_pending` returns, since it filters on this agent.
                 to_agent_id: agent_id.to_owned(),
                 task_id: task_id.to_owned(),
@@ -320,8 +315,7 @@ impl MessageService {
             .collect())
     }
 
-    /// Number of messages purged. The expiry rules live in the store
-    /// (PARITY.md §7.16), not here.
+    /// Number of messages purged. The expiry rules live in the store, not here.
     pub async fn purge_expired(&self) -> Result<usize> {
         self.messages.purge_expired().await
     }
@@ -358,8 +352,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 }
 
 /// `String.prototype.slice(0, max)` counts **UTF-16 code units**, so the caps
-/// are applied in those units rather than bytes or `char`s
-/// (`message-service.ts:45-46`).
+/// are applied in those units rather than bytes or `char`s.
 ///
 /// One divergence, in the only case Rust cannot express: where a cut would
 /// land between the halves of a surrogate pair, JS keeps the lone high
@@ -479,8 +472,7 @@ mod tests {
 
     #[test]
     fn truncation_stops_at_the_last_whole_character() {
-        // PARITY.md §14 / TRAITS-FROZEN §11, ruled L2 above the limit. JS
-        // slices by UTF-16 code unit and will cut *between* the surrogates of
+        // Slicing by UTF-16 code unit would cut *between* the surrogates of
         // a non-BMP character, leaving a lone surrogate that a Rust `String`
         // cannot even hold. We stop at the last whole character instead.
         let emoji = "\u{1F600}"; // two UTF-16 units, four UTF-8 bytes
@@ -556,7 +548,7 @@ mod tests {
         }
     }
 
-    /// The five agents the TS `beforeEach` seeds, in its order — `list()`
+    /// The five seeded agents, in order — `list()`
     /// returns seed order and broadcast fan-out follows it.
     fn harness() -> Harness {
         let messages = Arc::new(FakeMessageStore::new());
@@ -930,9 +922,8 @@ mod tests {
     async fn purge_expired_delegates_to_the_store() {
         let h = harness();
 
-        // The TS test stubs the store to return 5; `FakeMessageStore` has no
-        // clock and so always purges nothing. The assertion that carries the
-        // behaviour is the delegation, not the number.
+        // `FakeMessageStore` has no clock and so always purges nothing. The assertion that
+        // carries the behaviour is the delegation, not the number.
         assert_eq!(h.service.purge_expired().await.unwrap(), 0);
         assert_eq!(
             h.messages.calls.count_of(&MessageStoreCall::PurgeExpired),
@@ -1005,7 +996,7 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
     }
 
-    // ── Beyond the TS suite: rules §7.16 states that it never exercises ────
+    // ── Additional rules ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn the_cli_may_send_without_being_a_registered_agent() {
@@ -1071,8 +1062,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Replicated TS behaviour, not an oversight: unlike `lead`, broadcast
-        // does not reject an unknown team (`message-service.ts:62`).
+        // Deliberate, not an oversight: unlike `lead`, broadcast does not
+        // reject an unknown team.
         assert_eq!(messages.len(), 3);
     }
 
