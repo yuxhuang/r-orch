@@ -7,6 +7,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Added
 - The dashboard's Goals, Tasks and Agents lists have sortable column headers: `o` moves the sort to the next column, `O` reverses it, `0` restores the default order, and clicking a header sorts by it (ascending when it was inactive, flipped when it was already active). Goals and Tasks gain Started and Elapsed* columns, where Elapsed* runs from the start to now and stops at the last update once the row is terminal.
+- The dashboard's Goals, Tasks and Agents lists can be filtered by keyword: press `Ctrl+K` and type to narrow the list as you go. It works with sorting, grouping and show all; `Esc`, `Ctrl+U` or the `filter:` chip clears it. `/` still opens the command bar.
 - The dashboard's Agents view can group agents By node as well as By team: press `b` or click the `b group:` chip for a Local section, then one section per remote alias marked online or offline. The sort applies within each section and the selected agent stays selected.
 - A user manual in [docs/manual/](docs/manual/README.md): installing, concepts, every command, the dashboard and web dashboard with screenshots, templates and the agent shop, remote agents, configuration and troubleshooting.
 - Dashboard goal and agent details end with an Activity section in the Activity panel's columns, newest first: a goal lists the entries of its tasks, an agent its own entries. It follows new entries at the top; moving down pauses it and `Home` resumes, as the footer hint and the help overlay say. An empty one reads "No activity.".
@@ -15,6 +16,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ### Changed
 - Dashboard goal, task and agent details show their Overview as an aligned block: the title on a `━` rule, then Amber labels with values in two columns (one column on narrow terminals) and statuses, priorities and per-status task counts in their list colours. A value or title too long for its row wraps onto the rows below it, indented to its column, so nothing is cut off; only the two-row summary pinned above other sections, which uses the same style, still shortens them with `…`. The fields are unchanged; the goal's `Updated` label is now lower case like the others.
 - The dashboard's task-detail Activity section shows each entry in the same columns and colours as the Activity panel (time, agent, type icon, text, error and agent-group highlighting) instead of bare text.
+
+### Changed
+- On the dashboard's Tasks list, showing all tasks or collapsing back to ten (`S`, the `Show all` row or the footer's `S show all`) keeps the selected task selected instead of jumping to the first row. If collapsing hides the selected task, the cursor stays on the last row still listed.
 
 ### Removed
 - Parity validation against the TypeScript original: `docs/PARITY.md`, `cargo xtask parity` and `lint-scenarios`, the scenario corpus and the oracle setup are gone, and the docs no longer promise compatibility with the npm package. Compatibility with `.orchestry` data written by r-orch releases is unchanged ([ADR 0009](docs/decisions/0009-remove-parity-tooling.md)).

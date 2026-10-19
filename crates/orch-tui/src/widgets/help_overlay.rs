@@ -57,8 +57,13 @@ pub const ACTIONS: [(&str, &str); 10] = [
     ("Z", "Undo delete"),
 ];
 
-pub const COMMANDS: [(&str, &str); 8] = [
+/// `Ctrl+K`/`Ctrl+U` sit beside `/` because they are its neighbour on the
+/// lists: `/` stays the command bar and `Ctrl+K` is the keyword filter
+/// (R5). Ten entries, the column's `MAX_ROWS`.
+pub const COMMANDS: [(&str, &str); 10] = [
     ("/", "Command mode"),
+    ("Ctrl+K", "Filter list"),
+    ("Ctrl+U", "Clear filter"),
     ("/task add", "Create task"),
     ("/msg", "Message agent"),
     ("/run", "Execute"),

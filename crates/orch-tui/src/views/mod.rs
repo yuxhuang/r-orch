@@ -29,7 +29,7 @@ use crate::clock::Clock;
 use crate::hit::{ChromeId, HitMap, VerbId, ZoneId, ZoneKind};
 use crate::layout::{MIN_HEIGHT, MIN_WIDTH, regions};
 use crate::state::{AppState, DetailPanel, InputMode, SortColumn, ViewId};
-use crate::theme::{HEAVY_RULE, Palette, Token};
+use crate::theme::{CROSS, HEAVY_RULE, Palette, Token};
 use crate::widgets;
 
 /// Which optional actions the backend supports.
@@ -413,7 +413,78 @@ fn render_main_label(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         if focused { "> " } else { "" },
         ctx.state.view.label()
     );
-    section_label(frame, area, ctx, &title, None);
+    let chip = keyword_chip(ctx, area.width as usize, title.chars().count());
+    let width = chip.as_ref().map_or(0, |chip| spans_width(&chip[..1]));
+    let x = section_label(frame, area, ctx, &title, chip);
+    // The chip is the mouse path to Ctrl+U: clicking it clears the keyword.
+    if width > 0 {
+        ctx.zone(
+            Rect::new(x, area.y, width, 1),
+            area,
+            ZoneKind::Verb(VerbId::KeywordClear),
+            ZoneId::Verb(VerbId::KeywordClear),
+        );
+    }
+}
+
+/// The widest keyword the chip shows before it is cut with `…`.
+const KEYWORD_CHIP_MAX_COLS: usize = 32;
+
+/// The active keyword as a chip on the list's title rule — `filter: ship ·
+/// 2/5 ^U ✕` — so a filtered list never looks like the whole list. `None`
+/// while the list is unfiltered. The keyword is drawn safely (no control or
+/// zero-width characters) and cut to fit what the rule has left.
+fn keyword_chip(ctx: &RenderCtx, width: usize, title_cols: usize) -> Option<Vec<Span<'static>>> {
+    let view = ctx.state.view;
+    let keyword = ctx.state.keyword(view);
+    if keyword.is_empty() {
+        return None;
+    }
+    let (matches, total) = ctx.state.keyword_counts(view);
+    let tail = format!(" · {matches}/{total} ^U {CROSS} ");
+    // `━━━ title ━━` before the chip and a `━` after it.
+    let room = width.saturating_sub(3 + title_cols + 2 + 2 + 1);
+    let fixed = " filter: ".len() + crate::text::text_display_width(&tail);
+    let keyword_cols = room.saturating_sub(fixed).min(KEYWORD_CHIP_MAX_COLS);
+    if keyword_cols == 0 {
+        return None;
+    }
+    let shown = crate::format::cap_display(&sanitize(keyword), keyword_cols);
+    Some(vec![Span::styled(
+        format!(" filter: {shown}{tail}"),
+        ctx.chip(Token::Amber, Token::AccentBg)
+            .add_modifier(Modifier::BOLD),
+    )])
+}
+
+/// The line a filtered list draws under its rows when nothing matches, so
+/// an empty list reads as "filtered out", with the way back, rather than as
+/// "no data". Not a row: it has no selection and no zone.
+///
+/// Returns whether it drew, so a caller can place what follows below it.
+pub(crate) fn render_no_match_at(frame: &mut Frame, area: Rect, y: u16, ctx: &RenderCtx) -> bool {
+    let view = ctx.state.view;
+    let keyword = ctx.state.keyword(view);
+    if keyword.is_empty() || ctx.state.keyword_counts(view).0 > 0 || y >= area.bottom() {
+        return false;
+    }
+    let shown = crate::format::cap_display(&sanitize(keyword), KEYWORD_CHIP_MAX_COLS);
+    put_line(
+        frame,
+        area,
+        y,
+        vec![Span::styled(
+            fit_cells(
+                &format!(
+                    "    No {} match \u{201c}{shown}\u{201d} · Ctrl+U clears the filter",
+                    view.item_label()
+                ),
+                area.width as usize,
+            ),
+            ctx.style(Token::Dim),
+        )],
+    );
+    true
 }
 
 fn render_main(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
@@ -455,7 +526,7 @@ fn render_main(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             (selected.len(), rows.len(), selected)
         }
         ViewId::Goals => {
-            let count = state.goals.len() + usize::from(ctx.caps.can_create_goal);
+            let count = state.sorted_goals().len() + usize::from(ctx.caps.can_create_goal);
             (count, count, (0..count).collect())
         }
         ViewId::Logs => {

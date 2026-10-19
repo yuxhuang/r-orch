@@ -68,6 +68,11 @@ pub enum VerbId {
     CommandExec,
     CommandComplete,
     CommandCancel,
+    /// The keyword prompt's `Enter keep`: close it, keeping the keyword.
+    KeywordKeep,
+    /// Clear the visible list's keyword (the prompt's `Esc clear`, and the
+    /// keyword chip on the list's title rule) and close the prompt.
+    KeywordClear,
     DetailGrow,
     DetailShrink,
     DetailMax,
@@ -79,6 +84,8 @@ pub enum VerbId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FooterAction {
     CommandMode,
+    /// `^K filter`: the keyword prompt of the visible entity list.
+    Filter,
     New,
     Run,
     Cancel,

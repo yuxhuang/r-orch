@@ -8,7 +8,7 @@ use ratatui::text::Span;
 
 use crate::format::{cap_display, format_duration, format_started};
 use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
-use crate::state::{EntityType, GoalSortField, SortColumn};
+use crate::state::{EntityType, GoalSortField, SortColumn, goal_status_word};
 use crate::text::text_display_width;
 use crate::theme::{BLOCK, BULLSEYE, CHECK, CROSS, CURSOR, EM_DASH, PAUSE_BARS, SHADE, Token};
 use crate::views::{
@@ -21,25 +21,25 @@ const PROGRESS_CELLS: usize = 6;
 fn status_chip(status: GoalStatus) -> (String, Token, Token, bool) {
     match status {
         GoalStatus::Active => (
-            format!(" {BULLSEYE} ACTIVE "),
+            format!(" {BULLSEYE} {} ", goal_status_word(status)),
             Token::Green,
             Token::SuccessBg,
             true,
         ),
         GoalStatus::Paused => (
-            format!(" {PAUSE_BARS} PAUSED "),
+            format!(" {PAUSE_BARS} {} ", goal_status_word(status)),
             Token::Dim,
             Token::NeutralBg,
             false,
         ),
         GoalStatus::Achieved => (
-            format!(" {CHECK} DONE "),
+            format!(" {CHECK} {} ", goal_status_word(status)),
             Token::Amber,
             Token::AccentBg,
             true,
         ),
         GoalStatus::Abandoned => (
-            format!(" {CROSS} DROP "),
+            format!(" {CROSS} {} ", goal_status_word(status)),
             Token::Ghost,
             Token::NeutralBg,
             false,
@@ -268,6 +268,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
 
     // `+ add goal...` at selection index `goals.len()`.
+    let add_y = y;
     if ctx.caps.can_create_goal && y < area.bottom() {
         let selected = state.goal_selected == order.len();
         ctx.row_zone(
@@ -297,4 +298,6 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             )],
         );
     }
+    let below = add_y + u16::from(ctx.caps.can_create_goal);
+    super::render_no_match_at(frame, area, below, ctx);
 }

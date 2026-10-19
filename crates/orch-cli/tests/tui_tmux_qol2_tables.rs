@@ -1,6 +1,7 @@
 //! End to end in tmux: the list column headers, the sort keys and header
-//! clicks, and the Started/`Elapsed*` columns, as an operator sees them in a
-//! real terminal (AGENTS.md, "TUI end-to-end tests").
+//! clicks, the Started/`Elapsed*` columns and the keyword filter (Ctrl+K), as
+//! an operator sees them in a real terminal (AGENTS.md, "TUI end-to-end
+//! tests").
 //!
 //! The real `orch` binary runs `orch tui --observe` in a private tmux server
 //! over a temp project seeded on disk: two tasks, one goal and one run record.
@@ -394,6 +395,253 @@ fn tables_headers_sort_and_elapsed_in_tmux() {
     let header = row(&screen, "STATUS");
     assert!(header.contains("STARTED"), "{header:?}");
     assert!(header.contains("ELAPSED*"), "{header:?}");
+
+    tmux.keys(&["q"]);
+}
+
+/// `orch` with its trimmed stdout, for the ids `--quiet` prints.
+fn orch_out(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new(orch_binary())
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .env("HOME", dir.join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", global_config(dir))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("orch runs");
+    assert!(
+        output.status.success(),
+        "orch {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// For the keyword filter: three cancelled tasks: `Alpha deploy` without a goal, `Bravo docs` and
+/// `Charlie deploy` in the goal `Release train`.
+fn keyword_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("home")).expect("home");
+    orch(
+        dir.path(),
+        &["init", "--name", "proj", "--adapter", "shell"],
+    );
+    let goal = orch_out(dir.path(), &["goal", "add", "Release train", "--quiet"]);
+    for (title, goal) in [
+        ("Alpha deploy", None),
+        ("Bravo docs", Some(goal.as_str())),
+        ("Charlie deploy", Some(goal.as_str())),
+    ] {
+        let mut args = vec!["task", "add", title, "--quiet"];
+        if let Some(goal) = goal {
+            args.extend(["--goal-id", goal]);
+        }
+        let id = orch_out(dir.path(), &args);
+        orch(dir.path(), &["task", "cancel", &id]);
+    }
+    dir
+}
+
+/// Type `text` into the keyword prompt one key at a time, waiting for each
+/// to show, so the check is about the filter and not about key batching.
+fn type_keyword(tmux: &Tmux, text: &str) {
+    let mut typed = String::new();
+    for ch in text.chars() {
+        typed.push(ch);
+        tmux.run(&["send-keys", "-t", "dash", "-l", &ch.to_string()]);
+        let prompt = format!("Filter tasks › {typed}█");
+        tmux.wait_for(&prompt, |s| s.contains(&prompt));
+    }
+}
+
+#[test]
+fn keyword_sort_group_and_reset() {
+    let dir = keyword_project();
+    let tmux = launch(
+        dir.path(),
+        format!("orch-y3-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["t"]);
+    let screen = tmux.wait_for("the three tasks", |s| {
+        s.contains("Alpha deploy") && s.contains("Bravo docs") && s.contains("Charlie deploy")
+    });
+    assert!(screen.contains("^K filter"), "{screen}");
+
+    // `/` is still the command bar (R5).
+    tmux.keys(&["/"]);
+    tmux.wait_for("the command bar", |s| s.contains("COMMANDS"));
+    tmux.keys(&["Escape"]);
+    tmux.wait_for("the command bar to close", |s| !s.contains("COMMANDS"));
+
+    // Ctrl+K: the list narrows as the keyword is typed (R3).
+    tmux.keys(&["C-k"]);
+    tmux.wait_for("the keyword prompt", |s| s.contains("Filter tasks ›"));
+    type_keyword(&tmux, "DePloy");
+    let screen = tmux.wait_for("two matches", |s| s.contains("2/3"));
+    assert!(screen.contains("Alpha deploy"), "{screen}");
+    assert!(screen.contains("Charlie deploy"), "{screen}");
+    assert!(!screen.contains("Bravo docs"), "{screen}");
+
+    // Enter keeps it, shown as a chip on the list's title rule (R4).
+    tmux.keys(&["Enter"]);
+    tmux.wait_for("the keyword chip", |s| {
+        s.contains("filter: DePloy · 2/3") && !s.contains("Filter tasks ›")
+    });
+
+    // A header sort orders the matches only: Title ascending, then
+    // descending.
+    let screen = tmux.screen();
+    let (x, y) = locate(&screen, "TITLE");
+    tmux.click(x, y);
+    tmux.wait_for("Title ascending", |s| s.contains("TITLE↑"));
+    tmux.click(x, y);
+    let screen = tmux.wait_for("Title descending", |s| s.contains("TITLE↓"));
+    assert!(
+        locate(&screen, "Charlie deploy").1 < locate(&screen, "Alpha deploy").1,
+        "{screen}"
+    );
+
+    // Goal grouping keeps the filter; the goal's section counts its listed
+    // tasks against all of them.
+    tmux.keys(&["g"]);
+    let screen = tmux.wait_for("grouped matches", |s| {
+        s.contains("RELEASE TRAIN · 1/2 tasks") && s.contains("UNGROUPED · 1 task")
+    });
+    assert!(!screen.contains("Bravo docs"), "{screen}");
+    assert!(
+        locate(&screen, "Charlie deploy").1 < locate(&screen, "Alpha deploy").1,
+        "{screen}"
+    );
+
+    // Ctrl+U clears it; sort and grouping stay.
+    tmux.keys(&["C-u"]);
+    let screen = tmux.wait_for("the whole list", |s| s.contains("Bravo docs"));
+    assert!(!screen.contains("filter:"), "{screen}");
+    assert!(screen.contains("RELEASE TRAIN · 2 tasks"), "{screen}");
+    assert!(screen.contains("TITLE↓"), "{screen}");
+
+    // A paste loses its control characters, ESC and newline included (R13):
+    // `ESC c` would reset a terminal it reached.
+    let paste = dir.path().join("paste.txt");
+    std::fs::write(&paste, "\u{1b}char\nlie\t").expect("paste file");
+    tmux.keys(&["C-k"]);
+    tmux.wait_for("the keyword prompt", |s| s.contains("Filter tasks ›"));
+    tmux.run(&[
+        "load-buffer",
+        "-b",
+        "kw",
+        paste.to_str().expect("utf-8 temp path"),
+    ]);
+    // `-S`: hand the raw bytes over, not tmux's own `^[` rendering of them.
+    // A tmux without `-S` (CI's Ubuntu package) predates that rendering and
+    // already pastes the raw bytes.
+    let raw = tmux
+        .command()
+        .args(["paste-buffer", "-p", "-S", "-b", "kw", "-t", "dash"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("tmux runs");
+    if !raw.status.success() {
+        let stderr = String::from_utf8_lossy(&raw.stderr);
+        assert!(
+            stderr.contains("unknown flag"),
+            "paste-buffer failed: {stderr}"
+        );
+        tmux.run(&["paste-buffer", "-p", "-b", "kw", "-t", "dash"]);
+    }
+    let screen = tmux.wait_for("the sanitized paste", |s| {
+        s.contains("Filter tasks › charlie█")
+    });
+    assert!(screen.contains("1/3"), "{screen}");
+    assert!(screen.contains("ORCH"), "{screen}");
+    assert!(!screen.contains("Bravo docs"), "{screen}");
+
+    // Esc in the prompt clears and closes it.
+    tmux.keys(&["Escape"]);
+    let screen = tmux.wait_for("the cleared list", |s| {
+        s.contains("Bravo docs") && !s.contains("Filter tasks ›")
+    });
+    assert!(screen.contains("Alpha deploy"), "{screen}");
+
+    // The help overlay documents the keys (R5).
+    tmux.keys(&["?"]);
+    let screen = tmux.wait_for("the help overlay", |s| s.contains("Ctrl+K"));
+    assert!(screen.contains("Filter list"), "{screen}");
+    assert!(screen.contains("Ctrl+U"), "{screen}");
+    tmux.keys(&["Escape"]);
+
+    tmux.keys(&["q"]);
+}
+
+/// Eleven cancelled tasks: `Item 01`..`Item 10`, then `Zulu shipit`, which
+/// sorts last by Title and so starts behind the ten-row cap.
+fn capped_keyword_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("home")).expect("home");
+    orch(
+        dir.path(),
+        &["init", "--name", "proj", "--adapter", "shell"],
+    );
+    let titles = (1..=10)
+        .map(|i| format!("Item {i:02}"))
+        .chain(["Zulu shipit".to_string()]);
+    for title in titles {
+        let id = orch_out(dir.path(), &["task", "add", &title, "--quiet"]);
+        orch(dir.path(), &["task", "cancel", &id]);
+    }
+    dir
+}
+
+/// The keyword filters before the ten-row cap (R3, D1): a match that was
+/// behind `Show all` is listed as soon as it is typed, without show-all.
+#[test]
+fn keyword_finds_a_match_behind_the_ten_row_cap() {
+    let dir = capped_keyword_project();
+    let tmux = launch(
+        dir.path(),
+        format!("orch-y3-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["t"]);
+    // Newest first: `Zulu shipit` leads and `Item 01` is behind the cap.
+    let screen = tmux.wait_for("the task list", |s| s.contains("Item 02"));
+
+    // Title ascending puts `Zulu shipit` eleventh: behind the cap.
+    let (x, y) = locate(&screen, "TITLE");
+    tmux.click(x, y);
+    let screen = tmux.wait_for("Title ascending", |s| {
+        s.contains("TITLE↑") && s.contains("Show all (1 more)")
+    });
+    assert!(screen.contains("Item 10"), "{screen}");
+    assert!(!screen.contains("Zulu shipit"), "{screen}");
+
+    // Typed one key at a time, the list narrows to the hidden match.
+    tmux.keys(&["C-k"]);
+    tmux.wait_for("the keyword prompt", |s| s.contains("Filter tasks ›"));
+    type_keyword(&tmux, "shipit");
+    let screen = tmux.wait_for("the match behind the cap", |s| {
+        s.contains("Zulu shipit") && s.contains("1/11")
+    });
+    assert!(!screen.contains("Item 01"), "{screen}");
+    assert!(!screen.contains("Show all"), "{screen}");
+
+    // Kept, the chip counts it against the whole list.
+    tmux.keys(&["Enter"]);
+    let screen = tmux.wait_for("the keyword chip", |s| {
+        s.contains("filter: shipit · 1/11") && !s.contains("Filter tasks ›")
+    });
+    assert!(screen.contains("Zulu shipit"), "{screen}");
+
+    // Cleared, the cap applies again and the match goes back behind it.
+    tmux.keys(&["C-u"]);
+    let screen = tmux.wait_for("the capped list", |s| {
+        s.contains("Item 01") && s.contains("Show all (1 more)")
+    });
+    assert!(!screen.contains("filter:"), "{screen}");
+    assert!(!screen.contains("Zulu shipit"), "{screen}");
 
     tmux.keys(&["q"]);
 }
