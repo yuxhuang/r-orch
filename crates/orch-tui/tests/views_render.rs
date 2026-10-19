@@ -1668,6 +1668,7 @@ fn detail_rail_order_is_stable_across_focus() {
             Focus::GoalDetail(GoalSection::Overview),
             Focus::GoalDetail(GoalSection::Description),
             Focus::GoalDetail(GoalSection::Tasks),
+            Focus::GoalDetail(GoalSection::Activity),
         ]
     );
     for focus in ring.iter().copied() {

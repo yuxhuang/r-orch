@@ -30,7 +30,9 @@ pub fn section_name(focus: Focus) -> &'static str {
         Focus::TaskDetail(TaskSection::Attachments) => "Attachments",
         Focus::TaskDetail(TaskSection::Result) => "Result",
         Focus::TaskDetail(TaskSection::Files) => "Files",
-        Focus::TaskDetail(TaskSection::Activity) => "Activity",
+        Focus::TaskDetail(TaskSection::Activity)
+        | Focus::GoalDetail(GoalSection::Activity)
+        | Focus::AgentDetail(AgentSection::Activity) => "Activity",
         Focus::AgentDetail(AgentSection::Error) => "Error",
         Focus::AgentDetail(AgentSection::Role) => "Role",
         Focus::LogDetail(LogSection::Metadata) => "Metadata",
@@ -113,6 +115,12 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                             state.tasks[*i].title
                         )
                     })
+                    .collect(),
+                // Placeholder until X2 renders shared Activity rows.
+                GoalSection::Activity => state
+                    .detail_activity_rows(&state.pane_key(focus))
+                    .into_iter()
+                    .map(|i| state.messages[i].text.clone())
                     .collect(),
             }
         }
@@ -264,6 +272,12 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     lines.push(error.timestamp.clone());
                     lines
                 }
+                // Placeholder until X2 renders shared Activity rows.
+                AgentSection::Activity => state
+                    .detail_activity_rows(&state.pane_key(focus))
+                    .into_iter()
+                    .map(|i| state.messages[i].text.clone())
+                    .collect(),
             }
         }
         Focus::LogDetail(section) => {
@@ -542,7 +556,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let name = match focus {
         Focus::TaskDetail(TaskSection::Activity) => format!(
             "Activity · {}",
-            if state.task_activity_following(&key) {
+            if state.detail_activity_following(&key) {
                 "following"
             } else {
                 "paused · End follows"
@@ -684,7 +698,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         rows.push((empty.into(), None, 0));
     }
     let scroll = if focus == Focus::TaskDetail(TaskSection::Activity) {
-        state.task_activity_scroll(&key, body.height as usize)
+        state.detail_activity_scroll(&key, body.height as usize)
     } else {
         state.pane_scroll(&key)
     };

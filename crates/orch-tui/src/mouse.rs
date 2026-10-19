@@ -258,20 +258,24 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if let Some(pane) = pane {
             self.state.set_focus(pane.key.section);
             if pane.items > 0 {
-                let mut scroll =
-                    if pane.key.section == Focus::TaskDetail(crate::state::TaskSection::Activity) {
-                        self.state
-                            .task_activity_scroll(&pane.key, pane.body.height as usize)
-                    } else {
-                        self.state.pane_scroll(&pane.key)
-                    };
+                let activity = crate::follow::is_detail_activity(pane.key.section);
+                let mut scroll = if activity {
+                    self.state
+                        .detail_activity_scroll(&pane.key, pane.body.height as usize)
+                } else {
+                    self.state.pane_scroll(&pane.key)
+                };
                 scroll.selected = Some(
                     (scroll.offset + usize::from(y.saturating_sub(pane.body.y)))
                         .min(pane.items.saturating_sub(1)),
                 );
-                if pane.key.section == Focus::TaskDetail(crate::state::TaskSection::Activity)
-                    && scroll.selected == pane.items.checked_sub(1)
-                {
+                // Clicking the live-edge row resumes following.
+                let edge = if crate::follow::detail_activity_newest_first(pane.key.section) {
+                    Some(0)
+                } else {
+                    pane.items.checked_sub(1)
+                };
+                if activity && scroll.selected == edge {
                     scroll.selected = None;
                 }
                 self.state.set_pane_scroll(pane.key, scroll);
