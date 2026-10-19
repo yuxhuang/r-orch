@@ -178,8 +178,9 @@ selected. Like the sort, the grouping lasts only for this dashboard session.
 `Ctrl+K` on the Goals, Tasks or Agents list opens a keyword filter (`/` stays the command bar). The list narrows
 as you type, case-insensitively, on each row's ID, title or name, status (stored and shown: `in_progress` or
 `RUN`), assignee or agent name and ID, and the task's goal or the agent's team, adapter, model and node; never on
-descriptions or the Started/Elapsed text. It filters before the sort, grouping and the ten-task limit, so a match
-is never hidden behind `show all`, a section with no match disappears, and counts read `matches/total`.
+descriptions or the Started/Elapsed text. It filters before the sort, grouping and the ten-task limit, so the ten
+tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten
+matches, `show all` lists the rest. A section with no match disappears, and counts read `matches/total`.
 `Enter` keeps the keyword, shown as a `filter:` chip on the list's title rule; `Esc` in the prompt, `Ctrl+U` on
 the list or a click on the chip clears it. The selected row stays selected while it still matches. Each list keeps
 its own keyword, up to 256 characters, for this dashboard session; control characters in pasted text are dropped.
