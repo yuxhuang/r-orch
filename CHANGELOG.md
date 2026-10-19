@@ -6,15 +6,26 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Added
+- The dashboard's Agents view can group agents By node as well as By team: press `b` or click the `b group:` chip for a Local section, then one section per remote alias marked online or offline. The sort applies within each section and the selected agent stays selected.
 - A user manual in [docs/manual/](docs/manual/README.md): installing, concepts, every command, the dashboard and web dashboard with screenshots, templates and the agent shop, remote agents, configuration and troubleshooting.
+- Dashboard goal and agent details end with an Activity section in the Activity panel's columns, newest first: a goal lists the entries of its tasks, an agent its own entries. It follows new entries at the top; moving down pauses it and `Home` resumes, as the footer hint and the help overlay say. An empty one reads "No activity.".
+- Dashboard wizards' agent steps (task and goal assignee, team lead and members) filter as you type: letters narrow the numbered list to agents whose name, adapter or role contains them, `Backspace` edits the filter and `Esc` clears it, `1`–`9` still pick a listed row, and `Ctrl+O` cycles the order through Original, Name, Adapter and Status. Rows show each agent's status, the Auto-assign/None choice stays first, and only a listed agent or that choice can be submitted; `j`/`k` on these steps now type into the filter (use the arrow keys to move).
+
+### Changed
+- Dashboard goal, task and agent details show their Overview as an aligned block: the title on a `━` rule, then Amber labels with values in two columns (one column on narrow terminals) and statuses, priorities and per-status task counts in their list colours. A value or title too long for its row wraps onto the rows below it, indented to its column, so nothing is cut off; only the two-row summary pinned above other sections, which uses the same style, still shortens them with `…`. The fields are unchanged; the goal's `Updated` label is now lower case like the others.
+- The dashboard's task-detail Activity section shows each entry in the same columns and colours as the Activity panel (time, agent, type icon, text, error and agent-group highlighting) instead of bare text.
 
 ### Removed
 - Parity validation against the TypeScript original: `docs/PARITY.md`, `cargo xtask parity` and `lint-scenarios`, the scenario corpus and the oracle setup are gone, and the docs no longer promise compatibility with the npm package. Compatibility with `.orchestry` data written by r-orch releases is unchanged ([ADR 0009](docs/decisions/0009-remove-parity-tooling.md)).
 
 ### Fixed
+- An Activity entry with no agent (a system entry) at the top of the Activity panel or a detail's Activity section now shows its time, like the first entry of any other group. It also counts as the first group, so when the top entry has no agent, the alternating group shading below it can swap.
+- Dashboard goal, task and agent details keep their section titles in the same order when you move between sections; only the focused title changes style, and a narrow rail drops the titles farthest from the focused one instead of moving it to the front.
+- A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
+- Keys that reach the dashboard together (typed fast over SSH or `orch web`, sent by tmux, or pasted without bracketed paste) are all handled at once. Only the first used to show, so `jj` in a wizard list moved one row and `hello` read `h` until the next key was pressed.
+- Dashboard task, goal and team wizards check the chosen assignee, lead and members against the current agent list when you submit. An agent disabled or removed after you picked it is refused with "Nothing was saved: …": nothing is written, your other answers stay, and the step reopens on the agents that can still be chosen (a refused team member stays listed until you untick it). Before, the stale agent was usually saved anyway, and a new task whose assignee had been removed was created unassigned. The edit wizards' first assignee row now reads "Keep current", which is what it always did.
 - `orch task add --attach` now saves the files: each one is copied into `.orchestry/attachments/<task id>/` and listed on the task. A missing file stops the command with `Attachment file not found` before anything is saved.
 - Task attachments reject duplicate names (including case variants), names already attached on append, and non-file sources before anything is written; copy errors name the source, destination and cause.
-- A key pressed while the terminal is being resized is no longer ignored until the next key, in the `orch agent shop` picker and the dashboard. In tests on Linux, about one in five keys sent right after a resize was lost.
 
 ## [0.8.0] - 2026-10-18
 

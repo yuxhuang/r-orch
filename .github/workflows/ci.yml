@@ -64,6 +64,9 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The TUI end-to-end tests drive the real binary in tmux and fail when
+      # it is missing (AGENTS.md, "TUI end-to-end tests").
+      - run: sudo apt-get update && sudo apt-get install -y tmux
       # Build and run in one step; --no-fail-fast reports every failing binary,
       # as gate.sh does. Some orch-cli tests need python3 (preinstalled) and
       # open their own pty/localhost sockets, which work without a TTY.

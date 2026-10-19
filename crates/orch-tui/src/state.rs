@@ -39,6 +39,8 @@ pub enum GoalSection {
     Description,
     Progress,
     Tasks,
+    /// Always last in the rail; reachable even when empty.
+    Activity,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskSection {
@@ -54,6 +56,8 @@ pub enum AgentSection {
     Overview,
     Error,
     Role,
+    /// Always last in the rail; reachable even when empty.
+    Activity,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSection {
@@ -552,6 +556,54 @@ pub struct AgentSort {
     pub descending: bool,
 }
 
+/// How the agent list is cut into sections. Session-only, and separate from
+/// [`AgentSort`]: grouping decides the sections and their order, the sort
+/// orders agents inside each section, and neither resets the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentGroupBy {
+    /// Active teams by name, then the unassigned agents.
+    #[default]
+    Team,
+    /// Local agents, then one section per remote alias.
+    Node,
+}
+
+impl AgentGroupBy {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Team => Self::Node,
+            Self::Node => Self::Team,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Team => "Team",
+            Self::Node => "Node",
+        }
+    }
+}
+
+/// The section an agent falls in, under one [`AgentGroupBy`]. `Ord` is the
+/// section order on screen; it is the primary key of
+/// [`AppState::sorted_agents`], so the sort can never interleave sections.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AgentGroupKey {
+    /// An active team. The id breaks a tie between two teams of one name, so
+    /// their members cannot interleave under one header.
+    Team {
+        name: String,
+        id: String,
+    },
+    Unassigned,
+    Local,
+    /// A remote alias. Aliases are validated `[a-z0-9][a-z0-9-]*` when a
+    /// remote is added, so byte order is alias order.
+    Remote {
+        alias: String,
+    },
+}
+
 /// A rendered row of the agent list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRow {
@@ -562,6 +614,14 @@ pub enum AgentRow {
         lead_name: Option<String>,
     },
     UnassignedSection {
+        count: usize,
+    },
+    /// A node section: `alias` is `None` for this instance's own agents.
+    /// `online` is the peer link as its agents report it; always `true` for
+    /// the local section.
+    NodeSection {
+        alias: Option<String>,
+        online: bool,
         count: usize,
     },
     Agent {
@@ -649,6 +709,7 @@ pub struct AppState {
     pub task_selected: usize,
     pub agent_selected: usize,
     pub agent_sort: AgentSort,
+    pub agent_group_by: AgentGroupBy,
     pub goal_scroll: usize,
     pub task_scroll: usize,
     pub agent_scroll: usize,
@@ -762,6 +823,7 @@ impl Default for AppState {
             task_selected: 0,
             agent_selected: 0,
             agent_sort: AgentSort::default(),
+            agent_group_by: AgentGroupBy::default(),
             goal_scroll: 0,
             task_scroll: 0,
             agent_scroll: 0,
@@ -1157,6 +1219,7 @@ impl AppState {
                     if !self.tasks_of_goal(&g.id).is_empty() {
                         ring.push(Focus::GoalDetail(GoalSection::Tasks));
                     }
+                    ring.push(Focus::GoalDetail(GoalSection::Activity));
                 }
             }
             ViewId::Tasks => {
@@ -1195,6 +1258,7 @@ impl AppState {
                         ring.push(Focus::AgentDetail(AgentSection::Error));
                     }
                     ring.push(Focus::AgentDetail(AgentSection::Role));
+                    ring.push(Focus::AgentDetail(AgentSection::Activity));
                 }
             }
             ViewId::Logs => {
@@ -1337,18 +1401,13 @@ impl AppState {
             Focus::TaskDetail(TaskSection::Files) => {
                 entity(EntityType::Task, self.selected_task()?.id.clone(), "files")
             }
-            Focus::TaskDetail(TaskSection::Activity) => {
-                let task = self.selected_task()?;
-                let rows: Vec<_> = self
-                    .messages
-                    .iter()
-                    .filter(|m| m.task_id.as_deref() == Some(task.id.as_str()))
-                    .collect();
-                let selected = self
-                    .pane_scroll(&self.pane_key(self.focus))
-                    .selected
-                    .unwrap_or_else(|| rows.len().saturating_sub(1));
-                rows.get(selected).map(|m| ViewerSource::Message(m.id))
+            focus if crate::follow::is_detail_activity(focus) => {
+                let key = self.pane_key(focus);
+                let rows = self.detail_activity_rows(&key);
+                // The live edge does not depend on the viewport height.
+                let selected = self.detail_activity_scroll(&key, 0).selected?;
+                rows.get(selected)
+                    .map(|i| ViewerSource::Message(self.messages[*i].id))
             }
             _ => None,
         }
@@ -1581,78 +1640,102 @@ impl AppState {
         self.sorted_tasks().len() - self.visible_tasks().len()
     }
 
-    /// Active teams remain grouped; the session sort applies inside each section.
+    /// Sections first, by [`AgentGroupKey`]; the session sort applies inside
+    /// each section, so a descending sort never moves a section.
     /// Original is the existing status/source order, not a timestamp order:
     /// Agent carries neither created nor updated timestamps.
     pub fn sorted_agents(&self) -> Vec<usize> {
+        let keys: Vec<AgentGroupKey> = (0..self.agents.len())
+            .map(|i| self.agent_group_key(i))
+            .collect();
         let mut order: Vec<usize> = (0..self.agents.len()).collect();
         order.sort_by(|a, b| {
-            let (ta, tb) = (self.team_of(*a), self.team_of(*b));
-            let has_a = ta.is_some();
-            let has_b = tb.is_some();
-            has_b
-                .cmp(&has_a)
-                .then_with(|| {
-                    let na = ta.map(|t| t.name.as_str()).unwrap_or("");
-                    let nb = tb.map(|t| t.name.as_str()).unwrap_or("");
-                    na.cmp(nb)
-                })
-                .then_with(|| {
-                    let (left, right) = (&self.agents[*a], &self.agents[*b]);
-                    let order = match self.agent_sort.field {
-                        AgentSortField::Original => agent_status_order(left.status)
-                            .cmp(&agent_status_order(right.status))
-                            .then_with(|| a.cmp(b)),
-                        AgentSortField::Name => {
-                            left.name.to_lowercase().cmp(&right.name.to_lowercase())
-                        }
-                        AgentSortField::Status => {
-                            agent_status_order(left.status).cmp(&agent_status_order(right.status))
-                        }
-                        AgentSortField::AdapterModel => {
-                            left.adapter.cmp(&right.adapter).then_with(|| {
-                                left.config
-                                    .model
-                                    .as_deref()
-                                    .unwrap_or("")
-                                    .trim()
-                                    .cmp(right.config.model.as_deref().unwrap_or("").trim())
-                            })
-                        }
-                        AgentSortField::Location => left
-                            .remote
-                            .as_ref()
-                            .map_or("local", |remote| remote.alias.as_str())
-                            .to_lowercase()
-                            .cmp(
-                                &right
-                                    .remote
-                                    .as_ref()
-                                    .map_or("local", |remote| remote.alias.as_str())
-                                    .to_lowercase(),
-                            ),
-                    };
-                    let order = if self.agent_sort.descending {
-                        order.reverse()
-                    } else {
-                        order
-                    };
-                    // Keep equal field values deterministic in either direction.
-                    if self.agent_sort.field == AgentSortField::Original {
-                        order
-                    } else {
-                        order
-                            .then_with(|| left.name.cmp(&right.name))
-                            .then_with(|| left.id.cmp(&right.id))
+            keys[*a].cmp(&keys[*b]).then_with(|| {
+                let (left, right) = (&self.agents[*a], &self.agents[*b]);
+                let order = match self.agent_sort.field {
+                    AgentSortField::Original => agent_status_order(left.status)
+                        .cmp(&agent_status_order(right.status))
+                        .then_with(|| a.cmp(b)),
+                    AgentSortField::Name => {
+                        left.name.to_lowercase().cmp(&right.name.to_lowercase())
                     }
-                })
+                    AgentSortField::Status => {
+                        agent_status_order(left.status).cmp(&agent_status_order(right.status))
+                    }
+                    AgentSortField::AdapterModel => {
+                        left.adapter.cmp(&right.adapter).then_with(|| {
+                            left.config
+                                .model
+                                .as_deref()
+                                .unwrap_or("")
+                                .trim()
+                                .cmp(right.config.model.as_deref().unwrap_or("").trim())
+                        })
+                    }
+                    AgentSortField::Location => left
+                        .remote
+                        .as_ref()
+                        .map_or("local", |remote| remote.alias.as_str())
+                        .to_lowercase()
+                        .cmp(
+                            &right
+                                .remote
+                                .as_ref()
+                                .map_or("local", |remote| remote.alias.as_str())
+                                .to_lowercase(),
+                        ),
+                };
+                let order = if self.agent_sort.descending {
+                    order.reverse()
+                } else {
+                    order
+                };
+                // Keep equal field values deterministic in either direction.
+                if self.agent_sort.field == AgentSortField::Original {
+                    order
+                } else {
+                    order
+                        .then_with(|| left.name.cmp(&right.name))
+                        .then_with(|| left.id.cmp(&right.id))
+                }
+            })
         });
         order
     }
 
+    /// The section `agent_index` belongs to under the current grouping.
+    pub fn agent_group_key(&self, agent_index: usize) -> AgentGroupKey {
+        match self.agent_group_by {
+            AgentGroupBy::Team => match self.team_of(agent_index) {
+                Some(team) => AgentGroupKey::Team {
+                    name: team.name.clone(),
+                    id: team.id.clone(),
+                },
+                None => AgentGroupKey::Unassigned,
+            },
+            AgentGroupBy::Node => match &self.agents[agent_index].remote {
+                Some(remote) => AgentGroupKey::Remote {
+                    alias: remote.alias.clone(),
+                },
+                None => AgentGroupKey::Local,
+            },
+        }
+    }
+
     pub fn set_agent_sort(&mut self, sort: AgentSort) {
+        self.keeping_agent_selection(|state| state.agent_sort = sort);
+    }
+
+    pub fn set_agent_group_by(&mut self, group_by: AgentGroupBy) {
+        self.keeping_agent_selection(|state| state.agent_group_by = group_by);
+    }
+
+    /// Apply a change to the agent order and follow the selected agent, by
+    /// id, to wherever it lands. The add-agent row (no selected agent) keeps
+    /// its index: it is always last, and the agent count does not change.
+    fn keeping_agent_selection(&mut self, change: impl FnOnce(&mut Self)) {
         let selected = self.selected_agent().map(|agent| agent.id.clone());
-        self.agent_sort = sort;
+        change(self);
         if let Some(id) = selected
             && let Some(position) = self
                 .sorted_agents()
@@ -1818,37 +1901,57 @@ impl AppState {
 
     pub fn agent_rows(&self, can_add: bool) -> Vec<AgentRow> {
         let order = self.sorted_agents();
+        let keys: Vec<AgentGroupKey> = (0..self.agents.len())
+            .map(|i| self.agent_group_key(i))
+            .collect();
         let mut rows = Vec::new();
-        let mut prev_team: Option<Option<String>> = None;
+        let mut prev: Option<&AgentGroupKey> = None;
 
         for (selection, agent_index) in order.iter().enumerate() {
-            let team_id = self.team_of(*agent_index).map(|t| t.id.clone());
-            if prev_team.as_ref() != Some(&team_id) {
-                match &team_id {
-                    Some(id) => {
+            let key = &keys[*agent_index];
+            if prev != Some(key) {
+                // Sections are contiguous (the key leads the sort), so a
+                // count over the whole order is the section's size.
+                let members = || order.iter().filter(|i| &keys[**i] == key);
+                match key {
+                    AgentGroupKey::Team { id, .. } => {
                         if let Some(team) = self.teams.iter().find(|t| &t.id == id) {
-                            let count = order
-                                .iter()
-                                .filter(|i| self.team_of(**i).map(|t| &t.id) == Some(id))
-                                .count();
                             let lead_name = self
                                 .agent_by_id(&team.lead_agent_id)
                                 .map(|a| a.name.clone());
                             rows.push(AgentRow::TeamSection {
                                 team_id: id.clone(),
                                 name: team.name.clone(),
-                                count,
+                                count: members().count(),
                                 lead_name,
                             });
                         }
                     }
-                    None => {
-                        // Only once, on the transition into the unassigned block.
-                        let count = order.iter().filter(|i| self.team_of(**i).is_none()).count();
-                        rows.push(AgentRow::UnassignedSection { count });
+                    AgentGroupKey::Unassigned => {
+                        rows.push(AgentRow::UnassignedSection {
+                            count: members().count(),
+                        });
+                    }
+                    AgentGroupKey::Local => rows.push(AgentRow::NodeSection {
+                        alias: None,
+                        online: true,
+                        count: members().count(),
+                    }),
+                    AgentGroupKey::Remote { alias } => {
+                        // Every agent of one alias carries the same link
+                        // state when it is loaded; if a snapshot ever mixes
+                        // them, the node is offline unless all of its agents
+                        // are reachable, so the marker never overstates it.
+                        let online = members()
+                            .all(|i| self.agents[*i].remote.as_ref().is_some_and(|r| r.online));
+                        rows.push(AgentRow::NodeSection {
+                            alias: Some(alias.clone()),
+                            online,
+                            count: members().count(),
+                        });
                     }
                 }
-                prev_team = Some(team_id);
+                prev = Some(key);
             }
             rows.push(AgentRow::Agent {
                 index: *agent_index,
@@ -1864,8 +1967,15 @@ impl AppState {
         rows
     }
 
-    /// Team headers plus the unassigned header.
+    /// The section headers the agent list draws: team headers plus the
+    /// unassigned header, or one header per node.
     pub fn agent_section_rows(&self) -> usize {
+        if self.agent_group_by == AgentGroupBy::Node {
+            let nodes: IndexSet<AgentGroupKey> = (0..self.agents.len())
+                .map(|i| self.agent_group_key(i))
+                .collect();
+            return nodes.len();
+        }
         let active_teams: IndexSet<String> = (0..self.agents.len())
             .filter_map(|i| self.team_of(i).map(|t| t.id.clone()))
             .collect();
@@ -1980,7 +2090,7 @@ impl AppState {
     ) -> (
         Option<u64>,
         Option<u64>,
-        Option<crate::follow::TaskActivityAnchor>,
+        Vec<crate::follow::DetailActivityAnchor>,
     ) {
         let logs = self.filtered_messages();
         let activity = self.activity_messages();
@@ -1998,18 +2108,18 @@ impl AppState {
             } else {
                 None
             },
-            self.task_activity_anchor(),
+            self.detail_activity_anchors(),
         )
     }
     fn restore_message_viewports(
         &mut self,
-        (log, activity, task): (
+        (log, activity, detail): (
             Option<u64>,
             Option<u64>,
-            Option<crate::follow::TaskActivityAnchor>,
+            Vec<crate::follow::DetailActivityAnchor>,
         ),
     ) {
-        self.restore_task_activity_anchor(task);
+        self.restore_detail_activity_anchors(detail);
         if let Some(id) = log {
             self.log_scroll_offset = self
                 .filtered_messages()
