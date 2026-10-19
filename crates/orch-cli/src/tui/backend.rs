@@ -36,7 +36,7 @@ use orch_infra::clipboard::{
 use orch_tui::backend::{
     AgentFields, AgentOpts, BackendResult, ClipboardPaste, CopyOutcome, CopyResult, CopyTarget,
     CopyTicket, CreateTaskOpts, GoalFields, HistoryEntry, LaunchContext, MessageTarget,
-    ModelCatalog, ModelOption, TaskFields, TuiBackend, copy,
+    ModelCatalog, ModelOption, TaskFields, TimingSnapshot, TuiBackend, copy, derive_timings,
 };
 use tokio::runtime::Handle;
 
@@ -457,6 +457,23 @@ impl TuiBackend for EngineBackend {
     fn list_teams(&mut self) -> BackendResult<Vec<Team>> {
         self.block_on(self.engine.team_service.list())
             .map_err(to_message)
+    }
+
+    /// Every retained run record, read once per refresh — not the ten-run
+    /// history sample, which cannot tell a task's earliest start. A read
+    /// failure is reported, so the dashboard shows the timings as unknown
+    /// rather than claiming nothing ever started.
+    fn refresh_timings(
+        &mut self,
+        tasks: &[Task],
+        goals: &[Goal],
+        orch_state: Option<&OrchestratorState>,
+        now_ms: i64,
+    ) -> BackendResult<TimingSnapshot> {
+        let runs = self
+            .block_on(self.engine.run_service.list_all())
+            .map_err(to_message)?;
+        Ok(derive_timings(&runs, tasks, goals, orch_state, now_ms))
     }
 
     // ── Tasks ────────────────────────────────────────────────────────────

@@ -5,18 +5,18 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Span;
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::format::{cap_display, cap_line, format_duration, parse_timestamp_ms};
 use crate::hit::{PseudoRow, ScrollRegion, VerbId, ZoneId, ZoneKind};
-use crate::state::{AgentRow, AgentSortField, AppState, EntityType};
+use crate::state::{AgentRow, AgentSortField, AppState, EntityType, SortColumn};
 use crate::text::text_display_width;
 use crate::theme::{
     CHECK, CIRCLE, CIRCLE_FILLED, CROSS, CURSOR, DIAMOND_OUTLINE, EM_DASH, LOOP, LOZENGE, STAR,
     Token, light_rule, spinner_frame,
 };
-use crate::views::{RenderCtx, put_line, spans_width};
+use crate::views::{
+    HeaderCell, RenderCtx, cell, cell_right, put_line, render_header_row, sanitize, spans_width,
+};
 
 /// The agent-row error hint is capped at 30 characters. The task column
 /// grows to this before the model column takes any slack, so from
@@ -64,13 +64,26 @@ pub fn row_error_text(kind: &str, raw: &str) -> String {
 
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     render_status_bar(frame, area, ctx);
+    let state = ctx.state;
+    // Original has no column of its own: the sort bar marks it, and no
+    // header carries an arrow.
+    render_header_row(
+        frame,
+        area,
+        area.y.saturating_add(1),
+        ctx,
+        &AgentColumns::for_width(area.width as usize).header(),
+        (
+            SortColumn::Agent(state.agent_sort.field),
+            state.agent_sort.descending,
+        ),
+    );
     let area = Rect::new(
         area.x,
-        area.y.saturating_add(1),
+        area.y.saturating_add(2),
         area.width,
-        area.height.saturating_sub(1),
+        area.height.saturating_sub(2),
     );
-    let state = ctx.state;
     let rows = state.agent_rows(ctx.caps.can_add_agent);
 
     ctx.zone(
@@ -407,46 +420,34 @@ impl AgentColumns {
         }
         cols
     }
-}
 
-/// `text` made safe to measure: a grapheme holding a control character (a
-/// newline in a task title) becomes a space, and a zero-width one (ZWSP, a
-/// bidi mark or override, a soft hyphen, a lone combining mark) is dropped.
-///
-/// ratatui drops zero-width graphemes when it draws, but
-/// [`text_display_width`] clamps every grapheme to at least one cell (the
-/// editor cursor relies on that), so a zero-width grapheme left in would pad
-/// the cell one short and shift every later column left. Dropping them here
-/// also keeps a bidi override in a peer's agent name off the terminal.
-fn sanitize(text: &str) -> String {
-    text.graphemes(true)
-        .filter_map(|g| {
-            if g.contains(char::is_control) {
-                Some(" ")
-            } else if UnicodeWidthStr::width(g) == 0 {
-                None
-            } else {
-                Some(g)
-            }
-        })
-        .collect()
-}
-
-/// `text` fitted to exactly `width` display cells: [`sanitize`]d, an
-/// overlong value ends in `…`, a short one is padded. Measured in cells, not
-/// `char`s, so a CJK or emoji name cannot push the columns after it out of
-/// line.
-fn cell(text: &str, width: usize) -> String {
-    let capped = cap_display(&sanitize(text), width);
-    let pad = width.saturating_sub(text_display_width(&capped));
-    format!("{capped}{}", " ".repeat(pad))
-}
-
-/// [`cell`], right-aligned.
-fn cell_right(text: &str, width: usize) -> String {
-    let capped = cap_display(&sanitize(text), width);
-    let pad = width.saturating_sub(text_display_width(&capped));
-    format!("{}{capped}", " ".repeat(pad))
+    /// The header labels over these columns: status, name, adapter/model and
+    /// where sort; task, caps and runs are labels only.
+    fn header(self) -> Vec<HeaderCell> {
+        let agent = SortColumn::Agent;
+        let gap = |width: usize| HeaderCell::gap(usize::from(width > 0));
+        vec![
+            HeaderCell::gap(2),
+            HeaderCell::sort("STATUS", 10, agent(AgentSortField::Status)),
+            // The gap, the marks slot and the gap after it.
+            HeaderCell::gap(4),
+            HeaderCell::sort("NAME", self.name, agent(AgentSortField::Name)),
+            gap(self.model),
+            HeaderCell::sort(
+                "ADAPTER/MODEL",
+                self.model,
+                agent(AgentSortField::AdapterModel),
+            ),
+            gap(self.task),
+            HeaderCell::plain("TASK", self.task),
+            gap(self.caps),
+            HeaderCell::plain("CAPS", self.caps),
+            gap(self.place),
+            HeaderCell::sort("WHERE", self.place, agent(AgentSortField::Location)),
+            gap(self.time),
+            HeaderCell::plain("RUNS", self.time).right(),
+        ]
+    }
 }
 
 /// The where cell's text: `local`, or `{alias} online|offline` with the
@@ -813,7 +814,9 @@ mod tests {
             .enumerate()
             .map(|(i, name)| make_agent(&format!("agt_{i}"), name, AgentStatus::Idle))
             .collect();
-        for (width, height) in [(80, 26), (100, 26), (120, 40)] {
+        // Two rows taller than the bare list needs: the sort bar and the
+        // column header sit above the rows.
+        for (width, height) in [(80, 28), (100, 28), (120, 40)] {
             let buffer = draw(
                 FakeBackend::new().with_agents(agents.clone()),
                 width,
@@ -1066,7 +1069,8 @@ mod tests {
 
     #[test]
     fn rows_align_at_80_columns() {
-        assert_aligned(80, 24);
+        // 26 rather than 24: the column header takes a row of the list.
+        assert_aligned(80, 26);
     }
 
     #[test]

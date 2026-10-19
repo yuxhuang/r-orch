@@ -6,16 +6,19 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Span;
 
-use crate::format::{cap_line, format_duration, parse_timestamp_ms};
+use crate::format::{cap_display, cap_line, format_duration, format_started};
 use crate::hit::{PseudoRow, ScrollRegion, ZoneId, ZoneKind};
 use crate::onboarding::OnboardingStep;
-use crate::state::{EntityType, TaskRow};
+use crate::state::{EntityType, SortColumn, TaskRow, TaskSortField};
+use crate::text::text_display_width;
 use crate::theme::{
     ARROW_RIGHT, CHECK, CIRCLE, CROSS, CURSOR, DIAMOND, EM_DASH, LOZENGE, PAPERCLIP, PLUS_CIRCLE,
     TRIANGLE_DOWN, Token, heavy_rule, light_rule, priority_pips, priority_token, spinner_frame,
 };
 use crate::views::spans_width;
-use crate::views::{RenderCtx, put_line};
+use crate::views::{
+    HeaderCell, RenderCtx, cell, cell_right, put_line, render_header_row, sanitize,
+};
 
 const GOAL_BADGE_W: usize = 18;
 const GOAL_TITLE_CAP: usize = 13;
@@ -101,6 +104,24 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         return;
     }
 
+    let cols = TaskColumns::for_width(area.width as usize);
+    render_header_row(
+        frame,
+        area,
+        area.y,
+        ctx,
+        &cols.header(),
+        (
+            SortColumn::Task(state.task_sort.field),
+            state.task_sort.descending,
+        ),
+    );
+    let area = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
     let rows = state.task_rows(ctx.caps.can_create_task);
     let skip = state.task_scroll;
     let mut y = area.y;
@@ -161,7 +182,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 );
             }
             TaskRow::Task { index, selection } => {
-                render_task_row(frame, area, ctx, y, *index, *selection);
+                render_task_row(frame, area, ctx, y, cols, *index, *selection);
                 // Identity is the task id, not the row: a refresh between a
                 // press and a release must cancel the click, not move it to
                 // whatever slid into this row (§3.3).
@@ -276,11 +297,102 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
 }
 
+// ── Column layout ─────────────────────────────────────────────────────────
+//
+//   cursor │ status chip │ pri │ title │ goal │ assignee │ started │ elapsed*
+//
+// One width per column per frame, shared by the header and every row. Title
+// is elastic and holds the attachment mark; on a narrow terminal the optional
+// columns drop lowest-priority first (goal, assignee, started).
+
+/// Cursor (2) + status chip and its gap (10) + priority pips (4).
+const LEAD_W: usize = 2 + 10 + 4;
+const TITLE_MIN: usize = 10;
+const ASSIGNEE_W: usize = 14;
+const STARTED_W: usize = 8;
+/// `ELAPSED*↓` fits exactly.
+const ELAPSED_W: usize = 9;
+
+/// Column widths for one frame's task rows; `0` hides a column. Each optional
+/// column is preceded by a one-cell gap that is not counted here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskColumns {
+    pub title: usize,
+    pub goal: usize,
+    pub assignee: usize,
+    pub started: usize,
+    pub elapsed: usize,
+}
+
+impl TaskColumns {
+    pub fn for_width(width: usize) -> Self {
+        let mut avail = width.saturating_sub(LEAD_W);
+        let title = TITLE_MIN.min(avail);
+        avail -= title;
+        let mut take = |w: usize| {
+            if avail > w {
+                avail -= w + 1;
+                w
+            } else {
+                0
+            }
+        };
+        let elapsed = take(ELAPSED_W);
+        let started = take(STARTED_W);
+        let assignee = take(ASSIGNEE_W);
+        let goal = take(GOAL_BADGE_W);
+        TaskColumns {
+            title: title + avail,
+            goal,
+            assignee,
+            started,
+            elapsed,
+        }
+    }
+
+    fn header(self) -> Vec<HeaderCell> {
+        let task = SortColumn::Task;
+        let gap = |width: usize| HeaderCell::gap(usize::from(width > 0));
+        vec![
+            HeaderCell::gap(2),
+            HeaderCell::sort("STATUS", 10, task(TaskSortField::Status)),
+            HeaderCell::sort("PRI", 4, task(TaskSortField::Priority)),
+            HeaderCell::sort("TITLE", self.title, task(TaskSortField::Title)),
+            gap(self.goal),
+            HeaderCell::sort("GOAL", self.goal, task(TaskSortField::Goal)),
+            gap(self.assignee),
+            HeaderCell::sort("ASSIGNEE", self.assignee, task(TaskSortField::Assignee)),
+            gap(self.started),
+            HeaderCell::sort("STARTED", self.started, task(TaskSortField::Started)).right(),
+            gap(self.elapsed),
+            HeaderCell::sort("ELAPSED*", self.elapsed, task(TaskSortField::Elapsed)).right(),
+        ]
+    }
+}
+
+/// `text` as a chip exactly `width` cells wide: the chip colours only the
+/// text, and plain padding fills the rest of the column.
+fn chip_cell(
+    ctx: &RenderCtx,
+    text: &str,
+    width: usize,
+    fg: Token,
+    bg: Token,
+) -> Vec<Span<'static>> {
+    let text = cap_display(&sanitize(text), width);
+    let pad = width.saturating_sub(text_display_width(&text));
+    vec![
+        Span::styled(text, ctx.chip(fg, bg)),
+        Span::raw(" ".repeat(pad)),
+    ]
+}
+
 fn render_task_row(
     frame: &mut Frame,
     area: Rect,
     ctx: &RenderCtx,
     y: u16,
+    cols: TaskColumns,
     index: usize,
     selection: usize,
 ) {
@@ -289,17 +401,6 @@ fn render_task_row(
     let selected =
         selection == state.task_selected && !matches!(state.view, crate::state::ViewId::Logs);
     let running = matches!(task.status, TaskStatus::InProgress | TaskStatus::Retrying);
-
-    let goal_badge = state
-        .resolved_goal_id(index)
-        .and_then(|id| state.goal_by_id(&id).map(|g| g.title.clone()));
-    let goal_badge_w = if goal_badge.is_some() {
-        GOAL_BADGE_W
-    } else {
-        0
-    };
-    let fixed_cols = 2 + 10 + 4 + 14 + goal_badge_w + 7;
-    let title_w = (area.width as usize).saturating_sub(fixed_cols).max(10);
 
     let (chip_text, chip_fg, chip_bg, chip_bold) =
         status_chip(task.status, state.tick, state.remote_run(&task.id));
@@ -312,7 +413,7 @@ fn render_task_row(
             },
             ctx.style(Token::Amber),
         ),
-        Span::styled(format!("{chip_text:<9} "), {
+        Span::styled(cell(&chip_text, 9), {
             let style = ctx.chip(chip_fg, chip_bg);
             if chip_bold {
                 style.add_modifier(Modifier::BOLD)
@@ -320,6 +421,7 @@ fn render_task_row(
                 style
             }
         }),
+        Span::raw(" "),
         Span::styled(format!("{:<4}", priority_pips(task.priority)), {
             let style = ctx.style(priority_token(task.priority));
             if task.priority <= 2 {
@@ -328,68 +430,94 @@ fn render_task_row(
                 style
             }
         }),
-        Span::styled(
-            format!(
-                "{:<width$}",
-                cap_line(&task.title, title_w),
-                width = title_w
-            ),
-            {
-                let token = if selected {
-                    Token::White
-                } else {
-                    Token::Silver
-                };
-                let style = ctx.style(token);
-                if selected || running {
-                    style.add_modifier(Modifier::BOLD)
-                } else {
-                    style
-                }
-            },
-        ),
     ];
 
-    if let Some(attachments) = task.attachments.as_ref()
-        && !attachments.is_empty()
-    {
+    // The attachment mark lives inside the title column, so it never pushes
+    // the columns after it out of line.
+    let mark = match task.attachments.as_ref() {
+        Some(attachments) if !attachments.is_empty() => {
+            format!(" {PAPERCLIP}{}", attachments.len())
+        }
+        _ => String::new(),
+    };
+    let mark_w = text_display_width(&mark).min(cols.title.saturating_sub(TITLE_MIN));
+    spans.push(Span::styled(cell(&task.title, cols.title - mark_w), {
+        let token = if selected {
+            Token::White
+        } else {
+            Token::Silver
+        };
+        let style = ctx.style(token);
+        if selected || running {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }));
+    if mark_w > 0 {
+        spans.push(Span::styled(cell(&mark, mark_w), ctx.style(Token::Dim)));
+    }
+
+    if cols.goal > 0 {
+        spans.push(Span::raw(" "));
+        match state
+            .resolved_goal_id(index)
+            .and_then(|id| state.goal_by_id(&id).map(|g| g.title.clone()))
+        {
+            Some(title) => spans.extend(chip_cell(
+                ctx,
+                &format!(" {PLUS_CIRCLE} {} ", cap_line(&title, GOAL_TITLE_CAP)),
+                cols.goal,
+                Token::AmberDim,
+                Token::AccentBg,
+            )),
+            None => spans.push(Span::raw(" ".repeat(cols.goal))),
+        }
+    }
+
+    if cols.assignee > 0 {
+        spans.push(Span::raw(" "));
+        match task.assignee.as_deref() {
+            Some(agent_id) => spans.extend(chip_cell(
+                ctx,
+                &state.agent_name(agent_id),
+                cols.assignee,
+                Token::Green,
+                Token::SuccessBg,
+            )),
+            None => spans.push(Span::styled(
+                cell(EM_DASH, cols.assignee),
+                ctx.style(Token::Ghost),
+            )),
+        }
+    }
+
+    let unknown = state.timing_error.is_some();
+    if cols.started > 0 {
+        let text = match state.task_started_ms(index) {
+            Some(start) => format_started(start, ctx.now_ms),
+            None if unknown => "?".to_string(),
+            None => String::new(),
+        };
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!(" {PAPERCLIP}{}", attachments.len()),
+            cell_right(&text, cols.started),
             ctx.style(Token::Dim),
         ));
     }
-
-    if let Some(title) = goal_badge {
+    if cols.elapsed > 0 {
+        let (text, token) = match state.task_elapsed_ms(index, ctx.now_ms) {
+            Some(ms) if running => (format_duration(ms), Token::Cyan),
+            Some(ms) => (format_duration(ms), Token::Dim),
+            None if unknown => ("?".to_string(), Token::Dim),
+            None => (String::new(), Token::Dim),
+        };
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!(" {PLUS_CIRCLE} {} ", cap_line(&title, GOAL_TITLE_CAP)),
-            ctx.chip(Token::AmberDim, Token::AccentBg),
+            cell_right(&text, cols.elapsed),
+            ctx.style(token),
         ));
     }
-
-    match task.assignee.as_deref() {
-        Some(agent_id) => spans.push(Span::styled(
-            format!("{:<14}", cap_line(&state.agent_name(agent_id), 13)),
-            ctx.chip(Token::Green, Token::SuccessBg),
-        )),
-        None => spans.push(Span::styled(
-            format!("{EM_DASH:<14}"),
-            ctx.style(Token::Ghost),
-        )),
-    }
-
-    let (time_text, time_token) = match task.status {
-        TaskStatus::Done => (CHECK.to_string(), Token::Green),
-        TaskStatus::Failed => (CROSS.to_string(), Token::Red),
-        TaskStatus::InProgress | TaskStatus::Retrying => {
-            let updated = parse_timestamp_ms(&task.updated_at).unwrap_or(ctx.now_ms);
-            (format_duration(ctx.now_ms - updated), Token::Cyan)
-        }
-        _ => (EM_DASH.to_string(), Token::Dim),
-    };
-    spans.push(Span::styled(
-        format!("{time_text:>7}"),
-        ctx.style(time_token),
-    ));
 
     put_line(frame, area, y, spans);
 }

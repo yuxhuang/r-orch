@@ -20,7 +20,7 @@
 
 use ratatui::layout::Rect;
 
-use crate::state::{CopyOrigin, EntityType, Focus, PaneKey, ViewId};
+use crate::state::{CopyOrigin, EntityType, Focus, PaneKey, SortColumn, ViewId};
 use crate::widgets::text_viewer::ViewerSource;
 use crate::wizard::engine::WizardKind;
 use crate::wizard::{DraftKey, LeaveChoice};
@@ -134,28 +134,58 @@ pub enum PickerKind {
 pub enum ZoneKind {
     Pane(Focus),
     DetailSection(Focus),
-    ActivityRow { message_id: u64 },
+    ActivityRow {
+        message_id: u64,
+    },
     ExpandText,
     ViewerText,
     EditorText,
     TextAction(TextAction),
     LeaveChoice(LeaveChoice),
     Tab(ViewId),
-    TaskRow { selection: usize },
-    AgentRow { selection: usize },
-    GoalRow { selection: usize },
-    LogRow { filtered_index: usize },
-    LogAgentChip { index: usize },
-    PickerRow { index: usize, part: RowPart },
-    TypePickerRow { index: usize, part: RowPart },
-    SuggestionRow { index: usize },
-    WizardOption { index: usize, part: RowPart },
-    WizardSuggestion { value: String },
+    TaskRow {
+        selection: usize,
+    },
+    AgentRow {
+        selection: usize,
+    },
+    GoalRow {
+        selection: usize,
+    },
+    LogRow {
+        filtered_index: usize,
+    },
+    LogAgentChip {
+        index: usize,
+    },
+    PickerRow {
+        index: usize,
+        part: RowPart,
+    },
+    TypePickerRow {
+        index: usize,
+        part: RowPart,
+    },
+    SuggestionRow {
+        index: usize,
+    },
+    WizardOption {
+        index: usize,
+        part: RowPart,
+    },
+    WizardSuggestion {
+        value: String,
+    },
     CommandGhost,
     Pseudo(PseudoRow),
     Verb(VerbId),
+    /// A list's column header: select that sort field, or flip it if it is
+    /// already the active one.
+    SortHeader(SortColumn),
     FooterHint(FooterAction),
-    UndoRow { index: usize },
+    UndoRow {
+        index: usize,
+    },
     Chrome(ChromeId),
     Scroll(ScrollRegion),
 }
@@ -192,6 +222,9 @@ pub enum ZoneId {
     Pseudo(PseudoRow),
     Footer(FooterAction),
     Verb(VerbId),
+    /// A column header, by list and field — never by its x position, so a
+    /// resize between press and release cannot pair two different headers.
+    SortHeader(SortColumn),
     /// The `PendingDeletion.key`, not the banner row — the row is what
     /// `undo_deletion_at` needs, the key is what identifies the deletion.
     UndoRow(u64),

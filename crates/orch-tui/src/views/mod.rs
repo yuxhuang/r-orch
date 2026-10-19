@@ -28,7 +28,7 @@ use crate::backend::TuiBackend;
 use crate::clock::Clock;
 use crate::hit::{ChromeId, HitMap, VerbId, ZoneId, ZoneKind};
 use crate::layout::{MIN_HEIGHT, MIN_WIDTH, regions};
-use crate::state::{AppState, DetailPanel, InputMode, ViewId};
+use crate::state::{AppState, DetailPanel, InputMode, SortColumn, ViewId};
 use crate::theme::{HEAVY_RULE, Palette, Token};
 use crate::widgets;
 
@@ -470,15 +470,15 @@ fn render_main(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             area.width,
             area.height.saturating_sub(2),
         )
-    } else if state.view == ViewId::Agents {
+    } else {
+        // Sort bars and column headers are chrome above the scrolled rows.
+        let chrome = state.list_chrome_rows();
         Rect::new(
             area.x,
-            area.y.saturating_add(1),
+            area.y.saturating_add(chrome),
             area.width,
-            area.height.saturating_sub(1),
+            area.height.saturating_sub(chrome),
         )
-    } else {
-        area
     };
     ctx.publish_pane_metrics(crate::hit::PaneMetrics {
         key,
@@ -684,6 +684,148 @@ pub fn put_line(frame: &mut Frame, area: Rect, y: u16, spans: Vec<Span<'_>>) {
     }
     Paragraph::new(Line::from(spans))
         .render(Rect::new(area.x, y, area.width, 1), frame.buffer_mut());
+}
+
+// ── Table cells and column headers ─────────────────────────────────────────
+
+/// `text` made safe to measure: a grapheme holding a control character (a
+/// newline in a task title) becomes a space, and a zero-width one (ZWSP, a
+/// bidi mark or override, a soft hyphen, a lone combining mark) is dropped.
+///
+/// ratatui drops zero-width graphemes when it draws, but
+/// [`crate::text::text_display_width`] clamps every grapheme to at least one cell (the
+/// editor cursor relies on that), so a zero-width grapheme left in would pad
+/// the cell one short and shift every later column left. Dropping them here
+/// also keeps a bidi override in a peer's agent name off the terminal.
+pub(crate) fn sanitize(text: &str) -> String {
+    unicode_segmentation::UnicodeSegmentation::graphemes(text, true)
+        .filter_map(|g| {
+            if g.contains(char::is_control) {
+                Some(" ")
+            } else if unicode_width::UnicodeWidthStr::width(g) == 0 {
+                None
+            } else {
+                Some(g)
+            }
+        })
+        .collect()
+}
+
+/// `text` fitted to exactly `width` display cells: [`sanitize`]d, an
+/// overlong value ends in `…`, a short one is padded. Measured in cells, not
+/// `char`s, so a CJK or emoji name cannot push the columns after it out of
+/// line.
+pub(crate) fn cell(text: &str, width: usize) -> String {
+    let capped = crate::format::cap_display(&sanitize(text), width);
+    let pad = width.saturating_sub(crate::text::text_display_width(&capped));
+    format!("{capped}{}", " ".repeat(pad))
+}
+
+/// [`cell`], right-aligned.
+pub(crate) fn cell_right(text: &str, width: usize) -> String {
+    let capped = crate::format::cap_display(&sanitize(text), width);
+    let pad = width.saturating_sub(crate::text::text_display_width(&capped));
+    format!("{}{capped}", " ".repeat(pad))
+}
+
+/// One column of a list's header row, laid out left to right. A gap is a
+/// cell with an empty label and no column.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeaderCell {
+    pub label: &'static str,
+    pub width: usize,
+    pub right: bool,
+    pub column: Option<SortColumn>,
+}
+
+impl HeaderCell {
+    /// A label over a column that sorts.
+    pub(crate) fn sort(label: &'static str, width: usize, column: SortColumn) -> Self {
+        HeaderCell {
+            label,
+            width,
+            right: false,
+            column: Some(column),
+        }
+    }
+
+    /// A label over a column that does not sort.
+    pub(crate) fn plain(label: &'static str, width: usize) -> Self {
+        HeaderCell {
+            label,
+            width,
+            right: false,
+            column: None,
+        }
+    }
+
+    pub(crate) fn gap(width: usize) -> Self {
+        HeaderCell::plain("", width)
+    }
+
+    /// Right-aligned, over a right-aligned value.
+    pub(crate) fn right(mut self) -> Self {
+        self.right = true;
+        self
+    }
+}
+
+/// A list's column header row at `y`, from the same widths its rows use, so
+/// each label sits over its column. The active sort column reads
+/// `LABEL↑` / `LABEL↓` in amber; every sortable label is a
+/// [`ZoneKind::SortHeader`] the width of its column. The header is chrome:
+/// it is never a selectable row.
+pub(crate) fn render_header_row(
+    frame: &mut Frame,
+    area: Rect,
+    y: u16,
+    ctx: &RenderCtx,
+    cells: &[HeaderCell],
+    active: (SortColumn, bool),
+) {
+    if y >= area.bottom() {
+        return;
+    }
+    let (active_column, descending) = active;
+    let mut spans = Vec::new();
+    let mut x = area.x as usize;
+    for header in cells {
+        if header.width == 0 {
+            continue;
+        }
+        let is_active = header.column == Some(active_column);
+        let label = if is_active {
+            format!("{}{}", header.label, if descending { "↓" } else { "↑" })
+        } else {
+            header.label.to_string()
+        };
+        let text = if header.right {
+            cell_right(&label, header.width)
+        } else {
+            cell(&label, header.width)
+        };
+        let style = if is_active {
+            ctx.bold(Token::Amber)
+        } else {
+            ctx.style(Token::Dim).add_modifier(Modifier::BOLD)
+        };
+        if let Some(column) = header.column {
+            ctx.zone(
+                Rect::new(
+                    x.min(u16::MAX as usize) as u16,
+                    y,
+                    header.width.min(u16::MAX as usize) as u16,
+                    1,
+                ),
+                area,
+                ZoneKind::SortHeader(column),
+                ZoneId::SortHeader(column),
+            );
+        }
+        x += header.width;
+        spans.push(Span::styled(text, style));
+    }
+    put_line(frame, area, y, spans);
 }
 
 /// The original picker remains useful at normal sizes. At smaller sizes a

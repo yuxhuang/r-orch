@@ -6,8 +6,9 @@
 
 use orch_domain::{
     Agent, AgentConfig, AgentStats, AgentStatus, CreateGoalInput, CreateTeamInput, Goal,
-    GoalStatus, NotificationPreferences, OrchestratorEvent, OrchestratorState, Task, TaskStatus,
-    Team, TeamConfig, TeamMember, TeamMemberRole, TeamStatus, TuiPaletteName, default_state,
+    GoalStatus, NotificationPreferences, OrchestratorEvent, OrchestratorState, Run, Task,
+    TaskStatus, Team, TeamConfig, TeamMember, TeamMemberRole, TeamStatus, TuiPaletteName,
+    default_state,
 };
 
 use super::{
@@ -107,6 +108,11 @@ pub struct FakeBackend {
     pub goals: Vec<Goal>,
     pub teams: Vec<Team>,
     pub state: OrchestratorState,
+    /// Retained run records, the source of task Started/Elapsed.
+    pub runs: Vec<Run>,
+    /// While set, every [`TuiBackend::refresh_timings`] fails with it.
+    /// Separate from `fail_next`, which a refresh must never consume.
+    pub timings_error: Option<String>,
     pub calls: Vec<Call>,
     /// Queued events handed out by the next [`TuiBackend::poll_events`].
     pub pending_events: Vec<OrchestratorEvent>,
@@ -154,6 +160,8 @@ impl FakeBackend {
             goals: Vec::new(),
             teams: Vec::new(),
             state: default_state(),
+            runs: Vec::new(),
+            timings_error: None,
             calls: Vec::new(),
             pending_events: Vec::new(),
             pending_history: Vec::new(),
@@ -181,6 +189,11 @@ impl FakeBackend {
 
     pub fn with_tasks(mut self, tasks: Vec<Task>) -> Self {
         self.tasks = tasks;
+        self
+    }
+
+    pub fn with_runs(mut self, runs: Vec<Run>) -> Self {
+        self.runs = runs;
         self
     }
 
@@ -388,6 +401,21 @@ impl TuiBackend for FakeBackend {
 
     fn list_teams(&mut self) -> BackendResult<Vec<Team>> {
         Ok(self.teams.clone())
+    }
+
+    fn refresh_timings(
+        &mut self,
+        tasks: &[Task],
+        goals: &[Goal],
+        orch_state: Option<&OrchestratorState>,
+        now_ms: i64,
+    ) -> BackendResult<super::TimingSnapshot> {
+        if let Some(error) = &self.timings_error {
+            return Err(error.clone());
+        }
+        Ok(super::derive_timings(
+            &self.runs, tasks, goals, orch_state, now_ms,
+        ))
     }
 
     fn create_task(&mut self, title: &str, opts: CreateTaskOpts) -> BackendResult<Task> {

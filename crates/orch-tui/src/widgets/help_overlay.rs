@@ -63,6 +63,17 @@ pub const COMMANDS: [(&str, &str); 8] = [
     ("/quit", "Exit"),
 ];
 
+/// The Elapsed* disclosure, exactly as R15 words it, wrapped at a word
+/// boundary to fit the box, then when the order catches up (R14) and the
+/// Agents grouping key.
+pub const ELAPSED_HELP: [&str; 2] = [
+    "Elapsed*: start to now; terminal rows end at last update (edits change it).",
+    "Includes waiting/retries. Order re-sorts on refresh. b group by team/node.",
+];
+
+/// [`ELAPSED_HELP`]'s first sentence, the one the README carries too.
+pub const ELAPSED_DISCLOSURE: &str = "Elapsed*: start to now; terminal rows end at last update (edits change it). Includes waiting/retries.";
+
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     if ctx.state.copy_help.is_some() {
         render_contextual(frame, area, ctx);
@@ -70,7 +81,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
     Clear.render(area, frame.buffer_mut());
     let pad_x = ((area.width as usize).saturating_sub(OUTER_W)) / 2;
-    let margin_top = ((area.height as usize).saturating_sub(MAX_ROWS + 11)) / 2;
+    let margin_top = ((area.height as usize).saturating_sub(MAX_ROWS + 13)) / 2;
     let x = area.x + pad_x as u16;
     let width = OUTER_W.min(area.width as usize) as u16;
     let inner = Rect::new(x, area.y, width, area.height);
@@ -183,11 +194,22 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         inner,
         y,
         vec![Span::styled(
-            "Agents: o sort; O reverse; 0 original order; b group by team/node.",
+            "Lists: o sort; O reverse; 0 original order; click a header to sort.",
             ctx.style(Token::Dim),
         )],
     );
     y += 1;
+    // R15's disclosure, word-wrapped at the box: the sentence is too long for
+    // one 74-cell row, and every word of it must stay on screen.
+    for line in ELAPSED_HELP {
+        put_line(
+            frame,
+            inner,
+            y,
+            vec![Span::styled(line, ctx.style(Token::Dim))],
+        );
+        y += 1;
+    }
     put_line(
         frame,
         inner,

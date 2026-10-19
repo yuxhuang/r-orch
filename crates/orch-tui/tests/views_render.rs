@@ -172,7 +172,8 @@ fn v015_eleven_tasks_show_the_show_all_hint() {
     let tasks: Vec<_> = (0..11)
         .map(|i| make_task(&format!("tsk_{i}"), &format!("Task {i}"), TaskStatus::Todo))
         .collect();
-    let mut harness = harness_for(ViewId::Tasks, FakeBackend::new().with_tasks(tasks));
+    // Tall enough for the column header, ten rows and the hint.
+    let mut harness = Harness::sized(FakeBackend::new().with_tasks(tasks), 100, 34);
     harness.assert_text("Show all (1 more) — press S");
 }
 
@@ -1242,9 +1243,10 @@ fn v095_wizard_reserves_two_rows_before_banners_at_minimum_size() {
             .hits
             .pane_metrics(&key)
             .expect("main geometry published");
+        // The column header is chrome: the scrolled body starts under it.
         assert_eq!(
             metrics.body,
-            ratatui::layout::Rect::new(0, 7, 40, expected_height)
+            ratatui::layout::Rect::new(0, 8, 40, expected_height - 1)
         );
         let label: String = (0..40)
             .map(|x| harness.terminal.backend().buffer()[(x, 6)].symbol())
@@ -1420,9 +1422,10 @@ fn v099_wizard_main_metrics_follow_exact_banner_budget_at_ordinary_sizes() {
             );
             let work = height - 8;
             let expected_main = baseline.main_h.min(work - toast_count - 2);
+            // The column header is chrome: the scrolled body starts under it.
             assert_eq!(
                 actual,
-                ratatui::layout::Rect::new(0, 7, width, expected_main)
+                ratatui::layout::Rect::new(0, 8, width, expected_main - 1)
             );
         }
     }

@@ -9,7 +9,9 @@ use orch_domain::{
     TaskStatus, Team, TeamStatus, default_state, goal_status_order,
 };
 
-use crate::backend::{BackendResult, CopyOutcome, CopyResult, CopyTarget, CopyTicket};
+use crate::backend::{
+    BackendResult, CopyOutcome, CopyResult, CopyTarget, CopyTicket, EntityTiming, TimingSnapshot,
+};
 use crate::command_bar::CommandHistory;
 use crate::hit::{HitMap, ZoneId, ZoneKind};
 use crate::messages::{
@@ -546,10 +548,265 @@ impl AgentSortField {
     }
 }
 
+impl SortField for AgentSortField {
+    fn next(self) -> Self {
+        AgentSortField::next(self)
+    }
+    fn label(self) -> &'static str {
+        AgentSortField::label(self)
+    }
+}
+
+/// A list field the session sort can order by: `o` walks [`SortField::next`].
+pub trait SortField: Copy + Default + PartialEq {
+    fn next(self) -> Self;
+    fn label(self) -> &'static str;
+}
+
+/// One list's session sort: a typed field and a direction. Each list owns its
+/// own, so sorting goals never touches tasks or agents, and grouping is kept
+/// apart from it (see [`AgentGroupBy`] and `group_by_goal`).
+///
+/// The key, header and chip transitions are deliberately different: `o`
+/// ([`ListSort::cycled`]) keeps the direction, `O` ([`ListSort::reversed`])
+/// keeps the field, and a header click ([`ListSort::clicked`]) starts an
+/// inactive column ascending but flips the active one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AgentSort {
-    pub field: AgentSortField,
+pub struct ListSort<F> {
+    pub field: F,
     pub descending: bool,
+}
+
+impl<F: SortField> ListSort<F> {
+    /// `o`: the next field, in the same direction.
+    pub fn cycled(self) -> Self {
+        ListSort {
+            field: self.field.next(),
+            descending: self.descending,
+        }
+    }
+
+    /// `O`: the same field, the other direction.
+    pub fn reversed(self) -> Self {
+        ListSort {
+            field: self.field,
+            descending: !self.descending,
+        }
+    }
+
+    /// A header click: an inactive column sorts ascending, the active one
+    /// flips.
+    pub fn clicked(self, field: F) -> Self {
+        if self.field == field {
+            self.reversed()
+        } else {
+            ListSort {
+                field,
+                descending: false,
+            }
+        }
+    }
+}
+
+/// The Agents sort. Original is a reset mode marked on the sort bar, not a
+/// column: it keeps the status/source order inside each section.
+pub type AgentSort = ListSort<AgentSortField>;
+/// The Goals sort; the default is status ascending with source-order ties.
+pub type GoalSort = ListSort<GoalSortField>;
+/// The Tasks sort; the default is status ascending with source-order ties.
+pub type TaskSort = ListSort<TaskSortField>;
+
+/// The sortable Goals columns, in `o` order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GoalSortField {
+    #[default]
+    Status,
+    Title,
+    Progress,
+    Assignee,
+    Started,
+    Elapsed,
+}
+
+impl SortField for GoalSortField {
+    fn next(self) -> Self {
+        match self {
+            Self::Status => Self::Title,
+            Self::Title => Self::Progress,
+            Self::Progress => Self::Assignee,
+            Self::Assignee => Self::Started,
+            Self::Started => Self::Elapsed,
+            Self::Elapsed => Self::Status,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Status => "Status",
+            Self::Title => "Title",
+            Self::Progress => "Progress",
+            Self::Assignee => "Assignee",
+            Self::Started => "Started",
+            Self::Elapsed => "Elapsed*",
+        }
+    }
+}
+
+/// The sortable Tasks columns, in `o` order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskSortField {
+    #[default]
+    Status,
+    Priority,
+    Title,
+    Assignee,
+    Goal,
+    Started,
+    Elapsed,
+}
+
+impl SortField for TaskSortField {
+    fn next(self) -> Self {
+        match self {
+            Self::Status => Self::Priority,
+            Self::Priority => Self::Title,
+            Self::Title => Self::Assignee,
+            Self::Assignee => Self::Goal,
+            Self::Goal => Self::Started,
+            Self::Started => Self::Elapsed,
+            Self::Elapsed => Self::Status,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Status => "Status",
+            Self::Priority => "Priority",
+            Self::Title => "Title",
+            Self::Assignee => "Assignee",
+            Self::Goal => "Goal",
+            Self::Started => "Started",
+            Self::Elapsed => "Elapsed*",
+        }
+    }
+}
+
+/// A sortable column header: which list, and which field it sorts by. It is
+/// both what a header click does and which header it was, so a press and a
+/// release pair only on the same column of the same list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortColumn {
+    Goal(GoalSortField),
+    Task(TaskSortField),
+    Agent(AgentSortField),
+}
+
+/// A comparable sort key. Unknown values are `None` in a `SortKey` and sort
+/// last in either direction (see [`compare_sort_keys`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortValue {
+    Number(i64),
+    Text(String),
+    /// done / total, compared exactly by cross-multiplication.
+    Ratio {
+        done: u64,
+        total: u64,
+    },
+}
+
+type SortKey = Option<SortValue>;
+
+/// Known values in the requested direction, unknown values last in both.
+/// Values of different kinds never meet: one column yields one kind.
+fn compare_sort_keys(left: &SortKey, right: &SortKey, descending: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (left, right) = match (left, right) {
+        (Some(left), Some(right)) => (left, right),
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        (None, None) => return Ordering::Equal,
+    };
+    let order = match (left, right) {
+        (SortValue::Number(a), SortValue::Number(b)) => a.cmp(b),
+        (SortValue::Text(a), SortValue::Text(b)) => a.cmp(b),
+        (
+            SortValue::Ratio {
+                done: d1,
+                total: t1,
+            },
+            SortValue::Ratio {
+                done: d2,
+                total: t2,
+            },
+        ) => (u128::from(*d1) * u128::from(*t2)).cmp(&(u128::from(*d2) * u128::from(*t1))),
+        _ => Ordering::Equal,
+    };
+    if descending { order.reverse() } else { order }
+}
+
+/// Stable order of `0..len` by precomputed keys; equal keys keep source order
+/// in both directions, so reversing never reverses ties.
+fn order_by_keys(keys: &[SortKey], descending: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order
+        .sort_by(|a, b| compare_sort_keys(&keys[*a], &keys[*b], descending).then_with(|| a.cmp(b)));
+    order
+}
+
+/// Where a captured pick lands in a new list of entity `ids`, and whether it
+/// had to land on a different entity than the one captured.
+fn restore_pick(
+    (pick, position): &(ListPick, usize),
+    ids: &[&str],
+    add_row: Option<usize>,
+    show_all_row: Option<usize>,
+) -> (usize, bool) {
+    let clamped = || (*position).min(ids.len().saturating_sub(1));
+    match pick {
+        ListPick::Entity(id) => match ids.iter().position(|candidate| candidate == id) {
+            Some(found) => (found, false),
+            None if ids.is_empty() => (add_row.or(show_all_row).unwrap_or(0), true),
+            None => (clamped(), true),
+        },
+        ListPick::ShowAll => (show_all_row.unwrap_or_else(clamped), false),
+        ListPick::Add => (add_row.unwrap_or_else(clamped), false),
+        ListPick::Nothing => (*position, false),
+    }
+}
+
+/// The entity a list selection points at, captured before the list changes
+/// so it can be found again afterwards (D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListPick {
+    Entity(String),
+    ShowAll,
+    Add,
+    Nothing,
+}
+
+/// Every entity list's selection, by identity, plus the positions to fall
+/// back to when an entity is gone.
+#[derive(Debug, Clone)]
+pub struct ListSelection {
+    goal: (ListPick, usize),
+    task: (ListPick, usize),
+    agent: (ListPick, usize),
+}
+
+/// A task that ended: its Elapsed stops at its last update.
+pub fn is_terminal_task(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+    )
+}
+
+/// A goal that ended: its Elapsed stops at its last update.
+pub fn is_terminal_goal(status: orch_domain::GoalStatus) -> bool {
+    matches!(
+        status,
+        orch_domain::GoalStatus::Achieved | orch_domain::GoalStatus::Abandoned
+    )
 }
 
 /// How the agent list is cut into sections. Session-only, and separate from
@@ -706,6 +963,23 @@ pub struct AppState {
     pub agent_selected: usize,
     pub agent_sort: AgentSort,
     pub agent_group_by: AgentGroupBy,
+    pub goal_sort: GoalSort,
+    pub task_sort: TaskSort,
+    /// Started/Elapsed for goals and tasks, derived by the backend at the
+    /// last refresh. Never persisted.
+    pub timings: TimingSnapshot,
+    /// Why the last timing refresh failed. While set, task and goal timings
+    /// are unknown (`?`), not "never started".
+    pub timing_error: Option<String>,
+    /// The instant the Elapsed sort last sampled the clock (D1/D3). The
+    /// order only moves when this does — on a refresh or a list-control
+    /// change — while the Elapsed text on screen follows the frame clock.
+    pub sort_clock_ms: i64,
+    /// A refresh or control change lost the selected entity and moved the
+    /// cursor onto another one that has not been drawn yet. Entity actions
+    /// wait for the next frame, so a key can never act on a row the user
+    /// has not seen selected.
+    pub entity_actions_deferred: bool,
     pub goal_scroll: usize,
     pub task_scroll: usize,
     pub agent_scroll: usize,
@@ -820,6 +1094,12 @@ impl Default for AppState {
             agent_selected: 0,
             agent_sort: AgentSort::default(),
             agent_group_by: AgentGroupBy::default(),
+            goal_sort: GoalSort::default(),
+            task_sort: TaskSort::default(),
+            timings: TimingSnapshot::default(),
+            timing_error: None,
+            sort_clock_ms: 0,
+            entity_actions_deferred: false,
             goal_scroll: 0,
             task_scroll: 0,
             agent_scroll: 0,
@@ -1570,19 +1850,72 @@ impl AppState {
 
     // ── Derived collections ────────────────────────────────────────────────
 
-    /// By status rank, stable within a rank.
+    /// By the session [`GoalSort`] (status ascending by default), stable:
+    /// equal keys keep source order in both directions and unknown values
+    /// sort last. Elapsed is compared at [`AppState::sort_clock_ms`], never
+    /// at the frame clock, so a tick cannot move a row.
     pub fn sorted_goals(&self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.goals.len()).collect();
-        order.sort_by_key(|i| goal_status_order(self.goals[*i].status));
-        order
+        let at = self.sort_clock_ms;
+        let keys: Vec<SortKey> = (0..self.goals.len())
+            .map(|i| {
+                let goal = &self.goals[i];
+                match self.goal_sort.field {
+                    GoalSortField::Status => {
+                        Some(SortValue::Number(i64::from(goal_status_order(goal.status))))
+                    }
+                    GoalSortField::Title => Some(SortValue::Text(goal.title.to_lowercase())),
+                    GoalSortField::Progress => {
+                        let linked = self.tasks_of_goal(&goal.id);
+                        let done = linked
+                            .iter()
+                            .filter(|t| self.tasks[**t].status == TaskStatus::Done)
+                            .count();
+                        (!linked.is_empty()).then_some(SortValue::Ratio {
+                            done: done as u64,
+                            total: linked.len() as u64,
+                        })
+                    }
+                    GoalSortField::Assignee => goal
+                        .assignee
+                        .as_deref()
+                        .map(|id| SortValue::Text(self.agent_name(id).to_lowercase())),
+                    GoalSortField::Started => self.goal_started_ms(i).map(SortValue::Number),
+                    GoalSortField::Elapsed => self.goal_elapsed_ms(i, at).map(SortValue::Number),
+                }
+            })
+            .collect();
+        order_by_keys(&keys, self.goal_sort.descending)
     }
 
-    /// By status rank, then re-grouped by goal when
-    /// `groupByGoal` is on (groups in first-appearance order, status sort
-    /// preserved inside each group, ungrouped tasks last).
+    /// By the session [`TaskSort`] (status ascending by default, stable as
+    /// [`AppState::sorted_goals`] is), then re-grouped by goal when
+    /// `groupByGoal` is on: groups in first-appearance order of the sorted
+    /// list, the sort preserved inside each group, ungrouped tasks last.
     pub fn sorted_tasks(&self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.tasks.len()).collect();
-        order.sort_by_key(|i| task_status_order(self.tasks[*i].status));
+        let at = self.sort_clock_ms;
+        let keys: Vec<SortKey> = (0..self.tasks.len())
+            .map(|i| {
+                let task = &self.tasks[i];
+                match self.task_sort.field {
+                    TaskSortField::Status => {
+                        Some(SortValue::Number(i64::from(task_status_order(task.status))))
+                    }
+                    TaskSortField::Priority => Some(SortValue::Number(task.priority)),
+                    TaskSortField::Title => Some(SortValue::Text(task.title.to_lowercase())),
+                    TaskSortField::Assignee => task
+                        .assignee
+                        .as_deref()
+                        .map(|id| SortValue::Text(self.agent_name(id).to_lowercase())),
+                    TaskSortField::Goal => self.resolved_goal_id(i).and_then(|id| {
+                        self.goal_by_id(&id)
+                            .map(|goal| SortValue::Text(goal.title.to_lowercase()))
+                    }),
+                    TaskSortField::Started => self.task_started_ms(i).map(SortValue::Number),
+                    TaskSortField::Elapsed => self.task_elapsed_ms(i, at).map(SortValue::Number),
+                }
+            })
+            .collect();
+        let order = order_by_keys(&keys, self.task_sort.descending);
         if !self.group_by_goal {
             return order;
         }
@@ -1609,6 +1942,143 @@ impl AppState {
             }
         }
         grouped
+    }
+
+    // ── Timings (D3) ───────────────────────────────────────────────────────
+
+    fn task_timing(&self, task_index: usize) -> Option<&EntityTiming> {
+        self.timings.tasks.get(&self.tasks.get(task_index)?.id)
+    }
+
+    fn goal_timing(&self, goal_index: usize) -> Option<&EntityTiming> {
+        self.timings.goals.get(&self.goals.get(goal_index)?.id)
+    }
+
+    /// The task's earliest known run start, epoch ms; `None` when it never
+    /// started or its history is unknown.
+    pub fn task_started_ms(&self, task_index: usize) -> Option<i64> {
+        self.task_timing(task_index)?.started_at_ms
+    }
+
+    /// The goal's start (its creation time), epoch ms.
+    pub fn goal_started_ms(&self, goal_index: usize) -> Option<i64> {
+        self.goal_timing(goal_index)?.started_at_ms
+    }
+
+    /// The task's Elapsed* span at `at_ms`: start to `at_ms` while it is
+    /// live, the backend's frozen start-to-last-update span once terminal.
+    pub fn task_elapsed_ms(&self, task_index: usize, at_ms: i64) -> Option<i64> {
+        let timing = self.task_timing(task_index)?;
+        if is_terminal_task(self.tasks[task_index].status) {
+            timing.elapsed_ms
+        } else {
+            timing
+                .started_at_ms
+                .map(|start| at_ms.saturating_sub(start).max(0))
+        }
+    }
+
+    /// The goal's Elapsed* span at `at_ms`, as [`AppState::task_elapsed_ms`].
+    pub fn goal_elapsed_ms(&self, goal_index: usize, at_ms: i64) -> Option<i64> {
+        let timing = self.goal_timing(goal_index)?;
+        if is_terminal_goal(self.goals[goal_index].status) {
+            timing.elapsed_ms
+        } else {
+            timing
+                .started_at_ms
+                .map(|start| at_ms.saturating_sub(start).max(0))
+        }
+    }
+
+    // ── Sort controls and selection reconciliation (D1/D2) ─────────────────
+
+    /// Change the Goals sort, resample the sort clock and follow the
+    /// selected goal by id.
+    pub fn set_goal_sort(&mut self, sort: GoalSort, now_ms: i64, can_create_task: bool) {
+        let prior = self.capture_list_selection(can_create_task);
+        self.goal_sort = sort;
+        self.reconcile_list_selection(&prior, now_ms, can_create_task);
+    }
+
+    /// Change the Tasks sort, resample the sort clock and follow the
+    /// selected task by id.
+    pub fn set_task_sort(&mut self, sort: TaskSort, now_ms: i64, can_create_task: bool) {
+        let prior = self.capture_list_selection(can_create_task);
+        self.task_sort = sort;
+        self.reconcile_list_selection(&prior, now_ms, can_create_task);
+    }
+
+    /// Every list's selection by identity, from the order on screen now.
+    /// Take it **before** entities, controls or the sort clock change.
+    pub fn capture_list_selection(&self, can_create_task: bool) -> ListSelection {
+        let goals = self.sorted_goals();
+        let goal = match goals.get(self.goal_selected) {
+            Some(index) => ListPick::Entity(self.goals[*index].id.clone()),
+            None if self.goal_selected == goals.len() => ListPick::Add,
+            None => ListPick::Nothing,
+        };
+        let visible = self.visible_tasks();
+        let task = match visible.get(self.task_selected) {
+            Some(index) => ListPick::Entity(self.tasks[*index].id.clone()),
+            None if Some(self.task_selected) == self.show_all_row_index() => ListPick::ShowAll,
+            None if Some(self.task_selected) == self.add_task_row_index(can_create_task) => {
+                ListPick::Add
+            }
+            None => ListPick::Nothing,
+        };
+        let agents = self.sorted_agents();
+        let agent = match agents.get(self.agent_selected) {
+            Some(index) => ListPick::Entity(self.agents[*index].id.clone()),
+            None if self.agent_selected == agents.len() => ListPick::Add,
+            None => ListPick::Nothing,
+        };
+        ListSelection {
+            goal: (goal, self.goal_selected),
+            task: (task, self.task_selected),
+            agent: (agent, self.agent_selected),
+        }
+    }
+
+    /// Sample the sort clock, derive the new orders and put every cursor
+    /// back on the entity it was on. An entity that is gone — or, for
+    /// tasks, now past the ten-row cap — leaves the cursor at its old
+    /// position clamped to the remaining entities (show-all is never turned
+    /// on for it), and entity actions wait until that has been drawn.
+    pub fn reconcile_list_selection(
+        &mut self,
+        prior: &ListSelection,
+        now_ms: i64,
+        can_create_task: bool,
+    ) {
+        self.sort_clock_ms = now_ms;
+        let mut lost = false;
+
+        let goals = self.sorted_goals();
+        let ids: Vec<&str> = goals.iter().map(|i| self.goals[*i].id.as_str()).collect();
+        let (goal, goal_lost) = restore_pick(&prior.goal, &ids, Some(ids.len()), None);
+        lost |= goal_lost;
+
+        let visible = self.visible_tasks();
+        let ids: Vec<&str> = visible.iter().map(|i| self.tasks[*i].id.as_str()).collect();
+        let (task, task_lost) = restore_pick(
+            &prior.task,
+            &ids,
+            self.add_task_row_index(can_create_task),
+            self.show_all_row_index(),
+        );
+        lost |= task_lost;
+
+        let agents = self.sorted_agents();
+        let ids: Vec<&str> = agents.iter().map(|i| self.agents[*i].id.as_str()).collect();
+        let (agent, agent_lost) = restore_pick(&prior.agent, &ids, Some(ids.len()), None);
+        lost |= agent_lost;
+
+        self.goal_selected = goal;
+        self.task_selected = task;
+        self.agent_selected = agent;
+        if lost {
+            self.entity_actions_deferred = true;
+        }
     }
 
     /// The task's `goalId`, but only when it resolves to a live goal — an
@@ -2000,16 +2470,34 @@ impl AppState {
             .count()
     }
 
+    /// Rows the active list draws above its scrolled rows: the column
+    /// header, plus the Agents sort bar. The Tasks welcome screen has none.
+    pub fn list_chrome_rows(&self) -> u16 {
+        self.list_chrome_rows_for(self.view)
+    }
+
+    fn list_chrome_rows_for(&self, view: ViewId) -> u16 {
+        match view {
+            ViewId::Goals => 1,
+            ViewId::Tasks if self.onboarding == OnboardingStep::Welcome => 0,
+            ViewId::Tasks => 1,
+            ViewId::Agents => 2,
+            ViewId::Logs => 0,
+        }
+    }
+
     /// Feeds the layout's 50 % list cap.
     pub fn list_item_count(&self, _can_create: bool) -> usize {
         match self.view {
-            ViewId::Goals => self.sorted_goals().len() + 1,
+            // The `+ add` row and the column header.
+            ViewId::Goals => self.sorted_goals().len() + 2,
             // The welcome screen replaces the list, and the onboarding nudge
             // sits under it; both need rows of their own.
             ViewId::Tasks if self.onboarding == OnboardingStep::Welcome => 6,
             ViewId::Tasks => {
+                // The `+ add` row and the column header.
                 self.visible_tasks().len()
-                    + 1
+                    + 2
                     + usize::from(self.hidden_task_count() > 0)
                     + self.task_group_section_rows()
                     + usize::from(matches!(
@@ -2019,7 +2507,8 @@ impl AppState {
                             | OnboardingStep::Completed
                     ))
             }
-            ViewId::Agents => self.agents.len() + 2 + self.agent_section_rows(),
+            // The `+ add` row, the sort bar and the column header.
+            ViewId::Agents => self.agents.len() + 3 + self.agent_section_rows(),
             ViewId::Logs => 0,
         }
     }
@@ -2383,7 +2872,8 @@ impl AppState {
             }
             offset
         }
-        let viewport = |view: ViewId, chrome: u16| {
+        let viewport = |view: ViewId| {
+            let chrome = self.list_chrome_rows_for(view);
             self.mouse
                 .hits
                 .metrics
@@ -2394,26 +2884,31 @@ impl AppState {
                     m.body.height as usize
                 })
         };
+        let (goal_h, task_h, agent_h) = (
+            viewport(ViewId::Goals),
+            viewport(ViewId::Tasks),
+            viewport(ViewId::Agents),
+        );
         self.goal_scroll = reveal(
             self.goal_selected,
             self.goal_scroll,
             &goal_rows,
             goal_rows.len(),
-            viewport(ViewId::Goals, 0),
+            goal_h,
         );
         self.task_scroll = reveal(
             self.task_selected,
             self.task_scroll,
             &task_rows,
             self.task_rows(can_create).len(),
-            viewport(ViewId::Tasks, 0),
+            task_h,
         );
         self.agent_scroll = reveal(
             self.agent_selected,
             self.agent_scroll,
             &agent_rows,
             self.agent_rows(can_create).len(),
-            viewport(ViewId::Agents, 1),
+            agent_h,
         );
         self.reconcile_message_selection(self.log_selected_id);
         self.normalize_focus();
