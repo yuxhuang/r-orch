@@ -44,14 +44,14 @@ cargo install --path crates/orch-cli
 
 Releases are tags on `master` (`vX.Y.Z`). v0.5.0 is the first release with
 [remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
-`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard; v0.7.0 adds Agents-list sorting and activity feeds that follow new entries; v0.8.0 adds `--yaml` output, `update`/`patch` from JSON or YAML files, and organization templates with the built-in a-team. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
+`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard; v0.7.0 adds Agents-list sorting and activity feeds that follow new entries; v0.8.0 adds `--yaml` output, `update`/`patch` from JSON or YAML files, and organization templates with the built-in a-team; v0.9.0 adds sortable column headers, keyword filtering and node grouping to the dashboard lists, newest-first Activity in goal and agent details, and filtering agent pickers in the wizards, and makes `orch task add --attach` save its files. The Homebrew formula pins the latest release tag (and `--HEAD` follows `master`).
 `orch update` does not self-update: it only prints how to install. To build a specific release from source:
 
 ```bash
 git clone <this repo> r-orch && cd r-orch
-git checkout v0.8.0
+git checkout v0.9.0
 cargo install --locked --path crates/orch-cli
-orch --version      # 0.8.0
+orch --version      # 0.9.0
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
@@ -587,6 +587,16 @@ talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notic
 Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
 cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
 
+### Upgrading from v0.8.0
+
+v0.9.0 changes the dashboard and fixes `orch task add --attach`. The peer protocol is unchanged, so peers on
+0.5.x through 0.9.0 interoperate, and `--json` output keeps its shape. Keys you may notice: `o`, `O` and `0` now
+sort the Goals and Tasks lists as well as Agents, `Ctrl+K` filters a list (`/` is still the command bar), and on
+wizard steps that pick an agent, `j` and `k` type into the filter (use the arrow keys to move). `orch task add
+--attach` now copies each file into `.orchestry/attachments/<task id>/` and lists it on the task. Roll back by
+installing v0.8.0: it reads those attachments, and sorting, filtering and grouping last only for the dashboard
+session.
+
 ### Upgrading from v0.7.0
 
 v0.8.0 adds commands and output formats; `--json` output is byte-for-byte unchanged, and so is the peer
@@ -611,7 +621,7 @@ while the main list has focus. Mouse capture now reports drags for text selectio
 back to the terminal. Roll back by installing v0.5.2: v0.6.0 writes nothing new to `.orchestry/` (editor
 drafts last only for the dashboard session).
 
-### Known gaps in v0.8.0
+### Known gaps in v0.9.0
 
 - Copy and mouse selection in a native terminal (Terminal.app, iTerm2) were not verified by hand before
   release; the automated tests cover the copy routing, and the web dashboard's browser copy.
