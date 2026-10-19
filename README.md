@@ -153,7 +153,9 @@ section. A click or wheel focuses the section under the pointer. Entity action l
 return there to edit or delete. Opening a detail initially focuses its Overview section. The section titles
 above a detail keep their order as you move between them; only the focused one is marked. A task detail's
 Activity section shows that task's entries in the Activity panel's columns: time, agent, type icon and text,
-with errors highlighted.
+with errors highlighted. Goal and agent details end with an Activity section in the same columns, newest
+first: a goal's lists the entries of its tasks, an agent's its own. It follows new entries at the top; `Down`
+pauses it and `Home` resumes.
 
 In Agents, `o` cycles the sort field through Original, Name, Status, Adapter/Model and Location; `O` switches
 ascending/descending, and `0` resets to Original ascending. The sort chips above the list offer the same controls.

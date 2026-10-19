@@ -1820,3 +1820,238 @@ fn task_detail_activity_rows_match_feed() {
         "a group shows its badge once: {second:?}"
     );
 }
+
+/// `activity_backend_and_messages` plus a second task outside any goal, an
+/// alpha message on it, a beta message with no task whose text names the goal
+/// and task ids, an empty goal and an agent with no messages. Feed order:
+/// 1 alpha, 2 alpha, 3 beta, 5 alpha, 6 beta, 4 system.
+fn goal_agent_activity_harness() -> Harness {
+    use orch_tui::messages::{Message, MsgType};
+    use orch_tui::theme::Token;
+    let mut member = make_task("tsk_1", "Ship it", TaskStatus::InProgress);
+    member.goal_id = Some("g1".into());
+    let backend = FakeBackend::new()
+        .with_tasks(vec![
+            member,
+            make_task("tsk_2", "Elsewhere", TaskStatus::Todo),
+        ])
+        .with_goals(vec![
+            make_goal("g1", "Launch", GoalStatus::Active),
+            make_goal("g2", "Empty goal", GoalStatus::Active),
+        ])
+        .with_agents(vec![
+            make_agent("alpha", "alpha", AgentStatus::Running),
+            make_agent("beta", "beta", AgentStatus::Idle),
+            make_agent("gamma", "gamma", AgentStatus::Idle),
+        ]);
+    let (_, mut messages) = activity_backend_and_messages();
+    let settled = messages.pop().expect("message 4");
+    messages.push(
+        Message::new(5, 960_000, "other edit", Token::Cyan, MsgType::Tool)
+            .with_task(Some("tsk_2".into()))
+            .with_agent(Some("alpha".into())),
+    );
+    messages.push(
+        Message::new(6, 970_000, "see g1 tsk_1", Token::White, MsgType::Info)
+            .with_agent(Some("beta".into())),
+    );
+    messages.push(settled);
+    let mut harness = Harness::sized(backend, 120, 40);
+    harness.app.state.messages = messages;
+    harness
+}
+
+fn select_goal(harness: &mut Harness, id: &str) {
+    harness.app.state.view = ViewId::Goals;
+    harness.app.state.goal_selected = (0..harness.app.state.goals.len())
+        .find(|i| {
+            harness.app.state.goal_selected = *i;
+            harness
+                .app
+                .state
+                .selected_goal()
+                .is_some_and(|g| g.id == id)
+        })
+        .expect("goal row");
+}
+
+fn select_agent(harness: &mut Harness, id: &str) {
+    harness.app.state.view = ViewId::Agents;
+    harness.app.state.agent_selected = (0..harness.app.state.agents.len())
+        .find(|i| {
+            harness.app.state.agent_selected = *i;
+            harness
+                .app
+                .state
+                .selected_agent()
+                .is_some_and(|a| a.id == id)
+        })
+        .expect("agent row");
+}
+
+/// Bottom-feed row cells for each message id, captured before a detail opens.
+fn feed_rows(
+    harness: &mut Harness,
+    ids: &[u64],
+) -> Vec<(u64, Vec<(String, ratatui::style::Style)>)> {
+    use orch_tui::hit::ZoneKind;
+    ids.iter()
+        .map(|&id| {
+            (
+                id,
+                row_cells(harness, |zone| {
+                    zone.kind == ZoneKind::ActivityRow { message_id: id }
+                }),
+            )
+        })
+        .collect()
+}
+
+/// The detail Activity rows on screen: message id and cells, top to bottom.
+fn detail_activity_screen(
+    harness: &mut Harness,
+) -> Vec<(u64, Vec<(String, ratatui::style::Style)>)> {
+    use orch_tui::hit::{ZoneId, ZoneKind};
+    use orch_tui::widgets::text_viewer::ViewerSource;
+    harness.draw();
+    let mut rows: Vec<_> = harness
+        .hits()
+        .zones()
+        .iter()
+        .filter(|zone| zone.kind == ZoneKind::ExpandText)
+        .filter_map(|zone| match &zone.id {
+            ZoneId::ExpandText(ViewerSource::Message(id)) => Some((*id, zone.rect)),
+            _ => None,
+        })
+        .collect();
+    rows.sort_by_key(|(_, rect)| rect.y);
+    let buffer = harness.terminal.backend().buffer();
+    rows.into_iter()
+        .map(|(id, rect)| {
+            let cells = (rect.x..rect.right())
+                .map(|x| {
+                    let cell = &buffer[(x, rect.y)];
+                    (cell.symbol().to_owned(), cell.style())
+                })
+                .collect();
+            (id, cells)
+        })
+        .collect()
+}
+
+fn joined(cells: &[(String, ratatui::style::Style)]) -> String {
+    cells.iter().map(|(s, _)| s.as_str()).collect()
+}
+
+/// Time, badge, icon and short text match the feed cell for cell; the first
+/// cell is the accent bar, or `>` on the selected row.
+fn assert_matches_feed(
+    feed: &[(String, ratatui::style::Style)],
+    detail: &[(String, ratatui::style::Style)],
+    id: u64,
+) {
+    let width = 27;
+    let from = usize::from(feed[0].0 == ">" || detail[0].0 == ">");
+    assert_eq!(
+        feed[from..width],
+        detail[from..width],
+        "message {id}: feed {:?} detail {:?}",
+        joined(feed),
+        joined(detail)
+    );
+}
+
+/// R1/R12: a goal's Activity lists the messages of its tasks (structured
+/// task_id → goal_id only, never a text match), newest first, in the bottom
+/// feed's row format; an empty goal says "No activity."; pausing names Home.
+#[test]
+fn goal_detail_activity_rows() {
+    let mut harness = goal_agent_activity_harness();
+    harness.app.state.view = ViewId::Tasks;
+    let feed = feed_rows(&mut harness, &[3, 4]);
+
+    select_goal(&mut harness, "g1");
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Activity));
+    let rows = detail_activity_screen(&mut harness);
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![4, 3, 2, 1], "newest first, members only");
+    for (id, feed) in &feed {
+        let (_, detail) = rows.iter().find(|(r, _)| r == id).unwrap();
+        assert_matches_feed(feed, detail, *id);
+    }
+    let first = joined(&rows[0].1);
+    assert!(first.starts_with('>'), "following selects row 0: {first:?}");
+    assert!(
+        first.contains("now"),
+        "the top system row shows its time: {first:?}"
+    );
+    let alpha_top = joined(&rows[2].1);
+    let alpha_next = joined(&rows[3].1);
+    assert!(alpha_top.contains("alpha"), "{alpha_top:?}");
+    assert!(
+        !alpha_next.contains("alpha"),
+        "a group shows its badge once: {alpha_next:?}"
+    );
+    let text = harness.text();
+    assert!(text.contains("Activity · following"), "{text}");
+    assert!(!text.contains("see g1 tsk_1"), "no text matching: {text}");
+
+    harness.press(KeyCode::Down);
+    let text = harness.text();
+    assert!(text.contains("paused · Home follows"), "{text}");
+    harness.press(KeyCode::Home);
+    assert!(harness.text().contains("Activity · following"));
+
+    select_goal(&mut harness, "g2");
+    let rows = detail_activity_screen(&mut harness);
+    assert!(rows.is_empty(), "{rows:?}");
+    harness.assert_text("No activity.");
+}
+
+/// R1/R12: an agent's Activity lists exactly its own messages across tasks,
+/// newest first, in the bottom feed's row format; clicking a row selects it;
+/// an agent with no messages says "No activity.".
+#[test]
+fn agent_detail_activity_rows() {
+    let mut harness = goal_agent_activity_harness();
+    harness.app.state.view = ViewId::Tasks;
+    let feed = feed_rows(&mut harness, &[5]);
+
+    select_agent(&mut harness, "alpha");
+    harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
+    harness
+        .app
+        .state
+        .set_focus(Focus::AgentDetail(AgentSection::Activity));
+    let rows = detail_activity_screen(&mut harness);
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![5, 2, 1], "newest first, agent_id only");
+    assert_matches_feed(&feed[0].1, &rows[0].1, 5);
+    // One agent, one group: the badge shows once, on the newest row.
+    for (_, cells) in &rows[1..] {
+        let row = joined(cells);
+        assert!(!row.contains("alpha"), "{row:?}");
+    }
+
+    // Rows are selectable items: a click pauses on the clicked message.
+    let (x, y) = harness.find_text("plan ok").expect("row on screen");
+    harness.click(x, y);
+    let key = harness
+        .app
+        .state
+        .pane_key(Focus::AgentDetail(AgentSection::Activity));
+    assert_eq!(
+        harness.app.state.detail_activity_scroll(&key, 10).selected,
+        Some(2)
+    );
+    assert!(harness.text().contains("paused · Home follows"));
+
+    select_agent(&mut harness, "gamma");
+    let rows = detail_activity_screen(&mut harness);
+    assert!(rows.is_empty(), "{rows:?}");
+    harness.assert_text("No activity.");
+}

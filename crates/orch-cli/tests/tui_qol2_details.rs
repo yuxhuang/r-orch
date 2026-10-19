@@ -1,13 +1,14 @@
 //! End to end in tmux: detail views as an operator sees them in a real
 //! terminal (AGENTS.md, "TUI end-to-end tests"): the section rail keeps its
-//! order while focus moves (R2), and the task detail's Activity rows have the
-//! bottom feed's columns (R1).
+//! order while focus moves (R2), and the task, goal and agent details' Activity
+//! rows have the bottom feed's columns (R1, R12).
 //!
 //! The real `orch` binary runs `orch tui` in a private tmux server over a
-//! temp project with one shell agent, `bot`, and one cancelled task whose
-//! failed run left four events. The project is initialised with the shell
-//! adapter and the task is terminal, so the dashboard has nothing it could
-//! dispatch to an AI CLI.
+//! temp project with one shell agent, `bot`, one unassigned goal, `Launch`,
+//! and one cancelled task of that goal whose failed run left four events. The
+//! project is initialised with the shell adapter, the goal has no assignee and
+//! the task is terminal, so the dashboard has nothing it could dispatch to an
+//! AI CLI.
 
 #![cfg(unix)]
 
@@ -148,7 +149,8 @@ fn json_id(stdout: &str) -> String {
     value["id"].as_str().expect("an id").to_owned()
 }
 
-/// `bot`, a cancelled task `Ship it`, and a failed run of it (the dashboard
+/// `bot`, a goal `Launch`, its cancelled task `Ship it`, and a failed run of
+/// the task (the dashboard
 /// loads succeeded and failed runs into the feed) whose events are three and
 /// a half hours old, so the time column reads a stable `3h`.
 fn project() -> tempfile::TempDir {
@@ -171,7 +173,11 @@ fn project() -> tempfile::TempDir {
             "true",
         ],
     ));
-    let task = json_id(&orch(dir.path(), &["--json", "task", "add", "Ship it"]));
+    let goal = json_id(&orch(dir.path(), &["--json", "goal", "add", "Launch"]));
+    let task = json_id(&orch(
+        dir.path(),
+        &["--json", "task", "add", "Ship it", "--goal-id", &goal],
+    ));
     orch(dir.path(), &["task", "cancel", &task]);
 
     let at = |seconds: i64| {
@@ -358,5 +364,81 @@ fn task_detail_rail_keeps_order_and_activity_rows_match_the_feed() {
     });
     assert!(screen.contains("▶ Completed"), "{screen}");
 
+    tmux.keys(&["q"]);
+}
+
+/// The feed-format rows under the focused Activity title, in screen order.
+fn activity_rows(screen: &str) -> Vec<String> {
+    screen
+        .lines()
+        .skip_while(|line| !line.contains("> Activity"))
+        .skip(1)
+        .filter(|line| {
+            line.contains(" ▶ ")
+                || line.contains(" ✎ ")
+                || line.contains(" ✕ ")
+                || line.contains("planning")
+        })
+        .map(|row| row.trim_end().to_owned())
+        .collect()
+}
+
+/// R12: goal and agent details end their rail with Activity, which lists the
+/// same events in the feed's row format, newest first, following at the top;
+/// moving down pauses, and the title names Home as the way back.
+#[test]
+fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
+    let dir = project();
+    let tmux = launch(
+        dir.path(),
+        format!("orch-x2-{}-{}", std::process::id(), line!()),
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    // Newest first: one bot group, so the time and badge show on the top row,
+    // which following selects.
+    let newest_first = [
+        format!(">{:>5}{:<9}▶ Completed", "3h", "bot"),
+        format!("▏{:14}✕ lint failed once", ""),
+        format!("▏{:14}✎ src/lib.rs", ""),
+        format!("▏{:14}│ planning the change", ""),
+    ];
+    for (view, row) in [("a", "bot"), ("g", "Launch")] {
+        tmux.keys(&[view]);
+        tmux.wait_for(row, |s| s.contains(row));
+        // Wait for the run history: the feed shows its newest event.
+        tmux.wait_for("the feed", |s| s.contains("▶ Completed"));
+        tmux.keys(&["Enter"]);
+        tmux.wait_for("the detail", |s| s.contains("Overview"));
+        // Tab through the detail sections to Activity, the ring's last entry.
+        let mut tabs = 0;
+        while !tmux.screen().contains("> Activity · following") {
+            assert!(tabs < 8, "{view}: no Activity section: {}", tmux.screen());
+            let before = tmux.screen();
+            tmux.keys(&["Tab"]);
+            tmux.wait_for("focus to move", |s| s != before);
+            tabs += 1;
+        }
+        let screen = tmux.screen();
+        let title = screen
+            .lines()
+            .find(|line| line.contains("> Activity · following"))
+            .unwrap();
+        assert!(
+            title.trim_end().ends_with("│ > Activity · following"),
+            "Activity ends the rail: {screen}"
+        );
+        assert_eq!(activity_rows(&screen), newest_first, "{view}: {screen}");
+
+        tmux.keys(&["Down"]);
+        let screen = tmux.wait_for("the paused title", |s| {
+            s.contains("> Activity · paused · Home follows")
+        });
+        let rows = activity_rows(&screen);
+        assert!(rows[1].starts_with('>'), "{view}: {screen}");
+        tmux.keys(&["Home"]);
+        tmux.wait_for("following again", |s| s.contains("> Activity · following"));
+        tmux.keys(&["Escape"]);
+        tmux.wait_for("the detail closed", |s| !s.contains("Activity · following"));
+    }
     tmux.keys(&["q"]);
 }

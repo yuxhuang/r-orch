@@ -116,12 +116,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                         )
                     })
                     .collect(),
-                // Placeholder until X2 renders shared Activity rows.
-                GoalSection::Activity => state
-                    .detail_activity_rows(&state.pane_key(focus))
-                    .into_iter()
-                    .map(|i| state.messages[i].text.clone())
-                    .collect(),
+                GoalSection::Activity => activity_lines(state, focus),
             }
         }
         Focus::TaskDetail(section) => {
@@ -191,11 +186,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     };
                     proof.files_changed.clone()
                 }
-                TaskSection::Activity => activity_messages(state, focus)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|m| m.text.clone())
-                    .collect(),
+                TaskSection::Activity => activity_lines(state, focus),
             }
         }
         Focus::AgentDetail(section) => {
@@ -272,12 +263,7 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     lines.push(error.timestamp.clone());
                     lines
                 }
-                // Placeholder until X2 renders shared Activity rows.
-                AgentSection::Activity => state
-                    .detail_activity_rows(&state.pane_key(focus))
-                    .into_iter()
-                    .map(|i| state.messages[i].text.clone())
-                    .collect(),
+                AgentSection::Activity => activity_lines(state, focus),
             }
         }
         Focus::LogDetail(section) => {
@@ -310,22 +296,26 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
 }
 
 /// The messages an Activity section lists, in display order, or `None` for a
-/// section that is not an Activity section. Membership is structural (the
-/// message's own task id), never a text match.
+/// section that is not an Activity section. Rows come from the state-owned
+/// `detail_activity_rows`, so order and membership match keys and mouse
+/// exactly; membership is structural (task, agent or goal-of-task id), never
+/// a text match.
 pub(crate) fn activity_messages(state: &AppState, focus: Focus) -> Option<Vec<&Message>> {
-    match focus {
-        Focus::TaskDetail(TaskSection::Activity) => {
-            let task = state.selected_task();
-            Some(
-                state
-                    .messages
-                    .iter()
-                    .filter(|m| task.is_some_and(|t| m.task_id.as_deref() == Some(t.id.as_str())))
-                    .collect(),
-            )
-        }
-        _ => None,
-    }
+    crate::follow::is_detail_activity(focus).then(|| {
+        state
+            .detail_activity_rows(&state.pane_key(focus))
+            .into_iter()
+            .map(|i| &state.messages[i])
+            .collect()
+    })
+}
+
+fn activity_lines(state: &AppState, focus: Focus) -> Vec<String> {
+    activity_messages(state, focus)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.text.clone())
+        .collect()
 }
 
 fn field_lines(text: &str, empty: &str) -> Vec<String> {
@@ -378,7 +368,7 @@ pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<View
                     .collect()
             })
             .unwrap_or_default(),
-        Focus::TaskDetail(TaskSection::Activity) => activity_messages(state, focus)
+        focus if crate::follow::is_detail_activity(focus) => activity_messages(state, focus)
             .unwrap_or_default()
             .into_iter()
             .map(|m| Some(ViewerSource::Message(m.id)))
@@ -429,13 +419,12 @@ pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<View
 }
 
 fn selectable(focus: Focus) -> bool {
-    matches!(
-        focus,
-        Focus::GoalDetail(GoalSection::Tasks)
-            | Focus::TaskDetail(
-                TaskSection::Attachments | TaskSection::Files | TaskSection::Activity
-            )
-    )
+    crate::follow::is_detail_activity(focus)
+        || matches!(
+            focus,
+            Focus::GoalDetail(GoalSection::Tasks)
+                | Focus::TaskDetail(TaskSection::Attachments | TaskSection::Files)
+        )
 }
 
 /// Visual rows and byte offsets refer to the unmodified source string.
@@ -554,10 +543,12 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     ctx.zone(area, area, ZoneKind::Pane(focus), ZoneId::Pane(key.clone()));
     let active = state.focus == focus;
     let name = match focus {
-        Focus::TaskDetail(TaskSection::Activity) => format!(
+        focus if crate::follow::is_detail_activity(focus) => format!(
             "Activity · {}",
             if state.detail_activity_following(&key) {
                 "following"
+            } else if crate::follow::detail_activity_newest_first(focus) {
+                "paused · Home follows"
             } else {
                 "paused · End follows"
             }
@@ -697,7 +688,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         };
         rows.push((empty.into(), None, 0));
     }
-    let scroll = if focus == Focus::TaskDetail(TaskSection::Activity) {
+    let scroll = if crate::follow::is_detail_activity(focus) {
         state.detail_activity_scroll(&key, body.height as usize)
     } else {
         state.pane_scroll(&key)
