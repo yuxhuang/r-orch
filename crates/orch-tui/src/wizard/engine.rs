@@ -32,6 +32,9 @@ pub const ENTER_BLOCK_HINT_MS: i64 = 2_000;
 pub const FIX_THE_ERROR_ABOVE: &str = "Fix the error above";
 /// Confirming an agent step whose filter hides every agent.
 pub const NO_AGENT_MATCHES: &str = "No agent matches the filter";
+/// Confirming an agent step that has no agent to list, with nothing typed:
+/// every agent is disabled, or none exists yet.
+pub const NO_AGENT_TO_CHOOSE: &str = "No agent to choose — add or enable one first";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
@@ -1393,14 +1396,20 @@ impl Wizard {
                 WizardOutcome::Consumed
             }
             KeyCode::Backspace | KeyCode::Delete => self.go_back(),
-            // A filter that hides every agent leaves nothing to choose; the
-            // step stays open rather than submitting an empty answer.
+            // A filter that hides every agent, or an agent step with no agent
+            // at all, leaves nothing to choose; the step stays open rather
+            // than submitting an empty answer. Only the first blames the filter.
             KeyCode::Enter | KeyCode::Tab
                 if self.picker_blocked()
                     || (self.picker().is_some() && options.get(self.select_index).is_none()) =>
             {
+                let error = if self.picker_query.trim().is_empty() {
+                    NO_AGENT_TO_CHOOSE
+                } else {
+                    NO_AGENT_MATCHES
+                };
                 self.dirty = true;
-                self.validated = Some((self.current_value(), Some(NO_AGENT_MATCHES.into())));
+                self.validated = Some((self.current_value(), Some(error.into())));
                 WizardOutcome::Consumed
             }
             KeyCode::Enter | KeyCode::Tab => {
@@ -1542,6 +1551,35 @@ mod tests {
         for ch in text.chars() {
             wizard.handle_key(key(KeyCode::Char(ch)), now);
         }
+    }
+
+    fn lead_step_wizard(agents: &[orch_domain::Agent]) -> Wizard {
+        let options = agents
+            .iter()
+            .map(|a| Choice::new(&a.id, &a.name, ""))
+            .collect();
+        let step = WizardStep::new("lead", "Team lead", StepKind::Select)
+            .options(options)
+            .agent_picker(AgentPicker::new(agents));
+        Wizard::new(WizardKind::Team, "T", vec![step])
+    }
+
+    #[test]
+    fn confirming_an_agent_step_blames_the_filter_only_when_one_is_typed() {
+        let solo = [crate::backend::make_agent(
+            "agt_1",
+            "Solo",
+            orch_domain::AgentStatus::Idle,
+        )];
+        let mut filtered = lead_step_wizard(&solo);
+        type_text(&mut filtered, "zzz", 0);
+        filtered.handle_key(key(KeyCode::Enter), 0);
+        let mut empty = lead_step_wizard(&[]);
+        empty.handle_key(key(KeyCode::Enter), 0);
+        assert_eq!(
+            (filtered.visible_error(), empty.visible_error()),
+            (Some(NO_AGENT_MATCHES), Some(NO_AGENT_TO_CHOOSE))
+        );
     }
 
     #[test]
