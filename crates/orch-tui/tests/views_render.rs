@@ -2369,19 +2369,79 @@ fn overview_block_agent() {
     assert_eq!(cell_column(&harness, auto, "auto"), Some(x0));
 }
 
-/// D6 vectors: CJK and emoji in the title and in a left-column value never
-/// push the right column or overflow the pane, at any size; below the
-/// two-column width each field takes its own row with nothing dropped.
+/// Every row of the focused Overview block, top to bottom, as the cells
+/// drawn in its body: scrolls the pane with Down until the last row has
+/// been on screen, and checks the published row count is what was drawn.
+fn overview_rows(harness: &mut Harness, focus: Focus) -> Vec<String> {
+    let key = harness.app.state.pane_key(focus);
+    let mut rows: Vec<Option<String>> = Vec::new();
+    loop {
+        harness.draw();
+        let metrics = harness
+            .hits()
+            .pane_metrics(&key)
+            .expect("overview geometry")
+            .clone();
+        rows.resize(metrics.display_rows, None);
+        let offset = harness.app.state.pane_scroll(&key).offset;
+        let buffer = harness.terminal.backend().buffer();
+        for screen in 0..metrics.body.height {
+            let Some(slot) = rows.get_mut(offset + screen as usize) else {
+                break;
+            };
+            let y = metrics.body.y + screen;
+            // A wide glyph covers the cell after it on a terminal; the test
+            // backend keeps whatever an earlier frame left there.
+            let mut row = String::new();
+            let mut covered = 0;
+            for x in metrics.body.x..metrics.body.right() {
+                if covered > 0 {
+                    covered -= 1;
+                    row.push(' ');
+                    continue;
+                }
+                let symbol = buffer[(x, y)].symbol();
+                covered = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+                row.push_str(symbol);
+            }
+            *slot = Some(row);
+        }
+        if offset + metrics.body.height as usize >= metrics.display_rows {
+            break;
+        }
+        harness.press(KeyCode::Down);
+        assert!(
+            harness.app.state.pane_scroll(&key).offset > offset,
+            "Down scrolls the Overview towards its last row"
+        );
+    }
+    rows.into_iter()
+        .map(|row| row.expect("every published row is reachable by scrolling"))
+        .collect()
+}
+
+/// The block's text with whitespace and rule glyphs removed, so a value
+/// that wraps reads as one run however its rows were broken.
+fn squeezed(rows: &[String]) -> String {
+    rows.concat()
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '━')
+        .collect()
+}
+
+/// D6 vectors: CJK and emoji in the title and in the values never push the
+/// right column or overflow the pane, at any size. Nothing is clipped: a
+/// value too long for its column wraps (its row goes one field a row), the
+/// title wraps under the chip, and below the two-column width each field
+/// takes its own rows. Every value's full text is reachable by scrolling.
 #[test]
 fn overview_block_keeps_columns_with_wide_glyphs() {
+    let title = "发布 🚀 版本二的界面改进以及更多非常长的标题文字";
+    let long_label = "界面".repeat(30);
     for (width, height) in [(120, 40), (80, 24), (40, 14)] {
-        let mut task = make_task(
-            "tsk_1",
-            "发布 🚀 版本二的界面改进以及更多非常长的标题文字",
-            TaskStatus::InProgress,
-        );
+        let mut task = make_task("tsk_1", title, TaskStatus::InProgress);
         task.assignee = Some("agt_1".into());
-        task.labels = vec!["界面".repeat(30), "🧪".into()];
+        task.labels = vec![long_label.clone(), "🧪".into()];
         task.depends_on = vec!["missing_dependency_🚧".into()];
         let backend = FakeBackend::new()
             .with_tasks(vec![task])
@@ -2395,62 +2455,166 @@ fn overview_block_keeps_columns_with_wide_glyphs() {
         harness.app.state.detail = orch_tui::state::DetailPanel::Entity;
         // At the minimum size only a maximized detail has rows to spare.
         harness.app.state.detail_maximized = width < 80;
-        harness
-            .app
-            .state
-            .set_focus(Focus::TaskDetail(TaskSection::Overview));
-        harness.draw();
-        let top = row_with(&harness, 0, "━━━ DETAIL: ");
-        let x0 = cell_column(&harness, top, "━━━ DETAIL: ").unwrap();
-        let key = harness
-            .app
-            .state
-            .pane_key(Focus::TaskDetail(TaskSection::Overview));
-        let metrics = harness
-            .hits()
-            .pane_metrics(&key)
-            .expect("overview geometry");
+        let focus = Focus::TaskDetail(TaskSection::Overview);
+        harness.app.state.set_focus(focus);
+        let rows = overview_rows(&mut harness, focus);
+        let all = rows.join("\n");
+        assert!(
+            !all.contains('…'),
+            "{width}x{height}: nothing is clipped:\n{all}"
+        );
+        let text = squeezed(&rows);
+        for value in [
+            format!("DETAIL: {title}"),
+            "in_progress".into(),
+            "构建者 🤖 \"Bob\"".into(),
+            "P3".into(),
+            "0/3".into(),
+            format!("{long_label}, 🧪"),
+            "missing_dependency_🚧".into(),
+        ] {
+            let value: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(
+                text.contains(&value),
+                "{width}x{height}: {value:?} in full:\n{all}"
+            );
+        }
+        // Every label starts a row at the block's edge, in model order.
         let labels = [
             "status", "assignee", "priority", "attempts", "labels", "depends",
         ];
+        let starts: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| labels.iter().find(|l| row.starts_with(&format!("{l} "))))
+            .copied()
+            .collect();
+        harness.press(KeyCode::Home).draw();
+        let top = row_with(&harness, 0, "━━━ DETAIL: ");
+        let x0 = cell_column(&harness, top, "━━━ DETAIL: ").unwrap();
         if width >= 80 {
-            assert_eq!(
-                metrics.display_rows, 4,
-                "{width}: title and three paired rows"
-            );
+            // The rows that fit keep their aligned columns; the labels row
+            // is too long for its column, so labels and depends go one a row.
             assert_aligned_pairs(
                 &harness,
                 x0,
                 top + 1,
-                &[
-                    ("status", "assignee"),
-                    ("priority", "attempts"),
-                    ("labels", "depends"),
-                ],
+                &[("status", "assignee"), ("priority", "attempts")],
+            );
+            assert_eq!(starts, ["status", "priority", "labels", "depends"]);
+            let labels_row = row_with(&harness, top + 1, "labels ");
+            assert!(
+                cell_column(&harness, labels_row, "depends").is_none(),
+                "{width}: depends gets its own row"
+            );
+            assert_eq!(
+                rows.len(),
+                6,
+                "{width}: title, two pairs, labels over two rows, depends"
             );
         } else {
-            // One field a row: nothing is dropped, the rest scrolls.
-            assert_eq!(
-                metrics.display_rows,
-                1 + labels.len(),
-                "{width}: one field a row"
-            );
-            let visible = metrics.body.height as usize - 1;
-            for (row, label) in labels.iter().take(visible).enumerate() {
-                let y = top + 1 + row as u16;
-                assert_eq!(
-                    cell_column(&harness, y, label),
-                    Some(x0),
-                    "{width}: {label}"
-                );
-            }
-            let status = cell_column(&harness, top + 1, "in_progress");
-            assert!(status.is_some(), "the status is never clipped");
+            assert_eq!(starts, labels, "{width}: one field a row");
         }
-        let text = harness.text();
-        assert!(
-            text.contains('…'),
-            "{width}x{height} clips long values:\n{text}"
+        // Continuation rows of the wrapped labels start at the value column.
+        let at = rows
+            .iter()
+            .position(|row| row.starts_with("labels "))
+            .expect("labels row");
+        let value_column = rows[at]["labels".len()..].len()
+            - rows[at]["labels".len()..].trim_start().len()
+            + "labels".len();
+        let next = &rows[at + 1];
+        assert_eq!(
+            next.len() - next.trim_start().len(),
+            value_column,
+            "{width}: continuation indented to the value column:\n{all}"
         );
     }
+}
+
+/// I1: values that do not fit wrap onto continuation rows instead of being
+/// clipped. 14 skills are all on screen at 120x40, the skills continuation
+/// rows start at the value column, and a long title wraps under its chip.
+#[test]
+fn overview_block_wraps_long_values() {
+    let skills: Vec<String> = (0..14).map(|n| format!("skill-number-{n}")).collect();
+    let name = format!("alpha {}", "agent-with-a-very-long-name ".repeat(5));
+    let name = name.trim_end().to_owned();
+    let mut agent = make_agent("agt_1", &name, AgentStatus::Idle);
+    agent.config.model = Some(format!("provider/{}", "model-id-segment-".repeat(6)));
+    agent.config.skills = Some(skills.clone());
+    let mut harness = Harness::sized(FakeBackend::new().with_agents(vec![agent]), 120, 40);
+    harness.app.state.view = ViewId::Agents;
+    harness.press(KeyCode::Enter);
+    let focus = Focus::AgentDetail(AgentSection::Overview);
+    assert_eq!(harness.app.state.focus, focus);
+    let rows = overview_rows(&mut harness, focus);
+    let all = rows.join("\n");
+    assert!(!all.contains('…'), "nothing is clipped:\n{all}");
+
+    // Skills: every name on screen, over continuation rows indented to the
+    // value column.
+    let at = rows
+        .iter()
+        .position(|row| row.starts_with("skills "))
+        .expect("skills row");
+    let column = rows[at].find("skill-number-0").expect("first skill");
+    let mut shown = Vec::new();
+    for (n, row) in rows[at..].iter().enumerate() {
+        if n > 0 && !row[..column].trim().is_empty() {
+            break;
+        }
+        let value = &row[column..];
+        if value.trim().is_empty() {
+            break;
+        }
+        if n > 0 {
+            assert!(
+                !value.starts_with(' '),
+                "continuation row {n} starts at the value column:\n{all}"
+            );
+        }
+        shown.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    assert_eq!(shown, skills, "all 14 skills, in order:\n{all}");
+    assert!(
+        rows[at + 1..]
+            .iter()
+            .take_while(|r| r[..column].trim().is_empty())
+            .count()
+            >= 1,
+        "14 skills need more than one row at 120 columns:\n{all}"
+    );
+
+    // The title wraps under the chip, past the leading rule.
+    let title = squeezed(&rows);
+    let expected: String = format!("AGENT: {name}")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert!(title.contains(&expected), "full title:\n{all}");
+    assert!(rows[0].starts_with("━━━ AGENT: alpha"));
+    assert!(
+        rows[1].starts_with("    ") && !rows[1].starts_with("     "),
+        "the title continues under the chip text:\n{all}"
+    );
+
+    // The model is too long for the left column: it takes its own rows and
+    // wraps; task follows on its own row.
+    let model: String = format!("provider/{}", "model-id-segment-".repeat(6));
+    assert!(title.contains(&model), "full model id:\n{all}");
+    let model_row = rows
+        .iter()
+        .position(|row| row.starts_with("model "))
+        .expect("model row");
+    assert!(!rows[model_row].contains(" task "), "{all}");
+    assert!(
+        rows.iter().any(|row| row.starts_with("task ")),
+        "task keeps its row:\n{all}"
+    );
 }
