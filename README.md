@@ -152,6 +152,17 @@ The Agents view aligns rows in a table. Arrows, PageUp/PageDown, Home/End and th
 section. A click or wheel focuses the section under the pointer. Entity action letters act from the main list;
 return there to edit or delete. Opening a detail initially focuses its Overview section.
 
+The Goals, Tasks and Agents lists carry a column header row. `o` cycles the sort column, `O` reverses the
+direction and `0` restores that list's default order. Clicking an inactive header sorts by it ascending; clicking
+the active header flips its direction. The active column is marked `↑` or `↓`. Each list keeps its own sort, and
+none of these keys touch grouping.
+
+Goals and Tasks also show a Started and an Elapsed* column, both blank for an entity that never started.
+Elapsed*: start to now; terminal rows end at last update (edits change it). Includes waiting/retries.
+A task's Started is its earliest retained run record, which is written while the run is still Preparing — not the
+moment an agent process launched; a goal's Started is its creation time. Ordering by Elapsed re-sorts on a refresh
+or a list-control change, while the time the column shows stays live between those.
+
 In Agents, `o` cycles the sort field through Original, Name, Status, Adapter/Model and Location; `O` switches
 ascending/descending, and `0` resets to Original ascending. The sort chips above the list offer the same controls.
 Sorting preserves team sections and the selected agent, and lasts only for this dashboard session. Original is

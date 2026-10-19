@@ -8,7 +8,8 @@ The dashboard (`orch tui`) is the terminal screen where you watch agents work an
 - [Read the screen](#read-the-screen)
 - [Switch views and move around](#switch-views-and-move-around)
 - [Open and resize details](#open-and-resize-details)
-- [Sort agents](#sort-agents)
+- [Sort the lists](#sort-the-lists)
+- [Sort and group agents](#sort-and-group-agents)
 - [Follow activity feeds](#follow-activity-feeds)
 - [Read long text in the viewer](#read-long-text-in-the-viewer)
 - [Create and edit with wizards](#create-and-edit-with-wizards)
@@ -135,6 +136,25 @@ Letters that act on an item (`E`, `D`, `R`, `C` and so on) work only while the m
 | `+` or `=` | Gives the detail panel more room. |
 | `-` | Gives the list more room. |
 | `M` | Maximizes the detail panel, or restores the split. Upper case only. |
+
+## Sort the lists
+
+The Goals, Tasks and Agents lists have a column header row. Each list keeps its own sort for this session, and none of these controls change grouping.
+
+| Key | What it does |
+|---|---|
+| `o` | Moves the sort to the next column, keeping the direction. |
+| `O` | Reverses the direction, keeping the column. |
+| `0` | Restores that list's default order. |
+| Click a header | An inactive column sorts by it ascending; the active column flips its direction. |
+
+The active column is marked `↑` or `↓`.
+
+Goals and Tasks also have a Started and an Elapsed* column, both blank for an entity that never started.
+
+Elapsed*: start to now; terminal rows end at last update (edits change it). Includes waiting/retries.
+
+A task's Started is its earliest retained run record, which is written while the run is still `preparing` — not the moment an agent process launched. A goal's Started is its creation time. Ordering by Elapsed re-sorts on a refresh or a list-control change; the time the column shows stays live between those.
 
 ## Sort and group agents
 
@@ -430,6 +450,7 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | `D` | Delete the task (not while it is running). |
 | `S` | Show all tasks, or collapse the list. |
 | `G` | Group tasks by goal, or ungroup. |
+| `o`, `O`, `0` | Move the sort to the next column, reverse the direction, reset. |
 
 ### Agents view (main list focus)
 
@@ -451,6 +472,7 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | `P` | Pause an active goal, or resume a paused one. |
 | `C` | Mark an active or paused goal achieved, cancelling its tasks that can be cancelled. |
 | `X` | Abandon an active or paused goal. |
+| `o`, `O`, `0` | Move the sort to the next column, reverse the direction, reset. |
 
 ### Actions view
 

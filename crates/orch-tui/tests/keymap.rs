@@ -1130,9 +1130,10 @@ fn crossing_harness() -> Harness {
     a.updated_at = iso(base - 4_999);
     let mut b = make_task("tsk_b", "Ended B", TaskStatus::Done);
     b.updated_at = iso(base - 5_000);
-    let backend = FakeBackend::new()
-        .with_tasks(vec![b, a])
-        .with_runs(vec![run("tsk_a", base - 4_999), run("tsk_b", base - 10_000)]);
+    let backend = FakeBackend::new().with_tasks(vec![b, a]).with_runs(vec![
+        run("tsk_a", base - 4_999),
+        run("tsk_b", base - 10_000),
+    ]);
     let mut h = Harness::with(backend);
     h.app.state.view = ViewId::Tasks;
     h.key('o').key('o').key('o').key('o').key('o').key('o');
