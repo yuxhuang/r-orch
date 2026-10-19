@@ -1672,3 +1672,265 @@ fn w097_a_list_longer_than_its_window_shows_the_selection_position() {
     let mut harness = shop_at(120, 40);
     harness.refute_text(" of 15");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 11. Agent picker: type-ahead filter and order (R7, R8)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Five agents in catalogue order, one disabled. Names, adapters, roles and
+/// statuses are chosen so each order (Original, Name, Adapter, Status) lists
+/// the four eligible agents differently.
+fn picker_roster() -> Vec<orch_domain::Agent> {
+    let agent = |id: &str, name: &str, adapter: &str, role: &str, status: AgentStatus| {
+        let mut a = make_agent(id, name, status);
+        a.adapter = adapter.into();
+        a.role = (!role.is_empty()).then(|| role.to_string());
+        a
+    };
+    vec![
+        agent(
+            "agt_a",
+            "Alpha",
+            "claude",
+            "Frontend reviewer",
+            AgentStatus::Running,
+        ),
+        agent(
+            "agt_b",
+            "beta",
+            "codex",
+            "Backend builder",
+            AgentStatus::Idle,
+        ),
+        agent("agt_c", "Gamma", "shell", "", AgentStatus::Error),
+        agent(
+            "agt_d",
+            "Delta",
+            "claude",
+            "Never listed",
+            AgentStatus::Disabled,
+        ),
+        agent("agt_e", "alpha-2", "opencode", "Docs", AgentStatus::Idle),
+    ]
+}
+
+fn labels(choices: &[Choice]) -> Vec<String> {
+    choices.iter().map(|c| c.label.clone()).collect()
+}
+
+/// The NEW TASK wizard's real assignee step, alone.
+fn assignee_wizard(agents: &[orch_domain::Agent]) -> Wizard {
+    let step = configs::task_wizard_steps(agents)
+        .into_iter()
+        .find(|s| s.id == "assignee")
+        .unwrap();
+    Wizard::new(WizardKind::Task, "T", vec![step])
+}
+
+/// A harness on the NEW TASK wizard's assignee step.
+fn harness_at_assignee(width: u16, height: u16) -> Harness {
+    let backend = orch_tui::backend::FakeBackend::new().with_agents(picker_roster());
+    let mut harness = Harness::sized(backend, width, height);
+    harness.key('t');
+    harness.key('n');
+    harness.type_str("Ship it");
+    harness.press(KeyCode::Enter); // title
+    harness.press(KeyCode::Enter); // priority
+    assert_eq!(
+        harness.app.state.wizard.as_ref().unwrap().step_id(),
+        "assignee"
+    );
+    harness
+}
+
+#[test]
+fn agent_picker_filters_as_you_type() {
+    let mut wizard = assignee_wizard(&picker_roster());
+    assert_eq!(
+        labels(&wizard.options()),
+        ["Auto-assign", "Alpha", "beta", "Gamma", "alpha-2"]
+    );
+    // Name, case-insensitively; `j` and `k` are filter text, not navigation.
+    type_into(&mut wizard, "ALP", 0);
+    assert_eq!(
+        labels(&wizard.options()),
+        ["Auto-assign", "Alpha", "alpha-2"]
+    );
+    assert_eq!(
+        wizard.select_index(),
+        1,
+        "the cursor lands on the first match"
+    );
+    // Esc clears the filter and stays on the step.
+    assert_eq!(
+        wizard.handle_key(key(KeyCode::Esc), 0),
+        WizardOutcome::Consumed
+    );
+    assert_eq!(labels(&wizard.options()).len(), 5);
+    // Adapter, then role.
+    type_into(&mut wizard, "codex", 0);
+    assert_eq!(labels(&wizard.options()), ["Auto-assign", "beta"]);
+    wizard.handle_key(key(KeyCode::Esc), 0);
+    type_into(&mut wizard, "review", 0);
+    assert_eq!(labels(&wizard.options()), ["Auto-assign", "Alpha"]);
+    // Backspace edits the filter.
+    for _ in 0.."review".len() {
+        wizard.handle_key(key(KeyCode::Backspace), 0);
+    }
+    type_into(&mut wizard, "alpha", 0);
+    // Digits still pick, by the number the filtered row shows.
+    match wizard.handle_key(key(KeyCode::Char('3')), 0) {
+        WizardOutcome::Complete(values) => assert_eq!(values["assignee"], "agt_e"),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}
+
+#[test]
+fn agent_picker_filter_row_and_status_render_on_screen() {
+    let mut harness = harness_at_assignee(100, 30);
+    harness.assert_text("> type to filter");
+    harness.assert_text("Alpha ─ running · [claude] Frontend reviewer");
+    harness.type_str("alp");
+    harness.assert_text("> alp");
+    harness.refute_text("beta");
+    // Through the editor session: Backspace and Esc edit the filter before
+    // they leave the step.
+    harness.press(KeyCode::Backspace);
+    harness.assert_text("> al█");
+    harness.press(KeyCode::Esc);
+    harness.assert_text("beta");
+    let wizard = harness.app.state.wizard.as_ref().unwrap();
+    assert_eq!(wizard.step_id(), "assignee");
+    harness.refute_text("Leave this step?");
+    // With the filter empty, Esc leaves the step: the title was typed, so
+    // the wizard's leave guard asks first.
+    harness.press(KeyCode::Esc);
+    harness.assert_text("Leave this step?");
+}
+
+#[test]
+fn agent_picker_rejects_free_text() {
+    let mut wizard = assignee_wizard(&picker_roster());
+    // Typed text that lists no agent is refused, even with the sentinel on
+    // screen: Enter and Tab keep the step open with an error.
+    type_into(&mut wizard, "nobody", 0);
+    assert_eq!(labels(&wizard.options()), ["Auto-assign"]);
+    for confirm in [KeyCode::Enter, KeyCode::Tab] {
+        assert_eq!(wizard.handle_key(key(confirm), 0), WizardOutcome::Consumed);
+        assert_eq!(wizard.step_id(), "assignee");
+        assert!(wizard.visible_error().is_some(), "{confirm:?}");
+    }
+    // An agent id is not a name: it matches nothing, so it assigns nothing.
+    wizard.handle_key(key(KeyCode::Esc), 0);
+    type_into(&mut wizard, "agt_b", 0);
+    assert_eq!(
+        wizard.handle_key(key(KeyCode::Enter), 0),
+        WizardOutcome::Consumed
+    );
+    // A pasted digit is filter text, not a pick.
+    wizard.handle_key(key(KeyCode::Esc), 0);
+    wizard.insert_paste("2", 0);
+    assert_eq!(labels(&wizard.options()), ["Auto-assign", "alpha-2"]);
+    // A typed name submits the matching agent's id; the sentinel needs its
+    // own digit.
+    match wizard.handle_key(key(KeyCode::Enter), 0) {
+        WizardOutcome::Complete(values) => assert_eq!(values["assignee"], "agt_e"),
+        other => panic!("expected completion, got {other:?}"),
+    }
+    let mut wizard = assignee_wizard(&picker_roster());
+    type_into(&mut wizard, "nobody", 0);
+    match wizard.handle_key(key(KeyCode::Char('1')), 0) {
+        WizardOutcome::Complete(values) => assert_eq!(values["assignee"], ""),
+        other => panic!("expected completion, got {other:?}"),
+    }
+
+    // A team lead has no sentinel: a filter that lists nobody cannot submit
+    // an empty lead.
+    let lead = configs::team_wizard_steps(&picker_roster(), &[])
+        .into_iter()
+        .find(|s| s.id == "lead")
+        .unwrap();
+    let mut wizard = Wizard::new(WizardKind::Team, "T", vec![lead]);
+    type_into(&mut wizard, "zzz", 0);
+    assert!(wizard.options().is_empty());
+    assert_eq!(
+        wizard.handle_key(key(KeyCode::Enter), 0),
+        WizardOutcome::Consumed
+    );
+    assert_eq!(wizard.step_id(), "lead");
+    assert!(wizard.visible_error().is_some());
+}
+
+#[test]
+fn agent_picker_order_cycle() {
+    let mut harness = harness_at_assignee(100, 30);
+    let options = |h: &Harness| labels(&h.app.state.wizard.as_ref().unwrap().options());
+    let selected = |h: &Harness| {
+        let w = h.app.state.wizard.as_ref().unwrap();
+        w.options()[w.select_index()].value.clone()
+    };
+    assert_eq!(
+        options(&harness),
+        ["Auto-assign", "Alpha", "beta", "Gamma", "alpha-2"]
+    );
+    harness.assert_text("Ctrl+O order: Original");
+    // The cursor rests on `beta` and follows it through every order.
+    harness.press(KeyCode::Down).press(KeyCode::Down);
+    assert_eq!(selected(&harness), "agt_b");
+    for (order, expected) in [
+        ("Name", ["Auto-assign", "Alpha", "alpha-2", "beta", "Gamma"]),
+        (
+            "Adapter",
+            ["Auto-assign", "Alpha", "beta", "alpha-2", "Gamma"],
+        ),
+        (
+            "Status",
+            ["Auto-assign", "beta", "alpha-2", "Alpha", "Gamma"],
+        ),
+        (
+            "Original",
+            ["Auto-assign", "Alpha", "beta", "Gamma", "alpha-2"],
+        ),
+    ] {
+        harness.press_mod(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(options(&harness), expected, "{order}");
+        assert_eq!(selected(&harness), "agt_b", "{order}");
+        harness.assert_text(&format!("Ctrl+O order: {order}"));
+        harness.assert_text(&format!("order: {order} · Ctrl+O"));
+    }
+    // The order composes with the filter, sentinel still first.
+    harness.press_mod(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    harness.type_str("a");
+    assert_eq!(
+        options(&harness),
+        ["Auto-assign", "Alpha", "alpha-2", "beta", "Gamma"],
+        "every agent's name, adapter or role holds an `a`"
+    );
+    harness.type_str("l");
+    assert_eq!(options(&harness), ["Auto-assign", "Alpha", "alpha-2"]);
+}
+
+#[test]
+fn agent_picker_team_members_keep_hidden_selections() {
+    let members = configs::team_wizard_steps(&picker_roster(), &[])
+        .into_iter()
+        .find(|s| s.id == "members")
+        .unwrap();
+    let wizard = Wizard::new(WizardKind::Team, "T", vec![members]);
+    let backend = orch_tui::backend::FakeBackend::new();
+    let mut harness = Harness::sized(backend, 100, 30);
+    harness.app.open_wizard(wizard);
+    harness.type_str("alp");
+    harness.key(' ');
+    harness.press(KeyCode::Down);
+    harness.key(' ');
+    harness.press(KeyCode::Esc); // clear the filter, keep both ticks
+    harness.type_str("beta");
+    harness.key(' ');
+    harness.assert_text("3 selected · 2 hidden by the filter");
+    let wizard = harness.app.state.wizard.as_mut().unwrap();
+    match wizard.handle_key(key(KeyCode::Enter), 0) {
+        WizardOutcome::Complete(values) => assert_eq!(values["members"], "agt_a,agt_e,agt_b"),
+        other => panic!("expected completion, got {other:?}"),
+    }
+}

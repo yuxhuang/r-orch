@@ -9,7 +9,7 @@ use crate::hit::{RowPart, ScrollRegion, VerbId, ZoneId, ZoneKind};
 use crate::text::cursor::{Cursor, display_width, text_display_width};
 use crate::theme::{BLOCK, CHECK, CIRCLE, CIRCLE_FILLED, CURSOR, Token, light_rule};
 use crate::views::{RenderCtx, put_line, spans_width};
-use crate::wizard::engine::{StepKind, Wizard};
+use crate::wizard::engine::{Choice, StepKind, Wizard};
 
 /// `CMD_KEY` — `⌘` on macOS, `Ctrl` elsewhere.
 pub const CMD_KEY: &str = if cfg!(target_os = "macos") {
@@ -314,6 +314,14 @@ fn render_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard
             {
                 hint.push_str(scope);
             }
+            // An agent step names its current order next to the key that
+            // changes it (R8).
+            if wizard.picker().is_some() {
+                let order = format!("  Ctrl+O order: {}", wizard.picker_order().label());
+                if text_display_width(&hint) + text_display_width(&order) <= area.width as usize {
+                    hint.push_str(&order);
+                }
+            }
             // A list longer than its window says where the selection is, so
             // the rows below the fold are known to exist.
             if wizard.step().kind == StepKind::Select
@@ -498,7 +506,118 @@ fn render_textarea_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard:
     height
 }
 
+/// An agent step's filter row: the typed query (or how to start one) and the
+/// current order. Returns the rows left for the list below it.
+fn render_picker_filter(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard) -> Rect {
+    if wizard.picker().is_none() {
+        return area;
+    }
+    let query = wizard.picker_query();
+    // One row cannot hold both; the list wins until there is a query to show.
+    if area.height < 2 && query.is_empty() {
+        return area;
+    }
+    let width = area.width as usize;
+    let label = wizard.picker_order().label();
+    let prompt = "> ";
+    let placeholder = "type to filter";
+    let left_min = text_display_width(prompt)
+        + if query.is_empty() {
+            text_display_width(placeholder)
+        } else {
+            1
+        };
+    let order = [
+        format!("order: {label} · Ctrl+O"),
+        format!("order: {label}"),
+    ]
+    .into_iter()
+    .find(|o| left_min + 2 + text_display_width(o) <= width)
+    .unwrap_or_default();
+    let order_w = if order.is_empty() {
+        0
+    } else {
+        2 + text_display_width(&order)
+    };
+    let mut spans = vec![Span::styled(prompt, ctx.style(Token::Ghost))];
+    if query.is_empty() {
+        spans.push(Span::styled(placeholder, ctx.style(Token::Ghost)));
+    } else {
+        // The end of the query is where typing lands, so a long one shows
+        // its tail.
+        let room = width.saturating_sub(text_display_width(prompt) + 1 + order_w);
+        let mut tail = Vec::new();
+        let mut used = 0;
+        for ch in query.chars().rev() {
+            let w = text_display_width(ch.encode_utf8(&mut [0; 4]));
+            if used + w > room {
+                break;
+            }
+            used += w;
+            tail.push(ch);
+        }
+        spans.push(Span::styled(
+            tail.into_iter().rev().collect::<String>(),
+            ctx.style(Token::White),
+        ));
+        spans.push(Span::styled(BLOCK, ctx.style(Token::Amber)));
+    }
+    if !order.is_empty() {
+        let pad = width.saturating_sub(spans_width(&spans) as usize + order_w);
+        spans.push(Span::raw(" ".repeat(pad + 2)));
+        spans.push(Span::styled(order, ctx.style(Token::Dim)));
+    }
+    put_line(frame, area, area.y, spans);
+    let list = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    wizard.viewport_rows.set(list.height.max(1) as usize);
+    list
+}
+
+/// An agent step lists every agent the filter left, so a query that left none
+/// says so instead of drawing an unexplained short list.
+fn render_no_match(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard, y: u16) {
+    let Some(picker) = wizard.picker() else {
+        return;
+    };
+    if wizard.picker_query().is_empty()
+        || y >= area.bottom()
+        || wizard.options().iter().any(|c| picker.is_agent(&c.value))
+    {
+        return;
+    }
+    let text = format!(
+        "  No agent matches “{}” · Esc clears",
+        wizard.picker_query()
+    );
+    put_line(
+        frame,
+        area,
+        y,
+        vec![Span::styled(
+            fit(&text, area.width as usize),
+            ctx.style(Token::Dim),
+        )],
+    );
+}
+
+/// A row's details: on an agent step the agent's status leads them, so the
+/// Status order can be read off the list.
+fn row_details(wizard: &Wizard, choice: &Choice) -> String {
+    match wizard.picker().and_then(|p| p.status(&choice.value)) {
+        Some(status) if choice.hint.is_empty() => status.as_str().to_string(),
+        Some(status) => format!("{} · {}", status.as_str(), choice.hint),
+        None => choice.hint.clone(),
+    }
+}
+
 fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wizard) -> u16 {
+    let field = area;
+    let area = render_picker_filter(frame, field, ctx, wizard);
     let options = wizard.options();
     let visible = area.height as usize;
     let selected = wizard.select_index();
@@ -515,9 +634,12 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
         ZoneId::ScrollRegion(ScrollRegion::WizardOptions),
     );
 
+    // A filter that lists no agent has nothing chosen, so no row is drawn
+    // as if Enter would take it.
+    let blocked = wizard.picker_blocked();
     for (row, index) in (start..options.len()).take(visible).enumerate() {
         let choice = &options[index];
-        let is_selected = index == selected;
+        let is_selected = index == selected && !blocked;
         ctx.row_zone(
             area,
             area.y + row as u16,
@@ -537,10 +659,11 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
         let room = (area.width as usize).saturating_sub(text_display_width(&marker));
         let label = fit(&choice.label, room);
         let room = room.saturating_sub(text_display_width(&label));
-        let hint = if choice.hint.is_empty() || room == 0 {
+        let details = row_details(wizard, choice);
+        let hint = if details.is_empty() || room == 0 {
             String::new()
         } else {
-            fit(&format!(" ─ {}", choice.hint.replace('\n', " ")), room)
+            fit(&format!(" ─ {}", details.replace('\n', " ")), room)
         };
         let spans = vec![
             Span::styled(
@@ -563,7 +686,9 @@ fn render_select_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &
         ];
         put_line(frame, area, area.y + row as u16, spans);
     }
-    visible.min(options.len().saturating_sub(start)).max(1) as u16
+    let listed = visible.min(options.len().saturating_sub(start)) as u16;
+    render_no_match(frame, area, ctx, wizard, area.y + listed);
+    (area.y - field.y) + listed.max(1)
 }
 
 fn render_multiselect_field(
@@ -572,6 +697,8 @@ fn render_multiselect_field(
     ctx: &RenderCtx,
     wizard: &Wizard,
 ) -> u16 {
+    let field = area;
+    let area = render_picker_filter(frame, field, ctx, wizard);
     let options = wizard.options();
     let visible = area.height as usize;
     let selected = wizard.select_index();
@@ -603,10 +730,9 @@ fn render_multiselect_field(
             ),
             Span::styled(choice.label.clone(), ctx.style(Token::Silver)),
             Span::styled(
-                if choice.hint.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ─ {}", choice.hint)
+                match row_details(wizard, choice) {
+                    details if details.is_empty() => String::new(),
+                    details => format!(" ─ {details}"),
                 },
                 ctx.style(Token::Dim),
             ),
@@ -640,21 +766,34 @@ fn render_multiselect_field(
         );
         put_line(frame, area, row_y, spans);
     }
-    let mut used = visible.min(options.len().saturating_sub(start)).max(1) as u16;
+    let listed = visible.min(options.len().saturating_sub(start)) as u16;
+    render_no_match(frame, area, ctx, wizard, area.y + listed);
+    let mut used = listed.max(1);
     let checked = wizard.multi_selected().len();
     if checked > 0 && used < area.height {
+        // Members the filter hides stay selected; the count says so.
+        let hidden = wizard
+            .multi_selected()
+            .iter()
+            .filter(|id| !options.iter().any(|c| &c.value == *id))
+            .count();
+        let summary = if hidden > 0 {
+            format!("  └ {checked} selected · {hidden} hidden by the filter")
+        } else {
+            format!("  └ {checked} selected")
+        };
         put_line(
             frame,
             area,
             area.y + used,
             vec![Span::styled(
-                format!("  └ {checked} selected"),
+                fit(&summary, area.width as usize),
                 ctx.style(Token::Dim),
             )],
         );
         used += 1;
     }
-    used
+    (area.y - field.y) + used
 }
 
 /// The text field's sliding viewport: drop whole graphemes from the left until

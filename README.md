@@ -169,6 +169,11 @@ section for this instance's agents, then one section per remote alias in alias o
 offline. The sort still applies within each section, `0` leaves the grouping alone, and the selected agent stays
 selected. Like the sort, the grouping lasts only for this dashboard session.
 
+Wizard steps that pick an agent (task and goal assignee, team lead and members) filter as you type: letters
+narrow the numbered list to agents whose name, adapter or role contains them, `Backspace` edits the filter and
+`Esc` clears it. `1`–`9` still pick a listed row, and `Ctrl+O` cycles the order through Original, Name, Adapter
+and Status, as the filter row shows. Auto-assign/None stays first; only a listed agent or that choice is submitted.
+
 The Activity panel, ACTIONS list and task-detail Activity follow new entries at the tail. Scrolling up pauses
 following so you can read older entries. Resume with `End`, scroll down to the bottom with the wheel or
 PageDown, click the final entry, or focus a feed whose viewport is already at the bottom. The feed shows

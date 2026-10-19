@@ -19,6 +19,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::text::{TextInput, is_meta};
+use crate::wizard::picker::{AgentPicker, PickerOrder, push_query};
 
 /// Collected wizard answers, keyed by step id, in step order.
 pub type Values = IndexMap<String, String>;
@@ -29,6 +30,11 @@ pub const VALIDATION_DEBOUNCE_MS: i64 = 300;
 pub const ENTER_BLOCK_HINT_MS: i64 = 2_000;
 /// The blocked-confirm hint text.
 pub const FIX_THE_ERROR_ABOVE: &str = "Fix the error above";
+/// Confirming an agent step whose filter hides every agent.
+pub const NO_AGENT_MATCHES: &str = "No agent matches the filter";
+/// Confirming an agent step that has no agent to list, with nothing typed:
+/// every agent is disabled, or none exists yet.
+pub const NO_AGENT_TO_CHOOSE: &str = "No agent to choose — add or enable one first";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
@@ -125,6 +131,9 @@ pub struct WizardStep {
     pub suggestions_label: Option<String>,
     pub skip: Option<SkipFn>,
     pub validate: Option<ValidateFn>,
+    /// Set on agent steps: typing filters the listed agents and `Ctrl+O`
+    /// reorders them (R7, R8). See [`crate::wizard::picker`].
+    pub picker: Option<AgentPicker>,
 }
 
 impl WizardStep {
@@ -143,7 +152,14 @@ impl WizardStep {
             suggestions_label: None,
             skip: None,
             validate: None,
+            picker: None,
         }
+    }
+
+    /// Make a `Select` / `Multiselect` agent step filterable and orderable.
+    pub fn agent_picker(mut self, picker: AgentPicker) -> Self {
+        self.picker = Some(picker);
+        self
     }
 
     pub fn placeholder(mut self, placeholder: &str) -> Self {
@@ -296,6 +312,11 @@ pub struct Wizard {
     validated: Option<(String, Option<String>)>,
     validate_deadline: Option<i64>,
     enter_block_until: Option<i64>,
+
+    /// The agent step's type-ahead filter. Cleared on every step change.
+    picker_query: String,
+    /// The agent steps' order; kept for the wizard's lifetime.
+    picker_order: PickerOrder,
 }
 
 #[derive(Clone)]
@@ -341,6 +362,8 @@ impl Wizard {
             validated: None,
             validate_deadline: None,
             enter_block_until: None,
+            picker_query: String::new(),
+            picker_order: PickerOrder::default(),
         };
         wizard.index = wizard.first_active_index();
         wizard.prefill();
@@ -462,9 +485,40 @@ impl Wizard {
         self.textarea.lines().join("\n")
     }
 
-    /// The current step's options, resolved against the current answers.
+    /// The current step's options as listed: resolved against the current
+    /// answers and, on an agent step, filtered and ordered by the picker.
+    /// Row numbers, digit picks, clicks and the cursor all index this list.
     pub fn options(&self) -> Vec<Choice> {
-        self.step().options.resolve(&self.values)
+        let options = self.step().options.resolve(&self.values);
+        match &self.step().picker {
+            Some(picker) => picker.arrange(options, &self.picker_query, self.picker_order),
+            None => options,
+        }
+    }
+
+    /// The current step's agent picker, if it is an agent step.
+    pub fn picker(&self) -> Option<&AgentPicker> {
+        self.step().picker.as_ref()
+    }
+
+    /// The agent step's filter text.
+    pub fn picker_query(&self) -> &str {
+        &self.picker_query
+    }
+
+    /// The agent steps' current order.
+    pub fn picker_order(&self) -> PickerOrder {
+        self.picker_order
+    }
+
+    /// A typed filter that lists no agent: nothing is chosen, so confirming
+    /// is refused rather than falling through to the sentinel. A sentinel row
+    /// is still listed and still picked by its digit.
+    pub fn picker_blocked(&self) -> bool {
+        self.picker().is_some_and(|picker| {
+            !self.picker_query.trim().is_empty()
+                && !self.options().iter().any(|c| picker.is_agent(&c.value))
+        })
     }
 
     /// Suggestions filtered by the typed text, as the browse list shows them.
@@ -492,6 +546,8 @@ impl Wizard {
     /// of the default, `multiselect` → set of comma-separated values).
     fn prefill(&mut self) {
         self.missing_selection = None;
+        // Before any index is computed: the cursor indexes the listed rows.
+        self.picker_query.clear();
         let step = self.steps[self.index].clone();
         let default = step.default_value.resolve(&self.values);
         match step.kind {
@@ -502,7 +558,7 @@ impl Wizard {
                 self.textarea.move_cursor(CursorMove::End);
             }
             StepKind::Select => {
-                let options = step.options.resolve(&self.values);
+                let options = self.options();
                 self.select_index = options.iter().position(|o| o.value == default).unwrap_or(0);
             }
             StepKind::Multiselect => {
@@ -630,6 +686,7 @@ impl Wizard {
             + values_size(&self.source_defaults)
             + values_size(&self.values)
             + self.text.value().len()
+            + self.picker_query.len()
             + self.textarea.lines().iter().map(String::len).sum::<usize>()
             + self
                 .scratch
@@ -853,6 +910,14 @@ impl Wizard {
         }
 
         if key.code == KeyCode::Esc {
+            // Esc clears an agent filter before it leaves the step.
+            if self.picker().is_some() && !self.picker_query.is_empty() {
+                let before = self.cursor_value();
+                self.picker_query.clear();
+                self.validated = None;
+                self.reanchor(before, false);
+                return WizardOutcome::Consumed;
+            }
             return self.go_back();
         }
 
@@ -1180,8 +1245,95 @@ impl Wizard {
                 self.dirty = true;
                 self.schedule_validation(now_ms);
             }
+            // A paste on an agent step is filter text, digits included.
+            StepKind::Select | StepKind::Multiselect if self.picker().is_some() => {
+                let before = self.cursor_value();
+                if push_query(&mut self.picker_query, text) {
+                    self.clear_missing_selection();
+                    self.reanchor(before, true);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// The value under the list cursor, if any row is listed.
+    fn cursor_value(&self) -> Option<String> {
+        self.options()
+            .get(self.select_index)
+            .map(|c| c.value.clone())
+    }
+
+    fn clear_missing_selection(&mut self) {
+        if self.missing_selection.take().is_some() {
+            self.session_error = None;
+        }
+    }
+
+    /// Put the cursor back on a row after the agent filter or order changed.
+    ///
+    /// The cursor follows the agent it was on while that agent is listed. A
+    /// query edit that hid it, or that was typed with the sentinel under the
+    /// cursor, lands on the first matching agent, so typing a name and
+    /// pressing Enter picks that agent rather than `Auto-assign`. With no
+    /// match the cursor rests on the first row (the sentinel, if any).
+    fn reanchor(&mut self, before: Option<String>, query_edit: bool) {
+        let options = self.options();
+        let Some(picker) = self.picker() else {
+            return;
+        };
+        let at = |value: &str| options.iter().position(|c| c.value == value);
+        let kept = before.as_deref().and_then(|value| {
+            let is_agent = picker.is_agent(value);
+            (!query_edit || self.picker_query.trim().is_empty() || is_agent)
+                .then(|| at(value))
+                .flatten()
+        });
+        self.select_index = kept
+            .or_else(|| {
+                query_edit
+                    .then(|| options.iter().position(|c| picker.is_agent(&c.value)))
+                    .flatten()
+            })
+            .unwrap_or(0);
+    }
+
+    /// The agent-step keys that come before list navigation: printable
+    /// characters and `Backspace` edit the filter, `Ctrl+U` clears it and
+    /// `Ctrl+O` cycles the order. Digits `1`–`9` stay row picks on a `Select`
+    /// step and `Space` stays the toggle on a `Multiselect` one.
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Option<WizardOutcome> {
+        self.picker()?;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = !ctrl && !is_meta(key);
+        let multiselect = self.step().kind == StepKind::Multiselect;
+        let before = self.cursor_value();
+        match key.code {
+            KeyCode::Char('o' | 'O') if ctrl => {
+                self.picker_order = self.picker_order.next();
+                self.reanchor(before, false);
+            }
+            KeyCode::Char('u' | 'U') if ctrl && !self.picker_query.is_empty() => {
+                self.picker_query.clear();
+                self.reanchor(before, true);
+            }
+            KeyCode::Char('1'..='9') if !multiselect => return None,
+            KeyCode::Char(' ') if multiselect => return None,
+            KeyCode::Char(ch) if plain => {
+                if push_query(&mut self.picker_query, ch.encode_utf8(&mut [0; 4])) {
+                    self.reanchor(before, true);
+                }
+            }
+            KeyCode::Backspace | KeyCode::Delete if plain && !self.picker_query.is_empty() => {
+                self.picker_query.pop();
+                self.reanchor(before, true);
+            }
+            _ => return None,
+        }
+        self.clear_missing_selection();
+        // A refusal belonged to the previous filter.
+        self.validated = None;
+        Some(WizardOutcome::Consumed)
     }
 
     fn option_navigation(&mut self, key: KeyCode, len: usize, suggestions: bool) -> bool {
@@ -1225,6 +1377,9 @@ impl Wizard {
                 self.session_error = None;
             }
         }
+        if let Some(outcome) = self.handle_picker_key(key) {
+            return outcome;
+        }
         let options = self.options();
         if self.option_navigation(key.code, options.len(), false) {
             return WizardOutcome::Consumed;
@@ -1241,6 +1396,22 @@ impl Wizard {
                 WizardOutcome::Consumed
             }
             KeyCode::Backspace | KeyCode::Delete => self.go_back(),
+            // A filter that hides every agent, or an agent step with no agent
+            // at all, leaves nothing to choose; the step stays open rather
+            // than submitting an empty answer. Only the first blames the filter.
+            KeyCode::Enter | KeyCode::Tab
+                if self.picker_blocked()
+                    || (self.picker().is_some() && options.get(self.select_index).is_none()) =>
+            {
+                let error = if self.picker_query.trim().is_empty() {
+                    NO_AGENT_TO_CHOOSE
+                } else {
+                    NO_AGENT_MATCHES
+                };
+                self.dirty = true;
+                self.validated = Some((self.current_value(), Some(error.into())));
+                WizardOutcome::Consumed
+            }
             KeyCode::Enter | KeyCode::Tab => {
                 let value = options
                     .get(self.select_index)
@@ -1271,6 +1442,9 @@ impl Wizard {
     }
 
     fn handle_multiselect_key(&mut self, key: KeyEvent) -> WizardOutcome {
+        if let Some(outcome) = self.handle_picker_key(key) {
+            return outcome;
+        }
         let options = self.options();
         if self.option_navigation(key.code, options.len(), false) {
             return WizardOutcome::Consumed;
@@ -1377,6 +1551,35 @@ mod tests {
         for ch in text.chars() {
             wizard.handle_key(key(KeyCode::Char(ch)), now);
         }
+    }
+
+    fn lead_step_wizard(agents: &[orch_domain::Agent]) -> Wizard {
+        let options = agents
+            .iter()
+            .map(|a| Choice::new(&a.id, &a.name, ""))
+            .collect();
+        let step = WizardStep::new("lead", "Team lead", StepKind::Select)
+            .options(options)
+            .agent_picker(AgentPicker::new(agents));
+        Wizard::new(WizardKind::Team, "T", vec![step])
+    }
+
+    #[test]
+    fn confirming_an_agent_step_blames_the_filter_only_when_one_is_typed() {
+        let solo = [crate::backend::make_agent(
+            "agt_1",
+            "Solo",
+            orch_domain::AgentStatus::Idle,
+        )];
+        let mut filtered = lead_step_wizard(&solo);
+        type_text(&mut filtered, "zzz", 0);
+        filtered.handle_key(key(KeyCode::Enter), 0);
+        let mut empty = lead_step_wizard(&[]);
+        empty.handle_key(key(KeyCode::Enter), 0);
+        assert_eq!(
+            (filtered.visible_error(), empty.visible_error()),
+            (Some(NO_AGENT_MATCHES), Some(NO_AGENT_TO_CHOOSE))
+        );
     }
 
     #[test]
