@@ -10,11 +10,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::format::{cap_display, cap_line, format_duration, parse_timestamp_ms};
 use crate::hit::{PseudoRow, ScrollRegion, VerbId, ZoneId, ZoneKind};
-use crate::state::{AgentRow, EntityType};
+use crate::state::{AgentRow, AgentSortField, AppState, EntityType};
 use crate::text::text_display_width;
 use crate::theme::{
-    CHECK, CIRCLE, CROSS, CURSOR, DIAMOND_OUTLINE, EM_DASH, LOOP, LOZENGE, STAR, Token, light_rule,
-    spinner_frame,
+    CHECK, CIRCLE, CIRCLE_FILLED, CROSS, CURSOR, DIAMOND_OUTLINE, EM_DASH, LOOP, LOZENGE, STAR,
+    Token, light_rule, spinner_frame,
 };
 use crate::views::{RenderCtx, put_line, spans_width};
 
@@ -125,6 +125,18 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                     )],
                 );
             }
+            AgentRow::NodeSection {
+                alias,
+                online,
+                count,
+            } => {
+                put_line(
+                    frame,
+                    area,
+                    y,
+                    node_header(ctx, area.width as usize, alias.as_deref(), *online, *count),
+                );
+            }
             AgentRow::Agent { index, selection } => {
                 render_agent_row(frame, area, ctx, y, *index, *selection);
                 if let Some(agent) = state.agents.get(*index) {
@@ -171,16 +183,78 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
 }
 
-/// Like the Actions filter row, each hint owns a clipped semantic hit zone.
-fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    if area.height == 0 {
-        return;
+/// A By-node section header, drawn like a team header: `─── ◈ LOCAL · 3
+/// agents ───`, or for a peer `─── ◈ w1 ● online · 2 agents ───` with the
+/// state in green, or dim `○ offline`. The alias is the user's own
+/// identifier (`orch remote add <alias>`), so it is shown as typed, not
+/// upper-cased like a team name, and cut before the state and count are.
+fn node_header(
+    ctx: &RenderCtx,
+    width: usize,
+    alias: Option<&str>,
+    online: bool,
+    count: usize,
+) -> Vec<Span<'static>> {
+    let noun = if count == 1 { "agent" } else { "agents" };
+    let tail = format!(" · {count} {noun} ");
+    let (state_text, state_token) = match (alias, online) {
+        (None, _) => (String::new(), Token::Green),
+        (Some(_), true) => (format!(" {CIRCLE_FILLED} online"), Token::Green),
+        (Some(_), false) => (format!(" {CIRCLE} offline"), Token::Dim),
+    };
+    // Lead rule (3) and at least one cell of trailing rule stay visible.
+    let fixed = 3 + 3 + state_text.chars().count() + tail.chars().count() + 1;
+    let name = match alias {
+        None => "LOCAL".to_string(),
+        Some(alias) => cap_display(&sanitize(alias), width.saturating_sub(fixed).max(1)),
+    };
+    let label = format!(" {LOZENGE} {name}");
+    let used = 3
+        + text_display_width(&label)
+        + text_display_width(&state_text)
+        + text_display_width(&tail);
+    let mut spans = vec![
+        Span::styled(light_rule(3), ctx.style(Token::Ghost)),
+        Span::styled(
+            label,
+            ctx.chip(Token::Amber, Token::AccentBg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !state_text.is_empty() {
+        spans.push(Span::styled(
+            state_text,
+            ctx.chip(state_token, Token::AccentBg),
+        ));
     }
-    let sort = ctx.state.agent_sort;
-    let mut spans = Vec::new();
-    for (text, verb, token) in [
+    spans.push(Span::styled(tail, ctx.chip(Token::Amber, Token::AccentBg)));
+    spans.push(Span::styled(
+        light_rule(width.saturating_sub(used)),
+        ctx.style(Token::Ghost),
+    ));
+    spans
+}
+
+/// The sort and group-by chips, full or compact.
+///
+/// The group chip comes last: `0 reset` resets the sort only, and reads that
+/// way when the group chip is not between them. At the minimum width the full
+/// labels do not all fit, so the bar falls back to a compact form (`b node`,
+/// `sort:Adapter`) in which every chip still shows whole.
+fn status_chips(state: &AppState, compact: bool) -> [(String, VerbId, Token); 4] {
+    let sort = state.agent_sort;
+    let field = match sort.field {
+        AgentSortField::AdapterModel if compact => "Adapter",
+        field => field.label(),
+    };
+    let group = if compact {
+        format!("b {}", state.agent_group_by.label().to_lowercase())
+    } else {
+        format!("b group:{}", state.agent_group_by.label())
+    };
+    [
         (
-            format!("o sort:{}", sort.field.label()),
+            format!("o sort:{field}"),
             VerbId::CycleAgentSort,
             Token::Amber,
         ),
@@ -197,7 +271,31 @@ fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             Token::Cyan,
         ),
         ("0 reset".to_string(), VerbId::ResetAgentSort, Token::Dim),
-    ] {
+        (group, VerbId::ToggleAgentGroupBy, Token::Cyan),
+    ]
+}
+
+/// Like the Actions filter row, each hint owns a clipped semantic hit zone.
+fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    if area.height == 0 {
+        return;
+    }
+    // Chips plus a one-cell gap after each but the last.
+    let bar_width = |chips: &[(String, VerbId, Token)]| {
+        chips
+            .iter()
+            .map(|(text, ..)| text_display_width(text) + 1)
+            .sum::<usize>()
+            .saturating_sub(1)
+    };
+    let full = status_chips(ctx.state, false);
+    let chips = if bar_width(&full) <= area.width as usize {
+        full
+    } else {
+        status_chips(ctx.state, true)
+    };
+    let mut spans = Vec::new();
+    for (text, verb, token) in chips {
         let x = area.x + spans_width(&spans);
         spans.push(Span::styled(text, ctx.chip(token, Token::NeutralBg)));
         ctx.zone(

@@ -136,17 +136,20 @@ Letters that act on an item (`E`, `D`, `R`, `C` and so on) work only while the m
 | `-` | Gives the list more room. |
 | `M` | Maximizes the detail panel, or restores the split. Upper case only. |
 
-## Sort agents
+## Sort and group agents
 
-In the Agents view you can sort the table for this session. The sort chips above the list offer the same controls.
+In the Agents view you can sort and group the table for this session. The chips above the list offer the same controls.
 
 | Key | What it does |
 |---|---|
 | `o` | Cycles the sort field: Original, Name, Status, Adapter/Model, Location. |
 | `O` | Switches between ascending and descending. |
-| `0` | Resets to Original, ascending. |
+| `0` | Resets the sort to Original, ascending. The grouping is not changed. |
+| `b` | Switches the sections between By team (the default) and By node. |
 
-Sorting keeps team sections and the selected agent. It lasts only until you close the dashboard. Original is the default order (team, then status, then source).
+By team shows each active team, then the unassigned agents. By node shows a Local section for this instance's agents, then one section per remote alias in alias order, each marked online or offline.
+
+Sorting applies within each section and keeps the selected agent, and so does switching the grouping. Both last only until you close the dashboard. Original is the default order (section, then status, then source).
 
 ## Follow activity feeds
 

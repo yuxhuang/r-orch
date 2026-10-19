@@ -633,6 +633,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             VerbId::CycleAgentSort => self.cycle_agent_sort(),
             VerbId::ReverseAgentSort => self.reverse_agent_sort(),
             VerbId::ResetAgentSort => self.reset_agent_sort(),
+            VerbId::ToggleAgentGroupBy => self.toggle_agent_group_by(),
             VerbId::PickerToggle => {
                 if self.state.show_type_picker {
                     self.type_picker_toggle_cursor();
