@@ -905,16 +905,25 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// click on it toggles. Making the second click a no-op (as this did)
     /// meant the same gesture on two visually identical checkboxes — a
     /// picker's and a wizard's — did different things.
+    ///
+    /// An agent picker whose filter lists no agent refuses `Enter`, so that
+    /// typed text never falls through to the sentinel. A double click is not
+    /// typed text: it names the row it lands on, as that row's digit does, so
+    /// there it confirms by the digit. Only the sentinel rows can be listed
+    /// then, so the digit always exists; past nine rows it falls back to the
+    /// refused `Enter` rather than guessing.
     fn wizard_option_secondary(&mut self, index: usize, part: RowPart) {
-        let multiselect = self
-            .state
-            .wizard
-            .as_ref()
-            .is_some_and(|w| w.step().kind == StepKind::Multiselect);
+        let (multiselect, blocked) = self.state.wizard.as_ref().map_or((false, false), |w| {
+            (w.step().kind == StepKind::Multiselect, w.picker_blocked())
+        });
+        let digit = (index < 9).then(|| char::from(b'1' + index as u8));
         match part {
             RowPart::Checkbox => self.wizard_option_primary(index, part),
             RowPart::Label if multiselect => self.wizard_select_then(index, KeyCode::Char(' ')),
-            RowPart::Label => self.wizard_select_then(index, KeyCode::Enter),
+            RowPart::Label => match digit {
+                Some(digit) if blocked => self.wizard_select_then(index, KeyCode::Char(digit)),
+                _ => self.wizard_select_then(index, KeyCode::Enter),
+            },
         }
     }
 
