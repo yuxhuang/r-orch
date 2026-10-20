@@ -260,15 +260,18 @@ The mode is always on screen:
 
 ### Narrow terminals
 
-As the terminal gets narrower, columns drop out:
+As the terminal gets narrower, UPDATED is the first column to go, then CAPS. UPDATED shows only when every other column does:
 
 - From 108 columns: every column and the `GROUP:` chip.
 - From 93 to 107 columns: every column, no chip.
 - From 84 to 92 columns: every column but UPDATED.
-- At 82 and 83 columns: every column but CAPS. UPDATED is back, because it is narrower than CAPS and still fits.
-- At 80 and 81 columns: STATUS, NAME, ADAPTER/MODEL, TASK, WHERE and RUNS.
+- From 73 to 83 columns: STATUS, NAME, ADAPTER/MODEL, TASK, WHERE and RUNS.
 
-Each column is placed only if it still fits, so the drop order is not strict: a narrow column can show at a width where a wider one does not. Below 80 columns this happens again; for example, at 71 and 72 columns UPDATED shows but ADAPTER/MODEL does not.
+Narrower still, ADAPTER/MODEL and WHERE give way, and whichever of them fits is shown:
+
+- From 62 to 72 columns: STATUS, NAME, TASK, WHERE and RUNS.
+- At 60 and 61 columns: STATUS, NAME, ADAPTER/MODEL, TASK and RUNS.
+- From 49 to 59 columns: STATUS, NAME, TASK and RUNS.
 
 A sort by a column that is not shown still applies. The footer then names it after the mode, and a click on it moves the sort to the next column, like `o`. This is the footer at 80 columns while the list is sorted by CAPS:
 
