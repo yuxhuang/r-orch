@@ -13,7 +13,7 @@ use crate::backend::{
     BackendResult, CopyOutcome, CopyResult, CopyTarget, CopyTicket, EntityTiming, TimingSnapshot,
 };
 use crate::command_bar::CommandHistory;
-use crate::format::parse_timestamp_ms;
+use crate::format::parse_observation_ms;
 use crate::hit::{HitMap, ZoneId, ZoneKind};
 use crate::messages::{
     MAX_TOASTS, Message, MsgType, PendingMessage, RunMaps, TASK_LIST_LIMIT, UNDO_TIMEOUT_MS,
@@ -1211,6 +1211,8 @@ pub struct AppState {
     /// The instant the Elapsed sort last sampled the clock (D1/D3). The
     /// order only moves when this does — on a refresh or a list-control
     /// change — while the Elapsed text on screen follows the frame clock.
+    /// Also the reference the Agents UPDATED and `live` timestamps are
+    /// validated at, so a tick cannot blank or un-blank an agent either.
     pub sort_clock_ms: i64,
     /// A refresh or control change lost the selected entity and moved the
     /// cursor onto another one that has not been drawn yet. Entity actions
@@ -2836,9 +2838,14 @@ impl AppState {
     /// v2, Issue 1): the newest valid `started_at` / `last_event_at` across
     /// its running entries (`R`); else the newest valid `updated_at` of the
     /// loaded tasks currently assigned to it, whatever the list filters
-    /// (`T`); else `None`. A timestamp that does not parse is skipped, never
-    /// read as the epoch or as now. Linear in agents + tasks + runs.
+    /// (`T`); else `None`. A timestamp is valid only as
+    /// [`parse_observation_ms`] rules at [`AppState::sort_clock_ms`] (sampled
+    /// with the data, so the sort, the cell and the Overview agree on it); an
+    /// invalid one — malformed, impossible, before the epoch or more than a
+    /// day ahead — is skipped, never clamped or read as the epoch or as now
+    /// (adjudication v3, Ruling 1). Linear in agents + tasks + runs.
     pub fn agent_updated_observations(&self) -> Vec<Option<AgentUpdated>> {
+        let valid = |ts: &str| parse_observation_ms(ts, self.sort_clock_ms);
         let index: std::collections::HashMap<&str, usize> = self
             .agents
             .iter()
@@ -2854,14 +2861,14 @@ impl AppState {
         let mut runs: Vec<Option<i64>> = vec![None; self.agents.len()];
         for entry in self.orch_state.running.values() {
             if let Some(&i) = index.get(entry.agent_id.as_str()) {
-                newest(&mut runs[i], parse_timestamp_ms(&entry.started_at));
-                newest(&mut runs[i], parse_timestamp_ms(&entry.last_event_at));
+                newest(&mut runs[i], valid(&entry.started_at));
+                newest(&mut runs[i], valid(&entry.last_event_at));
             }
         }
         let mut tasks: Vec<Option<i64>> = vec![None; self.agents.len()];
         for task in &self.tasks {
             if let Some(&i) = task.assignee.as_deref().and_then(|id| index.get(id)) {
-                newest(&mut tasks[i], parse_timestamp_ms(&task.updated_at));
+                newest(&mut tasks[i], valid(&task.updated_at));
             }
         }
         runs.into_iter()
@@ -3933,6 +3940,50 @@ mod tests {
             last_event_at: event.into(),
             remote: None,
         }
+    }
+
+    /// Adjudication v3, Ruling 1: an absurd run time is skipped, so the agent
+    /// falls back to a valid assigned task (`T`), not `R now`; a time within
+    /// the day of skew counts; one before the epoch is unknown. Validity is
+    /// judged at the sort clock.
+    #[test]
+    fn updated_skips_out_of_domain_timestamps_and_keeps_modest_skew() {
+        let mut state = AppState::default();
+        // 2026-10-19T00:00:00Z.
+        state.sort_clock_ms = 1_792_368_000_000;
+        state.agents = ["future", "skew", "past"]
+            .into_iter()
+            .map(|id| make_agent(id, id, AgentStatus::Running))
+            .collect();
+        for entry in [
+            running_entry(
+                "future",
+                "9999-12-31T23:59:59.999Z",
+                "2026-10-21T00:00:00.000Z",
+            ),
+            running_entry("skew", "2026-10-19T01:00:00.000Z", "x"),
+            running_entry("past", "1969-12-31T23:59:59Z", "2026-02-31T00:00:00.000Z"),
+        ] {
+            state.orch_state.running.insert(entry.run_id.clone(), entry);
+        }
+        let mut task = make_task("t", "t", TaskStatus::InProgress);
+        task.assignee = Some("future".into());
+        task.updated_at = "2026-10-18T00:00:00.000Z".into();
+        state.tasks.push(task);
+        assert_eq!(
+            state.agent_updated_observations(),
+            [
+                Some(AgentUpdated {
+                    at_ms: 1_792_281_600_000,
+                    source: UpdatedSource::Task
+                }),
+                Some(AgentUpdated {
+                    at_ms: 1_792_371_600_000,
+                    source: UpdatedSource::Run
+                }),
+                None,
+            ]
+        );
     }
 
     #[test]

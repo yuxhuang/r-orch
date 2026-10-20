@@ -7,7 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::backend::CopyOutcome;
-use crate::format::{format_duration, format_started, parse_timestamp_ms};
+use crate::format::{format_duration, format_started, parse_observation_ms, parse_timestamp_ms};
 use crate::hit::{FooterAction, PaneMetrics, VerbId, ZoneId, ZoneKind};
 use crate::messages::Message;
 use crate::state::{
@@ -466,24 +466,41 @@ fn agent_updated_field(state: &AppState, agent: &Agent, now_ms: i64) -> Overview
                 ),
             }
         }
-        None => (
-            "unknown — no live run or assigned task".to_string(),
-            Token::Dim,
-        ),
+        None => {
+            // A run or task whose every time was rejected is still evidence
+            // that exists; say the time is what is missing.
+            let has_evidence = state
+                .orch_state
+                .running
+                .values()
+                .any(|entry| entry.agent_id == agent.id)
+                || state
+                    .tasks
+                    .iter()
+                    .any(|task| task.assignee.as_deref() == Some(agent.id.as_str()));
+            let why = if has_evidence {
+                "no valid run or task time"
+            } else {
+                "no live run or assigned task"
+            };
+            (format!("unknown — {why}"), Token::Dim)
+        }
     };
     OverviewField::new("updated", text, token)
 }
 
 /// The Agent Overview's `live` row, while the agent has a running entry:
 /// the time since the newest valid start among them (the RUNS cell shows
-/// lifetime statistics instead). `unknown` if no start parses.
+/// lifetime statistics instead). Valid is [`parse_observation_ms`] at the
+/// sort clock, as for UPDATED: a start within its day of skew ahead reads
+/// `0s`; a malformed or absurd one is skipped, and `unknown` if none is left.
 fn agent_live_field(state: &AppState, agent: &Agent, now_ms: i64) -> Option<OverviewField> {
     let starts: Vec<Option<i64>> = state
         .orch_state
         .running
         .values()
         .filter(|entry| entry.agent_id == agent.id)
-        .map(|entry| parse_timestamp_ms(&entry.started_at))
+        .map(|entry| parse_observation_ms(&entry.started_at, state.sort_clock_ms))
         .collect();
     if starts.is_empty() {
         return None;
@@ -1506,6 +1523,104 @@ mod tests {
         };
         state.set_focus(Focus::GoalDetail(GoalSection::Tasks));
         state
+    }
+
+    /// The Agent Overview `live` row for agent `a` with one running entry
+    /// per start, judged and dated at 2026-10-19T00:00:00Z.
+    fn live_text(starts: &[&str]) -> Option<String> {
+        const NOW: i64 = 1_792_368_000_000;
+        let mut state = AppState {
+            sort_clock_ms: NOW,
+            agents: vec![crate::backend::make_agent(
+                "a",
+                "A",
+                orch_domain::AgentStatus::Running,
+            )],
+            ..AppState::default()
+        };
+        for (i, start) in starts.iter().enumerate() {
+            let entry = orch_domain::RunningEntry {
+                run_id: format!("r{i}"),
+                agent_id: "a".into(),
+                task_id: "t".into(),
+                pid: 1,
+                started_at: (*start).into(),
+                last_event_at: (*start).into(),
+                remote: None,
+            };
+            state.orch_state.running.insert(entry.run_id.clone(), entry);
+        }
+        let field = agent_live_field(&state, &state.agents[0], NOW)?;
+        Some(field.value.into_iter().map(|(text, _)| text).collect())
+    }
+
+    /// The `updated` row says which is missing: the evidence, or a valid
+    /// time on the evidence that exists.
+    #[test]
+    fn updated_unknown_says_whether_evidence_or_its_time_is_missing() {
+        const NOW: i64 = 1_792_368_000_000;
+        let text = |state: &AppState| -> String {
+            agent_updated_field(state, &state.agents[0], NOW)
+                .value
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect()
+        };
+        let mut state = AppState {
+            sort_clock_ms: NOW,
+            agents: vec![crate::backend::make_agent(
+                "a",
+                "A",
+                orch_domain::AgentStatus::Running,
+            )],
+            ..AppState::default()
+        };
+        assert_eq!(text(&state), "unknown — no live run or assigned task");
+        let entry = orch_domain::RunningEntry {
+            run_id: "r".into(),
+            agent_id: "a".into(),
+            task_id: "t".into(),
+            pid: 1,
+            started_at: "9999-12-31T23:59:59.999Z".into(),
+            last_event_at: "9999-12-31T23:59:59.999Z".into(),
+            remote: None,
+        };
+        state.orch_state.running.insert(entry.run_id.clone(), entry);
+        assert_eq!(text(&state), "unknown — no valid run or task time");
+        state.orch_state.running.clear();
+        let mut task = make_task("t", "t", TaskStatus::Todo);
+        task.assignee = Some("a".into());
+        task.updated_at = "2026-02-31T00:00:00.000Z".into();
+        state.tasks.push(task);
+        assert_eq!(text(&state), "unknown — no valid run or task time");
+    }
+
+    /// Adjudication v3, Ruling 1 (T27 as amended): a start within the day of
+    /// skew clamps to `0s`; an absurd one is skipped like a malformed one,
+    /// leaving the newest valid start, or `unknown`.
+    #[test]
+    fn live_skips_absurd_starts_and_clamps_modest_skew() {
+        assert_eq!(live_text(&[]), None);
+        assert_eq!(
+            live_text(&["2026-10-18T23:59:00.000Z"]).as_deref(),
+            Some("1:00 elapsed")
+        );
+        assert_eq!(
+            live_text(&["2026-10-19T01:00:00.000Z"]).as_deref(),
+            Some("0s elapsed")
+        );
+        assert_eq!(
+            live_text(&["9999-12-31T23:59:59.999Z"]).as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            live_text(&["1969-12-31T23:59:59Z", "2026-02-31T00:00:00Z"]).as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            live_text(&["9999-12-31T23:59:59.999Z", "2026-10-18T23:59:00.000Z"]).as_deref(),
+            Some("1:00 elapsed")
+        );
     }
 
     /// Draw only the inspector into `area` of a larger screen.

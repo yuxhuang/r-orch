@@ -369,11 +369,25 @@ fn node_header(
 //
 // The task column is the elastic one in the middle, so the narrow fixed
 // columns stay right-aligned to the edge. On a narrow terminal the optional
-// columns are granted in the order runs, task, where, model, caps, updated
-// while each still fits, rather than squeezed, because a column that is too
-// narrow to read is worse than an absent one; the name is never dropped.
-// UPDATED comes last, so it never takes a cell from a column that was there
-// before it existed. The `GROUP: <Mode>` chip is chrome, budgeted after every
+// columns are granted in the order runs, task, where, model, caps while each
+// still fits, rather than squeezed, because a column that is too narrow to
+// read is worse than an absent one; the name is never dropped. UPDATED is
+// strictly last: it is granted only when all five others were, so it is the
+// first column to go and never takes a cell from a column that was there
+// before it existed. With today's widths (row width in cells):
+//
+//   width     columns besides the name
+//   < 36      none
+//   36–46     runs
+//   47–48     runs, model
+//   49–59     runs, task
+//   60–61     runs, task, model
+//   62–72     runs, task, where
+//   73–83     runs, task, where, model
+//   84–92     runs, task, where, model, caps
+//   ≥ 93      every column, UPDATED included
+//
+// The `GROUP: <Mode>` chip is chrome, budgeted after every
 // column and before any slack: it shows only when its 15 cells are spare
 // (from [`GROUP_CHIP_FROM`]); narrower, the footer's `b <Mode>` names the
 // grouping.
@@ -437,7 +451,11 @@ impl AgentColumns {
         let place = take(WHERE_W);
         let model = take(MODEL_MIN);
         let caps = take(CAPS_W);
-        let updated = take(UPDATED_W);
+        // UPDATED is strictly the lowest priority: only once every other
+        // column is in. Otherwise its cells stay in the slack pool, so a
+        // width that has UPDATED always has all the rest (adjudication v3).
+        let all_others = [time, task, place, model, caps].iter().all(|&w| w > 0);
+        let updated = if all_others { take(UPDATED_W) } else { 0 };
         // The chip and the gap before it, only out of what the columns left.
         let chip = avail > GROUP_CHIP_W;
         if chip {
@@ -774,6 +792,34 @@ mod tests {
         assert_eq!(cols.time, TIME_W, "{cols:?}");
         assert_eq!(cols.updated, 0, "{cols:?}");
         assert!(!cols.chip, "{cols:?}");
+    }
+
+    /// Adjudication v3, Ruling 2: UPDATED is strictly the lowest-priority
+    /// column. At every width it is present only with all five others, and
+    /// from 93 columns every column is present.
+    #[test]
+    fn updated_shows_only_when_every_other_column_does() {
+        for width in 0..=240 {
+            let cols = AgentColumns::for_width(width);
+            let others = [cols.time, cols.task, cols.place, cols.model, cols.caps];
+            if cols.updated > 0 {
+                assert!(others.iter().all(|&w| w > 0), "{width}: {cols:?}");
+            }
+            assert_eq!(cols.updated > 0, width >= 93, "{width}: {cols:?}");
+        }
+    }
+
+    #[test]
+    fn at_82_columns_caps_and_updated_are_both_dropped() {
+        // Before Ruling 2, UPDATED took the cells CAPS could not use here.
+        for width in [82, 83] {
+            let cols = AgentColumns::for_width(width);
+            assert_eq!((cols.caps, cols.updated), (0, 0), "{width}: {cols:?}");
+            assert!(
+                cols.model > 0 && cols.task > 0 && cols.place > 0,
+                "{cols:?}"
+            );
+        }
     }
 
     #[test]
