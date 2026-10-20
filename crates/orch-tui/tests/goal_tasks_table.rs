@@ -1722,3 +1722,107 @@ fn losing_the_pending_substitute_keeps_the_guard_and_only_the_painted_new_substi
         );
     }
 }
+
+// ── Gate C1: the pane offset recomputed on the first click / key ───────────
+//
+// While the Tasks pane is hidden (an Overview frame) it publishes no metrics,
+// so its stored scroll offset goes stale. If the task sort is reversed from
+// elsewhere in that time, the first click or key after returning must act on
+// the window that is drawn, not on the stale one.
+
+/// `n` tasks of goal `g1`, titled `Many 00`..; each task's description names
+/// its index (`DESC-00`..), so a viewer body identifies the row that opened it.
+fn many_backend(n: usize) -> FakeBackend {
+    let tasks: Vec<Task> = (0..n)
+        .map(|i| {
+            let mut t = task(
+                &format!("t_{i:02}"),
+                &format!("Many {i:02}"),
+                TaskStatus::Todo,
+                3,
+                Some("g1"),
+            );
+            t.description = format!("DESC-{i:02}");
+            t
+        })
+        .collect();
+    FakeBackend::new()
+        .with_tasks(tasks)
+        .with_goals(vec![make_goal("g1", "Goal one", GoalStatus::Active)])
+}
+
+/// The id of the focused viewer source when it is a task description.
+fn focused_task_id(h: &Harness) -> Option<String> {
+    match h.app.state.focused_source() {
+        Some(ViewerSource::Entity {
+            kind: EntityType::Task,
+            id,
+            ..
+        }) => Some(id),
+        _ => None,
+    }
+}
+
+/// 40 tasks sorted by title, the last one picked (the window scrolled to the
+/// bottom), then the Overview shown, the sort reversed while the pane is
+/// hidden, and the Tasks pane drawn again. The pick is still `t_39`, now the
+/// first drawn row, while the stored offset is still the bottom window's.
+fn stale_offset_after_hidden_reorder() -> Harness {
+    let mut h = section_with(many_backend(40), 100, 30);
+    let now = h.now();
+    h.app.state.set_task_sort(
+        TaskSort {
+            field: TaskSortField::Title,
+            descending: false,
+        },
+        now,
+        false,
+    );
+    h.app.state.clamp_all(false);
+    h.draw();
+    h.press(KeyCode::End);
+    h.draw();
+    h.app
+        .state
+        .set_focus(Focus::GoalDetail(GoalSection::Overview));
+    h.draw(); // an Overview frame: the Tasks pane publishes no metrics
+    let now = h.now();
+    let reversed = h.app.state.task_sort.reversed();
+    h.app.state.set_task_sort(reversed, now, false);
+    h.app.state.clamp_all(false);
+    h.app.state.set_focus(Focus::GoalDetail(GoalSection::Tasks));
+    h.draw();
+    assert_eq!(
+        focused_task_id(&h).as_deref(),
+        Some("t_39"),
+        "setup: the pick survives the reorder"
+    );
+    h
+}
+
+#[test]
+fn a_click_after_a_hidden_pane_reorder_picks_the_drawn_row_not_the_stale_window_row() {
+    let mut h = stale_offset_after_hidden_reorder();
+    let y = header_y(&mut h) + 2; // the second drawn row
+    let line = h.line(y);
+    let index = line
+        .split("Many ")
+        .nth(1)
+        .and_then(|rest| rest.get(..2))
+        .unwrap_or_else(|| panic!("no task row at y={y}: {line:?}"))
+        .to_string();
+    h.click(30, y).press(KeyCode::Enter);
+    let viewer = h.app.state.viewer.as_ref().expect("Enter opens the viewer");
+    assert_eq!(&*viewer.document().body, format!("DESC-{index}"));
+}
+
+#[test]
+fn a_key_after_a_hidden_pane_reorder_moves_from_the_drawn_row() {
+    let mut h = stale_offset_after_hidden_reorder();
+    h.press(KeyCode::Down);
+    assert_eq!(
+        focused_task_id(&h).as_deref(),
+        Some("t_38"),
+        "Down from the first drawn row (t_39) lands on the second (t_38)"
+    );
+}
