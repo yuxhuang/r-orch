@@ -6,6 +6,7 @@ use orch_tui::backend::{FakeBackend, make_agent, make_team};
 use orch_tui::messages::{MsgType, PendingMessage};
 use orch_tui::state::{DetailPanel, Focus, ViewId};
 use orch_tui::theme::Token;
+use orch_tui::widgets::help_overlay::AGENTS_HELP;
 use ratatui::crossterm::event::KeyCode;
 
 fn agents() -> Vec<Agent> {
@@ -610,10 +611,7 @@ fn group_by_keys_chip_and_help() {
     // Help names the keys.
     h.key('?');
     let text = h.text();
-    assert!(
-        text.contains("b/B group by team/node/status/adapter"),
-        "{text}"
-    );
+    assert!(text.contains("b/B change the grouping"), "{text}");
     h.key('x');
 
     // Inert outside the Agents view and while typing a command.
@@ -664,4 +662,93 @@ fn group_mode_hint_is_visible_and_clickable_at_minimum_width() {
         ]
     );
     assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+}
+
+// ── The help overlay's Agents lines (adjudication-v2 Issue 1, RT-D3) ───────
+
+/// The help overlay at `width`×`height` over the Agents view.
+fn help_screen(width: u16, height: u16) -> String {
+    let mut h = Harness::sized(FakeBackend::new().with_agents(agents()), width, height);
+    h.app.state.view = ViewId::Agents;
+    h.key('?');
+    h.text()
+}
+
+/// The [`AGENTS_HELP`] block as it reads on `screen`: its rows, consecutive,
+/// trimmed.
+#[track_caller]
+fn agents_help_block(screen: &str) -> Vec<String> {
+    let rows: Vec<&str> = screen.lines().collect();
+    let first = rows
+        .iter()
+        .position(|line| line.contains(AGENTS_HELP[0]))
+        .unwrap_or_else(|| panic!("the first Agents help line is not on screen:\n{screen}"));
+    rows[first..]
+        .iter()
+        .take(AGENTS_HELP.len())
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+#[test]
+fn help_agents_lines_word_the_rulings_verbatim_once_each() {
+    let wrapped = AGENTS_HELP.join(" ");
+    assert_eq!(
+        [
+            // RT-D3, as adjudication-v2 words it.
+            "grouped by first capability; use the filter to find every agent with a capability",
+            // Issue 1: the question UPDATED answers, and what `T` means.
+            "UPDATED: which agent's run or assignment record changed most recently",
+            "T: assigned task record updated; may be an administrative change, not proof the agent ran",
+            "R: run",
+            "b/B change the grouping",
+        ]
+        .map(|phrase| wrapped.matches(phrase).count()),
+        [1; 5],
+        "{wrapped:?}"
+    );
+}
+
+#[test]
+fn help_agents_lines_fit_inside_the_box_border() {
+    let long: Vec<(usize, &str)> = AGENTS_HELP
+        .iter()
+        .map(|line| (line.chars().count(), *line))
+        .filter(|(cells, _)| *cells > 74)
+        .collect();
+    assert!(long.is_empty(), "wider than the 74-cell box: {long:?}");
+}
+
+// The default terminal size: every Agents line, and the box's own title,
+// dismiss hint and both borders, are on screen with nothing past column 80.
+#[test]
+fn help_shows_the_agents_lines_and_the_whole_box_at_80x24() {
+    let screen = help_screen(80, 24);
+    assert_eq!(agents_help_block(&screen), AGENTS_HELP, "{screen}");
+    let missing: Vec<&str> = [
+        "KEYBOARD SHORTCUTS",
+        "Press any key to dismiss",
+        "╭",
+        "╯",
+        "Inspector",
+        "Elapsed*: start to now",
+    ]
+    .into_iter()
+    .filter(|needle| !screen.contains(needle))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "missing {missing:?} at 80x24:\n{screen}"
+    );
+    assert!(
+        screen.lines().all(|line| line.chars().count() <= 80),
+        "{screen}"
+    );
+}
+
+#[test]
+fn help_shows_the_agents_lines_at_120x40() {
+    let screen = help_screen(120, 40);
+    assert_eq!(agents_help_block(&screen), AGENTS_HELP, "{screen}");
+    assert!(screen.contains("Press any key to dismiss"), "{screen}");
 }

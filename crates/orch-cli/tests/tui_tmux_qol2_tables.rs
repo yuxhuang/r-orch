@@ -380,8 +380,10 @@ fn tables_headers_sort_and_elapsed_in_tmux() {
         "Elapsed*: start to now; terminal rows end at last update (edits change it).",
         "Includes waiting/retries. Elapsed order updates on refresh or",
         "list-control changes; displayed time is live.",
-        "Agents: b/B group by team/node/status/adapter/first capability/none.",
-        "UPDATED: R run; T assigned task record changed, not proof the agent ran.",
+        "Agents: b/B change the grouping. Caps: grouped by first capability; use",
+        "the filter to find every agent with a capability. UPDATED: which agent's",
+        "run or assignment record changed most recently. R: run; T: assigned task",
+        "record updated; may be an administrative change, not proof the agent ran.",
         "Press any key to dismiss",
     ];
     let screen = tmux.wait_for("the help overlay at 80x24", |s| {

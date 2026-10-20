@@ -4,13 +4,15 @@
 //! rows in three 22-column columns, and the dismiss footer.
 //!
 //! The box is [`FULL_H`] rows tall. Where the overlay area below the header is
-//! shorter than that (an 80×24 terminal), it first drops its four spacer rows,
-//! then draws over the whole frame, so the footer lines (the dismiss hint and
-//! the R15 Elapsed* disclosure) stay on screen at the default terminal size.
+//! shorter than that (an 80×24 terminal), it first goes compact (it drops its
+//! four spacer rows and draws the title and the dismiss hint into its top and
+//! bottom borders), then draws over the whole frame, so the footer lines (the
+//! dismiss hint, the R15 Elapsed* disclosure and the Agents lines) stay on
+//! screen at the default terminal size.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 use crate::backend::CopyOutcome;
@@ -82,11 +84,15 @@ pub const ELAPSED_HELP: [&str; 3] = [
     "list-control changes; displayed time is live.",
 ];
 
-/// The Agents grouping keys and what UPDATED's `R` / `T` mean: `T` is a
-/// task record changing, which an assignment or an edit does too.
-pub const AGENTS_HELP: [&str; 2] = [
-    "Agents: b/B group by team/node/status/adapter/first capability/none.",
-    "UPDATED: R run; T assigned task record changed, not proof the agent ran.",
+/// The Agents grouping keys (the footer's `b <Mode>` names the mode), what
+/// Caps grouping means (RT-D3), and what UPDATED and its `R` / `T` markers
+/// mean (Issue 1), in the words adjudication-v2 rules, wrapped at word
+/// boundaries to fit the box.
+pub const AGENTS_HELP: [&str; 4] = [
+    "Agents: b/B change the grouping. Caps: grouped by first capability; use",
+    "the filter to find every agent with a capability. UPDATED: which agent's",
+    "run or assignment record changed most recently. R: run; T: assigned task",
+    "record updated; may be an administrative change, not proof the agent ran.",
 ];
 
 /// [`ELAPSED_HELP`]'s first sentence, the one the README carries too.
@@ -105,8 +111,11 @@ const SPACERS_ABOVE: usize = 3;
 /// lists hint, the [`ELAPSED_HELP`] and [`AGENTS_HELP`] lines, bottom border.
 pub const FULL_H: usize =
     SPACERS_ABOVE + 3 + MAX_ROWS + 1 + 4 + ELAPSED_HELP.len() + AGENTS_HELP.len() + 1;
-/// [`FULL_H`] without its four spacer rows.
-pub const COMPACT_H: usize = FULL_H - SPACERS_ABOVE - 1;
+/// [`FULL_H`] without its four spacer rows, and with the title and the
+/// dismiss hint drawn into the top and bottom borders instead of rows of
+/// their own: 23 rows, so the whole box fits an 80×24 terminal, and fits
+/// under the header (`height - 7` rows) from 30 rows.
+pub const COMPACT_H: usize = FULL_H - SPACERS_ABOVE - 1 - 2;
 
 /// Where the box goes and whether it keeps its spacers: the overlay area
 /// below the header if the box fits there (spacers first), else the whole
@@ -159,27 +168,32 @@ pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
         format!("{}{}", " ".repeat(pad), text)
     };
 
-    put_line(
-        frame,
-        inner,
-        y,
-        vec![Span::styled(format!("╭{}╮", "─".repeat(INNER_W)), border)],
-    );
-    y += 1;
+    const TITLE: &str = "KEYBOARD SHORTCUTS";
+    const DISMISS: &str = "Press any key to dismiss";
     if spaced {
-        put_line(frame, inner, y, vec![Span::styled("│", border)]);
+        put_line(
+            frame,
+            inner,
+            y,
+            vec![Span::styled(format!("╭{}╮", "─".repeat(INNER_W)), border)],
+        );
+        put_line(frame, inner, y + 1, vec![Span::styled("│", border)]);
+        put_line(
+            frame,
+            inner,
+            y + 2,
+            vec![Span::styled(centre(TITLE.into()), ctx.bold(Token::Amber))],
+        );
+        y += 4;
+    } else {
+        put_line(
+            frame,
+            inner,
+            y,
+            labelled_rule(('╭', '╮'), TITLE, border, ctx.bold(Token::Amber)),
+        );
         y += 1;
     }
-    put_line(
-        frame,
-        inner,
-        y,
-        vec![Span::styled(
-            centre("KEYBOARD SHORTCUTS".into()),
-            ctx.bold(Token::Amber),
-        )],
-    );
-    y += 1 + spacer;
 
     let dividers = ["NAVIGATION", "ACTIONS", "COMMANDS"];
     let mut header = String::new();
@@ -225,17 +239,15 @@ pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
         y += 1;
     }
 
-    y += spacer;
-    put_line(
-        frame,
-        inner,
-        y,
-        vec![Span::styled(
-            centre("Press any key to dismiss".into()),
-            ctx.style(Token::Dim),
-        )],
-    );
-    y += 1;
+    if spaced {
+        put_line(
+            frame,
+            inner,
+            y + 1,
+            vec![Span::styled(centre(DISMISS.into()), ctx.style(Token::Dim))],
+        );
+        y += 2;
+    }
     put_line(
         frame,
         inner,
@@ -266,9 +278,9 @@ pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
         )],
     );
     y += 1;
-    // R15's disclosure and D1's ordering rule, word-wrapped at the box: the
-    // sentences are too long for one 74-cell row, and every word of them must
-    // stay on screen.
+    // R15's disclosure, D1's ordering rule and the Agents rulings,
+    // word-wrapped at the box: the sentences are too long for one 74-cell
+    // row, and every word of them must stay on screen.
     for line in ELAPSED_HELP.into_iter().chain(AGENTS_HELP) {
         put_line(
             frame,
@@ -278,12 +290,30 @@ pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
         );
         y += 1;
     }
-    put_line(
-        frame,
-        inner,
-        y,
-        vec![Span::styled(format!("╰{}╯", "─".repeat(INNER_W)), border)],
-    );
+    let bottom = if spaced {
+        vec![Span::styled(format!("╰{}╯", "─".repeat(INNER_W)), border)]
+    } else {
+        labelled_rule(('╰', '╯'), DISMISS, border, ctx.style(Token::Dim))
+    };
+    put_line(frame, inner, y, bottom);
+}
+
+/// A border row of the box with `label` centred in it, `─` either side:
+/// how the compact box keeps its title and dismiss hint without a row each.
+fn labelled_rule(
+    (left, right): (char, char),
+    label: &str,
+    border: Style,
+    text: Style,
+) -> Vec<Span<'static>> {
+    let label = format!(" {label} ");
+    let dashes = INNER_W.saturating_sub(label.chars().count());
+    let before = dashes / 2;
+    vec![
+        Span::styled(format!("{left}{}", "─".repeat(before)), border),
+        Span::styled(label, text),
+        Span::styled(format!("{}{right}", "─".repeat(dashes - before)), border),
+    ]
 }
 
 // The inverse of format::parse_timestamp_ms's civil-epoch conversion keeps
