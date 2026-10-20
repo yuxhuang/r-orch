@@ -125,6 +125,27 @@ fn col_of(line: &str, needle: &str) -> Option<u16> {
         .map(|byte| UnicodeWidthStr::width(&line[..byte]) as u16)
 }
 
+/// Buffer column of `needle` on screen row `y`, counted in cells. A wide
+/// glyph fills two cells and its hidden second cell flattens to a space in
+/// [`Harness::line`], so [`col_of`] over-counts a row holding wide glyphs.
+/// This walks the cells themselves; a cell's symbol may be one grapheme or
+/// empty, never several cells.
+fn cell_col_of(h: &Harness, y: u16, needle: &str) -> Option<u16> {
+    let buffer = h.terminal.backend().buffer();
+    let mut text = String::new();
+    let mut starts = Vec::new();
+    for x in 0..buffer.area.width {
+        starts.push((text.len(), x));
+        text.push_str(buffer[(x, y)].symbol());
+    }
+    let byte = text.find(needle)?;
+    starts
+        .iter()
+        .rev()
+        .find(|(start, _)| *start <= byte)
+        .map(|(_, x)| *x)
+}
+
 /// Display column one past the end of `needle` in `line`.
 fn end_col_of(line: &str, needle: &str) -> Option<u16> {
     col_of(line, needle).map(|c| c + UnicodeWidthStr::width(needle) as u16)
@@ -421,8 +442,15 @@ fn world_backend() -> FakeBackend {
         ])
 }
 
+/// Terminal height for [`world`]. Status mode draws the most list rows over
+/// [`world_agents`]: the header, five section rules and six agents (12). The
+/// list pane is capped at half the content height (`layout::regions`), which
+/// is 11 rows at [`HIGH`], so the last agent would scroll out of view and the
+/// screen-read oracles would miss it. 32 rows give the list 12.
+const WORLD_HIGH: u16 = 32;
+
 fn world(width: u16) -> Harness {
-    agents_view(world_backend(), width, HIGH)
+    agents_view(world_backend(), width, WORLD_HIGH)
 }
 
 /// Section labels with the agent names under each, in row order.
@@ -2404,13 +2432,21 @@ fn r5_a_long_unicode_name_cannot_push_the_columns_out_of_line() {
         let text = h.text();
         let hy = header_y(&mut h);
         let header = h.line(hy);
-        let rows: Vec<&str> = text.lines().filter(|l| l.contains("wnode")).collect();
+        let rows: Vec<u16> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("wnode"))
+            .map(|(y, _)| y as u16)
+            .collect();
         assert_eq!(rows.len(), 2, "{width}:\n{text}");
-        for row in rows {
+        let where_col = cell_col_of(&h, hy, "WHERE");
+        assert!(where_col.is_some(), "{width}: no WHERE header:\n{header}");
+        for y in rows {
             assert_eq!(
-                col_of(&header, "WHERE"),
-                col_of(row, "wnode"),
-                "{width}:\n{header}\n{row}"
+                where_col,
+                cell_col_of(&h, y, "wnode"),
+                "{width}:\n{header}\n{}",
+                h.line(y)
             );
         }
     }
