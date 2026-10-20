@@ -5,6 +5,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-19
+
+Dashboard patch release: a goal detail's Tasks section is the Tasks list's table. No peer-protocol change, so 0.5.x
+through 0.9.1 peers can be mixed.
+
 ### Changed
 - The dashboard's goal detail Tasks section is now the Tasks list's table for that goal's tasks: the same column header and rows (status chip, priority pips, title with attachment count, assignee, Started, Elapsed*), without the goal column, whose width goes to the title. It is sorted by the Tasks list's sort, so `o`, `O`, `0` and clicking a header there (which also focuses the section) re-sort both; the selected task stays selected across a sort or refresh, and Enter and `Ctrl+Y` still expand and copy its description. The Tasks section is now in every goal's detail, and a goal without tasks shows the header and "No entries." instead of having no Tasks section.
 
@@ -175,7 +180,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/yuxhuang/r-orch/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/yuxhuang/r-orch/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/yuxhuang/r-orch/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/yuxhuang/r-orch/compare/v0.6.0...v0.7.0
