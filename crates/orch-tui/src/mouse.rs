@@ -33,7 +33,7 @@ use crate::hit::{
 };
 use crate::messages::MsgType;
 use crate::navigation::NavAction;
-use crate::state::{ArmedClick, Focus, InputMode, ViewId};
+use crate::state::{ArmedClick, Focus, GoalSection, InputMode, ViewId};
 use crate::theme::Token;
 use crate::wizard::engine::StepKind;
 
@@ -265,6 +265,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 } else {
                     self.state.pane_scroll(&pane.key)
                 };
+                if pane.key.section == Focus::GoalDetail(GoalSection::Tasks) {
+                    // The row under the pointer in the window that was drawn.
+                    scroll.offset = crate::state::goal_tasks_offset(
+                        &scroll,
+                        pane.items,
+                        pane.body.height as usize,
+                    );
+                }
                 scroll.selected = Some(
                     (scroll.offset + usize::from(y.saturating_sub(pane.body.y)))
                         .min(pane.items.saturating_sub(1)),

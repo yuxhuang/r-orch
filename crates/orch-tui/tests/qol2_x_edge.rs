@@ -257,9 +257,9 @@ fn goal_rail_places_progress_before_tasks_and_activity_last_in_every_combination
         if progress {
             expected.push(Focus::GoalDetail(GoalSection::Progress));
         }
-        if linked {
-            expected.push(Focus::GoalDetail(GoalSection::Tasks));
-        }
+        // Tasks is in the rail of every live goal, linked tasks or none: an
+        // empty goal shows its header and `No entries.` there (design D6).
+        expected.push(Focus::GoalDetail(GoalSection::Tasks));
         expected.push(Focus::GoalDetail(GoalSection::Activity));
         assert_eq!(
             detail_ring(&mut harness),

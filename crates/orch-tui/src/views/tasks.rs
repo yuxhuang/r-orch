@@ -202,7 +202,9 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 );
             }
             TaskRow::Task { index, selection } => {
-                render_task_row(frame, area, ctx, y, cols, *index, *selection);
+                let selected = *selection == state.task_selected
+                    && !matches!(state.view, crate::state::ViewId::Logs);
+                render_task_row(frame, area, ctx, y, cols, *index, selected);
                 // Identity is the task id, not the row: a refresh between a
                 // press and a release must cancel the click, not move it to
                 // whatever slid into this row (§3.3).
@@ -373,7 +375,21 @@ impl TaskColumns {
         }
     }
 
-    fn header(self) -> Vec<HeaderCell> {
+    /// These columns without the goal badge: its cells and the gap before
+    /// it go to the title, so every other column keeps its width and place.
+    /// For a list whose rows all belong to one goal (the goal inspector).
+    pub(crate) fn without_goal(self) -> Self {
+        if self.goal == 0 {
+            return self;
+        }
+        TaskColumns {
+            title: self.title + self.goal + 1,
+            goal: 0,
+            ..self
+        }
+    }
+
+    pub(crate) fn header(self) -> Vec<HeaderCell> {
         let task = SortColumn::Task;
         let gap = |width: usize| HeaderCell::gap(usize::from(width > 0));
         vec![
@@ -410,19 +426,21 @@ fn chip_cell(
     ]
 }
 
-fn render_task_row(
+/// One task row, shared by the Tasks view and the goal inspector's Tasks
+/// section. `index` is into `ctx.state.tasks`; the caller says whether this
+/// row carries its cursor, since each surface owns its own selection. Visual
+/// only: no zones and no state writes.
+pub(crate) fn render_task_row(
     frame: &mut Frame,
     area: Rect,
     ctx: &RenderCtx,
     y: u16,
     cols: TaskColumns,
     index: usize,
-    selection: usize,
+    selected: bool,
 ) {
     let state = ctx.state;
     let task = &state.tasks[index];
-    let selected =
-        selection == state.task_selected && !matches!(state.view, crate::state::ViewId::Logs);
     let running = matches!(task.status, TaskStatus::InProgress | TaskStatus::Retrying);
 
     let (chip_text, chip_fg, chip_bg, chip_bold) =
@@ -600,4 +618,29 @@ fn render_welcome(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx.style(Token::Amber),
         )],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn without_goal_gives_the_goal_width_and_its_gap_to_the_title_and_moves_nothing_else() {
+        for width in 0..=240 {
+            let full = TaskColumns::for_width(width);
+            let cols = full.without_goal();
+            assert_eq!(cols.goal, 0, "width {width}");
+            assert_eq!(
+                (cols.assignee, cols.started, cols.elapsed),
+                (full.assignee, full.started, full.elapsed),
+                "width {width}"
+            );
+            let reclaimed = if full.goal > 0 { full.goal + 1 } else { 0 };
+            assert_eq!(cols.title, full.title + reclaimed, "width {width}");
+            // The header spans exactly the same cells as the full one.
+            let span = |cells: Vec<HeaderCell>| cells.iter().map(|c| c.width).sum::<usize>();
+            assert_eq!(span(cols.header()), span(full.header()), "width {width}");
+            assert_eq!(cols.without_goal(), cols, "idempotent at width {width}");
+        }
+    }
 }

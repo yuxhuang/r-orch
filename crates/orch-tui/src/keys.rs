@@ -894,8 +894,18 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.retain_command_bar = false;
     }
 
+    /// The goal inspector's Tasks section has keyboard focus: `o` `O` `0`
+    /// act on the Tasks view's sort, which that section shares (R2).
+    fn goal_tasks_focused(&self) -> bool {
+        self.state.focus == Focus::GoalDetail(GoalSection::Tasks)
+    }
+
     /// `o` in the active list.
     pub(crate) fn cycle_sort(&mut self) {
+        if self.goal_tasks_focused() {
+            self.change_task_sort(self.state.task_sort.cycled());
+            return;
+        }
         match self.state.view {
             ViewId::Goals => self.change_goal_sort(self.state.goal_sort.cycled()),
             ViewId::Tasks => self.change_task_sort(self.state.task_sort.cycled()),
@@ -906,6 +916,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     /// `O` in the active list.
     pub(crate) fn reverse_sort(&mut self) {
+        if self.goal_tasks_focused() {
+            self.change_task_sort(self.state.task_sort.reversed());
+            return;
+        }
         match self.state.view {
             ViewId::Goals => self.change_goal_sort(self.state.goal_sort.reversed()),
             ViewId::Tasks => self.change_task_sort(self.state.task_sort.reversed()),
@@ -916,6 +930,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     /// `0` in the active list: its default order, and nothing else.
     pub(crate) fn reset_sort(&mut self) {
+        if self.goal_tasks_focused() {
+            self.change_task_sort(crate::state::TaskSort::default());
+            return;
+        }
         match self.state.view {
             ViewId::Goals => self.change_goal_sort(crate::state::GoalSort::default()),
             ViewId::Tasks => self.change_task_sort(crate::state::TaskSort::default()),
@@ -930,7 +948,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         use crate::state::SortColumn;
         match column {
             SortColumn::Goal(field) => self.change_goal_sort(self.state.goal_sort.clicked(field)),
-            SortColumn::Task(field) => self.change_task_sort(self.state.task_sort.clicked(field)),
+            SortColumn::Task(field) => {
+                // On the Goals view a task header is the inspector's Tasks
+                // table: the click takes focus there first, so `o` `O` `0`
+                // go on acting on what was just sorted.
+                let section = Focus::GoalDetail(GoalSection::Tasks);
+                if self.state.view == ViewId::Goals && self.state.focus_ring().contains(&section) {
+                    self.state.set_focus(section);
+                }
+                self.change_task_sort(self.state.task_sort.clicked(field));
+            }
             SortColumn::Agent(field) => {
                 self.change_agent_sort(self.state.agent_sort.clicked(field));
             }
@@ -1127,6 +1154,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.state.set_focus(focus);
     }
     pub(crate) fn open_focused_viewer(&mut self) {
+        // A goal Tasks pick moved onto a task the pane has not shown yet.
+        if self.state.goal_task_action_pending() {
+            return;
+        }
         let Some(mut document) = self.state.focused_text() else {
             return;
         };
@@ -1150,6 +1181,10 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             }
             _ => return false,
         };
+        // Consumed, not copied: the pick is a task the pane has not shown.
+        if self.state.goal_task_action_pending() {
+            return true;
+        }
         let Some(document) = self.state.focused_text() else {
             return true;
         };
@@ -1378,8 +1413,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     Focus::GoalDetail(GoalSection::Tasks)
                         | Focus::TaskDetail(TaskSection::Attachments | TaskSection::Files)
                 );
+                let goal_tasks = focus == Focus::GoalDetail(GoalSection::Tasks);
                 let rows = published.as_ref().map_or_else(
                     || {
+                        // A goal task is one table row however long its
+                        // title; other sections wrap their text.
+                        if goal_tasks {
+                            return text.len();
+                        }
                         text.iter()
                             .map(|s| {
                                 crate::views::detail::wrap_rows(s, self.state.width as usize).len()
@@ -1388,8 +1429,14 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     },
                     |m| m.display_rows,
                 );
+                let mut scroll = self.state.pane_scroll(&key);
+                if goal_tasks {
+                    // Start from the window on screen, not a saved offset a
+                    // refresh or sort left behind.
+                    scroll.offset = crate::state::goal_tasks_offset(&scroll, text.len(), h);
+                }
                 (
-                    self.state.pane_scroll(&key),
+                    scroll,
                     text.len(),
                     rows,
                     Vec::new(),

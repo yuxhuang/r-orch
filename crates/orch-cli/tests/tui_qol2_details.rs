@@ -5,7 +5,9 @@
 //! aligned label/value block under a `━` title rule, focused and pinned (R6).
 //! The new-task wizard's Assignee step filters its agents as you type and
 //! cycles their order with `Ctrl+O` (R7, R8), and its final submit refuses an
-//! agent another process disabled after it was picked (R7, D7).
+//! agent another process disabled after it was picked (R7, D7). The goal
+//! detail's Tasks section is the Tasks view's table for that goal's tasks,
+//! sorted by the same header clicks and `o` `O` `0`.
 //!
 //! The real `orch` binary runs `orch tui` in a private tmux server over a
 //! temp project with one shell agent, `bot`, one unassigned goal, `Launch`,
@@ -121,6 +123,17 @@ impl Tmux {
         args.extend_from_slice(keys);
         self.run(&args);
     }
+
+    /// An SGR left click (press and release) at a 0-based cell.
+    fn click(&self, x: usize, y: usize) {
+        for end in ['M', 'm'] {
+            let sequence = format!("\x1b[<0;{};{}{end}", x + 1, y + 1);
+            let hex: Vec<String> = sequence.bytes().map(|b| format!("{b:02x}")).collect();
+            let mut args = vec!["send-keys", "-t", "dash", "-H"];
+            args.extend(hex.iter().map(String::as_str));
+            self.run(&args);
+        }
+    }
 }
 
 impl Drop for Tmux {
@@ -231,6 +244,11 @@ fn project() -> tempfile::TempDir {
 }
 
 fn launch(dir: &Path, socket: String) -> Tmux {
+    launch_tui(dir, socket, "tui")
+}
+
+/// `orch <subcommand>` in a 120x40 private tmux session over `dir`.
+fn launch_tui(dir: &Path, socket: String, subcommand: &str) -> Tmux {
     let mut tmux = Tmux {
         bin: tmux_binary(),
         socket,
@@ -243,7 +261,7 @@ fn launch(dir: &Path, socket: String) -> Tmux {
         global_config(dir).display()
     );
     let cwd = dir.display().to_string();
-    let command = format!("'{}' tui", orch_binary().display());
+    let command = format!("'{}' {subcommand}", orch_binary().display());
     tmux.run(&[
         "start-server",
         ";",
@@ -898,5 +916,269 @@ fn wizard_final_submit_refuses_an_agent_disabled_by_another_process() {
         Some(ids["mid-reviewer"].as_str())
     );
     assert_eq!(tasks[0]["description"].as_str(), Some("keep-this"));
+    tmux.keys(&["q"]);
+}
+
+/// Goal `Launch` with three tasks of distinct priority, title and
+/// description (`Alpha build` cancelled), goal `Other` with one task and an
+/// ungrouped task. No agent exists and the dashboard runs `--observe`, so
+/// nothing can be dispatched.
+fn goal_tasks_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("home")).expect("home");
+    orch(
+        dir.path(),
+        &["init", "--name", "proj", "--adapter", "shell"],
+    );
+    let launch = json_id(&orch(dir.path(), &["--json", "goal", "add", "Launch"]));
+    let other = json_id(&orch(dir.path(), &["--json", "goal", "add", "Other"]));
+    for (title, priority, description) in [
+        ("Zulu deploy", "2", "DESC-ZULU"),
+        ("Alpha build", "3", "DESC-ALPHA"),
+        ("Mike review", "1", "DESC-MIKE"),
+    ] {
+        let id = json_id(&orch(
+            dir.path(),
+            &[
+                "--json",
+                "task",
+                "add",
+                title,
+                "-p",
+                priority,
+                "-d",
+                description,
+                "--goal-id",
+                &launch,
+            ],
+        ));
+        if title == "Alpha build" {
+            orch(dir.path(), &["task", "cancel", &id]);
+        }
+    }
+    orch(
+        dir.path(),
+        &["task", "add", "Foreign work", "--goal-id", &other],
+    );
+    orch(dir.path(), &["task", "add", "Loose end"]);
+    dir
+}
+
+const GOAL_TASKS: [&str; 3] = ["Zulu deploy", "Alpha build", "Mike review"];
+
+/// The goal Tasks section on screen: the row of its header (the one table
+/// header with a `PRI` column below the rail; an active `PRI↑` fills its four
+/// cells, so no space follows it) and the titles of the rows
+/// under it, in screen order.
+fn goal_table(screen: &str) -> Result<(usize, &str, Vec<&'static str>), String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let rail = lines
+        .iter()
+        .position(|line| line.contains("Overview │"))
+        .ok_or("no detail rail")?;
+    let header = (rail..lines.len())
+        .find(|y| {
+            ["STATUS", "PRI", "TITLE"]
+                .iter()
+                .all(|l| lines[*y].contains(l))
+        })
+        .ok_or("no table header under the rail")?;
+    let rows = lines[header + 1..]
+        .iter()
+        .filter_map(|line| GOAL_TASKS.iter().copied().find(|t| line.contains(t)))
+        .collect();
+    Ok((header, lines[header], rows))
+}
+
+/// The title the section's cursor is on.
+fn goal_table_cursor(screen: &str) -> Result<&'static str, String> {
+    let (header, _, _) = goal_table(screen)?;
+    screen
+        .lines()
+        .skip(header + 1)
+        .find(|line| line.starts_with('▸'))
+        .and_then(|line| GOAL_TASKS.iter().copied().find(|t| line.contains(t)))
+        .ok_or_else(|| "no cursor row in the section".to_owned())
+}
+
+/// The goal detail's Tasks section is the Tasks view's table filtered to
+/// the goal: same header and row format with no goal column, only the goal's
+/// tasks, and one sort shared with the Tasks view, driven from the section
+/// by `o` `O` `0` and by a header click that also focuses it. The picked task
+/// keeps the cursor across a sort, and Enter expands its description. At
+/// 80x24 the section keeps that layout; at the 40x14 minimum it still draws.
+#[test]
+fn goal_detail_tasks_section_is_the_tasks_table_for_the_goal() {
+    let dir = goal_tasks_project();
+    let tmux = launch_tui(
+        dir.path(),
+        format!("orch-gt-{}-{}", std::process::id(), line!()),
+        "tui --observe",
+    );
+    tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
+    tmux.keys(&["Left"]);
+    tmux.wait_for("the Goals view", |s| {
+        s.contains("PROGRESS") && s.contains("Launch")
+    });
+    // Put the cursor on `Launch` and open it.
+    let mut moves = 0;
+    while !tmux
+        .screen()
+        .lines()
+        .any(|line| line.starts_with('▸') && line.contains("Launch"))
+    {
+        assert!(moves < 3, "no Launch row to select: {}", tmux.screen());
+        tmux.keys(&["Down"]);
+        std::thread::sleep(Duration::from_millis(200));
+        moves += 1;
+    }
+    tmux.keys(&["Enter"]);
+    tmux.wait_for("the goal detail", |s| s.contains("GOAL: Launch"));
+    let (_, mut marked) = tmux.wait_until("the Overview focused", focused);
+    while marked != "Tasks" {
+        tmux.keys(&["Tab"]);
+        marked = tmux
+            .wait_until("focus to move", |s| {
+                let now = focused(s)?;
+                expect(now != marked, "focus has not moved")?;
+                Ok(now)
+            })
+            .1;
+    }
+
+    // The table: the Tasks view's header without GOAL, the goal's three
+    // tasks with their status chips and pips, and nothing of another goal.
+    tmux.wait_until("the Tasks table", |s| {
+        let (_, header, rows) = goal_table(s)?;
+        for label in ["STATUS↑", "PRI", "TITLE", "ASSIGNEE", "STARTED", "ELAPSED*"] {
+            expect(header.contains(label), &format!("no {label} in {header:?}"))?;
+        }
+        expect(!header.contains("GOAL"), "a GOAL column in the section")?;
+        expect_eq("rows", rows.len(), 3)?;
+        // Ties in status keep source order, which is by id: only the
+        // cancelled task's place is fixed.
+        expect_eq("last row", rows[2], "Alpha build")?;
+        expect(
+            s.lines()
+                .any(|l| l.contains("─ OFF") && l.contains("!   Alpha build")),
+            "no cancelled chip and one pip on Alpha build",
+        )?;
+        expect(
+            s.lines()
+                .any(|l| l.contains("○ TODO") && l.contains("!!! Mike review")),
+            "no todo chip and three pips on Mike review",
+        )?;
+        expect(
+            !s.contains("Foreign work") && !s.contains("Loose end"),
+            "a task of another goal or of none",
+        )
+    });
+
+    // `o`: Status → Priority, ascending; `O` the other way; `0` the default.
+    tmux.keys(&["o"]);
+    tmux.wait_until("o sorts by priority", |s| {
+        let (_, header, rows) = goal_table(s)?;
+        expect(header.contains("PRI↑"), "no PRI↑")?;
+        expect_eq("rows", rows, ["Mike review", "Zulu deploy", "Alpha build"])
+    });
+    tmux.keys(&["O"]);
+    tmux.wait_until("O reverses it", |s| {
+        let (_, header, rows) = goal_table(s)?;
+        expect(header.contains("PRI↓"), "no PRI↓")?;
+        expect_eq("rows", rows, ["Alpha build", "Zulu deploy", "Mike review"])
+    });
+    tmux.keys(&["0"]);
+    tmux.wait_until("0 restores the default", |s| {
+        let (_, header, rows) = goal_table(s)?;
+        expect(header.contains("STATUS↑"), "no STATUS↑")?;
+        expect_eq("last row", rows.get(2).copied(), Some("Alpha build"))
+    });
+
+    // Give the list keyboard focus by clicking the goal's own row (the
+    // section stays on screen, unfocused), then click the section's TITLE
+    // header: the click focuses the section and sorts by title.
+    let (_, (row_y, row_x)) = tmux.wait_until("the Launch row", |s| {
+        s.lines()
+            .enumerate()
+            .find(|(_, l)| l.starts_with('▸') && l.contains("Launch"))
+            .and_then(|(y, l)| column(l, "Launch").map(|x| (y, x)))
+            .ok_or_else(|| "no selected Launch row".to_owned())
+    });
+    tmux.click(row_x, row_y);
+    tmux.wait_until("the list focused, Tasks still shown", |s| {
+        let rail = rail(s)?;
+        expect(
+            !rail.contains("> "),
+            &format!("a section is focused: {rail}"),
+        )?;
+        goal_table(s).map(|_| ())
+    });
+    let (_, (y, x)) = tmux.wait_until("the header to click", |s| {
+        let (y, header, _) = goal_table(s)?;
+        let x = column(header, "TITLE").ok_or("no TITLE")?;
+        Ok((y, x))
+    });
+    tmux.click(x, y);
+    tmux.wait_until("the header click sorts by title", |s| {
+        expect_eq("focused section", focused(s)?.as_str(), "Tasks")?;
+        let (_, header, rows) = goal_table(s)?;
+        expect(header.contains("TITLE↑"), "no TITLE↑")?;
+        expect_eq("rows", rows, ["Alpha build", "Mike review", "Zulu deploy"])
+    });
+
+    // Pick the third row, reverse: the cursor stays on its task, and Enter
+    // expands that task's description.
+    tmux.keys(&["Down"]);
+    tmux.keys(&["Down"]);
+    tmux.wait_until("the third row picked", |s| {
+        expect_eq("cursor", goal_table_cursor(s)?, "Zulu deploy")
+    });
+    tmux.keys(&["O"]);
+    tmux.wait_until("the pick follows its task", |s| {
+        let (_, header, rows) = goal_table(s)?;
+        expect(header.contains("TITLE↓"), "no TITLE↓")?;
+        expect_eq("rows", rows, ["Zulu deploy", "Mike review", "Alpha build"])?;
+        expect_eq("cursor", goal_table_cursor(s)?, "Zulu deploy")
+    });
+
+    // 80x24: the same table, still without GOAL, still on its task.
+    tmux.run(&["resize-window", "-t", "dash", "-x", "80", "-y", "24"]);
+    tmux.wait_until("the 80x24 table", |s| {
+        expect(s.lines().all(|l| l.chars().count() <= 80), "a line past 80")?;
+        let (_, header, rows) = goal_table(s)?;
+        expect(
+            header.contains("TITLE↓") && header.contains("PRI"),
+            "no header",
+        )?;
+        expect(!header.contains("GOAL"), "a GOAL column at 80")?;
+        expect_eq("first row", rows.first().copied(), Some("Zulu deploy"))?;
+        expect_eq("cursor", goal_table_cursor(s)?, "Zulu deploy")
+    });
+    tmux.keys(&["Enter"]);
+    tmux.wait_for("Zulu deploy's description", |s| s.contains("DESC-ZULU"));
+    tmux.keys(&["Escape"]);
+    tmux.wait_for("the viewer closed", |s| !s.contains("DESC-ZULU"));
+
+    // The 40x14 minimum still draws a dashboard, and going back to 120x40
+    // restores the table on the same pick.
+    tmux.run(&["resize-window", "-t", "dash", "-x", "40", "-y", "14"]);
+    tmux.wait_for("the 40x14 dashboard", |s| {
+        s.contains("ORCH") && s.lines().all(|l| l.chars().count() <= 40)
+    });
+    tmux.run(&["resize-window", "-t", "dash", "-x", "120", "-y", "40"]);
+    tmux.wait_until("the table again", |s| {
+        let (_, _, rows) = goal_table(s)?;
+        expect_eq("rows", rows, ["Zulu deploy", "Mike review", "Alpha build"])?;
+        expect_eq("cursor", goal_table_cursor(s)?, "Zulu deploy")
+    });
+
+    // The Tasks view shows the same sort the section set.
+    tmux.keys(&["Escape"]);
+    tmux.wait_for("the detail closed", |s| !s.contains("GOAL: Launch"));
+    tmux.keys(&["Right"]);
+    tmux.wait_for("the Tasks view, sorted by title descending", |s| {
+        s.lines()
+            .any(|l| l.contains("TITLE↓") && l.contains("GOAL") && l.contains("PRI"))
+    });
     tmux.keys(&["q"]);
 }

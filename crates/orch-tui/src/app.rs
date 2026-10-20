@@ -525,6 +525,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     pub fn set_hits(&mut self, hits: crate::hit::HitMap) {
         // The reconciled selection is on screen now; entity actions may use it.
         self.state.entity_actions_deferred = false;
+        // A goal Tasks pane's substitute pick counts as seen only where this
+        // frame painted it as that pane's selected row (D5b).
+        self.state.acknowledge_goal_task_picks(&hits);
         self.state.frame_generation = hits.metrics.generation;
         self.state.mouse.hits = hits;
         self.start_frame();
