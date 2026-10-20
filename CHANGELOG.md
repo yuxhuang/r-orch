@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Changed
+- The dashboard's Agents list is a table like Goals and Tasks: one header row (the `o sort` / `b group:` chip row above it is gone, and its row goes to the list), every column sortable by `o`, `O`, `0` or a header click, and the active column marked `↑`/`↓`. The default order, and what `0` restores, is STATUS ascending (ACTIVE, IDLE, ERROR, OFFLINE, DISABLED); equal values keep the agents' configured order and blanks sort last. A new UPDATED column reads `R <age>` for the newest start or event of the agent's live run, else `T <age>` for the newest update of a task assigned to it (an assignment or an edit counts too, so it is not proof the agent ran), else `—`; while it is the sort, the footer says `R run · T task`. `b` and `B` cycle the grouping through Team, Node, Status, Adapter, Caps (each agent once, under its alphabetically first capability; the keyword filter matches every capability) and None (no sections). The footer always leads with `b <Mode>`, clickable, and from 108 columns the header ends with a clickable `GROUP: <Mode>` chip; at 80 columns the table shows the same columns as before, and a sort whose column is hidden is named in the footer as `o <Field>↑`.
+- The Agents list's RUNS column now always shows lifetime completed/total runs, also for an active agent (which showed its live elapsed time there); the live run's elapsed time is in the agent detail's Overview, with its capabilities, node and UPDATED source.
 ## [0.9.1] - 2026-10-19
 
 Dashboard patch release: a goal detail's Tasks section is the Tasks list's table. No peer-protocol change, so 0.5.x

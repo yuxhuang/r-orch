@@ -74,12 +74,19 @@ pub const COMMANDS: [(&str, &str); 10] = [
 ];
 
 /// The Elapsed* disclosure, exactly as R15 words it, then when the order
-/// catches up, exactly as D1 words it, then the Agents grouping key. Both
-/// sentences are wrapped at word boundaries to fit the box.
+/// catches up, exactly as D1 words it. Both sentences are wrapped at word
+/// boundaries to fit the box.
 pub const ELAPSED_HELP: [&str; 3] = [
     "Elapsed*: start to now; terminal rows end at last update (edits change it).",
     "Includes waiting/retries. Elapsed order updates on refresh or",
-    "list-control changes; displayed time is live. b group by team/node.",
+    "list-control changes; displayed time is live.",
+];
+
+/// The Agents grouping keys and what UPDATED's `R` / `T` mean: `T` is a
+/// task record changing, which an assignment or an edit does too.
+pub const AGENTS_HELP: [&str; 2] = [
+    "Agents: b/B group by team/node/status/adapter/first capability/none.",
+    "UPDATED: R run; T assigned task record changed, not proof the agent ran.",
 ];
 
 /// [`ELAPSED_HELP`]'s first sentence, the one the README carries too.
@@ -95,8 +102,9 @@ pub const ELAPSED_ORDER: &str =
 const SPACERS_ABOVE: usize = 3;
 /// Every row of the box: top border, spacer, title, spacer, dividers, spacer,
 /// the shortcut rows, spacer, dismiss, panes hint, detail Activity hint,
-/// lists hint, the [`ELAPSED_HELP`] lines, bottom border.
-pub const FULL_H: usize = SPACERS_ABOVE + 3 + MAX_ROWS + 1 + 4 + ELAPSED_HELP.len() + 1;
+/// lists hint, the [`ELAPSED_HELP`] and [`AGENTS_HELP`] lines, bottom border.
+pub const FULL_H: usize =
+    SPACERS_ABOVE + 3 + MAX_ROWS + 1 + 4 + ELAPSED_HELP.len() + AGENTS_HELP.len() + 1;
 /// [`FULL_H`] without its four spacer rows.
 pub const COMPACT_H: usize = FULL_H - SPACERS_ABOVE - 1;
 
@@ -253,7 +261,7 @@ pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
         inner,
         y,
         vec![Span::styled(
-            "Lists: o sort; O reverse; 0 original order; click a header to sort.",
+            "Lists: o sort; O reverse; 0 default order; click a header to sort.",
             ctx.style(Token::Dim),
         )],
     );
@@ -261,7 +269,7 @@ pub fn render(frame: &mut Frame, overlay: Rect, full: Rect, ctx: &RenderCtx) {
     // R15's disclosure and D1's ordering rule, word-wrapped at the box: the
     // sentences are too long for one 74-cell row, and every word of them must
     // stay on screen.
-    for line in ELAPSED_HELP {
+    for line in ELAPSED_HELP.into_iter().chain(AGENTS_HELP) {
         put_line(
             frame,
             inner,

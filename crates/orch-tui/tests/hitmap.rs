@@ -811,7 +811,8 @@ fn header_click_sorts() {
         .collect();
     assert_eq!(agents, ["b", "z"]);
     a.assert_text("NAME↑");
-    a.assert_text("o sort:Name");
+    // The header is the only sort control: there is no chip row any more.
+    a.refute_text("o sort:");
 }
 
 #[test]

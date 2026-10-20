@@ -13,6 +13,7 @@ use crate::backend::{
     BackendResult, CopyOutcome, CopyResult, CopyTarget, CopyTicket, EntityTiming, TimingSnapshot,
 };
 use crate::command_bar::CommandHistory;
+use crate::format::parse_timestamp_ms;
 use crate::hit::{HitMap, ZoneId, ZoneKind};
 use crate::messages::{
     MAX_TOASTS, Message, MsgType, PendingMessage, RunMaps, TASK_LIST_LIMIT, UNDO_TIMEOUT_MS,
@@ -530,35 +531,47 @@ pub enum TaskRow {
     },
 }
 
-/// Session-only agent ordering; Original preserves status then source order.
+/// The sortable Agents columns, in `o` order. The default is status
+/// ascending; equal values keep index order (the order the dispatcher picks
+/// agents in) in both directions, and blanks sort last in both.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AgentSortField {
     #[default]
-    Original,
-    Name,
     Status,
+    Name,
     AdapterModel,
+    Task,
+    Caps,
     Location,
+    Runs,
+    Updated,
 }
 
 impl AgentSortField {
     pub fn next(self) -> Self {
         match self {
-            Self::Original => Self::Name,
-            Self::Name => Self::Status,
-            Self::Status => Self::AdapterModel,
-            Self::AdapterModel => Self::Location,
-            Self::Location => Self::Original,
+            Self::Status => Self::Name,
+            Self::Name => Self::AdapterModel,
+            Self::AdapterModel => Self::Task,
+            Self::Task => Self::Caps,
+            Self::Caps => Self::Location,
+            Self::Location => Self::Runs,
+            Self::Runs => Self::Updated,
+            Self::Updated => Self::Status,
         }
     }
 
+    /// The short name the footer uses for a sort whose column is hidden.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Original => "Original",
-            Self::Name => "Name",
             Self::Status => "Status",
-            Self::AdapterModel => "Adapter/Model",
-            Self::Location => "Location",
+            Self::Name => "Name",
+            Self::AdapterModel => "Adapter",
+            Self::Task => "Task",
+            Self::Caps => "Caps",
+            Self::Location => "Where",
+            Self::Runs => "Runs",
+            Self::Updated => "Updated",
         }
     }
 }
@@ -623,8 +636,7 @@ impl<F: SortField> ListSort<F> {
     }
 }
 
-/// The Agents sort. Original is a reset mode marked on the sort bar, not a
-/// column: it keeps the status/source order inside each section.
+/// The Agents sort; the default is status ascending with index-order ties.
 pub type AgentSort = ListSort<AgentSortField>;
 /// The Goals sort; the default is status ascending with source-order ties.
 pub type GoalSort = ListSort<GoalSortField>;
@@ -722,6 +734,8 @@ pub enum SortColumn {
 enum SortValue {
     Number(i64),
     Text(String),
+    /// Two texts compared in turn (adapter, then model).
+    Pair(String, String),
     /// done / total, compared exactly by cross-multiplication.
     Ratio {
         done: u64,
@@ -744,6 +758,7 @@ fn compare_sort_keys(left: &SortKey, right: &SortKey, descending: bool) -> std::
     let order = match (left, right) {
         (SortValue::Number(a), SortValue::Number(b)) => a.cmp(b),
         (SortValue::Text(a), SortValue::Text(b)) => a.cmp(b),
+        (SortValue::Pair(a1, a2), SortValue::Pair(b1, b2)) => a1.cmp(b1).then_with(|| a2.cmp(b2)),
         (
             SortValue::Ratio {
                 done: d1,
@@ -914,7 +929,8 @@ pub fn is_terminal_goal(status: orch_domain::GoalStatus) -> bool {
 
 /// How the agent list is cut into sections. Session-only, and separate from
 /// [`AgentSort`]: grouping decides the sections and their order, the sort
-/// orders agents inside each section, and neither resets the other.
+/// orders agents inside each section, and neither resets the other. `b`
+/// walks the modes in declaration order ([`AgentGroupBy::next`]), `B` back.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AgentGroupBy {
     /// Active teams by name, then the unassigned agents.
@@ -922,13 +938,37 @@ pub enum AgentGroupBy {
     Team,
     /// Local agents, then one section per remote alias.
     Node,
+    /// ACTIVE, IDLE, ERROR, OFFLINE, DISABLED.
+    Status,
+    /// One section per adapter, alphabetical.
+    Adapter,
+    /// One section per capability, alphabetical; an agent is listed once,
+    /// under its alphabetically first capability, and `no caps` comes last.
+    Caps,
+    /// One flat table, no section rows.
+    None,
 }
 
 impl AgentGroupBy {
     pub fn next(self) -> Self {
         match self {
             Self::Team => Self::Node,
+            Self::Node => Self::Status,
+            Self::Status => Self::Adapter,
+            Self::Adapter => Self::Caps,
+            Self::Caps => Self::None,
+            Self::None => Self::Team,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Team => Self::None,
             Self::Node => Self::Team,
+            Self::Status => Self::Node,
+            Self::Adapter => Self::Status,
+            Self::Caps => Self::Adapter,
+            Self::None => Self::Caps,
         }
     }
 
@@ -936,6 +976,10 @@ impl AgentGroupBy {
         match self {
             Self::Team => "Team",
             Self::Node => "Node",
+            Self::Status => "Status",
+            Self::Adapter => "Adapter",
+            Self::Caps => "Caps",
+            Self::None => "None",
         }
     }
 }
@@ -943,6 +987,7 @@ impl AgentGroupBy {
 /// The section an agent falls in, under one [`AgentGroupBy`]. `Ord` is the
 /// section order on screen; it is the primary key of
 /// [`AppState::sorted_agents`], so the sort can never interleave sections.
+/// One grouping only ever yields the variants of its own mode.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AgentGroupKey {
     /// An active team. The id breaks a tie between two teams of one name, so
@@ -958,6 +1003,23 @@ pub enum AgentGroupKey {
     Remote {
         alias: String,
     },
+    /// [`agent_status_order`] of the agent's status.
+    Status {
+        rank: u8,
+    },
+    /// The raw adapter string; byte order, so adapters are alphabetical.
+    Adapter {
+        name: String,
+    },
+    /// The agent's first capability in byte order. A real capability named
+    /// `no caps` is a `Cap`, never confused with [`AgentGroupKey::NoCaps`].
+    Cap {
+        name: String,
+    },
+    /// No non-empty capability; after every `Cap`.
+    NoCaps,
+    /// [`AgentGroupBy::None`]: one section that draws no row.
+    All,
 }
 
 /// A rendered row of the agent list.
@@ -980,6 +1042,21 @@ pub enum AgentRow {
         online: bool,
         count: usize,
     },
+    /// A Status section: every agent in it has `status`.
+    StatusSection {
+        status: AgentStatus,
+        count: usize,
+    },
+    /// An Adapter section, by the raw adapter string.
+    AdapterSection {
+        adapter: String,
+        count: usize,
+    },
+    /// A Caps section: `cap` is `None` for the agents with no capability.
+    CapsSection {
+        cap: Option<String>,
+        count: usize,
+    },
     Agent {
         index: usize,
         selection: usize,
@@ -987,6 +1064,23 @@ pub enum AgentRow {
     AddAgent {
         selection: usize,
     },
+}
+
+/// Where an agent's UPDATED value comes from (adjudication v2, Issue 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatedSource {
+    /// `R`: the newest `started_at` / `last_event_at` of its live runs.
+    Run,
+    /// `T`: the newest `updated_at` of the tasks assigned to it. An
+    /// assignment or an edit bumps it too, so it is not proof the agent ran.
+    Task,
+}
+
+/// An agent's UPDATED value: a timestamp and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentUpdated {
+    pub at_ms: i64,
+    pub source: UpdatedSource,
 }
 
 /// `STATUS_ORDER`.
@@ -1002,15 +1096,49 @@ pub fn task_status_order(status: TaskStatus) -> u8 {
     }
 }
 
-/// `AGENT_STATUS_ORDER`.
+/// The STATUS sort rank and the Status section order: ACTIVE, IDLE, ERROR,
+/// OFFLINE, DISABLED.
 pub fn agent_status_order(status: AgentStatus) -> u8 {
     match status {
         AgentStatus::Running => 0,
         AgentStatus::Idle => 1,
         AgentStatus::Error => 2,
-        AgentStatus::Disabled => 3,
-        AgentStatus::Offline => 4,
+        AgentStatus::Offline => 3,
+        AgentStatus::Disabled => 4,
     }
+}
+
+/// The word a Status section names its status by. Unlike the row chip
+/// (`OFF`), a section header has room for `DISABLED`.
+pub fn agent_status_section_word(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Disabled => "DISABLED",
+        status => agent_status_word(status),
+    }
+}
+
+/// An agent's non-empty capabilities, comma-joined in stored order: the
+/// CAPS cell and its sort key.
+pub fn agent_caps_text(agent: &Agent) -> String {
+    agent
+        .capabilities
+        .iter()
+        .filter(|cap| !cap.is_empty())
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The capability the Caps grouping files an agent under: its first
+/// non-empty one in byte order (alphabetical for the usual lowercase names),
+/// so every agent is listed once.
+pub fn agent_first_cap(agent: &Agent) -> Option<&str> {
+    agent
+        .capabilities
+        .iter()
+        .filter(|cap| !cap.is_empty())
+        .map(String::as_str)
+        .min()
 }
 
 /// `RUNNABLE` — the statuses `r` / `/run` accept.
@@ -2252,7 +2380,8 @@ impl AppState {
 
     /// As [`AppState::goal_matches`], over an agent's id, name, status
     /// (stored and shown), adapter, model, node (`local` or the remote
-    /// alias) and active team id and name.
+    /// alias), every capability (the Caps grouping places an agent under
+    /// its first one only) and active team id and name.
     fn agent_matches(&self, agent_index: usize, needle: &str) -> bool {
         let agent = &self.agents[agent_index];
         let node = agent
@@ -2270,6 +2399,10 @@ impl AppState {
                 .as_deref()
                 .is_some_and(|model| contains_folded(needle, model.trim()))
             || contains_folded(needle, node)
+            || agent
+                .capabilities
+                .iter()
+                .any(|cap| contains_folded(needle, cap))
             || self.team_of(agent_index).is_some_and(|team| {
                 contains_folded(needle, &team.id) || contains_folded(needle, &team.name)
             })
@@ -2599,9 +2732,9 @@ impl AppState {
     }
 
     /// Sections first, by [`AgentGroupKey`]; the session sort applies inside
-    /// each section, so a descending sort never moves a section.
-    /// Original is the existing status/source order, not a timestamp order:
-    /// Agent carries neither created nor updated timestamps.
+    /// each section, so a descending sort never moves a section. Equal values
+    /// keep index order in both directions, and an agent with no value for
+    /// the field (no task, no caps, no runs, no timestamp) sorts last in both.
     ///
     /// Only agents matching the Agents keyword are listed, filtered before
     /// sections and sort, so a section with no match disappears (D1).
@@ -2617,65 +2750,148 @@ impl AppState {
     }
 
     fn order_agents(&self, mut order: Vec<usize>) -> Vec<usize> {
-        let keys: Vec<AgentGroupKey> = (0..self.agents.len())
+        let groups: Vec<AgentGroupKey> = (0..self.agents.len())
             .map(|i| self.agent_group_key(i))
             .collect();
+        let keys = self.agent_sort_keys(self.agent_sort.field);
+        let descending = self.agent_sort.descending;
         order.sort_by(|a, b| {
-            keys[*a].cmp(&keys[*b]).then_with(|| {
-                let (left, right) = (&self.agents[*a], &self.agents[*b]);
-                let order = match self.agent_sort.field {
-                    AgentSortField::Original => agent_status_order(left.status)
-                        .cmp(&agent_status_order(right.status))
-                        .then_with(|| a.cmp(b)),
-                    AgentSortField::Name => {
-                        left.name.to_lowercase().cmp(&right.name.to_lowercase())
-                    }
-                    AgentSortField::Status => {
-                        agent_status_order(left.status).cmp(&agent_status_order(right.status))
-                    }
-                    AgentSortField::AdapterModel => {
-                        left.adapter.cmp(&right.adapter).then_with(|| {
-                            left.config
-                                .model
-                                .as_deref()
-                                .unwrap_or("")
-                                .trim()
-                                .cmp(right.config.model.as_deref().unwrap_or("").trim())
-                        })
-                    }
-                    AgentSortField::Location => left
-                        .remote
-                        .as_ref()
-                        .map_or("local", |remote| remote.alias.as_str())
-                        .to_lowercase()
-                        .cmp(
-                            &right
-                                .remote
-                                .as_ref()
-                                .map_or("local", |remote| remote.alias.as_str())
-                                .to_lowercase(),
-                        ),
-                };
-                let order = if self.agent_sort.descending {
-                    order.reverse()
-                } else {
-                    order
-                };
-                // Keep equal field values deterministic in either direction.
-                if self.agent_sort.field == AgentSortField::Original {
-                    order
-                } else {
-                    order
-                        .then_with(|| left.name.cmp(&right.name))
-                        .then_with(|| left.id.cmp(&right.id))
-                }
-            })
+            groups[*a]
+                .cmp(&groups[*b])
+                .then_with(|| compare_sort_keys(&keys[*a], &keys[*b], descending))
+                .then_with(|| a.cmp(b))
         });
         order
     }
 
+    /// Every agent's key for `field`, aligned to `self.agents`. Text keys use
+    /// the stored strings, not the sanitized display text.
+    fn agent_sort_keys(&self, field: AgentSortField) -> Vec<SortKey> {
+        let non_empty = |text: String| (!text.is_empty()).then_some(SortValue::Text(text));
+        match field {
+            AgentSortField::Updated => self
+                .agent_updated_times()
+                .into_iter()
+                .map(|at| at.map(SortValue::Number))
+                .collect(),
+            AgentSortField::Task => {
+                // One pass over the tasks, not one per agent.
+                let titles: std::collections::HashMap<&str, &str> = self
+                    .tasks
+                    .iter()
+                    .map(|task| (task.id.as_str(), task.title.as_str()))
+                    .collect();
+                self.agents
+                    .iter()
+                    .map(|agent| {
+                        // The row shows a title only for a running agent;
+                        // an error in the cell is not a task.
+                        let task_id = agent
+                            .current_task
+                            .as_deref()
+                            .filter(|_| agent.status == AgentStatus::Running)?;
+                        // A remote agent's task may not be mirrored here: its
+                        // id is what the row shows, so it is the key.
+                        let title = titles.get(task_id).copied().unwrap_or(task_id);
+                        non_empty(title.to_lowercase())
+                    })
+                    .collect()
+            }
+            _ => self
+                .agents
+                .iter()
+                .map(|agent| match field {
+                    AgentSortField::Status => {
+                        Some(SortValue::Number(agent_status_order(agent.status).into()))
+                    }
+                    AgentSortField::Name => Some(SortValue::Text(agent.name.to_lowercase())),
+                    AgentSortField::AdapterModel => Some(SortValue::Pair(
+                        agent.adapter.clone(),
+                        agent
+                            .config
+                            .model
+                            .as_deref()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    )),
+                    AgentSortField::Caps => non_empty(agent_caps_text(agent)),
+                    AgentSortField::Location => Some(SortValue::Text(
+                        agent
+                            .remote
+                            .as_ref()
+                            .map_or("local", |remote| remote.alias.as_str())
+                            .to_lowercase(),
+                    )),
+                    AgentSortField::Runs => (agent.stats.total_runs > 0).then(|| {
+                        SortValue::Number(i64::try_from(agent.stats.total_runs).unwrap_or(i64::MAX))
+                    }),
+                    AgentSortField::Task | AgentSortField::Updated => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Every agent's UPDATED value, aligned to `self.agents` (adjudication
+    /// v2, Issue 1): the newest valid `started_at` / `last_event_at` across
+    /// its running entries (`R`); else the newest valid `updated_at` of the
+    /// loaded tasks currently assigned to it, whatever the list filters
+    /// (`T`); else `None`. A timestamp that does not parse is skipped, never
+    /// read as the epoch or as now. Linear in agents + tasks + runs.
+    pub fn agent_updated_observations(&self) -> Vec<Option<AgentUpdated>> {
+        let index: std::collections::HashMap<&str, usize> = self
+            .agents
+            .iter()
+            .enumerate()
+            .rev() // the first of two equal ids wins, as `agent_by_id` does
+            .map(|(i, agent)| (agent.id.as_str(), i))
+            .collect();
+        let newest = |slot: &mut Option<i64>, at: Option<i64>| {
+            if let Some(at) = at {
+                *slot = Some(slot.map_or(at, |old| old.max(at)));
+            }
+        };
+        let mut runs: Vec<Option<i64>> = vec![None; self.agents.len()];
+        for entry in self.orch_state.running.values() {
+            if let Some(&i) = index.get(entry.agent_id.as_str()) {
+                newest(&mut runs[i], parse_timestamp_ms(&entry.started_at));
+                newest(&mut runs[i], parse_timestamp_ms(&entry.last_event_at));
+            }
+        }
+        let mut tasks: Vec<Option<i64>> = vec![None; self.agents.len()];
+        for task in &self.tasks {
+            if let Some(&i) = task.assignee.as_deref().and_then(|id| index.get(id)) {
+                newest(&mut tasks[i], parse_timestamp_ms(&task.updated_at));
+            }
+        }
+        runs.into_iter()
+            .zip(tasks)
+            .map(|(run, task)| match (run, task) {
+                (Some(at_ms), _) => Some(AgentUpdated {
+                    at_ms,
+                    source: UpdatedSource::Run,
+                }),
+                (None, Some(at_ms)) => Some(AgentUpdated {
+                    at_ms,
+                    source: UpdatedSource::Task,
+                }),
+                (None, None) => None,
+            })
+            .collect()
+    }
+
+    /// [`AppState::agent_updated_observations`]' timestamps: the UPDATED
+    /// sort key.
+    pub fn agent_updated_times(&self) -> Vec<Option<i64>> {
+        self.agent_updated_observations()
+            .into_iter()
+            .map(|seen| seen.map(|seen| seen.at_ms))
+            .collect()
+    }
+
     /// The section `agent_index` belongs to under the current grouping.
     pub fn agent_group_key(&self, agent_index: usize) -> AgentGroupKey {
+        let agent = &self.agents[agent_index];
         match self.agent_group_by {
             AgentGroupBy::Team => match self.team_of(agent_index) {
                 Some(team) => AgentGroupKey::Team {
@@ -2684,12 +2900,25 @@ impl AppState {
                 },
                 None => AgentGroupKey::Unassigned,
             },
-            AgentGroupBy::Node => match &self.agents[agent_index].remote {
+            AgentGroupBy::Node => match &agent.remote {
                 Some(remote) => AgentGroupKey::Remote {
                     alias: remote.alias.clone(),
                 },
                 None => AgentGroupKey::Local,
             },
+            AgentGroupBy::Status => AgentGroupKey::Status {
+                rank: agent_status_order(agent.status),
+            },
+            AgentGroupBy::Adapter => AgentGroupKey::Adapter {
+                name: agent.adapter.clone(),
+            },
+            AgentGroupBy::Caps => match agent_first_cap(agent) {
+                Some(cap) => AgentGroupKey::Cap {
+                    name: cap.to_string(),
+                },
+                None => AgentGroupKey::NoCaps,
+            },
+            AgentGroupBy::None => AgentGroupKey::All,
         }
     }
 
@@ -2928,6 +3157,24 @@ impl AppState {
                             count: members().count(),
                         });
                     }
+                    AgentGroupKey::Status { .. } => rows.push(AgentRow::StatusSection {
+                        status: self.agents[*agent_index].status,
+                        count: members().count(),
+                    }),
+                    AgentGroupKey::Adapter { name } => rows.push(AgentRow::AdapterSection {
+                        adapter: name.clone(),
+                        count: members().count(),
+                    }),
+                    AgentGroupKey::Cap { name } => rows.push(AgentRow::CapsSection {
+                        cap: Some(name.clone()),
+                        count: members().count(),
+                    }),
+                    AgentGroupKey::NoCaps => rows.push(AgentRow::CapsSection {
+                        cap: None,
+                        count: members().count(),
+                    }),
+                    // Grouping None: one flat table.
+                    AgentGroupKey::All => {}
                 }
                 prev = Some(key);
             }
@@ -2945,25 +3192,14 @@ impl AppState {
         rows
     }
 
-    /// The section headers the agent list draws: team headers plus the
-    /// unassigned header, or one header per node — over the agents the
-    /// keyword leaves, so a section it emptied is not counted.
+    /// The section headers the agent list draws, over the agents the
+    /// keyword leaves, so a section it emptied is not counted. Counted from
+    /// [`AppState::agent_rows`] itself, so the two can never disagree.
     pub fn agent_section_rows(&self) -> usize {
-        let order = self.sorted_agents();
-        if self.agent_group_by == AgentGroupBy::Node {
-            let nodes: IndexSet<AgentGroupKey> =
-                order.iter().map(|i| self.agent_group_key(*i)).collect();
-            return nodes.len();
-        }
-        let active_teams: IndexSet<String> = order
+        self.agent_rows(false)
             .iter()
-            .filter_map(|i| self.team_of(*i).map(|t| t.id.clone()))
-            .collect();
-        if active_teams.is_empty() {
-            return 0;
-        }
-        let has_unassigned = order.iter().any(|i| self.team_of(*i).is_none());
-        active_teams.len() + usize::from(has_unassigned)
+            .filter(|row| !matches!(row, AgentRow::Agent { .. } | AgentRow::AddAgent { .. }))
+            .count()
     }
 
     fn task_group_section_rows(&self) -> usize {
@@ -2982,7 +3218,7 @@ impl AppState {
     }
 
     /// Rows the active list draws above its scrolled rows: the column
-    /// header, plus the Agents sort bar. The Tasks welcome screen has none.
+    /// header. The Tasks welcome screen has none.
     pub fn list_chrome_rows(&self) -> u16 {
         self.list_chrome_rows_for(self.view)
     }
@@ -2992,7 +3228,7 @@ impl AppState {
             ViewId::Goals => 1,
             ViewId::Tasks if self.onboarding == OnboardingStep::Welcome => 0,
             ViewId::Tasks => 1,
-            ViewId::Agents => 2,
+            ViewId::Agents => 1,
             ViewId::Logs => 0,
         }
     }
@@ -3019,9 +3255,9 @@ impl AppState {
                             | OnboardingStep::Completed
                     ))
             }
-            // The `+ add` row, the sort bar and the column header.
+            // The `+ add` row and the column header.
             ViewId::Agents => {
-                self.sorted_agents().len() + 3 + self.agent_section_rows() + self.no_match_rows()
+                self.sorted_agents().len() + 2 + self.agent_section_rows() + self.no_match_rows()
             }
             ViewId::Logs => 0,
         }
@@ -3687,6 +3923,105 @@ mod tests {
         assert_eq!(state.agent_section_rows(), 2);
     }
 
+    fn running_entry(agent: &str, started: &str, event: &str) -> orch_domain::RunningEntry {
+        orch_domain::RunningEntry {
+            run_id: format!("run_{agent}_{started}"),
+            agent_id: agent.into(),
+            task_id: "t".into(),
+            pid: 1,
+            started_at: started.into(),
+            last_event_at: event.into(),
+            remote: None,
+        }
+    }
+
+    #[test]
+    fn updated_takes_run_evidence_first_then_assigned_tasks_and_skips_bad_timestamps() {
+        let mut state = AppState::default();
+        state.agents = ["r", "t", "bad", "none"]
+            .into_iter()
+            .map(|id| make_agent(id, id, AgentStatus::Idle))
+            .collect();
+        let at = |s: u32| format!("1970-01-01T00:00:{s:02}.000Z");
+        // r: run evidence (newest field of both entries: 9 s) beats its
+        // newer assigned task (30 s).
+        for entry in [
+            running_entry("r", &at(1), &at(9)),
+            running_entry("r", &at(5), "x"),
+        ] {
+            state.orch_state.running.insert(entry.run_id.clone(), entry);
+        }
+        let mut assigned = |id: &str, agent: &str, updated: String| {
+            let mut task = make_task(id, id, TaskStatus::Done);
+            task.assignee = Some(agent.into());
+            task.updated_at = updated;
+            state.tasks.push(task);
+        };
+        assigned("t_r", "r", at(30));
+        // t: no run, two assigned tasks: the newer one.
+        assigned("t1", "t", at(3));
+        assigned("t2", "t", at(7));
+        // bad: an unparsable run and task are skipped, not read as epoch/now.
+        assigned("t3", "bad", "never".into());
+        let bad = running_entry("bad", "garbage", "");
+        state.orch_state.running.insert(bad.run_id.clone(), bad);
+        let seen = state.agent_updated_observations();
+        assert_eq!(
+            seen,
+            [
+                Some(AgentUpdated {
+                    at_ms: 9_000,
+                    source: UpdatedSource::Run
+                }),
+                Some(AgentUpdated {
+                    at_ms: 7_000,
+                    source: UpdatedSource::Task
+                }),
+                None,
+                None,
+            ]
+        );
+        // Sorted by the timestamp alone, oldest first, blanks last both ways.
+        state.agent_group_by = AgentGroupBy::None;
+        state.agent_sort = AgentSort {
+            field: AgentSortField::Updated,
+            descending: false,
+        };
+        assert_eq!(state.sorted_agents(), [1, 0, 2, 3]);
+        state.agent_sort.descending = true;
+        assert_eq!(state.sorted_agents(), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn the_keyword_matches_every_capability_and_caps_groups_by_the_first() {
+        let mut state = AppState::default();
+        let mut a = make_agent("a", "one", AgentStatus::Idle);
+        a.capabilities = vec!["linux".into(), "gpu".into()];
+        state.agents = vec![a, make_agent("b", "two", AgentStatus::Idle)];
+        state.view = ViewId::Agents;
+        state.agent_group_by = AgentGroupBy::Caps;
+        assert_eq!(
+            state.agent_group_key(0),
+            AgentGroupKey::Cap { name: "gpu".into() }
+        );
+        assert_eq!(state.agent_group_key(1), AgentGroupKey::NoCaps);
+        state.agent_keyword.reset("linux");
+        assert_eq!(state.sorted_agents(), [0]);
+        assert_eq!(
+            state.agent_rows(false),
+            [
+                AgentRow::CapsSection {
+                    cap: Some("gpu".into()),
+                    count: 1
+                },
+                AgentRow::Agent {
+                    index: 0,
+                    selection: 0
+                }
+            ]
+        );
+    }
+
     #[test]
     fn disbanded_teams_do_not_group_agents() {
         let mut state = AppState::default();
@@ -3695,7 +4030,18 @@ mod tests {
         team.status = TeamStatus::Disbanded;
         state.teams = vec![team];
         assert!(state.team_of(0).is_none());
-        assert_eq!(state.agent_section_rows(), 0);
+        // The agent is unassigned, under the one header the list draws for it.
+        assert_eq!(
+            state.agent_rows(false),
+            [
+                AgentRow::UnassignedSection { count: 1 },
+                AgentRow::Agent {
+                    index: 0,
+                    selection: 0
+                }
+            ]
+        );
+        assert_eq!(state.agent_section_rows(), 1);
     }
 
     #[test]

@@ -386,8 +386,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             match key.code {
                 // `b`: group *by*. Free in every view; `g`, the Tasks
                 // grouping key, means "goals tab" here.
-                KeyCode::Char('b') | KeyCode::Char('B') => {
+                KeyCode::Char('b') => {
                     self.toggle_agent_group_by();
+                    return;
+                }
+                KeyCode::Char('B') => {
+                    self.previous_agent_group_by();
                     return;
                 }
                 _ => {}
@@ -999,11 +1003,22 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         self.state.clamp_all(self.backend.can_add_agent());
     }
 
-    /// `b` — By team ⇄ By node. The sort is left as it is: it applies inside
-    /// whichever sections are drawn.
+    /// `b` (and the group chip and footer hint) — the next grouping: Team,
+    /// Node, Status, Adapter, Caps, None, round again. The sort is left as
+    /// it is: it applies inside whichever sections are drawn.
     pub(crate) fn toggle_agent_group_by(&mut self) {
         let next = self.state.agent_group_by.next();
-        self.state.set_agent_group_by(next);
+        self.change_agent_group_by(next);
+    }
+
+    /// `B` — the previous grouping.
+    pub(crate) fn previous_agent_group_by(&mut self) {
+        let prev = self.state.agent_group_by.prev();
+        self.change_agent_group_by(prev);
+    }
+
+    fn change_agent_group_by(&mut self, group_by: crate::state::AgentGroupBy) {
+        self.state.set_agent_group_by(group_by);
         self.state.clamp_all(self.backend.can_add_agent());
     }
 

@@ -6,16 +6,19 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::Span;
 
-use crate::format::{cap_display, cap_line, format_duration, parse_timestamp_ms};
+use crate::format::{cap_display, cap_line, format_started};
 use crate::hit::{PseudoRow, ScrollRegion, VerbId, ZoneId, ZoneKind};
-use crate::state::{AgentRow, AgentSortField, AppState, EntityType, SortColumn, agent_status_word};
+use crate::state::{
+    AgentRow, AgentSortField, AgentUpdated, EntityType, SortColumn, UpdatedSource, agent_caps_text,
+    agent_status_section_word, agent_status_word,
+};
 use crate::text::text_display_width;
 use crate::theme::{
     CHECK, CIRCLE, CIRCLE_FILLED, CROSS, CURSOR, DIAMOND_OUTLINE, EM_DASH, LOOP, LOZENGE, STAR,
     Token, light_rule, spinner_frame,
 };
 use crate::views::{
-    HeaderCell, RenderCtx, cell, cell_right, put_line, render_header_row, sanitize, spans_width,
+    HeaderCell, RenderCtx, cell, cell_right, put_line, render_header_row, sanitize,
 };
 
 /// The agent-row error hint is capped at 30 characters. The task column
@@ -68,28 +71,38 @@ pub fn row_error_text(kind: &str, raw: &str) -> String {
 }
 
 pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    render_status_bar(frame, area, ctx);
     let state = ctx.state;
-    // Original has no column of its own: the sort bar marks it, and no
-    // header carries an arrow.
+    let cols = AgentColumns::for_width(area.width as usize);
+    // One header row, like Goals and Tasks; the grouping chip ends it when
+    // there is room for it (`GROUP_CHIP_FROM`), else the footer names the
+    // grouping.
     render_header_row(
         frame,
         area,
-        area.y.saturating_add(1),
+        area.y,
         ctx,
-        &AgentColumns::for_width(area.width as usize).header(),
+        &cols.header(),
         (
             SortColumn::Agent(state.agent_sort.field),
             state.agent_sort.descending,
         ),
     );
+    if cols.chip {
+        render_group_chip(frame, area, ctx);
+    }
     let area = Rect::new(
         area.x,
-        area.y.saturating_add(2),
+        area.y.saturating_add(1),
         area.width,
-        area.height.saturating_sub(2),
+        area.height.saturating_sub(1),
     );
     let rows = state.agent_rows(ctx.caps.can_add_agent);
+    // Once per frame, not once per row: it scans every task and run.
+    let updated = if cols.updated > 0 {
+        state.agent_updated_observations()
+    } else {
+        Vec::new()
+    };
 
     ctx.zone(
         area,
@@ -105,6 +118,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         area.y.saturating_add(drawn.min(u16::MAX as usize) as u16),
         ctx,
     );
+    let width = area.width as usize;
     for (y, row) in (area.y..).zip(rows.iter().skip(state.agent_scroll)) {
         if y >= area.bottom() {
             return;
@@ -115,40 +129,20 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                 count,
                 lead_name,
                 ..
-            } => {
-                let noun = if *count == 1 { "agent" } else { "agents" };
-                let lead = match lead_name {
-                    Some(lead) => format!(" · {STAR} {lead}"),
-                    None => String::new(),
-                };
-                let label = format!(" {LOZENGE} {} · {count} {noun}{lead} ", name.to_uppercase());
-                let rule = (area.width as usize).saturating_sub(label.chars().count() + 3);
-                put_line(
-                    frame,
-                    area,
-                    y,
-                    vec![
-                        Span::styled(light_rule(3), ctx.style(Token::Ghost)),
-                        Span::styled(
-                            label,
-                            ctx.chip(Token::Amber, Token::AccentBg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(light_rule(rule), ctx.style(Token::Ghost)),
-                    ],
-                );
-            }
+            } => put_line(
+                frame,
+                area,
+                y,
+                section_rule(
+                    ctx,
+                    width,
+                    &sanitize(name).to_uppercase(),
+                    *count,
+                    lead_name.as_deref(),
+                ),
+            ),
             AgentRow::UnassignedSection { count } => {
-                let noun = if *count == 1 { "agent" } else { "agents" };
-                put_line(
-                    frame,
-                    area,
-                    y,
-                    vec![Span::styled(
-                        format!(" {DIAMOND_OUTLINE} UNASSIGNED · {count} {noun} "),
-                        ctx.chip(Token::Dim, Token::NeutralBg),
-                    )],
-                );
+                put_line(frame, area, y, outline_section(ctx, "UNASSIGNED", *count));
             }
             AgentRow::NodeSection {
                 alias,
@@ -159,11 +153,41 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
                     frame,
                     area,
                     y,
-                    node_header(ctx, area.width as usize, alias.as_deref(), *online, *count),
+                    node_header(ctx, width, alias.as_deref(), *online, *count),
                 );
             }
+            AgentRow::StatusSection { status, count } => put_line(
+                frame,
+                area,
+                y,
+                section_rule(ctx, width, agent_status_section_word(*status), *count, None),
+            ),
+            AgentRow::AdapterSection { adapter, count } => {
+                let name = sanitize(adapter);
+                let name = if name.trim().is_empty() {
+                    EM_DASH.to_string()
+                } else {
+                    name
+                };
+                put_line(
+                    frame,
+                    area,
+                    y,
+                    section_rule(ctx, width, &name, *count, None),
+                );
+            }
+            AgentRow::CapsSection { cap, count } => match cap {
+                Some(cap) => put_line(
+                    frame,
+                    area,
+                    y,
+                    section_rule(ctx, width, &sanitize(cap), *count, None),
+                ),
+                None => put_line(frame, area, y, outline_section(ctx, "no caps", *count)),
+            },
             AgentRow::Agent { index, selection } => {
-                render_agent_row(frame, area, ctx, y, *index, *selection);
+                let seen = updated.get(*index).copied().flatten();
+                render_agent_row(frame, area, ctx, y, *index, *selection, seen);
                 if let Some(agent) = state.agents.get(*index) {
                     ctx.row_zone(
                         area,
@@ -206,6 +230,81 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             }
         }
     }
+}
+
+/// The `GROUP: <Mode>` chip at the right end of the header row: one
+/// unclickable gap cell, then [`GROUP_CHIP_W`] cells holding the label
+/// right-aligned. The label is a click target that cycles the grouping like
+/// `b`; it never overlaps the last sortable header.
+fn render_group_chip(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    let chip_w = GROUP_CHIP_W as u16;
+    if area.height == 0 || area.width < chip_w {
+        return;
+    }
+    let text = format!("GROUP: {}", ctx.state.agent_group_by.label());
+    let text_w = text_display_width(&text).min(GROUP_CHIP_W) as u16;
+    let x = area.right() - text_w;
+    put_line(
+        frame,
+        Rect::new(x, area.y, text_w, 1),
+        area.y,
+        vec![Span::styled(text, ctx.chip(Token::Cyan, Token::NeutralBg))],
+    );
+    let verb = VerbId::ToggleAgentGroupBy;
+    ctx.zone(
+        Rect::new(x, area.y, text_w, 1),
+        area,
+        ZoneKind::Verb(verb),
+        ZoneId::Verb(verb),
+    );
+}
+
+/// A section header drawn as a rule, as the team headers always were:
+/// `─── ◈ NAME · 3 agents · ★ lead ───`. `name` must already be sanitized.
+/// It is cut before the count, and the lead is cut, then dropped, before
+/// the name is.
+fn section_rule(
+    ctx: &RenderCtx,
+    width: usize,
+    name: &str,
+    count: usize,
+    lead: Option<&str>,
+) -> Vec<Span<'static>> {
+    let noun = if count == 1 { "agent" } else { "agents" };
+    let tail = format!(" · {count} {noun}");
+    // Lead rule (3), ` ◈ ` (3), the tail, a trailing space and one cell of
+    // trailing rule always stay.
+    let fixed = 3 + 3 + text_display_width(&tail) + 2;
+    let room = width.saturating_sub(fixed);
+    let name_w = text_display_width(name);
+    // ` · ★ ` and at least three cells of the lead's name.
+    let lead = lead
+        .map(|lead| (lead, room.saturating_sub(name_w)))
+        .filter(|(_, left)| *left >= 8)
+        .map(|(lead, left)| format!(" · {STAR} {}", cap_display(&sanitize(lead), left - 5)))
+        .unwrap_or_default();
+    let name = cap_display(name, room.saturating_sub(text_display_width(&lead)).max(1));
+    let label = format!(" {LOZENGE} {name}{tail}{lead} ");
+    let rule = width.saturating_sub(text_display_width(&label) + 3);
+    vec![
+        Span::styled(light_rule(3), ctx.style(Token::Ghost)),
+        Span::styled(
+            label,
+            ctx.chip(Token::Amber, Token::AccentBg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(light_rule(rule), ctx.style(Token::Ghost)),
+    ]
+}
+
+/// The dim header of the rest-of section that ends a grouping (`◇
+/// UNASSIGNED`, `◇ no caps`). `label` is a fixed word, never user text.
+fn outline_section(ctx: &RenderCtx, label: &str, count: usize) -> Vec<Span<'static>> {
+    let noun = if count == 1 { "agent" } else { "agents" };
+    vec![Span::styled(
+        format!(" {DIAMOND_OUTLINE} {label} · {count} {noun} "),
+        ctx.chip(Token::Dim, Token::NeutralBg),
+    )]
 }
 
 /// A By-node section header, drawn like a team header: `─── ◈ LOCAL · 3
@@ -260,93 +359,24 @@ fn node_header(
     spans
 }
 
-/// The sort and group-by chips, full or compact.
-///
-/// The group chip comes last: `0 reset` resets the sort only, and reads that
-/// way when the group chip is not between them. At the minimum width the full
-/// labels do not all fit, so the bar falls back to a compact form (`b node`,
-/// `sort:Adapter`) in which every chip still shows whole.
-fn status_chips(state: &AppState, compact: bool) -> [(String, VerbId, Token); 4] {
-    let sort = state.agent_sort;
-    let field = match sort.field {
-        AgentSortField::AdapterModel if compact => "Adapter",
-        field => field.label(),
-    };
-    let group = if compact {
-        format!("b {}", state.agent_group_by.label().to_lowercase())
-    } else {
-        format!("b group:{}", state.agent_group_by.label())
-    };
-    [
-        (
-            format!("o sort:{field}"),
-            VerbId::CycleAgentSort,
-            Token::Amber,
-        ),
-        (
-            format!(
-                "O {}",
-                if sort.descending {
-                    "desc ↓"
-                } else {
-                    "asc ↑"
-                }
-            ),
-            VerbId::ReverseAgentSort,
-            Token::Cyan,
-        ),
-        ("0 reset".to_string(), VerbId::ResetAgentSort, Token::Dim),
-        (group, VerbId::ToggleAgentGroupBy, Token::Cyan),
-    ]
-}
-
-/// Like the Actions filter row, each hint owns a clipped semantic hit zone.
-fn render_status_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    if area.height == 0 {
-        return;
-    }
-    // Chips plus a one-cell gap after each but the last.
-    let bar_width = |chips: &[(String, VerbId, Token)]| {
-        chips
-            .iter()
-            .map(|(text, ..)| text_display_width(text) + 1)
-            .sum::<usize>()
-            .saturating_sub(1)
-    };
-    let full = status_chips(ctx.state, false);
-    let chips = if bar_width(&full) <= area.width as usize {
-        full
-    } else {
-        status_chips(ctx.state, true)
-    };
-    let mut spans = Vec::new();
-    for (text, verb, token) in chips {
-        let x = area.x + spans_width(&spans);
-        spans.push(Span::styled(text, ctx.chip(token, Token::NeutralBg)));
-        ctx.zone(
-            Rect::new(x, area.y, area.x + spans_width(&spans) - x, 1),
-            area,
-            ZoneKind::Verb(verb),
-            ZoneId::Verb(verb),
-        );
-        spans.push(Span::raw(" "));
-    }
-    put_line(frame, area, area.y, spans);
-}
-
 // ── Row layout ──────────────────────────────────────────────────────────────
 //
 // An agent row is a table row, laid out like the goals and tasks rows: fixed
 // lead cells, then columns of a fixed width per frame so every row lines up
 // with the one above it, whatever its data. Left to right:
 //
-//   cursor │ status chip │ marks │ name │ adapter/model │ task │ caps │ where │ runs
+//   cursor │ status chip │ marks │ name │ adapter/model │ task │ caps │ where │ runs │ updated │ [GROUP chip]
 //
 // The task column is the elastic one in the middle, so the narrow fixed
 // columns stay right-aligned to the edge. On a narrow terminal the optional
-// columns are dropped lowest-priority first (caps, model, where, task, runs)
-// rather than squeezed, because a column that is too narrow to read is worse
-// than an absent one; the name is never dropped.
+// columns are granted in the order runs, task, where, model, caps, updated
+// while each still fits, rather than squeezed, because a column that is too
+// narrow to read is worse than an absent one; the name is never dropped.
+// UPDATED comes last, so it never takes a cell from a column that was there
+// before it existed. The `GROUP: <Mode>` chip is chrome, budgeted after every
+// column and before any slack: it shows only when its 15 cells are spare
+// (from [`GROUP_CHIP_FROM`]); narrower, the footer's `b <Mode>` names the
+// grouping.
 
 /// Cursor (2) + status chip (10 + gap) + marks (`⟳★` + gap).
 const LEAD_W: usize = 2 + 11 + 3;
@@ -359,10 +389,17 @@ const CAPS_W: usize = 10;
 /// cut so the state word always survives.
 const WHERE_W: usize = 12;
 const TIME_W: usize = 9;
+/// `UPDATED↑`, and `R 59m` / `T 12d` with room to spare.
+const UPDATED_W: usize = 8;
+/// The `GROUP: <Mode>` chip: `GROUP: Adapter`, the longest, is 14 cells.
+const GROUP_CHIP_W: usize = 14;
+/// The first table width with the group chip: today's columns at their
+/// minimums plus UPDATED leave its 15 cells (gap + chip) spare from here.
+pub const GROUP_CHIP_FROM: usize = 108;
 /// The narrowest row at which the task column reaches [`ROW_ERROR_CAP`], so
 /// no error hint (mapped or raw) is cut. Narrower, the hint ends in `…` and
 /// the full text is in the detail panel's error box.
-pub const ERROR_WHOLE_FROM: usize = 106;
+pub const ERROR_WHOLE_FROM: usize = 130;
 
 /// Column widths for one frame's agent rows, in display cells; `0` hides a
 /// column. Every row in a frame uses the same widths — that is the alignment.
@@ -374,6 +411,10 @@ pub struct AgentColumns {
     pub caps: usize,
     pub place: usize,
     pub time: usize,
+    pub updated: usize,
+    /// Whether the header row ends with the `GROUP: <Mode>` chip; the rows
+    /// leave its cells (and the gap before it) blank.
+    pub chip: bool,
 }
 
 impl AgentColumns {
@@ -396,6 +437,12 @@ impl AgentColumns {
         let place = take(WHERE_W);
         let model = take(MODEL_MIN);
         let caps = take(CAPS_W);
+        let updated = take(UPDATED_W);
+        // The chip and the gap before it, only out of what the columns left.
+        let chip = avail > GROUP_CHIP_W;
+        if chip {
+            avail -= GROUP_CHIP_W + 1;
+        }
         let mut cols = AgentColumns {
             name,
             model,
@@ -403,6 +450,8 @@ impl AgentColumns {
             caps,
             place,
             time,
+            updated,
+            chip,
         };
 
         // Hand out the slack in steps so no one column hogs it: names first
@@ -433,8 +482,22 @@ impl AgentColumns {
         cols
     }
 
-    /// The header labels over these columns: status, name, adapter/model and
-    /// where sort; task, caps and runs are labels only.
+    /// Whether the column `field` sorts by is drawn at this width; STATUS
+    /// and NAME always are.
+    pub fn shows(self, field: AgentSortField) -> bool {
+        let width = match field {
+            AgentSortField::Status | AgentSortField::Name => return true,
+            AgentSortField::AdapterModel => self.model,
+            AgentSortField::Task => self.task,
+            AgentSortField::Caps => self.caps,
+            AgentSortField::Location => self.place,
+            AgentSortField::Runs => self.time,
+            AgentSortField::Updated => self.updated,
+        };
+        width > 0
+    }
+
+    /// The header labels over these columns; every one sorts.
     fn header(self) -> Vec<HeaderCell> {
         let agent = SortColumn::Agent;
         let gap = |width: usize| HeaderCell::gap(usize::from(width > 0));
@@ -451,15 +514,28 @@ impl AgentColumns {
                 agent(AgentSortField::AdapterModel),
             ),
             gap(self.task),
-            HeaderCell::plain("TASK", self.task),
+            HeaderCell::sort("TASK", self.task, agent(AgentSortField::Task)),
             gap(self.caps),
-            HeaderCell::plain("CAPS", self.caps),
+            HeaderCell::sort("CAPS", self.caps, agent(AgentSortField::Caps)),
             gap(self.place),
             HeaderCell::sort("WHERE", self.place, agent(AgentSortField::Location)),
             gap(self.time),
-            HeaderCell::plain("RUNS", self.time).right(),
+            HeaderCell::sort("RUNS", self.time, agent(AgentSortField::Runs)).right(),
+            gap(self.updated),
+            HeaderCell::sort("UPDATED", self.updated, agent(AgentSortField::Updated)),
         ]
     }
+}
+
+/// The UPDATED cell: `R <age>` (run evidence) or `T <age>` (an assigned
+/// task's record), the age cut so the marker always shows.
+fn updated_text(seen: AgentUpdated, now_ms: i64, width: usize) -> String {
+    let marker = match seen.source {
+        UpdatedSource::Run => 'R',
+        UpdatedSource::Task => 'T',
+    };
+    let age = format_started(seen.at_ms, now_ms);
+    format!("{marker} {}", cap_display(&age, width.saturating_sub(2)))
 }
 
 /// The where cell's text: `local`, or `{alias} online|offline` with the
@@ -488,6 +564,7 @@ fn render_agent_row(
     y: u16,
     index: usize,
     selection: usize,
+    updated: Option<AgentUpdated>,
 ) {
     let state = ctx.state;
     let agent = &state.agents[index];
@@ -577,10 +654,11 @@ fn render_agent_row(
     }
 
     if cols.caps > 0 {
-        let (text, token) = if agent.capabilities.is_empty() {
+        let caps = agent_caps_text(agent);
+        let (text, token) = if caps.is_empty() {
             (EM_DASH.to_string(), Token::Ghost)
         } else {
-            (agent.capabilities.join(","), Token::Dim)
+            (caps, Token::Dim)
         };
         spans.push(Span::raw(" "));
         spans.push(Span::styled(cell(&text, cols.caps), ctx.style(token)));
@@ -600,16 +678,10 @@ fn render_agent_row(
     }
 
     if cols.time > 0 {
+        // Lifetime statistics on every row, active or not: they are what the
+        // RUNS sort orders by. A live run's elapsed time is in the Overview.
         let stats = &agent.stats;
-        let running_entry = state
-            .orch_state
-            .running
-            .values()
-            .find(|entry| entry.agent_id == agent.id);
-        let (time_text, time_token) = if let Some(entry) = running_entry {
-            let started = parse_timestamp_ms(&entry.started_at).unwrap_or(ctx.now_ms);
-            (format_duration(ctx.now_ms - started), Token::Cyan)
-        } else if stats.total_runs > 0 {
+        let (time_text, time_token) = if stats.total_runs > 0 {
             let ratio = stats.tasks_completed as f64 / stats.total_runs as f64;
             let token = if ratio >= 0.8 {
                 Token::Green
@@ -632,6 +704,21 @@ fn render_agent_row(
         ));
     }
 
+    if cols.updated > 0 {
+        let (text, token) = match updated {
+            Some(seen) => (
+                updated_text(seen, ctx.now_ms, cols.updated),
+                match seen.source {
+                    UpdatedSource::Run => Token::Cyan,
+                    UpdatedSource::Task => Token::Dim,
+                },
+            ),
+            None => (EM_DASH.to_string(), Token::Ghost),
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(cell(&text, cols.updated), ctx.style(token)));
+    }
+
     put_line(frame, area, y, spans);
 }
 
@@ -647,9 +734,17 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
-    /// The cells a row of `cols` occupies, by the layout's own arithmetic.
+    /// The cells a row of `cols` occupies, by the layout's own arithmetic,
+    /// plus the group chip and its gap when the header carries it.
     fn row_width(cols: AgentColumns) -> usize {
-        let optional = [cols.model, cols.task, cols.caps, cols.place, cols.time];
+        let optional = [
+            cols.model,
+            cols.task,
+            cols.caps,
+            cols.place,
+            cols.time,
+            cols.updated,
+        ];
         LEAD_W
             + cols.name
             + optional
@@ -657,6 +752,7 @@ mod tests {
                 .filter(|w| **w > 0)
                 .map(|w| w + 1)
                 .sum::<usize>()
+            + if cols.chip { GROUP_CHIP_W + 1 } else { 0 }
     }
 
     #[test]
@@ -669,40 +765,46 @@ mod tests {
     }
 
     #[test]
-    fn at_80_columns_caps_is_the_only_column_dropped() {
+    fn at_80_columns_caps_is_the_only_column_dropped_and_there_is_no_chip() {
         let cols = AgentColumns::for_width(80);
         assert_eq!(cols.caps, 0, "{cols:?}");
         assert!(cols.model >= MODEL_MIN, "{cols:?}");
         assert!(cols.task >= TASK_MIN, "{cols:?}");
         assert_eq!(cols.place, WHERE_W, "{cols:?}");
         assert_eq!(cols.time, TIME_W, "{cols:?}");
+        assert_eq!(cols.updated, 0, "{cols:?}");
+        assert!(!cols.chip, "{cols:?}");
     }
 
     #[test]
-    fn at_120_columns_every_column_shows_and_the_task_holds_a_whole_error() {
+    fn at_120_columns_every_column_and_the_chip_show() {
         let cols = AgentColumns::for_width(120);
         assert_eq!(cols.caps, CAPS_W, "{cols:?}");
-        assert_eq!(cols.name, 22, "{cols:?}");
-        assert_eq!(cols.model, 16, "{cols:?}");
-        assert_eq!(cols.task, ROW_ERROR_CAP, "{cols:?}");
+        assert_eq!(cols.updated, UPDATED_W, "{cols:?}");
+        assert!(cols.chip, "{cols:?}");
     }
 
-    /// Pins the column-width table.
+    /// Pins the column-width table (adjudication v2, Issue 2): today's
+    /// allocation for the five old columns, UPDATED granted after them, the
+    /// chip only out of what is left.
     #[test]
     fn the_documented_column_widths_hold() {
-        // (width, name, model, task, caps, where, time)
+        // (width, name, model, task, caps, where, runs, updated, chip)
         let table = [
-            (60, 10, 10, 12, 0, 0, 9),
-            (70, 14, 0, 16, 0, 12, 9),
-            (80, 14, 10, 15, 0, 12, 9),
-            (90, 14, 10, 14, 10, 12, 9),
-            (100, 14, 10, 24, 10, 12, 9),
-            (104, 14, 10, 28, 10, 12, 9),
-            (106, 14, 10, 30, 10, 12, 9),
-            (120, 22, 16, 30, 10, 12, 9),
-            (160, 22, 20, 66, 10, 12, 9),
+            (60, 10, 10, 12, 0, 0, 9, 0, false),
+            (70, 14, 0, 16, 0, 12, 9, 0, false),
+            (80, 14, 10, 15, 0, 12, 9, 0, false),
+            (90, 14, 10, 14, 10, 12, 9, 0, false),
+            (93, 10, 10, 12, 10, 12, 9, 8, false),
+            (100, 14, 10, 15, 10, 12, 9, 8, false),
+            (107, 14, 10, 22, 10, 12, 9, 8, false),
+            (108, 10, 10, 12, 10, 12, 9, 8, true),
+            (120, 14, 10, 20, 10, 12, 9, 8, true),
+            (130, 14, 10, 30, 10, 12, 9, 8, true),
+            (140, 18, 16, 30, 10, 12, 9, 8, true),
+            (160, 22, 20, 42, 10, 12, 9, 8, true),
         ];
-        for (width, name, model, task, caps, place, time) in table {
+        for (width, name, model, task, caps, place, time, updated, chip) in table {
             assert_eq!(
                 AgentColumns::for_width(width),
                 AgentColumns {
@@ -711,8 +813,21 @@ mod tests {
                     task,
                     caps,
                     place,
-                    time
+                    time,
+                    updated,
+                    chip,
                 },
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chip_shows_from_its_documented_width() {
+        for width in 40..=240 {
+            assert_eq!(
+                AgentColumns::for_width(width).chip,
+                width >= GROUP_CHIP_FROM,
                 "{width}"
             );
         }
@@ -730,7 +845,27 @@ mod tests {
         let cols = AgentColumns::for_width(40);
         assert!(cols.name >= NAME_MIN, "{cols:?}");
         assert_eq!(cols.time, TIME_W, "{cols:?}");
-        assert_eq!((cols.task, cols.model, cols.caps, cols.place), (0, 0, 0, 0));
+        assert_eq!(
+            (cols.task, cols.model, cols.caps, cols.place, cols.updated),
+            (0, 0, 0, 0, 0)
+        );
+        assert!(!cols.chip, "{cols:?}");
+    }
+
+    #[test]
+    fn the_updated_marker_survives_a_cut_age() {
+        let seen = |source| AgentUpdated { at_ms: 0, source };
+        // 100 000 days: `100000d` does not fit beside the marker.
+        let now = 100_000 * 86_400_000;
+        for (source, marker) in [(UpdatedSource::Run, "R "), (UpdatedSource::Task, "T ")] {
+            let text = updated_text(seen(source), now, UPDATED_W);
+            assert!(text.starts_with(marker), "{text:?}");
+            assert!(text_display_width(&text) <= UPDATED_W, "{text:?}");
+        }
+        assert_eq!(
+            updated_text(seen(UpdatedSource::Run), 300_000, UPDATED_W),
+            "R 5m"
+        );
     }
 
     #[test]
@@ -826,8 +961,8 @@ mod tests {
             .enumerate()
             .map(|(i, name)| make_agent(&format!("agt_{i}"), name, AgentStatus::Idle))
             .collect();
-        // Two rows taller than the bare list needs: the sort bar and the
-        // column header sit above the rows.
+        // Taller than the bare list needs: the column header sits above
+        // the rows.
         for (width, height) in [(80, 28), (100, 28), (120, 40)] {
             let buffer = draw(
                 FakeBackend::new().with_agents(agents.clone()),
@@ -889,10 +1024,14 @@ mod tests {
         let hint = error_hint(AdapterErrorKind::SpawnFailed).message;
         let screen = text(&draw(spawn_failed_backend(), ERROR_WHOLE_FROM as u16, 24));
         assert!(screen.contains(hint), "{screen}");
-        // At 100 columns it is cut, and says so with an ellipsis.
-        let screen = text(&draw(spawn_failed_backend(), 100, 24));
+        // At 120 columns, where the group chip takes its cells, it is cut,
+        // and says so with an ellipsis.
+        let narrower = 120;
+        let screen = text(&draw(spawn_failed_backend(), narrower as u16, 24));
         assert!(!screen.contains(hint), "{screen}");
-        assert!(screen.contains("Failed to start the pro…"), "{screen}");
+        let cut = cap_display(hint, AgentColumns::for_width(narrower).task);
+        assert!(cut.ends_with('…'), "{cut:?}");
+        assert!(screen.contains(&cut), "{screen}");
     }
 
     fn remote_agent(id: &str, alias: &str, online: bool) -> Agent {

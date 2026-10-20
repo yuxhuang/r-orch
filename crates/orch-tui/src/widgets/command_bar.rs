@@ -485,6 +485,37 @@ fn render_navigate(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         ));
     }
 
+    // The Agents grouping leads, at every width: the header's `GROUP:` chip
+    // only fits from `GROUP_CHIP_FROM` columns, and this is where the mode
+    // shows below that. A sort whose column is hidden at this width is named
+    // here too, so it is never a silent mode, and the UPDATED markers are
+    // spelled out while they are what the list is sorted by.
+    if view == ViewId::Agents {
+        // Padded to the longest mode word, so a click never moves anything
+        // to its right: the hint can fire again at once (see `fire_footer`).
+        hint(
+            &mut spans,
+            "b",
+            &format!("{:<7}", state.agent_group_by.label()),
+            Token::Cyan,
+            Some(FooterAction::AgentGroupBy),
+        );
+        let sort = state.agent_sort;
+        if !crate::views::agents::AgentColumns::for_width(area.width as usize).shows(sort.field) {
+            let arrow = if sort.descending { "↓" } else { "↑" };
+            hint(
+                &mut spans,
+                "o",
+                &format!("{}{arrow}", sort.field.label()),
+                Token::Amber,
+                Some(FooterAction::AgentSortField),
+            );
+        }
+        if sort.field == crate::state::AgentSortField::Updated {
+            hint(&mut spans, "R", "run · T task", Token::Gray, None);
+        }
+    }
+
     // `↑↓` and `Tab/←→` stay unclickable: a 2-cell span with two opposite
     // meanings would have to guess the direction from the sub-cell.
     hint(&mut spans, "↑↓", "", Token::Gray, None);
