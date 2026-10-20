@@ -10,12 +10,14 @@ use crate::backend::CopyOutcome;
 use crate::format::{format_duration, parse_timestamp_ms};
 use crate::hit::{FooterAction, PaneMetrics, VerbId, ZoneId, ZoneKind};
 use crate::messages::Message;
+use crate::state::SortColumn;
 use crate::state::{
     AgentSection, AppState, CopyOrigin, EntityType, Focus, GoalSection, LogSection, TaskSection,
 };
 use crate::theme::{EM_DASH, Token};
 use crate::views::activity::{RowGroups, row_spans};
-use crate::views::{RenderCtx, fit_cells, put_line};
+use crate::views::tasks::{TaskColumns, render_task_row};
+use crate::views::{RenderCtx, fit_cells, put_line, render_header_row};
 use crate::widgets::text_viewer::ViewerSource;
 
 pub fn section_name(focus: Focus) -> &'static str {
@@ -57,7 +59,6 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
             let Some(goal) = state.selected_goal() else {
                 return Vec::new();
             };
-            let linked = state.tasks_of_goal(&goal.id);
             match section {
                 GoalSection::Overview => overview_text(state, focus),
                 GoalSection::Description => field_lines(&goal.description, "No description."),
@@ -65,7 +66,11 @@ pub(crate) fn section_text(state: &AppState, focus: Focus) -> Vec<String> {
                     state.goal_progress_report.as_deref().unwrap_or(""),
                     "No progress report.",
                 ),
-                GoalSection::Tasks => linked
+                // One line per row of the drawn table, in its order. The
+                // table paints through the Tasks view's row renderer; these
+                // strings only count and order the rows.
+                GoalSection::Tasks => state
+                    .sorted_goal_tasks(&goal.id)
                     .iter()
                     .map(|i| {
                         format!(
@@ -792,7 +797,7 @@ pub(crate) fn section_sources(state: &AppState, focus: Focus) -> Vec<Option<View
             .selected_goal()
             .map(|g| {
                 state
-                    .tasks_of_goal(&g.id)
+                    .sorted_goal_tasks(&g.id)
                     .into_iter()
                     .map(|i| {
                         Some(entity_source(
@@ -966,13 +971,11 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         .into_iter()
         .filter(|f| !matches!(f, Focus::MainList | Focus::Activity | Focus::TextViewer))
         .collect();
-    let focus = if ring.contains(&state.focus) {
-        state.focus
-    } else if ring.contains(&state.detail_focus) {
-        state.detail_focus
-    } else if let Some(first) = ring.first() {
-        *first
-    } else {
+    // No row to draw on, not even the rail.
+    if area.height == 0 {
+        return;
+    }
+    let Some(focus) = state.displayed_detail_section() else {
         return;
     };
     let key = state.pane_key(focus);
@@ -1080,6 +1083,11 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         );
         body.y += 2;
         body.height -= 2;
+    }
+    if focus == Focus::GoalDetail(GoalSection::Tasks) {
+        render_goal_tasks(frame, area, ctx, key, body);
+        render_footer(frame, area, ctx, footer_rows);
+        return;
     }
     let mut lines = section_text(state, focus);
     if focus == Focus::AgentDetail(AgentSection::Error)
@@ -1215,6 +1223,110 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
             ctx.publish_text_anchor(source.clone(), row, *byte);
         }
     }
+    render_footer(frame, area, ctx, footer_rows);
+}
+
+/// The goal's Tasks section: the Tasks view's header and rows, for this
+/// goal's tasks only, in the Tasks view's order (design v2 D1–D4).
+///
+/// ```text
+///   rail
+///   optional overview pin (2 rows)
+///   shared header       <- chrome, not in PaneMetrics.body
+///   body.y: task_ids[offset]
+///           task_ids[offset + 1] ...
+///   footer
+/// ```
+///
+/// Every body row is one task: no goal column (they all share it; its width
+/// goes to the title), no goal rules, no show-all or add-task row. A row is
+/// an `ExpandText` zone and anchor for that task's description, so a click
+/// names the task id, never a row number.
+fn render_goal_tasks(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &RenderCtx,
+    key: crate::state::PaneKey,
+    mut body: Rect,
+) {
+    let state = ctx.state;
+    let focus = key.section;
+    let rows = state
+        .selected_goal()
+        .map(|goal| state.sorted_goal_tasks(&goal.id))
+        .unwrap_or_default();
+    let cols = TaskColumns::for_width(body.width as usize).without_goal();
+    if body.height > 0 {
+        render_header_row(
+            frame,
+            body,
+            body.y,
+            ctx,
+            &cols.header(),
+            (
+                SortColumn::Task(state.task_sort.field),
+                state.task_sort.descending,
+            ),
+        );
+        body.y += 1;
+        body.height -= 1;
+    }
+    let scroll = state.pane_scroll(&key);
+    let offset = crate::state::goal_tasks_offset(&scroll, rows.len(), body.height as usize);
+    ctx.publish_pane_metrics(PaneMetrics {
+        key: key.clone(),
+        body,
+        items: rows.len(),
+        display_rows: rows.len().max(1),
+        selection_rows: (0..rows.len()).collect(),
+    });
+    ctx.zone(body, area, ZoneKind::Pane(focus), ZoneId::Pane(key));
+    if rows.is_empty() {
+        if body.height > 0 {
+            put_line(
+                frame,
+                body,
+                body.y,
+                vec![Span::styled(
+                    fit_cells("No entries.", body.width as usize),
+                    ctx.style(Token::Silver),
+                )],
+            );
+        }
+        return;
+    }
+    for (screen_row, (ordinal, index)) in rows
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(offset)
+        .take(body.height as usize)
+        .enumerate()
+    {
+        let y = body.y + screen_row as u16;
+        render_task_row(
+            frame,
+            body,
+            ctx,
+            y,
+            cols,
+            index,
+            scroll.selected == Some(ordinal),
+        );
+        let row = Rect::new(body.x, y, body.width, 1);
+        let source = entity_source(EntityType::Task, &state.tasks[index].id, "description");
+        ctx.zone(
+            row,
+            body,
+            ZoneKind::ExpandText,
+            ZoneId::ExpandText(source.clone()),
+        );
+        ctx.publish_text_anchor(source, row, 0);
+    }
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx, footer_rows: u16) {
+    let state = ctx.state;
     if footer_rows > 0 {
         let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
         let hint = if state.detail_maximized {
@@ -1284,6 +1396,186 @@ pub(crate) fn field_feedback(ctx: &RenderCtx, origin: &CopyOrigin) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::fake::{make_goal, make_task};
+    use crate::hit::HitMap;
+    use crate::state::{DetailPanel, ViewId};
+    use crate::views::Caps;
+    use orch_domain::GoalStatus;
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
+    const NO_CAPS: Caps = Caps {
+        can_create_task: false,
+        can_add_agent: false,
+        can_create_goal: false,
+        can_force_stop_agent: false,
+        can_send_message: false,
+    };
+
+    /// Goal `g1` open on its Tasks section, with `n` tasks `Task 0..n`.
+    fn goal_tasks_state(n: usize) -> AppState {
+        let mut state = AppState {
+            width: 120,
+            height: 40,
+            view: ViewId::Goals,
+            goals: vec![make_goal("g1", "Goal one", GoalStatus::Active)],
+            tasks: (0..n)
+                .map(|i| {
+                    let mut t = make_task(&format!("t{i}"), &format!("Task {i}"), TaskStatus::Todo);
+                    t.goal_id = Some("g1".into());
+                    t
+                })
+                .collect(),
+            detail: DetailPanel::Entity,
+            ..AppState::default()
+        };
+        state.set_focus(Focus::GoalDetail(GoalSection::Tasks));
+        state
+    }
+
+    /// Draw only the inspector into `area` of a larger screen.
+    fn draw_pane(state: &AppState, area: Rect) -> (Buffer, HitMap) {
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut hits = None;
+        terminal
+            .draw(|frame| {
+                let ctx = RenderCtx::new(state, NO_CAPS, 0, frame.area());
+                render(frame, area, &ctx);
+                hits = Some(ctx.hits.into_inner());
+            })
+            .unwrap();
+        (terminal.backend().buffer().clone(), hits.unwrap())
+    }
+
+    fn row(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn task_key() -> crate::state::PaneKey {
+        crate::state::PaneKey {
+            view: ViewId::Goals,
+            entity: Some(crate::state::PaneEntity::Entity("g1".into())),
+            section: Focus::GoalDetail(GoalSection::Tasks),
+        }
+    }
+
+    #[test]
+    fn a_tiny_goal_tasks_pane_never_paints_or_publishes_outside_its_area() {
+        for n in [0, 3] {
+            let state = goal_tasks_state(n);
+            for width in 20..=39 {
+                for height in 0..=4 {
+                    let area = Rect::new(2, 1, width, height);
+                    let (buffer, hits) = draw_pane(&state, area);
+                    for y in 0..buffer.area.height {
+                        for x in 0..buffer.area.width {
+                            if !area.contains((x, y).into()) {
+                                assert_eq!(
+                                    buffer[(x, y)].symbol(),
+                                    " ",
+                                    "n={n} {width}x{height}: painted ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                    for zone in hits.zones() {
+                        assert_eq!(
+                            zone.rect.intersection(area),
+                            zone.rect,
+                            "n={n} {width}x{height}: zone {zone:?}"
+                        );
+                    }
+                    if height == 0 {
+                        continue;
+                    }
+                    let pane = hits.pane_metrics(&task_key()).expect("pane metrics");
+                    assert!(pane.body.bottom() <= area.bottom(), "{pane:?}");
+                    assert_eq!(pane.items, n);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_header_is_chrome_above_the_body_and_each_body_row_is_one_task() {
+        let state = goal_tasks_state(3);
+        let area = Rect::new(0, 0, 60, 8);
+        let (buffer, hits) = draw_pane(&state, area);
+        let pane = hits.pane_metrics(&task_key()).unwrap().clone();
+        assert_eq!((pane.items, pane.display_rows), (3, 3));
+        assert!(row(&buffer, pane.body.y - 1).contains("STATUS"));
+        let order = state.sorted_goal_tasks("g1");
+        for (ordinal, index) in order.iter().enumerate().take(pane.body.height as usize) {
+            let y = pane.body.y + ordinal as u16;
+            assert!(
+                row(&buffer, y).contains(&state.tasks[*index].title),
+                "row {y}"
+            );
+            let source = entity_source(EntityType::Task, &state.tasks[*index].id, "description");
+            assert!(
+                hits.source_anchors
+                    .iter()
+                    .any(|(rect, s, _)| s == &source && rect.y == y),
+                "anchor of {source:?} on row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_goal_paints_the_header_and_no_entries_with_nothing_to_select() {
+        let state = goal_tasks_state(0);
+        let (buffer, hits) = draw_pane(&state, Rect::new(0, 0, 60, 8));
+        let pane = hits.pane_metrics(&task_key()).unwrap().clone();
+        assert_eq!((pane.items, pane.display_rows), (0, 1));
+        assert!(pane.selection_rows.is_empty());
+        assert!(row(&buffer, pane.body.y - 1).contains("STATUS"));
+        assert!(row(&buffer, pane.body.y).contains("No entries."));
+        assert!(hits.source_anchors.is_empty());
+        assert!(
+            !hits
+                .zones()
+                .iter()
+                .any(|z| matches!(z.kind, ZoneKind::ExpandText))
+        );
+    }
+
+    #[test]
+    fn only_a_frame_painting_the_selected_substitute_releases_a_pending_pane() {
+        let mut state = goal_tasks_state(3);
+        let key = task_key();
+        state.set_pane_scroll(
+            key.clone(),
+            crate::navigation::ScrollState {
+                selected: Some(2),
+                offset: 0,
+            },
+        );
+        state.goal_task_pending.push(key.clone());
+        // Rail + header only: no body, nothing painted as selected.
+        let (_, hits) = draw_pane(&state, Rect::new(0, 0, 60, 2));
+        state.acknowledge_goal_task_picks(&hits);
+        assert_eq!(state.goal_task_pending, std::slice::from_ref(&key));
+        // A body too short to reach the pick does not show it either.
+        state.set_pane_scroll(
+            key.clone(),
+            crate::navigation::ScrollState {
+                selected: Some(2),
+                offset: 0,
+            },
+        );
+        let (_, mut hits) = draw_pane(&state, Rect::new(0, 0, 60, 8));
+        let shown = hits.pane_metrics(&key).unwrap().clone();
+        assert!(shown.body.height as usize > 2, "{shown:?}");
+        // The same frame with the selected row's anchor missing is no proof.
+        let painted = hits.source_anchors.clone();
+        hits.source_anchors.clear();
+        state.acknowledge_goal_task_picks(&hits);
+        assert_eq!(state.goal_task_pending, std::slice::from_ref(&key));
+        hits.source_anchors = painted;
+        state.acknowledge_goal_task_picks(&hits);
+        assert!(state.goal_task_pending.is_empty());
+    }
 
     fn task(section: TaskSection) -> Focus {
         Focus::TaskDetail(section)

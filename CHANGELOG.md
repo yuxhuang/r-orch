@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Changed
+- The dashboard's goal detail Tasks section is now the Tasks list's table for that goal's tasks: the same column header and rows (status chip, priority pips, title with attachment count, assignee, Started, Elapsed*), without the goal column, whose width goes to the title. It is sorted by the Tasks list's sort, so `o`, `O`, `0` and clicking a header there (which also focuses the section) re-sort both; the selected task stays selected across a sort or refresh, and Enter and `Ctrl+Y` still expand and copy its description. The Tasks section is now in every goal's detail, and a goal without tasks shows the header and "No entries." instead of having no Tasks section.
+
 ## [0.9.0] - 2026-10-19
 
 Dashboard (TUI) release: sortable, filterable lists, newest-first Activity in goal and agent details, and agent

@@ -789,6 +789,29 @@ fn restore_pick(
     }
 }
 
+/// The first row a goal Tasks pane shows: its saved offset, clamped to the
+/// rows and moved just enough to show the pick. The renderer, the mouse,
+/// the keys and the paint check all use this one window, so a saved offset
+/// that a refresh or a sort left behind can never put a click, a key and the
+/// painted cursor on different rows.
+pub(crate) fn goal_tasks_offset(
+    scroll: &crate::navigation::ScrollState,
+    rows: usize,
+    height: usize,
+) -> usize {
+    let mut offset = scroll.offset.min(rows.saturating_sub(height));
+    if height > 0
+        && let Some(selected) = scroll.selected.filter(|s| *s < rows)
+    {
+        if selected < offset {
+            offset = selected;
+        } else if selected >= offset + height {
+            offset = selected + 1 - height;
+        }
+    }
+    offset
+}
+
 /// The entity a list selection points at, captured before the list changes
 /// so it can be found again afterwards (D1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -806,6 +829,18 @@ pub struct ListSelection {
     goal: (ListPick, usize),
     task: (ListPick, usize),
     agent: (ListPick, usize),
+    goal_tasks: Vec<GoalTaskPick>,
+}
+
+/// A goal inspector's Tasks pane pick, by task id. Saved panes are captured whether shown or not; the displayed
+/// pane is captured even before anything was picked in it, because its
+/// first row is then what Enter acts on.
+#[derive(Debug, Clone)]
+struct GoalTaskPick {
+    key: PaneKey,
+    goal_id: String,
+    task: Option<String>,
+    scroll: crate::navigation::ScrollState,
 }
 
 /// Does `field` contain `needle`, case-insensitively? `needle` is already
@@ -1054,6 +1089,12 @@ pub struct AppState {
     /// wait for the next frame, so a key can never act on a row the user
     /// has not seen selected.
     pub entity_actions_deferred: bool,
+    /// Goal inspector Tasks panes whose pick was lost by a refresh or a
+    /// control change and moved onto another task that pane has not painted
+    /// as selected yet (design v2 D5a). Enter and the copy keys do nothing
+    /// in such a pane until a frame shows the substitute; the main-list
+    /// [`AppState::entity_actions_deferred`] neither clears nor sets it.
+    pub(crate) goal_task_pending: Vec<PaneKey>,
     pub goal_scroll: usize,
     pub task_scroll: usize,
     pub agent_scroll: usize,
@@ -1177,6 +1218,7 @@ impl Default for AppState {
             timing_error: None,
             sort_clock_ms: 0,
             entity_actions_deferred: false,
+            goal_task_pending: Vec::new(),
             goal_scroll: 0,
             task_scroll: 0,
             agent_scroll: 0,
@@ -1545,6 +1587,35 @@ impl AppState {
         } else {
             self.pane_states.push((key, scroll));
         }
+        self.prune_goal_task_pending();
+    }
+    /// A pending substitute lives only as long as its pane's saved state.
+    fn prune_goal_task_pending(&mut self) {
+        let states = &self.pane_states;
+        self.goal_task_pending
+            .retain(|key| states.iter().any(|(saved, _)| saved == key));
+    }
+    /// Is the focused goal Tasks pane waiting to paint a substitute pick?
+    /// Enter and the copy keys check this before resolving a document.
+    pub(crate) fn goal_task_action_pending(&self) -> bool {
+        self.focus == Focus::GoalDetail(GoalSection::Tasks)
+            && self.goal_task_pending.contains(&self.pane_key(self.focus))
+    }
+    /// The detail section the inspector draws: the focused one, else the
+    /// last focused, else the first in the rail.
+    pub(crate) fn displayed_detail_section(&self) -> Option<Focus> {
+        let ring: Vec<_> = self
+            .focus_ring()
+            .into_iter()
+            .filter(|f| !matches!(f, Focus::MainList | Focus::Activity | Focus::TextViewer))
+            .collect();
+        if ring.contains(&self.focus) {
+            Some(self.focus)
+        } else if ring.contains(&self.detail_focus) {
+            Some(self.detail_focus)
+        } else {
+            ring.first().copied()
+        }
     }
     pub fn focus_ring(&self) -> Vec<Focus> {
         if self.width < crate::layout::MIN_WIDTH || self.height < crate::layout::MIN_HEIGHT {
@@ -1562,7 +1633,7 @@ impl AppState {
         }
         match self.view {
             ViewId::Goals => {
-                if let Some(g) = self.selected_goal() {
+                if self.selected_goal().is_some() {
                     ring.extend([
                         Focus::GoalDetail(GoalSection::Overview),
                         Focus::GoalDetail(GoalSection::Description),
@@ -1570,9 +1641,9 @@ impl AppState {
                     if self.goal_progress_report.is_some() {
                         ring.push(Focus::GoalDetail(GoalSection::Progress));
                     }
-                    if !self.tasks_of_goal(&g.id).is_empty() {
-                        ring.push(Focus::GoalDetail(GoalSection::Tasks));
-                    }
+                    // Always present, empty or not: an empty goal shows the
+                    // table header and `No entries.` (D6).
+                    ring.push(Focus::GoalDetail(GoalSection::Tasks));
                     ring.push(Focus::GoalDetail(GoalSection::Activity));
                 }
             }
@@ -1671,6 +1742,7 @@ impl AppState {
         let keys: Vec<_> = ring.iter().map(|f| self.pane_key(*f)).collect();
         self.pane_states
             .retain(|(k, _)| k.view != self.view || keys.contains(k));
+        self.prune_goal_task_pending();
         self.sync_field_origin();
     }
     pub fn sync_field_origin(&mut self) {
@@ -1739,7 +1811,7 @@ impl AppState {
             }
             Focus::GoalDetail(GoalSection::Tasks) => {
                 let goal = self.selected_goal()?;
-                let rows = self.tasks_of_goal(&goal.id);
+                let rows = self.sorted_goal_tasks(&goal.id);
                 let selected = self
                     .pane_scroll(&self.pane_key(self.focus))
                     .selected
@@ -1995,6 +2067,17 @@ impl AppState {
     /// are not the list (`/tasks list`).
     pub fn sorted_tasks_unfiltered(&self) -> Vec<usize> {
         self.order_tasks((0..self.tasks.len()).collect())
+    }
+
+    /// The tasks of a live goal in the Tasks view's order (its sort and
+    /// sort clock), with none of that list's keyword, cap, grouping rules
+    /// or pseudo-rows: the goal inspector's Tasks section, its sources and
+    /// its pick all read this one order. Empty for a goal that is gone.
+    pub(crate) fn sorted_goal_tasks(&self, goal_id: &str) -> Vec<usize> {
+        if self.goal_by_id(goal_id).is_none() {
+            return Vec::new();
+        }
+        self.order_tasks(self.tasks_of_goal(goal_id))
     }
 
     fn order_tasks(&self, candidates: Vec<usize>) -> Vec<usize> {
@@ -2284,7 +2367,118 @@ impl AppState {
             goal: (goal, self.goal_selected),
             task: (task, self.task_selected),
             agent: (agent, self.agent_selected),
+            goal_tasks: self.capture_goal_task_picks(),
         }
+    }
+
+    fn capture_goal_task_picks(&self) -> Vec<GoalTaskPick> {
+        let section = Focus::GoalDetail(GoalSection::Tasks);
+        let mut keys: Vec<(PaneKey, crate::navigation::ScrollState)> = self
+            .pane_states
+            .iter()
+            .filter(|(key, _)| key.view == ViewId::Goals && key.section == section)
+            .cloned()
+            .collect();
+        if self.view == ViewId::Goals && self.displayed_detail_section() == Some(section) {
+            let key = self.pane_key(section);
+            if !keys.iter().any(|(saved, _)| saved == &key) {
+                keys.push((key, crate::navigation::ScrollState::default()));
+            }
+        }
+        keys.into_iter()
+            .filter_map(|(key, scroll)| {
+                let Some(PaneEntity::Entity(goal_id)) = key.entity.clone() else {
+                    return None;
+                };
+                let task = self
+                    .sorted_goal_tasks(&goal_id)
+                    .get(scroll.selected.unwrap_or(0))
+                    .map(|i| self.tasks[*i].id.clone());
+                Some(GoalTaskPick {
+                    key,
+                    goal_id,
+                    task,
+                    scroll,
+                })
+            })
+            .collect()
+    }
+
+    /// Put each captured goal Tasks pane back on its task. A task that is
+    /// gone (deleted, or moved to another goal) leaves the pick at its old
+    /// position clamped to the remaining rows, and that pane's Enter and
+    /// copy wait until it has painted the substitute as selected (D5a). A
+    /// pane left with no rows has no pick, and nothing to wait for.
+    ///
+    /// Every caller ends in [`AppState::clamp_all`], which retires the hit
+    /// map and any armed or half-done double click, so a click pressed on
+    /// the old rows can never land on whatever slid into them.
+    fn reconcile_goal_task_picks(&mut self, prior: &[GoalTaskPick]) {
+        for pick in prior {
+            let order: Vec<String> = self
+                .sorted_goal_tasks(&pick.goal_id)
+                .into_iter()
+                .map(|i| self.tasks[i].id.clone())
+                .collect();
+            let saved = self
+                .pane_states
+                .iter()
+                .position(|(key, _)| key == &pick.key);
+            if self.goal_by_id(&pick.goal_id).is_none() {
+                if let Some(at) = saved {
+                    self.pane_states.remove(at);
+                }
+                continue;
+            }
+            let mut scroll = pick.scroll.clone();
+            let mut lost = false;
+            if order.is_empty() {
+                scroll = crate::navigation::ScrollState::default();
+            } else {
+                let found = pick
+                    .task
+                    .as_ref()
+                    .and_then(|id| order.iter().position(|candidate| candidate == id));
+                match found {
+                    // An untouched pane whose first row stayed first stays
+                    // untouched; otherwise the cursor follows its task.
+                    Some(0) if scroll.selected.is_none() => {}
+                    Some(found) => scroll.selected = Some(found),
+                    // Gone, or a pick already past the rows: the old
+                    // position, clamped, and wait for it to be seen.
+                    None if pick.task.is_some() || scroll.selected.is_some() => {
+                        let position = scroll.selected.unwrap_or(0).min(order.len() - 1);
+                        scroll.selected = Some(position);
+                        lost = true;
+                    }
+                    None => {}
+                }
+            }
+            if let Some(h) = self
+                .mouse
+                .hits
+                .metrics
+                .panes
+                .iter()
+                .find(|pane| pane.key == pick.key)
+                .map(|pane| pane.body.height as usize)
+            {
+                scroll.offset = goal_tasks_offset(&scroll, order.len(), h);
+            }
+            match saved {
+                Some(at) => self.pane_states[at].1 = scroll,
+                None if scroll != crate::navigation::ScrollState::default() => {
+                    self.pane_states.push((pick.key.clone(), scroll));
+                }
+                None => {}
+            }
+            if order.is_empty() {
+                self.goal_task_pending.retain(|key| key != &pick.key);
+            } else if lost && !self.goal_task_pending.contains(&pick.key) {
+                self.goal_task_pending.push(pick.key.clone());
+            }
+        }
+        self.prune_goal_task_pending();
     }
 
     /// Sample the sort clock, derive the new orders and put every cursor
@@ -2327,6 +2521,53 @@ impl AppState {
         if lost {
             self.entity_actions_deferred = true;
         }
+        self.reconcile_goal_task_picks(&prior.goal_tasks);
+    }
+
+    /// The frame just adopted paints the selected row of a pending goal
+    /// Tasks pane: that pane's substitute has been seen, so its Enter and
+    /// copy act again (D5b). Only that pane's own body counts — another
+    /// surface, an offscreen pick or a header-only frame proves nothing.
+    pub(crate) fn acknowledge_goal_task_picks(&mut self, hits: &crate::hit::HitMap) {
+        let pending = std::mem::take(&mut self.goal_task_pending);
+        self.goal_task_pending = pending
+            .into_iter()
+            .filter(|key| !self.goal_task_pick_painted(key, hits))
+            .collect();
+    }
+
+    fn goal_task_pick_painted(&self, key: &PaneKey, hits: &crate::hit::HitMap) -> bool {
+        let Some(pane) = hits.pane_metrics(key) else {
+            return false;
+        };
+        let Some(PaneEntity::Entity(goal_id)) = &key.entity else {
+            return false;
+        };
+        let height = pane.body.height as usize;
+        if height == 0 {
+            return false;
+        }
+        let scroll = self.pane_scroll(key);
+        let Some(selected) = scroll.selected else {
+            return false;
+        };
+        let order = self.sorted_goal_tasks(goal_id);
+        let Some(index) = order.get(selected) else {
+            return false;
+        };
+        let offset = goal_tasks_offset(&scroll, order.len(), height);
+        if selected < offset || selected >= offset + height {
+            return false;
+        }
+        let row_y = pane.body.y + (selected - offset) as u16;
+        let source = ViewerSource::Entity {
+            kind: EntityType::Task,
+            id: self.tasks[*index].id.clone(),
+            field: "description".into(),
+        };
+        hits.source_anchors
+            .iter()
+            .any(|(rect, painted, _)| painted == &source && rect.y == row_y)
     }
 
     /// The task's `goalId`, but only when it resolves to a live goal — an
