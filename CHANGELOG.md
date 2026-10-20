@@ -5,6 +5,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-20
+
+Dashboard patch release: the Agents list is a sortable, grouped table with an UPDATED column. No peer-protocol
+change, so 0.5.x through 0.9.2 peers can be mixed.
+
 ### Changed
 - The dashboard's Agents list is a table like Goals and Tasks: one header row (the `o sort` / `b group:` chip row above it is gone, and its row goes to the list), every column sortable by `o`, `O`, `0` or a header click, and the active column marked `↑`/`↓`. The default order, and what `0` restores, is STATUS ascending (ACTIVE, IDLE, ERROR, OFFLINE, DISABLED); equal values keep the agents' configured order and blanks sort last. A new UPDATED column reads `R <age>` for the newest start or event of the agent's live run, else `T <age>` for the newest update of a task assigned to it (an assignment or an edit counts too, so it is not proof the agent ran), else `—`; while it is the sort, the footer says `R run · T task`. `b` and `B` cycle the grouping through Team, Node, Status, Adapter, Caps (each agent once, under its alphabetically first capability; the keyword filter matches every capability) and None (no sections). The footer always leads with `b <Mode>`, clickable, and from 108 columns the header ends with a clickable `GROUP: <Mode>` chip; at 80 columns the table shows the same columns as before, and a sort whose column is hidden is named in the footer as `o <Field>↑`.
 - The Agents list's RUNS column now always shows lifetime completed/total runs, also for an active agent (which showed its live elapsed time there); the live run's elapsed time is in the agent detail's Overview, with its capabilities, node and UPDATED source.
@@ -186,7 +191,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/yuxhuang/r-orch/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/yuxhuang/r-orch/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/yuxhuang/r-orch/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/yuxhuang/r-orch/compare/v0.7.0...v0.8.0
