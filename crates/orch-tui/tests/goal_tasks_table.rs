@@ -903,8 +903,11 @@ fn the_pane_wheel_still_scrolls_the_table_rows() {
     let mut sec = section_with(backend, 100, 30);
     sec.refute_text("Many 39");
     let y = header_y(&mut sec) + 2;
-    for _ in 0..30 {
+    // The wheel lands at most `WHEEL_MAX_STEPS_PER_FRAME` steps per frame, so
+    // draw between notches the way the event loop does.
+    for _ in 0..40 {
         sec.wheel_down(10, y);
+        sec.draw();
     }
     sec.assert_text("Many 39");
 }
@@ -1246,13 +1249,11 @@ fn a_refresh_that_reorders_the_rows_keeps_the_picked_task_picked_for_enter_and_c
         let picked = pick(&mut sec, 2);
         let index = |h: &Harness| state_order(h).iter().position(|t| *t == picked);
         let before = index(&sec);
-        // The picked task is cancelled, so the Status sort moves it to the end.
-        let status = if picked == "Delta" {
-            TaskStatus::Failed
-        } else {
-            TaskStatus::Done
-        };
-        edit_task(&mut sec, &tid(&picked), |t| t.status = status);
+        // The picked task is cancelled, so the Status sort moves it to the end
+        // (Cancelled ranks last; Failed would tie with Bravo and stay put).
+        edit_task(&mut sec, &tid(&picked), |t| {
+            t.status = TaskStatus::Cancelled
+        });
         sec.app.refresh_all(false);
         assert_ne!(index(&sec), before, "the refresh must move the picked row");
         assert_eq!(
