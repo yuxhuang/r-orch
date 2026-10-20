@@ -138,9 +138,31 @@ Letters that act on an item (`E`, `D`, `R`, `C` and so on) work only while the m
 | `-` | Gives the list more room. |
 | `M` | Maximizes the detail panel, or restores the split. Upper case only. |
 
+### A goal's Tasks section
+
+A goal's detail has a Tasks section between Description and Activity. It is the Tasks list's table, filtered to that goal's tasks. This is a goal's Tasks section with its first task selected, in a 120-column terminal:
+
+```text
+Overview │ Description │ > Tasks │ Activity
+━━━ GOAL: Ship signup ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+status    ACTIVE         assignee  —
+  STATUS↑   PRI TITLE                                                                  ASSIGNEE        STARTED  ELAPSED*
+▸ ○ TODO    !!! Add email validation                                                   —
+  ○ TODO    !!  Write signup form                                                      —
+  ─ OFF     ·   Review signup copy                                                     —
+```
+
+- **Columns.** The same header and rows as the Tasks list: status, priority, title, assignee, Started and Elapsed*. The Goal column is left out, because every row has the same goal, and its width goes to the title.
+- **Rows.** Every task of this goal and nothing else. The Tasks list's keyword filter and its ten-task limit do not apply here, so a goal with 13 tasks lists all 13.
+- **Order.** The section uses the Tasks list's sort, so both always show the goal's tasks in the same order. With the section focused, `o`, `O` and `0` change that sort for both (see [Sort the lists](#sort-the-lists)). Clicking a header in the section sorts the same way and also focuses the section, even when the goal list had focus.
+- **Selection.** The selected task stays selected when a sort moves it to another row.
+- **Actions.** `Enter` opens the selected task's description in the [viewer](#read-long-text-in-the-viewer), and `Ctrl+Y` copies that description (see [Copy text](#copy-text)). The section does not open the task itself; to edit or run a task, use the Tasks view.
+
+A goal with no tasks still has a Tasks section. It shows the header and `No entries.`, and `Enter` and `Ctrl+Y` do nothing there.
+
 ## Sort the lists
 
-The Goals, Tasks and Agents lists have a column header row. Each list keeps its own sort for this session, and none of these controls change grouping.
+The Goals, Tasks and Agents lists have a column header row. Each list keeps its own sort for this session, and none of these controls change grouping. A goal's [Tasks section](#a-goals-tasks-section) has no sort of its own: it uses the Tasks list's sort, and these controls change that sort while the section has focus.
 
 | Key | What it does |
 |---|---|
@@ -187,7 +209,7 @@ On the Goals, Tasks or Agents list, press `Ctrl+K` (or click `^K filter` in the 
 
 Matching ignores case and looks at each field on its own: the ID, the title or name, the status (both `in_progress` and the `RUN` the row shows), the assignee's or agent's name and ID, a task's goal, and an agent's team, adapter, model and node (`local` or the remote alias). Descriptions and the Started and Elapsed times are not searched.
 
-A kept keyword shows as a `filter: … · matches/total` chip on the list's title rule; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten matches, `show all` lists the rest (`▼ Show all (2 more) — press S`). Empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard. `/` still opens the command bar.
+A kept keyword shows as a `filter: … · matches/total` chip on the list's title rule; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten matches, `show all` lists the rest (`▼ Show all (2 more) — press S`). Empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard. The Tasks keyword does not narrow a goal's [Tasks section](#a-goals-tasks-section). `/` still opens the command bar.
 
 ## Follow activity feeds
 
@@ -494,6 +516,14 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | `C` | Mark an active or paused goal achieved, cancelling its tasks that can be cancelled. |
 | `X` | Abandon an active or paused goal. |
 | `o`, `O`, `0` | Move the sort to the next column, reverse the direction, reset. |
+
+### Goal Tasks section (section focus)
+
+| Key | What it does |
+|---|---|
+| `o`, `O`, `0` | Move the Tasks list's sort to the next column, reverse the direction, reset. The section and the Tasks list both follow. |
+| `Enter` | Open the selected task's description in the viewer. |
+| `Ctrl+Y` | Copy the selected task's description. |
 
 ### Actions view
 
