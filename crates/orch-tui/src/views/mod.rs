@@ -866,7 +866,16 @@ pub(crate) fn render_header_row(
         }
         let is_active = header.column == Some(active_column);
         let label = if is_active {
-            format!("{}{}", header.label, if descending { "↓" } else { "↑" })
+            let arrow = if descending { "↓" } else { "↑" };
+            let full = format!("{}{arrow}", header.label);
+            if crate::text::text_display_width(&full) <= header.width {
+                full
+            } else {
+                // Too narrow for the whole label: cut the label, never the
+                // arrow, so the active column is always marked.
+                let cut = crate::format::cap_display(header.label, header.width - 1);
+                format!("{cut}{arrow}")
+            }
         } else {
             header.label.to_string()
         };

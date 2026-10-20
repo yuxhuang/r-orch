@@ -1,5 +1,7 @@
-//! End to end in tmux: the Agents view's By team / By node grouping, as an
-//! operator sees it in a real terminal (AGENTS.md, "TUI end-to-end tests").
+//! End to end in tmux: the Agents view's grouping (Team, Node, Status, ...),
+//! switched by `b`/`B`, the header's `GROUP:` chip and the footer's
+//! `b <Mode>` hint, as an operator sees it in a real terminal (AGENTS.md,
+//! "TUI end-to-end tests").
 //!
 //! The real `orch` binary runs `orch tui` in a private tmux server over a
 //! temp project with two local agents and one remote alias, `w1`, whose
@@ -261,12 +263,18 @@ fn agents_group_by_node_shows_local_then_remote_sections() {
     tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
     tmux.keys(&["a"]);
 
-    // By team (the default): no teams, so one unassigned section.
+    // By team (the default): no teams, so one unassigned section. At 120
+    // columns the header ends with the group chip, and the footer leads with
+    // the mode too.
     let screen = tmux.wait_for("the Agents view By team", |s| {
-        shows_all(s, &["b group:Team", "rover@w1", "UNASSIGNED · 3 agents"])
+        shows_all(
+            s,
+            &["GROUP: Team", "b Team", "rover@w1", "UNASSIGNED · 3 agents"],
+        )
     });
-    assert!(screen.contains("UNASSIGNED · 3 agents"), "{screen}");
+    assert!(screen.contains("STATUS↑"), "{screen}");
     assert!(!screen.contains("◈ LOCAL"), "{screen}");
+    assert!(!screen.contains("b group:"), "the old chip row:\n{screen}");
 
     // `b`: By node — Local first, then w1, marked offline.
     tmux.keys(&["b"]);
@@ -274,7 +282,8 @@ fn agents_group_by_node_shows_local_then_remote_sections() {
         shows_all(
             s,
             &[
-                "b group:Node",
+                "GROUP: Node",
+                "b Node",
                 "◈ LOCAL · 2 agents",
                 "◈ w1 ○ offline · 1 agent",
                 "rover@w1",
@@ -292,32 +301,48 @@ fn agents_group_by_node_shows_local_then_remote_sections() {
     );
     assert!(!screen.contains("UNASSIGNED"), "{screen}");
 
-    // The chip is the mouse path back to By team.
-    let (x, y) = locate(&screen, "b group:Node").expect(&screen);
+    // The chip is a mouse path to the next mode: By status. The remote's
+    // agent reports offline with its node.
+    let (x, y) = locate(&screen, "GROUP: Node").expect(&screen);
     tmux.click(x, y);
-    let screen = tmux.wait_for("By team again", |s| {
-        shows_all(s, &["b group:Team", "UNASSIGNED · 3 agents"])
-    });
-    assert!(screen.contains("UNASSIGNED · 3 agents"), "{screen}");
-    assert!(!screen.contains("◈ LOCAL"), "{screen}");
-
-    // At the minimum width the bar goes compact and the headers still fit.
-    tmux.keys(&["b"]);
-    tmux.run(&["resize-window", "-t", "dash", "-x", "40", "-y", "20"]);
-    let screen = tmux.wait_for("the 40-column bar", |s| {
+    let screen = tmux.wait_for("By status", |s| {
         shows_all(
             s,
-            &[
-                "b node",
-                "0 reset",
-                "◈ LOCAL · 2 agents",
-                "◈ w1 ○ offline · 1 agent",
-            ],
+            &["GROUP: Status", "◈ IDLE · 2 agents", "◈ OFFLINE · 1 agent"],
         )
     });
-    assert!(screen.contains("0 reset"), "{screen}");
-    assert!(screen.contains("◈ LOCAL · 2 agents"), "{screen}");
-    assert!(screen.contains("◈ w1 ○ offline · 1 agent"), "{screen}");
+    let idle = locate(&screen, "◈ IDLE").expect(&screen);
+    let offline = locate(&screen, "◈ OFFLINE").expect(&screen);
+    assert!(idle.1 < offline.1, "{screen}");
+    assert!(!screen.contains("◈ LOCAL"), "{screen}");
+
+    // `B` walks back: Node, then Team.
+    tmux.keys(&["B", "B"]);
+    tmux.wait_for("By team again", |s| {
+        shows_all(s, &["GROUP: Team", "UNASSIGNED · 3 agents"])
+    });
+
+    // At 80 columns there is no chip; the footer's hint names the mode and
+    // is the mouse path.
+    tmux.run(&["resize-window", "-t", "dash", "-x", "80", "-y", "24"]);
+    let screen = tmux.wait_for("the 80-column table", |s| {
+        shows_all(s, &["b Team", "UNASSIGNED · 3 agents"]) && !s.contains("GROUP:")
+    });
+    let (x, y) = locate(&screen, "b Team").expect(&screen);
+    tmux.click(x, y);
+    tmux.wait_for("By node from the footer", |s| {
+        shows_all(s, &["b Node", "◈ LOCAL · 2 agents"])
+    });
+
+    // At the minimum width the hint and the section headers still fit.
+    tmux.run(&["resize-window", "-t", "dash", "-x", "40", "-y", "20"]);
+    let screen = tmux.wait_for("the 40-column table", |s| {
+        shows_all(
+            s,
+            &["b Node", "◈ LOCAL · 2 agents", "◈ w1 ○ offline · 1 agent"],
+        )
+    });
+    assert!(!screen.contains("GROUP:"), "{screen}");
 
     tmux.keys(&["q"]);
 }

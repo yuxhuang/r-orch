@@ -738,7 +738,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         // not *set* the suppression, but it is still *subject* to one set by
         // another action, so a reflow after `A approve` cannot drop a stray
         // second click onto it.
-        if action != FooterAction::Quit {
+        //
+        // `b <Mode>` is the other exception: its label is padded to the
+        // longest mode, and changing the grouping changes no other hint, so
+        // nothing in the row moves and it can be clicked round like the
+        // header's group chip.
+        if !matches!(action, FooterAction::Quit | FooterAction::AgentGroupBy) {
             self.suppress_footer();
         }
         match action {
@@ -799,6 +804,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     self.set_goal_status(&goal.id, next, false);
                 }
             }
+            FooterAction::AgentGroupBy => self.toggle_agent_group_by(),
+            FooterAction::AgentSortField => self.cycle_agent_sort(),
             FooterAction::ShowAllTasks => self.toggle_show_all_tasks(),
             FooterAction::Delete => self.delete_selected(),
             FooterAction::Undo => self.undo_deletion(),

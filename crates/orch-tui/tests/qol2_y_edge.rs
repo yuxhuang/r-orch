@@ -585,12 +585,13 @@ fn a_click_on_the_name_header_at_40_cols_sorts_agents_by_name() {
 }
 
 #[test]
-fn a_click_on_the_unsortable_last_agents_header_changes_nothing() {
-    // RUNS is the last cell of the row and has no sort field: no zone.
+fn a_click_on_the_last_agents_header_at_40_cols_sorts_by_runs() {
+    // RUNS is the last cell of the row; every Agents column sorts now, and
+    // its zone reaches the last cell.
     let mut h = agents_at_40_cols();
     let (_, y) = h.find_text("RUNS").expect("the RUNS header");
     h.click(39, y);
-    assert_eq!(h.app.state.agent_sort, Default::default());
+    assert_eq!(h.app.state.agent_sort.field, AgentSortField::Runs);
 }
 
 #[test]
@@ -947,7 +948,7 @@ fn by_team_still_groups_by_team_after_a_node_round_trip() {
             .with_teams(vec![make_team("t1", "Crew", "a", &["a"])]),
     );
     h.app.state.view = ViewId::Agents;
-    h.key('b').key('b');
+    h.key('b').key('B');
     assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
     let rows = h.app.state.agent_rows(false);
     assert!(

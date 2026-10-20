@@ -6,6 +6,7 @@ use orch_tui::backend::{FakeBackend, make_agent, make_team};
 use orch_tui::messages::{MsgType, PendingMessage};
 use orch_tui::state::{DetailPanel, Focus, ViewId};
 use orch_tui::theme::Token;
+use orch_tui::widgets::help_overlay::AGENTS_HELP;
 use ratatui::crossterm::event::KeyCode;
 
 fn agents() -> Vec<Agent> {
@@ -53,18 +54,27 @@ fn ids(h: &Harness) -> Vec<&str> {
 }
 
 #[test]
-fn original_preserves_status_then_source_order_without_timestamps() {
+fn the_default_is_status_ascending_with_source_order_ties() {
+    // Idle before Error; the three Idle agents keep their source order.
     assert_eq!(ids(&harness()), ["b", "a2", "a1", "z"]);
 }
 
 #[test]
-fn every_field_sorts_in_both_directions_with_name_and_id_ties() {
+fn every_field_sorts_in_both_directions_with_source_order_ties() {
+    // `o` presses from the default: Status, Name, Adapter/Model, Task, Caps,
+    // Where, Runs, Updated. No agent has a task, caps, runs or a timestamp,
+    // so those four are all-blank: every agent ties, in source order, both
+    // ways.
+    let blank = || vec!["z", "b", "a2", "a1"];
     let cases = [
-        (0, vec!["b", "a2", "a1", "z"], vec!["z", "a1", "a2", "b"]),
-        (1, vec!["a1", "a2", "b", "z"], vec!["z", "b", "a1", "a2"]),
-        (2, vec!["a1", "a2", "b", "z"], vec!["z", "a1", "a2", "b"]),
-        (3, vec!["a1", "a2", "b", "z"], vec!["z", "b", "a1", "a2"]),
-        (4, vec!["b", "a1", "a2", "z"], vec!["z", "a1", "a2", "b"]),
+        (0, vec!["b", "a2", "a1", "z"], vec!["z", "b", "a2", "a1"]),
+        (1, vec!["a2", "a1", "b", "z"], vec!["z", "b", "a2", "a1"]),
+        (2, vec!["a2", "a1", "b", "z"], vec!["z", "b", "a2", "a1"]),
+        (3, blank(), blank()),
+        (4, blank(), blank()),
+        (5, vec!["b", "a2", "a1", "z"], vec!["z", "a2", "a1", "b"]),
+        (6, blank(), blank()),
+        (7, blank(), blank()),
     ];
     for (cycles, asc, desc) in cases {
         let mut h = harness();
@@ -78,14 +88,14 @@ fn every_field_sorts_in_both_directions_with_name_and_id_ties() {
 }
 
 #[test]
-fn reset_restores_original_and_keeps_the_selected_agent() {
+fn reset_restores_the_default_and_keeps_the_selected_agent() {
     let mut h = harness();
-    h.app.state.agent_selected = 1; // a2 in original order.
+    h.app.state.agent_selected = 1; // a2 in the default order.
     h.key('o');
-    assert_eq!(ids(&h), ["a1", "a2", "b", "z"]);
+    assert_eq!(ids(&h), ["a2", "a1", "b", "z"]);
     assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
     h.key('O');
-    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
+    assert_eq!(ids(&h), ["z", "b", "a2", "a1"]);
     assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
     h.key('0');
     assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
@@ -93,13 +103,16 @@ fn reset_restores_original_and_keeps_the_selected_agent() {
 }
 
 #[test]
-fn cycle_wraps_to_original_without_losing_direction() {
+fn cycle_wraps_to_status_without_losing_direction() {
+    use orch_tui::state::AgentSortField;
     let mut h = harness();
     h.key('O');
-    for _ in 0..5 {
+    for _ in 0..8 {
         h.key('o');
     }
-    assert_eq!(ids(&h), ["z", "a1", "a2", "b"]);
+    assert_eq!(h.app.state.agent_sort.field, AgentSortField::Status);
+    assert!(h.app.state.agent_sort.descending);
+    assert_eq!(ids(&h), ["z", "b", "a2", "a1"]);
 }
 
 #[test]
@@ -143,21 +156,25 @@ fn sorting_works_with_detail_open_and_keeps_its_agent() {
     h.press(KeyCode::Enter).key('o');
     assert_eq!(h.app.state.detail, DetailPanel::Entity);
     assert_eq!(h.app.state.selected_agent().unwrap().id, "b");
-    assert_eq!(ids(&h), ["a1", "a2", "b", "z"]);
+    assert_eq!(ids(&h), ["a2", "a1", "b", "z"]);
 }
 
 #[test]
-fn sort_chips_are_clickable_and_help_describes_the_keys() {
+fn sort_headers_are_clickable_and_help_describes_the_keys() {
     let mut h = harness();
-    h.draw().click_text("o sort");
-    assert_eq!(ids(&h), ["a1", "a2", "b", "z"]);
-    h.draw().click_text("O asc");
-    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
-    h.draw().click_text("0 reset");
+    h.draw().click_text("NAME");
+    assert_eq!(ids(&h), ["a2", "a1", "b", "z"]);
+    h.draw().click_text("NAME");
+    assert_eq!(ids(&h), ["z", "b", "a2", "a1"]);
+    h.key('0');
     assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
+    assert!(h.text().contains("STATUS↑"));
     h.key('?');
     let text = h.text();
-    assert!(text.contains("o sort; O reverse; 0 original"), "{text}");
+    assert!(
+        text.contains("o sort; O reverse; 0 default order"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -167,10 +184,12 @@ fn adapter_sort_handles_missing_empty_and_trimmed_models() {
     h.app.state.agents[1].config.model = Some("  ".into());
     h.app.state.agents[2].config.model = Some(" model ".into());
     h.app.state.agents[3].config.model = Some("model".into());
-    h.key('o').key('o').key('o');
-    assert_eq!(ids(&h), ["b", "z", "a1", "a2"]);
+    h.key('o').key('o');
+    // No model and a blank model are the same empty model: z and b tie, in
+    // source order; a trimmed model ties with the bare one.
+    assert_eq!(ids(&h), ["z", "b", "a2", "a1"]);
     h.key('O');
-    assert_eq!(ids(&h), ["a1", "a2", "b", "z"]);
+    assert_eq!(ids(&h), ["a2", "a1", "z", "b"]);
 }
 
 #[test]
@@ -188,10 +207,10 @@ fn status_sort_covers_every_status_rank() {
     .collect();
     let mut h = Harness::with(FakeBackend::new().with_agents(agents));
     h.app.state.view = ViewId::Agents;
-    h.key('o').key('o');
-    assert_eq!(ids(&h), ["4", "3", "2", "1", "0"]);
+    // ACTIVE, IDLE, ERROR, OFFLINE, DISABLED.
+    assert_eq!(ids(&h), ["4", "3", "2", "0", "1"]);
     h.key('O');
-    assert_eq!(ids(&h), ["0", "1", "2", "3", "4"]);
+    assert_eq!(ids(&h), ["1", "0", "2", "3", "4"]);
 }
 
 #[test]
@@ -225,18 +244,34 @@ fn sorting_reveals_the_preserved_selection_in_the_shorter_agent_body() {
 }
 
 #[test]
-fn every_sort_chip_is_visible_and_clickable_at_minimum_width() {
+fn every_sort_is_named_at_minimum_width() {
+    // At 40 columns only STATUS, NAME and RUNS have a column: the other
+    // fields are named, with their direction, by a clickable footer hint.
     let mut h = Harness::sized(FakeBackend::new().with_agents(agents()), 40, 14);
     h.app.state.view = ViewId::Agents;
-    for _ in 0..5 {
-        let text = h.text();
-        assert!(text.contains("0 reset"), "{text}");
-        for needle in ["o sort", "O asc", "0 reset"] {
-            let (x, y) = h.find_text(needle).unwrap();
-            assert!(matches!(
-                h.zone_at(x, y).unwrap().kind,
-                orch_tui::hit::ZoneKind::Verb(_)
-            ));
+    for _ in 0..8 {
+        for _ in 0..2 {
+            let text = h.text();
+            let sort = h.app.state.agent_sort;
+            let arrow = if sort.descending { '↓' } else { '↑' };
+            let header = text
+                .lines()
+                .find(|l| l.contains("STATUS") && l.contains("NAME"))
+                .unwrap();
+            if !header.contains(arrow) {
+                let hint = format!("o {}{arrow}", sort.field.label());
+                let Some((x, y)) = h.find_text(&hint) else {
+                    panic!("{hint:?} missing:\n{text}");
+                };
+                assert!(
+                    matches!(
+                        h.zone_at(x, y).unwrap().kind,
+                        orch_tui::hit::ZoneKind::FooterHint(_)
+                    ),
+                    "{hint:?} is not clickable:\n{text}"
+                );
+            }
+            h.key('O');
         }
         h.key('o');
     }
@@ -265,7 +300,7 @@ fn sort_and_follow_keys_keep_independent_state_in_agents_view() {
     h.draw().press(KeyCode::Up);
     assert!(!h.app.state.activity_follow_tail);
     h.key('o').key('O');
-    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
+    assert_eq!(ids(&h), ["z", "b", "a2", "a1"]);
     assert!(!h.app.state.activity_follow_tail);
     let sort = h.app.state.agent_sort;
     h.press(KeyCode::End);
@@ -282,7 +317,7 @@ fn sort_and_follow_keys_keep_independent_state_in_agents_view() {
 }
 
 #[test]
-fn name_and_location_sort_ignore_case_then_break_ties_by_raw_name_and_id() {
+fn name_and_location_sort_ignore_case_then_keep_source_order() {
     use orch_tui::state::{AgentSort, AgentSortField};
     for field in [AgentSortField::Name, AgentSortField::Location] {
         let agents = [
@@ -308,16 +343,16 @@ fn name_and_location_sort_ignore_case_then_break_ties_by_raw_name_and_id() {
             field,
             descending: false,
         });
-        assert_eq!(ids(&h), ["upper", "a1", "a2", "b", "z"], "{field:?}");
+        assert_eq!(ids(&h), ["a2", "a1", "upper", "b", "z"], "{field:?}");
         h.app.state.set_agent_sort(AgentSort {
             field,
             descending: true,
         });
-        assert_eq!(ids(&h), ["z", "b", "upper", "a1", "a2"], "{field:?}");
+        assert_eq!(ids(&h), ["z", "b", "a2", "a1", "upper"], "{field:?}");
     }
 }
 
-// ── Group by team | node ───────────────────────────────────────────────────
+// ── Grouping ────────────────────────────────────────────────────────────────
 
 /// [`agents`] with one link state per alias, as the loader writes it, plus a
 /// team that By node must ignore.
@@ -336,13 +371,13 @@ fn group_by_node_sections() {
     let mut h = node_harness();
     h.key('o'); // Name ascending.
     // By team: the team section leads.
-    assert_eq!(ids(&h), ["z", "a1", "a2", "b"]);
+    assert_eq!(ids(&h), ["z", "a2", "a1", "b"]);
 
     h.key('b');
     assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Node);
     // Local first, then the aliases in alias order; the sort applies inside
     // each section, and the team no longer groups anything.
-    assert_eq!(ids(&h), ["b", "a1", "a2", "z"]);
+    assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
     let rows = h.app.state.agent_rows(true);
     let node = |alias: Option<&str>, online: bool, count: usize| AgentRow::NodeSection {
         alias: alias.map(str::to_string),
@@ -360,11 +395,12 @@ fn group_by_node_sections() {
     assert_eq!(rows.len(), 8);
     assert_eq!(h.app.state.agent_section_rows(), 3);
 
-    // Descending reverses inside the sections, never the sections.
+    // Descending never moves a section (and equal statuses keep source
+    // order both ways).
     h.key('0');
     assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
     h.key('O');
-    assert_eq!(ids(&h), ["b", "a1", "a2", "z"]);
+    assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
 
     // The headers on screen, each node marked online or offline.
     let text = h.draw().text();
@@ -486,19 +522,19 @@ fn group_by_team_keeps_two_teams_of_one_name_apart() {
 #[test]
 fn group_by_node_preserves_selection() {
     let mut h = node_harness();
-    h.app.state.agent_selected = 2; // a2 in original team order: z, b, a2, a1.
+    h.app.state.agent_selected = 2; // a2 in team order: z, b, a2, a1.
     assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
     h.key('o').key('O'); // Name descending.
     assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
-    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
-    assert_eq!(h.app.state.agent_selected, 3);
-    h.key('b');
-    assert_eq!(ids(&h), ["b", "a1", "a2", "z"]);
+    assert_eq!(ids(&h), ["z", "b", "a2", "a1"]);
     assert_eq!(h.app.state.agent_selected, 2);
-    assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
     h.key('b');
-    assert_eq!(ids(&h), ["z", "b", "a1", "a2"]);
-    assert_eq!(h.app.state.agent_selected, 3);
+    assert_eq!(ids(&h), ["b", "a2", "a1", "z"]);
+    assert_eq!(h.app.state.agent_selected, 1);
+    assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
+    h.key('B');
+    assert_eq!(ids(&h), ["z", "b", "a2", "a1"]);
+    assert_eq!(h.app.state.agent_selected, 2);
     assert_eq!(h.app.state.selected_agent().unwrap().id, "a2");
 
     // The add-agent row stays selected across both directions.
@@ -506,7 +542,7 @@ fn group_by_node_preserves_selection() {
     h.key('b');
     assert!(h.app.state.selected_agent().is_none());
     assert_eq!(h.app.state.agent_selected, h.app.state.agents.len());
-    h.key('b');
+    h.key('B');
     assert_eq!(h.app.state.agent_selected, h.app.state.agents.len());
 }
 
@@ -542,14 +578,18 @@ fn group_by_node_reveals_the_preserved_selection() {
 }
 
 #[test]
-fn group_by_toggle_key() {
+fn group_by_keys_chip_and_help() {
     use orch_tui::state::AgentGroupBy;
-    let mut h = node_harness();
+    let mut h = Harness::sized(FakeBackend::new().with_agents(agents()), 120, 30);
+    h.app.state.view = ViewId::Agents;
     assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
     h.key('b');
     assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Node);
     h.key('B');
     assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+    h.key('B');
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::None);
+    h.key('b');
 
     // `0` resets the sort, not the grouping, and `b` leaves the sort alone.
     h.key('b').key('o').key('O');
@@ -557,80 +597,158 @@ fn group_by_toggle_key() {
     h.key('b').key('b');
     assert_eq!(h.app.state.agent_sort, sort);
     h.key('0');
-    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Node);
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Adapter);
 
-    // The chip toggles it and names the current mode.
+    // The header chip and the footer hint name the mode; the chip cycles it.
     let text = h.draw().text();
-    assert!(text.contains("b group:Node"), "{text}");
-    h.click_text("b group:Node");
-    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+    assert!(text.contains("GROUP: Adapter"), "{text}");
+    assert!(text.contains("b Adapter"), "{text}");
+    h.click_text("GROUP: Adapter");
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Caps);
     let text = h.draw().text();
-    assert!(text.contains("b group:Team"), "{text}");
+    assert!(text.contains("GROUP: Caps"), "{text}");
 
-    // Help names the key.
+    // Help names the keys.
     h.key('?');
     let text = h.text();
-    assert!(text.contains("b group by team/node"), "{text}");
+    assert!(text.contains("b/B change the grouping"), "{text}");
     h.key('x');
 
     // Inert outside the Agents view and while typing a command.
     h.app.state.view = ViewId::Tasks;
-    h.key('b');
-    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+    h.key('b').key('B');
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Caps);
     h.app.state.view = ViewId::Agents;
     h.key('/').type_str("bB");
-    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+    assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Caps);
 }
 
 #[test]
-fn group_chip_is_visible_and_clickable_at_minimum_width() {
+fn group_mode_hint_is_visible_and_clickable_at_minimum_width() {
     use orch_tui::state::AgentGroupBy;
+    // At 40 columns there is no header chip; the footer leads with the mode
+    // and cycles it through all six, whatever the sort.
     let mut h = Harness::sized(FakeBackend::new().with_agents(agents()), 40, 14);
     h.app.state.view = ViewId::Agents;
-    let mut compact_seen = false;
-    for mode in [AgentGroupBy::Team, AgentGroupBy::Node] {
-        assert_eq!(h.app.state.agent_group_by, mode);
-        let full = format!("b group:{}", mode.label());
-        let compact = format!("b {}", mode.label().to_lowercase());
-        for _ in 0..5 {
-            for _ in 0..2 {
-                let text = h.text();
-                let direction = if h.app.state.agent_sort.descending {
-                    "O desc"
-                } else {
-                    "O asc"
-                };
-                // Full labels where they fit, the compact form where not;
-                // either way every chip is whole and clickable.
-                let group = if text.contains(&full) {
-                    full.clone()
-                } else {
-                    compact_seen = true;
-                    compact.clone()
-                };
-                for needle in ["o sort", direction, "0 reset", group.as_str()] {
-                    let Some((x, y)) = h.find_text(needle) else {
-                        panic!("{needle:?} missing:\n{text}");
-                    };
-                    assert!(
-                        matches!(
-                            h.zone_at(x, y).unwrap().kind,
-                            orch_tui::hit::ZoneKind::Verb(_)
-                        ),
-                        "{needle:?} is not a chip:\n{text}"
-                    );
-                }
-                h.key('O');
-            }
-            h.key('o');
-        }
-        let chip = if h.text().contains(&full) {
-            full
-        } else {
-            compact
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        let mode = h.app.state.agent_group_by;
+        seen.push(mode);
+        let text = h.text();
+        assert!(!text.contains("GROUP:"), "{text}");
+        let hint = format!("b {}", mode.label());
+        let Some((x, y)) = h.find_text(&hint) else {
+            panic!("{hint:?} missing:\n{text}");
         };
-        h.click_text(&chip);
+        assert!(
+            matches!(
+                h.zone_at(x, y).unwrap().kind,
+                orch_tui::hit::ZoneKind::FooterHint(_)
+            ),
+            "{hint:?} is not clickable:\n{text}"
+        );
+        h.key('o').key('O');
+        h.click_text(&hint);
     }
-    assert!(compact_seen, "40 columns never needed the compact bar");
+    assert_eq!(
+        seen,
+        [
+            AgentGroupBy::Team,
+            AgentGroupBy::Node,
+            AgentGroupBy::Status,
+            AgentGroupBy::Adapter,
+            AgentGroupBy::Caps,
+            AgentGroupBy::None,
+        ]
+    );
     assert_eq!(h.app.state.agent_group_by, AgentGroupBy::Team);
+}
+
+// ── The help overlay's Agents lines (adjudication-v2 Issue 1, RT-D3) ───────
+
+/// The help overlay at `width`×`height` over the Agents view.
+fn help_screen(width: u16, height: u16) -> String {
+    let mut h = Harness::sized(FakeBackend::new().with_agents(agents()), width, height);
+    h.app.state.view = ViewId::Agents;
+    h.key('?');
+    h.text()
+}
+
+/// The [`AGENTS_HELP`] block as it reads on `screen`: its rows, consecutive,
+/// trimmed.
+#[track_caller]
+fn agents_help_block(screen: &str) -> Vec<String> {
+    let rows: Vec<&str> = screen.lines().collect();
+    let first = rows
+        .iter()
+        .position(|line| line.contains(AGENTS_HELP[0]))
+        .unwrap_or_else(|| panic!("the first Agents help line is not on screen:\n{screen}"));
+    rows[first..]
+        .iter()
+        .take(AGENTS_HELP.len())
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+#[test]
+fn help_agents_lines_word_the_rulings_verbatim_once_each() {
+    let wrapped = AGENTS_HELP.join(" ");
+    assert_eq!(
+        [
+            // RT-D3, as adjudication-v2 words it.
+            "grouped by first capability; use the filter to find every agent with a capability",
+            // Issue 1: the question UPDATED answers, and what `T` means.
+            "UPDATED: which agent's run or assignment record changed most recently",
+            "T: assigned task record updated; may be an administrative change, not proof the agent ran",
+            "R: run",
+            "b/B change the grouping",
+        ]
+        .map(|phrase| wrapped.matches(phrase).count()),
+        [1; 5],
+        "{wrapped:?}"
+    );
+}
+
+#[test]
+fn help_agents_lines_fit_inside_the_box_border() {
+    let long: Vec<(usize, &str)> = AGENTS_HELP
+        .iter()
+        .map(|line| (line.chars().count(), *line))
+        .filter(|(cells, _)| *cells > 74)
+        .collect();
+    assert!(long.is_empty(), "wider than the 74-cell box: {long:?}");
+}
+
+// The default terminal size: every Agents line, and the box's own title,
+// dismiss hint and both borders, are on screen with nothing past column 80.
+#[test]
+fn help_shows_the_agents_lines_and_the_whole_box_at_80x24() {
+    let screen = help_screen(80, 24);
+    assert_eq!(agents_help_block(&screen), AGENTS_HELP, "{screen}");
+    let missing: Vec<&str> = [
+        "KEYBOARD SHORTCUTS",
+        "Press any key to dismiss",
+        "╭",
+        "╯",
+        "Inspector",
+        "Elapsed*: start to now",
+    ]
+    .into_iter()
+    .filter(|needle| !screen.contains(needle))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "missing {missing:?} at 80x24:\n{screen}"
+    );
+    assert!(
+        screen.lines().all(|line| line.chars().count() <= 80),
+        "{screen}"
+    );
+}
+
+#[test]
+fn help_shows_the_agents_lines_at_120x40() {
+    let screen = help_screen(120, 40);
+    assert_eq!(agents_help_block(&screen), AGENTS_HELP, "{screen}");
+    assert!(screen.contains("Press any key to dismiss"), "{screen}");
 }

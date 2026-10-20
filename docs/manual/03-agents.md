@@ -362,9 +362,9 @@ An unknown ID is an error:
 
 The dashboard shows agents as a table, with their status, task and model, and has a wizard for adding one. Press the agent action keys from the main list.
 
-![The Agents view: a table of agents grouped by team, with each agent's status, adapter and model, platform, location and run results](images/dashboard-agents.png)
+![The Agents view: a table of agents grouped by team, with each agent's status, name, adapter and model, capabilities, location, runs and last update](images/dashboard-agents.png)
 
-*The Agents view. The sort controls sit above the table; the team lead is marked with a star.*
+*The Agents view, grouped by team. Click a column header to sort; the `GROUP: Team` chip at the end of the header row names the grouping. The team lead is marked with a star.*
 
 ![The New Agent wizard on step 1 of 6, asking for the agent name, with a list of agent templates to browse below the input](images/dashboard-new-agent.png)
 

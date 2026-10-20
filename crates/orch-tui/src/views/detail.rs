@@ -1,19 +1,19 @@
 //! Sectioned inspectors. The rail and optional overview pin are chrome;
 //! metrics describe only the independently navigable section body.
 
-use orch_domain::{AdapterErrorKind, TaskStatus, error_hint};
+use orch_domain::{AdapterErrorKind, Agent, TaskStatus, error_hint};
 use ratatui::{Frame, layout::Rect, text::Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::backend::CopyOutcome;
-use crate::format::{format_duration, parse_timestamp_ms};
+use crate::format::{format_duration, format_started, parse_observation_ms, parse_timestamp_ms};
 use crate::hit::{FooterAction, PaneMetrics, VerbId, ZoneId, ZoneKind};
 use crate::messages::Message;
-use crate::state::SortColumn;
 use crate::state::{
     AgentSection, AppState, CopyOrigin, EntityType, Focus, GoalSection, LogSection, TaskSection,
 };
+use crate::state::{SortColumn, UpdatedSource, agent_caps_text};
 use crate::theme::{EM_DASH, Token};
 use crate::views::activity::{RowGroups, row_spans};
 use crate::views::tasks::{TaskColumns, render_task_row};
@@ -227,7 +227,8 @@ fn dash_or(text: String) -> String {
     }
 }
 
-fn overview_block(state: &AppState, focus: Focus) -> Option<OverviewBlock> {
+/// `now_ms` dates the Agent Overview's `updated` and `live` rows.
+fn overview_block(state: &AppState, focus: Focus, now_ms: i64) -> Option<OverviewBlock> {
     use crate::theme::{
         agent_status_token, goal_status_token, priority_token, remote_phase_token,
         task_status_token,
@@ -404,6 +405,24 @@ fn overview_block(state: &AppState, focus: Focus) -> Option<OverviewBlock> {
                 ),
                 OverviewField::new("team", team, Token::Silver),
             ]);
+            // Every capability (the Caps grouping files the agent under its
+            // first only) and the node, readable at any width.
+            let node = match agent.remote.as_ref() {
+                Some(remote) => format!(
+                    "{} {}",
+                    remote.alias,
+                    if remote.online { "online" } else { "offline" }
+                ),
+                None => "local".to_string(),
+            };
+            rows.push(vec![
+                OverviewField::new("caps", dash_or(agent_caps_text(agent)), Token::Silver),
+                OverviewField::new("node", node, Token::Silver),
+            ]);
+            rows.push(vec![agent_updated_field(state, agent, now_ms)]);
+            if let Some(live) = agent_live_field(state, agent, now_ms) {
+                rows.push(vec![live]);
+            }
             if agent.autonomous == Some(true) {
                 rows.push(vec![OverviewField::new("auto", "↻ ON", Token::Green)]);
             }
@@ -422,6 +441,78 @@ fn overview_block(state: &AppState, focus: Focus) -> Option<OverviewBlock> {
         }
         _ => None,
     }
+}
+
+/// The Agent Overview's `updated` row: the UPDATED column's value, with
+/// its source in words. `T` is only a task record changing, which an
+/// assignment or an edit does too.
+fn agent_updated_field(state: &AppState, agent: &Agent, now_ms: i64) -> OverviewField {
+    let seen = state
+        .agents
+        .iter()
+        .position(|a| a.id == agent.id)
+        .and_then(|i| state.agent_updated_observations().get(i).copied().flatten());
+    let (text, token) = match seen {
+        Some(seen) => {
+            let age = format_started(seen.at_ms, now_ms);
+            match seen.source {
+                UpdatedSource::Run => (format!("R {age} · newest run start or event"), Token::Cyan),
+                UpdatedSource::Task => (
+                    format!(
+                        "T {age} · assigned task record updated; may be an \
+                         administrative change, not proof the agent ran"
+                    ),
+                    Token::Silver,
+                ),
+            }
+        }
+        None => {
+            // A run or task whose every time was rejected is still evidence
+            // that exists; say the time is what is missing.
+            let has_evidence = state
+                .orch_state
+                .running
+                .values()
+                .any(|entry| entry.agent_id == agent.id)
+                || state
+                    .tasks
+                    .iter()
+                    .any(|task| task.assignee.as_deref() == Some(agent.id.as_str()));
+            let why = if has_evidence {
+                "no valid run or task time"
+            } else {
+                "no live run or assigned task"
+            };
+            (format!("unknown — {why}"), Token::Dim)
+        }
+    };
+    OverviewField::new("updated", text, token)
+}
+
+/// The Agent Overview's `live` row, while the agent has a running entry:
+/// the time since the newest valid start among them (the RUNS cell shows
+/// lifetime statistics instead). Valid is [`parse_observation_ms`] at the
+/// sort clock, as for UPDATED: a start within its day of skew ahead reads
+/// `0s`; a malformed or absurd one is skipped, and `unknown` if none is left.
+fn agent_live_field(state: &AppState, agent: &Agent, now_ms: i64) -> Option<OverviewField> {
+    let starts: Vec<Option<i64>> = state
+        .orch_state
+        .running
+        .values()
+        .filter(|entry| entry.agent_id == agent.id)
+        .map(|entry| parse_observation_ms(&entry.started_at, state.sort_clock_ms))
+        .collect();
+    if starts.is_empty() {
+        return None;
+    }
+    let text = match starts.into_iter().flatten().max() {
+        Some(start) => format!(
+            "{} elapsed",
+            format_duration(now_ms.saturating_sub(start).max(0))
+        ),
+        None => "unknown".to_string(),
+    };
+    Some(OverviewField::new("live", text, Token::Cyan))
 }
 
 impl OverviewBlock {
@@ -462,8 +553,10 @@ impl OverviewBlock {
 }
 
 /// Plain lines for `section_text`: what the block says, without styling.
+/// The plain lines (copy, key-side row counts) date ages by the last refresh
+/// (`sort_clock_ms`): one line per row whatever the age reads.
 fn overview_text(state: &AppState, focus: Focus) -> Vec<String> {
-    let Some(block) = overview_block(state, focus) else {
+    let Some(block) = overview_block(state, focus, state.sort_clock_ms) else {
         return Vec::new();
     };
     let label = block.label_cells();
@@ -1059,7 +1152,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     if let Some(overview) = overview.filter(|o| *o != focus && body.height >= 6) {
         // The pin is the block's first two rows: the title rule and the
         // identity row, styled as in the focused block.
-        let pinned = match overview_block(state, overview) {
+        let pinned = match overview_block(state, overview, ctx.now_ms) {
             Some(block) => overview_lines(ctx, &block, body.width as usize, false),
             None => section_text(state, overview)
                 .iter()
@@ -1106,7 +1199,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     // The focused Overview draws its own wrapped block; its rows below are
     // placeholders, so scrolling counts exactly the rows drawn.
     let styled = is_overview(focus)
-        .then(|| overview_block(state, focus))
+        .then(|| overview_block(state, focus, ctx.now_ms))
         .flatten()
         .map(|block| overview_lines(ctx, &block, body.width as usize, true));
     let mut rows = Vec::new();
@@ -1430,6 +1523,104 @@ mod tests {
         };
         state.set_focus(Focus::GoalDetail(GoalSection::Tasks));
         state
+    }
+
+    /// The Agent Overview `live` row for agent `a` with one running entry
+    /// per start, judged and dated at 2026-10-19T00:00:00Z.
+    fn live_text(starts: &[&str]) -> Option<String> {
+        const NOW: i64 = 1_792_368_000_000;
+        let mut state = AppState {
+            sort_clock_ms: NOW,
+            agents: vec![crate::backend::make_agent(
+                "a",
+                "A",
+                orch_domain::AgentStatus::Running,
+            )],
+            ..AppState::default()
+        };
+        for (i, start) in starts.iter().enumerate() {
+            let entry = orch_domain::RunningEntry {
+                run_id: format!("r{i}"),
+                agent_id: "a".into(),
+                task_id: "t".into(),
+                pid: 1,
+                started_at: (*start).into(),
+                last_event_at: (*start).into(),
+                remote: None,
+            };
+            state.orch_state.running.insert(entry.run_id.clone(), entry);
+        }
+        let field = agent_live_field(&state, &state.agents[0], NOW)?;
+        Some(field.value.into_iter().map(|(text, _)| text).collect())
+    }
+
+    /// The `updated` row says which is missing: the evidence, or a valid
+    /// time on the evidence that exists.
+    #[test]
+    fn updated_unknown_says_whether_evidence_or_its_time_is_missing() {
+        const NOW: i64 = 1_792_368_000_000;
+        let text = |state: &AppState| -> String {
+            agent_updated_field(state, &state.agents[0], NOW)
+                .value
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect()
+        };
+        let mut state = AppState {
+            sort_clock_ms: NOW,
+            agents: vec![crate::backend::make_agent(
+                "a",
+                "A",
+                orch_domain::AgentStatus::Running,
+            )],
+            ..AppState::default()
+        };
+        assert_eq!(text(&state), "unknown — no live run or assigned task");
+        let entry = orch_domain::RunningEntry {
+            run_id: "r".into(),
+            agent_id: "a".into(),
+            task_id: "t".into(),
+            pid: 1,
+            started_at: "9999-12-31T23:59:59.999Z".into(),
+            last_event_at: "9999-12-31T23:59:59.999Z".into(),
+            remote: None,
+        };
+        state.orch_state.running.insert(entry.run_id.clone(), entry);
+        assert_eq!(text(&state), "unknown — no valid run or task time");
+        state.orch_state.running.clear();
+        let mut task = make_task("t", "t", TaskStatus::Todo);
+        task.assignee = Some("a".into());
+        task.updated_at = "2026-02-31T00:00:00.000Z".into();
+        state.tasks.push(task);
+        assert_eq!(text(&state), "unknown — no valid run or task time");
+    }
+
+    /// Adjudication v3, Ruling 1 (T27 as amended): a start within the day of
+    /// skew clamps to `0s`; an absurd one is skipped like a malformed one,
+    /// leaving the newest valid start, or `unknown`.
+    #[test]
+    fn live_skips_absurd_starts_and_clamps_modest_skew() {
+        assert_eq!(live_text(&[]), None);
+        assert_eq!(
+            live_text(&["2026-10-18T23:59:00.000Z"]).as_deref(),
+            Some("1:00 elapsed")
+        );
+        assert_eq!(
+            live_text(&["2026-10-19T01:00:00.000Z"]).as_deref(),
+            Some("0s elapsed")
+        );
+        assert_eq!(
+            live_text(&["9999-12-31T23:59:59.999Z"]).as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            live_text(&["1969-12-31T23:59:59Z", "2026-02-31T00:00:00Z"]).as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            live_text(&["9999-12-31T23:59:59.999Z", "2026-10-18T23:59:00.000Z"]).as_deref(),
+            Some("1:00 elapsed")
+        );
     }
 
     /// Draw only the inspector into `area` of a larger screen.

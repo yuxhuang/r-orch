@@ -97,6 +97,11 @@ pub enum FooterAction {
     /// `m` on the Agents tab: compose a message to the selection.
     Message,
     PauseGoal,
+    /// `b <Mode>` on the Agents tab: the next grouping.
+    AgentGroupBy,
+    /// `o <Field>` on the Agents tab, shown while the sorted column is
+    /// hidden at this width: the next sort field.
+    AgentSortField,
     ShowAllTasks,
     Delete,
     Undo,

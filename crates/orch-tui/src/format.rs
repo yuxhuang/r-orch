@@ -161,6 +161,82 @@ pub fn parse_timestamp_ms(ts: &str) -> Option<i64> {
     Some(((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000) + millis)
 }
 
+/// How far past the reference clock an observation may lie and still count:
+/// modest clock skew between machines, not an absurd date.
+pub const OBSERVATION_SKEW_MS: i64 = 86_400_000;
+
+/// [`parse_timestamp_ms`] behind a strict gate, for timestamps the Agents
+/// table treats as evidence (UPDATED and the Overview's `live` row).
+///
+/// Accepts exactly the form ORCH writes — `YYYY-MM-DDTHH:MM:SS`, an optional
+/// `.` and 1–9 fractional digits, then `Z` (`iso_from_epoch_ms` writes
+/// `.mmmZ`; `jiff::Timestamp`'s `Display` writes other fraction lengths) — for
+/// a real calendar date and time of day, between the epoch and `now_ms` plus
+/// [`OBSERVATION_SKEW_MS`]. Anything else is `None`, never clamped: no
+/// offsets, no trailing bytes, no Feb 30, no year 9999. The shared parser is
+/// left as permissive as its other callers expect.
+pub fn parse_observation_ms(ts: &str, now_ms: i64) -> Option<i64> {
+    let b = ts.as_bytes();
+    if !(20..=30).contains(&b.len()) || b[b.len() - 1] != b'Z' {
+        return None;
+    }
+    let digits = |range: std::ops::Range<usize>| b[range].iter().all(u8::is_ascii_digit);
+    let shape = digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        && b[10] == b'T'
+        && digits(11..13)
+        && b[13] == b':'
+        && digits(14..16)
+        && b[16] == b':'
+        && digits(17..19);
+    if !shape {
+        return None;
+    }
+    // Sub-millisecond digits are dropped; `.5` is 500 ms.
+    let fraction_ms = match &b[19..b.len() - 1] {
+        [] => 0,
+        [b'.', fraction @ ..]
+            if (1..=9).contains(&fraction.len()) && fraction.iter().all(u8::is_ascii_digit) =>
+        {
+            fraction
+                .iter()
+                .chain(std::iter::repeat(&b'0'))
+                .take(3)
+                .fold(0, |ms, d| ms * 10 + i64::from(d - b'0'))
+        }
+        _ => return None,
+    };
+    let field = |range: std::ops::Range<usize>| {
+        b[range]
+            .iter()
+            .fold(0_i64, |n, d| n * 10 + i64::from(d - b'0'))
+    };
+    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=month_days).contains(&day)
+        || field(11..13) > 23
+        || field(14..16) > 59
+        || field(17..19) > 59
+    {
+        return None;
+    }
+    // Whole seconds from the shared parser (the slice is checked ASCII).
+    let at = parse_timestamp_ms(&ts[..19])? + fraction_ms;
+    (0..=now_ms.saturating_add(OBSERVATION_SKEW_MS))
+        .contains(&at)
+        .then_some(at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +341,141 @@ mod tests {
         );
         assert_eq!(parse_timestamp_ms("nope"), None);
         assert_eq!(parse_timestamp_ms(""), None);
+    }
+
+    // ── parse_observation_ms (adjudication v3, Ruling 1) ──
+
+    /// 2026-10-19T00:00:00Z, the reference clock for these cases.
+    const NOW: i64 = 1_792_368_000_000;
+
+    #[test]
+    fn observation_rejects_text_that_is_not_a_timestamp() {
+        assert_eq!(parse_observation_ms("not-a-date", NOW), None);
+        assert_eq!(parse_observation_ms("", NOW), None);
+        assert_eq!(parse_observation_ms("😀😀😀😀😀😀😀😀😀😀", NOW), None);
+    }
+
+    #[test]
+    fn observation_rejects_year_9999() {
+        assert_eq!(parse_observation_ms("9999-12-31T23:59:59.999Z", NOW), None);
+    }
+
+    #[test]
+    fn observation_rejects_a_time_before_the_epoch() {
+        assert_eq!(parse_observation_ms("1969-12-31T23:59:59Z", NOW), None);
+    }
+
+    #[test]
+    fn observation_rejects_an_impossible_date_and_time() {
+        assert_eq!(parse_observation_ms("2026-02-31T99:99:99Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-02-31T00:00:00Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-10-19T24:00:00Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-10-19T00:60:00Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-10-19T00:00:60Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-13-01T00:00:00Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-00-01T00:00:00Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-04-31T00:00:00Z", NOW), None);
+    }
+
+    #[test]
+    fn observation_rejects_wrong_separators_and_trailing_bytes() {
+        assert_eq!(
+            parse_observation_ms("2026-10-19T00x00x00garbage", NOW),
+            None
+        );
+        assert_eq!(parse_observation_ms("2026-10-19 00:00:00Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-10-19T00:00:00", NOW), None);
+        assert_eq!(parse_observation_ms("2026-10-19T00:00:00.Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-10-19T00:00:00Zx", NOW), None);
+        assert_eq!(parse_observation_ms("+026-10-19T00:00:00Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-+1-19T00:00:00Z", NOW), None);
+    }
+
+    #[test]
+    fn observation_rejects_a_long_suffix() {
+        let long = format!("2026-10-19T00:00:00Z{}", "x".repeat(2000));
+        assert_eq!(parse_observation_ms(&long, NOW), None);
+        let long_fraction = format!("2026-10-19T00:00:00.{}Z", "1".repeat(2000));
+        assert_eq!(parse_observation_ms(&long_fraction, NOW), None);
+    }
+
+    #[test]
+    fn observation_accepts_the_epoch() {
+        assert_eq!(parse_observation_ms("1970-01-01T00:00:00Z", NOW), Some(0));
+        assert_eq!(
+            parse_observation_ms("1970-01-01T00:00:00.000Z", NOW),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn observation_accepts_what_orch_writes() {
+        assert_eq!(
+            parse_observation_ms("2026-10-19T00:00:00.000Z", NOW),
+            Some(NOW)
+        );
+        assert_eq!(
+            parse_observation_ms("2026-10-18T23:59:59.250Z", NOW),
+            Some(NOW - 750)
+        );
+    }
+
+    #[test]
+    fn observation_accepts_an_hour_ahead_but_not_25_hours() {
+        let hour = 3_600_000;
+        assert_eq!(
+            parse_observation_ms("2026-10-19T01:00:00Z", NOW),
+            Some(NOW + hour)
+        );
+        // The tolerance's edge is inclusive.
+        assert_eq!(
+            parse_observation_ms("2026-10-20T00:00:00Z", NOW),
+            Some(NOW + 24 * hour)
+        );
+        assert_eq!(parse_observation_ms("2026-10-20T00:00:00.001Z", NOW), None);
+        assert_eq!(parse_observation_ms("2026-10-20T01:00:00Z", NOW), None);
+    }
+
+    #[test]
+    fn observation_knows_leap_years() {
+        assert_eq!(
+            parse_observation_ms("2024-02-29T00:00:00Z", NOW),
+            parse_timestamp_ms("2024-02-29T00:00:00Z")
+        );
+        assert!(parse_observation_ms("2024-02-29T00:00:00Z", NOW).is_some());
+        assert_eq!(parse_observation_ms("2023-02-29T00:00:00Z", NOW), None);
+        assert!(parse_observation_ms("2000-02-29T00:00:00Z", NOW).is_some());
+        assert_eq!(parse_observation_ms("2100-02-29T00:00:00Z", i64::MAX), None);
+    }
+
+    #[test]
+    fn observation_accepts_one_to_nine_fractional_digits_only() {
+        let base = parse_timestamp_ms("2026-10-18T12:00:00Z").unwrap();
+        assert_eq!(
+            parse_observation_ms("2026-10-18T12:00:00.5Z", NOW),
+            Some(base + 500)
+        );
+        assert_eq!(
+            parse_observation_ms("2026-10-18T12:00:00.12Z", NOW),
+            Some(base + 120)
+        );
+        assert_eq!(
+            parse_observation_ms("2026-10-18T12:00:00.123456789Z", NOW),
+            Some(base + 123)
+        );
+        assert_eq!(
+            parse_observation_ms("2026-10-18T12:00:00.1234567890Z", NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn observation_rejects_an_offset_form() {
+        // No producer in `crates/` writes these fields with an offset.
+        assert_eq!(parse_observation_ms("2026-10-18T12:00:00+00:00", NOW), None);
+        assert_eq!(
+            parse_observation_ms("2026-10-18T12:00:00.000+00:00", NOW),
+            None
+        );
     }
 }

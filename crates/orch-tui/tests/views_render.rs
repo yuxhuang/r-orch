@@ -387,10 +387,14 @@ fn agent_with_error(kind: &str, message: &str) -> FakeBackend {
 
 #[test]
 fn v034_the_row_shows_the_mapped_hint_not_the_raw_message() {
-    let mut harness = harness_for(
-        ViewId::Agents,
+    // Wide enough that the task column holds a whole hint.
+    let width = orch_tui::views::agents::ERROR_WHOLE_FROM as u16;
+    let mut harness = Harness::sized(
         agent_with_error("adapter_not_found", "spawn claude ENOENT"),
+        width,
+        30,
     );
+    harness.app.state.view = ViewId::Agents;
     harness.assert_text("CLI is not installed.");
     harness.refute_text("spawn claude ENOENT");
 }
