@@ -168,17 +168,24 @@ A task's Started is its earliest retained run record, which is written while the
 moment an agent process launched; a goal's Started is its creation time. Ordering by Elapsed re-sorts on a refresh
 or a list-control change, while the time the column shows stays live between those.
 
-In Agents, `o` cycles the sort field through Original, Name, Status, Adapter/Model and Location; `O` switches
-ascending/descending, and `0` resets to Original ascending. The sort chips above the list offer the same controls.
-Sorting preserves team sections and the selected agent, and lasts only for this dashboard session. Original is
-exactly the previous team/status/source order: agents have no created/updated timestamps. Original descending
-reverses that order within each section while keeping the sections in place. Name and Location compare
-case-insensitively, with raw agent name and ID breaking ties.
+The Agents table's columns are STATUS, NAME, ADAPTER/MODEL, TASK, CAPS, WHERE, RUNS and UPDATED, and `o` steps
+through all eight. Its default order, which `0` restores, is STATUS ascending: active, idle, error, offline, then
+disabled. Agents with equal values keep their configured order and blanks (`—`) sort last, in both directions. RUNS
+is the agent's lifetime runs as completed/total, for example `1/1 ✓`. UPDATED tells you which agent's run or
+assignment record changed most recently, not when the agent last worked: `R <age>` is the newest start or event of
+its live run, `T <age>` the newest update of a task assigned to it (possibly an administrative change such as an
+edit or approval), and `R` wins over `T`. While UPDATED is the sort column the footer reads `R run · T task`.
+Narrower than 93 columns, UPDATED, CAPS or both are hidden; a sort by a hidden column still applies, and the
+footer names it, for example `o Caps↑`.
 
-`b` (or the `b group:` chip) switches the Agents sections between By team (the default) and By node: a Local
-section for this instance's agents, then one section per remote alias in alias order, each marked online or
-offline. The sort still applies within each section, `0` leaves the grouping alone, and the selected agent stays
-selected. Like the sort, the grouping lasts only for this dashboard session.
+`b` moves the Agents table to the next grouping and `B` to the previous one: Team (the default), Node, Status,
+Adapter, Caps and None. Node puts a `LOCAL` section first, then one section per remote alias in alias order, each
+marked online or offline. Caps lists each agent once, under its alphabetically first capability. The footer's first
+hint names the mode (`b Team`), and from 108 columns the header row ends with a `GROUP: <Mode>` chip; clicking
+either moves to the next mode. The sort orders agents within each section; the sort keys never change the grouping
+and `b`/`B` never change the sort, and the selected agent stays selected. Both last only for this dashboard
+session. The [dashboard manual](docs/manual/08-dashboard.md#sort-and-group-agents) has the full column and
+grouping reference.
 
 Wizard steps that pick an agent (task and goal assignee, team lead and members) filter as you type: letters
 narrow the numbered list to agents whose name, adapter or role contains them, `Backspace` edits the filter and
@@ -187,13 +194,14 @@ and Status, as the filter row shows. Auto-assign/None stays first; only a listed
 
 `Ctrl+K` on the Goals, Tasks or Agents list opens a keyword filter (`/` stays the command bar). The list narrows
 as you type, case-insensitively, on each row's ID, title or name, status (stored and shown: `in_progress` or
-`RUN`), assignee or agent name and ID, and the task's goal or the agent's team, adapter, model and node; never on
-descriptions or the Started/Elapsed text. It filters before the sort, grouping and the ten-task limit, so the ten
-tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten
-matches, `show all` lists the rest. A section with no match disappears, and counts read `matches/total`.
-`Enter` keeps the keyword, shown as a `filter:` chip on the list's title rule; `Esc` in the prompt, `Ctrl+U` on
-the list or a click on the chip clears it. The selected row stays selected while it still matches. Each list keeps
-its own keyword, up to 256 characters, for this dashboard session; control characters in pasted text are dropped.
+`RUN`), assignee or agent name and ID, and the task's goal or the agent's team, adapter, model, node and every
+capability; never on descriptions or the Started/Elapsed text. It filters before the sort, grouping and the
+ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not
+lost; with more than ten matches, `show all` lists the rest. A section with no match disappears, and counts read
+`matches/total`. `Enter` keeps the keyword, shown as a `filter:` chip on the list's title rule; `Esc` in the
+prompt, `Ctrl+U` on the list or a click on the chip clears it. The selected row stays selected while it still
+matches. Each list keeps its own keyword, up to 256 characters, for this dashboard session; control characters
+in pasted text are dropped.
 
 The Activity panel, ACTIONS list and task-detail Activity follow new entries at the tail. Scrolling up pauses
 following so you can read older entries. Resume with `End`, scroll down to the bottom with the wheel or
