@@ -95,12 +95,12 @@ The dashboard has four views. The tab for the current view is upper case in the 
 |---|---|---|
 | Goals | `G` | [Goals](02-concepts.md#goals) and their progress. |
 | Tasks | `T` | [Tasks](02-concepts.md#tasks). This is the default view. |
-| Agents | `A` | [Agents](02-concepts.md#agents-and-adapters) as a table, grouped by team. |
+| Agents | `A` | [Agents](02-concepts.md#agents-and-adapters) as a table, grouped by team by default. |
 | Actions | `L` | The log of everything agents and the orchestrator did, with filters. |
 
-![The Agents view: a table of agents grouped by team, with each agent's status, adapter and model, platform, location and run results](images/dashboard-agents.png)
+![The Agents view: a table of agents grouped by team, with each agent's status, name, adapter and model, capabilities, location, runs and last update](images/dashboard-agents.png)
 
-*The Agents view. The sort controls sit above the table; the team lead is marked with a star.*
+*The Agents view, grouped by team. Click a column header to sort; the `GROUP: Team` chip at the end of the header row names the grouping. The team lead is marked with a star.*
 
 To switch views:
 
@@ -168,10 +168,10 @@ The Goals, Tasks and Agents lists have a column header row. Each list keeps its 
 |---|---|
 | `o` | Moves the sort to the next column, keeping the direction. |
 | `O` | Reverses the direction, keeping the column. |
-| `0` | Restores that list's default order. |
+| `0` | Restores that list's default order. In Agents that is STATUS ascending. |
 | Click a header | An inactive column sorts by it ascending; the active column flips its direction. |
 
-The active column is marked `↑` or `↓`.
+The active column is marked `↑` or `↓`. When a column is too narrow for its whole label, the label is cut and the arrow stays, for example `ADAPTER/…↑`. For what each Agents column sorts by, see [Sort and group agents](#sort-and-group-agents).
 
 Goals and Tasks also have a Started and an Elapsed* column, both blank for an entity that never started.
 
@@ -181,18 +181,97 @@ A task's Started is its earliest retained run record, which is written while the
 
 ## Sort and group agents
 
-In the Agents view you can sort and group the table for this session. The chips above the list offer the same controls.
+The Agents list is a table with one header row, like Goals and Tasks. You sort it with the keys in [Sort the lists](#sort-the-lists) and cut it into sections with `b`. The sort and the grouping are separate: the sort orders the agents inside each section, and neither one resets the other. Both keep the selected agent selected, and both last only until you close the dashboard.
 
-| Key | What it does |
+This is the Agents view of a small project in a 120-column terminal, grouped by team and in the default order:
+
+```text
+━━━ > AGENTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STATUS↑       NAME           ADAPTER/M… TASK                 CAPS       WHERE             RUNS UPDATED     GROUP: Team
+─── ◈ PLATFORM · 5 agents · ★ Ada ──────────────────────────────────────────────────────────────────────────────────────
+▸ ○ IDLE        Builder        shell      —                    macos      local            1/1 ✓ T 1m
+  ○ IDLE        Tester         shell      —                    macos      local            1/1 ✓ T 1m
+  ○ IDLE        Grace          codex/gpt… —                    macos      local                — —
+  ○ IDLE        Linus          opencode   —                    macos      local                — —
+  ○ IDLE     ⟳★ Ada            claude/cl… —                    macos      local                — —
+ ◇ UNASSIGNED · 3 agents
+  ○ IDLE        Reviewer       shell      —                    macos      local            1/1 ✓ T 19s
+  ○ IDLE        Flaky          shell      —                    macos      local            0/1 ✓ T 1m
+  ○ IDLE        Margaret       cursor     —                    macos      local                — —
+    + add agent...
+…
+b Team     ↑↓   Tab panes; ←→ views   / cmd  ^K filter  N new  E edit  S stop  U auto on  m msg  D delete  Enter detail
+```
+
+### The columns
+
+| Column | What it shows | Ascending order |
+|---|---|---|
+| STATUS | `ACTIVE` (with a spinner), `IDLE`, `ERROR`, `OFFLINE`, or `OFF` for a disabled agent. After it, `⟳` marks an agent in autonomous mode and `★` the lead of its team. | ACTIVE, IDLE, ERROR, OFFLINE, disabled. This is the default sort. |
+| NAME | The agent's name. | Alphabetical, ignoring case. |
+| ADAPTER/MODEL | The adapter, then `/` and the model if one is set. | By adapter, then by model. |
+| TASK | The title of the task an active agent is running. For an agent in `ERROR` it shows the error instead. | By task title. Rows with no running task count as blank. |
+| CAPS | Every capability of the agent, comma-separated. | Alphabetical by the cell's text. An agent with no capability counts as blank. |
+| WHERE | `local`, or the remote alias with its online or offline state. | `local` and the remote aliases, alphabetically. |
+| RUNS | Lifetime runs as completed/total, for example `1/1 ✓`. An agent that has never run shows `—`. | By total runs. |
+| UPDATED | Which agent's run or assignment record changed most recently (see below). | Oldest first. |
+
+Rules that hold for every column:
+
+- Agents with equal values keep their configured order, in both directions.
+- Blank values (`—`) sort last, in both directions.
+- RUNS shows lifetime statistics for an active agent too. The elapsed time of its live run is in the agent's detail: press `Enter` and read the `live` row of the Overview.
+
+### What UPDATED means
+
+UPDATED answers "which agent's run or assignment record changed most recently". It does not tell you when the agent last did anything. Each cell starts with a letter that says where the time comes from:
+
+| Cell | Source |
 |---|---|
-| `o` | Cycles the sort field: Original, Name, Status, Adapter/Model, Location. |
-| `O` | Switches between ascending and descending. |
-| `0` | Resets the sort to Original, ascending. The grouping is not changed. |
-| `b` | Switches the sections between By team (the default) and By node. |
+| `R <age>` | The newest start or event of the agent's live run. Only an agent with a run in progress has one. |
+| `T <age>` | The newest update of a task currently assigned to the agent. The assigned task record was updated; that may be an administrative change, such as an edit, an approval or a new assignment, and is not proof that the agent ran. |
+| `—` | Neither: no live run and no assigned task. |
 
-By team shows each active team, then the unassigned agents. By node shows a Local section for this instance's agents, then one section per remote alias in alias order, each marked online or offline.
+`R` wins over `T`, even when the task changed later. While UPDATED is the sort column, the footer spells out the letters as `R run · T task`. The agent's Overview has an `updated` row that gives the same value in words, for example:
 
-Sorting applies within each section and keeps the selected agent, and so does switching the grouping. Both last only until you close the dashboard. Original is the default order (section, then status, then source).
+```text
+updated  T 2m · assigned task record updated; may be an administrative change, not proof the agent ran
+```
+
+### Group the table
+
+Press `b` to move to the next grouping and `B` to move back. The modes come in this order and then start again:
+
+| Mode | Sections |
+|---|---|
+| Team (the default) | One section per active team, with its lead after `★`, then `◇ UNASSIGNED` for agents in no team. |
+| Node | `LOCAL` for this instance's agents, then one section per remote alias in alias order, marked `● online` or `○ offline`. |
+| Status | ACTIVE, IDLE, ERROR, OFFLINE, DISABLED, in that order. |
+| Adapter | One section per adapter, alphabetical. |
+| Caps | Grouped by first capability: each agent appears once, under its alphabetically first capability, and `◇ no caps` comes last. To find every agent with a capability, use the [keyword filter](#filter-a-list-by-keyword), which matches every capability. |
+| None | One table with no section rows. |
+
+A section with no agents is not drawn. Each section row counts its agents, for example `─── ◈ PLATFORM · 5 agents · ★ Ada ───`.
+
+The mode is always on screen:
+
+- **Footer.** The first hint in the footer names the mode, for example `b Team`. (While mouse capture is off, `⌨ mouse off · F2` comes before it.) Click it to move to the next mode, like `b`. This hint is there at every width.
+- **Header chip.** When the table is at least 108 columns wide, the header row ends with a `GROUP: <Mode>` chip, for example `GROUP: Team`. Click it to move to the next mode. Below 108 columns there is no chip.
+
+### Narrow terminals
+
+As the terminal gets narrower, UPDATED is the first column to go, then CAPS:
+
+- From 108 columns: every column and the `GROUP:` chip.
+- From 93 to 107 columns: every column, no chip.
+- From 84 to 92 columns: every column but UPDATED.
+- At 80 columns: STATUS, NAME, ADAPTER/MODEL, TASK, WHERE and RUNS.
+
+A sort by a column that is not shown still applies. The footer then names it after the mode, and a click on it moves the sort to the next column, like `o`. This is the footer at 80 columns while the list is sorted by CAPS:
+
+```text
+b Team     o Caps↑  ↑↓   Tab panes; ←→ views   / cmd  ^K filter  N new  E edit
+```
 
 ## Filter a list by keyword
 
@@ -207,7 +286,7 @@ On the Goals, Tasks or Agents list, press `Ctrl+K` (or click `^K filter` in the 
 | `Esc` | Clear the keyword and close the prompt. |
 | `Ctrl+U` | On the list: clear the keyword. |
 
-Matching ignores case and looks at each field on its own: the ID, the title or name, the status (both `in_progress` and the `RUN` the row shows), the assignee's or agent's name and ID, a task's goal, and an agent's team, adapter, model and node (`local` or the remote alias). Descriptions and the Started and Elapsed times are not searched.
+Matching ignores case and looks at each field on its own: the ID, the title or name, the status (both `in_progress` and the `RUN` the row shows), the assignee's or agent's name and ID, a task's goal, and an agent's team, adapter, model, node (`local` or the remote alias) and every capability. Descriptions and the Started and Elapsed times are not searched.
 
 A kept keyword shows as a `filter: … · matches/total` chip on the list's title rule; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten matches, `show all` lists the rest (`▼ Show all (2 more) — press S`). Empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard. The Tasks keyword does not narrow a goal's [Tasks section](#a-goals-tasks-section). `/` still opens the command bar.
 
@@ -428,7 +507,7 @@ Mouse capture takes click-drag text selection away from the terminal. To get it 
 - In most terminals you can hold `Shift` while dragging. **This does not work under tmux.** Use `F2` there.
 - Start with the mouse off: `ORCH_TUI_MOUSE=0 orch`.
 
-Under tmux, clicks reach the dashboard only if you set `set -g mouse on`. While capture is off the footer shows `⌨ F2 mouse`.
+Under tmux, clicks reach the dashboard only if you set `set -g mouse on`. While capture is off the footer starts with `⌨ mouse off · F2`.
 
 ## Get help and quit
 
@@ -504,7 +583,10 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | `D` | Delete the agent. |
 | `U` | Turn autonomous mode on or off. |
 | `m` | Message the agent (lower case only). |
-| `o`, `O`, `0` | Cycle the sort field, reverse the order, reset. |
+| `o`, `O`, `0` | Move the sort to the next column, reverse the direction, reset to STATUS ascending. |
+| Click a header | Sort by that column ascending, or flip the direction of the active column. |
+| `b`, `B` | Next or previous grouping: Team, Node, Status, Adapter, Caps, None. Upper case `B` goes back. |
+| Click `b <Mode>` in the footer, or the `GROUP:` chip | Next grouping, like `b`. |
 
 ### Goals view (main list focus)
 
