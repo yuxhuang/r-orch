@@ -125,6 +125,10 @@ fn backend(agents: Vec<Agent>, runs: Vec<(String, RunningEntry)>, tasks: Vec<Tas
 fn agents_view(b: FakeBackend, now_ms: i64, width: u16, height: u16) -> Harness {
     let mut h = Harness::sized(b, width, height);
     h.clock.set_ms(now_ms);
+    // The app samples its sort/validation clock with the data (start-up and
+    // every refresh); mirror a start-up at `now_ms` so the fixture's data and
+    // that clock agree, as they do in the running app.
+    h.app.state.sort_clock_ms = now_ms;
     h.app.state.view = ViewId::Agents;
     h
 }
