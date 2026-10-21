@@ -9,7 +9,8 @@ and [`deny.toml`](deny.toml) limits which licences they may use.
 
 | Component | Upstream | Licence | Files in this tree |
 |---|---|---|---|
-| ORCH | [oxgeneral/ORCH](https://github.com/oxgeneral/ORCH) | MIT | `skills/library/`, `crates/orch-domain/src/shop/`, `crates/orch-infra/src/template/*.liquid`, `fixtures/shop/`, `fixtures/prompts/`, `fixtures/adapters/` |
+| ORCH | [oxgeneral/ORCH](https://github.com/oxgeneral/ORCH) | MIT | `crates/` (Rust source and ported tests, translated from ORCH's TypeScript), `skills/library/`, `crates/orch-domain/src/shop/`, `crates/orch-infra/src/template/*.liquid`, `fixtures/shop/`, `fixtures/prompts/`, `fixtures/adapters/` |
+| gstack | [garrytan/gstack](https://github.com/garrytan/gstack) | MIT | `skills/library/*.md` (modified by ORCH), the skill text in `fixtures/prompts/_skills.json` |
 | xterm.js (`@xterm/xterm` 5.5.0) | [xtermjs/xterm.js](https://github.com/xtermjs/xterm.js) | MIT | `crates/orch-cli/src/web/assets/xterm.js`, `xterm.css`, `LICENSE-xterm.txt` |
 | `@xterm/addon-fit` 0.10.0 | [xtermjs/xterm.js](https://github.com/xtermjs/xterm.js) | MIT | `crates/orch-cli/src/web/assets/addon-fit.js`, `LICENSE-addon-fit.txt` |
 
@@ -22,10 +23,16 @@ When you add material that originates outside this project, add a row and a sect
   of. Checked at commit `c066dc013e98e08d753ce204e604e04621dd4167`.
 - **Licence:** MIT (the repository's `LICENSE` file; `package.json` declares `"license": "MIT"`).
 - **Copyright:** Copyright (c) 2026 Agents Organizations Contributors.
-- **Files:**
-  - `skills/library/*.md`: the 26 library skills, unmodified copies of ORCH's `skills/library/` (byte-identical
-    at the commit above). The licence is also at [`skills/library/LICENSE-MIT`](skills/library/LICENSE-MIT), so
-    it travels with copies of that directory.
+- **Files:** r-orch's Rust source began as a translation of ORCH's TypeScript source; those portions and the
+  files listed below are derived from ORCH and are used under the MIT License below.
+  - `crates/`: the Rust source, including the tests ported from ORCH's `test/` suites. The module structure,
+    domain model, state machine (for example `crates/orch-domain/src/transitions.rs`, from ORCH's
+    `src/domain/transitions.ts`), config schema and CLI and TUI text began as a translation of ORCH's `src/`;
+    most of today's code is r-orch's own work built on that core.
+  - `skills/library/*.md`: the 26 library skills, copies of ORCH's `skills/library/` (byte-identical at the
+    commit above). ORCH adapted them from gstack's skills, so they are also covered by the [gstack](#gstack)
+    notice. Both licences are also in [`skills/library/LICENSE-MIT`](skills/library/LICENSE-MIT), so they travel
+    with copies of that directory.
   - `crates/orch-domain/src/shop/`: the agent-shop and organization-shop catalogues and the role prompts in
     `roles/*.md`, copied from ORCH's `src/domain/agent-shop.ts`, `src/domain/org-shop.ts` and
     `src/domain/default-agents.ts`.
@@ -40,6 +47,42 @@ When you add material that originates outside this project, add a row and a sect
 MIT License
 
 Copyright (c) 2026 Agents Organizations Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## gstack
+
+- **Upstream:** https://github.com/garrytan/gstack, Garry Tan's collection of agent skills. Compared at commit
+  `407b15692073dfd8aaff13e755d99a6022ff8ae5`, the last gstack commit before ORCH added its skill library.
+- **Licence:** MIT (the repository's `LICENSE` file).
+- **Copyright:** Copyright (c) 2026 Garry Tan.
+- **Files:**
+  - `skills/library/*.md`: ORCH's adaptations of gstack's `<skill>/SKILL.md` files (`upgrade.md` comes from
+    `gstack-upgrade/SKILL.md`). ORCH modified them, removing gstack's preamble and telemetry blocks; r-orch ships
+    ORCH's modified copies unchanged. ORCH's changelog describes them as "adapted from gstack".
+  - `fixtures/prompts/_skills.json`: golden snapshots that embed the text of the skills above.
+
+```text
+MIT License
+
+Copyright (c) 2026 Garry Tan
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
