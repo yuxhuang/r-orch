@@ -11,8 +11,8 @@ cargo build && docs/manual/tools/gen-command-reference.sh
 
 `gen-command-reference.sh` runs `orch init` in a throwaway directory under the system temp dir (with its own
 `HOME`), collects `orch … --help` for every command, and has `command_reference.py` rewrite
-`../14-command-reference.md`. Pass a different binary as the first argument. Needs Python 3 (standard library
-only).
+`../14-command-reference.md`, stamped with the version that `orch --version` prints. Pass a different binary as
+the first argument. Needs Python 3 (standard library only).
 
 ## Screenshots
 

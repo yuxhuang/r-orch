@@ -2,7 +2,7 @@
 """Render docs/manual/14-command-reference.md from the `orch --help` tree dump."""
 import re, sys
 
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, version = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(src).read()
 parts = re.split(r'^=================== orch ?(.*)$', text, flags=re.M)
 cmds = []
@@ -34,8 +34,8 @@ chapter = {
     'config': ('12-configuration-and-output.md', 'Configuration and output'),
 }
 special = {'agent shop': ('10-templates-and-shop.md', 'Templates and the agent shop')}
-# orch 0.8.0's --help has no summary, or a wrong one, for these commands; the descriptions come from
-# docs/org-templates.md. Drop an entry once the command's own help is fixed.
+# orch's --help (still in 0.9.3) has no summary, or a wrong one, for these commands; the descriptions come
+# from docs/org-templates.md. Drop an entry once the command's own help is fixed.
 summary_override = {
     'org template': 'Manage organization templates: list, show, create and change them',
     'org deploy': 'Deploy a template: create its agents, a team and an optional goal',
@@ -49,7 +49,7 @@ summary_override = {
 cmds = [(path, summary_override.get(path, about), usage) for path, about, usage in cmds]
 
 # Where --help overstates what the command does in this version.
-caveat = {'update': 'In 0.8.0 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md).'}
+caveat = {'update': f'In {version} it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md).'}
 
 def cell(s):
     return s.replace('|', '\\|')
@@ -117,7 +117,7 @@ for t in order:
     w('')
 w('---')
 w('')
-w('This page is generated from the `--help` output of orch 0.8.0. If it and `--help` ever disagree, `--help` is')
+w(f'This page is generated from the `--help` output of orch {version}. If it and `--help` ever disagree, `--help` is')
 w('right; see [About this manual](about-this-manual.md#keeping-the-manual-accurate).')
 open(dst, 'w').write('\n'.join(out) + '\n')
 print(len(cmds), 'commands')
