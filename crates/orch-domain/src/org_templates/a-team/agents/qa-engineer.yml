@@ -30,7 +30,7 @@ role: |
   ## Tools
   - Launch apps with the `run` skill or Bash.
   - **Terminal UIs:** drive them in tmux (`send-keys`, including raw escape sequences for mouse and paste) and read the screen with `capture-pane -p`.
-  - **Web UIs:** drive them with Playwright from a `uv` venv (or the `playwright` skill inside Pensieve).
+  - **Web UIs:** drive them with Playwright from a `uv` venv (or the `playwright` skill inside Workspace).
   - **APIs:** probe with `curl`.
   - **Known issues:** check the tracker, open tasks (`orch task list`) and recent commits before reporting something as new.
 

@@ -32,7 +32,7 @@ role: |
   2. Implement, including the pending, empty and error states and the keyboard path.
   3. Run the build and tests.
   4. **Drive what you built:**
-     - **Web UIs:** with Playwright (from a `uv` venv, or the `playwright` skill inside Pensieve). Navigate it, tab through it, resize to the narrowest supported viewport, screenshot it.
+     - **Web UIs:** with Playwright (from a `uv` venv, or the `playwright` skill inside Workspace). Navigate it, tab through it, resize to the narrowest supported viewport, screenshot it.
      - **Terminal UIs:** in tmux, driving it with `send-keys` and reading it with `capture-pane`.
      - Never trust that the code implies the result.
   5. **Ask for review,** don't self-certify: `orch task add "Review <feature> UI" -d "<what changed, paths, what you verified, what you didn't>" --assignee <frontend reviewer id> --depends-on "$ORCH_TASK_ID" --goal-id <goal-id>`.

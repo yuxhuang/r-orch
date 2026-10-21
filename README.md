@@ -370,7 +370,7 @@ orch org template update my-team -f org.json                # replace org.yml fr
 `update` replaces a file from a complete JSON or YAML document and `patch` applies an RFC 7396 merge patch; both read
 a file or stdin, validate the whole template first and write one file atomically. `--yaml` works wherever `--json`
 does. Builtins are read-only (copy them with `init --from`). Deploying is **not transactional**: a failure part way
-names the agents and team that were already created. The a-team assumes agent CLIs, skills and a sibling `../pensieve`
+names the agents and team that were already created. The a-team assumes agent CLIs, skills and a sibling `../workspace`
 directory that `deploy` does not check. The format, precedence rules, error messages, repair of a broken template,
 limits and prerequisites are in [docs/org-templates.md](docs/org-templates.md); runnable templates and mutation
 inputs are in [examples/org-templates/](examples/org-templates/).

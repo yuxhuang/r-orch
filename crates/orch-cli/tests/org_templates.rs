@@ -531,7 +531,13 @@ fn builtin_bundle_carries_no_personal_paths_or_identities() {
     let shown = sb.json(&["org", "template", "show", "builtin:a-team", "--resolved"]);
     let text = shown.to_string();
     let found: Vec<&str> = [
-        "/Users/", "/home/", "felix", "yuxhuang", "gzfelix", "2com", "192.168.",
+        "/Users/",
+        "/home/",
+        "192.168.",
+        "10.0.",
+        "@gmail",
+        "ssh://",
+        "git@github.com:",
     ]
     .into_iter()
     .filter(|needle| text.contains(needle))

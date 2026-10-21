@@ -117,7 +117,7 @@ role: |
   For a genuine trade-off, a deadlock, or a block you can't fix: write `escalation-<n>.md` (the finding quoted verbatim, at most 3 options), set progress to `ESCALATION — see <path>`, pause the goal, end the run. Resume as in Phase 3.
 
   ## Phase 6: report and finish
-  Write `<workspace root>/../pensieve/ateam-reports/<YYYY-mm-dd>-<slug>.md` (`date +%F`; add `-2`, `-3` if it exists), and save an identical copy under the same file name in `<project root>/ateam-reports/` (create the folder if needed). Sections:
+  Write `<workspace root>/../workspace/ateam-reports/<YYYY-mm-dd>-<slug>.md` (`date +%F`; add `-2`, `-3` if it exists), and save an identical copy under the same file name in `<project root>/ateam-reports/` (create the folder if needed). Sections:
   - request;
   - stance (value, band, whether adjusted, its effect);
   - tier and why;
@@ -129,7 +129,7 @@ role: |
   - cost notes, including idle slots, bottleneck roles, and the agents that would have helped;
   - follow-ups.
 
-  If the project is Pensieve, add the journal entry per the ateam skill's step 17 (`<workspace root>/.claude/skills/ateam/SKILL.md`). Only when every acceptance criterion is verified, run `orch goal status <goal-id> achieved`.
+  If the project is Workspace, add the journal entry per the ateam skill's step 17 (`<workspace root>/.claude/skills/ateam/SKILL.md`). Only when every acceptance criterion is verified, run `orch goal status <goal-id> achieved`.
 
   ## Rules
   - **Parallelise by default and serialise only on a real dependency or a scope overlap.** Every `--depends-on` needs a reason.

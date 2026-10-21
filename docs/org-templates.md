@@ -131,7 +131,7 @@ Its exact text is:
 
 > `<workspace root>` means the owning orch project root (the directory containing .orchestry), not the per-task
 > checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the
-> lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites;
+> lead instead of guessing from cwd. Sibling ../workspace destinations and named skills are deployment prerequisites;
 > edit the template for other layouts.
 
 A role with an **empty closure** is deployed byte for byte as written, even if it contains `<workspace root>`.
@@ -421,7 +421,8 @@ A deployed a-team assumes the following. `deploy` does not check any of it.
 - **`<workspace root>`** in a role means the directory that contains `.orchestry/`, not the per-task checkout. The
   addendum tells each agent to establish it from the task or context and to report to the lead rather than guess from
   its working directory.
-- Some destinations are written relative to that root as **`<workspace root>/../pensieve/…`** (for example
+- Some destinations are written relative to that root as **`<workspace root>/../workspace/…`** (a sibling directory
+  named `workspace` beside the project root, not the root itself; for example
   `specs/` and `ateam-reports/` in the orchestrator and technical-writer roles) and as `<project root>/ateam-reports/`.
   The directory beside your project root must exist, or those roles must be edited for your layout.
 
