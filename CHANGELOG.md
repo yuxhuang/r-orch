@@ -5,6 +5,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-21
+
+Manual and dashboard patch release: the user manual describes 0.9.3, and grouped lists keep a section's header in
+view. No peer-protocol change, so 0.5.x through 0.9.4 peers can be mixed.
+
 ### Changed
 - The user manual in [docs/manual/](docs/manual/README.md) now describes orch 0.9.3: task attachments, the a-team's `../workspace` and `.worktrees` wording, the Agents table, keyword filter and other 0.9.x dashboard changes, a regenerated command reference and screenshots, and the 0.9.3 behaviour of the limits it lists.
 
@@ -209,7 +214,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/yuxhuang/r-orch/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/yuxhuang/r-orch/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/yuxhuang/r-orch/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/yuxhuang/r-orch/compare/v0.9.0...v0.9.1
