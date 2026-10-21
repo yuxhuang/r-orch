@@ -3623,17 +3623,12 @@ impl AppState {
             })
             .collect();
         fn reveal(selected: usize, offset: usize, rows: &[usize], total: usize, h: usize) -> usize {
-            let mut offset = offset.min(total.saturating_sub(h));
-            if h > 0
-                && let Some(row) = rows.get(selected)
-            {
-                if *row < offset {
-                    offset = *row;
-                } else if *row >= offset.saturating_add(h) {
-                    offset = row.saturating_add(1).saturating_sub(h);
-                }
+            let offset = offset.min(total.saturating_sub(h));
+            if h > 0 && selected < rows.len() {
+                crate::navigation::reveal(offset, selected, rows, h)
+            } else {
+                offset
             }
-            offset
         }
         let task_display_rows = self.task_rows(can_create).len();
         let agent_display_rows = self.agent_rows(can_create).len();
@@ -3849,6 +3844,93 @@ mod tests {
         state.tasks.truncate(3);
         assert_eq!(state.add_task_row_index(true), Some(3));
         assert_eq!(state.task_selection_max(true), 3);
+    }
+
+    /// Pins the main list's viewport to `height` rows, as the last frame
+    /// would have, for `clamp_all` to reveal against.
+    fn pin_main_list(state: &mut AppState, items: usize, display_rows: usize, height: u16) {
+        let key = state.pane_key(Focus::MainList);
+        state.mouse.hits.metrics.panes = vec![crate::hit::PaneMetrics {
+            key,
+            body: ratatui::layout::Rect::new(0, 5, 80, height),
+            items,
+            display_rows,
+            selection_rows: Vec::new(),
+        }];
+    }
+
+    #[test]
+    fn refresh_reveals_the_section_header_of_a_selected_first_agent() {
+        let mut state = AppState::default();
+        state.height = 40;
+        state.view = ViewId::Agents;
+        state.agent_group_by = AgentGroupBy::Status;
+        state.agents = vec![
+            make_agent("a0", "run-0", AgentStatus::Running),
+            make_agent("a1", "run-1", AgentStatus::Running),
+            make_agent("a2", "idle-2", AgentStatus::Idle),
+            make_agent("a3", "idle-3", AgentStatus::Idle),
+        ];
+        // Header 0, agents 1 2, header 3, agents 4 5.
+        let rows = state.agent_rows(false);
+        assert!(
+            matches!(rows[3], AgentRow::StatusSection { .. }),
+            "{rows:?}"
+        );
+        assert!(matches!(
+            rows[4],
+            AgentRow::Agent {
+                index: 2,
+                selection: 2
+            }
+        ));
+        // Above the viewport, and on its top row with the header cut off.
+        for scroll in [5, 4] {
+            state.agent_selected = 2;
+            state.agent_scroll = scroll;
+            pin_main_list(&mut state, 4, 6, 2);
+            state.clamp_all(false);
+            assert_eq!(state.agent_scroll, 3, "from offset {scroll}");
+        }
+        // The first agent of the list brings row 0 back.
+        state.agent_selected = 0;
+        state.agent_scroll = 1;
+        pin_main_list(&mut state, 4, 6, 2);
+        state.clamp_all(false);
+        assert_eq!(state.agent_scroll, 0);
+        // A header already in view is left alone.
+        state.agent_selected = 3;
+        state.agent_scroll = 4;
+        pin_main_list(&mut state, 4, 6, 2);
+        state.clamp_all(false);
+        assert_eq!(state.agent_scroll, 4);
+    }
+
+    #[test]
+    fn refresh_reveals_the_goal_header_of_a_selected_first_task() {
+        let mut state = AppState::default();
+        state.height = 40;
+        state.view = ViewId::Tasks;
+        state.group_by_goal = true;
+        state.goals = vec![make_goal("goal_1", "Ship it", GoalStatus::Active)];
+        let mut tasks: Vec<Task> = (0..4)
+            .map(|i| make_task(&format!("tsk_{i}"), &format!("t{i}"), TaskStatus::Todo))
+            .collect();
+        tasks[0].goal_id = Some("goal_1".into());
+        tasks[1].goal_id = Some("goal_1".into());
+        state.tasks = tasks;
+        // Goal header 0, tasks 1 2, ungrouped header 3, tasks 4 5.
+        let rows = state.task_rows(false);
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert!(
+            matches!(rows[3], TaskRow::UngroupedSection { .. }),
+            "{rows:?}"
+        );
+        state.task_selected = 2;
+        state.task_scroll = 4;
+        pin_main_list(&mut state, 4, 6, 2);
+        state.clamp_all(false);
+        assert_eq!(state.task_scroll, 3);
     }
 
     #[test]
