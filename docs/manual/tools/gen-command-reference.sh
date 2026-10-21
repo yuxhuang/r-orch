@@ -40,4 +40,6 @@ walk() {
 }
 walk > "$dump"
 
-python3 -I "$here/command_reference.py" "$dump" "$manual/14-command-reference.md"
+version="$("$orch" --version)"
+version="${version##* }"
+python3 -I "$here/command_reference.py" "$dump" "$manual/14-command-reference.md" "$version"

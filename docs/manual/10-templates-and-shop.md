@@ -168,6 +168,9 @@ orch org deploy a-team --goal "Ship the release"
 - Your agent CLI provides the skills the roles name, such as `review`, `qa`, `ship` and `feature-dev:feature-dev`. orch does not install skills. A missing skill only shows when an agent tries to use it.
 - A directory called `workspace` exists next to your project root (`../workspace`). Several roles write specs and reports there.
 - Roles that refer to `<workspace root>` mean the directory that contains `.orchestry/`.
+- The lead (`orchestrator`) creates git work trees under `<repo root>/.worktrees`, as its role tells it to.
+
+> **Note:** Before orch 0.9.3, the a-team named a different sibling directory, and its lead said `.worktree`. A copy you made with `orch org template init --from a-team`, and agents you already deployed, keep that old wording. Rename your sibling directory to `workspace`, or edit the copy and the deployed agents.
 
 To use the a-team in another layout, copy it and edit the copy (see below). The full list of skills is in [docs/org-templates.md](../org-templates.md#prerequisites).
 

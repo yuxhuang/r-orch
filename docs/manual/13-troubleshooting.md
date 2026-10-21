@@ -10,7 +10,7 @@ This chapter helps you when something does not work. Find your symptom, read the
 - [The web dashboard](#the-web-dashboard)
 - [Remote agents](#remote-agents)
 - [Templates and files](#templates-and-files)
-- [Known gaps in v0.8.0](#known-gaps-in-v080)
+- [Known gaps in v0.9.3](#known-gaps-in-v093)
 - [Get more detail](#get-more-detail)
 
 ## Setup and project
@@ -72,7 +72,7 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 - **Cause.** One of these:
   1. Nothing is dispatching. orch runs tasks only while an orchestrator runs (`orch serve`, `orch run --watch`, or the dashboard in `WATCHING` mode), or when you run a task by hand.
   2. The task has no enabled agent, or its agent is busy or disabled.
-  3. Another `todo` task is assigned to the same agent. In 0.8.0 `orch run <task-id>` then does nothing.
+  3. Another `todo` task is assigned to the same agent. In 0.9.3 `orch run <task-id>` then does nothing.
 - **Do.** Start an orchestrator, or run `orch run <task-id>`. In the dashboard, type `/watch`. For the third cause, cancel or reassign the other task, or use `orch run --all`. See [Run one task](07-running-and-monitoring.md#run-one-task).
 
 ### A task stays in `review` and `orch serve --once` never exits
@@ -234,11 +234,12 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 - **Do.** Copy the template with `orch org template init NAME --from builtin:a-team`, then change the copy.
 
-## Known gaps in v0.8.0
+## Known gaps in v0.9.3
 
 These are limits in the released version.
 
 - Copy and mouse selection in Terminal.app and iTerm2 were not checked by hand before release. If copying fails there, use **Copy on this host** or your terminal's own selection.
+- No automated test covers remote agents on two machines or a real network: the tests run every instance on one machine. Two machines were last checked by hand with v0.5.1, a macOS controller and a Linux worker on a local network.
 - Messages and task results between peers use plain TCP, with no authentication or encryption.
 - If writing to `claude`'s standard input fails after the first 32 KiB, `claude` can run with a cut-off prompt. orch logs a warning but does not report a run error.
 - The `cursor`, `opencode`, `agy` and `grok` adapters pass the prompt as a command-line argument, and `pi` passes its system prompt that way. On Linux they can hit the 128 KiB limit for one argument. `claude` and `codex` do not.

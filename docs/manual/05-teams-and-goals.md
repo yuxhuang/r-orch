@@ -29,12 +29,12 @@ A team is a named group of agents with one lead.
 
 ### What a team changes
 
-In orch 0.8.0 a team changes less than its name suggests. It does two things:
+In orch 0.9.3 a team changes less than its name suggests. It does two things:
 
 - It groups agents, so the dashboard can show them together.
 - It limits a broadcast message to the team's members: `orch msg broadcast --team <team-id>` ([Send a message to many agents](06-messages-and-context.md#send-a-message-to-many-agents)).
 
-In 0.8.0 the orchestrator does not use a team's task pool or its auto-claim setting, so a team never changes which agent gets a task. Assign work with `orch task assign` ([Assign a task](04-tasks.md#assign-a-task)).
+In 0.9.3 the orchestrator does not use a team's task pool or its auto-claim setting, so a team never changes which agent gets a task. Assign work with `orch task assign` ([Assign a task](04-tasks.md#assign-a-task)).
 
 | To | Run |
 |---|---|

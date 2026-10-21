@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Changed
+- The user manual in [docs/manual/](docs/manual/README.md) now describes orch 0.9.3: task attachments, the a-team's `../workspace` and `.worktrees` wording, the Agents table, keyword filter and other 0.9.x dashboard changes, a regenerated command reference and screenshots, and the 0.9.3 behaviour of the limits it lists.
+
 ## [0.9.3] - 2026-10-20
 
 Licence and template release: r-orch is now Apache-2.0, and the a-team template's directory names are fixed. No

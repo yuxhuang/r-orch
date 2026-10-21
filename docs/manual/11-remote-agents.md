@@ -1,6 +1,6 @@
 # Remote agents
 
-Remote agents let one machine hand tasks to agents that run on another machine running orch. Read this chapter when you want to use a second computer, for example a Linux box for tests, from your main project. You need two things before you start: orch 0.8.0 on both machines, and a network you trust (see the warning below).
+Remote agents let one machine hand tasks to agents that run on another machine running orch. Read this chapter when you want to use a second computer, for example a Linux box for tests, from your main project. You need two things before you start: orch 0.9.3 on both machines, and a network you trust (see the warning below).
 
 ## In this chapter
 

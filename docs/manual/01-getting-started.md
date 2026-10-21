@@ -80,10 +80,10 @@ Before you start, install `git` and Rust (with `rustup`). `rustup` reads the ver
    git clone https://github.com/yuxhuang/r-orch.git r-orch && cd r-orch
    ```
 
-2. Check out the release you want. This manual describes version 0.8.0.
+2. Check out the release you want. This manual describes version 0.9.3.
 
    ```sh
-   git checkout v0.8.0
+   git checkout v0.9.3
    ```
 
 3. Install the binaries.
@@ -101,10 +101,13 @@ Before you start, install `git` and Rust (with `rustup`). `rustup` reads the ver
    You should see:
 
    ```text
-   0.8.0
+   0.9.3
    ```
 
 Keep the cloned folder. orch finds its library skills in `skills/library` of the checkout it was built from.
+
+orch is open-source software under the Apache License 2.0; see `LICENSE` in the repository. Some bundled material,
+such as the library skills, keeps its own MIT licence; `THIRD-PARTY-NOTICES.md` in the repository lists it.
 
 To build without installing, run `cargo build --release`. The binaries are then in `target/release/`.
 
@@ -123,7 +126,7 @@ orch update
 ```
 
 ```text
-  orch update · version 0.8.0
+  orch update · version 0.9.3
 
   This build does not update itself.
   To install the latest version:
@@ -141,7 +144,7 @@ orch update
 In this tutorial you create a project, add an agent that prints a greeting, give it a task, run the task, and
 open the dashboard. The agent uses the `shell` adapter, so you do not need an AI CLI.
 
-The output below was captured from orch 0.8.0. The IDs in your output differ, because orch generates them.
+The output below was checked against orch 0.9.3. The IDs in your output differ, because orch generates them.
 
 Before you start, install orch (see [Install orch](#install-orch)) and `git`.
 

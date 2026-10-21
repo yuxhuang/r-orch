@@ -125,7 +125,7 @@ See [Update definitions from files](#update-definitions-from-files).
 | `defaults.agent.stall_timeout_ms` | How long a run may produce no output before orch stops it, in milliseconds. Applies while the orchestrator loop runs. | `600000` |
 | `defaults.agent.workspace_mode` | The workspace mode when neither the task nor the agent sets one: `shared`, `worktree` or `isolated`. | `worktree` |
 | `defaults.task.max_attempts` | The attempt limit a new task gets. | `3` |
-| `defaults.task.priority` | Stored, but not used in orch 0.8.0: `orch task add` gives a new task priority 3 unless you pass `-p`. | `3` |
+| `defaults.task.priority` | Stored, but not used in orch 0.9.3: `orch task add` gives a new task priority 3 unless you pass `-p`. | `3` |
 | `scheduling.poll_interval_ms` | How often the orchestrator checks the project, in milliseconds. | `10000` |
 | `scheduling.max_concurrent_agents` | How many local runs may go at the same time. Remote runs do not count. | `6` |
 | `scheduling.retry_base_delay_ms` | The wait before the first retry of a failed task. Each later retry doubles it. | `10000` |

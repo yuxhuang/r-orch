@@ -180,11 +180,11 @@ Check adapters and dependencies. Explained in [Running and monitoring](07-runnin
 
 ### orch update
 
-Check for updates and install the latest version. Explained in [Running and monitoring](07-running-and-monitoring.md). In 0.8.0 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md).
+Check for updates and install the latest version. Explained in [Running and monitoring](07-running-and-monitoring.md). In 0.9.3 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md).
 
 | Command | What it does | Usage |
 |---|---|---|
-| `orch update` | Check for updates and install the latest version. In 0.8.0 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md). | `orch update [OPTIONS]` |
+| `orch update` | Check for updates and install the latest version. In 0.9.3 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md). | `orch update [OPTIONS]` |
 
 ### orch tui
 
@@ -258,5 +258,5 @@ Manage configuration. Explained in [Configuration and output](12-configuration-a
 
 ---
 
-This page is generated from the `--help` output of orch 0.8.0. If it and `--help` ever disagree, `--help` is
+This page is generated from the `--help` output of orch 0.9.3. If it and `--help` ever disagree, `--help` is
 right; see [About this manual](about-this-manual.md#keeping-the-manual-accurate).

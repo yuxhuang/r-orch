@@ -67,7 +67,7 @@ An agent has one of five statuses. orch gives work only to `idle` agents.
 |---|---|
 | `idle` | Ready for work. |
 | `running` | Working on a task. |
-| `error` | Never set by orch 0.8.0. |
+| `error` | Never set by orch 0.9.3. |
 | `disabled` | You turned it off with `orch agent disable`. Turn it on again with `orch agent enable`. |
 | `offline` | A remote agent whose machine cannot be reached. |
 
@@ -85,7 +85,8 @@ A **task** is one piece of work for an agent. It has:
   against the agents' skills and roles;
 - optional dependencies (`--depends-on`). A task waits until every task it depends on is `done`;
 - an attempt limit (`--max-attempts`, default 3);
-- optional labels, a file scope, review criteria and a goal.
+- optional labels, a file scope, review criteria and a goal;
+- optional attached files (`--attach`), which orch copies into `.orchestry/attachments/<task id>/`.
 
 A **file scope** is a list of glob patterns such as `src/auth/**`. orch does not run two tasks at once when their
 scopes overlap.
@@ -160,7 +161,7 @@ The project default (`defaults.agent.approval_policy`) is `auto`. `orch agent ad
 except that `shell` agents are always `auto` unless you pass `--approval-policy`. The Agent Creator agent that
 `orch init` makes uses `suggest`.
 
-> **Note:** In orch 0.8.0, `suggest` and `manual` behave the same way: both leave a finished task in `review`.
+> **Note:** In orch 0.9.3, `suggest` and `manual` behave the same way: both leave a finished task in `review`.
 > Only `auto` is different.
 
 Tasks that orch creates for an [autonomous agent](#autonomy) are approved automatically.
