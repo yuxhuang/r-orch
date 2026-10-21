@@ -37,6 +37,15 @@ jobs:
           # Nothing here pushes; keep the token out of .git/config, which
           # build scripts and the cargo-deny container can read.
           persist-credentials: false
+      # terminfo (WTFPL only, not OSI) arrives with termwiz, which ratatui's
+      # `underline-color` default locks even though no backend activates it.
+      # cargo-deny below only sees the activated Linux graph, so it would pass
+      # with terminfo back in Cargo.lock. See the ratatui entry in Cargo.toml.
+      # The `test` stops a missing lockfile reading as a pass (grep exit 2).
+      - name: Cargo.lock has no termwiz/terminfo
+        run: |
+          test -s Cargo.lock
+          ! grep -qE '^name = "(terminfo|termwiz)"$' Cargo.lock
       # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
       # explicit version), so let rustup read the file: one pin, not two.
       - run: rustup toolchain install
