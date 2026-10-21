@@ -63,7 +63,7 @@ orch web
 
 You can also fill the variable from a password manager.
 
-> **Note:** `orch web` passes its environment to every dashboard session and to every local agent process those sessions start. Local runs inherit the full environment, and the filter for secret-looking names applies only to remote runs. Agents can therefore see the password. If agents you do not trust run in this project, use token mode on loopback instead.
+> **Note:** orch removes `ORCH_WEB_PASSWORD` from each dashboard session's environment, but any process that runs as your user, including a local agent, can read the environment of the running `orch web` process, for example with `ps eww`. Agents can therefore see the password. If agents you do not trust run in this project, use token mode on loopback instead.
 
 Rules for passwords:
 

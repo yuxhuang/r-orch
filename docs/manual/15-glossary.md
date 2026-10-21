@@ -22,13 +22,13 @@ A built-in catalogue of ready-made agent templates that you install one at a tim
 The agent setting (`suggest`, `auto` or `manual`) that decides whether a finished task waits for your approval.
 See [Review and approval](02-concepts.md#review-and-approval).
 
-**attempt**
-One try at a task. A task has an attempt limit (3 by default). When a task uses all its attempts, it becomes
-`failed`. See [Task lifecycle](02-concepts.md#task-lifecycle).
-
 **attachment**
 A file you attach to a task with `orch task add --attach`. orch copies it into
 `.orchestry/attachments/<task id>/`. See [Options for `orch task add`](04-tasks.md#options-for-orch-task-add).
+
+**attempt**
+One try at a task. A task has an attempt limit (3 by default). When a task uses all its attempts, it becomes
+`failed`. See [Task lifecycle](02-concepts.md#task-lifecycle).
 
 **autonomous agent**
 An agent that orch gives new tasks automatically when it is idle, based on active goals or its role. See

@@ -32,7 +32,7 @@ Find your goal in the table, then read the chapter. The table lists every chapte
 | Look up a word | [15. Glossary](15-glossary.md) | The terms this manual uses |
 
 Each chapter starts with what you can do after reading it. Commands are in `sh` blocks. The output below
-them was captured from orch 0.9.3, so your IDs and times differ.
+them was checked against orch 0.9.3, so your IDs and times differ.
 
 For how this manual was written and how to keep it accurate, see [About this manual](about-this-manual.md).
 

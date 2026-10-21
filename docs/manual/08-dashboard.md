@@ -83,7 +83,7 @@ listen off · controller none
 |---|---|
 | Header | The version, the project name, the four view tabs, and a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`. |
 | Second header line | The peer listen address, the connected controller and each remote's online state. See [Remote agents](11-remote-agents.md). |
-| Status counts | One chip for each task status that has tasks, such as `○ TODO 2`, and a `TEAMS` chip with the number of teams. |
+| Status counts | One chip for each task status that has tasks, except cancelled, such as `○ TODO 2`, and a `TEAMS` chip with the number of teams. |
 | Main list | The list for the current view: a column header row (the sort column is marked `↑` or `↓`), the rows, and a `+ add …` row at the end. In a new project a hint under the list suggests the next step, such as `◆ Press R to run task`. |
 | Detail panel | Opens under the list when you press `Enter`. |
 | Activity feed | Recent events. A label shows the filter and whether the feed is `following` or `paused`. |
@@ -380,13 +380,13 @@ Bracketed paste keeps newlines in the wizard and the command bar. A single paste
 
 ## Keep drafts and avoid losing edits
 
-If you leave a changed wizard, orch asks what to do. It also asks when you go back a step in a changed wizard; the prompt then starts `Leave this step?`, and Discard goes back one step:
+If you leave a changed wizard, orch asks what to do. It also asks when you go back a step in a changed wizard, including when you press `Esc` on its first step. That prompt starts `Leave this step?`, and **Discard and leave** goes back one step (on the first step, it closes the wizard):
 
-- **Continue** goes back to editing.
-- **Keep draft** saves the edits in memory so you can recover them later.
-- **Discard** drops them.
+- **Continue editing** goes back to editing.
+- **Keep draft and leave** saves the edits in memory so you can recover them later.
+- **Discard and leave** drops them.
 
-Choose with the arrow keys or `Tab`, then press `Enter`. `Esc` means Continue.
+Choose with the arrow keys or `Tab`, then press `Enter`. `Esc` means **Continue editing**.
 
 Drafts live only in the running dashboard. Limits: 20 drafts, 256 KiB each, 2 MiB in total. A full store refuses a new draft rather than deleting an old one. Closing the dashboard discards all drafts. When you press `q` with unsaved edits or saved drafts, the dashboard asks you to confirm.
 

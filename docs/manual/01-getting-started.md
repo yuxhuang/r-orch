@@ -144,7 +144,7 @@ orch update
 In this tutorial you create a project, add an agent that prints a greeting, give it a task, run the task, and
 open the dashboard. The agent uses the `shell` adapter, so you do not need an AI CLI.
 
-The output below was captured from orch 0.9.3. The IDs in your output differ, because orch generates them.
+The output below was checked against orch 0.9.3. The IDs in your output differ, because orch generates them.
 
 Before you start, install orch (see [Install orch](#install-orch)) and `git`.
 

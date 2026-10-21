@@ -29,9 +29,9 @@ applies them like this. It follows the standard's principles; it has not been as
 
 ### How the manual was checked
 
-Before release, people who had not written the manual checked it four ways:
+Before the 0.8.0 release, people who had not written the manual checked it four ways:
 
-- **Facts.** Every command, flag, default, limit, key binding and example output was compared with orch 0.9.3
+- **Facts.** Every command, flag, default, limit, key binding and example output was compared with orch 0.8.0
   itself, by running it in scratch projects and by reading its source. Where older documentation disagreed with
   the program, the manual follows the program.
 - **Plain language.** An editor reviewed every chapter against the four principles above: sentence length,
@@ -41,6 +41,12 @@ Before release, people who had not written the manual checked it four ways:
   tested again.
 - **Safety.** A security reviewer checked the advice on the web dashboard and remote agents against the source,
   and the tools that produce the screenshots.
+
+The update for orch 0.9.3 was checked in three of these ways. Two fact-checkers compared every command and flag,
+and the limits, key bindings, figures and example output, with orch 0.9.3. A tester followed the quick start and
+the changed procedures (task attachments, the dashboard, templates and troubleshooting) as a new user. A security
+reviewer checked the advice on the web dashboard and remote agents, and the tools that produce the screenshots. No
+plain-language editor reviewed the 0.9.3 changes.
 
 Some behaviour could not be tested without a second machine or a real AI agent, such as two-machine remote
 setups. The chapters that describe it say where it comes from the source or the [runbook](../RUNBOOK.md).
@@ -55,7 +61,7 @@ setups. The chapters that describe it say where it comes from the source or the 
 | **Warning:** | Something that can lose data, cost money or expose your machine |
 | **Note:** | Something easy to miss |
 
-Examples were run against orch 0.9.3 in a scratch project. IDs, times and paths in your output will differ.
+Examples were checked against orch 0.9.3 in a scratch project. IDs, times and paths in your output will differ.
 
 ## Keeping the manual accurate
 
