@@ -15,7 +15,7 @@ members = [
 version = "0.9.2"
 edition = "2024"
 rust-version = "1.99"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/yuxhuang/r-orch"
 # Nothing here is published. Besides preventing an irreversible accident, this
 # is what lets `deny.toml`'s `allow-wildcard-paths` apply: cargo-deny treats a
