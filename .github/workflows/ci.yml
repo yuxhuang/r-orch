@@ -6,13 +6,13 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
   # Weekly: a new RUSTSEC advisory should surface on a quiet week too, not
   # only on the next PR. Runs the check job alone (see its `if`).
   schedule:
     - cron: '17 6 * * 1'
 
-# One run per ref. A newer PR push makes the older run irrelevant; on master a
+# One run per ref. A newer PR push makes the older run irrelevant; on main a
 # push and the weekly schedule share the ref, so there we let both finish.
 concurrency:
   group: ci-${{ github.ref }}

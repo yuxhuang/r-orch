@@ -86,11 +86,11 @@ Authoritative docs:
 
 ## Workflow
 
-Everything reaches `master` through a PR. A GitHub ruleset enforces this, needs 0 approvals, and requires the
+Everything reaches `main` through a PR. A GitHub ruleset enforces this, needs 0 approvals, and requires the
 `check` and `test` CI jobs to pass. The same ruleset protects `release/**`, so do not create branches under that
 prefix. A red PR is not reviewed or merged.
 
-1. Branch from current `master`: `fix/<slug>`, `feature/<slug>`, `docs/<slug>`, `chore/<slug>`, and
+1. Branch from current `main`: `fix/<slug>`, `feature/<slug>`, `docs/<slug>`, `chore/<slug>`, and
    `chore/release-vX.Y.Z` for releases.
 2. Commit as `type(scope): summary`, imperative, no trailing period. Types in use: `feat`, `fix`, `docs`,
    `test`, `chore`, `refactor`. Scope is a crate or area: `fix(peer): bound a worker's free-form error text`,
@@ -105,7 +105,7 @@ prefix. A red PR is not reviewed or merged.
 6. Merge, per the policy below. Implementers and reviewers never merge their own work.
    - Convention: squash for single-concern PRs (the squash title becomes the commit; make it a good one);
      merge commit for release PRs and multi-commit PRs whose commits are individually meaningful.
-   - Never force-push `master`.
+   - Never force-push `main`.
 
 **Merge policy.** The human owner merges by default. The owner may standing-delegate categories to the
 orchestrator; current delegation: docs-only, test-only, and CHANGELOG/plan-status PRs, once required checks are
@@ -384,7 +384,7 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
 
 ## Release
 
-1. Branch `chore/release-vX.Y.Z` from `master`. Do not use `release/vX.Y.Z`: the ruleset protects
+1. Branch `chore/release-vX.Y.Z` from `main`. Do not use `release/vX.Y.Z`: the ruleset protects
    `release/**`. Run the cold gate on a platform it supports (see Pre-PR check). Every gate step must pass. Record the platform
    and the result in the PR.
 2. Set `workspace.package.version` in `Cargo.toml` (and let `Cargo.lock` update).
@@ -392,17 +392,17 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
    and update the compare links at the bottom.
 4. Update README release notes (the "Upgrading" and "Known gaps" sections) if behaviour users must act on changed.
 5. Commit `chore(release): X.Y.Z`, open the PR, CI green, owner merges (merge commit, per the convention).
-6. On `master`: `git tag -a vX.Y.Z -m "vX.Y.Z"` then `git push origin vX.Y.Z`.
+6. On `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"` then `git push origin vX.Y.Z`.
 7. Create the GitHub release with notes copied from the CHANGELOG section:
    `gh release create vX.Y.Z --title vX.Y.Z --notes-file <extract>`.
 8. The tag push runs `.github/workflows/homebrew.yml`, which points the Homebrew formula at the new tag and
-   commit. It skips pre-release tags, and refuses a tag that is not on `master` or does not match `Cargo.toml`.
+   commit. It skips pre-release tags, and refuses a tag that is not on `main` or does not match `Cargo.toml`.
    Check that the run is green. To retry it, or for a tag created before the workflow existed, run
    `gh workflow run homebrew -f tag=vX.Y.Z`. The tap's name and token live in repository variables and secrets
    (see the workflow's header), never in the repo.
 
 `orch update` does not self-update; it only prints install instructions, so there is no update channel to
-publish. Never tag from a branch other than `master`, and never move or delete a pushed tag.
+publish. Never tag from a branch other than `main`, and never move or delete a pushed tag.
 
 The release procedure is this section. Do not write a new release runbook or one-off publish scripts for each
 release. If a step is missing, fix this section in the release PR. Scripts that are needed again belong under
@@ -434,7 +434,7 @@ CHANGELOG wording, plans and ADR clarity. Must not skip: verifying every command
 Document current behaviour only; no aspirational features.
 
 **Release.** Reads: the Release section, `CHANGELOG.md`, `git log <last-tag>..HEAD`. Owns: version bump, changelog
-cut, tag, GitHub release. Must not skip: the cold gate, tagging only from `master`, asking the owner before
+cut, tag, GitHub release. Must not skip: the cold gate, tagging only from `main`, asking the owner before
 pushing a tag.
 
 ## Don'ts
@@ -446,7 +446,7 @@ pushing a tag.
 - Don't flip the repo public, add remotes, or paste private names (taps, hosts, paths) anywhere in the repo or PRs.
 - Don't add a dependency without the §4.8 check; add an ADR when it is load-bearing.
 - Don't edit `docs/TRAITS-FROZEN.md` without an ADR.
-- Don't push to `master`, force-push shared branches, or merge your own PR.
+- Don't push to `main`, force-push shared branches, or merge your own PR.
 - Don't silence a lint without `reason = "..."` on the `#[allow]` (clippy enforces this), and don't skip hooks.
 - Don't wrap a broken repo script in an external harness; fix the script (see Broken tooling).
 - Don't create `release/**` branches; the ruleset protects them.
