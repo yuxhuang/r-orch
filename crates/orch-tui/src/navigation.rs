@@ -95,15 +95,35 @@ pub fn navigate(state: &mut ScrollState, action: NavAction, metrics: ScrollMetri
         }
     };
     state.selected = Some(selected);
-    let row = row_of(selected);
     // Reveal minimally after independently clamping the page and selection.
+    state.offset = reveal(state.offset, selected, metrics.selection_rows, height).min(max_offset);
+}
+
+/// The offset that shows item `selected` in a viewport `height` rows high,
+/// moving `offset` as little as possible. `rows` maps items to display rows;
+/// empty means one display row per item.
+///
+/// Whenever the rows between the previous item and this one (its section
+/// header) are above the viewport, they come into view with it, as many as
+/// fit: row 0 for the first item. That covers Up and PageUp, and a PageDown
+/// whose page jump leaves the header above. The selection itself always
+/// shows. Down by one is unchanged: the selection lands on the bottom row,
+/// and its header is already above it.
+pub(crate) fn reveal(offset: usize, selected: usize, rows: &[usize], height: usize) -> usize {
+    let row_of = |index: usize| rows.get(index).copied().unwrap_or(index);
+    let row = row_of(selected);
+    let top = selected
+        .checked_sub(1)
+        .map_or(0, |prev| row_of(prev).saturating_add(1))
+        .min(row);
     // Subtraction avoids overflowing offset + height for logical usize counts.
-    if row < state.offset {
-        state.offset = row;
-    } else if row.saturating_sub(state.offset) >= height {
-        state.offset = row.saturating_sub(height - 1);
+    if top < offset {
+        top.max(row.saturating_add(1).saturating_sub(height))
+    } else if row.saturating_sub(offset) >= height {
+        row.saturating_sub(height.saturating_sub(1))
+    } else {
+        offset
     }
-    state.offset = state.offset.min(max_offset);
 }
 
 #[cfg(test)]
@@ -302,12 +322,198 @@ mod tests {
                 offset: 3
             }
         );
+        // The first item's header (row 0) comes back with it.
         navigate(&mut state, NavAction::Up, metrics);
         assert_eq!(
             state,
             ScrollState {
                 selected: Some(0),
-                offset: 1
+                offset: 0
+            }
+        );
+    }
+
+    /// Two sections of two items: header 0, items 1 2, header 3, items 4 5.
+    fn two_sections(height: usize) -> ScrollMetrics<'static> {
+        ScrollMetrics {
+            items: 4,
+            display_rows: 6,
+            viewport_rows: height,
+            selection_rows: &[1, 2, 4, 5],
+            mode: ScrollMode::Selectable,
+        }
+    }
+
+    #[test]
+    fn up_onto_a_section_first_item_above_the_viewport_reveals_its_header() {
+        // Selection at the top row, then Up lands on the first item of the
+        // second section, which sits above the viewport.
+        let mut state = ScrollState {
+            selected: Some(3),
+            offset: 5,
+        };
+        navigate(&mut state, NavAction::Up, two_sections(2));
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(2),
+                offset: 3
+            }
+        );
+    }
+
+    #[test]
+    fn up_onto_a_section_first_item_on_the_top_row_reveals_its_header() {
+        // From End, the second section's first item is already on screen at
+        // the top row; its header just scrolled out above and comes back.
+        let mut state = ScrollState::default();
+        navigate(&mut state, NavAction::End, two_sections(2));
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(3),
+                offset: 4
+            }
+        );
+        for (selected, offset) in [(2, 3), (1, 2), (0, 0)] {
+            navigate(&mut state, NavAction::Up, two_sections(2));
+            assert_eq!(
+                state,
+                ScrollState {
+                    selected: Some(selected),
+                    offset
+                },
+                "Up to item {selected}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_stays_visible_when_its_header_does_not_fit() {
+        let mut state = ScrollState {
+            selected: Some(3),
+            offset: 5,
+        };
+        navigate(&mut state, NavAction::Up, two_sections(1));
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(2),
+                offset: 4
+            }
+        );
+        // Three stacked rows (0-2) above item 0 at row 3, two rows high:
+        // the nearest one and the item show.
+        let metrics = ScrollMetrics {
+            items: 3,
+            display_rows: 6,
+            viewport_rows: 2,
+            selection_rows: &[3, 4, 5],
+            mode: ScrollMode::Selectable,
+        };
+        let mut state = ScrollState {
+            selected: Some(1),
+            offset: 4,
+        };
+        navigate(&mut state, NavAction::Up, metrics);
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(0),
+                offset: 2
+            }
+        );
+    }
+
+    #[test]
+    fn down_through_sections_reveals_exactly_as_before() {
+        let mut state = ScrollState::default();
+        for (selected, offset) in [(1, 1), (2, 3), (3, 4), (3, 4)] {
+            navigate(&mut state, NavAction::Down, two_sections(2));
+            assert_eq!(
+                state,
+                ScrollState {
+                    selected: Some(selected),
+                    offset
+                },
+                "Down to item {selected}"
+            );
+        }
+    }
+
+    #[test]
+    fn ungrouped_up_reveals_only_the_selected_row() {
+        let mut state = ScrollState {
+            selected: Some(5),
+            offset: 5,
+        };
+        navigate(&mut state, NavAction::Up, list(10, 3));
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(4),
+                offset: 4
+            }
+        );
+        navigate(&mut state, NavAction::Up, list(10, 3));
+        navigate(&mut state, NavAction::Up, list(10, 3));
+        navigate(&mut state, NavAction::Down, list(10, 3));
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(3),
+                offset: 2
+            }
+        );
+    }
+
+    #[test]
+    fn page_up_onto_a_section_first_item_reveals_its_header() {
+        // Task-list shape: goal header 0, tasks 1-3, ungrouped header 4,
+        // tasks 5-7, show-all row 8. PageUp keeps the selection on the top
+        // row, which is the ungrouped section's first task.
+        let metrics = ScrollMetrics {
+            items: 7,
+            display_rows: 9,
+            viewport_rows: 2,
+            selection_rows: &[1, 2, 3, 5, 6, 7, 8],
+            mode: ScrollMode::Selectable,
+        };
+        let mut state = ScrollState {
+            selected: Some(5),
+            offset: 7,
+        };
+        navigate(&mut state, NavAction::PageUp, metrics);
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(3),
+                offset: 4
+            }
+        );
+    }
+
+    #[test]
+    fn page_down_onto_a_section_first_item_reveals_its_header() {
+        // Agents 0 1, header 2, agents 3-7. The page jump moves the offset
+        // to 3, past the header of the item PageDown lands on.
+        let metrics = ScrollMetrics {
+            items: 7,
+            display_rows: 8,
+            viewport_rows: 3,
+            selection_rows: &[0, 1, 3, 4, 5, 6, 7],
+            mode: ScrollMode::Selectable,
+        };
+        let mut state = ScrollState {
+            selected: Some(0),
+            offset: 0,
+        };
+        navigate(&mut state, NavAction::PageDown, metrics);
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(2),
+                offset: 2
             }
         );
     }
