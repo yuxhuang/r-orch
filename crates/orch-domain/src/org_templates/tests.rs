@@ -112,7 +112,7 @@ fn registered_rules_selected_by_another_agent_do_not_rewrite_a_rule_free_role() 
 
 #[test]
 fn explicit_rules_in_other_orgs_get_only_the_generic_explanation_once() {
-    let mut bundle = bundle_with_role("Keep authored Pensieve instructions.");
+    let mut bundle = bundle_with_role("Keep authored Workspace instructions.");
     bundle.org.rules = vec!["first".into(), "unused".into()];
     bundle.rules = [
         ("first".into(), "First rule".into()),
@@ -125,7 +125,7 @@ fn explicit_rules_in_other_orgs_get_only_the_generic_explanation_once() {
         bundle.org.name = name.into();
         assert_eq!(
             bundle.render_role(&bundle.agents[0]).unwrap(),
-            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.\n\nKeep authored Pensieve instructions.\n\n## Shared rule: first\n\nFirst rule"
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required.\n\nKeep authored Workspace instructions.\n\n## Shared rule: first\n\nFirst rule"
         );
     }
 }
@@ -171,7 +171,7 @@ fn a_team_bundle() -> Bundle {
     bundle
 }
 
-const WORKSPACE_ROOT_CONTEXT: &str = " <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.";
+const WORKSPACE_ROOT_CONTEXT: &str = " <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../workspace destinations and named skills are deployment prerequisites; edit the template for other layouts.";
 
 #[test]
 fn renamed_a_team_members_using_workspace_root_keep_its_definition() {
@@ -180,12 +180,12 @@ fn renamed_a_team_members_using_workspace_root_keep_its_definition() {
     bundle.validate().unwrap();
     for name in ["orchestrator", "tech-writer"] {
         let agent = bundle.agents.iter().find(|a| a.name == name).unwrap();
-        assert!(agent.role.contains("<workspace root>/../pensieve/"));
+        assert!(agent.role.contains("<workspace root>/../workspace/"));
         let rendered = bundle.render_role(agent).unwrap();
         assert!(rendered.starts_with(&format!(
             "Embedded shared-rule sections are authoritative; no rule-file lookup is required.{WORKSPACE_ROOT_CONTEXT}\n\n"
         )), "{name}");
-        assert!(rendered.contains("<workspace root>/../pensieve/"));
+        assert!(rendered.contains("<workspace root>/../workspace/"));
     }
 }
 
@@ -302,7 +302,7 @@ fn a_team_members_with_rules_keep_their_frozen_ptt_role_bytes() {
     let mut checked = 0;
     for agent in bundle.agents.iter().filter(|a| !a.rules.is_empty()) {
         let mut expected = String::from(
-            "Embedded shared-rule sections are authoritative; no rule-file lookup is required. <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.\n\n",
+            "Embedded shared-rule sections are authoritative; no rule-file lookup is required. <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../workspace destinations and named skills are deployment prerequisites; edit the template for other layouts.\n\n",
         );
         expected.push_str(&rewrite_fixture(&agent.role));
         for id in bundle

@@ -1,0 +1,16 @@
+r-orch
+Copyright 2026 Stochastic Dev
+
+This product includes software derived from ORCH
+(https://github.com/oxgeneral/ORCH), Copyright (c) 2026 Agents
+Organizations Contributors, licensed under the MIT License. r-orch is a
+derivative work of ORCH: its Rust source began as a translation of ORCH's
+TypeScript source.
+
+This product includes software from gstack
+(https://github.com/garrytan/gstack), Copyright (c) 2026 Garry Tan,
+licensed under the MIT License, as adapted by ORCH.
+
+THIRD-PARTY-NOTICES.md lists the files these and other third-party
+components cover and reproduces their copyright notices and full licence
+texts.

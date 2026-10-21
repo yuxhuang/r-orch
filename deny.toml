@@ -63,9 +63,10 @@ ignore = [
 
 [licenses]
 version = 2
-# Everything the tree resolves to today, all permissive. Deliberately not a
-# wildcard: a new dependency arriving under an unexpected licence should stop
-# the gate and get a decision, which is the whole point of the list.
+# Everything the tree resolves to today: permissive licences plus one
+# weak-copyleft exception, MPL-2.0 (below). Deliberately not a wildcard: a new
+# dependency arriving under an unexpected licence should stop the gate and get
+# a decision, which is the whole point of the list.
 allow = [
   "MIT",
   "Apache-2.0",
@@ -78,11 +79,14 @@ allow = [
   "Unlicense",
   "Unicode-3.0",
   # `option-ext`, reached through `dirs` -> `dirs-sys`, is MPL-2.0 with no dual
-  # option. MPL's copyleft is per-file and triggers on modifying *its* files,
-  # which we do not do — linking it into our binary carries no obligation over
-  # our own source. Flagged rather than buried: it is the one dependency in the
-  # tree whose licence is not permissive, and if policy forbids weak copyleft
-  # at all then `dirs` has to go, not this line.
+  # option. MPL's copyleft is per-file: our own source stays Apache-2.0, and
+  # option-ext's files stay MPL-2.0. Linking it is not free of duty, though:
+  # shipping it in an executable means telling recipients where its Source Code
+  # Form is (MPL-2.0 §3.2), even unmodified. THIRD-PARTY-NOTICES.md carries that
+  # notice; any change we make to its files must be published under MPL-2.0 too.
+  # Flagged rather than buried: it is the one dependency in the tree whose
+  # licence is not permissive, and if policy forbids weak copyleft at all then
+  # `dirs` has to go, not this line.
   "MPL-2.0",
 ]
 confidence-threshold = 0.9

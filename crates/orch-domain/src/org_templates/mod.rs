@@ -376,7 +376,7 @@ impl Bundle {
                 .any(|id| self.rules[id].contains("<workspace root>"))
         {
             role.push_str(
-                " <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../pensieve destinations and named skills are deployment prerequisites; edit the template for other layouts.",
+                " <workspace root> means the owning orch project root (the directory containing .orchestry), not the per-task checkout. Establish it from task/context before using destination placeholders. If unavailable, report it to the lead instead of guessing from cwd. Sibling ../workspace destinations and named skills are deployment prerequisites; edit the template for other layouts.",
             );
         }
         role.push_str("\n\n");

@@ -166,7 +166,7 @@ orch org deploy a-team --goal "Ship the release"
 
 - The `claude` and `codex` CLIs are installed and signed in. Run `orch doctor`.
 - Your agent CLI provides the skills the roles name, such as `review`, `qa`, `ship` and `feature-dev:feature-dev`. orch does not install skills. A missing skill only shows when an agent tries to use it.
-- A directory called `pensieve` exists next to your project root (`../pensieve`). Several roles write specs and reports there.
+- A directory called `workspace` exists next to your project root (`../workspace`). Several roles write specs and reports there.
 - Roles that refer to `<workspace root>` mean the directory that contains `.orchestry/`.
 
 To use the a-team in another layout, copy it and edit the copy (see below). The full list of skills is in [docs/org-templates.md](../org-templates.md#prerequisites).

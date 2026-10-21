@@ -20,8 +20,10 @@ setting up agent-facing process ([ADR 0001](../decisions/0001-plans-and-decision
 Independent checklist items; each is its own small PR or a repository-settings change by the owner.
 
 ## Steps
-- [ ] Add a `LICENSE` file. `Cargo.toml` declares MIT but no file exists. The original's copyright notice must be
-      retained; the owner decides the copyright line for r-orch's own work.
+- [x] Add a `LICENSE` file: Apache-2.0 (`LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.md`; `Cargo.toml` declares
+      `Apache-2.0`), done in the Apache-2.0 licence PR. The original's MIT copyright notice is retained in
+      `THIRD-PARTY-NOTICES.md` and `skills/library/LICENSE-MIT`. The copyright line is "Stochastic Dev" until the
+      owner confirms it.
 - [x] Fix `Cargo.toml` `repository`, which points at `oxgeneral/r-orch` (done in the agents/SDLC PR).
 - [ ] Add `SECURITY.md` with a private disclosure channel.
 - [x] Make `ci / check` and `ci / test` required status checks on `master`, after their first green run (owner,
@@ -45,5 +47,5 @@ data or peers.
 CHANGELOG `Unreleased` (done for this plan); README Documentation table if a new top-level file is added.
 
 ## Open questions
-- Copyright holder line for `LICENSE`.
+- Copyright holder line for `NOTICE`: "Stochastic Dev" for now, to be confirmed by the owner.
 - Which private disclosure channel `SECURITY.md` names.

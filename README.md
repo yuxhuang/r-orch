@@ -370,7 +370,7 @@ orch org template update my-team -f org.json                # replace org.yml fr
 `update` replaces a file from a complete JSON or YAML document and `patch` applies an RFC 7396 merge patch; both read
 a file or stdin, validate the whole template first and write one file atomically. `--yaml` works wherever `--json`
 does. Builtins are read-only (copy them with `init --from`). Deploying is **not transactional**: a failure part way
-names the agents and team that were already created. The a-team assumes agent CLIs, skills and a sibling `../pensieve`
+names the agents and team that were already created. The a-team assumes agent CLIs, skills and a sibling `../workspace`
 directory that `deploy` does not check. The format, precedence rules, error messages, repair of a broken template,
 limits and prerequisites are in [docs/org-templates.md](docs/org-templates.md); runnable templates and mutation
 inputs are in [examples/org-templates/](examples/org-templates/).
@@ -656,6 +656,7 @@ drafts last only for the dashboard session).
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |
 | [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release |
+| [LICENSE](LICENSE), [NOTICE](NOTICE), [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | Licence (Apache-2.0), attribution notices, and the licences of bundled third-party material |
 | [docs/specs/](docs/specs/) | Specs: what goal-sized work must do and how it is accepted |
 | [docs/plans/](docs/plans/) | Plans for non-trivial work, before it is built: design, task split, status |
 | [docs/decisions/](docs/decisions/) | Decision records: why things are the way they are |
@@ -682,4 +683,12 @@ See [ARCHITECTURE.md §8](docs/ARCHITECTURE.md) for the test strategy and
 
 ## License
 
-MIT.
+Licensed under the Apache License, Version 2.0: see [LICENSE](LICENSE), and [NOTICE](NOTICE) for the
+attribution notices. Contributions are accepted under the same licence.
+
+r-orch is a derivative of [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH) (MIT): its Rust source began as
+a translation of ORCH's TypeScript, and the shop catalogue, prompt templates and library skills come from ORCH. The
+library skills are ORCH's adaptations of [`garrytan/gstack`](https://github.com/garrytan/gstack) skills (MIT), and
+`orch web` serves a vendored xterm.js (MIT). That material keeps its MIT licence;
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists each component with its full licence text, and says what to
+ship with a built binary or package.

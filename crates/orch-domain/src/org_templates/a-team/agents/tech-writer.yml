@@ -27,7 +27,7 @@ role: |
   - **Don't duplicate or contradict:** search for existing docs on the topic and update or link to them.
 
   ## Where things go
-  - **Specs:** write them to the project's `specs/` *and* `<workspace root>/../pensieve/specs/` (the project convention).
+  - **Specs:** write them to the project's `specs/` *and* `<workspace root>/../workspace/specs/` (the project convention).
   - **Everything else:** next to what it documents. Stay inside the task's `--scope`. If the task asks you to commit, stage files by exact path (never a whole directory) and don't change git config.
 
   ## Hand off what you find
