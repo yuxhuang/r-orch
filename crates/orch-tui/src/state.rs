@@ -3622,12 +3622,20 @@ impl AppState {
                 matches!(r, AgentRow::Agent { .. } | AgentRow::AddAgent { .. }).then_some(i)
             })
             .collect();
+        // A visible selection in an unmoved list is left where it is: a click
+        // leaves a section's first row on top with its header cut off, and
+        // revealing it on the next poll would shift the rows under the
+        // pointer. Only when the re-clamp scrolls anyway (the list shrank, or
+        // the selection is out of view) does its header come with it.
         fn reveal(selected: usize, offset: usize, rows: &[usize], total: usize, h: usize) -> usize {
-            let offset = offset.min(total.saturating_sub(h));
-            if h > 0 && selected < rows.len() {
-                crate::navigation::reveal(offset, selected, rows, h)
+            let clamped = offset.min(total.saturating_sub(h));
+            if h > 0
+                && let Some(&row) = rows.get(selected)
+                && (clamped != offset || row < clamped || row >= clamped.saturating_add(h))
+            {
+                crate::navigation::reveal(clamped, selected, rows, h)
             } else {
-                offset
+                clamped
             }
         }
         let task_display_rows = self.task_rows(can_create).len();
@@ -3884,17 +3892,16 @@ mod tests {
                 selection: 2
             }
         ));
-        // Above the viewport, and on its top row with the header cut off.
-        for scroll in [5, 4] {
-            state.agent_selected = 2;
-            state.agent_scroll = scroll;
-            pin_main_list(&mut state, 4, 6, 2);
-            state.clamp_all(false);
-            assert_eq!(state.agent_scroll, 3, "from offset {scroll}");
-        }
-        // The first agent of the list brings row 0 back.
+        // The list shrank under an offset past its end: the re-clamp scrolls
+        // anyway, and the header comes back with the selection.
+        state.agent_selected = 2;
+        state.agent_scroll = 5;
+        pin_main_list(&mut state, 4, 6, 2);
+        state.clamp_all(false);
+        assert_eq!(state.agent_scroll, 3);
+        // The first agent of the list, above the viewport, brings row 0 back.
         state.agent_selected = 0;
-        state.agent_scroll = 1;
+        state.agent_scroll = 2;
         pin_main_list(&mut state, 4, 6, 2);
         state.clamp_all(false);
         assert_eq!(state.agent_scroll, 0);
@@ -3904,6 +3911,30 @@ mod tests {
         pin_main_list(&mut state, 4, 6, 2);
         state.clamp_all(false);
         assert_eq!(state.agent_scroll, 4);
+    }
+
+    #[test]
+    fn refresh_leaves_a_visible_selection_where_it_is() {
+        let mut state = AppState::default();
+        state.height = 40;
+        state.view = ViewId::Agents;
+        state.agent_group_by = AgentGroupBy::Status;
+        state.agents = vec![
+            make_agent("a0", "run-0", AgentStatus::Running),
+            make_agent("a1", "run-1", AgentStatus::Running),
+            make_agent("a2", "idle-2", AgentStatus::Idle),
+            make_agent("a3", "idle-3", AgentStatus::Idle),
+        ];
+        // Header 0, agents 1 2, header 3, agents 4 5. A click selected the
+        // IDLE section's first agent on the top row, its header cut off: a
+        // refresh must not shift the rows under the pointer.
+        for (selected, scroll) in [(2, 4), (0, 1)] {
+            state.agent_selected = selected;
+            state.agent_scroll = scroll;
+            pin_main_list(&mut state, 4, 6, 2);
+            state.clamp_all(false);
+            assert_eq!(state.agent_scroll, scroll, "agent {selected}");
+        }
     }
 
     #[test]
@@ -3927,7 +3958,7 @@ mod tests {
             "{rows:?}"
         );
         state.task_selected = 2;
-        state.task_scroll = 4;
+        state.task_scroll = 5;
         pin_main_list(&mut state, 4, 6, 2);
         state.clamp_all(false);
         assert_eq!(state.task_scroll, 3);

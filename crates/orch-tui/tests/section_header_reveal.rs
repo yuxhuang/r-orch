@@ -111,10 +111,10 @@ fn a_refresh_keeps_the_section_header_above_a_selected_first_agent() {
         h.press(KeyCode::Up).draw();
     }
     assert_eq!(h.app.state.selected_agent().unwrap().name, "Agx-06");
-    // Whatever left the ERROR header cut off above the viewport (rows 0-7 are
-    // the three sections up to Agx-05, the header is row 8, Agx-06 row 9), a
-    // refresh brings it back.
-    h.app.state.agent_scroll = 9;
+    // Whatever left Agx-06 and its ERROR header above the viewport (rows 0-7
+    // are the sections up to Agx-05, the header is row 8, Agx-06 row 9), a
+    // refresh brings both back.
+    h.app.state.agent_scroll = 10;
     h.app.refresh_all(true);
     h.draw();
     let text = h.text();
@@ -123,6 +123,26 @@ fn a_refresh_keeps_the_section_header_above_a_selected_first_agent() {
         text.lines().nth(at - 1).unwrap().contains("ERROR"),
         "the ERROR header must sit above Agx-06:\n{text}"
     );
+}
+
+#[test]
+fn a_refresh_after_a_click_does_not_shift_the_list() {
+    let mut h = agents_harness();
+    h.draw();
+    for _ in 0..4 {
+        h.press(KeyCode::Down).draw();
+    }
+    // Agx-03, the first IDLE agent, is on the top row with its header cut
+    // off. Clicking it changes the selection only; the periodic refresh that
+    // follows must leave every row where the pointer last saw it.
+    h.click_text("Agx-03").draw();
+    assert_eq!(h.app.state.selected_agent().unwrap().name, "Agx-03");
+    let before = h.text();
+    let scroll = h.app.state.agent_scroll;
+    h.app.refresh_all(true);
+    h.draw();
+    assert_eq!(h.app.state.agent_scroll, scroll);
+    assert_eq!(h.text(), before, "the refresh moved the list");
 }
 
 #[test]

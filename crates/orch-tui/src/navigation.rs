@@ -103,10 +103,12 @@ pub fn navigate(state: &mut ScrollState, action: NavAction, metrics: ScrollMetri
 /// moving `offset` as little as possible. `rows` maps items to display rows;
 /// empty means one display row per item.
 ///
-/// Moving up, the rows between the previous item and this one (its section
-/// header) come into view with it, as many as fit: row 0 for the first item.
-/// The selection itself always shows. Moving down is unchanged: the selection
-/// lands on the bottom row, and its header is already above it.
+/// Whenever the rows between the previous item and this one (its section
+/// header) are above the viewport, they come into view with it, as many as
+/// fit: row 0 for the first item. That covers Up and PageUp, and a PageDown
+/// whose page jump leaves the header above. The selection itself always
+/// shows. Down by one is unchanged: the selection lands on the bottom row,
+/// and its header is already above it.
 pub(crate) fn reveal(offset: usize, selected: usize, rows: &[usize], height: usize) -> usize {
     let row_of = |index: usize| rows.get(index).copied().unwrap_or(index);
     let row = row_of(selected);
@@ -487,6 +489,31 @@ mod tests {
             ScrollState {
                 selected: Some(3),
                 offset: 4
+            }
+        );
+    }
+
+    #[test]
+    fn page_down_onto_a_section_first_item_reveals_its_header() {
+        // Agents 0 1, header 2, agents 3-7. The page jump moves the offset
+        // to 3, past the header of the item PageDown lands on.
+        let metrics = ScrollMetrics {
+            items: 7,
+            display_rows: 8,
+            viewport_rows: 3,
+            selection_rows: &[0, 1, 3, 4, 5, 6, 7],
+            mode: ScrollMode::Selectable,
+        };
+        let mut state = ScrollState {
+            selected: Some(0),
+            offset: 0,
+        };
+        navigate(&mut state, NavAction::PageDown, metrics);
+        assert_eq!(
+            state,
+            ScrollState {
+                selected: Some(2),
+                offset: 2
             }
         );
     }
