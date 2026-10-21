@@ -81,7 +81,17 @@ json-patch = { version = "4.2", default-features = false }
 liquid = "0.26.11"
 
 # ── TUI (ARCHITECTURE §4.4) ────────────────────────────────────────────────
-ratatui = "0.30"
+# Defaults minus `underline-color`. That feature's weak `ratatui-termwiz?/…` and
+# `ratatui-termina?/…` entries make Cargo lock the inactive termwiz/termina
+# backends (termwiz pulls WTFPL-only `terminfo`). Underline colour stays on:
+# ratatui-crossterm's own defaults enable `ratatui-core/underline-color`, and
+# ratatui's own source has no `underline-color` cfg. Same features compiled.
+ratatui = { version = "0.30", default-features = false, features = [
+  "all-widgets",
+  "crossterm",
+  "layout-cache",
+  "macros",
+] }
 # `use-dev-tty` selects crossterm's level-triggered `poll(2)` event source. The default mio source is
 # edge-triggered and, when one wakeup reports both the tty and SIGWINCH, returns the first event and drops
 # the other readiness, so a key pressed during a resize stays unread until the next key.
