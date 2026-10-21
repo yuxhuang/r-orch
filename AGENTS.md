@@ -74,8 +74,14 @@ Authoritative docs:
   DCO sign-off.
 - Material that originates outside this project (copied or adapted files, vendored assets, fixtures recorded
   from another project) needs a permissive, Apache-2.0-compatible licence, and goes into
-  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) (component, upstream, licence, files, full licence text) and
-  `NOTICE` in the same PR. Crate dependencies are covered by `deny.toml` instead (rule 4).
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) (component, upstream, licence, files, full licence text) in the
+  same PR. Add to `NOTICE` only what that file's rule requires. Crate dependencies are covered by `deny.toml`
+  instead (rule 4).
+- Before merging work from outside the project, confirm with its submitter that they wrote it or have the right
+  to contribute it, and where any copied part came from.
+- A built binary, archive or package must carry `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.md` and the licence
+  notices of the crates it links (THIRD-PARTY-NOTICES.md, "Distributing r-orch"); the root files alone do not reach
+  an installed binary.
 - Do not change the licence or the copyright line; those are the owner's decisions.
 
 ## Workflow
@@ -232,7 +238,7 @@ Docs ship in the same PR as the change. The PR template asks which row applied.
 | An operator-visible failure mode or a new error message | `docs/RUNBOOK.md` |
 | Crate boundaries, dependency edges, traits, concurrency or error model | `docs/ARCHITECTURE.md` (and keep `cargo xtask crate-graph` passing) |
 | Anything a user could notice | `CHANGELOG.md`, under `## [Unreleased]` |
-| Material from outside the project (copied, adapted or vendored) | `THIRD-PARTY-NOTICES.md` and `NOTICE` (see Licensing) |
+| Material from outside the project (copied, adapted or vendored) | `THIRD-PARTY-NOTICES.md` (and `NOTICE` only when required; see Licensing) |
 | A trait in `orch-core` listed in `docs/TRAITS-FROZEN.md` | Only via an ADR, then that file |
 | A choice someone will later ask "why?" about | An ADR |
 | What goal-sized work must do, and how it is accepted | A spec |

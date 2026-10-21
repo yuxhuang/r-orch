@@ -6,7 +6,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Changed
-- r-orch is now licensed under the Apache License 2.0 instead of MIT: the repository ships `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES.md`, and every crate declares `license = "Apache-2.0"`. The bundled MIT-licensed material (the library skills and shop catalogue from `oxgeneral/ORCH`, and the xterm.js files served by `orch web`) keeps its MIT licence, with the full texts in `THIRD-PARTY-NOTICES.md`.
+- r-orch is now licensed under the Apache License 2.0 instead of MIT: the repository ships `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES.md`, and every crate declares `license = "Apache-2.0"`. r-orch is a derivative of `oxgeneral/ORCH` (MIT), and the material that comes from other projects keeps its MIT licence: the ORCH-derived Rust source, shop catalogue and prompt templates, the library skills (ORCH's adaptations of `garrytan/gstack` skills), and the xterm.js files served by `orch web`. `THIRD-PARTY-NOTICES.md` has their full licence texts and what a binary or package distribution must ship.
 
 ## [0.9.2] - 2026-10-20
 

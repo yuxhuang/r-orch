@@ -2,10 +2,11 @@
 
 r-orch is licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE)); [NOTICE](NOTICE) carries the
 attribution notices. This file lists the third-party material included in this source tree, the files each
-component covers, and the full text of each component's licence.
+component covers, and the full text of each component's licence. Third-party components keep their own licences;
+r-orch's Apache-2.0 licence does not replace them.
 
 Rust crate dependencies are not in this tree: Cargo downloads them from crates.io with their own licence files,
-and [`deny.toml`](deny.toml) limits which licences they may use.
+and [`deny.toml`](deny.toml) limits which licences they may use. See [Rust crate dependencies](#rust-crate-dependencies).
 
 | Component | Upstream | Licence | Files in this tree |
 |---|---|---|---|
@@ -14,8 +15,22 @@ and [`deny.toml`](deny.toml) limits which licences they may use.
 | xterm.js (`@xterm/xterm` 5.5.0) | [xtermjs/xterm.js](https://github.com/xtermjs/xterm.js) | MIT | `crates/orch-cli/src/web/assets/xterm.js`, `xterm.css`, `LICENSE-xterm.txt` |
 | `@xterm/addon-fit` 0.10.0 | [xtermjs/xterm.js](https://github.com/xtermjs/xterm.js) | MIT | `crates/orch-cli/src/web/assets/addon-fit.js`, `LICENSE-addon-fit.txt` |
 
-When you add material that originates outside this project, add a row and a section here (and a line in
-`NOTICE`) in the same PR.
+When you add material that originates outside this project, add a row and a section here in the same PR. Add a
+line to `NOTICE` only when the material's licence requires one (for example, it comes with its own Apache-2.0
+`NOTICE` file) or it substantially changes what r-orch is derived from; everything else belongs here.
+
+## Distributing r-orch
+
+This file covers the source tree. A copy distributed in any other form needs its notices carried with it:
+
+- **A built `orch` binary, archive or package** compiles in ORCH-derived code, the default prompt templates and
+  role prompts, and the xterm.js files, and it statically links the Rust crate dependencies. Ship `LICENSE`,
+  `NOTICE` and this file with it, together with the licence notices of the crates it links (see
+  [Rust crate dependencies](#rust-crate-dependencies)). An install that copies `skills/library/` should copy
+  `skills/library/LICENSE-MIT` with it.
+- **Files that `orch init` writes** into `.orchestry/` (the default prompt template, and the Agent Creator role
+  prompt in `agents/agt_creator.yml`) contain ORCH-derived text. If you redistribute them outside your project, include the ORCH MIT
+  notice below.
 
 ## ORCH
 
@@ -166,3 +181,37 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
+
+## Rust crate dependencies
+
+The crates in `Cargo.lock` are not part of this source tree, so this file does not reproduce their licences:
+each crate's own licence files come with it from crates.io. A built binary statically links them, so a binary
+distribution must ship the licence and copyright notices of the crates it actually links, generated from
+`Cargo.lock` for that build (for example with `cargo about`). Include the supplementary notices that some crates
+carry besides their top-level licence (third-party and Unicode-data notices inside the crate), and apply both
+terms of every `AND` licence expression.
+
+The following applies to any such distribution:
+
+```text
+Third-party components retain their own licences. The Apache-2.0 licence
+for r-orch does not replace or restrict those licences.
+
+option-ext 0.2.0 is governed by the Mozilla Public License, v. 2.0.
+Its complete, unmodified Source Code Form is available from:
+https://crates.io/api/v1/crates/option-ext/0.2.0/download
+Upstream: https://github.com/soc/option-ext
+Licence: https://mozilla.org/MPL/2.0/
+Any modifications to its covered files distributed with future versions
+must also be made available in Source Code Form under MPL-2.0, with the
+applicable notices preserved. This obligation applies to the MPL-covered
+files and does not change the licence of r-orch's separate source files.
+
+For code with an MIT OR Apache-2.0 alternative, this distribution elects
+Apache-2.0 unless a component-specific notice says otherwise.
+Both terms of every AND expression continue to apply. Unicode data and
+other embedded third-party material retain their accompanying notices.
+```
+
+`option-ext` is reached through `dirs` → `dirs-sys`; it is the one linked crate under a weak-copyleft licence.
+r-orch does not modify it.

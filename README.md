@@ -686,6 +686,9 @@ See [ARCHITECTURE.md §8](docs/ARCHITECTURE.md) for the test strategy and
 Licensed under the Apache License, Version 2.0: see [LICENSE](LICENSE), and [NOTICE](NOTICE) for the
 attribution notices. Contributions are accepted under the same licence.
 
-Some bundled material comes from other projects under their own licences, notably the MIT-licensed library
-skills and catalogue prompts from [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH) and the vendored xterm.js
-used by `orch web`; [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists each one with its full licence text.
+r-orch is a derivative of [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH) (MIT): its Rust source began as
+a translation of ORCH's TypeScript, and the shop catalogue, prompt templates and library skills come from ORCH. The
+library skills are ORCH's adaptations of [`garrytan/gstack`](https://github.com/garrytan/gstack) skills (MIT), and
+`orch web` serves a vendored xterm.js (MIT). That material keeps its MIT licence;
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists each component with its full licence text, and says what to
+ship with a built binary or package.

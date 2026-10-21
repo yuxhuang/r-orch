@@ -1,25 +1,16 @@
 r-orch
 Copyright 2026 Stochastic Dev
 
-This product includes software developed by the Agents Organizations
-Contributors as part of ORCH (https://github.com/oxgeneral/ORCH),
-Copyright (c) 2026 Agents Organizations Contributors, licensed under the
-MIT License. r-orch began as a Rust port of ORCH: its Rust source under
-crates/, including the ported tests, began as a translation of ORCH's
-TypeScript source. The agent-shop and organization-shop catalogues, the
-default prompt templates and the recorded adapter fixtures are copied or
-derived from ORCH, and the files in skills/library/*.md are copies of
-ORCH's skills/library.
+This product includes software derived from ORCH
+(https://github.com/oxgeneral/ORCH), Copyright (c) 2026 Agents
+Organizations Contributors, licensed under the MIT License. r-orch is a
+derivative work of ORCH: its Rust source began as a translation of ORCH's
+TypeScript source.
 
-This product includes software developed by Garry Tan as part of gstack
+This product includes software from gstack
 (https://github.com/garrytan/gstack), Copyright (c) 2026 Garry Tan,
-licensed under the MIT License. ORCH adapted the skills in
-skills/library/*.md from gstack's skills, modifying them; the skill text in
-fixtures/prompts/_skills.json comes from the same files.
+licensed under the MIT License, as adapted by ORCH.
 
-This product includes xterm.js and @xterm/addon-fit
-(https://github.com/xtermjs/xterm.js), developed by the xterm.js authors
-and licensed under the MIT License.
-
-THIRD-PARTY-NOTICES.md lists the files each component covers and
-reproduces each component's copyright notices and full licence text.
+THIRD-PARTY-NOTICES.md lists the files these and other third-party
+components cover and reproduces their copyright notices and full licence
+texts.
