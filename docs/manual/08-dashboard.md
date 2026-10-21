@@ -50,36 +50,41 @@ If another process already runs the orchestrator for the project (for example `o
 
 `orch tui --observe --listen` is refused at once with exit code 2 and the message `--listen requires the engine owner; --observe cannot listen`.
 
-![The dashboard's Tasks view: nine tasks in review, to-do, done and failed states with their priority, goal and assignee, and the activity feed below](images/dashboard-overview.png)
+![The dashboard's Tasks view: nine tasks in review, to-do, done and failed states, sorted by STATUS with an up arrow, in columns for status, priority, title, goal, assignee, Started and Elapsed*, with the activity feed below](images/dashboard-overview.png)
 
-*The Tasks view, which the dashboard opens on. The header counts tasks by status.*
+*The Tasks view, which the dashboard opens on. Under the header, chips count tasks by status and count the teams. The `↑` after STATUS marks the sort column.*
 
 The screenshots in this chapter were taken in observe mode, so the header shows `OBSERVING` and the second header line reads `listen off · controller none`. When you run `orch tui` yourself, the header shows `WATCHING` instead. The second line tells you about peer connections: whether this machine listens for other orch machines (`listen off` or an address), which machine controls it (`controller none`), and the state of each remote you registered. See [Remote agents](11-remote-agents.md).
 
 ## Read the screen
 
-From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal:
+From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, started with `orch tui --observe`. Runs of empty rows are shortened to `…`:
 
 ```text
-◆ ORCH 0.8.0 · proj  G goals  T TASKS  A agents L actions   ● OBSERVING
+◆ ORCH 0.9.3 · proj  G goals  T TASKS  A agents L actions   ● OBSERVING
 listen off · controller none
  ○ TODO 2
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-━━━ > TASKS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-▸ ○ TODO    !   Second task                           —            —
-  ○ TODO    !   Write the docs                        worker       —
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━ > TASKS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STATUS↑   PRI TITLE                                               GOAL               ASSIGNEE        STARTED  ELAPSED*
+▸ ○ TODO    !   Second task                                                            —
+  ○ TODO    !   Write the docs                                                         worker
     + add task...
-━━━ ACTIVITY ━━F:ALL │ 1/1 · following━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+◆ Press R to run task  R run task
 …
-↑↓   Tab panes; ←→ views   / cmd  N new  R run  C cancel  E edit  …  ? help
+━━━ ACTIVITY ━━F:ALL │ 1/1 · following━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+…
+>  now         ◆ Observer mode: watching external orchestrator via disk polling.
+↑↓   Tab panes; ←→ views   / cmd  ^K filter  N new  R run  C cancel  E edit  S show all  D delete  Enter detail  Q quit
 ```
 
 | Part | What it shows |
 |---|---|
 | Header | The version, the project name, the four view tabs, and a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`. |
 | Second header line | The peer listen address, the connected controller and each remote's online state. See [Remote agents](11-remote-agents.md). |
-| Status counts | Task counts by status. |
-| Main list | The list for the current view, with a `+ add …` row at the end. |
+| Status counts | One chip for each task status that has tasks, such as `○ TODO 2`, and a `TEAMS` chip with the number of teams. |
+| Main list | The list for the current view: a column header row (the sort column is marked `↑` or `↓`), the rows, and a `+ add …` row at the end. In a new project a hint under the list suggests the next step, such as `◆ Press R to run task`. |
 | Detail panel | Opens under the list when you press `Enter`. |
 | Activity feed | Recent events. A label shows the filter and whether the feed is `following` or `paused`. |
 | Command bar | Appears at the bottom when you press `/`. |
@@ -98,7 +103,7 @@ The dashboard has four views. The tab for the current view is upper case in the 
 | Agents | `A` | [Agents](02-concepts.md#agents-and-adapters) as a table, grouped by team by default. |
 | Actions | `L` | The log of everything agents and the orchestrator did, with filters. |
 
-![The Agents view: a table of agents grouped by team, with each agent's status, name, adapter and model, capabilities, location, runs and last update](images/dashboard-agents.png)
+![The Agents view: a table of eight agents sorted by STATUS with an up arrow, in a PLATFORM team section led by Ada and an UNASSIGNED section, with columns for status, name, adapter and model, task, capabilities, location, runs and UPDATED, and a GROUP: Team chip at the right end of the header row](images/dashboard-agents.png)
 
 *The Agents view, grouped by team. Click a column header to sort; the `GROUP: Team` chip at the end of the header row names the grouping. The team lead is marked with a star.*
 
@@ -128,9 +133,11 @@ Letters that act on an item (`E`, `D`, `R`, `C` and so on) work only while the m
 3. Press `Tab` to move through sections such as Description, Activity and Files.
 4. Press `Esc` to close the panel.
 
-![A task opened below the task list, showing its Overview tab with status, assignee, priority and attempts, next to the Description and Activity tabs](images/dashboard-task-detail.png)
+![A task opened below the task list, with the Overview, Description and Activity section titles and the Overview focused: the task title on a rule, then status, assignee, priority, attempts, labels and depends as labels and values in two columns](images/dashboard-task-detail.png)
 
-*A task's detail, opened with Enter.*
+*A task's detail, opened with Enter. The Overview section is a block of labels and values.*
+
+The Overview section starts with the item's title on a `━` rule. Below it, labels and values stand in two columns, or in one column on a narrow terminal. Statuses, priorities and task counts have the same colours as in the lists. A value too long for its row wraps onto the next rows, so nothing is cut off.
 
 | Key | What it does |
 |---|---|
@@ -173,9 +180,12 @@ The Goals, Tasks and Agents lists have a column header row. Each list keeps its 
 
 The active column is marked `↑` or `↓`. When a column is too narrow for its whole label, the label is cut and the arrow stays, for example `ADAPTER/…↑`. For what each Agents column sorts by, see [Sort and group agents](#sort-and-group-agents).
 
-Goals and Tasks also have a Started and an Elapsed* column, both blank for an entity that never started.
+Goals and Tasks also have a Started and an Elapsed* column, both blank for an entity that never started. The help overlay sums up Elapsed* like this:
 
-Elapsed*: start to now; terminal rows end at last update (edits change it). Includes waiting/retries.
+```text
+Elapsed*: start to now; terminal rows end at last update (edits change it).
+Includes waiting/retries.
+```
 
 A task's Started is its earliest retained run record, which is written while the run is still `preparing` — not the moment an agent process launched. A goal's Started is its creation time. Ordering by Elapsed re-sorts on a refresh or a list-control change; the time the column shows stays live between those.
 
@@ -294,7 +304,7 @@ On the Goals, Tasks or Agents list, press `Ctrl+K` (or click `^K filter` in the 
 
 Matching ignores case and looks at each field on its own: the ID, the title or name, the status (both `in_progress` and the `RUN` the row shows), the assignee's or agent's name and ID, a task's goal, and an agent's team, adapter, model, node (`local` or the remote alias) and every capability. Descriptions and the Started and Elapsed times are not searched.
 
-A kept keyword shows as a `filter: … · matches/total` chip on the list's title rule; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten matches, `show all` lists the rest (`▼ Show all (2 more) — press S`). Empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard. The Tasks keyword does not narrow a goal's [Tasks section](#a-goals-tasks-section). `/` still opens the command bar.
+A keyword shows as a chip on the list's title rule, for example `filter: docs · 1/2 ^U ✕`; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten matches, `show all` lists the rest (`▼ Show all (2 more) — press S`). Empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard. The Tasks keyword does not narrow a goal's [Tasks section](#a-goals-tasks-section). `/` still opens the command bar.
 
 ## Follow activity feeds
 
@@ -316,7 +326,7 @@ Long messages, log entries and descriptions do not fit in a list row. Open the f
 3. Scroll with `Up`, `Down`, `PageUp`, `PageDown`, `Home` and `End`.
 4. Press `Esc` or `q` to close it.
 
-![The full-text viewer showing one complete activity entry, a failed run's error message, with the copy control in the footer](images/dashboard-message-viewer.png)
+![The full-text viewer opened from the Actions view, with a header line reading Snapshot, Raw 156B and Message 6, showing one complete activity entry, a failed run's error message, with the copy control in the footer](images/dashboard-message-viewer.png)
 
 *The full-text viewer shows a snapshot of the whole text. Close and reopen it to see newer content.*
 
@@ -341,18 +351,18 @@ Wizards are step-by-step forms. Each one shows its title and a step counter, for
 | Edit Task, Agent or Goal | `E` on the selected item | The same steps, filled in |
 | Settings | `/config <setting>` | One step |
 
-![The New Agent wizard on step 1 of 6, asking for the agent name, with a list of agent templates to browse below the input](images/dashboard-new-agent.png)
+![The New Agent wizard on step 1 of 6 under the Agents table, asking for the agent name, with the 15 agent templates to browse below the input](images/dashboard-new-agent.png)
 
 *The New Agent wizard. You can type a name or start from a template.*
 
 To fill in a wizard:
 
-1. Type a value, or choose an option with `Up` and `Down` (or `j` and `k`).
+1. Type a value, or choose an option with `Up` and `Down` (or `j` and `k`, except on steps that pick an agent).
 2. Press `Enter` or `Tab` to accept the step.
 3. Press `Esc`, or `Backspace` on an empty text field, to go back one step. `Esc` on the first step leaves the wizard.
 4. Accept the last step to create the item. If creation fails, the form stays open so you can fix it.
 
-On select steps the number keys `1` to `9` choose and accept an option at once. Steps that pick an agent (assignee, team lead, team members) filter as you type instead: letters, including `j` and `k`, narrow the list to agents whose name, adapter or role contains them (move with the arrow keys), `Backspace` edits the filter, `Esc` clears it, and `Ctrl+O` cycles the order through Original, Name, Adapter and Status. The numbers follow the filtered list, and typed text alone never assigns anyone: choose a listed agent, or Auto-assign/None. On multi-select steps `Space` toggles the option. In description fields, `Enter` adds a new line; press `Tab` or `Ctrl+Enter` to accept the field. The model step offers suggestions: press `Down` to browse them.
+On select steps the number keys `1` to `9` choose and accept an option at once. Steps that pick an agent (assignee, team lead, team members) filter as you type instead: letters, including `j` and `k`, narrow the list to agents whose name, adapter or role contains them (move with the arrow keys), `Backspace` edits the filter, `Esc` clears it, and `Ctrl+O` cycles the order through Original, Name, Adapter and Status. The prompt shows the order, for example `order: Original · Ctrl+O`, and each row shows the agent's status and adapter, for example `worker ─ idle · shell`. With the filter empty, `Esc` and `Backspace` go back one step. The numbers follow the filtered list, and typed text alone never assigns anyone: choose a listed agent, or Auto-assign/None. When you submit, orch checks the chosen agents again. An agent that was disabled or removed after you picked it is refused with `Nothing was saved: …`; nothing is written and the step opens again. In edit wizards, the first assignee row is `Keep current`. On multi-select steps `Space` toggles the option. In description fields, `Enter` adds a new line; press `Tab` or `Ctrl+Enter` to accept the field. The model step offers suggestions: press `Down` to browse them.
 
 ### Install from the agent shop
 
@@ -370,7 +380,7 @@ Bracketed paste keeps newlines in the wizard and the command bar. A single paste
 
 ## Keep drafts and avoid losing edits
 
-If you leave a changed wizard, orch asks what to do:
+If you leave a changed wizard, orch asks what to do. It also asks when you go back a step in a changed wizard; the prompt then starts `Leave this step?`, and Discard goes back one step:
 
 - **Continue** goes back to editing.
 - **Keep draft** saves the edits in memory so you can recover them later.
@@ -517,9 +527,11 @@ Under tmux, clicks reach the dashboard only if you set `set -g mouse on`. While 
 
 ## Get help and quit
 
-Press `F1` or `?` for help. The overlay lists the main shortcuts and commands. When text, a viewer or an editor field has focus, `F1` shows help for copying that text instead. Press `Esc`, `F1` or `?` to close it; any other key closes it and also does what the key normally does.
+Press `F1` or `?` for help. The overlay lists the main shortcuts and commands. Under them, short notes explain feeds, sorting, Elapsed*, the Agents grouping and UPDATED. When text, a viewer or an editor field has focus, `F1` shows help for copying that text instead. Press `Esc`, `F1` or `?` to close it; any other key closes it and also does what the key normally does.
 
-![The keyboard shortcuts overlay, with Navigation, Actions and Commands columns over a dimmed Tasks view](images/dashboard-help.png)
+The whole overlay fits an 80×24 terminal. On a short terminal the box drops its blank rows and may cover the header.
+
+![The KEYBOARD SHORTCUTS overlay in the middle of the screen, with Navigation, Actions and Commands columns and, below them, notes on feeds, sorting, Elapsed*, Agents grouping and UPDATED; the header and footer stay visible around it](images/dashboard-help.png)
 
 *The help overlay, opened with F1.*
 
@@ -651,9 +663,11 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | Key | What it does |
 |---|---|
 | `Enter`, `Tab` | Accept the step. In description fields `Enter` adds a line, and `Tab` or `Ctrl+Enter` accepts. |
-| `Esc` | Go back one step; on the first step, leave the wizard (with a draft prompt if you changed something). |
-| `Backspace` | On an empty text field or a select step, go back one step. |
-| `Up`, `Down`, `j`, `k` | Choose an option (select steps). |
+| `Esc` | Go back one step; on the first step, leave the wizard. If you changed something, orch asks first (see [Keep drafts](#keep-drafts-and-avoid-losing-edits)). On a step that picks an agent, `Esc` clears the filter first. |
+| `Backspace` | On an empty text field or a select step, go back one step. On a step that picks an agent, it edits the filter first. |
+| `Up`, `Down`, `j`, `k` | Choose an option (select steps). On steps that pick an agent, `j` and `k` type into the filter; use `Up` and `Down`. |
+| Letters | Steps that pick an agent: filter the list. `Esc` clears the filter. |
+| `Ctrl+O` | Steps that pick an agent: cycle the order (Original, Name, Adapter, Status). |
 | `Down` | In a text step with suggestions, start browsing them. |
 | `1` to `9` | Choose the numbered option and accept it. |
 | `Space` | Toggle an option (multi-select steps). |
@@ -705,4 +719,4 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 |---|---|
 | `Esc`, `F1`, `?` | Close. |
 | `Up`, `Down`, `PageUp`, `PageDown`, `Home`, `End` | Scroll the copy help. |
-| Any other key | Close the overview, then act as normal. |
+| Any other key | Close the overlay, then act as normal. |
