@@ -29,7 +29,7 @@ applies them like this. It follows the standard's principles; it has not been as
 
 ### How the manual was checked
 
-Before the 0.8.0 release, people who had not written the manual checked it four ways:
+The first edition of this manual, which described orch 0.8.0, was checked four ways by people who had not written it:
 
 - **Facts.** Every command, flag, default, limit, key binding and example output was compared with orch 0.8.0
   itself, by running it in scratch projects and by reading its source. Where older documentation disagreed with
