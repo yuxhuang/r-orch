@@ -656,6 +656,7 @@ drafts last only for the dashboard session).
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |
 | [AGENTS.md](AGENTS.md) | Contributors and agents: rules, workflow, testing, release checklist |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release |
+| [LICENSE](LICENSE), [NOTICE](NOTICE), [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | Licence (Apache-2.0), attribution notices, and the licences of bundled third-party material |
 | [docs/specs/](docs/specs/) | Specs: what goal-sized work must do and how it is accepted |
 | [docs/plans/](docs/plans/) | Plans for non-trivial work, before it is built: design, task split, status |
 | [docs/decisions/](docs/decisions/) | Decision records: why things are the way they are |
@@ -682,4 +683,9 @@ See [ARCHITECTURE.md §8](docs/ARCHITECTURE.md) for the test strategy and
 
 ## License
 
-MIT.
+Licensed under the Apache License, Version 2.0: see [LICENSE](LICENSE), and [NOTICE](NOTICE) for the
+attribution notices. Contributions are accepted under the same licence.
+
+Some bundled material comes from other projects under their own licences, notably the MIT-licensed library
+skills and catalogue prompts from [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH) and the vendored xterm.js
+used by `orch web`; [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists each one with its full licence text.

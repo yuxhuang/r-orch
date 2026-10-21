@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Changed
+- r-orch is now licensed under the Apache License 2.0 instead of MIT: the repository ships `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES.md`, and every crate declares `license = "Apache-2.0"`. The bundled MIT-licensed material (the library skills and shop catalogue from `oxgeneral/ORCH`, and the xterm.js files served by `orch web`) keeps its MIT licence, with the full texts in `THIRD-PARTY-NOTICES.md`.
+
 ## [0.9.2] - 2026-10-20
 
 Dashboard patch release: the Agents list is a sortable, grouped table with an UPDATED column. No peer-protocol
