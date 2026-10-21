@@ -36,7 +36,7 @@ What gets easier, what gets harder, what must change as a result.
 
 ## Numbering and lifecycle
 
-- Four digits, sequential, taken from the highest number on `master` plus one. If two PRs collide, the later one
+- Four digits, sequential, taken from the highest number on `main` plus one. If two PRs collide, the later one
   renumbers before merge.
 - Never reuse or renumber a merged ADR.
 - Do not rewrite an accepted ADR's decision. Supersede it with a new ADR and change the old status line to

@@ -67,7 +67,7 @@ jobs:
         with:
           path: src
           ref: ${{ env.TAG }}
-          # Full history, so the tagged commit can be checked against master.
+          # Full history, so the tagged commit can be checked against main.
           fetch-depth: 0
           persist-credentials: false
 
@@ -78,9 +78,9 @@ jobs:
         run: |
           set -eu
           commit=$(git rev-parse "refs/tags/$TAG^{commit}")
-          # AGENTS.md, Release: tags are cut on master only.
-          if ! git merge-base --is-ancestor "$commit" origin/master; then
-            echo "::error::$TAG ($commit) is not on master"
+          # AGENTS.md, Release: tags are cut on main only.
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$TAG ($commit) is not on main"
             exit 1
           fi
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
