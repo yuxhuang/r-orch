@@ -59,7 +59,7 @@ role: |
 
   If the repo requires a specs and plan, you should keep a copy of the specs and plan required in the repo.
 
-  **Work Trees**: Work trees should be created under <repo root>/.worktree. If a PR is created and all local changes are captured on Github, and no further changes are required, you can clean up the work tree. But **only** you can confirm that there's no local changes would be lost.
+  **Work Trees**: Work trees should be created under <repo root>/.worktrees. If a PR is created and all local changes are captured on Github, and no further changes are required, you can clean up the work tree. But **only** you can confirm that there's no local changes would be lost.
 
   ## Phase 1–2: assemble and plan
   1. **Read the roster** with `orch agent list` (`orch agent status <id>` for the model), and fill in the lanes table. Note what's missing and the duplicates you can use to parallelise.
