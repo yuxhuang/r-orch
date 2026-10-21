@@ -35,7 +35,7 @@ orch task add "Build the report" --assignee builder -p 2 \
 
 Starting a task is a separate step: `orch run <task-id>`, or the orchestrator in [Running and monitoring](07-running-and-monitoring.md).
 
-> **Note:** In orch 0.8.0, `orch run <task-id>` prints its header line and silently does nothing when another `todo` task is assigned to the same agent. Cancel or reassign the other task, or use `orch run --all`. See [Run one task](07-running-and-monitoring.md#run-one-task). The examples in this chapter give each task its own agent for that reason.
+> **Note:** In orch 0.9.3, `orch run <task-id>` prints its header line and silently does nothing when another `todo` task is assigned to the same agent. Cancel or reassign the other task, or use `orch run --all`. See [Run one task](07-running-and-monitoring.md#run-one-task). The examples in this chapter give each task its own agent for that reason.
 
 ### Options for `orch task add`
 
@@ -74,7 +74,7 @@ $ orch task add directory --attach directory
   ✕ Attachment is not a regular file: directory
 ```
 
-> **Note:** In orch 0.8.0 and earlier, `orch task add --attach` accepted a path but did not save the attachment. Upgrade, or put the file's path in the description instead.
+> **Note:** In orch 0.8.0 and earlier, `orch task add --attach` accepted a path but did not save the attachment. orch 0.9.0 and later save it as described above. On an older version, upgrade, or put the file's path in the description instead.
 
 Two output options help in scripts. `--quiet` prints only the new ID, and `--json` or `--yaml` prints the whole task.
 

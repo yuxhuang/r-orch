@@ -10,7 +10,7 @@ operators who work in a terminal and use git, but do not read orch's source code
 whether orch fits their work can read [Getting started](01-getting-started.md) and
 [Concepts](02-concepts.md) only.
 
-It covers orch **0.8.0**: every command, the dashboard, the web dashboard, templates and the agent shop, and
+It covers orch **0.9.3**: every command, the dashboard, the web dashboard, templates and the agent shop, and
 remote agents. It does not cover how orch is built. Contributors should read [AGENTS.md](../../AGENTS.md) and
 [ARCHITECTURE.md](../ARCHITECTURE.md).
 
@@ -31,7 +31,7 @@ applies them like this. It follows the standard's principles; it has not been as
 
 Before release, people who had not written the manual checked it four ways:
 
-- **Facts.** Every command, flag, default, limit, key binding and example output was compared with orch 0.8.0
+- **Facts.** Every command, flag, default, limit, key binding and example output was compared with orch 0.9.3
   itself, by running it in scratch projects and by reading its source. Where older documentation disagreed with
   the program, the manual follows the program.
 - **Plain language.** An editor reviewed every chapter against the four principles above: sentence length,
@@ -55,7 +55,7 @@ setups. The chapters that describe it say where it comes from the source or the 
 | **Warning:** | Something that can lose data, cost money or expose your machine |
 | **Note:** | Something easy to miss |
 
-Examples were run against orch 0.8.0 in a scratch project. IDs, times and paths in your output will differ.
+Examples were run against orch 0.9.3 in a scratch project. IDs, times and paths in your output will differ.
 
 ## Keeping the manual accurate
 

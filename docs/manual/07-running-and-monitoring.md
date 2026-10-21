@@ -70,7 +70,7 @@ After a successful run the task is `done`, or `review` if the agent's policy ask
 
 - The task is not `todo` or `retrying`. Run `orch task retry` first for a `failed` task.
 - The task is assigned to an agent that is busy or disabled.
-- Another `todo` task is assigned to the same agent. In orch 0.8.0 the agent counts as taken, and the run does nothing. Cancel or finish the other task, reassign one of them, or use `orch run --all`.
+- Another `todo` task is assigned to the same agent. In orch 0.9.3 the agent counts as taken, and the run does nothing. Cancel or finish the other task, reassign one of them, or use `orch run --all`.
 
 To see why, run `orch task list --status todo` and `orch agent list`.
 
@@ -302,7 +302,7 @@ orch doctor
   ✓  git          git version 2.56.0
   ✓  git repo     git repository detected
   ✓  .gitignore   .orchestry is excluded
-  ✓  toolchain    r-orch 0.8.0 (rust 1.99)
+  ✓  toolchain    r-orch 0.9.3 (rust 1.99)
 
   ✓  .orchestry/   exists · 5 agents · 20 tasks
 

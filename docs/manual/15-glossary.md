@@ -26,6 +26,10 @@ See [Review and approval](02-concepts.md#review-and-approval).
 One try at a task. A task has an attempt limit (3 by default). When a task uses all its attempts, it becomes
 `failed`. See [Task lifecycle](02-concepts.md#task-lifecycle).
 
+**attachment**
+A file you attach to a task with `orch task add --attach`. orch copies it into
+`.orchestry/attachments/<task id>/`. See [Options for `orch task add`](04-tasks.md#options-for-orch-task-add).
+
 **autonomous agent**
 An agent that orch gives new tasks automatically when it is idle, based on active goals or its role. See
 [Autonomy](02-concepts.md#autonomy).
@@ -66,6 +70,12 @@ An agent status. A disabled agent gets no work until you enable it. See
 **done**
 The task status after approval. It is final. See [Task lifecycle](02-concepts.md#task-lifecycle).
 
+## E
+
+**Elapsed\***
+A dashboard column on the Goals and Tasks lists: the time from the start to now, or to the last update once the
+row is terminal. It includes waiting and retries. See [Sort the lists](08-dashboard.md#sort-the-lists).
+
 ## F
 
 **failed**
@@ -86,6 +96,10 @@ Preferences for the dashboard that apply to every project, stored in `~/.orchest
 A lasting objective, with the status `active`, `paused`, `achieved` or `abandoned`. Goals drive autonomous
 agents. See [Goals](02-concepts.md#goals).
 
+**grouping**
+How the dashboard cuts a list into sections. Press `b` to group the Agents table by team, node, status, adapter
+or capability, or not at all; press `G` to group tasks by goal. See [Group the table](08-dashboard.md#group-the-table).
+
 ## I
 
 **idle**
@@ -98,6 +112,12 @@ The task status while an agent works on the task. See [Task lifecycle](02-concep
 **isolated**
 A workspace mode that gives the agent a separate copy of the project, made with `git clone`, and does not merge
 it back. See [Workspaces](02-concepts.md#workspaces).
+
+## K
+
+**keyword filter**
+A dashboard prompt, opened with `Ctrl+K`, that narrows the Goals, Tasks or Agents list to the rows that match
+what you type. See [Filter a list by keyword](08-dashboard.md#filter-a-list-by-keyword).
 
 ## L
 
@@ -221,6 +241,12 @@ A task status that orch does not start by itself: `done`, `failed` or `cancelled
 
 **todo**
 The task status of a task that has not started. See [Task lifecycle](02-concepts.md#task-lifecycle).
+
+## U
+
+**UPDATED**
+A column in the dashboard's Agents table: how long ago the agent's live run (`R`) or a task assigned to it (`T`)
+last changed. It does not say when the agent last did anything. See [What UPDATED means](08-dashboard.md#what-updated-means).
 
 ## W
 
