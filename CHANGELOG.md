@@ -9,6 +9,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - r-orch is now licensed under the Apache License 2.0 instead of MIT: the repository ships `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES.md`, and every crate declares `license = "Apache-2.0"`. r-orch is a derivative of `oxgeneral/ORCH` (MIT), and the material that comes from other projects keeps its MIT licence: the ORCH-derived Rust source, shop catalogue and prompt templates, the library skills (ORCH's adaptations of `garrytan/gstack` skills), and the xterm.js files served by `orch web`. `THIRD-PARTY-NOTICES.md` has their full licence texts and what a binary or package distribution must ship.
 - The a-team templates now use a sibling `../workspace` directory for the specs and reports some roles write (it was named after a private project before); rename that sibling directory, or edit a copy of the template, when upgrading.
 
+### Fixed
+- The a-team orchestrator's rules now say to create work trees under `<repo root>/.worktrees` (they said `.worktree`). A copy of the template you made with `orch org template init --from a-team`, and agents already deployed from it, keep the old wording.
+
 ## [0.9.2] - 2026-10-20
 
 Dashboard patch release: the Agents list is a sortable, grouped table with an UPDATED column. No peer-protocol
