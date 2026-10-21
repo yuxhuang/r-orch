@@ -5,6 +5,11 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-20
+
+Licence and template release: r-orch is now Apache-2.0, and the a-team template's directory names are fixed. No
+behaviour or peer-protocol change, so 0.5.x through 0.9.3 peers can be mixed.
+
 ### Changed
 - r-orch is now licensed under the Apache License 2.0 instead of MIT: the repository ships `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES.md`, and every crate declares `license = "Apache-2.0"`. r-orch is a derivative of `oxgeneral/ORCH` (MIT), and the material that comes from other projects keeps its MIT licence: the ORCH-derived Rust source, shop catalogue and prompt templates, the library skills (ORCH's adaptations of `garrytan/gstack` skills), and the xterm.js files served by `orch web`. `THIRD-PARTY-NOTICES.md` has their full licence texts and what a binary or package distribution must ship.
 - The a-team templates now use a sibling `../workspace` directory for the specs and reports some roles write (it was named after a private project before); rename that sibling directory, or edit a copy of the template, when upgrading.
@@ -198,7 +203,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/yuxhuang/r-orch/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/yuxhuang/r-orch/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/yuxhuang/r-orch/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/yuxhuang/r-orch/compare/v0.8.0...v0.9.0
