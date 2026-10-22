@@ -44,14 +44,14 @@ cargo install --path crates/orch-cli
 
 Releases are tags on `main` (`vX.Y.Z`). v0.5.0 is the first release with
 [remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
-`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard; v0.7.0 adds Agents-list sorting and activity feeds that follow new entries; v0.8.0 adds `--yaml` output, `update`/`patch` from JSON or YAML files, and organization templates with the built-in a-team; v0.9.0 adds sortable column headers, keyword filtering and node grouping to the dashboard lists, newest-first Activity in goal and agent details, and filtering agent pickers in the wizards, and makes `orch task add --attach` save its files; v0.9.1 shows a goal detail's Tasks section as the Tasks list's table; v0.9.2 makes the Agents list a sortable table with an UPDATED column and more groupings; v0.9.3 relicenses r-orch under Apache-2.0 and fixes paths in the a-team template. The Homebrew formula pins the latest release tag (and `--HEAD` follows `main`).
+`v0.5.0-alpha.2`. v0.5.1 makes remote task state truthful and reconnection reliable; v0.5.2 is a maintenance release (newer dependencies, Rust 1.99 to build); v0.6.0 improves the dashboard: full-text message viewing, focusable and scrollable sections, guarded editors with drafts, and copy to the clipboard; v0.7.0 adds Agents-list sorting and activity feeds that follow new entries; v0.8.0 adds `--yaml` output, `update`/`patch` from JSON or YAML files, and organization templates with the built-in a-team; v0.9.0 adds sortable column headers, keyword filtering and node grouping to the dashboard lists, newest-first Activity in goal and agent details, and filtering agent pickers in the wizards, and makes `orch task add --attach` save its files; v0.9.1 shows a goal detail's Tasks section as the Tasks list's table; v0.9.2 makes the Agents list a sortable table with an UPDATED column and more groupings; v0.9.3 relicenses r-orch under Apache-2.0 and fixes paths in the a-team template; v0.9.4 updates the user manual and keeps section headers in view in grouped dashboard lists. The Homebrew formula pins the latest release tag (and `--HEAD` follows `main`).
 `orch update` does not self-update: it only prints how to install. To build a specific release from source:
 
 ```bash
 git clone <this repo> r-orch && cd r-orch
-git checkout v0.9.3
+git checkout v0.9.4
 cargo install --locked --path crates/orch-cli
-orch --version      # 0.9.3
+orch --version      # 0.9.4
 ```
 
 Keep the clone: the library skills are found in `skills/library` of the checkout the binary was built from.
@@ -636,7 +636,7 @@ while the main list has focus. Mouse capture now reports drags for text selectio
 back to the terminal. Roll back by installing v0.5.2: v0.6.0 writes nothing new to `.orchestry/` (editor
 drafts last only for the dashboard session).
 
-### Known gaps in v0.9.3
+### Known gaps in v0.9.4
 
 - Copy and mouse selection in a native terminal (Terminal.app, iTerm2) were not verified by hand before
   release; the automated tests cover the copy routing, and the web dashboard's browser copy.
