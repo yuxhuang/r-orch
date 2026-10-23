@@ -29,7 +29,7 @@ driving-agent-clis.md.
 
 | # | Question | Answer |
 |---|---|---|
-| Q1 | What orchestration logic is there; how are goals, tasks and agents set up; how is work handled, recorded and handed off? | [orchestration.md §2](orchestration.md#2-q1-orchestration-logic); setup [§2.10](orchestration.md#210-setting-up-goals-tasks-and-agents), evidence [§2.11](orchestration.md#211-evidence-what-is-written-where), checklist [§2.12](orchestration.md#212-checklist-will-this-task-be-handled) |
+| Q1 | What orchestration logic is there; how are goals, tasks and agents set up; how is work handled, recorded and handed off? | [orchestration.md §2](orchestration.md#2-q1-orchestration-logic); setup [§2.10](orchestration.md#210-setting-up-goals-tasks-and-agents), evidence [§2.11](orchestration.md#211-evidence-what-is-written-where), checklist [§2.12](orchestration.md#212-checklist-will-this-task-be-handled); handoff [§3](orchestration.md#3-q2-how-does-one-agent-connect-to-another-agent) and [§4](orchestration.md#4-q3-how-does-one-agent-connect-to-another-task) |
 | Q2 | How does one agent connect to another agent? | [orchestration.md §3](orchestration.md#3-q2-how-does-one-agent-connect-to-another-agent) |
 | Q3 | How does one agent connect to another task? | [orchestration.md §4](orchestration.md#4-q3-how-does-one-agent-connect-to-another-task) |
 | Q4 | How does a goal-driven system work? | [orchestration.md §5](orchestration.md#5-q4-how-does-a-goal-driven-system-work) |
@@ -53,9 +53,10 @@ orchestration.md [§2.5](orchestration.md#25-completion-success-review-retry-cas
 
 Both documents describe commit `40a6dc7` (tag `v0.10.0`) and nothing later. orchestration.md cites
 `file:line` with shortened paths (prefix table at its top); driving-agent-clis.md uses reference links to
-`github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/...#L<n>`. Gaps between code and
-manual are listed in [orchestration.md §8](orchestration.md#8-known-gaps-pending-fixes); a row there may
-already be fixed on `main` (row 1 is).
+`github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/...#L<n>`. Known gaps and limits:
+engine gaps in [orchestration.md §8](orchestration.md#8-known-gaps-pending-fixes) (a row there may already be
+fixed on `main`; row 1 is); adapter limits in
+[driving-agent-clis.md Q9 "Known limits"](driving-agent-clis.md#known-limits).
 
 To refresh a citation after the code moves:
 

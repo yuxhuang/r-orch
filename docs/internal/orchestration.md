@@ -7,7 +7,8 @@ work, and how work pauses and resumes. Written for engineers changing the engine
   disagree, this document describes the code and lists the gap in [§8](#8-known-gaps-pending-fixes).
 - **Scope:** flow and logic. Crate layout, traits and the lock order are in
   [ARCHITECTURE.md](../ARCHITECTURE.md) (§3, §5, §6) and are not repeated here. How a prompt is built and
-  how each adapter spawns and parses its CLI is in the sibling document `docs/internal/driving-agent-clis.md`.
+  how each adapter spawns and parses its CLI is in the sibling document
+  [driving-agent-clis.md](driving-agent-clis.md).
 - **User-facing behaviour** is in the [manual](../manual/README.md); this document links to it rather than
   restating it.
 
@@ -107,7 +108,7 @@ and in-process ones within about 0.5 s.
 
 | Command | Owner lock | Reconcile | Creates `[auto]` tasks | Starts | Ends |
 |---|---|---|---|---|---|
-| `orch run <task-id>` | temporary (`orchestrator.rs:379-393`, `484-490`) | no | no | that task only; every other ready task is claimed so it cannot start (`orchestrator/dispatch.rs:264-293`) | when its collectors finish (`orchestrator.rs:681-688`) |
+| `orch run <task-id>` | temporary (`orchestrator.rs:379-393`, `484-490`) | no | no | that task only; every other ready task is claimed so it cannot start (`orchestrator/dispatch.rs:264-293`), which also means it starts nothing and exits 0 when the assignee has another `todo`/`retrying` task ([§8](#8-known-gaps-pending-fixes) row 9) | when its collectors finish (`orchestrator.rs:681-688`) |
 | `orch run --all` | temporary (`orchestrator.rs:493-498`) | no | no | one pass over everything ready (`orchestrator/dispatch.rs:25-34`) | when its collectors finish |
 | `orch run --watch`, `orch serve`, the dashboard (`orch`, `orch tui`, `orch web`) | held while running (`orchestrator.rs:563-567`) | every tick | yes | every tick, plus reactive dispatch | on a signal, `/pause`, or the tick circuit breaker |
 | `orch serve --once` | held | every tick | **no** (`orchestrator.rs:165-172`) | every tick | when every task is terminal |
@@ -264,7 +265,7 @@ sequenceDiagram
     O->>FS: drain recipient mailbox (messages marked delivered)
     O->>FS: read goal and goal-id-progress context entry
     Note over O: render prompt (see driving-agent-clis.md)
-    O->>FS: runs/run.json created, status preparing, full prompt
+    O->>FS: runs/run.json created, status preparing, user prompt (the system half — role, team, rules, skills — is not stored)
     O->>FS: task: in_progress, assignee, attempts + 1, proof.branch
     O->>FS: agent: running, current_task
     O->>AD: execute(prompt, env ORCH_AGENT_ID, ORCH_TASK_ID, ...)
@@ -299,7 +300,9 @@ sequenceDiagram
 | Collector | Appends each event to the run log, refreshes `last_event_at`, forwards it to the event bus | `orchestrator/collect.rs:81-157`, `159-300` |
 
 Prompt assembly, adapter argv, stdout parsing and the meaning of each event kind are covered in
-`docs/internal/driving-agent-clis.md`.
+[driving-agent-clis.md](driving-agent-clis.md): spawning in
+[Q6](driving-agent-clis.md#q6-how-does-an-agent-drive-the-agent-cli), events in
+[Q7](driving-agent-clis.md#q7-how-does-the-agent-send-request-response-tool-call).
 
 ### 2.5 Completion: success, review, retry, cascade
 
@@ -350,7 +353,8 @@ flowchart TD
 - Merge-back happens **before** review: in the [worked example](#7-worked-example-one-goal-end-to-end) the
   worker's branch was merged into `main` while its task still waited in `review`
   (`orchestrator/collect.rs:445-486` runs before `488-538`).
-- Review criteria commands are hard-coded to npm (`engine/review_runner.rs:38-40`). If they fail and
+- Review criteria commands are hard-coded to the npm toolchain: `npm test`, `npx tsc --noEmit` and
+  `npm run lint` (`engine/review_runner.rs:38-40`). If they fail and
   auto-approve is on, the task is still forced to `done` with a non-fatal error event
   (`orchestrator/collect.rs:747-765`).
 
@@ -391,7 +395,7 @@ stateDiagram-v2
     review --> todo : reject with feedback
     review --> cancelled : cancel
     failed --> todo : orch task retry
-    failed --> retrying : manual
+    failed --> retrying : allowed by the table (no CLI command)
     cancelled --> todo : orch task retry
     done --> [*]
 ```
@@ -470,7 +474,7 @@ places below; the user view is in [manual chapter 11](../manual/11-remote-agents
 | Concurrency | Not counted against `max_concurrent_agents`; each remote agent runs one task | `orchestrator/dispatch.rs:46-54` |
 | Mailbox | Not drained locally | `engine/message_service.rs:273-275`, `orchestrator/dispatch.rs:460-463` |
 | Deadlines | An unacknowledged submit fails after 5 min of online time; a mirror queued for 1 h warns hourly | `orchestrator.rs:95-106`, `orchestrator/remote.rs:88-145` |
-| Outcome | Mapped onto the same success and failure handlers | `orchestrator/remote.rs:633-720` |
+| Outcome | Only `Failed` goes through the shared failure handler (`handle_run_failure_locked`). `Succeeded` and `Cancelled` are handled inline in `handle_remote_outcome`: success sets `proof`, moves the task to `review` and on to `done` under the same auto-approve or criteria-passed rule; cancel cancels the run and the task. No merge-back runs, and `handle_run_success_locked` is not called, so a change to the local success handler does not reach remote runs | `orchestrator/remote.rs:690-693` (failure), `695-709` (cancel), `710-775` (success) |
 | On the worker | A submitted task for an agent whose policy is not `auto` is held with `awaiting-approval` | `domain/task.rs:67-71` |
 
 ### 2.10 Setting up goals, tasks and agents
@@ -485,7 +489,7 @@ What each setup command writes, verified in a fresh project:
 | `orch goal add [--assignee A]` | `goals/<id>.yml`, `status: active` | The assignee gets `autonomous: true` | `engine/goal_service.rs:85-115` |
 | `orch agent autonomous <id>` | the agent's `autonomous` flag | — | CLI |
 | `orch msg send` | `messages/<id>.json`, `status: pending`, `expires_at` 24 h later (at most 7 days) | none until the recipient is next dispatched | `engine/message_service.rs:118-174`, `domain/message.rs:130-133` |
-| `orch context set` | `context/<key>.json` | Shown in every later prompt | `infra/template/user.liquid:36-41` |
+| `orch context set [--ttl <ms>]` | `context/<key>.json` | Offered to every later prompt, which shows **at most 15** entries ranked by relevance to the task and agent (goal id, agent name, scope, role); with 15 or fewer entries every agent sees all. Expires after `--ttl` | `infra/template/context.rs:75-149`, `crates/orch-core/src/template.rs:214`, `infra/storage/context.rs:49-57`, `84-110` |
 
 `init` creates `agt_creator`, an AI agent. In a test project disable it (`orch agent disable agt_creator`), or
 an unassigned task may start a real AI CLI.
@@ -501,9 +505,10 @@ an unassigned task may start a real AI CLI.
 **Prompt composition (pointer only).** Each dispatch renders a system and a user prompt from Liquid templates
 (`infra/template/system.liquid`, `infra/template/user.liquid`; eco variants in `eco_*.liquid`). The user prompt
 contains, in order: the task, attempt and retry error; project and working directory; the **Team** list;
-review feedback; **Shared Context** (every entry); **Inbox** (drained messages); **Goal** (status, linked
-tasks with status, latest progress) (`infra/template/user.liquid:1-70`). The full treatment, including what the
-agent's CLI actually receives, is in `docs/internal/driving-agent-clis.md`.
+review feedback; **Shared Context** (at most 15 entries, ranked by relevance; see [§3](#3-q2-how-does-one-agent-connect-to-another-agent));
+**Inbox** (drained messages); **Goal** (status, linked tasks with status, latest progress)
+(`infra/template/user.liquid:1-70`). The full treatment, including what the agent's CLI actually receives, is
+in [driving-agent-clis.md](driving-agent-clis.md#q6-how-does-an-agent-drive-the-agent-cli).
 
 ### 2.11 Evidence: what is written where
 
@@ -531,7 +536,7 @@ point it.
 
 | Evidence | Lives in | Written when | Source |
 |---|---|---|---|
-| The prompt an attempt got | `runs/<run>.json` → `prompt` | at dispatch, before the spawn | `orchestrator/dispatch.rs:622-632` |
+| The user half of the prompt an attempt got (the system half is not persisted; see [driving-agent-clis.md "What gets persisted?"](driving-agent-clis.md#what-gets-persisted)) | `runs/<run>.json` → `prompt` | at dispatch, before the spawn | `orchestrator/dispatch.rs:586-620` (render), `622-632` (store) |
 | Attempt outcome | `runs/<run>.json` → `status`, `finished_at`, `error`, `error_kind`, `tokens`, `pid` | at start and at finish | `domain/run.rs:58-78` |
 | Everything the agent emitted | `runs/<run>.jsonl`, one `{timestamp, type, data}` per event; `type` is `agent_output`, `file_changed`, `command_run`, `tool_call`, `error` or `done`; `data` capped at 8 KB | as each event arrives | `orchestrator/collect.rs:235-248`, `domain/run.rs:122-131`, `orchestrator.rs:71-72` |
 | The task's result | `tasks/<id>.yml` → `proof.branch` | at dispatch | `orchestrator/dispatch.rs:663-674` |
@@ -585,7 +590,7 @@ channels:
 |---|---|---|---|---|
 | Direct message | `orch msg send <agent-id> "<body>" -s <subject> --from <my-id>` | one agent | the recipient's **next dispatch** | [mechanism] |
 | Broadcast / team lead | `orch msg broadcast …`, `--team` | every non-disabled agent but the sender (or a team), or a team's lead | each recipient's next dispatch | [mechanism] |
-| Shared context | `orch context set <key> "<value>"` | **every** agent | every later prompt, until deleted | [mechanism] |
+| Shared context | `orch context set <key> "<value>" [--ttl <ms>]` | each prompt shows **at most 15** entries, ranked by relevance to the task and agent; with 15 or fewer entries every agent sees all | every later prompt, until deleted or expired (`--ttl`) | [mechanism] |
 | A task | `orch task add --assignee <agent-id>` | one agent | when the task is dispatched | [mechanism], see [§4](#4-q3-how-does-one-agent-connect-to-another-task) |
 
 ```mermaid
@@ -615,7 +620,17 @@ sequenceDiagram
 - A `lead` message to a team whose lead was deleted is stored for nobody (`engine/message_service.rs:241-243`).
 - A remote recipient is addressed as `<agent>@<alias>` (`engine/message_service.rs:252-262`).
 - Shared context is last-writer-wins: `set` overwrites the whole entry (`infra/storage/context.rs:84-110`).
-  Every entry is included in every prompt (`infra/template/user.liquid:36-41`), so it costs tokens on every run.
+  An entry set with `--ttl <ms>` expires and is purged on the next read (`infra/storage/context.rs:49-57`,
+  `127-147`).
+- Shared context is **not** a guaranteed broadcast. Each prompt shows at most 15 entries
+  (`MAX_CONTEXT_ENTRIES`, `crates/orch-core/src/template.rs:214`), chosen by `filter_relevant_context`
+  (`infra/template/context.rs:75-149`, called from `192-202`). Each entry is scored against the task and agent:
+  +10 if the key starts with the task's goal id, +8 if the agent's name is in the key or value, +6 if a task
+  scope path is in the key or value, +4 if the key starts with a role keyword and `-` or `_`, +1 for a generic
+  prefix (`bug-`, `perf-`, `stability-`, `docs-`, `arch-`, `spec-`). Scored entries come first, best first;
+  the remaining slots go to unscored entries in key order. The rest are left out silently. Measured: 20 keys
+  set, the prompt listed 15 (`k01`…`k15`); see [§8](#8-known-gaps-pending-fixes) row 8. With 15 or fewer entries
+  every agent sees all of them (`infra/template/user.liquid:36-41`), and they cost tokens on every run.
 
 **Conventions** [convention], from the `a-team` organisation template roles
 (`domain/org_templates/a-team/agents/*.yml`): ask with your best guess and proceed without waiting; reply with
@@ -665,7 +680,7 @@ flowchart LR
     LEAD -- "context set goal-progress" --> CTX[("shared context")]
     A -- "done unblocks" --> B
     INBOX -. "drained into A's prompt" .-> A
-    CTX -. "every prompt" .-> A & B
+    CTX -. "Goal section of each goal task prompt<br/>(and Shared Context if in the top 15)" .-> A & B
     B -- "done" --> CHECK["lead: next [auto] run<br/>reads statuses, marks goal achieved"]
 ```
 
@@ -779,7 +794,9 @@ The key `<goal-id>-progress` in shared context is **read** by code: it is added 
 prompt for a goal-linked task (`orchestrator/dispatch.rs:484-492`, `infra/template/user.liquid:66-69`) and
 shown by `orch goal show` (`engine/goal_service.rs:245-255`). It is **written** only by agents following the
 template instruction (`infra/template/system.liquid:26`) [convention]. Being shared context, it also appears
-in every other agent's prompt.
+in the Shared Context section of other agents' prompts, but only if it ranks in that prompt's top 15
+([§3](#3-q2-how-does-one-agent-connect-to-another-agent)). Its key starts with the goal id, so it scores +10 in
+the prompts of that goal's own tasks.
 
 ### 5.5 What pausing a goal does to its tasks
 
@@ -1142,7 +1159,9 @@ workspace_mode: shared
 goalId: goal_dM7wWns
 ```
 
-The worker's run record (the 4746-character prompt replaced by its length) and its event log:
+The worker's run record and its event log. The stored `prompt` is the 4746-character **user** prompt, shown
+here replaced by its length; the system half (role, team, rules, skills) is not stored, so the CLI received
+more than this (see [driving-agent-clis.md "What gets persisted?"](driving-agent-clis.md#what-gets-persisted)):
 
 ```json
 {
@@ -1263,6 +1282,8 @@ every section that links to it.
 | 5 | Pausing a goal cancels the assignee's queued autonomous tasks of **every** goal (`engine/goal_service.rs:336-356`) | nothing explicit | [§6.3](#63-what-we-measured), second row · intent unconfirmed |
 | 6 | `orch agent disable` on a running agent is undone when its run ends: success, failure and merge all write `idle` without checking (`orchestrator/collect.rs:508-511`, `589-593`, `811-815`), and the agent takes its next queued task | manual [03-agents](../manual/03-agents.md) line 288: "A disabled agent gets no new tasks" | [§6.3](#63-what-we-measured), agent-disable row · open |
 | 7 | Abandoning or achieving a goal cancels none of its queued tasks, autonomous-labelled ones included; they still run and auto-approve (`engine/goal_service.rs:170-171`) | the achieved guard's comment, "the side effects below cancel them afterwards" (`engine/goal_service.rs:259-261`) | [§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks) · intent unconfirmed |
+| 8 | Each prompt shows at most 15 shared-context entries, ranked by relevance to the task and agent; the rest are left out silently (`infra/template/context.rs:75-149`, `crates/orch-core/src/template.rs:214`) | manual [06-messages-and-context](../manual/06-messages-and-context.md#how-agents-see-the-context) lines 244 and 253: every entry is in every prompt | set 20 keys, dispatch one shell task: the prompt lists 15 ([§3](#3-q2-how-does-one-agent-connect-to-another-agent)) · open; not filed, reported to the owner |
+| 9 | `orch run <task-id>` exits 0 and runs nothing when the assignee has any other dispatchable (`todo`/`retrying`) task: `dispatch_only_task` claims every other such task (`orchestrator/dispatch.rs:264-293`), the eligibility filter then excludes any agent with another claimed task (`orchestrator/dispatch.rs:386-401`), and the claim is dropped with `Ok(())` (`orchestrator/dispatch.rs:402-411`). Unchanged on `main` after PR #54 | the run-one-task contract of `orch run <task-id>` ([§1](#who-runs-the-orchestrator)) | two `todo` tasks on one shell agent; `orch run A` prints `orch · running <id> "A"`, exits 0, writes no run record, and both stay `todo`. With B cancelled, the same command runs A to `done` · open; not filed, reported to the owner |
 
 Also documented as current limits in the manual: `timeout_ms` is stored but not enforced
 ([manual 07](../manual/07-running-and-monitoring.md#stop-a-stalled-run)).
