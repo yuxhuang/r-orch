@@ -24,7 +24,10 @@ script was put on `PATH` in place of the tool; no AI tool was called.
 
 ## What eco mode changes
 
-The prompt mode is `normal` or `eco`. `normal` is the default and sends exactly the prompt orch 0.9.4 sends.
+The prompt mode is `normal` or `eco`. `normal` is the default and is designed to send the same prompt as orch
+0.9.4. The automated byte-for-byte check against 0.9.4 is **pending**; until the release notes say it passed,
+treat this as the intended behaviour. A manual check of one case agrees: for an OpenCode agent written by 0.9.4
+with effort `high`, whose first run failed, the retry prompt matched 0.9.4's except for IDs and paths.
 
 In eco mode, each run gets the same task, the same instructions and the same agent, but a shorter description of
 the rest of the team:
