@@ -597,6 +597,14 @@ talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notic
 Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
 cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
 
+### Upgrading from v0.9.4
+
+v0.10.0 adds the opt-in eco prompt mode and more effort levels; `normal` stays the default. orch refuses to add
+or change an agent whose effort its adapter and model do not allow. orch 0.9.4 cannot read an agent file with an
+effort other than `low`, `medium` or `high`: before downgrading, clear those efforts (`--effort default`) or
+restore the agent files from a backup. See [Eco mode, reasoning effort and default
+models](docs/manual/16-eco-mode-and-effort.md).
+
 ### Upgrading from v0.9.2
 
 v0.9.3 changes no behaviour, data or protocol. Agents you deploy from the built-in a-team template now write
@@ -638,7 +646,7 @@ while the main list has focus. Mouse capture now reports drags for text selectio
 back to the terminal. Roll back by installing v0.5.2: v0.6.0 writes nothing new to `.orchestry/` (editor
 drafts last only for the dashboard session).
 
-### Known gaps in v0.9.4
+### Known gaps in v0.10.0
 
 - Copy and mouse selection in a native terminal (Terminal.app, iTerm2) were not verified by hand before
   release; the automated tests cover the copy routing, and the web dashboard's browser copy.
