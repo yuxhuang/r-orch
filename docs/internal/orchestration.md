@@ -265,7 +265,7 @@ sequenceDiagram
     O->>FS: drain recipient mailbox (messages marked delivered)
     O->>FS: read goal and goal-id-progress context entry
     Note over O: render prompt (see driving-agent-clis.md)
-    O->>FS: runs/run.json created, status preparing, user prompt (the system half — role, team, rules, skills — is not stored)
+    O->>FS: runs/run.json created, status preparing, user prompt (the system half — identity and role, orchestrator CLI instructions, goal-mode and rules text, skills — is not stored)
     O->>FS: task: in_progress, assignee, attempts + 1, proof.branch
     O->>FS: agent: running, current_task
     O->>AD: execute(prompt, env ORCH_AGENT_ID, ORCH_TASK_ID, ...)
@@ -1160,8 +1160,9 @@ goalId: goal_dM7wWns
 ```
 
 The worker's run record and its event log. The stored `prompt` is the 4746-character **user** prompt, shown
-here replaced by its length; the system half (role, team, rules, skills) is not stored, so the CLI received
-more than this (see [driving-agent-clis.md "What gets persisted?"](driving-agent-clis.md#what-gets-persisted)):
+here replaced by its length; the system half (identity and role, orchestrator CLI instructions, goal-mode
+and rules text, skills; in eco mode the team roster too) is not stored, so the CLI received more than this
+(see [driving-agent-clis.md "What gets persisted?"](driving-agent-clis.md#what-gets-persisted)):
 
 ```json
 {
