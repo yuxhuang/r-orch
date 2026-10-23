@@ -39,11 +39,11 @@ CLI). Temporary paths are shown as `<tmp>`.
 
 | Owner's question | Short answer | Details |
 |---|---|---|
-| **Q1.** What orchestration logic is there, how do goals, tasks and agents get set up, and how is work handled, recorded and handed off? | One process owns the project (a PID lock) and runs a **tick**: reconcile running work, create `[auto]` tasks for idle autonomous agents, then start ready tasks. "Ready" means: `todo` or `retrying`, all dependencies `done`, no scope overlap with running work, a free slot and an idle eligible agent. A detached **collector** per run records every event and then moves the task to `review`/`done` or `retrying`/`failed`. Everything lives as files under `.orchestry/`. | [§2](#2-q1-orchestration-logic) |
+| **Q1.** What orchestration logic is there, how do goals, tasks and agents get set up, and how is work handled, recorded and handed off? | One process owns the project (a PID lock) and runs a **tick**: reconcile running work, create `[auto]` tasks for idle autonomous agents, then start ready tasks. "Ready" means: `todo` or `retrying`, not claimed or running already, all dependencies `done`, no `awaiting-approval` label, no scope overlap with running work, a free slot and an idle eligible agent (full rule in [§2.3](#23-scheduling-which-task-starts-next-on-which-agent)). A detached **collector** per run records every event and then moves the task to `review`/`done` or `retrying`/`failed`. Everything lives as files under `.orchestry/`. | [§2](#2-q1-orchestration-logic) |
 | **Q2.** How does one agent connect to another agent? | Never directly. An agent writes a **message** file (`orch msg send`) or a **shared context** entry (`orch context set`). The message is injected into the recipient's prompt the next time the recipient is dispatched; nothing wakes the recipient. | [§3](#3-q2-how-does-one-agent-connect-to-another-agent) |
 | **Q3.** How does one agent connect to another task? | Through the `orch` CLI, from inside its run: it creates tasks (`--assignee`, `--depends-on`, `--goal-id`), inspects them (`orch task show`), and approves or rejects them. The orchestrator gives each run `ORCH_AGENT_ID` and `ORCH_TASK_ID`. A finished task's result sits in its `proof`; nobody pushes it to the creator. | [§4](#4-q3-how-does-one-agent-connect-to-another-task) |
-| **Q4.** How does a goal-driven system work? | A goal with an assignee makes that agent **autonomous**. While a goal is `active`, every tick gives each idle autonomous agent with no open task an `[auto]` task carrying the goal text (30-second cooldown per agent). The agent decomposes the goal into tasks, and marks the goal `achieved` when its linked tasks are finished. | [§5](#5-q4-how-does-a-goal-driven-system-work) |
-| **Q5.** How, when and why does a pause happen, and what makes it continue? | There is no single pause. **Goal pause** stops new `[auto]` work for that goal but lets running work finish. **Watch stop** (`/pause`, `Ctrl+C`, `SIGTERM`) kills running agents and sends their tasks back to `retrying`. Individual tasks also **wait** in `review`, on dependencies, on scope, or for an agent. Each resumes on a specific command or state change; no message or inbox entry resumes anything by itself. | [§6](#6-q5-how-does-a-pause-happen) |
+| **Q4.** How does a goal-driven system work? | A goal with an assignee makes that agent **autonomous**. While a goal is `active`, every tick gives each idle autonomous agent with no open task an `[auto]` task carrying the goal text (30-second cooldown per agent). The prompt tells the agent to decompose the goal into tasks and to mark the goal `achieved` when they are finished. That part is **[convention]**: nothing closes a goal automatically. | [§5](#5-q4-how-does-a-goal-driven-system-work) |
+| **Q5.** How, when and why does a pause happen, and what makes it continue? | There is no single pause. **Goal pause** stops new `[auto]` work for that goal but lets running work finish. **Abandoning** (or achieving) a goal stops `[auto]` work too, but cancels nothing: queued tasks still run. **Agent disable** holds an idle agent, but a run that ends sets the agent back to `idle`. **Watch stop** (`/pause`, `Ctrl+C`, `SIGTERM`) kills running agents and sends their tasks back to `retrying`. Individual tasks also **wait** in `review`, on dependencies, on scope, or for an agent. Each resumes on a specific command or state change; no message or inbox entry resumes anything by itself. | [§6](#6-q5-how-does-a-pause-happen) |
 
 ---
 
@@ -98,7 +98,8 @@ Ids are a prefix plus a nanoid (`infra/ids.rs:18-20`). Path builders are in `inf
 
 **The event bus is in-process.** `task:created`, `task:status_changed` and the rest go to subscribers in the
 same process only. A task created by another process (an agent's `orch task add`, your terminal) is not
-seen until the orchestrator's next tick reads the files (`orchestrator.rs:607-615`). That is why
+seen until the orchestrator's next tick reloads its caches and the files (`orchestrator/tick.rs:48-49`). A task
+created inside the orchestrator's own process triggers a reactive dispatch instead (`orchestrator.rs:607-615`). That is why
 cross-process changes take effect within `scheduling.poll_interval_ms` (default 10 s, `domain/config.rs:239`)
 and in-process ones within about 0.5 s.
 
@@ -208,8 +209,7 @@ suppresses it, so a one-shot command never starts other work (`orchestrator/tick
 Step 3 exists so that a child that exited cleanly, whose success handler is still waiting for the state
 mutex, is not misread as a crash (`orchestrator.rs:197-200`). Its side effect is that steps 4 and 5 apply only
 to entries **without** a collector in this process, which in practice means runs adopted after a restart.
-For runs this process started, stall detection never fires: see [§8](#8-known-gaps-pending-fixes) (task
-`tsk_87NnOcm`).
+For runs this process started, stall detection never fires: see [§8](#8-known-gaps-pending-fixes), row 2.
 
 After the per-entry checks, reconcile also:
 
@@ -234,7 +234,7 @@ After the per-entry checks, reconcile also:
 | **Scope** | A candidate whose `scope` overlaps a scoped `in_progress` task, or a candidate already started in this pass, is skipped and `task:scope_overlap` is emitted. Later candidates are still tried. | `orchestrator/dispatch.rs:92-145` |
 | **One task per agent** | An agent with a running entry, or with another claimed task assigned, is not eligible | `orchestrator/dispatch.rs:386-401` |
 | **Agent choice** | A task with an `assignee` waits for **that** agent to be idle; it is never given to someone else. An unassigned task goes to the highest-scoring idle agent: +50 per label that matches a skill, +30 if a label is a substring of the role, +20 for idle, plus up to +10 for its success rate. | `engine/agent_service.rs:601-630`, `693-724` |
-| **Eligibility** | Agent status `idle` (so `disabled` and `running` agents never qualify), remote agents online, and every `cap:<name>` label on the task present in the agent's capabilities | `engine/agent_service.rs:681-689` |
+| **Eligibility** | Agent status `idle`, so a `running` agent never qualifies. A `disabled` agent does not qualify either, but only while it stays disabled: the end of a run it was executing writes `idle` over `disabled` ([§6.1](#61-pause-and-resume-table), [§8](#8-known-gaps-pending-fixes) row 6). Also: remote agents online, and every `cap:<name>` label on the task present in the agent's capabilities | `engine/agent_service.rs:681-689` |
 | **No agent** | No eligible agent: the claim is released and the task keeps its place. No agents at all: a `NoAgents` error. | `orchestrator/dispatch.rs:402-411` |
 
 **Scope overlap is string-prefix logic, not glob matching** (`domain/scope.rs:1-6`): two patterns overlap
@@ -339,7 +339,7 @@ flowchart TD
 
 - The result text is `proof.agent_summary`: the `done` event's result, or else the last non-empty output
   event, cut to 2000 characters (`orchestrator/collect.rs:141-146`, `364-368`; `orchestrator.rs:91-92`).
-  The shell adapter's output never reaches this field ([§8](#8-known-gaps-pending-fixes), `tsk_Jw68iEc`).
+  The shell adapter's output never reaches this field ([§8](#8-known-gaps-pending-fixes), row 4).
 - `proof.files_changed` comes from the adapter's events or, if empty, from the worktree branch's diff
   (`orchestrator/collect.rs:354-375`).
 - Success always passes through `review` (`domain/transitions.rs:121-132`).
@@ -362,7 +362,9 @@ flowchart TD
   (10 s, 20 s, 40 s … capped at 300 s; `domain/transitions.rs:134-143`, `orchestrator/collect.rs:667-680`).
   **The delay is announced but not enforced**: a `retrying` task is also an ordinary ready candidate, so the
   reactive dispatch 500 ms later restarts it. Measured: three attempts in 1.5 s with `run:retry` events
-  announcing 10 s and 20 s ([§8](#8-known-gaps-pending-fixes), `tsk_1g1DntO`).
+  announcing 10 s and 20 s ([§8](#8-known-gaps-pending-fixes), row 1). Fixed on `main` after `40a6dc7`
+  by PR #54 (not in 0.10.0): dispatch now skips a `retrying` task until its retry-queue entry is due, and
+  `process_retry_queue` starts it after that.
 - A permanent failure walks the reverse dependency graph breadth-first and writes every non-terminal
   dependent, direct or transitive, as `failed`, emitting `task:status_changed` and `task:cascade_failed` for
   each (`orchestrator/dispatch.rs:1035-1116`). These writes bypass the state machine because `todo → failed` is
@@ -532,8 +534,10 @@ point it.
 | The prompt an attempt got | `runs/<run>.json` → `prompt` | at dispatch, before the spawn | `orchestrator/dispatch.rs:622-632` |
 | Attempt outcome | `runs/<run>.json` → `status`, `finished_at`, `error`, `error_kind`, `tokens`, `pid` | at start and at finish | `domain/run.rs:58-78` |
 | Everything the agent emitted | `runs/<run>.jsonl`, one `{timestamp, type, data}` per event; `type` is `agent_output`, `file_changed`, `command_run`, `tool_call`, `error` or `done`; `data` capped at 8 KB | as each event arrives | `orchestrator/collect.rs:235-248`, `domain/run.rs:122-131`, `orchestrator.rs:71-72` |
-| The task's result | `tasks/<id>.yml` → `proof.agent_summary` (≤ 2000 chars), `proof.files_changed`, `proof.branch`, `proof.test_results`, `review_results` | at completion | `orchestrator/collect.rs:363-378`, `733-739` |
-| Why it is waiting or failed | task `status`, `attempts`, `feedback`; agent `last_error`; `state.json` `retry_queue` | on each transition | `orchestrator/collect.rs:618-634` |
+| The task's result | `tasks/<id>.yml` → `proof.branch` | at dispatch | `orchestrator/dispatch.rs:663-674` |
+| | `proof.agent_summary` (≤ 2000 chars), `proof.files_changed`, `proof.test_results`, `review_results` | at completion | `orchestrator/collect.rs:363-378`, `733-739` |
+| Why it failed or is retrying | agent `last_error`; then task `status`, `attempts`; `state.json` `retry_queue` | at a failed run's end | `orchestrator/collect.rs:618-634` (`last_error`), `655-680` (status, retry queue) |
+| Why it was sent back | task `feedback` | at `orch task reject` | `engine/task_service.rs:292-296` |
 | What was delivered to whom | `messages/<id>.json` → `status: delivered`, `delivered_at` | at the recipient's dispatch | `engine/message_service.rs:272-293` |
 | Goal progress | `context/<goal-id>-progress.json` | whenever an agent sets it | [§5.4](#54-goal-progress-mechanism-reads-convention-writes) |
 | Totals | `state.json` → `stats` | at each completion | `orchestrator/collect.rs:399-443` |
@@ -559,12 +563,12 @@ does not see it). This is a known hazard with a recovery procedure:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `todo`, never starts | its `assignee` is busy, disabled or does not exist (it is never reassigned) | `orch task assign`, `orch agent enable` |
+| `todo`, never starts | its `assignee` is busy, disabled or does not exist (it is never reassigned) | `orch task assign`, `orch agent enable`. (The reverse also happens: a disabled agent that was busy starts queued work again once its run ends, [§8](#8-known-gaps-pending-fixes) row 6.) |
 | `todo`, never starts | a dependency is not `done` (in `review` counts as not done) | finish or approve the dependency |
 | `todo`, never starts | a scope overlap with a long-running task | narrow the scopes |
 | `todo`, never starts | no orchestrator is running | start `orch serve` or `orch run --watch` |
 | `review` forever | the agent's policy is `manual`/`suggest` and nobody approves | `orch task approve` / `reject` |
-| `in_progress` for hours | an agent that hangs is not stopped: stall detection does not fire for live runs (`tsk_87NnOcm`) and `timeout_ms` is not enforced ([manual](../manual/07-running-and-monitoring.md#stop-a-stalled-run)) | cancel it (with the owner, see `tsk_e_DWiGF`) |
+| `in_progress` for hours | an agent that hangs is not stopped: stall detection does not fire for live runs ([§8](#8-known-gaps-pending-fixes) row 2) and `timeout_ms` is not enforced ([manual](../manual/07-running-and-monitoring.md#stop-a-stalled-run)) | `orch task cancel` fails while a daemon owns the project ([§8](#8-known-gaps-pending-fixes) row 3). Stop the daemon (its run is killed and the task goes to `retrying`), then `orch task cancel <id>`, which needs no lock for a task that is not `in_progress` (`cli/commands/task.rs:486-490`) |
 | A message was "lost" | the mailbox is drained before the prompt renders; a failure after the drain loses it (`engine/message_service.rs:267-271`) | resend |
 
 ---
@@ -600,17 +604,18 @@ sequenceDiagram
 
 **Rules** [mechanism]:
 
-- `--from` defaults to `cli`; an unknown sender is refused (`engine/message_service.rs:130-139`). Agents must
-  pass `--from $ORCH_AGENT_ID` to be identifiable.
+- `--from` defaults to `cli` (`cli/commands/msg.rs:43`, `79`); an unknown sender is refused
+  (`engine/message_service.rs:130-139`). Agents must pass `--from $ORCH_AGENT_ID` to be identifiable.
 - A message is delivered **once**: draining marks it delivered at dispatch (`engine/message_service.rs:267-293`,
   `orchestrator/dispatch.rs:460-471`). It appears in exactly one prompt.
-- A message does **not** create a task or wake anyone. If the recipient has no task and is not autonomous, the
-  message waits until it expires (default 24 h, max 7 days; `domain/message.rs:130-133`).
+- A message does **not** create a task or wake anyone: no code path does either. The only reader of a mailbox
+  is the drain at dispatch (`orchestrator/dispatch.rs:460-471`). If the recipient has no task and is not
+  autonomous, the message waits until it expires (default 24 h, max 7 days; `domain/message.rs:130-133`).
 - A broadcast with a `--team` that names no team goes to **all** agents (`engine/message_service.rs:176-182`).
 - A `lead` message to a team whose lead was deleted is stored for nobody (`engine/message_service.rs:241-243`).
 - A remote recipient is addressed as `<agent>@<alias>` (`engine/message_service.rs:252-262`).
-- Shared context is last-writer-wins and every entry is included in every prompt
-  (`infra/template/user.liquid:36-41`), so it costs tokens on every run.
+- Shared context is last-writer-wins: `set` overwrites the whole entry (`infra/storage/context.rs:84-110`).
+  Every entry is included in every prompt (`infra/template/user.liquid:36-41`), so it costs tokens on every run.
 
 **Conventions** [convention], from the `a-team` organisation template roles
 (`domain/org_templates/a-team/agents/*.yml`): ask with your best guess and proceed without waiting; reply with
@@ -671,7 +676,7 @@ them (no `Decide:` or `BLOCKED` string appears in any Rust source):
 |---|---|---|
 | `Decide: <question>` task assigned to the lead, with the continuation `--depends-on` it | `domain/org_templates/a-team/agents/senior-eng.yml:28`, `orchestrator.yml:20` | two ordinary tasks and a dependency |
 | A result starting `BLOCKED — continued in <id>` or `AWAITING DECISION — <id>` | `senior-eng.yml:31`, `orchestrator.yml:21` | a successful run (exit 0) → `done` |
-| `[ateam] checkpoint` tasks with `-l autonomous` as the lead's next wake-up | `orchestrator.yml:17-19` | an autonomous-labelled task: auto-approved, ignored by the achieved guard, **cancelled if any goal assigned to the lead is paused** ([§5.5](#55-what-pausing-a-goal-does-to-its-tasks)) |
+| `[ateam] checkpoint` tasks with `-l autonomous` as the lead's next wake-up | `orchestrator.yml:17-19` | an autonomous-labelled task: auto-approved, ignored by the achieved guard, **cancelled if any goal assigned to the lead is paused** ([§5.5](#55-what-pausing-a-goal-does-to-its-tasks)), and **still dispatched after its goal is abandoned or achieved** ([§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks)) |
 | "Do NOT finish the `[auto]` task until the goal is achieved" | `infra/template/system.liquid:28` | nothing; the run ends when the CLI exits |
 
 ---
@@ -702,7 +707,8 @@ stateDiagram-v2
 ```
 
 `domain/goal.rs:38-53`; side effects in `engine/goal_service.rs:133-176`. `achieved` and `abandoned` are
-final. The TUI keys `P` (pause/resume), `C` (achieve with force) and `X` (abandon) call the same service
+final for the goal, but not for its work: neither cancels the goal's queued tasks
+([§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks)). The TUI keys `P` (pause/resume), `C` (achieve with force) and `X` (abandon) call the same service
 (`tui/keys.rs:475-497`).
 
 ### 5.2 The seeding loop
@@ -760,6 +766,10 @@ task is terminal.
 3. The goal is saved `achieved`; `goal:status_changed` is emitted.
 4. The assignee's `autonomous` flag is cleared if it has no other `active` goal. No more `[auto]` tasks.
 
+Queued tasks labelled `autonomous` are **not** cancelled. The guard's code comment says "the side effects
+below cancel them afterwards" (`engine/goal_service.rs:259-261`), but the only side effect for `achieved` is
+step 4 (`engine/goal_service.rs:170-171`). See [§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks).
+
 In the worked example the lead's own `[auto]` run executed `orch goal status … achieved` and the guard passed
 while that run was still `in_progress`.
 
@@ -786,13 +796,56 @@ in every other agent's prompt.
 | A goal with no assignee | none of the above side effects; only seeding stops |
 
 **Observed, intent unconfirmed:** pausing goal A cancelled a `todo` autonomous task linked to goal B, because
-the cancel filters on assignee and label, not on goal id. For the `a-team` lead this means an approval-gate
-pause cancels its queued checkpoint tasks for other goals. No test covers the multi-goal case; the question is
-with the team lead (message `msg_WqBljfv`).
+the cancel filters on assignee and label, not on goal id. No test covers the multi-goal case.
+
+The same-goal case matters more in practice. The `a-team` lead schedules its next wake-up as an
+`[ateam] checkpoint` task labelled `autonomous`, then pauses its goal at the approval gate. The pause cancels
+that checkpoint, and the checkpoints the lead has queued for its other goals.
 
 **Resume:** `orch goal status <id> active` re-enables the assignee's autonomous flag
 (`engine/goal_service.rs:168-169`). Cancelled tasks are **not** restored. The next tick seeds a fresh `[auto]`
 task (cooldown permitting).
+
+### 5.6 What abandoning or achieving a goal does to its tasks
+
+`orch goal status <id> abandoned` (or `achieved`) runs one side effect: it clears the assignee's
+`autonomous` flag if the agent has no other `active` goal (`engine/goal_service.rs:170-171`, `312-319`).
+Nothing else changes. Dispatch never reads goal status (the only goal-status check in the orchestrator is
+the seeder's, `orchestrator/tick.rs:449-457`).
+
+| Thing | Pause | Abandon or achieve |
+|---|---|---|
+| Seeding of new `[auto]` tasks for the goal | stops | stops |
+| Assignee's `autonomous` flag | cleared (unless another goal is `active`) | cleared (unless another goal is `active`) |
+| Assignee's queued tasks labelled `autonomous` | **cancelled**, any goal | **left queued, and they run** |
+| Queued tasks without the label, linked to the goal | left queued, and they run | left queued, and they run |
+| Running tasks | finish | finish |
+
+So **abandon is weaker than pause**: it stops new `[auto]` work, but every task already queued, including
+the lead's own `[ateam] checkpoint`, is still dispatched and, if labelled `autonomous`, auto-approved. To stop
+a goal's queued work, cancel each task: `orch task list --goal-id <id>`, then `orch task cancel <task-id>`.
+Whether abandon should cancel like pause does is unconfirmed; see [§8](#8-known-gaps-pending-fixes) row 7.
+
+Measured on 0.10.0 (shell stub agent, no daemon running while the goal changed status, then `orch serve`):
+
+```text
+$ orch goal status goal_bQBNoiK abandoned
+  ✓ Goal "Goal C" → abandoned
+$ grep '^autonomous' .orchestry/agents/agt_3bM6TN3.yml
+autonomous: false
+$ orch task show <id> --json | jq -r '"\(.id) \(.status) \(.labels)"'    # for both tasks
+tsk_4ib1UHe todo ["autonomous"]        # "[ateam] checkpoint C", linked to the goal
+tsk_aXagEfz todo []                    # "plain C", linked to the goal
+$ orch serve --log-file serve.log      # task:status_changed lines, abridged
+21:02:14.647Z tsk_aXagEfz todo -> in_progress
+21:02:14.868Z tsk_aXagEfz review -> done
+21:02:15.402Z tsk_4ib1UHe todo -> in_progress
+21:02:15.557Z tsk_4ib1UHe review -> done
+```
+
+Achieving a goal (with `achieved`, no `--force`) left its queued `[ateam] checkpoint D` task in `todo`, and
+`orch serve` then ran it to `done` in the same way. `--force` cancels only tasks that are **not** labelled
+`autonomous`, because the guard ignores those (`engine/goal_service.rs:267-290`).
 
 ---
 
@@ -800,9 +853,16 @@ task (cooldown permitting).
 
 > *"How does a pause happen? When a pause happen? What signal drives it to continue?"*
 
-**Answer.** r-orch has no single "pause" switch. Five things stop work, at three levels: a **goal** stops
-generating work, the **orchestrator** stops running work, or one **task** waits. None of them is resumed by a
-message: the inbox is read only when a task is dispatched, so a message cannot restart anything. What
+**Answer.** r-orch has no single "pause" switch. Seven things stop or hold work, at three levels:
+
+- a **goal** stops generating work (pause, abandon);
+- an **agent** stops taking work (disable);
+- the **orchestrator** stops running work (watch stop, standalone interrupt, circuit breaker, crash).
+
+Separately, one **task** can wait on its own conditions ("Waits that look like pauses", below). A goal pause
+cancels queued autonomous work, and the orchestrator-level stops kill running work. Abandoning the goal and
+disabling the agent, the two levers an operator is likely to try first, do neither: queued work still runs.
+None of them is resumed by a message: the inbox is read only when a task is dispatched, so a message cannot restart anything. What
 resumes each one is a command or a change of state, picked up at the next tick (within
 `poll_interval_ms`) because the orchestrator re-reads the files each tick (`orchestrator/tick.rs:48-50`).
 
@@ -811,12 +871,15 @@ resumes each one is a command or a change of state, picked up at the next tick (
 | Trigger | When it happens | What stops | What keeps going | What is persisted | What resumes it |
 |---|---|---|---|---|---|
 | **Goal pause**: `orch goal status <id> paused`, dashboard `P`, `/goal status <id> paused` | A human or an agent decides. The `a-team` lead pauses its goal at the approval gate [convention] (`domain/org_templates/a-team/agents/orchestrator.yml:78`). | Seeding for that goal; the assignee's autonomous flag; the assignee's queued autonomous tasks (cancelled) | Running tasks; non-autonomous linked tasks | `goals/<id>.yml` `status: paused`; agent `autonomous: false`; cancelled tasks | `orch goal status <id> active` (or `P`). The a-team convention: the owner sends `orch msg send <lead> …` **and** runs `goal status active`; the message alone does nothing. |
-| **Watch stop**: dashboard `/pause`, `Ctrl+C` or `SIGTERM` to `run --watch` / `serve` / the dashboard | An operator stops the daemon or the dashboard pauses | All ticks; **every local run is killed** (10 s grace) | Remote runs (detached) | runs `cancelled`; tasks `retrying` (or `failed`); `state.json` `pid: null`, `running` emptied; lock released | Start a watch process again (`orch serve`, `orch run --watch`, dashboard `/watch`). `retrying` tasks start on the first tick. |
+| **Goal abandon** (or achieve): `orch goal status <id> abandoned`, dashboard `X` | A human or an agent gives up on (or closes) the goal | Seeding for that goal; the assignee's autonomous flag | **Every queued task**, autonomous-labelled ones included; running tasks ([§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks)) | `goals/<id>.yml` `status: abandoned`; agent `autonomous: false` | Nothing: the status is final. To stop the queued work, `orch task cancel` each task. |
+| **Agent disable**: `orch agent disable <id>` | A human wants one agent to stop taking work | New dispatch to the agent and `[auto]` seeding for it, **only while it is idle** | Its current run. When that run ends (success, failure or merge), the agent is written back to `idle` and takes its next queued task ([§8](#8-known-gaps-pending-fixes) row 6, pending fix) | `agents/<id>.yml` `status: disabled`, until a run ends | `orch agent enable <id>`, **or the end of any run it was executing** |
+| **Watch stop**: dashboard `/pause`, `Ctrl+C` or `SIGTERM` to `run --watch` / `serve` / the dashboard | An operator stops the daemon or the dashboard pauses | All ticks; **every local run is killed** (10 s grace). The dashboard's `/pause` also drops this node's peer listener, so controllers that use this node as a remote lose it until `/watch` (`cli/tui/backend.rs:868-877`; test at `cli/serve/peer.rs:228-246`) | Remote runs this node submitted (detached) | runs `cancelled`; tasks `retrying` (or `failed`); `state.json` `pid: null`, `running` emptied; lock released | Start a watch process again (`orch serve`, `orch run --watch`, dashboard `/watch`). `retrying` tasks start on the first tick. |
 | **Standalone interrupt**: `Ctrl+C`/`SIGTERM` to `orch run <id>` or `run --all` | An operator interrupts a one-shot run | New dispatches; the runs this command started | Runs started by other processes | Same as watch stop, for its own runs; exit code 130 or 143 | Run the command again |
 | **Circuit breaker** | Five consecutive failing ticks, for example an unreadable store | Same as watch stop | — | Same as watch stop; each failure is an `orchestrator:error` with context `tick`, and the fifth has `fatal: true` | Fix the cause, start again |
 | **Crash or `kill -9`** | The orchestrator dies without `stop()` | The tick and all collectors; child processes **may keep running** | Orphaned children | `state.json` still lists the runs and the old PID; the lock goes stale | Start again. Dead entries: their tasks are **cancelled** (`orch task retry` to restart). Live children: adopted, retried when they exit ([§2.8](#28-shutdown-and-restart-recovery)). |
 
-Sources: goal `engine/goal_service.rs:133-176`; `/pause` `tui/commands.rs:174-187` → `cli/tui/backend.rs:868-877` →
+Sources: goal `engine/goal_service.rs:133-176`; agent disable `engine/agent_service.rs:527-529`, `546-556`, and
+the run-end resets `orchestrator/collect.rs:508-511` (success), `589-593` (failure), `811-815` (merge); `/pause` `tui/commands.rs:174-187` → `cli/tui/backend.rs:868-877` →
 `orchestrator.rs:751-831`; signals `orchestrator.rs:583-600`, `725-734`, `1132-1135`; standalone interrupt
 `orchestrator.rs:833-922`, exit codes `cli/commands/run.rs:361-362`; breaker `orchestrator.rs:1148-1168`; crash recovery `orchestrator/recovery.rs:245-485`.
 
@@ -829,7 +892,7 @@ Sources: goal `engine/goal_service.rs:133-176`; `/pause` `tui/commands.rs:174-18
 | `todo` | a dependency is not `done` | the dependency becomes `done` (or is deleted) |
 | `todo` | its scope overlaps running work | the overlapping task leaves `in_progress` |
 | `todo` | its assignee is busy, disabled or absent; or all slots are full | the agent is idle and enabled; a slot frees |
-| `retrying` | a failed attempt; the backoff is announced but not enforced (`tsk_1g1DntO`) | next dispatch, about 0.5 s later |
+| `retrying` | a failed attempt; the backoff is announced but not enforced at `40a6dc7` ([§8](#8-known-gaps-pending-fixes) row 1; fixed on `main` by PR #54) | next dispatch, about 0.5 s later |
 
 ### 6.2 State diagrams
 
@@ -851,19 +914,18 @@ stateDiagram-v2
 The dashboard's labels are `watching`, `observing` and `idle` (`tui/state.rs:3712-3720`). `stopping` and
 `crashed` are not shown states; they are drawn to show what happens.
 
-A goal and its work:
+A goal and what each status does to its queued work (the goal's own state machine is in [§5.1](#51-goal-state-machine)):
 
 ```mermaid
 stateDiagram-v2
     state "active: [auto] tasks seeded" as active
-    state "paused: no seeding, running work finishes" as paused
+    state "paused: no seeding; assignee's queued autonomous tasks cancelled; the rest still runs" as paused
+    state "achieved or abandoned: no seeding; nothing cancelled, every queued task still runs" as closed
     [*] --> active
     active --> paused : goal status paused
-    paused --> active : goal status active
-    active --> achieved : guard passes
-    paused --> achieved : guard passes
-    active --> abandoned
-    paused --> abandoned
+    paused --> active : goal status active (cancelled tasks stay cancelled)
+    active --> closed : achieved (guard passes) or abandoned
+    paused --> closed : achieved (guard passes) or abandoned
 ```
 
 ### 6.3 What we measured
@@ -874,10 +936,12 @@ Throwaway project, shell agents (`sleep 15`), `poll_interval_ms: 1000`, shared w
 |---|---|
 | Pause goal one while its `[auto]` task runs | The `[auto]` task ran to completion (`20:12:33` → `20:12:48`, `done`). A non-autonomous task linked to the paused goal was dispatched at `20:12:49`. The agent's flag became `autonomous: false`; resuming set it back to `true`. |
 | Pause goal one while the agent has a queued autonomous task for goal two | The goal-two task went to `cancelled`. |
+| Abandon a goal with an `autonomous`-labelled and a plain task queued, then `orch serve`; separately, achieve a goal with an `autonomous`-labelled task queued | Both abandoned-goal tasks ran to `done` (`21:02:14`–`21:02:15`); the achieved goal's task ran to `done` too ([§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks)). |
+| `orch agent disable` while the agent runs the first of two queued tasks (stub `sleep 6`) | Agent `status: running` → `disabled` at about `21:02:34`. When the run ended the agent was `idle`, and the second task went `todo → in_progress` at `21:02:40.502` and finished `done`. |
 | `SIGTERM` to `orch serve` during a run | `orchestrator:shutdown "Received SIGTERM"`; run `cancelled`; task `retrying` (attempts 1); `state.json` `pid: null`, `running: {}`; lock file removed. |
 | Start `orch serve` again | The `retrying` task was dispatched in the first tick (`20:13:11.194`). |
 | `kill -9` the daemon during a run, then start again | The child survived. The new daemon took over the stale lock and kept the running entry. When the child exited (`20:13:27`), reconcile failed the run with `Process crashed unexpectedly`, the task went to `retrying` with a 20 s retry announced, and it was re-dispatched 54 ms later. |
-| `orch task cancel <running-task>` while `orch serve` runs | `✕ Orchestrator already running (PID: …)`, exit 4; the task stayed `in_progress` (`tsk_e_DWiGF`). |
+| `orch task cancel <running-task>` while `orch serve` runs | `✕ Orchestrator already running (PID: …)`, exit 4; the task stayed `in_progress` ([§8](#8-known-gaps-pending-fixes) row 3). |
 
 ---
 
@@ -1056,7 +1120,7 @@ scope:
 goalId: goal_dM7wWns
 ```
 
-There is no `proof.agent_summary`, although the worker printed a line: the shell adapter gap (`tsk_Jw68iEc`).
+There is no `proof.agent_summary`, although the worker printed a line: the shell adapter gap ([§8](#8-known-gaps-pending-fixes) row 4).
 
 Task B, blocked on A:
 
@@ -1185,16 +1249,20 @@ f21f62b init
 
 ## 8. Known gaps (pending fixes)
 
-Behaviour this document describes that differs from what the manual or code comments promise. Each has a fix
-task with a reproduction.
+Behaviour this document describes that differs from what the manual or code comments promise, or that an
+operator would not expect. Each row was reproduced on `40a6dc7` (0.10.0); the "Reproduction" column points to
+the measurement in this document. None is tracked in a public issue yet. When a fix lands, update the row and
+every section that links to it.
 
-| # | Actual behaviour at `40a6dc7` | Contradicts | Task |
+| # | Actual behaviour at `40a6dc7` | Contradicts | Reproduction · status |
 |---|---|---|---|
-| 1 | Retry backoff is announced (`run:retry delay_ms`) but not enforced; `retrying` tasks restart in about 0.5 s | manual [02-concepts](../manual/02-concepts.md) line 138, [04-tasks](../manual/04-tasks.md) line 414 | `tsk_1g1DntO` |
-| 2 | Stall detection never fires for a run whose collector is live in this process, which is every run the process started (`orchestrator/tick.rs:201-206`) | manual [07](../manual/07-running-and-monitoring.md#stop-a-stalled-run), [02-concepts](../manual/02-concepts.md) lines 137 and 299, [RUNBOOK](../RUNBOOK.md) line 304 | `tsk_87NnOcm` |
-| 3 | `orch task cancel` of an `in_progress` task fails with exit 4 while another process owns the lock (`cli/commands/task.rs:483-490`) | manual [04-tasks](../manual/04-tasks.md#cancel-a-task) line 370; the reconcile comment at `orchestrator/tick.rs:135-139` | `tsk_e_DWiGF` |
-| 4 | Shell-adapter output never becomes `proof.agent_summary`: shell events carry a bare string and the collector reads only `text`/`message` (`orchestrator/collect.rs:193-204`, `infra/adapters/shell.rs:118`) | the fallback comment at `orchestrator/collect.rs:141-142` | `tsk_Jw68iEc` |
-| 5 | Pausing a goal cancels the assignee's queued autonomous tasks of **every** goal (`engine/goal_service.rs:336-356`) | nothing explicit; intent unconfirmed | question to the lead, `msg_WqBljfv` |
+| 1 | Retry backoff is announced (`run:retry delay_ms`) but not enforced; `retrying` tasks restart in about 0.5 s | manual [02-concepts](../manual/02-concepts.md) line 138, [04-tasks](../manual/04-tasks.md) line 414 | stub agent that exits 1: three attempts in 1.5 s ([§2.5](#25-completion-success-review-retry-cascade)) · **fixed on `main` by PR #54**, after 0.10.0 |
+| 2 | Stall detection never fires for a run whose collector is live in this process, which is every run the process started (`orchestrator/tick.rs:201-206`) | manual [07](../manual/07-running-and-monitoring.md#stop-a-stalled-run), [02-concepts](../manual/02-concepts.md) lines 137 and 299, [RUNBOOK](../RUNBOOK.md) line 304 | code path in [§2.2](#22-reconcile-what-happened-to-running-work) · open |
+| 3 | `orch task cancel` of an `in_progress` task fails with exit 4 while another process owns the lock (`cli/commands/task.rs:486-488` → `orchestrator.rs:384-386`; `LockConflict` maps to 4 at `domain/error.rs:104`) | manual [04-tasks](../manual/04-tasks.md#cancel-a-task) line 370; the reconcile comment at `orchestrator/tick.rs:135-139` | [§6.3](#63-what-we-measured), last row · open |
+| 4 | Shell-adapter output never becomes `proof.agent_summary`: shell events carry a bare string and the collector reads only `text`/`message` (`orchestrator/collect.rs:193-204`, `infra/adapters/shell.rs:119`) | the fallback comment at `orchestrator/collect.rs:141-142` | worked example, task A's `proof` ([§7.3](#73-the-on-disk-trail)) · open |
+| 5 | Pausing a goal cancels the assignee's queued autonomous tasks of **every** goal (`engine/goal_service.rs:336-356`) | nothing explicit | [§6.3](#63-what-we-measured), second row · intent unconfirmed |
+| 6 | `orch agent disable` on a running agent is undone when its run ends: success, failure and merge all write `idle` without checking (`orchestrator/collect.rs:508-511`, `589-593`, `811-815`), and the agent takes its next queued task | manual [03-agents](../manual/03-agents.md) line 288: "A disabled agent gets no new tasks" | [§6.3](#63-what-we-measured), agent-disable row · open |
+| 7 | Abandoning or achieving a goal cancels none of its queued tasks, autonomous-labelled ones included; they still run and auto-approve (`engine/goal_service.rs:170-171`) | the achieved guard's comment, "the side effects below cancel them afterwards" (`engine/goal_service.rs:259-261`) | [§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks) · intent unconfirmed |
 
 Also documented as current limits in the manual: `timeout_ms` is stored but not enforced
 ([manual 07](../manual/07-running-and-monitoring.md#stop-a-stalled-run)).
