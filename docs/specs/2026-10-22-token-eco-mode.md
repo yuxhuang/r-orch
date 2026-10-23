@@ -107,11 +107,11 @@ means no gate has passed the row yet.
 | R3 | pass | c2f6962 (T1 D3-1…D3-8) | macOS |
 | R4 | pass | fix-round head (`f4f81bf` placement + T1 vector `token_eco_prompt_eco.rs::eco_shared_context_keys_and_full_values_are_only_in_the_user_half_for_every_adapter`; delta re-review) + c2f6962 (Claude second-read cache > 0 in both eco pairs; OpenCode warm not measured) | macOS |
 | R5 | pass | c2f6962 (T1 D3-9, D3-10 with the real `orch --json logs` reader) | macOS |
-| R6 | pending | engine-trace test passes at c2f6962; held-out outcome evaluation E2 blocked on the 2com Linux containment matrix and the route-1 readiness plan | |
+| R6 | blocked | engine-trace test passes at c2f6962 (orchestration equality, T1); held-out outcome evaluation E2 not run: 2com Linux containment matrix partial (75/145; the frozen confinement helper needs CAP_MKNOD and a uid map an unprivileged user cannot grant), SRE and security reviews block, 0/7 route-1 prerequisites closed; environment decision with the owner (ateam escalation-1) | macOS (engine trace); Linux 2com partial |
 | R7 | pass | c2f6962 (T1 D2-2 pairing) | macOS |
 | R8 | pass | c2f6962 (T1 compatibility matrix, 544 cells, real 0.9.4 reader) + fix-round head (ruling-13 shell row, delta re-review) | macOS |
 | R9 | pass | c2f6962 | macOS (perf gate, cold 0.089) |
-| R10 | pending | fact-check at c2f6962 passed with conditions; the docs delta is re-checked on the fix-round head | |
+| R10 | pass | df3c712 (fact-check gate at c2f6962 passed with conditions; conditions re-checked on 8757de3 and df3c712, both pass; Pensieve spec copy byte-identical) | macOS |
 | R11 | pass | c2f6962 (QA gate, tmux) + fix-round head (delta re-review) | macOS |
 | R12 | pass | c2f6962 (`static_choices_match_the_dated_catalog_for_all_tiers`) | macOS |
 | R13 | pass | c2f6962 (T1 D7-1, D7-2) | macOS |
