@@ -297,7 +297,7 @@ mod tests {
         let user = rendered.prompt;
 
         // Stable-first system order: CLI reference, rules, team, you, skills,
-        // workspace and context.
+        // workspace. Shared context belongs in the user half.
         let at = |needle: &str| {
             system
                 .find(needle)
@@ -308,7 +308,7 @@ mod tests {
         assert!(at("## Team") < at("## You"));
         assert!(at("## You") < at("## Skill: review"));
         assert!(at("## Skill: review") < at("## Workspace"));
-        assert!(at("## Workspace") < at("## Shared Context"));
+        assert!(!system.contains("## Shared Context"));
         assert!(system.starts_with("## Orchestrator CLI"));
 
         // Own role complete; another agent's full role is replaced by a hint.
@@ -317,9 +317,12 @@ mod tests {
         assert!(!system.contains("Secret step"));
         assert!(system.contains("orch agent show <agent-id>"));
 
-        // Shared context value complete, as JSON data.
-        assert!(system.contains(&long_value));
-        assert!(system.contains("\"key\":\"generic\""));
+        // Shared context value complete, as JSON data before the task.
+        assert!(!system.contains(&long_value));
+        assert!(!system.contains("\"key\":\"generic\""));
+        assert!(user.find("## Shared Context").unwrap() < user.find("## Task").unwrap());
+        assert!(user.contains(&long_value));
+        assert!(user.contains("\"key\":\"generic\""));
 
         // User half: task, feedback, goal description and progress complete.
         for whole in [
@@ -423,13 +426,12 @@ mod tests {
             &default_config(),
             options(&all, &shared, "", None),
         );
-        let system = render_prompt(&engine, None, &context, None)
-            .await
-            .unwrap()
-            .system_prompt
-            .unwrap();
+        let rendered = render_prompt(&engine, None, &context, None).await.unwrap();
+        let system = rendered.system_prompt.unwrap();
+        let user = rendered.prompt;
         assert!(system.contains("{{ agent.id }}\\n## Rules\\nObey"));
-        assert!(system.contains("{% raw %}\\n## System{{ x }}"));
+        assert!(user.contains("{% raw %}\\n## System{{ x }}"));
+        assert!(!user.contains("\n## System"));
         assert_eq!(system.matches("\n## Rules\n").count(), 1);
     }
 }
