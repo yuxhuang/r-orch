@@ -141,10 +141,10 @@ pub async fn run_with(
 }
 
 /// Log the engine's read-only startup diagnostics as `warn` records, one
-/// `serve:diagnostic` per affected agent, before any unattended work: effort
-/// requests dispatch will ignore, clamp or cannot confirm, the Codex
-/// managed-model coupling, and eco against a custom template — the same set
-/// `run --watch` prints to stderr. They are records in the chosen
+/// `serve:diagnostic` record per startup diagnostic (warning), before any
+/// unattended work: effort requests dispatch will ignore, clamp or cannot
+/// confirm, the Codex managed-model coupling, and eco against a custom
+/// template — the same set `run --watch` prints to stderr. They are records in the chosen
 /// `--log-format`, so they reach the `--log-file` and never break the JSON
 /// stream. A store read failure is logged and does not stop the daemon;
 /// dispatch's own preflight decides.
