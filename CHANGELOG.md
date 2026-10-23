@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-23
+
+Cancel and stall patch release. No peer-protocol change, so 0.5.x through 0.10.2 peers can be mixed.
+
 ### Fixed
 - Cancelling a task in the dashboard (`C`, `/cancel`, or `C cancel` in the footer) now works while `orch serve` or `orch run --watch` has the project open and the dashboard shows `OBSERVING`. It used to fail with "Orchestrator already running" for a task in any status. The task is cancelled at once; if an agent is running it, the open orchestrator stops the agent at its next check.
 - A dashboard that is only watching a project another process owns (`orch serve`, `orch run --watch` or another dashboard) now shows a cancelled task as `in_progress → cancelled`. It used to report `in_progress → failed` with a "Task failed" toast, although the task and its run were cancelled.
@@ -250,7 +254,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/yuxhuang/r-orch/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/yuxhuang/r-orch/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/yuxhuang/r-orch/compare/v0.9.3...v0.9.4
