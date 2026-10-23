@@ -788,9 +788,32 @@ impl Orchestrator {
                 return Err(Error::other(message));
             }
         };
-        self.record_preparation_diagnostics(&run.id, &agent.id, &preparation.diagnostics)
-            .await;
         params.config = preparation.config;
+        // Effort diagnostics come from one source per adapter (lead ruling 8):
+        // OpenCode's preparation, whose wire check can change the outcome,
+        // or, for every other adapter, the pure dispatch plan of the prepared
+        // config. Their identity preparation carries no diagnostics, so the
+        // two never repeat a note. A plan rejection is the same error
+        // `execute` would return, raised here before any model child.
+        let mut diagnostics = preparation.diagnostics;
+        if !PREPARATION_OWNS_EFFORT_DIAGNOSTICS.contains(&adapter.kind()) {
+            match orch_infra::adapters::effort_diagnostics(adapter.kind(), &params.config) {
+                Ok(planned) => diagnostics.extend(planned),
+                Err(err) => {
+                    self.fail_before_spawn(
+                        state,
+                        &task_id,
+                        &run.id,
+                        &agent.id,
+                        &err.to_string(),
+                        err.kind,
+                    )
+                    .await;
+                    return Err(err.into());
+                }
+            }
+        }
+        self.report_effort_diagnostics(&run.id, &agent.id, &diagnostics);
 
         let handle = match adapter.execute(params) {
             Ok(handle) => handle,
@@ -926,44 +949,21 @@ impl Orchestrator {
         }
     }
 
-    /// Effort-preparation diagnostics go into the run's own event log before
-    /// the model's first event, and onto the bus and the log, so a later
-    /// operator can see a legacy-ignored or uncertain effort request. They are
-    /// ordinary output events: no new run schema, no JSON stdout change.
-    async fn record_preparation_diagnostics(
-        &self,
-        run_id: &str,
-        agent_id: &str,
-        diagnostics: &[String],
-    ) {
+    /// Effort diagnostics (`request-only`, `legacy-ignored`, capability
+    /// uncertainty) are operator information, not provider output (design
+    /// D5.2, lead ruling 8). Each goes to exactly one surface before the model
+    /// child exists: a non-fatal `orchestrator:error` on the bus, with
+    /// `context` starting [`EFFORT_DIAGNOSTIC_CONTEXT`] and `error` the note
+    /// verbatim. `serve` logs it as a warn-level record (stderr or
+    /// `--log-file`); `run --watch` and `logs --follow` print it as a ⚠ line.
+    /// It is never a run event, so retry `previous_output`, the collector's
+    /// `last_agent_message` and the task's `final_result` cannot see it.
+    fn report_effort_diagnostics(&self, run_id: &str, agent_id: &str, diagnostics: &[String]) {
         for diagnostic in diagnostics {
-            let text = format!("effort preparation: {diagnostic}");
-            tracing::warn!(run_id, agent_id, "{text}");
-            let data = serde_json::json!({ "text": text });
-            let serialized = super::collect::serialize_event_data(&data, super::MAX_EVENT_DATA_LEN);
-            if let Err(err) = self
-                .deps()
-                .run_service
-                .append_event(
-                    run_id,
-                    &orch_domain::RunEvent {
-                        timestamp: self.deps().clock.now_iso(),
-                        event_type: orch_domain::RunEventType::AgentOutput,
-                        data: serde_json::Value::String(serialized.clone()),
-                    },
-                )
-                .await
-            {
-                self.emit_error(err, format!("record effort diagnostics for run {run_id}"));
-            }
-            self.emit(OrchestratorEvent::AgentOutput {
-                run_id: run_id.to_owned(),
-                agent_id: agent_id.to_owned(),
-                data: super::collect::serialize_event_data(
-                    &serde_json::Value::String(serialized),
-                    super::MAX_BUS_DATA_LEN,
-                ),
-            });
+            self.emit_error(
+                diagnostic,
+                format!("{EFFORT_DIAGNOSTIC_CONTEXT} for run {run_id} (agent {agent_id})"),
+            );
         }
     }
 
@@ -1080,6 +1080,15 @@ impl Orchestrator {
         }
     }
 }
+
+/// The `orchestrator:error` context prefix of an effort diagnostic; the
+/// rest names the run and agent.
+pub(crate) const EFFORT_DIAGNOSTIC_CONTEXT: &str = "effort preparation";
+
+/// Adapters whose `prepare_effort` returns the complete diagnostics for a
+/// dispatch (its wire check can change the plan), so the pure plan must not
+/// be consulted again for them.
+const PREPARATION_OWNS_EFFORT_DIAGNOSTICS: &[&str] = &["opencode"];
 
 /// Enforce the preparation contract at its only production caller: the
 /// prepared copy may differ from the invocation config only by a cleared

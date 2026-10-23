@@ -5,8 +5,9 @@
 //!   assembly, so a project toggle applies to the **next** dispatch;
 //! - a config read failure or an eco/custom-template conflict fails before
 //!   any run exists, through the existing claim rollback;
-//! - the effort preparation hook is awaited before execute, its diagnostics
-//!   are recorded, and its failure goes through the run-failure path;
+//! - the effort preparation hook is awaited before execute, its failure goes
+//!   through the run-failure path, and effort diagnostics reach exactly one
+//!   surface (non-fatal `orchestrator:error`), never a run event (ruling 8);
 //! - the retry context names the exact failed run only when its event window
 //!   is stable;
 //! - with equal adapter outputs, the mechanical trace is identical in both
@@ -249,6 +250,7 @@ async fn a_custom_template_still_renders_normal_agents_byte_for_byte() {
 
 /// A fake adapter whose preparation outcome is scripted; execute delegates.
 struct PreparingAdapter {
+    kind: &'static str,
     inner: Arc<FakeAdapter>,
     outcome: Mutex<Option<std::result::Result<EffortPreparation, AdapterError>>>,
     prepared: Mutex<Vec<orch_domain::AgentConfig>>,
@@ -256,12 +258,25 @@ struct PreparingAdapter {
 
 impl PreparingAdapter {
     fn new(outcome: std::result::Result<EffortPreparation, AdapterError>) -> Self {
+        Self::of_kind("shell", Some(outcome))
+    }
+
+    /// The default hook: identity, no diagnostics.
+    fn identity() -> Self {
+        Self::of_kind("shell", None)
+    }
+
+    fn of_kind(
+        kind: &'static str,
+        outcome: Option<std::result::Result<EffortPreparation, AdapterError>>,
+    ) -> Self {
         PreparingAdapter {
+            kind,
             inner: Arc::new(FakeAdapter::with_events([
                 output_event(NOW_ISO, "hi"),
                 done_event(NOW_ISO),
             ])),
-            outcome: Mutex::new(Some(outcome)),
+            outcome: Mutex::new(outcome),
             prepared: Mutex::new(Vec::new()),
         }
     }
@@ -270,7 +285,7 @@ impl PreparingAdapter {
 #[async_trait]
 impl Adapter for PreparingAdapter {
     fn kind(&self) -> &'static str {
-        "shell"
+        self.kind
     }
 
     async fn test(&self) -> AdapterTestResult {
@@ -413,18 +428,168 @@ async fn preparation_runs_before_execute_and_its_config_and_diagnostics_are_used
         h.agent("agt_test1").config.effort,
         Some(ReasoningEffort::High)
     );
-    // The diagnostic is the run's first event, as ordinary output.
-    let run = h.runs.snapshot().pop().expect("run");
-    let events = h.runs.peek_events(&run.id);
-    assert_eq!(events[0].event_type, RunEventType::AgentOutput);
-    assert!(
-        events[0]
-            .data
-            .as_str()
-            .is_some_and(|d| d.contains("effort preparation: legacy-ignored")),
-        "{:?}",
-        events[0]
+    // The preparation's diagnostic is reported once, as a diagnostic.
+    assert_eq!(
+        effort_diagnostics(&h),
+        vec!["legacy-ignored: wire check failed".to_owned()]
     );
+    assert_no_diagnostic_run_events(&h);
+}
+
+/// `(context, error)` of every effort diagnostic on the bus, in order.
+fn effort_diagnostic_events(h: &Harness) -> Vec<(String, String)> {
+    h.events()
+        .into_iter()
+        .filter_map(|event| match event {
+            orch_domain::OrchestratorEvent::OrchestratorError {
+                error,
+                context,
+                fatal,
+            } if context.starts_with(super::super::dispatch::EFFORT_DIAGNOSTIC_CONTEXT) => {
+                assert!(!fatal, "an effort diagnostic is never fatal");
+                Some((context, error))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn effort_diagnostics(h: &Harness) -> Vec<String> {
+    effort_diagnostic_events(h)
+        .into_iter()
+        .map(|(_, error)| error)
+        .collect()
+}
+
+/// The run's event log holds only what the adapter streamed: no diagnostic
+/// can reach `previous_output` or `final_result`, and the bus carries no
+/// diagnostic as `agent:output`.
+fn assert_no_diagnostic_run_events(h: &Harness) {
+    let run = h.runs.snapshot().pop().expect("run");
+    for event in h.runs.peek_events(&run.id) {
+        let text = event.data.to_string();
+        assert!(
+            !["effort preparation", "legacy-ignored", "request-only"]
+                .iter()
+                .any(|marker| text.contains(marker)),
+            "diagnostic in run events: {event:?}"
+        );
+    }
+    for event in h.events() {
+        if let orch_domain::OrchestratorEvent::AgentOutput { data, .. } = event {
+            assert!(
+                !data.contains("legacy-ignored") && !data.contains("request-only"),
+                "diagnostic on the bus as agent output: {data}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_non_opencode_plan_diagnostic_is_reported_once_before_spawn_and_never_as_output() {
+    // Identity preparation: the shell agent's legacy `high` is ignored by the
+    // pure plan, which is the diagnostic's only source.
+    let adapter = Arc::new(PreparingAdapter::identity());
+    let h = Harness::builder()
+        .tasks([make_task()])
+        .agents([agent_with_effort()])
+        .adapter_impl(Arc::clone(&adapter) as Arc<dyn Adapter>)
+        .build();
+
+    dispatch_once(&h).await;
+
+    let call = adapter.inner.execute_calls.last().expect("executed");
+    assert_eq!(call.config.effort, Some(ReasoningEffort::High));
+    let reported = effort_diagnostic_events(&h);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    let run = h.runs.snapshot().pop().expect("run");
+    assert_eq!(
+        reported[0].0,
+        format!("effort preparation for run {} (agent agt_test1)", run.id)
+    );
+    assert!(
+        reported[0].1.starts_with("legacy-ignored: "),
+        "{:?}",
+        reported[0].1
+    );
+    // Reported before the model child exists, i.e. before agent:started.
+    let events = h.events();
+    let diagnostic_at = events
+        .iter()
+        .position(|e| {
+            matches!(e, orch_domain::OrchestratorEvent::OrchestratorError { context, .. }
+                if context.starts_with("effort preparation"))
+        })
+        .expect("diagnostic");
+    if let Some(started_at) = events
+        .iter()
+        .position(|e| matches!(e, orch_domain::OrchestratorEvent::AgentStarted { .. }))
+    {
+        assert!(diagnostic_at < started_at);
+    }
+    assert_no_diagnostic_run_events(&h);
+}
+
+#[tokio::test]
+async fn opencode_diagnostics_come_only_from_its_preparation() {
+    // The preparation keeps the legacy effort and returns one note. The pure
+    // plan for this unknown model would add a `legacy-ignored` note; it must
+    // not be consulted for OpenCode.
+    let mut invocation = agent_with_effort().config;
+    invocation.prompt_mode = Some(PromptMode::Normal);
+    let adapter = Arc::new(PreparingAdapter::of_kind(
+        "opencode",
+        Some(Ok(EffortPreparation {
+            config: invocation,
+            diagnostics: vec!["request-only: from the wire-checked preparation".into()],
+        })),
+    ));
+    let mut agent = agent_with_effort();
+    agent.adapter = "opencode".into();
+    let h = Harness::builder()
+        .tasks([make_task()])
+        .agents([agent])
+        .adapter_impl(Arc::clone(&adapter) as Arc<dyn Adapter>)
+        .build();
+
+    dispatch_once(&h).await;
+
+    assert!(adapter.inner.execute_calls.last().is_some(), "executed");
+    assert_eq!(
+        effort_diagnostics(&h),
+        vec!["request-only: from the wire-checked preparation".to_owned()]
+    );
+    assert_no_diagnostic_run_events(&h);
+}
+
+#[tokio::test]
+async fn a_non_opencode_plan_rejection_fails_before_spawn_with_no_diagnostic() {
+    let adapter = Arc::new(PreparingAdapter::identity());
+    let mut agent = agent_with_effort();
+    agent.config.effort = Some(ReasoningEffort::Xhigh);
+    let h = Harness::builder()
+        .tasks([make_task()])
+        .agents([agent])
+        .adapter_impl(Arc::clone(&adapter) as Arc<dyn Adapter>)
+        .build();
+
+    dispatch_once(&h).await;
+
+    assert!(adapter.inner.execute_calls.is_empty(), "no model child");
+    assert!(effort_diagnostics(&h).is_empty());
+    let runs = h.runs.snapshot();
+    assert_eq!(runs[0].status, RunStatus::Failed);
+    assert!(
+        runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("xhigh")),
+        "{:?}",
+        runs[0].error
+    );
+    assert_eq!(h.agent("agt_test1").status, AgentStatus::Idle);
+    assert!(h.persisted_state().running.is_empty());
+    assert_eq!(h.task("tsk_test1").status, TaskStatus::Retrying);
 }
 
 #[tokio::test]
