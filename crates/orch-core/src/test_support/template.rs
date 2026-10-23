@@ -97,6 +97,7 @@ mod tests {
                 scope: None,
                 is_autonomous: false,
                 goal_id: None,
+                depends_on: Vec::new(),
             },
             agent: AgentContext {
                 id: "agt_test1".into(),
@@ -111,6 +112,7 @@ mod tests {
             shared_context: None,
             messages: None,
             goal: None,
+            eco: None,
         }
     }
 

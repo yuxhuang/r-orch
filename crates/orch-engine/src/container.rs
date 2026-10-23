@@ -360,6 +360,7 @@ async fn build_full_internal(
         goal_store: Some(Arc::clone(&engine.goals)),
         skill_loader: Some(Arc::clone(&skills)),
     }));
+    orchestrator.set_config_store(Arc::clone(&engine.config_store));
 
     Ok(FullEngine {
         engine,

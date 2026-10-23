@@ -91,7 +91,7 @@ mod tests {
     fn claude_gets_its_balanced_model_and_every_field_from_the_template() {
         let input = template_to_agent_input(&BASE, "claude").unwrap();
         assert_eq!(input.adapter, "claude");
-        assert_eq!(input.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(input.model.as_deref(), Some("claude-sonnet-5-5"));
         assert_eq!(input.name, "Test Agent");
         assert_eq!(input.role.as_deref(), Some("Test role"));
         assert_eq!(input.approval_policy, Some(ApprovalPolicy::Auto));
@@ -101,14 +101,14 @@ mod tests {
     fn codex_gets_its_own_balanced_model() {
         let input = template_to_agent_input(&BASE, "codex").unwrap();
         assert_eq!(input.adapter, "codex");
-        assert_eq!(input.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(input.model.as_deref(), Some("gpt-6.1-sol"));
     }
 
     #[test]
     fn pi_gets_its_own_balanced_model() {
         let input = template_to_agent_input(&BASE, "pi").unwrap();
         assert_eq!(input.adapter, "pi");
-        assert_eq!(input.model.as_deref(), Some("openai-codex/gpt-5.5"));
+        assert_eq!(input.model.as_deref(), Some("openai-codex/gpt-6.1-sol"));
     }
 
     #[test]
@@ -150,7 +150,7 @@ mod tests {
             ..BASE
         };
         let input = template_to_agent_input(&capable, "claude").unwrap();
-        assert_eq!(input.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(input.model.as_deref(), Some("claude-opus-5-5"));
     }
 
     #[test]

@@ -133,6 +133,8 @@ fn preview_record(input: &CreateAgentInput) -> Agent {
             system_prompt: input.system_prompt.clone(),
             workspace_mode: input.workspace_mode,
             skills: input.skills.clone(),
+            prompt_mode: input.prompt_mode,
+            role_summary: input.role_summary.clone(),
         },
         status: AgentStatus::Idle,
         current_task: None,

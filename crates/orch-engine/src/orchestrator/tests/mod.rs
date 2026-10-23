@@ -24,6 +24,7 @@ mod perf_opts;
 mod resilience;
 mod retry_race;
 mod skills;
+mod token_eco;
 
 mod remote;
 mod watch_restart;

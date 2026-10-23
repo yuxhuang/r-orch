@@ -215,6 +215,7 @@ pub fn build_prompt_context(
             scope: task.scope.clone(),
             is_autonomous: task.is_autonomous(),
             goal_id: task.goal_id.clone(),
+            depends_on: task.depends_on.clone(),
         },
         agent: AgentContext {
             id: agent.id.clone(),
@@ -248,6 +249,7 @@ pub fn build_prompt_context(
         shared_context,
         messages,
         goal: options.goal,
+        eco: None,
     }
 }
 
@@ -261,6 +263,7 @@ mod tests {
         RetryContext {
             previous_error: "boom".into(),
             previous_output: "out".into(),
+            source_run_id: None,
         }
     }
 

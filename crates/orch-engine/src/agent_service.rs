@@ -16,7 +16,8 @@ use orch_core::ids::IdGenerator;
 use orch_core::storage::{AgentStore, StateStore};
 use orch_domain::{
     Agent, AgentConfig, AgentStats, AgentStatus, ApprovalPolicy, CreateAgentInput, DomainError,
-    OrchestratorConfig, OrchestratorEvent, ReasoningEffort, Task,
+    OrchestratorConfig, OrchestratorEvent, PromptMode, ReasoningEffort, Task,
+    normalize_role_summary, validate_effort_authoring,
 };
 
 use crate::events::EventBus;
@@ -27,7 +28,10 @@ use crate::events::EventBus;
 /// `None` leaves the field alone, and for the string fields an empty value
 /// **clears** it (`fields.model || undefined`). `effort` needs the extra layer
 /// because its cleared form is the literal `''`, which is not a valid
-/// `ReasoningEffort`.
+/// `ReasoningEffort`. `prompt_mode` and `role_summary` use the same outer
+/// layer: `Some(None)` removes the override (inherit the project mode) or the
+/// explicit summary; `Some(Some(_))` sets it. An explicit summary is
+/// normalized and rejected when empty or over the byte limit, never shortened.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateAgentFields {
     pub name: Option<String>,
@@ -37,6 +41,8 @@ pub struct UpdateAgentFields {
     pub model: Option<String>,
     pub effort: Option<Option<ReasoningEffort>>,
     pub approval_policy: Option<ApprovalPolicy>,
+    pub prompt_mode: Option<Option<PromptMode>>,
+    pub role_summary: Option<Option<String>>,
 }
 
 /// A partial update to [`AgentStats`]. `None` leaves a counter untouched,
@@ -103,6 +109,11 @@ impl AgentService {
                 "Agent \"{name}\" already exists"
             )));
         }
+        let role_summary = input
+            .role_summary
+            .as_deref()
+            .map(normalize_summary)
+            .transpose()?;
 
         let agent = Agent {
             id: self.ids.generate("agt"),
@@ -140,6 +151,8 @@ impl AgentService {
                 system_prompt: input.system_prompt,
                 workspace_mode: input.workspace_mode,
                 skills: input.skills,
+                prompt_mode: input.prompt_mode,
+                role_summary,
             },
             status: AgentStatus::Idle,
             current_task: None,
@@ -150,6 +163,7 @@ impl AgentService {
             remote: None,
         };
 
+        self.validate_candidate(&agent.id, &agent.name, &agent.adapter, &agent.config)?;
         self.agents.save(&agent).await?;
         Ok(agent)
     }
@@ -212,6 +226,13 @@ impl AgentService {
             return Err(Error::invalid_arguments("Shell agents require a command"));
         }
 
+        // Validate an explicit summary before anything else is applied, so a
+        // rejection names the field and leaves the definition untouched.
+        let role_summary = match fields.role_summary {
+            Some(Some(raw)) => Some(Some(normalize_summary(&raw)?)),
+            other => other,
+        };
+
         if let Some(new_name) = fields.name.as_deref() {
             let trimmed = new_name.trim();
             if trimmed.is_empty() {
@@ -243,6 +264,12 @@ impl AgentService {
         if let Some(effort) = fields.effort {
             agent.config.effort = effort;
         }
+        if let Some(mode) = fields.prompt_mode {
+            agent.config.prompt_mode = mode;
+        }
+        if let Some(summary) = role_summary {
+            agent.config.role_summary = summary;
+        }
         // Switching *into* shell drops model/effort and, absent an explicit
         // choice, forces `auto` — the same normalization `create` applies.
         if entering_shell {
@@ -257,6 +284,7 @@ impl AgentService {
             None => {}
         }
 
+        self.validate_candidate(&agent.id, &agent.name, &agent.adapter, &agent.config)?;
         self.agents.save(&agent).await?;
         Ok(agent)
     }
@@ -298,6 +326,9 @@ impl AgentService {
                 "config: runtime limits must be positive",
             ));
         }
+        if let Some(summary) = config.role_summary.as_deref() {
+            config.role_summary = Some(normalize_summary(summary)?);
+        }
         let mut agent = self.get(id).await?;
         if agent.status == AgentStatus::Running || agent.remote.is_some() {
             return Err(Error::invalid_arguments(
@@ -316,12 +347,37 @@ impl AgentService {
             config.model = None;
             config.effort = None;
         }
+        self.validate_candidate(id, name.trim(), adapter.trim(), &config)?;
         agent.name = name.trim().to_owned();
         agent.adapter = adapter.trim().to_owned();
         agent.role = role;
         agent.config = config;
         self.agents.save(&agent).await?;
         Ok(agent)
+    }
+
+    /// Final-candidate authoring checks shared by every definition mutation
+    /// (add, flag update, wizard, file replacement, patch, editor): strict
+    /// effort validation for the candidate adapter/model, and the eco versus
+    /// custom-template conflict. Runs before any write, so a rejection leaves
+    /// the stored definition and index untouched. Warning-only effort statuses
+    /// never become errors here.
+    ///
+    /// Legacy spellings get no exemption at authoring: an unrelated edit of a
+    /// stored combination the table refuses fails with the remedy, while
+    /// dispatch keeps ignoring it with a warning.
+    pub fn validate_candidate(
+        &self,
+        id: &str,
+        name: &str,
+        adapter: &str,
+        config: &AgentConfig,
+    ) -> Result<()> {
+        if adapter != "shell" {
+            validate_effort_authoring(adapter, config.model.as_deref(), config.effort)
+                .map_err(|err| Error::invalid_arguments(format!("agent {id}: {err}")))?;
+        }
+        crate::prompt_mode::check_agent_candidate(&self.config, id, name, config)
     }
 
     pub async fn disable(&self, id: &str) -> Result<Agent> {
@@ -440,6 +496,13 @@ fn reject_remote_id(id: &str) -> Result<()> {
     }
 }
 
+/// Normalize an explicit `role_summary` for storage, or reject it with the
+/// field name and limit. Explicit prose is never silently shortened.
+fn normalize_summary(raw: &str) -> Result<String> {
+    normalize_role_summary(raw)
+        .map_err(|err| Error::invalid_arguments(format!("config.role_summary: {err}")))
+}
+
 /// Capability labels constrain explicit and automatic assignment alike.
 pub fn agent_eligible(task: &Task, agent: &Agent) -> bool {
     agent.status == AgentStatus::Idle
@@ -496,7 +559,10 @@ fn js_round(value: f64) -> i64 {
 mod tests {
     use super::*;
     use orch_core::test_support::{FakeAgentStore, FakeStateStore, SeqIdGenerator, make_task};
-    use orch_domain::{OrchestratorEventType, OrchestratorState, RunningEntry, default_config};
+    use orch_domain::{
+        OrchestratorEventType, OrchestratorState, ROLE_SUMMARY_MAX_BYTES, RunningEntry,
+        default_config,
+    };
 
     struct Harness {
         service: AgentService,
@@ -725,6 +791,129 @@ mod tests {
         let value = serde_json::to_value(&agent).unwrap();
         assert!(value["config"].get("model").is_none());
         assert!(value["config"].get("effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_sets_and_clears_prompt_mode_and_role_summary_in_one_write() {
+        let h = harness(vec![agent("agt_1")]);
+        let updated = h
+            .service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(Some(PromptMode::Eco)),
+                    role_summary: Some(Some("  Reviews\n\tRust   diffs. ".into())),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.config.prompt_mode, Some(PromptMode::Eco));
+        assert_eq!(
+            updated.config.role_summary.as_deref(),
+            Some("Reviews Rust diffs.")
+        );
+        assert_eq!(h.agents.saved().len(), 1);
+
+        // Untouched fields stay; Some(None) clears back to inherit / derived.
+        let untouched = h
+            .service
+            .update("agt_1", UpdateAgentFields::default())
+            .await
+            .unwrap();
+        assert_eq!(untouched.config.prompt_mode, Some(PromptMode::Eco));
+        let cleared = h
+            .service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(None),
+                    role_summary: Some(None),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.config.prompt_mode, None);
+        assert_eq!(cleared.config.role_summary, None);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_an_empty_or_oversized_summary_without_writing() {
+        let before = agent("agt_1");
+        let h = harness(vec![before.clone()]);
+        for bad in [" \n ".to_owned(), "x".repeat(ROLE_SUMMARY_MAX_BYTES + 1)] {
+            let err = h
+                .service
+                .update(
+                    "agt_1",
+                    UpdateAgentFields {
+                        prompt_mode: Some(Some(PromptMode::Eco)),
+                        role_summary: Some(Some(bad)),
+                        ..UpdateAgentFields::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("config.role_summary"), "{err}");
+        }
+        assert_eq!(h.service.get("agt_1").await.unwrap(), before);
+        assert!(h.agents.saved().is_empty());
+        // Exactly the limit is accepted unchanged.
+        let at_limit = "y".repeat(ROLE_SUMMARY_MAX_BYTES);
+        let ok = h
+            .service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    role_summary: Some(Some(at_limit.clone())),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.config.role_summary, Some(at_limit));
+    }
+
+    #[tokio::test]
+    async fn update_to_eco_with_a_custom_template_is_rejected_before_writing() {
+        let mut config = default_config();
+        config.prompt = Some(orch_domain::PromptConfig {
+            system_template: Some("custom".into()),
+            ..orch_domain::PromptConfig::default()
+        });
+        let store = Arc::new(FakeAgentStore::with_agents(vec![agent("agt_1")]));
+        let service = AgentService::new(
+            Arc::clone(&store) as Arc<dyn AgentStore>,
+            Arc::new(FakeStateStore::new()) as Arc<dyn StateStore>,
+            Arc::new(EventBus::new()),
+            config,
+            Arc::new(SeqIdGenerator::new()),
+        );
+        let err = service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(Some(PromptMode::Eco)),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("agt_1"), "{err}");
+        assert!(store.saved().is_empty());
+        // An explicit normal override is the documented remedy and succeeds.
+        let normal = service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(Some(PromptMode::Normal)),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(normal.config.prompt_mode, Some(PromptMode::Normal));
     }
 
     #[tokio::test]

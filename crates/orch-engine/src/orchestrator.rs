@@ -208,6 +208,9 @@ struct Inner {
 
     remote_state_dirty: AtomicBool,
     remote_bridge: std::sync::RwLock<Arc<dyn orch_core::remote::RemoteBridge>>,
+    /// Where dispatch re-reads the project prompt mode; see
+    /// [`Orchestrator::set_config_store`].
+    config_store: std::sync::RwLock<Option<Arc<dyn orch_core::storage::ConfigStore>>>,
     event_tap: std::sync::RwLock<Option<Arc<dyn orch_core::remote::RunEventTap>>>,
     /// The instance id of the controller connected to this instance's peer
     /// listener, if any. Dispatch consults it before starting a mirror.
@@ -276,6 +279,7 @@ impl Orchestrator {
                 remote_bridge: std::sync::RwLock::new(Arc::new(
                     orch_core::remote::NoopRemoteBridge,
                 )),
+                config_store: std::sync::RwLock::new(None),
                 event_tap: std::sync::RwLock::new(None),
                 inbound_controller: std::sync::RwLock::new(None),
                 deps,
@@ -310,6 +314,26 @@ impl Orchestrator {
 
     fn config(&self) -> &OrchestratorConfig {
         &self.inner.deps.config
+    }
+
+    /// Let dispatch re-read `defaults.agent.prompt_mode` from the project
+    /// config before each prompt assembly, so a mode switch applies to the
+    /// next dispatch. Without it the startup config's mode is used. Only that
+    /// one key is refreshed; every other setting keeps the startup snapshot.
+    pub fn set_config_store(&self, store: Arc<dyn orch_core::storage::ConfigStore>) {
+        *self
+            .inner
+            .config_store
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(store);
+    }
+
+    fn config_store(&self) -> Option<Arc<dyn orch_core::storage::ConfigStore>> {
+        self.inner
+            .config_store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn emit(&self, event: OrchestratorEvent) {
