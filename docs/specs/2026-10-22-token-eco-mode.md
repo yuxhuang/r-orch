@@ -111,7 +111,7 @@ means no gate has passed the row yet.
 | R7 | pass | c2f6962 (T1 D2-2 pairing) | macOS |
 | R8 | pass | c2f6962 (T1 compatibility matrix, 544 cells, real 0.9.4 reader) + fix-round head (ruling-13 shell row, delta re-review) | macOS |
 | R9 | pass | c2f6962 | macOS (perf gate, cold 0.089) |
-| R10 | pass | df3c712 (fact-check gate at c2f6962 passed with conditions; conditions re-checked on 8757de3 and df3c712, both pass; Pensieve spec copy byte-identical) | macOS |
+| R10 | pass | df3c712 (fact-check gate at c2f6962 passed with conditions; re-checked on 8757de3 (pass with conditions FC3-1, FC3-2, FC-1) and on df3c712 (pass, all closed); Pensieve spec copy byte-identical) | macOS |
 | R11 | pass | c2f6962 (QA gate, tmux) + fix-round head (delta re-review) | macOS |
 | R12 | pass | c2f6962 (`static_choices_match_the_dated_catalog_for_all_tiers`) | macOS |
 | R13 | pass | c2f6962 (T1 D7-1, D7-2) | macOS |
