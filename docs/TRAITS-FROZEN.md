@@ -351,6 +351,43 @@ one-line change. Anything that *reads* a pipe is unaffected. `orch-infra`'s
 and `crates/orch-infra/tests/fake_process_manager.rs`, which is the pattern
 WP-4 should copy.
 
+### Amendment 2 — `Adapter::prepare_effort` and the eco prompt context (token eco mode)
+
+Proposed in [ADR 0010](decisions/0010-prompt-mode-and-effort-contract.md).
+
+```rust
+// added to orch_core::adapter
+pub struct EffortPreparation { config: AgentConfig, diagnostics: Vec<String> }
+
+pub trait Adapter {
+    // kind, test, execute (still NOT async), stop: unchanged
+    async fn prepare_effort(&self, params: &ExecuteParams)
+        -> std::result::Result<EffortPreparation, AdapterError>;  // default: identity, no I/O
+}
+
+// added to orch_core::template
+pub struct PromptContext { /* … as above … */, eco: Option<EcoContext> }
+// plus EcoContext, EcoRosterRow, EcoRetry, EcoGoalTasks, GoalTaskRow;
+// RetryContext.source_run_id, GoalContext.task_rows, TaskContext.depends_on
+```
+
+**Why.** OpenCode needs a bounded version and help check before it may
+append `#<level>` to a model, and that check spawns processes, so it cannot
+run inside synchronous `execute` without hiding work in the event stream.
+The eco renderer needs inputs the normal templates never see.
+
+**Rules.** The default method clones `params.config` unchanged and returns no
+diagnostics; only OpenCode overrides it. The returned config may differ from
+the input only by a cleared `effort`. Callers await it before `execute` and
+pass the returned config on; the engine's dispatch is the only production
+caller. A hook error goes through the same cleanup as a spawn error.
+
+**Departure from the WP-3 rule.** `PromptContext.eco` is
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, and the new
+`source_run_id`, `task_rows` and `depends_on` fields are `#[serde(skip)]`, so
+the context a normal render sees is the same as before. Every variable the
+normal templates use is still always present.
+
 ---
 
 ## Deviations from ARCHITECTURE §5, and why

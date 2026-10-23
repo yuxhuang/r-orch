@@ -16,10 +16,12 @@ use orch_core::ids::IdGenerator;
 use orch_core::storage::{AgentStore, StateStore};
 use orch_domain::{
     Agent, AgentConfig, AgentStats, AgentStatus, ApprovalPolicy, CreateAgentInput, DomainError,
-    OrchestratorConfig, OrchestratorEvent, ReasoningEffort, Task,
+    OrchestratorConfig, OrchestratorEvent, PromptMode, ReasoningEffort, Task,
+    normalize_role_summary, validate_effort_authoring,
 };
 
 use crate::events::EventBus;
+use crate::prompt_mode::{AgentDiagnostic, DefinitionLock, agent_effort_diagnostics};
 
 /// Fields `agent edit` may change.
 ///
@@ -27,7 +29,10 @@ use crate::events::EventBus;
 /// `None` leaves the field alone, and for the string fields an empty value
 /// **clears** it (`fields.model || undefined`). `effort` needs the extra layer
 /// because its cleared form is the literal `''`, which is not a valid
-/// `ReasoningEffort`.
+/// `ReasoningEffort`. `prompt_mode` and `role_summary` use the same outer
+/// layer: `Some(None)` removes the override (inherit the project mode) or the
+/// explicit summary; `Some(Some(_))` sets it. An explicit summary is
+/// normalized and rejected when empty or over the byte limit, never shortened.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateAgentFields {
     pub name: Option<String>,
@@ -37,6 +42,8 @@ pub struct UpdateAgentFields {
     pub model: Option<String>,
     pub effort: Option<Option<ReasoningEffort>>,
     pub approval_policy: Option<ApprovalPolicy>,
+    pub prompt_mode: Option<Option<PromptMode>>,
+    pub role_summary: Option<Option<String>>,
 }
 
 /// A partial update to [`AgentStats`]. `None` leaves a counter untouched,
@@ -48,6 +55,18 @@ pub struct AgentStatsUpdate {
     pub total_runs: Option<u64>,
     pub total_runtime_ms: Option<u64>,
     pub tokens_used: Option<u64>,
+}
+
+/// A definition written by one of the `*_locked` mutations, with what to show
+/// for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredAgent {
+    pub agent: Agent,
+    /// [`agent_effort_diagnostics`] of the final candidate *before* the shell
+    /// normalization drops its effort, so a legacy level requested for a
+    /// shell agent is reported as ignored instead of vanishing silently. For
+    /// every other adapter this equals the diagnostics of `agent`.
+    pub diagnostics: Vec<AgentDiagnostic>,
 }
 
 pub struct AgentService {
@@ -77,14 +96,36 @@ impl AgentService {
 
     /// `create` emits **no event**, which is
     /// why `agent add` produces no `task:created`-style record.
+    ///
+    /// Defaults and the final-candidate check use the engine's construction
+    /// snapshot of the project config; interactive and CLI authoring use
+    /// [`AgentService::create_locked`] instead.
     pub async fn create(&self, input: CreateAgentInput) -> Result<Agent> {
+        Ok(self.create_against(&self.config, input).await?.agent)
+    }
+
+    /// [`AgentService::create`] under the held definition lock: defaults and
+    /// the final-candidate check use the project config read inside the lock.
+    pub async fn create_locked(
+        &self,
+        lock: &DefinitionLock,
+        input: CreateAgentInput,
+    ) -> Result<AuthoredAgent> {
+        self.create_against(lock.config(), input).await
+    }
+
+    async fn create_against(
+        &self,
+        config: &OrchestratorConfig,
+        input: CreateAgentInput,
+    ) -> Result<AuthoredAgent> {
         let name = input.name.trim();
         if name.is_empty() {
             return Err(Error::invalid_arguments("Agent name is required"));
         }
 
         let adapter = match input.adapter.trim() {
-            "" => self.config.defaults.agent.adapter.clone(),
+            "" => config.defaults.agent.adapter.clone(),
             given => given.to_owned(),
         };
         let is_shell = adapter == "shell";
@@ -103,43 +144,42 @@ impl AgentService {
                 "Agent \"{name}\" already exists"
             )));
         }
+        let role_summary = input
+            .role_summary
+            .as_deref()
+            .map(normalize_summary)
+            .transpose()?;
 
-        let agent = Agent {
+        let mut agent = Agent {
             id: self.ids.generate("agt"),
             name: name.to_owned(),
             adapter,
             role: input.role,
             config: AgentConfig {
                 command: command.map(str::to_owned),
-                // `model` and `effort` are forced absent for shell, whatever
-                // was passed.
+                // `model` is forced absent for shell, whatever was passed;
+                // `effort` is checked first and then dropped (below).
                 model: if is_shell { None } else { input.model },
-                effort: if is_shell { None } else { input.effort },
+                effort: input.effort,
                 // Shell defaults to `auto` rather than the configured default.
                 approval_policy: Some(input.approval_policy.unwrap_or(if is_shell {
                     ApprovalPolicy::Auto
                 } else {
-                    self.config.defaults.agent.approval_policy
+                    config.defaults.agent.approval_policy
                 })),
-                max_turns: Some(
-                    input
-                        .max_turns
-                        .unwrap_or(self.config.defaults.agent.max_turns),
-                ),
-                timeout_ms: Some(
-                    input
-                        .timeout_ms
-                        .unwrap_or(self.config.defaults.agent.timeout_ms),
-                ),
+                max_turns: Some(input.max_turns.unwrap_or(config.defaults.agent.max_turns)),
+                timeout_ms: Some(input.timeout_ms.unwrap_or(config.defaults.agent.timeout_ms)),
                 stall_timeout_ms: Some(
                     input
                         .stall_timeout_ms
-                        .unwrap_or(self.config.defaults.agent.stall_timeout_ms),
+                        .unwrap_or(config.defaults.agent.stall_timeout_ms),
                 ),
                 env: input.env,
                 system_prompt: input.system_prompt,
                 workspace_mode: input.workspace_mode,
                 skills: input.skills,
+                prompt_mode: input.prompt_mode,
+                role_summary,
             },
             status: AgentStatus::Idle,
             current_task: None,
@@ -150,8 +190,22 @@ impl AgentService {
             remote: None,
         };
 
+        if is_shell {
+            check_shell_effort(&agent.id, agent.config.effort, None)?;
+        }
+        let diagnostics = agent_effort_diagnostics(std::slice::from_ref(&agent));
+        if is_shell {
+            agent.config.effort = None;
+        }
+        Self::validate_candidate_with(
+            config,
+            &agent.id,
+            &agent.name,
+            &agent.adapter,
+            &agent.config,
+        )?;
         self.agents.save(&agent).await?;
-        Ok(agent)
+        Ok(AuthoredAgent { agent, diagnostics })
     }
 
     /// Index order, i.e. last-write order. Not sorted — see
@@ -190,10 +244,33 @@ impl AgentService {
         self.agents.delete(id).await
     }
 
+    /// Flag/wizard update, checked against the engine's construction snapshot
+    /// of the project config; see [`AgentService::update_locked`].
     pub async fn update(&self, id: &str, fields: UpdateAgentFields) -> Result<Agent> {
+        Ok(self.update_against(&self.config, id, fields).await?.agent)
+    }
+
+    /// [`AgentService::update`] under the held definition lock: the final
+    /// candidate is checked against the project config read inside the lock.
+    pub async fn update_locked(
+        &self,
+        lock: &DefinitionLock,
+        id: &str,
+        fields: UpdateAgentFields,
+    ) -> Result<AuthoredAgent> {
+        self.update_against(lock.config(), id, fields).await
+    }
+
+    async fn update_against(
+        &self,
+        config: &OrchestratorConfig,
+        id: &str,
+        fields: UpdateAgentFields,
+    ) -> Result<AuthoredAgent> {
         reject_remote_id(id)?;
         let mut agent = self.get(id).await?;
         let was_shell = agent.adapter == "shell";
+        let stored_shell_effort = if was_shell { agent.config.effort } else { None };
 
         let adapter = match fields.adapter.as_deref() {
             Some(given) => given.trim().to_owned(),
@@ -211,6 +288,13 @@ impl AgentService {
         if adapter == "shell" && command.is_none() {
             return Err(Error::invalid_arguments("Shell agents require a command"));
         }
+
+        // Validate an explicit summary before anything else is applied, so a
+        // rejection names the field and leaves the definition untouched.
+        let role_summary = match fields.role_summary {
+            Some(Some(raw)) => Some(Some(normalize_summary(&raw)?)),
+            other => other,
+        };
 
         if let Some(new_name) = fields.name.as_deref() {
             let trimmed = new_name.trim();
@@ -243,11 +327,25 @@ impl AgentService {
         if let Some(effort) = fields.effort {
             agent.config.effort = effort;
         }
-        // Switching *into* shell drops model/effort and, absent an explicit
-        // choice, forces `auto` — the same normalization `create` applies.
+        if let Some(mode) = fields.prompt_mode {
+            agent.config.prompt_mode = mode;
+        }
+        if let Some(summary) = role_summary {
+            agent.config.role_summary = summary;
+        }
+        let is_shell = agent.adapter == "shell";
+        if is_shell {
+            check_shell_effort(&agent.id, agent.config.effort, stored_shell_effort)?;
+        }
+        let diagnostics = agent_effort_diagnostics(std::slice::from_ref(&agent));
+        // A shell agent never stores an effort. Switching *into* shell also
+        // drops the model and, absent an explicit choice, forces `auto` — the
+        // same normalization `create` applies.
+        if is_shell {
+            agent.config.effort = None;
+        }
         if entering_shell {
             agent.config.model = None;
-            agent.config.effort = None;
         }
         match fields.approval_policy {
             Some(policy) => agent.config.approval_policy = Some(policy),
@@ -257,20 +355,61 @@ impl AgentService {
             None => {}
         }
 
+        Self::validate_candidate_with(
+            config,
+            &agent.id,
+            &agent.name,
+            &agent.adapter,
+            &agent.config,
+        )?;
         self.agents.save(&agent).await?;
-        Ok(agent)
+        Ok(AuthoredAgent { agent, diagnostics })
     }
 
     /// Replace only authored fields, re-reading runtime state immediately before
     /// the single store save. Legacy/runtime writers remain last-writer-wins.
+    ///
+    /// Checked against the engine's construction snapshot of the project
+    /// config; see [`AgentService::replace_definition_locked`].
     pub async fn replace_definition(
         &self,
         id: &str,
         name: String,
         adapter: String,
         role: Option<String>,
-        mut config: AgentConfig,
+        config: AgentConfig,
     ) -> Result<Agent> {
+        Ok(self
+            .replace_definition_against(&self.config, id, name, adapter, role, config)
+            .await?
+            .agent)
+    }
+
+    /// [`AgentService::replace_definition`] under the held definition lock:
+    /// the final candidate is checked against the project config read inside
+    /// the lock.
+    pub async fn replace_definition_locked(
+        &self,
+        lock: &DefinitionLock,
+        id: &str,
+        name: String,
+        adapter: String,
+        role: Option<String>,
+        config: AgentConfig,
+    ) -> Result<AuthoredAgent> {
+        self.replace_definition_against(lock.config(), id, name, adapter, role, config)
+            .await
+    }
+
+    async fn replace_definition_against(
+        &self,
+        project: &OrchestratorConfig,
+        id: &str,
+        name: String,
+        adapter: String,
+        role: Option<String>,
+        mut config: AgentConfig,
+    ) -> Result<AuthoredAgent> {
         reject_remote_id(id)?;
         if name.trim().is_empty() || adapter.trim().is_empty() {
             return Err(Error::invalid_arguments("name/adapter: cannot be empty"));
@@ -298,6 +437,9 @@ impl AgentService {
                 "config: runtime limits must be positive",
             ));
         }
+        if let Some(summary) = config.role_summary.as_deref() {
+            config.role_summary = Some(normalize_summary(summary)?);
+        }
         let mut agent = self.get(id).await?;
         if agent.status == AgentStatus::Running || agent.remote.is_some() {
             return Err(Error::invalid_arguments(
@@ -309,19 +451,77 @@ impl AgentService {
             && agent.role == role
             && agent.config == config
         {
-            return Ok(agent);
+            let diagnostics = agent_effort_diagnostics(std::slice::from_ref(&agent));
+            return Ok(AuthoredAgent { agent, diagnostics });
         }
-        if adapter.trim() == "shell" {
-            config.command = config.command.map(|command| command.trim().to_owned());
-            config.model = None;
-            config.effort = None;
-        }
+        let stored_shell_effort = if agent.adapter == "shell" {
+            agent.config.effort
+        } else {
+            None
+        };
+        let is_shell = adapter.trim() == "shell";
         agent.name = name.trim().to_owned();
         agent.adapter = adapter.trim().to_owned();
         agent.role = role;
         agent.config = config;
+        if is_shell {
+            check_shell_effort(id, agent.config.effort, stored_shell_effort)?;
+        }
+        let diagnostics = agent_effort_diagnostics(std::slice::from_ref(&agent));
+        if is_shell {
+            let config = &mut agent.config;
+            config.command = config
+                .command
+                .take()
+                .map(|command| command.trim().to_owned());
+            config.model = None;
+            config.effort = None;
+        }
+        Self::validate_candidate_with(project, id, &agent.name, &agent.adapter, &agent.config)?;
         self.agents.save(&agent).await?;
-        Ok(agent)
+        Ok(AuthoredAgent { agent, diagnostics })
+    }
+
+    /// Final-candidate authoring checks shared by every definition mutation
+    /// (add, flag update, wizard, file replacement, patch, editor): strict
+    /// effort validation for the candidate adapter/model, and the eco versus
+    /// custom-template conflict. Runs before any write, so a rejection leaves
+    /// the stored definition and index untouched. Warning-only effort statuses
+    /// never become errors here.
+    ///
+    /// Legacy spellings get no exemption at authoring: an unrelated edit of a
+    /// stored combination the table refuses fails with the remedy, while
+    /// dispatch keeps ignoring it with a warning.
+    ///
+    /// Checks against the engine's construction snapshot of the project
+    /// config; a caller holding the definition lock uses
+    /// [`AgentService::validate_candidate_with`] and
+    /// [`DefinitionLock::config`].
+    pub fn validate_candidate(
+        &self,
+        id: &str,
+        name: &str,
+        adapter: &str,
+        config: &AgentConfig,
+    ) -> Result<()> {
+        Self::validate_candidate_with(&self.config, id, name, adapter, config)
+    }
+
+    /// [`AgentService::validate_candidate`] against an explicit project
+    /// config. Shell candidates arrive here already normalized (no effort);
+    /// their effort check is [`check_shell_effort`], before the normalization.
+    pub fn validate_candidate_with(
+        project: &OrchestratorConfig,
+        id: &str,
+        name: &str,
+        adapter: &str,
+        config: &AgentConfig,
+    ) -> Result<()> {
+        if adapter != "shell" {
+            validate_effort_authoring(adapter, config.model.as_deref(), config.effort)
+                .map_err(|err| Error::invalid_arguments(format!("agent {id}: {err}")))?;
+        }
+        crate::prompt_mode::check_agent_candidate(project, id, name, config)
     }
 
     pub async fn disable(&self, id: &str) -> Result<Agent> {
@@ -440,6 +640,43 @@ fn reject_remote_id(id: &str) -> Result<()> {
     }
 }
 
+/// The effort check for a shell candidate, run *before* the normalization
+/// that drops a shell agent's effort (lead ruling 13, design D5-7). Shell has
+/// no effort channel:
+///
+/// - a new spelling (outside `low|medium|high`) is a configuration error with
+///   the same shape as every other adapter's unsupported value;
+/// - a legacy level this mutation requests is accepted and ignored (0.9.4
+///   accepted it); the caller reports the legacy-ignored warning from the
+///   un-normalized candidate and stores no effort;
+/// - a legacy level carried unchanged from the stored shell definition is an
+///   incompatible stored combination, refused on an unrelated edit like
+///   Cursor's, with the `--effort default` remedy.
+///
+/// `stored` is the effort of the stored definition when it already is a
+/// shell agent, else `None`.
+fn check_shell_effort(
+    id: &str,
+    effort: Option<ReasoningEffort>,
+    stored: Option<ReasoningEffort>,
+) -> Result<()> {
+    match effort {
+        Some(level) if !level.is_legacy() || stored == Some(level) => {
+            validate_effort_authoring("shell", None, Some(level))
+                .map(drop)
+                .map_err(|err| Error::invalid_arguments(format!("agent {id}: {err}")))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Normalize an explicit `role_summary` for storage, or reject it with the
+/// field name and limit. Explicit prose is never silently shortened.
+fn normalize_summary(raw: &str) -> Result<String> {
+    normalize_role_summary(raw)
+        .map_err(|err| Error::invalid_arguments(format!("config.role_summary: {err}")))
+}
+
 /// Capability labels constrain explicit and automatic assignment alike.
 pub fn agent_eligible(task: &Task, agent: &Agent) -> bool {
     agent.status == AgentStatus::Idle
@@ -496,7 +733,10 @@ fn js_round(value: f64) -> i64 {
 mod tests {
     use super::*;
     use orch_core::test_support::{FakeAgentStore, FakeStateStore, SeqIdGenerator, make_task};
-    use orch_domain::{OrchestratorEventType, OrchestratorState, RunningEntry, default_config};
+    use orch_domain::{
+        OrchestratorEventType, OrchestratorState, ROLE_SUMMARY_MAX_BYTES, RunningEntry,
+        default_config,
+    };
 
     struct Harness {
         service: AgentService,
@@ -725,6 +965,129 @@ mod tests {
         let value = serde_json::to_value(&agent).unwrap();
         assert!(value["config"].get("model").is_none());
         assert!(value["config"].get("effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_sets_and_clears_prompt_mode_and_role_summary_in_one_write() {
+        let h = harness(vec![agent("agt_1")]);
+        let updated = h
+            .service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(Some(PromptMode::Eco)),
+                    role_summary: Some(Some("  Reviews\n\tRust   diffs. ".into())),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.config.prompt_mode, Some(PromptMode::Eco));
+        assert_eq!(
+            updated.config.role_summary.as_deref(),
+            Some("Reviews Rust diffs.")
+        );
+        assert_eq!(h.agents.saved().len(), 1);
+
+        // Untouched fields stay; Some(None) clears back to inherit / derived.
+        let untouched = h
+            .service
+            .update("agt_1", UpdateAgentFields::default())
+            .await
+            .unwrap();
+        assert_eq!(untouched.config.prompt_mode, Some(PromptMode::Eco));
+        let cleared = h
+            .service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(None),
+                    role_summary: Some(None),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.config.prompt_mode, None);
+        assert_eq!(cleared.config.role_summary, None);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_an_empty_or_oversized_summary_without_writing() {
+        let before = agent("agt_1");
+        let h = harness(vec![before.clone()]);
+        for bad in [" \n ".to_owned(), "x".repeat(ROLE_SUMMARY_MAX_BYTES + 1)] {
+            let err = h
+                .service
+                .update(
+                    "agt_1",
+                    UpdateAgentFields {
+                        prompt_mode: Some(Some(PromptMode::Eco)),
+                        role_summary: Some(Some(bad)),
+                        ..UpdateAgentFields::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("config.role_summary"), "{err}");
+        }
+        assert_eq!(h.service.get("agt_1").await.unwrap(), before);
+        assert!(h.agents.saved().is_empty());
+        // Exactly the limit is accepted unchanged.
+        let at_limit = "y".repeat(ROLE_SUMMARY_MAX_BYTES);
+        let ok = h
+            .service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    role_summary: Some(Some(at_limit.clone())),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.config.role_summary, Some(at_limit));
+    }
+
+    #[tokio::test]
+    async fn update_to_eco_with_a_custom_template_is_rejected_before_writing() {
+        let mut config = default_config();
+        config.prompt = Some(orch_domain::PromptConfig {
+            system_template: Some("custom".into()),
+            ..orch_domain::PromptConfig::default()
+        });
+        let store = Arc::new(FakeAgentStore::with_agents(vec![agent("agt_1")]));
+        let service = AgentService::new(
+            Arc::clone(&store) as Arc<dyn AgentStore>,
+            Arc::new(FakeStateStore::new()) as Arc<dyn StateStore>,
+            Arc::new(EventBus::new()),
+            config,
+            Arc::new(SeqIdGenerator::new()),
+        );
+        let err = service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(Some(PromptMode::Eco)),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("agt_1"), "{err}");
+        assert!(store.saved().is_empty());
+        // An explicit normal override is the documented remedy and succeeds.
+        let normal = service
+            .update(
+                "agt_1",
+                UpdateAgentFields {
+                    prompt_mode: Some(Some(PromptMode::Normal)),
+                    ..UpdateAgentFields::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(normal.config.prompt_mode, Some(PromptMode::Normal));
     }
 
     #[tokio::test]

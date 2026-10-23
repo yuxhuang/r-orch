@@ -103,6 +103,8 @@ pub fn default_agents(adapter: &str) -> Vec<Agent> {
             system_prompt: None,
             workspace_mode: None,
             skills: Some(skills),
+            prompt_mode: None,
+            role_summary: None,
         },
         status: AgentStatus::Idle,
         current_task: None,
@@ -300,7 +302,7 @@ mod tests {
         assert_eq!(agent.name, "Agent Creator");
         assert_eq!(agent.adapter, "claude");
         assert_eq!(agent.role.as_deref(), Some(AGENT_CREATOR_ROLE));
-        assert_eq!(agent.config.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(agent.config.model.as_deref(), Some("claude-sonnet-5-5"));
         assert_eq!(agent.config.approval_policy, Some(ApprovalPolicy::Suggest));
         assert_eq!(agent.config.max_turns, Some(50));
         assert_eq!(agent.config.timeout_ms, Some(3_600_000));
@@ -323,7 +325,7 @@ mod tests {
     fn non_claude_adapters_get_no_mcp_skills() {
         let agents = default_agents("codex");
         assert_eq!(agents[0].config.skills.as_deref(), Some([].as_slice()));
-        assert_eq!(agents[0].config.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(agents[0].config.model.as_deref(), Some("gpt-6.1-sol"));
     }
 
     #[test]

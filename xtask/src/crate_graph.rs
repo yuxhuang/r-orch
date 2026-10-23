@@ -106,6 +106,13 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
          service resolves itself",
     ),
     (
+        "prompt_mode.rs",
+        "the project prompt-mode toggle edits one key of the raw config \
+         under the `.definition.lock` (`Paths`, `fs_utils`), via \
+         `FileConfigStore::read_raw`/`write_raw`, which the orch-core \
+         `ConfigStore` trait does not expose",
+    ),
+    (
         "lock.rs",
         "the PID-file lock mechanism, re-exported so the engine's \
          `ProjectLock` impl is a thin wrapper rather than a second \
@@ -138,6 +145,12 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
     (
         "orchestrator/tests/skills.rs",
         "a test asserting the dispatch templates are the real ones",
+    ),
+    (
+        "orchestrator/tests/token_eco.rs",
+        "a test asserting a normal-mode agent with only a custom system \
+         template still renders the real default user template, as \
+         skills.rs does",
     ),
 ];
 

@@ -31,8 +31,8 @@ use orch_tui::backend::{
 };
 use orch_tui::state::ViewId;
 use orch_tui::wizard::configs::{
-    self, AGENT_NAME_TAKEN, COMMAND_REQUIRED_FOR_SHELL, CUSTOM_ROLE, EFFORT_ADAPTERS,
-    NAME_REQUIRED, PRIORITY_RANGE, TEAM_NAME_TAKEN, TITLE_REQUIRED,
+    self, AGENT_NAME_TAKEN, COMMAND_REQUIRED_FOR_SHELL, CUSTOM_ROLE, NAME_REQUIRED, PRIORITY_RANGE,
+    TEAM_NAME_TAKEN, TITLE_REQUIRED,
 };
 use orch_tui::wizard::engine::{ENTER_BLOCK_HINT_MS, FIX_THE_ERROR_ABOVE, VALIDATION_DEBOUNCE_MS};
 use orch_tui::wizard::{Choice, StepKind, Values, Wizard, WizardKind, WizardOutcome, WizardStep};
@@ -81,7 +81,7 @@ fn type_into(wizard: &mut Wizard, text: &str, now: i64) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn w001_new_agent_has_ten_steps_in_order() {
+fn w001_new_agent_has_twelve_steps_in_order() {
     let steps = configs::agent_wizard_steps(&[], &[], &empty_catalog(), "claude");
     assert_eq!(
         step_ids(&steps),
@@ -91,8 +91,10 @@ fn w001_new_agent_has_ten_steps_in_order() {
             "command",
             "model",
             "effort",
+            "prompt_mode",
             "role",
             "role_custom",
+            "role_summary",
             "skills",
             "approval_policy",
             "team",
@@ -139,21 +141,39 @@ fn w003_model_role_skills_team_skip_only_for_shell() {
 }
 
 #[test]
-fn w004_effort_skips_for_every_adapter_except_claude_pi_grok() {
+fn w004_effort_shows_exactly_for_adapters_with_a_generic_effort_selector() {
+    // design-v3 D5: Claude, Codex, Antigravity, Pi and Grok take a generic
+    // effort request; Cursor and Shell have none; OpenCode only for an
+    // explicit recognised model (its #variant syntax needs a model to attach
+    // to), so with no model the step is skipped.
     let steps = configs::agent_wizard_steps(&[], &[], &empty_catalog(), "claude");
     let effort = find(&steps, "effort");
-    for adapter in EFFORT_ADAPTERS {
+    for adapter in ["claude", "codex", "antigravity", "pi", "grok"] {
         assert!(
             !effort.is_skipped(&vals(&[("adapter", adapter)])),
             "effort must show for {adapter}"
         );
     }
-    for adapter in ["codex", "cursor", "opencode", "antigravity", "shell"] {
+    for adapter in ["cursor", "shell", "opencode"] {
         assert!(
             effort.is_skipped(&vals(&[("adapter", adapter)])),
-            "effort must skip for {adapter}"
+            "effort must skip for {adapter} with no model"
         );
     }
+    assert!(
+        !effort.is_skipped(&vals(&[
+            ("adapter", "opencode"),
+            ("model", "openrouter/anthropic/claude-opus-5.5")
+        ])),
+        "effort must show for a recognised OpenCode model"
+    );
+    assert!(
+        effort.is_skipped(&vals(&[
+            ("adapter", "opencode"),
+            ("model", "some/unknown-model")
+        ])),
+        "effort must skip for an unknown OpenCode model"
+    );
 }
 
 #[test]
@@ -450,11 +470,11 @@ fn w020_apply_shop_template_keeps_mcp_skills_for_claude_only() {
 
 #[test]
 fn w021_apply_shop_template_model_falls_back_to_the_empty_option() {
-    // resolve_model("claude", Balanced) = "claude-sonnet-4-6", which is not
-    // among the claude fallback options — must fall back to "".
+    // resolve_model("claude", Balanced) = "claude-sonnet-5-5" (design-v3 D6),
+    // which is not among the claude fallback options — must fall back to "".
     assert_eq!(
         resolve_model("claude", orch_domain::ModelTier::Balanced),
-        "claude-sonnet-4-6"
+        "claude-sonnet-5-5"
     );
     let steps = configs::apply_shop_template(
         configs::agent_wizard_steps(&[], &[], &empty_catalog(), "claude"),
@@ -503,10 +523,10 @@ fn w024_agent_from_shop_wizard_prefills_the_name_step() {
     assert_eq!(wizard.text_value(), "QA Engineer");
 }
 
-/// EDIT AGENT has 8 steps: the 10-step NEW AGENT catalogue minus skills and
+/// EDIT AGENT has 10 steps: the 12-step NEW AGENT catalogue minus skills and
 /// approval_policy.
 #[test]
-fn w025_edit_agent_has_eight_steps_minus_skills_and_approval_policy() {
+fn w025_edit_agent_has_ten_steps_minus_skills_and_approval_policy() {
     let agent = make_agent("agt_1", "alpha", AgentStatus::Idle);
     let steps = configs::edit_agent_wizard_steps(&agent, &[], &[], &empty_catalog());
     assert_eq!(
@@ -517,8 +537,10 @@ fn w025_edit_agent_has_eight_steps_minus_skills_and_approval_policy() {
             "command",
             "model",
             "effort",
+            "prompt_mode",
             "role",
             "role_custom",
+            "role_summary",
             "team"
         ]
     );

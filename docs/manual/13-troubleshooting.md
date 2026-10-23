@@ -223,6 +223,38 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 - **Cause.** A mirror (the task a worker makes for a controller's request) stays when its controller never returns.
 - **Do.** On the worker, run `orch task cancel <task id>`. The worker also cancels `todo` mirrors itself after 24 hours without the controller. See [Mirrors left behind on a worker](../RUNBOOK.md#mirrors-left-behind-on-a-worker).
 
+## Prompt mode and effort
+
+### `eco prompt mode is incompatible with custom templates`
+
+- **Cause.** You tried to switch the project, or an agent, to eco while `prompt.template`, `prompt.system_template` or `prompt.user_template` is set. Nothing was saved. If the message comes from `orch run` or the `serve` log, a file edited by hand combines them: no run was created and the task stays `todo` until the conflict is gone.
+- **Do.** Give the agents the message lists `--prompt-mode normal`, or remove the custom templates (a running `orch serve` sees a removed template only after a restart). See [Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates).
+
+### `r-orch does not accept effort …` when I add or change an agent
+
+- **Cause.** The effort is not allowed for that adapter and model ([Effort levels by adapter](16-eco-mode-and-effort.md#effort-levels-by-adapter)). When you changed something else, the stored effort may come from orch 0.9.4: orch checks the whole result.
+- **Do.** Pick a level from the `Allowed:` list, choose a model that has it, or clear the effort with `orch agent update <id> --effort default`.
+
+### A run fails with `effort preparation failed`
+
+- **Cause.** An OpenCode agent asks for a level that orch 0.9.4 did not have, and the installed `opencode` is not version 2 or its help does not show `provider/model#variant`. The model was not started.
+- **Do.** Install OpenCode 2, or clear the effort (`orch agent update <id> --effort default`). Check with `opencode --version`.
+
+### `orch serve` logs `configuration preflight: cannot read defaults.agent.prompt_mode` and the task stays `todo`
+
+- **Cause.** orch reads the project prompt mode again before every dispatch and could not read or parse `.orchestry/config.yml`, which changed while `serve` was running. No run is created and the task's attempts do not change. `serve` logs the error as `orchestrator:error` and tries again on every tick; `orch serve --once` does not finish while this repeats.
+- **Do.** Fix the file; `orch config get defaults.agent` shows the parse error. You do not need to retry the task: the next tick dispatches it once the file reads cleanly. See [Prompt mode and effort failures](../RUNBOOK.md#prompt-mode-and-effort-failures).
+
+### A Codex agent uses a different model than before
+
+- **Cause.** The agent has an effort and no model. orch now passes the effort to Codex, which can bypass a managed default model for new threads.
+- **Do.** Set an explicit model: `echo '{"config":{"model":"gpt-6.1-sol"}}' | orch agent patch <id> -f -`. See [Effort warnings](16-eco-mode-and-effort.md#effort-warnings).
+
+### After a downgrade, every agent command fails with `parse …/agents/agt_….yml`
+
+- **Cause.** orch 0.9.4 cannot read an effort it does not know, such as `xhigh`, `max` or `ultra`.
+- **Do.** Run the newer orch again and clear those efforts (`orch agent update <id> --effort default`), or restore the agent files from a backup. See [Upgrade, downgrade and roll back](16-eco-mode-and-effort.md#upgrade-downgrade-and-roll-back).
+
 ## Templates and files
 
 ### `org deploy` failed half way

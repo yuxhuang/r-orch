@@ -56,7 +56,8 @@ impl std::fmt::Debug for AntigravityAdapter {
 
 /// The prompt is argv[1] — **before** `--dangerously-skip-permissions`, not
 /// last.
-fn build_args(params: &ExecuteParams) -> Vec<String> {
+fn build_args(params: &ExecuteParams) -> Result<Vec<String>, AdapterError> {
+    let effort = super::effort::selection("antigravity", &params.config)?;
     let mut args = vec![
         "-p".to_owned(),
         build_full_prompt(
@@ -69,11 +70,12 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
         "--dangerously-skip-permissions".to_owned(),
     ];
 
-    if let Some(model) = &params.config.model {
+    if let Some(model) = &effort.model {
         args.push("--model".to_owned());
         args.push(model.clone());
     }
-    args
+    args.extend(effort.args);
+    Ok(args)
 }
 
 fn antigravity_events(
@@ -158,7 +160,7 @@ impl Adapter for AntigravityAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let args = build_args(&params);
+        let args = build_args(&params)?;
         let io = spawn_child(
             &self.process_manager,
             "agy",

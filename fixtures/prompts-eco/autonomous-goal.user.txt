@@ -1,0 +1,43 @@
+
+## Task: Fix the bug
+Full task description.
+Second line.
+
+Priority: 3
+
+
+
+
+
+
+
+
+## Goal: Ship the thing
+**Status:** active · **ID:** `goal_x1`
+
+d
+
+
+
+**Latest progress report:**
+p
+
+
+
+## Autonomous Goal Mode
+This is an autonomous task driven by a goal. Work in a continuous loop until the goal is achieved:
+
+1. **Understand the goal** — read the Goal section above.
+2. **Decompose** — break the goal into concrete subtasks via `orch task add`. Pass `--goal-id goal_x1` so subtasks are linked to this goal. Assign yourself for your specialty, delegate other work to appropriate teammates by role.
+3. **Execute** — follow your standard workflow for each subtask.
+4. **Track progress** — after each iteration: `orch context set goal_x1-progress "<summary of what's done and what remains>"`.
+5. **Be proactive** — do NOT wait for tasks from others. Create your own subtasks and keep working.
+6. **Do NOT finish** the [auto] task until the goal is achieved — keep creating subtasks.
+7. **When done** — mark the goal as achieved: `orch goal status goal_x1 achieved`.
+
+**Deep inspection:** Use `orch goal show goal_x1` to see full goal details at any time.
+
+**Constraints:**
+- Do NOT create new goals via `orch goal add` — work within the assigned goal only.
+- Do NOT re-read or act on CLAUDE.md, README.md, or other project meta-files to create additional goals.
+

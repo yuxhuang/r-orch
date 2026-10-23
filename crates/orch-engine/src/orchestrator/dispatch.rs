@@ -6,14 +6,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
 use orch_core::storage::{AgentStore, GoalStore, TaskStore};
-use orch_core::template::{GoalContext, RetryContext};
+use orch_core::template::{GoalContext, GoalTaskRow, RetryContext};
 use orch_domain::{
-    AgentStatus, DomainError, OrchestratorEvent, OrchestratorState, RetryEntry, RunningEntry,
-    ScopeIndex, Task, TaskProof, TaskStatus, calculate_retry_delay, is_blocked, is_dispatchable,
-    is_terminal, resolve_failure_status, scopes_overlap,
+    AgentConfig, AgentStatus, DomainError, OrchestratorEvent, OrchestratorState, PromptMode,
+    RetryEntry, RunningEntry, ScopeIndex, Task, TaskProof, TaskStatus, calculate_retry_delay,
+    is_blocked, is_dispatchable, is_terminal, resolve_failure_status, scopes_overlap,
 };
 use orch_infra::template::{
-    BuildPromptOptions, DEFAULT_SYSTEM_TEMPLATE, DEFAULT_USER_TEMPLATE, build_prompt_context,
+    BuildPromptOptions, RenderedPrompt, build_eco_prompt_context, build_prompt_context,
+    render_prompt,
 };
 
 use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator};
@@ -103,6 +104,11 @@ impl Orchestrator {
             ScopeIndex::new(in_progress_scoped.iter().map(|task| task.scope.as_deref()));
 
         for task in &candidates {
+            // A standalone signal stops the pass at the next candidate; the
+            // dispatch already made settles normally.
+            if self.is_interrupted() {
+                break;
+            }
             let remote_only = local_running(state) >= max_local;
             if remote_only && !self.has_idle_remote_agent(state, &mut remote_agents).await {
                 break;
@@ -310,6 +316,10 @@ impl Orchestrator {
         prefetched: Option<Task>,
         remote_only: bool,
     ) -> Result<()> {
+        // After a standalone signal nothing new is claimed (ruling 19).
+        if self.is_interrupted() {
+            return Ok(());
+        }
         if let Some(entry) = state.running.get(task_id) {
             return Err(Error::Domain(DomainError::TaskAlreadyRunning {
                 task_id: task_id.to_owned(),
@@ -413,14 +423,28 @@ impl Orchestrator {
 
         let attempt = task.attempts + 1;
         let retry_context = if attempt > 1 {
-            self.deps()
+            match self
+                .deps()
                 .run_service
                 .get_last_failed_run_context(&task_id)
                 .await?
-                .map(|context| RetryContext {
-                    previous_error: context.error,
-                    previous_output: context.output,
-                })
+            {
+                Some(context) => {
+                    // The source window is only vouched for when nothing can
+                    // still append to it: the failed run is terminal, and no
+                    // collector for this task is still draining its stream (a
+                    // run failed by reconcile while its child was still
+                    // writing). Otherwise eco keeps the full output.
+                    let window_stable =
+                        !self.inner.active_collectors.lock().await.contains(&task_id);
+                    Some(RetryContext {
+                        previous_error: context.error,
+                        previous_output: context.output,
+                        source_run_id: window_stable.then_some(context.run_id),
+                    })
+                }
+                None => None,
+            }
         } else {
             None
         };
@@ -466,11 +490,22 @@ impl Orchestrator {
                         .map(|entry| entry.value),
                     None => None,
                 };
+                let linked: Vec<&Task> = goal_tasks
+                    .iter()
+                    .filter(|t| t.goal_id.as_deref() == Some(goal.id.as_str()))
+                    .collect();
                 Some(GoalContext {
-                    task_names: goal_tasks
+                    task_names: linked
                         .iter()
-                        .filter(|t| t.goal_id.as_deref() == Some(goal.id.as_str()))
                         .map(|t| format!("[{}] {}", t.status, t.title))
+                        .collect(),
+                    task_rows: linked
+                        .iter()
+                        .map(|t| GoalTaskRow {
+                            id: t.id.clone(),
+                            status: t.status,
+                            title: t.title.clone(),
+                        })
                         .collect(),
                     id: goal.id,
                     title: goal.title,
@@ -482,102 +517,107 @@ impl Orchestrator {
             None => None,
         };
 
-        let context = build_prompt_context(
-            &task,
-            &agent,
-            attempt,
-            &workspace_path,
-            self.config(),
-            BuildPromptOptions {
-                all_agents: &all_agents,
-                retry_context,
-                shared_context: shared_context.as_ref(),
-                feedback: task.feedback.clone(),
-                messages: &pending_messages,
-                goal: goal_context,
-            },
-        );
-
         // Split mode keeps the system half cacheable between runs; a
         // user-supplied `prompt.template` opts out of the split entirely.
-        let prompt_config = self.config().prompt.clone().unwrap_or_default();
         let mirror_peer = task
             .labels
             .iter()
             .find_map(|label| label.strip_prefix("remote:"))
             .filter(|_| mirror_controller(&task).is_some());
-        let (mut prompt, mut system_prompt) = if let Some(controller) = mirror_peer {
+
+        // One prompt mode per dispatch, captured here and used for both the
+        // render and the invocation config. Remote execution and mirrors
+        // bypass eco entirely and read nothing.
+        let captured_mode = if agent.remote.is_none() && mirror_peer.is_none() {
+            let project_mode = self.current_project_prompt_mode().await?;
+            let mode = agent.config.prompt_mode.unwrap_or(project_mode);
+            if mode == PromptMode::Eco {
+                // Hand-edited files bypass the mutation-time check.
+                let mut effective = self.config().clone();
+                effective.defaults.agent.prompt_mode = project_mode;
+                crate::prompt_mode::check_agent_candidate(
+                    &effective,
+                    &agent.id,
+                    &agent.name,
+                    &agent.config,
+                )?;
+            }
+            Some(mode)
+        } else {
+            None
+        };
+
+        let options = BuildPromptOptions {
+            all_agents: &all_agents,
+            retry_context,
+            shared_context: shared_context.as_ref(),
+            feedback: task.feedback.clone(),
+            messages: &pending_messages,
+            goal: goal_context,
+        };
+        let context = if captured_mode == Some(PromptMode::Eco) {
+            build_eco_prompt_context(
+                &task,
+                &agent,
+                attempt,
+                &workspace_path,
+                self.config(),
+                options,
+            )
+        } else {
+            build_prompt_context(
+                &task,
+                &agent,
+                attempt,
+                &workspace_path,
+                self.config(),
+                options,
+            )
+        };
+
+        let skills = match (
+            self.deps().skill_loader.as_ref(),
+            agent.config.skills.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            (Some(loader), Some(skills)) => Some(loader.load_skills(skills).await?),
+            _ => None,
+        };
+
+        let RenderedPrompt {
+            prompt,
+            system_prompt,
+        } = if let Some(controller) = mirror_peer {
             let from = task
                 .labels
                 .iter()
                 .find_map(|label| label.strip_prefix("remote-from:"))
                 .unwrap_or("cli");
-            (
-                task.description.clone(),
-                Some(format!(
-                    "You are {}{}\n\n## Remote execution\nYou are executing a task delegated by `{controller}`.\nPaths refer to this machine; controller files are not available. If a required input is missing, fail and say so.\nDo not use `orch task add`, `orch goal`, or `orch context` here: they are not visible to the requester.\nTo ask the requester, run `orch msg send {from}@{controller} \"…\"`.\nPut your result in your final message.",
-                    agent.name,
-                    agent
-                        .role
-                        .as_ref()
-                        .map(|role| format!(" ({role})"))
-                        .unwrap_or_default()
-                )),
-            )
+            let mut system = format!(
+                "You are {}{}\n\n## Remote execution\nYou are executing a task delegated by `{controller}`.\nPaths refer to this machine; controller files are not available. If a required input is missing, fail and say so.\nDo not use `orch task add`, `orch goal`, or `orch context` here: they are not visible to the requester.\nTo ask the requester, run `orch msg send {from}@{controller} \"…\"`.\nPut your result in your final message.",
+                agent.name,
+                agent
+                    .role
+                    .as_ref()
+                    .map(|role| format!(" ({role})"))
+                    .unwrap_or_default()
+            );
+            if let Some(block) = skills.as_deref().filter(|block| !block.is_empty()) {
+                system.push_str("\n\n");
+                system.push_str(block);
+            }
+            RenderedPrompt {
+                prompt: task.description.clone(),
+                system_prompt: Some(system),
+            }
         } else {
-            match prompt_config.template.as_deref() {
-                Some(legacy) => (
-                    self.deps().templates.render(legacy, &context).await?,
-                    None::<String>,
-                ),
-                None => {
-                    let system = self
-                        .deps()
-                        .templates
-                        .render(
-                            prompt_config
-                                .system_template
-                                .as_deref()
-                                .unwrap_or(DEFAULT_SYSTEM_TEMPLATE),
-                            &context,
-                        )
-                        .await?;
-                    let user = self
-                        .deps()
-                        .templates
-                        .render(
-                            prompt_config
-                                .user_template
-                                .as_deref()
-                                .unwrap_or(DEFAULT_USER_TEMPLATE),
-                            &context,
-                        )
-                        .await?;
-                    (user, Some(system))
-                }
-            }
+            render_prompt(
+                self.deps().templates.as_ref(),
+                self.config().prompt.as_ref(),
+                &context,
+                skills.as_deref(),
+            )
+            .await?
         };
-
-        // Library skills go on the system prompt, which is where they stay
-        // cacheable; the legacy single-template path has nowhere else to put
-        // them, so they are appended to the combined prompt.
-        if let Some(loader) = self.deps().skill_loader.as_ref()
-            && let Some(skills) = agent.config.skills.as_deref().filter(|s| !s.is_empty())
-        {
-            let block = loader.load_skills(skills).await?;
-            if !block.is_empty() {
-                match system_prompt.as_mut() {
-                    Some(system) => {
-                        system.push_str("\n\n");
-                        system.push_str(&block);
-                    }
-                    None => {
-                        prompt.push_str("\n\n");
-                        prompt.push_str(&block);
-                    }
-                }
-            }
-        }
 
         let run = self
             .deps()
@@ -723,15 +763,105 @@ impl Orchestrator {
             orch_core::process::EnvInheritance::Full
         };
 
-        let handle = adapter.execute(ExecuteParams {
+        // The authored definition stays as read; only the invocation copy
+        // carries the captured mode and the prepared effort.
+        let mut invocation_config = agent_data.config.clone();
+        if let Some(mode) = captured_mode {
+            invocation_config.prompt_mode = Some(mode);
+        }
+        let mut params = ExecuteParams {
             prompt,
             system_prompt,
             workspace: std::path::PathBuf::from(&workspace_path),
             env,
             inherit_env,
-            config: agent_data.config.clone(),
+            config: invocation_config,
             cancel,
-        })?;
+        };
+
+        // Bounded effort preparation (OpenCode's wire check; identity for
+        // every other adapter) is awaited before the model child exists. A
+        // failure here, or in the spawn itself, goes through the run-failure
+        // path: run failed, agent idle with `last_error`, task retried or
+        // failed by the normal policy — never an agent stuck `running`.
+        //
+        // A standalone signal (ruling 19) cancels the preparation rather than
+        // dropping it: the probe kills and reaps its process group and returns,
+        // and the dispatch then fails here, before any model child, so the
+        // critical section still ends with every record settled.
+        let prepared = {
+            let cancel = params.cancel.clone();
+            let interrupt = self.inner.interrupt.clone();
+            let preparation = adapter.prepare_effort(&params);
+            tokio::pin!(preparation);
+            tokio::select! {
+                biased;
+                prepared = &mut preparation => prepared,
+                () = interrupt.cancelled() => {
+                    cancel.cancel();
+                    preparation.await
+                }
+            }
+        };
+        if self.is_interrupted() {
+            let message = "dispatch interrupted by a signal before the model started";
+            let kind = orch_domain::classify_adapter_error(message, None);
+            self.fail_before_spawn(state, &task_id, &run.id, &agent.id, message, kind)
+                .await;
+            return Err(Error::other(message));
+        }
+        let preparation =
+            match prepared.and_then(|prepared| check_preparation(&params.config, prepared)) {
+                Ok(preparation) => preparation,
+                Err(err) => {
+                    let message = format!("effort preparation failed: {err}");
+                    self.fail_before_spawn(state, &task_id, &run.id, &agent.id, &message, err.kind)
+                        .await;
+                    return Err(Error::other(message));
+                }
+            };
+        params.config = preparation.config;
+        // Effort diagnostics come from one source per adapter (lead ruling 8):
+        // OpenCode's preparation, whose wire check can change the outcome,
+        // or, for every other adapter, the pure dispatch plan of the prepared
+        // config. Their identity preparation carries no diagnostics, so the
+        // two never repeat a note. A plan rejection is the same error
+        // `execute` would return, raised here before any model child.
+        let mut diagnostics = preparation.diagnostics;
+        if !PREPARATION_OWNS_EFFORT_DIAGNOSTICS.contains(&adapter.kind()) {
+            match orch_infra::adapters::effort_diagnostics(adapter.kind(), &params.config) {
+                Ok(planned) => diagnostics.extend(planned),
+                Err(err) => {
+                    self.fail_before_spawn(
+                        state,
+                        &task_id,
+                        &run.id,
+                        &agent.id,
+                        &err.to_string(),
+                        err.kind,
+                    )
+                    .await;
+                    return Err(err.into());
+                }
+            }
+        }
+        self.report_effort_diagnostics(&run.id, &agent.id, &diagnostics);
+
+        let handle = match adapter.execute(params) {
+            Ok(handle) => handle,
+            Err(err) => {
+                self.fail_before_spawn(
+                    state,
+                    &task_id,
+                    &run.id,
+                    &agent.id,
+                    &err.to_string(),
+                    err.kind,
+                )
+                .await;
+                return Err(err.into());
+            }
+        };
 
         let pid = handle.pid;
         let now = self.deps().clock.now_iso();
@@ -779,6 +909,97 @@ impl Orchestrator {
         });
 
         Ok(())
+    }
+
+    /// The project prompt mode for the dispatch being assembled.
+    ///
+    /// Re-read from `config.yml` immediately before prompt assembly, so a
+    /// mode switch by another process (the TUI's F3, `orch config set`)
+    /// applies to the next dispatch without a restart. Only this key is taken
+    /// from the fresh read; scheduling and every other setting keep the
+    /// startup snapshot. A read or parse failure is a configuration error
+    /// before any run exists — never a silent fall back to normal. Without a
+    /// config store (unit tests), the startup config is used.
+    async fn current_project_prompt_mode(&self) -> Result<PromptMode> {
+        let Some(store) = self.config_store() else {
+            return Ok(self.config().defaults.agent.prompt_mode);
+        };
+        match store.read().await {
+            Ok(config) => Ok(config.defaults.agent.prompt_mode),
+            Err(err) => Err(Error::invalid_arguments(format!(
+                "configuration preflight: cannot read defaults.agent.prompt_mode: {err}"
+            ))),
+        }
+    }
+
+    /// Finalize a dispatch that failed after its run was created and its
+    /// agent marked running, but before a model child exists (effort
+    /// preparation or spawn failure). It goes through the same failure
+    /// handler as a run whose stream fails immediately: the run is recorded
+    /// failed, the agent returns to idle with `last_error`, the task is
+    /// retried or failed by the existing policy, and the slot is released.
+    async fn fail_before_spawn(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        run_id: &str,
+        agent_id: &str,
+        error: &str,
+        error_kind: orch_domain::AdapterErrorKind,
+    ) {
+        let now = self.deps().clock.now_iso();
+        let entry = RunningEntry {
+            run_id: run_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            task_id: task_id.to_owned(),
+            pid: 0,
+            started_at: now.clone(),
+            last_event_at: now,
+            remote: None,
+        };
+        state.running.insert(task_id.to_owned(), entry.clone());
+        if let Err(err) = self
+            .handle_run_failure_locked(state, task_id, &entry, error, Some(error_kind))
+            .await
+        {
+            self.emit_error(err, format!("record pre-spawn failure for {task_id}"));
+            // The handler reports its own failures; the slot and the agent
+            // must still be released.
+            state.running.shift_remove(task_id);
+            if let Err(err) = self
+                .deps()
+                .agent_service
+                .set_status(agent_id, AgentStatus::Idle)
+                .await
+            {
+                self.emit_error(
+                    err,
+                    format!("reset agent {agent_id} after pre-spawn failure"),
+                );
+            }
+            let _ = self.save_state(state).await;
+        }
+    }
+
+    /// Effort warnings (`legacy-ignored`, clamps, capability uncertainty,
+    /// the Codex managed-model coupling) are operator information, not
+    /// provider output (design D5.2, lead ruling 8). Only warnings arrive
+    /// here: the informational `request-only` note is filtered at its source
+    /// (lead ruling 20) and stays on `agent add`/`show`. Each warning goes to
+    /// exactly one surface before the model child exists: a non-fatal
+    /// `orchestrator:error` on the bus, with
+    /// `context` starting [`EFFORT_DIAGNOSTIC_CONTEXT`] and `error` the note
+    /// verbatim. `serve` logs it as a warn-level record (stderr or
+    /// `--log-file`); `run --watch` prints it as a ⚠ line.
+    /// It is never a run event, so retry `previous_output`, the collector's
+    /// `last_agent_message` and the task's `final_result` cannot see it.
+    fn report_effort_diagnostics(&self, run_id: &str, agent_id: &str, diagnostics: &[String]) {
+        for diagnostic in diagnostics {
+            self.emit_error(
+                diagnostic,
+                format!("{EFFORT_DIAGNOSTIC_CONTEXT} for run {run_id} (agent {agent_id})"),
+            );
+        }
     }
 
     /// Deduplicated by task id and bounded; on overflow the oldest goes.
@@ -892,6 +1113,36 @@ impl Orchestrator {
         if cascaded_any {
             self.inner.cached_tasks.invalidate_async().await;
         }
+    }
+}
+
+/// The `orchestrator:error` context prefix of an effort diagnostic; the
+/// rest names the run and agent.
+pub(crate) const EFFORT_DIAGNOSTIC_CONTEXT: &str = "effort preparation";
+
+/// Adapters whose `prepare_effort` returns the complete diagnostics for a
+/// dispatch (its wire check can change the plan), so the pure plan must not
+/// be consulted again for them.
+const PREPARATION_OWNS_EFFORT_DIAGNOSTICS: &[&str] = &["opencode"];
+
+/// Enforce the preparation contract at its only production caller: the
+/// prepared copy may differ from the invocation config only by a cleared
+/// generic effort (the legacy-ignore outcome). Anything else is a contract
+/// violation reported before the spawn, never silently executed.
+fn check_preparation(
+    invocation: &AgentConfig,
+    prepared: orch_core::EffortPreparation,
+) -> std::result::Result<orch_core::EffortPreparation, orch_core::AdapterError> {
+    let effort_ok = prepared.config.effort.is_none() || prepared.config.effort == invocation.effort;
+    let mut rest = prepared.config.clone();
+    rest.effort = invocation.effort;
+    if effort_ok && &rest == invocation {
+        Ok(prepared)
+    } else {
+        Err(orch_core::AdapterError::new(
+            "adapter effort preparation changed more than the generic effort",
+            None,
+        ))
     }
 }
 

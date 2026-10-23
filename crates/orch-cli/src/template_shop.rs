@@ -4,7 +4,9 @@ use crate::output::{Styles, print_table};
 use crate::shop_picker::{ShopEntryView, pick_index};
 use clap::Args;
 use orch_core::Result;
+use orch_domain::CreateAgentInput;
 use orch_engine::Engine;
+use orch_engine::prompt_mode::DefinitionLock;
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -106,8 +108,29 @@ pub async fn run(
         return Ok(());
     };
     let input = inputs.into_iter().nth(index).expect("picker index");
+    install(engine, ctx, styles, input).await
+}
+
+/// Create the picked template agent.
+///
+/// The definition lock is taken here, after the interactive picker, and held
+/// only around the preflight and the create: the candidate is checked
+/// against the project config read inside the lock, not the engine's
+/// construction snapshot taken before the (human-scale) pick.
+pub async fn install(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    input: CreateAgentInput,
+) -> Result<()> {
+    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
     orch_engine::org_templates::preflight(engine, std::slice::from_ref(&input)).await?;
-    let agent = engine.agent_service.create(input).await?;
+    let agent = engine
+        .agent_service
+        .create_locked(&lock, input)
+        .await?
+        .agent;
+    drop(lock);
     if ctx.quiet {
         println!("{}", agent.id);
     } else {

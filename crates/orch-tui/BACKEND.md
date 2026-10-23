@@ -72,6 +72,11 @@ Grouped as in the trait.
 * **Agents** — `add_agent(name, adapter, AgentOpts)`,
   `update_agent(id, AgentFields)`, `delete_agent`, `force_stop_agent`,
   `toggle_autonomous(id, enabled)`, `disable_agent`, `enable_agent`.
+  `take_agent_diagnostics() -> Vec<String>` (default empty) hands out, once,
+  the effort diagnostics of the agent the last successful add/update wrote;
+  the dashboard shows each as a yellow `⚠` line. The engine backend's
+  add/update take `.definition.lock` and validate against the project config
+  read inside it.
 * **Teams** — `create_team(CreateTeamInput)`, `join_team`, `leave_team`,
   `disband_team`, `set_team_lead`.
 * **Goals** — `create_goal(CreateGoalInput)`, `update_goal(id, GoalFields)`,

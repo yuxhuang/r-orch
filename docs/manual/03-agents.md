@@ -67,7 +67,9 @@ orch agent add reviewer --adapter claude --model claude-sonnet-4-6 \
 | `--adapter <adapter>` | The tool the agent runs: `claude`, `opencode`, `codex`, `cursor`, `pi`, `grok`, `antigravity` or `shell`. Required. | |
 | `--command <cmd>` | The command a `shell` agent runs. Required for `shell`. | |
 | `--model <model>` | The model name, for AI adapters. Ignored for `shell`. | The tool's own default |
-| `--effort <level>` | Reasoning effort: `low`, `medium` or `high`. Ignored for `shell`. | The tool's own default |
+| `--effort <level>` | A reasoning-effort request: `none`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` or `ultra`. Which values are allowed depends on the adapter and model; see [Effort levels by adapter](16-eco-mode-and-effort.md#effort-levels-by-adapter). Refused for `cursor`; ignored for `shell`. | The tool's own default |
+| `--prompt-mode <mode>`, `--mode` | `normal`, `eco` or `inherit`. See [Eco mode](16-eco-mode-and-effort.md#turn-eco-mode-on-or-off). | `inherit` (follow the project) |
+| `--role-summary <text>` | A one-line hint, at most 192 bytes, that other agents see instead of the role in eco mode. | Derived from the role |
 | `--role <role>` | A description of the agent's job. orch puts it in the agent's prompt and uses it when it matches tasks to agents. | None |
 | `--skills <skills>` | A comma-separated list of skills. | None |
 | `--max-turns <n>` | The maximum number of turns per run. | 50 |
@@ -80,7 +82,7 @@ orch agent add reviewer --adapter claude --model claude-sonnet-4-6 \
 
 Three details about the defaults:
 
-- A `shell` agent ignores `--model` and `--effort`, and its approval policy is `auto` unless you pass `--approval-policy`.
+- A `shell` agent ignores `--model`. It drops `--effort low`, `medium` or `high` with a `legacy-ignored` warning and refuses any other level ([Effort levels by adapter](16-eco-mode-and-effort.md#effort-levels-by-adapter)). Its approval policy is `auto` unless you pass `--approval-policy`.
 - Other adapters take the approval policy from the project setting `defaults.agent.approval_policy`, which is `auto` after `orch init`.
 - `orch init` also creates one agent, Agent Creator, with the policy `suggest`. It uses the project's default adapter, which is `claude` unless you ran `orch init --adapter <adapter>`.
 
@@ -103,15 +105,15 @@ The table shows which of your options orch passes to each tool.
 | Adapter | Tool | `--model` | `--effort` | `--max-turns` |
 |---|---|---|---|---|
 | `claude` | Claude Code (`claude`) | Yes | Yes | Yes |
-| `codex` | Codex (`codex`) | Yes | No | No |
+| `codex` | Codex (`codex`) | Yes | Yes, as `model_reasoning_effort` | No |
 | `cursor` | Cursor agent CLI (`cursor-agent` or `agent`) | Yes | No | No |
-| `opencode` | OpenCode (`opencode`) | Yes | No | No |
+| `opencode` | OpenCode (`opencode`) | Yes | Yes, as a `#<level>` model variant, for listed models | No |
 | `pi` | Pi (`pi`) | Yes | Yes, as its thinking level | No |
-| `grok` | Grok (`grok`) | Yes | Yes | Yes |
-| `antigravity` | Google Antigravity (`agy`) | Yes | No | No |
+| `grok` | Grok (`grok`) | Yes | Yes (`low`, `medium`, `high`) | Yes |
+| `antigravity` | Google Antigravity (`agy`) | Yes | Yes | No |
 | `shell` | `bash -lc <your command>` | No | No | No |
 
-"No" means orch stores the value but does not pass it to the tool. Model names differ between tools; use the names that tool accepts.
+"No" means orch does not pass the value to the tool. Model names differ between tools; use the names that tool accepts. The allowed effort values per adapter and model, and what orch does with a value stored by orch 0.9.4, are in [Eco mode, reasoning effort and default models](16-eco-mode-and-effort.md#set-reasoning-effort).
 
 A `shell` agent runs your command with `bash -lc`. orch gives it the task text in the environment variable `ORCHESTRY_TASK_PROMPT`, and the variables `ORCH_AGENT_ID`, `ORCH_AGENT_NAME` and `ORCH_TASK_ID`. An exit code of 0 means success; any other code fails the run. Everything the command prints becomes the run's log. Always quote the task text in your command (`"$ORCHESTRY_TASK_PROMPT"`) and treat it as untrusted input: on a worker that listens for remote peers, any host that can reach the port supplies it. See [Restrict who can connect](11-remote-agents.md#restrict-who-can-connect).
 
@@ -191,7 +193,7 @@ orch agent status agt_3cU5sQA
   Tokens used      0
 ```
 
-An AI agent also shows its model, effort, role and skills. `orch agent list --json` and `--yaml` print every field; see [Choose the output format](12-configuration-and-output.md#choose-the-output-format).
+An AI agent also shows its model, effort, prompt mode, role hint, role and skills, and any effort warning ([Effort warnings](16-eco-mode-and-effort.md#effort-warnings)). Add `--effective` to see which prompt mode the agent will use and whether it comes from the agent or the project. `orch agent list --json` and `--yaml` print every field; see [Choose the output format](12-configuration-and-output.md#choose-the-output-format).
 
 ## Change an agent
 
@@ -202,6 +204,7 @@ You have three ways to change an agent. You cannot change a remote agent (one wh
 | `orch agent edit <id>` | Change the name, command, model and role in your editor. |
 | `orch agent patch <id> -f <file>` | Change some settings from a JSON or YAML file or from standard input. Settings you leave out stay as they are. |
 | `orch agent update <id> -f <file>` | Replace the whole definition from a file. Optional settings you leave out are cleared. |
+| `orch agent update <id> --prompt-mode … --effort … --role-summary …` | Change only these settings. `--prompt-mode inherit` and `--effort default` clear them. You cannot combine these with `-f`. |
 
 ### Change an agent in your editor
 
@@ -246,10 +249,10 @@ orch agent update agt_3cU5sQA -f agent.yaml
 
 | Option | What it does |
 |---|---|
-| `-f`, `--file <file>` | The file to read. Use `-` for standard input. Required. At most 1 MiB. |
+| `-f`, `--file <file>` | The file to read. Use `-` for standard input. Required unless you use the flags in the table above. At most 1 MiB. |
 | `--input-format json` or `yaml` | Overrides the format orch detects from the file name or first character. |
 
-The writable settings are `name`, `adapter` and `role`, and under `config` the keys `command`, `model`, `effort`, `approval_policy`, `max_turns`, `timeout_ms`, `stall_timeout_ms`, `env`, `system_prompt`, `workspace_mode` and `skills`. A change that is not valid is refused and nothing is saved:
+The writable settings are `name`, `adapter` and `role`, and under `config` the keys `command`, `model`, `effort`, `approval_policy`, `max_turns`, `timeout_ms`, `stall_timeout_ms`, `env`, `system_prompt`, `workspace_mode`, `skills`, `prompt_mode` and `role_summary`. orch checks the whole result, including the effort against the adapter and model, so a change can be refused because of a setting you did not touch; see [Agents written by orch 0.9.4](16-eco-mode-and-effort.md#agents-written-by-orch-094). A change that is not valid is refused and nothing is saved:
 
 ```sh
 echo '{"config":{"typo":1}}' | orch agent patch agt_3cU5sQA -f -

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 use orch_domain::{
     Agent, CreateGoalInput, CreateTeamInput, Goal, GoalStatus, NotificationPreferences,
-    OrchestratorEvent, OrchestratorState, Run, Task, Team, TuiPaletteName,
+    OrchestratorEvent, OrchestratorState, PromptMode, Run, Task, Team, TuiPaletteName,
 };
 
 use crate::format::parse_timestamp_ms;
@@ -186,12 +186,18 @@ pub struct AgentOpts {
     pub role: Option<String>,
     pub approval_policy: Option<String>,
     pub skills: Option<Vec<String>>,
+    /// `normal` or `eco`; `None` or `""` stores no override (the agent
+    /// inherits the project mode).
+    pub prompt_mode: Option<String>,
+    /// Explicit one-line role hint; `None` or `""` stores none.
+    pub role_summary: Option<String>,
 }
 
 /// Fields to change on an agent.
 ///
 /// `Some(String::new())` means "clear this field" — the edit-agent mapper
-/// relies on it for `command` and `effort`.
+/// relies on it for `command`, `effort`, `prompt_mode` (clearing the override
+/// means inheriting the project mode) and `role_summary`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentFields {
     pub name: Option<String>,
@@ -200,6 +206,8 @@ pub struct AgentFields {
     pub command: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub prompt_mode: Option<String>,
+    pub role_summary: Option<String>,
 }
 
 /// Fields to change on a goal.
@@ -277,6 +285,12 @@ pub struct LaunchContext {
     pub observer_mode: bool,
     /// Watch-mode failure message, suppressed in observer mode.
     pub watch_error: Option<String>,
+    /// The project prompt mode (`defaults.agent.prompt_mode`) at launch.
+    pub initial_prompt_mode: PromptMode,
+    /// Read-only configuration diagnostics found at launch (effort requests
+    /// dispatch will ignore or cannot confirm, eco/custom-template
+    /// conflicts), one line per affected agent.
+    pub startup_warnings: Vec<String>,
 }
 
 impl Default for LaunchContext {
@@ -295,6 +309,8 @@ impl Default for LaunchContext {
             initial_watch_active: false,
             observer_mode: false,
             watch_error: None,
+            initial_prompt_mode: PromptMode::Normal,
+            startup_warnings: Vec::new(),
         }
     }
 }
@@ -387,6 +403,15 @@ pub trait TuiBackend {
 
     fn add_agent(&mut self, name: &str, adapter: &str, opts: AgentOpts) -> BackendResult<Agent>;
     fn update_agent(&mut self, id: &str, fields: AgentFields) -> BackendResult<Agent>;
+    /// The read-only effort diagnostics for the agent the last successful
+    /// [`TuiBackend::add_agent`] / [`TuiBackend::update_agent`] wrote (a
+    /// requested level dispatch will ignore or cannot confirm, Codex effort
+    /// with no model), one line per diagnostic in the launch warnings' shape,
+    /// handed out once. Empty when there are none, after a failed write, or
+    /// for a backend that cannot compute them.
+    fn take_agent_diagnostics(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn delete_agent(&mut self, id: &str) -> BackendResult<()>;
     fn force_stop_agent(&mut self, id: &str) -> BackendResult<()>;
     fn toggle_autonomous(&mut self, id: &str, enabled: bool) -> BackendResult<Agent>;
@@ -444,6 +469,34 @@ pub trait TuiBackend {
     fn save_notifications(&mut self, notifications: NotificationPreferences) -> BackendResult<()>;
     fn save_max_concurrent(&mut self, value: u32) -> BackendResult<()>;
     fn complete_onboarding(&mut self) -> BackendResult<()>;
+
+    // ── Project prompt mode ────────────────────────────────────────────────
+
+    /// The project prompt mode as stored now. Read on every refresh, so a
+    /// change made by `orch config set` in another process reaches the header.
+    fn project_prompt_mode(&mut self) -> BackendResult<PromptMode> {
+        Ok(self.context().initial_prompt_mode)
+    }
+
+    /// Start a write of the project prompt mode: `Some(mode)` sets it, `None`
+    /// toggles normal ↔ eco from the value stored at write time.
+    ///
+    /// The write is asynchronous so the dashboard can show it as pending and
+    /// refuse a second one meanwhile; its outcome arrives through
+    /// [`TuiBackend::poll_prompt_mode`]. It re-reads the raw file under the
+    /// project definition lock, changes one key, validates every agent that
+    /// would resolve to eco against custom templates, and writes nothing on
+    /// failure. It never touches agent overrides, models, effort, running
+    /// agents or the scheduler; the next dispatch reads the new value.
+    fn request_prompt_mode(&mut self, _target: Option<PromptMode>) -> BackendResult<()> {
+        Err("Switching the prompt mode is not available".into())
+    }
+
+    /// The outcome of the last [`TuiBackend::request_prompt_mode`], once:
+    /// the mode now stored, or the reason nothing was written.
+    fn poll_prompt_mode(&mut self) -> Option<BackendResult<PromptMode>> {
+        None
+    }
 
     // ── Polled streams ─────────────────────────────────────────────────────
 

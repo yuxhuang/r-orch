@@ -23,12 +23,14 @@ const MAX_AGENT_ROWS: usize = 40;
 const ROW_COLUMNS: usize = 32;
 
 /// `CONFIG_SETTINGS`.
-pub const CONFIG_SETTINGS: [&str; 5] = [
+pub const CONFIG_SETTINGS: [&str; 6] = [
     "palette",
     "activity-filter",
     "max-concurrent",
     "notifications-toast",
     "notifications-bell",
+    // The project setting `F3` toggles; here it opens a normal/eco select.
+    "prompt-mode",
 ];
 
 pub fn is_config_setting(value: &str) -> bool {

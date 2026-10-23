@@ -66,6 +66,9 @@ __pycache__
 pub struct InitArgs {
     pub name: Option<String>,
     pub adapter: Option<String>,
+    /// `--prompt-mode`. Omitted writes `normal`; an already initialized
+    /// project is left untouched, as with every other init flag.
+    pub prompt_mode: Option<orch_domain::PromptMode>,
     /// Both stdout and stdin are a TTY, which is what gates the multi-adapter
     /// prompt. Scripted runs have stdin on `/dev/null`, so they never take that
     /// branch.
@@ -119,6 +122,7 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
             .unwrap_or_else(|| "my-project".to_owned())
     });
     config.defaults.agent.adapter = adapter.clone();
+    config.defaults.agent.prompt_mode = args.prompt_mode.unwrap_or_default();
     if !git_available {
         config.defaults.agent.workspace_mode = WorkspaceMode::Shared;
     }
@@ -164,6 +168,12 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
     }
     println!("  {} templates/default.md", styles.dim("├──"));
     println!("  {} .gitignore", styles.dim("└──"));
+    println!();
+    println!(
+        "  Prompt mode: {} {}",
+        config.defaults.agent.prompt_mode,
+        styles.dim("(change with `orch config set defaults.agent.prompt_mode eco|normal`)")
+    );
     println!();
 
     Ok(InitOutcome {
@@ -401,6 +411,7 @@ mod tests {
         InitArgs {
             name: Some("proj".into()),
             adapter: Some("shell".into()),
+            prompt_mode: None,
             interactive: false,
         }
     }
@@ -449,6 +460,7 @@ mod tests {
             InitArgs {
                 name: Some("p".into()),
                 adapter: Some("claude".into()),
+                prompt_mode: None,
                 interactive: false,
             },
         )
@@ -486,6 +498,7 @@ mod tests {
             InitArgs {
                 name: Some("p".into()),
                 adapter: Some("claude".into()),
+                prompt_mode: None,
                 interactive: false,
             },
         )
@@ -500,7 +513,10 @@ mod tests {
         assert_eq!(agent.role.as_deref(), Some(orch_domain::AGENT_CREATOR_ROLE));
         // 300000 here, not the 600000 project default.
         assert_eq!(agent.config.stall_timeout_ms, Some(300_000));
-        assert_eq!(agent.config.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            agent.config.model.as_deref(),
+            Some(orch_domain::default_model_for_adapter("claude"))
+        );
     }
 
     #[tokio::test]
@@ -511,6 +527,7 @@ mod tests {
             InitArgs {
                 name: Some("proj".into()),
                 adapter: Some("codex".into()),
+                prompt_mode: None,
                 interactive: false,
             },
         )
@@ -524,6 +541,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_config_records_the_prompt_mode_and_defaults_to_normal() {
+        for (mode, expected) in [
+            (None, "prompt_mode: normal"),
+            (Some(orch_domain::PromptMode::Eco), "prompt_mode: eco"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            init(
+                temp.path(),
+                InitArgs {
+                    prompt_mode: mode,
+                    ..shell_args()
+                },
+            )
+            .await;
+            let content = tokio::fs::read_to_string(Paths::new(temp.path()).config_path())
+                .await
+                .unwrap();
+            assert!(content.contains(expected), "{content}");
+        }
+    }
+
+    #[tokio::test]
     async fn the_project_name_defaults_to_the_directory_name() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("my-dir");
@@ -533,6 +572,7 @@ mod tests {
             InitArgs {
                 name: None,
                 adapter: Some("shell".into()),
+                prompt_mode: None,
                 interactive: false,
             },
         )
@@ -585,6 +625,7 @@ mod tests {
             InitArgs {
                 name: Some("different".into()),
                 adapter: Some("codex".into()),
+                prompt_mode: None,
                 interactive: false,
             },
         )

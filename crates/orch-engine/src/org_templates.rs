@@ -133,6 +133,8 @@ fn preview_record(input: &CreateAgentInput) -> Agent {
             system_prompt: input.system_prompt.clone(),
             workspace_mode: input.workspace_mode,
             skills: input.skills.clone(),
+            prompt_mode: input.prompt_mode,
+            role_summary: input.role_summary.clone(),
         },
         status: AgentStatus::Idle,
         current_task: None,
@@ -169,6 +171,10 @@ pub struct Deployment {
 
 /// Preflight completes before any service mutation. A later I/O failure
 /// names exactly the surviving entities; it never claims a rollback.
+///
+/// Preflight and agent creation run under the definition lock, and every
+/// candidate is checked against the project config read inside it, not the
+/// engine's construction snapshot.
 pub async fn deploy_bundle(
     engine: &Engine,
     bundle: &Bundle,
@@ -178,6 +184,7 @@ pub async fn deploy_bundle(
     validate_record: fn(&Agent) -> Result<()>,
 ) -> Result<Deployment> {
     let inputs = resolve_inputs(bundle, &engine.config, adapter, model, validate_record)?;
+    let lock = crate::prompt_mode::DefinitionLock::acquire(engine.paths.project_root()).await?;
     preflight(engine, &inputs).await?;
     if goal.is_some_and(|s| s.trim().is_empty()) {
         return Err(Error::invalid_arguments(
@@ -217,8 +224,8 @@ pub async fn deploy_bundle(
     let mut ids = Vec::new();
     for input in inputs {
         let name = input.name.clone();
-        match agent_service.create(input).await {
-            Ok(agent) => ids.push(agent.id),
+        match agent_service.create_locked(&lock, input).await {
+            Ok(authored) => ids.push(authored.agent.id),
             Err(e) => {
                 return Err(
                     deployment_failure(engine, &allocated, &format!("agent:{name}"), e).await,
@@ -226,6 +233,7 @@ pub async fn deploy_bundle(
             }
         }
     }
+    drop(lock);
     let lead = bundle
         .agents
         .iter()

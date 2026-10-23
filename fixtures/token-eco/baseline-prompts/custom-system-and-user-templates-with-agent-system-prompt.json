@@ -1,0 +1,5 @@
+{
+  "name": "custom-system-and-user-templates-with-agent-system-prompt",
+  "user": "USER Fix the bug",
+  "system": "SYS my-project\n\n## Skill: review\nCheck the diff.\n\n## Skill: qa\nRun it."
+}

@@ -419,6 +419,20 @@ fn overview_block(state: &AppState, focus: Focus, now_ms: i64) -> Option<Overvie
                 OverviewField::new("caps", dash_or(agent_caps_text(agent)), Token::Silver),
                 OverviewField::new("node", node, Token::Silver),
             ]);
+            if agent.adapter != "shell" {
+                rows.push(vec![
+                    agent_prompt_field(state, agent),
+                    OverviewField::new(
+                        "effort",
+                        agent
+                            .config
+                            .effort
+                            .map(|effort| format!("{} (requested)", effort.as_str()))
+                            .unwrap_or_else(|| "default".to_string()),
+                        Token::Silver,
+                    ),
+                ]);
+            }
             rows.push(vec![agent_updated_field(state, agent, now_ms)]);
             if let Some(live) = agent_live_field(state, agent, now_ms) {
                 rows.push(vec![live]);
@@ -441,6 +455,26 @@ fn overview_block(state: &AppState, focus: Focus, now_ms: i64) -> Option<Overvie
         }
         _ => None,
     }
+}
+
+/// The Agent Overview's `prompt` field: the mode the agent's next dispatch
+/// renders with, and where it comes from. An override survives a project
+/// switch (`F3`); an inherited mode follows it. Remote runs bypass eco.
+fn agent_prompt_field(state: &AppState, agent: &Agent) -> OverviewField {
+    let (mode, origin) = match agent.config.prompt_mode {
+        Some(mode) => (mode, "agent override"),
+        None => (state.prompt_mode, "inherits project"),
+    };
+    let text = if agent.remote.is_some() {
+        format!("{mode} ({origin}; not applied to remote runs)")
+    } else {
+        format!("{mode} ({origin})")
+    };
+    let token = match mode {
+        orch_domain::PromptMode::Eco => Token::Green,
+        orch_domain::PromptMode::Normal => Token::Silver,
+    };
+    OverviewField::new("prompt", text, token)
 }
 
 /// The Agent Overview's `updated` row: the UPDATED column's value, with

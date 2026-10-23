@@ -1,0 +1,5 @@
+{
+  "name": "custom-system-template-only",
+  "user": "## Task: Fix the bug\nFull task description.\nSecond line.\n\nPriority: 3\n\n\n\n## Context\nProject: my-project\nWorking directory: /tmp/ws\n\n## Team\nYou are part of a multi-agent team. Available agents:\n- **Zed** (claude) — Reviewer. Reviews code. · ID: `agt_zed`\n- **Me** (claude) · ID: `agt_me`\n- **Alpha** (claude) · ID: `agt_alpha`\n\nUse `orch agent list` to check current agent statuses. Find teammates by name/role — do NOT hardcode agent IDs.\n\n\n\n\n\n\n\n\n",
+  "system": "ONLYSYS tsk_cur"
+}

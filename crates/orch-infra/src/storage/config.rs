@@ -310,7 +310,7 @@ mod tests {
             tokio::fs::read_to_string(store.paths.config_path())
                 .await
                 .unwrap(),
-            "project:\n  name: proj\ndefaults:\n  agent:\n    adapter: claude\n    approval_policy: auto\n    max_turns: 50\n    timeout_ms: 3600000\n    stall_timeout_ms: 600000\n    workspace_mode: worktree\n  task:\n    max_attempts: 3\n    priority: 3\nscheduling:\n  poll_interval_ms: 10000\n  max_concurrent_agents: 6\n  retry_base_delay_ms: 10000\n  retry_max_delay_ms: 300000\n"
+            "project:\n  name: proj\ndefaults:\n  agent:\n    adapter: claude\n    approval_policy: auto\n    max_turns: 50\n    timeout_ms: 3600000\n    stall_timeout_ms: 600000\n    workspace_mode: worktree\n    prompt_mode: normal\n  task:\n    max_attempts: 3\n    priority: 3\nscheduling:\n  poll_interval_ms: 10000\n  max_concurrent_agents: 6\n  retry_base_delay_ms: 10000\n  retry_max_delay_ms: 300000\n"
         );
     }
 

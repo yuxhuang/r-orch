@@ -36,6 +36,10 @@ pub struct CreateRunInput {
 /// What a retried agent is told about its predecessor's failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryContext {
+    /// The failed run `error` and `output` were read from: the same run, so
+    /// dispatch never has to rediscover it by task id. Eco names it in its
+    /// recovery instruction (`orch --json logs <run_id>`).
+    pub run_id: String,
     pub error: String,
     pub output: String,
 }
@@ -232,7 +236,11 @@ impl RunService {
             }
         };
 
-        Ok(Some(RetryContext { error, output }))
+        Ok(Some(RetryContext {
+            run_id: run.id.clone(),
+            error,
+            output,
+        }))
     }
 
     /// Fails with a bare `Error`, not an `OrchestratorError`, so this is exit 1
@@ -416,6 +424,8 @@ mod tests {
             .expect("a failed run");
         assert_eq!(context.error, "Process crashed");
         assert_eq!(context.output, "line 1\nline 2\nfatal error occurred");
+        // The source is the same run the error and output came from.
+        assert_eq!(context.run_id, "run_2");
     }
 
     #[tokio::test]

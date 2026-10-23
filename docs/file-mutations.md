@@ -44,7 +44,7 @@ rejected for agents and tasks (`agent.role: null is not allowed; omit the field`
 
 | Entity | Writable (replace) | Never writable |
 |---|---|---|
-| Agent | `name`, `adapter`, `config` (required); `role` (optional). `config` keys: `command`, `model`, `effort`, `approval_policy`, `max_turns`, `timeout_ms`, `stall_timeout_ms`, `env`, `system_prompt`, `workspace_mode`, `skills` | `id`, `status`, `stats`, `capabilities`, `current_task`, `last_error`, `autonomous`, `remote` |
+| Agent | `name`, `adapter`, `config` (required); `role` (optional). `config` keys: `command`, `model`, `effort`, `approval_policy`, `max_turns`, `timeout_ms`, `stall_timeout_ms`, `env`, `system_prompt`, `workspace_mode`, `skills`, `prompt_mode`, `role_summary` | `id`, `status`, `stats`, `capabilities`, `current_task`, `last_error`, `autonomous`, `remote` |
 | Task | `title`, `description` (strings, required), `priority` (integer 1-4, required), `labels` (optional, default empty) | `id`, `status`, `assignee`, `depends_on`, `created_at`, `updated_at`, `attempts`, `max_attempts`, `scope`, `attachments` and the other runtime fields (reassign with `task assign`) |
 | Config | The whole project `config.yml` object: `project`, `defaults` and `scheduling` with their required fields; any other key is kept | Global preferences (`orch config global`) |
 
@@ -54,7 +54,8 @@ rejected for agents and tasks (`agent.role: null is not allowed; omit the field`
 - **Reserved labels.** Labels starting with `remote-ctl:` or `exec:` belong to worker mirrors and are rejected;
   `remote-ctlx` and `exec-ish` are accepted.
 - **Agents.** A shell agent still needs `config.command`; the name must not belong to another agent; the runtime
-  limits must be positive; a shell agent's `model` and `effort` are dropped. An agent that is running, or a remote
+  limits must be positive; a shell agent's `model` is dropped, and so is its effort when it is `low`, `medium` or
+  `high` (with a `legacy-ignored` warning); any other effort is refused. An agent that is running, or a remote
   one (an id containing `@`), cannot be changed.
 - **Tasks.** A task that is `in_progress`, or labelled `remote-ctl:…`, cannot be changed. An update that changes nothing
   does not rewrite the task or touch `updated_at`.

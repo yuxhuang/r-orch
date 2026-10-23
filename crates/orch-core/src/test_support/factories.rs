@@ -63,6 +63,8 @@ pub fn make_agent() -> Agent {
             system_prompt: None,
             workspace_mode: None,
             skills: None,
+            prompt_mode: None,
+            role_summary: None,
         },
         status: AgentStatus::Idle,
         current_task: None,

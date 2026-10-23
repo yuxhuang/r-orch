@@ -14,14 +14,27 @@
 //! debounce in which a completion can start the next task. `run <id>` needs no
 //! such window: the orchestrator records it as a single-task run and suppresses
 //! reactive dispatch.
+//!
+//! # Why `run <id>` and `run --all` catch SIGINT/SIGTERM
+//!
+//! Watch, serve and the TUI install termination handlers; these two did not,
+//! so a signal killed orch outright. During a dispatch that orphaned the
+//! OpenCode effort probe's process group (gate-resilience F1): its deadline
+//! and kill guard live in this runtime, and the probe pid is deliberately not
+//! in the model-pid slot startup recovery reads. Both paths now latch the
+//! signal ([`StandaloneSignals`]), let the bounded dispatch critical section
+//! finish — the orchestrator cancels an in-flight preparation, which kills and
+//! reaps its group, and starts no model child — then stop this process's runs
+//! and settle their records before exiting `128 + signal`.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use orch_core::error::Result;
 use orch_domain::OrchestratorEvent;
-use orch_engine::{EventSubscription, FullEngine};
+use orch_engine::{EventSubscription, FullEngine, Orchestrator};
 
 use crate::output::{Color, Icon, Styles, print_error, print_success};
 
@@ -37,6 +50,33 @@ const REACTIVE_DISPATCH_WINDOW: Duration = Duration::from_millis(1_500);
 /// early would truncate the stream.
 const LOST_COMPLETION_POLL: Duration = Duration::from_secs(60);
 
+/// Print the engine's read-only startup diagnostics to **stderr**: one line
+/// per affected agent for effort requests dispatch will ignore, clamp or
+/// cannot confirm, the Codex managed-model coupling, and agents that would
+/// render eco against a custom template. Nothing is spawned or written; a
+/// store read failure is itself reported and does not stop the run, whose own
+/// preflight decides.
+pub async fn report_startup_diagnostics(engine: &FullEngine, styles: &Styles) {
+    let agents = match engine.agent_service.list().await {
+        Ok(agents) => agents,
+        Err(err) => {
+            print_error(
+                styles,
+                &format!("Could not check agent diagnostics: {err}"),
+                None,
+            );
+            return;
+        }
+    };
+    let glyph = styles.paint(Color::Yellow, styles.icon(Icon::Warning));
+    for diagnostic in orch_engine::prompt_mode::startup_diagnostics(&engine.config, &agents) {
+        eprintln!(
+            "  {glyph} {} ({}): {}",
+            diagnostic.agent_name, diagnostic.agent_id, diagnostic.message
+        );
+    }
+}
+
 /// `run <task-id>` — dispatch one task and stream its events.
 pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Result<ExitCode> {
     let task = engine.task_service.get(task_id).await?;
@@ -47,12 +87,24 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
         task.title
     );
 
+    // Installed before the dispatch: from here a signal is latched, never
+    // the default immediate death (module docs).
+    let mut signals = StandaloneSignals::install();
     // Subscribed before the dispatch, so `agent:started` cannot be missed.
     let mut events = engine.events.subscribe();
     let mut target_run: Option<String> = None;
     let mut failed = false;
 
-    engine.orchestrator.run_task(task_id).await?;
+    let (dispatched, interrupted) = settle_dispatch(
+        &engine.orchestrator,
+        engine.orchestrator.run_task(task_id),
+        &mut signals,
+    )
+    .await;
+    if let Some(signal) = interrupted {
+        return interrupted_exit(engine, styles, signal, dispatched.err()).await;
+    }
+    dispatched?;
 
     // Everything the dispatch emitted is already buffered, so this decides
     // correctly whether a run started at all — the `if (!targetRunId)` of the
@@ -74,7 +126,13 @@ pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Resu
     if target_run.is_some() && !completed {
         let mut dropped = 0;
         loop {
-            match tokio::time::timeout(LOST_COMPLETION_POLL, events.recv()).await {
+            let next = tokio::select! {
+                signal = signals.next() => {
+                    return interrupted_exit(engine, styles, signal, None).await;
+                }
+                next = tokio::time::timeout(LOST_COMPLETION_POLL, events.recv()) => next,
+            };
+            match next {
                 Ok(Some(event)) => {
                     let ended =
                         handle_single(styles, &event, task_id, &mut target_run, &mut failed);
@@ -214,13 +272,146 @@ pub async fn all(engine: &FullEngine, styles: &Styles) -> Result<ExitCode> {
     );
     println!();
 
+    let mut signals = StandaloneSignals::install();
     let mut events = engine.events.subscribe();
-    engine.orchestrator.run_all().await?;
-    drain_runs(&mut events).await;
+    let (dispatched, interrupted) = settle_dispatch(
+        &engine.orchestrator,
+        engine.orchestrator.run_all(),
+        &mut signals,
+    )
+    .await;
+    if let Some(signal) = interrupted {
+        return interrupted_exit(engine, styles, signal, dispatched.err()).await;
+    }
+    dispatched?;
+    tokio::select! {
+        () = drain_runs(&mut events) => {}
+        signal = signals.next() => {
+            return interrupted_exit(engine, styles, signal, None).await;
+        }
+    }
     // The last completion event arrives from inside a collector; this waits
     // for the work that follows it.
     engine.orchestrator.wait_for_collectors().await;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `SIGINT`/`SIGTERM` arms of the standalone paths.
+///
+/// Creating an arm replaces the default disposition for the rest of the
+/// process, so they are installed once per command and kept until it returns.
+/// An arm that cannot be installed is reported and leaves that signal's
+/// default behaviour in place.
+struct StandaloneSignals {
+    interrupt: Option<tokio::signal::unix::Signal>,
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl StandaloneSignals {
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        let install = |kind: SignalKind, name: &str| {
+            signal(kind)
+                .inspect_err(|err| tracing::warn!(%err, "could not install the {name} handler"))
+                .ok()
+        };
+        StandaloneSignals {
+            interrupt: install(SignalKind::interrupt(), "SIGINT"),
+            terminate: install(SignalKind::terminate(), "SIGTERM"),
+        }
+    }
+
+    /// The next signal. Pending forever when neither arm exists.
+    async fn next(&mut self) -> Signal {
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => tokio::select! {
+                _ = interrupt.recv() => Signal::Interrupt,
+                _ = terminate.recv() => Signal::Terminate,
+            },
+            (Some(interrupt), None) => {
+                interrupt.recv().await;
+                Signal::Interrupt
+            }
+            (None, Some(terminate)) => {
+                terminate.recv().await;
+                Signal::Terminate
+            }
+            (None, None) => std::future::pending().await,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Signal {
+    Interrupt,
+    Terminate,
+}
+
+impl Signal {
+    fn name(self) -> &'static str {
+        match self {
+            Signal::Interrupt => "SIGINT",
+            Signal::Terminate => "SIGTERM",
+        }
+    }
+
+    /// The shell convention for death by this signal.
+    fn exit_code(self) -> ExitCode {
+        ExitCode::from(match self {
+            Signal::Interrupt => 130,
+            Signal::Terminate => 143,
+        })
+    }
+}
+
+/// Await a dispatch to completion even when a signal arrives meanwhile.
+///
+/// The dispatch is never dropped: it may be between two persisted writes, and
+/// abandoning it there is exactly the half-written critical section the
+/// orchestrator's own stop path refuses to produce. A signal instead latches
+/// the orchestrator's interrupt, which bounds what is left (an effort probe in
+/// flight is killed and reaped, no model child starts), and the dispatch's own
+/// result is still returned.
+async fn settle_dispatch(
+    orchestrator: &Orchestrator,
+    dispatch: impl Future<Output = Result<()>>,
+    signals: &mut StandaloneSignals,
+) -> (Result<()>, Option<Signal>) {
+    tokio::pin!(dispatch);
+    tokio::select! {
+        biased;
+        result = &mut dispatch => (result, None),
+        signal = signals.next() => {
+            orchestrator.interrupt();
+            (dispatch.await, Some(signal))
+        }
+    }
+}
+
+/// Stop this process's runs after a signal, report it, and pick the exit code.
+async fn interrupted_exit(
+    engine: &FullEngine,
+    styles: &Styles,
+    signal: Signal,
+    dispatch_error: Option<orch_core::Error>,
+) -> Result<ExitCode> {
+    let stopped = engine
+        .orchestrator
+        .stop_interrupted_runs(signal.name())
+        .await;
+    println!();
+    print_error(
+        styles,
+        &format!(
+            "Interrupted by {}: stopped the runs this command started",
+            signal.name()
+        ),
+        None,
+    );
+    for err in dispatch_error.iter().chain(stopped.as_ref().err()) {
+        print_error(styles, &err.to_string(), None);
+    }
+    Ok(signal.exit_code())
 }
 
 /// Wait until no run is in flight and no reactive dispatch starts another.

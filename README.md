@@ -21,7 +21,9 @@ through `todo → in_progress → review → done` with retries and backoff on f
 
 Beyond that: **goals** that drive autonomous agents, **teams** with a lead, inter-agent **messaging**, a
 shared **context** store, git **worktree** isolation per task with automatic merge-back, and automatic
-review criteria (`typecheck`, `lint`, `test_pass`).
+review criteria (`typecheck`, `lint`, `test_pass`). An opt-in **eco** prompt mode sends each agent a shorter
+team description, and a per-adapter **effort** setting is passed to each CLI in its own syntax; see
+[Eco mode, reasoning effort and default models](docs/manual/16-eco-mode-and-effort.md).
 
 ---
 

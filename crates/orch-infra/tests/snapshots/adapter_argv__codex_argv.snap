@@ -20,7 +20,9 @@ command: codex
   argv[4]: "danger-full-access"
   argv[5]: "--model"
   argv[6]: "a-model"
-  argv[7]: "-"
+  argv[7]: "-c"
+  argv[8]: "model_reasoning_effort=\"high\""
+  argv[9]: "-"
 cwd: /ws
 stdin: Pipe
 

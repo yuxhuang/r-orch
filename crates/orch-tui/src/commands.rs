@@ -604,6 +604,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                             "✓ Created agent \"{}\" ({}, {}){hint}",
                             agent.name, agent.id, agent.adapter
                         ));
+                        self.emit_agent_diagnostics();
                         self.refresh_all(false);
                     }
                     Err(err) => self.fail(&err),

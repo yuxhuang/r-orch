@@ -259,6 +259,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                             command: flags.command.clone(),
                             model: flags.model.clone(),
                             effort: parse_enum(flags.effort.as_deref(), "effort")?,
+                            prompt_mode: parse_enum(flags.prompt_mode.as_deref(), "prompt-mode")?,
+                            role_summary: flags.role_summary.clone(),
                             max_turns: match &flags.max_turns {
                                 Some(raw) => Some(parse_int(raw, "max-turns")? as u32),
                                 None => None,
@@ -292,19 +294,45 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     .await?;
                 }
                 AgentSub::List => commands::agent::list(&engine, &ctx, &styles).await?,
-                AgentSub::Status { id } => {
-                    commands::agent::status(&engine, &ctx, &styles, id).await?;
+                AgentSub::Status { id, effective } => {
+                    commands::agent::status(&engine, &ctx, &styles, id, *effective).await?;
                 }
-                AgentSub::Update(args) => {
-                    commands::agent::mutate(
-                        &engine,
-                        &ctx,
-                        &styles,
-                        args,
-                        document_input::MutationKind::Update,
-                    )
-                    .await?
-                }
+                AgentSub::Update(args) => match &args.file {
+                    // The file form is the unchanged full replacement.
+                    Some(file) => {
+                        commands::agent::mutate(
+                            &engine,
+                            &ctx,
+                            &styles,
+                            &crate::tree::EntityDefinitionInput {
+                                id: args.id.clone(),
+                                input: crate::tree::DefinitionInput {
+                                    file: file.clone(),
+                                    input_format: args.input_format,
+                                },
+                            },
+                            document_input::MutationKind::Update,
+                        )
+                        .await?
+                    }
+                    None => {
+                        commands::agent::update_flags(
+                            &engine,
+                            &ctx,
+                            &styles,
+                            &args.id,
+                            commands::agent::AgentFlagUpdate {
+                                prompt_mode: parse_enum(
+                                    args.prompt_mode.as_deref(),
+                                    "prompt-mode",
+                                )?,
+                                effort: parse_enum(args.effort.as_deref(), "effort")?,
+                                role_summary: args.role_summary.clone(),
+                            },
+                        )
+                        .await?
+                    }
+                },
                 AgentSub::Patch(args) => {
                     commands::agent::mutate(
                         &engine,
@@ -636,6 +664,10 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             }
             let engine =
                 orch_engine::build_full_with_peer(ctx.project_root.clone(), peer.config()).await?;
+            // Read-only diagnostics before any unattended dispatch: legacy
+            // or uncertain effort requests and eco/custom-template conflicts,
+            // one line per affected agent, on stderr.
+            commands::run::report_startup_diagnostics(&engine, &styles).await;
             // `--watch` wins over `--all`, which wins over a task id, as the
             // original's if/else chain does.
             if *watch {
@@ -677,6 +709,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                 &commands::init::InitArgs {
                     name: None,
                     adapter: None,
+                    prompt_mode: None,
                     interactive: env.stdout_is_tty && env.stdin_is_tty,
                 },
                 version(),
@@ -715,6 +748,20 @@ async fn run_init(
         );
         return Ok(ExitCode::from(2));
     }
+    let prompt_mode = match args.prompt_mode.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<orch_domain::PromptMode>() {
+            Ok(mode) => Some(mode),
+            Err(()) => {
+                print_error(
+                    &styles,
+                    &format!("Unknown prompt mode \"{raw}\""),
+                    Some("Supported: normal, eco"),
+                );
+                return Ok(ExitCode::from(2));
+            }
+        },
+    };
 
     commands::init::run(
         &styles,
@@ -722,6 +769,7 @@ async fn run_init(
         &commands::init::InitArgs {
             name: args.name.clone(),
             adapter: args.adapter.clone(),
+            prompt_mode,
             interactive: env.stdout_is_tty && env.stdin_is_tty,
         },
     )

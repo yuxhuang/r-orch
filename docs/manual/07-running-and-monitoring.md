@@ -159,6 +159,27 @@ Each line is a JSON object, so tools such as `jq` can read it. For people, use `
 23:07:26.178 INFO  agent:started  agentId=agt_3cU5sQA taskId=tsk_wNh-4LS runId=run_VO8Qay2
 ```
 
+Right after `serve:started`, and before it starts any work, `serve` logs one `serve:diagnostic` warning for each
+effort warning ([Effort warnings](16-eco-mode-and-effort.md#effort-warnings)), and one for each agent whose eco
+mode conflicts with a custom template ([Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates)).
+The records are per warning, not per agent: an agent with two warnings gets two records with the same `agentId`,
+like `pi1` here:
+
+```text
+05:49:17.128 INFO  serve:started  mode=once pid=83167 poll_interval_ms=10000
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_bp3vdi0 agentName=cx message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_WoYXdTJ agentName=oc message=local-override-possible: a local opencode variant with the same name can replace the catalog variant's settings
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_Lt8wZYD agentName=pi1 message=clamp-possible: pi clamps the requested thinking level to the model's support; a non-reasoning model runs with thinking off
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_Lt8wZYD agentName=pi1 message=request-only: the explicit --thinking level takes precedence over the model's :level suffix
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_tlU9bxS agentName=sh message=legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)
+```
+
+In JSON the fields are `agentId`, `agentName` and `message`. If `serve` cannot read the agents to check them, it
+logs one `serve:diagnostics_unavailable` warning with an `error` field and carries on. When a run starts
+for an agent with an effort, each effort warning for that run is logged once as an `orchestrator:error` warning
+with `fatal=false` and the context `effort preparation for run <run-id> (agent <agent-id>)`. An agent with no
+warning logs none ([Warnings when a run starts](16-eco-mode-and-effort.md#warnings-when-a-run-starts)).
+
 | Option | What it does | Default |
 |---|---|---|
 | `--once` | Processes the `todo` tasks, then exits when all tasks are final. | Off |
@@ -192,6 +213,20 @@ Shutting down...
 ```
 
 After that, `orch status` says `idle`.
+
+`orch run <task-id>` and `orch run --all` stop on `Ctrl+C` or `SIGTERM` too. They stop only the runs that command
+started: each run's task goes to `retrying` (or `failed` when it has no attempts left) and its agent back to idle.
+A run whose model had started is marked `cancelled`. A run whose OpenCode version check is still going is stopped
+before its model starts, together with the check's processes, and is marked `failed` with the error
+`dispatch interrupted by a signal before the model started`. The command exits with code 130 after `Ctrl+C` and
+143 after `SIGTERM`:
+
+```text
+  orch · running tsk_SvWl33_ "slow"
+
+
+  ✕ Interrupted by SIGINT: stopped the runs this command started
+```
 
 Avoid `kill -9`. It leaves the lock file and the saved state behind, so `orch status` may keep saying `watching`. If that happens, check that no orch process runs, and see [Troubleshooting](13-troubleshooting.md).
 

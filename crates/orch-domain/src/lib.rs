@@ -18,6 +18,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod effort;
 pub mod error;
 pub mod events;
 pub mod global_config;
@@ -36,11 +37,22 @@ pub mod transitions;
 
 pub use agent::{
     Agent, AgentConfig, AgentLastError, AgentStats, AgentStatus, ApprovalPolicy, CreateAgentInput,
-    ReasoningEffort,
+    ROLE_SUMMARY_MAX_BYTES, ReasoningEffort, RoleSummaryError, clip_with_marker,
+    derive_role_summary, normalize_role_summary, normalize_whitespace, role_summary_for,
+    truncation_marker,
 };
 pub use config::{
     AgentDefaults, Defaults, OrchestratorConfig, PeerConfig, ProjectConfig, PromptConfig,
-    SchedulingConfig, TaskDefaults, deep_merge, default_config, get_by_path, set_by_path,
+    PromptMode, PromptModeSelection, PromptModeSource, SchedulingConfig, TaskDefaults, deep_merge,
+    default_config, effective_prompt_mode, get_by_path, set_by_path,
+};
+pub use effort::{
+    CODEX_ULTRA_LABEL, EFFORT_CAPABILITIES, EFFORT_REQUEST_ONLY_NOTE, EFFORT_TABLE_CHECKED,
+    EffortCapability, EffortDiagnostic, EffortDispatch, EffortError, EffortEvidence, EffortReason,
+    EffortRejection, EffortSelection, EffortSelector, EffortStatus, EffortWire, EvidenceStatus,
+    GROK_EVIDENCE_GAP, ModelEffortRow, UnknownModelPolicy, allowed_efforts, effort_capability,
+    plan_after_wire_check_failure, plan_effort_dispatch, split_variant_suffix,
+    validate_effort_authoring,
 };
 pub use error::{
     AdapterErrorHint, AdapterErrorKind, DomainError, ERROR_HINTS, Result, classify_adapter_error,

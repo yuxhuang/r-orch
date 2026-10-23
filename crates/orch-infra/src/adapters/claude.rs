@@ -79,6 +79,7 @@ fn build_args(
     params: &ExecuteParams,
     system_prompt_file: Option<&Path>,
 ) -> Result<Vec<String>, AdapterError> {
+    let effort = super::effort::selection("claude", &params.config)?;
     let mut args = vec![
         "--print".to_owned(),
         "--output-format".to_owned(),
@@ -95,14 +96,11 @@ fn build_args(
         "--dangerously-skip-permissions".to_owned(),
     ];
 
-    if let Some(model) = &params.config.model {
+    if let Some(model) = &effort.model {
         args.push("--model".to_owned());
         args.push(model.clone());
     }
-    if let Some(effort) = params.config.effort {
-        args.push("--effort".to_owned());
-        args.push(effort.as_str().to_owned());
-    }
+    args.extend(effort.args);
     if let Some(path) = system_prompt_file {
         let path = path.to_str().ok_or_else(|| {
             AdapterError::new(
@@ -363,6 +361,7 @@ impl Adapter for ClaudeAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
+        super::effort::selection("claude", &params.config)?;
         // Dropped (deleting the file) on any early return, including a failed
         // spawn.
         let system_prompt_file = effective_system_prompt(&params)

@@ -107,6 +107,8 @@ pub async fn run_with(
         ],
     );
 
+    log_startup_diagnostics(&logger, engine).await;
+
     let code = if args.once {
         let result = once::run_once(
             orchestrator,
@@ -136,6 +138,39 @@ pub async fn run_with(
     let _ = pump.await;
     logger.flush();
     Ok(code)
+}
+
+/// Log the engine's read-only startup diagnostics as `warn` records, one
+/// `serve:diagnostic` record per startup diagnostic (warning), before any
+/// unattended work: effort requests dispatch will ignore, clamp or cannot
+/// confirm, the Codex managed-model coupling, and eco against a custom
+/// template — the same set `run --watch` prints to stderr. They are records in the chosen
+/// `--log-format`, so they reach the `--log-file` and never break the JSON
+/// stream. A store read failure is logged and does not stop the daemon;
+/// dispatch's own preflight decides.
+async fn log_startup_diagnostics(logger: &StructuredLogger, engine: &Engine) {
+    let agents = match engine.agent_service.list().await {
+        Ok(agents) => agents,
+        Err(err) => {
+            logger.log(
+                LogLevel::Warn,
+                "serve:diagnostics_unavailable",
+                vec![("error", Value::String(err.to_string()))],
+            );
+            return;
+        }
+    };
+    for diagnostic in orch_engine::prompt_mode::startup_diagnostics(&engine.config, &agents) {
+        logger.log(
+            LogLevel::Warn,
+            "serve:diagnostic",
+            vec![
+                ("agentId", Value::String(diagnostic.agent_id)),
+                ("agentName", Value::String(diagnostic.agent_name)),
+                ("message", Value::String(diagnostic.message)),
+            ],
+        );
+    }
 }
 
 /// [`ServeOrchestrator`] over the real orchestrator.
@@ -274,6 +309,128 @@ mod tests {
             written.contains("Received SIGTERM"),
             "lost the shutdown record:\n{written}"
         );
+    }
+
+    /// Records, at `start_watch`, what the log file already held: the
+    /// diagnostics have to be written before any unattended work begins.
+    struct WatchProbe {
+        log_path: std::path::PathBuf,
+        log_at_start: Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ServeOrchestrator for WatchProbe {
+        async fn start_watch(&self, _skip_autonomous_seeding: bool) -> Result<()> {
+            let seen = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+            *self.log_at_start.lock().unwrap() = Some(seen);
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn wait_for_stop(&self) {}
+    }
+
+    async fn serve_with_agents(agents: Vec<orch_domain::Agent>) -> (Vec<Value>, Vec<Value>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        orch_infra::storage::fs_utils::clear_ensured_dirs();
+        std::fs::create_dir_all(orch_infra::storage::Paths::new(temp.path()).root())
+            .expect("create .orchestry");
+        let engine = orch_engine::build_light_with(
+            temp.path(),
+            orch_engine::EngineSeams {
+                clock: Arc::new(orch_core::test_support::FixedClock::new()),
+                ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
+                global_config_path: None,
+            },
+        )
+        .await
+        .expect("build_light");
+        for agent in &agents {
+            engine.agents.save(agent).await.expect("save agent");
+        }
+
+        let log_path = temp.path().join("serve.log");
+        let orchestrator = WatchProbe {
+            log_path: log_path.clone(),
+            log_at_start: Mutex::new(None),
+        };
+        run_with(
+            &orchestrator,
+            &engine,
+            ServeArgs {
+                once: false,
+                tick_interval: None,
+                log_file: Some(log_path.to_string_lossy().into_owned()),
+                format: LogFormat::Json,
+                verbose: false,
+            },
+        )
+        .await
+        .expect("serve");
+
+        let parse = |text: &str| -> Vec<Value> {
+            text.lines()
+                .map(|line| serde_json::from_str(line).expect("every record is JSON"))
+                .collect()
+        };
+        let at_start = orchestrator
+            .log_at_start
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("start_watch was called");
+        let written = std::fs::read_to_string(&log_path).expect("read log");
+        (parse(&at_start), parse(&written))
+    }
+
+    fn diagnostics(records: &[Value]) -> Vec<&Value> {
+        records
+            .iter()
+            .filter(|record| record["event"] == "serve:diagnostic")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn watch_startup_logs_one_warning_per_affected_agent_before_unattended_work() {
+        let mut cursor = orch_core::test_support::make_agent();
+        cursor.id = "agt_cur2".into();
+        cursor.name = "cur2".into();
+        cursor.adapter = "cursor".into();
+        cursor.config.effort = Some(orch_domain::ReasoningEffort::High);
+        let mut clean = orch_core::test_support::make_agent();
+        clean.id = "agt_clean".into();
+        clean.name = "clean".into();
+
+        let (at_start, written) = serve_with_agents(vec![cursor, clean]).await;
+
+        let found = diagnostics(&written);
+        assert_eq!(found.len(), 1, "one warning, for cur2 only: {written:#?}");
+        let record = found[0];
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["agentId"], "agt_cur2");
+        assert_eq!(record["agentName"], "cur2");
+        assert!(
+            record["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("legacy-ignored")),
+            "names the disposition: {record}"
+        );
+        assert_eq!(
+            diagnostics(&at_start).len(),
+            1,
+            "the warning is logged before start_watch: {at_start:#?}"
+        );
+        assert_eq!(
+            written[0]["event"], "serve:started",
+            "serve:started stays the first record: {written:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_startup_logs_no_diagnostic_when_no_agent_is_affected() {
+        let (_, written) = serve_with_agents(vec![orch_core::test_support::make_agent()]).await;
+        assert!(diagnostics(&written).is_empty(), "{written:#?}");
     }
 
     #[test]

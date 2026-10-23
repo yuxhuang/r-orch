@@ -30,6 +30,7 @@ Find your goal in the table, then read the chapter. The table lists every chapte
 | Fix a problem | [13. Troubleshooting](13-troubleshooting.md) | Symptoms, causes and fixes |
 | Look up a command | [14. Command reference](14-command-reference.md) | Every command in one list |
 | Look up a word | [15. Glossary](15-glossary.md) | The terms this manual uses |
+| Send agents shorter prompts, set reasoning effort, or check default models | [16. Eco mode, reasoning effort and default models](16-eco-mode-and-effort.md) | The eco prompt mode, effort levels per adapter, warnings, default models, upgrade and downgrade |
 
 Each chapter starts with what you can do after reading it. Commands are in `sh` blocks. The output below
 them was checked against orch 0.9.3, so your IDs and times differ.

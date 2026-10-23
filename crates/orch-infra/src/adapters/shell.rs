@@ -232,6 +232,7 @@ impl Adapter for ShellAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
+        super::effort::selection("shell", &params.config)?;
         let Some(command) = params.config.command.clone() else {
             return Ok(missing_command(self.clock.as_ref()));
         };

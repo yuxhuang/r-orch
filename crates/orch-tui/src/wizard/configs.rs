@@ -6,8 +6,9 @@
 //! through the UI.
 
 use orch_domain::{
-    AGENT_SHOP_TEMPLATES, Agent, AgentShopTemplate, AgentStatus, Goal, ModelTier, Task, Team,
-    TeamStatus, is_adapter_kind, resolve_model,
+    AGENT_SHOP_TEMPLATES, Agent, AgentShopTemplate, AgentStatus, CODEX_ULTRA_LABEL, Goal,
+    ModelTier, PromptMode, ROLE_SUMMARY_MAX_BYTES, ReasoningEffort, Task, Team, TeamStatus,
+    allowed_efforts, is_adapter_kind, normalize_role_summary, resolve_model,
 };
 
 use crate::backend::{
@@ -22,8 +23,28 @@ use crate::wizard::picker::AgentPicker;
 /// Role sentinel meaning "type your own".
 pub const CUSTOM_ROLE: &str = "__custom__";
 
-/// Adapters that support `--effort`.
+/// The adapters whose pre-0.10 wizard offered an effort step. Kept for
+/// reference only: the step is now driven by the shared capability table
+/// ([`effort_options_for`]), which covers every adapter with a native
+/// selector.
 pub const EFFORT_ADAPTERS: [&str; 3] = ["claude", "pi", "grok"];
+
+/// The effort step's description: the value is a request, never a promise of
+/// the effective reasoning level (design D5.1).
+pub const EFFORT_STEP_DESCRIPTION: &str =
+    "Requests the provider's native reasoning level · the provider decides the effective level";
+
+/// The prompt-mode step's description.
+pub const PROMPT_MODE_STEP_DESCRIPTION: &str =
+    "Eco sends a compact team roster; the agent's own role, task and context stay complete";
+
+/// The role-summary step's description, with the byte limit.
+pub fn role_summary_step_description() -> String {
+    format!(
+        "Optional · the one-line hint other agents see in eco mode · at most \
+         {ROLE_SUMMARY_MAX_BYTES} UTF-8 bytes · empty derives it from the role"
+    )
+}
 
 const AGENT_ROLE_MAX_LEN: usize = 60;
 
@@ -56,6 +77,97 @@ pub fn effort_options() -> Vec<Choice> {
         ("medium", "Medium", "balanced speed and quality"),
         ("low", "Low", "fastest responses, minimal reasoning"),
     ])
+}
+
+/// What one effort level means for the user, without claiming an effective
+/// level.
+fn effort_hint(level: ReasoningEffort) -> &'static str {
+    match level {
+        ReasoningEffort::None => "request no reasoning",
+        ReasoningEffort::Off => "request thinking off",
+        ReasoningEffort::Minimal => "request minimal reasoning",
+        ReasoningEffort::Low => "request low reasoning",
+        ReasoningEffort::Medium => "request medium reasoning",
+        ReasoningEffort::High => "request high reasoning",
+        ReasoningEffort::Xhigh => "request extra-high reasoning",
+        ReasoningEffort::Max => "request maximum reasoning",
+        // Lead ruling 2: exact label, explicit opt-in, never suggested.
+        ReasoningEffort::Ultra => CODEX_ULTRA_LABEL,
+    }
+}
+
+/// The effort choices for an adapter and model, from the shared capability
+/// table that authoring validation also uses: `Default` (no request) first,
+/// then each level the table allows, in its order. `current` is kept as a
+/// choice even when the table no longer lists it, so editing an agent never
+/// silently changes a stored value; submitting it is validated like any
+/// other edit.
+pub fn effort_options_for(adapter: &str, model: Option<&str>, current: &str) -> Vec<Choice> {
+    let mut out = vec![Choice::new(
+        "",
+        "Default",
+        "no request — the provider or model default applies",
+    )];
+    for level in allowed_efforts(adapter, model.filter(|m| !m.is_empty())) {
+        let value = level.as_str();
+        out.push(Choice::new(value, &capitalize(value), effort_hint(level)));
+    }
+    if !current.is_empty() && !out.iter().any(|choice| choice.value == current) {
+        out.push(Choice::new(
+            current,
+            &capitalize(current),
+            "stored value — not offered for this provider and model",
+        ));
+    }
+    out
+}
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The agent prompt-mode choices. `""` stores no override.
+pub fn prompt_mode_options() -> Vec<Choice> {
+    choices(&[
+        ("", "Inherit project", "follow the project prompt mode"),
+        ("normal", "Normal", "full team roles in every prompt"),
+        (
+            "eco",
+            "Eco",
+            "compact team roster; own role, task and context complete",
+        ),
+    ])
+}
+
+/// The project prompt-mode choices for the settings wizard.
+pub fn project_prompt_mode_options() -> Vec<Choice> {
+    choices(&[
+        (
+            "normal",
+            "Normal",
+            "full team roles in every prompt (default)",
+        ),
+        (
+            "eco",
+            "Eco",
+            "compact team roster; agent overrides retained",
+        ),
+    ])
+}
+
+/// `None` when the explicit summary is acceptable (or empty, meaning none),
+/// else the authoring error. Explicit prose is never shortened.
+pub fn validate_role_summary(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    normalize_role_summary(value)
+        .err()
+        .map(|err| format!("Role summary: {err}"))
 }
 
 /// `PRIORITY_OPTIONS`.
@@ -353,6 +465,14 @@ fn value_of(values: &Values, key: &str) -> String {
     values.get(key).cloned().unwrap_or_default()
 }
 
+/// A non-empty answer, borrowed.
+fn non_empty_ref<'a>(values: &'a Values, key: &str) -> Option<&'a str> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+}
+
 /// Whether `key` already holds a non-empty answer. An agent step that holds
 /// one is never skipped, so a refused answer can always be reopened and
 /// replaced, even when no other agent is left to offer.
@@ -442,14 +562,32 @@ pub fn agent_wizard_steps(
             .suggestions_label("available models")
             .skip(|v| value_of(v, "adapter") == "shell"),
         WizardStep::new("effort", "Reasoning effort", StepKind::Select)
-            .options(effort_options())
-            .skip(|v| !EFFORT_ADAPTERS.contains(&value_of(v, "adapter").as_str())),
+            .description(EFFORT_STEP_DESCRIPTION)
+            .get_options(|v| {
+                effort_options_for(
+                    &value_of(v, "adapter"),
+                    v.get("model").map(String::as_str),
+                    "",
+                )
+            })
+            .skip(|v| {
+                allowed_efforts(&value_of(v, "adapter"), non_empty_ref(v, "model")).is_empty()
+            }),
+        WizardStep::new("prompt_mode", "Prompt mode", StepKind::Select)
+            .description(PROMPT_MODE_STEP_DESCRIPTION)
+            .options(prompt_mode_options())
+            .skip(|v| value_of(v, "adapter") == "shell"),
         WizardStep::new("role", "Role / specialization", StepKind::Select)
             .options(role_presets())
             .skip(|v| value_of(v, "adapter") == "shell"),
         WizardStep::new("role_custom", "Describe the role", StepKind::Textarea)
             .placeholder("e.g. Specialist in React and TypeScript")
             .skip(|v| value_of(v, "adapter") == "shell" || value_of(v, "role") != CUSTOM_ROLE),
+        WizardStep::new("role_summary", "Role summary (optional)", StepKind::Text)
+            .placeholder("e.g. Reviews Rust changes for correctness")
+            .description(&role_summary_step_description())
+            .validate(validate_role_summary)
+            .skip(|v| value_of(v, "adapter") == "shell"),
         WizardStep::new("skills", "Skills (comma-separated)", StepKind::Text)
             .placeholder("e.g. feature-dev:feature-dev, testing-suite:generate-tests")
             .skip(|v| value_of(v, "adapter") == "shell"),
@@ -541,6 +679,16 @@ pub fn agent_wizard_to_input(values: &Values, default_adapter: &str) -> AgentWiz
             role,
             approval_policy,
             skills,
+            prompt_mode: if is_shell {
+                None
+            } else {
+                non_empty(value_of(values, "prompt_mode"))
+            },
+            role_summary: if is_shell {
+                None
+            } else {
+                non_empty(value_of(values, "role_summary").trim().to_string())
+            },
         },
         team_id: if is_shell {
             None
@@ -693,7 +841,27 @@ pub fn edit_agent_wizard_steps(
     let a6 = adapter_or.clone();
     let a7 = adapter_or.clone();
     let a8 = adapter_or.clone();
+    let a9 = adapter_or.clone();
+    let a10 = adapter_or.clone();
+    let a11 = adapter_or.clone();
     let agent_adapter_for_model = agent.adapter.clone();
+    let agent_adapter_for_effort = agent.adapter.clone();
+    let stored_model = agent.config.model.clone().unwrap_or_default();
+    let stored_model_for_skip = stored_model.clone();
+    let stored_effort = agent
+        .config
+        .effort
+        .map(|effort| effort.as_str().to_owned())
+        .unwrap_or_default();
+    let stored_effort_for_skip = stored_effort.clone();
+    // The model the effort step validates against: the answer when given,
+    // else the stored model while the adapter is unchanged.
+    let model_for =
+        move |v: &Values, adapter: &str, stored: &str, stored_adapter: &str| match v.get("model") {
+            Some(model) => model.clone(),
+            None if adapter == stored_adapter => stored.to_owned(),
+            None => String::new(),
+        };
 
     vec![
         WizardStep::new("name", "Agent name", StepKind::Text)
@@ -728,9 +896,50 @@ pub fn edit_agent_wizard_steps(
             })
             .skip(move |v| a4(v) == "shell"),
         WizardStep::new("effort", "Reasoning effort", StepKind::Select)
-            .options(effort_options())
-            .default_value(agent.config.effort.map(|e| e.as_str()).unwrap_or(""))
-            .skip(move |v| !EFFORT_ADAPTERS.contains(&a5(v).as_str())),
+            .description(EFFORT_STEP_DESCRIPTION)
+            .get_options({
+                let stored_adapter = agent_adapter_for_effort.clone();
+                let stored_effort = stored_effort.clone();
+                move |v| {
+                    let adapter = a9(v);
+                    let model = model_for(v, &adapter, &stored_model, &stored_adapter);
+                    // A stored value stays selectable only on its own adapter.
+                    let current = if adapter == stored_adapter {
+                        stored_effort.as_str()
+                    } else {
+                        ""
+                    };
+                    effort_options_for(&adapter, Some(&model), current)
+                }
+            })
+            .default_value(&stored_effort)
+            .skip({
+                let stored_adapter = agent_adapter_for_effort.clone();
+                move |v| {
+                    let adapter = a5(v);
+                    let model = model_for(v, &adapter, &stored_model_for_skip, &stored_adapter);
+                    let keeps_stored =
+                        adapter == stored_adapter && !stored_effort_for_skip.is_empty();
+                    adapter == "shell"
+                        || (allowed_efforts(
+                            &adapter,
+                            Some(model.as_str()).filter(|m| !m.is_empty()),
+                        )
+                        .is_empty()
+                            && !keeps_stored)
+                }
+            }),
+        WizardStep::new("prompt_mode", "Prompt mode", StepKind::Select)
+            .description(PROMPT_MODE_STEP_DESCRIPTION)
+            .options(prompt_mode_options())
+            .default_value(
+                agent
+                    .config
+                    .prompt_mode
+                    .map(|mode| mode.as_str())
+                    .unwrap_or(""),
+            )
+            .skip(move |v| a10(v) == "shell"),
         WizardStep::new("role", "Role / specialization", StepKind::Select)
             .options(role_presets())
             .default_value(&role_default)
@@ -739,6 +948,12 @@ pub fn edit_agent_wizard_steps(
             .default_value(&role_custom_default)
             .placeholder("e.g. Specialist in React and TypeScript")
             .skip(move |v| a7(v) == "shell" || value_of(v, "role") != CUSTOM_ROLE),
+        WizardStep::new("role_summary", "Role summary (optional)", StepKind::Text)
+            .default_value(agent.config.role_summary.as_deref().unwrap_or(""))
+            .placeholder("e.g. Reviews Rust changes for correctness")
+            .description(&role_summary_step_description())
+            .validate(validate_role_summary)
+            .skip(move |v| a11(v) == "shell"),
         WizardStep::new("team", "Team", StepKind::Select)
             .options(team_opts)
             .default_value(&current_team)
@@ -784,6 +999,17 @@ pub fn edit_agent_wizard_to_fields(values: &Values) -> (AgentFields, Option<Stri
             None
         } else {
             values.get("effort").cloned()
+        },
+        // `""` clears: inherit the project mode / derive the summary.
+        prompt_mode: if is_shell {
+            None
+        } else {
+            values.get("prompt_mode").cloned()
+        },
+        role_summary: if is_shell {
+            None
+        } else {
+            values.get("role_summary").map(|s| s.trim().to_string())
         },
     };
     let team_id = if is_shell {
@@ -1042,6 +1268,22 @@ pub fn config_wizard_steps(
         ],
         _ => Vec::new(),
     }
+}
+
+/// The project prompt-mode settings wizard (`/config prompt-mode`): one
+/// select, defaulting to the mode stored now.
+pub fn prompt_mode_wizard(current: PromptMode) -> Wizard {
+    Wizard::new(
+        WizardKind::Config,
+        &config_wizard_title("prompt-mode"),
+        vec![
+            WizardStep::new("prompt_mode", "Project prompt mode", StepKind::Select)
+                .description("Applies from the next dispatch; agent overrides are retained")
+                .options(project_prompt_mode_options())
+                .default_value(current.as_str()),
+        ],
+    )
+    .with_setting("prompt-mode")
 }
 
 /// `SETTINGS — {SETTING}` with hyphens replaced by spaces, uppercased.
