@@ -169,6 +169,46 @@ pub fn effective_config_of_raw(raw: &Value) -> Result<OrchestratorConfig> {
     })
 }
 
+/// The project's `.definition.lock`, held, with the project config re-read
+/// inside it.
+///
+/// Agent definition mutations validate their final candidate against
+/// [`DefinitionLock::config`], never against a config snapshot taken before
+/// the lock (an engine's construction-time config, or a long-lived TUI
+/// session's): a project mode switch that ran in between is otherwise
+/// invisible, and an "inherit" edit can be accepted against a project that is
+/// now eco with a custom template. The lock is the same one the project mode
+/// writers and `config set/patch/update` take, so the two sides serialize.
+///
+/// The lock is per open file, not re-entrant: a holder must not try to take it
+/// again (that waits out the lock's timeout). Released on drop.
+pub struct DefinitionLock {
+    _file: std::fs::File,
+    config: OrchestratorConfig,
+}
+
+impl DefinitionLock {
+    /// Take the lock (bounded wait), then read the project config the same
+    /// way the engine does at construction.
+    pub async fn acquire(project_root: &Path) -> Result<Self> {
+        use orch_core::storage::ConfigStore;
+        use orch_infra::storage::{FileConfigStore, Paths, fs_utils};
+
+        let paths = Paths::new(project_root.to_path_buf());
+        let file = fs_utils::mutation_lock(&paths.root().join(".definition.lock")).await?;
+        let config = FileConfigStore::new(paths).read().await?;
+        Ok(DefinitionLock {
+            _file: file,
+            config,
+        })
+    }
+
+    /// The project config as read inside the lock.
+    pub fn config(&self) -> &OrchestratorConfig {
+        &self.config
+    }
+}
+
 /// Set `defaults.agent.prompt_mode` key-only, under the project's definition
 /// lock.
 ///
