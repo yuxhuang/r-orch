@@ -107,6 +107,14 @@ impl Orchestrator {
 
         // Release the cached JSONL append handle for this run either way.
         self.deps().run_store.close_run_events(run_id);
+        // From here on the run's outcome is decided and only waits for the
+        // state lock, so reconcile must not read the stale stall clock as a
+        // stall. Cleared by whoever deregisters the collector.
+        self.inner
+            .finishing_collectors
+            .lock()
+            .await
+            .insert(task_id.to_owned());
 
         if let Some(err) = stream_error {
             let error = err.to_string();

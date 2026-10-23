@@ -333,6 +333,13 @@ impl Orchestrator {
                 agent: entry.agent_id.clone(),
             }));
         }
+        // A run reconcile failed (a stall) may still be draining its stream.
+        // The collector state and the cancel token are keyed by task id, so
+        // a second run now would have the old collector's late completion
+        // finish it. The task keeps its place until the stream ends.
+        if self.inner.active_collectors.lock().await.contains(task_id) {
+            return Ok(());
+        }
 
         let task = match prefetched {
             Some(task) => task,
@@ -445,7 +452,9 @@ impl Orchestrator {
                     // still append to it: the failed run is terminal, and no
                     // collector for this task is still draining its stream (a
                     // run failed by reconcile while its child was still
-                    // writing). Otherwise eco keeps the full output.
+                    // writing). `dispatch_task_to` already waits for that
+                    // collector; this keeps eco safe should another path
+                    // dispatch. Otherwise eco keeps the full output.
                     let window_stable =
                         !self.inner.active_collectors.lock().await.contains(&task_id);
                     Some(RetryContext {
@@ -911,6 +920,13 @@ impl Orchestrator {
             {
                 orchestrator.emit_error(err, format!("adapter execution for {task_id}"));
             }
+            // `finishing` first, so it stays a subset of `active`.
+            orchestrator
+                .inner
+                .finishing_collectors
+                .lock()
+                .await
+                .remove(&collector_task_id);
             orchestrator
                 .inner
                 .active_collectors

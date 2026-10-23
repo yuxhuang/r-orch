@@ -331,8 +331,8 @@ async fn reconcile_drops_a_running_entry_whose_task_is_already_terminal() {
 /// Keeps its stream open until the run's cancellation token fires, the way a
 /// real adapter's child keeps working until the cancel path kills it.
 #[derive(Default)]
-struct CancelAwareAdapter {
-    tokens: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>,
+pub(super) struct CancelAwareAdapter {
+    pub(super) tokens: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>,
 }
 
 #[async_trait::async_trait]

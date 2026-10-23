@@ -673,6 +673,7 @@ The orchestrator serializes state mutation with a `tokio::sync::Mutex`, and the 
 pub struct Orchestrator {
     state: Arc<Mutex<OrchestratorState>>,
     active_collectors: Arc<Mutex<HashSet<String>>>,
+    finishing_collectors: Arc<Mutex<HashSet<String>>>,
     cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /* deps: Arc<dyn …> */
 }
@@ -688,8 +689,16 @@ pub struct Orchestrator {
    it does (file I/O), so use `tokio::sync::Mutex` there too.
 
 `Orchestrator` is `Clone`-able over `Arc`s so background tasks can hold it. One `Arc<Mutex<_>>` per concern
-rather than one giant lock, with a documented acquisition order (`state` → `active_collectors` → `cancels`) to
-make deadlock impossible by construction.
+rather than one giant lock, with a documented acquisition order (`state` → `active_collectors` →
+`finishing_collectors` → `cancels`) to make deadlock impossible by construction.
+
+Reconcile and a run's collector meet at two guards. While a collector is registered in `active_collectors`,
+reconcile skips the PID check: the child may have exited cleanly with the success handler queued for the state
+lock, and the collector reports the outcome. The stall check still runs, because an open stream with no events
+is what it exists to catch. Once the stream ends, the collector adds the task to `finishing_collectors`, and
+reconcile skips the stall check too until the collector deregisters (removing `finishing` before `active`).
+Dispatch waits for that deregistration before starting the task again: collector state and cancel tokens are keyed
+by task id, so a second run alongside a draining collector would be completed by the old run's late handler.
 
 ### 6.2 Tick loop
 

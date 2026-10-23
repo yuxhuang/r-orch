@@ -22,16 +22,16 @@
 //!
 //! One consequence is worth stating: `collect_events` updates
 //! `running[task].last_event_at` under the same guard, so that write waits for
-//! an in-flight phase instead of interleaving with it. The
-//! write is already debounced by [`Orchestrator::save_state_lazy`] and
-//! reconcile skips stall checks for tasks with an active collector, so no
-//! observable behaviour depends on the interleaving — and a torn read is
-//! impossible by construction.
+//! an in-flight phase instead of interleaving with it, and a torn read is
+//! impossible by construction. Reconcile's stall check therefore reads the
+//! clock as of the last event that took the lock; an event queued behind
+//! reconcile at the very moment the timeout passes still counts as late. The
+//! write is debounced by [`Orchestrator::save_state_lazy`].
 //!
-//! The other three pieces of shared state have their own locks, acquired in
-//! this documented order so deadlock is impossible: **`state` →
-//! `active_collectors` → `cancels`**. `last_auto_seed_at` and `single_task_runs`
-//! are leaves and may be taken at any point.
+//! The other shared state has its own locks, acquired in this documented
+//! order so deadlock is impossible: **`state` → `active_collectors` →
+//! `finishing_collectors` → `cancels`**. `last_auto_seed_at` and
+//! `single_task_runs` are leaves and may be taken at any point.
 
 mod collect;
 mod dispatch;
@@ -195,9 +195,15 @@ struct Inner {
     /// `stateMutex` **and** `this.state`. See the module docs.
     state: Mutex<Option<OrchestratorState>>,
     /// Task ids whose `collect_events` task is still running. Reconcile skips
-    /// the PID and stall checks for these, because the child may have exited
-    /// cleanly while the success handler is still queued for the state lock.
+    /// the PID check for these, because the child may have exited cleanly
+    /// while the success handler is still queued for the state lock; the
+    /// collector, not the PID, reports how the run ended.
     active_collectors: Mutex<HashSet<String>>,
+    /// The subset of `active_collectors` whose event stream has ended and
+    /// whose completion handler has yet to run. Reconcile skips the stall
+    /// check only for these: an open stream with no events is a stall, an
+    /// ended one is a completion waiting for the state lock.
+    finishing_collectors: Mutex<HashSet<String>>,
     /// `abortControllers`.
     cancels: Mutex<HashMap<String, CancellationToken>>,
     /// Task ids started by `run <id>`; these must not trigger a reactive
@@ -289,6 +295,7 @@ impl Orchestrator {
                 deps,
                 state: Mutex::new(None),
                 active_collectors: Mutex::new(HashSet::new()),
+                finishing_collectors: Mutex::new(HashSet::new()),
                 cancels: Mutex::new(HashMap::new()),
                 single_task_runs: Mutex::new(HashSet::new()),
                 last_auto_seed_at: Mutex::new(HashMap::new()),
