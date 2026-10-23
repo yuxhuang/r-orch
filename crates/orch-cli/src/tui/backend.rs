@@ -28,6 +28,8 @@ use orch_domain::{
     OrchestratorState, PromptMode, ReasoningEffort, Run, RunStatus, Task, TaskStatus, Team,
     TuiPaletteName,
 };
+use orch_engine::agent_service::AuthoredAgent;
+use orch_engine::prompt_mode::{AgentDiagnostic, DefinitionLock};
 use orch_engine::{
     FullEngine, UpdateAgentFields, UpdateGoalFields, UpdateTaskFields, WatchOptions,
 };
@@ -115,6 +117,9 @@ pub struct EngineBackend {
     /// stored here by the spawned write and handed out once by
     /// `poll_prompt_mode`.
     prompt_mode: Arc<Mutex<PromptModeWrite>>,
+    /// The effort diagnostics of the agent the last successful `add_agent` /
+    /// `update_agent` wrote, handed out once by `take_agent_diagnostics`.
+    authored_diagnostics: Vec<String>,
 }
 
 /// The lifecycle of one asynchronous project prompt-mode write.
@@ -180,7 +185,7 @@ impl EngineBackend {
                 Ok(agents) => {
                     orch_engine::prompt_mode::startup_diagnostics(&engine.config, &agents)
                         .into_iter()
-                        .map(|d| format!("{} ({}): {}", d.agent_name, d.agent_id, d.message))
+                        .map(|d| diagnostic_line(&d))
                         .collect()
                 }
                 Err(err) => vec![format!("Could not check agent diagnostics: {err}")],
@@ -248,6 +253,7 @@ impl EngineBackend {
             // a native copy request that may never come.
             copy: CopyTransport::system(),
             prompt_mode: Arc::new(Mutex::new(PromptModeWrite::Idle)),
+            authored_diagnostics: Vec::new(),
         };
         // History is loaded eagerly because the dashboard's activity view
         // wants it on the first frame. The model catalog starts on the first
@@ -297,6 +303,13 @@ impl EngineBackend {
     /// see the module docs.
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         self.handle.block_on(future)
+    }
+
+    /// Keep the authored agent's diagnostics for `take_agent_diagnostics`
+    /// and hand back the agent.
+    fn authored(&mut self, authored: AuthoredAgent) -> Agent {
+        self.authored_diagnostics = authored.diagnostics.iter().map(diagnostic_line).collect();
+        authored.agent
     }
 
     // There was a `report` helper here that put a background failure on the
@@ -596,12 +609,18 @@ impl TuiBackend for EngineBackend {
     // ── Agents ───────────────────────────────────────────────────────────
 
     /// An empty `adapter` falls through to `defaults.agent.adapter`, which the
-    /// engine's `AgentService::create` already does.
+    /// engine's `AgentService::create_locked` already does.
+    ///
+    /// Taken under `.definition.lock`, with defaults and the final-candidate
+    /// check against the project config read inside it (ruling 21/22b), the
+    /// same path `orch agent add` takes. A concurrent F3 write holds the same
+    /// lock, so this waits for it (bounded at the lock's 5 s timeout).
     fn add_agent(&mut self, name: &str, adapter: &str, opts: AgentOpts) -> BackendResult<Agent> {
+        self.authored_diagnostics.clear();
         let effort = parse_optional(opts.effort.as_deref(), "effort")?;
         let approval_policy = parse_optional(opts.approval_policy.as_deref(), "approval policy")?;
         let prompt_mode = parse_optional(opts.prompt_mode.as_deref(), "prompt mode")?;
-        self.block_on(self.engine.agent_service.create(CreateAgentInput {
+        let input = CreateAgentInput {
             name: name.to_owned(),
             adapter: adapter.to_owned(),
             command: non_empty(opts.command),
@@ -613,11 +632,23 @@ impl TuiBackend for EngineBackend {
             prompt_mode,
             role_summary: non_empty(opts.role_summary),
             ..Default::default()
-        }))
-        .map_err(to_message)
+        };
+        let engine = Arc::clone(&self.engine);
+        let authored = self
+            .block_on(async move {
+                // One block: the lock is per open file and not re-entrant,
+                // and is dropped before the call returns.
+                let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
+                engine.agent_service.create_locked(&lock, input).await
+            })
+            .map_err(to_message)?;
+        Ok(self.authored(authored))
     }
 
+    /// Under `.definition.lock` against the freshly read project config, like
+    /// [`EngineBackend::add_agent`] and `orch agent update`.
     fn update_agent(&mut self, id: &str, fields: AgentFields) -> BackendResult<Agent> {
+        self.authored_diagnostics.clear();
         // `Some("")` clears, so an empty string must not be parsed as a value.
         let effort = match fields.effort.as_deref() {
             None => None,
@@ -633,24 +664,33 @@ impl TuiBackend for EngineBackend {
         let role_summary = fields
             .role_summary
             .map(|summary| Some(summary).filter(|s| !s.trim().is_empty()));
-        self.block_on(self.engine.agent_service.update(
-            id,
-            UpdateAgentFields {
-                name: fields.name,
-                adapter: fields.adapter,
-                role: fields.role,
-                command: fields.command,
-                model: fields.model,
-                effort,
-                // The only caller — the edit-agent wizard — never sends an
-                // approval policy, so the trait leaves it out. Editing it is
-                // `orch agent edit`'s job.
-                approval_policy: None,
-                prompt_mode,
-                role_summary,
-            },
-        ))
-        .map_err(to_message)
+        let update = UpdateAgentFields {
+            name: fields.name,
+            adapter: fields.adapter,
+            role: fields.role,
+            command: fields.command,
+            model: fields.model,
+            effort,
+            // The only caller — the edit-agent wizard — never sends an
+            // approval policy, so the trait leaves it out. Editing it is
+            // `orch agent edit`'s job.
+            approval_policy: None,
+            prompt_mode,
+            role_summary,
+        };
+        let engine = Arc::clone(&self.engine);
+        let id = id.to_owned();
+        let authored = self
+            .block_on(async move {
+                let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
+                engine.agent_service.update_locked(&lock, &id, update).await
+            })
+            .map_err(to_message)?;
+        Ok(self.authored(authored))
+    }
+
+    fn take_agent_diagnostics(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.authored_diagnostics)
     }
 
     fn delete_agent(&mut self, id: &str) -> BackendResult<()> {
@@ -1437,6 +1477,15 @@ async fn history_entries(engine: &FullEngine, run: &Run) -> Vec<HistoryEntry> {
             },
         })
         .collect()
+}
+
+/// One diagnostic as the dashboard shows it, at launch and after authoring:
+/// `name (id): message`, the shape `orch agent add/show` prints.
+fn diagnostic_line(diagnostic: &AgentDiagnostic) -> String {
+    format!(
+        "{} ({}): {}",
+        diagnostic.agent_name, diagnostic.agent_id, diagnostic.message
+    )
 }
 
 /// The TUI only ever renders the message.
@@ -2290,5 +2339,199 @@ mod tests {
             transport.copy_text_via("later", CopyTarget::Terminal),
             Ok(CopyTicket(1))
         );
+    }
+}
+
+/// Wizard add/edit through the real engine: validated against the project
+/// config read under `.definition.lock`, and the authored agent's effort
+/// diagnostics handed to the dashboard (gate C1/QA-1, C2/QA-2).
+#[cfg(test)]
+mod authoring_tests {
+    use orch_core::storage::ConfigStore;
+    use orch_domain::{WorkspaceMode, default_config};
+    use orch_engine::{EngineSeams, build_full_with};
+    use orch_infra::storage::{FileConfigStore, Paths};
+
+    use super::*;
+
+    /// A project with a custom combined template, in normal mode, plus an
+    /// engine over it whose global config stays inside the project.
+    async fn custom_template_project() -> (tempfile::TempDir, Arc<FullEngine>) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        orch_core::test_support::assert_hermetic(temp.path());
+        orch_infra::storage::fs_utils::clear_ensured_dirs();
+        let paths = Paths::new(temp.path());
+        tokio::fs::create_dir_all(paths.root())
+            .await
+            .expect("create .orchestry");
+        let mut config = default_config();
+        config.project.name = "authoring".into();
+        config.defaults.agent.workspace_mode = WorkspaceMode::Shared;
+        config.defaults.agent.prompt_mode = PromptMode::Normal;
+        config.prompt = Some(orch_domain::PromptConfig {
+            template: Some("custom {{ task.title }}".into()),
+            ..Default::default()
+        });
+        config.scheduling.poll_interval_ms = 100_000;
+        ConfigStore::write(&FileConfigStore::new(paths), &config)
+            .await
+            .expect("write config.yml");
+        let engine = build_full_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join(".orchestry/global.yml")),
+                ..EngineSeams::default()
+            },
+        )
+        .await
+        .expect("build_full");
+        (temp, Arc::new(engine))
+    }
+
+    /// Run `body` on a thread that is not driving the runtime, as the draw
+    /// loop is, so the backend's `Handle::block_on` is legal.
+    async fn on_draw_thread<T, F>(mut backend: EngineBackend, body: F) -> (EngineBackend, T)
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut EngineBackend) -> T + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let value = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| body(&mut backend))
+                    .join()
+                    .expect("the draw thread panicked")
+            });
+            (backend, value)
+        })
+        .await
+        .expect("the blocking task panicked")
+    }
+
+    fn agent_file(temp: &tempfile::TempDir, id: &str) -> Vec<u8> {
+        std::fs::read(temp.path().join(format!(".orchestry/agents/{id}.yml"))).expect("agent file")
+    }
+
+    /// QA-1: the session started in normal; the project switched to eco
+    /// after launch (as F3 does). An edit to "Inherit project" is checked
+    /// against the eco config read under the lock, not the launch snapshot,
+    /// and refused with the definition untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inherit_edit_after_the_project_switched_to_eco_is_refused_against_the_fresh_config()
+    {
+        let (temp, engine) = custom_template_project().await;
+        let backend = EngineBackend::launch_with(Arc::clone(&engine), "9.9.9", true).await;
+
+        let (backend, pinned) = on_draw_thread(backend, |backend| {
+            backend
+                .add_agent(
+                    "pinned",
+                    "claude",
+                    AgentOpts {
+                        prompt_mode: Some("normal".into()),
+                        ..Default::default()
+                    },
+                )
+                .expect("add a normal-pinned agent")
+        })
+        .await;
+        // Every agent overrides normal, so the switch is legitimate.
+        orch_engine::prompt_mode::set_project_prompt_mode(
+            engine.paths.project_root(),
+            engine.agents.as_ref(),
+            PromptMode::Eco,
+        )
+        .await
+        .expect("switch the project to eco");
+        let before = agent_file(&temp, &pinned.id);
+
+        let id = pinned.id.clone();
+        let (backend, edited) = on_draw_thread(backend, move |backend| {
+            let result = backend.update_agent(
+                &id,
+                AgentFields {
+                    prompt_mode: Some(String::new()),
+                    ..Default::default()
+                },
+            );
+            (result, backend.take_agent_diagnostics())
+        })
+        .await;
+        let (result, diagnostics) = edited;
+        let error = result.expect_err("inherit must be refused under eco + custom template");
+        assert!(
+            error.contains("incompatible with custom templates"),
+            "{error}"
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            agent_file(&temp, &pinned.id),
+            before,
+            "a refused edit writes nothing"
+        );
+
+        // A new agent that would inherit eco is refused the same way.
+        let (backend, added) = on_draw_thread(backend, |backend| {
+            backend.add_agent("inherits", "claude", AgentOpts::default())
+        })
+        .await;
+        let error = added.expect_err("an inheriting agent must be refused");
+        assert!(
+            error.contains("incompatible with custom templates"),
+            "{error}"
+        );
+        drop(backend);
+        drop(temp);
+    }
+
+    /// QA-2: Codex with effort and no model, created then edited from the
+    /// wizard, yields the managed-model warning for the dashboard, once per
+    /// write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_effort_with_no_model_hands_the_managed_model_warning_to_the_dashboard() {
+        let (temp, engine) = custom_template_project().await;
+        let backend = EngineBackend::launch_with(Arc::clone(&engine), "9.9.9", true).await;
+
+        let (backend, (agent, created, drained)) = on_draw_thread(backend, |backend| {
+            let agent = backend
+                .add_agent(
+                    "Wizard 🧪",
+                    "codex",
+                    AgentOpts {
+                        effort: Some("high".into()),
+                        prompt_mode: Some("normal".into()),
+                        ..Default::default()
+                    },
+                )
+                .expect("add codex");
+            let created = backend.take_agent_diagnostics();
+            let drained = backend.take_agent_diagnostics();
+            (agent, created, drained)
+        })
+        .await;
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert!(
+            created[0].starts_with(&format!("Wizard 🧪 ({}): ", agent.id))
+                && created[0].contains("codex effort with no model"),
+            "{created:?}"
+        );
+        assert!(drained.is_empty(), "handed out once: {drained:?}");
+
+        let id = agent.id.clone();
+        let (_backend, edited) = on_draw_thread(backend, move |backend| {
+            backend
+                .update_agent(
+                    &id,
+                    AgentFields {
+                        role_summary: Some("測試 🧪".into()),
+                        ..Default::default()
+                    },
+                )
+                .expect("edit codex");
+            backend.take_agent_diagnostics()
+        })
+        .await;
+        assert_eq!(edited, created, "the edit reports the same warning");
+        drop(temp);
     }
 }

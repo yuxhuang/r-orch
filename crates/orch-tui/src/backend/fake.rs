@@ -116,6 +116,9 @@ pub struct FakeBackend {
     /// Separate from `fail_next`, which a refresh must never consume.
     pub timings_error: Option<String>,
     pub calls: Vec<Call>,
+    /// Lines handed out by the next [`TuiBackend::take_agent_diagnostics`],
+    /// as if the last authored agent had produced them.
+    pub agent_diagnostics: Vec<String>,
     /// Queued events handed out by the next [`TuiBackend::poll_events`].
     pub pending_events: Vec<OrchestratorEvent>,
     pub pending_history: Vec<Vec<HistoryEntry>>,
@@ -193,6 +196,7 @@ impl FakeBackend {
             runs: Vec::new(),
             timings_error: None,
             calls: Vec::new(),
+            agent_diagnostics: Vec::new(),
             pending_events: Vec::new(),
             pending_history: Vec::new(),
             pending_catalog: None,
@@ -870,6 +874,10 @@ impl TuiBackend for FakeBackend {
 
     fn poll_prompt_mode(&mut self) -> Option<BackendResult<orch_domain::PromptMode>> {
         self.prompt_mode_result.take()
+    }
+
+    fn take_agent_diagnostics(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.agent_diagnostics)
     }
 
     fn complete_onboarding(&mut self) -> BackendResult<()> {

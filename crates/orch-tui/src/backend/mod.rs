@@ -403,6 +403,15 @@ pub trait TuiBackend {
 
     fn add_agent(&mut self, name: &str, adapter: &str, opts: AgentOpts) -> BackendResult<Agent>;
     fn update_agent(&mut self, id: &str, fields: AgentFields) -> BackendResult<Agent>;
+    /// The read-only effort diagnostics for the agent the last successful
+    /// [`TuiBackend::add_agent`] / [`TuiBackend::update_agent`] wrote (a
+    /// requested level dispatch will ignore or cannot confirm, Codex effort
+    /// with no model), one line per diagnostic in the launch warnings' shape,
+    /// handed out once. Empty when there are none, after a failed write, or
+    /// for a backend that cannot compute them.
+    fn take_agent_diagnostics(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn delete_agent(&mut self, id: &str) -> BackendResult<()>;
     fn force_stop_agent(&mut self, id: &str) -> BackendResult<()>;
     fn toggle_autonomous(&mut self, id: &str, enabled: bool) -> BackendResult<Agent>;

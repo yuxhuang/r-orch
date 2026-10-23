@@ -1131,6 +1131,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
     }
 
+    /// The effort diagnostics of the agent just written, one yellow line
+    /// each, like the launch warnings: shown at authoring so a requested
+    /// level dispatch will ignore, or Codex effort with no model, is not
+    /// discovered only at the next launch or dispatch.
+    pub(crate) fn emit_agent_diagnostics(&mut self) {
+        for warning in self.backend.take_agent_diagnostics() {
+            self.emit(&format!("⚠ {warning}"), Token::Yellow, MsgType::System);
+        }
+    }
+
     fn submit_agent(&mut self, values: &Values) -> SubmitOutcome {
         let default_adapter = self.state.default_adapter.clone();
         let input = configs::agent_wizard_to_input(values, &default_adapter);
@@ -1159,6 +1169,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     Token::Green,
                     MsgType::System,
                 );
+                self.emit_agent_diagnostics();
                 match input.team_id {
                     Some(team_id) => {
                         match self.backend.join_team(&team_id, &agent.id) {
@@ -1200,6 +1211,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     Token::Green,
                     MsgType::System,
                 );
+                self.emit_agent_diagnostics();
                 // A *skipped* Team step means "unchanged", not "leave".
                 let new_team = if values.contains_key("team") {
                     team_id.clone().unwrap_or_default()
