@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-23
+
+Retry-delay patch release. No peer-protocol change, so 0.5.x through 0.10.1 peers can be mixed.
+
 ### Fixed
 - A failed task now waits its retry delay (`scheduling.retry_base_delay_ms`, doubling each time) before the next attempt. In 0.10.0 orch restarted it about half a second after each failure, so every attempt was used up within a couple of seconds. The retry starts at the orchestrator's first check after the delay is up. `orch run --all` no longer retries a failed task straight away: it leaves the task in `retrying` for `orch run --watch`, `orch serve` or the dashboard to retry when the delay is up. `orch run <task-id>` still starts a `retrying` task at once.
 
@@ -240,7 +244,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/yuxhuang/r-orch/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/yuxhuang/r-orch/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/yuxhuang/r-orch/compare/v0.9.2...v0.9.3
