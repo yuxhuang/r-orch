@@ -128,9 +128,8 @@ impl DiskObserver {
             events.extend(self.tail_run_events(&run_id).await);
 
             let run = self.runs.get(&run_id).await.ok().flatten();
-            let success = run
-                .as_ref()
-                .is_some_and(|run| run.status == RunStatus::Succeeded);
+            let status = run.as_ref().map(|run| run.status);
+            let success = status == Some(RunStatus::Succeeded);
             let agent_id = self
                 .tracked
                 .get(&run_id)
@@ -146,10 +145,13 @@ impl DiskObserver {
                 events.push(OrchestratorEvent::TaskStatusChanged {
                     task_id,
                     from: TaskStatus::InProgress,
-                    to: if success {
-                        TaskStatus::Review
-                    } else {
-                        TaskStatus::Failed
+                    // A cancel finishes the run `cancelled` and the task
+                    // `cancelled`; reporting it as a failure would raise a
+                    // "Task failed" toast for a task nobody saw fail.
+                    to: match status {
+                        Some(RunStatus::Succeeded) => TaskStatus::Review,
+                        Some(RunStatus::Cancelled) => TaskStatus::Cancelled,
+                        _ => TaskStatus::Failed,
                     },
                 });
             }
@@ -622,6 +624,39 @@ mod tests {
                     to: TaskStatus::Failed,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_reports_the_cancelled_status_not_a_failure() {
+        let mut fixture = fixture();
+        fixture.state.seed(with_running(&["run_1"]));
+        fixture.observer.poll().await;
+
+        fixture.runs.seed(orch_domain::Run {
+            id: "run_1".to_owned(),
+            task_id: "tsk_1".to_owned(),
+            status: RunStatus::Cancelled,
+            ..make_run()
+        });
+        fixture.state.seed(default_state());
+
+        let events = fixture.observer.poll().await;
+        assert_eq!(
+            events,
+            vec![
+                OrchestratorEvent::AgentCompleted {
+                    run_id: "run_1".to_owned(),
+                    agent_id: "agt_1".to_owned(),
+                    success: false,
+                },
+                OrchestratorEvent::TaskStatusChanged {
+                    task_id: "tsk_1".to_owned(),
+                    from: TaskStatus::InProgress,
+                    to: TaskStatus::Cancelled,
+                },
+            ],
+            "the pair a live orchestrator's cancel emits"
         );
     }
 

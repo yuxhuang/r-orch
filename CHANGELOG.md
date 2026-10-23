@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Fixed
+- A dashboard that is only watching a project another process owns (`orch serve`, `orch run --watch` or another dashboard) now shows a cancelled task as `in_progress → cancelled`. It used to report `in_progress → failed` with a "Task failed" toast, although the task and its run were cancelled.
+
 ## [0.10.1] - 2026-10-23
 
 Retry-delay patch release. No peer-protocol change, so 0.5.x through 0.10.1 peers can be mixed.
