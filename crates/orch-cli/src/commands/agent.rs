@@ -11,7 +11,7 @@ use orch_domain::{
 };
 use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
-use orch_engine::prompt_mode::{AgentDiagnostic, agent_effort_diagnostics};
+use orch_engine::prompt_mode::{AgentDiagnostic, DefinitionLock, agent_effort_diagnostics};
 use serde::Serialize;
 
 use crate::context::CliContext;
@@ -96,35 +96,43 @@ pub async fn add(
     styles: &Styles,
     args: AgentAddArgs,
 ) -> Result<()> {
-    let agent = engine
+    // The final candidate is checked against the project config read inside
+    // the definition lock, not the engine's construction snapshot.
+    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
+    let authored = engine
         .agent_service
-        .create(CreateAgentInput {
-            name: args.name,
-            adapter: args.adapter,
-            role: args.role,
-            command: args.command,
-            model: args.model,
-            effort: args.effort,
-            approval_policy: args.approval_policy,
-            max_turns: args.max_turns,
-            timeout_ms: args.timeout_ms,
-            // `agent add` has no `--stall-timeout` flag; the default applies.
-            stall_timeout_ms: None,
-            env: None,
-            system_prompt: None,
-            workspace_mode: args.workspace_mode,
-            skills: args
-                .skills
-                .as_deref()
-                .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect()),
-            // Absent means live inheritance of the project default: the
-            // default is never copied into the agent (design D1).
-            prompt_mode: args
-                .prompt_mode
-                .and_then(PromptModeSelection::into_override),
-            role_summary: args.role_summary,
-        })
+        .create_locked(
+            &lock,
+            CreateAgentInput {
+                name: args.name,
+                adapter: args.adapter,
+                role: args.role,
+                command: args.command,
+                model: args.model,
+                effort: args.effort,
+                approval_policy: args.approval_policy,
+                max_turns: args.max_turns,
+                timeout_ms: args.timeout_ms,
+                // `agent add` has no `--stall-timeout` flag; the default applies.
+                stall_timeout_ms: None,
+                env: None,
+                system_prompt: None,
+                workspace_mode: args.workspace_mode,
+                skills: args
+                    .skills
+                    .as_deref()
+                    .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect()),
+                // Absent means live inheritance of the project default: the
+                // default is never copied into the agent (design D1).
+                prompt_mode: args
+                    .prompt_mode
+                    .and_then(PromptModeSelection::into_override),
+                role_summary: args.role_summary,
+            },
+        )
         .await?;
+    drop(lock);
+    let agent = authored.agent;
 
     if let Some(format) = ctx.output {
         format.print(&agent)?;
@@ -141,11 +149,7 @@ pub async fn add(
             ),
         );
     }
-    report_diagnostics(
-        ctx,
-        styles,
-        &agent_effort_diagnostics(std::slice::from_ref(&agent)),
-    );
+    report_diagnostics(ctx, styles, &authored.diagnostics);
     Ok(())
 }
 
@@ -561,12 +565,8 @@ pub async fn mutate(
     let file = args.input.file.clone();
     let source = move |err| crate::document_input::at_source(&file, err);
     let updated = apply_definition(engine, &args.id, &input, kind, &source).await?;
-    print_updated(ctx, styles, &updated)?;
-    report_diagnostics(
-        ctx,
-        styles,
-        &agent_effort_diagnostics(std::slice::from_ref(&updated)),
-    );
+    print_updated(ctx, styles, &updated.agent)?;
+    report_diagnostics(ctx, styles, &updated.diagnostics);
     Ok(())
 }
 
@@ -634,12 +634,8 @@ pub async fn update_flags(
         &|err| err,
     )
     .await?;
-    print_updated(ctx, styles, &updated)?;
-    report_diagnostics(
-        ctx,
-        styles,
-        &agent_effort_diagnostics(std::slice::from_ref(&updated)),
-    );
+    print_updated(ctx, styles, &updated.agent)?;
+    report_diagnostics(ctx, styles, &updated.diagnostics);
     Ok(())
 }
 
@@ -664,16 +660,17 @@ fn print_updated(ctx: &CliContext, styles: &Styles, updated: &Agent) -> Result<(
 /// The locked read → candidate → validate → single save path shared by the
 /// file and flag forms. `source` attributes errors to the input document.
 /// The service's final-candidate validation (effort table, eco versus custom
-/// templates) runs before the save, so a rejection writes nothing.
+/// templates) runs before the save, against the project config re-read
+/// inside the lock, so a rejection writes nothing and a concurrent project
+/// mode switch is never missed.
 async fn apply_definition(
     engine: &Engine,
     id: &str,
     input: &serde_json::Value,
     kind: crate::document_input::MutationKind,
     source: &(dyn Fn(orch_core::Error) -> orch_core::Error + Sync),
-) -> Result<Agent> {
+) -> Result<orch_engine::agent_service::AuthoredAgent> {
     use orch_core::Error;
-    use orch_infra::storage::fs_utils::mutation_lock;
     if id.contains('@') {
         return Err(source(Error::invalid_arguments(
             "id: remote agents cannot be mutated",
@@ -681,7 +678,7 @@ async fn apply_definition(
     }
     // One stable project lock also serializes duplicate-name validation between
     // new agent mutations. Existing edit/runtime writes retain their old race.
-    let _lock = mutation_lock(&engine.paths.root().join(".definition.lock"))
+    let lock = DefinitionLock::acquire(engine.paths.project_root())
         .await
         .map_err(source)?;
     let current = engine.agent_service.get(id).await?;
@@ -702,7 +699,8 @@ async fn apply_definition(
     orch_infra::storage::fs_utils::check_definition_write_size(&authored).map_err(source)?;
     engine
         .agent_service
-        .replace_definition(
+        .replace_definition_locked(
+            &lock,
             id,
             candidate["name"].as_str().expect("validated").to_owned(),
             candidate["adapter"].as_str().expect("validated").to_owned(),
@@ -789,7 +787,13 @@ pub async fn shop(
     };
 
     let input = template_to_agent_input(template, &engine.config.defaults.agent.adapter)?;
-    let agent = engine.agent_service.create(input).await?;
+    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
+    let agent = engine
+        .agent_service
+        .create_locked(&lock, input)
+        .await?
+        .agent;
+    drop(lock);
     print_success(
         styles,
         &format!(

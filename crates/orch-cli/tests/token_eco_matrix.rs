@@ -273,14 +273,9 @@ fn new_reader_unrelated_update_accepts_valid_and_rejects_incompatible_with_bytes
                         failures.push(format!("{c}: unset effort edit failed: {}", out.all()));
                     }
                 }
-                // Shell silently drops a stored effort (baseline behaviour); the
-                // design says a non-AI adapter's value should be rejected. See the
-                // ignored `shell_agent_effort_is_rejected_...` test.
-                Some(_) if row.key == "shell" => {
-                    if !out.ok() {
-                        failures.push(format!("{c}: shell edit failed: {}", out.all()));
-                    }
-                }
+                // Shell has no generic effort: a stored value, legacy or new,
+                // is an incompatible combination like Cursor's (D5-7, lead
+                // ruling 13), so it takes the rejection arm below.
                 Some(e) if authoring_ok(row, e) => {
                     if !out.ok() {
                         failures.push(format!("{c}: valid combination edit failed: {}", out.all()));
@@ -866,7 +861,6 @@ fn old_binary_dispatch_of_a_new_spelling_fails_before_any_child() {
 /// not silently accept and discard a requested value, nor silently discard a
 /// stored one while rewriting the definition.
 #[test]
-#[ignore = "BUG: shell agents drop effort silently on add/patch/update (validate_candidate skips shell); lead ruling needed, see tests-t1.md"]
 fn shell_agent_effort_is_rejected_on_authoring_and_on_unrelated_edit_with_bytes_preserved() {
     let new = new_reader();
     let (sb, id) = seeded(&new, &ROWS[8], Some("high"));
@@ -897,5 +891,256 @@ fn shell_agent_effort_is_rejected_on_authoring_and_on_unrelated_edit_with_bytes_
     assert!(
         !set.ok(),
         "setting effort on a shell agent must be an error, not a silent no-op"
+    );
+}
+
+// ── shell effort (lead ruling 13) ───────────────────────────────────────────
+
+fn shell_replacement(effort: &str) -> String {
+    format!(
+        r#"{{"name":"Subject","adapter":"shell","config":{{"command":"printf shell-ok","effort":"{effort}"}}}}"#
+    )
+}
+
+/// A new spelling requested for a shell agent is a configuration error on
+/// every authoring surface (add, patch, flag update, full replacement), with
+/// the per-adapter refusal shape, before the normalization that would drop
+/// it; nothing is written.
+#[test]
+fn shell_new_effort_is_refused_on_add_patch_update_and_replacement_with_bytes_preserved() {
+    let new = new_reader();
+    let (sb, id) = seeded(&new, &ROWS[8], None);
+    let before = sb.agent_bytes();
+    let mut failures = Vec::new();
+    for effort in NEW_ONLY {
+        let patch = format!(r#"{{"config":{{"effort":"{effort}"}}}}"#);
+        let replacement = shell_replacement(effort);
+        let surfaces: [(&str, Vec<&str>, Option<&str>); 4] = [
+            (
+                "add",
+                vec![
+                    "agent",
+                    "add",
+                    "Other",
+                    "--adapter",
+                    "shell",
+                    "--command",
+                    "printf shell-ok",
+                    "--effort",
+                    effort,
+                ],
+                None,
+            ),
+            (
+                "patch",
+                vec!["agent", "patch", &id, "-f", "-"],
+                Some(patch.as_str()),
+            ),
+            (
+                "update",
+                vec!["agent", "update", &id, "--effort", effort],
+                None,
+            ),
+            (
+                "replace",
+                vec!["agent", "update", &id, "-f", "-"],
+                Some(replacement.as_str()),
+            ),
+        ];
+        for (surface, args, stdin) in surfaces {
+            let c = format!("shell/{effort}/{surface}");
+            let out = sb.run(&new, &args, stdin);
+            let text = out.all();
+            if out.ok() {
+                failures.push(format!("{c}: accepted: {text}"));
+                continue;
+            }
+            for needle in [
+                format!("does not accept effort `{effort}` for adapter `shell`"),
+                "--effort default".to_owned(),
+            ] {
+                if !text.contains(&needle) {
+                    failures.push(format!("{c}: refusal lacks `{needle}`: {text}"));
+                }
+            }
+            if sb.agent_bytes() != before {
+                failures.push(format!(
+                    "{c}: refused mutation changed definition/index bytes"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A legacy `low|medium|high` requested for a shell agent keeps D5-7: it is
+/// not newly rejected, it is reported as ignored, and the definition is
+/// written without it.
+#[test]
+fn shell_legacy_effort_request_is_ignored_with_a_warning_and_stored_without_effort() {
+    let new = new_reader();
+    let (sb, id) = seeded(&new, &ROWS[8], None);
+    let mut failures = Vec::new();
+    for (n, effort) in LEGACY.into_iter().enumerate() {
+        let name = format!("Other{n}");
+        let patch = format!(r#"{{"config":{{"effort":"{effort}"}}}}"#);
+        let replacement = shell_replacement(effort);
+        let surfaces: [(&str, Vec<&str>, Option<&str>); 4] = [
+            (
+                "add",
+                vec![
+                    "agent",
+                    "add",
+                    &name,
+                    "--adapter",
+                    "shell",
+                    "--command",
+                    "printf shell-ok",
+                    "--effort",
+                    effort,
+                ],
+                None,
+            ),
+            (
+                "patch",
+                vec!["agent", "patch", &id, "-f", "-"],
+                Some(patch.as_str()),
+            ),
+            (
+                "update",
+                vec!["agent", "update", &id, "--effort", effort],
+                None,
+            ),
+            (
+                "replace",
+                vec!["agent", "update", &id, "-f", "-"],
+                Some(replacement.as_str()),
+            ),
+        ];
+        for (surface, args, stdin) in surfaces {
+            let c = format!("shell/{effort}/{surface}");
+            let out = sb.run(&new, &args, stdin);
+            if !out.ok() {
+                failures.push(format!("{c}: legacy request newly rejected: {}", out.all()));
+                continue;
+            }
+            if !out.all().contains("legacy-ignored") {
+                failures.push(format!("{c}: no legacy-ignored warning: {}", out.all()));
+            }
+            if let Some((file, bytes)) = sb.agent_bytes().into_iter().find(|(file, bytes)| {
+                file.ends_with(".yml") && String::from_utf8_lossy(bytes).contains("effort:")
+            }) {
+                failures.push(format!(
+                    "{c}: {file} stores an effort: {}",
+                    String::from_utf8_lossy(&bytes)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ── fresh project config under the definition lock (C1 / F2) ──────────────
+
+/// The SRE lock-window reproduction (gate-resilience F2, review-b4 F1): an
+/// `agent update --prompt-mode inherit` that started while the project was
+/// normal and waited on `.definition.lock` must validate against the project
+/// config as it is once it holds the lock. A project switch to eco (legal:
+/// every agent overrides normal) landed while it waited, and a custom
+/// template is set, so the inherit edit must be refused and the agent bytes
+/// left as they were.
+#[test]
+fn an_inherit_update_waiting_on_the_definition_lock_is_refused_after_a_concurrent_switch_to_eco() {
+    use std::process::Stdio;
+
+    let new = new_reader();
+    let sb = Sandbox::new(&new);
+    let list = sb.run(&new, &["--json", "agent", "list"], None);
+    let listed: serde_json::Value = serde_json::from_str(&list.stdout).expect("agent list json");
+    for agent in listed.as_array().expect("array") {
+        let id = agent["id"].as_str().unwrap();
+        assert!(sb.run(&new, &["agent", "remove", id], None).ok());
+    }
+    let add = sb.run(
+        &new,
+        &[
+            "agent",
+            "add",
+            "a",
+            "--adapter",
+            "claude",
+            "--model",
+            "claude-sonnet-5-5",
+            "--prompt-mode",
+            "normal",
+            "--workspace-mode",
+            "shared",
+            "--quiet",
+        ],
+        None,
+    );
+    assert!(add.ok(), "{}", add.all());
+    let id = add.stdout.trim().to_owned();
+    let template = sb.run(
+        &new,
+        &[
+            "config",
+            "set",
+            "prompt.system_template",
+            "CUSTOM {{ task.title }}",
+        ],
+        None,
+    );
+    assert!(template.ok(), "{}", template.all());
+    let before = sb.agent_bytes();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let lock_path = sb.root().join(".definition.lock");
+    let held = runtime
+        .block_on(orch_infra::storage::fs_utils::mutation_lock(&lock_path))
+        .expect("hold the definition lock");
+
+    let mut child = sb
+        .command(&new)
+        .args(["agent", "update", &id, "--prompt-mode", "inherit"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orch agent update");
+    // The update builds its engine (project normal) and then waits on the
+    // lock, which it polls for up to 5 s; still running after 1 s means it
+    // is waiting there.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let waiting = child.try_wait().unwrap().is_none();
+
+    // The concurrent mode writer, modelled as the file edit it makes while it
+    // holds the lock (we hold it, so the real command cannot run here).
+    let config_path = sb.root().join("config.yml");
+    let mut config: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["defaults"]["agent"]["prompt_mode"] = serde_yaml_ng::Value::String("eco".into());
+    std::fs::write(&config_path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+    drop(held);
+
+    let out = child.wait_with_output().expect("wait orch agent update");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(waiting, "the update must wait for the held lock: {text}");
+    assert!(
+        !out.status.success(),
+        "inherit after a concurrent switch to eco must be refused: {text}"
+    );
+    assert!(text.contains("inherits project eco"), "{text}");
+    assert_eq!(
+        sb.agent_bytes(),
+        before,
+        "refused update changed agent bytes"
     );
 }
