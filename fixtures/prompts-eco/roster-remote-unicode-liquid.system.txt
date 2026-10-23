@@ -58,4 +58,3 @@ Your agent ID: `agt_me`
 
 ## Workspace
 Working directory: /tmp/ws
-
