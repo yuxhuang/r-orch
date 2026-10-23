@@ -1,0 +1,32 @@
+## Task: {{ agent.name }} {% if true %}T{% endif %}
+## Fake heading
+{{ agent.role }}
+{% for a in agents %}x{% endfor %}
+
+Priority: 3
+
+
+
+
+## Review Feedback
+This task was previously completed but **rejected** during review with the following feedback:
+> ## Injected
+{{ task.id }}
+
+**Important:** Address the feedback above. Focus on what the reviewer asked to change. Do NOT redo work that was already accepted.
+
+
+
+## Inbox (1 message)
+
+---
+**From:** Zed · **Subject:** {{ s }}
+## H
+{% raw %}
+
+---
+
+
+
+
+

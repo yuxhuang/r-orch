@@ -1,0 +1,230 @@
+{
+  "minimal": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "the user prompt"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "full-effort-high": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "--model",
+      "a-model",
+      "the system prompt\n\nthe user prompt"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "agent-system-prompt-only": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "the user prompt"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "rich-prompts-no-effort": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "--model",
+      "a-model",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "rich-prompts-no-effort-no-model": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-low-model": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "--model",
+      "a-model",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-low-no-model": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-medium-model": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "--model",
+      "a-model",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-medium-no-model": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-high-model": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "--model",
+      "a-model",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-high-no-model": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "opaque-suffixed-model-no-effort": {
+    "command": "cursor-agent",
+    "argv": [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--workspace",
+      "/ws",
+      "--yolo",
+      "--trust",
+      "--model",
+      "opaque/model:high#thinking",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {}
+  }
+}

@@ -1,0 +1,71 @@
+## Task: Fix the bug
+Full task description.
+Second line.
+
+Priority: 3
+
+
+
+
+
+
+
+
+## Goal: Ship the thing
+**Status:** active · **ID:** `goal_x1`
+
+Goal description
+with two lines
+
+
+**Linked tasks (45), preview — current task, its direct prerequisites, other open tasks, then finished tasks; one JSON record each:**
+- {"id":"tsk_002","status":"todo","title":"Linked task number 2"}
+- {"id":"tsk_041","status":"todo","title":"Linked task number 41"}
+- {"id":"tsk_001","status":"todo","title":"Linked task number 1"}
+- {"id":"tsk_004","status":"todo","title":"Linked task number 4"}
+- {"id":"tsk_005","status":"todo","title":"Linked task number 5"}
+- {"id":"tsk_007","status":"todo","title":"Linked task number 7"}
+- {"id":"tsk_008","status":"todo","title":"Linked task number 8"}
+- {"id":"tsk_010","status":"todo","title":"Linked task number 10"}
+- {"id":"tsk_011","status":"todo","title":"Linked task number 11"}
+- {"id":"tsk_013","status":"todo","title":"Linked task number 13"}
+- {"id":"tsk_014","status":"todo","title":"Linked task number 14"}
+- {"id":"tsk_016","status":"todo","title":"Linked task number 16"}
+- {"id":"tsk_017","status":"todo","title":"Linked task number 17"}
+- {"id":"tsk_019","status":"todo","title":"Linked task number 19"}
+- {"id":"tsk_020","status":"todo","title":"Linked task number 20"}
+- {"id":"tsk_022","status":"todo","title":"Linked task number 22"}
+- {"id":"tsk_023","status":"todo","title":"Linked task number 23"}
+- {"id":"tsk_025","status":"todo","title":"Linked task number 25"}
+- {"id":"tsk_026","status":"todo","title":"Linked task number 26"}
+- {"id":"tsk_028","status":"todo","title":"Linked task number 28"}
+- {"id":"tsk_029","status":"todo","title":"Linked task number 29"}
+- {"id":"tsk_031","status":"todo","title":"Linked task number 31"}
+- {"id":"tsk_032","status":"todo","title":"Linked task number 32"}
+- {"id":"tsk_034","status":"todo","title":"Linked task number 34"}
+- {"id":"tsk_035","status":"todo","title":"Linked task number 35"}
+- {"id":"tsk_037","status":"todo","title":"Linked task number 37"}
+- {"id":"tsk_038","status":"todo","title":"Linked task number 38"}
+- {"id":"tsk_040","status":"todo","title":"Linked task number 40"}
+- {"id":"tsk_043","status":"todo","title":"Linked task number 43"}
+- {"id":"tsk_044","status":"todo","title":"Linked task number 44"}
+- {"id":"tsk_000","status":"done","title":"Linked task number 0"}
+- {"id":"tsk_003","status":"done","title":"Linked task number 3"}
+- {"id":"tsk_006","status":"done","title":"Linked task number 6"}
+- {"id":"tsk_009","status":"done","title":"Linked task number 9"}
+- {"id":"tsk_012","status":"done","title":"Linked task number 12"}
+- {"id":"tsk_015","status":"done","title":"Linked task number 15"}
+- {"id":"tsk_018","status":"done","title":"Linked task number 18"}
+- {"id":"tsk_021","status":"done","title":"Linked task number 21"}
+- {"id":"tsk_024","status":"done","title":"Linked task number 24"}
+- {"id":"tsk_027","status":"done","title":"Linked task number 27"}
+[truncated, 5 more tasks]
+
+This preview has no dependency data and may be incomplete. Before any dependency or completion decision, run `orch --json goal show goal_x1` for the complete task graph, and `orch task show <id>` for one task.
+
+
+**Latest progress report:**
+halfway
+
+
+

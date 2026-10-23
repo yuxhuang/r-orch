@@ -1,0 +1,194 @@
+{
+  "minimal": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"the user prompt\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "full-effort-high": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--model",
+      "a-model",
+      "--thinking",
+      "high",
+      "--append-system-prompt",
+      "the system prompt"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"the user prompt\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "agent-system-prompt-only": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--append-system-prompt",
+      "the agent prompt"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"the user prompt\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "rich-prompts-no-effort": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--model",
+      "a-model",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "rich-prompts-no-effort-no-model": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-low-model": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--model",
+      "a-model",
+      "--thinking",
+      "low",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-low-no-model": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--thinking",
+      "low",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-medium-model": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--model",
+      "a-model",
+      "--thinking",
+      "medium",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-medium-no-model": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--thinking",
+      "medium",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-high-model": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--model",
+      "a-model",
+      "--thinking",
+      "high",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-high-no-model": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--thinking",
+      "high",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "opaque-suffixed-model-no-effort": {
+    "command": "pi",
+    "argv": [
+      "--mode",
+      "rpc",
+      "--model",
+      "opaque/model:high#thinking",
+      "--append-system-prompt",
+      "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "{\"id\":\"orch-1760373453426\",\"type\":\"prompt\",\"message\":\"Task: do the thing.\\nLine two with `ticks` and \\\"quotes\\\".\\n\\ttabbed → arrow\\n\"}\n",
+    "system_prompt_file": null,
+    "env": {}
+  }
+}

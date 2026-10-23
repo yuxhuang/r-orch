@@ -1,0 +1,170 @@
+{
+  "minimal": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "the user prompt"
+    }
+  },
+  "full-effort-high": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "the system prompt\n\nthe user prompt"
+    }
+  },
+  "agent-system-prompt-only": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "the user prompt"
+    }
+  },
+  "rich-prompts-no-effort": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "rich-prompts-no-effort-no-model": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "effort-low-model": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "effort-low-no-model": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "effort-medium-model": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "effort-medium-no-model": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "effort-high-model": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "effort-high-no-model": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  },
+  "opaque-suffixed-model-no-effort": {
+    "command": "bash",
+    "argv": [
+      "-lc",
+      "npm test"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Ignore",
+    "stdin_bytes": null,
+    "system_prompt_file": null,
+    "env": {
+      "ORCHESTRY_TASK_PROMPT": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n"
+    }
+  }
+}

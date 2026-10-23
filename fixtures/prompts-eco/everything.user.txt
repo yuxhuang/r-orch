@@ -1,0 +1,81 @@
+## Task: Fix the bug
+Full task description.
+Second line.
+
+Priority: 3
+Attempt: 2
+
+## Previous attempt failed
+**Error:** err
+
+**Last output (preview of failed run `run_src001`: 9856 bytes omitted from the middle):**
+```
+head00000 head00001 head00002 head00003 head00004 head00005 head00006 head00007 head00008 head00009 head00010 head00011 head00012 head00013 head00014 head00015 head00016 head00017 head00018 head00019 head00020 head00021 head00022 head00023 head00024 head00025 head00026 head00027 head00028 head00029 head00030 head00031 head00032 head00033 head00034 head00035 head00036 head00037 head00038 head00039 head00040 head00041 head00042 head00043 head00044 head00045 head00046 head00047 head00048 head00049 head00050 head00051 head00052 head00053 head00054 head00055 head00056 head00057 head00058 head00059 head00060 head00061 head00062 head00063 head00064 head00065 head00066 head00067 head00068 head00069 head00070 head00071 head00072 head00073 head00074 head00075 head00076 head00077 head00078 head00079 head00080 head00081 head00082 head00083 head00084 head00085 head00086 head00087 head00088 head00089 head00090 head00091 head00092 head00093 head00094 head00095 head00096 head00097 head00098 head00099 head00100 head00101 head00102 head00103 head00104 head00105 head00106 head00107 head00108 head00109 head00110 head00111 head00112 head00113 head00114 head00115 head00116 head00117 head00118 head00119 head00120 head00121 head00122 head00123 head00124 head00125 head00126 head00127 head00128 head00129 head00130 head00131 head00132 head00133 head00134 head00135 head00136 head00137 head00138 head00139 head00140 head00141 head00142 head00143 head00144 head00145 head00146 head00147 head00148 head00149 head00150 head00151 head00152 head00153 head00154 head00155 head00156 head00157 head00158 head00159 head00160 head00161 head00162 head00163 head00164 head00165 head00166 head00167 head00168 head00169 head00170 head00171 head00172 head00173 head00174 head00175 head00176 head00177 head00178 head00179 head00180 head00181 head00182 head00183 head00184 head00185 head00186 head00187 head00188 head00189 head00190 head00191 head00192 head00193 head00194 head00195 head00196 head00197 head00198 head00199 head00200 head00201 head00202 head00203 head0020
+[truncated, 9856 more bytes]
+288 tail00289 tail00290 tail00291 tail00292 tail00293 tail00294 tail00295 tail00296 tail00297 tail00298 tail00299 tail00300 tail00301 tail00302 tail00303 tail00304 tail00305 tail00306 tail00307 tail00308 tail00309 tail00310 tail00311 tail00312 tail00313 tail00314 tail00315 tail00316 tail00317 tail00318 tail00319 tail00320 tail00321 tail00322 tail00323 tail00324 tail00325 tail00326 tail00327 tail00328 tail00329 tail00330 tail00331 tail00332 tail00333 tail00334 tail00335 tail00336 tail00337 tail00338 tail00339 tail00340 tail00341 tail00342 tail00343 tail00344 tail00345 tail00346 tail00347 tail00348 tail00349 tail00350 tail00351 tail00352 tail00353 tail00354 tail00355 tail00356 tail00357 tail00358 tail00359 tail00360 tail00361 tail00362 tail00363 tail00364 tail00365 tail00366 tail00367 tail00368 tail00369 tail00370 tail00371 tail00372 tail00373 tail00374 tail00375 tail00376 tail00377 tail00378 tail00379 tail00380 tail00381 tail00382 tail00383 tail00384 tail00385 tail00386 tail00387 tail00388 tail00389 tail00390 tail00391 tail00392 tail00393 tail00394 tail00395 tail00396 tail00397 tail00398 tail00399 tail00400 tail00401 tail00402 tail00403 tail00404 tail00405 tail00406 tail00407 tail00408 tail00409 tail00410 tail00411 tail00412 tail00413 tail00414 tail00415 tail00416 tail00417 tail00418 tail00419 tail00420 tail00421 tail00422 tail00423 tail00424 tail00425 tail00426 tail00427 tail00428 tail00429 tail00430 tail00431 tail00432 tail00433 tail00434 tail00435 tail00436 tail00437 tail00438 tail00439 tail00440 tail00441 tail00442 tail00443 tail00444 tail00445 tail00446 tail00447 tail00448 tail00449 tail00450 tail00451 tail00452 tail00453 tail00454 tail00455 tail00456 tail00457 tail00458 tail00459 tail00460 tail00461 tail00462 tail00463 tail00464 tail00465 tail00466 tail00467 tail00468 tail00469 tail00470 tail00471 tail00472 tail00473 tail00474 tail00475 tail00476 tail00477 tail00478 tail00479 tail00480 tail00481 tail00482 tail00483 tail00484 tail00485 tail00486 tail00487 tail00488 tail00489 tail00490 tail00491 tail00492 tail00493 tail00494 tail00495 tail00496 tail00497 tail00498 tail00499 tail00500 tail00501 tail00502 tail00503 tail00504 tail00505 tail00506 tail00507 tail00508 tail00509 tail00510 tail00511 tail00512 tail00513 tail00514 tail00515 tail00516 tail00517 tail00518 tail00519 tail00520 tail00521 tail00522 tail00523 tail00524 tail00525 tail00526 tail00527 tail00528 tail00529 tail00530 tail00531 tail00532 tail00533 tail00534 tail00535 tail00536 tail00537 tail00538 tail00539 tail00540 tail00541 tail00542 tail00543 tail00544 tail00545 tail00546 tail00547 tail00548 tail00549 tail00550 tail00551 tail00552 tail00553 tail00554 tail00555 tail00556 tail00557 tail00558 tail00559 tail00560 tail00561 tail00562 tail00563 tail00564 tail00565 tail00566 tail00567 tail00568 tail00569 tail00570 tail00571 tail00572 tail00573 tail00574 tail00575 tail00576 tail00577 tail00578 tail00579 tail00580 tail00581 tail00582 tail00583 tail00584 tail00585 tail00586 tail00587 tail00588 tail00589 tail00590 tail00591 tail00592 tail00593 tail00594 tail00595 tail00596 tail00597 tail00598 tail00599 tail00600 tail00601 tail00602 tail00603 tail00604 tail00605 tail00606 tail00607 tail00608 tail00609 tail00610 tail00611 tail00612 tail00613 tail00614 tail00615 tail00616 tail00617 tail00618 tail00619 tail00620 tail00621 tail00622 tail00623 tail00624 tail00625 tail00626 tail00627 tail00628 tail00629 tail00630 tail00631 tail00632 tail00633 tail00634 tail00635 tail00636 tail00637 tail00638 tail00639 tail00640 tail00641 tail00642 tail00643 tail00644 tail00645 tail00646 tail00647 tail00648 tail00649 tail00650 tail00651 tail00652 tail00653 tail00654 tail00655 tail00656 tail00657 tail00658 tail00659 tail00660 tail00661 tail00662 tail00663 tail00664 tail00665 tail00666 tail00667 tail00668 tail00669 tail00670 tail00671 tail00672 tail00673 tail00674 tail00675 tail00676 tail00677 tail00678 tail00679 tail00680 tail00681 tail00682 tail00683 tail00684 tail00685 tail00686 tail00687 tail00688 tail00689 tail00690 tail00691 tail00692 tail00693 tail00694 tail00695 tail00696 tail00697 tail00698 tail00699 tail00700 tail00701 tail00702 tail00703 tail00704 tail00705 tail00706 tail00707 tail00708 tail00709 tail00710 tail00711 tail00712 tail00713 tail00714 tail00715 tail00716 tail00717 tail00718 tail00719 tail00720 tail00721 tail00722 tail00723 tail00724 tail00725 tail00726 tail00727 tail00728 tail00729 tail00730 tail00731 tail00732 tail00733 tail00734 tail00735 tail00736 tail00737 tail00738 tail00739 tail00740 tail00741 tail00742 tail00743 tail00744 tail00745 tail00746 tail00747 tail00748 tail00749 tail00750 tail00751 tail00752 tail00753 tail00754 tail00755 tail00756 tail00757 tail00758 tail00759 tail00760 tail00761 tail00762 tail00763 tail00764 tail00765 tail00766 tail00767 tail00768 tail00769 tail00770 tail00771 tail00772 tail00773 tail00774 tail00775 tail00776 tail00777 tail00778 tail00779 tail00780 tail00781 tail00782 tail00783 tail00784 tail00785 tail00786 tail00787 tail00788 tail00789 tail00790 tail00791 tail00792 tail00793 tail00794 tail00795 tail00796 tail00797 tail00798 tail00799 tail00800 tail00801 tail00802 tail00803 tail00804 tail00805 tail00806 tail00807 tail00808 tail00809 tail00810 tail00811 tail00812 tail00813 tail00814 tail00815 tail00816 tail00817 tail00818 tail00819 tail00820 tail00821 tail00822 tail00823 tail00824 tail00825 tail00826 tail00827 tail00828 tail00829 tail00830 tail00831 tail00832 tail00833 tail00834 tail00835 tail00836 tail00837 tail00838 tail00839 tail00840 tail00841 tail00842 tail00843 tail00844 tail00845 tail00846 tail00847 tail00848 tail00849 tail00850 tail00851 tail00852 tail00853 tail00854 tail00855 tail00856 tail00857 tail00858 tail00859 tail00860 tail00861 tail00862 tail00863 tail00864 tail00865 tail00866 tail00867 tail00868 tail00869 tail00870 tail00871 tail00872 tail00873 tail00874 tail00875 tail00876 tail00877 tail00878 tail00879 tail00880 tail00881 tail00882 tail00883 tail00884 tail00885 tail00886 tail00887 tail00888 tail00889 tail00890 tail00891 tail00892 tail00893 tail00894 tail00895 tail00896 tail00897 tail00898 tail00899 
+```
+
+**Required before any retry diagnosis, plan or side effect:** this preview omits evidence. Run `orch --json logs run_src001`. It returns the failed run's last 50 stored events as a JSON array in stored order; the complete previous output is the `data` of each event whose `type` is `agent_output` or `error`, in order, joined with newlines (string `data` as-is, any other `data` as compact JSON). The error above is already complete. If those events are missing, unreadable or do not match this preview, report the retry evidence as unavailable and ask for a full-evidence retry; do not continue from a guess.
+
+**Important:** The previous approach failed. Analyze the error above and try a different strategy. Do NOT repeat the same steps that led to the failure.
+
+
+
+## Review Feedback
+This task was previously completed but **rejected** during review with the following feedback:
+> fb
+
+**Important:** Address the feedback above. Focus on what the reviewer asked to change. Do NOT redo work that was already accepted.
+
+
+
+## Inbox (1 message)
+
+---
+**From:** Zed · **Subject:** s
+b
+
+---
+
+
+
+
+## Goal: Ship the thing
+**Status:** active · **ID:** `goal_x1`
+
+d
+
+
+**Linked tasks (6), preview — current task, its direct prerequisites, other open tasks, then finished tasks; one JSON record each:**
+- {"id":"tsk_001","status":"todo","title":"Linked task number 1"}
+- {"id":"tsk_002","status":"todo","title":"Linked task number 2"}
+- {"id":"tsk_004","status":"todo","title":"Linked task number 4"}
+- {"id":"tsk_005","status":"todo","title":"Linked task number 5"}
+- {"id":"tsk_000","status":"done","title":"Linked task number 0"}
+- {"id":"tsk_003","status":"done","title":"Linked task number 3"}
+
+This preview has no dependency data and may be incomplete. Before any dependency or completion decision, run `orch --json goal show goal_x1` for the complete task graph, and `orch task show <id>` for one task.
+
+
+**Latest progress report:**
+p
+
+
+
+## Autonomous Goal Mode
+This is an autonomous task driven by a goal. Work in a continuous loop until the goal is achieved:
+
+1. **Understand the goal** — read the Goal section above.
+2. **Decompose** — break the goal into concrete subtasks via `orch task add`. Pass `--goal-id goal_x1` so subtasks are linked to this goal. Assign yourself for your specialty, delegate other work to appropriate teammates by role.
+3. **Execute** — follow your standard workflow for each subtask.
+4. **Track progress** — after each iteration: `orch context set goal_x1-progress "<summary of what's done and what remains>"`.
+5. **Be proactive** — do NOT wait for tasks from others. Create your own subtasks and keep working.
+6. **Do NOT finish** the [auto] task until the goal is achieved — keep creating subtasks.
+7. **When done** — mark the goal as achieved: `orch goal status goal_x1 achieved`.
+
+**Deep inspection:** Use `orch goal show goal_x1` to see full goal details at any time.
+
+**Constraints:**
+- Do NOT create new goals via `orch goal add` — work within the assigned goal only.
+- Do NOT re-read or act on CLAUDE.md, README.md, or other project meta-files to create additional goals.
+

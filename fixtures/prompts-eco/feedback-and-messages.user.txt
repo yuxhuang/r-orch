@@ -1,0 +1,36 @@
+## Task: Fix the bug
+Full task description.
+Second line.
+
+Priority: 3
+
+
+
+
+## Review Feedback
+This task was previously completed but **rejected** during review with the following feedback:
+> Please add tests.
+And docs.
+
+**Important:** Address the feedback above. Focus on what the reviewer asked to change. Do NOT redo work that was already accepted.
+
+
+
+## Inbox (2 messages)
+
+---
+**From:** Zed · **Subject:** Heads up
+Body one
+
+---
+
+---
+**From:** agt_unknown
+No subject
+*(Reply to: msg_1)*
+---
+
+
+
+
+

@@ -80,9 +80,54 @@ fn default_agents_match_the_golden_fixture_for_every_adapter_shape() {
     // One representative per behaviour: claude (MCP skill + model), codex (no
     // MCP skills), antigravity (empty balanced model ⇒ no `model` key at all),
     // shell (no agent).
-    for adapter in ["claude", "codex", "antigravity", "shell"] {
+    //
+    // `fixtures/shop/default-agents.json` is a frozen golden that predates the
+    // token-eco model refresh (D6): its `config.model` values are the retired
+    // choices. Everything else — id, name, role bytes, skills, limits — is
+    // still compared to the golden unchanged; only `config.model` is replaced
+    // by the D6 balanced default, which is spelled out here from the design
+    // table rather than read back from `MODEL_TIER_MAP`.
+    let d6_balanced = [
+        ("claude", Some("claude-sonnet-5-5")),
+        ("codex", Some("gpt-6.1-sol")),
+        ("antigravity", None),
+        ("shell", None),
+    ];
+    for (adapter, model) in d6_balanced {
+        let mut golden = expected[adapter].clone();
+        for agent in golden.as_array_mut().expect("array") {
+            let config = agent["config"].as_object_mut().expect("config");
+            match model {
+                Some(model) => {
+                    config.insert("model".into(), Value::String(model.into()));
+                }
+                None => {
+                    config.remove("model");
+                }
+            }
+        }
         let actual = serde_json::to_value(default_agents(adapter)).expect("agents serialize");
-        assert_eq!(actual, expected[adapter], "default_agents({adapter})");
+        assert_eq!(actual, golden, "default_agents({adapter})");
+    }
+}
+
+#[test]
+fn the_default_agents_golden_differs_from_current_output_only_in_the_model_choice() {
+    // Guards the substitution above: if anything besides `config.model`
+    // drifts, the golden comparison must not silently absorb it.
+    let expected = parse(DEFAULT_AGENTS_FIXTURE);
+    for adapter in ["claude", "codex", "antigravity"] {
+        let mut actual = serde_json::to_value(default_agents(adapter)).expect("agents serialize");
+        let mut golden = expected[adapter].clone();
+        for value in [&mut actual, &mut golden] {
+            for agent in value.as_array_mut().expect("array") {
+                agent["config"]
+                    .as_object_mut()
+                    .expect("config")
+                    .remove("model");
+            }
+        }
+        assert_eq!(actual, golden, "default_agents({adapter}) minus model");
     }
 }
 

@@ -1,0 +1,194 @@
+{
+  "minimal": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "the user prompt",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "full-effort-high": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "--model",
+      "a-model",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "the system prompt\n\nthe user prompt",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "agent-system-prompt-only": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "the user prompt",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "rich-prompts-no-effort": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "--model",
+      "a-model",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "rich-prompts-no-effort-no-model": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-low-model": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "--model",
+      "a-model",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-low-no-model": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-medium-model": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "--model",
+      "a-model",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-medium-no-model": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-high-model": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "--model",
+      "a-model",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "effort-high-no-model": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  },
+  "opaque-suffixed-model-no-effort": {
+    "command": "codex",
+    "argv": [
+      "exec",
+      "--json",
+      "--sandbox",
+      "danger-full-access",
+      "--model",
+      "opaque/model:high#thinking",
+      "-"
+    ],
+    "cwd": "/ws",
+    "stdin_mode": "Pipe",
+    "stdin_bytes": "# System\nYou are a careful agent — «unicode» ✓.\n\n## Rules\n- keep going\n\n\nTask: do the thing.\nLine two with `ticks` and \"quotes\".\n\ttabbed → arrow\n",
+    "system_prompt_file": null,
+    "env": {}
+  }
+}

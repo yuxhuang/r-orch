@@ -17,6 +17,8 @@ command: agy
   argv[3]: "--dangerously-skip-permissions"
   argv[4]: "--model"
   argv[5]: "a-model"
+  argv[6]: "--effort"
+  argv[7]: "high"
 cwd: /ws
 stdin: Ignore
 

@@ -374,6 +374,8 @@ async fn the_agent_lifecycle_round_trips_and_parses_its_stringly_typed_fields() 
                     // Empty strings are absent.
                     command: Some(String::new()),
                     skills: Some(vec!["review".into()]),
+                    prompt_mode: None,
+                    role_summary: None,
                 },
             )
             .expect("add")
