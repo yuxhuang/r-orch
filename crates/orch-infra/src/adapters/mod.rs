@@ -15,6 +15,7 @@ pub mod buffer;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+mod effort;
 pub mod grok;
 pub mod opencode;
 pub mod pi;

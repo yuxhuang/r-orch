@@ -49,7 +49,8 @@ impl std::fmt::Debug for CodexAdapter {
     }
 }
 
-fn build_args(params: &ExecuteParams) -> Vec<String> {
+fn build_args(params: &ExecuteParams) -> Result<Vec<String>, AdapterError> {
+    let effort = super::effort::selection("codex", &params.config)?;
     let mut args = vec![
         "exec".to_owned(),
         "--json".to_owned(),
@@ -58,14 +59,15 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
         "danger-full-access".to_owned(),
     ];
 
-    if let Some(model) = &params.config.model {
+    if let Some(model) = &effort.model {
         args.push("--model".to_owned());
         args.push(model.clone());
     }
+    args.extend(effort.args);
 
     // Read the prompt from stdin.
     args.push("-".to_owned());
-    args
+    Ok(args)
 }
 
 /// A single write of the combined prompt with **no trailing newline**, then
@@ -352,7 +354,8 @@ impl Adapter for CodexAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let args = build_args(&params);
+        let effort = super::effort::selection("codex", &params.config)?;
+        let args = build_args(&params)?;
         let mut io = spawn_child(
             &self.process_manager,
             "codex",
@@ -381,7 +384,11 @@ impl Adapter for CodexAdapter {
             "Codex",
             params.cancel,
         );
-        Ok(ExecuteHandle { pid, events })
+        Ok(super::effort::with_diagnostics(
+            ExecuteHandle { pid, events },
+            effort.diagnostics,
+            self.clock.as_ref(),
+        ))
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

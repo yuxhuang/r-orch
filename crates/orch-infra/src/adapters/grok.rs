@@ -57,7 +57,8 @@ impl std::fmt::Debug for GrokAdapter {
     }
 }
 
-fn build_args(params: &ExecuteParams) -> Vec<String> {
+fn build_args(params: &ExecuteParams) -> Result<Vec<String>, AdapterError> {
+    let effort = super::effort::selection("grok", &params.config)?;
     let mut args = vec![
         // The prompt is argv[1], raw.
         "-p".to_owned(),
@@ -72,14 +73,11 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
         params.workspace.to_string_lossy().into_owned(),
     ];
 
-    if let Some(model) = &params.config.model {
+    if let Some(model) = &effort.model {
         args.push("--model".to_owned());
         args.push(model.clone());
     }
-    if let Some(effort) = params.config.effort {
-        args.push("--effort".to_owned());
-        args.push(effort.as_str().to_owned());
-    }
+    args.extend(effort.args);
     // Truthiness: `max_turns: 0` omits the flag.
     if let Some(max_turns) = params.config.max_turns.filter(|turns| *turns != 0) {
         args.push("--max-turns".to_owned());
@@ -94,7 +92,7 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
         args.push("--system-prompt-override".to_owned());
         args.push(system_prompt.to_owned());
     }
-    args
+    Ok(args)
 }
 
 /// Aggregated assistant text: `text_buffer` is the unflushed chunk,
@@ -285,7 +283,8 @@ impl Adapter for GrokAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let args = build_args(&params);
+        let effort = super::effort::selection("grok", &params.config)?;
+        let args = build_args(&params)?;
         let io = spawn_child(
             &self.process_manager,
             "grok",
@@ -302,7 +301,11 @@ impl Adapter for GrokAdapter {
 
         let pid = io.pid;
         let events = grok_events(io, Arc::clone(&self.clock), params.cancel);
-        Ok(ExecuteHandle { pid, events })
+        Ok(super::effort::with_diagnostics(
+            ExecuteHandle { pid, events },
+            effort.diagnostics,
+            self.clock.as_ref(),
+        ))
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

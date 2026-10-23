@@ -188,6 +188,15 @@ pub struct ExecuteParams {
     pub cancel: CancellationToken,
 }
 
+/// Invocation-local effort preparation; never persisted.
+#[derive(Debug, Clone)]
+pub struct EffortPreparation {
+    /// Only effort may change (cleared for legacy-ignore); all other fields stay identical.
+    pub config: AgentConfig,
+    /// Request-only and compatibility diagnostics for the pre-spawn run output.
+    pub diagnostics: Vec<String>,
+}
+
 /// Returned **synchronously** from [`Adapter::execute`]: the PID is available
 /// before any event is pulled, because the orchestrator must write
 /// `state.running` before it starts consuming the stream.
@@ -250,6 +259,18 @@ pub trait Adapter: Send + Sync {
     fn kind(&self) -> &'static str;
 
     async fn test(&self) -> AdapterTestResult;
+
+    /// Pre-spawn preparation, without model invocation or persistent changes.
+    /// Default: identity, no I/O and no diagnostics.
+    async fn prepare_effort(
+        &self,
+        params: &ExecuteParams,
+    ) -> std::result::Result<EffortPreparation, AdapterError> {
+        Ok(EffortPreparation {
+            config: params.config.clone(),
+            diagnostics: Vec::new(),
+        })
+    }
 
     /// **Not async**: `execute()` returns `{ pid, events }` synchronously.
     /// Lifecycle listeners (close, error, stderr) must be attached before the

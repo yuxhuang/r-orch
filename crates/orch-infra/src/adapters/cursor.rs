@@ -61,7 +61,8 @@ impl std::fmt::Debug for CursorAdapter {
 
 /// Cursor's print mode needs the prompt as a positional argument; unlike
 /// codex it cannot read it from stdin.
-fn build_args(params: &ExecuteParams) -> Vec<String> {
+fn build_args(params: &ExecuteParams) -> Result<Vec<String>, AdapterError> {
+    let effort = super::effort::selection("cursor", &params.config)?;
     let mut args = vec![
         "-p".to_owned(),
         "--output-format".to_owned(),
@@ -73,17 +74,18 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
         "--trust".to_owned(),
     ];
 
-    if let Some(model) = &params.config.model {
+    if let Some(model) = &effort.model {
         args.push("--model".to_owned());
         args.push(model.clone());
     }
+    args.extend(effort.args);
 
     // `config.system_prompt` is deliberately ignored here.
     args.push(build_full_prompt(
         params.system_prompt.as_deref(),
         &params.prompt,
     ));
-    args
+    Ok(args)
 }
 
 #[async_trait]
@@ -111,7 +113,8 @@ impl Adapter for CursorAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let args = build_args(&params);
+        let effort = super::effort::selection("cursor", &params.config)?;
+        let args = build_args(&params)?;
         let io = spawn_child(
             &self.process_manager,
             self.command(),
@@ -134,7 +137,11 @@ impl Adapter for CursorAdapter {
             "Cursor agent",
             params.cancel,
         );
-        Ok(ExecuteHandle { pid, events })
+        Ok(super::effort::with_diagnostics(
+            ExecuteHandle { pid, events },
+            effort.diagnostics,
+            self.clock.as_ref(),
+        ))
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

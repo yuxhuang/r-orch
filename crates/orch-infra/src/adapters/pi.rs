@@ -102,17 +102,15 @@ impl std::fmt::Debug for PiAdapter {
     }
 }
 
-fn build_args(params: &ExecuteParams) -> Vec<String> {
+fn build_args(params: &ExecuteParams) -> Result<Vec<String>, AdapterError> {
+    let effort = super::effort::selection("pi", &params.config)?;
     let mut args = vec!["--mode".to_owned(), "rpc".to_owned()];
 
-    if let Some(model) = &params.config.model {
+    if let Some(model) = &effort.model {
         args.push("--model".to_owned());
         args.push(model.clone());
     }
-    if let Some(effort) = params.config.effort {
-        args.push("--thinking".to_owned());
-        args.push(effort.as_str().to_owned());
-    }
+    args.extend(effort.args);
 
     // Pi's own coding-agent harness prompt is preserved: ORCH's system prompt
     // is *appended* as extra project/task governance, never `--system-prompt`.
@@ -124,7 +122,7 @@ fn build_args(params: &ExecuteParams) -> Vec<String> {
         args.push("--append-system-prompt".to_owned());
         args.push(system_prompt.to_owned());
     }
-    args
+    Ok(args)
 }
 
 /// The stdin handle, shared between the prompt writer and the event stream.
@@ -781,7 +779,8 @@ impl Adapter for PiAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let args = build_args(&params);
+        let effort = super::effort::selection("pi", &params.config)?;
+        let args = build_args(&params)?;
         let mut child = spawn_child(
             &self.process_manager,
             "pi",
@@ -809,7 +808,11 @@ impl Adapter for PiAdapter {
             Arc::clone(&self.clock),
             params.cancel,
         );
-        Ok(ExecuteHandle { pid, events })
+        Ok(super::effort::with_diagnostics(
+            ExecuteHandle { pid, events },
+            effort.diagnostics,
+            self.clock.as_ref(),
+        ))
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

@@ -232,8 +232,13 @@ impl Adapter for ShellAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
+        let effort = super::effort::selection("shell", &params.config)?;
         let Some(command) = params.config.command.clone() else {
-            return Ok(missing_command(self.clock.as_ref()));
+            return Ok(super::effort::with_diagnostics(
+                missing_command(self.clock.as_ref()),
+                effort.diagnostics,
+                self.clock.as_ref(),
+            ));
         };
 
         let mut env = params.env;
@@ -263,7 +268,11 @@ impl Adapter for ShellAdapter {
             Arc::clone(&self.clock),
             params.cancel,
         );
-        Ok(ExecuteHandle { pid, events })
+        Ok(super::effort::with_diagnostics(
+            ExecuteHandle { pid, events },
+            effort.diagnostics,
+            self.clock.as_ref(),
+        ))
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

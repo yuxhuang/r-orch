@@ -110,6 +110,9 @@ impl std::str::FromStr for ModelTier {
 
 /// Tier → model mapping per adapter.
 ///
+/// New selections only; never resolve or rewrite a saved model through this table.
+/// Evidence checked 2026-10-22 (token eco design D6 / provider CLI catalogs).
+///
 /// Conventions:
 /// - `shell`: `""` for all tiers (model irrelevant)
 /// - `opencode`: `""` for balanced (delegate to opencode's own config)
@@ -119,25 +122,25 @@ pub const MODEL_TIER_MAP: [(AdapterKind, [(ModelTier, &str); 3]); 8] = [
     (
         AdapterKind::Claude,
         [
-            (ModelTier::Capable, "claude-opus-4-6"),
-            (ModelTier::Balanced, "claude-sonnet-4-6"),
-            (ModelTier::Fast, "claude-haiku-4-6"),
+            (ModelTier::Capable, "claude-opus-5-5"),
+            (ModelTier::Balanced, "claude-sonnet-5-5"),
+            (ModelTier::Fast, "claude-haiku-5-5"),
         ],
     ),
     (
         AdapterKind::Opencode,
         [
-            (ModelTier::Capable, "openrouter/anthropic/claude-opus-4.6"),
+            (ModelTier::Capable, "openrouter/anthropic/claude-opus-5.5"),
             (ModelTier::Balanced, ""),
-            (ModelTier::Fast, "openrouter/google/gemini-2.5-flash"),
+            (ModelTier::Fast, "openrouter/google/gemini-3.8-flash"),
         ],
     ),
     (
         AdapterKind::Codex,
         [
-            (ModelTier::Capable, "gpt-5.4"),
-            (ModelTier::Balanced, "gpt-5.3-codex"),
-            (ModelTier::Fast, "gpt-5-mini"),
+            (ModelTier::Capable, "gpt-6-astra"),
+            (ModelTier::Balanced, "gpt-6.1-sol"),
+            (ModelTier::Fast, "gpt-6-luna"),
         ],
     ),
     (
@@ -151,25 +154,25 @@ pub const MODEL_TIER_MAP: [(AdapterKind, [(ModelTier, &str); 3]); 8] = [
     (
         AdapterKind::Pi,
         [
-            (ModelTier::Capable, "openai-codex/gpt-5.5"),
-            (ModelTier::Balanced, "openai-codex/gpt-5.5"),
-            (ModelTier::Fast, "openai-codex/gpt-5.5"),
+            (ModelTier::Capable, "openai-codex/gpt-6-astra"),
+            (ModelTier::Balanced, "openai-codex/gpt-6.1-sol"),
+            (ModelTier::Fast, "openai-codex/gpt-6-luna"),
         ],
     ),
     (
         AdapterKind::Grok,
         [
             (ModelTier::Capable, "grok-build"),
-            (ModelTier::Balanced, "grok-composer-2.5-fast"),
-            (ModelTier::Fast, "grok-composer-2.5-fast"),
+            (ModelTier::Balanced, ""),
+            (ModelTier::Fast, ""),
         ],
     ),
     (
         AdapterKind::Antigravity,
         [
-            (ModelTier::Capable, "gemini-3-pro"),
+            (ModelTier::Capable, "gemini-4-argon"),
             (ModelTier::Balanced, ""),
-            (ModelTier::Fast, "gemini-3-flash"),
+            (ModelTier::Fast, "gemini-3.8-flash"),
         ],
     ),
     (
@@ -224,16 +227,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn static_choices_match_the_dated_catalog_for_all_tiers() {
+        for (kind, expected) in [
+            (
+                "claude",
+                ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+            ),
+            ("codex", ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"]),
+            (
+                "opencode",
+                [
+                    "openrouter/anthropic/claude-opus-5.5",
+                    "",
+                    "openrouter/google/gemini-3.8-flash",
+                ],
+            ),
+            (
+                "pi",
+                [
+                    "openai-codex/gpt-6-astra",
+                    "openai-codex/gpt-6.1-sol",
+                    "openai-codex/gpt-6-luna",
+                ],
+            ),
+            ("grok", ["grok-build", "", ""]),
+            ("antigravity", ["gemini-4-argon", "", "gemini-3.8-flash"]),
+            ("cursor", ["auto", "auto", "auto"]),
+            ("shell", ["", "", ""]),
+        ] {
+            assert_eq!(
+                ModelTier::ALL.map(|tier| resolve_model(kind, tier)),
+                expected,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
     fn claude_tiers() {
         assert_eq!(
             resolve_model("claude", ModelTier::Capable),
-            "claude-opus-4-6"
+            "claude-opus-5-5"
         );
         assert_eq!(
             resolve_model("claude", ModelTier::Balanced),
-            "claude-sonnet-4-6"
+            "claude-sonnet-5-5"
         );
-        assert_eq!(resolve_model("claude", ModelTier::Fast), "claude-haiku-4-6");
+        assert_eq!(resolve_model("claude", ModelTier::Fast), "claude-haiku-5-5");
     }
 
     #[test]
@@ -244,20 +284,17 @@ mod tests {
 
     #[test]
     fn codex_tiers() {
-        assert_eq!(resolve_model("codex", ModelTier::Capable), "gpt-5.4");
-        assert_eq!(resolve_model("codex", ModelTier::Balanced), "gpt-5.3-codex");
+        assert_eq!(resolve_model("codex", ModelTier::Capable), "gpt-6-astra");
+        assert_eq!(resolve_model("codex", ModelTier::Balanced), "gpt-6.1-sol");
     }
 
     #[test]
     fn pi_grok_and_antigravity_balanced() {
         assert_eq!(
             resolve_model("pi", ModelTier::Balanced),
-            "openai-codex/gpt-5.5"
+            "openai-codex/gpt-6.1-sol"
         );
-        assert_eq!(
-            resolve_model("grok", ModelTier::Balanced),
-            "grok-composer-2.5-fast"
-        );
+        assert_eq!(resolve_model("grok", ModelTier::Balanced), "");
         assert_eq!(resolve_model("antigravity", ModelTier::Balanced), "");
     }
 
@@ -284,10 +321,10 @@ mod tests {
 
     #[test]
     fn default_model_is_the_balanced_tier() {
-        assert_eq!(default_model_for_adapter("claude"), "claude-sonnet-4-6");
-        assert_eq!(default_model_for_adapter("codex"), "gpt-5.3-codex");
-        assert_eq!(default_model_for_adapter("pi"), "openai-codex/gpt-5.5");
-        assert_eq!(default_model_for_adapter("grok"), "grok-composer-2.5-fast");
+        assert_eq!(default_model_for_adapter("claude"), "claude-sonnet-5-5");
+        assert_eq!(default_model_for_adapter("codex"), "gpt-6.1-sol");
+        assert_eq!(default_model_for_adapter("pi"), "openai-codex/gpt-6.1-sol");
+        assert_eq!(default_model_for_adapter("grok"), "");
         assert_eq!(default_model_for_adapter("antigravity"), "");
         assert_eq!(default_model_for_adapter("shell"), "");
     }

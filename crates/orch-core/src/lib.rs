@@ -33,7 +33,7 @@ pub mod test_support;
 
 pub use adapter::{
     Adapter, AdapterError, AdapterRegistry, AdapterTestResult, AgentEvent, AgentEventKind,
-    ExecuteHandle, ExecuteParams,
+    EffortPreparation, ExecuteHandle, ExecuteParams,
 };
 pub use clock::Clock;
 pub use error::{Error, Result};
