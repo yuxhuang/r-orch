@@ -159,6 +159,16 @@ Each line is a JSON object, so tools such as `jq` can read it. For people, use `
 23:07:26.178 INFO  agent:started  agentId=agt_3cU5sQA taskId=tsk_wNh-4LS runId=run_VO8Qay2
 ```
 
+Right after `serve:started`, and before it starts any work, `serve` logs one `serve:diagnostic` warning for each
+agent with an effort warning ([Effort warnings](16-eco-mode-and-effort.md#effort-warnings)):
+
+```text
+01:47:30.870 WARN  serve:diagnostic  agentId=agt_CxeaEuR agentName=cx-nomodel message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
+```
+
+In JSON the fields are `agentId`, `agentName` and `message`. If `serve` cannot read the agents to check them, it
+logs one `serve:diagnostics_unavailable` warning with an `error` field and carries on.
+
 | Option | What it does | Default |
 |---|---|---|
 | `--once` | Processes the `todo` tasks, then exits when all tasks are final. | Off |

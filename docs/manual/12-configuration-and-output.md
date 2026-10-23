@@ -124,13 +124,14 @@ See [Update definitions from files](#update-definitions-from-files).
 | `defaults.agent.timeout_ms` | The timeout a new agent gets, in milliseconds. orch stores it but does not enforce it. | `3600000` |
 | `defaults.agent.stall_timeout_ms` | How long a run may produce no output before orch stops it, in milliseconds. Applies while the orchestrator loop runs. | `600000` |
 | `defaults.agent.workspace_mode` | The workspace mode when neither the task nor the agent sets one: `shared`, `worktree` or `isolated`. | `worktree` |
+| `defaults.agent.prompt_mode` | The prompt mode for agents that have no `config.prompt_mode` of their own: `normal` or `eco`. Read again at every run. See [Eco mode](16-eco-mode-and-effort.md). | `normal`, or `--prompt-mode` on `orch init` |
 | `defaults.task.max_attempts` | The attempt limit a new task gets. | `3` |
 | `defaults.task.priority` | Stored, but not used in orch 0.9.3: `orch task add` gives a new task priority 3 unless you pass `-p`. | `3` |
 | `scheduling.poll_interval_ms` | How often the orchestrator checks the project, in milliseconds. | `10000` |
 | `scheduling.max_concurrent_agents` | How many local runs may go at the same time. Remote runs do not count. | `6` |
 | `scheduling.retry_base_delay_ms` | The wait before the first retry of a failed task. Each later retry doubles it. | `10000` |
 | `scheduling.retry_max_delay_ms` | The longest wait between retries. | `300000` |
-| `prompt.template` | Optional. The text of one prompt template for the whole prompt. When set, `system_template` and `user_template` are ignored. | Built-in prompt |
+| `prompt.template` | Optional. The text of one prompt template for the whole prompt. When set, `system_template` and `user_template` are ignored. None of the three can be set while any agent uses eco mode ([why](16-eco-mode-and-effort.md#eco-mode-and-custom-templates)). | Built-in prompt |
 | `prompt.system_template` | Optional. The text of the system prompt template. | Built-in prompt |
 | `prompt.user_template` | Optional. The text of the task prompt template. | Built-in prompt |
 | `peer.name` | The name this installation announces to other machines. See [Remote agents](11-remote-agents.md). | The short host name |
@@ -143,10 +144,15 @@ Things to know:
   into the new task. Changing a default later does not change existing agents and tasks. Change
   those with [`orch agent edit`](03-agents.md) or [`orch task edit`](04-tasks.md).
 - **`workspace_mode` is read when a run starts.** A task's own mode wins, then the agent's, then this default.
+- **`prompt_mode` is read when a run starts, too.** An agent's own `config.prompt_mode` wins over this default,
+  and `orch agent add` does not copy the default into the agent. A change reaches the next run in every orch
+  process on the project.
 - **Retry delays double.** With the defaults, retries wait 10, 20, 40, 80, 160 seconds, then 300 seconds each.
 - **Prompt templates are advanced.** Leave `prompt` unset unless you need to change what agents are told.
-- **`orch init` can change two defaults.** With `--adapter`, it sets `defaults.agent.adapter`. If git is not
-  available, it sets `defaults.agent.workspace_mode` to `shared`.
+- **`orch init` can change three defaults.** With `--adapter`, it sets `defaults.agent.adapter`; with
+  `--prompt-mode`, `defaults.agent.prompt_mode`. If git is not available, it sets
+  `defaults.agent.workspace_mode` to `shared`. A project made by an older orch gets `prompt_mode: normal`
+  written into `config.yml` by the first `orch config set`.
 - **Unknown keys are kept.** You can add your own keys to `config.yml`. orch leaves them alone.
 
 The dashboard can also change `scheduling.max_concurrent_agents`. See [Dashboard](08-dashboard.md).
@@ -369,7 +375,7 @@ This removes `project.description` and prints the saved configuration as YAML.
 
 | Definition | You can write | You cannot write |
 |---|---|---|
-| Agent | `name`, `adapter`, `role`, and in `config`: `command`, `model`, `effort`, `approval_policy`, `max_turns`, `timeout_ms`, `stall_timeout_ms`, `env`, `system_prompt`, `workspace_mode`, `skills` | `id`, `status`, `stats`, `capabilities`, `current_task`, `last_error`, `autonomous`, `remote` |
+| Agent | `name`, `adapter`, `role`, and in `config`: `command`, `model`, `effort`, `approval_policy`, `max_turns`, `timeout_ms`, `stall_timeout_ms`, `env`, `system_prompt`, `workspace_mode`, `skills`, `prompt_mode`, `role_summary` | `id`, `status`, `stats`, `capabilities`, `current_task`, `last_error`, `autonomous`, `remote` |
 | Task | `title`, `description`, `priority` (1 to 4), `labels` | `id`, `status`, `assignee`, `depends_on`, timestamps, `attempts`, `max_attempts`, `scope`, `attachments` |
 | Project configuration | The whole `config.yml` object | Global settings |
 

@@ -81,7 +81,7 @@ listen off · controller none
 
 | Part | What it shows |
 |---|---|
-| Header | The version, the project name, the four view tabs, and a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`. |
+| Header | The version, the project name, the four view tabs, a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`, and the project prompt mode, `Prompt: normal` or `Prompt: eco` (see [Switch the prompt mode](#switch-the-prompt-mode)). |
 | Second header line | The peer listen address, the connected controller and each remote's online state. See [Remote agents](11-remote-agents.md). |
 | Status counts | One chip for each task status that has tasks, except cancelled, such as `○ TODO 2`, and a `TEAMS` chip with the number of teams. |
 | Main list | The list for the current view: a column header row (the sort column is marked `↑` or `↓`), the rows, and a `+ add …` row at the end. In a new project a hint under the list suggests the next step, such as `◆ Press R to run task`. |
@@ -345,7 +345,7 @@ Wizards are step-by-step forms. Each one shows its title and a step counter, for
 | Wizard | Open it with | Steps |
 |---|---|---|
 | New Task | `N` in Tasks, `/task add`, or the `+ add task...` row | Title, priority, assignee, description |
-| New Agent | `N` in Agents, `/agent add`, or the `+ add agent...` row | Name, provider (adapter), command (shell only), model, reasoning effort, role, skills, team |
+| New Agent | `N` in Agents, `/agent add`, or the `+ add agent...` row | Name, provider (adapter), command (shell only), model, reasoning effort, prompt mode, role, role summary, skills, approval policy, team |
 | New Goal | `N` in Goals, `/goal add` | Title, assignee, description |
 | New Team | `/team create` | Name, lead, members, description |
 | Edit Task, Agent or Goal | `E` on the selected item | The same steps, filled in |
@@ -457,6 +457,21 @@ The commands do the same as their CLI counterparts: see [Tasks](04-tasks.md), [A
 | `/config max-concurrent` | How many agents may run at the same time (choose from 1, 2, 3, 4, 6, 8 or 10). |
 | `/config notifications-toast` | Turns toast notifications on or off. |
 | `/config notifications-bell` | Turns the completion bell on or off. |
+| `/config prompt-mode` | The project prompt mode, `normal` or `eco`, like `F3`. |
+
+### Switch the prompt mode
+
+Press `F3` to switch the project's prompt mode between `normal` and `eco` ([Eco mode](16-eco-mode-and-effort.md)). It works only on the main screen, with no help, picker, viewer, wizard or command bar open. orch writes `defaults.agent.prompt_mode` and shows:
+
+```text
+ ✓ Project prompt mode: eco next dispatch; agent overrides retained
+```
+
+The header then reads `Prompt: eco`. While the change is being written the header shows `…` after the mode, and another `F3` is refused. The change applies from the next run that starts, in this dashboard and in any other orch process on the project; runs already going keep their mode, and agents with their own prompt mode keep it. `F3` does not stop agents, change models or effort, or touch watch mode.
+
+If the write fails, the mode stays as it was, and a toast and the Activity feed say why, for example `✕ Prompt mode unchanged: write …/.orchestry/.config.yml.<random>.tmp`. Switching to eco is refused, with the agents named, while a custom prompt template is set ([Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates)).
+
+An agent's detail shows the mode its next run uses, for example `prompt   eco (inherits project)` or `normal (agent override)`, and its requested effort, for example `effort   high (requested)`. Effort warnings for your agents appear in the Activity feed when the dashboard starts.
 
 ## Message an agent
 
@@ -574,6 +589,7 @@ You can use these keys in every state. `F6` is not here: it works only in the vi
 | `Ctrl+K` | Filter the Goals, Tasks or Agents list by keyword (main list focus). |
 | `Ctrl+U` | Clear that list's keyword (main list focus). |
 | `?` | Open help. |
+| `F3` | Switch the project prompt mode between `normal` and `eco` (no overlay, picker, viewer, wizard or command bar open). See [Switch the prompt mode](#switch-the-prompt-mode). |
 | `q` | Quit. |
 | `Ctrl+Y` | Copy the focused text. |
 | `Ctrl+Alt+C` | Copy the focused text through the terminal route. |

@@ -32,6 +32,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `orch --json doctor` or `--yaml doctor` output will not parse | [Structured output for `doctor`, `logs --follow` and `serve`](#structured-output-for-doctor-logs---follow-and-serve) |
 | `update`/`patch` fails with `mutation lock timed out`, `read mutation input` or a `<stdin>:` error | [File mutations: update and patch failures](#file-mutations-update-and-patch-failures) |
 | `org deploy` failed half way, or a template will not load or change | [Organization templates: failures and recovery](#organization-templates-failures-and-recovery) |
+| A run fails before start with `effort preparation failed`, `configuration preflight` or the eco/custom-template message | [Prompt mode and effort failures](#prompt-mode-and-effort-failures) |
 
 ---
 
@@ -717,6 +718,29 @@ definition unchanged, because parsing, merging and validation finish before anyt
 Mutations cannot interlock with `edit`, `agent add`, a running orchestrator or the dashboard: those keep
 last-writer-wins behaviour. For bulk changes, stop the runner and use one writer. To roll back, run `update` with
 the definition you saved earlier (`orch --yaml agent show <id> > before.yaml`).
+
+## Prompt mode and effort failures
+
+Applies to the eco prompt mode and effort validation ([manual](manual/16-eco-mode-and-effort.md)). Each of these
+fails one run before the tool starts, through the normal failed-run path (the agent goes back to idle, the task
+retries with its usual backoff), or refuses a write and leaves the files unchanged.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Run fails: `configuration preflight: cannot read defaults.agent.prompt_mode: …` | The project config could not be read or parsed when the run started. orch reads only the prompt mode again per run; other settings come from start-up. | Repair `.orchestry/config.yml`; the next attempt reads it again. |
+| Run fails: `eco prompt mode is incompatible with custom templates (…)` | A hand-edited file combines eco with a custom prompt template. | Set the listed agents to `prompt_mode: normal`, or remove the template. |
+| Run fails: `effort preparation failed: … the installed opencode did not prove provider/model#variant support …` | OpenCode agent with an effort newer than 0.9.4's, and the `opencode` on `PATH` is not version 2 (or the check timed out after 2 s or produced more than 64 KiB). | Install OpenCode 2, or `orch agent update <id> --effort default`. A stored `low`/`medium`/`high` never fails this way: it is dropped with a `legacy-ignored` warning. |
+| `legacy-ignored`, `capability-unknown` and other effort warnings at `orch run` start, or `serve:diagnostic` records in the `serve` log | Stored efforts that this adapter or model cannot take, or that orch cannot check. Not an error. | Review with `orch agent list`; clear with `--effort default` or set a model. |
+| v0.9.4 fails every agent command with `parse …/agents/agt_….yml` | A newer effort value in that file. | Clear it with the newer binary, or restore the file from a backup. Do not hand-map `max`/`ultra` to `high`. |
+
+The OpenCode check runs `opencode --version` and `opencode run --help` in the agent's workspace with the agent's
+environment; on a timeout or too much output orch kills the process group. Its diagnostics name a fixed reason,
+never the tool's output. A binary replaced between the check and the run is not detected; pin the installed
+version if that matters.
+
+To turn eco off everywhere: `orch config set defaults.agent.prompt_mode normal`, then
+`orch agent update <id> --prompt-mode inherit` for agents with their own eco setting. It applies from the next
+run; nothing needs restarting.
 
 ## Organization templates: failures and recovery
 
