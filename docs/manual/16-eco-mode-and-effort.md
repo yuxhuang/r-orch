@@ -298,8 +298,9 @@ orch prints effort warnings when you add or change an agent, under `orch agent l
 when `orch run` (with a task ID, `--all` or `--watch`) and the dashboard start. They go to standard error, so
 `--json` output stays clean. `orch serve` writes them to its log instead, as one `serve:diagnostic` warning per
 agent right after `serve:started`, with the fields `agentId`, `agentName` and `message`
-([Run orch without a terminal](07-running-and-monitoring.md#run-orch-without-a-terminal)). Each run reports its
-agent's warnings again when it starts ([Warnings when a run starts](#warnings-when-a-run-starts)).
+([Run orch without a terminal](07-running-and-monitoring.md#run-orch-without-a-terminal)). When a run starts,
+orch reports every effort note for that run again, including a `request-only` note that is not a warning
+([Warnings when a run starts](#warnings-when-a-run-starts)).
 
 Each warning starts with a status:
 
@@ -323,20 +324,47 @@ different model than it did with orch 0.9.4, which passed no effort. Set an expl
 
 ### Warnings when a run starts
 
-When orch starts a run for an agent with an effort warning, it reports that warning once more, just before the
-model starts, with the context `effort preparation for run <run-id> (agent <agent-id>)`. Only these show it:
+When orch starts a run for an agent with a stored effort, it reports each effort note for that run, one record
+per note, just before the model starts, with the context `effort preparation for run <run-id> (agent <agent-id>)`.
+Only these show them:
 
-- `orch serve`: a `warn` record with the event `orchestrator:error`, whose fields are `error` (the warning),
+- `orch serve`: a `warn` record with the event `orchestrator:error`, whose fields are `error` (the note),
   `context` and `fatal: false`. `--verbose` is not needed.
-- `orch run --watch`: a `⚠ <context>: <warning>` line.
+- `orch run --watch`: a `⚠ <context>: <note>` line.
 
-`orch run <task-id>` and the dashboard show only their start-up warnings. The warning is never part
-of the agent's output: it is not in the run's events (`orch logs <run-id>`), the run's result, or the previous
+The notes are the agent's start-up warnings plus, whenever orch sends the effort, the note that `orch agent show`
+prints as plain text under the agent's details (`Effort requests the provider's native reasoning selector; …`).
+In a run-start record it reads:
+
+```text
+request-only: Effort requests the provider's native reasoning selector; the provider decides the effective level and may clamp, override or reject it.
+```
+
+This note is not a warning and needs no action. So an agent whose effort is sent gets at least one record on
+every run, even with no start-up warning, and some get several: a Codex agent with no model gets two (the note
+and `capability-unknown`), a Pi agent whose model has a `:level` suffix gets three. An effort that orch drops
+gets only its `legacy-ignored` warning. A Claude agent with `--model claude-sonnet-5-5 --effort high` has no
+start-up warning; one of its runs under `orch serve --once --log-format text`:
+
+```text
+02:18:30.476 WARN  orchestrator:error  error=request-only: Effort requests the provider's native reasoning selector; the provider decides the effective level and may clamp, override or reject it. context=effort preparation for run run_8OX2daJ (agent agt_UjlvB0t) fatal=false
+02:18:30.528 INFO  agent:started  agentId=agt_UjlvB0t taskId=tsk_nK1_Sz3 runId=run_8OX2daJ
+```
+
+and under `orch run --watch`:
+
+```text
+  22:18  ⚠ effort preparation for run run_O8iPA4G (agent agt_UjlvB0t): request-only: Effort requests the provider's native reasoning selector; the provider decides the effective level and may clamp, override or reject it.
+```
+
+`orch run <task-id>` and the dashboard show only their start-up warnings. These notes are never part
+of the agent's output: they are not in the run's events (`orch logs <run-id>`), the run's result, or the previous
 output a retry passes to the agent.
 
-The run-start check can find more than the start-up list. For OpenCode it also runs the version check, so an
-OpenCode 1 installation turns a `local-override-possible` start-up warning into a `legacy-ignored` one for the
-run. A shell agent with an effort edited in by hand, and the OpenCode 1.4.0 stand-in from
+For OpenCode the run-start notes also reflect the version check. On OpenCode 2 a run reports the `request-only`
+note and `local-override-possible`. An OpenCode 1 installation turns the `local-override-possible` start-up
+warning into a single `legacy-ignored` one for the run, because the effort is dropped.
+A shell agent with an effort edited in by hand, and the OpenCode 1.4.0 stand-in from
 [OpenCode checks the installed version first](#opencode-checks-the-installed-version-first), under
 `orch serve --once --log-format text`:
 

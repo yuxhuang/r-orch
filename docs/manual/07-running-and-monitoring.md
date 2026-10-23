@@ -167,10 +167,11 @@ agent with an effort warning ([Effort warnings](16-eco-mode-and-effort.md#effort
 ```
 
 In JSON the fields are `agentId`, `agentName` and `message`. If `serve` cannot read the agents to check them, it
-logs one `serve:diagnostics_unavailable` warning with an `error` field and carries on. When a run starts, its
-agent's effort warning is logged again, as an `orchestrator:error` warning with `fatal=false` and the context
-`effort preparation for run <run-id> (agent <agent-id>)`
-([Warnings when a run starts](16-eco-mode-and-effort.md#warnings-when-a-run-starts)).
+logs one `serve:diagnostics_unavailable` warning with an `error` field and carries on. When a run starts
+for an agent with an effort, each effort note for that run is logged as an `orchestrator:error` warning with
+`fatal=false` and the context `effort preparation for run <run-id> (agent <agent-id>)`. Whenever the effort
+is sent, the notes include the informational `request-only` note, so such an agent logs at least one of these
+records on every run, even with no start-up warning ([Warnings when a run starts](16-eco-mode-and-effort.md#warnings-when-a-run-starts)).
 
 | Option | What it does | Default |
 |---|---|---|

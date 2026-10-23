@@ -111,7 +111,7 @@ slices share one compile dependency chain (B1 → B4), and the workspace does no
 | B4 | implemented, `7f96bdd`; CLI and TUI lib tests pass on macOS; `orch serve` start-up diagnostics `784169c`, record fields renamed `agentId`/`agentName` in `3b03c62` |
 | T1 | in progress |
 | W | committed with this plan; examples re-run on `3b03c62` in disposable projects |
-| F1 | implemented: effort diagnostics left the agent-output stream (lead ruling 8); adapters `72125b1`, engine `6ae9839` (one non-fatal `orchestrator:error` per run before spawn); manual and spec updated in the W follow-up |
+| F1 | implemented: effort diagnostics left the agent-output stream (lead ruling 8); adapters `72125b1`, engine `6ae9839` (before spawn, one non-fatal `orchestrator:error` per effort diagnostic of the run, including the informational `request-only` note); manual and spec updated in the W follow-up |
 | I, P, E | pending |
 
 ## Test plan
