@@ -1342,6 +1342,58 @@ async fn a_dispatch_that_cannot_take_the_lock_fails_the_call_with_the_holders_pi
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn in_observer_mode_a_cancel_reaches_the_store_while_the_lock_is_held() {
+    let (temp, engine) = project().await;
+    // Another process (`serve`, `run --watch`) owns the orchestrator.
+    let held = orch_engine::FileLock::new(engine.paths.lock_path());
+    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
+
+    let backend = launch(Arc::clone(&engine)).await;
+    assert!(backend.context().observer_mode);
+
+    let (backend, ids) = on_draw_thread(backend, |backend| {
+        ["Queued", "Running"].map(|title| {
+            backend
+                .create_task(title, CreateTaskOpts::default())
+                .expect("create")
+                .id
+        })
+    })
+    .await;
+    let [todo, running] = ids;
+    // Dispatched by the owner, which is the case that has a child to stop.
+    engine
+        .task_service
+        .update_status(&running, TaskStatus::InProgress)
+        .await
+        .expect("to in_progress");
+
+    // The owner's reconcile stops the run of a task it finds terminal, so the
+    // dashboard only has to cancel it in the store. Taking the lock itself
+    // would fail with "Orchestrator already running".
+    let ids = [todo.clone(), running.clone()];
+    let (_backend, results) = on_draw_thread(backend, move |backend| {
+        ids.map(|id| backend.cancel_task(&id))
+    })
+    .await;
+    for result in results {
+        result.expect("cancel while another process holds the lock");
+    }
+    for id in [&todo, &running] {
+        assert_eq!(
+            engine.task_service.get(id).await.expect("read").status,
+            TaskStatus::Cancelled,
+            "{id}"
+        );
+    }
+    // Still the other process's lock: the fallback must not have taken it.
+    assert!(!engine.orchestrator.is_owner());
+
+    orch_engine::ProjectLock::release(&held).await;
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn in_observer_mode_a_refresh_sees_another_process_writing_state() {
     let (temp, engine) = project().await;
     // Another process owns the orchestrator and the lock.
