@@ -171,11 +171,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             return;
         }
 
-        // 1. Help overlay: `?`, `Esc` and F1 are swallowed; anything else
-        //    dismisses the overlay *and* performs its normal action.
+        // 1. Help overlay: `?`, `Esc`, F1 and F3 are swallowed; anything
+        //    else dismisses the overlay *and* performs its normal action. F3
+        //    is swallowed because it writes project config: a key pressed to
+        //    leave help must never switch the prompt mode (design D1).
         if self.state.show_help {
             self.state.show_help = false;
-            if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1)) {
+            if matches!(
+                key.code,
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1) | KeyCode::F(3)
+            ) {
                 return;
             }
         }
@@ -231,6 +236,19 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     fn handle_normal_key(&mut self, key: KeyEvent) {
         let view = self.state.view;
         let detail_open = self.state.detail_open();
+
+        // `F3` switches the project prompt mode normal ↔ eco (design D1). It
+        // is reached only from ordinary navigation — every overlay, picker,
+        // viewer, wizard and input mode returned above — and only unmodified.
+        // The guard below repeats those conditions so a future stage
+        // reordering cannot turn it into a config write from inside a modal
+        // surface. Key repeat never reaches here (press-only, `runner.rs`).
+        if key.code == KeyCode::F(3) {
+            if key.modifiers.is_empty() && self.prompt_mode_key_allowed() {
+                self.request_prompt_mode(None);
+            }
+            return;
+        }
 
         if self.copy_focused_key(key) {
             return;
@@ -2164,6 +2182,19 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 .state
                 .selected_task()
                 .is_some_and(|t| t.status == TaskStatus::Review)
+    }
+
+    /// Whether `F3` may write: ordinary navigation only. Pending writes are
+    /// refused, visibly, by [`App::request_prompt_mode`].
+    pub(crate) fn prompt_mode_key_allowed(&self) -> bool {
+        let state = &self.state;
+        !state.show_help
+            && !state.show_agent_picker
+            && !state.show_type_picker
+            && state.viewer.is_none()
+            && state.wizard.is_none()
+            && state.wizard_sessions.pending_leave.is_none()
+            && state.input_mode == InputMode::None
     }
 
     /// Emit a refusal message in the shared style.

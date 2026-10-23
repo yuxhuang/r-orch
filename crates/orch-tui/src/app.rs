@@ -71,6 +71,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             palette: Palette::new(context.initial_palette),
             notifications: context.initial_notifications,
             max_concurrent: context.initial_max_concurrent,
+            prompt_mode: context.initial_prompt_mode,
             watch_active: context.initial_watch_active,
             observer_mode: context.observer_mode,
             activity_filter: crate::messages::preset_types(&context.initial_activity_filter),
@@ -138,6 +139,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 MsgType::Error,
             );
         }
+        // Read-only configuration diagnostics, one line per affected agent,
+        // before anything is dispatched from this dashboard.
+        for warning in app.backend.context().startup_warnings {
+            app.emit(&format!("⚠ {warning}"), Token::Yellow, MsgType::System);
+        }
         app
     }
 
@@ -191,6 +197,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         if let Some(catalog) = self.backend.poll_model_catalog() {
             self.model_catalog = catalog;
             self.refresh_open_agent_wizard();
+        }
+        if let Some(result) = self.backend.poll_prompt_mode() {
+            self.finish_prompt_mode_change(result);
         }
         if let Some(version) = self.backend.poll_update() {
             if self.state.latest_version.is_none() && !self.state.install_started {
@@ -471,6 +480,13 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
         if include_teams && let Ok(teams) = self.backend.list_teams() {
             self.state.teams = teams;
+        }
+        // While a write is in flight its outcome decides the header; a read
+        // racing it could show the old value after the new one.
+        if !self.state.prompt_mode_pending
+            && let Ok(mode) = self.backend.project_prompt_mode()
+        {
+            self.state.prompt_mode = mode;
         }
         // State is always committed.
         let state_read = match self.backend.refresh_state() {
@@ -774,6 +790,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     }
 
     pub fn open_config_wizard(&mut self, setting: &str) {
+        if setting == "prompt-mode" {
+            let wizard = configs::prompt_mode_wizard(self.state.prompt_mode);
+            self.open_wizard(wizard);
+            return;
+        }
         if !matches!(
             setting,
             "palette"
@@ -1335,6 +1356,30 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                     .save_max_concurrent(parsed)
                     .map(|()| self.state.max_concurrent = parsed)
             }
+            "prompt-mode" => {
+                let Some(mode) = values
+                    .get("prompt_mode")
+                    .and_then(|v| v.parse::<orch_domain::PromptMode>().ok())
+                else {
+                    return self.submission_failed("Invalid prompt mode");
+                };
+                if self.state.prompt_mode_pending {
+                    return self.submission_failed("Prompt mode change already in progress");
+                }
+                // Asynchronous: the outcome is reported when it arrives, not
+                // as "Settings saved" here. A refused request keeps the
+                // wizard open with the reason.
+                if let Err(error) = self.backend.request_prompt_mode(Some(mode)) {
+                    return self.submission_failed(&error);
+                }
+                self.state.prompt_mode_pending = true;
+                self.emit(
+                    &format!("Switching project prompt mode to {mode}…"),
+                    Token::Amber,
+                    MsgType::System,
+                );
+                return SubmitOutcome::Committed;
+            }
             "notifications-toast" | "notifications-bell" => {
                 let field = if setting == "notifications-toast" {
                     "notifications_toast"
@@ -1379,6 +1424,71 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     pub fn fail(&mut self, err: &str) {
         let text = format!("Failed: {err}");
         self.emit(&text, Token::Red, MsgType::Error);
+    }
+
+    // ── Project prompt mode ────────────────────────────────────────────────
+
+    /// Start a project prompt-mode write: `None` toggles (`F3`), `Some` sets
+    /// (the settings action). Refused while another write is pending. The
+    /// header keeps the stored value until the outcome arrives, so nothing on
+    /// screen claims a change that has not been written.
+    pub fn request_prompt_mode(&mut self, target: Option<orch_domain::PromptMode>) {
+        if self.state.prompt_mode_pending {
+            self.refuse("Prompt mode change already in progress");
+            return;
+        }
+        match self.backend.request_prompt_mode(target) {
+            Ok(()) => {
+                self.state.prompt_mode_pending = true;
+                let next = target.unwrap_or_else(|| self.state.prompt_mode.toggled());
+                self.emit(
+                    &format!("Switching project prompt mode to {next}…"),
+                    Token::Amber,
+                    MsgType::System,
+                );
+            }
+            Err(err) => self.prompt_mode_failed(&err),
+        }
+    }
+
+    fn finish_prompt_mode_change(
+        &mut self,
+        result: crate::backend::BackendResult<orch_domain::PromptMode>,
+    ) {
+        self.state.prompt_mode_pending = false;
+        match result {
+            Ok(mode) => {
+                self.state.prompt_mode = mode;
+                let message = format!(
+                    "Project prompt mode: {mode} — next dispatch; agent overrides retained"
+                );
+                self.emit(&message, Token::Green, MsgType::System);
+                let now = self.now();
+                self.state.push_toast(
+                    crate::state::ToastKind::Done,
+                    &format!("Project prompt mode: {mode}"),
+                    "next dispatch; agent overrides retained",
+                    now,
+                );
+            }
+            Err(err) => self.prompt_mode_failed(&err),
+        }
+    }
+
+    /// A refused or failed write: state is untouched, the reason is shown.
+    fn prompt_mode_failed(&mut self, err: &str) {
+        self.emit(
+            &format!("Prompt mode unchanged: {err}"),
+            Token::Red,
+            MsgType::Error,
+        );
+        let now = self.now();
+        self.state.push_toast(
+            crate::state::ToastKind::Failed,
+            "Prompt mode unchanged",
+            err,
+            now,
+        );
     }
 
     // ── Clipboard ──────────────────────────────────────────────────────────

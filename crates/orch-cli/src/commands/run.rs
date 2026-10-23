@@ -37,6 +37,33 @@ const REACTIVE_DISPATCH_WINDOW: Duration = Duration::from_millis(1_500);
 /// early would truncate the stream.
 const LOST_COMPLETION_POLL: Duration = Duration::from_secs(60);
 
+/// Print the engine's read-only startup diagnostics to **stderr**: one line
+/// per affected agent for effort requests dispatch will ignore, clamp or
+/// cannot confirm, the Codex managed-model coupling, and agents that would
+/// render eco against a custom template. Nothing is spawned or written; a
+/// store read failure is itself reported and does not stop the run, whose own
+/// preflight decides.
+pub async fn report_startup_diagnostics(engine: &FullEngine, styles: &Styles) {
+    let agents = match engine.agent_service.list().await {
+        Ok(agents) => agents,
+        Err(err) => {
+            print_error(
+                styles,
+                &format!("Could not check agent diagnostics: {err}"),
+                None,
+            );
+            return;
+        }
+    };
+    let glyph = styles.paint(Color::Yellow, styles.icon(Icon::Warning));
+    for diagnostic in orch_engine::prompt_mode::startup_diagnostics(&engine.config, &agents) {
+        eprintln!(
+            "  {glyph} {} ({}): {}",
+            diagnostic.agent_name, diagnostic.agent_id, diagnostic.message
+        );
+    }
+}
+
 /// `run <task-id>` — dispatch one task and stream its events.
 pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Result<ExitCode> {
     let task = engine.task_service.get(task_id).await?;

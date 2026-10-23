@@ -5,13 +5,72 @@
 //! need WP-4's service methods.
 
 use orch_core::error::Result;
-use orch_domain::{AGENT_SHOP_TEMPLATES, CreateAgentInput};
+use orch_domain::{
+    AGENT_SHOP_TEMPLATES, Agent, CreateAgentInput, EFFORT_REQUEST_ONLY_NOTE, EffortSelection,
+    PromptModeSelection, PromptModeSource, effective_prompt_mode,
+};
 use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
+use orch_engine::prompt_mode::{AgentDiagnostic, agent_effort_diagnostics};
+use serde::Serialize;
 
 use crate::context::CliContext;
-use crate::output::{Styles, format_tokens, print_key_value, print_success, print_table};
+use crate::output::{
+    Styles, format_tokens, print_key_value, print_success, print_table, print_warning,
+};
 use crate::shop_picker;
+
+/// Where read-only effort diagnostics go. Human output keeps them inline as
+/// `⚠` lines; with `--json`/`--yaml` or `--quiet` they go to **stderr**, so a
+/// script parsing stdout never sees them (design D5.4).
+pub(crate) fn report_diagnostics(
+    ctx: &CliContext,
+    styles: &Styles,
+    diagnostics: &[AgentDiagnostic],
+) {
+    for diagnostic in diagnostics {
+        let line = format!(
+            "{} ({}): {}",
+            diagnostic.agent_name, diagnostic.agent_id, diagnostic.message
+        );
+        if ctx.output.is_some() || ctx.quiet {
+            eprintln!("warning: {line}");
+        } else {
+            print_warning(styles, &line);
+        }
+    }
+}
+
+/// The resolved prompt mode of an agent for `agent show --effective`.
+#[derive(Debug, Serialize)]
+struct EffectiveConfig {
+    prompt_mode: orch_domain::PromptMode,
+    prompt_mode_source: PromptModeSource,
+}
+
+/// `agent show --effective` with `--json`/`--yaml`: the ordinary agent shape,
+/// unchanged, under `agent`, plus the resolution under `effective_config`.
+#[derive(Debug, Serialize)]
+struct EffectiveAgent<'a> {
+    agent: &'a Agent,
+    effective_config: EffectiveConfig,
+}
+
+/// Human description of a resolved mode: `eco (agent override)`,
+/// `normal (project default)`.
+fn describe_mode(engine: &Engine, agent: &Agent) -> String {
+    let (mode, source) = effective_prompt_mode(&agent.config, &engine.config.defaults.agent);
+    let origin = match source {
+        PromptModeSource::Agent => "agent override",
+        PromptModeSource::Project => "project default",
+    };
+    if agent.remote.is_some() {
+        // Remote execution bypasses eco processing entirely.
+        format!("{mode} ({origin}; not applied to remote runs)")
+    } else {
+        format!("{mode} ({origin})")
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentAddArgs {
@@ -21,6 +80,9 @@ pub struct AgentAddArgs {
     pub command: Option<String>,
     pub model: Option<String>,
     pub effort: Option<orch_domain::ReasoningEffort>,
+    /// `--prompt-mode`; `inherit` and omission store no override.
+    pub prompt_mode: Option<PromptModeSelection>,
+    pub role_summary: Option<String>,
     pub max_turns: Option<u32>,
     pub timeout_ms: Option<u64>,
     pub approval_policy: Option<orch_domain::ApprovalPolicy>,
@@ -55,6 +117,12 @@ pub async fn add(
                 .skills
                 .as_deref()
                 .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect()),
+            // Absent means live inheritance of the project default: the
+            // default is never copied into the agent (design D1).
+            prompt_mode: args
+                .prompt_mode
+                .and_then(PromptModeSelection::into_override),
+            role_summary: args.role_summary,
         })
         .await?;
 
@@ -73,6 +141,11 @@ pub async fn add(
             ),
         );
     }
+    report_diagnostics(
+        ctx,
+        styles,
+        &agent_effort_diagnostics(std::slice::from_ref(&agent)),
+    );
     Ok(())
 }
 
@@ -116,6 +189,11 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
         2,
     );
     println!("\n  {}\n", summary_line(styles, &agents));
+    let diagnostics = agent_effort_diagnostics(&agents);
+    if !diagnostics.is_empty() {
+        report_diagnostics(ctx, styles, &diagnostics);
+        println!();
+    }
     Ok(())
 }
 
@@ -185,14 +263,35 @@ pub async fn set_enabled(engine: &Engine, styles: &Styles, id: &str, enabled: bo
 /// slot 1 and no `Effort`, everything else gets `Effort` in slot 2, so the
 /// order is adapter/command/status/policy for shell and
 /// adapter/status/effort/policy otherwise.
-pub async fn status(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
+pub async fn status(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    id: &str,
+    effective: bool,
+) -> Result<()> {
     let agent = orch_infra::storage::remote::RemoteAgentDirectory::new(engine.paths.clone())
         .resolve(id, engine.agent_service.list().await?)
         .await?
         .ok_or_else(|| orch_core::Error::invalid_arguments(format!("Agent not found: {id}")))?;
+    let diagnostics = agent_effort_diagnostics(std::slice::from_ref(&agent));
 
     if let Some(format) = ctx.output {
-        return format.print(&agent);
+        if effective {
+            let (prompt_mode, prompt_mode_source) =
+                effective_prompt_mode(&agent.config, &engine.config.defaults.agent);
+            format.print(&EffectiveAgent {
+                agent: &agent,
+                effective_config: EffectiveConfig {
+                    prompt_mode,
+                    prompt_mode_source,
+                },
+            })?;
+        } else {
+            format.print(&agent)?;
+        }
+        report_diagnostics(ctx, styles, &diagnostics);
+        return Ok(());
     }
 
     println!("\n  {}", agent.name);
@@ -233,8 +332,22 @@ pub async fn status(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str
             agent
                 .config
                 .effort
-                .map(|effort| effort.as_str().to_owned())
+                .map(|effort| format!("{} (requested)", effort.as_str()))
                 .unwrap_or_else(|| "default".to_owned()),
+        ));
+    }
+    pairs.push(("Prompt mode".to_owned(), describe_mode(engine, &agent)));
+    if !is_shell {
+        pairs.push((
+            "Role hint".to_owned(),
+            match agent.config.role_summary.as_deref() {
+                Some(summary) => summary.to_owned(),
+                None => format!(
+                    "{} {}",
+                    orch_domain::role_summary_for(&agent),
+                    styles.dim("(derived)")
+                ),
+            },
         ));
     }
     pairs.push(("CAPS".to_owned(), agent.capabilities.join(", ")));
@@ -268,6 +381,13 @@ pub async fn status(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str
         pairs.push(("Skills".to_owned(), skills.join(", ")));
     }
     print_key_value(styles, &pairs);
+    if agent.config.effort.is_some() && !is_shell {
+        println!("\n  {}", styles.dim(EFFORT_REQUEST_ONLY_NOTE));
+    }
+    if !diagnostics.is_empty() {
+        println!();
+        report_diagnostics(ctx, styles, &diagnostics);
+    }
 
     println!("\n  Stats\n  {}", "─".repeat(42));
     print_key_value(
@@ -365,6 +485,8 @@ const CONFIG_FIELDS: &[&str] = &[
     "system_prompt",
     "workspace_mode",
     "skills",
+    "prompt_mode",
+    "role_summary",
 ];
 
 fn definition_candidate(
@@ -434,55 +556,96 @@ pub async fn mutate(
     args: &crate::tree::EntityDefinitionInput,
     kind: crate::document_input::MutationKind,
 ) -> Result<()> {
-    use orch_core::Error;
-    use orch_infra::storage::fs_utils::mutation_lock;
     let input =
         crate::document_input::read_document(&args.input.file, args.input.input_format).await?;
-    if args.id.contains('@') {
-        return Err(crate::document_input::at_source(
-            &args.input.file,
-            Error::invalid_arguments("id: remote agents cannot be mutated"),
-        ));
+    let file = args.input.file.clone();
+    let source = move |err| crate::document_input::at_source(&file, err);
+    let updated = apply_definition(engine, &args.id, &input, kind, &source).await?;
+    print_updated(ctx, styles, &updated)?;
+    report_diagnostics(
+        ctx,
+        styles,
+        &agent_effort_diagnostics(std::slice::from_ref(&updated)),
+    );
+    Ok(())
+}
+
+/// `agent update ID` with flags only. Each flag compiles to one key of an
+/// RFC 7396 merge patch on `config`, applied through the same locked
+/// final-candidate path as `agent patch`:
+///
+/// - `--prompt-mode inherit` → `prompt_mode: null` (the override is removed);
+/// - `--effort default` → `effort: null` (generic effort cleared; a native
+///   suffix in the model string is part of `model` and stays as authored);
+/// - `--role-summary TEXT` → `role_summary: TEXT`, normalized by the service.
+///
+/// Everything else in the definition, including fields this binary does not
+/// model, is left as stored.
+#[derive(Debug, Clone, Default)]
+pub struct AgentFlagUpdate {
+    pub prompt_mode: Option<PromptModeSelection>,
+    pub effort: Option<EffortSelection>,
+    pub role_summary: Option<String>,
+}
+
+impl AgentFlagUpdate {
+    /// The merge patch these flags stand for.
+    pub fn to_patch(&self) -> serde_json::Value {
+        let mut config = serde_json::Map::new();
+        if let Some(mode) = self.prompt_mode {
+            config.insert(
+                "prompt_mode".into(),
+                mode.into_override()
+                    .map(|mode| serde_json::Value::String(mode.as_str().to_owned()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Some(effort) = self.effort {
+            config.insert(
+                "effort".into(),
+                effort
+                    .into_effort()
+                    .map(|effort| serde_json::Value::String(effort.as_str().to_owned()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Some(summary) = &self.role_summary {
+            config.insert(
+                "role_summary".into(),
+                serde_json::Value::String(summary.clone()),
+            );
+        }
+        serde_json::json!({ "config": config })
     }
-    // One stable project lock also serializes duplicate-name validation between
-    // new agent mutations. Existing edit/runtime writes retain their old race.
-    let _lock = mutation_lock(&engine.paths.root().join(".definition.lock"))
-        .await
-        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
-    let current = engine.agent_service.get(&args.id).await?;
-    let value = serde_json::to_value(&current).map_err(|_| Error::other("serialize agent"))?;
-    let candidate = definition_candidate(&value, &input, kind)
-        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
-    let config: orch_domain::AgentConfig = serde_json::from_value(candidate["config"].clone())
-        .map_err(|_| Error::invalid_arguments("config: invalid definition"))?;
-    let mut authored = current.clone();
-    authored.name = candidate["name"].as_str().expect("validated").to_owned();
-    authored.adapter = candidate["adapter"].as_str().expect("validated").to_owned();
-    authored.role = candidate
-        .get("role")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-    authored.config = config.clone();
-    // Serialization belongs to the CLI/infra boundary, not AgentService. The
-    // service re-reads runtime state before saving; legacy writers may still race.
-    orch_infra::storage::fs_utils::check_definition_write_size(&authored)
-        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
-    let updated = engine
-        .agent_service
-        .replace_definition(
-            &args.id,
-            candidate["name"].as_str().expect("validated").to_owned(),
-            candidate["adapter"].as_str().expect("validated").to_owned(),
-            candidate
-                .get("role")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned),
-            config,
-        )
-        .await
-        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
+}
+
+pub async fn update_flags(
+    engine: &Engine,
+    ctx: &CliContext,
+    styles: &Styles,
+    id: &str,
+    flags: AgentFlagUpdate,
+) -> Result<()> {
+    let updated = apply_definition(
+        engine,
+        id,
+        &flags.to_patch(),
+        crate::document_input::MutationKind::Patch,
+        &|err| err,
+    )
+    .await?;
+    print_updated(ctx, styles, &updated)?;
+    report_diagnostics(
+        ctx,
+        styles,
+        &agent_effort_diagnostics(std::slice::from_ref(&updated)),
+    );
+    Ok(())
+}
+
+fn print_updated(ctx: &CliContext, styles: &Styles, updated: &Agent) -> Result<()> {
     if let Some(format) = ctx.output {
-        format.print(&updated)?;
+        format.print(updated)?;
     } else if ctx.quiet {
         println!("{}", updated.id);
     } else {
@@ -496,6 +659,61 @@ pub async fn mutate(
         );
     }
     Ok(())
+}
+
+/// The locked read → candidate → validate → single save path shared by the
+/// file and flag forms. `source` attributes errors to the input document.
+/// The service's final-candidate validation (effort table, eco versus custom
+/// templates) runs before the save, so a rejection writes nothing.
+async fn apply_definition(
+    engine: &Engine,
+    id: &str,
+    input: &serde_json::Value,
+    kind: crate::document_input::MutationKind,
+    source: &(dyn Fn(orch_core::Error) -> orch_core::Error + Sync),
+) -> Result<Agent> {
+    use orch_core::Error;
+    use orch_infra::storage::fs_utils::mutation_lock;
+    if id.contains('@') {
+        return Err(source(Error::invalid_arguments(
+            "id: remote agents cannot be mutated",
+        )));
+    }
+    // One stable project lock also serializes duplicate-name validation between
+    // new agent mutations. Existing edit/runtime writes retain their old race.
+    let _lock = mutation_lock(&engine.paths.root().join(".definition.lock"))
+        .await
+        .map_err(source)?;
+    let current = engine.agent_service.get(id).await?;
+    let value = serde_json::to_value(&current).map_err(|_| Error::other("serialize agent"))?;
+    let candidate = definition_candidate(&value, input, kind).map_err(source)?;
+    let config: orch_domain::AgentConfig = serde_json::from_value(candidate["config"].clone())
+        .map_err(|_| Error::invalid_arguments("config: invalid definition"))?;
+    let mut authored = current.clone();
+    authored.name = candidate["name"].as_str().expect("validated").to_owned();
+    authored.adapter = candidate["adapter"].as_str().expect("validated").to_owned();
+    authored.role = candidate
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    authored.config = config.clone();
+    // Serialization belongs to the CLI/infra boundary, not AgentService. The
+    // service re-reads runtime state before saving; legacy writers may still race.
+    orch_infra::storage::fs_utils::check_definition_write_size(&authored).map_err(source)?;
+    engine
+        .agent_service
+        .replace_definition(
+            id,
+            candidate["name"].as_str().expect("validated").to_owned(),
+            candidate["adapter"].as_str().expect("validated").to_owned(),
+            candidate
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            config,
+        )
+        .await
+        .map_err(source)
 }
 
 /// `orch agent remove`. Ignores `--json` and `--quiet`.

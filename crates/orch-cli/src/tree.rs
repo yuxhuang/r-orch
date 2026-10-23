@@ -211,6 +211,13 @@ pub struct InitCmd {
         help = "Default agent adapter (claude, opencode, codex, cursor, pi, grok, antigravity, shell)"
     )]
     pub adapter: Option<String>,
+    #[arg(
+        long = "prompt-mode",
+        visible_alias = "mode",
+        value_name = "mode",
+        help = "Project prompt mode for new dispatches: normal (default) or eco"
+    )]
+    pub prompt_mode: Option<String>,
 }
 
 // ── task ───────────────────────────────────────────────────────────────────
@@ -365,14 +372,20 @@ pub enum AgentSub {
     Status {
         #[arg(value_name = "id")]
         id: String,
+        /// Add the resolved prompt mode and where it comes from. With
+        /// `--json`/`--yaml` the output becomes
+        /// `{agent, effective_config: {prompt_mode, prompt_mode_source}}`.
+        #[arg(long, help = "Include the effective prompt mode and its source")]
+        effective: bool,
     },
     /// Edit an agent in $EDITOR
     Edit {
         #[arg(value_name = "id")]
         id: String,
     },
-    /// Replace an authored definition from JSON or YAML
-    Update(EntityDefinitionInput),
+    /// Replace an authored definition from JSON or YAML, or change only the
+    /// prompt mode, effort or role summary with flags
+    Update(AgentUpdateInput),
     /// Apply an RFC 7396 merge patch from JSON or YAML
     Patch(EntityDefinitionInput),
     /// Remove an agent
@@ -418,12 +431,21 @@ pub struct AgentAddFlags {
     pub command: Option<String>,
     #[arg(long, value_name = "model", help = "Model name (for AI adapters)")]
     pub model: Option<String>,
-    #[arg(
-        long,
-        value_name = "level",
-        help = "Reasoning effort: low, medium, high"
-    )]
+    #[arg(long, value_name = "level", help = EFFORT_HELP)]
     pub effort: Option<String>,
+    #[arg(
+        long = "prompt-mode",
+        visible_alias = "mode",
+        value_name = "mode",
+        help = "Prompt mode override: inherit (default: follow the project), normal or eco"
+    )]
+    pub prompt_mode: Option<String>,
+    #[arg(
+        long = "role-summary",
+        value_name = "text",
+        help = "One-line role hint other agents see in eco mode (at most 192 UTF-8 bytes)"
+    )]
+    pub role_summary: Option<String>,
     #[arg(long = "max-turns", value_name = "n", help = "Max turns per run")]
     pub max_turns: Option<String>,
     #[arg(long, value_name = "ms", help = "Timeout in ms")]
@@ -473,6 +495,67 @@ pub struct DefinitionInput {
     pub file: std::path::PathBuf,
     #[arg(long, value_enum)]
     pub input_format: Option<crate::document_input::InputFormat>,
+}
+
+/// `--effort` help, shared by `agent add` and `agent update`.
+///
+/// The level is a *request*: the provider decides the effective reasoning
+/// (design D5.1), so the help never promises one.
+pub const EFFORT_HELP: &str = "Reasoning effort request: none, off, minimal, low, medium, high, \
+xhigh, max or ultra; which levels an adapter and model accept differs, and the provider decides \
+the effective level. Codex `ultra` is an explicit opt-in: maximum reasoning with \
+provider-internal sub-agent delegation; multiplies spend";
+
+/// `agent update`: **either** the file form (full definition replacement,
+/// unchanged) **or** flag-only changes compiled to a locked merge patch.
+/// Mixing them is a usage error reported before anything is read or written
+/// (design D1, lead ruling 4).
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("agent_update_form")
+        .required(true)
+        .multiple(true)
+        .args(["file", "prompt_mode", "effort", "role_summary"])
+))]
+pub struct AgentUpdateInput {
+    #[arg(value_name = "id")]
+    pub id: String,
+    #[arg(
+        short = 'f',
+        long,
+        value_name = "FILE_OR_DASH",
+        conflicts_with_all = ["prompt_mode", "effort", "role_summary"]
+    )]
+    pub file: Option<std::path::PathBuf>,
+    // `requires` alone does not reject `--input-format` next to the flag form
+    // (the update-form group is already satisfied), so the conflict is
+    // spelled out as well.
+    #[arg(
+        long,
+        value_enum,
+        requires = "file",
+        conflicts_with_all = ["prompt_mode", "effort", "role_summary"]
+    )]
+    pub input_format: Option<crate::document_input::InputFormat>,
+    #[arg(
+        long = "prompt-mode",
+        visible_alias = "mode",
+        value_name = "mode",
+        help = "Prompt mode override: inherit (clears the override), normal or eco"
+    )]
+    pub prompt_mode: Option<String>,
+    #[arg(
+        long,
+        value_name = "level",
+        help = "Reasoning effort request, or `default` to clear it (a model's own suffix is kept)"
+    )]
+    pub effort: Option<String>,
+    #[arg(
+        long = "role-summary",
+        value_name = "text",
+        help = "One-line role hint other agents see in eco mode (at most 192 UTF-8 bytes)"
+    )]
+    pub role_summary: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -950,7 +1033,15 @@ mod tests {
     /// a scenario — `<name>` is a required positional, `[name]` optional, and
     /// an option is `--long/-s <value-name>` or `--long` for a flag.
     const SURFACE: &[(&str, &[&str], &[&str])] = &[
-        ("init", &[], &["--name <name>", "--adapter <adapter>"]),
+        (
+            "init",
+            &[],
+            &[
+                "--name <name>",
+                "--adapter <adapter>",
+                "--prompt-mode <mode>",
+            ],
+        ),
         (
             "task add",
             &["<title>"],
@@ -986,6 +1077,8 @@ mod tests {
                 "--command <cmd>",
                 "--model <model>",
                 "--effort <level>",
+                "--prompt-mode <mode>",
+                "--role-summary <text>",
                 "--max-turns <n>",
                 "--timeout <ms>",
                 "--approval-policy <policy>",
@@ -1000,7 +1093,18 @@ mod tests {
             &["--list", "--template <TEMPLATE>", "--template-dir <PATH>"],
         ),
         ("agent list", &[], &[]),
-        ("agent status", &["<id>"], &[]),
+        ("agent status", &["<id>"], &["--effective"]),
+        (
+            "agent update",
+            &["<id>"],
+            &[
+                "--file/-f <FILE_OR_DASH>",
+                "--input-format <INPUT_FORMAT>",
+                "--prompt-mode <mode>",
+                "--effort <level>",
+                "--role-summary <text>",
+            ],
+        ),
         ("agent edit", &["<id>"], &[]),
         ("agent remove", &["<id>"], &[]),
         ("agent disable", &["<id>"], &[]),
@@ -1547,5 +1651,92 @@ mod file_mutation_tests {
                 assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
             }
         }
+    }
+
+    fn agent_update(args: &[&str]) -> Result<AgentUpdateInput, clap::Error> {
+        let mut argv = vec!["orch", "agent", "update", "agt_1"];
+        argv.extend(args);
+        let cli = Cli::try_parse_from(&argv)?;
+        let Some(Command::Agent(AgentCmd {
+            command: Some(AgentSub::Update(input)),
+        })) = cli.command
+        else {
+            panic!("agent update: {argv:?}");
+        };
+        Ok(input)
+    }
+
+    #[test]
+    fn agent_update_takes_either_a_file_or_flags_never_both_nor_neither() {
+        let file = agent_update(&["-f", "-"]).expect("file form");
+        assert_eq!(file.file.as_deref(), Some(std::path::Path::new("-")));
+        assert!(file.prompt_mode.is_none() && file.effort.is_none());
+
+        let flags =
+            agent_update(&["--prompt-mode", "eco", "--effort", "default"]).expect("flag form");
+        assert!(flags.file.is_none());
+        assert_eq!(flags.prompt_mode.as_deref(), Some("eco"));
+        assert_eq!(flags.effort.as_deref(), Some("default"));
+        assert_eq!(
+            agent_update(&["--mode", "inherit"])
+                .unwrap()
+                .prompt_mode
+                .as_deref(),
+            Some("inherit")
+        );
+        assert_eq!(
+            agent_update(&["--role-summary", "Reviews Rust"])
+                .unwrap()
+                .role_summary
+                .as_deref(),
+            Some("Reviews Rust")
+        );
+
+        // Neither form, and both forms, are usage errors raised by the
+        // parser, before the handler reads a file or takes a lock.
+        assert!(agent_update(&[]).is_err());
+        for flag in [
+            ["--prompt-mode", "eco"],
+            ["--effort", "high"],
+            ["--role-summary", "x"],
+        ] {
+            let mut argv = vec!["-f", "-"];
+            argv.extend(flag);
+            let err = agent_update(&argv).expect_err("mixed");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag:?}"
+            );
+        }
+        // `--input-format` belongs to the file form only.
+        assert!(agent_update(&["--input-format", "json", "--effort", "high"]).is_err());
+    }
+
+    #[test]
+    fn init_and_agent_add_accept_the_mode_alias() {
+        let cli = Cli::try_parse_from(["orch", "init", "--mode", "eco"]).expect("parses");
+        let Some(Command::Init(init)) = cli.command else {
+            panic!("init");
+        };
+        assert_eq!(init.prompt_mode.as_deref(), Some("eco"));
+        let cli = Cli::try_parse_from([
+            "orch",
+            "agent",
+            "add",
+            "a",
+            "--adapter",
+            "claude",
+            "--mode",
+            "inherit",
+        ])
+        .expect("parses");
+        let Some(Command::Agent(AgentCmd {
+            command: Some(AgentSub::Add(flags)),
+        })) = cli.command
+        else {
+            panic!("agent add");
+        };
+        assert_eq!(flags.prompt_mode.as_deref(), Some("inherit"));
     }
 }

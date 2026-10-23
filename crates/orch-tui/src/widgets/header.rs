@@ -112,6 +112,19 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         mode_text,
         ctx.chip(fg, bg).add_modifier(Modifier::BOLD),
     ));
+    // The project prompt mode (design D1): the stored value, never an
+    // optimistic one; `…` while a switch is being written.
+    spans.push(Span::styled(
+        format!(
+            " Prompt: {}{}",
+            state.prompt_mode,
+            if state.prompt_mode_pending { "…" } else { "" }
+        ),
+        match state.prompt_mode {
+            orch_domain::PromptMode::Eco => ctx.style(Token::Green),
+            orch_domain::PromptMode::Normal => ctx.style(Token::Dim),
+        },
+    ));
     if running(ctx) > 0 {
         spans.push(Span::styled(
             format!("  {} {} active ", spinner_frame(state.tick), running(ctx)),

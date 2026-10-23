@@ -1295,6 +1295,13 @@ pub struct AppState {
     pub observer_mode: bool,
     pub default_adapter: String,
     pub max_concurrent: u32,
+    /// The project prompt mode as last read from the backend. Changed only by
+    /// a confirmed write or a refresh, never optimistically, so a failed
+    /// switch leaves the header as it was.
+    pub prompt_mode: orch_domain::PromptMode,
+    /// A project prompt-mode write is in flight: `F3` and the settings
+    /// action refuse until its outcome arrives.
+    pub prompt_mode_pending: bool,
     pub palette: Palette,
     pub tick: u64,
     pub should_exit: bool,
@@ -1402,6 +1409,8 @@ impl Default for AppState {
             observer_mode: false,
             default_adapter: "claude".into(),
             max_concurrent: 2,
+            prompt_mode: orch_domain::PromptMode::Normal,
+            prompt_mode_pending: false,
             palette: Palette::default(),
             tick: 0,
             should_exit: false,

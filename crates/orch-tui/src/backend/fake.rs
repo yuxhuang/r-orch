@@ -94,6 +94,8 @@ pub enum Call {
     SaveActivityFilter(String),
     SaveNotifications(NotificationPreferences),
     SaveMaxConcurrent(u32),
+    /// `None` is a toggle request.
+    RequestPromptMode(Option<orch_domain::PromptMode>),
     CompleteOnboarding,
     PasteImage,
     BackgroundInstall(String),
@@ -126,6 +128,16 @@ pub struct FakeBackend {
     pub fail_next: Option<String>,
     /// The header's peer line, as [`TuiBackend::peer_status`] reports it now.
     pub peer_status: Option<String>,
+    /// The stored project prompt mode, as the fake's "config file" holds it.
+    pub prompt_mode: orch_domain::PromptMode,
+    /// A requested prompt-mode write that has not completed yet. Tests finish
+    /// it with [`FakeBackend::complete_prompt_mode`], so "pending" is a state
+    /// a test can hold the dashboard in.
+    pub prompt_mode_request: Option<Option<orch_domain::PromptMode>>,
+    /// When set, the next completed prompt-mode write fails with this
+    /// message and the stored mode is left unchanged.
+    pub prompt_mode_fail: Option<String>,
+    prompt_mode_result: Option<BackendResult<orch_domain::PromptMode>>,
     pub can_create_task: bool,
     pub can_add_agent: bool,
     pub can_create_goal: bool,
@@ -141,6 +153,24 @@ pub struct FakeBackend {
 }
 
 impl FakeBackend {
+    /// Finish the pending prompt-mode write: apply it (or fail it with
+    /// `prompt_mode_fail`) and queue the result for the next poll. Returns
+    /// whether a write was pending.
+    pub fn complete_prompt_mode(&mut self) -> bool {
+        let Some(target) = self.prompt_mode_request.take() else {
+            return false;
+        };
+        let result = match self.prompt_mode_fail.take() {
+            Some(error) => Err(error),
+            None => {
+                self.prompt_mode = target.unwrap_or_else(|| self.prompt_mode.toggled());
+                Ok(self.prompt_mode)
+            }
+        };
+        self.prompt_mode_result = Some(result);
+        true
+    }
+
     /// Queue a deterministic completion, retaining capacity until polled.
     pub fn complete_copy(&mut self, result: super::CopyResult) -> bool {
         if !self.copy_tickets.contains(&result.ticket)
@@ -172,6 +202,10 @@ impl FakeBackend {
             clipboard: ClipboardPaste::Empty,
             fail_next: None,
             peer_status: None,
+            prompt_mode: orch_domain::PromptMode::Normal,
+            prompt_mode_request: None,
+            prompt_mode_fail: None,
+            prompt_mode_result: None,
             can_create_task: true,
             can_add_agent: true,
             can_create_goal: true,
@@ -213,6 +247,8 @@ impl FakeBackend {
     }
 
     pub fn with_context(mut self, context: LaunchContext) -> Self {
+        // The launch value is what the fake's "config file" holds.
+        self.prompt_mode = context.initial_prompt_mode;
         self.context = context;
         self
     }
@@ -810,6 +846,30 @@ impl TuiBackend for FakeBackend {
     fn save_max_concurrent(&mut self, value: u32) -> BackendResult<()> {
         self.calls.push(Call::SaveMaxConcurrent(value));
         self.check_failure()
+    }
+
+    fn project_prompt_mode(&mut self) -> BackendResult<orch_domain::PromptMode> {
+        Ok(self.prompt_mode)
+    }
+
+    /// Records the request and holds it pending until the test calls
+    /// [`FakeBackend::complete_prompt_mode`]. `fail_next` refuses the request
+    /// itself (nothing becomes pending).
+    fn request_prompt_mode(
+        &mut self,
+        target: Option<orch_domain::PromptMode>,
+    ) -> BackendResult<()> {
+        self.calls.push(Call::RequestPromptMode(target));
+        self.check_failure()?;
+        if self.prompt_mode_request.is_some() {
+            return Err("A prompt mode change is already in progress".into());
+        }
+        self.prompt_mode_request = Some(target);
+        Ok(())
+    }
+
+    fn poll_prompt_mode(&mut self) -> Option<BackendResult<orch_domain::PromptMode>> {
+        self.prompt_mode_result.take()
     }
 
     fn complete_onboarding(&mut self) -> BackendResult<()> {

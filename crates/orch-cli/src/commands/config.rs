@@ -11,9 +11,20 @@
 //!   and still **exits 0**;
 //! - `config global get` knows exactly two keys and answers `undefined` for
 //!   anything else.
+//!
+//! The prompt mode adds one rule (design D1): a `set`, `patch` or `update`
+//! that could change which agents render eco, or whether a custom template is
+//! configured, is validated as a complete candidate **under the definition
+//! lock** — the enum, and every agent that would resolve to eco against a
+//! custom template — before anything is written. `defaults.agent.prompt_mode`
+//! itself is written key-only, so unknown extension keys and unset defaults
+//! stay exactly as they were.
 
-use orch_core::error::Result;
-use orch_domain::{ACTIVITY_FILTER_PRESETS, GlobalConfig, TUI_PALETTE_NAMES, TuiPaletteName};
+use orch_core::error::{Error, Result};
+use orch_domain::{
+    ACTIVITY_FILTER_PRESETS, GlobalConfig, PromptMode, TUI_PALETTE_NAMES, TuiPaletteName,
+    set_by_path,
+};
 use orch_engine::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -60,7 +71,35 @@ pub async fn set(
 ) -> Result<()> {
     // `JSON.parse` first, the raw string as the fallback.
     let parsed: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
-    engine.config_store.set(key, parsed.clone()).await?;
+    if key == PROMPT_MODE_KEY {
+        let mode = parsed
+            .as_str()
+            .and_then(|value| value.parse::<PromptMode>().ok())
+            .ok_or_else(|| {
+                Error::invalid_arguments(format!(
+                    "{PROMPT_MODE_KEY}: expected normal or eco, got {}",
+                    serde_json::to_string(&parsed).unwrap_or_default()
+                ))
+            })?;
+        orch_engine::prompt_mode::set_project_prompt_mode(
+            engine.paths.project_root(),
+            engine.agents.as_ref(),
+            mode,
+        )
+        .await?;
+    } else if affects_prompt_rendering(key) {
+        use orch_infra::storage::fs_utils;
+        let _lock = fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock")).await?;
+        // The same merged candidate `ConfigStore::set` writes, checked first.
+        let mut candidate = orch_infra::storage::FileConfigStore::new(engine.paths.clone())
+            .read_merged()
+            .await?;
+        set_by_path(&mut candidate, key, parsed.clone());
+        validate_prompt_candidate(engine, &candidate).await?;
+        engine.config_store.set(key, parsed.clone()).await?;
+    } else {
+        engine.config_store.set(key, parsed.clone()).await?;
+    }
     // No JSON mode: the success line is all `config set` prints.
     print_success(
         styles,
@@ -97,6 +136,9 @@ pub async fn mutate(
     let complete = kind == MutationKind::Update;
     orch_infra::storage::config::validate_raw_config(&candidate, complete)
         .map_err(|err| crate::document_input::at_source(&args.file, err))?;
+    validate_prompt_candidate(engine, &candidate)
+        .await
+        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
     if candidate != current {
         store
             .write_raw(&candidate, complete)
@@ -109,6 +151,29 @@ pub async fn mutate(
         print_success(styles, "Updated project configuration");
     }
     Ok(())
+}
+
+/// The project prompt-mode key.
+pub const PROMPT_MODE_KEY: &str = "defaults.agent.prompt_mode";
+
+/// Whether setting `key` can change the project prompt mode or the custom
+/// templates: an ancestor of `defaults.agent.prompt_mode`, or anything under
+/// `prompt`. Only these sets take the lock and the candidate check; every
+/// other key keeps `config set`'s existing behaviour.
+fn affects_prompt_rendering(key: &str) -> bool {
+    let segments: Vec<&str> = key.split('.').collect();
+    let mode: Vec<&str> = PROMPT_MODE_KEY.split('.').collect();
+    segments.first() == Some(&"prompt")
+        || (segments.len() <= mode.len() && segments[..] == mode[..segments.len()])
+}
+
+/// Reject a raw config candidate whose known fields do not parse (including a
+/// prompt mode other than `normal`/`eco`) or under which an agent would render
+/// eco against a custom template. Lists every offender and both remedies.
+async fn validate_prompt_candidate(engine: &Engine, candidate: &Value) -> Result<()> {
+    let typed = orch_engine::prompt_mode::effective_config_of_raw(candidate)?;
+    let agents = engine.agent_service.list().await?;
+    orch_engine::prompt_mode::validate_project_config_candidate(&typed, &agents)
 }
 
 /// The two keys `config global get`/`set` understand.
@@ -249,6 +314,31 @@ mod tests {
         assert_eq!(render_value(Some(&value)), "10000");
         // A string value keeps its quotes, as `JSON.stringify` gives.
         assert_eq!(render_value(Some(&json!("amber"))), "\"amber\"");
+    }
+
+    #[test]
+    fn only_prompt_related_keys_take_the_candidate_check() {
+        for key in [
+            "defaults",
+            "defaults.agent",
+            "defaults.agent.prompt_mode",
+            "prompt",
+            "prompt.template",
+            "prompt.system_template",
+            "prompt.user_template",
+        ] {
+            assert!(affects_prompt_rendering(key), "{key}");
+        }
+        for key in [
+            "defaults.agent.max_turns",
+            "defaults.task",
+            "scheduling.max_concurrent_agents",
+            "project.name",
+            "prompts",
+            "defaults.agent.prompt_mode.deeper",
+        ] {
+            assert!(!affects_prompt_rendering(key), "{key}");
+        }
     }
 
     #[test]

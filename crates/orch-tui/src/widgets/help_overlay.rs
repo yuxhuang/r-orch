@@ -62,6 +62,11 @@ pub const ACTIONS: [(&str, &str); 10] = [
 /// `Ctrl+K`/`Ctrl+U` sit beside `/` because they are its neighbour on the
 /// lists: `/` stays the command bar and `Ctrl+K` is the keyword filter
 /// (R5). Ten entries, the column's `MAX_ROWS`.
+///
+/// `F3` (project prompt mode, design D1) sits under `/config`, the settings
+/// verb that offers the same switch as `/config prompt-mode`. It replaced
+/// `/help`, which only repeated this overlay; every column is at `MAX_ROWS`,
+/// so a new row would have moved the box off an 80×24 terminal.
 pub const COMMANDS: [(&str, &str); 10] = [
     ("/", "Command mode"),
     ("Ctrl+K", "Filter list"),
@@ -71,7 +76,7 @@ pub const COMMANDS: [(&str, &str); 10] = [
     ("/run", "Execute"),
     ("/watch", "Auto-dispatch"),
     ("/config", "Settings"),
-    ("/help", "Help"),
+    ("F3", "Prompt normal/eco"),
     ("/quit", "Exit"),
 ];
 

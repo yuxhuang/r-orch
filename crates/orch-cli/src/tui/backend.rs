@@ -25,7 +25,8 @@ use orch_core::storage::{GoalFilter, TaskFilter};
 use orch_domain::{
     Agent, CreateAgentInput, CreateGoalInput, CreateMessageInput, CreateTaskInput, CreateTeamInput,
     Goal, GoalStatus, MessageChannel, NotificationPreferences, OrchestratorEvent,
-    OrchestratorState, ReasoningEffort, Run, RunStatus, Task, TaskStatus, Team, TuiPaletteName,
+    OrchestratorState, PromptMode, ReasoningEffort, Run, RunStatus, Task, TaskStatus, Team,
+    TuiPaletteName,
 };
 use orch_engine::{
     FullEngine, UpdateAgentFields, UpdateGoalFields, UpdateTaskFields, WatchOptions,
@@ -110,6 +111,19 @@ pub struct EngineBackend {
     watch_active: bool,
     peer_runtime: Arc<Mutex<Option<orch_peer::PeerRuntime>>>,
     copy: CopyTransport,
+    /// The project prompt-mode write in flight, if any: its outcome is
+    /// stored here by the spawned write and handed out once by
+    /// `poll_prompt_mode`.
+    prompt_mode: Arc<Mutex<PromptModeWrite>>,
+}
+
+/// The lifecycle of one asynchronous project prompt-mode write.
+#[derive(Debug, Default)]
+enum PromptModeWrite {
+    #[default]
+    Idle,
+    Writing,
+    Finished(BackendResult<PromptMode>),
 }
 
 impl std::fmt::Debug for EngineBackend {
@@ -161,6 +175,16 @@ impl EngineBackend {
             initial_watch_active: false,
             observer_mode: false,
             watch_error: None,
+            initial_prompt_mode: engine.config.defaults.agent.prompt_mode,
+            startup_warnings: match engine.agent_service.list().await {
+                Ok(agents) => {
+                    orch_engine::prompt_mode::startup_diagnostics(&engine.config, &agents)
+                        .into_iter()
+                        .map(|d| format!("{} ({}): {}", d.agent_name, d.agent_id, d.message))
+                        .collect()
+                }
+                Err(err) => vec![format!("Could not check agent diagnostics: {err}")],
+            },
         };
 
         // Watch mode auto-starts so the orchestrator is live, with seeding on —
@@ -223,6 +247,7 @@ impl EngineBackend {
             // Opens nothing and starts no thread: the native worker waits for
             // a native copy request that may never come.
             copy: CopyTransport::system(),
+            prompt_mode: Arc::new(Mutex::new(PromptModeWrite::Idle)),
         };
         // History is loaded eagerly because the dashboard's activity view
         // wants it on the first frame. The model catalog starts on the first
@@ -575,6 +600,7 @@ impl TuiBackend for EngineBackend {
     fn add_agent(&mut self, name: &str, adapter: &str, opts: AgentOpts) -> BackendResult<Agent> {
         let effort = parse_optional(opts.effort.as_deref(), "effort")?;
         let approval_policy = parse_optional(opts.approval_policy.as_deref(), "approval policy")?;
+        let prompt_mode = parse_optional(opts.prompt_mode.as_deref(), "prompt mode")?;
         self.block_on(self.engine.agent_service.create(CreateAgentInput {
             name: name.to_owned(),
             adapter: adapter.to_owned(),
@@ -584,6 +610,8 @@ impl TuiBackend for EngineBackend {
             role: non_empty(opts.role),
             approval_policy,
             skills: opts.skills,
+            prompt_mode,
+            role_summary: non_empty(opts.role_summary),
             ..Default::default()
         }))
         .map_err(to_message)
@@ -596,6 +624,15 @@ impl TuiBackend for EngineBackend {
             Some("") => Some(None),
             Some(value) => Some(Some(parse_one::<ReasoningEffort>(value, "effort")?)),
         };
+        // `Some("")` removes the override: the agent inherits the project mode.
+        let prompt_mode = match fields.prompt_mode.as_deref() {
+            None => None,
+            Some("") => Some(None),
+            Some(value) => Some(Some(parse_one::<PromptMode>(value, "prompt mode")?)),
+        };
+        let role_summary = fields
+            .role_summary
+            .map(|summary| Some(summary).filter(|s| !s.trim().is_empty()));
         self.block_on(self.engine.agent_service.update(
             id,
             UpdateAgentFields {
@@ -609,6 +646,8 @@ impl TuiBackend for EngineBackend {
                 // approval policy, so the trait leaves it out. Editing it is
                 // `orch agent edit`'s job.
                 approval_policy: None,
+                prompt_mode,
+                role_summary,
             },
         ))
         .map_err(to_message)
@@ -831,6 +870,75 @@ impl TuiBackend for EngineBackend {
                 .set("scheduling.max_concurrent_agents", value.into()),
         )
         .map_err(to_message)
+    }
+
+    /// The stored value: the raw file merged over the defaults, re-read on
+    /// every call so another process's change shows up.
+    fn project_prompt_mode(&mut self) -> BackendResult<PromptMode> {
+        let paths = self.engine.paths.clone();
+        self.block_on(async move {
+            let raw = orch_infra::storage::FileConfigStore::new(paths)
+                .read_raw()
+                .await?;
+            orch_engine::prompt_mode::effective_config_of_raw(&raw)
+        })
+        .map(|config| config.defaults.agent.prompt_mode)
+        .map_err(to_message)
+    }
+
+    /// Spawned on the runtime so the frame keeps drawing while the lock is
+    /// taken; the engine's key-only write does the locked re-read, the
+    /// custom-template check over every agent, and the atomic publish.
+    fn request_prompt_mode(&mut self, target: Option<PromptMode>) -> BackendResult<()> {
+        {
+            let mut write = self
+                .prompt_mode
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if matches!(*write, PromptModeWrite::Writing) {
+                return Err("A prompt mode change is already in progress".into());
+            }
+            *write = PromptModeWrite::Writing;
+        }
+        let engine = Arc::clone(&self.engine);
+        let slot = Arc::clone(&self.prompt_mode);
+        self.handle.spawn(async move {
+            let root = engine.paths.project_root();
+            let result = match target {
+                Some(mode) => {
+                    orch_engine::prompt_mode::set_project_prompt_mode(
+                        root,
+                        engine.agents.as_ref(),
+                        mode,
+                    )
+                    .await
+                }
+                None => {
+                    orch_engine::prompt_mode::toggle_project_prompt_mode(
+                        root,
+                        engine.agents.as_ref(),
+                    )
+                    .await
+                }
+            };
+            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                PromptModeWrite::Finished(result.map_err(to_message));
+        });
+        Ok(())
+    }
+
+    fn poll_prompt_mode(&mut self) -> Option<BackendResult<PromptMode>> {
+        let mut write = self
+            .prompt_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match std::mem::take(&mut *write) {
+            PromptModeWrite::Finished(result) => Some(result),
+            other => {
+                *write = other;
+                None
+            }
+        }
     }
 
     fn complete_onboarding(&mut self) -> BackendResult<()> {
