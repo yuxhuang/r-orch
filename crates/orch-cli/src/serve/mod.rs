@@ -165,8 +165,8 @@ async fn log_startup_diagnostics(logger: &StructuredLogger, engine: &Engine) {
             LogLevel::Warn,
             "serve:diagnostic",
             vec![
-                ("agent_id", Value::String(diagnostic.agent_id)),
-                ("agent_name", Value::String(diagnostic.agent_name)),
+                ("agentId", Value::String(diagnostic.agent_id)),
+                ("agentName", Value::String(diagnostic.agent_name)),
                 ("message", Value::String(diagnostic.message)),
             ],
         );
@@ -408,8 +408,8 @@ mod tests {
         assert_eq!(found.len(), 1, "one warning, for cur2 only: {written:#?}");
         let record = found[0];
         assert_eq!(record["level"], "warn");
-        assert_eq!(record["agent_id"], "agt_cur2");
-        assert_eq!(record["agent_name"], "cur2");
+        assert_eq!(record["agentId"], "agt_cur2");
+        assert_eq!(record["agentName"], "cur2");
         assert!(
             record["message"]
                 .as_str()
@@ -421,15 +421,10 @@ mod tests {
             1,
             "the warning is logged before start_watch: {at_start:#?}"
         );
-        let started = written
-            .iter()
-            .position(|r| r["event"] == "serve:started")
-            .expect("serve:started");
-        let warned = written
-            .iter()
-            .position(|r| r["event"] == "serve:diagnostic")
-            .expect("serve:diagnostic");
-        assert!(started < warned, "serve:started stays the first record");
+        assert_eq!(
+            written[0]["event"], "serve:started",
+            "serve:started stays the first record: {written:#?}"
+        );
     }
 
     #[tokio::test]
