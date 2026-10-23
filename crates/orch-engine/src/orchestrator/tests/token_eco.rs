@@ -664,7 +664,10 @@ async fn the_retry_context_names_the_same_failed_run_its_evidence_came_from() {
 }
 
 #[tokio::test]
-async fn a_still_draining_collector_withholds_the_source_so_eco_keeps_full_output() {
+async fn a_still_draining_collector_defers_the_retry_until_its_window_is_final() {
+    // The source window is only vouched for once nothing can append to it.
+    // A retry does not start while the failed run's collector still drains,
+    // so when it does start, the window is final and eco names its source.
     let h = retry_harness();
     h.orchestrator
         .inner
@@ -674,6 +677,16 @@ async fn a_still_draining_collector_withholds_the_source_so_eco_keeps_full_outpu
         .insert("tsk_test1".to_owned());
     h.load_state().await.unwrap();
     h.tick().await.unwrap();
+    assert!(h.templates.contexts().is_empty());
+    assert!(!h.was_dispatched("tsk_test1"));
+
+    h.orchestrator
+        .inner
+        .active_collectors
+        .lock()
+        .await
+        .remove("tsk_test1");
+    h.tick().await.unwrap();
     let retry = h
         .templates
         .contexts()
@@ -681,13 +694,7 @@ async fn a_still_draining_collector_withholds_the_source_so_eco_keeps_full_outpu
         .and_then(|c| c.retry)
         .expect("retry context");
     assert_eq!(retry.previous_output, "evidence");
-    assert_eq!(retry.source_run_id, None);
-    h.orchestrator
-        .inner
-        .active_collectors
-        .lock()
-        .await
-        .remove("tsk_test1");
+    assert_eq!(retry.source_run_id.as_deref(), Some("run_new"));
 }
 
 // ── Engine invariance under equal outputs (D8.1) ─────────────────────────

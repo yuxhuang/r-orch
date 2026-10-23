@@ -199,14 +199,21 @@ impl Orchestrator {
             }
 
             // 2. A live collector means the child may have exited cleanly with
-            // the success handler still queued for the state lock. Checking
-            // the PID or the stall clock here would misread that as a crash.
-            if self.inner.active_collectors.lock().await.contains(task_id) {
+            // the success handler still queued for the state lock, so a dead
+            // PID is not a crash: the collector reports the outcome. Once its
+            // stream has ended the stall clock is stale too. While the stream
+            // is open, a silent child is still a stall.
+            let (collector_live, collector_finishing) = {
+                let active = self.inner.active_collectors.lock().await;
+                let finishing = self.inner.finishing_collectors.lock().await;
+                (active.contains(task_id), finishing.contains(task_id))
+            };
+            if collector_finishing {
                 continue;
             }
 
-            // 3. PID liveness.
-            if !self.deps().processes.is_alive(entry.pid) {
+            // 3. PID liveness, for runs no collector in this process watches.
+            if !collector_live && !self.deps().processes.is_alive(entry.pid) {
                 // A failure *inside* the failure handler — an invalid
                 // transition, say — must still free the slot, or the entry
                 // leaks and the agent stays busy forever. The handler has

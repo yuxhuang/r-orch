@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Fixed
+- `orch serve`, `orch run --watch` and the dashboard now stop a run whose agent produces no output for `stall_timeout_ms`, as documented. Before, a run started by that orch process was never checked for a stall, so a silent agent ran until it exited on its own.
+
 ## [0.10.0] - 2026-10-23
 
 Eco prompt mode and reasoning-effort release. Opt-in; `normal` mode and the peer protocol are unchanged, so 0.5.x through 0.10.0 peers can be mixed.
