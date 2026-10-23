@@ -17,6 +17,7 @@ use orch_domain::{
 };
 use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
+use orch_engine::prompt_mode::DefinitionLock;
 use serde::Serialize;
 
 use crate::context::{CliContext, EnvFlags};
@@ -281,11 +282,16 @@ pub async fn deploy(
 /// `None` means the deployment failed and the error has already been printed;
 /// the agents created before the failure are deliberately left in place, which
 /// is what the hint tells the user to clean up.
+///
+/// Every candidate is checked against the project config read inside the
+/// definition lock, held across the whole roster, not the engine's
+/// construction snapshot.
 async fn create_agents(
     engine: &Engine,
     styles: &Styles,
     template: &OrgTemplate,
 ) -> Result<Option<Vec<String>>> {
+    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
     let mut agent_ids: Vec<String> = Vec::new();
 
     for entry in template.agents {
@@ -304,11 +310,11 @@ async fn create_agents(
                 ..input
             });
         let created = match input {
-            Ok(input) => engine.agent_service.create(input).await,
+            Ok(input) => engine.agent_service.create_locked(&lock, input).await,
             Err(err) => Err(err),
         };
         match created {
-            Ok(agent) => agent_ids.push(agent.id),
+            Ok(authored) => agent_ids.push(authored.agent.id),
             Err(err) => {
                 print_error(
                     styles,
