@@ -367,7 +367,7 @@ orch task cancel tsk_OTg9w5a
   ✓ Cancelled tsk_OTg9w5a
 ```
 
-You can cancel a task in any status except `done`, `failed` and `cancelled`. If an agent is running the task, orch stops the run. A task that is already cancelled gives an error:
+You can cancel a task in any status except `done`, `failed` and `cancelled`. If an agent is running the task, orch stops the run. When `orch serve`, `orch run --watch` or the dashboard has the project open, the task is cancelled at once and that process stops the run at its next check (`scheduling.poll_interval_ms`, 10 seconds by default). A task that is already cancelled gives an error:
 
 ```text
   ✕ Invalid transition for tsk_PjBRFEn: cancelled → cancelled
