@@ -308,8 +308,9 @@ command and the output mode:
 JSON and YAML output never contains a warning, so a script can parse standard output as it is. In normal output
 the warnings share standard output with the table or confirmation, so `2>/dev/null` does not hide them.
 
-`orch serve` writes them to its log instead, as one `serve:diagnostic` warning per
-agent right after `serve:started`, with the fields `agentId`, `agentName` and `message`
+`orch serve` writes them to its log instead, right after `serve:started`, as one `serve:diagnostic` record per
+warning, so an agent with two warnings gets two records. Each record has the fields `agentId`, `agentName` and
+`message`
 ([Run orch without a terminal](07-running-and-monitoring.md#run-orch-without-a-terminal)). When a run starts,
 orch reports every effort note for that run again, including a `request-only` note that is not a warning
 ([Warnings when a run starts](#warnings-when-a-run-starts)).

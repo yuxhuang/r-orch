@@ -160,10 +160,18 @@ Each line is a JSON object, so tools such as `jq` can read it. For people, use `
 ```
 
 Right after `serve:started`, and before it starts any work, `serve` logs one `serve:diagnostic` warning for each
-agent with an effort warning ([Effort warnings](16-eco-mode-and-effort.md#effort-warnings)):
+effort warning ([Effort warnings](16-eco-mode-and-effort.md#effort-warnings)), and one for each agent whose eco
+mode conflicts with a custom template ([Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates)).
+The records are per warning, not per agent: an agent with two warnings gets two records with the same `agentId`,
+like `pi1` here:
 
 ```text
-01:47:30.870 WARN  serve:diagnostic  agentId=agt_CxeaEuR agentName=cx-nomodel message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
+02:08:30.300 INFO  serve:started  mode=once pid=50292 poll_interval_ms=10000
+02:08:30.307 WARN  serve:diagnostic  agentId=agt_4uMJoUb agentName=oc message=local-override-possible: a local opencode variant with the same name can replace the catalog variant's settings
+02:08:30.310 WARN  serve:diagnostic  agentId=agt_XlDL3q3 agentName=sh message=legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)
+02:08:30.313 WARN  serve:diagnostic  agentId=agt_IZ-vDwz agentName=pi1 message=clamp-possible: pi clamps the requested thinking level to the model's support; a non-reasoning model runs with thinking off
+02:08:30.316 WARN  serve:diagnostic  agentId=agt_IZ-vDwz agentName=pi1 message=request-only: the explicit --thinking level takes precedence over the model's :level suffix
+02:08:30.316 WARN  serve:diagnostic  agentId=agt_QfgfSRa agentName=cx message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
 ```
 
 In JSON the fields are `agentId`, `agentName` and `message`. If `serve` cannot read the agents to check them, it

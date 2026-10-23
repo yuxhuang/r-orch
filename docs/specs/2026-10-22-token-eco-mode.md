@@ -63,8 +63,8 @@ in the source plan. See Open questions.
   them as `⚠` lines on stdout in human output and as `warning: …` lines on stderr under `--json`/`--yaml`/`--quiet`;
   `agent list` prints them on stdout after the table in human output and omits them under `--json`/`--yaml`/
   `--quiet`. The start of `orch run` prints them to stderr in every mode; the dashboard shows them in its Activity
-  feed; `orch serve` logs one `serve:diagnostic` record per agent (`agentId`,
-  `agentName`, `message`) after `serve:started`. Each dispatch reports its own once, before the model starts, as a
+  feed; `orch serve` logs one `serve:diagnostic` record per warning, not per agent (`agentId`, `agentName`,
+  `message`; an agent with two warnings gets two records) after `serve:started`. Each dispatch reports its own once, before the model starts, as a
   non-fatal `orchestrator:error` bus event (`error` = the diagnostic, `context` = `effort preparation for run
   <run> (agent <agent>)`, `fatal: false`), shown by the `serve` log and `orch run --watch`. They are never
   `agent:output` or run-log events, so a run's result and a retry's previous output cannot contain them.
