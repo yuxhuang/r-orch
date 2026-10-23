@@ -9,8 +9,8 @@ use std::sync::atomic::Ordering;
 use orch_core::error::Result;
 use orch_core::storage::{AgentStore, GoalStore, TaskStore};
 use orch_domain::{
-    AgentStatus, OrchestratorEvent, OrchestratorState, RunningEntry, TaskStatus, is_dispatchable,
-    is_terminal,
+    AgentStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry, TaskStatus,
+    is_dispatchable, is_terminal,
 };
 
 use super::{AUTO_SEED_COOLDOWN_MS, DEBOUNCE, MAX_IMMEDIATE_DISPATCH_RETRIES, Orchestrator};
@@ -142,6 +142,21 @@ impl Orchestrator {
                     self.cancel_remote(remote).await;
                 }
                 self.take_cancel(task_id).await;
+                // Once the entry is gone the collector's outcome is ignored,
+                // so an unfinished run record is finished here or never.
+                let unfinished = matches!(
+                    self.deps().run_store.get(&entry.run_id).await,
+                    Ok(Some(run)) if matches!(run.status, RunStatus::Preparing | RunStatus::Running)
+                );
+                if unfinished
+                    && let Err(err) = self
+                        .deps()
+                        .run_service
+                        .finish(&entry.run_id, RunStatus::Cancelled, None, None)
+                        .await
+                {
+                    self.emit_error(err, format!("reconcile finish run {}", entry.run_id));
+                }
                 state.running.shift_remove(task_id);
                 if entry.remote.is_none()
                     && let Err(err) = self

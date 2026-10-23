@@ -387,7 +387,9 @@ async fn reconcile_cancels_a_live_local_run_whose_task_was_made_terminal_externa
         .build();
     h.load_state().await.unwrap();
     h.tick().await.unwrap();
-    assert!(h.in_memory_state().await.running.contains_key("tsk_test1"));
+    let run_id = h.in_memory_state().await.running["tsk_test1"]
+        .run_id
+        .clone();
     let token = adapter.tokens.lock().unwrap()[0].clone();
     assert!(!token.is_cancelled());
 
@@ -413,6 +415,11 @@ async fn reconcile_cancels_a_live_local_run_whose_task_was_made_terminal_externa
             .is_none()
     );
     h.settle().await;
+    // Dropping the entry makes the collector's outcome a no-op, so the run
+    // record is finished here or never.
+    let run = h.runs.peek(&run_id).unwrap();
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert!(run.finished_at.is_some());
 }
 
 #[tokio::test]

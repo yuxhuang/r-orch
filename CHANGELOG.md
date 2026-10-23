@@ -6,7 +6,16 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Fixed
+- Cancelling a task in the dashboard (`C`, `/cancel`, or `C cancel` in the footer) now works while `orch serve` or `orch run --watch` has the project open and the dashboard shows `OBSERVING`. It used to fail with "Orchestrator already running" for a task in any status. The task is cancelled at once; if an agent is running it, the open orchestrator stops the agent at its next check.
 - `orch serve`, `orch run --watch` and the dashboard now stop a run whose agent produces no output for `stall_timeout_ms`, as documented. Before, a run started by that orch process was never checked for a stall, so a silent agent ran until it exited on its own.
+
+## [0.10.1] - 2026-10-23
+
+Retry-delay patch release. No peer-protocol change, so 0.5.x through 0.10.1 peers can be mixed.
+
+### Fixed
+- A failed task now waits its retry delay (`scheduling.retry_base_delay_ms`, doubling each time) before the next attempt. In 0.10.0 orch restarted it about half a second after each failure, so every attempt was used up within a couple of seconds. The retry starts at the orchestrator's first check after the delay is up. `orch run --all` no longer retries a failed task straight away: it leaves the task in `retrying` for `orch run --watch`, `orch serve` or the dashboard to retry when the delay is up. `orch run <task-id>` still starts a `retrying` task at once.
+- `orch task cancel` of a running task now works while `orch serve`, `orch run --watch` or the dashboard has the project open. It used to fail with "Orchestrator already running" and leave the agent running. The task is cancelled at once; the open orchestrator stops the agent at its next check and marks the run cancelled. A run stopped this way, or because its task was deleted, no longer stays `running` in the run history.
 
 ## [0.10.0] - 2026-10-23
 
@@ -240,7 +249,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/yuxhuang/r-orch/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/yuxhuang/r-orch/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/yuxhuang/r-orch/compare/v0.9.2...v0.9.3

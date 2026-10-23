@@ -11,6 +11,8 @@ r-orch is an AI-agent orchestrator: a CLI, a TUI, and a long-running engine that
 (`claude`, `codex`, `cursor`, …) as child processes, streams their JSONL output, drives a task state machine,
 and persists everything as plain files under `.orchestry/`. It is a layered Rust workspace with trait seams for
 every external effect, so the engine is testable deterministically without real processes, clocks or AI CLIs.
+For the runtime flows (scheduling, handoffs, goals, pause, and how adapters drive each CLI), see
+[docs/internal/](internal/README.md).
 
 **No distributed system here.** (Optional peer links delegate work between installations; each project still has one engine.) One process per project, guarded by a PID lock file, with a filesystem as the
 database. The hard problems are (a) child-process lifecycle and cancellation, (b) exact, stable

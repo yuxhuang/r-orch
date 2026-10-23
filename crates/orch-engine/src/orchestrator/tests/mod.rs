@@ -22,6 +22,7 @@ mod mutex;
 mod parallel_race;
 mod perf_opts;
 mod resilience;
+mod retry_backoff;
 mod retry_race;
 mod skills;
 mod token_eco;

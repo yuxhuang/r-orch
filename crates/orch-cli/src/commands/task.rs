@@ -7,7 +7,8 @@
 //! - `edit` compares the edited buffer against the existing task and prints
 //!   `  No changes.` when nothing differs, without touching the store;
 //! - `cancel` builds the **full** container only when the task is
-//!   `in_progress`, because only then is there a process to kill;
+//!   `in_progress`, because only then is there a process to kill, and falls
+//!   back to a store-only cancel when another process holds the lock;
 //! - none of `cancel`/`approve`/`reject`/`retry` honours `--json` or
 //!   `--quiet`: they always print their success line.
 
@@ -480,12 +481,22 @@ pub async fn edit(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
 /// mid-flight, and only for an `in_progress` task: cancelling that one has to
 /// kill the agent process, release the claim and finish the run, which lives
 /// on the orchestrator.
+///
+/// When another process owns the project (`serve`, `run --watch`, the TUI),
+/// the orchestrator cannot take the lock. The task is then cancelled in the
+/// store only, and the owner's next reconcile sees it terminal and stops the
+/// run itself.
 pub async fn cancel(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
     let task = engine.task_service.get(id).await?;
 
     if task.status == TaskStatus::InProgress {
         let full = orch_engine::build_full(engine.paths.project_root().to_path_buf()).await?;
-        full.orchestrator.cancel_task(id).await?;
+        match full.orchestrator.cancel_task(id).await {
+            Err(orch_core::Error::Domain(orch_domain::DomainError::LockConflict(_))) => {
+                engine.task_service.cancel(id).await?;
+            }
+            result => result?,
+        }
     } else {
         engine.task_service.cancel(id).await?;
     }
