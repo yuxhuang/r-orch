@@ -215,10 +215,11 @@ Shutting down...
 After that, `orch status` says `idle`.
 
 `orch run <task-id>` and `orch run --all` stop on `Ctrl+C` or `SIGTERM` too. They stop only the runs that command
-started: each run is marked `cancelled`, its task goes to `retrying` (or `failed` when it has no attempts left)
-and its agent back to idle. A run whose OpenCode version check is still going is stopped before its model starts,
-and the check's processes are stopped with it. The command exits with code 130 after `Ctrl+C` and 143 after
-`SIGTERM`:
+started: each run's task goes to `retrying` (or `failed` when it has no attempts left) and its agent back to idle.
+A run whose model had started is marked `cancelled`. A run whose OpenCode version check is still going is stopped
+before its model starts, together with the check's processes, and is marked `failed` with the error
+`dispatch interrupted by a signal before the model started`. The command exits with code 130 after `Ctrl+C` and
+143 after `SIGTERM`:
 
 ```text
   orch · running tsk_SvWl33_ "slow"

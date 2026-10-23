@@ -105,9 +105,9 @@ means no gate has passed the row yet.
 | R1 | pass | c2f6962 (T1 D1-1…D1-5, QA gate) + fix-round head (delta re-review) | macOS |
 | R2 | pass | c2f6962 (board, fact-check R2-a..j) + fix-round head (delta re-review) | macOS; Linux pending CI |
 | R3 | pass | c2f6962 (T1 D3-1…D3-8) | macOS |
-| R4 | pass | c2f6962 | macOS (Claude second-read cache > 0 in both eco pairs; OpenCode warm not measured) |
+| R4 | pass | fix-round head (`f4f81bf` placement + T1 vector `token_eco_prompt_eco.rs::eco_shared_context_keys_and_full_values_are_only_in_the_user_half_for_every_adapter`; delta re-review) + c2f6962 (Claude second-read cache > 0 in both eco pairs; OpenCode warm not measured) | macOS |
 | R5 | pass | c2f6962 (T1 D3-9, D3-10 with the real `orch --json logs` reader) | macOS |
-| R6 | pending | engine-trace test passes at c2f6962; held-out outcome evaluation E2 blocked on the owner's VM and spend | |
+| R6 | pending | engine-trace test passes at c2f6962; held-out outcome evaluation E2 blocked on the 2com Linux containment matrix and the route-1 readiness plan | |
 | R7 | pass | c2f6962 (T1 D2-2 pairing) | macOS |
 | R8 | pass | c2f6962 (T1 compatibility matrix, 544 cells, real 0.9.4 reader) + fix-round head (ruling-13 shell row, delta re-review) | macOS |
 | R9 | pass | c2f6962 | macOS (perf gate, cold 0.089) |
