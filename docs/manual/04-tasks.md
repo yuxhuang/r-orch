@@ -415,7 +415,7 @@ When a run fails, orch does not give up at once. A task has `max_attempts` attem
 2. The next attempt gets the previous error and output in its prompt.
 3. After the last attempt the task is `failed`, and every task that depends on it fails as well.
 
-A task with `--max-attempts 1` fails on its first error, as `Break on purpose` did above. The retry delays apply while the orchestrator runs (`orch run --watch`, `orch serve` or the dashboard). `orch task show` prints the attempt count as `attempt 2/3`.
+A task with `--max-attempts 1` fails on its first error, as `Break on purpose` did above. The retry delays apply while the orchestrator runs (`orch run --watch`, `orch serve` or the dashboard). It starts a retry at its first check after the delay is up, and it checks every `scheduling.poll_interval_ms` (10 seconds by default), so a retry can start up to that much later than the delay. `orch run --all` does not wait for a retry: it leaves the task in `retrying`, and the orchestrator retries it once the delay is up. `orch run <task-id>` on a `retrying` task starts it at once. `orch task show` prints the attempt count as `attempt 2/3`.
 
 ## See a task in the dashboard
 

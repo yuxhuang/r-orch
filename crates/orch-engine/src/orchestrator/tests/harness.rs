@@ -447,11 +447,9 @@ impl Harness {
         self.orchestrator.tick_once().await
     }
 
-    /// Reconcile only, with no dispatch after it.
-    ///
-    /// A whole tick would re-dispatch a task reconcile has just moved to
-    /// `retrying`, which is correct but hides what the reconcile tests are
-    /// actually asserting.
+    /// Reconcile only, with no dispatch after it, so the reconcile tests
+    /// assert on reconcile's own effects and not on whatever a dispatch
+    /// pass then started.
     pub(crate) async fn reconcile(&self) -> orch_core::error::Result<()> {
         let mut slot = self.orchestrator.inner.state.lock().await;
         self.orchestrator.load_state(&mut slot).await?;

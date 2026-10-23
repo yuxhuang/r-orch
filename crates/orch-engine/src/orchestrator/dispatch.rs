@@ -17,6 +17,7 @@ use orch_infra::template::{
     render_prompt,
 };
 
+use super::tick::epoch_ms_from_iso;
 use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator};
 
 impl Orchestrator {
@@ -68,6 +69,9 @@ impl Orchestrator {
             .map(|task| (task.id.clone(), task.clone()))
             .collect();
 
+        // A `retrying` task still waiting out its retry delay is left to
+        // `process_retry_queue`, which starts it once the entry comes due.
+        let now_ms = self.deps().clock.now_ms();
         let mut candidates: Vec<Task> = all_tasks
             .iter()
             .filter(|task| {
@@ -75,6 +79,8 @@ impl Orchestrator {
                     && !is_blocked(task, &task_map)
                     && !state.running.contains_key(&task.id)
                     && !state.claimed.contains(&task.id)
+                    && !(task.status == TaskStatus::Retrying
+                        && retry_pending(state, &task.id, now_ms))
             })
             .cloned()
             .collect();
@@ -354,6 +360,11 @@ impl Orchestrator {
         }
 
         state.claimed.insert(task_id.to_owned());
+        // Starting the task consumes its retry, whichever path started it
+        // (the entry came due, or `run <id>` overrode the wait). A leftover
+        // entry would swallow the next failure's retry, because
+        // `enqueue_retry` deduplicates by task id.
+        state.retry_queue.retain(|retry| retry.task_id != task_id);
         self.save_state(state).await?;
 
         match self.dispatch_claimed(state, task, remote_only).await {
@@ -1153,6 +1164,17 @@ fn mirror_controller(task: &Task) -> Option<&str> {
     task.labels
         .iter()
         .find_map(|label| label.strip_prefix("remote-ctl:"))
+}
+
+/// Whether `task_id` has a retry queued that is not yet due. An entry whose
+/// `due_at` does not parse never comes due in `process_retry_queue`, so it
+/// does not hold the task back here either: that would strand it in
+/// `retrying` for good.
+fn retry_pending(state: &OrchestratorState, task_id: &str, now_ms: i64) -> bool {
+    state.retry_queue.iter().any(|retry| {
+        retry.task_id == task_id
+            && epoch_ms_from_iso(&retry.due_at).is_some_and(|due_at| now_ms < due_at)
+    })
 }
 
 fn local_running(state: &OrchestratorState) -> usize {

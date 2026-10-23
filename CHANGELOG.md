@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Fixed
+- A failed task now waits its retry delay (`scheduling.retry_base_delay_ms`, doubling each time) before the next attempt. In 0.10.0 orch restarted it about half a second after each failure, so every attempt was used up within a couple of seconds. The retry starts at the orchestrator's first check after the delay is up. `orch run --all` no longer retries a failed task straight away: it leaves the task in `retrying` for `orch run --watch`, `orch serve` or the dashboard to retry when the delay is up. `orch run <task-id>` still starts a `retrying` task at once.
+
 ## [0.10.0] - 2026-10-23
 
 Eco prompt mode and reasoning-effort release. Opt-in; `normal` mode and the peer protocol are unchanged, so 0.5.x through 0.10.0 peers can be mixed.
