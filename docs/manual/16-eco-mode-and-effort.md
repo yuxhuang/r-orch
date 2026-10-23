@@ -295,8 +295,20 @@ OpenCode is noticed. It cannot notice a binary swapped between the check and the
 ## Effort warnings
 
 orch prints effort warnings when you add or change an agent, under `orch agent list` and `orch agent show`, and
-when `orch run` (with a task ID, `--all` or `--watch`) and the dashboard start. They go to standard error, so
-`--json` output stays clean. `orch serve` writes them to its log instead, as one `serve:diagnostic` warning per
+when `orch run` (with a task ID, `--all` or `--watch`) and the dashboard start. Where they appear depends on the
+command and the output mode:
+
+| Command | Normal output | With `--json`, `--yaml` or `--quiet` |
+|---|---|---|
+| `orch agent add`, changing an agent, `orch agent show` | `⚠` lines on standard output, after the command's own output | `warning: …` lines on standard error |
+| `orch agent list` | `⚠` lines on standard output, after the table | Not printed; use `orch agent show <id>` |
+| `orch run` | `⚠` lines on standard error, before anything is dispatched | — |
+| Dashboard | The Activity feed | — |
+
+JSON and YAML output never contains a warning, so a script can parse standard output as it is. In normal output
+the warnings share standard output with the table or confirmation, so `2>/dev/null` does not hide them.
+
+`orch serve` writes them to its log instead, as one `serve:diagnostic` warning per
 agent right after `serve:started`, with the fields `agentId`, `agentName` and `message`
 ([Run orch without a terminal](07-running-and-monitoring.md#run-orch-without-a-terminal)). When a run starts,
 orch reports every effort note for that run again, including a `request-only` note that is not a warning

@@ -57,10 +57,13 @@ in the source plan. See Open questions.
 - On-disk: `defaults.agent.prompt_mode` (written by `orch init` and any config write), `config.prompt_mode` and
   `config.role_summary` are additive; old files read as `normal` with no override. Files with the new effort
   values or fields are not readable by v0.9.4; see the plan's rollback section.
-- CLI/`--json`: ordinary `agent show`/`list` JSON keeps its shape; `--effective` adds a new envelope. Warnings go to
-  stderr, never JSON stdout.
-- Effort diagnostics (lead ruling 8): not provider output. Authoring, `agent list`/`show` and the start of `orch run`
-  and the dashboard print them to stderr; `orch serve` logs one `serve:diagnostic` record per agent (`agentId`,
+- CLI/`--json`: ordinary `agent show`/`list` JSON keeps its shape; `--effective` adds a new envelope. Warnings never
+  appear in JSON or YAML stdout.
+- Effort diagnostics (lead ruling 8): not provider output. Authoring (`agent add`/update) and `agent show` print
+  them as `⚠` lines on stdout in human output and as `warning: …` lines on stderr under `--json`/`--yaml`/`--quiet`;
+  `agent list` prints them on stdout after the table in human output and omits them under `--json`/`--yaml`/
+  `--quiet`. The start of `orch run` prints them to stderr in every mode; the dashboard shows them in its Activity
+  feed; `orch serve` logs one `serve:diagnostic` record per agent (`agentId`,
   `agentName`, `message`) after `serve:started`. Each dispatch reports its own once, before the model starts, as a
   non-fatal `orchestrator:error` bus event (`error` = the diagnostic, `context` = `effort preparation for run
   <run> (agent <agent>)`, `fatal: false`), shown by the `serve` log and `orch run --watch`. They are never
