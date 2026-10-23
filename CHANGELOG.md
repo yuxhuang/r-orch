@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-23
+
+Eco prompt mode and reasoning-effort release. Opt-in; `normal` mode and the peer protocol are unchanged, so 0.5.x through 0.10.0 peers can be mixed.
+
 ### Added
 - You can switch a project, or one agent, to the opt-in **eco** prompt mode. Each agent then gets every teammate's name, ID, adapter and capabilities with a one-line role hint (at most 192 bytes) instead of the full role, a retry's previous output clipped to 8,192 bytes when orch knows which failed run it came from, and a goal's task list cut to 40 tasks and 12,288 bytes, each with a `[truncated, …]` marker and the `orch` command that fetches the rest. The agent's own role and skills, the task, review feedback, messages, shared context and goal progress stay in full. The stable parts of the prompt come first; shared context goes with the task, never into a tool's system prompt. Eco mode does not change scheduling, retries, reviews, models, effort or turns. On orch's 28-agent reference team an eco prompt was 8.9% of the normal prompt's size (largest 14.2%); whether models reach the same outcome is still being evaluated. `normal` stays the default and sends byte-for-byte the prompt and command orch 0.9.4 sends (checked on macOS), except the effort deltas under Changed and the retry fix under Fixed; an OpenCode agent with an effort and a listed model also gets two short version checks before its run. See [Eco mode, reasoning effort and default models](docs/manual/16-eco-mode-and-effort.md).
 - Set the mode with `orch init --prompt-mode normal|eco` (or `--mode`), `orch config set defaults.agent.prompt_mode`, `orch agent add|update --prompt-mode normal|eco|inherit`, or `F3` and `/config prompt-mode` in the dashboard, whose header shows `Prompt: normal` or `Prompt: eco` (on its second line when the window is too narrow). A change applies from the next run, in every orch process on the project. Eco mode cannot be combined with a custom prompt template: orch refuses a change that would combine them, from the CLI or the dashboard, checking the project settings as they are when the change is written, and names every agent affected. `orch agent show <id> --effective` (and its `--json` envelope `{agent, effective_config}`) shows the mode an agent will use and whether it comes from the agent or the project.
@@ -233,7 +237,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/yuxhuang/r-orch/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/yuxhuang/r-orch/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/yuxhuang/r-orch/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/yuxhuang/r-orch/compare/v0.9.1...v0.9.2
