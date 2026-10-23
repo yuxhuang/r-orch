@@ -210,3 +210,126 @@ fn help_lists_the_f3_prompt_mode_toggle() {
     let text = h.text();
     assert!(text.contains("F3") && text.contains("Prompt"), "{text}");
 }
+
+// ── review-b4 F2 / gate C7: the settings wizard and the refresh race ────────
+
+#[test]
+fn a_refresh_while_a_write_is_pending_keeps_the_stored_header_value_until_the_outcome() {
+    let mut h = harness();
+    h.press(KeyCode::F(3));
+    // The file already says eco (the write landed, or another process wrote)
+    // but the outcome has not been polled: a refresh must not move the
+    // header ahead of, or behind, the outcome it is waiting for.
+    h.app.backend.prompt_mode = PromptMode::Eco;
+    h.app.refresh_all(false);
+    assert_eq!(h.app.state.prompt_mode, PromptMode::Normal);
+    let pending = header(&mut h);
+    assert!(
+        pending.contains("Prompt: normal…") && !pending.contains("Prompt: eco"),
+        "{pending}"
+    );
+    // The outcome decides.
+    h.app.backend.prompt_mode_request = Some(Some(PromptMode::Eco));
+    assert!(h.app.backend.complete_prompt_mode());
+    h.app.tick();
+    assert_eq!(h.app.state.prompt_mode, PromptMode::Eco);
+    let settled = header(&mut h);
+    assert!(
+        settled.contains("Prompt: eco") && !settled.contains("Prompt: eco…"),
+        "{settled}"
+    );
+}
+
+#[test]
+fn the_prompt_mode_settings_wizard_submitted_while_a_write_is_pending_is_refused_and_requests_nothing()
+ {
+    let mut h = harness();
+    h.press(KeyCode::F(3));
+    assert_eq!(mode_requests(&h), 1);
+    h.run_command("/config prompt-mode");
+    assert_eq!(h.app.state.input_mode, InputMode::Wizard);
+    // Pick eco and submit the one-step wizard.
+    h.press(KeyCode::Down);
+    h.press(KeyCode::Enter);
+    assert_eq!(
+        mode_requests(&h),
+        1,
+        "the wizard must not issue a second write while one is pending"
+    );
+    assert!(
+        h.messages()
+            .iter()
+            .any(|m| m.contains("Prompt mode change already in progress")),
+        "the refusal must be visible: {:?}",
+        h.messages()
+    );
+    assert_eq!(h.app.backend.prompt_mode, PromptMode::Normal);
+    // The first write still lands on its own.
+    assert!(h.app.backend.complete_prompt_mode());
+    h.app.tick();
+    assert_eq!(h.app.backend.prompt_mode, PromptMode::Eco);
+}
+
+// ── QA-4: the prompt mode stays readable on narrow frames ───────────────────
+
+/// Rows 1 and 2 of the header (brand bar, then the peer-status line) at the
+/// given width, in QA's observing session on a short project name.
+fn header_rows(width: u16, height: u16) -> (String, String) {
+    let mut h = Harness::sized(
+        FakeBackend::new().with_agents(vec![make_agent("agt_1", "alpha", AgentStatus::Idle)]),
+        width,
+        height,
+    );
+    h.app.state.project_name = "main".into();
+    h.app.state.observer_mode = true;
+    h.app.state.prompt_mode = PromptMode::Normal;
+    let text = h.text();
+    let mut lines = text.lines().skip(1);
+    (
+        lines.next().unwrap_or_default().to_owned(),
+        lines.next().unwrap_or_default().to_owned(),
+    )
+}
+
+#[test]
+fn at_120_columns_the_prompt_mode_stays_on_the_brand_bar() {
+    let (brand, second) = header_rows(120, 36);
+    assert!(brand.contains("OBSERVING Prompt: normal"), "{brand}");
+    assert!(!second.contains("Prompt:"), "{second}");
+}
+
+#[test]
+fn at_80_columns_the_prompt_mode_leads_the_second_header_line_in_full() {
+    let (brand, second) = header_rows(80, 24);
+    assert!(
+        second.trim_start().starts_with("Prompt: normal"),
+        "row 2: {second}"
+    );
+    assert!(!brand.contains("Prompt"), "no clipped fragment: {brand}");
+    assert!(brand.contains("OBSERVING"), "{brand}");
+}
+
+#[test]
+fn at_40_columns_the_header_renders_and_the_prompt_mode_is_still_readable() {
+    let (_brand, second) = header_rows(40, 24);
+    assert!(
+        second.trim_start().starts_with("Prompt: normal"),
+        "{second}"
+    );
+}
+
+#[test]
+fn the_narrow_layout_shows_the_pending_ellipsis_and_eco() {
+    let mut h = Harness::sized(
+        FakeBackend::new().with_agents(vec![make_agent("agt_1", "alpha", AgentStatus::Idle)]),
+        80,
+        24,
+    );
+    h.app.state.project_name = "main".into();
+    h.app.state.observer_mode = true;
+    h.press(KeyCode::F(3));
+    assert!(h.text().contains("Prompt: normal…"), "{}", h.text());
+    h.app.backend.complete_prompt_mode();
+    h.app.tick();
+    assert!(h.text().contains("Prompt: eco"), "{}", h.text());
+}

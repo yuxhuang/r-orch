@@ -23,17 +23,22 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     if area.height == 0 {
         return;
     }
-    render_brand_bar(frame, area, ctx);
+    let prompt_inline = render_brand_bar(frame, area, ctx);
     if area.height > 2 {
-        put_line(
-            frame,
-            area,
-            area.y + 2,
-            vec![Span::styled(
-                ctx.state.peer_status.clone(),
-                ctx.style(Token::Dim),
-            )],
-        );
+        let mut spans = Vec::new();
+        // Narrow layout: the prompt mode leads the second line, so it is the
+        // last thing clipped there.
+        if !prompt_inline {
+            spans.push(prompt_mode_span(ctx, ""));
+            if !ctx.state.peer_status.is_empty() {
+                spans.push(Span::styled(format!(" {DOT} "), ctx.style(Token::Ghost)));
+            }
+        }
+        spans.push(Span::styled(
+            ctx.state.peer_status.clone(),
+            ctx.style(Token::Dim),
+        ));
+        put_line(frame, area, area.y + 2, spans);
     }
     if area.height > 3 {
         render_stats_bar(frame, area, ctx);
@@ -47,7 +52,32 @@ fn running(ctx: &RenderCtx) -> usize {
     ctx.state.running_count()
 }
 
-fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+/// The project prompt mode (design D1): the stored value, never an
+/// optimistic one; `…` while a switch is being written.
+fn prompt_mode_span(ctx: &RenderCtx, leading: &str) -> Span<'static> {
+    let state = ctx.state;
+    Span::styled(
+        format!(
+            "{leading}Prompt: {}{}",
+            state.prompt_mode,
+            if state.prompt_mode_pending { "…" } else { "" }
+        ),
+        match state.prompt_mode {
+            orch_domain::PromptMode::Eco => ctx.style(Token::Green),
+            orch_domain::PromptMode::Normal => ctx.style(Token::Dim),
+        },
+    )
+}
+
+/// Row 1. Returns whether the prompt mode is on it.
+///
+/// Wide layout: the prompt mode sits right of the watch chip, and the active
+/// count and uptime after it clip from the right when the frame is short.
+/// Narrow layout, when the row up to and including the prompt mode would not
+/// fit (QA-4: at 80 columns it was clipped away): the prompt mode moves to
+/// the start of row 2, ahead of the peer status, and row 1 keeps the brand,
+/// the tabs, the watch chip and whatever else fits.
+fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
     let state = ctx.state;
     let mut spans = Vec::new();
 
@@ -112,19 +142,8 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         mode_text,
         ctx.chip(fg, bg).add_modifier(Modifier::BOLD),
     ));
-    // The project prompt mode (design D1): the stored value, never an
-    // optimistic one; `…` while a switch is being written.
-    spans.push(Span::styled(
-        format!(
-            " Prompt: {}{}",
-            state.prompt_mode,
-            if state.prompt_mode_pending { "…" } else { "" }
-        ),
-        match state.prompt_mode {
-            orch_domain::PromptMode::Eco => ctx.style(Token::Green),
-            orch_domain::PromptMode::Normal => ctx.style(Token::Dim),
-        },
-    ));
+    let prompt_at = spans.len();
+    spans.push(prompt_mode_span(ctx, " "));
     if running(ctx) > 0 {
         spans.push(Span::styled(
             format!("  {} {} active ", spinner_frame(state.tick), running(ctx)),
@@ -140,7 +159,14 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         ));
     }
 
+    // Only what precedes it counts: the active count and the uptime after it
+    // are lower priority and clip from the right, as they always have.
+    let inline = crate::views::spans_width(&spans[..=prompt_at]) <= area.width;
+    if !inline {
+        spans.remove(prompt_at);
+    }
     put_line(frame, area, area.y + 1, spans);
+    inline
 }
 
 /// The tab pills: the active tab is an inverted amber pill, the others are
