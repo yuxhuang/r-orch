@@ -103,6 +103,8 @@ pub fn default_agents(adapter: &str) -> Vec<Agent> {
             system_prompt: None,
             workspace_mode: None,
             skills: Some(skills),
+            prompt_mode: None,
+            role_summary: None,
         },
         status: AgentStatus::Idle,
         current_task: None,

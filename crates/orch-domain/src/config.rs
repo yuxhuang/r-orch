@@ -11,6 +11,138 @@ pub struct ProjectConfig {
     pub description: Option<String>,
 }
 
+/// How the default prompt templates present a dispatch.
+///
+/// `normal` is the historical renderer, byte-for-byte. `eco` is the opt-in
+/// compact presentation of the same task, context and obligations. The mode
+/// changes presentation only; no scheduling, retry, review or selection logic
+/// reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromptMode {
+    #[default]
+    #[serde(rename = "normal")]
+    Normal,
+    #[serde(rename = "eco")]
+    Eco,
+}
+
+impl PromptMode {
+    pub const ALL: [PromptMode; 2] = [PromptMode::Normal, PromptMode::Eco];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PromptMode::Normal => "normal",
+            PromptMode::Eco => "eco",
+        }
+    }
+
+    /// The other mode: what the TUI project toggle switches to.
+    pub fn toggled(self) -> PromptMode {
+        match self {
+            PromptMode::Normal => PromptMode::Eco,
+            PromptMode::Eco => PromptMode::Normal,
+        }
+    }
+}
+
+impl std::fmt::Display for PromptMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for PromptMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        PromptMode::ALL
+            .into_iter()
+            .find(|v| v.as_str() == s)
+            .ok_or(())
+    }
+}
+
+/// A per-agent prompt-mode choice as a command argument: `inherit` clears the
+/// override, `normal`/`eco` set it. `inherit` is a command, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PromptModeSelection {
+    Inherit,
+    Set(PromptMode),
+}
+
+impl PromptModeSelection {
+    /// The spelling that clears an agent's override.
+    pub const INHERIT: &'static str = "inherit";
+
+    /// The value to store in `AgentConfig::prompt_mode`.
+    pub fn into_override(self) -> Option<PromptMode> {
+        match self {
+            PromptModeSelection::Inherit => None,
+            PromptModeSelection::Set(mode) => Some(mode),
+        }
+    }
+}
+
+impl std::fmt::Display for PromptModeSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromptModeSelection::Inherit => f.write_str(Self::INHERIT),
+            PromptModeSelection::Set(mode) => mode.fmt(f),
+        }
+    }
+}
+
+impl std::str::FromStr for PromptModeSelection {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == Self::INHERIT {
+            Ok(PromptModeSelection::Inherit)
+        } else {
+            s.parse().map(PromptModeSelection::Set)
+        }
+    }
+}
+
+/// Where an agent's effective prompt mode came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromptModeSource {
+    /// The agent's own `config.prompt_mode` override.
+    #[serde(rename = "agent")]
+    Agent,
+    /// Inherited from `defaults.agent.prompt_mode` (normal when the project
+    /// file predates the setting).
+    #[serde(rename = "project")]
+    Project,
+}
+
+impl PromptModeSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PromptModeSource::Agent => "agent",
+            PromptModeSource::Project => "project",
+        }
+    }
+}
+
+impl std::fmt::Display for PromptModeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An agent's effective prompt mode: its override, else the current project
+/// default. Pure; the caller supplies the defaults it read for this dispatch.
+pub fn effective_prompt_mode(
+    agent: &crate::agent::AgentConfig,
+    defaults: &AgentDefaults,
+) -> (PromptMode, PromptModeSource) {
+    match agent.prompt_mode {
+        Some(mode) => (mode, PromptModeSource::Agent),
+        None => (defaults.prompt_mode, PromptModeSource::Project),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDefaults {
     pub adapter: String,
@@ -19,6 +151,10 @@ pub struct AgentDefaults {
     pub timeout_ms: u64,
     pub stall_timeout_ms: u64,
     pub workspace_mode: crate::task::WorkspaceMode,
+    /// The project prompt mode agents without an override inherit. Files that
+    /// predate it read as `normal`; nothing writes it back on read.
+    #[serde(default)]
+    pub prompt_mode: PromptMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +228,7 @@ pub fn default_config() -> OrchestratorConfig {
                 timeout_ms: 3_600_000,
                 stall_timeout_ms: 600_000,
                 workspace_mode: crate::task::WorkspaceMode::Worktree,
+                prompt_mode: PromptMode::Normal,
             },
             task: TaskDefaults {
                 max_attempts: 3,
@@ -201,6 +338,7 @@ mod tests {
                         "timeout_ms": 3_600_000,
                         "stall_timeout_ms": 600_000,
                         "workspace_mode": "worktree",
+                        "prompt_mode": "normal",
                     },
                     "task": { "max_attempts": 3, "priority": 3 },
                 },
@@ -331,5 +469,102 @@ mod tests {
         let read: OrchestratorConfig =
             serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
         assert_eq!(read.peer, config.peer);
+    }
+
+    #[test]
+    fn a_config_file_without_prompt_mode_reads_as_normal() {
+        let mut value = serde_json::to_value(default_config()).unwrap();
+        value["defaults"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prompt_mode");
+        let config: OrchestratorConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.defaults.agent.prompt_mode, PromptMode::Normal);
+    }
+
+    #[test]
+    fn prompt_mode_spellings_are_normal_and_eco_only() {
+        for mode in PromptMode::ALL {
+            assert_eq!(
+                serde_json::to_string(&mode).unwrap(),
+                format!("\"{}\"", mode.as_str())
+            );
+            assert_eq!(mode.as_str().parse::<PromptMode>(), Ok(mode));
+        }
+        assert_eq!(PromptMode::default(), PromptMode::Normal);
+        assert_eq!(PromptMode::Normal.toggled(), PromptMode::Eco);
+        assert_eq!(PromptMode::Eco.toggled(), PromptMode::Normal);
+        for bad in ["inherit", "Eco", "default", ""] {
+            assert_eq!(bad.parse::<PromptMode>(), Err(()), "{bad}");
+            assert!(serde_json::from_value::<PromptMode>(json!(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn prompt_mode_selection_distinguishes_inherit_from_a_mode() {
+        assert_eq!(
+            "inherit".parse::<PromptModeSelection>(),
+            Ok(PromptModeSelection::Inherit)
+        );
+        assert_eq!(
+            "eco".parse::<PromptModeSelection>(),
+            Ok(PromptModeSelection::Set(PromptMode::Eco))
+        );
+        assert_eq!("default".parse::<PromptModeSelection>(), Err(()));
+        assert_eq!(PromptModeSelection::Inherit.into_override(), None);
+        assert_eq!(
+            PromptModeSelection::Set(PromptMode::Normal).into_override(),
+            Some(PromptMode::Normal)
+        );
+        for selection in [
+            PromptModeSelection::Inherit,
+            PromptModeSelection::Set(PromptMode::Eco),
+        ] {
+            assert_eq!(
+                selection.to_string().parse::<PromptModeSelection>(),
+                Ok(selection)
+            );
+        }
+    }
+
+    #[test]
+    fn effective_mode_is_the_override_else_the_live_project_default() {
+        let mut defaults = default_config().defaults.agent;
+        let inherited = crate::agent::AgentConfig::default();
+        let pinned = crate::agent::AgentConfig {
+            prompt_mode: Some(PromptMode::Normal),
+            ..crate::agent::AgentConfig::default()
+        };
+        assert_eq!(
+            effective_prompt_mode(&inherited, &defaults),
+            (PromptMode::Normal, PromptModeSource::Project)
+        );
+        defaults.prompt_mode = PromptMode::Eco;
+        assert_eq!(
+            effective_prompt_mode(&inherited, &defaults),
+            (PromptMode::Eco, PromptModeSource::Project)
+        );
+        assert_eq!(
+            effective_prompt_mode(&pinned, &defaults),
+            (PromptMode::Normal, PromptModeSource::Agent)
+        );
+        assert_eq!(
+            serde_json::to_value(PromptModeSource::Project).unwrap(),
+            json!("project")
+        );
+        assert_eq!(
+            serde_json::to_value(PromptModeSource::Agent).unwrap(),
+            json!("agent")
+        );
+    }
+
+    #[test]
+    fn config_set_can_switch_the_project_mode() {
+        let mut value = serde_json::to_value(default_config()).unwrap();
+        set_by_path(&mut value, "defaults.agent.prompt_mode", json!("eco"));
+        let config: OrchestratorConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.defaults.agent.prompt_mode, PromptMode::Eco);
+        set_by_path(&mut value, "defaults.agent.prompt_mode", json!("inherit"));
+        assert!(serde_json::from_value::<OrchestratorConfig>(value).is_err());
     }
 }
