@@ -7,6 +7,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Fixed
 - Cancelling a task in the dashboard (`C`, `/cancel`, or `C cancel` in the footer) now works while `orch serve` or `orch run --watch` has the project open and the dashboard shows `OBSERVING`. It used to fail with "Orchestrator already running" for a task in any status. The task is cancelled at once; if an agent is running it, the open orchestrator stops the agent at its next check.
+- A dashboard that is only watching a project another process owns (`orch serve`, `orch run --watch` or another dashboard) now shows a cancelled task as `in_progress → cancelled`. It used to report `in_progress → failed` with a "Task failed" toast, although the task and its run were cancelled.
 - `orch serve`, `orch run --watch` and the dashboard now stop a run whose agent produces no output for `stall_timeout_ms`, as documented. Before, a run started by that orch process was never checked for a stall, so a silent agent ran until it exited on its own.
 
 ## [0.10.1] - 2026-10-23
