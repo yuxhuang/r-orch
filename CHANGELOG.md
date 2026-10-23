@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Fixed
+- Cancelling a task in the dashboard (`C`, `/cancel`, or `C cancel` in the footer) now works while `orch serve` or `orch run --watch` has the project open and the dashboard shows `OBSERVING`. It used to fail with "Orchestrator already running" for a task in any status. The task is cancelled at once; if an agent is running it, the open orchestrator stops the agent at its next check.
+
 ## [0.10.1] - 2026-10-23
 
 Retry-delay patch release. No peer-protocol change, so 0.5.x through 0.10.1 peers can be mixed.
