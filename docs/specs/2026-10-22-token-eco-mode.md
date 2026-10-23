@@ -59,6 +59,12 @@ in the source plan. See Open questions.
   values or fields are not readable by v0.9.4; see the plan's rollback section.
 - CLI/`--json`: ordinary `agent show`/`list` JSON keeps its shape; `--effective` adds a new envelope. Warnings go to
   stderr, never JSON stdout.
+- Effort diagnostics (lead ruling 8): not provider output. Authoring, `agent list`/`show` and the start of `orch run`
+  and the dashboard print them to stderr; `orch serve` logs one `serve:diagnostic` record per agent (`agentId`,
+  `agentName`, `message`) after `serve:started`. Each dispatch reports its own once, before the model starts, as a
+  non-fatal `orchestrator:error` bus event (`error` = the diagnostic, `context` = `effort preparation for run
+  <run> (agent <agent>)`, `fatal: false`), shown by the `serve` log and `orch run --watch`. They are never
+  `agent:output` or run-log events, so a run's result and a retry's previous output cannot contain them.
 - Peer protocol: unchanged; remote and mirror dispatch ignore the prompt mode.
 
 Security checklist:

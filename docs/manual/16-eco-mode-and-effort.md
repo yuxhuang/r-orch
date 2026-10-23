@@ -276,8 +276,9 @@ script that reports version 2.1.2 and that help line, the model argument was:
 openrouter/anthropic/claude-opus-5.5#max
 ```
 
-With a stand-in that reports version 1.4.0, a level written by orch 0.9.4 (`high`) is dropped with a warning and
-the run goes ahead with the model unchanged; a newer level (`max`) stops the run before the model starts:
+With a stand-in that reports version 1.4.0, a level written by orch 0.9.4 (`high`) is dropped with a
+`legacy-ignored` warning when the run starts ([Warnings when a run starts](#warnings-when-a-run-starts)) and the
+run goes ahead with the model unchanged; a newer level (`max`) stops the run before the model starts:
 
 ```text
   ✕ effort preparation failed: r-orch does not accept effort `max` for adapter `opencode` with model `openrouter/anthropic/claude-opus-5.5`: the installed opencode did not prove provider/model#variant support (only major version 2 is supported). Allowed: low, medium, high, xhigh, max. Clear it with `--effort default` or choose an allowed level. (OpenCode version is not recognized major 2)
@@ -290,12 +291,10 @@ OpenCode is noticed. It cannot notice a binary swapped between the check and the
 
 orch prints effort warnings when you add or change an agent, under `orch agent list` and `orch agent show`, and
 when `orch run` (with a task ID, `--all` or `--watch`) and the dashboard start. They go to standard error, so
-`--json` output stays clean. `orch serve` writes them to its log instead, as `serve:diagnostic` records after
-`serve:started` ([Run orch without a terminal](07-running-and-monitoring.md#run-orch-without-a-terminal)).
-
-Where a run records its own warnings is changing: they are being moved out of the agent's output, so that a
-retry's prompt never repeats them (pending change, tasks `tsk_Blnhui2` and `tsk_zODAcO8`). This section will name
-the new place once that lands.
+`--json` output stays clean. `orch serve` writes them to its log instead, as one `serve:diagnostic` warning per
+agent right after `serve:started`, with the fields `agentId`, `agentName` and `message`
+([Run orch without a terminal](07-running-and-monitoring.md#run-orch-without-a-terminal)). Each run reports its
+agent's warnings again when it starts ([Warnings when a run starts](#warnings-when-a-run-starts)).
 
 Each warning starts with a status:
 
@@ -316,6 +315,49 @@ run starts:
 
 If your Codex installation sets a managed default model for new threads, passing an effort can make Codex pick a
 different model than it did with orch 0.9.4, which passed no effort. Set an explicit `--model` to avoid this.
+
+### Warnings when a run starts
+
+When orch starts a run for an agent with an effort warning, it reports that warning once more, just before the
+model starts, with the context `effort preparation for run <run-id> (agent <agent-id>)`. Only these show it:
+
+- `orch serve`: a `warn` record with the event `orchestrator:error`, whose fields are `error` (the warning),
+  `context` and `fatal: false`. `--verbose` is not needed.
+- `orch run --watch`: a `⚠ <context>: <warning>` line.
+
+`orch run <task-id>` and the dashboard show only their start-up warnings. The warning is never part
+of the agent's output: it is not in the run's events (`orch logs <run-id>`), the run's result, or the previous
+output a retry passes to the agent.
+
+The run-start check can find more than the start-up list. For OpenCode it also runs the version check, so an
+OpenCode 1 installation turns a `local-override-possible` start-up warning into a `legacy-ignored` one for the
+run. A shell agent with an effort edited in by hand, and the OpenCode 1.4.0 stand-in from
+[OpenCode checks the installed version first](#opencode-checks-the-installed-version-first), under
+`orch serve --once --log-format text`:
+
+```text
+02:01:43.029 WARN  serve:diagnostic  agentId=agt_Hgnq0_O agentName=oc message=local-override-possible: a local opencode variant with the same name can replace the catalog variant's settings
+02:01:43.029 WARN  serve:diagnostic  agentId=agt_0etJPjj agentName=sh message=legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)
+02:01:43.141 INFO  task:status_changed  taskId=tsk_CwY1NL1 from=todo to=in_progress
+02:01:43.248 WARN  orchestrator:error  error=legacy-ignored: the installed opencode did not prove provider/model#variant support; the original model is kept and the stored effort is ignored (OpenCode version is not recognized major 2) context=effort preparation for run run_PKyvVfU (agent agt_Hgnq0_O) fatal=false
+02:01:43.257 INFO  agent:started  agentId=agt_Hgnq0_O taskId=tsk_CwY1NL1 runId=run_PKyvVfU
+```
+
+In JSON (the default `--log-format`):
+
+```json
+{"ts":"2026-10-23T02:00:00.188Z","level":"warn","event":"orchestrator:error","error":"legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)","context":"effort preparation for run run_mwwzg7O (agent agt_0etJPjj)","fatal":false}
+```
+
+The same shell agent under `orch run --watch`:
+
+```text
+  22:00  ⚠ effort preparation for run run_CjNqeg2 (agent agt_0etJPjj): legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)
+```
+
+An effort the run cannot send at all (for example a newer level on OpenCode 1) is not a warning: the run fails
+before the model starts, as shown in
+[OpenCode checks the installed version first](#opencode-checks-the-installed-version-first).
 
 ## Agents written by orch 0.9.4
 

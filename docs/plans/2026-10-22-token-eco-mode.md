@@ -62,7 +62,9 @@ model_reasoning_effort="<level>"`, OpenCode `<model>#<level>`. OpenCode alone ov
 --help` (2 s and 64 KiB each, process group killed on failure) and requires major version 2 and the
 `provider/model#variant` signature. `execute` stays synchronous and returns the model child's PID. Diagnostics
 use five statuses (`request-only`, `clamp-possible`, `local-override-possible`, `capability-unknown`,
-`legacy-ignored`) and never claim an effective level.
+`legacy-ignored`) and never claim an effective level. They are never agent output: each run reports its own once,
+before the model starts, as a non-fatal `orchestrator:error` with context `effort preparation for run <run> (agent
+<agent>)` (lead ruling 8).
 
 **Models (D6).** `orch-domain/src/model_tiers.rs` changes the static capable/balanced/fast choices for new
 selections only; stored models are never resolved through it.
@@ -107,7 +109,7 @@ slices share one compile dependency chain (B1 → B4), and the workspace does no
 | B4 | implemented, `7f96bdd`; CLI and TUI lib tests pass on macOS; `orch serve` start-up diagnostics `784169c`, record fields renamed `agentId`/`agentName` in `3b03c62` |
 | T1 | in progress |
 | W | committed with this plan; examples re-run on `3b03c62` in disposable projects |
-| F1 | in progress: effort diagnostics move out of the agent-output stream (lead ruling 8); adapters `72125b1`, engine pending; manual follow-up after it lands |
+| F1 | implemented: effort diagnostics left the agent-output stream (lead ruling 8); adapters `72125b1`, engine `6ae9839` (one non-fatal `orchestrator:error` per run before spawn); manual and spec updated in the W follow-up |
 | I, P, E | pending |
 
 ## Test plan
