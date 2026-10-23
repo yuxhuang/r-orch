@@ -361,7 +361,7 @@ impl Adapter for ClaudeAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let effort = super::effort::selection("claude", &params.config)?;
+        super::effort::selection("claude", &params.config)?;
         // Dropped (deleting the file) on any early return, including a failed
         // spawn.
         let system_prompt_file = effective_system_prompt(&params)
@@ -399,11 +399,7 @@ impl Adapter for ClaudeAdapter {
             "Claude",
             params.cancel,
         );
-        Ok(super::effort::with_diagnostics(
-            ExecuteHandle { pid, events },
-            effort.diagnostics,
-            self.clock.as_ref(),
-        ))
+        Ok(ExecuteHandle { pid, events })
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

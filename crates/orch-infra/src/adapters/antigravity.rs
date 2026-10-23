@@ -160,7 +160,6 @@ impl Adapter for AntigravityAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let effort = super::effort::selection("antigravity", &params.config)?;
         let args = build_args(&params)?;
         let io = spawn_child(
             &self.process_manager,
@@ -178,11 +177,7 @@ impl Adapter for AntigravityAdapter {
 
         let pid = io.pid;
         let events = antigravity_events(io, Arc::clone(&self.clock), params.cancel);
-        Ok(super::effort::with_diagnostics(
-            ExecuteHandle { pid, events },
-            effort.diagnostics,
-            self.clock.as_ref(),
-        ))
+        Ok(ExecuteHandle { pid, events })
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

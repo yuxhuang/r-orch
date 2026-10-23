@@ -354,7 +354,6 @@ impl Adapter for CodexAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let effort = super::effort::selection("codex", &params.config)?;
         let args = build_args(&params)?;
         let mut io = spawn_child(
             &self.process_manager,
@@ -384,11 +383,7 @@ impl Adapter for CodexAdapter {
             "Codex",
             params.cancel,
         );
-        Ok(super::effort::with_diagnostics(
-            ExecuteHandle { pid, events },
-            effort.diagnostics,
-            self.clock.as_ref(),
-        ))
+        Ok(ExecuteHandle { pid, events })
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {

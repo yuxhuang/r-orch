@@ -1,69 +1,56 @@
 //! Native selectors come only from the domain dispatch policy.
 
-use futures::StreamExt;
-use orch_core::{AdapterError, AgentEvent, AgentEventKind, Clock, ExecuteHandle};
+use orch_core::AdapterError;
 use orch_domain::{AgentConfig, EffortDispatch, EffortWire, plan_effort_dispatch};
 
 pub(super) struct Selection {
     pub model: Option<String>,
     pub args: Vec<String>,
-    pub diagnostics: Vec<String>,
 }
 
 pub(super) fn selection(adapter: &str, config: &AgentConfig) -> Result<Selection, AdapterError> {
     let mut selected = Selection {
         model: config.model.clone(),
         args: Vec::new(),
-        diagnostics: Vec::new(),
     };
-    let diagnostics = match plan_effort_dispatch(adapter, config.model.as_deref(), config.effort) {
+    match plan_effort_dispatch(adapter, config.model.as_deref(), config.effort) {
         EffortDispatch::Unset => return Ok(selected),
         EffortDispatch::Reject(error) => return Err(AdapterError::new(error.to_string(), None)),
-        EffortDispatch::IgnoreLegacy { diagnostics } => diagnostics,
-        EffortDispatch::Forward {
-            wire, diagnostics, ..
-        } => {
-            match wire {
-                EffortWire::Flag { flag, level } => {
-                    selected.args = vec![flag.to_owned(), level.as_str().to_owned()];
-                }
-                EffortWire::ConfigOverride { key, level } => {
-                    selected.args = vec!["-c".to_owned(), format!("{key}=\"{}\"", level.as_str())];
-                }
-                EffortWire::ModelVariant { model } => selected.model = Some(model),
+        EffortDispatch::IgnoreLegacy { .. } => {}
+        EffortDispatch::Forward { wire, .. } => match wire {
+            EffortWire::Flag { flag, level } => {
+                selected.args = vec![flag.to_owned(), level.as_str().to_owned()];
             }
-            diagnostics
-        }
-    };
-    selected.diagnostics = diagnostics.into_iter().map(|d| d.to_string()).collect();
+            EffortWire::ConfigOverride { key, level } => {
+                selected.args = vec!["-c".to_owned(), format!("{key}=\"{}\"", level.as_str())];
+            }
+            EffortWire::ModelVariant { model } => selected.model = Some(model),
+        },
+    }
     Ok(selected)
 }
 
-pub(super) fn with_diagnostics(
-    handle: ExecuteHandle,
-    diagnostics: Vec<String>,
-    clock: &dyn Clock,
-) -> ExecuteHandle {
-    if diagnostics.is_empty() {
-        return handle;
-    }
-    let timestamp = clock.now_iso();
-    let notes = diagnostics.into_iter().map(move |text| {
-        Ok(AgentEvent::new(
-            AgentEventKind::Output,
-            timestamp.clone(),
-            serde_json::json!({ "text": text }),
-        ))
-    });
-    ExecuteHandle {
-        pid: handle.pid,
-        events: Box::pin(futures::stream::iter(notes).chain(handle.events)),
-    }
+/// Pure pre-execution diagnostics for a non-OpenCode adapter's resolved config.
+/// OpenCode callers must use `EffortPreparation::diagnostics` instead, since
+/// its wire check can change the dispatch outcome.
+pub fn effort_diagnostics(
+    adapter: &str,
+    config: &AgentConfig,
+) -> Result<Vec<String>, AdapterError> {
+    let diagnostics = match plan_effort_dispatch(adapter, config.model.as_deref(), config.effort) {
+        EffortDispatch::Unset => return Ok(Vec::new()),
+        EffortDispatch::Reject(error) => return Err(AdapterError::new(error.to_string(), None)),
+        EffortDispatch::IgnoreLegacy { diagnostics }
+        | EffortDispatch::Forward { diagnostics, .. } => diagnostics,
+    };
+    Ok(diagnostics.into_iter().map(|d| d.to_string()).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use orch_core::AgentEventKind;
     use orch_core::{ExecuteParams, test_support::FakeProcessManager};
     use orch_domain::{EffortDispatch, ReasoningEffort as E};
     use std::sync::Arc;
@@ -78,6 +65,36 @@ mod tests {
             config,
             cancel: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_claude_high_stream_contains_zero_diagnostic_output_events() {
+        let pm = Arc::new(
+            FakeProcessManager::new()
+                .with_stdout_lines([r#"{"type":"result","result":"provider result"}"#]),
+        );
+        let registry = super::super::build_registry(pm.clone());
+        let handle = registry
+            .get("claude")
+            .unwrap()
+            .execute(params(AgentConfig {
+                model: Some("claude-opus-5-5".into()),
+                effort: Some(E::High),
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_eq!(handle.pid, pm.pid());
+        let events = handle.events.collect::<Vec<_>>().await;
+        let events = events.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == AgentEventKind::Output)
+                .count(),
+            0,
+            "effort diagnostics must never become provider Output: {events:?}"
+        );
+        assert!(events.iter().any(|e| e.kind == AgentEventKind::Done));
     }
 
     #[tokio::test]
@@ -125,10 +142,13 @@ mod tests {
                     ..Default::default()
                 };
                 let planned = plan_effort_dispatch(kind, Some(model), Some(level));
+                let diagnostics = effort_diagnostics(kind, &config);
+                assert!(pm.spawned().is_empty());
                 let result = registry.get(kind).unwrap().execute(params(config));
                 match planned {
                     EffortDispatch::Reject(_) => {
                         assert!(result.is_err(), "{kind} {level}");
+                        assert!(diagnostics.is_err());
                         assert!(pm.spawned().is_empty());
                     }
                     EffortDispatch::Forward { wire, .. } => {
@@ -152,22 +172,23 @@ mod tests {
                             1,
                             "{kind} {level}: {args:?}"
                         );
-                        let mut events = handle.events;
-                        let first = events.next().await.unwrap().unwrap();
+                        let diagnostics = diagnostics.unwrap();
+                        assert!(diagnostics.iter().any(|d| d.starts_with("request-only")));
+                        let events = handle.events.collect::<Vec<_>>().await;
                         assert!(
-                            first.data["text"]
-                                .as_str()
-                                .unwrap()
-                                .starts_with("request-only")
+                            events
+                                .into_iter()
+                                .all(|e| e.unwrap().kind != AgentEventKind::Output)
                         );
                     }
                     EffortDispatch::IgnoreLegacy { .. } => {
-                        let mut events = result.unwrap().events;
+                        let diagnostics = diagnostics.unwrap();
+                        assert!(diagnostics.iter().any(|d| d.starts_with("legacy-ignored")));
+                        let events = result.unwrap().events.collect::<Vec<_>>().await;
                         assert!(
-                            events.next().await.unwrap().unwrap().data["text"]
-                                .as_str()
-                                .unwrap()
-                                .starts_with("legacy-ignored")
+                            events
+                                .into_iter()
+                                .all(|e| e.unwrap().kind != AgentEventKind::Output)
                         );
                         let args = &pm.spawned()[0].1;
                         assert!(!args.iter().any(|a| a == "--effort"

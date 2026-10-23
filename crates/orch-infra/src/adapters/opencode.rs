@@ -355,7 +355,6 @@ impl Adapter for OpenCodeAdapter {
     }
 
     fn execute(&self, params: ExecuteParams) -> Result<ExecuteHandle, AdapterError> {
-        let effort = super::effort::selection("opencode", &params.config)?;
         let args = build_args(&params)?;
         let io = spawn_child(
             &self.process_manager,
@@ -379,11 +378,7 @@ impl Adapter for OpenCodeAdapter {
             "OpenCode",
             params.cancel,
         );
-        Ok(super::effort::with_diagnostics(
-            ExecuteHandle { pid, events },
-            effort.diagnostics,
-            self.clock.as_ref(),
-        ))
+        Ok(ExecuteHandle { pid, events })
     }
 
     async fn stop(&self, pid: u32) -> orch_core::Result<()> {
@@ -397,6 +392,7 @@ impl Adapter for OpenCodeAdapter {
 #[cfg(test)]
 mod effort_tests {
     use super::*;
+    use futures::StreamExt;
     use orch_core::process::{
         EnvInheritance, ExitNotifier, ExitOutcome, ExitSignal, Signal, SpawnedChild,
     };
@@ -573,6 +569,17 @@ mod effort_tests {
             assert_eq!(
                 handle.pid, 456,
                 "execute returns the model PID, never the probe PID"
+            );
+            let events = handle.events.collect::<Vec<_>>().await;
+            assert!(
+                events.into_iter().all(|event| {
+                    let event = event.unwrap();
+                    !event.data["text"].as_str().is_some_and(|text| {
+                        text.starts_with("request-only:")
+                            || text.starts_with("local-override-possible:")
+                    })
+                }),
+                "preparation diagnostics must not be re-emitted by execute"
             );
             let calls = pm.calls.lock().unwrap();
             assert_eq!(calls.len(), 3);

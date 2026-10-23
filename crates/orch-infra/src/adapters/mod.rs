@@ -28,6 +28,7 @@ pub use buffer::EventBuffer;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
+pub use effort::effort_diagnostics;
 pub use grok::GrokAdapter;
 pub use opencode::OpenCodeAdapter;
 pub use pi::PiAdapter;
