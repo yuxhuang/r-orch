@@ -280,12 +280,11 @@ async fn a_v2_binary_with_the_variant_signature_permits_synthesis_after_exactly_
     assert_eq!(rig.probe_args()[..2], ["--version", "run --help"]);
     assert_eq!(rig.calls().len(), 3, "two probes then one model child");
     assert!(rig.model_child_ran());
-    // D5-10: the request is reported as a request with the override caveat,
-    // never as a confirmed effective level.
-    assert!(
-        diags.iter().any(|d| d.starts_with("request-only:")),
-        "{diags:?}"
-    );
+    // D5-10: the request carries the override caveat, never a confirmed
+    // effective level. The informational request-only note is not a
+    // run-start warning (lead ruling 20); it stays on agent add/show.
+    let plain_note = format!("request-only: {}", orch_domain::EFFORT_REQUEST_ONLY_NOTE);
+    assert!(!diags.contains(&plain_note), "{diags:?}");
     assert!(
         diags
             .iter()
@@ -617,6 +616,165 @@ async fn cancelling_preparation_kills_the_probe_group_without_waiting_for_the_de
         .parse()
         .unwrap();
     assert_dead_soon(pid, "grandchild after cancel").await;
+}
+
+// ── drop and reap (T1 gaps A3b, A3c; lead ruling 19) ───────────────────────
+
+/// The probe script both tests below run: it records its own pid and a
+/// descendant's, then waits, so it never answers.
+const HANGING: &str =
+    "sleep 60 & echo $! > \"$D/grandchild.pid\"; echo $$ > \"$D/child.pid\"; wait";
+
+async fn wait_for_pid(dir: &std::path::Path, name: &str) -> i32 {
+    for _ in 0..500 {
+        if let Some(pid) = std::fs::read_to_string(dir.join(name))
+            .ok()
+            .and_then(|c| c.trim().parse().ok())
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{name} was never written");
+}
+
+#[tokio::test]
+async fn dropping_the_preparation_future_mid_probe_kills_the_probe_process_group() {
+    // A3b: the Drop guard is the backstop when the preparation is abandoned
+    // rather than cancelled (a dropped dispatch, a runtime shutting down).
+    let _gate = GATE.read().await;
+    let rig = Rig::new(Fake::version_sh(HANGING));
+    let params = rig.params(Some(MODEL), Some(E::High));
+    let started = Instant::now();
+    let (child, grandchild) = tokio::select! {
+        _ = rig.adapter.prepare_effort(&params) => panic!("a hanging probe cannot finish"),
+        pids = async {
+            let grandchild = wait_for_pid(rig.dir.path(), "grandchild.pid").await;
+            (wait_for_pid(rig.dir.path(), "child.pid").await, grandchild)
+        } => pids,
+    };
+    // The preparation future is dropped here, before its deadline.
+    assert!(
+        started.elapsed() < Duration::from_millis(1800),
+        "the drop must happen mid-probe, not after the deadline"
+    );
+    // Both are checked before either assertion, so a failure cannot leave
+    // the other behind.
+    let mut survivors = Vec::new();
+    for (pid, what) in [(child, "probe"), (grandchild, "probe descendant")] {
+        if !dead_within(pid, Duration::from_secs(2)).await {
+            survivors.push(what);
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+    }
+    assert!(
+        survivors.is_empty(),
+        "survived the dropped preparation: {survivors:?}"
+    );
+}
+
+async fn dead_within(pid: i32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while pid_alive(pid) {
+        if Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// The real process manager, except that each child's exit is acknowledged
+/// [`SlowReap::DELAY`] after it is reaped. The time of the (delayed)
+/// acknowledgement is recorded, so a test can tell whether the probe waited
+/// for it before returning.
+struct SlowReap {
+    inner: Arc<FakeBin>,
+    acked: Arc<Mutex<Vec<Instant>>>,
+}
+
+impl SlowReap {
+    const DELAY: Duration = Duration::from_millis(300);
+}
+
+#[async_trait]
+impl ProcessManager for SlowReap {
+    fn is_alive(&self, pid: u32) -> bool {
+        self.inner.is_alive(pid)
+    }
+    fn kill(&self, pid: u32, signal: Signal) {
+        self.inner.kill(pid, signal)
+    }
+    async fn kill_with_grace(&self, pid: u32, grace: Duration) {
+        self.inner.kill_with_grace(pid, grace).await
+    }
+    fn spawn(
+        &self,
+        command: &str,
+        args: &[String],
+        opts: SpawnOptions,
+    ) -> orch_core::Result<SpawnedChild> {
+        let mut child = self.inner.spawn(command, args, opts)?;
+        let (notifier, delayed) = orch_core::process::ExitSignal::channel();
+        let reaped = std::mem::replace(&mut child.exit, delayed);
+        let acked = Arc::clone(&self.acked);
+        tokio::spawn(async move {
+            let outcome = reaped.wait().await;
+            tokio::time::sleep(SlowReap::DELAY).await;
+            acked.lock().unwrap().push(Instant::now());
+            notifier.notify(outcome);
+        });
+        Ok(child)
+    }
+}
+
+/// Prepare against [`SlowReap`]; `cancel_when_running` cancels once the probe
+/// child exists, otherwise the 2 s deadline cuts it off. Returns whether the
+/// child's exit had been acknowledged when the preparation returned.
+async fn reap_acknowledged_before_return(cancel_when_running: bool) -> bool {
+    let rig = Rig::new(Fake::version_sh(HANGING));
+    let slow = Arc::new(SlowReap {
+        inner: Arc::clone(&rig.pm),
+        acked: Arc::new(Mutex::new(Vec::new())),
+    });
+    let adapter = OpenCodeAdapter::new(Arc::clone(&slow) as Arc<dyn ProcessManager>);
+    let params = rig.params(Some(MODEL), Some(E::High));
+    if cancel_when_running {
+        let token = params.cancel.clone();
+        let dir = rig.dir.path().to_path_buf();
+        tokio::spawn(async move {
+            wait_for_pid(&dir, "child.pid").await;
+            token.cancel();
+        });
+    }
+    let _ = adapter.prepare_effort(&params).await;
+    let returned = Instant::now();
+    let acked = slow.acked.lock().unwrap().clone();
+    let child = wait_for_pid(rig.dir.path(), "child.pid").await;
+    assert_dead_soon(child, "probe").await;
+    !acked.is_empty() && acked.iter().all(|at| *at <= returned)
+}
+
+#[tokio::test]
+async fn a_killed_probe_child_is_reaped_before_the_preparation_returns() {
+    // A3c: after a deadline or cancel kill the probe waits for the reaper's
+    // acknowledgement (bounded by the kill grace) instead of returning with
+    // the child possibly unreaped.
+    let _gate = GATE.read().await;
+    let (cancelled, deadline) = tokio::join!(
+        reap_acknowledged_before_return(true),
+        reap_acknowledged_before_return(false),
+    );
+    assert!(
+        cancelled,
+        "cancel kill: returned before the exit was acknowledged"
+    );
+    assert!(
+        deadline,
+        "deadline kill: returned before the exit was acknowledged"
+    );
 }
 
 // ── no real CLI ─────────────────────────────────────────────────────────────

@@ -104,6 +104,11 @@ impl Orchestrator {
             ScopeIndex::new(in_progress_scoped.iter().map(|task| task.scope.as_deref()));
 
         for task in &candidates {
+            // A standalone signal stops the pass at the next candidate; the
+            // dispatch already made settles normally.
+            if self.is_interrupted() {
+                break;
+            }
             let remote_only = local_running(state) >= max_local;
             if remote_only && !self.has_idle_remote_agent(state, &mut remote_agents).await {
                 break;
@@ -311,6 +316,10 @@ impl Orchestrator {
         prefetched: Option<Task>,
         remote_only: bool,
     ) -> Result<()> {
+        // After a standalone signal nothing new is claimed (ruling 19).
+        if self.is_interrupted() {
+            return Ok(());
+        }
         if let Some(entry) = state.running.get(task_id) {
             return Err(Error::Domain(DomainError::TaskAlreadyRunning {
                 task_id: task_id.to_owned(),
@@ -775,19 +784,42 @@ impl Orchestrator {
         // failure here, or in the spawn itself, goes through the run-failure
         // path: run failed, agent idle with `last_error`, task retried or
         // failed by the normal policy — never an agent stuck `running`.
-        let preparation = match adapter
-            .prepare_effort(&params)
-            .await
-            .and_then(|prepared| check_preparation(&params.config, prepared))
-        {
-            Ok(preparation) => preparation,
-            Err(err) => {
-                let message = format!("effort preparation failed: {err}");
-                self.fail_before_spawn(state, &task_id, &run.id, &agent.id, &message, err.kind)
-                    .await;
-                return Err(Error::other(message));
+        //
+        // A standalone signal (ruling 19) cancels the preparation rather than
+        // dropping it: the probe kills and reaps its process group and returns,
+        // and the dispatch then fails here, before any model child, so the
+        // critical section still ends with every record settled.
+        let prepared = {
+            let cancel = params.cancel.clone();
+            let interrupt = self.inner.interrupt.clone();
+            let preparation = adapter.prepare_effort(&params);
+            tokio::pin!(preparation);
+            tokio::select! {
+                biased;
+                prepared = &mut preparation => prepared,
+                () = interrupt.cancelled() => {
+                    cancel.cancel();
+                    preparation.await
+                }
             }
         };
+        if self.is_interrupted() {
+            let message = "dispatch interrupted by a signal before the model started";
+            let kind = orch_domain::classify_adapter_error(message, None);
+            self.fail_before_spawn(state, &task_id, &run.id, &agent.id, message, kind)
+                .await;
+            return Err(Error::other(message));
+        }
+        let preparation =
+            match prepared.and_then(|prepared| check_preparation(&params.config, prepared)) {
+                Ok(preparation) => preparation,
+                Err(err) => {
+                    let message = format!("effort preparation failed: {err}");
+                    self.fail_before_spawn(state, &task_id, &run.id, &agent.id, &message, err.kind)
+                        .await;
+                    return Err(Error::other(message));
+                }
+            };
         params.config = preparation.config;
         // Effort diagnostics come from one source per adapter (lead ruling 8):
         // OpenCode's preparation, whose wire check can change the outcome,
@@ -949,10 +981,13 @@ impl Orchestrator {
         }
     }
 
-    /// Effort diagnostics (`request-only`, `legacy-ignored`, capability
-    /// uncertainty) are operator information, not provider output (design
-    /// D5.2, lead ruling 8). Each goes to exactly one surface before the model
-    /// child exists: a non-fatal `orchestrator:error` on the bus, with
+    /// Effort warnings (`legacy-ignored`, clamps, capability uncertainty,
+    /// the Codex managed-model coupling) are operator information, not
+    /// provider output (design D5.2, lead ruling 8). Only warnings arrive
+    /// here: the informational `request-only` note is filtered at its source
+    /// (lead ruling 20) and stays on `agent add`/`show`. Each warning goes to
+    /// exactly one surface before the model child exists: a non-fatal
+    /// `orchestrator:error` on the bus, with
     /// `context` starting [`EFFORT_DIAGNOSTIC_CONTEXT`] and `error` the note
     /// verbatim. `serve` logs it as a warn-level record (stderr or
     /// `--log-file`); `run --watch` prints it as a ⚠ line.

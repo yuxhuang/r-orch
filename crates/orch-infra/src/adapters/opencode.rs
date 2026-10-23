@@ -323,13 +323,15 @@ impl Adapter for OpenCodeAdapter {
             EffortDispatch::Reject(error) => {
                 return Err(AdapterError::new(error.to_string(), None));
             }
+            // Warnings only (lead ruling 20): the `request-only` note is not
+            // reported at run start.
             EffortDispatch::IgnoreLegacy { diagnostics } => {
                 prepared.config.effort = None;
-                prepared.diagnostics = diagnostics.into_iter().map(|d| d.to_string()).collect();
+                prepared.diagnostics = super::effort::warnings(diagnostics);
                 return Ok(prepared);
             }
             EffortDispatch::Forward { diagnostics, .. } => {
-                prepared.diagnostics = diagnostics.into_iter().map(|d| d.to_string()).collect();
+                prepared.diagnostics = super::effort::warnings(diagnostics);
             }
         }
         if let Err(reason) = self.check_effort_wire(params).await {
@@ -342,6 +344,7 @@ impl Adapter for OpenCodeAdapter {
                     prepared.config.effort = None;
                     prepared.diagnostics = diagnostics
                         .into_iter()
+                        .filter(|d| d.is_warning())
                         .map(|d| format!("{d} ({reason})"))
                         .collect();
                 }

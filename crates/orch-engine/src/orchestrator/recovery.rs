@@ -571,10 +571,22 @@ impl Orchestrator {
         &self,
         state: &mut OrchestratorState,
     ) -> Vec<String> {
+        self.shutdown_running_entries_where(state, |_| true).await
+    }
+
+    /// [`Self::shutdown_running_entries`] for the entries whose task id
+    /// `select` accepts; the rest are left untouched. The standalone
+    /// interrupt uses it to wind down only this process's own runs.
+    pub(super) async fn shutdown_running_entries_where(
+        &self,
+        state: &mut OrchestratorState,
+        select: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
         let mut detached = Vec::new();
         let entries: Vec<(String, orch_domain::RunningEntry)> = state
             .running
             .iter()
+            .filter(|(task_id, _)| select(task_id))
             .map(|(task_id, entry)| (task_id.clone(), entry.clone()))
             .collect();
 

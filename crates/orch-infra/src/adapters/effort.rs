@@ -30,9 +30,14 @@ pub(super) fn selection(adapter: &str, config: &AgentConfig) -> Result<Selection
     Ok(selected)
 }
 
-/// Pure pre-execution diagnostics for a non-OpenCode adapter's resolved config.
-/// OpenCode callers must use `EffortPreparation::diagnostics` instead, since
-/// its wire check can change the dispatch outcome.
+/// Pure pre-execution effort **warnings** for a non-OpenCode adapter's
+/// resolved config: one string per [`EffortDiagnostic::is_warning`]
+/// diagnostic. The informational `request-only` note is not one; it is shown
+/// on `agent add`/`show`, never at run start (lead ruling 20). OpenCode
+/// callers must use `EffortPreparation::diagnostics` instead, since its wire
+/// check can change the dispatch outcome.
+///
+/// [`EffortDiagnostic::is_warning`]: orch_domain::EffortDiagnostic::is_warning
 pub fn effort_diagnostics(
     adapter: &str,
     config: &AgentConfig,
@@ -43,7 +48,17 @@ pub fn effort_diagnostics(
         EffortDispatch::IgnoreLegacy { diagnostics }
         | EffortDispatch::Forward { diagnostics, .. } => diagnostics,
     };
-    Ok(diagnostics.into_iter().map(|d| d.to_string()).collect())
+    Ok(warnings(diagnostics))
+}
+
+/// The run-start rendering of a dispatch plan's diagnostics: warnings only,
+/// each once, in plan order.
+pub(super) fn warnings(diagnostics: Vec<orch_domain::EffortDiagnostic>) -> Vec<String> {
+    diagnostics
+        .into_iter()
+        .filter(|d| d.is_warning())
+        .map(|d| d.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -173,7 +188,12 @@ mod tests {
                             "{kind} {level}: {args:?}"
                         );
                         let diagnostics = diagnostics.unwrap();
-                        assert!(diagnostics.iter().any(|d| d.starts_with("request-only")));
+                        let plain_note =
+                            format!("request-only: {}", orch_domain::EFFORT_REQUEST_ONLY_NOTE);
+                        assert!(
+                            !diagnostics.contains(&plain_note),
+                            "{kind} {level}: the request-only note is not a run-start warning: {diagnostics:?}"
+                        );
                         let events = handle.events.collect::<Vec<_>>().await;
                         assert!(
                             events

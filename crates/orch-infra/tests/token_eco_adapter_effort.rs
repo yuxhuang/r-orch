@@ -628,13 +628,19 @@ async fn no_adapter_ever_emits_effort_diagnostics_as_provider_output() {
 async fn the_pre_execute_surface_still_carries_the_diagnostic_the_stream_no_longer_does() {
     // Guards the other half of the move: a diagnostic that vanished from both
     // surfaces would pass the sweep above.
+    // A warning (Codex with no model: the managed-model coupling) is on the
+    // surface; the informational request-only note is not, at run start
+    // (lead ruling 20): it stays on agent add/show.
+    let warned = run("codex", cfg(None, Some(E::High))).await;
+    assert!(warned.stream_notes.is_empty());
+    assert!(
+        warned.note_with("capability-unknown").is_some(),
+        "{:?}",
+        warned.notes
+    );
     let forwarded = run("claude", cfg(Some("claude-opus-5-5"), Some(E::High))).await;
     assert!(forwarded.stream_notes.is_empty());
-    assert!(
-        forwarded.note_with("request-only").is_some(),
-        "{:?}",
-        forwarded.notes
-    );
+    assert!(forwarded.notes.is_empty(), "{:?}", forwarded.notes);
     let ignored = run("shell", cfg(None, Some(E::High))).await;
     assert!(ignored.stream_notes.is_empty());
     assert!(

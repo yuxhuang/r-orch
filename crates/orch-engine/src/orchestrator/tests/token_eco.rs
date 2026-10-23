@@ -897,3 +897,204 @@ async fn a_mirror_dispatch_reads_no_prompt_mode_and_keeps_its_own_prompt() {
     );
     assert_eq!(call.config.prompt_mode, None);
 }
+
+// ── Standalone interrupt (gate-resilience F1, lead ruling 19) ────────────
+
+/// Preparation that, when `hang` is set, waits for its cancellation (a hung
+/// wire probe) before returning the identity; a model stream that ends only
+/// when its run is cancelled.
+struct InterruptibleAdapter {
+    hang: bool,
+    entered: tokio::sync::Notify,
+    executed: Mutex<u32>,
+}
+
+impl InterruptibleAdapter {
+    fn new(hang: bool) -> Self {
+        InterruptibleAdapter {
+            hang,
+            entered: tokio::sync::Notify::new(),
+            executed: Mutex::new(0),
+        }
+    }
+}
+
+const INTERRUPTIBLE_PID: u32 = 4321;
+
+#[async_trait]
+impl Adapter for InterruptibleAdapter {
+    fn kind(&self) -> &'static str {
+        "shell"
+    }
+
+    async fn test(&self) -> AdapterTestResult {
+        AdapterTestResult::ok("1.0.0")
+    }
+
+    async fn prepare_effort(
+        &self,
+        params: &ExecuteParams,
+    ) -> std::result::Result<EffortPreparation, AdapterError> {
+        if self.hang {
+            self.entered.notify_one();
+            params.cancel.cancelled().await;
+        }
+        Ok(EffortPreparation {
+            config: params.config.clone(),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    fn execute(&self, params: ExecuteParams) -> std::result::Result<ExecuteHandle, AdapterError> {
+        *self.executed.lock().unwrap() += 1;
+        let events = futures::stream::unfold(params.cancel, |cancel| async move {
+            cancel.cancelled().await;
+            None::<(std::result::Result<AgentEvent, AdapterError>, _)>
+        });
+        Ok(ExecuteHandle {
+            pid: INTERRUPTIBLE_PID,
+            events: Box::pin(events),
+        })
+    }
+
+    async fn stop(&self, _pid: u32) -> orch_core::error::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn after_a_standalone_interrupt_run_task_claims_and_starts_nothing() {
+    let adapter = Arc::new(InterruptibleAdapter::new(false));
+    let h = Harness::builder()
+        .tasks([make_task()])
+        .agents([make_agent()])
+        .adapter_impl(Arc::clone(&adapter) as Arc<dyn Adapter>)
+        .build();
+
+    h.orchestrator.interrupt();
+    h.orchestrator.run_task("tsk_test1").await.unwrap();
+
+    assert_eq!(*adapter.executed.lock().unwrap(), 0);
+    assert!(h.runs.snapshot().is_empty(), "no run record");
+    assert_eq!(h.task("tsk_test1").status, TaskStatus::Todo);
+    assert!(h.persisted_state().claimed.is_empty());
+}
+
+#[tokio::test]
+async fn an_interrupt_during_preparation_cancels_it_and_fails_before_any_model_child() {
+    let adapter = Arc::new(InterruptibleAdapter::new(true));
+    let h = Harness::builder()
+        .tasks([make_task()])
+        .agents([make_agent()])
+        .adapter_impl(Arc::clone(&adapter) as Arc<dyn Adapter>)
+        .build();
+
+    let dispatch = {
+        let orchestrator = h.orchestrator.clone();
+        tokio::spawn(async move { orchestrator.run_task("tsk_test1").await })
+    };
+    adapter.entered.notified().await;
+    h.orchestrator.interrupt();
+    // The preparation only returns once cancelled: a dispatch that ignored
+    // the interrupt would hang here.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
+        .await
+        .expect("the interrupt must cancel the in-flight preparation")
+        .unwrap();
+
+    assert!(result.is_err(), "the dispatch reports the interrupt");
+    assert_eq!(*adapter.executed.lock().unwrap(), 0, "no model child");
+    let runs = h.runs.snapshot();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Failed);
+    assert!(
+        runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("interrupted")),
+        "{:?}",
+        runs[0].error
+    );
+    assert_eq!(h.agent("agt_test1").status, AgentStatus::Idle);
+    assert!(h.persisted_state().running.is_empty());
+    assert!(h.persisted_state().claimed.is_empty());
+    assert_ne!(h.task("tsk_test1").status, TaskStatus::InProgress);
+}
+
+#[tokio::test]
+async fn stopping_interrupted_runs_winds_down_only_this_process_runs() {
+    // Another process's run (say a second `orch run` in another terminal) is
+    // in the shared state; this process starts its own and is interrupted.
+    let foreign = Task {
+        id: "tsk_foreign".into(),
+        status: TaskStatus::InProgress,
+        assignee: Some("agt_other".into()),
+        ..make_task()
+    };
+    let mine = Task {
+        assignee: Some("agt_test1".into()),
+        ..make_task()
+    };
+    let other = Agent {
+        id: "agt_other".into(),
+        name: "Other".into(),
+        status: AgentStatus::Running,
+        ..make_agent()
+    };
+    let adapter = Arc::new(InterruptibleAdapter::new(false));
+    let h = Harness::builder()
+        .tasks([mine, foreign])
+        .agents([make_agent(), other])
+        .state(super::harness::state_running(
+            "tsk_foreign",
+            "agt_other",
+            "run_foreign",
+            777,
+            NOW_ISO,
+        ))
+        .adapter_impl(Arc::clone(&adapter) as Arc<dyn Adapter>)
+        .build();
+
+    h.orchestrator.run_task("tsk_test1").await.unwrap();
+    assert_eq!(*adapter.executed.lock().unwrap(), 1);
+    assert!(h.persisted_state().running.contains_key("tsk_test1"));
+
+    h.orchestrator
+        .stop_interrupted_runs("SIGINT")
+        .await
+        .unwrap();
+
+    let state = h.persisted_state();
+    assert!(!state.running.contains_key("tsk_test1"), "own run stopped");
+    assert!(
+        state.running.contains_key("tsk_foreign"),
+        "another process's run is not touched"
+    );
+    let killed: Vec<u32> = h
+        .processes
+        .killed_with_grace()
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect();
+    assert_eq!(killed, [INTERRUPTIBLE_PID]);
+    let mine = h
+        .runs
+        .snapshot()
+        .into_iter()
+        .find(|run| run.task_id == "tsk_test1")
+        .expect("own run");
+    assert_eq!(mine.status, RunStatus::Cancelled);
+    assert_eq!(h.agent("agt_test1").status, AgentStatus::Idle);
+    assert_eq!(h.agent("agt_other").status, AgentStatus::Running);
+    assert_ne!(h.task("tsk_test1").status, TaskStatus::InProgress);
+    assert_eq!(h.task("tsk_foreign").status, TaskStatus::InProgress);
+    assert!(
+        h.orchestrator
+            .inner
+            .active_collectors
+            .lock()
+            .await
+            .is_empty(),
+        "the collector finished"
+    );
+}

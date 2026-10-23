@@ -11,9 +11,11 @@
 //! * the bus carries no `agent:output` of diagnostic origin, and the
 //!   collector's `final_result` (`result_text` or the last agent message)
 //!   cannot be a diagnostic;
-//! * the diagnostic is reported on the pre-spawn surface, once per dispatch:
-//!   a non-fatal `orchestrator:error` whose context starts
-//!   `effort preparation`, whose text is the note verbatim.
+//! * every **warning** is reported on the pre-spawn surface, once per
+//!   dispatch: a non-fatal `orchestrator:error` whose context starts
+//!   `effort preparation`, whose text is the note verbatim;
+//! * the informational `request-only` note is never reported there (lead
+//!   ruling 20): it is not a warning, and stays on `agent add`/`show`.
 //!
 //! The oracle is the diagnostic vocabulary of design-v3 D5.2 (the five status
 //! words), written out here, not read from the implementation.
@@ -22,11 +24,13 @@ mod token_eco_support;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use orch_core::adapter::Adapter;
-use orch_core::process::ProcessManager;
+use orch_core::process::{ProcessManager, Signal, SpawnOptions, SpawnedChild};
 use orch_core::test_support::FakeProcessManager;
 use orch_domain::{
-    OrchestratorEvent, ReasoningEffort as E, Run, RunEventType, RunStatus, TaskStatus,
+    EFFORT_REQUEST_ONLY_NOTE, OrchestratorEvent, ReasoningEffort as E, Run, RunEventType,
+    RunStatus, TaskStatus,
 };
 use orch_infra::adapters::{
     AntigravityAdapter, ClaudeAdapter, CodexAdapter, CursorAdapter, GrokAdapter, OpenCodeAdapter,
@@ -73,17 +77,19 @@ struct Case {
 
 /// Forward and IgnoreLegacy outcomes across all eight adapters.
 const CASES: [Case; 12] = [
+    // Claude's only diagnostic is the informational request-only note, which
+    // is never a run-start record (ruling 20).
     Case {
         kind: "claude",
         model: Some("claude-opus-5-5"),
         effort: E::High,
-        note: Some("request-only"),
+        note: None,
     },
     Case {
         kind: "claude",
         model: None,
         effort: E::High,
-        note: Some("request-only"),
+        note: None,
     },
     Case {
         kind: "codex",
@@ -91,11 +97,12 @@ const CASES: [Case; 12] = [
         effort: E::High,
         note: None,
     },
+    // Codex with effort and no model: the managed-model coupling warning.
     Case {
         kind: "codex",
         model: None,
         effort: E::High,
-        note: None,
+        note: Some("capability-unknown"),
     },
     Case {
         kind: "pi",
@@ -268,6 +275,147 @@ async fn every_guaranteed_note_is_reported_exactly_once_on_the_pre_spawn_surface
             "{label}"
         );
     }
+}
+
+fn plain_request_only_note() -> String {
+    format!("request-only: {EFFORT_REQUEST_ONLY_NOTE}")
+}
+
+/// Every reported note is distinct (a warning is never repeated) and none is
+/// the informational request-only note.
+fn assert_warnings_once_and_no_request_only(label: &str, notes: &[String]) {
+    assert!(
+        !notes.contains(&plain_request_only_note()),
+        "{label}: the request-only note reached the run-start surface: {notes:?}"
+    );
+    let mut distinct = notes.to_vec();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        notes.len(),
+        "{label}: a warning was reported twice: {notes:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_request_only_note_is_never_reported_at_run_start_and_no_warning_repeats() {
+    for case in &CASES {
+        let label = format!("{} {:?} {}", case.kind, case.model, case.effort);
+        let rig = rig_for(
+            case.kind,
+            case.model,
+            Some(case.effort),
+            FakeProcessManager::new(),
+        )
+        .await;
+        rig.dispatch().await;
+        let notes: Vec<String> = reported(&rig).into_iter().map(|(_, e)| e).collect();
+        assert_warnings_once_and_no_request_only(&label, &notes);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_normal_mode_legacy_claude_high_dispatch_emits_no_orchestrator_error_at_all() {
+    // gate-code C4: a 0.9.4 Claude agent at `effort: high` in a normal-mode
+    // project must not add an `orchestrator:error` to every dispatch.
+    let rig = rig_for(
+        "claude",
+        Some("claude-opus-5-5"),
+        Some(E::High),
+        FakeProcessManager::new(),
+    )
+    .await;
+    rig.dispatch().await;
+    let errors: Vec<_> = rig
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, OrchestratorEvent::OrchestratorError { .. }))
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// OpenCode v2 that answers both probes: `--version` is `2.1.2`, `run --help`
+/// carries the variant signature, and the model child prints one finish line.
+struct OpencodeV2 {
+    inner: FakeProcessManager,
+}
+
+#[async_trait]
+impl ProcessManager for OpencodeV2 {
+    fn is_alive(&self, pid: u32) -> bool {
+        self.inner.is_alive(pid)
+    }
+    fn kill(&self, pid: u32, signal: Signal) {
+        self.inner.kill(pid, signal)
+    }
+    async fn kill_with_grace(&self, pid: u32, grace: std::time::Duration) {
+        self.inner.kill_with_grace(pid, grace).await
+    }
+    fn spawn(
+        &self,
+        command: &str,
+        args: &[String],
+        opts: SpawnOptions,
+    ) -> orch_core::Result<SpawnedChild> {
+        assert_eq!(command, "opencode", "only the fake OpenCode may be spawned");
+        let stdout = match args {
+            [v] if v == "--version" => "2.1.2\n".to_owned(),
+            [run, help] if run == "run" && help == "--help" => {
+                "  -m, --model   model to use in the format of provider/model#variant\n".to_owned()
+            }
+            _ => format!(
+                "{}\n",
+                json!({"type":"step_finish","part":{"reason":"stop"}})
+            ),
+        };
+        self.inner.set_stdout(stdout);
+        self.inner.spawn(command, args, opts)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_v2_probe_success_reports_each_warning_exactly_once_and_never_request_only() {
+    // T1 gap R8d (ruling 8, as amended by ruling 20): with the wire check
+    // passing and an effort set, OpenCode's preparation is the only source.
+    // The engine must not also add the plan's diagnostics (which would repeat
+    // the local-override warning), and the request-only note is not reported.
+    let pm = FakeProcessManager::new();
+    let spy = pm.clone();
+    let model = "openrouter/anthropic/claude-opus-5.5";
+    let mut agent = claude_agent("agt_a", "Alpha");
+    agent.adapter = "opencode".to_owned();
+    agent.config.model = Some(model.to_owned());
+    agent.config.effort = Some(E::High);
+    let rig = Rig::new_with_adapter(
+        RigSpec {
+            raw_config: config_with(Some("normal"), json!({})),
+            agents: vec![agent],
+            tasks: vec![task("tsk_1", Some("agt_a"))],
+            skills: vec![],
+            config_store: true,
+        },
+        Arc::new(OpenCodeAdapter::new(Arc::new(OpencodeV2 { inner: pm }))),
+    )
+    .await;
+    rig.dispatch().await;
+
+    let spawned = spy.spawned();
+    assert_eq!(spawned.len(), 3, "two probes, then the model: {spawned:?}");
+    assert!(
+        spawned[2].1.iter().any(|a| a == &format!("{model}#high")),
+        "the probe passed, so the variant is synthesised: {spawned:?}"
+    );
+    let notes: Vec<String> = reported(&rig).into_iter().map(|(_, e)| e).collect();
+    assert_warnings_once_and_no_request_only("opencode v2", &notes);
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|n| n.starts_with("local-override-possible:"))
+            .count(),
+        1,
+        "the local-override warning exactly once: {notes:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

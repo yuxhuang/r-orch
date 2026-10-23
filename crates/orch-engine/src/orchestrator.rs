@@ -235,6 +235,10 @@ struct Inner {
 
     /// Cancels the watch loop.
     shutdown: std::sync::Mutex<CancellationToken>,
+    /// Latched by a signal on the standalone paths (`run <id>`, `run --all`);
+    /// see [`Orchestrator::interrupt`]. Never cancelled in watch mode, whose
+    /// signal arms go through [`Orchestrator::stop`] instead.
+    interrupt: CancellationToken,
     /// Flips to `true` once `stop` completes or is aborted, releasing waiters.
     stopped: std::sync::Mutex<watch::Sender<bool>>,
 
@@ -300,6 +304,7 @@ impl Orchestrator {
                 skip_autonomous_seeding: AtomicBool::new(false),
                 consecutive_tick_failures: AtomicU32::new(0),
                 shutdown: std::sync::Mutex::new(CancellationToken::new()),
+                interrupt: CancellationToken::new(),
                 stopped: std::sync::Mutex::new(stopped),
                 cached_tasks,
                 cached_agents,
@@ -359,6 +364,11 @@ impl Orchestrator {
 
     pub fn is_shutting_down(&self) -> bool {
         self.inner.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// Whether a standalone signal has been latched by [`Orchestrator::interrupt`].
+    pub fn is_interrupted(&self) -> bool {
+        self.inner.interrupt.is_cancelled()
     }
 
     // ── locking ──────────────────────────────────────────────────────────
@@ -818,6 +828,97 @@ impl Orchestrator {
             self.emit_error(err, "stop: persist the cleared state");
         }
         saved
+    }
+
+    /// Latch a `SIGINT`/`SIGTERM` received by a standalone `run <id>` or
+    /// `run --all` (gate-resilience F1, lead ruling 19). Synchronous and
+    /// idempotent; it aborts nothing.
+    ///
+    /// From here no new dispatch starts: the scheduling pass stops at its next
+    /// candidate and the reactive dispatch finds nothing to do. A dispatch
+    /// already inside its critical section runs to its end, bounded: an
+    /// effort preparation in flight (OpenCode's wire probe) is cancelled, so
+    /// its process group is killed and reaped now instead of at its deadline,
+    /// and the dispatch then fails before any model child exists through the
+    /// ordinary pre-spawn failure path. Its caller still awaits that dispatch
+    /// to completion, then calls [`Orchestrator::stop_interrupted_runs`].
+    ///
+    /// Watch mode does not use this; its signal arms call
+    /// [`Orchestrator::stop`].
+    pub fn interrupt(&self) {
+        self.inner.interrupt.cancel();
+    }
+
+    /// The second half of a standalone interrupt: once the in-flight dispatch
+    /// has settled, stop every run **this process** started and wait for
+    /// their collectors.
+    ///
+    /// The same wind-down `stop` applies to watch mode's runs, restricted to
+    /// this process's own collectors, so a concurrent `orch run` in another
+    /// terminal keeps its run: each local child is killed with the default
+    /// grace, its run finished `cancelled`, its task sent to
+    /// `resolve_failure_status` and its agent returned to idle; a remote
+    /// execution is detached exactly as `stop` detaches it. The project lock
+    /// is taken for the write when it is free, and the state is then re-read
+    /// first; when another process owns it, the write goes through the state
+    /// this process holds, the way its collectors would have written the same
+    /// outcomes. The collector wait is bounded by the kill grace.
+    pub async fn stop_interrupted_runs(&self, signal: &str) -> Result<()> {
+        self.interrupt();
+        self.emit(OrchestratorEvent::OrchestratorShutdown {
+            reason: format!("Received {signal}"),
+        });
+        if self.is_owner() {
+            // Watch mode owns the lock and its own stop path.
+            return Ok(());
+        }
+        let lock = self.deps().lock.acquire().await;
+        let saved = self.stop_interrupted_runs_locked(lock.acquired).await;
+        if lock.acquired {
+            self.deps().lock.release().await;
+        }
+        let collectors = tokio::time::timeout(
+            orch_core::process::DEFAULT_KILL_GRACE,
+            self.wait_for_collectors(),
+        )
+        .await;
+        if collectors.is_err() {
+            self.emit_error(
+                "collectors did not finish within the kill grace",
+                format!("stop after {signal} signal"),
+            );
+        }
+        if let Err(err) = &saved {
+            self.emit_error(err, format!("stop after {signal} signal"));
+        }
+        saved
+    }
+
+    async fn stop_interrupted_runs_locked(&self, reload: bool) -> Result<()> {
+        let mut slot = self.inner.state.lock().await;
+        // Read under the state lock: a dispatch registers its collector before
+        // it releases that lock, so nothing this process started is missed.
+        let owned: HashSet<String> = self.inner.active_collectors.lock().await.clone();
+        if owned.is_empty() {
+            return Ok(());
+        }
+        if reload || slot.is_none() {
+            self.load_state(&mut slot).await?;
+        }
+        let state = slot.as_mut().expect("state loaded");
+        let detached = self
+            .shutdown_running_entries_where(state, |task_id| owned.contains(task_id))
+            .await;
+        state
+            .running
+            .retain(|task_id, _| !owned.contains(task_id) || detached.contains(task_id));
+        state.claimed.retain(|task_id| !owned.contains(task_id));
+        self.inner
+            .single_task_runs
+            .lock()
+            .await
+            .retain(|task_id| !owned.contains(task_id));
+        self.save_state(state).await
     }
 
     /// Cancel a running task: abort, kill, finish the run, mark cancelled.
