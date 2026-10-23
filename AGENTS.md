@@ -26,6 +26,7 @@ Authoritative docs:
 | Question | Read |
 |---|---|
 | How is it built, which crate owns what, which traits | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| How the engine behaves at runtime: goals, tasks, handoffs, pause; how adapters drive agent CLIs | [docs/internal/](docs/internal/README.md) |
 | Something is broken at runtime | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | What users see and how they install | [README.md](README.md) |
 | How to use every feature, step by step | [docs/manual/](docs/manual/README.md) (regenerate the command reference and screenshots with `docs/manual/tools/`) |
