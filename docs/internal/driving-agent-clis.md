@@ -1,6 +1,6 @@
 # Driving agent CLIs
 
-Version 1. Code baseline: **`40a6dc7` (v0.10.0)**. Every source citation below is pinned to
+Version 2. Code baseline: **`40a6dc7` (v0.10.0)**. Every source citation below is pinned to
 `40a6dc78a8bd305ac00163282629c50855616788`; it describes this checkout, not a promise about the latest
 provider CLI. Examples are existing repository fixtures, not fresh provider sessions. Scheduling, task
 handoffs, goals and pause/resume of orchestration belong in `docs/internal/orchestration.md`.
@@ -9,8 +9,8 @@ handoffs, goals and pause/resume of orchestration belong in `docs/internal/orche
 
 **The orchestrator drives a child process through an adapter.** It renders the task's prompt, chooses the
 adapter registered for the agent, and calls `execute`. That call returns the real child PID and an async
-stream immediately. The orchestrator records the PID before consuming the stream. It does not embed the
-provider's agent loop: the CLI owns that loop inside the child process.
+stream before collection begins. The orchestrator records the PID before consuming the stream. The CLI
+owns the agent loop inside the child process; r-orch does not embed that loop.
 [adapter.rs:201 @40a6dc7][src1] [dispatch.rs:741 @40a6dc7][src2]
 [dispatch.rs:850 @40a6dc7][src3]
 
@@ -33,9 +33,10 @@ flowchart LR
 ```
 
 The diagram's boundaries follow the port traits, the common spawn helper and the collector. The adapter
-registry preserves insertion order and replaces a duplicate kind. Registration order is Claude, OpenCode,
-Codex, Cursor, Pi, Grok, Antigravity, Shell. `AgentEventKind` lives in **orch-core**, not orch-domain;
-orch-domain owns the persisted `RunEventType` and `Run`.
+registry preserves insertion order and replaces a duplicate kind. Registration order is Claude, Codex,
+Cursor, Shell, OpenCode, Pi, Grok, Antigravity; this is also the sequential doctor probe order.
+`AgentEventKind` lives in **orch-core**, not orch-domain; orch-domain owns the persisted `RunEventType`
+and `Run`.
 [adapter.rs:51 @40a6dc7][src4] [adapter.rs:292 @40a6dc7][src5]
 [registry.rs:18 @40a6dc7][src6] [spawn.rs:110 @40a6dc7][src7]
 [run.rs:57 @40a6dc7][src8] [collect.rs:159 @40a6dc7][src9]
@@ -72,8 +73,9 @@ Sources: [adapter.rs:265 @40a6dc7][src17] [adapter.rs:310 @40a6dc7][src18]
 ### One run, from prepared task to outcome
 
 This sequence uses Codex as the concrete transport. Other adapters change the prompt delivery and parser,
-not the dispatch/collection boundary. A `Done` record is not the same as process exit; the shared stream
-continues reading and waits for exit before the collector finishes.
+not the dispatch/collection boundary. This shows the normal output path: a `Done` record is not the same
+as process exit; the shared stream continues reading and waits for exit before the collector finishes.
+Read-error and Pi terminal shortcuts are shown under Q9.
 [codex.rs:356 @40a6dc7][src29] [util.rs:144 @40a6dc7][src30]
 
 ```mermaid
@@ -420,29 +422,44 @@ verify auth. [opencode.rs:48 @40a6dc7][src137]
 ### Cancellation, idle detection and child cleanup
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Preparing
-    Preparing --> SpawnRejected: effort or spawn error
-    Preparing --> Running: PID returned and saved
-    Running --> Draining: stdout closes or terminal protocol record
-    Running --> Stopping: explicit cancel or shutdown
-    Running --> Stopping: eligible reconcile stall
-    Stopping --> Reaped: SIGTERM and child exits
-    Stopping --> KillSent: grace expires
-    KillSent --> Reaped: background waiter observes exit
-    Draining --> Reaped: ordinary CLI exits
-    Draining --> Stopping: Pi terminal event
-    Reaped --> Collected: EOF or stream error reaches collector
-    SpawnRejected --> [*]
-    Collected --> [*]
+flowchart TD
+    subgraph Process["Child process: termination and exit acknowledgement"]
+        Running["Child running"] --> Reaped["Background waiter publishes ExitOutcome"]
+        Running --> Stopping["Graceful termination attempt"]
+        Stopping -->|"Child exits during grace"| Reaped
+        Stopping -->|"Grace expires"| KillSent["Send SIGKILL; return without confirming death"]
+        KillSent -->|"Waiter later observes exit"| Reaped
+        Cancel["Explicit cancel, shutdown or eligible stall"] --> Stopping
+    end
+    subgraph Stream["Adapter stream: selected completion paths"]
+        Reading["Consume stdout and emit events"] -->|"Normal shared-stream EOF or Pi nonterminal drain"| WaitExit["Await ExitSignal; apply exit policy"]
+        Reading -->|"Pi terminal record"| Terminal["Emit terminal event; await graceful-kill attempt"]
+        Terminal -->|"Attempt returns; no exit wait"| End["Stream EOF or AdapterError"]
+        Reading -->|"Shared-stream stdout read error"| End
+        WaitExit --> End
+        End --> Collected["Collector finalizes run outcome"]
+    end
+    Terminal -.->|"Requests termination"| Stopping
+    Reaped -.->|"Resolves ExitSignal"| WaitExit
 ```
 
-This is the child lifecycle, not the task-status state machine. The background waiter publishes the
-exit code/signal; the adapter determines whether that becomes a stream error. `kill_with_grace` checks
-PID liveness, sends group-first SIGTERM, polls every 200 ms, then group-first SIGKILL. It does **not**
-confirm death after SIGKILL. The process manager has no kill-on-drop behavior, so a crashed orchestrator
-does not automatically dispose of children. Process groups reach descendants that remain in the group;
-they are not containment for children that detach into another group.
+Process exit and stream completion are separate contracts, not one universal lifecycle or the task-status
+state machine. On the normal shared-stream path, the adapter awaits `ExitSignal` before finishing;
+a stdout read error propagates before that wait. Pi's terminal path emits its terminal event, awaits a
+one-second graceful termination attempt, then returns or throws terminal failure **without awaiting
+`ExitSignal`**. Its nonterminal drain path does await exit. The collector handles stream EOF or an
+adapter error without a separate process-exit wait. **Stream completion, including a succeeded Pi run,
+is not a receipt that the child has been reaped.**
+[util.rs:173 @40a6dc7][src231] [util.rs:181 @40a6dc7][src165]
+[pi.rs:713 @40a6dc7][src83] [pi.rs:739 @40a6dc7][src232]
+[collect.rs:91 @40a6dc7][src14]
+
+The background waiter publishes the exit code/signal; the adapter determines whether that becomes a
+stream error on paths that await it. `kill_with_grace` checks PID liveness, sends group-first SIGTERM,
+polls every 200 ms, then group-first SIGKILL. It does **not** confirm death after SIGKILL. The process
+manager has no kill-on-drop behavior, so a crashed orchestrator does not automatically dispose of
+children. Process groups reach descendants that remain in the group; they are not containment for
+children that detach into another group.
 [manager.rs:92 @40a6dc7][src141] [manager.rs:108 @40a6dc7][src28]
 [manager.rs:152 @40a6dc7][src142] [process.rs:330 @40a6dc7][src143]
 
@@ -452,7 +469,7 @@ they are not containment for children that detach into another group.
 | Explicit task cancel / forced agent stop | Orchestrator also invokes graceful kill with 3-second grace. |
 | Eligible stall | Graceful kill with 5-second grace, then failure `Agent stalled (no events)`. |
 | Orchestrator shutdown / adapter `stop` | Default grace 10 seconds. Shutdown records cancelled runs and applies task failure/retry policy. |
-| Pi terminal record | Adapter emits the terminal event, graceful-kills Pi with 1-second grace, then returns or throws terminal failure. |
+| Pi terminal record | Adapter emits the terminal event, attempts graceful termination with 1-second grace, then returns or throws terminal failure without awaiting exit acknowledgement. |
 | Shell abort | In addition to the shared watcher, its stream installs a 5-second graceful-kill watcher. |
 | Startup finds orphaned running run | Recovery may kill a live local PID and finish that orphan run cancelled. |
 
@@ -667,8 +684,9 @@ FileChange, other tool results become Output, and failed tool results become Err
 Text deltas accumulate silently until `text_end`. Completion uses the last assistant in `agent_end`;
 if `willRetry` is present, even false, the adapter waits for `agent_settled` and uses the pending
 completion. This avoids treating an automatically retried intermediate end as final. Terminal failure
-is emitted and thrown; success emits Done. Either terminal outcome gracefully stops the long-lived RPC
-child with a one-second grace. This is a one-shot use of an RPC transport, not session pooling.
+is emitted and thrown; success emits Done. Either terminal outcome requests graceful termination of the
+long-lived RPC child with a one-second grace, then ends the stream without awaiting `ExitSignal`.
+This is a one-shot use of an RPC transport, not session pooling; completion does not confirm reaping.
 [pi.rs:310 @40a6dc7][src207] [pi.rs:444 @40a6dc7][src63]
 [pi.rs:489 @40a6dc7][src208] [pi.rs:687 @40a6dc7][src209]
 [pi.rs:45 @40a6dc7][src147]
@@ -1018,3 +1036,5 @@ need their own evidence and review; this chapter records the implementation engi
 [src228]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/effort.rs#L140
 [src229]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/tests/adapter_argv.rs#L80
 [src230]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/tests/adapter_fixtures.rs#L90
+[src231]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/util.rs#L173
+[src232]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/pi.rs#L739
