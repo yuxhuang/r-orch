@@ -955,7 +955,7 @@ impl Orchestrator {
     /// child exists: a non-fatal `orchestrator:error` on the bus, with
     /// `context` starting [`EFFORT_DIAGNOSTIC_CONTEXT`] and `error` the note
     /// verbatim. `serve` logs it as a warn-level record (stderr or
-    /// `--log-file`); `run --watch` and `logs --follow` print it as a ⚠ line.
+    /// `--log-file`); `run --watch` prints it as a ⚠ line.
     /// It is never a run event, so retry `previous_output`, the collector's
     /// `last_agent_message` and the task's `final_result` cannot see it.
     fn report_effort_diagnostics(&self, run_id: &str, agent_id: &str, diagnostics: &[String]) {
