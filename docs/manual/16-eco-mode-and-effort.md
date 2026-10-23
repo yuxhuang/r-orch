@@ -199,8 +199,10 @@ agent affected, and saves nothing:
 ```
 
 The same check runs for `orch config patch`, `orch agent update`, `orch agent patch` and `F3`. If a file edited
-by hand combines them anyway, the run fails before the tool starts, with the same message. Normal mode renders
-custom templates exactly as before.
+by hand combines them anyway, orch refuses to dispatch the affected agents' tasks with the same message. No run
+is created and the task stays `todo`: `orch run` prints the error, and `orch serve` logs it on every tick until
+the conflict is gone ([runbook](../RUNBOOK.md#prompt-mode-and-effort-failures)). Normal mode renders custom
+templates exactly as before.
 
 ## Set reasoning effort
 

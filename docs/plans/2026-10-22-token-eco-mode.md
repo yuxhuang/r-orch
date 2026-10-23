@@ -29,11 +29,13 @@ service, rewriting stored agents. See the spec.
 (serde default `normal`, written by `orch init`), optional agent override `config.prompt_mode` (absent means
 inherit, never copied from the project). Dispatch reads the project value once per dispatch, after the agent is
 chosen, through an injected `ConfigStore`, and captures it on the invocation's config clone, so a running child
-keeps its mode and the next dispatch sees a change made by another process. A read failure fails that dispatch
-before spawn through the existing cleanup. Project writes (`config set`, `config patch`, `F3`) re-read the raw
-file inside the definition lock, change one key, validate the merged result and publish atomically; unknown keys
-survive. Eco plus any custom template (`prompt.template`, `system_template`, `user_template`, project or agent)
-is refused at write time with every offending agent listed, and again at dispatch for hand-edited files.
+keeps its mode and the next dispatch sees a change made by another process. A read failure aborts that dispatch
+before any run is created: the task stays `todo` with its attempts unchanged, the error is reported as
+`orchestrator:error`, and the next tick tries again. Project writes (`config set`, `config patch`, `F3`) re-read
+the raw file inside the definition lock, change one key, validate the merged result and publish atomically;
+unknown keys survive. Eco plus any custom template (`prompt.template`, `system_template`, `user_template`, project
+or agent) is refused at write time with every offending agent listed, and again at dispatch for hand-edited
+files (the same no-run path as a read failure).
 
 **Normal byte identity (D2).** `system.liquid`, `user.liquid`, the normal context builder and the fixtures under
 `fixtures/prompts/` are unchanged. Eco is a separate pair of templates and a pure projection

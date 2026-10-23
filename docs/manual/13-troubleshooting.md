@@ -227,8 +227,8 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ### `eco prompt mode is incompatible with custom templates`
 
-- **Cause.** You tried to switch the project, or an agent, to eco while `prompt.template`, `prompt.system_template` or `prompt.user_template` is set. Nothing was saved. If the message comes from a run, a file edited by hand combines them; the run failed before the tool started.
-- **Do.** Give the agents the message lists `--prompt-mode normal`, or remove the custom templates. See [Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates).
+- **Cause.** You tried to switch the project, or an agent, to eco while `prompt.template`, `prompt.system_template` or `prompt.user_template` is set. Nothing was saved. If the message comes from `orch run` or the `serve` log, a file edited by hand combines them: no run was created and the task stays `todo` until the conflict is gone.
+- **Do.** Give the agents the message lists `--prompt-mode normal`, or remove the custom templates (a running `orch serve` sees a removed template only after a restart). See [Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates).
 
 ### `r-orch does not accept effort …` when I add or change an agent
 
@@ -240,10 +240,10 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 - **Cause.** An OpenCode agent asks for a level that orch 0.9.4 did not have, and the installed `opencode` is not version 2 or its help does not show `provider/model#variant`. The model was not started.
 - **Do.** Install OpenCode 2, or clear the effort (`orch agent update <id> --effort default`). Check with `opencode --version`.
 
-### A run fails with `configuration preflight: cannot read defaults.agent.prompt_mode`
+### `orch serve` logs `configuration preflight: cannot read defaults.agent.prompt_mode` and the task stays `todo`
 
-- **Cause.** orch reads the project prompt mode before every run and could not read or parse `.orchestry/config.yml`. The run stopped before the tool started, and the task retries as usual.
-- **Do.** Fix the file, for example with `orch config get defaults.agent` to see the error, then retry the task.
+- **Cause.** orch reads the project prompt mode again before every dispatch and could not read or parse `.orchestry/config.yml`, which changed while `serve` was running. No run is created and the task's attempts do not change. `serve` logs the error as `orchestrator:error` and tries again on every tick; `orch serve --once` does not finish while this repeats.
+- **Do.** Fix the file; `orch config get defaults.agent` shows the parse error. You do not need to retry the task: the next tick dispatches it once the file reads cleanly. See [Prompt mode and effort failures](../RUNBOOK.md#prompt-mode-and-effort-failures).
 
 ### A Codex agent uses a different model than before
 
