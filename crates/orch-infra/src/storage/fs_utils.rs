@@ -1196,13 +1196,14 @@ pub async fn read_jsonl_tail<T: DeserializeOwned>(path: &Path, count: usize) -> 
         .map_err(|err| Error::io(format!("open {}", path.display()), path, err))?;
 
     let chunk_size = std::cmp::min(size, if size > 1_048_576 { 131_072 } else { 65_536 });
-    let mut position = size.saturating_sub(chunk_size);
-    let mut earliest_read = position;
-    let mut tail = String::new();
+    let mut position = size;
+    let mut tail = Vec::new();
 
     for _ in 0..4 {
-        earliest_read = position;
-        let read_size = std::cmp::min(chunk_size, size - position) as usize;
+        // Position bounds the unread prefix, so the last short chunk cannot
+        // overlap bytes already accumulated in tail.
+        let read_size = std::cmp::min(chunk_size, position) as usize;
+        position -= read_size as u64;
         let mut buffer = vec![0u8; read_size];
         file.seek(std::io::SeekFrom::Start(position))
             .await
@@ -1211,21 +1212,22 @@ pub async fn read_jsonl_tail<T: DeserializeOwned>(path: &Path, count: usize) -> 
             .await
             .map_err(|err| Error::io(format!("read {}", path.display()), path, err))?;
 
-        // A chunk boundary can split a multi-byte character; the lossy decode
-        // only ever damages the partial first line, which is discarded below.
-        tail = format!("{}{tail}", String::from_utf8_lossy(&buffer));
+        // Keep bytes intact across internal boundaries that split UTF-8.
+        buffer.extend_from_slice(&tail);
+        tail = buffer;
 
-        let lines = tail.lines().filter(|l| !l.trim().is_empty()).count();
+        let content = String::from_utf8_lossy(&tail);
+        let lines = content.lines().filter(|l| !l.trim().is_empty()).count();
         // Strictly more than `count`, because the first line may be partial
         // and is discarded below.
         if lines > count || position == 0 {
             break;
         }
-        position = position.saturating_sub(chunk_size);
     }
 
-    let mut lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
-    if earliest_read > 0 && !lines.is_empty() {
+    let content = String::from_utf8_lossy(&tail);
+    let mut lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if position > 0 && !lines.is_empty() {
         lines.remove(0);
     }
     let start = lines.len().saturating_sub(count);
@@ -2557,6 +2559,97 @@ mod tests {
         let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, 100).await.unwrap();
         assert_eq!(tail.len(), 100);
         assert_eq!(tail[99]["n"], 499);
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_tail_preserves_order_when_the_final_chunk_is_short() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.jsonl");
+
+        for padding in [700, 1300, 2000, 2800, 3900, 5000] {
+            let records: Vec<_> = (0..50)
+                .map(|n| serde_json::json!({ "n": n, "pad": "x".repeat(padding) }))
+                .collect();
+            let mut content = records
+                .iter()
+                .map(|record| serde_json::to_string(record).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(content.len() > 32_768 && content.len() < 4 * 65_536);
+            assert_ne!(content.len() % 65_536, 0);
+
+            for trailing_newline in [false, true] {
+                if trailing_newline {
+                    content.push('\n');
+                }
+                tokio::fs::write(&path, &content).await.unwrap();
+                for count in [0, 1, 5, 25, 49, 50, 51, 75] {
+                    let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, count).await.unwrap();
+                    let expected = &records[50usize.saturating_sub(count)..];
+                    let ids: Vec<_> = tail.iter().map(|record| record["n"].as_u64()).collect();
+                    let expected_ids: Vec<_> =
+                        expected.iter().map(|record| record["n"].as_u64()).collect();
+                    assert_eq!(ids, expected_ids, "size={}, count={count}", content.len());
+                    assert!(tail == expected, "record contents changed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_tail_preserves_utf8_split_across_internal_chunk_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.jsonl");
+        let size = 80_003;
+        let start = "{\"text\":\"";
+        let end = "\"}\n{\"n\":1}\n";
+
+        for character in ["é", "漢", "🦀"] {
+            for split in 1..character.len() {
+                let prefix = "x".repeat(size - 65_536 - start.len() - split);
+                let suffix =
+                    "y".repeat(size - start.len() - prefix.len() - character.len() - end.len());
+                let text = format!("{prefix}{character}{suffix}");
+                let content = format!("{start}{text}{end}");
+                assert_eq!(content.len(), size);
+                assert!(!content.is_char_boundary(size - 65_536));
+                tokio::fs::write(&path, content).await.unwrap();
+
+                let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, 2).await.unwrap();
+                assert_eq!(tail.len(), 2);
+                assert!(
+                    tail[0]["text"] == text,
+                    "damaged {character} at byte {split}"
+                );
+                assert_eq!(tail[1]["n"], 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_jsonl_tail_stops_after_four_chunks_for_both_chunk_sizes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.jsonl");
+
+        // Each record is exactly 1024 bytes. Even an unlimited record request
+        // must return only the complete records inside the four-chunk window.
+        for (records, expected_start) in [(600, 345), (1200, 689)] {
+            let content: String = (0..records)
+                .map(|n| format!("{{\"n\":\"{n:04}\",\"pad\":\"{}\"}}\n", "x".repeat(1002)))
+                .collect();
+            assert_eq!(content.len(), records * 1024);
+            tokio::fs::write(&path, content).await.unwrap();
+
+            let tail: Vec<serde_json::Value> = read_jsonl_tail(&path, usize::MAX).await.unwrap();
+            let ids: Vec<_> = tail
+                .iter()
+                .map(|record| record["n"].as_str().unwrap())
+                .collect();
+            let expected: Vec<_> = (expected_start..records)
+                .map(|n| format!("{n:04}"))
+                .collect();
+            assert_eq!(ids, expected);
+        }
     }
 
     #[tokio::test]
