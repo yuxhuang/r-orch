@@ -3,7 +3,33 @@
 Version 2. Code baseline: **`40a6dc7` (v0.10.0)**. Every source citation below is pinned to
 `40a6dc78a8bd305ac00163282629c50855616788`; it describes this checkout, not a promise about the latest
 provider CLI. Examples are existing repository fixtures, not fresh provider sessions. Scheduling, task
-handoffs, goals and pause/resume of orchestration belong in `docs/internal/orchestration.md`.
+handoffs, goals and pause/resume of orchestration belong in
+[Orchestration: answers at a glance](orchestration.md#answers-at-a-glance).
+
+## Answers at a glance
+
+| Question | Short answer | Section |
+|---|---|---|
+| **Q6.** How does an agent drive the agent CLI? | The orchestrator starts a child process through an adapter, sends the prompt, then collects its output. The CLI runs its own agent and tools. | [Q6](#q6-how-does-an-agent-drive-the-agent-cli); [Glossary](#glossary) |
+| **Q7.** How does the agent send request, response, tool call? | Prompts go through arguments, stdin, a file or the environment. Output events report what the CLI did; requests to r-orch use `orch` commands. | [Q7](#q7-how-does-the-agent-send-request-response-tool-call) |
+| **Q8.** How does the agent maintain the conversation with the CLI tool? | Each run starts a fresh process. r-orch rebuilds context from stored state, messages and retry evidence; it does not resume the provider's conversation. | [Q8](#q8-how-does-the-agent-maintain-the-conversation-with-the-cli-tool) |
+| **Q9.** What else matters when driving a CLI? | Environment, permissions, cancellation, output limits and exit handling affect the result. An error event, process exit and finished task mean different things. | [Q9](#q9-any-other-important-factors-when-driving-the-cli) |
+| **Q10.** How do different adapters work? | Eight adapters share process management and collection, but differ in prompt delivery, parsing, completion and usage reporting. | [Q10](#q10-how-do-different-adapters-work) |
+
+## Glossary
+
+| Term | Plain meaning |
+|---|---|
+| Shared stream | The common output-reading helper used by Claude, Codex, Cursor and OpenCode. |
+| `ExitSignal` | A notification that can be awaited to learn the child's exit code or signal. |
+| Reaped | The parent has waited for the exited child and collected its exit status. |
+| Terminal record | A provider record that says this request has finished, successfully or with an error. |
+| Nonterminal drain | Reading output until it ends without taking the terminal-record shortcut. |
+| Invocation-local | Used only for this run; not saved back to the agent's configuration. |
+| Split mode | Rendering the instructions and task into separate system and user prompts. |
+| Governance | Instructions about roles, rules and how to coordinate work. |
+| Wire check | A CLI version/help probe to check whether an argument format is supported. |
+| Group-first | Try signalling the child's process group first, then its individual PID if that fails. |
 
 ## Q6. How does an agent drive the agent CLI?
 
@@ -11,7 +37,7 @@ handoffs, goals and pause/resume of orchestration belong in `docs/internal/orche
 adapter registered for the agent, and calls `execute`. That call returns the real child PID and an async
 stream before collection begins. The orchestrator records the PID before consuming the stream. The CLI
 owns the agent loop inside the child process; r-orch does not embed that loop.
-[adapter.rs:201 @40a6dc7][src1] [dispatch.rs:741 @40a6dc7][src2]
+[orch-core/src/adapter.rs:201 @40a6dc7][src1] [dispatch.rs:741 @40a6dc7][src2]
 [dispatch.rs:850 @40a6dc7][src3]
 
 ### Components and boundaries
@@ -37,9 +63,9 @@ registry preserves insertion order and replaces a duplicate kind. Registration o
 Cursor, Shell, OpenCode, Pi, Grok, Antigravity; this is also the sequential doctor probe order.
 `AgentEventKind` lives in **orch-core**, not orch-domain; orch-domain owns the persisted `RunEventType`
 and `Run`.
-[adapter.rs:51 @40a6dc7][src4] [adapter.rs:292 @40a6dc7][src5]
+[orch-core/src/adapter.rs:51 @40a6dc7][src4] [orch-core/src/adapter.rs:292 @40a6dc7][src5]
 [registry.rs:18 @40a6dc7][src6] [spawn.rs:110 @40a6dc7][src7]
-[run.rs:57 @40a6dc7][src8] [collect.rs:159 @40a6dc7][src9]
+[orch-domain/src/run.rs:57 @40a6dc7][src8] [collect.rs:159 @40a6dc7][src9]
 
 | Boundary | Owner and contract | Failure behavior |
 |---|---|---|
@@ -48,8 +74,8 @@ and `Run`.
 | Adapter → collector | `BoxStream<Result<AgentEvent, AdapterError>>`; each event has kind, timestamp, arbitrary JSON data, optional tokens and error classification | An `Ok(Error event)` is observable output; an `Err(AdapterError)` ends collection as failure. |
 | Collector → storage/UI | Map kind to `RunEventType`, serialize/cap data, append event, update activity time, emit selected bus events | Append failure propagates; dispatch logs collector failure. This is not a transactional write across log, state and bus. |
 
-Sources for the table: [adapter.rs:176 @40a6dc7][src10] [process.rs:153 @40a6dc7][src11]
-[process.rs:176 @40a6dc7][src12] [dispatch.rs:782 @40a6dc7][src13]
+Sources for the table: [orch-core/src/adapter.rs:176 @40a6dc7][src10] [orch-core/src/process.rs:153 @40a6dc7][src11]
+[orch-core/src/process.rs:176 @40a6dc7][src12] [dispatch.rs:782 @40a6dc7][src13]
 [collect.rs:91 @40a6dc7][src14] [collect.rs:235 @40a6dc7][src15]
 [dispatch.rs:895 @40a6dc7][src16]
 
@@ -63,12 +89,12 @@ Sources for the table: [adapter.rs:176 @40a6dc7][src10] [process.rs:153 @40a6dc7
 | `execute(&self, ExecuteParams) -> Result<ExecuteHandle, AdapterError>` (**synchronous**) | Local dispatch after preparation | Spawns and returns `{pid, events}` before collection. Stderr draining, cancellation watcher and child reaper are installed without waiting for the collector. Shell's missing-command path is a documented exception: PID 0 and one error event, no child. |
 | `stop(&self, pid) -> Result<()>` (async) | Available to adapter callers; the local orchestrator's cancel/stop paths instead call `ProcessManager::kill_with_grace` directly | Each adapter implementation delegates to a 10-second graceful kill and returns `Ok(())`; it is not a confirmed-death receipt. |
 
-Sources: [adapter.rs:265 @40a6dc7][src17] [adapter.rs:310 @40a6dc7][src18]
+Sources: [orch-core/src/adapter.rs:265 @40a6dc7][src17] [orch-core/src/adapter.rs:300 @40a6dc7][src18] [orch-core/src/adapter.rs:259 @40a6dc7][src233]
 [doctor_service.rs:92 @40a6dc7][src19] [dispatch.rs:795 @40a6dc7][src20]
-[dispatch.rs:1131 @40a6dc7][src21] [cursor.rs:97 @40a6dc7][src22]
+[dispatch.rs:1131 @40a6dc7][src21] [adapters/cursor.rs:97 @40a6dc7][src22]
 [shell.rs:197 @40a6dc7][src23] [shell.rs:219 @40a6dc7][src24]
 [claude.rs:405 @40a6dc7][src25] [orchestrator.rs:946 @40a6dc7][src26]
-[recovery.rs:621 @40a6dc7][src27] [manager.rs:108 @40a6dc7][src28]
+[recovery.rs:621 @40a6dc7][src27] [orch-infra/src/process/manager.rs:108 @40a6dc7][src28]
 
 ### One run, from prepared task to outcome
 
@@ -113,7 +139,7 @@ sequenceDiagram
 Sequence evidence: prompt assembly and run creation [dispatch.rs:550 @40a6dc7][src31];
 stdin [codex.rs:73 @40a6dc7][src32]; PID publication
 [dispatch.rs:866 @40a6dc7][src33]; reaper
-[manager.rs:168 @40a6dc7][src34]; collection
+[orch-infra/src/process/manager.rs:168 @40a6dc7][src34]; collection
 [collect.rs:81 @40a6dc7][src35].
 
 ## Q7. How does the agent send request, response, tool call?
@@ -128,6 +154,11 @@ not commands decoded from output events.
 [claude.rs:363 @40a6dc7][src38] [shell.rs:234 @40a6dc7][src39]
 [collect.rs:176 @40a6dc7][src40]
 
+Requests from the agent **to r-orch** (create a task, send a message, set context) do not travel as
+stdout events: the agent runs `orch ...` commands with the supplied `ORCH_*` environment variables;
+see [agent connections](orchestration.md#3-q2-how-does-one-agent-connect-to-another-agent) and
+[task connections](orchestration.md#4-q3-how-does-one-agent-connect-to-another-task).
+
 ### Directions and formats
 
 | Direction | Data | Format and handling |
@@ -139,7 +170,7 @@ not commands decoded from output events.
 | CLI → r-orch | Diagnostics | Tail, discard or stream policy described under Q9; stderr is never parsed as tool instructions. |
 | r-orch → CLI | Cancellation | OS signals to the process group, not a tool-result reply or conversational message. |
 
-Sources: [manager.rs:129 @40a6dc7][src41] [claude.rs:78 @40a6dc7][src42]
+Sources: [orch-infra/src/process/manager.rs:129 @40a6dc7][src41] [claude.rs:78 @40a6dc7][src42]
 [codex.rs:373 @40a6dc7][src43] [util.rs:40 @40a6dc7][src44]
 [pi.rs:105 @40a6dc7][src45] [pi.rs:133 @40a6dc7][src37]
 [antigravity.rs:81 @40a6dc7][src46] [shell.rs:97 @40a6dc7][src47]
@@ -151,7 +182,7 @@ The Q10 matrix gives the remaining exact transports and argv.
 `AgentEventKind` has six variants. The canonical payload is a guide for consumers, not a schema enforced
 on every adapter: Claude/Cursor preserve message objects or strings, and OpenCode can emit a bare text
 string. Consumers must not assume every output has `data.text`.
-[adapter.rs:51 @40a6dc7][src4] [adapter.rs:121 @40a6dc7][src50]
+[orch-core/src/adapter.rs:51 @40a6dc7][src4] [orch-core/src/adapter.rs:121 @40a6dc7][src50]
 [util.rs:294 @40a6dc7][src51] [opencode.rs:234 @40a6dc7][src52]
 
 | Adapter kind | Persisted RunEventType | Canonical useful fields |
@@ -163,18 +194,18 @@ string. Consumers must not assume every output has `data.text`.
 | `Error` | `error` | `message`, optional `raw`; classification is separate on `AgentEvent` |
 | `Done` | `done` | optional `result`, `raw`; usage is separate on `AgentEvent` |
 
-Mapping and envelope: [adapter.rs:86 @40a6dc7][src53] [adapter.rs:121 @40a6dc7][src50].
+Mapping and envelope: [orch-core/src/adapter.rs:86 @40a6dc7][src53] [orch-core/src/adapter.rs:121 @40a6dc7][src50].
 
 ### Annotated real event samples
 
 The following JSONL lines are copied verbatim from the pinned fixtures. They are repository test inputs
 with documented upstream-test provenance, not a claim that a current live provider emitted them today.
 The fixture suite replays them through the actual adapters over scripted child pipes and compares whole
-events, omitting timestamps. [README.md:1 @40a6dc7][src54]
+events, omitting timestamps. [adapters/README.md:1 @40a6dc7][src54]
 [adapter_fixtures.rs:54 @40a6dc7][src55]
 
 **Claude: tool observation, then completion.** Source lines 2–4:
-[session.jsonl:2 @40a6dc7][src56]
+[claude/session.jsonl:2 @40a6dc7][src56]
 
 ```jsonl
 {"type": "tool_use", "name": "read", "input": {"path": "src/index.ts"}}
@@ -187,7 +218,7 @@ string exists in this sample**. The adapter does not manufacture one from `subty
 [util.rs:293 @40a6dc7][src57]
 
 **Codex: a command already executed by Codex.** Source line 6:
-[session.jsonl:6 @40a6dc7][src58]
+[codex/session.jsonl:6 @40a6dc7][src58]
 
 ```jsonl
 {"type": "item.completed", "item": {"type": "command_execution", "command": "ls", "aggregated_output": "file.txt\n", "exit_code": 0}}
@@ -199,7 +230,7 @@ it does not run `ls` a second time. [codex.rs:192 @40a6dc7][src59]
 [collect.rs:235 @40a6dc7][src15]
 
 **Pi: tool start and terminal transcript.** Source lines 5 and 9, noncontiguous excerpts:
-[session.jsonl:5 @40a6dc7][src60] [session.jsonl:9 @40a6dc7][src61]
+[pi/session.jsonl:5 @40a6dc7][src60] [pi/session.jsonl:9 @40a6dc7][src61]
 
 ```jsonl
 {"type": "tool_execution_start", "toolName": "read", "args": {"path": "src/foo.ts"}}
@@ -213,7 +244,7 @@ has no `willRetry` key, so it can complete immediately; a frame with that key wa
 [pi.rs:705 @40a6dc7][src64]
 
 **OpenCode: an intermediate step is not completion.** Source lines 4–5:
-[session.jsonl:4 @40a6dc7][src65]
+[opencode/session.jsonl:4 @40a6dc7][src65]
 
 ```jsonl
 {"type": "step_finish", "part": {"type": "step-finish", "reason": "tool-calls", "tokens": {"total": 500, "input": 400, "output": 100}}}
@@ -223,7 +254,7 @@ has no `willRetry` key, so it can complete immediately; a frame with that key wa
 The first is dropped. The second becomes `Done` with the part as data. Usage is recomputed from
 input/output/reasoning, not the provider's `total`; `cost` remains payload data and is not a normalized
 price measurement. [opencode.rs:196 @40a6dc7][src66]
-[opencode.rs:266 @40a6dc7][src67] [run.rs:101 @40a6dc7][src68]
+[opencode.rs:266 @40a6dc7][src67] [orch-domain/src/run.rs:101 @40a6dc7][src68]
 
 ### What counts as “the result”?
 
@@ -235,12 +266,12 @@ message shapes do not populate that fallback. This is a narrower contract than �
 [shell.rs:119 @40a6dc7][src70] [opencode.rs:234 @40a6dc7][src52]
 
 The result becomes `task.proof.agent_summary`, capped at 2,000 characters; file changes come from explicit
-`FileChange` events, recognized write tool calls, or a worktree diff when no paths were reported. The
-run record itself stores status, prompt, PID, error and usage, not a separate result field. A normal EOF
+`FileChange` events, recognized write tool calls, or a worktree diff when no paths were reported **and `task.proof.branch` is set**.
+The run record itself stores status, prompt, PID, error and usage, not a separate result field. A normal EOF
 without a stream error enters the success handler even without `Done`; task review/approval happens
-outside the CLI run and is explained in `docs/internal/orchestration.md`.
+outside the CLI run; see [task completion and review](orchestration.md#2-q1-orchestration-logic).
 [orchestrator.rs:92 @40a6dc7][src71] [collect.rs:213 @40a6dc7][src72]
-[collect.rs:354 @40a6dc7][src73] [run.rs:59 @40a6dc7][src74]
+[collect.rs:354 @40a6dc7][src73] [orch-domain/src/run.rs:59 @40a6dc7][src74]
 [collect.rs:108 @40a6dc7][src75]
 
 ### What gets persisted?
@@ -251,7 +282,7 @@ The `RunService` creates a `preparing` record, later marks it `running` with PID
 in the run record. Thus a run JSON alone cannot reconstruct the exact complete model input.
 [run_service.rs:72 @40a6dc7][src76] [run_service.rs:99 @40a6dc7][src77]
 [run_service.rs:141 @40a6dc7][src78] [paths.rs:144 @40a6dc7][src79]
-[run.rs:81 @40a6dc7][src80] [dispatch.rs:622 @40a6dc7][src81]
+[orch-infra/src/storage/run.rs:81 @40a6dc7][src80] [dispatch.rs:622 @40a6dc7][src81]
 
 For collected events, `RunEvent.data` is a **string containing serialized/truncated event data**, not
 necessarily a JSON object. Append precedes the activity-clock update and bus emission. Output/tool calls
@@ -269,18 +300,39 @@ or OpenCode `sessionID` in stdout is not saved as a resume handle. This describe
 it does not assert that an external CLI never reads its own local config or project files.
 [claude.rs:78 @40a6dc7][src42] [codex.rs:52 @40a6dc7][src36]
 [pi.rs:105 @40a6dc7][src45] [pi.rs:713 @40a6dc7][src83]
-[opencode.rs:178 @40a6dc7][src84] [cursor.rs:64 @40a6dc7][src85]
+[opencode.rs:178 @40a6dc7][src84] [adapters/cursor.rs:64 @40a6dc7][src85]
 [grok.rs:60 @40a6dc7][src86] [antigravity.rs:59 @40a6dc7][src87]
 [shell.rs:234 @40a6dc7][src39] [codex.rs:130 @40a6dc7][src88]
 
 ### Memory is rebuilt as input
+
+```mermaid
+flowchart LR
+    N["Run N: fresh CLI process"] -->|"Collected events and outcome"| R["runs/id.json and runs/id.jsonl"]
+    N -->|"Collector saves result on success"| T["Task proof in tasks/id.yml"]
+    N -->|"Agent runs orch msg/context commands"| M["Mailbox: messages/id.json<br/>Shared context: context/key.json"]
+    R -->|"On retry: latest failed run"| E["Error plus last 50 stored events<br/>keep output/error events"]
+    E --> D["Next dispatch rebuilds prompt"]
+    M -->|"Drain mailbox; select context"| D
+    D --> P["Run N+1: another fresh CLI process"]
+    T -.->|"Available through orch task show"| P
+```
+
+Paths in this diagram are under `.orchestry/`. Run records and task proof are stored evidence, not a
+saved provider session. Retry context is rebuilt from the failed run's record and event log; task proof
+can be inspected explicitly and is not automatically pasted into the next prompt.
+[paths.rs:116 @40a6dc7][src237] [paths.rs:132 @40a6dc7][src238]
+[paths.rs:144 @40a6dc7][src79] [collect.rs:354 @40a6dc7][src73]
+[run_service.rs:193 @40a6dc7][src96] [run_service.rs:20 @40a6dc7][src95]
+[dispatch.rs:452 @40a6dc7][src90]
+See [task handoffs](orchestration.md#4-q3-how-does-one-agent-connect-to-another-task) for inspecting proof.
 
 Each dispatch prepares a workspace and builds context from the task, the agent's role, team roster,
 project, current attempt, relevant shared context, drained mailbox, reviewer feedback and linked goal.
 Library skills are loaded and rendered into the prompt. These are fresh reads/projections, not an
 incremental chat transcript sent to an existing child.
 [dispatch.rs:413 @40a6dc7][src89] [dispatch.rs:452 @40a6dc7][src90]
-[dispatch.rs:550 @40a6dc7][src31] [context.rs:162 @40a6dc7][src91]
+[dispatch.rs:550 @40a6dc7][src31] [template/context.rs:162 @40a6dc7][src91]
 
 | Carries forward | How | What does not automatically carry forward |
 |---|---|---|
@@ -291,8 +343,8 @@ incremental chat transcript sent to an existing child.
 | Files | The workspace path prepared for the task | A guarantee that a new task gets the same workspace or that external CLI caches are portable |
 
 Sources: [dispatch.rs:425 @40a6dc7][src92]
-[dispatch.rs:452 @40a6dc7][src90] [context.rs:75 @40a6dc7][src93]
-[template.rs:214 @40a6dc7][src94] [run_service.rs:23 @40a6dc7][src95]
+[dispatch.rs:452 @40a6dc7][src90] [template/context.rs:75 @40a6dc7][src93]
+[orch-core/src/template.rs:214 @40a6dc7][src94] [run_service.rs:20 @40a6dc7][src95]
 [run_service.rs:193 @40a6dc7][src96] [dispatch.rs:413 @40a6dc7][src89].
 
 Normal mode usually renders separate system/user templates and appends loaded skills to the system
@@ -303,7 +355,7 @@ Shell receives the combined text in its environment. See Q10 for exact fallbacks
 [render.rs:105 @40a6dc7][src97] [util.rs:40 @40a6dc7][src44]
 [claude.rs:125 @40a6dc7][src98] [pi.rs:115 @40a6dc7][src99]
 [grok.rs:87 @40a6dc7][src100] [codex.rs:373 @40a6dc7][src43]
-[opencode.rs:188 @40a6dc7][src101] [cursor.rs:83 @40a6dc7][src102]
+[opencode.rs:188 @40a6dc7][src101] [adapters/cursor.rs:83 @40a6dc7][src102]
 [antigravity.rs:59 @40a6dc7][src87] [shell.rs:240 @40a6dc7][src103]
 
 ### Token eco mode changes presentation, not sessions
@@ -324,7 +376,7 @@ presentation bounds, not deletion of persisted evidence, and neither lower the c
 nor introduce a session-resume flag.
 [eco.rs:8 @40a6dc7][src110] [eco.rs:30 @40a6dc7][src111]
 [eco.rs:118 @40a6dc7][src112] [dispatch.rs:432 @40a6dc7][src113]
-[dispatch.rs:766 @40a6dc7][src114] [effort.rs:11 @40a6dc7][src115]
+[dispatch.rs:766 @40a6dc7][src114] [adapters/effort.rs:11 @40a6dc7][src115]
 
 Related design intent: [ADR 0010](../decisions/0010-prompt-mode-and-effort-contract.md), whose status at
 this baseline is still `proposed`, plus the [eco spec](../specs/2026-10-22-token-eco-mode.md) and
@@ -346,14 +398,14 @@ The manager applies `params.workspace` as cwd and starts a new POSIX **process g
 where requested. Local runs inherit the parent environment, then apply agent `config.env`, with
 `ORCH_AGENT_ID`, `ORCH_AGENT_NAME`, `ORCH_TASK_ID` overwritten by dispatch. There is no general clean-env
 or provider-variable stripping pass for local runs.
-[manager.rs:129 @40a6dc7][src41] [dispatch.rs:744 @40a6dc7][src118]
+[orch-infra/src/process/manager.rs:129 @40a6dc7][src41] [dispatch.rs:744 @40a6dc7][src118]
 
 Remote mirrors use `WithoutSecrets`: a name-based credential denylist on inherited variables, with exact
 allowlisted names from `ORCH_REMOTE_ENV_PASSTHROUGH`. The explicit config overlay still wins. It is not
 complete secret isolation: the code explicitly notes innocently named secret values such as database
 URLs are not caught. The cwd is an execution location, not a sandbox.
-[process.rs:55 @40a6dc7][src119] [process.rs:109 @40a6dc7][src120]
-[manager.rs:142 @40a6dc7][src121]
+[orch-core/src/process.rs:55 @40a6dc7][src119] [orch-core/src/process.rs:109 @40a6dc7][src120]
+[orch-infra/src/process/manager.rs:142 @40a6dc7][src121]
 
 The adapters' permission flags are fixed by their argv builders; they do not translate
 `approval_policy` into a live approval conversation. For example, Claude always skips permissions,
@@ -361,7 +413,7 @@ Codex requests `danger-full-access`, Cursor uses `--yolo --trust`, and Grok bypa
 Pi and OpenCode add no approval flag here. r-orch reads `approval_policy == Auto` when deciding task
 auto-approval after the run. Do not interpret `manual` task review as a provider tool sandbox.
 [claude.rs:83 @40a6dc7][src122] [codex.rs:54 @40a6dc7][src123]
-[cursor.rs:66 @40a6dc7][src124] [grok.rs:62 @40a6dc7][src125]
+[adapters/cursor.rs:66 @40a6dc7][src124] [grok.rs:62 @40a6dc7][src125]
 [pi.rs:105 @40a6dc7][src45] [opencode.rs:178 @40a6dc7][src84]
 [collect.rs:380 @40a6dc7][src117]
 
@@ -371,7 +423,7 @@ The tables below describe the **checked-in mapping**, not an independent claim a
 availability. A stored model generally passes through unchanged. Tier names are resolved for new
 selections, not re-resolved during each run. An unset model is different from a literal empty string;
 argv builders commonly test `Option::Some`, so they can forward an explicitly empty configured value.
-[model_tiers.rs:111 @40a6dc7][src126] [effort.rs:11 @40a6dc7][src115]
+[model_tiers.rs:111 @40a6dc7][src126] [adapters/effort.rs:11 @40a6dc7][src115]
 [codex.rs:62 @40a6dc7][src127]
 
 | Adapter | `capable` / `balanced` / `fast` static choices | Effort emitted by adapter |
@@ -385,8 +437,8 @@ argv builders commonly test `Option::Some`, so they can forward an explicitly em
 | Antigravity | `gemini-4-argon` / no tier model / `gemini-3.8-flash` | `--effort <level>` |
 | Shell | No tier model in any tier | No model or effort argument |
 
-Sources: [model_tiers.rs:121 @40a6dc7][src128] [effort.rs:159 @40a6dc7][src129]
-[effort.rs:11 @40a6dc7][src115]. “No tier model” denotes an empty static-table entry,
+Sources: [model_tiers.rs:121 @40a6dc7][src128] [orch-domain/src/effort.rs:159 @40a6dc7][src129]
+[adapters/effort.rs:11 @40a6dc7][src115]. “No tier model” denotes an empty static-table entry,
 not a requirement to send `--model ""`.
 
 | Adapter | Authorable effort in the pinned policy | Qualification |
@@ -400,14 +452,14 @@ not a requirement to send `--model ""`.
 | Antigravity | `low medium high` | `gpt-oss-120b` row permits medium only; known effort-suffixed model slugs are legacy-only combinations. |
 | Shell | None | New authoring refused; stored legacy `low medium high` ignored with warning. |
 
-Sources: table [effort.rs:141 @40a6dc7][src130]; model/flag refinements
-[effort.rs:783 @40a6dc7][src131] [effort.rs:870 @40a6dc7][src132]; authoring vs dispatch
-[effort.rs:997 @40a6dc7][src133]. `default` clears effort rather than naming a level.
+Sources: table [orch-domain/src/effort.rs:141 @40a6dc7][src130]; model/flag refinements
+[orch-domain/src/effort.rs:783 @40a6dc7][src131] [orch-domain/src/effort.rs:870 @40a6dc7][src132]; authoring vs dispatch
+[orch-domain/src/effort.rs:997 @40a6dc7][src133]. `default` clears effort rather than naming a level.
 An unset effort emits no selector or effort probe. Stored legacy `low|medium|high` is forwarded where
 possible, otherwise ignored with warning; nonlegacy invalid combinations reject before model spawn.
 Forwarded effort is a request, never a verified effective reasoning level.
-[effort.rs:379 @40a6dc7][src134] [effort.rs:1019 @40a6dc7][src135]
-[effort.rs:39 @40a6dc7][src136]
+[orch-domain/src/effort.rs:379 @40a6dc7][src134] [orch-domain/src/effort.rs:1019 @40a6dc7][src135]
+[orch-domain/src/effort.rs:39 @40a6dc7][src136]
 
 OpenCode's preparation, only for a forwardable stored effort, checks `--version` for numeric major 2 and
 `run --help` for the `--model` / `provider/model#variant` signature. Each probe has a two-second deadline
@@ -443,13 +495,13 @@ flowchart TD
     Reaped -.->|"Resolves ExitSignal"| WaitExit
 ```
 
-Process exit and stream completion are separate contracts, not one universal lifecycle or the task-status
-state machine. On the normal shared-stream path, the adapter awaits `ExitSignal` before finishing;
-a stdout read error propagates before that wait. Pi's terminal path emits its terminal event, awaits a
-one-second graceful termination attempt, then returns or throws terminal failure **without awaiting
-`ExitSignal`**. Its nonterminal drain path does await exit. The collector handles stream EOF or an
-adapter error without a separate process-exit wait. **Stream completion, including a succeeded Pi run,
-is not a receipt that the child has been reaped.**
+**The output stream can finish before the child has exited.** The shared stream normally waits for
+`ExitSignal`, but a stdout read error ends it before that wait. When Pi receives a terminal record, it
+emits the event and tries to stop the child with a one-second grace period. It then ends the stream,
+with an error if the request failed, **without waiting for `ExitSignal`**. Pi waits for exit only on its
+other path, when output ends without that terminal shortcut. The collector acts on the stream's end
+or error; it does not wait for the process separately. **Even a succeeded Pi run does not confirm that
+the parent has collected the child's exit status.**
 [util.rs:173 @40a6dc7][src231] [util.rs:181 @40a6dc7][src165]
 [pi.rs:713 @40a6dc7][src83] [pi.rs:739 @40a6dc7][src232]
 [collect.rs:91 @40a6dc7][src14]
@@ -460,8 +512,8 @@ polls every 200 ms, then group-first SIGKILL. It does **not** confirm death afte
 manager has no kill-on-drop behavior, so a crashed orchestrator does not automatically dispose of
 children. Process groups reach descendants that remain in the group; they are not containment for
 children that detach into another group.
-[manager.rs:92 @40a6dc7][src141] [manager.rs:108 @40a6dc7][src28]
-[manager.rs:152 @40a6dc7][src142] [process.rs:330 @40a6dc7][src143]
+[orch-infra/src/process/manager.rs:92 @40a6dc7][src141] [orch-infra/src/process/manager.rs:108 @40a6dc7][src28]
+[orch-infra/src/process/manager.rs:152 @40a6dc7][src142] [orch-core/src/process.rs:330 @40a6dc7][src143]
 
 | Trigger | Actual action at this baseline |
 |---|---|
@@ -469,9 +521,15 @@ children that detach into another group.
 | Explicit task cancel / forced agent stop | Orchestrator also invokes graceful kill with 3-second grace. |
 | Eligible stall | Graceful kill with 5-second grace, then failure `Agent stalled (no events)`. |
 | Orchestrator shutdown / adapter `stop` | Default grace 10 seconds. Shutdown records cancelled runs and applies task failure/retry policy. |
-| Pi terminal record | Adapter emits the terminal event, attempts graceful termination with 1-second grace, then returns or throws terminal failure without awaiting exit acknowledgement. |
+| Pi terminal record | Adapter emits the terminal event, attempts graceful termination with 1-second grace, then ends the stream, with an error on terminal failure, without awaiting exit acknowledgement. |
 | Shell abort | In addition to the shared watcher, its stream installs a 5-second graceful-kill watcher. |
 | Startup finds orphaned running run | Recovery may kill a live local PID and finish that orphan run cancelled. |
+
+[ARCHITECTURE.md §6.3](../ARCHITECTURE.md#63-child-process-io) shows an earlier design sketch
+(collector cancellation with `kill_with_grace(5 s)`); this section describes what ships: the
+`spawn_child` watcher sends SIGTERM, and explicit task cancel/forced agent stop use a 3-second grace.
+[spawn.rs:145 @40a6dc7][src49] [orchestrator.rs:946 @40a6dc7][src26]
+[orchestrator.rs:87 @40a6dc7][src144]
 
 Sources: [spawn.rs:145 @40a6dc7][src49] [orchestrator.rs:87 @40a6dc7][src144]
 [orchestrator.rs:946 @40a6dc7][src26] [orchestrator.rs:1025 @40a6dc7][src145]
@@ -486,14 +544,14 @@ blocked on a silent child therefore does not receive a guaranteed stall deadline
 Similarly, `timeout_ms` defaults to 3,600,000 ms in config, but the local dispatch/adapter execution path
 does not install a wall-clock timer using it. Do not promise that a hung local run stops in ten minutes
 or one hour. These are code-reading findings at this snapshot, not measurements of a live AI process.
-[config.rs:228 @40a6dc7][src150] [tick.rs:201 @40a6dc7][src151]
+[orch-domain/src/config.rs:228 @40a6dc7][src150] [tick.rs:201 @40a6dc7][src151]
 [tick.rs:244 @40a6dc7][src146] [collect.rs:250 @40a6dc7][src152]
 [dispatch.rs:850 @40a6dc7][src3] [util.rs:144 @40a6dc7][src30]
 
 Cleanup is also limited by parent-PID liveness: `kill_with_grace` returns if that PID is already gone,
 even if a descendant remains in the group. A descendant holding stdout/stderr open can postpone EOF;
 `StderrTail::tail` waits for stderr EOF without its own deadline. These details matter when diagnosing
-“the CLI exited but the run still hangs.” [manager.rs:108 @40a6dc7][src28]
+“the CLI exited but the run still hangs.” [orch-infra/src/process/manager.rs:108 @40a6dc7][src28]
 [spawn.rs:64 @40a6dc7][src153] [util.rs:147 @40a6dc7][src154]
 
 ### Buffering and large output
@@ -526,11 +584,11 @@ all adapters. [util.rs:147 @40a6dc7][src154]
 
 | Adapter/path | Completion and failure rule |
 |---|---|
-| Claude, Codex, Cursor, OpenCode shared stream | Numeric nonzero exit throws only if not cancelled and no `Done` was seen. Any `Done` suppresses that exit error. Signal-only exit (`code = None`) does not throw here. Zero exit with no `Done` ends normally. |
+| Claude, Codex, Cursor, OpenCode shared stream | A nonzero exit code ends the stream with an error only if the run was not cancelled and no `Done` was seen. Any `Done` suppresses that exit error. Exit by signal (`code = None`) and exit code zero both end normally here, even without `Done`. |
 | Grok | Same nonzero/Done suppression; clean zero exit without `end` synthesizes `Done` from accumulated text. |
-| Antigravity | Numeric nonzero exit throws unless cancelled; otherwise emits `Done` with accumulated lines. Signal-only exit is not rejected by this check. |
+| Antigravity | A nonzero exit code ends the stream with an error unless cancelled. If not cancelled, it emits `Done` with the collected lines after passing this check. The check does not reject exit by signal. |
 | Pi | Failed RPC response or terminal assistant `stopReason: error/aborted` yields an error event **and** a stream error. Terminal success kills the RPC process deliberately. Without a terminal event, numeric nonzero exit fails unless cancelled; zero/signal-only EOF is not a strict “missing terminal” rejection. |
-| Shell | Nonzero or signal-only exit throws unless cancelled; zero exit emits no synthetic `Done`. stderr `Error` events alone do not fail it. Missing command returns PID 0 plus an `Ok(Error)` event rather than `Err`. |
+| Shell | A nonzero exit code or exit by signal ends the stream with an error unless cancelled. Exit code zero ends without adding `Done`. stderr `Error` events alone do not fail the run. A missing command returns PID 0 and an error event, but no stream error. |
 | Collector | `Err` enters failure handling; normal EOF enters success handling. `Error` events only remember classification and emit/log diagnostics. Removed running entries are not completed again by the success handler. |
 
 Sources: [util.rs:181 @40a6dc7][src165] [grok.rs:240 @40a6dc7][src166]
@@ -557,14 +615,14 @@ not summed across every output event; missing usage stays `None`. The domain tot
 [pi.rs:444 @40a6dc7][src63] [pi.rs:584 @40a6dc7][src176]
 [grok.rs:171 @40a6dc7][src177] [antigravity.rs:139 @40a6dc7][src178]
 [shell.rs:119 @40a6dc7][src70] [collect.rs:177 @40a6dc7][src179]
-[run.rs:80 @40a6dc7][src180]
+[orch-domain/src/run.rs:80 @40a6dc7][src180]
 
 There is no normalized price/currency/cost field in `Run` or `TokenUsage`, and the finish path does not
 convert usage to money. A provider `cost` field may survive in event payload data, as in the OpenCode
 fixture, but that is not an r-orch billing ledger. Failed-run handling finishes with no token total,
-even if an earlier event carried usage. [run.rs:59 @40a6dc7][src74]
+even if an earlier event carried usage. [orch-domain/src/run.rs:59 @40a6dc7][src74]
 [run_service.rs:141 @40a6dc7][src78] [collect.rs:579 @40a6dc7][src181]
-[session.jsonl:5 @40a6dc7][src182]
+[opencode/session.jsonl:5 @40a6dc7][src182]
 
 ### What breaks and why
 
@@ -580,7 +638,7 @@ even if an earlier event carried usage. [run.rs:59 @40a6dc7][src74]
 | Log persistence fails | `record_event` propagates the append error; the collector task emits an orchestrator error | Storage error and subsequent reconciliation; this is distinct from an adapter stream error. |
 
 Evidence: spawn/probe [spawn.rs:118 @40a6dc7][src183]
-[util.rs:208 @40a6dc7][src140] [cursor.rs:27 @40a6dc7][src184];
+[util.rs:208 @40a6dc7][src140] [adapters/cursor.rs:27 @40a6dc7][src184];
 schema [util.rs:282 @40a6dc7][src185] [pi.rs:292 @40a6dc7][src186];
 hangs [tick.rs:201 @40a6dc7][src151]; flood
 [line_reader.rs:85 @40a6dc7][src187]; input delivery
@@ -589,12 +647,29 @@ hangs [tick.rs:201 @40a6dc7][src151]; flood
 [collect.rs:235 @40a6dc7][src15] [dispatch.rs:895 @40a6dc7][src16].
 Transport-size observations follow the exact argv/env builders in Q10; no live provider stress test was run.
 
+### Known limits
+
+These collect the limits described above; each is behavior at the pinned baseline.
+
+- **Missing Shell command:** returns PID 0 and one error event, then normal EOF can take the collector's success path. [shell.rs:197 @40a6dc7][src23] [collect.rs:91 @40a6dc7][src14]
+- **Failed-run usage:** failure handling stores no token total, even if earlier events carried usage. [collect.rs:579 @40a6dc7][src181]
+- **Async stdin writes:** Claude, Codex and Pi log write failures as warnings instead of directly failing the event stream. [claude.rs:310 @40a6dc7][src188] [codex.rs:75 @40a6dc7][src189] [pi.rs:133 @40a6dc7][src37]
+- **No local wall-clock timeout:** `timeout_ms` is configured but is not enforced by local dispatch/adapter execution. [orch-domain/src/config.rs:228 @40a6dc7][src150] [dispatch.rs:850 @40a6dc7][src3] [util.rs:144 @40a6dc7][src30]
+- **Stall checks:** reconcile skips PID and stall checks while a collector is live, so a silent child can outlast the configured stall timeout. [tick.rs:201 @40a6dc7][src151]
+- **Pi completion:** its terminal-record path ends after a graceful-kill attempt without awaiting exit acknowledgement. [pi.rs:713 @40a6dc7][src83]
+- **Cleanup is not containment:** graceful kill returns if the parent PID is gone, does not confirm death after SIGKILL, and cannot reach descendants that leave the process group; there is no kill-on-drop. [orch-infra/src/process/manager.rs:108 @40a6dc7][src28] [orch-infra/src/process/manager.rs:152 @40a6dc7][src142] [orch-infra/src/process/manager.rs:92 @40a6dc7][src141]
+- **Open pipes can hang a run:** descendants can keep output pipes open; stderr-tail collection has no deadline of its own. [spawn.rs:64 @40a6dc7][src153] [util.rs:147 @40a6dc7][src154]
+- **Output caps are partial:** line/event caps do not bound total memory; a line without a newline, Pi frames and accumulated final text can grow. [line_reader.rs:77 @40a6dc7][src155] [grok.rs:98 @40a6dc7][src162] [pi.rs:648 @40a6dc7][src164]
+- **Exit is not semantic success:** a `Done` can suppress a nonzero-exit error on the shared stream, and an Error event alone does not fail the collector. [util.rs:181 @40a6dc7][src165] [collect.rs:91 @40a6dc7][src14]
+- **Doctor is a version probe:** it checks neither authentication nor a model invocation; ordinary probes run sequentially in registry order and lack the effort-probe time/output bounds. [doctor_service.rs:92 @40a6dc7][src19] [registry.rs:18 @40a6dc7][src6] [util.rs:208 @40a6dc7][src140]
+- **Evidence is incomplete:** the run stores only the user prompt in split mode, result extraction accepts only selected string fields, and event data can be truncated. [dispatch.rs:622 @40a6dc7][src81] [collect.rs:141 @40a6dc7][src69] [collect.rs:235 @40a6dc7][src15]
+
 ## Q10. How do different adapters work?
 
 **They share process ownership and event collection, but implement different wire protocols.** Use the
 matrix to choose the transport/result expectations, and the adapter sections for exact argv and parser
 exceptions. Every row starts a fresh process: none resumes a prior CLI conversation.
-[registry.rs:44 @40a6dc7][src190] [adapter.rs:265 @40a6dc7][src17]
+[registry.rs:44 @40a6dc7][src190] [orch-core/src/adapter.rs:265 @40a6dc7][src17]
 
 ### Comparison matrix
 
@@ -615,7 +690,7 @@ system text, two newlines, then user text (or only user text when system is abse
 
 Matrix sources, one per implementation: [claude.rs:363 @40a6dc7][src38]
 [codex.rs:356 @40a6dc7][src29] [pi.rs:781 @40a6dc7][src191]
-[opencode.rs:360 @40a6dc7][src192] [cursor.rs:115 @40a6dc7][src193]
+[opencode.rs:360 @40a6dc7][src192] [adapters/cursor.rs:115 @40a6dc7][src193]
 [grok.rs:285 @40a6dc7][src194] [antigravity.rs:162 @40a6dc7][src195]
 [shell.rs:234 @40a6dc7][src39]. Terminal/usage details are sourced in the sections below.
 
@@ -638,7 +713,7 @@ and deletes it when dropped; an age-based sweep handles stale prompt files. The 
 not argv. On a multithread Tokio runtime, the first write attempts up to 32 KiB with a one-second wait;
 the remainder is asynchronous, then stdin closes.
 [claude.rs:62 @40a6dc7][src196] [claude.rs:78 @40a6dc7][src42]
-[claude.rs:125 @40a6dc7][src98] [claude.rs:175 @40a6dc7][src197]
+[claude.rs:125 @40a6dc7][src98] [claude.rs:143 @40a6dc7][src197] [claude.rs:181 @40a6dc7][src234]
 [claude.rs:259 @40a6dc7][src198] [claude.rs:292 @40a6dc7][src199]
 [claude.rs:390 @40a6dc7][src200]
 
@@ -664,7 +739,7 @@ non-error parsed event; model-metadata warnings can be downgraded to Output. `tu
 with optional result and usage.
 [codex.rs:52 @40a6dc7][src36] [codex.rs:91 @40a6dc7][src202]
 [codex.rs:114 @40a6dc7][src203] [codex.rs:170 @40a6dc7][src204]
-[codex.rs:311 @40a6dc7][src205] [codex.rs:373 @40a6dc7][src43]
+[codex.rs:316 @40a6dc7][src205] [codex.rs:373 @40a6dc7][src43]
 
 ### Pi
 
@@ -673,19 +748,23 @@ pi --mode rpc [--model <model>] [--thinking <level>]
    [--append-system-prompt <system>]
 ```
 
-The rendered system prompt wins over `config.system_prompt` when present. It appends governance to Pi's
-own coding-agent harness prompt. One JSONL prompt frame goes to stdin, which remains open. There is no
-interactive tool-result exchange implemented in r-orch: tool-start events are observations, progress
-updates are dropped, successful Bash results become Command, Write/Edit results with paths become
-FileChange, other tool results become Output, and failed tool results become Error.
+The rendered system prompt wins over `config.system_prompt` when present, even if empty: Pi sends it
+as an empty argument. Claude instead skips blank system prompts.
+[pi.rs:115 @40a6dc7][src99] [claude.rs:125 @40a6dc7][src98]
+Pi appends governance to its own coding-agent harness prompt. One JSONL prompt frame goes to stdin,
+which remains open. There is no interactive tool-result exchange implemented in r-orch: tool-start events are observations, progress
+updates are dropped, and successful results with exactly lowercase `tool_name == "bash"` become
+Command (`Bash` becomes Output). Write/Edit names ignore ASCII case and become FileChange when a path
+is present; other tool results become Output, and failed tool results become Error.
+[pi.rs:388 @40a6dc7][src235] [pi.rs:399 @40a6dc7][src236]
 [pi.rs:105 @40a6dc7][src45] [pi.rs:133 @40a6dc7][src37]
 [pi.rs:244 @40a6dc7][src62] [pi.rs:372 @40a6dc7][src206]
 
 Text deltas accumulate silently until `text_end`. Completion uses the last assistant in `agent_end`;
 if `willRetry` is present, even false, the adapter waits for `agent_settled` and uses the pending
 completion. This avoids treating an automatically retried intermediate end as final. Terminal failure
-is emitted and thrown; success emits Done. Either terminal outcome requests graceful termination of the
-long-lived RPC child with a one-second grace, then ends the stream without awaiting `ExitSignal`.
+emits an Error event and ends the stream with an error; success emits Done. Either terminal outcome
+requests graceful termination of the long-lived RPC child with a one-second grace, then ends the stream without awaiting `ExitSignal`.
 This is a one-shot use of an RPC transport, not session pooling; completion does not confirm reaping.
 [pi.rs:310 @40a6dc7][src207] [pi.rs:444 @40a6dc7][src63]
 [pi.rs:489 @40a6dc7][src208] [pi.rs:687 @40a6dc7][src209]
@@ -718,9 +797,9 @@ before probing uses `cursor-agent`. The prompt is positional argv, with rendered
 no per-agent system fallback. Cursor shares Claude's stream-json parser, except it does not read the
 Claude `stats.usage` fallback. Generic effort is unsupported by the checked-in policy; legacy effort
 may be ignored with warning.
-[cursor.rs:21 @40a6dc7][src212] [cursor.rs:62 @40a6dc7][src213]
-[cursor.rs:97 @40a6dc7][src22] [cursor.rs:133 @40a6dc7][src214]
-[effort.rs:270 @40a6dc7][src215] [effort.rs:1019 @40a6dc7][src135]
+[adapters/cursor.rs:21 @40a6dc7][src212] [adapters/cursor.rs:62 @40a6dc7][src213]
+[adapters/cursor.rs:97 @40a6dc7][src22] [adapters/cursor.rs:133 @40a6dc7][src214]
+[orch-domain/src/effort.rs:270 @40a6dc7][src215] [orch-domain/src/effort.rs:1019 @40a6dc7][src135]
 
 ### Grok
 
@@ -731,9 +810,15 @@ grok -p <user-prompt> --output-format streaming-json
      [--system-prompt-override <system>]
 ```
 
-The rendered system prompt wins over `config.system_prompt` when present. `thought` records are dropped;
-`text.data` accumulates into complete final text and is flushed to Output in chunks at 240 UTF-16 units,
-or at completion/clean drain. `tool_call`/`tool_use` becomes ToolCall, `tool_result` becomes Output,
+The rendered system prompt wins over `config.system_prompt` when present, even if empty: Grok sends
+it as an empty argument. Claude instead skips blank system prompts.
+[grok.rs:87 @40a6dc7][src100] [claude.rs:125 @40a6dc7][src98]
+`thought` records are dropped; `text.data` accumulates into complete final text and is flushed to Output
+in chunks at 240 UTF-16 units or at completion. After `exit.wait()`, any remaining buffer is also flushed
+when no `end` was seen and the run was not cancelled, including before a nonzero-exit error.
+[grok.rs:240 @40a6dc7][src166]
+
+`tool_call`/`tool_use` becomes ToolCall, `tool_result` becomes Output,
 `error` is classified, and `end` becomes Done with accumulated text. A clean exit without `end` also
 synthesizes Done. Stderr is discarded and no normalized token usage is extracted.
 [grok.rs:33 @40a6dc7][src216] [grok.rs:60 @40a6dc7][src86]
@@ -765,15 +850,17 @@ The shell runs the configured command as a login-shell command string. Prompt te
 value, not interpolated into that command by the adapter. The command decides whether to read/use it.
 The adapter ignores model, max-turns and per-agent system fallback; stdin is null. stdout and stderr
 are pumped concurrently into a bounded FIFO as bare-string Output and classified Error events.
-A successful exit ends the stream without Done; a nonzero/signal exit throws unless cancelled.
+A successful exit ends the stream without Done; a nonzero/signal exit ends the stream with an error
+unless cancelled.
 [shell.rs:97 @40a6dc7][src47] [shell.rs:127 @40a6dc7][src219]
 [shell.rs:234 @40a6dc7][src39]
 
 If the command is absent, the adapter does not spawn at all: it returns PID 0 and one error event.
-Because that stream ends normally, the collector can take its success path. Do not use this exceptional path as evidence that error
-events fail a run.
+Because that stream ends normally, the collector can take its success path. While its collector is
+live, reconcile skips the PID check even for this PID-0 entry, although `is_alive(0)` is false.
+Do not use this exceptional path as evidence that error events fail a run.
 [shell.rs:197 @40a6dc7][src23] [collect.rs:91 @40a6dc7][src14]
-[manager.rs:78 @40a6dc7][src220] [tick.rs:201 @40a6dc7][src151]
+[orch-infra/src/process/manager.rs:78 @40a6dc7][src220] [tick.rs:201 @40a6dc7][src151]
 
 ### Verification vectors and maintenance
 
@@ -785,16 +872,16 @@ These are focused checks for changes to this boundary, rather than a request to 
 | Codex duplicated error plus `turn.failed` | One matching adjacent error observation | `codex/duplicate-error` fixture |
 | Pi `agent_end` with `willRetry`, then retry and settle | Do not finalize the first end; settle final pending completion | `pi/auto-retry` fixture |
 | OpenCode `step_finish: tool-calls`, then stop | No Done for intermediate step; Done for stop | `opencode/session` fixture |
-| Invalid JSON or overlong completed line | Text fallback, not an invented structured tool event | Shared line reader and malformed-output fixture |
+| Invalid JSON or overlong completed line | Text fallback, not an invented structured tool event | Invalid JSON: `claude/errors.jsonl`; overlong lines: `cap_line` and line-reader cap tests (the fixture has no overlong line) |
 | Shell exit zero / nonzero / signal | Normal EOF / stream error / stream error, unless cancelled | `exit_failure` tests |
 | Producer fills Shell queue then consumer drains | Producer blocks for space; order retained | `EventBuffer` tests |
 | Effort unset vs valid vs invalid combination | No selector/probe vs one native selector vs pre-spawn rejection or legacy ignore | Effort dispatch matrix tests |
 
 Evidence: [adapter_fixtures.rs:139 @40a6dc7][src221]
 [duplicate-error.jsonl:1 @40a6dc7][src222] [auto-retry.jsonl:1 @40a6dc7][src223]
-[session.jsonl:4 @40a6dc7][src65] [errors.jsonl:1 @40a6dc7][src224]
+[opencode/session.jsonl:4 @40a6dc7][src65] [errors.jsonl:1 @40a6dc7][src224]
 [line_reader.rs:39 @40a6dc7][src225] [shell.rs:340 @40a6dc7][src226]
-[buffer.rs:246 @40a6dc7][src227] [effort.rs:140 @40a6dc7][src228].
+[buffer.rs:246 @40a6dc7][src227] [adapters/effort.rs:140 @40a6dc7][src228].
 
 Adapter argv snapshots and fixture replay tests pin r-orch's side of the boundary; they cannot prove an
 arbitrary installed CLI still supports the same protocol. When updating an adapter, compare both its
@@ -823,7 +910,7 @@ need their own evidence and review; this chapter records the implementation engi
 [src15]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/orchestrator/collect.rs#L235
 [src16]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/orchestrator/dispatch.rs#L895
 [src17]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-core/src/adapter.rs#L265
-[src18]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-core/src/adapter.rs#L310
+[src18]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-core/src/adapter.rs#L300
 [src19]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/doctor_service.rs#L92
 [src20]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/orchestrator/dispatch.rs#L795
 [src21]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/orchestrator/dispatch.rs#L1131
@@ -900,7 +987,7 @@ need their own evidence and review; this chapter records the implementation engi
 [src92]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/orchestrator/dispatch.rs#L425
 [src93]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/template/context.rs#L75
 [src94]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-core/src/template.rs#L214
-[src95]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/run_service.rs#L23
+[src95]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/run_service.rs#L20
 [src96]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-engine/src/run_service.rs#L193
 [src97]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/template/render.rs#L105
 [src98]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L125
@@ -1002,7 +1089,7 @@ need their own evidence and review; this chapter records the implementation engi
 [src194]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/grok.rs#L285
 [src195]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/antigravity.rs#L162
 [src196]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L62
-[src197]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L175
+[src197]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L143
 [src198]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L259
 [src199]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L292
 [src200]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L390
@@ -1010,7 +1097,7 @@ need their own evidence and review; this chapter records the implementation engi
 [src202]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/codex.rs#L91
 [src203]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/codex.rs#L114
 [src204]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/codex.rs#L170
-[src205]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/codex.rs#L311
+[src205]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/codex.rs#L316
 [src206]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/pi.rs#L372
 [src207]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/pi.rs#L310
 [src208]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/pi.rs#L489
@@ -1038,3 +1125,9 @@ need their own evidence and review; this chapter records the implementation engi
 [src230]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/tests/adapter_fixtures.rs#L90
 [src231]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/util.rs#L173
 [src232]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/pi.rs#L739
+[src233]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-core/src/adapter.rs#L259
+[src234]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/claude.rs#L181
+[src235]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/pi.rs#L388
+[src236]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/adapters/pi.rs#L399
+[src237]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/storage/paths.rs#L116
+[src238]: https://github.com/yuxhuang/r-orch/blob/40a6dc78a8bd305ac00163282629c50855616788/crates/orch-infra/src/storage/paths.rs#L132
