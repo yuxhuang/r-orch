@@ -166,20 +166,19 @@ The records are per warning, not per agent: an agent with two warnings gets two 
 like `pi1` here:
 
 ```text
-02:08:30.300 INFO  serve:started  mode=once pid=50292 poll_interval_ms=10000
-02:08:30.307 WARN  serve:diagnostic  agentId=agt_4uMJoUb agentName=oc message=local-override-possible: a local opencode variant with the same name can replace the catalog variant's settings
-02:08:30.310 WARN  serve:diagnostic  agentId=agt_XlDL3q3 agentName=sh message=legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)
-02:08:30.313 WARN  serve:diagnostic  agentId=agt_IZ-vDwz agentName=pi1 message=clamp-possible: pi clamps the requested thinking level to the model's support; a non-reasoning model runs with thinking off
-02:08:30.316 WARN  serve:diagnostic  agentId=agt_IZ-vDwz agentName=pi1 message=request-only: the explicit --thinking level takes precedence over the model's :level suffix
-02:08:30.316 WARN  serve:diagnostic  agentId=agt_QfgfSRa agentName=cx message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
+05:49:17.128 INFO  serve:started  mode=once pid=83167 poll_interval_ms=10000
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_bp3vdi0 agentName=cx message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_WoYXdTJ agentName=oc message=local-override-possible: a local opencode variant with the same name can replace the catalog variant's settings
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_Lt8wZYD agentName=pi1 message=clamp-possible: pi clamps the requested thinking level to the model's support; a non-reasoning model runs with thinking off
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_Lt8wZYD agentName=pi1 message=request-only: the explicit --thinking level takes precedence over the model's :level suffix
+05:49:17.129 WARN  serve:diagnostic  agentId=agt_tlU9bxS agentName=sh message=legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)
 ```
 
 In JSON the fields are `agentId`, `agentName` and `message`. If `serve` cannot read the agents to check them, it
 logs one `serve:diagnostics_unavailable` warning with an `error` field and carries on. When a run starts
-for an agent with an effort, each effort note for that run is logged as an `orchestrator:error` warning with
-`fatal=false` and the context `effort preparation for run <run-id> (agent <agent-id>)`. Whenever the effort
-is sent, the notes include the informational `request-only` note, so such an agent logs at least one of these
-records on every run, even with no start-up warning ([Warnings when a run starts](16-eco-mode-and-effort.md#warnings-when-a-run-starts)).
+for an agent with an effort, each effort warning for that run is logged once as an `orchestrator:error` warning
+with `fatal=false` and the context `effort preparation for run <run-id> (agent <agent-id>)`. An agent with no
+warning logs none ([Warnings when a run starts](16-eco-mode-and-effort.md#warnings-when-a-run-starts)).
 
 | Option | What it does | Default |
 |---|---|---|
@@ -214,6 +213,19 @@ Shutting down...
 ```
 
 After that, `orch status` says `idle`.
+
+`orch run <task-id>` and `orch run --all` stop on `Ctrl+C` or `SIGTERM` too. They stop only the runs that command
+started: each run is marked `cancelled`, its task goes to `retrying` (or `failed` when it has no attempts left)
+and its agent back to idle. A run whose OpenCode version check is still going is stopped before its model starts,
+and the check's processes are stopped with it. The command exits with code 130 after `Ctrl+C` and 143 after
+`SIGTERM`:
+
+```text
+  orch · running tsk_SvWl33_ "slow"
+
+
+  ✕ Interrupted by SIGINT: stopped the runs this command started
+```
 
 Avoid `kill -9`. It leaves the lock file and the saved state behind, so `orch status` may keep saying `watching`. If that happens, check that no orch process runs, and see [Troubleshooting](13-troubleshooting.md).
 

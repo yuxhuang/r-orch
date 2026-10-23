@@ -82,7 +82,7 @@ orch agent add reviewer --adapter claude --model claude-sonnet-4-6 \
 
 Three details about the defaults:
 
-- A `shell` agent ignores `--model` and `--effort`, and its approval policy is `auto` unless you pass `--approval-policy`.
+- A `shell` agent ignores `--model`. It drops `--effort low`, `medium` or `high` with a `legacy-ignored` warning and refuses any other level ([Effort levels by adapter](16-eco-mode-and-effort.md#effort-levels-by-adapter)). Its approval policy is `auto` unless you pass `--approval-policy`.
 - Other adapters take the approval policy from the project setting `defaults.agent.approval_policy`, which is `auto` after `orch init`.
 - `orch init` also creates one agent, Agent Creator, with the policy `suggest`. It uses the project's default adapter, which is `claude` unless you ran `orch init --adapter <adapter>`.
 

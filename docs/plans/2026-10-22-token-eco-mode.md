@@ -7,7 +7,7 @@ spec: [../specs/2026-10-22-token-eco-mode.md](../specs/2026-10-22-token-eco-mode
 
 ## Goal
 An opt-in `eco` prompt mode sends a compact, stable-first prompt with the same orchestration as `normal`; `normal`
-stays byte-identical to v0.9.4. Independently of the mode, every adapter forwards the effort levels its current
+stays byte-identical to v0.9.4 (one named exception, spec R2). Independently of the mode, every adapter forwards the effort levels its current
 CLI documents, validated when an agent is written, and new agents get current default models.
 
 ## Non-goals
@@ -19,7 +19,7 @@ service, rewriting stored agents. See the spec.
 - Baseline measurement (M0, frozen 28-agent fixture): median total rendered input 241,478.5 UTF-8 bytes (60,370
   estimated tokens at bytes/4), of which the Team block, every other agent's full role, is 226,440 bytes (93.77%).
   These are rendered-size estimates, not billed tokens. In the same measurement a second identical Claude run
-  read 108,041 tokens from cache with 2 new input tokens, so the user half of a prompt can already be cached.
+  read 108,041 tokens from cache with 2 new input tokens.
 - Research and design inputs: provider practice research, effort/model research, session-reuse measurement, the
   final design and the lead's rulings 1–7. They are kept with the team's working files, not in the repo.
 
@@ -42,9 +42,9 @@ files (the same no-run path as a read failure).
 (`orch-infra/src/template/eco.rs`) selected by the context; the shared entry point is `render_prompt`.
 
 **Eco layout (D3).** System half: CLI reference plus record-lookup commands, unchanged rules, mandatory-lookup
-rules, the concise-reporting instruction, project, roster, the agent's own full role and skills, workspace and
-the same ≤15 shared-context entries in full. User half: task, retry, feedback, inbox, autonomous instructions,
-goal. Roster rows are sorted by agent id and JSON-encoded as data. Each row's `summary` is `config.role_summary`
+rules, the concise-reporting instruction, project, roster, the agent's own full role and skills, workspace. User
+half: the same ≤15 shared-context entries in full (first, by security ruling 23: agent-writable text stays out of
+the provider's system role, and out of Pi's argv), task, retry, feedback, inbox, autonomous instructions, goal. Roster rows are sorted by agent id and JSON-encoded as data. Each row's `summary` is `config.role_summary`
 (≤192 bytes, whitespace-normalized) or the first sentence of the role's first paragraph after skipping headings
 and the exact shared-rule preamble, clipped to 192 bytes with `[truncated, N more bytes]`. Retry output is
 clipped to 8,192 bytes (head 2,048) only with the same failed run's id and a finished collector; the prompt then
@@ -64,9 +64,10 @@ model_reasoning_effort="<level>"`, OpenCode `<model>#<level>`. OpenCode alone ov
 --help` (2 s and 64 KiB each, process group killed on failure) and requires major version 2 and the
 `provider/model#variant` signature. `execute` stays synchronous and returns the model child's PID. Diagnostics
 use five statuses (`request-only`, `clamp-possible`, `local-override-possible`, `capability-unknown`,
-`legacy-ignored`) and never claim an effective level. They are never agent output: each run reports its own once,
-before the model starts, as a non-fatal `orchestrator:error` with context `effort preparation for run <run> (agent
-<agent>)` (lead ruling 8).
+`legacy-ignored`) and never claim an effective level. They are never agent output: each run reports its own
+warnings, once each, before the model starts, as a non-fatal `orchestrator:error` with context `effort preparation
+for run <run> (agent <agent>)` (lead ruling 8); the informational request-only note stays on `agent show` and is
+not reported at run start (ruling 20).
 
 **Models (D6).** `orch-domain/src/model_tiers.rs` changes the static capable/balanced/fast choices for new
 selections only; stored models are never resolved through it.
@@ -109,10 +110,13 @@ slices share one compile dependency chain (B1 → B4), and the workspace does no
 | B2 | implemented, `a813a54`; adapter tests pass on macOS in a prerequisite copy |
 | B3 | implemented, `6400433`; engine, infra and `prompt_golden` pass on macOS |
 | B4 | implemented, `7f96bdd`; CLI and TUI lib tests pass on macOS; `orch serve` start-up diagnostics `784169c`, record fields renamed `agentId`/`agentName` in `3b03c62` |
-| T1 | in progress |
-| W | committed with this plan; examples re-run on `3b03c62` in disposable projects |
-| F1 | implemented: effort diagnostics left the agent-output stream (lead ruling 8); adapters `72125b1`, engine `6ae9839` (before spawn, one non-fatal `orchestrator:error` per effort diagnostic of the run, including the informational `request-only` note); manual and spec updated in the W follow-up |
-| I, P, E | pending |
+| T1 | committed, `54f7236`; 5137 passed, 0 failed, 5 ignored on macOS; legacy matrix 544 cells against the real 0.9.4 binary |
+| W | committed with this plan; follow-ups for rulings 8 and 10; CP3 condition round documented, examples re-run on `8782037` in disposable projects |
+| F1 | implemented: effort diagnostics left the agent-output stream (lead ruling 8); adapters `72125b1`, engine `6ae9839`; run-start records reduced to warnings, once each (ruling 20), in `ee600d0` |
+| I | frozen at `c2f6962` for the board; CP3 condition round in progress, then re-frozen at the fix-round head (named in the PR) |
+| CP3 fixes | `ee600d0` standalone `run`/`run --all` signal handling and run-start warnings (rulings 19, 20); `e1ecc6a`, `57cc5f4` fresh-config validation under the definition lock and shell effort refusal (ruling 21); `8d16fa6`, `8782037` dashboard wizard warnings, locked validation and narrow header (ruling 22); `f4f81bf`, `c3d13e5` eco shared context in the user half (ruling 23) |
+| P | done at `c2f6962`: R9 cold ratio 0.089 aggregate, 0.089 median, 0.142 worst; OpenCode version check median 145 ms; Claude second-read cache positive in both eco pairs; OpenCode warm counters not measured (provider route rejected) |
+| E | held-out evaluation blocked on the owner's VM and spend |
 
 ## Test plan
 The spec's acceptance checks; the AGENTS.md CI set on Linux CI and macOS; `F3` and the wizard in tmux; the cold
@@ -139,6 +143,6 @@ regenerated command reference; `docs/file-mutations.md`; `README.md`; `CHANGELOG
 process file the owner merges (AGENTS.md, merge policy).
 
 ## Open questions
-- R9 and the warm-cache and outcome results land in a follow-up docs change after the freeze.
+- The outcome result (E) lands in a follow-up docs change once the held-out evaluation runs.
 - B3 points the goal recovery command at `orch --json goal show <goal-id>` (it includes dependencies) instead of
   the design's `orch task list --goal-id`; kept unless the lead decides otherwise.

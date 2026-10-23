@@ -54,7 +54,8 @@ rejected for agents and tasks (`agent.role: null is not allowed; omit the field`
 - **Reserved labels.** Labels starting with `remote-ctl:` or `exec:` belong to worker mirrors and are rejected;
   `remote-ctlx` and `exec-ish` are accepted.
 - **Agents.** A shell agent still needs `config.command`; the name must not belong to another agent; the runtime
-  limits must be positive; a shell agent's `model` and `effort` are dropped. An agent that is running, or a remote
+  limits must be positive; a shell agent's `model` is dropped, and so is its effort when it is `low`, `medium` or
+  `high` (with a `legacy-ignored` warning); any other effort is refused. An agent that is running, or a remote
   one (an id containing `@`), cannot be changed.
 - **Tasks.** A task that is `in_progress`, or labelled `remote-ctl:…`, cannot be changed. An update that changes nothing
   does not rewrite the task or touch `updated_at`.
