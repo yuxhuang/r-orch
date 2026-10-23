@@ -6,6 +6,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Fixed
+- Cancelling a task in the dashboard (`C`, `/cancel`, or `C cancel` in the footer) now works while `orch serve` or `orch run --watch` has the project open and the dashboard shows `OBSERVING`. It used to fail with "Orchestrator already running" for a task in any status. The task is cancelled at once; if an agent is running it, the open orchestrator stops the agent at its next check.
 - A dashboard that is only watching a project another process owns (`orch serve`, `orch run --watch` or another dashboard) now shows a cancelled task as `in_progress → cancelled`. It used to report `in_progress → failed` with a "Task failed" toast, although the task and its run were cancelled.
 
 ## [0.10.1] - 2026-10-23
@@ -14,6 +15,7 @@ Retry-delay patch release. No peer-protocol change, so 0.5.x through 0.10.1 peer
 
 ### Fixed
 - A failed task now waits its retry delay (`scheduling.retry_base_delay_ms`, doubling each time) before the next attempt. In 0.10.0 orch restarted it about half a second after each failure, so every attempt was used up within a couple of seconds. The retry starts at the orchestrator's first check after the delay is up. `orch run --all` no longer retries a failed task straight away: it leaves the task in `retrying` for `orch run --watch`, `orch serve` or the dashboard to retry when the delay is up. `orch run <task-id>` still starts a `retrying` task at once.
+- `orch task cancel` of a running task now works while `orch serve`, `orch run --watch` or the dashboard has the project open. It used to fail with "Orchestrator already running" and leave the agent running. The task is cancelled at once; the open orchestrator stops the agent at its next check and marks the run cancelled. A run stopped this way, or because its task was deleted, no longer stays `running` in the run history.
 
 ## [0.10.0] - 2026-10-23
 

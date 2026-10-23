@@ -601,9 +601,21 @@ impl TuiBackend for EngineBackend {
 
     /// Awaited: cancelling is bounded by the 3 s kill grace, and the dashboard
     /// wants to know whether the task really was cancelled.
+    ///
+    /// In observer mode another process (`serve`, `run --watch`) holds the
+    /// lock, so the orchestrator cannot take it. The task is then cancelled in
+    /// the store only, as `orch task cancel` does, and the owner's next
+    /// reconcile sees it terminal and stops the run itself.
     fn cancel_task(&mut self, id: &str) -> BackendResult<()> {
-        self.block_on(self.engine.orchestrator.cancel_task(id))
-            .map_err(to_message)
+        self.block_on(async {
+            match self.engine.orchestrator.cancel_task(id).await {
+                Err(orch_core::Error::Domain(orch_domain::DomainError::LockConflict(_))) => {
+                    self.engine.task_service.cancel(id).await.map(|_| ())
+                }
+                result => result,
+            }
+        })
+        .map_err(to_message)
     }
 
     // ── Agents ───────────────────────────────────────────────────────────
