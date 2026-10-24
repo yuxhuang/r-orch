@@ -183,7 +183,7 @@ orch config global show
 
 | Key | What it does | Values | Default |
 |---|---|---|---|
-| `palette` | The dashboard's colours. | `amber`, `ocean`, `forest`, `violet`, `light` | `amber` |
+| `palette` | The dashboard's colours. | `amber`, `ocean`, `forest`, `violet`, `light`, `catppuccin_latte`, `catppuccin_mocha`, `dracula`, `gruvbox_dark`, `nord`, `one_dark`, `solarized_dark`, `solarized_light`, `tokyo_night` | `amber` |
 | `activity_filter` | Which entries the dashboard's activity feed shows. | `all`, `text`, `tools`, `errors`, `events` | `all` |
 
 ```sh
@@ -204,8 +204,13 @@ orch config global get palette
 
 `set` ignores capital letters in a palette name. Other keys, such as `tui.palette`, are not accepted.
 
+`light`, `catppuccin_latte` and `solarized_light` suit a light terminal background; the others suit a dark one.
+The palettes from `catppuccin_latte` on are adapted from the Catppuccin, Dracula, Gruvbox, Nord, One Dark,
+Solarized and Tokyo Night themes. An orch older than the release that added them reads an unknown palette name as
+`amber`, and writes `amber` back the next time it saves a global setting (such as the activity filter).
+
 > **Note:** `orch config global set` exits with code 0 even when it rejects your input. It prints an error
-> instead, for example `✕ Invalid value "pink". Valid: amber, ocean, forest, violet, light` or
+> instead, for example `✕ Invalid value "pink". Valid: amber, ocean, forest, violet, light, catppuccin_latte, …` or
 > `✕ Unknown global config key: foo`. In a script, run `orch config global get <key>` afterwards to check.
 
 `global.yml` also holds `tui.notifications.toast` (default `true`) and `tui.notifications.bell` (default

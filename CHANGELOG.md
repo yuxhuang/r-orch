@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- Nine more dashboard colour palettes, adapted from popular terminal themes: `catppuccin_latte`, `catppuccin_mocha`, `dracula`, `gruvbox_dark`, `nord`, `one_dark`, `solarized_dark`, `solarized_light` and `tokyo_night`. Pick one with `/config palette <name>` (or `/config palette` for the list), or `orch config global set palette <name>`. An older orch reads a palette name it does not know as `amber`.
+
 ## [0.10.2] - 2026-10-23
 
 Cancel and stall patch release. No peer-protocol change, so 0.5.x through 0.10.2 peers can be mixed.

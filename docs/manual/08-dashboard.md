@@ -452,7 +452,7 @@ The commands do the same as their CLI counterparts: see [Tasks](04-tasks.md), [A
 
 | Command | What it changes |
 |---|---|
-| `/config palette [name]` | The colour palette: `amber`, `ocean`, `forest`, `violet` or `light`. With a name it applies directly. |
+| `/config palette [name]` | The colour palette: `amber`, `ocean`, `forest`, `violet`, `light`, `catppuccin_latte`, `catppuccin_mocha`, `dracula`, `gruvbox_dark`, `nord`, `one_dark`, `solarized_dark`, `solarized_light` or `tokyo_night`. With a name it applies directly. |
 | `/config activity-filter` | The default Activity filter. |
 | `/config max-concurrent` | How many agents may run at the same time (choose from 1, 2, 3, 4, 6, 8 or 10). |
 | `/config notifications-toast` | Turns toast notifications on or off. |

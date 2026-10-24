@@ -1029,7 +1029,7 @@ observer; `update`/update-check; `editor` and `shop_picker`. It implements `TuiB
 
 **Holds:** the four views with their lists and detail panels; the ordered key-dispatch chain; the command bar
 with completion, suggestions and history; all wizards with their skip predicates and validation messages; help
-overlay; both filter pickers; onboarding; toasts/bell/tab-flash; soft delete with undo; the five palettes; the
+overlay; both filter pickers; onboarding; toasts/bell/tab-flash; soft delete with undo; the fourteen palettes; the
 80 ms batching, 2 KB detail caps and 500-entry LRU. Its tests use the in-crate `FakeBackend`.
 
 The TUI is the **default command** (bare `orch` launches it), so it is most users' entire experience, and the

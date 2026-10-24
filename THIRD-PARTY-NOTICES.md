@@ -14,6 +14,13 @@ and [`deny.toml`](deny.toml) limits which licences they may use. See [Rust crate
 | gstack | [garrytan/gstack](https://github.com/garrytan/gstack) | MIT | `skills/library/*.md` (modified by ORCH), the skill text in `fixtures/prompts/_skills.json` |
 | xterm.js (`@xterm/xterm` 5.5.0) | [xtermjs/xterm.js](https://github.com/xtermjs/xterm.js) | MIT | `crates/orch-cli/src/web/assets/xterm.js`, `xterm.css`, `LICENSE-xterm.txt` |
 | `@xterm/addon-fit` 0.10.0 | [xtermjs/xterm.js](https://github.com/xtermjs/xterm.js) | MIT | `crates/orch-cli/src/web/assets/addon-fit.js`, `LICENSE-addon-fit.txt` |
+| Catppuccin (colour values) | [catppuccin/palette](https://github.com/catppuccin/palette) | MIT | `crates/orch-tui/src/theme.rs` (`CATPPUCCIN_LATTE` and `CATPPUCCIN_MOCHA`) |
+| Dracula (colour values) | [dracula/dracula-theme](https://github.com/dracula/dracula-theme) | MIT | `crates/orch-tui/src/theme.rs` (`DRACULA`) |
+| Gruvbox (colour values) | [gruvbox-community/gruvbox](https://github.com/gruvbox-community/gruvbox) | MIT | `crates/orch-tui/src/theme.rs` (`GRUVBOX_DARK`) |
+| Nord (colour values) | [nordtheme/nord](https://github.com/nordtheme/nord) | MIT | `crates/orch-tui/src/theme.rs` (`NORD`) |
+| One Dark (colour values) | [joshdick/onedark.vim](https://github.com/joshdick/onedark.vim) | MIT | `crates/orch-tui/src/theme.rs` (`ONE_DARK`) |
+| Solarized (colour values) | [altercation/solarized](https://github.com/altercation/solarized) | MIT | `crates/orch-tui/src/theme.rs` (`SOLARIZED_DARK` and `SOLARIZED_LIGHT`) |
+| Tokyo Night (colour values) | [tokyo-night/tokyo-night-vscode-theme](https://github.com/tokyo-night/tokyo-night-vscode-theme) | MIT | `crates/orch-tui/src/theme.rs` (`TOKYO_NIGHT`) |
 
 When you add material that originates outside this project, add a row and a section here in the same PR. Add a
 line to `NOTICE` only when the material's licence requires one (for example, it comes with its own Apache-2.0
@@ -24,8 +31,8 @@ line to `NOTICE` only when the material's licence requires one (for example, it 
 This file covers the source tree. A copy distributed in any other form needs its notices carried with it:
 
 - **A built `orch` binary, archive or package** compiles in ORCH-derived code, the default prompt templates and
-  role prompts, and the xterm.js files, and it statically links the Rust crate dependencies. Ship `LICENSE`,
-  `NOTICE` and this file with it, together with the licence notices of the crates it links (see
+  role prompts, the xterm.js files and the theme-derived colour palettes, and it statically links the Rust crate
+  dependencies. Ship `LICENSE`, `NOTICE` and this file with it, together with the licence notices of the crates it links (see
   [Rust crate dependencies](#rust-crate-dependencies)). An install that copies `skills/library/` should copy
   `skills/library/LICENSE-MIT` with it.
 - **Files that `orch init` writes** into `.orchestry/` (the default prompt template, and the Agent Creator role
@@ -180,6 +187,247 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+```
+
+## Catppuccin
+
+- **Upstream:** https://github.com/catppuccin/palette, checked at commit
+  `07d02aa110ef9eb7e7427afca5c73ba9cf7f8ebd`. Colours taken from `palette.json` (the `latte` and `mocha` flavours).
+- **Licence:** MIT (the repository's `LICENSE` file).
+- **Copyright:** Copyright (c) 2021 Catppuccin.
+- **Files:** `CATPPUCCIN_LATTE` and `CATPPUCCIN_MOCHA` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
+  r-orch's 26 palette tokens. The tinted backgrounds and any colour the theme lacks are r-orch's own derivations
+  (listed as "Derived" in the comment above each table). No upstream file is copied.
+
+```text
+MIT License
+
+Copyright (c) 2021 Catppuccin
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Dracula
+
+- **Upstream:** https://github.com/dracula/dracula-theme, checked at commit
+  `e22ebcc048b8aff586f9bc94db30ff5347070b42`. Colours taken from `README.md` (the colour palette table).
+- **Licence:** MIT (the repository's `LICENSE` file).
+- **Copyright:** Copyright (c) 2023 Dracula Theme.
+- **Files:** `DRACULA` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
+  r-orch's 26 palette tokens. The tinted backgrounds and any colour the theme lacks are r-orch's own derivations
+  (listed as "Derived" in the comment above each table). No upstream file is copied.
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2023 Dracula Theme
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Gruvbox
+
+- **Upstream:** https://github.com/gruvbox-community/gruvbox, checked at commit
+  `180ad85971343df68be3422a5630fa84e45a9ab2`. Colours taken from `colors/gruvbox.vim` (the palette definitions).
+  gruvbox-community/gruvbox is the maintained fork of `morhetz/gruvbox` (whose README states MIT but which has no
+  licence file); the palette values are the same.
+- **Licence:** MIT (the repository's `LICENSE.md` file).
+- **Copyright:** Copyright (c) 2018 Pavel Pertsev.
+- **Files:** `GRUVBOX_DARK` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
+  r-orch's 26 palette tokens. The tinted backgrounds and any colour the theme lacks are r-orch's own derivations
+  (listed as "Derived" in the comment above each table). No upstream file is copied.
+
+```text
+MIT License
+
+Copyright (c) 2018 Pavel Pertsev
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Nord
+
+- **Upstream:** https://github.com/nordtheme/nord, checked at commit `1cef71605416a222e57225b544540ce0fcec18d4`.
+  Colours taken from `src/nord.css` (`--nord0` to `--nord15`).
+- **Licence:** MIT (the repository's `license` file).
+- **Copyright:** Copyright (c) 2016-present Sven Greb.
+- **Files:** `NORD` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
+  r-orch's 26 palette tokens. The tinted backgrounds and any colour the theme lacks are r-orch's own derivations
+  (listed as "Derived" in the comment above each table). No upstream file is copied.
+
+```text
+MIT License (MIT)
+
+Copyright (c) 2016-present Sven Greb <development@svengreb.de> (https://www.svengreb.de)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## One Dark
+
+- **Upstream:** https://github.com/joshdick/onedark.vim, checked at commit
+  `47bec7a6196a843dad195d2666c3ac84c6e80c78`. Colours taken from `autoload/onedark.vim` (the `gui` colours).
+  onedark.vim's colours are inspired by Atom's One Dark theme.
+- **Licence:** MIT (the repository's `LICENSE` file).
+- **Copyright:** Copyright (c) 2015 Joshua Dick.
+- **Files:** `ONE_DARK` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
+  r-orch's 26 palette tokens. The tinted backgrounds and any colour the theme lacks are r-orch's own derivations
+  (listed as "Derived" in the comment above each table). No upstream file is copied.
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Joshua Dick
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+## Solarized
+
+- **Upstream:** https://github.com/altercation/solarized, checked at commit
+  `62f656a02f93c5190a8753159e34b385588d5ff3`. Colours taken from `README.md` (the colour values table).
+- **Licence:** MIT (the repository's `LICENSE` file).
+- **Copyright:** Copyright (c) 2011 Ethan Schoonover.
+- **Files:** `SOLARIZED_DARK` and `SOLARIZED_LIGHT` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
+  r-orch's 26 palette tokens. The tinted backgrounds and any colour the theme lacks are r-orch's own derivations
+  (listed as "Derived" in the comment above each table). No upstream file is copied.
+
+```text
+Copyright (c) 2011 Ethan Schoonover
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+## Tokyo Night
+
+- **Upstream:** https://github.com/tokyo-night/tokyo-night-vscode-theme, checked at commit
+  `7c0f11eaef322f293621ca7befe462214b7ea468`. Colours taken from `README.md` (the colour palette table) and
+  `themes/tokyo-night-color-theme.json` (`#3d59a1` and `#16161e`).
+- **Licence:** MIT (the repository's `LICENSE.txt` file).
+- **Copyright:** Copyright (c) 2018-present Enkia.
+- **Files:** `TOKYO_NIGHT` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
+  r-orch's 26 palette tokens. The tinted backgrounds and any colour the theme lacks are r-orch's own derivations
+  (listed as "Derived" in the comment above each table). No upstream file is copied.
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2018-present Enkia
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ## Rust crate dependencies
