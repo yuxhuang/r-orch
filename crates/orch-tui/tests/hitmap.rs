@@ -348,7 +348,7 @@ fn h022_tab_pill_zones_keep_their_columns_whatever_the_width_and_the_status_grou
     // right group holds, or on which tab is selected: every tab occupies
     // ` {key} {LABEL} ` in every state. (x, width) per pill, in
     // `ViewId::ALL` order.
-    let columns = [(21, 9), (31, 9), (41, 10), (52, 11)];
+    let columns = [(20, 9), (30, 9), (40, 10), (51, 11)];
     let expected = [(ViewId::Tasks, columns), (ViewId::Logs, columns)];
     for (selected, pills) in expected {
         for width in [80u16, 100, 120, 200] {
@@ -396,17 +396,10 @@ fn h023_a_tab_keeps_its_cells_and_its_label_column_selected_unselected_or_flashi
         Flashing,
         Plain,
     }
-    // Per tab: (zone x, zone width, label column, how its label was drawn).
-    let layout = |selected: ViewId, flashing: Option<ViewId>| {
-        let mut harness = Harness::sized(FakeBackend::new().with_tasks(tasks(12)), 160, 30);
-        harness.app.state.project_name = "main".to_string();
-        harness.app.state.view = selected;
-        harness.app.state.flash = flashing.map(|tab| TabFlash {
-            tab,
-            color: Token::Green,
-            started_tick: harness.app.state.tick,
-        });
-        harness.draw();
+    // Per tab, as last drawn: (zone x, zone width, label column, how its
+    // label was drawn, the zone's cells).
+    let measure = |harness: &Harness| {
+        let selected = harness.app.state.view;
         let line = harness.line(1);
         let buffer = harness.terminal.backend().buffer().clone();
         ViewId::ALL.map(|view| {
@@ -440,6 +433,22 @@ fn h023_a_tab_keeps_its_cells_and_its_label_column_selected_unselected_or_flashi
             (zone.rect.x, zone.rect.width, column, look, cells)
         })
     };
+    let fixture = || {
+        let mut harness = Harness::sized(FakeBackend::new().with_tasks(tasks(12)), 160, 30);
+        harness.app.state.project_name = "main".to_string();
+        harness
+    };
+    let layout = |selected: ViewId, flashing: Option<ViewId>| {
+        let mut harness = fixture();
+        harness.app.state.view = selected;
+        harness.app.state.flash = flashing.map(|tab| TabFlash {
+            tab,
+            color: Token::Green,
+            started_tick: harness.app.state.tick,
+        });
+        harness.draw();
+        measure(&harness)
+    };
     let baseline = layout(ViewId::Goals, None);
     let tasks_pill = &baseline[1].4;
     assert!(
@@ -471,6 +480,46 @@ fn h023_a_tab_keeps_its_cells_and_its_label_column_selected_unselected_or_flashi
                     "{view:?} with {selected:?} selected and {flashing:?} flashing"
                 );
             }
+        }
+    }
+
+    // The same frames reached by switching views in one running harness:
+    // click each pill in turn, as m001 does, and every tab stays where the
+    // first frame drew it.
+    let geometry =
+        |tabs: &[(u16, u16, u16, Look, String); 4]| tabs.clone().map(|t| (t.0, t.1, t.2));
+    let mut harness = fixture();
+    harness.app.state.view = ViewId::Goals;
+    harness.draw();
+    let before = measure(&harness);
+    assert_eq!(geometry(&before), geometry(&baseline));
+    for target in [ViewId::Tasks, ViewId::Agents, ViewId::Logs, ViewId::Goals] {
+        let from = harness.app.state.view;
+        harness.click_text(target.label());
+        assert_eq!(
+            harness.app.state.view,
+            target,
+            "clicking {:?}",
+            target.label()
+        );
+        harness.draw();
+        let after = measure(&harness);
+        assert_eq!(
+            geometry(&after),
+            geometry(&before),
+            "a tab moved switching from {from:?} to {target:?}"
+        );
+        assert_eq!(after[1].4, before[1].4, "the Tasks badge changed");
+        for (i, view) in ViewId::ALL.into_iter().enumerate() {
+            let expected = if view == target {
+                Look::Selected
+            } else {
+                Look::Plain
+            };
+            assert_eq!(
+                after[i].3, expected,
+                "{view:?} after switching to {target:?}"
+            );
         }
     }
 }

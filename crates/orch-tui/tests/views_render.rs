@@ -975,10 +975,11 @@ fn v108_the_eco_mode_and_its_pending_ellipsis_render_in_the_group() {
 #[test]
 fn v109_a_narrow_row_drops_the_uptime_then_the_counts_then_moves_the_prompt_mode() {
     // The oracle: the group is the longest of its suffixes that leaves at
-    // least two blank cells after the tabs, and the tabs never move. Every
+    // least two blank cells after the last tab's label, and the tabs never
+    // move. Every
     // width from 60 to 220 is checked, with names that land each stage at
-    // 80 columns ("p", "main": chip only, the mode on row 2; "main-project"
-    // and the long name: not even the chip fits, so it clips).
+    // 80 columns ("p": mode and chip; "main": chip only, the mode on row 2;
+    // "main-project" and the long name: not even the chip fits, so it clips).
     let suffixes = [
         "16:40 · 1 running │ 2 todo · normal · ● OBSERVING",
         "1 running │ 2 todo · normal · ● OBSERVING",
@@ -1004,8 +1005,8 @@ fn v109_a_narrow_row_drops_the_uptime_then_the_counts_then_moves_the_prompt_mode
                 );
                 continue;
             }
-            // The last pill ends one padding cell after its label.
-            let tabs_end = column_of(&row, "L ACTIONS") + "L ACTIONS".len() + 1;
+            // The last pill's padding cell counts toward the two-cell gap.
+            let tabs_end = column_of(&row, "L ACTIONS") + "L ACTIONS".len();
             let fitting = suffixes
                 .iter()
                 .find(|s| tabs_end + 2 + s.chars().count() <= width);
@@ -1072,6 +1073,40 @@ fn v110_the_drop_stages_at_80_90_and_110_columns() {
     assert!(row.ends_with(" ● OBSERVING"), "{row:?}");
     assert!(!row.contains("normal"), "{row:?}");
     assert!(second.starts_with("normal · "), "{second:?}");
+}
+
+#[test]
+fn v111_at_80_columns_main_with_the_tasks_badge_keeps_the_whole_status_chip() {
+    // QA1: project `main`, twelve tasks (ten show, so the Tasks tab carries
+    // `(12)`) and a two-digit minor version. The chip must not lose its last
+    // letters; the prompt mode leads row 2.
+    type Setup = fn(&mut FakeBackend);
+    let cases: [(&str, Setup); 2] = [
+        ("● OBSERVING", |b| b.context.observer_mode = true),
+        ("● WATCHING", |b| b.context.initial_watch_active = true),
+    ];
+    for (chip, setup) in cases {
+        let tasks = (0..12)
+            .map(|i| make_task(&format!("tsk_{i}"), &format!("Task {i}"), TaskStatus::Todo))
+            .collect();
+        let mut backend = FakeBackend::new().with_tasks(tasks);
+        setup(&mut backend);
+        let mut harness = Harness::sized(backend, 80, 30);
+        harness.app.state.project_name = "main".into();
+        harness.app.state.version = "0.11.0".into();
+        harness.app.state.view = ViewId::Tasks;
+        harness.draw();
+        let (row, second) = (harness.line(1), harness.line(2));
+        assert!(row.contains(" T TASKS (12) "), "{row:?}");
+        assert_eq!(row.chars().count(), 80, "{row:?}");
+        let tail = &row[row.find("L ACTIONS").unwrap() + "L ACTIONS".len()..];
+        assert!(
+            tail.ends_with(chip) && tail.len() - chip.len() >= 2,
+            "the whole chip, at least two cells after the tabs: {row:?}"
+        );
+        assert!(tail.trim_end_matches(chip).trim().is_empty(), "{row:?}");
+        assert!(second.starts_with("normal"), "{second:?}");
+    }
 }
 
 // ── Onboarding ─────────────────────────────────────────────────────────────
