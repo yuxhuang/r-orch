@@ -159,10 +159,10 @@ const CATPPUCCIN_MOCHA: [u32; 26] = [
 // Dracula (dracula/dracula-theme `README.md`, MIT). Derived: `amberDim`,
 // `silver`, `gray`, `olive`, `solidText` (the background darkened), and `blue`
 // (Dracula has none: the midpoint of its cyan and purple). `amber` and
-// `purple` are both Purple.
+// `purple` are both Purple. `dim` mixes Comment with 42% white for TODO chips.
 const DRACULA: [u32; 26] = [
     0xbd93f9, 0x7a64a1, 0x50fa7b, 0xff5555, 0xa4befb, 0xf1fa8c, 0x8be9fd, 0xbd93f9, 0xf8f8f2,
-    0xcecfcc, 0xa9aaab, 0x6272a4, 0x44475a, 0x282a36, 0x53333c, 0x505447, 0x305444, 0x393f52,
+    0xcecfcc, 0xa9aaab, 0xa4adca, 0x44475a, 0x282a36, 0x53333c, 0x505447, 0x305444, 0x393f52,
     0x384956, 0x4f4569, 0x3d3f49, 0x32343f, 0x191a21, 0xff79c6, 0xb8c76b, 0xffb86c,
 ];
 // Gruvbox dark (gruvbox-community/gruvbox `colors/gruvbox.vim`, MIT). `purple`
@@ -173,20 +173,22 @@ const GRUVBOX_DARK: [u32; 26] = [
     0x384035, 0x524629, 0x3c3a36, 0x32312f, 0x1d2021, 0xd3869b, 0x98971a, 0xfe8019,
 ];
 // Nord (nordtheme/nord `src/nord.css`, MIT). Derived: `gray`, `dim`, `pink`,
-// `olive`. `solidText` is black: no single Nord colour reaches 4.5:1 on all of
+// `olive`, and `red` (nord11 mixed with 41% white for FAIL chips).
+// `solidText` is black: no single Nord colour reaches 4.5:1 on all of
 // `amber`, `green`, `red` and `blue`.
 const NORD: [u32; 26] = [
-    0x88c0d0, 0x81a1c1, 0xa3be8c, 0xbf616a, 0x5e81ac, 0xebcb8b, 0x8fbcbb, 0xb48ead, 0xeceff4,
+    0x88c0d0, 0x81a1c1, 0xa3be8c, 0xd9a2a7, 0x5e81ac, 0xebcb8b, 0x8fbcbb, 0xb48ead, 0xeceff4,
     0xd8dee9, 0x979da9, 0x7a808c, 0x4c566a, 0x2e3440, 0x4b3d48, 0x54524f, 0x45504f, 0x353f4f,
     0x3e4a54, 0x40505d, 0x3f4551, 0x363c48, 0x000000, 0xe0aec3, 0xaca553, 0xd08770,
 ];
 // One Dark (joshdick/onedark.vim `autoload/onedark.vim`, MIT). Derived:
 // `amberDim`, `white` (its foreground lightened), `gray`, `pink`, `olive`.
 // `amber` and `blue` are both Blue; `solidText` is black (the background is
-// below 4.5:1 on Red).
+// below 4.5:1 on Red). `gray` mixes its derived #797f8a with 36% white; `dim` mixes
+// #5c6370 with 42% white for labels and TODO chips.
 const ONE_DARK: [u32; 26] = [
     0x61afef, 0x47749b, 0x98c379, 0xe06c75, 0x61afef, 0xe5c07b, 0x56b6c2, 0xc678dd, 0xcdd1d9,
-    0xabb2bf, 0x797f8a, 0x5c6370, 0x4b5263, 0x282c34, 0x4d3941, 0x4e4a42, 0x3e4a42, 0x303e4e,
+    0xabb2bf, 0xa9adb4, 0xa0a5ac, 0x4b5263, 0x282c34, 0x4d3941, 0x4e4a42, 0x3e4a42, 0x303e4e,
     0x2f424b, 0x374e65, 0x353942, 0x2f333b, 0x000000, 0xe996bf, 0xacac53, 0xd19a66,
 ];
 // Solarized dark (altercation/solarized `README.md`, MIT). Derived: `amberDim`,
@@ -200,19 +202,21 @@ const SOLARIZED_DARK: [u32; 26] = [
 ];
 // Solarized light (altercation/solarized `README.md`, MIT): the dark variant's
 // accents and black `solidText`, base02..base1 as the text ramp, base3 as the
-// background and base2 as `neutralBg`. Derived: `amberDim`, `olive`.
+// background and base2 as `neutralBg`. Derived: `amberDim`, `olive`,
+// `gray` (base00 mixed with 11% black), `dim` (base0 with 30% black).
 const SOLARIZED_LIGHT: [u32; 26] = [
     0xb58900, 0xd2b55b, 0x859900, 0xdc322f, 0x268bd2, 0xb58900, 0x2aa198, 0x6c71c4, 0x073642,
-    0x586e75, 0x657b83, 0x839496, 0x93a1a1, 0xfdf6e3, 0xf9decd, 0xf4e9c8, 0xefebc8, 0xecede2,
+    0x586e75, 0x5a6d75, 0x5c6869, 0x93a1a1, 0xfdf6e3, 0xf9decd, 0xf4e9c8, 0xefebc8, 0xecede2,
     0xe8eedc, 0xefe0b6, 0xeee8d5, 0xf6efdc, 0x000000, 0xd33682, 0x849550, 0xcb4b16,
 ];
 // Tokyo Night (enkia/tokyo-night-vscode-theme `README.md` and
 // `themes/tokyo-night-color-theme.json`, MIT). Derived: `pink`. `olive` is the
 // theme's teal (#73daca); `amber` and `blue` are both Blue; `solidText` is the
-// side-bar background (#16161e).
+// side-bar background (#16161e). `dim` mixes Comment with 33% white
+// for labels and TODO chips.
 const TOKYO_NIGHT: [u32; 26] = [
     0x7aa2f7, 0x3d59a1, 0x9ece6a, 0xf7768e, 0x7aa2f7, 0xe0af68, 0x7dcfff, 0xbb9af7, 0xc0caf5,
-    0xa9b1d6, 0x9aa5ce, 0x565f89, 0x414868, 0x1a1b26, 0x462d3b, 0x423933, 0x343f34, 0x272e43,
+    0xa9b1d6, 0x9aa5ce, 0x8e94b0, 0x414868, 0x1a1b26, 0x462d3b, 0x423933, 0x343f34, 0x272e43,
     0x2a3849, 0x333e5c, 0x282a38, 0x21222f, 0x16161e, 0xf49ac7, 0x73daca, 0xff9e64,
 ];
 
@@ -524,6 +528,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn corrected_operational_text_stays_readable_on_its_surfaces() {
+        // F1: solidText alone misses TODO/FAIL chips and supporting labels.
+        // Keep a 4.5:1 floor for these text pairs on the intended theme base
+        // and the backgrounds actually used by the table/chip renderers.
+        let mut failures = Vec::new();
+        for (name, foreground, backgrounds) in [
+            (TuiPaletteName::Dracula, Token::Dim, &[Token::NeutralBg][..]),
+            (TuiPaletteName::Nord, Token::Red, &[Token::ErrorBg][..]),
+            (
+                TuiPaletteName::OneDark,
+                Token::Dim,
+                &[Token::NeutralBg, Token::Void, Token::AlternatingRowBg][..],
+            ),
+            (
+                TuiPaletteName::OneDark,
+                Token::Gray,
+                &[Token::Void, Token::AlternatingRowBg][..],
+            ),
+            (
+                TuiPaletteName::SolarizedLight,
+                Token::Dim,
+                &[Token::NeutralBg, Token::Void, Token::AlternatingRowBg][..],
+            ),
+            (
+                TuiPaletteName::SolarizedLight,
+                Token::Gray,
+                &[Token::Void, Token::AlternatingRowBg][..],
+            ),
+            (
+                TuiPaletteName::TokyoNight,
+                Token::Dim,
+                &[Token::NeutralBg, Token::Void, Token::AlternatingRowBg][..],
+            ),
+        ] {
+            let p = Palette::new(name);
+            for background in backgrounds {
+                let ratio = contrast(p.hex(foreground), p.hex(*background));
+                if ratio < 4.5 {
+                    failures.push(format!(
+                        "{name}: {} on {} {ratio:.2}",
+                        foreground.name(),
+                        background.name()
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
