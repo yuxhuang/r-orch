@@ -97,10 +97,10 @@ fn logs_with_messages() -> Harness {
 #[test]
 fn m001_clicking_each_tab_pill_switches_to_that_view() {
     for (label, expected) in [
-        ("agents", ViewId::Agents),
-        ("actions", ViewId::Logs),
-        ("goals", ViewId::Goals),
-        ("tasks", ViewId::Tasks),
+        ("AGENTS", ViewId::Agents),
+        ("ACTIONS", ViewId::Logs),
+        ("GOALS", ViewId::Goals),
+        ("TASKS", ViewId::Tasks),
     ] {
         let mut harness = view(ViewId::Tasks);
         if expected == ViewId::Tasks {
@@ -118,7 +118,7 @@ fn m002_a_tab_pill_is_found_whatever_the_project_name_width() {
         let mut harness = view(ViewId::Tasks);
         harness.app.state.project_name = name.to_string();
         harness.draw();
-        harness.click_text("agents");
+        harness.click_text("AGENTS");
         assert_eq!(
             harness.app.state.view,
             ViewId::Agents,
@@ -1004,7 +1004,7 @@ fn m063_a_tab_pill_click_with_a_detail_open_closes_it_and_switches() {
     let mut harness = view(ViewId::Tasks);
     harness.app.state.detail = DetailPanel::Entity;
     harness.draw();
-    harness.click_text("agents");
+    harness.click_text("AGENTS");
     assert_eq!(harness.app.state.detail, DetailPanel::None);
     assert_eq!(harness.app.state.view, ViewId::Agents);
 }
@@ -1063,7 +1063,7 @@ fn m067_an_open_picker_swallows_a_tab_pill_click() {
     let mut harness = agent_picker();
     harness.app.state.picker_draft = ["agt_1".to_string()].into_iter().collect();
     harness.draw();
-    harness.click_text("goals");
+    harness.click_text("GOALS");
     assert!(harness.app.state.show_agent_picker, "the picker stays open");
     assert_eq!(
         harness.app.state.view,
@@ -1105,7 +1105,7 @@ fn m070_the_help_overlay_swallows_everything_but_its_own_outside() {
     harness.draw();
     // A tab pill sits in the header, which the overlay does not cover, so it
     // is "outside": the overlay closes and the pill does **not** fire.
-    harness.click_text("agents");
+    harness.click_text("AGENTS");
     assert!(!harness.app.state.show_help);
     assert_eq!(
         harness.app.state.view,
@@ -2057,7 +2057,7 @@ fn m107_a_late_release_still_fires_and_a_resize_between_cancels_it() {
     // writes after a resize, so the release arrives in a later batch. The arm
     // has to survive that — otherwise the click is simply lost.
     let mut harness = view(ViewId::Tasks);
-    let (x, y) = harness.find_text("agents").expect("the agents pill");
+    let (x, y) = harness.find_text("AGENTS").expect("the agents pill");
     harness.press_at(x, y);
     // Frames pass with no release in sight.
     harness.draw();
@@ -2072,7 +2072,7 @@ fn m107_a_late_release_still_fires_and_a_resize_between_cancels_it() {
     // But if the geometry it was pressed against is retired in between, the
     // click is cancelled rather than fired against a rebuilt frame.
     let mut harness = view(ViewId::Tasks);
-    let (x, y) = harness.find_text("agents").expect("the agents pill");
+    let (x, y) = harness.find_text("AGENTS").expect("the agents pill");
     harness.press_at(x, y);
     harness.app.resize(80, 24);
     assert!(

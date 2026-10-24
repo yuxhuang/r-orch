@@ -841,16 +841,234 @@ fn v071_the_active_count_chip_renders_while_an_agent_runs() {
         },
     );
     let mut harness = harness_for(ViewId::Tasks, backend);
-    harness.assert_text("1 active");
+    harness.assert_text("1 running");
+    harness.refute_text("active");
 }
 
 #[test]
 fn v072_the_tab_pills_render_the_active_tab_and_the_inactive_labels() {
     let mut harness = harness_for(ViewId::Tasks, FakeBackend::new());
     harness.assert_text(" T TASKS ");
-    harness.assert_text("A agents");
-    harness.assert_text("G goals");
-    harness.assert_text("L actions");
+    harness.assert_text("A AGENTS");
+    harness.assert_text("G GOALS");
+    harness.assert_text("L ACTIONS");
+}
+
+// ── Header row 1: upper-case tabs, right-aligned status group ─────────────
+
+/// One running agent, two `todo` tasks (and one `done`, which is not
+/// counted), the orchestrator started at the epoch: `now` is 1,000,000 ms, so
+/// the uptime reads `16:40`.
+fn status_backend() -> FakeBackend {
+    let mut backend = FakeBackend::new().with_tasks(vec![
+        make_task("tsk_1", "A", TaskStatus::Todo),
+        make_task("tsk_2", "B", TaskStatus::Todo),
+        make_task("tsk_3", "C", TaskStatus::Done),
+    ]);
+    backend.state.started_at = Some("1970-01-01T00:00:00.000Z".into());
+    backend.state.running.insert(
+        "run_1".into(),
+        RunningEntry {
+            remote: None,
+            run_id: "run_1".into(),
+            agent_id: "agt_1".into(),
+            task_id: "tsk_3".into(),
+            pid: 42,
+            started_at: "1970-01-01T00:00:00.000Z".into(),
+            last_event_at: "1970-01-01T00:00:00.000Z".into(),
+        },
+    );
+    backend
+}
+
+/// Rows 1 and 2 (the brand bar and the line under it), as drawn.
+fn brand_rows(backend: FakeBackend, width: u16, project: &str) -> (String, String) {
+    let mut harness = Harness::sized(backend, width, 30);
+    harness.app.state.project_name = project.into();
+    harness.draw();
+    (harness.line(1), harness.line(2))
+}
+
+/// The column of `needle`'s first cell. Every header glyph is one cell
+/// wide, so the char index is the column.
+fn column_of(line: &str, needle: &str) -> usize {
+    let byte = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} not in {line:?}"));
+    line[..byte].chars().count()
+}
+
+#[test]
+fn v105_every_tab_label_is_upper_case_whichever_tab_is_selected() {
+    for selected in ViewId::ALL {
+        let mut harness = harness_for(selected, FakeBackend::new());
+        harness.draw();
+        let row = harness.line(1);
+        for view in ViewId::ALL {
+            let label = view.label();
+            if view == selected {
+                // The active pill is unchanged: padded, key then label.
+                let pill = format!(" {} {label} ", view.hotkey());
+                assert!(row.contains(&pill), "{pill:?} in {row:?}");
+            } else {
+                let plain = format!("{} {label}", view.hotkey());
+                assert!(row.contains(&plain), "{plain:?} in {row:?}");
+            }
+            assert!(
+                !row.contains(&label.to_lowercase()),
+                "no lower-case {label:?} with {selected:?} selected: {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn v106_at_120_and_200_columns_the_status_group_ends_in_the_last_column() {
+    type Setup = fn(&mut FakeBackend);
+    let cases: [(&str, Setup); 3] = [
+        ("● OBSERVING", |b| b.context.observer_mode = true),
+        ("● WATCHING", |b| b.context.initial_watch_active = true),
+        ("○ IDLE", |_| {}),
+    ];
+    for width in [120u16, 200] {
+        for (chip, setup) in cases {
+            let mut backend = status_backend();
+            setup(&mut backend);
+            let (row, _) = brand_rows(backend, width, "main");
+            let group = format!("16:40 · 1 running │ 2 todo · normal · {chip}");
+            assert_eq!(row.chars().count(), usize::from(width), "{row:?}");
+            assert!(
+                row.ends_with(&group),
+                "at {width} the row must end with {group:?}: {row:?}"
+            );
+            assert!(!row.contains("Prompt"), "{row:?}");
+            assert!(!row.contains("active"), "{row:?}");
+        }
+    }
+}
+
+#[test]
+fn v107_the_status_group_omits_the_uptime_without_a_start_time_and_shows_zero_counts() {
+    let mut backend = FakeBackend::new();
+    backend.context.observer_mode = true;
+    let (row, _) = brand_rows(backend, 200, "main");
+    assert!(
+        row.ends_with("  0 running │ 0 todo · normal · ● OBSERVING"),
+        "no uptime and no dangling dot before the counts: {row:?}"
+    );
+}
+
+#[test]
+fn v108_the_eco_mode_and_its_pending_ellipsis_render_in_the_group() {
+    let mut harness = Harness::sized(status_backend(), 200, 30);
+    harness.app.state.project_name = "main".into();
+    harness.app.state.prompt_mode = orch_domain::PromptMode::Eco;
+    harness.app.state.prompt_mode_pending = true;
+    harness.app.state.observer_mode = true;
+    harness.draw();
+    let row = harness.line(1);
+    assert!(row.ends_with("2 todo · eco… · ● OBSERVING"), "{row:?}");
+}
+
+#[test]
+fn v109_a_narrow_row_drops_the_uptime_then_the_counts_then_moves_the_prompt_mode() {
+    // The oracle: the group is the longest of its suffixes that leaves at
+    // least two blank cells after the tabs, and the tabs never move. Every
+    // width from 60 to 220 is checked, with names that land each stage at
+    // 80 columns ("main": mode and chip; "main-project": chip only, the mode
+    // on row 2; the long name: not even the chip fits, so it clips).
+    let suffixes = [
+        "16:40 · 1 running │ 2 todo · normal · ● OBSERVING",
+        "1 running │ 2 todo · normal · ● OBSERVING",
+        "normal · ● OBSERVING",
+        "● OBSERVING",
+    ];
+    for project in [
+        "p",
+        "main",
+        "main-project",
+        "a-project-with-a-rather-long-name",
+    ] {
+        for width in 60u16..=220 {
+            let mut backend = status_backend();
+            backend.context.observer_mode = true;
+            let (row, second) = brand_rows(backend, width, project);
+            let width = usize::from(width);
+            if !row.contains("L ACTIONS") {
+                // The tabs themselves clip: no room for any of the group.
+                assert!(
+                    second.starts_with("normal"),
+                    "{project:?} at {width}: {second:?}"
+                );
+                continue;
+            }
+            let tabs_end = column_of(&row, "L ACTIONS") + "L ACTIONS".len();
+            let fitting = suffixes
+                .iter()
+                .find(|s| tabs_end + 2 + s.chars().count() <= width);
+            let context = format!("{project:?} at {width}: {row:?} / {second:?}");
+            match fitting {
+                Some(group) => {
+                    assert!(row.ends_with(group), "expected {group:?}: {context}");
+                    // Nothing longer than the chosen suffix: the part
+                    // before it is blank up to the tabs.
+                    let start = width - group.chars().count();
+                    let gap: String = row.chars().skip(tabs_end).take(start - tabs_end).collect();
+                    assert!(
+                        gap.chars().count() >= 2 && gap.trim().is_empty(),
+                        "gap {gap:?}: {context}"
+                    );
+                }
+                None => {
+                    // The chip follows the tabs after two blanks and clips
+                    // (or the tabs end at the frame edge).
+                    let rest: String = row.chars().skip(tabs_end).collect();
+                    assert!(
+                        rest.is_empty() || "  ● OBSERVING".starts_with(&rest),
+                        "{context}"
+                    );
+                }
+            }
+            let mode_inline = fitting.is_some_and(|g| g.contains("normal"));
+            assert_eq!(
+                second.trim_start().starts_with("normal"),
+                !mode_inline,
+                "the prompt mode is on row 2 iff it is not on row 1: {context}"
+            );
+            assert_eq!(
+                row.contains("normal"),
+                mode_inline,
+                "no clipped fragment of the mode on row 1: {context}"
+            );
+        }
+    }
+}
+
+#[test]
+fn v110_the_drop_stages_at_80_and_100_columns() {
+    let stage = |width: u16, project: &str| {
+        let mut backend = status_backend();
+        backend.context.observer_mode = true;
+        brand_rows(backend, width, project)
+    };
+    // 100 columns: the uptime went, the counts stayed.
+    let (row, second) = stage(100, "main");
+    assert!(
+        row.ends_with("  1 running │ 2 todo · normal · ● OBSERVING"),
+        "{row:?}"
+    );
+    assert!(!row.contains("16:40"), "{row:?}");
+    assert!(!second.contains("normal"), "{second:?}");
+    // 80 columns: the counts went too; the mode and chip stay on row 1.
+    let (row, second) = stage(80, "main");
+    assert!(row.ends_with("  normal · ● OBSERVING"), "{row:?}");
+    assert!(!row.contains("running"), "{row:?}");
+    assert!(!second.contains("normal"), "{second:?}");
+    // 80 columns, longer name: only the chip fits; the mode leads row 2.
+    let (row, second) = stage(80, "main-project");
+    assert!(row.ends_with(" ● OBSERVING"), "{row:?}");
+    assert!(!row.contains("normal"), "{row:?}");
+    assert!(second.starts_with("normal · "), "{second:?}");
 }
 
 // ── Onboarding ─────────────────────────────────────────────────────────────
