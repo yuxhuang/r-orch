@@ -1165,6 +1165,58 @@ fn c7_compact_inner_geometry_and_fixed_rail_slots_never_overlap() {
 }
 
 #[test]
+fn single_line_clicks_map_both_wide_cells_and_text_after_the_cursor() {
+    for (offset, expected) in [
+        (0, 0),
+        (1, 1),
+        (2, 1),
+        (3, 2),
+        (4, 2),
+        (5, 3),
+        (6, 4),
+        (7, 5),
+    ] {
+        let mut app = app();
+        app.open_wizard(field(StepKind::Text, "a界🙂bc"));
+        key(&mut app, KeyCode::Home);
+        let area = Rect::new(1, 16, 38, 7);
+        draw(&mut app, area);
+        let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
+        click(&mut app, body.x + 2 + offset, body.y);
+        assert_eq!(
+            app.state
+                .wizard
+                .as_ref()
+                .unwrap()
+                .text_input()
+                .cursor()
+                .pos(),
+            expected,
+            "cell {offset}"
+        );
+    }
+    // A scrolled viewport starts at c, then d, 界, and the reversed 🙂.
+    let mut app = app();
+    app.open_wizard(field(StepKind::Text, "abcd界🙂z"));
+    key(&mut app, KeyCode::Left);
+    key(&mut app, KeyCode::Left);
+    let area = Rect::new(1, 16, 8, 7);
+    draw(&mut app, area);
+    let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
+    click(&mut app, body.x + 7, body.y);
+    assert_eq!(
+        app.state
+            .wizard
+            .as_ref()
+            .unwrap()
+            .text_input()
+            .cursor()
+            .pos(),
+        5
+    );
+}
+
+#[test]
 fn v4_editor_drag_uses_library_mapping_and_copies_exact_unicode_bytes() {
     let mut app = app();
     app.open_wizard(field(StepKind::Textarea, "a界b\nnext"));
@@ -1724,7 +1776,7 @@ fn e10_no_selection_makes_no_transport_attempt_and_rail_cancel_never_leaves_edit
 fn v4_single_line_drag_maps_graphemes_and_capture_or_geometry_loss_cancels_only_the_drag() {
     let mut app = app();
     app.open_wizard(field(StepKind::Text, "a界bc"));
-    key(&mut app, KeyCode::Home); // Cursor block precedes the displayed text.
+    key(&mut app, KeyCode::Home); // Cursor overlays the first displayed grapheme.
     let area = Rect::new(1, 16, 38, 7);
     draw(&mut app, area);
     let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
@@ -1737,13 +1789,13 @@ fn v4_single_line_drag_maps_graphemes_and_capture_or_geometry_loss_cancels_only_
     mouse(
         &mut app,
         MouseEventKind::Drag(MouseButton::Left),
-        body.x + 7,
+        body.x + 6,
         body.y,
     );
     mouse(
         &mut app,
         MouseEventKind::Up(MouseButton::Left),
-        body.x + 7,
+        body.x + 6,
         body.y,
     );
     assert_eq!(

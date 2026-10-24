@@ -15,7 +15,7 @@ use crate::hit::{FooterAction, ScrollRegion, VerbId, ZoneId, ZoneKind};
 use crate::msg::{Chip, chip, parse_partial};
 use crate::state::{InputMode, ViewId};
 use crate::text::{display_width, text_display_width};
-use crate::theme::{BLOCK, CROSS, CURSOR, RETURN_GLYPH, Token};
+use crate::theme::{CROSS, CURSOR, RETURN_GLYPH, Token};
 use crate::views::{RenderCtx, put_line, spans_width};
 
 const HINT_SUGGESTIONS: &str = "  ↑↓ select  Tab fill  Esc ✕";
@@ -47,7 +47,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
 
 const HINT_KEYWORD: &str = "  Enter keep  Esc clear";
 
-/// The keyword prompt (Ctrl+K): `Filter tasks › ship█  2/5  Enter keep  Esc
+/// The keyword prompt (Ctrl+K): `Filter tasks › ship   2/5  Enter keep  Esc
 /// clear`. The list above narrows as it is typed; the count says by how
 /// much, including to `0/5`. Drawn with the command bar's own window, so a
 /// long keyword scrolls around the cursor instead of pushing it off screen.
@@ -60,8 +60,10 @@ fn render_keyword_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let (matches, total) = ctx.state.keyword_counts(view);
     let count = format!("  {matches}/{total}");
     let mut hint = HINT_KEYWORD;
-    let fixed =
-        |hint: &str| label.chars().count() + 1 + count.chars().count() + hint.chars().count();
+    let at_end = input.cursor().pos() == input.cursor().len();
+    let fixed = |hint: &str| {
+        label.chars().count() + usize::from(at_end) + count.chars().count() + hint.chars().count()
+    };
     // The hint goes before the value's window does; the clickable `Esc
     // clear` then goes with it, but the key still works.
     if (area.width as usize).saturating_sub(fixed(hint)) < MIN_VALUE_COLUMNS {
@@ -69,17 +71,13 @@ fn render_keyword_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
     let value_cols = (area.width as usize).saturating_sub(fixed(hint)).max(4);
     let window = value_window(input.cursor(), value_cols);
-    let at_end = input.cursor().pos() == input.cursor().len();
 
     let mut spans = vec![Span::styled(label, ctx.style(Token::Amber))];
     if window.clipped_left {
         spans.push(Span::styled("…".to_string(), ctx.style(Token::Ghost)));
     }
     spans.extend(value_spans(&window.before, ctx));
-    spans.push(Span::styled(BLOCK, ctx.style(Token::Amber)));
-    if !at_end {
-        spans.extend(value_spans(&window.after, ctx));
-    }
+    spans.extend(cursor_spans(&window.after, ctx));
     spans.push(Span::styled(
         count,
         ctx.style(if matches == 0 {
@@ -151,8 +149,9 @@ fn render_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     let chip = recipient_chip(ctx, value);
 
     // Everything but the value, the hint and the chip, as today: `/ `, the
-    // ghost completion and the cursor cell.
-    let fixed = 6 + completion.chars().count() + 1;
+    // ghost completion and, only at end of value, a blank cursor cell.
+    let at_end = input.cursor().pos() == input.cursor().len();
+    let fixed = 6 + completion.chars().count() + usize::from(at_end);
     let mut hint_cols = hint.chars().count();
     let mut chip_cols = chip
         .as_ref()
@@ -193,7 +192,6 @@ fn render_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     }
 
     let window = value_window(input.cursor(), value_cols);
-    let at_end = input.cursor().pos() == input.cursor().len();
 
     let mut spans = vec![Span::styled("/ ", ctx.style(Token::Amber))];
     if let (Some(text), Some(chip)) = (&chip_text, &chip) {
@@ -204,11 +202,6 @@ fn render_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         spans.push(Span::styled("…".to_string(), ctx.style(Token::Ghost)));
     }
     spans.extend(value_spans(&window.before, ctx));
-    // With the cursor at the end this is today's trailing `BLOCK` after the
-    // ghost, so the common case is unchanged; elsewhere the block *is* the
-    // insertion point, which `←`, `Ctrl-A` and `Ctrl-W` have always moved
-    // invisibly (design-v2 §3.6.2).
-    //
     // The ghost belongs at the **end of the value**, which is off screen when
     // the window clipped the text after the cursor — drawn there it would read
     // as a completion of whatever the clip stopped at, so it is dropped
@@ -218,17 +211,9 @@ fn render_input(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
     } else {
         completion.clone()
     };
-    let ghost_at;
-    if at_end {
-        ghost_at = spans.len();
-        spans.push(Span::styled(ghost.clone(), ctx.style(Token::Ghost)));
-        spans.push(Span::styled(BLOCK, ctx.style(Token::Amber)));
-    } else {
-        spans.push(Span::styled(BLOCK, ctx.style(Token::Amber)));
-        spans.extend(value_spans(&window.after, ctx));
-        ghost_at = spans.len();
-        spans.push(Span::styled(ghost.clone(), ctx.style(Token::Ghost)));
-    }
+    spans.extend(cursor_spans(&window.after, ctx));
+    let ghost_at = spans.len();
+    spans.push(Span::styled(ghost.clone(), ctx.style(Token::Ghost)));
     let hint_at = spans.len();
     spans.push(Span::styled(hint.to_string(), ctx.style(Token::Gray)));
 
@@ -308,9 +293,9 @@ struct ValueWindow {
 /// middle of a long command moves the insertion point off screen, which is
 /// what made the `\"` escapes in a quoted name unworkable to edit by hand.
 ///
-/// `budget` is the whole window, the `…` included: the cursor cell is already
-/// reserved by the caller's `fixed`, so reserving it again here cost every
-/// verb a column against the pre-chip bar (gate F4).
+/// `budget` is the whole window, the `…` included. A mid-line cursor
+/// overlays its grapheme; only an end-of-value blank is reserved by the
+/// caller's `fixed`. The tail must keep the whole cursor grapheme visible.
 ///
 /// **Linear in the columns drawn, not in the length of the value.** Both walks
 /// start at the cursor and stop at `budget`, so a pasted stack trace costs the
@@ -328,7 +313,7 @@ fn value_window(cursor: &crate::text::Cursor, budget: usize) -> ValueWindow {
     let tail_reserve = if after_segs.is_empty() {
         0
     } else {
-        (budget / 3).max(1)
+        (budget / 3).max(display_width(&after_segs[0])).min(budget)
     };
     let head = budget - tail_reserve;
 
@@ -345,12 +330,12 @@ fn value_window(cursor: &crate::text::Cursor, budget: usize) -> ValueWindow {
     // Dropping text from the left costs a column for the `…`, which is only
     // known once the walk has stopped short — so give one back here.
     let clipped_left = start > 0;
-    while clipped_left && used + 1 > head {
+    while clipped_left && start < before_segs.len() && used + 1 > head {
         used -= display_width(&before_segs[start]);
         start += 1;
     }
 
-    let mut remaining = budget - used - usize::from(clipped_left);
+    let mut remaining = budget.saturating_sub(used + usize::from(clipped_left));
     let mut after = String::new();
     let mut kept = 0;
     for segment in after_segs {
@@ -382,6 +367,21 @@ fn value_spans(text: &str, ctx: &RenderCtx) -> Vec<Span<'static>> {
             spans.push(Span::styled(part.to_string(), ctx.style(Token::White)));
         }
     }
+    spans
+}
+
+/// Overlay the first displayed grapheme, or a blank at end of value. The
+/// cursor uses the same text colours as the editor, reversed by the terminal.
+fn cursor_spans(after: &str, ctx: &RenderCtx) -> Vec<Span<'static>> {
+    let segments = crate::text::grapheme_segments(after);
+    let Some(segment) = segments.first() else {
+        return vec![Span::styled(" ", ctx.style(Token::White).reversed())];
+    };
+    let mut spans = value_spans(segment, ctx);
+    for span in &mut spans {
+        span.style = span.style.reversed();
+    }
+    spans.extend(value_spans(&after[segment.len()..], ctx));
     spans
 }
 
@@ -860,6 +860,134 @@ pub const HINT_CLOSE_GLYPH: &str = CROSS;
 mod tests {
     use super::*;
     use crate::text::Cursor;
+
+    #[test]
+    fn command_and_keyword_cursors_overlay_wide_graphemes_without_shifting_text() {
+        use crate::{App, backend::FakeBackend, clock::TestClock};
+        use ratatui::{Terminal, backend::TestBackend};
+        for mode in [InputMode::Command, InputMode::Keyword] {
+            for (value, pos, x, symbol) in [
+                ("hi", 0, 0, "h"),
+                ("a界🙂z", 1, 1, "界"),
+                ("a界🙂z", 2, 3, "🙂"),
+            ] {
+                let mut app = App::new(FakeBackend::new(), TestClock::new(1000));
+                app.state.input_mode = mode;
+                let input = if mode == InputMode::Command {
+                    &mut app.state.command_bar.input
+                } else {
+                    app.state.keyword_input_mut(app.state.view).unwrap()
+                };
+                *input.cursor_mut() = Cursor::at(value, pos);
+                let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        crate::views::draw(frame, &app);
+                    })
+                    .unwrap();
+                let prefix = if mode == InputMode::Command {
+                    2
+                } else {
+                    text_display_width(&format!("Filter {} › ", app.state.view.item_label())) as u16
+                };
+                let buffer = terminal.backend().buffer();
+                let y = (0..30)
+                    .find(|&y| {
+                        buffer[(0, y)].symbol()
+                            == if mode == InputMode::Command { "/" } else { "F" }
+                    })
+                    .unwrap();
+                let cell = &buffer[(prefix + x, y)];
+                assert_eq!(cell.symbol(), symbol, "{mode:?}");
+                assert!(cell.modifier.contains(Modifier::REVERSED), "{mode:?}");
+                if value == "hi" {
+                    assert_eq!(buffer[(prefix + 1, y)].symbol(), "i");
+                } else {
+                    assert_eq!(buffer[(prefix + 5, y)].symbol(), "z");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moving_short_inputs_preserves_columns_on_every_palette() {
+        use crate::{App, backend::FakeBackend, clock::TestClock};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        for palette in orch_domain::TUI_PALETTE_NAMES {
+            for mode in [InputMode::Command, InputMode::Keyword] {
+                let mut app = App::new(FakeBackend::new(), TestClock::new(1000));
+                app.state.palette = crate::theme::Palette::new(palette);
+                app.state.input_mode = mode;
+                let input = if mode == InputMode::Command {
+                    &mut app.state.command_bar.input
+                } else {
+                    app.state.keyword_input_mut(app.state.view).unwrap()
+                };
+                *input.cursor_mut() = Cursor::new("hi");
+                let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                for (key, mods, pos) in [
+                    (KeyCode::Left, KeyModifiers::NONE, 1),
+                    (KeyCode::Left, KeyModifiers::NONE, 0),
+                    (KeyCode::Right, KeyModifiers::NONE, 1),
+                    (KeyCode::Home, KeyModifiers::NONE, 0),
+                    (KeyCode::End, KeyModifiers::NONE, 2),
+                    (KeyCode::Char('a'), KeyModifiers::CONTROL, 0),
+                    (KeyCode::Char('e'), KeyModifiers::CONTROL, 2),
+                ] {
+                    app.handle_key(KeyEvent::new(key, mods));
+                    terminal
+                        .draw(|frame| {
+                            crate::views::draw(frame, &app);
+                        })
+                        .unwrap();
+                    let prefix = if mode == InputMode::Command {
+                        2
+                    } else {
+                        text_display_width(&format!("Filter {} › ", app.state.view.item_label()))
+                            as u16
+                    };
+                    let buffer = terminal.backend().buffer();
+                    let y = (0..24)
+                        .find(|&y| {
+                            buffer[(0, y)].symbol()
+                                == if mode == InputMode::Command { "/" } else { "F" }
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        buffer[(prefix, y)].symbol(),
+                        "h",
+                        "{palette:?} {mode:?} {key:?}"
+                    );
+                    assert_eq!(buffer[(prefix + 1, y)].symbol(), "i");
+                    let caret = &buffer[(prefix + pos, y)];
+                    assert!(
+                        caret.modifier.contains(Modifier::REVERSED),
+                        "{palette:?} {mode:?} {key:?}"
+                    );
+                    assert_eq!(caret.fg, app.state.palette.get(Token::White));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_cursor_keeps_its_whole_grapheme_at_a_clipped_boundary() {
+        for cluster in ["界", "🙂", "👩‍💻"] {
+            for budget in 4..24 {
+                let value = format!("{}{}z", "a".repeat(100), cluster);
+                let window = value_window(&Cursor::at(&value, 100), budget);
+                assert!(window.clipped_left);
+                assert!(window.after.starts_with(cluster));
+                assert!(text_display_width(&drawn(&window)) <= budget);
+            }
+        }
+        // A mid-line overlay spends the entire budget on the value.
+        let window = value_window(&Cursor::at("hi", 0), 2);
+        assert_eq!(drawn(&window), "hi");
+        let window = value_window(&Cursor::at("界🙂", 0), 4);
+        assert_eq!(drawn(&window), "界🙂");
+    }
 
     /// What the bar draws for the value, `…` included — the whole window.
     fn drawn(window: &ValueWindow) -> String {

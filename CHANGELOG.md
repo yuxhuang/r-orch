@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Fixed
+- Single-line cursors in the command bar, keyword filter and wizard fields now reverse the grapheme under the cursor, like the large editor, without shifting the text when moved.
+
 ## [0.11.0] - 2026-10-24
 
 Dashboard palettes and header release. No peer-protocol change, so 0.5.x through 0.11.0 peers can be mixed.

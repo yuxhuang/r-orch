@@ -304,7 +304,7 @@ pub struct Wizard {
     pub suppress_validation_footer: bool,
     pub(crate) viewport_rows: std::cell::Cell<usize>,
     missing_selection: Option<String>,
-    pub(crate) text_render: std::cell::Cell<Option<(ratatui::layout::Rect, usize, usize)>>,
+    pub(crate) text_render: std::cell::Cell<Option<(ratatui::layout::Rect, usize)>>,
     steps: Vec<WizardStep>,
     values: Values,
     /// Index into the **full** step list.
@@ -1320,7 +1320,7 @@ impl Wizard {
                 }
             }
             StepKind::Text => {
-                let Some((rendered, start_at, draw_cursor)) = self.text_render.get() else {
+                let Some((rendered, start_at)) = self.text_render.get() else {
                     return;
                 };
                 if rendered.y != body.y || rendered.x != body.x || rendered.width != body.width {
@@ -1328,14 +1328,9 @@ impl Wizard {
                 }
                 let mut cells = 0;
                 let mut at = start_at;
-                let mut target = position.x.saturating_sub(body.x + 2) as usize;
-                let segments = crate::text::grapheme_segments(self.text.value());
-                let before_width =
-                    crate::text::text_display_width(&segments[start_at..draw_cursor].concat());
-                // Map against the last drawn block/viewport, not the moving caret.
-                if target > before_width {
-                    target -= 1;
-                }
+                // Cursor reversal does not occupy an extra column. Map both
+                // cells of a wide grapheme to that grapheme's insertion point.
+                let target = position.x.saturating_sub(body.x + 2) as usize;
                 for segment in crate::text::grapheme_segments(self.text.value())
                     .iter()
                     .skip(start_at)

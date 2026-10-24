@@ -92,6 +92,17 @@ impl Tmux {
             .into_owned()
     }
 
+    /// The keyword caret is a reversed blank after the typed value. Capture
+    /// attributes as well as text so a missing caret cannot pass as a space.
+    fn keyword_cursor_reversed(&self, keyword: &str) -> bool {
+        let output = self.run(&["capture-pane", "-p", "-e", "-t", "dash"]);
+        let screen = String::from_utf8_lossy(&output.stdout);
+        let cursor = format!("{keyword}\x1b[7m ");
+        screen
+            .lines()
+            .any(|line| line.contains("Filter tasks › ") && line.contains(&cursor))
+    }
+
     /// Poll the screen until `ready` holds, with a bounded deadline.
     fn wait_for(&self, what: &str, ready: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + DEADLINE;
@@ -455,8 +466,10 @@ fn type_keyword(tmux: &Tmux, text: &str) {
     for ch in text.chars() {
         typed.push(ch);
         tmux.run(&["send-keys", "-t", "dash", "-l", &ch.to_string()]);
-        let prompt = format!("Filter tasks › {typed}█");
-        tmux.wait_for(&prompt, |s| s.contains(&prompt));
+        let prompt = format!("Filter tasks › {typed} ");
+        tmux.wait_for(&prompt, |s| {
+            s.contains(&prompt) && tmux.keyword_cursor_reversed(&typed)
+        });
     }
 }
 
@@ -557,7 +570,7 @@ fn keyword_sort_group_and_reset() {
         tmux.run(&["paste-buffer", "-p", "-b", "kw", "-t", "dash"]);
     }
     let screen = tmux.wait_for("the sanitized paste", |s| {
-        s.contains("Filter tasks › charlie█")
+        s.contains("Filter tasks › charlie ") && tmux.keyword_cursor_reversed("charlie")
     });
     assert!(screen.contains("1/3"), "{screen}");
     assert!(screen.contains("ORCH"), "{screen}");

@@ -194,6 +194,8 @@ narrow the numbered list to agents whose name, adapter or role contains them, `B
 `Esc` clears it. `1`–`9` still pick a listed row, and `Ctrl+O` cycles the order through Original, Name, Adapter
 and Status, as the filter row shows. Auto-assign/None stays first; only a listed agent or that choice is submitted.
 
+The command bar, keyword filter and single-line wizard fields use the large editor’s reversed cursor: it overlays the character being edited and shows a reversed blank at the end.
+
 `Ctrl+K` on the Goals, Tasks or Agents list opens a keyword filter (`/` stays the command bar). The list narrows
 as you type, case-insensitively, on each row's ID, title or name, status (stored and shown: `in_progress` or
 `RUN`), assignee or agent name and ID, and the task's goal or the agent's team, adapter, model, node and every
