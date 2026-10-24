@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Fixed
+- The dashboard header's view tabs no longer shift when you switch views or a tab flashes: every tab now keeps the same padding as the highlighted one, so only its colour changes. The tabs take six more columns, so on an 80-column terminal the prompt mode moves to the second header line sooner.
+
 ## [0.11.0] - 2026-10-24
 
 Dashboard palettes and header release. No peer-protocol change, so 0.5.x through 0.11.0 peers can be mixed.

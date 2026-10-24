@@ -222,7 +222,9 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
 
 /// The tab pills: the active tab is an inverted amber pill, the others are
 /// `{key} {LABEL}` in ghost/dim. Every state shows the upper-case label, so
-/// only the pill, not the letter case, marks the current view.
+/// only the pill, not the letter case, marks the current view. Every state
+/// also occupies the same ` {key} {LABEL}{badge} ` cells, so selecting or
+/// flashing a tab never moves its label or the tabs after it.
 ///
 /// Registers each pill's zone as it emits it, because a pill's start column
 /// is only knowable here: it follows the pulsing diamond, `" ORCH"`, the
@@ -258,12 +260,15 @@ fn tab_pills(area: Rect, ctx: &RenderCtx, before: &[Span<'_>]) -> Vec<Span<'stat
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
+                // Same cells as the pill, padding included, so selecting a
+                // tab only restyles it: nothing moves.
+                spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     view.hotkey().to_string(),
                     ctx.style(Token::Ghost),
                 ));
                 spans.push(Span::styled(
-                    format!(" {}{badge}", view.label()),
+                    format!(" {}{badge} ", view.label()),
                     ctx.style(Token::Dim),
                 ));
             }

@@ -840,7 +840,9 @@ fn v071_the_active_count_chip_renders_while_an_agent_runs() {
             last_event_at: "2026-10-13T11:59:30.000Z".into(),
         },
     );
-    let mut harness = harness_for(ViewId::Tasks, backend);
+    // Wide enough that the counts are not dropped from the brand bar.
+    let mut harness = Harness::sized(backend, 120, 30);
+    harness.app.state.view = ViewId::Tasks;
     harness.assert_text("1 running");
     harness.refute_text("active");
 }
@@ -975,8 +977,8 @@ fn v109_a_narrow_row_drops_the_uptime_then_the_counts_then_moves_the_prompt_mode
     // The oracle: the group is the longest of its suffixes that leaves at
     // least two blank cells after the tabs, and the tabs never move. Every
     // width from 60 to 220 is checked, with names that land each stage at
-    // 80 columns ("main": mode and chip; "main-project": chip only, the mode
-    // on row 2; the long name: not even the chip fits, so it clips).
+    // 80 columns ("p", "main": chip only, the mode on row 2; "main-project"
+    // and the long name: not even the chip fits, so it clips).
     let suffixes = [
         "16:40 · 1 running │ 2 todo · normal · ● OBSERVING",
         "1 running │ 2 todo · normal · ● OBSERVING",
@@ -1002,7 +1004,8 @@ fn v109_a_narrow_row_drops_the_uptime_then_the_counts_then_moves_the_prompt_mode
                 );
                 continue;
             }
-            let tabs_end = column_of(&row, "L ACTIONS") + "L ACTIONS".len();
+            // The last pill ends one padding cell after its label.
+            let tabs_end = column_of(&row, "L ACTIONS") + "L ACTIONS".len() + 1;
             let fitting = suffixes
                 .iter()
                 .find(|s| tabs_end + 2 + s.chars().count() <= width);
@@ -1045,27 +1048,27 @@ fn v109_a_narrow_row_drops_the_uptime_then_the_counts_then_moves_the_prompt_mode
 }
 
 #[test]
-fn v110_the_drop_stages_at_80_and_100_columns() {
+fn v110_the_drop_stages_at_80_90_and_110_columns() {
     let stage = |width: u16, project: &str| {
         let mut backend = status_backend();
         backend.context.observer_mode = true;
         brand_rows(backend, width, project)
     };
-    // 100 columns: the uptime went, the counts stayed.
-    let (row, second) = stage(100, "main");
+    // 110 columns: the uptime went, the counts stayed.
+    let (row, second) = stage(110, "main");
     assert!(
         row.ends_with("  1 running │ 2 todo · normal · ● OBSERVING"),
         "{row:?}"
     );
     assert!(!row.contains("16:40"), "{row:?}");
     assert!(!second.contains("normal"), "{second:?}");
-    // 80 columns: the counts went too; the mode and chip stay on row 1.
-    let (row, second) = stage(80, "main");
+    // 90 columns: the counts went too; the mode and chip stay on row 1.
+    let (row, second) = stage(90, "main");
     assert!(row.ends_with("  normal · ● OBSERVING"), "{row:?}");
     assert!(!row.contains("running"), "{row:?}");
     assert!(!second.contains("normal"), "{second:?}");
-    // 80 columns, longer name: only the chip fits; the mode leads row 2.
-    let (row, second) = stage(80, "main-project");
+    // 80 columns: only the chip fits; the mode leads row 2.
+    let (row, second) = stage(80, "main");
     assert!(row.ends_with(" ● OBSERVING"), "{row:?}");
     assert!(!row.contains("normal"), "{row:?}");
     assert!(second.starts_with("normal · "), "{second:?}");

@@ -344,13 +344,12 @@ fn h008_tab_pill_zones_land_on_their_labels_whatever_the_brand_width() {
 
 #[test]
 fn h022_tab_pill_zones_keep_their_columns_whatever_the_width_and_the_status_group() {
-    // Columns recorded on main before the status group moved right (fa6381e):
-    // the pills' x ranges must not depend on the frame width or on what the
-    // right group holds. (x, width) per pill, in `ViewId::ALL` order.
-    let expected = [
-        (ViewId::Tasks, [(21, 7), (29, 9), (39, 8), (48, 9)]),
-        (ViewId::Logs, [(21, 7), (29, 7), (37, 8), (46, 11)]),
-    ];
+    // The pills' x ranges must not depend on the frame width, on what the
+    // right group holds, or on which tab is selected: every tab occupies
+    // ` {key} {LABEL} ` in every state. (x, width) per pill, in
+    // `ViewId::ALL` order.
+    let columns = [(21, 9), (31, 9), (41, 10), (52, 11)];
+    let expected = [(ViewId::Tasks, columns), (ViewId::Logs, columns)];
     for (selected, pills) in expected {
         for width in [80u16, 100, 120, 200] {
             let mut backend = FakeBackend::new().with_tasks(tasks(3));
@@ -379,6 +378,99 @@ fn h022_tab_pill_zones_keep_their_columns_whatever_the_width_and_the_status_grou
                 "{selected:?} selected at {width} columns:\n{}",
                 harness.text()
             );
+        }
+    }
+}
+
+#[test]
+fn h023_a_tab_keeps_its_cells_and_its_label_column_selected_unselected_or_flashing() {
+    // Selecting or flashing a tab only restyles it: its pill zone, its label
+    // column and every tab after it stay put. Twelve tasks put the `(12)`
+    // badge on the Tasks tab (ten show, two wait behind show-all).
+    use orch_tui::state::TabFlash;
+    use ratatui::style::Modifier;
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Look {
+        Selected,
+        Flashing,
+        Plain,
+    }
+    // Per tab: (zone x, zone width, label column, how its label was drawn).
+    let layout = |selected: ViewId, flashing: Option<ViewId>| {
+        let mut harness = Harness::sized(FakeBackend::new().with_tasks(tasks(12)), 160, 30);
+        harness.app.state.project_name = "main".to_string();
+        harness.app.state.view = selected;
+        harness.app.state.flash = flashing.map(|tab| TabFlash {
+            tab,
+            color: Token::Green,
+            started_tick: harness.app.state.tick,
+        });
+        harness.draw();
+        let line = harness.line(1);
+        let buffer = harness.terminal.backend().buffer().clone();
+        ViewId::ALL.map(|view| {
+            let zone = harness
+                .hits()
+                .zones()
+                .iter()
+                .find(|z| z.id == ZoneId::Tab(view))
+                .unwrap_or_else(|| panic!("no pill zone for {view:?}"));
+            let cells: String = line
+                .chars()
+                .skip(usize::from(zone.rect.x))
+                .take(usize::from(zone.rect.width))
+                .collect();
+            let offset = cells
+                .find(view.label())
+                .unwrap_or_else(|| panic!("{view:?} zone covers {cells:?}"));
+            let column = zone.rect.x + u16::try_from(offset).unwrap();
+            assert!(
+                cells.starts_with(' ') && cells.ends_with(' '),
+                "{view:?} pill is not padded on both sides: {cells:?}"
+            );
+            let style = buffer[(column, 1)].style();
+            let look = if !style.add_modifier.contains(Modifier::BOLD) {
+                Look::Plain
+            } else if view == selected {
+                Look::Selected
+            } else {
+                Look::Flashing
+            };
+            (zone.rect.x, zone.rect.width, column, look, cells)
+        })
+    };
+    let baseline = layout(ViewId::Goals, None);
+    let tasks_pill = &baseline[1].4;
+    assert!(
+        tasks_pill.contains("TASKS (12)"),
+        "badge missing: {tasks_pill:?}"
+    );
+    for selected in ViewId::ALL {
+        let flashes = std::iter::once(None)
+            .chain(ViewId::ALL.into_iter().filter(|v| *v != selected).map(Some));
+        for flashing in flashes {
+            let got = layout(selected, flashing);
+            for (i, view) in ViewId::ALL.into_iter().enumerate() {
+                let (x, width, column, look, _) = &got[i];
+                let (bx, bwidth, bcolumn, _, _) = &baseline[i];
+                assert_eq!(
+                    (x, width, column),
+                    (bx, bwidth, bcolumn),
+                    "{view:?} moved with {selected:?} selected and {flashing:?} flashing"
+                );
+                let expected = if view == selected {
+                    Look::Selected
+                } else if Some(view) == flashing {
+                    Look::Flashing
+                } else {
+                    Look::Plain
+                };
+                assert_eq!(
+                    *look, expected,
+                    "{view:?} with {selected:?} selected and {flashing:?} flashing"
+                );
+            }
         }
     }
 }
