@@ -805,7 +805,25 @@ fn c088_config_palette_applies_directly_with_no_wizard() {
 fn c089_config_palette_unknown_name_refuses() {
     let mut harness = Harness::new();
     harness.run_command("/config palette nope");
-    harness.assert_message("Unknown palette: nope. Available: amber, ocean, forest, violet, light");
+    harness.assert_message(
+        "Unknown palette: nope. Available: amber, ocean, forest, violet, light, \
+         catppuccin_latte, catppuccin_mocha, dracula, gruvbox_dark, nord, one_dark, \
+         solarized_dark, solarized_light, tokyo_night",
+    );
+}
+
+#[test]
+fn c089b_config_palette_applies_every_built_in_palette_directly() {
+    for palette in orch_domain::TUI_PALETTE_NAMES {
+        let mut harness = Harness::new();
+        harness.run_command(&format!(
+            "/config palette {}",
+            palette.as_str().to_uppercase()
+        ));
+        harness.assert_message(&format!("Palette: {}", palette.as_str()));
+        assert_eq!(harness.app.state.palette.name, palette);
+        harness.assert_called(|c| matches!(c, Call::SavePalette(p) if *p == palette));
+    }
 }
 
 #[test]

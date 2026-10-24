@@ -1114,8 +1114,46 @@ fn w066_palette_option_order_is_exact() {
                 "Light",
                 "high-contrast palette for light terminals"
             ),
+            Choice::new(
+                "catppuccin_latte",
+                "Catppuccin Latte",
+                "soft pastels for light terminals"
+            ),
+            Choice::new(
+                "catppuccin_mocha",
+                "Catppuccin Mocha",
+                "soothing pastels on deep blue"
+            ),
+            Choice::new("dracula", "Dracula", "vivid neon on dark purple-grey"),
+            Choice::new("gruvbox_dark", "Gruvbox Dark", "warm retro earth tones"),
+            Choice::new("nord", "Nord", "muted arctic blues"),
+            Choice::new("one_dark", "One Dark", "the Atom editor's classic dark"),
+            Choice::new(
+                "solarized_dark",
+                "Solarized Dark",
+                "precise low-contrast teal"
+            ),
+            Choice::new(
+                "solarized_light",
+                "Solarized Light",
+                "Solarized accents on warm cream"
+            ),
+            Choice::new("tokyo_night", "Tokyo Night", "neon city lights on navy"),
         ]
     );
+}
+
+#[test]
+fn w066b_palette_options_cover_every_built_in_palette_in_order() {
+    let values: Vec<String> = configs::palette_options()
+        .into_iter()
+        .map(|choice| choice.value)
+        .collect();
+    let names: Vec<&str> = orch_domain::TUI_PALETTE_NAMES
+        .iter()
+        .map(|palette| palette.as_str())
+        .collect();
+    assert_eq!(values, names);
 }
 
 #[test]

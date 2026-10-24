@@ -15,22 +15,60 @@ pub type ActivityFilterPreset = String;
 pub const ACTIVITY_FILTER_PRESETS: [&str; 5] = ["all", "text", "tools", "errors", "events"];
 
 /// Built-in TUI colour palette name.
+///
+/// Each variant's `global.yml` spelling is pinned with `#[serde(rename)]`,
+/// so renaming a variant cannot change the on-disk value. The palettes after
+/// `Light` are adapted from third-party terminal themes (see
+/// `THIRD-PARTY-NOTICES.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TuiPaletteName {
+    #[serde(rename = "amber")]
     Amber,
+    #[serde(rename = "ocean")]
     Ocean,
+    #[serde(rename = "forest")]
     Forest,
+    #[serde(rename = "violet")]
     Violet,
+    #[serde(rename = "light")]
     Light,
+    #[serde(rename = "catppuccin_latte")]
+    CatppuccinLatte,
+    #[serde(rename = "catppuccin_mocha")]
+    CatppuccinMocha,
+    #[serde(rename = "dracula")]
+    Dracula,
+    #[serde(rename = "gruvbox_dark")]
+    GruvboxDark,
+    #[serde(rename = "nord")]
+    Nord,
+    #[serde(rename = "one_dark")]
+    OneDark,
+    #[serde(rename = "solarized_dark")]
+    SolarizedDark,
+    #[serde(rename = "solarized_light")]
+    SolarizedLight,
+    #[serde(rename = "tokyo_night")]
+    TokyoNight,
 }
 
-pub const TUI_PALETTE_NAMES: [TuiPaletteName; 5] = [
+/// Every built-in palette, in display order: the five original palettes
+/// first (`amber` is the default), then the theme-derived ones by name.
+pub const TUI_PALETTE_NAMES: [TuiPaletteName; 14] = [
     TuiPaletteName::Amber,
     TuiPaletteName::Ocean,
     TuiPaletteName::Forest,
     TuiPaletteName::Violet,
     TuiPaletteName::Light,
+    TuiPaletteName::CatppuccinLatte,
+    TuiPaletteName::CatppuccinMocha,
+    TuiPaletteName::Dracula,
+    TuiPaletteName::GruvboxDark,
+    TuiPaletteName::Nord,
+    TuiPaletteName::OneDark,
+    TuiPaletteName::SolarizedDark,
+    TuiPaletteName::SolarizedLight,
+    TuiPaletteName::TokyoNight,
 ];
 
 impl TuiPaletteName {
@@ -41,6 +79,15 @@ impl TuiPaletteName {
             TuiPaletteName::Forest => "forest",
             TuiPaletteName::Violet => "violet",
             TuiPaletteName::Light => "light",
+            TuiPaletteName::CatppuccinLatte => "catppuccin_latte",
+            TuiPaletteName::CatppuccinMocha => "catppuccin_mocha",
+            TuiPaletteName::Dracula => "dracula",
+            TuiPaletteName::GruvboxDark => "gruvbox_dark",
+            TuiPaletteName::Nord => "nord",
+            TuiPaletteName::OneDark => "one_dark",
+            TuiPaletteName::SolarizedDark => "solarized_dark",
+            TuiPaletteName::SolarizedLight => "solarized_light",
+            TuiPaletteName::TokyoNight => "tokyo_night",
         }
     }
 }
@@ -185,13 +232,67 @@ mod tests {
     #[test]
     fn validates_every_built_in_palette_name() {
         let names: Vec<&str> = TUI_PALETTE_NAMES.iter().map(|p| p.as_str()).collect();
-        assert_eq!(names, ["amber", "ocean", "forest", "violet", "light"]);
+        assert_eq!(
+            names,
+            [
+                "amber",
+                "ocean",
+                "forest",
+                "violet",
+                "light",
+                "catppuccin_latte",
+                "catppuccin_mocha",
+                "dracula",
+                "gruvbox_dark",
+                "nord",
+                "one_dark",
+                "solarized_dark",
+                "solarized_light",
+                "tokyo_night",
+            ]
+        );
         for palette in TUI_PALETTE_NAMES {
             assert!(is_tui_palette_name(Some(&json!(palette.as_str()))));
         }
         assert!(!is_tui_palette_name(Some(&json!("unknown"))));
+        assert!(!is_tui_palette_name(Some(&json!("Nord"))));
+        assert!(!is_tui_palette_name(Some(&json!("tokyo-night"))));
         assert!(!is_tui_palette_name(Some(&Value::Null)));
         assert!(!is_tui_palette_name(None));
+    }
+
+    #[test]
+    fn every_palette_name_round_trips_through_parse_display_and_serde() {
+        for palette in TUI_PALETTE_NAMES {
+            let name = palette.as_str();
+            assert_eq!(name.parse::<TuiPaletteName>(), Ok(palette), "{name}");
+            assert_eq!(palette.to_string(), name);
+            // The `global.yml` spelling is the same string as `as_str`.
+            assert_eq!(serde_json::to_value(palette).unwrap(), json!(name));
+            assert_eq!(
+                serde_json::from_value::<TuiPaletteName>(json!(name)).unwrap(),
+                palette
+            );
+            let raw = json!({ "tui": { "palette": name } });
+            assert_eq!(GlobalConfig::from_raw(Some(&raw)).tui.palette, palette);
+        }
+        let mut names: Vec<&str> = TUI_PALETTE_NAMES.iter().map(|p| p.as_str()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), TUI_PALETTE_NAMES.len(), "names are unique");
+    }
+
+    #[test]
+    fn an_unknown_palette_name_in_the_file_falls_back_to_amber() {
+        // What an older orch does with a palette name it does not know.
+        for unknown in ["rose_pine", "Nord", "", "tokyo-night"] {
+            let raw = json!({ "tui": { "palette": unknown } });
+            assert_eq!(
+                GlobalConfig::from_raw(Some(&raw)).tui.palette,
+                TuiPaletteName::Amber,
+                "{unknown:?}"
+            );
+        }
     }
 
     #[test]
