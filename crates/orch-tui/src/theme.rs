@@ -144,9 +144,11 @@ const LIGHT: [u32; 26] = [
 // Catppuccin Latte (catppuccin/palette `palette.json`, MIT). Derived: `amberDim`,
 // `olive`; `solidText` is white. `green` is Latte green mixed with 16% black
 // (#40a02b -> #368624) so `solidText` reaches 4.5:1 on it (3.3:1 before).
+// For light chips, `amber`, `amberDim`, `yellow` and `dim` mix their original
+// values (#8839ef, #b183f1, #df8e1d, #7c7f93) with 7%, 36%, 36% and 19% black.
 const CATPPUCCIN_LATTE: [u32; 26] = [
-    0x8839ef, 0xb183f1, 0x368624, 0xd20f39, 0x1e66f5, 0xdf8e1d, 0x04a5e5, 0x7287fd, 0x4c4f69,
-    0x5c5f77, 0x6c6f85, 0x7c7f93, 0x9ca0b0, 0xeff1f5, 0xecd6de, 0xede5db, 0xd9e4dc, 0xdee6f5,
+    0x7e35de, 0x71549a, 0x368624, 0xd20f39, 0x1e66f5, 0x8f5b13, 0x04a5e5, 0x7287fd, 0x4c4f69,
+    0x5c5f77, 0x6c6f85, 0x646777, 0x9ca0b0, 0xeff1f5, 0xecd6de, 0xede5db, 0xd9e4dc, 0xdee6f5,
     0xd8e9f3, 0xe3dbf4, 0xe5e7ed, 0xeaecf1, 0xffffff, 0xea76cb, 0x7d8f24, 0xfe640b,
 ];
 // Catppuccin Mocha (catppuccin/palette `palette.json`, MIT). Derived:
@@ -204,12 +206,16 @@ const SOLARIZED_DARK: [u32; 26] = [
 // accents and black `solidText`, base02..base1 as the text ramp, base3 as the
 // background and base2 as `neutralBg`. Derived: `amberDim`, `olive`,
 // `gray` (base00 mixed with 11% black), `dim` (base0 with 30% black).
+// For light chips, `amber`, `amberDim` and `yellow` mix #b58900, #d2b55b and
+// #b58900 with 19%, 46% and 27% black. `accentBg` mixes #efe0b6 with 95% white:
+// darkening `amber` alone cannot give both black `solidText` on `amber` and
+// `amber` on the original accent tint 4.5:1. Other background tints stay intact.
 const SOLARIZED_LIGHT: [u32; 26] = [
-    0xb58900, 0xd2b55b, 0x859900, 0xdc322f, 0x268bd2, 0xb58900, 0x2aa198, 0x6c71c4, 0x073642,
+    0x936f00, 0x716231, 0x859900, 0xdc322f, 0x268bd2, 0x846400, 0x2aa198, 0x6c71c4, 0x073642,
     0x586e75, 0x5a6d75, 0x5c6869, 0x93a1a1, 0xfdf6e3, 0xf9decd, 0xf4e9c8, 0xefebc8, 0xecede2,
-    0xe8eedc, 0xefe0b6, 0xeee8d5, 0xf6efdc, 0x000000, 0xd33682, 0x849550, 0xcb4b16,
+    0xe8eedc, 0xfefdfb, 0xeee8d5, 0xf6efdc, 0x000000, 0xd33682, 0x849550, 0xcb4b16,
 ];
-// Tokyo Night (enkia/tokyo-night-vscode-theme `README.md` and
+// Tokyo Night (https://github.com/tokyo-night/tokyo-night-vscode-theme `README.md` and
 // `themes/tokyo-night-color-theme.json`, MIT). Derived: `pink`. `olive` is the
 // theme's teal (#73daca); `amber` and `blue` are both Blue; `solidText` is the
 // side-bar background (#16161e). `dim` mixes Comment with 33% white
@@ -296,9 +302,16 @@ impl Palette {
     }
 }
 
-/// Resolve a stored hex back to its token in
-/// the `from` palette and return the `to` palette's value; an unknown hex
-/// passes through unchanged.
+/// Resolve a stored hex to the first matching token in [`Token::ALL`] order
+/// in `from`, then return that token's value in `to`. Unknown hexes pass through.
+///
+/// Palettes may intentionally reuse one RGB for several tokens: `Amber` is
+/// the signature accent (Dracula purple, One Dark / Tokyo Night blue,
+/// Catppuccin Mocha mauve, Solarized yellow). The light Solarized palette
+/// darkens its accent for chip contrast.
+/// A shared RGB loses token identity, so mapping back need not round-trip,
+/// even when the original RGB was unique in `from`: `to` may have a collision.
+/// Keep semantic [`Token`] values when identity must survive palette changes.
 pub fn remap(hex: u32, from: TuiPaletteName, to: TuiPaletteName) -> u32 {
     let from_hexes = palette_hexes(from);
     match from_hexes.iter().position(|h| *h == hex) {
@@ -463,16 +476,100 @@ mod tests {
         assert_ne!(light.hex(Token::Gray), light.hex(Token::Ghost));
     }
 
+    // Foregrounds only; background tints and the base (`Void`) are excluded.
+    const FOREGROUND_TOKENS: [Token; 17] = [
+        Token::Amber,
+        Token::AmberDim,
+        Token::Green,
+        Token::Red,
+        Token::Blue,
+        Token::Yellow,
+        Token::Cyan,
+        Token::Purple,
+        Token::White,
+        Token::Silver,
+        Token::Gray,
+        Token::Dim,
+        Token::Ghost,
+        Token::SolidText,
+        Token::Pink,
+        Token::Olive,
+        Token::Orange,
+    ];
+
+    fn has_unique_rgb(palette: TuiPaletteName, token: Token) -> bool {
+        let hexes = palette_hexes(palette);
+        hexes
+            .iter()
+            .filter(|&&hex| hex == hexes[token.index()])
+            .count()
+            == 1
+    }
+
     #[test]
-    fn remap_round_trips_semantic_tokens() {
-        let amber = Palette::new(TuiPaletteName::Amber);
-        let ocean = Palette::new(TuiPaletteName::Ocean);
-        let green = amber.hex(Token::Green);
-        assert_eq!(
-            remap(green, TuiPaletteName::Amber, TuiPaletteName::Ocean),
-            ocean.hex(Token::Green)
-        );
-        // Unknown hex passes through.
+    fn remap_maps_source_unique_foregrounds_and_round_trips_unique_destinations() {
+        for from in orch_domain::TUI_PALETTE_NAMES {
+            for to in orch_domain::TUI_PALETTE_NAMES {
+                for token in FOREGROUND_TOKENS {
+                    if !has_unique_rgb(from, token) {
+                        continue;
+                    }
+                    let original = Palette::new(from).hex(token);
+                    let mapped = remap(original, from, to);
+                    assert_eq!(
+                        mapped,
+                        Palette::new(to).hex(token),
+                        "{from} -> {to}: {token:?}"
+                    );
+                    if has_unique_rgb(to, token) {
+                        assert_eq!(
+                            remap(mapped, to, from),
+                            original,
+                            "{from} -> {to} -> {from}: {token:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn palette_rgb_collisions_match_the_intentional_allow_list() {
+        use TuiPaletteName::*;
+        let allowed = [
+            (Amber, Token::InfoBg, Token::NeutralBg),
+            (Light, Token::Void, Token::NeutralBg),
+            (CatppuccinMocha, Token::Amber, Token::Purple),
+            (Dracula, Token::Amber, Token::Purple),
+            (OneDark, Token::Amber, Token::Blue),
+            (SolarizedDark, Token::Amber, Token::Yellow),
+            (TokyoNight, Token::Amber, Token::Blue),
+        ];
+        for name in orch_domain::TUI_PALETTE_NAMES {
+            let p = Palette::new(name);
+            for (i, first) in Token::ALL.iter().enumerate() {
+                for second in &Token::ALL[i + 1..] {
+                    assert_eq!(
+                        p.hex(*first) == p.hex(*second),
+                        allowed.contains(&(name, *first, *second)),
+                        "{name}: {first:?} / {second:?} collision changed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remap_uses_first_match_when_rgb_is_shared() {
+        let mocha = TuiPaletteName::CatppuccinMocha;
+        let light = TuiPaletteName::Light;
+        // Unique Light purple becomes shared Mocha mauve, then first-match Amber.
+        assert_eq!(remap(0x6941c6, light, mocha), 0xcba6f7);
+        assert_eq!(remap(0xcba6f7, mocha, light), 0x9a6700);
+    }
+
+    #[test]
+    fn remap_passes_unknown_hex_through() {
         assert_eq!(
             remap(0x123456, TuiPaletteName::Amber, TuiPaletteName::Ocean),
             0x123456
@@ -568,6 +665,28 @@ mod tests {
             let p = Palette::new(name);
             for background in backgrounds {
                 let ratio = contrast(p.hex(foreground), p.hex(*background));
+                if ratio < 4.5 {
+                    failures.push(format!(
+                        "{name}: {} on {} {ratio:.2}",
+                        foreground.name(),
+                        background.name()
+                    ));
+                }
+            }
+        }
+        for name in [
+            TuiPaletteName::Light,
+            TuiPaletteName::CatppuccinLatte,
+            TuiPaletteName::SolarizedLight,
+        ] {
+            let p = Palette::new(name);
+            for (foreground, background) in [
+                (Token::AmberDim, Token::AccentBg), // Linked-goal label.
+                (Token::Yellow, Token::WarnBg),     // RETRY.
+                (Token::Amber, Token::AccentBg),    // OBSERVING.
+                (Token::Dim, Token::NeutralBg),     // TODO / IDLE.
+            ] {
+                let ratio = contrast(p.hex(foreground), p.hex(background));
                 if ratio < 4.5 {
                     failures.push(format!(
                         "{name}: {} on {} {ratio:.2}",

@@ -20,7 +20,7 @@ and [`deny.toml`](deny.toml) limits which licences they may use. See [Rust crate
 | Nord (colour values) | [nordtheme/nord](https://github.com/nordtheme/nord) | MIT | `crates/orch-tui/src/theme.rs` (`NORD`) |
 | One Dark (colour values) | [joshdick/onedark.vim](https://github.com/joshdick/onedark.vim) | MIT | `crates/orch-tui/src/theme.rs` (`ONE_DARK`) |
 | Solarized (colour values) | [altercation/solarized](https://github.com/altercation/solarized) | MIT | `crates/orch-tui/src/theme.rs` (`SOLARIZED_DARK` and `SOLARIZED_LIGHT`) |
-| Tokyo Night (colour values) | [enkia/tokyo-night-vscode-theme](https://github.com/enkia/tokyo-night-vscode-theme) | MIT | `crates/orch-tui/src/theme.rs` (`TOKYO_NIGHT`) |
+| Tokyo Night (colour values) | [tokyo-night/tokyo-night-vscode-theme](https://github.com/tokyo-night/tokyo-night-vscode-theme) | MIT | `crates/orch-tui/src/theme.rs` (`TOKYO_NIGHT`) |
 
 When you add material that originates outside this project, add a row and a section here in the same PR. Add a
 line to `NOTICE` only when the material's licence requires one (for example, it comes with its own Apache-2.0
@@ -331,7 +331,7 @@ SOFTWARE.
 
 - **Upstream:** https://github.com/joshdick/onedark.vim, checked at commit
   `47bec7a6196a843dad195d2666c3ac84c6e80c78`. Colours taken from `autoload/onedark.vim` (the `gui` colours).
-  onedark.vim ports the colours of Atom's One Dark theme.
+  onedark.vim's colours are inspired by Atom's One Dark theme.
 - **Licence:** MIT (the repository's `LICENSE` file).
 - **Copyright:** Copyright (c) 2015 Joshua Dick.
 - **Files:** `ONE_DARK` in `crates/orch-tui/src/theme.rs`: the theme's documented hex colours, mapped onto
@@ -396,7 +396,7 @@ THE SOFTWARE.
 
 ## Tokyo Night
 
-- **Upstream:** https://github.com/enkia/tokyo-night-vscode-theme, checked at commit
+- **Upstream:** https://github.com/tokyo-night/tokyo-night-vscode-theme, checked at commit
   `7c0f11eaef322f293621ca7befe462214b7ea468`. Colours taken from `README.md` (the colour palette table) and
   `themes/tokyo-night-color-theme.json` (`#3d59a1` and `#16161e`).
 - **Licence:** MIT (the repository's `LICENSE.txt` file).
