@@ -8,6 +8,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ### Added
 - Nine more dashboard colour palettes, adapted from popular terminal themes: `catppuccin_latte`, `catppuccin_mocha`, `dracula`, `gruvbox_dark`, `nord`, `one_dark`, `solarized_dark`, `solarized_light` and `tokyo_night`. Pick one with `/config palette <name>` (or `/config palette` for the list), or `orch config global set palette <name>`. An older orch reads a palette name it does not know as `amber`.
 
+### Changed
+- The dashboard header shows every view tab in upper case, not only the current one, which is still the highlighted pill. Its status now sits at the right edge as one group, `uptime · x running │ y todo · eco|normal · ● OBSERVING` (or `● WATCHING`, `○ IDLE`); the `Prompt:` label and the `N active` chip are gone. On a narrow terminal the uptime and then the counts give way, and the prompt mode moves to the second header line only when it still does not fit.
+
 ## [0.10.2] - 2026-10-23
 
 Cancel and stall patch release. No peer-protocol change, so 0.5.x through 0.10.2 peers can be mixed.

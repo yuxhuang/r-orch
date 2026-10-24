@@ -37,6 +37,19 @@ fn header(h: &mut Harness) -> String {
     h.text().lines().take(4).collect::<Vec<_>>().join("\n")
 }
 
+/// Whether the header shows exactly `mode` (`normal`, `eco…`, ...) as the
+/// prompt mode: in the brand bar's right group (`… · {mode} · {chip}`), or
+/// leading row 2 in the narrow layout.
+fn shows_mode(h: &mut Harness, mode: &str) -> bool {
+    let text = h.text();
+    let mut rows = text.lines().skip(1);
+    let brand = rows.next().unwrap_or_default();
+    let second = rows.next().unwrap_or_default().trim_start();
+    let inline = brand.contains(&format!(" {mode} · "));
+    let narrow = second.trim_end() == mode || second.starts_with(&format!("{mode} · "));
+    inline || narrow
+}
+
 fn modal_wizard() -> Wizard {
     Wizard::new(
         WizardKind::Task,
@@ -56,11 +69,7 @@ fn f3_in_ordinary_navigation_requests_one_toggle_and_the_header_keeps_the_stored
     );
     assert_eq!(mode_requests(&h), 1);
     // Pending: the header still shows the stored value, with an ellipsis.
-    assert!(
-        header(&mut h).contains("Prompt: normal…"),
-        "{}",
-        header(&mut h)
-    );
+    assert!(shows_mode(&mut h, "normal…"), "{}", header(&mut h));
     assert_eq!(
         h.app.backend.prompt_mode,
         PromptMode::Normal,
@@ -75,8 +84,8 @@ fn a_completed_f3_shows_the_new_mode_and_the_truthful_next_dispatch_toast() {
     assert!(h.app.backend.complete_prompt_mode());
     h.app.tick();
     assert_eq!(h.app.backend.prompt_mode, PromptMode::Eco);
+    assert!(shows_mode(&mut h, "eco"), "{}", header(&mut h));
     let text = h.text();
-    assert!(text.contains("Prompt: eco"), "{text}");
     assert!(
         text.contains("Project prompt mode: eco")
             && text.contains("next dispatch; agent overrides retained"),
@@ -129,11 +138,12 @@ fn a_failed_write_leaves_the_header_and_stored_mode_unchanged_and_shows_the_reas
         "stored mode must not change"
     );
     assert_eq!(h.app.state.prompt_mode, PromptMode::Normal);
-    let text = h.text();
     assert!(
-        text.contains("Prompt: normal") && !text.contains("Prompt: eco"),
-        "{text}"
+        shows_mode(&mut h, "normal") && !shows_mode(&mut h, "eco"),
+        "{}",
+        header(&mut h)
     );
+    let text = h.text();
     assert!(
         text.contains("incompatible with custom templates"),
         "the reason must be visible: {text}"
@@ -223,20 +233,20 @@ fn a_refresh_while_a_write_is_pending_keeps_the_stored_header_value_until_the_ou
     h.app.backend.prompt_mode = PromptMode::Eco;
     h.app.refresh_all(false);
     assert_eq!(h.app.state.prompt_mode, PromptMode::Normal);
-    let pending = header(&mut h);
     assert!(
-        pending.contains("Prompt: normal…") && !pending.contains("Prompt: eco"),
-        "{pending}"
+        shows_mode(&mut h, "normal…") && !shows_mode(&mut h, "eco"),
+        "{}",
+        header(&mut h)
     );
     // The outcome decides.
     h.app.backend.prompt_mode_request = Some(Some(PromptMode::Eco));
     assert!(h.app.backend.complete_prompt_mode());
     h.app.tick();
     assert_eq!(h.app.state.prompt_mode, PromptMode::Eco);
-    let settled = header(&mut h);
     assert!(
-        settled.contains("Prompt: eco") && !settled.contains("Prompt: eco…"),
-        "{settled}"
+        shows_mode(&mut h, "eco") && !shows_mode(&mut h, "eco…"),
+        "{}",
+        header(&mut h)
     );
 }
 
@@ -273,14 +283,14 @@ fn the_prompt_mode_settings_wizard_submitted_while_a_write_is_pending_is_refused
 // ── QA-4: the prompt mode stays readable on narrow frames ───────────────────
 
 /// Rows 1 and 2 of the header (brand bar, then the peer-status line) at the
-/// given width, in QA's observing session on a short project name.
-fn header_rows(width: u16, height: u16) -> (String, String) {
+/// given width, in QA's observing session on the given project name.
+fn header_rows_for(project: &str, width: u16, height: u16) -> (String, String) {
     let mut h = Harness::sized(
         FakeBackend::new().with_agents(vec![make_agent("agt_1", "alpha", AgentStatus::Idle)]),
         width,
         height,
     );
-    h.app.state.project_name = "main".into();
+    h.app.state.project_name = project.into();
     h.app.state.observer_mode = true;
     h.app.state.prompt_mode = PromptMode::Normal;
     let text = h.text();
@@ -291,31 +301,46 @@ fn header_rows(width: u16, height: u16) -> (String, String) {
     )
 }
 
+fn header_rows(width: u16, height: u16) -> (String, String) {
+    header_rows_for("main", width, height)
+}
+
 #[test]
 fn at_120_columns_the_prompt_mode_stays_on_the_brand_bar() {
     let (brand, second) = header_rows(120, 36);
-    assert!(brand.contains("OBSERVING Prompt: normal"), "{brand}");
-    assert!(!second.contains("Prompt:"), "{second}");
+    assert!(
+        brand.ends_with("0 running │ 0 todo · normal · ● OBSERVING"),
+        "{brand}"
+    );
+    assert!(!brand.contains("Prompt"), "no prefix any more: {brand}");
+    assert!(!second.contains("normal"), "{second}");
+}
+
+#[test]
+fn at_80_columns_the_prompt_mode_stays_on_the_brand_bar_when_it_fits() {
+    // The counts give way first, so a short project name keeps the mode and
+    // the chip on row 1.
+    let (brand, second) = header_rows(80, 24);
+    assert!(brand.ends_with(" normal · ● OBSERVING"), "{brand}");
+    assert!(!second.contains("normal"), "{second}");
 }
 
 #[test]
 fn at_80_columns_the_prompt_mode_leads_the_second_header_line_in_full() {
-    let (brand, second) = header_rows(80, 24);
+    // A longer name leaves room for the chip only: the mode moves to row 2.
+    let (brand, second) = header_rows_for("main-project", 80, 24);
     assert!(
-        second.trim_start().starts_with("Prompt: normal"),
+        second.trim_start().starts_with("normal · "),
         "row 2: {second}"
     );
-    assert!(!brand.contains("Prompt"), "no clipped fragment: {brand}");
-    assert!(brand.contains("OBSERVING"), "{brand}");
+    assert!(!brand.contains("normal"), "no clipped fragment: {brand}");
+    assert!(brand.ends_with(" ● OBSERVING"), "{brand}");
 }
 
 #[test]
 fn at_40_columns_the_header_renders_and_the_prompt_mode_is_still_readable() {
     let (_brand, second) = header_rows(40, 24);
-    assert!(
-        second.trim_start().starts_with("Prompt: normal"),
-        "{second}"
-    );
+    assert!(second.trim_start().starts_with("normal · "), "{second}");
 }
 
 #[test]
@@ -325,11 +350,12 @@ fn the_narrow_layout_shows_the_pending_ellipsis_and_eco() {
         80,
         24,
     );
-    h.app.state.project_name = "main".into();
+    h.app.state.project_name = "main-project".into();
     h.app.state.observer_mode = true;
     h.press(KeyCode::F(3));
-    assert!(h.text().contains("Prompt: normal…"), "{}", h.text());
+    let second = |h: &mut Harness| h.text().lines().nth(2).unwrap_or_default().to_owned();
+    assert!(second(&mut h).starts_with("normal… · "), "{}", h.text());
     h.app.backend.complete_prompt_mode();
     h.app.tick();
-    assert!(h.text().contains("Prompt: eco"), "{}", h.text());
+    assert!(second(&mut h).starts_with("eco · "), "{}", h.text());
 }
