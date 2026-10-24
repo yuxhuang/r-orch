@@ -39,7 +39,7 @@ In-module unit tests, by file:
 | `messages/mod.rs` | 14 | Event formatting, message types, activity presets |
 | `onboarding.rs` | 12 | Onboarding |
 | `command_bar.rs` | 21 | Completion, suggestions, history, plus the `/msg` rows |
-| `theme.rs` | 8 | Palettes, remap, WCAG contrast |
+| `theme.rs` | 10 | Palettes, remap, WCAG contrast, agent-colour and gray/ghost distinctness |
 | `hit.rs` | 8 | Z-order, clipping, scroll vs click, invalidation, identity |
 | `layout.rs` | 8 | The region arithmetic and the clamp tests |
 | `format.rs` | 8 | Line and text caps, durations, relative time, `cap_display` |
@@ -95,7 +95,7 @@ In-module unit tests, by file:
 | Onboarding | `onboarding.rs` (12), `v073`–`v079` |
 | Goal↔task linking (read-only) | `v022`–`v030`, `v055` |
 | Observer mode, palette switching, activity filter, watch toggle | `app.rs` observer cases, `f033`, `f034`, `c0xx` `/watch`,`/pause`,`/config palette` |
-| Palettes, semantic roles, glyphs | `theme.rs` (8), glyph cases in `v004`–`v014` |
+| Palettes, semantic roles, glyphs | `theme.rs` (10), glyph cases in `v004`–`v014` |
 
 ## Deliberate design choices, each with a case
 

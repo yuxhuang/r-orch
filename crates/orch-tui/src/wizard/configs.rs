@@ -260,6 +260,31 @@ pub fn palette_options() -> Vec<Choice> {
             "Light",
             "high-contrast palette for light terminals",
         ),
+        (
+            "catppuccin_latte",
+            "Catppuccin Latte",
+            "soft pastels for light terminals",
+        ),
+        (
+            "catppuccin_mocha",
+            "Catppuccin Mocha",
+            "soothing pastels on deep blue",
+        ),
+        ("dracula", "Dracula", "vivid neon on dark purple-grey"),
+        ("gruvbox_dark", "Gruvbox Dark", "warm retro earth tones"),
+        ("nord", "Nord", "muted arctic blues"),
+        ("one_dark", "One Dark", "the Atom editor's classic dark"),
+        (
+            "solarized_dark",
+            "Solarized Dark",
+            "precise low-contrast teal",
+        ),
+        (
+            "solarized_light",
+            "Solarized Light",
+            "Solarized accents on warm cream",
+        ),
+        ("tokyo_night", "Tokyo Night", "neon city lights on navy"),
     ])
 }
 

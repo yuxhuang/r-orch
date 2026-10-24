@@ -135,6 +135,87 @@ const LIGHT: [u32; 26] = [
     0xeef4ff, 0xfff7e0, 0xf2f4f7, 0xf8fafc, 0xffffff, 0xc11574, 0x5f6f13, 0xb54708,
 ];
 
+// Theme-derived palettes. The theme's documented colours fill the foreground
+// tokens and `void` (the theme background). The tinted backgrounds (`errorBg`
+// ... `alternatingRowBg`) mix a theme colour into that background; every other
+// token not taken from the theme is listed as "Derived" above its table.
+// Upstream sources and licences are in THIRD-PARTY-NOTICES.md.
+//
+// Catppuccin Latte (catppuccin/palette `palette.json`, MIT). Derived: `amberDim`,
+// `olive`; `solidText` is white. `green` is Latte green mixed with 16% black
+// (#40a02b -> #368624) so `solidText` reaches 4.5:1 on it (3.3:1 before).
+const CATPPUCCIN_LATTE: [u32; 26] = [
+    0x8839ef, 0xb183f1, 0x368624, 0xd20f39, 0x1e66f5, 0xdf8e1d, 0x04a5e5, 0x7287fd, 0x4c4f69,
+    0x5c5f77, 0x6c6f85, 0x7c7f93, 0x9ca0b0, 0xeff1f5, 0xecd6de, 0xede5db, 0xd9e4dc, 0xdee6f5,
+    0xd8e9f3, 0xe3dbf4, 0xe5e7ed, 0xeaecf1, 0xffffff, 0xea76cb, 0x7d8f24, 0xfe640b,
+];
+// Catppuccin Mocha (catppuccin/palette `palette.json`, MIT). Derived:
+// `amberDim`, `olive`. `amber` and `purple` are both Mauve.
+const CATPPUCCIN_MOCHA: [u32; 26] = [
+    0xcba6f7, 0x7d699d, 0xa6e3a1, 0xf38ba8, 0x89b4fa, 0xf9e2af, 0x89dceb, 0xcba6f7, 0xcdd6f4,
+    0xbac2de, 0xa6adc8, 0x7f849c, 0x585b70, 0x1e1e2e, 0x493446, 0x4a4548, 0x394545, 0x2d334b,
+    0x2f3c4c, 0x4b4162, 0x303042, 0x272738, 0x11111b, 0xf5c2e7, 0xc6d289, 0xfab387,
+];
+// Dracula (dracula/dracula-theme `README.md`, MIT). Derived: `amberDim`,
+// `silver`, `gray`, `olive`, `solidText` (the background darkened), and `blue`
+// (Dracula has none: the midpoint of its cyan and purple). `amber` and
+// `purple` are both Purple.
+const DRACULA: [u32; 26] = [
+    0xbd93f9, 0x7a64a1, 0x50fa7b, 0xff5555, 0xa4befb, 0xf1fa8c, 0x8be9fd, 0xbd93f9, 0xf8f8f2,
+    0xcecfcc, 0xa9aaab, 0x6272a4, 0x44475a, 0x282a36, 0x53333c, 0x505447, 0x305444, 0x393f52,
+    0x384956, 0x4f4569, 0x3d3f49, 0x32343f, 0x191a21, 0xff79c6, 0xb8c76b, 0xffb86c,
+];
+// Gruvbox dark (gruvbox-community/gruvbox `colors/gruvbox.vim`, MIT). `purple`
+// is neutral_purple and `pink` bright_purple, so the two stay apart.
+const GRUVBOX_DARK: [u32; 26] = [
+    0xfabd2f, 0xb57614, 0xb8bb26, 0xfb4934, 0x83a598, 0xd79921, 0x8ec07c, 0xb16286, 0xfbf1c7,
+    0xd5c4a1, 0xa89984, 0x928374, 0x665c54, 0x282828, 0x522f2a, 0x4b3f27, 0x454528, 0x353a38,
+    0x384035, 0x524629, 0x3c3a36, 0x32312f, 0x1d2021, 0xd3869b, 0x98971a, 0xfe8019,
+];
+// Nord (nordtheme/nord `src/nord.css`, MIT). Derived: `gray`, `dim`, `pink`,
+// `olive`. `solidText` is black: no single Nord colour reaches 4.5:1 on all of
+// `amber`, `green`, `red` and `blue`.
+const NORD: [u32; 26] = [
+    0x88c0d0, 0x81a1c1, 0xa3be8c, 0xbf616a, 0x5e81ac, 0xebcb8b, 0x8fbcbb, 0xb48ead, 0xeceff4,
+    0xd8dee9, 0x979da9, 0x7a808c, 0x4c566a, 0x2e3440, 0x4b3d48, 0x54524f, 0x45504f, 0x353f4f,
+    0x3e4a54, 0x40505d, 0x3f4551, 0x363c48, 0x000000, 0xe0aec3, 0xaca553, 0xd08770,
+];
+// One Dark (joshdick/onedark.vim `autoload/onedark.vim`, MIT). Derived:
+// `amberDim`, `white` (its foreground lightened), `gray`, `pink`, `olive`.
+// `amber` and `blue` are both Blue; `solidText` is black (the background is
+// below 4.5:1 on Red).
+const ONE_DARK: [u32; 26] = [
+    0x61afef, 0x47749b, 0x98c379, 0xe06c75, 0x61afef, 0xe5c07b, 0x56b6c2, 0xc678dd, 0xcdd1d9,
+    0xabb2bf, 0x797f8a, 0x5c6370, 0x4b5263, 0x282c34, 0x4d3941, 0x4e4a42, 0x3e4a42, 0x303e4e,
+    0x2f424b, 0x374e65, 0x353942, 0x2f333b, 0x000000, 0xe996bf, 0xacac53, 0xd19a66,
+];
+// Solarized dark (altercation/solarized `README.md`, MIT). Derived: `amberDim`,
+// `olive`. `amber` and `yellow` are both Yellow; `neutralBg` is base02.
+// `solidText` is black: no single Solarized colour reaches 4.5:1 on all four
+// chip colours.
+const SOLARIZED_DARK: [u32; 26] = [
+    0xb58900, 0x6d6316, 0x859900, 0xdc322f, 0x268bd2, 0xb58900, 0x2aa198, 0x6c71c4, 0xeee8d5,
+    0x93a1a1, 0x839496, 0x657b83, 0x586e75, 0x002b36, 0x2c2c35, 0x243e2b, 0x1b412b, 0x05384c,
+    0x073e46, 0x364726, 0x073642, 0x04303c, 0x000000, 0xd33682, 0x849550, 0xcb4b16,
+];
+// Solarized light (altercation/solarized `README.md`, MIT): the dark variant's
+// accents and black `solidText`, base02..base1 as the text ramp, base3 as the
+// background and base2 as `neutralBg`. Derived: `amberDim`, `olive`.
+const SOLARIZED_LIGHT: [u32; 26] = [
+    0xb58900, 0xd2b55b, 0x859900, 0xdc322f, 0x268bd2, 0xb58900, 0x2aa198, 0x6c71c4, 0x073642,
+    0x586e75, 0x657b83, 0x839496, 0x93a1a1, 0xfdf6e3, 0xf9decd, 0xf4e9c8, 0xefebc8, 0xecede2,
+    0xe8eedc, 0xefe0b6, 0xeee8d5, 0xf6efdc, 0x000000, 0xd33682, 0x849550, 0xcb4b16,
+];
+// Tokyo Night (enkia/tokyo-night-vscode-theme `README.md` and
+// `themes/tokyo-night-color-theme.json`, MIT). Derived: `pink`. `olive` is the
+// theme's teal (#73daca); `amber` and `blue` are both Blue; `solidText` is the
+// side-bar background (#16161e).
+const TOKYO_NIGHT: [u32; 26] = [
+    0x7aa2f7, 0x3d59a1, 0x9ece6a, 0xf7768e, 0x7aa2f7, 0xe0af68, 0x7dcfff, 0xbb9af7, 0xc0caf5,
+    0xa9b1d6, 0x9aa5ce, 0x565f89, 0x414868, 0x1a1b26, 0x462d3b, 0x423933, 0x343f34, 0x272e43,
+    0x2a3849, 0x333e5c, 0x282a38, 0x21222f, 0x16161e, 0xf49ac7, 0x73daca, 0xff9e64,
+];
+
 /// Raw `#rrggbb` values for a palette, in [`Token::ALL`] order.
 pub fn palette_hexes(name: TuiPaletteName) -> &'static [u32; 26] {
     match name {
@@ -143,6 +224,15 @@ pub fn palette_hexes(name: TuiPaletteName) -> &'static [u32; 26] {
         TuiPaletteName::Forest => &FOREST,
         TuiPaletteName::Violet => &VIOLET,
         TuiPaletteName::Light => &LIGHT,
+        TuiPaletteName::CatppuccinLatte => &CATPPUCCIN_LATTE,
+        TuiPaletteName::CatppuccinMocha => &CATPPUCCIN_MOCHA,
+        TuiPaletteName::Dracula => &DRACULA,
+        TuiPaletteName::GruvboxDark => &GRUVBOX_DARK,
+        TuiPaletteName::Nord => &NORD,
+        TuiPaletteName::OneDark => &ONE_DARK,
+        TuiPaletteName::SolarizedDark => &SOLARIZED_DARK,
+        TuiPaletteName::SolarizedLight => &SOLARIZED_LIGHT,
+        TuiPaletteName::TokyoNight => &TOKYO_NIGHT,
     }
 }
 
@@ -398,29 +488,61 @@ mod tests {
         );
     }
 
+    /// WCAG 2 relative luminance of a `#rrggbb` value.
+    fn luminance(hex: u32) -> f64 {
+        let channel = |c: u32| {
+            let s = c as f64 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel((hex >> 16) & 0xff)
+            + 0.7152 * channel((hex >> 8) & 0xff)
+            + 0.0722 * channel(hex & 0xff)
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
     #[test]
-    fn solid_text_meets_wcag_contrast_in_the_light_palette() {
-        // solidText against amber/green/red/blue >= 4.5:1.
-        fn luminance(hex: u32) -> f64 {
-            let channel = |c: u32| {
-                let s = c as f64 / 255.0;
-                if s <= 0.03928 {
-                    s / 12.92
-                } else {
-                    ((s + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * channel((hex >> 16) & 0xff)
-                + 0.7152 * channel((hex >> 8) & 0xff)
-                + 0.0722 * channel(hex & 0xff)
+    fn solid_text_meets_wcag_contrast_in_every_palette() {
+        // solidText is drawn on amber (active tab) and on green/red/blue
+        // (tab flash) chips: >= 4.5:1 on each.
+        for name in orch_domain::TUI_PALETTE_NAMES {
+            let p = Palette::new(name);
+            for token in [Token::Amber, Token::Green, Token::Red, Token::Blue] {
+                let ratio = contrast(p.hex(Token::SolidText), p.hex(token));
+                assert!(
+                    ratio >= 4.5,
+                    "{name}: solidText on {} {ratio:.2}",
+                    token.name()
+                );
+            }
         }
-        let light = Palette::new(TuiPaletteName::Light);
-        let fg = luminance(light.hex(Token::SolidText));
-        for token in [Token::Amber, Token::Green, Token::Red, Token::Blue] {
-            let bg = luminance(light.hex(token));
-            let (hi, lo) = if fg > bg { (fg, bg) } else { (bg, fg) };
-            let ratio = (hi + 0.05) / (lo + 0.05);
-            assert!(ratio >= 4.5, "{} contrast {ratio}", token.name());
+    }
+
+    #[test]
+    fn gray_and_ghost_stay_distinct_in_every_palette() {
+        for name in orch_domain::TUI_PALETTE_NAMES {
+            let p = Palette::new(name);
+            assert_ne!(p.hex(Token::Gray), p.hex(Token::Ghost), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_eight_agent_colours_are_pairwise_distinct_in_every_palette() {
+        for name in orch_domain::TUI_PALETTE_NAMES {
+            let p = Palette::new(name);
+            for (i, a) in Palette::AGENT_TOKENS.iter().enumerate() {
+                for b in &Palette::AGENT_TOKENS[i + 1..] {
+                    assert_ne!(p.hex(*a), p.hex(*b), "{name}: {} = {}", a.name(), b.name());
+                }
+            }
         }
     }
 
