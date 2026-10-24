@@ -58,10 +58,10 @@ The screenshots in this chapter were taken in observe mode, so the header shows 
 
 ## Read the screen
 
-From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, started with `orch tui --observe`. Runs of empty rows are shortened to `…`:
+From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, started with `orch tui --observe`. No orchestrator had started for the project, so the header shows no uptime. Runs of empty rows are shortened to `…`:
 
 ```text
-◆ ORCH 0.9.3 · proj  G goals  T TASKS  A agents L actions   ● OBSERVING
+◆ ORCH 0.10.2 · proj  G GOALS  T TASKS  A AGENTS L ACTIONS                     0 running │ 2 todo · normal · ● OBSERVING
 listen off · controller none
  ○ TODO 2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
