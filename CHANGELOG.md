@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-24
+
+Dashboard palettes and header release. No peer-protocol change, so 0.5.x through 0.11.0 peers can be mixed.
+
 ### Added
 - Nine more dashboard colour palettes, adapted from popular terminal themes: `catppuccin_latte`, `catppuccin_mocha`, `dracula`, `gruvbox_dark`, `nord`, `one_dark`, `solarized_dark`, `solarized_light` and `tokyo_night`. Pick one with `/config palette <name>` (or `/config palette` for the list), or `orch config global set palette <name>`. An older orch reads a palette name it does not know as `amber`.
 
@@ -260,7 +264,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/yuxhuang/r-orch/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/yuxhuang/r-orch/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/yuxhuang/r-orch/compare/v0.9.4...v0.10.0
