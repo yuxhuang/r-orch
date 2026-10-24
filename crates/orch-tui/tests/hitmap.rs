@@ -342,6 +342,47 @@ fn h008_tab_pill_zones_land_on_their_labels_whatever_the_brand_width() {
     }
 }
 
+#[test]
+fn h022_tab_pill_zones_keep_their_columns_whatever_the_width_and_the_status_group() {
+    // Columns recorded on main before the status group moved right (fa6381e):
+    // the pills' x ranges must not depend on the frame width or on what the
+    // right group holds. (x, width) per pill, in `ViewId::ALL` order.
+    let expected = [
+        (ViewId::Tasks, [(21, 7), (29, 9), (39, 8), (48, 9)]),
+        (ViewId::Logs, [(21, 7), (29, 7), (37, 8), (46, 11)]),
+    ];
+    for (selected, pills) in expected {
+        for width in [80u16, 100, 120, 200] {
+            let mut backend = FakeBackend::new().with_tasks(tasks(3));
+            backend.context.observer_mode = true;
+            backend.state.started_at = Some("1970-01-01T00:00:00.000Z".into());
+            let mut harness = Harness::sized(backend, width, 30);
+            harness.app.state.project_name = "main".to_string();
+            harness.app.state.view = selected;
+            harness.draw();
+            let zones: Vec<(u16, u16)> = ViewId::ALL
+                .iter()
+                .map(|view| {
+                    let zone = harness
+                        .hits()
+                        .zones()
+                        .iter()
+                        .find(|z| z.id == ZoneId::Tab(*view))
+                        .unwrap_or_else(|| panic!("no pill zone for {view:?} at {width}"));
+                    assert_eq!(zone.rect.y, 1);
+                    (zone.rect.x, zone.rect.width)
+                })
+                .collect();
+            assert_eq!(
+                zones,
+                pills.to_vec(),
+                "{selected:?} selected at {width} columns:\n{}",
+                harness.text()
+            );
+        }
+    }
+}
+
 // ── Clipping ───────────────────────────────────────────────────────────────
 
 #[test]

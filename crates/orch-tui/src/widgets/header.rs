@@ -14,8 +14,8 @@ use crate::format::{format_duration, format_tokens, parse_timestamp_ms};
 use crate::hit::{ZoneId, ZoneKind};
 use crate::state::ViewId;
 use crate::theme::{
-    CHECK, CIRCLE, CIRCLE_FILLED, CROSS, DIAMOND, DOT, HEAVY_RULE, LOZENGE, RETRY_ARROW, SIGMA,
-    TRIANGLE_RIGHT, Token, heavy_rule, spinner_frame,
+    CHECK, CIRCLE, CIRCLE_FILLED, CROSS, DIAMOND, DOT, HEAVY_RULE, LOZENGE, PIPE, RETRY_ARROW,
+    SIGMA, TRIANGLE_RIGHT, Token, heavy_rule, spinner_frame,
 };
 use crate::views::{RenderCtx, put_line};
 
@@ -29,7 +29,7 @@ pub fn render(frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         // Narrow layout: the prompt mode leads the second line, so it is the
         // last thing clipped there.
         if !prompt_inline {
-            spans.push(prompt_mode_span(ctx, ""));
+            spans.push(prompt_mode_span(ctx));
             if !ctx.state.peer_status.is_empty() {
                 spans.push(Span::styled(format!(" {DOT} "), ctx.style(Token::Ghost)));
             }
@@ -54,11 +54,11 @@ fn running(ctx: &RenderCtx) -> usize {
 
 /// The project prompt mode (design D1): the stored value, never an
 /// optimistic one; `…` while a switch is being written.
-fn prompt_mode_span(ctx: &RenderCtx, leading: &str) -> Span<'static> {
+fn prompt_mode_span(ctx: &RenderCtx) -> Span<'static> {
     let state = ctx.state;
     Span::styled(
         format!(
-            "{leading}Prompt: {}{}",
+            "{}{}",
             state.prompt_mode,
             if state.prompt_mode_pending { "…" } else { "" }
         ),
@@ -69,14 +69,29 @@ fn prompt_mode_span(ctx: &RenderCtx, leading: &str) -> Span<'static> {
     )
 }
 
+fn separator(ctx: &RenderCtx, glyph: &str) -> Span<'static> {
+    Span::styled(format!(" {glyph} "), ctx.style(Token::Ghost))
+}
+
+/// Blank cells between the last tab pill and the right group, at least: one
+/// reads as a continuation (`L ACTIONS 0 running`), two match the gap before
+/// the tabs.
+const MIN_GAP: u16 = 2;
+
 /// Row 1. Returns whether the prompt mode is on it.
 ///
-/// Wide layout: the prompt mode sits right of the watch chip, and the active
-/// count and uptime after it clip from the right when the frame is short.
-/// Narrow layout, when the row up to and including the prompt mode would not
-/// fit (QA-4: at 80 columns it was clipped away): the prompt mode moves to
-/// the start of row 2, ahead of the peer status, and row 1 keeps the brand,
-/// the tabs, the watch chip and whatever else fits.
+/// Left: brand, version, update chip, project and the tab pills, in that
+/// order and at the columns they have always had. Right, flush to the last
+/// column: `{uptime} · {x} running │ {y} todo · {mode} · {chip}`.
+///
+/// The right group must leave at least [`MIN_GAP`] blank cells after the
+/// tabs. When it would not, it gives up parts from its left end, least useful first: the
+/// uptime, then the counts (both repeat what the stats bar and the scanner
+/// already show), then the prompt mode, which moves to the start of row 2
+/// ahead of the peer status (QA-4: at 80 columns it used to be clipped away).
+/// The watch chip is never dropped; when even it does not fit it follows the
+/// tabs after the same gap and clips at the frame edge, as it always has. The
+/// tabs never move.
 fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
     let state = ctx.state;
     let mut spans = Vec::new();
@@ -111,18 +126,54 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    spans.push(Span::styled(format!(" {DOT} "), ctx.style(Token::Ghost)));
+    spans.push(separator(ctx, DOT));
     spans.push(Span::styled(
         state.project_name.clone(),
         ctx.style(Token::Silver),
     ));
 
-    // Centre: the tab pills.
+    // Centre: the tab pills. They end with one blank cell; the rest of the
+    // minimum gap to the right group is counted here.
     spans.push(Span::raw("  "));
     spans.extend(tab_pills(area, ctx, &spans));
+    let left_width = crate::views::spans_width(&spans) + MIN_GAP - 1;
 
-    // Right: the mode chip, the active count and the uptime.
-    spans.push(Span::raw("  "));
+    // Right: the group's parts, in drop order. Each part but the chip carries
+    // its trailing separator, so dropping a part drops its dot with it.
+    let uptime: Vec<Span<'static>> = state
+        .orch_state
+        .started_at
+        .as_deref()
+        .and_then(parse_timestamp_ms)
+        .map(|started_ms| {
+            vec![
+                Span::styled(
+                    format_duration(ctx.now_ms - started_ms),
+                    ctx.style(Token::Ghost),
+                ),
+                separator(ctx, DOT),
+            ]
+        })
+        .unwrap_or_default();
+    let todo = state
+        .tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Todo)
+        .count();
+    let counts = vec![
+        Span::styled(
+            format!("{} running", running(ctx)),
+            ctx.style(if running(ctx) > 0 {
+                Token::Green
+            } else {
+                Token::Dim
+            }),
+        ),
+        separator(ctx, PIPE),
+        Span::styled(format!("{todo} todo"), ctx.style(Token::Dim)),
+        separator(ctx, DOT),
+    ];
+    let prompt = vec![prompt_mode_span(ctx), separator(ctx, DOT)];
     let (mode_text, fg, bg) = if state.watch_active {
         (
             format!("{CIRCLE_FILLED} WATCHING"),
@@ -138,39 +189,40 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
     } else {
         (format!("{CIRCLE} IDLE"), Token::Dim, Token::NeutralBg)
     };
-    spans.push(Span::styled(
+    let chip = vec![Span::styled(
         mode_text,
         ctx.chip(fg, bg).add_modifier(Modifier::BOLD),
-    ));
-    let prompt_at = spans.len();
-    spans.push(prompt_mode_span(ctx, " "));
-    if running(ctx) > 0 {
-        spans.push(Span::styled(
-            format!("  {} {} active ", spinner_frame(state.tick), running(ctx)),
-            ctx.chip(Token::Green, Token::SuccessBg),
-        ));
-    }
-    if let Some(started_at) = state.orch_state.started_at.as_deref()
-        && let Some(started_ms) = parse_timestamp_ms(started_at)
-    {
-        spans.push(Span::styled(
-            format!(" {}", format_duration(ctx.now_ms - started_ms)),
-            ctx.style(Token::Ghost),
-        ));
-    }
+    )];
 
-    // Only what precedes it counts: the active count and the uptime after it
-    // are lower priority and clip from the right, as they always have.
-    let inline = crate::views::spans_width(&spans[..=prompt_at]) <= area.width;
-    if !inline {
-        spans.remove(prompt_at);
+    let mut parts = vec![uptime, counts, prompt, chip];
+    let fits = |parts: &[Vec<Span<'static>>]| {
+        let group: u16 = parts.iter().map(|p| crate::views::spans_width(p)).sum();
+        u32::from(left_width) + u32::from(group) <= u32::from(area.width)
+    };
+    // Drop from the left until the group fits; the chip (the last part) is
+    // never dropped.
+    let mut dropped = 0;
+    while dropped < parts.len() - 1 && !fits(&parts[dropped..]) {
+        dropped += 1;
     }
+    // The prompt mode is the third part: it stays on row 1 unless it went.
+    let inline = dropped <= 2;
+    let fitted = fits(&parts[dropped..]);
+    let group: Vec<Span<'static>> = parts.drain(dropped..).flatten().collect();
+    let gap = if fitted {
+        area.width - left_width - crate::views::spans_width(&group)
+    } else {
+        0
+    };
+    spans.push(Span::raw(" ".repeat(usize::from(MIN_GAP - 1 + gap))));
+    spans.extend(group);
     put_line(frame, area, area.y + 1, spans);
     inline
 }
 
 /// The tab pills: the active tab is an inverted amber pill, the others are
-/// `{key} {label}` in ghost/dim.
+/// `{key} {LABEL}` in ghost/dim. Every state shows the upper-case label, so
+/// only the pill, not the letter case, marks the current view.
 ///
 /// Registers each pill's zone as it emits it, because a pill's start column
 /// is only knowable here: it follows the pulsing diamond, `" ORCH"`, the
@@ -211,7 +263,7 @@ fn tab_pills(area: Rect, ctx: &RenderCtx, before: &[Span<'_>]) -> Vec<Span<'stat
                     ctx.style(Token::Ghost),
                 ));
                 spans.push(Span::styled(
-                    format!(" {}{badge}", view.label().to_lowercase()),
+                    format!(" {}{badge}", view.label()),
                     ctx.style(Token::Dim),
                 ));
             }

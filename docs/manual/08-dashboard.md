@@ -81,7 +81,7 @@ listen off · controller none
 
 | Part | What it shows |
 |---|---|
-| Header | The version, the project name, the four view tabs, a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`, and the project prompt mode, `Prompt: normal` or `Prompt: eco` (see [Switch the prompt mode](#switch-the-prompt-mode)). |
+| Header | The version, the project name and the four view tabs on the left. On the right, ending at the last column: how long the orchestrator has been up, how many agents are running and how many tasks are `todo` (`12:05 · 2 running │ 5 todo`), the project prompt mode, `normal` or `eco` (see [Switch the prompt mode](#switch-the-prompt-mode)), and a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`. On a narrow terminal the uptime goes first, then the counts; if the prompt mode still does not fit it moves to the start of the second header line. |
 | Second header line | The peer listen address, the connected controller and each remote's online state. See [Remote agents](11-remote-agents.md). |
 | Status counts | One chip for each task status that has tasks, except cancelled, such as `○ TODO 2`, and a `TEAMS` chip with the number of teams. |
 | Main list | The list for the current view: a column header row (the sort column is marked `↑` or `↓`), the rows, and a `+ add …` row at the end. In a new project a hint under the list suggests the next step, such as `◆ Press R to run task`. |
@@ -94,7 +94,7 @@ Colours follow a palette. Change it with `/config palette` (see [Change dashboar
 
 ## Switch views and move around
 
-The dashboard has four views. The tab for the current view is upper case in the header.
+The dashboard has four views. The tab for the current view is highlighted in the header.
 
 | View | Key | Shows |
 |---|---|---|
@@ -110,7 +110,7 @@ The dashboard has four views. The tab for the current view is upper case in the 
 To switch views:
 
 1. Press `G`, `T`, `A` or `L`, or press `Left` and `Right` to go to the previous or next view.
-2. Check that the header shows the new view in upper case.
+2. Check that the header highlights the new view's tab.
 
 View keys do nothing while a detail panel is open. Press `Esc` first.
 
@@ -467,7 +467,7 @@ Press `F3` to switch the project's prompt mode between `normal` and `eco` ([Eco 
  ✓ Project prompt mode: eco next dispatch; agent overrides retained
 ```
 
-The header then reads `Prompt: eco`. While the change is being written the header shows `…` after the mode, and another `F3` is refused. The change applies from the next run that starts, in this dashboard and in any other orch process on the project; runs already going keep their mode, and agents with their own prompt mode keep it. `F3` does not stop agents, change models or effort, or touch watch mode.
+The header then shows `eco` next to the status chip. While the change is being written the header shows `…` after the mode, and another `F3` is refused. The change applies from the next run that starts, in this dashboard and in any other orch process on the project; runs already going keep their mode, and agents with their own prompt mode keep it. `F3` does not stop agents, change models or effort, or touch watch mode.
 
 If the write fails, the mode stays as it was, and a toast and the Activity feed say why, for example `✕ Prompt mode unchanged: write …/.orchestry/.config.yml.<random>.tmp`. Switching to eco is refused, with the agents named, while a custom prompt template is set ([Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates)).
 
