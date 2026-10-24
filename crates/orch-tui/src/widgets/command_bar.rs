@@ -14,6 +14,7 @@ use crate::format::{cap_display, cap_line};
 use crate::hit::{FooterAction, ScrollRegion, VerbId, ZoneId, ZoneKind};
 use crate::msg::{Chip, chip, parse_partial};
 use crate::state::{InputMode, ViewId};
+use crate::text::cursor::single_line_grapheme;
 use crate::text::{display_width, text_display_width};
 use crate::theme::{CROSS, CURSOR, RETURN_GLYPH, Token};
 use crate::views::{RenderCtx, put_line, spans_width};
@@ -356,7 +357,7 @@ fn value_window(cursor: &crate::text::Cursor, budget: usize) -> ValueWindow {
     }
 }
 
-/// A value fragment as spans, with each kept newline drawn as a dim glyph.
+/// Display-only input spans: visible zero-width placeholders and dim newlines.
 fn value_spans(text: &str, ctx: &RenderCtx) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, part) in text.split('\n').enumerate() {
@@ -364,7 +365,11 @@ fn value_spans(text: &str, ctx: &RenderCtx) -> Vec<Span<'static>> {
             spans.push(Span::styled(RETURN_GLYPH, ctx.style(Token::Dim)));
         }
         if !part.is_empty() {
-            spans.push(Span::styled(part.to_string(), ctx.style(Token::White)));
+            let displayed: String = crate::text::grapheme_segments(part)
+                .iter()
+                .map(|g| single_line_grapheme(g))
+                .collect();
+            spans.push(Span::styled(displayed, ctx.style(Token::White)));
         }
     }
     spans

@@ -6,7 +6,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Fixed
-- Single-line cursors in the command bar, keyword filter and wizard fields now reverse the grapheme under the cursor, like the large editor, without shifting the text when moved.
+- Single-line cursors in the command bar, keyword filter and wizard fields now reverse the grapheme under the cursor, like the large editor, without shifting the text when moved; zero-width graphemes display as `◌` placeholders so the caret stays visible, without changing stored text.
 
 ## [0.11.0] - 2026-10-24
 

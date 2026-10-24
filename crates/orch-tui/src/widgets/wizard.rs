@@ -6,7 +6,7 @@ use ratatui::text::Span;
 
 use crate::format::cap_line;
 use crate::hit::{RowPart, ScrollRegion, VerbId, ZoneId, ZoneKind};
-use crate::text::cursor::{Cursor, display_width, text_display_width};
+use crate::text::cursor::{Cursor, display_width, single_line_grapheme, text_display_width};
 use crate::theme::{BLOCK, CHECK, CIRCLE, CIRCLE_FILLED, CURSOR, Token, light_rule};
 use crate::views::{RenderCtx, put_line, spans_width};
 use crate::wizard::engine::{Choice, StepKind, Wizard};
@@ -406,7 +406,10 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
             } else {
                 ctx.style(Token::White)
             };
-            spans.push(Span::styled(segment.clone(), style));
+            spans.push(Span::styled(
+                single_line_grapheme(segment).to_string(),
+                style,
+            ));
         }
         if cursor.pos() == cursor.len() {
             spans.push(Span::styled(" ", ctx.style(Token::White).reversed()));
@@ -419,7 +422,10 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
                 } else {
                     ctx.style(Token::White)
                 };
-            spans.push(Span::styled(segment.clone(), style));
+            spans.push(Span::styled(
+                single_line_grapheme(segment).to_string(),
+                style,
+            ));
         }
     }
     put_line(frame, area, area.y, spans);
