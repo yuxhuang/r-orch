@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-24
+
+Dashboard cursor and tab patch release. No peer-protocol change, so 0.5.x through 0.11.1 peers can be mixed.
+
 ### Fixed
 - Single-line cursors in the command bar, keyword filter and wizard fields now reverse the grapheme under the cursor, like the large editor, without shifting the text when moved; zero-width graphemes display as `◌` placeholders so the caret stays visible, without changing stored text.
 - The dashboard header's view tabs no longer shift when you switch views or a tab flashes: every tab now keeps the same padding as the highlighted one, so only its colour changes. The tabs take four more columns, so on an 80-column terminal the prompt mode moves to the second header line sooner.
@@ -268,7 +272,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/yuxhuang/r-orch/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/yuxhuang/r-orch/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/yuxhuang/r-orch/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/yuxhuang/r-orch/compare/v0.10.0...v0.10.1
