@@ -27,6 +27,25 @@ fn fleet_harness() -> Harness {
     Harness::with(fleet())
 }
 
+/// The rendered caret is a reversed cell, including the trailing blank.
+fn command_cursor(harness: &mut Harness) -> (u16, u16) {
+    harness.draw();
+    let buffer = harness.terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        if buffer[(0, y)].symbol() == "/" {
+            let x = (2..buffer.area.width)
+                .find(|&x| {
+                    buffer[(x, y)]
+                        .modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+                })
+                .expect("the command cursor is visible");
+            return (x, y);
+        }
+    }
+    panic!("the command bar is visible");
+}
+
 fn sent(call: &Call) -> bool {
     matches!(call, Call::SendMessage { .. })
 }
@@ -705,10 +724,8 @@ fn msg037_a_wide_name_does_not_overflow_the_bar() {
         // over the flattened frame: a wide glyph holds two cells and the
         // second renders as a space, so that measure counts every CJK cluster
         // twice.)
-        assert!(
-            bar.contains('█'),
-            "the bar overflowed and lost its cursor: {bar:?}"
-        );
+        let (x, y) = command_cursor(&mut harness);
+        assert_eq!(harness.terminal.backend().buffer()[(x, y)].symbol(), " ");
         assert!(
             bar.trim_end().ends_with('✕'),
             "the bar overflowed and lost its cancel: {bar:?}"
@@ -774,29 +791,22 @@ fn msg039_the_window_anchors_on_the_cursor_not_the_end() {
 }
 
 #[test]
-fn msg040_the_block_cursor_sits_at_the_insertion_point() {
+fn msg040_the_reversed_cursor_sits_at_the_insertion_point() {
     let mut harness = fleet_harness();
     harness.key('/').type_str("msg Code hi");
-    // At the end, the block trails the value exactly as it always has.
-    let line = harness
-        .text()
-        .lines()
-        .find(|line| line.starts_with("/ "))
-        .map(str::to_owned)
-        .expect("the bar renders");
-    assert!(line.contains("hi█"), "{line:?}");
+    let (end_x, y) = command_cursor(&mut harness);
+    let buffer = harness.terminal.backend().buffer();
+    assert_eq!(buffer[(end_x, y)].symbol(), " ");
+    assert_eq!(buffer[(end_x - 1, y)].symbol(), "i");
+    assert_eq!(buffer[(end_x - 2, y)].symbol(), "h");
 
     harness.press(KeyCode::Left).press(KeyCode::Left);
-    let line = harness
-        .text()
-        .lines()
-        .find(|line| line.starts_with("/ "))
-        .map(str::to_owned)
-        .expect("the bar renders");
-    assert!(
-        line.contains("█hi"),
-        "the block must move with the cursor: {line:?}"
-    );
+    let (x, y) = command_cursor(&mut harness);
+    assert_eq!(x, end_x - 2);
+    let buffer = harness.terminal.backend().buffer();
+    assert_eq!(buffer[(x, y)].symbol(), "h");
+    assert_eq!(buffer[(x + 1, y)].symbol(), "i");
+    harness.assert_text("hi");
 }
 
 // ── Mouse (§3.5.4) ───────────────────────────────────────────────────────
@@ -1517,9 +1527,10 @@ fn msg064_the_chip_leaves_the_body_a_readable_window_at_eighty_columns() {
         .split_once("│ ")
         .expect("the chip divider")
         .1
-        .split('█')
+        .split("Esc ✕")
         .next()
-        .expect("the cursor");
+        .expect("the cancel hint")
+        .trim_end();
     let columns = unicode_width::UnicodeWidthStr::width(window);
     assert!(
         columns >= 25,
@@ -1548,7 +1559,8 @@ fn msg065_a_long_command_shows_the_window_it_always_did() {
         .lines()
         .find(|line| line.starts_with("/ "))
         .unwrap_or_else(|| panic!("no bar in:\n{frame}"));
-    let window: String = bar.chars().skip(2).take_while(|ch| *ch != '█').collect();
+    let (cursor_x, _) = command_cursor(&mut harness);
+    let window: String = bar.chars().skip(2).take(cursor_x as usize - 2).collect();
     assert_eq!(
         unicode_width::UnicodeWidthStr::width(window.as_str()),
         48,

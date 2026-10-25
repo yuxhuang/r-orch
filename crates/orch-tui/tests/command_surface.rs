@@ -917,10 +917,32 @@ fn c100_ghost_completion_suffix_is_shown_for_help() {
     let mut harness = Harness::new();
     harness.key('/');
     harness.type_str("he");
-    // "he" + the resolved ghost suffix "lp" renders contiguously, immediately
-    // followed by the block cursor — unique to the input line (the
-    // suggestions panel never renders the block glyph).
-    harness.assert_text("help█");
+    // The blank caret is at the actual insertion point; the ghost follows it.
+    harness.assert_text("/ /he lp");
+    let (x, y) = harness.find_text("/ /he lp").unwrap();
+    let cell = &harness.terminal.backend().buffer()[(x + 5, y)];
+    assert_eq!(cell.symbol(), " ");
+    assert!(cell.modifier.contains(ratatui::style::Modifier::REVERSED));
+    // Its zone follows the blank too, so clicking the first ghost cell accepts.
+    harness.click(x + 6, y);
+    assert_eq!(harness.app.state.command_bar.input.value(), "/help");
+}
+
+#[test]
+fn a_midline_overlay_does_not_add_a_column_to_the_ghost_zone() {
+    let mut harness = Harness::new();
+    harness.key('/').type_str("he");
+    // Home/End navigate the suggestion list while it is open; arrows edit the caret.
+    harness.press(KeyCode::Left).press(KeyCode::Left);
+    harness.assert_text("/ /help");
+    let (x, y) = harness.find_text("/ /help").unwrap();
+    assert!(
+        harness.terminal.backend().buffer()[(x + 3, y)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED)
+    );
+    harness.click(x + 5, y);
+    assert_eq!(harness.app.state.command_bar.input.value(), "/help");
 }
 
 #[test]

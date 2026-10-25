@@ -1165,6 +1165,58 @@ fn c7_compact_inner_geometry_and_fixed_rail_slots_never_overlap() {
 }
 
 #[test]
+fn single_line_clicks_map_both_wide_cells_and_text_after_the_cursor() {
+    for (offset, expected) in [
+        (0, 0),
+        (1, 1),
+        (2, 1),
+        (3, 2),
+        (4, 2),
+        (5, 3),
+        (6, 4),
+        (7, 5),
+    ] {
+        let mut app = app();
+        app.open_wizard(field(StepKind::Text, "a界🙂bc"));
+        key(&mut app, KeyCode::Home);
+        let area = Rect::new(1, 16, 38, 7);
+        draw(&mut app, area);
+        let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
+        click(&mut app, body.x + 2 + offset, body.y);
+        assert_eq!(
+            app.state
+                .wizard
+                .as_ref()
+                .unwrap()
+                .text_input()
+                .cursor()
+                .pos(),
+            expected,
+            "cell {offset}"
+        );
+    }
+    // A scrolled viewport starts at c, then d, 界, and the reversed 🙂.
+    let mut app = app();
+    app.open_wizard(field(StepKind::Text, "abcd界🙂z"));
+    key(&mut app, KeyCode::Left);
+    key(&mut app, KeyCode::Left);
+    let area = Rect::new(1, 16, 8, 7);
+    draw(&mut app, area);
+    let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
+    click(&mut app, body.x + 7, body.y);
+    assert_eq!(
+        app.state
+            .wizard
+            .as_ref()
+            .unwrap()
+            .text_input()
+            .cursor()
+            .pos(),
+        5
+    );
+}
+
+#[test]
 fn v4_editor_drag_uses_library_mapping_and_copies_exact_unicode_bytes() {
     let mut app = app();
     app.open_wizard(field(StepKind::Textarea, "a界b\nnext"));
@@ -1724,7 +1776,7 @@ fn e10_no_selection_makes_no_transport_attempt_and_rail_cancel_never_leaves_edit
 fn v4_single_line_drag_maps_graphemes_and_capture_or_geometry_loss_cancels_only_the_drag() {
     let mut app = app();
     app.open_wizard(field(StepKind::Text, "a界bc"));
-    key(&mut app, KeyCode::Home); // Cursor block precedes the displayed text.
+    key(&mut app, KeyCode::Home); // Cursor overlays the first displayed grapheme.
     let area = Rect::new(1, 16, 38, 7);
     draw(&mut app, area);
     let body = orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
@@ -1737,13 +1789,13 @@ fn v4_single_line_drag_maps_graphemes_and_capture_or_geometry_loss_cancels_only_
     mouse(
         &mut app,
         MouseEventKind::Drag(MouseButton::Left),
-        body.x + 7,
+        body.x + 6,
         body.y,
     );
     mouse(
         &mut app,
         MouseEventKind::Up(MouseButton::Left),
-        body.x + 7,
+        body.x + 6,
         body.y,
     );
     assert_eq!(
@@ -1861,4 +1913,192 @@ fn n8_catalog_reordering_preserves_semantic_choice_and_untouched_removed_default
     wizard.replace_steps(vec![step(vec![b])]);
     assert_eq!(wizard.current_value(), "b");
     assert!(!wizard.semantic_dirty(&[]));
+}
+
+// Exercise actual paste and key handling on each surface, not just cursor construction.
+fn zero_width_cursor_surface(surface: &str) {
+    use ratatui::style::Modifier;
+    use unicode_width::UnicodeWidthStr;
+    for width in [80, 40] {
+        for value in [
+            "\u{200b}hi".to_string(),
+            "\u{301}hi".to_string(),
+            "a\u{200b}hi".to_string(),
+            "hi\u{200b}".to_string(),
+            "\u{200b}\u{301}hi".to_string(),
+            "hi\u{200b}\u{301}".to_string(),
+            "\u{200b}".to_string(),
+            "\u{301}".to_string(),
+            format!("{}\u{200b}\u{301}hi", "x".repeat(90)),
+            "\u{200b}界🙂z".to_string(),
+        ] {
+            let mut app = app();
+            app.state.width = width;
+            app.state.height = 24;
+            match surface {
+                "command" => {
+                    key(&mut app, KeyCode::Char('/'));
+                    modified(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+                    modified(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+                }
+                "keyword" => modified(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL),
+                "wizard" => app.open_wizard(field(StepKind::Text, "")),
+                _ => panic!("unknown test surface"),
+            }
+            app.handle_paste(&value);
+            let segments = orch_tui::text::grapheme_segments(&value);
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let keys = std::iter::once((KeyCode::Char('a'), KeyModifiers::CONTROL, 0))
+                .chain((1..=segments.len()).map(|pos| (KeyCode::Right, KeyModifiers::NONE, pos)))
+                .chain(
+                    (0..segments.len())
+                        .rev()
+                        .map(|pos| (KeyCode::Left, KeyModifiers::NONE, pos)),
+                )
+                .chain([
+                    (KeyCode::Char('e'), KeyModifiers::CONTROL, segments.len()),
+                    (KeyCode::Home, KeyModifiers::NONE, 0),
+                    (KeyCode::End, KeyModifiers::NONE, segments.len()),
+                ]);
+            for (code, mods, pos) in keys {
+                modified(&mut app, code, mods);
+                let mut hits = None;
+                terminal
+                    .draw(|frame| hits = Some(orch_tui::views::draw(frame, &app)))
+                    .unwrap();
+                app.set_hits(hits.unwrap());
+                let cursor = match surface {
+                    "command" => app.state.command_bar.input.cursor(),
+                    "keyword" => app.state.keyword_input(app.state.view).unwrap().cursor(),
+                    _ => app.state.wizard.as_ref().unwrap().text_input().cursor(),
+                };
+                assert_eq!(cursor.text().as_bytes(), value.as_bytes());
+                assert_eq!(cursor.pos(), pos);
+                let buffer = terminal.backend().buffer();
+                let (prefix, y) = match surface {
+                    "wizard" => {
+                        let y = (0..24).find(|&y| buffer[(0, y)].symbol() == ">").unwrap();
+                        (2, y)
+                    }
+                    _ => {
+                        let label = if surface == "command" {
+                            "/ "
+                        } else {
+                            "Filter tasks › "
+                        };
+                        let y = (0..24)
+                            .find(|&y| buffer[(0, y)].symbol() == &label[..1])
+                            .unwrap();
+                        (UnicodeWidthStr::width(label) as u16, y)
+                    }
+                };
+                let reversed: Vec<_> = (prefix..width)
+                    .filter(|&x| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+                    .collect();
+                assert_eq!(reversed.len(), 1, "{surface} {width} {value:?} pos={pos}");
+                let expected = segments.get(pos).map_or(" ", |g| {
+                    if UnicodeWidthStr::width(g.as_str()) == 0 {
+                        "◌"
+                    } else {
+                        g
+                    }
+                });
+                assert_eq!(buffer[(reversed[0], y)].symbol(), expected);
+                if value.len() < 30 {
+                    let offset: usize = segments[..pos]
+                        .iter()
+                        .map(|g| UnicodeWidthStr::width(g.as_str()).max(1))
+                        .sum();
+                    assert_eq!(reversed[0], prefix + offset as u16);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn command_zero_width_cursor_stays_visible_without_changing_pasted_bytes() {
+    zero_width_cursor_surface("command");
+}
+
+#[test]
+fn keyword_zero_width_cursor_stays_visible_without_changing_pasted_bytes() {
+    zero_width_cursor_surface("keyword");
+}
+
+#[test]
+fn wizard_zero_width_cursor_stays_visible_without_changing_pasted_bytes() {
+    zero_width_cursor_surface("wizard");
+}
+
+#[test]
+fn single_line_clicks_map_zero_width_placeholders_and_wide_neighbors() {
+    // U+0301 attaches to a preceding drawable letter; after ZWSP it is standalone.
+    for value in [
+        "\u{200b}界🙂z",
+        "\u{301}界🙂z",
+        "a\u{200b}\u{301}界z",
+        "hi\u{200b}\u{301}",
+    ] {
+        let segments = orch_tui::text::grapheme_segments(value);
+        for width in [80, 40, 8] {
+            for cursor_pos in [0, segments.len() / 2, segments.len()] {
+                let mut app = app();
+                app.open_wizard(field(StepKind::Text, ""));
+                app.handle_paste(value);
+                key(&mut app, KeyCode::Home);
+                for _ in 0..cursor_pos {
+                    key(&mut app, KeyCode::Right);
+                }
+                let area = Rect::new(0, 16, width, 7);
+                let terminal = draw(&mut app, area);
+                let rect =
+                    orch_tui::widgets::wizard::field_rect(area, app.state.wizard.as_ref().unwrap());
+                // Six value cells leave five before an end blank in the 8-column field.
+                let start = usize::from(
+                    width == 8
+                        && cursor_pos == segments.len()
+                        && orch_tui::text::text_display_width(value) == 6,
+                );
+                let mut offset = 0;
+                for (pos, segment) in segments.iter().enumerate().skip(start) {
+                    let cells = orch_tui::text::display_width(segment) as u16;
+                    if offset + cells > rect.width.saturating_sub(2) {
+                        break;
+                    }
+                    let expected = if unicode_width::UnicodeWidthStr::width(segment.as_str()) == 0 {
+                        "◌"
+                    } else {
+                        segment.as_str()
+                    };
+                    assert_eq!(
+                        terminal.backend().buffer()[(rect.x + 2 + offset, rect.y)].symbol(),
+                        expected
+                    );
+                    for cell in 0..cells {
+                        app.clock.advance_ms(500); // Separate clicks, never a double-click selection.
+                        click(&mut app, rect.x + 2 + offset + cell, rect.y);
+                        let cursor = app.state.wizard.as_ref().unwrap().text_input().cursor();
+                        assert_eq!(cursor.pos(), pos, "{value:?} width={width} cell={cell}");
+                        assert_eq!(cursor.text().as_bytes(), value.as_bytes());
+                    }
+                    offset += cells;
+                }
+                if offset < rect.width.saturating_sub(2) {
+                    app.clock.advance_ms(500);
+                    click(&mut app, rect.x + 2 + offset, rect.y);
+                    assert_eq!(
+                        app.state
+                            .wizard
+                            .as_ref()
+                            .unwrap()
+                            .text_input()
+                            .cursor()
+                            .pos(),
+                        segments.len()
+                    );
+                }
+            }
+        }
+    }
 }

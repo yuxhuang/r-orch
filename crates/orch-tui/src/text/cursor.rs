@@ -41,6 +41,18 @@ pub fn display_width(grapheme: &str) -> usize {
     UnicodeWidthStr::width(grapheme).clamp(1, 2)
 }
 
+/// Display-only representation for a single-line input grapheme. Ratatui
+/// skips zero-width clusters, so give them the one cell already reserved by
+/// `display_width`. Keeping this placeholder even away from the caret makes
+/// movement, viewport budgets and pointer positions agree without editing text.
+pub(crate) fn single_line_grapheme(grapheme: &str) -> &str {
+    if !grapheme.is_empty() && UnicodeWidthStr::width(grapheme) == 0 {
+        "◌"
+    } else {
+        grapheme
+    }
+}
+
 /// Total display width of a string, summed per cluster.
 pub fn text_display_width(text: &str) -> usize {
     text.graphemes(true).map(display_width).sum()
@@ -318,6 +330,30 @@ mod tests {
         assert_eq!(text_display_width("hi你!"), 5);
         assert_eq!(text_display_width("hi你"), 4);
         assert_eq!(text_display_width(""), 0);
+    }
+
+    #[test]
+    fn single_line_zero_width_placeholders_match_cursor_widths_without_mutating_text() {
+        for value in [
+            "\u{200b}hi",
+            "\u{301}hi",
+            "a\u{200b}界🙂",
+            "hi\u{200b}\u{301}",
+        ] {
+            let cursor = Cursor::new(value);
+            let displayed: String = cursor
+                .before_segs()
+                .iter()
+                .map(|g| single_line_grapheme(g))
+                .collect();
+            assert_eq!(
+                UnicodeWidthStr::width(displayed.as_str()),
+                text_display_width(value)
+            );
+            assert_eq!(cursor.text().as_bytes(), value.as_bytes());
+        }
+        assert_eq!(single_line_grapheme(""), "");
+        assert_eq!(single_line_grapheme("e\u{301}"), "e\u{301}");
     }
 
     // ── construction ───────────────────────────────────────────────────────

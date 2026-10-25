@@ -6,7 +6,7 @@ use ratatui::text::Span;
 
 use crate::format::cap_line;
 use crate::hit::{RowPart, ScrollRegion, VerbId, ZoneId, ZoneKind};
-use crate::text::cursor::{Cursor, display_width, text_display_width};
+use crate::text::cursor::{Cursor, display_width, single_line_grapheme, text_display_width};
 use crate::theme::{BLOCK, CHECK, CIRCLE, CIRCLE_FILLED, CURSOR, Token, light_rule};
 use crate::views::{RenderCtx, put_line, spans_width};
 use crate::wizard::engine::{Choice, StepKind, Wizard};
@@ -383,12 +383,12 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
     wizard.text_render.set(Some((
         Rect::new(area.x, area.y, area.width, 1),
         viewport_start(cursor, max_w.max(1)),
-        cursor.pos(),
     )));
     let mut spans = vec![Span::styled("> ", ctx.style(Token::Ghost))];
     if value.is_empty() && !step.placeholder.is_empty() {
+        spans.push(Span::styled(" ", ctx.style(Token::White).reversed()));
         spans.push(Span::styled(
-            cap_line(&step.placeholder, max_w),
+            cap_line(&step.placeholder, max_w.saturating_sub(1)),
             ctx.style(Token::Ghost),
         ));
     } else {
@@ -406,17 +406,26 @@ fn render_text_field(frame: &mut Frame, area: Rect, ctx: &RenderCtx, wizard: &Wi
             } else {
                 ctx.style(Token::White)
             };
-            spans.push(Span::styled(segment.clone(), style));
+            spans.push(Span::styled(
+                single_line_grapheme(segment).to_string(),
+                style,
+            ));
         }
-        spans.push(Span::styled(BLOCK, ctx.style(Token::Amber)));
+        if cursor.pos() == cursor.len() {
+            spans.push(Span::styled(" ", ctx.style(Token::White).reversed()));
+        }
         let after_start = cursor.pos();
         for (i, segment) in crate::text::grapheme_segments(&after).iter().enumerate() {
-            let style = if selection.is_some_and(|(a, b)| (a..b).contains(&(after_start + i))) {
-                ctx.style(Token::White).reversed()
-            } else {
-                ctx.style(Token::White)
-            };
-            spans.push(Span::styled(segment.clone(), style));
+            let style =
+                if i == 0 || selection.is_some_and(|(a, b)| (a..b).contains(&(after_start + i))) {
+                    ctx.style(Token::White).reversed()
+                } else {
+                    ctx.style(Token::White)
+                };
+            spans.push(Span::styled(
+                single_line_grapheme(segment).to_string(),
+                style,
+            ));
         }
     }
     put_line(frame, area, area.y, spans);
@@ -808,30 +817,39 @@ fn render_multiselect_field(
 /// with what follows. Widths come from [`text_display_width`], so a CJK
 /// character or an emoji costs two cells.
 ///
-/// `width` is the cell budget for the value itself; the block cursor sits in
-/// the last cell, so the text before it gets `width - 1`.
+/// `width` includes the cursor: its grapheme when mid-line, a blank at end.
 pub(crate) fn viewport_start(cursor: &Cursor, width: usize) -> usize {
-    let budget = width.saturating_sub(1).max(1);
+    let cursor_width = cursor.after_segs().first().map_or(1, |g| display_width(g));
+    let budget = width.saturating_sub(cursor_width);
     let segs = cursor.before_segs();
-    let mut start = 0;
-    while start < segs.len() && text_display_width(&segs[start..].concat()) > budget {
-        start += 1;
+    let mut start = segs.len();
+    let mut used = 0;
+    while start > 0 {
+        let w = display_width(&segs[start - 1]);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start -= 1;
     }
     start
 }
 
 fn slide_viewport(cursor: &Cursor, width: usize) -> (String, String) {
-    let budget = width.saturating_sub(1).max(1);
+    let at_end = cursor.pos() == cursor.len();
+    let budget = width.saturating_sub(usize::from(at_end));
     let before_segs = cursor.before_segs();
     let start = viewport_start(cursor, width);
     let before = before_segs[start..].concat();
 
-    let remaining = budget.saturating_sub(text_display_width(&before));
+    let mut remaining = budget.saturating_sub(text_display_width(&before));
     let mut after = String::new();
     for segment in cursor.after_segs() {
-        if text_display_width(&after) + display_width(segment) > remaining {
+        let w = display_width(segment);
+        if w > remaining {
             break;
         }
+        remaining -= w;
         after.push_str(segment);
     }
     (before, after)
@@ -840,6 +858,107 @@ fn slide_viewport(cursor: &Cursor, width: usize) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_test_field(
+        wizard: &Wizard,
+        palette: orch_domain::TuiPaletteName,
+        width: u16,
+    ) -> ratatui::buffer::Buffer {
+        use crate::views::Caps;
+        use crate::{App, backend::FakeBackend, clock::TestClock};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new(FakeBackend::new(), TestClock::new(1000));
+        app.state.palette = crate::theme::Palette::new(palette);
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let ctx = RenderCtx::new(
+                    &app.state,
+                    Caps {
+                        can_create_task: false,
+                        can_add_agent: false,
+                        can_create_goal: false,
+                        can_force_stop_agent: false,
+                        can_send_message: false,
+                    },
+                    1000,
+                    area,
+                );
+                render_text_field(frame, area, &ctx, wizard);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn wizard_cursor_overlays_wide_graphemes_and_keeps_a_full_viewport() {
+        use crate::wizard::{WizardKind, WizardStep};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::style::Modifier;
+        for cluster in ["界", "🙂", "👩‍💻"] {
+            let value = format!("abcd{cluster}z");
+            let mut wizard = Wizard::new(
+                WizardKind::Task,
+                "Test",
+                vec![WizardStep::new("field", "Field", StepKind::Text).default_value(&value)],
+            );
+            wizard.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 0);
+            wizard.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 0);
+            let buffer = render_test_field(&wizard, orch_domain::TuiPaletteName::Amber, 6);
+            assert_eq!(buffer[(2, 0)].symbol(), "c");
+            assert_eq!(buffer[(3, 0)].symbol(), "d");
+            assert_eq!(buffer[(4, 0)].symbol(), cluster);
+            assert!(buffer[(4, 0)].modifier.contains(Modifier::REVERSED));
+            assert_eq!(wizard.text_render.get().unwrap().1, 2);
+            // The complete wide cursor fits even in a two-cell value window.
+            assert_eq!(
+                slide_viewport(wizard.text_input().cursor(), 2),
+                (String::new(), cluster.into())
+            );
+        }
+    }
+
+    #[test]
+    fn wizard_movement_preserves_text_columns_on_every_palette() {
+        use crate::wizard::{WizardKind, WizardStep};
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::style::Modifier;
+        for palette in orch_domain::TUI_PALETTE_NAMES {
+            let mut wizard = Wizard::new(
+                WizardKind::Task,
+                "Test",
+                vec![WizardStep::new("field", "Field", StepKind::Text).default_value("hi")],
+            );
+            for (key, mods, pos) in [
+                (KeyCode::Left, KeyModifiers::NONE, 1),
+                (KeyCode::Left, KeyModifiers::NONE, 0),
+                (KeyCode::Right, KeyModifiers::NONE, 1),
+                (KeyCode::Home, KeyModifiers::NONE, 0),
+                (KeyCode::End, KeyModifiers::NONE, 2),
+                (KeyCode::Char('a'), KeyModifiers::CONTROL, 0),
+                (KeyCode::Char('e'), KeyModifiers::CONTROL, 2),
+            ] {
+                wizard.handle_key(KeyEvent::new(key, mods), 0);
+                let buffer = render_test_field(&wizard, palette, 80);
+                assert_eq!(buffer[(2, 0)].symbol(), "h");
+                assert_eq!(buffer[(3, 0)].symbol(), "i");
+                assert!(
+                    buffer[(2 + pos, 0)].modifier.contains(Modifier::REVERSED),
+                    "{palette:?} {key:?}"
+                );
+            }
+            let wizard = Wizard::new(
+                WizardKind::Task,
+                "Empty",
+                vec![WizardStep::new("field", "Field", StepKind::Text).placeholder("type here")],
+            );
+            let buffer = render_test_field(&wizard, palette, 80);
+            assert_eq!(buffer[(2, 0)].symbol(), " ");
+            assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
+            assert_eq!(buffer[(3, 0)].symbol(), "t");
+        }
+    }
 
     #[test]
     fn a_short_value_is_shown_whole() {
@@ -860,7 +979,7 @@ mod tests {
         let cursor = Cursor::at("abcdefghij", 2);
         let (before, after) = slide_viewport(&cursor, 5);
         assert_eq!(before, "ab");
-        assert_eq!(after, "cd");
+        assert_eq!(after, "cde");
     }
 
     #[test]
@@ -877,8 +996,8 @@ mod tests {
         let cursor = Cursor::at("你好世界", 0);
         let (before, after) = slide_viewport(&cursor, 4);
         assert!(before.is_empty());
-        // Three cells of budget fit one two-cell character, not one and a half.
-        assert_eq!(after, "你");
+        // The cursor overlays the first cluster, leaving all four cells for text.
+        assert_eq!(after, "你好");
     }
 
     #[test]
