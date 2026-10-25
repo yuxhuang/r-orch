@@ -73,19 +73,25 @@ fn separator(ctx: &RenderCtx, glyph: &str) -> Span<'static> {
     Span::styled(format!(" {glyph} "), ctx.style(Token::Ghost))
 }
 
-/// Blank cells between the last tab pill and the right group, at least: one
-/// reads as a continuation (`L ACTIONS 0 running`), two match the gap before
-/// the tabs.
+/// Blank cells between the last tab's label and the right group, at least:
+/// one reads as a continuation (`L ACTIONS 0 running`), two match the gap
+/// before the first tab's key.
 const MIN_GAP: u16 = 2;
+
+/// Blank cells the tab pills already end with: the last pill's own trailing
+/// padding cell and the separator after it. They count toward [`MIN_GAP`].
+const TABS_TRAILING_BLANKS: u16 = 2;
+const _: () = assert!(MIN_GAP >= TABS_TRAILING_BLANKS);
 
 /// Row 1. Returns whether the prompt mode is on it.
 ///
 /// Left: brand, version, update chip, project and the tab pills, in that
-/// order and at the columns they have always had. Right, flush to the last
-/// column: `{uptime} · {x} running │ {y} todo · {mode} · {chip}`.
+/// order. Right, flush to the last column:
+/// `{uptime} · {x} running │ {y} todo · {mode} · {chip}`.
 ///
 /// The right group must leave at least [`MIN_GAP`] blank cells after the
-/// tabs. When it would not, it gives up parts from its left end, least useful first: the
+/// last tab's label, its padding cell included. When it would not, it gives
+/// up parts from its left end, least useful first: the
 /// uptime, then the counts (both repeat what the stats bar and the scanner
 /// already show), then the prompt mode, which moves to the start of row 2
 /// ahead of the peer status (QA-4: at 80 columns it used to be clipped away).
@@ -132,11 +138,13 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
         ctx.style(Token::Silver),
     ));
 
-    // Centre: the tab pills. They end with one blank cell; the rest of the
-    // minimum gap to the right group is counted here.
-    spans.push(Span::raw("  "));
+    // Centre: the tab pills. One blank, then the first pill's own leading
+    // padding cell, keeps the two-cell gap before its key. They end with the
+    // last pill's padding cell and a separator; the rest of the minimum gap to
+    // the right group is counted here.
+    spans.push(Span::raw(" "));
     spans.extend(tab_pills(area, ctx, &spans));
-    let left_width = crate::views::spans_width(&spans) + MIN_GAP - 1;
+    let left_width = crate::views::spans_width(&spans) + MIN_GAP - TABS_TRAILING_BLANKS;
 
     // Right: the group's parts, in drop order. Each part but the chip carries
     // its trailing separator, so dropping a part drops its dot with it.
@@ -214,7 +222,9 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
     } else {
         0
     };
-    spans.push(Span::raw(" ".repeat(usize::from(MIN_GAP - 1 + gap))));
+    spans.push(Span::raw(
+        " ".repeat(usize::from(MIN_GAP - TABS_TRAILING_BLANKS + gap)),
+    ));
     spans.extend(group);
     put_line(frame, area, area.y + 1, spans);
     inline
@@ -222,7 +232,9 @@ fn render_brand_bar(frame: &mut Frame, area: Rect, ctx: &RenderCtx) -> bool {
 
 /// The tab pills: the active tab is an inverted amber pill, the others are
 /// `{key} {LABEL}` in ghost/dim. Every state shows the upper-case label, so
-/// only the pill, not the letter case, marks the current view.
+/// only the pill, not the letter case, marks the current view. Every state
+/// also occupies the same ` {key} {LABEL}{badge} ` cells, so selecting or
+/// flashing a tab never moves its label or the tabs after it.
 ///
 /// Registers each pill's zone as it emits it, because a pill's start column
 /// is only knowable here: it follows the pulsing diamond, `" ORCH"`, the
@@ -258,12 +270,15 @@ fn tab_pills(area: Rect, ctx: &RenderCtx, before: &[Span<'_>]) -> Vec<Span<'stat
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
+                // Same cells as the pill, padding included, so selecting a
+                // tab only restyles it: nothing moves.
+                spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     view.hotkey().to_string(),
                     ctx.style(Token::Ghost),
                 ));
                 spans.push(Span::styled(
-                    format!(" {}{badge}", view.label()),
+                    format!(" {}{badge} ", view.label()),
                     ctx.style(Token::Dim),
                 ));
             }

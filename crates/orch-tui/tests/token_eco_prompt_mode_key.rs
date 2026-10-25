@@ -317,18 +317,18 @@ fn at_120_columns_the_prompt_mode_stays_on_the_brand_bar() {
 }
 
 #[test]
-fn at_80_columns_the_prompt_mode_stays_on_the_brand_bar_when_it_fits() {
+fn at_90_columns_the_prompt_mode_stays_on_the_brand_bar_when_it_fits() {
     // The counts give way first, so a short project name keeps the mode and
     // the chip on row 1.
-    let (brand, second) = header_rows(80, 24);
+    let (brand, second) = header_rows(90, 24);
     assert!(brand.ends_with(" normal · ● OBSERVING"), "{brand}");
     assert!(!second.contains("normal"), "{second}");
 }
 
 #[test]
 fn at_80_columns_the_prompt_mode_leads_the_second_header_line_in_full() {
-    // A longer name leaves room for the chip only: the mode moves to row 2.
-    let (brand, second) = header_rows_for("main-project", 80, 24);
+    // 80 columns leave room for the chip only: the mode moves to row 2.
+    let (brand, second) = header_rows(80, 24);
     assert!(
         second.trim_start().starts_with("normal · "),
         "row 2: {second}"
