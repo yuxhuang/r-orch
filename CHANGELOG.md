@@ -7,6 +7,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Added
 - `orch mcp` serves the project to MCP clients such as Claude Code, Codex and Cursor over stdio: typed tools for tasks, goals, agents, messages, context, teams, logs, `doctor` and configuration, plus read-only `orch://` resources. Each tool returns the same JSON as the matching `orch --json` command; for commands that print only a message, it returns the changed entity or `null`. Read and ordinary change tools are on by default (45 tools); `--read-only` keeps only the 18 read tools, and `--allow-destructive` (50 tools) adds cancel, delete and remove and lets a client pause or force a goal. `--agent` or `ORCH_AGENT_ID` sets the default message sender and inbox. It takes no orchestrator lock, so it runs next to `orch run --watch`, `orch serve` and the dashboard. See [the MCP server](docs/manual/17-mcp-server.md).
+  The server exits cleanly on stdin EOF, SIGINT, SIGTERM and SIGHUP; if the client stops reading its stdout it runs no further call and exits 1 with the reason on stderr. With `RUST_LOG` or `ORCHESTRY_DEBUG` set, diagnostics go to stderr, and the MCP SDK's `debug` and `trace` events, which carry tool arguments and results, are never recorded.
 
 ## [0.11.1] - 2026-10-24
 

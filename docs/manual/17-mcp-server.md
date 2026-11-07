@@ -736,6 +736,11 @@ off unless `RUST_LOG` or `ORCHESTRY_DEBUG` is set in its environment; only start
 discard it. To keep it, start the server through a small wrapper that sends stderr to a file:
 [Capturing `orch mcp` diagnostics](../RUNBOOK.md#capturing-orch-mcp-diagnostics).
 
+**Debug logging.** `RUST_LOG` and `ORCHESTRY_DEBUG` send diagnostics to stderr, never to stdout. The MCP SDK's
+`debug` and `trace` events, which carry raw requests, results and rejected input lines, are never recorded,
+whatever `RUST_LOG` says (`RUST_LOG=trace` and `RUST_LOG=rmcp=trace` included); the SDK's `info`, `warn` and
+`error` lines stay. orch's own `debug` lines, such as an error's cause chain, are still recorded.
+
 ### Read-only mode still writes
 
 `--read-only` registers no tool that changes authored data. It is not a read-only file system:

@@ -214,8 +214,8 @@ services as the CLI commands, never their printing wrappers.
 
 | Module | Owns |
 |---|---|
-| `mcp` (`mod.rs`) | `orch mcp` entry: identity, mode and project root resolved before anything reaches stdout; a first light-Engine build so a broken config is a startup error; its own Tokio runtime with a 250 ms bounded shutdown (Tokio's stdin read cannot be cancelled) |
-| `mcp::server` | `rmcp::ServerHandler`; per-call admission (store lane: 16 permits, FIFO `tokio::sync::Mutex`, 10 s wait; diagnostic lane for `doctor`: 2 permits, 120 s whole-call deadline); a fresh light `Engine` per admitted call; SIGINT/SIGTERM and EOF lifecycle; `initialize` instructions |
+| `mcp` (`mcp.rs`) | `orch mcp` entry: identity, mode and project root resolved before anything reaches stdout; a first light-Engine build so a broken config is a startup error; its own Tokio runtime with a 250 ms bounded shutdown (Tokio's stdin read cannot be cancelled) |
+| `mcp::server` | `rmcp::ServerHandler`; per-call admission (store lane: 16 permits, FIFO `tokio::sync::Mutex`, 10 s wait; diagnostic lane for `doctor`: 2 permits, 120 s whole-call deadline); a fresh light `Engine` per admitted call; lifecycle: stdin EOF and SIGINT/SIGTERM/SIGHUP are clean exits (signal handlers installed before `initialize`), and the first failed stdout write admits no further call, leaves calls that already ran done, and exits 1 with a `cannot write to stdout` reason on stderr; `initialize` instructions |
 | `mcp::registry` | `Registry::add` over rmcp's `ToolRouter`: one name, schema (`schemars`), annotations and class per tool; strict decode (unknown fields refused) and `ToolArgs::validate` before any Engine; mode filtering at registration and again at call |
 | `mcp::mode`, `mcp::identity` | Pure policy: `Default`/`ReadOnly`/`AllowDestructive` and the `Read`/`Mutate`/`Destructive` classes; `--agent` over `ORCH_AGENT_ID` |
 | `mcp::projections`, `mcp::resources` | Print-free read projections shared by tools and the `orch://` resources; strict URI grammar |
@@ -364,7 +364,7 @@ not open-ended work.
 | `dirs` | `7.0` | `~/.orchestry/`. |
 | `which` | `8.0` | Adapter binary probing (`cursor-agent` → `agent` fallback). |
 | `globset` | `0.4` | Available if scope matching ever becomes real glob matching. **Not used for `scopesOverlap`**, which is deliberately raw string-prefix logic and must stay that way. |
-| `tracing` + `tracing-subscriber` | `0.1` / `0.3` | Internal diagnostics. **Must not** write to stdout — stdout is the CLI contract. Default to stderr at `warn`, controlled by `ORCHESTRY_DEBUG`/`RUST_LOG`. |
+| `tracing` + `tracing-subscriber` | `0.1` / `0.3` | Internal diagnostics. **Must not** write to stdout — stdout is the CLI contract. Writes to stderr and is off by default; `RUST_LOG` (a filter) or `ORCHESTRY_DEBUG` (`debug`) turns it on. The MCP SDK's (`rmcp`) `debug` and `trace` events are never recorded, whatever `RUST_LOG` says, because they carry raw tool arguments and results; its `info` and above stay. |
 | `indexmap` | `2.14` | Insertion-ordered maps where key order is part of the format. |
 | `toml` | `1.1` | Only for our own tooling/config, not for `.orchestry/`. |
 

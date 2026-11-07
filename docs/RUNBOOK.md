@@ -239,7 +239,8 @@ ORCHESTRY_DEBUG=1 orch run <task-id> 2>debug.log
 ```
 
 For `orch mcp`, stderr belongs to the MCP client, which may discard it; see
-[Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics).
+[Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics). On that path the MCP SDK's `debug` and
+`trace` events, which carry tool arguments and results, are never recorded, whatever `RUST_LOG` says.
 
 Without `ORCHESTRY_DEBUG`, tracing output is suppressed entirely — including the one signal that
 distinguishes "another process holds the lock" from "I could not read the lock file", since both print
@@ -906,14 +907,16 @@ tool:
 | none | The wrapper's `start` line, startup errors and the `cannot write to stdout` error |
 | `RUST_LOG=warn` | Also each JSON-RPC error sent to the client: `WARN rmcp::service: response error id=4 error=ErrorData { code: ErrorCode(-32602), message: "tool not found", data: None }` |
 | `RUST_LOG=info` | Also the connection's life: `Service initialized as server`, `client initialized`, `input stream terminated`, `serve finished quit_reason=Closed` |
-| `RUST_LOG=debug` or `ORCHESTRY_DEBUG=1` | Also every request and every response, **with their arguments and results** |
+| `RUST_LOG=debug` or `ORCHESTRY_DEBUG=1` | The same as `info` for this session. The SDK's `debug` and `trace` events (requests and responses with their arguments and results) are never recorded, even with `RUST_LOG=trace` or `RUST_LOG=rmcp=trace`; orch's own `debug` lines, such as an error's cause chain, are still recorded |
 
-- Tool errors (`isError: true`, such as `Task not found: tsk_nope`) and dropped invalid JSON lines leave no line
-  below `debug`.
+- Tool errors (`isError: true`, such as `Task not found: tsk_nope`) and dropped invalid JSON lines leave no SDK
+  line at any level.
 - `RUST_LOG` wins over `ORCHESTRY_DEBUG` when both are set.
 - Lines have no timestamps; the `start` line has one.
-- At `debug` the file holds project content: task descriptions, messages, configuration values. `umask 077` makes
-  it readable by you only (mode `600`). Nothing rotates or deletes these files.
+- The file can still hold project content. `info` lines include the client's `initialize` parameters and each
+  notification it sends; a `warn` line repeats the error sent to the client, and an invalid-arguments error quotes
+  the mistyped value (`invalid type: string "…", expected u64`). `umask 077` makes it readable by you only
+  (mode `600`). Nothing rotates or deletes these files.
 
 When the client stops reading the server's output, a file recorded at `RUST_LOG=info` ends like this (from a
 disposable project):
