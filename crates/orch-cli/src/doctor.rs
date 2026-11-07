@@ -48,7 +48,7 @@ pub fn container_less_registry(process_manager: Arc<dyn ProcessManager>) -> Adap
 /// The printed shape of a report: camelCase here, unlike
 /// every stored entity, and this is the only place that matters.
 #[derive(Debug, Serialize)]
-struct DoctorJson<'a> {
+pub(crate) struct DoctorJson<'a> {
     checks: &'a [DoctorCheck],
     #[serde(rename = "adaptersReady")]
     adapters_ready: usize,

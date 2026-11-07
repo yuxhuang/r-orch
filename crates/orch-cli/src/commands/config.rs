@@ -69,6 +69,24 @@ pub async fn set(
     key: &str,
     raw: &str,
 ) -> Result<()> {
+    let parsed = set_value(engine, key, raw).await?;
+    // No JSON mode: the success line is all `config set` prints.
+    print_success(
+        styles,
+        &format!(
+            "{key} = {}",
+            serde_json::to_string(&parsed).unwrap_or_default()
+        ),
+    );
+    Ok(())
+}
+
+/// The print-free half of `config set`, shared with `orch mcp`: parse `raw`
+/// as JSON or keep it as a string, then write it with exactly the existing
+/// validation branches. Only the prompt mode key and keys that affect prompt
+/// rendering are validated (under the definition lock); every other key is a
+/// raw store set. Returns the parsed value.
+pub(crate) async fn set_value(engine: &Engine, key: &str, raw: &str) -> Result<Value> {
     // `JSON.parse` first, the raw string as the fallback.
     let parsed: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
     if key == PROMPT_MODE_KEY {
@@ -100,15 +118,7 @@ pub async fn set(
     } else {
         engine.config_store.set(key, parsed.clone()).await?;
     }
-    // No JSON mode: the success line is all `config set` prints.
-    print_success(
-        styles,
-        &format!(
-            "{key} = {}",
-            serde_json::to_string(&parsed).unwrap_or_default()
-        ),
-    );
-    Ok(())
+    Ok(parsed)
 }
 
 /// `config edit` spawns the editor on the real file and prints nothing.
@@ -123,34 +133,49 @@ pub async fn mutate(
     args: &crate::tree::DefinitionInput,
     kind: crate::document_input::MutationKind,
 ) -> Result<()> {
-    use crate::document_input::{MutationKind, apply_mutation};
-    use orch_infra::storage::{FileConfigStore, fs_utils};
     let input = crate::document_input::read_document(&args.file, args.input_format).await?;
-    let _lock = fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock"))
-        .await
-        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
-    let store = FileConfigStore::new(engine.paths.clone());
-    let current = store.read_raw().await?;
-    let candidate = apply_mutation(&current, &input, kind)
-        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
-    let complete = kind == MutationKind::Update;
-    orch_infra::storage::config::validate_raw_config(&candidate, complete)
-        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
-    validate_prompt_candidate(engine, &candidate)
-        .await
-        .map_err(|err| crate::document_input::at_source(&args.file, err))?;
-    if candidate != current {
-        store
-            .write_raw(&candidate, complete)
-            .await
-            .map_err(|err| crate::document_input::at_source(&args.file, err))?;
-    }
+    let file = args.file.clone();
+    let source = move |err| crate::document_input::at_source(&file, err);
+    let candidate = apply_definition(engine, &input, kind, &source).await?;
     if let Some(format) = ctx.output {
         format.print(&candidate)?;
     } else {
         print_success(styles, "Updated project configuration");
     }
     Ok(())
+}
+
+/// The print-free half of `config update`/`config patch`, shared with
+/// `orch mcp`: under the definition lock, merge the already-parsed document
+/// into the raw project config, validate it (complete for an update) and the
+/// prompt candidate, and write it if it changed. Returns the raw candidate.
+/// `source` attributes errors to the input document, as the CLI always has.
+pub(crate) async fn apply_definition(
+    engine: &Engine,
+    input: &Value,
+    kind: crate::document_input::MutationKind,
+    source: &(dyn Fn(Error) -> Error + Sync),
+) -> Result<Value> {
+    use crate::document_input::{MutationKind, apply_mutation};
+    use orch_infra::storage::{FileConfigStore, fs_utils};
+    let _lock = fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock"))
+        .await
+        .map_err(source)?;
+    let store = FileConfigStore::new(engine.paths.clone());
+    let current = store.read_raw().await?;
+    let candidate = apply_mutation(&current, input, kind).map_err(source)?;
+    let complete = kind == MutationKind::Update;
+    orch_infra::storage::config::validate_raw_config(&candidate, complete).map_err(source)?;
+    validate_prompt_candidate(engine, &candidate)
+        .await
+        .map_err(source)?;
+    if candidate != current {
+        store
+            .write_raw(&candidate, complete)
+            .await
+            .map_err(source)?;
+    }
+    Ok(candidate)
 }
 
 /// The project prompt-mode key.

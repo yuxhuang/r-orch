@@ -22,6 +22,7 @@ pub mod doctor;
 pub mod document_input;
 pub mod editor;
 pub mod logs;
+mod mcp;
 pub mod output;
 pub mod routing;
 pub mod serve;
@@ -115,6 +116,12 @@ fn is_initialized(cwd: &std::path::Path) -> bool {
 
 fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     let styles = styles_for(&cli, env);
+
+    // `orch mcp` owns its runtime: its shutdown must be bounded, and nothing
+    // of the ordinary command path may write to stdout.
+    if let Some(Command::Mcp(args)) = &cli.command {
+        return mcp::run(args, &styles);
+    }
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -384,6 +391,9 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         Some(Command::Serve(args)) => run_serve(cli, env, &cwd, args).await,
 
         Some(Command::Web(args)) => run_web(cli, env, &cwd, args).await,
+
+        // Dispatched before the runtime is built, in `dispatch_parsed`.
+        Some(Command::Mcp(_)) => unreachable!("orch mcp is dispatched before the runtime"),
 
         Some(Command::Remote(args)) => {
             let Some(sub) = &args.command else {
