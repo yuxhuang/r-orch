@@ -2931,3 +2931,72 @@ fn tools_list_sizes_are_reported_for_all_three_modes() {
     );
     assert!(read_only < default && default < destructive);
 }
+
+// ── a negative call for every tool ────────────────────────────────────────
+
+#[test]
+fn every_one_of_the_fifty_tools_refuses_an_undeclared_argument_and_changes_nothing() {
+    let mut fx = Fx::destructive();
+    let before = snapshot(&fx.root().join(".orchestry"));
+    let tools: Vec<&str> = EXPECTED.iter().chain(DESTRUCTIVE).copied().collect();
+    assert_eq!(tools.len(), 50);
+    for tool in tools {
+        // Required arguments are deliberately missing too: unknown fields and
+        // missing fields are both refused before any service is entered.
+        let response = fx.rpc_error(tool, json!({"undeclared_argument_for_the_test": 1}));
+        assert_eq!(error_code(&response), Some(-32602), "{tool}: {response}");
+    }
+    assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
+    assert!(
+        fx.ok("status", json!({})).is_object(),
+        "the session survives all of them"
+    );
+}
+
+#[test]
+fn context_delete_without_a_key_is_invalid_params() {
+    let mut fx = Fx::destructive();
+    assert_eq!(fx.rpc_code("context_delete", json!({})), -32602);
+}
+
+#[test]
+fn context_set_without_a_value_is_invalid_params_and_stores_nothing() {
+    let mut fx = Fx::new();
+    assert_eq!(fx.rpc_code("context_set", json!({"key": "k"})), -32602);
+    assert_eq!(fx.cli(&["context", "list"]), json!([]));
+}
+
+#[test]
+fn team_leave_with_an_unknown_team_is_a_tool_error() {
+    let mut fx = Fx::new();
+    let agent = fx.agent("a");
+    fx.tool_error(
+        "team_leave",
+        json!({"team_id": "team_nope", "agent_id": agent}),
+    );
+}
+
+#[test]
+fn agent_disable_without_an_id_is_invalid_params() {
+    let mut fx = Fx::new();
+    assert_eq!(fx.rpc_code("agent_disable", json!({})), -32602);
+}
+
+#[test]
+fn a_list_tool_given_an_argument_it_does_not_declare_is_invalid_params() {
+    let mut fx = Fx::new();
+    for tool in [
+        "agent_list",
+        "goal_list",
+        "msg_list",
+        "team_list",
+        "remote_list",
+    ] {
+        let arguments = if tool == "goal_list" || tool == "msg_list" {
+            json!({"unknown": 1})
+        } else {
+            json!({"status": "x"})
+        };
+        assert_eq!(fx.rpc_code(tool, arguments), -32602, "{tool}");
+    }
+}
