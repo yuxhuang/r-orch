@@ -3,7 +3,7 @@
 status: approved
 owner: orchestrator (lead), for the repository owner
 date: 2026-11-07
-plan: to be written (`docs/plans/2026-11-07-mcp-server.md`; link it when the plan lands)
+plan: [docs/plans/2026-11-07-mcp-server.md](../plans/2026-11-07-mcp-server.md)
 
 ## Source
 > Based on the orch architecture and all the commands, use your best judgement and capability, to add a stdio
