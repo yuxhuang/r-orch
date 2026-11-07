@@ -27,8 +27,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use mcp_common::{
-    DESTRUCTIVE, EXPECTED, McpServer, READ_ONLY, error_code, initialized_project,
-    initialized_project_named, orch_command, tool_text,
+    DESTRUCTIVE, EXPECTED, McpServer, READ_ONLY, Rendezvous, error_code, initialized_project,
+    initialized_project_named, orch_command, output_of, spawn_bounded, tool_text,
 };
 use serde_json::{Value, json};
 
@@ -129,10 +129,7 @@ impl Fx {
 
     /// `orch <args>` on this project, asserting success.
     fn cli_plain(&self, args: &[&str]) {
-        let output = orch_command(self.root())
-            .args(args)
-            .output()
-            .expect("run orch");
+        let output = output_of(orch_command(self.root()).args(args));
         assert!(
             output.status.success(),
             "orch {args:?} failed: {}{}",
@@ -184,6 +181,27 @@ impl Fx {
         let _ = std::fs::remove_file(self.root().join(".orchestry/tasks/_index.json"));
     }
 
+    /// Make a stored task's attempt counter `attempts`, the way earlier failed
+    /// runs would have left it (the index is rebuilt on the next read).
+    fn force_attempts(&self, id: &str, attempts: u32) {
+        let path = self.root().join(format!(".orchestry/tasks/{id}.yml"));
+        let text = std::fs::read_to_string(&path).expect("read task file");
+        let mut replaced = false;
+        let mut out = String::new();
+        for line in text.lines() {
+            if line.starts_with("attempts: ") {
+                out.push_str(&format!("attempts: {attempts}\n"));
+                replaced = true;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        assert!(replaced, "no `attempts:` line in {text}");
+        std::fs::write(&path, out).expect("write task file");
+        let _ = std::fs::remove_file(self.root().join(".orchestry/tasks/_index.json"));
+    }
+
     /// Write a definition document inside the project and return its
     /// project-relative name.
     fn doc(&self, name: &str, text: &str) -> String {
@@ -194,11 +212,7 @@ impl Fx {
 
 /// `orch --json <args>` in `cwd`; the parsed stdout, or a failure with stderr.
 fn cli_json(cwd: &Path, args: &[&str]) -> Value {
-    let output = orch_command(cwd)
-        .arg("--json")
-        .args(args)
-        .output()
-        .expect("run orch");
+    let output = output_of(orch_command(cwd).arg("--json").args(args));
     assert!(
         output.status.success(),
         "orch --json {args:?} failed: {}{}",
@@ -477,6 +491,12 @@ fn task_retry_resets_a_failed_task_to_todo_with_zero_attempts() {
     let mut fx = Fx::new();
     let id = fx.task("t");
     fx.force_task(&id, "failed", None);
+    fx.force_attempts(&id, 2);
+    assert_eq!(
+        fx.cli(&["task", "show", &id])["attempts"],
+        2,
+        "the precondition: earlier runs used attempts up"
+    );
     let retried = fx.ok("task_retry", json!({"id": id}));
     assert_eq!(retried["status"], "todo");
     assert_eq!(retried["attempts"], 0);
@@ -1544,10 +1564,7 @@ fn status_rejects_an_argument_it_does_not_declare() {
 
 /// The JSON object of `orch doctor --json`, which prints a header first.
 fn cli_doctor_json(cwd: &Path) -> Value {
-    let output = orch_command(cwd)
-        .args(["--json", "doctor"])
-        .output()
-        .expect("run doctor");
+    let output = output_of(orch_command(cwd).args(["--json", "doctor"]));
     let text = String::from_utf8_lossy(&output.stdout);
     let start = text.find("{\n").expect("a JSON object in doctor output");
     serde_json::from_str(&text[start..]).expect("doctor JSON")
@@ -1775,8 +1792,7 @@ fn logs_has_no_follow_argument() {
 #[test]
 fn logs_of_an_unknown_run_is_an_empty_event_list() {
     let mut fx = Fx::new();
-    let response = fx.call("logs", json!({"run_id": "run_missing"}));
-    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(fx.ok("logs", json!({"run_id": "run_missing"})), json!([]));
 }
 
 // ── config ────────────────────────────────────────────────────────────────
@@ -1916,12 +1932,49 @@ fn remote_list_and_status_equal_the_cli_for_a_registered_peer() {
 }
 
 #[test]
-fn remote_list_and_status_of_a_project_with_no_peers_are_empty_without_opening_a_socket() {
+fn remote_list_and_status_of_a_project_with_no_peers_are_empty() {
     let mut fx = Fx::new();
     assert_eq!(fx.ok("remote_list", json!({})), json!([]));
     let status = fx.ok("remote_status", json!({}));
     assert_eq!(status["remotes"], json!([]));
     assert_eq!(status["listen"], Value::Null);
+}
+
+#[test]
+fn remote_list_and_status_read_the_registry_without_connecting_to_a_registered_peer() {
+    // The observer is a real listener standing in for the peer. A connection
+    // attempt on loopback is queued in its backlog as soon as it is made, so
+    // by the time the calls have returned an `accept` sees any dial.
+    let observer = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the observer");
+    observer
+        .set_nonblocking(true)
+        .expect("non-blocking observer");
+    let address = observer.local_addr().expect("observer address").to_string();
+    let mut fx = Fx::new();
+    fx.cli_plain(&["remote", "add", "peer", &address]);
+    assert_eq!(fx.ok("remote_list", json!({}))[0]["alias"], "peer");
+    assert_eq!(
+        fx.ok("remote_status", json!({}))["remotes"][0]["alias"],
+        "peer"
+    );
+    let dialled = observer.accept();
+    assert!(
+        matches!(&dialled, Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+        "the read-only remote tools dialled the registered peer: {dialled:?}"
+    );
+    // Control: the observer does see a connection when one is made.
+    let _probe = std::net::TcpStream::connect(&address).expect("connect to the observer");
+    assert!(
+        wait_for_accept(&observer),
+        "the observer cannot see connections, so the check above proves nothing"
+    );
+}
+
+/// Whether `listener` (non-blocking) accepts a connection within the harness
+/// deadline; the loopback handshake is complete before `connect` returns, so
+/// this normally succeeds on the first poll.
+fn wait_for_accept(listener: &std::net::TcpListener) -> bool {
+    mcp_common::wait_until(mcp_common::TIMEOUT, || listener.accept().is_ok())
 }
 
 #[test]
@@ -1940,7 +1993,13 @@ struct SharedAssignee {
     agent: String,
     g1: String,
     g2: String,
+    /// Autonomous, todo, in goal G2.
     autonomous_task: String,
+    /// Autonomous, todo, in the paused goal G1 itself.
+    autonomous_in_g1: String,
+    /// Autonomous, `retrying`, in goal G2.
+    retrying_autonomous_task: String,
+    /// Not autonomous, todo, in goal G2.
     plain_task: String,
 }
 
@@ -1953,15 +2012,28 @@ fn shared_assignee(fx: &mut Fx) -> SharedAssignee {
         "task_add",
         json!({"title": "auto", "labels": "autonomous", "assignee": agent, "goal_id": g2_id}),
     );
+    let g1_id = g1["id"].as_str().expect("id").to_owned();
+    let in_g1 = fx.ok(
+        "task_add",
+        json!({"title": "auto-g1", "labels": "autonomous", "assignee": agent, "goal_id": g1_id}),
+    );
+    let retrying = fx.ok(
+        "task_add",
+        json!({"title": "auto-retrying", "labels": "autonomous", "assignee": agent, "goal_id": g2_id}),
+    );
+    let retrying_id = retrying["id"].as_str().expect("id").to_owned();
+    fx.force_task(&retrying_id, "retrying", None);
     let plain = fx.ok(
         "task_add",
         json!({"title": "plain", "assignee": agent, "goal_id": g2_id}),
     );
     SharedAssignee {
         agent,
-        g1: g1["id"].as_str().expect("id").to_owned(),
+        g1: g1_id,
         g2: g2_id,
         autonomous_task: autonomous["id"].as_str().expect("id").to_owned(),
+        autonomous_in_g1: in_g1["id"].as_str().expect("id").to_owned(),
+        retrying_autonomous_task: retrying_id,
         plain_task: plain["id"].as_str().expect("id").to_owned(),
     }
 }
@@ -1976,10 +2048,13 @@ fn default_mode_refuses_pausing_a_goal_and_leaves_every_stored_file_untouched() 
     let message = response["error"]["message"].as_str().expect("message");
     assert!(message.contains("--allow-destructive"), "{message}");
     assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
-    assert_eq!(
-        fx.cli(&["task", "show", &s.autonomous_task])["status"],
-        "todo"
-    );
+    for (task, status) in [
+        (&s.autonomous_task, "todo"),
+        (&s.autonomous_in_g1, "todo"),
+        (&s.retrying_autonomous_task, "retrying"),
+    ] {
+        assert_eq!(fx.cli(&["task", "show", task])["status"], status, "{task}");
+    }
 }
 
 #[test]
@@ -2029,10 +2104,17 @@ fn allow_destructive_pausing_g1_also_cancels_the_autonomous_todo_task_of_goal_g2
     let s = shared_assignee(&mut fx);
     let paused = fx.ok("goal_status", json!({"id": s.g1, "status": "paused"}));
     assert_eq!(paused["status"], "paused");
-    assert_eq!(
-        fx.cli(&["task", "show", &s.autonomous_task])["status"],
-        "cancelled"
-    );
+    for task in [
+        &s.autonomous_task,
+        &s.autonomous_in_g1,
+        &s.retrying_autonomous_task,
+    ] {
+        assert_eq!(
+            fx.cli(&["task", "show", task])["status"],
+            "cancelled",
+            "{task}: the sweep covers todo and retrying autonomous tasks of both goals"
+        );
+    }
 }
 
 #[test]
@@ -2111,27 +2193,75 @@ fn every_mutating_tool_is_not_found_in_read_only_mode() {
 }
 
 #[test]
-fn read_only_mode_serves_every_read_tool() {
+fn read_only_mode_serves_every_read_tool_with_real_entities() {
+    // Entities are made through the CLI (a read-only server cannot create
+    // them), so every read below finds something and a tool that was
+    // registered but broken - or answered with a not-found error - fails.
     let mut fx = Fx::with(&["--read-only"], &[]);
-    let id = fx.task("t");
-    let arguments = |tool: &str| match tool {
-        "agent_show" => json!({"id": "agt_x"}),
-        "config_get" => json!({"key": "project.name"}),
-        "context_get" => json!({"key": "k"}),
-        "goal_show" => json!({"id": "goal_x"}),
-        "logs" => json!({"agent": "agt_x"}),
-        "msg_inbox" => json!({"agent_id": "agt_x"}),
-        "task_show" => json!({"id": id}),
-        "team_show" => json!({"id": "team_x"}),
-        _ => json!({}),
+    let agent = fx.agent("reader");
+    let task = fx.task("t");
+    let goal = fx.cli(&["goal", "add", "G"])["id"]
+        .as_str()
+        .expect("goal id")
+        .to_owned();
+    let team = fx.cli(&["team", "create", "crew", "--lead", &agent])["id"]
+        .as_str()
+        .expect("team id")
+        .to_owned();
+    fx.cli_plain(&["context", "set", "k", "v"]);
+    fx.cli_plain(&["msg", "send", &agent, "hello", "--from", "cli"]);
+    seed_run(
+        fx.root(),
+        "run_a",
+        &task,
+        &agent,
+        OLD,
+        Some(OLD),
+        &[OLD, OLD],
+    );
+
+    let mut covered: Vec<String> = Vec::new();
+    let mut read = |tool: &str, arguments: Value| -> Value {
+        covered.push(tool.to_owned());
+        fx.ok(tool, arguments)
     };
-    for tool in READ_ONLY {
-        let response = fx.call(tool, arguments(tool));
-        assert!(
-            response.get("error").is_none(),
-            "read tool {tool} must be served in --read-only: {response}"
-        );
-    }
+    assert_eq!(read("agent_show", json!({"id": agent}))["id"], json!(agent));
+    assert_eq!(read("agent_list", json!({}))[0]["id"], json!(agent));
+    assert_eq!(
+        read("config_get", json!({"key": "project.name"})),
+        json!({"key": "project.name", "value": "p"})
+    );
+    assert_eq!(read("context_get", json!({"key": "k"}))["value"], "v");
+    assert_eq!(read("context_list", json!({}))[0]["key"], "k");
+    assert!(read("doctor", json!({})).is_object());
+    assert_eq!(read("goal_show", json!({"id": goal}))["id"], json!(goal));
+    assert_eq!(read("goal_list", json!({}))[0]["id"], json!(goal));
+    assert_eq!(
+        read("logs", json!({"run_id": "run_a"}))
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        read("msg_inbox", json!({"agent_id": agent}))[0]["body"],
+        "hello"
+    );
+    assert_eq!(
+        read("msg_list", json!({"agent": agent}))[0]["body"],
+        "hello"
+    );
+    assert!(read("remote_list", json!({})).is_array());
+    assert!(read("remote_status", json!({})).is_object());
+    assert!(read("status", json!({})).is_object());
+    assert_eq!(read("task_show", json!({"id": task}))["id"], json!(task));
+    assert_eq!(read("task_list", json!({}))[0]["id"], json!(task));
+    assert_eq!(read("team_show", json!({"id": team}))["id"], json!(team));
+    assert_eq!(read("team_list", json!({}))[0]["id"], json!(team));
+    // The loop above is the whole read-only catalogue, no more and no fewer.
+    covered.sort();
+    let mut expected: Vec<String> = READ_ONLY.iter().map(|tool| (*tool).to_owned()).collect();
+    expected.sort();
+    assert_eq!(covered, expected);
 }
 
 #[test]
@@ -2211,13 +2341,57 @@ fn a_definition_over_one_mebibyte_is_a_tool_error_and_changes_nothing() {
     assert_eq!(fx.cli(&["task", "show", &id]), before);
 }
 
+/// `{"<key>": [[...[1]...]]}` with `levels` nested arrays. The root object is
+/// level 0 and the array under `key` level 1, so the scalar sits at depth
+/// `levels + 1`; the server allows scalars down to depth 64.
+fn nested_document(key: &str, levels: usize) -> String {
+    format!(
+        r#"{{"{key}": {}1{}}}"#,
+        "[".repeat(levels),
+        "]".repeat(levels)
+    )
+}
+
+/// The wording only the depth guard produces (`document_input::parse_json`).
+const DEPTH_REFUSAL: &str = "depth <= 64";
+
 #[test]
-fn a_definition_nested_deeper_than_sixty_four_levels_is_a_tool_error() {
+fn a_definition_nested_deeper_than_sixty_four_levels_is_refused_for_its_depth_and_changes_nothing()
+{
     let mut fx = Fx::new();
     let id = fx.task("t");
-    let deep = format!(r#"{{"labels": {}1{}}}"#, "[".repeat(65), "]".repeat(65));
-    let file = fx.doc("deep.json", &deep);
-    fx.tool_error("task_patch", json!({"id": id, "file": file}));
+    let before = snapshot(&fx.root().join(".orchestry"));
+    // `labels` is a flat list of strings, so this document is invalid for
+    // other reasons too: only the depth wording proves the depth guard ran.
+    let file = fx.doc("deep.json", &nested_document("labels", 65));
+    let message = fx.tool_error("task_patch", json!({"id": id, "file": file}));
+    assert!(message.contains(DEPTH_REFUSAL), "{message}");
+    assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
+}
+
+#[test]
+fn a_config_extension_one_level_past_the_depth_limit_is_refused_for_its_depth_and_changes_nothing()
+{
+    // A document that is valid at every depth the guard allows (config keeps
+    // unknown extensions verbatim), so the depth is the only thing wrong.
+    let mut fx = Fx::new();
+    let before = snapshot(&fx.root().join(".orchestry"));
+    let file = fx.doc("too-deep.json", &nested_document("x_ext", 64));
+    let message = fx.tool_error("config_patch", json!({"file": file}));
+    assert!(message.contains(DEPTH_REFUSAL), "{message}");
+    assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
+}
+
+#[test]
+fn a_config_extension_nested_exactly_to_the_depth_limit_is_accepted_and_stored() {
+    // The boundary control for the refusal above: one level shallower passes,
+    // so the guard is "deeper than 64", not "nested at all".
+    let mut fx = Fx::new();
+    let file = fx.doc("at-limit.json", &nested_document("x_ext", 63));
+    fx.ok("config_patch", json!({"file": file}));
+    let stored =
+        std::fs::read_to_string(fx.root().join(".orchestry/config.yml")).expect("read the config");
+    assert!(stored.contains("x_ext"), "{stored}");
 }
 
 #[test]
@@ -2380,19 +2554,29 @@ fn an_external_default_agent_edit_is_seen_by_the_next_agent_add() {
 
 // ── concurrency and recovery evidence (decision-2 E2) ─────────────────────
 
+/// How long a test waits for a helper thread. Longer than the 90 s `orch run`
+/// deadline plus its own CLI calls, so a hung worker is reported by its own
+/// deadline first and this only catches a thread that never returns.
+const WORKER_JOIN_LIMIT: Duration = Duration::from_secs(150);
+
 #[test]
 fn two_servers_creating_distinct_tasks_at_once_both_keep_every_index_entry() {
     const PER_SERVER: usize = 8;
     let dir = initialized_project();
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    // A cancelable rendezvous: a creator that fails before arriving releases
+    // its peer with an error instead of leaving it waiting forever.
+    let rendezvous = Rendezvous::new(2);
     let workers: Vec<_> = (0..2)
         .map(|worker| {
             let root = dir.path().to_owned();
-            let barrier = std::sync::Arc::clone(&barrier);
-            std::thread::spawn(move || {
+            let rendezvous = std::sync::Arc::clone(&rendezvous);
+            spawn_bounded("a task-creating server thread", move || {
+                let _participant = rendezvous.participant();
                 let mut server = McpServer::spawn(&root);
                 server.initialize();
-                barrier.wait();
+                rendezvous
+                    .arrive(mcp_common::TIMEOUT)
+                    .expect("both servers start creating together");
                 (0..PER_SERVER)
                     .map(|n| {
                         let response = server
@@ -2407,7 +2591,7 @@ fn two_servers_creating_distinct_tasks_at_once_both_keep_every_index_entry() {
         .collect();
     let mut created: Vec<String> = workers
         .into_iter()
-        .flat_map(|worker| worker.join().expect("worker thread"))
+        .flat_map(|worker| worker.join(WORKER_JOIN_LIMIT))
         .collect();
     created.sort();
     let index: Value = serde_json::from_str(
@@ -2510,14 +2694,18 @@ fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
 fn git_project(name: &str) -> tempfile::TempDir {
     let dir = initialized_project_named(name);
     let git = |args: &[&str]| {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir.path())
-            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("run git");
+        // The fixture's own private HOME and the system directories only: no
+        // developer-machine PATH entry, no inherited user git config.
+        let output = output_of(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env_clear()
+                .env("HOME", dir.path().join(".test-home"))
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1"),
+        );
         assert!(
             output.status.success(),
             "git {args:?}: {}",
@@ -2659,12 +2847,13 @@ fn run_worker(project: &Path, mode: &str, title: &str, launch: Launch<'_>) -> (W
         .to_owned();
 
     let log = out.path().join("run.log");
+    // `orch_command`'s PATH (`/usr/bin:/bin`) stays: the worker, git and the
+    // worker's MCP child all see the system directories and nothing else.
     let status = run_with_deadline(
         orch_command(project)
             .args(["run", &task])
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+            .env("GIT_CONFIG_NOSYSTEM", "1"),
         &log,
         Duration::from_secs(90),
     );
@@ -2693,23 +2882,23 @@ fn run_worker(project: &Path, mode: &str, title: &str, launch: Launch<'_>) -> (W
 }
 
 /// Run `command` to completion within `limit`, output going to `log`; true on
-/// a zero exit. A process that overruns is killed.
+/// a zero exit. The command leads its own process group, and one that overruns
+/// is killed together with every descendant (the worker script, its `orch mcp`
+/// child, whatever they started), then reaped.
 fn run_with_deadline(command: &mut std::process::Command, log: &Path, limit: Duration) -> bool {
     let sink = std::fs::File::create(log).expect("log file");
-    let mut child = command
+    mcp_common::own_process_group(command)
         .stdin(Stdio::null())
         .stdout(sink.try_clone().expect("clone log"))
-        .stderr(sink)
-        .spawn()
-        .expect("spawn orch run");
+        .stderr(sink);
+    let mut child = command.spawn().expect("spawn orch run");
     let deadline = Instant::now() + limit;
     loop {
         if let Some(status) = child.try_wait().expect("poll orch run") {
             return status.success();
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            mcp_common::kill_and_reap(&mut child);
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -2806,10 +2995,14 @@ fn worker_pair(mode: &str) {
     let (a_path, b_path) = (a.path().to_owned(), b.path().to_owned());
     let (mode_a, mode_b) = (mode.to_owned(), mode.to_owned());
     let (ta, tb) = (title_a.clone(), title_b.clone());
-    let worker_a = std::thread::spawn(move || run_worker(&a_path, &mode_a, &ta, FORWARDING));
-    let worker_b = std::thread::spawn(move || run_worker(&b_path, &mode_b, &tb, FORWARDING));
-    let (run_a, agent_a) = worker_a.join().expect("worker A");
-    let (run_b, agent_b) = worker_b.join().expect("worker B");
+    let worker_a = spawn_bounded("worker A", move || {
+        run_worker(&a_path, &mode_a, &ta, FORWARDING)
+    });
+    let worker_b = spawn_bounded("worker B", move || {
+        run_worker(&b_path, &mode_b, &tb, FORWARDING)
+    });
+    let (run_a, agent_a) = worker_a.join(WORKER_JOIN_LIMIT);
+    let (run_b, agent_b) = worker_b.join(WORKER_JOIN_LIMIT);
     assert_ne!(agent_a, agent_b);
     assert_worker_served_its_project(&run_a, &agent_a, a.path(), "proj-a", mode, &title_a);
     assert_worker_served_its_project(&run_b, &agent_b, b.path(), "proj-b", mode, &title_b);
@@ -2895,6 +3088,113 @@ fn a_registration_pinned_to_project_a_makes_a_worker_in_b_write_into_a() {
     assert!(!task_titles(b.path()).contains(&"pinned-wrongly".to_owned()));
 }
 
+// ── harness self-checks (the deadlines every fixture relies on) ───────────
+
+#[test]
+fn a_fixture_command_that_overruns_is_killed_with_every_descendant() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pid_file = dir.path().join("descendant.pid");
+    let script = format!("sleep 300 & echo $! > '{}'; wait", pid_file.display());
+    let limit = Duration::from_secs(3);
+    let run = spawn_bounded("the overrunning command", move || {
+        output_within_for_test(&script, limit)
+    });
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || pid_file.exists()
+            && std::fs::read_to_string(&pid_file).is_ok_and(|text| !text.trim().is_empty())),
+        "the command never started its descendant"
+    );
+    let descendant: u32 = std::fs::read_to_string(&pid_file)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    assert!(mcp_common::StallingAdapters::alive(descendant));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run.join(Duration::from_secs(30))
+    }));
+    let panic = outcome.expect_err("an overrun must fail the test, not return");
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(message.contains("did not finish within"), "{message}");
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || {
+            !mcp_common::StallingAdapters::alive(descendant)
+        }),
+        "the descendant of the overrunning command survived the timeout"
+    );
+}
+
+fn output_within_for_test(script: &str, limit: Duration) -> std::process::Output {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", script]);
+    mcp_common::output_within(&mut command, limit)
+}
+
+#[test]
+fn a_fixture_command_that_finishes_returns_its_status_and_output() {
+    let output = output_within_for_test("echo out; echo err >&2; exit 3", mcp_common::CLI_TIMEOUT);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.stdout, b"out\n");
+    assert_eq!(output.stderr, b"err\n");
+}
+
+#[test]
+fn a_rendezvous_is_released_with_an_error_when_a_peer_fails_before_arriving() {
+    let rendezvous = Rendezvous::new(2);
+    let waiting = {
+        let rendezvous = std::sync::Arc::clone(&rendezvous);
+        spawn_bounded("the waiting peer", move || {
+            rendezvous.arrive(Duration::from_secs(60))
+        })
+    };
+    let failing = {
+        let rendezvous = std::sync::Arc::clone(&rendezvous);
+        spawn_bounded("the failing peer", move || {
+            let _participant = rendezvous.participant();
+            panic!("the creator failed before reaching the rendezvous");
+        })
+    };
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        failing.join(Duration::from_secs(30))
+    }));
+    assert!(failure.is_err());
+    // Released by the cancellation, long before its own 60 s deadline.
+    let released = waiting.join(Duration::from_secs(30));
+    assert!(
+        released.is_err_and(|reason| reason.contains("cancelled")),
+        "the waiting peer must be told the rendezvous was cancelled"
+    );
+}
+
+#[test]
+fn a_rendezvous_of_two_parties_releases_both_when_both_arrive() {
+    let rendezvous = Rendezvous::new(2);
+    let peer = {
+        let rendezvous = std::sync::Arc::clone(&rendezvous);
+        spawn_bounded("the peer", move || rendezvous.arrive(mcp_common::TIMEOUT))
+    };
+    assert_eq!(rendezvous.arrive(mcp_common::TIMEOUT), Ok(()));
+    assert_eq!(peer.join(Duration::from_secs(30)), Ok(()));
+}
+
+#[test]
+fn a_bounded_join_fails_instead_of_waiting_for_a_thread_that_never_returns() {
+    let (release, hold) = std::sync::mpsc::channel::<()>();
+    let stuck = spawn_bounded("a stuck helper", move || {
+        let _ = hold.recv();
+    });
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stuck.join(Duration::from_millis(100))
+    }));
+    let panic = outcome.expect_err("the join must time out");
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        message.contains("a stuck helper did not finish"),
+        "{message}"
+    );
+    drop(release);
+}
+
 // ── tools/list size per mode (design D20) ─────────────────────────────────
 
 /// The serialized bytes of the `tools/list` result of a mode: the JSON-RPC
@@ -2931,23 +3231,202 @@ fn tools_list_sizes_are_reported_for_all_three_modes() {
 
 // ── a negative call for every tool ────────────────────────────────────────
 
-#[test]
-fn every_one_of_the_fifty_tools_refuses_an_undeclared_argument_and_changes_nothing() {
-    let mut fx = Fx::destructive();
-    let before = snapshot(&fx.root().join(".orchestry"));
+/// Entities every tool of the catalogue can be pointed at.
+struct Catalogue {
+    agent: String,
+    spare_agent: String,
+    task: String,
+    spare_task: String,
+    goal: String,
+    spare_goal: String,
+    team: String,
+    spare_team: String,
+}
+
+/// An otherwise valid `arguments` object for each of the 50 tools, typed out
+/// from the CLI (never read from the registry): every required field present
+/// and well-typed, naming entities that exist. Panics for an unlisted tool, so
+/// a tool added to the catalogue cannot slip past the loops that use this.
+fn valid_arguments(tool: &str, c: &Catalogue) -> Value {
+    match tool {
+        "agent_add" => json!({"name": "added", "adapter": "shell", "command": "true"}),
+        "agent_autonomous" => json!({"id": c.agent, "on": true}),
+        "agent_disable" | "agent_enable" | "agent_show" => json!({"id": c.agent}),
+        "agent_list" | "context_list" | "doctor" | "goal_list" | "msg_list" | "remote_list"
+        | "remote_status" | "status" | "task_list" | "team_list" => json!({}),
+        "agent_patch" | "task_patch" | "task_update" => {
+            json!({"id": if tool == "agent_patch" { &c.agent } else { &c.task }, "file": "def.json"})
+        }
+        "agent_remove" => json!({"id": c.spare_agent}),
+        "agent_update" => json!({"id": c.agent, "role_summary": "r"}),
+        "config_get" => json!({"key": "project.name"}),
+        "config_patch" => json!({"file": "def.json"}),
+        "config_set" => json!({"key": "defaults.task.priority", "value": "2"}),
+        "config_update" => json!({"file": "config.yml"}),
+        "context_delete" | "context_get" => json!({"key": "k"}),
+        "context_set" => json!({"key": "k2", "value": "v"}),
+        "goal_add" => json!({"title": "added"}),
+        "goal_delete" => json!({"id": c.spare_goal}),
+        "goal_show" => json!({"id": c.goal}),
+        "goal_status" => json!({"id": c.goal, "status": "abandoned"}),
+        "goal_update" => json!({"id": c.goal, "title": "renamed"}),
+        "logs" => json!({"agent": c.agent}),
+        "msg_broadcast" => json!({"body": "hello", "from": c.spare_agent}),
+        "msg_inbox" => json!({"agent_id": c.agent}),
+        "msg_send" => json!({"to_agent_id": c.agent, "body": "hello", "from": c.spare_agent}),
+        "task_add" => json!({"title": "added"}),
+        "task_approve" | "task_reject" | "task_retry" | "task_show" => json!({"id": c.task}),
+        "task_assign" => json!({"task_id": c.task, "agent_id": c.agent}),
+        "task_cancel" => json!({"id": c.spare_task}),
+        "team_add_task" => json!({"team_id": c.team, "task_id": c.task}),
+        "team_create" => json!({"name": "added", "lead": c.agent}),
+        "team_disband" => json!({"id": c.spare_team}),
+        "team_join" | "team_leave" | "team_set_lead" => {
+            json!({"team_id": c.team, "agent_id": c.spare_agent})
+        }
+        "team_show" => json!({"id": c.team}),
+        other => panic!("no valid arguments are typed out for the tool `{other}`"),
+    }
+}
+
+/// A destructive server holding one of everything, plus the files the
+/// file-taking tools point at.
+fn catalogue_fixture() -> (Fx, Catalogue) {
+    let fx = Fx::destructive();
+    let agent = fx.agent("first");
+    let spare_agent = fx.agent("spare");
+    let task = fx.task("t");
+    let spare_task = fx.task("spare");
+    let id_of = |value: Value| value["id"].as_str().expect("id").to_owned();
+    let goal = id_of(fx.cli(&["goal", "add", "G"]));
+    let spare_goal = id_of(fx.cli(&["goal", "add", "spare"]));
+    let team = id_of(fx.cli(&["team", "create", "crew", "--lead", &agent]));
+    let spare_team = id_of(fx.cli(&["team", "create", "spare", "--lead", &agent]));
+    fx.cli_plain(&["context", "set", "k", "v"]);
+    fx.doc("def.json", "{}");
+    let config = std::fs::read_to_string(fx.root().join(".orchestry/config.yml")).expect("config");
+    fx.doc("config.yml", &config);
+    let catalogue = Catalogue {
+        agent,
+        spare_agent,
+        task,
+        spare_task,
+        goal,
+        spare_goal,
+        team,
+        spare_team,
+    };
+    (fx, catalogue)
+}
+
+fn all_fifty_tools() -> Vec<&'static str> {
     let tools: Vec<&str> = EXPECTED.iter().chain(DESTRUCTIVE).copied().collect();
     assert_eq!(tools.len(), 50);
-    for tool in tools {
-        // Required arguments are deliberately missing too: unknown fields and
-        // missing fields are both refused before any service is entered.
-        let response = fx.rpc_error(tool, json!({"undeclared_argument_for_the_test": 1}));
+    tools
+}
+
+#[test]
+fn every_one_of_the_fifty_tools_refuses_an_undeclared_field_naming_it_and_changes_nothing() {
+    const EXTRA: &str = "undeclared_argument_for_the_test";
+    let (mut fx, catalogue) = catalogue_fixture();
+    let before = snapshot(&fx.root().join(".orchestry"));
+    for tool in all_fifty_tools() {
+        // Everything the tool needs is present and valid; the undeclared field
+        // is the only thing wrong, so only the field check can refuse it.
+        let mut arguments = valid_arguments(tool, &catalogue);
+        arguments[EXTRA] = json!(1);
+        let response = fx.rpc_error(tool, arguments.clone());
         assert_eq!(error_code(&response), Some(-32602), "{tool}: {response}");
+        let message = response["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains(EXTRA),
+            "{tool} must refuse for the undeclared field: {response}"
+        );
+        assert!(
+            !message.contains("missing field"),
+            "{tool}: the arguments were meant to be complete: {response}"
+        );
     }
     assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
     assert!(
         fx.ok("status", json!({})).is_object(),
         "the session survives all of them"
     );
+}
+
+#[test]
+fn the_typed_out_arguments_of_all_fifty_tools_pass_argument_validation() {
+    // The control for the test above: without the undeclared field the same
+    // arguments are accepted by argument validation (a tool-level error such
+    // as "already a member" is fine - only a protocol error would mean the
+    // arguments were malformed and the test above proved nothing).
+    let (mut fx, catalogue) = catalogue_fixture();
+    for tool in all_fifty_tools() {
+        let arguments = valid_arguments(tool, &catalogue);
+        let response = fx.call(tool, arguments.clone());
+        assert!(
+            response.get("error").is_none(),
+            "{tool} {arguments}: the typed-out arguments are not valid: {response}"
+        );
+    }
+}
+
+#[test]
+fn every_tool_with_required_arguments_refuses_their_absence_naming_the_field() {
+    // Kept apart from the undeclared-field loop so each failure has one cause.
+    let required: &[(&str, &str)] = &[
+        ("agent_add", "name"),
+        ("agent_autonomous", "id"),
+        ("agent_disable", "id"),
+        ("agent_enable", "id"),
+        ("agent_patch", "id"),
+        ("agent_remove", "id"),
+        ("agent_show", "id"),
+        ("agent_update", "id"),
+        ("config_get", "key"),
+        ("config_patch", "file"),
+        ("config_set", "key"),
+        ("config_update", "file"),
+        ("context_delete", "key"),
+        ("context_get", "key"),
+        ("context_set", "key"),
+        ("goal_add", "title"),
+        ("goal_delete", "id"),
+        ("goal_show", "id"),
+        ("goal_status", "id"),
+        ("goal_update", "id"),
+        ("msg_broadcast", "body"),
+        ("msg_send", "to_agent_id"),
+        ("task_add", "title"),
+        ("task_approve", "id"),
+        ("task_assign", "task_id"),
+        ("task_cancel", "id"),
+        ("task_patch", "id"),
+        ("task_reject", "id"),
+        ("task_retry", "id"),
+        ("task_show", "id"),
+        ("task_update", "id"),
+        ("team_add_task", "team_id"),
+        ("team_create", "name"),
+        ("team_disband", "id"),
+        ("team_join", "team_id"),
+        ("team_leave", "team_id"),
+        ("team_set_lead", "team_id"),
+        ("team_show", "id"),
+    ];
+    let (mut fx, _) = catalogue_fixture();
+    let before = snapshot(&fx.root().join(".orchestry"));
+    for (tool, field) in required {
+        let response = fx.rpc_error(tool, json!({}));
+        assert_eq!(error_code(&response), Some(-32602), "{tool}: {response}");
+        let message = response["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains(&format!("missing field `{field}`")),
+            "{tool}: {response}"
+        );
+    }
+    assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
+    assert!(fx.ok("status", json!({})).is_object());
 }
 
 #[test]

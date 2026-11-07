@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,242 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// The previous revision, which the server must keep accepting (design D21).
 pub const LEGACY_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Deadline for a one-shot CLI invocation the fixtures make (`orch init`,
+/// `orch --json task add`, `mkfifo`, ...). Generous: they share the machine
+/// with every other test thread, but finite, so a CLI regression fails a test
+/// instead of hanging CI.
+pub const CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ── bounded blocking operations ───────────────────────────────────────────
+//
+// Nothing a fixture does may block without a deadline: a child that stops
+// reading its stdin, a CLI that never returns, a peer thread that panicked
+// before a rendezvous. Each helper below turns "waits forever" into a panic
+// that says what it was waiting for.
+
+/// SIGKILL the whole process group led by `leader`. Used only on failure or
+/// timeout paths, before the leader is reaped, so the pgid cannot have been
+/// recycled; children are spawned with their own group (`process_group(0)`).
+#[cfg(unix)]
+fn kill_group(leader: u32) {
+    if let Ok(pid) = i32::try_from(leader) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
+/// Put the child in a process group of its own, so a timeout can kill it and
+/// every descendant it started.
+#[cfg(unix)]
+pub fn own_process_group(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0)
+}
+
+/// Kill `child` and its whole process group, then reap it.
+pub fn kill_and_reap(child: &mut Child) {
+    #[cfg(unix)]
+    kill_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A background thread whose completion can be awaited with a deadline.
+pub struct Worker {
+    handle: JoinHandle<()>,
+    done: Receiver<()>,
+}
+
+impl Worker {
+    pub fn spawn(work: impl FnOnce() + Send + 'static) -> Self {
+        let (finished, done) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            work();
+            let _ = finished.send(());
+        });
+        Self { handle, done }
+    }
+
+    /// Whether the thread finished within `limit`. A thread that did not is
+    /// left detached rather than joined, because joining is what blocks.
+    pub fn finish_within(self, limit: Duration) -> bool {
+        match self.done.recv_timeout(limit) {
+            Err(RecvTimeoutError::Timeout) => false,
+            // Finished, or died by panicking; either way it is over.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let _ = self.handle.join();
+                true
+            }
+        }
+    }
+}
+
+/// A thread that returns a value, joined with a deadline. A panic in the
+/// thread is re-raised in the joiner, like `JoinHandle::join().unwrap()`.
+pub struct Bounded<T> {
+    result: Receiver<thread::Result<T>>,
+    what: String,
+}
+
+/// Run `work` on a thread; [`Bounded::join`] collects it within a limit.
+pub fn spawn_bounded<T: Send + 'static>(
+    what: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Bounded<T> {
+    let (sender, result) = mpsc::channel();
+    thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        let _ = sender.send(outcome);
+    });
+    Bounded {
+        result,
+        what: what.to_owned(),
+    }
+}
+
+impl<T> Bounded<T> {
+    pub fn join(self, limit: Duration) -> T {
+        match self.result.recv_timeout(limit) {
+            Ok(Ok(value)) => value,
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(_) => panic!("{} did not finish within {limit:?}", self.what),
+        }
+    }
+}
+
+/// A rendezvous of `parties` threads that a failing participant can cancel, so
+/// its peers fail fast instead of waiting forever (`std::sync::Barrier` cannot
+/// be cancelled). Every wait also has a deadline.
+pub struct Rendezvous {
+    parties: usize,
+    state: Mutex<(usize, bool)>,
+    changed: Condvar,
+}
+
+impl Rendezvous {
+    pub fn new(parties: usize) -> Arc<Self> {
+        Arc::new(Self {
+            parties,
+            state: Mutex::new((0, false)),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// A guard to hold for the participant's whole life: if it unwinds before
+    /// (or without) arriving, the rendezvous is cancelled for everyone.
+    pub fn participant(self: &Arc<Self>) -> Participant {
+        Participant {
+            rendezvous: Arc::clone(self),
+        }
+    }
+
+    /// Arrive and wait for every party. `Err` when cancelled or timed out.
+    pub fn arrive(&self, limit: Duration) -> Result<(), &'static str> {
+        let mut state = self.state.lock().expect("rendezvous lock");
+        state.0 += 1;
+        self.changed.notify_all();
+        let deadline = Instant::now() + limit;
+        while state.0 < self.parties {
+            if state.1 {
+                return Err("the rendezvous was cancelled by a failed peer");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("the rendezvous timed out waiting for a peer");
+            }
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("rendezvous wait")
+                .0;
+        }
+        Ok(())
+    }
+
+    fn cancel(&self) {
+        self.state.lock().expect("rendezvous lock").1 = true;
+        self.changed.notify_all();
+    }
+}
+
+/// See [`Rendezvous::participant`].
+pub struct Participant {
+    rendezvous: Arc<Rendezvous>,
+}
+
+impl Drop for Participant {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.rendezvous.cancel();
+        }
+    }
+}
+
+/// Run `command` to completion within `limit` and capture its output, like
+/// `Command::output` but bounded: the child leads its own process group and,
+/// on a timeout, that whole group is killed and reaped before this panics.
+pub fn output_within(command: &mut Command, limit: Duration) -> Output {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    own_process_group(command);
+    let described = format!("{command:?}");
+    let mut child = command.spawn().expect("spawn a fixture command");
+    let collect = |mut pipe: Box<dyn Read + Send>| {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bytes);
+        let worker = Worker::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = pipe.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                sink.lock()
+                    .expect("capture lock")
+                    .extend_from_slice(&chunk[..read]);
+            }
+        });
+        (bytes, worker)
+    };
+    let (stdout, stdout_worker) = collect(Box::new(child.stdout.take().expect("piped stdout")));
+    let (stderr, stderr_worker) = collect(Box::new(child.stderr.take().expect("piped stderr")));
+
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll a fixture command") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            kill_and_reap(&mut child);
+            panic!("{described} did not finish within {limit:?}; its process group was killed");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    // The pipes close with the command; if a descendant still holds them, it
+    // outlived its parent: kill the group (it still has members) and fail.
+    let drained = stdout_worker.finish_within(TIMEOUT) & stderr_worker.finish_within(TIMEOUT);
+    if !drained {
+        #[cfg(unix)]
+        kill_group(child.id());
+        panic!("{described} exited but left a descendant holding its output pipes");
+    }
+    let take = |bytes: Arc<Mutex<Vec<u8>>>| std::mem::take(&mut *bytes.lock().expect("capture"));
+    Output {
+        status,
+        stdout: take(stdout),
+        stderr: take(stderr),
+    }
+}
+
+/// [`output_within`] with the fixtures' standard [`CLI_TIMEOUT`].
+pub fn output_of(command: &mut Command) -> Output {
+    output_within(command, CLI_TIMEOUT)
+}
 
 /// Tool names the default mode must list, sorted, no more and no fewer
 /// (design-v2 §9, "Exact EXPECTED list for mcp_stdio.rs"). This is an
@@ -139,10 +375,8 @@ pub fn initialized_project() -> tempfile::TempDir {
 /// [`initialized_project`] with a chosen project name, to tell two apart.
 pub fn initialized_project_named(name: &str) -> tempfile::TempDir {
     let dir = empty_project();
-    let output = orch_command(dir.path())
-        .args(["init", "--name", name, "--adapter", "shell"])
-        .output()
-        .expect("run `orch init`");
+    let output =
+        output_of(orch_command(dir.path()).args(["init", "--name", name, "--adapter", "shell"]));
     assert!(
         output.status.success(),
         "`orch init` failed: {}",
@@ -183,10 +417,15 @@ pub struct Exit {
 /// A running `orch mcp` and the channels reading its output.
 pub struct McpServer {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// Lines for the writer thread; `None` once stdin is closed. Writes never
+    /// run on the test thread, so a server that stops reading cannot block it.
+    stdin: Option<Sender<Vec<u8>>>,
+    /// Why the writer thread gave up, if it did (a broken pipe: the server is gone).
+    write_failure: Arc<Mutex<Option<String>>>,
     frames: Receiver<String>,
     stderr: Arc<Mutex<String>>,
-    readers: Vec<JoinHandle<()>>,
+    /// The two output readers and the stdin writer.
+    threads: Vec<Worker>,
     seen: Vec<String>,
     /// Responses that arrived while another id was being waited for.
     pending: HashMap<u64, Value>,
@@ -214,6 +453,10 @@ impl McpServer {
                 None => command.env_remove(key),
             };
         }
+        // Its own process group, so a failed test can kill the server and
+        // everything it started (a probe, an adapter) in one go.
+        #[cfg(unix)]
+        own_process_group(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -221,13 +464,13 @@ impl McpServer {
             .spawn()
             .expect("spawn `orch mcp`");
 
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let mut stderr_pipe = child.stderr.take().expect("piped stderr");
 
         // Reads happen on threads so the test thread can put a deadline on them.
         let (sender, frames) = mpsc::channel();
-        let stdout_reader = thread::spawn(move || {
+        let stdout_reader = Worker::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if sender.send(line).is_err() {
@@ -237,7 +480,7 @@ impl McpServer {
         });
         let stderr = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&stderr);
-        let stderr_reader = thread::spawn(move || {
+        let stderr_reader = Worker::spawn(move || {
             let mut chunk = [0_u8; 4096];
             while let Ok(read) = stderr_pipe.read(&mut chunk) {
                 if read == 0 {
@@ -249,12 +492,28 @@ impl McpServer {
             }
         });
 
+        // Writes happen on a thread too: a full pipe blocks the writer, never
+        // the test, and a dead server surfaces as a recorded failure.
+        let (lines, queued) = mpsc::channel::<Vec<u8>>();
+        let write_failure = Arc::new(Mutex::new(None));
+        let failure = Arc::clone(&write_failure);
+        let writer = Worker::spawn(move || {
+            while let Ok(bytes) = queued.recv() {
+                if let Err(err) = stdin.write_all(&bytes).and_then(|()| stdin.flush()) {
+                    *failure.lock().expect("write failure lock") = Some(err.to_string());
+                    break;
+                }
+            }
+            // Dropping `stdin` here is the EOF the server sees.
+        });
+
         Self {
             child,
-            stdin,
+            stdin: Some(lines),
+            write_failure,
             frames,
             stderr,
-            readers: vec![stdout_reader, stderr_reader],
+            threads: vec![stdout_reader, stderr_reader, writer],
             seen: Vec::new(),
             pending: HashMap::new(),
             next_id: 1,
@@ -270,13 +529,21 @@ impl McpServer {
     pub fn send(&mut self, message: &Value) {
         let mut line = serde_json::to_string(message).expect("serialise request");
         line.push('\n');
-        let stdin = self.stdin.as_mut().expect("stdin already closed");
-        let written = stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush());
-        if let Err(err) = written {
+        self.write_bytes(line.into_bytes());
+    }
+
+    /// Queue bytes for the writer thread; panics if an earlier write failed.
+    fn write_bytes(&mut self, bytes: Vec<u8>) {
+        let failure = self
+            .write_failure
+            .lock()
+            .expect("write failure lock")
+            .clone();
+        let queued = self.stdin.as_ref().expect("stdin already closed");
+        if failure.is_some() || queued.send(bytes).is_err() {
             panic!(
-                "could not write to the server ({err}); it has probably exited. stderr: {}",
+                "could not write to the server ({}); it has probably exited. stderr: {}",
+                failure.unwrap_or_else(|| "the writer stopped".to_owned()),
                 self.stderr()
             );
         }
@@ -330,11 +597,7 @@ impl McpServer {
 
     /// Write `line` plus a newline verbatim (for malformed-input cases).
     pub fn send_raw_line(&mut self, line: &str) {
-        let stdin = self.stdin.as_mut().expect("stdin already closed");
-        let written = stdin
-            .write_all(format!("{line}\n").as_bytes())
-            .and_then(|()| stdin.flush());
-        written.expect("write a raw line to the server");
+        self.write_bytes(format!("{line}\n").into_bytes());
     }
 
     pub fn notify(&mut self, method: &str, params: Value) {
@@ -412,9 +675,10 @@ impl McpServer {
                 line
             }
             Err(RecvTimeoutError::Timeout) => panic!(
-                "timed out after {TIMEOUT:?} waiting for {waiting_for}. stdout so far: {:?}; stderr: {}",
+                "timed out after {TIMEOUT:?} waiting for {waiting_for}. stdout so far: {:?}; stderr: {}; write failure: {:?}",
                 self.seen,
-                self.stderr()
+                self.stderr(),
+                self.write_failure.lock().expect("write failure lock")
             ),
             Err(RecvTimeoutError::Disconnected) => panic!(
                 "the server closed stdout before {waiting_for}. stdout so far: {:?}; stderr: {}",
@@ -439,8 +703,7 @@ impl McpServer {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                kill_and_reap(&mut self.child);
                 panic!(
                     "the server did not exit within {SHUTDOWN_TIMEOUT:?}. stdout: {:?}; stderr: {}",
                     self.seen,
@@ -450,9 +713,24 @@ impl McpServer {
             thread::sleep(Duration::from_millis(10));
         };
 
-        // The pipes close with the process, so the readers finish promptly.
-        for reader in self.readers.drain(..) {
-            let _ = reader.join();
+        // The pipes close with the process, so the threads finish promptly. A
+        // descendant that outlived the server and still holds a pipe keeps a
+        // reader alive: that is a leak, so kill its group and fail loudly
+        // instead of blocking until the descendant happens to exit.
+        self.stdin = None; // the server is gone; let the writer thread end
+        let mut stuck = 0;
+        for thread in self.threads.drain(..) {
+            if !thread.finish_within(TIMEOUT) {
+                stuck += 1;
+            }
+        }
+        if stuck > 0 {
+            #[cfg(unix)]
+            kill_group(self.child.id());
+            panic!(
+                "{stuck} of the server's pipe threads outlived it for {TIMEOUT:?}: a descendant still holds its pipes. stderr: {}",
+                self.stderr()
+            );
         }
         let mut stdout_lines = std::mem::take(&mut self.seen);
         stdout_lines.extend(self.frames.try_iter());
@@ -473,9 +751,12 @@ impl McpServer {
 impl Drop for McpServer {
     /// Never leave a server behind when an assertion fails mid-test.
     fn drop(&mut self) {
+        // Let the writer finish; only a server still running is killed (with
+        // its process group). One that already exited and was reaped is left
+        // alone, so a test can still look for descendants it leaked.
+        self.stdin = None;
         if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            kill_and_reap(&mut self.child);
         }
     }
 }
@@ -524,7 +805,7 @@ pub struct ConfigStall {
     real: std::path::PathBuf,
     fifo: std::path::PathBuf,
     content: Vec<u8>,
-    writer: Option<JoinHandle<()>>,
+    writer: Option<Worker>,
 }
 
 #[cfg(unix)]
@@ -538,11 +819,8 @@ impl ConfigStall {
         let fifo = dir.join("config.fifo");
         let content = std::fs::read(&config).expect("read config.yml");
         std::fs::rename(&config, &real).expect("move the real config aside");
-        let made = Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("run mkfifo");
-        assert!(made.success(), "mkfifo failed");
+        let made = output_of(Command::new("mkfifo").arg(&fifo));
+        assert!(made.status.success(), "mkfifo failed");
         std::fs::hard_link(&fifo, &config).expect("link the fifo as config.yml");
         Self {
             config,
@@ -558,7 +836,7 @@ impl ConfigStall {
     pub fn release(&mut self) {
         std::fs::rename(&self.real, &self.config).expect("restore the real config");
         let (fifo, content) = (self.fifo.clone(), self.content.clone());
-        self.writer = Some(thread::spawn(move || {
+        self.writer = Some(Worker::spawn(move || {
             // Blocks until the stalled reader (if any) opens its end.
             if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(fifo) {
                 let _ = file.write_all(&content);
@@ -566,17 +844,40 @@ impl ConfigStall {
         }));
     }
 
+    /// Open (and immediately keep) a non-blocking read end, so a feeder whose
+    /// `open(write)` is still waiting for a reader returns.
+    fn open_read_end(&self) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&self.fifo)
+    }
+
     /// Join the feeder. If the stalled reader never reached the FIFO (it
     /// opened the restored file instead), open a read end so the feeder's
     /// `open` returns.
     pub fn finish(mut self) {
-        use std::os::unix::fs::OpenOptionsExt;
         if let Some(writer) = self.writer.take() {
-            let _unblock = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_NONBLOCK)
-                .open(&self.fifo);
-            writer.join().expect("join the fifo feeder");
+            let _unblock = self.open_read_end();
+            assert!(
+                writer.finish_within(TIMEOUT),
+                "the fifo feeder did not finish within {TIMEOUT:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConfigStall {
+    /// A test that fails before [`Self::finish`] must not leave the feeder
+    /// blocked in `open` for the rest of the test binary's life.
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            let _unblock = self.open_read_end();
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.finish_within(TIMEOUT);
+            }
         }
     }
 }
