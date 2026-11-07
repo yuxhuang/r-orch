@@ -1018,6 +1018,172 @@ fn a_refused_resource_read_does_not_end_the_session() {
     assert!(result["contents"][0]["text"].is_string());
 }
 
+// ── entity resources equal their tool projections (R5) ────────────────────
+
+/// A project with two agents, a goal that has a linked task and a progress
+/// entry, and two pending messages for `rx` — everything the entity
+/// resources project, built through the CLI before any server starts.
+struct Populated {
+    project: tempfile::TempDir,
+    goal: String,
+    task: String,
+    agent: String,
+}
+
+fn cli_json(project: &std::path::Path, args: &[&str]) -> Value {
+    let output = mcp_common::output_of(orch_command(project).arg("--json").args(args));
+    assert!(output.status.success(), "orch {args:?} failed: {output:?}");
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("orch {args:?} printed no JSON ({err}): {output:?}"))
+}
+
+fn id_of(value: &Value) -> String {
+    value["id"].as_str().expect("an id").to_owned()
+}
+
+fn populated_project() -> Populated {
+    let project = initialized_project();
+    let path = project.path();
+    let add_agent = |name: &str| {
+        id_of(&cli_json(
+            path,
+            &[
+                "agent",
+                "add",
+                name,
+                "--adapter",
+                "shell",
+                "--command",
+                "true",
+            ],
+        ))
+    };
+    let agent = add_agent("rx");
+    let sender = add_agent("tx");
+    let goal = id_of(&cli_json(path, &["goal", "add", "ship the thing"]));
+    let task = id_of(&cli_json(
+        path,
+        &["task", "add", "linked work", "--goal-id", &goal],
+    ));
+    cli_json(
+        path,
+        &[
+            "context",
+            "set",
+            &format!("{goal}-progress"),
+            "two of three done",
+        ],
+    );
+    for body in ["first", "second"] {
+        cli_json(path, &["msg", "send", &agent, body, "--from", &sender]);
+    }
+    Populated {
+        project,
+        goal,
+        task,
+        agent,
+    }
+}
+
+/// `resources/read` of `uri`: asserts the one content block names `uri` and
+/// is `application/json`, and returns its parsed text.
+fn read_resource_json(server: &mut McpServer, uri: &str) -> Value {
+    let result = server.expect_result("resources/read", json!({"uri": uri}));
+    let contents = result["contents"].as_array().expect("contents array");
+    assert_eq!(contents.len(), 1, "{uri}: {result}");
+    assert_eq!(contents[0]["uri"], json!(uri));
+    assert_eq!(contents[0]["mimeType"], json!("application/json"), "{uri}");
+    serde_json::from_str(contents[0]["text"].as_str().expect("text content"))
+        .unwrap_or_else(|err| panic!("{uri} is not JSON ({err}): {result}"))
+}
+
+fn tool_json(server: &mut McpServer, name: &str, arguments: Value) -> Value {
+    let response = server.call_tool(name, arguments);
+    assert_ne!(
+        response["result"]["isError"],
+        json!(true),
+        "{name} failed: {response}"
+    );
+    serde_json::from_str(tool_text(&response)).expect("tool text is JSON")
+}
+
+/// Goal, agent and inbox resources, read in a server launched with `args`,
+/// must equal what `goal_show`, `agent_show` and `msg_inbox` return.
+fn assert_entity_resources_equal_their_tools(args: &[&str]) {
+    let fixture = populated_project();
+    let mut server = McpServer::spawn_with_args(fixture.project.path(), args);
+    server.initialize();
+
+    let goal = read_resource_json(&mut server, &format!("orch://goals/{}", fixture.goal));
+    let agent = read_resource_json(&mut server, &format!("orch://agents/{}", fixture.agent));
+    let inbox = read_resource_json(&mut server, &format!("orch://inbox/{}", fixture.agent));
+
+    assert_eq!(
+        goal,
+        tool_json(&mut server, "goal_show", json!({"id": fixture.goal}))
+    );
+    assert_eq!(
+        agent,
+        tool_json(&mut server, "agent_show", json!({"id": fixture.agent}))
+    );
+    assert_eq!(
+        inbox,
+        tool_json(&mut server, "msg_inbox", json!({"agent_id": fixture.agent}))
+    );
+    // The projections are not trivially equal: each carries the seeded data.
+    assert_eq!(goal["id"], json!(fixture.goal));
+    assert_eq!(goal["progress"], json!("two of three done"));
+    assert_eq!(goal["tasks"][0]["id"], json!(fixture.task));
+    assert_eq!(agent["id"], json!(fixture.agent));
+    assert_eq!(agent["name"], json!("rx"));
+    let bodies: Vec<&str> = inbox
+        .as_array()
+        .expect("an inbox array")
+        .iter()
+        .map(|message| message["body"].as_str().expect("body"))
+        .collect();
+    assert_eq!(bodies, ["first", "second"]);
+}
+
+#[test]
+fn goal_agent_and_inbox_resources_equal_goal_show_agent_show_and_msg_inbox() {
+    assert_entity_resources_equal_their_tools(&[]);
+}
+
+#[test]
+fn entity_resources_are_served_in_read_only_mode() {
+    assert_entity_resources_equal_their_tools(&["--read-only"]);
+}
+
+#[test]
+fn entity_resources_are_served_in_allow_destructive_mode() {
+    assert_entity_resources_equal_their_tools(&["--allow-destructive"]);
+}
+
+#[test]
+fn reading_the_inbox_resource_twice_does_not_consume_the_messages() {
+    let fixture = populated_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+    let uri = format!("orch://inbox/{}", fixture.agent);
+
+    let first = read_resource_json(&mut server, &uri);
+    let second = read_resource_json(&mut server, &uri);
+
+    assert_eq!(first.as_array().map(Vec::len), Some(2), "{first}");
+    assert_eq!(second, first);
+    assert_eq!(
+        tool_json(&mut server, "msg_inbox", json!({"agent_id": fixture.agent})),
+        first,
+        "the tool still sees both messages after two resource reads"
+    );
+    assert_eq!(
+        cli_json(fixture.project.path(), &["msg", "inbox", &fixture.agent]),
+        first,
+        "and so does the CLI"
+    );
+}
+
 // ── lifecycle (R8) ────────────────────────────────────────────────────────
 
 #[test]
@@ -1352,26 +1518,134 @@ fn the_seventeenth_concurrent_store_call_is_refused_as_not_executed_and_nothing_
     }
 }
 
+/// Every file and directory under `.orchestry` as path → bytes (`None` for a
+/// directory), except the three names `ConfigStall` juggles. Fails closed: an
+/// unreadable entry panics rather than being left out of the comparison.
+#[cfg(unix)]
+fn orchestry_state(
+    project: &std::path::Path,
+) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read {dir:?}: {err}")) {
+            let path = entry.expect("a directory entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if dir == root && ["config.yml", "config.yml.real", "config.fifo"].contains(&name) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .expect("under root")
+                .display()
+                .to_string();
+            if path.is_dir() {
+                out.insert(relative, None);
+                walk(root, &path, out);
+            } else {
+                let bytes =
+                    std::fs::read(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+                out.insert(relative, Some(bytes));
+            }
+        }
+    }
+    let root = project.join(".orchestry");
+    let mut state = std::collections::BTreeMap::new();
+    walk(&root, &root, &mut state);
+    state
+}
+
+/// Paths whose entry was added, removed or changed between two snapshots.
+#[cfg(unix)]
+fn differing_paths(
+    before: &std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    after: &std::collections::BTreeMap<String, Option<Vec<u8>>>,
+) -> Vec<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Seventeen `task_add` calls while the store lane is stalled: sixteen are
+/// admitted, one is refused as `Not executed`. Which one is the server's
+/// choice (calls sent together may run in any order), so the oracle names it
+/// by response id. The refusal must have written nothing — the project bytes
+/// are identical when it arrives — and once the lane drains, exactly the
+/// sixteen admitted titles exist and the refused one does not.
 #[cfg(unix)]
 #[test]
 fn a_refused_store_call_changes_nothing_and_the_lane_serves_again_afterwards() {
     let project = initialized_project();
     let mut server = McpServer::spawn(project.path());
     server.initialize();
+    status_ok(&mut server);
+    let before = orchestry_state(project.path());
     let mut stall = mcp_common::ConfigStall::engage(project.path());
-    let ids: Vec<u64> = (0..17)
-        .map(|_| server.send_request("tools/call", json!({"name": "status", "arguments": {}})))
+    let titles: Vec<String> = (0..17).map(|n| format!("queued-{n}")).collect();
+    let ids: Vec<u64> = titles
+        .iter()
+        .map(|title| {
+            server.send_request(
+                "tools/call",
+                json!({"name": "task_add", "arguments": {"title": title}}),
+            )
+        })
         .collect();
-    let (refused_id, _) = server.next_response("the overflow refusal");
+
+    let (refused_id, refused) = server.next_response("the overflow refusal");
+    let at_refusal = orchestry_state(project.path());
     stall.release();
+    let mut completed = Vec::new();
     for id in ids.iter().filter(|id| **id != refused_id) {
-        server.read_response(*id);
+        completed.push(server.read_response(*id));
     }
     stall.finish();
 
-    let status = status_ok(&mut server);
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        tool_text(&refused).starts_with("Not executed: the store queue is full"),
+        "{refused}"
+    );
+    assert_eq!(
+        differing_paths(&before, &at_refusal),
+        Vec::<String>::new(),
+        "the refusal and the stall must leave every byte under .orchestry as it was"
+    );
+    for response in &completed {
+        assert_ne!(response["result"]["isError"], json!(true), "{response}");
+    }
+    let refused_title = &titles[ids
+        .iter()
+        .position(|id| *id == refused_id)
+        .expect("a known id")];
+    let mut want: Vec<String> = titles
+        .iter()
+        .filter(|title| *title != refused_title)
+        .cloned()
+        .collect();
+    want.sort();
+    let mut got = task_titles(project.path());
+    got.sort();
+    assert_eq!(got, want, "only the sixteen admitted calls ran");
 
-    assert!(status["tasks"].is_array(), "{status}");
+    let after = tool_json(
+        &mut server,
+        "task_add",
+        json!({"title": "after the refusal"}),
+    );
+    assert_eq!(after["title"], json!("after the refusal"));
+    assert!(task_titles(project.path()).contains(&"after the refusal".to_owned()));
+    assert!(status_ok(&mut server)["tasks"].is_array());
 }
 
 #[cfg(unix)]
