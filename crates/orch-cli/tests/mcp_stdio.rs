@@ -618,10 +618,7 @@ fn instructions_name_the_mode() {
 fn mcp_subcommand_is_registered_and_documents_itself() {
     let project = initialized_project();
 
-    let output = orch_command(project.path())
-        .args(["mcp", "--help"])
-        .output()
-        .expect("run `orch mcp --help`");
+    let output = mcp_common::output_of(orch_command(project.path()).args(["mcp", "--help"]));
 
     assert!(
         output.status.success(),
@@ -634,10 +631,7 @@ fn mcp_subcommand_is_registered_and_documents_itself() {
 fn mcp_help_works_without_a_project() {
     let dir = empty_project();
 
-    let output = orch_command(dir.path())
-        .args(["mcp", "--help"])
-        .output()
-        .expect("run `orch mcp --help`");
+    let output = mcp_common::output_of(orch_command(dir.path()).args(["mcp", "--help"]));
 
     assert!(
         output.status.success(),
@@ -650,10 +644,7 @@ fn mcp_help_works_without_a_project() {
 fn mcp_help_lists_the_documented_flags() {
     let dir = empty_project();
 
-    let output = orch_command(dir.path())
-        .args(["mcp", "--help"])
-        .output()
-        .expect("run `orch mcp --help`");
+    let output = mcp_common::output_of(orch_command(dir.path()).args(["mcp", "--help"]));
 
     let help = String::from_utf8_lossy(&output.stdout);
     for flag in [
@@ -723,10 +714,12 @@ fn project_root_wins_over_the_project_found_from_the_working_directory() {
 #[test]
 fn project_root_serves_the_requested_project_state() {
     let requested = initialized_project();
-    let created = orch_command(requested.path())
-        .args(["--json", "task", "add", "from the requested project"])
-        .output()
-        .expect("task add");
+    let created = mcp_common::output_of(orch_command(requested.path()).args([
+        "--json",
+        "task",
+        "add",
+        "from the requested project",
+    ]));
     assert!(created.status.success(), "{created:?}");
     let working = initialized_project();
     let root = requested.path().to_str().expect("utf-8 path");
@@ -1051,10 +1044,12 @@ fn the_status_resource_equals_the_status_tool() {
 #[test]
 fn a_task_template_uri_reads_the_task_the_cli_created() {
     let project = initialized_project();
-    let created = orch_command(project.path())
-        .args(["--json", "task", "add", "read me through a resource"])
-        .output()
-        .expect("task add");
+    let created = mcp_common::output_of(orch_command(project.path()).args([
+        "--json",
+        "task",
+        "add",
+        "read me through a resource",
+    ]));
     assert!(created.status.success(), "{created:?}");
     let task: Value = serde_json::from_slice(&created.stdout).expect("task add JSON");
     let id = task["id"].as_str().expect("task id").to_owned();
@@ -1075,10 +1070,8 @@ fn a_task_template_uri_reads_the_task_the_cli_created() {
 #[test]
 fn the_tasks_resource_lists_a_task_created_before_the_server_started() {
     let project = initialized_project();
-    let created = orch_command(project.path())
-        .args(["task", "add", "listed"])
-        .output()
-        .expect("task add");
+    let created =
+        mcp_common::output_of(orch_command(project.path()).args(["task", "add", "listed"]));
     assert!(created.status.success(), "{created:?}");
     let mut server = McpServer::spawn(project.path());
     server.initialize();
