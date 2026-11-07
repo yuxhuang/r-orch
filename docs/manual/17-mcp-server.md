@@ -96,7 +96,9 @@ Every startup failure is printed to stderr, with stdout empty.
 | stdin closes, before or after `initialize` | none | 0 |
 | SIGINT or SIGTERM, before or after `initialize`, even while the client keeps stdin open | none | 0 |
 
-`orch mcp` creates no lock file and leaves no process behind when it exits.
+`orch mcp` does not take the orchestrator's PID lock (`.orchestry/orchestry.lock`) and leaves no process behind
+when it exits. Calls that write a store create that store's `.index.lock` (for example
+`.orchestry/tasks/.index.lock`) and leave it in place; that file is normal and is not held after the call.
 
 ### What the client sees on connect
 
@@ -587,7 +589,7 @@ parsed JSON (same keys, same order of list items), not the same whitespace as `o
 | Unknown tool, or a tool this mode does not register | JSON-RPC error `-32602` `tool not found` | No |
 | Missing, unknown or wrongly typed argument; `file: "-"`; a bad `since`; `logs` with no selector; `agent_update` with no form or mixed forms; `goal_status` pause or force outside allow-destructive mode | JSON-RPC error `-32602`, for example ``Invalid arguments for status: unknown field `bogus`, there are no fields``, ``Invalid arguments for task_add: invalid type: string "2", expected i64`` or `file must be a nonempty regular file path; '-' would consume protocol stdin` | No |
 | `msg_send` or `msg_broadcast` without `from`, or `msg_inbox` without `agent_id`, and no identity | JSON-RPC error `-32602` naming the missing argument | No |
-| orch refuses a valid call (blank title, illegal transition, not found, unknown sender, locked definition, corrupt file) | Tool result with `isError: true`: the CLI's message, for example `Task not found: tsk_nope` or `Task title is required`, then `Hint: …` when the CLI has a hint | No, as with the CLI |
+| orch refuses or fails a valid call (blank title, illegal transition, not found, unknown sender, locked definition, corrupt file, I/O error, index lock timeout) | Tool result with `isError: true`: the CLI's message, for example `Task not found: tsk_nope` or `Task title is required`, then `Hint: …` when the CLI has a hint | **Possibly, as with the CLI.** The error can come after the entity file was saved; see [Before you retry a tool error](#before-you-retry-a-tool-error) |
 | Too much work queued: 16 calls already admitted (2 for `doctor`), or 10 s waiting for a turn | Tool result with `isError: true`, `Not executed: …; retry later` | No |
 | The server is shutting down (stdin closed or a signal) and the call had to wait | Tool result with `isError: true`, `Not executed: the server is shutting down` | No |
 | The client cancelled the call (`notifications/cancelled`) before it started | Tool result with `isError: true`, `Not executed: the request was cancelled` | No |
@@ -597,6 +599,10 @@ parsed JSON (same keys, same order of list items), not the same whitespace as `o
 | Resource read fails for another reason | JSON-RPC error `-32603` with the message and `Hint: …` | No |
 | Resource read refused by the queue limits | JSON-RPC error `-32000` with the `Not executed` text | No |
 | Invalid JSON, or a line longer than 16 MiB | No reply; the line is dropped and the next one works | No |
+
+"No" means the call changed no authored data: no task, goal, agent, team, message, context entry or configuration
+was created, changed or deleted. Reads can still rebuild an index or purge expired context
+([Read-only mode still writes](#read-only-mode-still-writes)).
 
 A failed call never ends the session. Error texts carry no colours and no stack traces.
 
@@ -610,6 +616,47 @@ before you retry. The server never retries for you and never rolls back.
 
 **Wait for answers before closing stdin.** After stdin closes or a signal arrives, a call that would have to wait
 is not executed. A script that writes several requests and then closes stdin at once can see later calls refused.
+
+### Before you retry a tool error
+
+Only two kinds of failure guarantee that nothing was written:
+
+- a JSON-RPC error `-32602` in reply to `tools/call`, which is returned before the call reaches orch's services;
+- a tool result whose text starts with `Not executed`, which is returned before the call starts.
+
+Any other `isError: true` result from a tool that changes data comes from orch's services, and may come **after
+part of the change was saved**. The task, goal, agent and context stores write the entity file first and the
+store's `_index.json` second, as two separate steps (see [Concurrent writers](#concurrent-writers)). If the
+second step fails, the call returns an error although the entity file was written. The error text does not say
+which step failed.
+
+For example, while another process held `.orchestry/tasks/.index.lock` for longer than 5 s, this call (in a
+disposable project; `<project>` stands for its path):
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"task_add","arguments":{"title":"Write the release notes"}}}
+```
+
+returned, after 5.0 s:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Timed out after 5000 ms waiting for index writer lock <project>/.orchestry/tasks/.index.lock; retry the operation"}],"isError":true}}
+```
+
+The new task's file, `.orchestry/tasks/tsk_snN9HTG.yml`, had been written all the same. `task_show tsk_snN9HTG`
+returned the task, while `task_list` (and `orch task list`) did not list it, because its index entry was never
+written. `orch task add` under the same lock fails the same way: exit code 1, the same message, and a new task
+file. Calling `task_add` again, as the message suggests, would create a second task.
+
+Before you retry such an error:
+
+1. **Updates and deletes** (the call names an existing id): read the entity with its show tool, for example
+   `task_show`, and retry only if the change is missing.
+2. **Creates** (`task_add`, `goal_add`, `agent_add` and the like, where orch picks the new id): the id is not in
+   the error, and `task_list` can omit a task whose index entry is missing. Look for the new entity in the list
+   first. If it is not there and a duplicate would matter, have an operator rebuild the index, as in
+   [Rebuilding an index after a lost update](../RUNBOOK.md#rebuilding-an-index-after-a-lost-update), and list
+   again before you retry. No tool can rebuild an index.
 
 ## Limitations
 
