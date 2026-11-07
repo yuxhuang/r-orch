@@ -1110,6 +1110,212 @@ fn a_signal_writes_no_non_protocol_bytes_to_stdout() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn sighup_with_stdin_still_open_exits_zero_within_the_shutdown_bound() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn(project.path());
+    server.initialize();
+
+    server.signal(nix::sys::signal::Signal::SIGHUP);
+    let exit = server.wait_for_exit();
+
+    assert_eq!(exit.status.code(), Some(0), "stderr: {}", exit.stderr);
+}
+
+// ── lost output: a client that stops reading but never hangs up ──────────
+
+/// `orch mcp` driven by a client that completes the handshake, then closes
+/// its end of the server's stdout while keeping stdin open — a client that
+/// stopped reading without hanging up. Every frame the server writes from
+/// then on fails with a broken pipe. `McpServer` cannot model this: its
+/// reader thread owns stdout for the life of the process.
+#[cfg(unix)]
+struct DeafClient {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<mcp_common::Bounded<String>>,
+    next_id: u64,
+}
+
+#[cfg(unix)]
+impl DeafClient {
+    /// Spawn the server and complete the handshake; stdout is still open.
+    fn handshake(project: &std::path::Path) -> Self {
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::Stdio;
+
+        let mut command = orch_command(project);
+        command.arg("mcp");
+        mcp_common::own_process_group(&mut command);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn `orch mcp`");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+        let stderr = mcp_common::spawn_bounded("the server's stderr", move || {
+            let mut text = String::new();
+            let _ = stderr_pipe.read_to_string(&mut text);
+            text
+        });
+        let mut client = Self {
+            child,
+            stdin,
+            stdout: None,
+            stderr: Some(stderr),
+            next_id: 1,
+        };
+
+        client.send_request(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "orch-mcp-deaf-client", "version": "0.0.0"},
+            }),
+        );
+        // Only the initialize response can arrive before the next write.
+        let (stdout, line) = mcp_common::spawn_bounded("the initialize response", move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            (reader.into_inner(), line)
+        })
+        .join(TIMEOUT);
+        let response: Value = serde_json::from_str(&line)
+            .unwrap_or_else(|_| panic!("not an initialize response: {line:?}"));
+        assert!(response["result"]["serverInfo"].is_object(), "{response}");
+        client.stdout = Some(stdout);
+        client.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        client
+    }
+
+    /// Close the read end of the server's stdout. stdin stays open.
+    fn stop_reading(&mut self) {
+        self.stdout = None;
+    }
+
+    /// Write one frame. A failure means the server has already gone, which
+    /// the exit assertions report, so it is not an error here.
+    fn send(&mut self, message: &Value) {
+        use std::io::Write;
+        let mut line = serde_json::to_string(message).expect("serialise request");
+        line.push('\n');
+        let _ = self
+            .stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stdin.flush());
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        id
+    }
+
+    /// Wait for the server to exit on its own within [`SHUTDOWN_TIMEOUT`],
+    /// with stdin still open; then its stderr. A server that stays up fails
+    /// the test (and is killed with its process group on drop).
+    fn wait_for_exit(mut self) -> (std::process::ExitStatus, String) {
+        let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("poll the child") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server was still running {SHUTDOWN_TIMEOUT:?} after its output was lost"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let stderr = self.stderr.take().expect("stderr reader").join(TIMEOUT);
+        (status, stderr)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DeafClient {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            mcp_common::kill_and_reap(&mut self.child);
+        }
+    }
+}
+
+/// Titles of the project's tasks, read through the CLI.
+#[cfg(unix)]
+fn task_titles(project: &std::path::Path) -> Vec<String> {
+    let output = mcp_common::output_of(orch_command(project).args(["--json", "task", "list"]));
+    assert!(output.status.success(), "{output:?}");
+    let tasks: Value = serde_json::from_slice(&output.stdout).expect("task list JSON");
+    tasks
+        .as_array()
+        .expect("a task array")
+        .iter()
+        .map(|task| task["title"].as_str().expect("a title").to_owned())
+        .collect()
+}
+
+/// The server cannot answer anyone once its output is gone, so it must not
+/// stay up (and keep accepting work): it exits on its own, with an error that
+/// names the cause on stderr even with tracing off. The call whose answer
+/// was lost had already run; it stays committed — no rollback is claimed.
+#[cfg(unix)]
+#[test]
+fn a_client_that_stops_reading_ends_the_server_with_an_error_within_the_shutdown_bound() {
+    let project = initialized_project();
+    let mut client = DeafClient::handshake(project.path());
+    client.stop_reading();
+
+    client.send_request(
+        "tools/call",
+        json!({"name": "task_add", "arguments": {"title": "answered into a closed pipe"}}),
+    );
+    let (status, stderr) = client.wait_for_exit();
+
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("stdout"),
+        "the lost output is not reported on stderr: {stderr:?}"
+    );
+    assert_eq!(
+        task_titles(project.path()),
+        vec!["answered into a closed pipe".to_owned()]
+    );
+}
+
+/// A mutation still waiting for the store lane when the output is lost is
+/// refused, never run: nobody could learn that it happened. The lane is held
+/// by a call stalled in its Engine build (`ConfigStall`), and the first frame
+/// the server writes is the `ping` answer that finds the pipe closed.
+#[cfg(unix)]
+#[test]
+fn once_the_output_is_lost_a_queued_mutation_never_runs() {
+    let project = initialized_project();
+    let mut client = DeafClient::handshake(project.path());
+    let mut stall = mcp_common::ConfigStall::engage(project.path());
+    client.stop_reading();
+
+    client.send_request("tools/call", json!({"name": "status", "arguments": {}}));
+    client.send_request(
+        "tools/call",
+        json!({"name": "task_add", "arguments": {"title": "queued when the output was lost"}}),
+    );
+    client.send_request("ping", json!({}));
+    let (status, stderr) = client.wait_for_exit();
+    stall.release();
+    stall.finish();
+
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(task_titles(project.path()), Vec::<String>::new());
+}
+
 // ── the store queue at the binary boundary (D8) ───────────────────────────
 
 /// Seventeen `status` calls while the store lane cannot make progress: one is
@@ -1229,9 +1435,10 @@ fn a_third_concurrent_doctor_call_is_refused_as_not_executed() {
     );
 }
 
+/// Start a `doctor` whose adapter probes never answer, stop the server with
+/// `stop`, and require a clean exit that takes every probe with it.
 #[cfg(unix)]
-#[test]
-fn a_doctor_probe_stalled_at_shutdown_leaves_no_child_behind() {
+fn assert_stalled_probes_die_with_the_server(stop: impl FnOnce(McpServer) -> mcp_common::Exit) {
     let project = initialized_project();
     let fakes = mcp_common::StallingAdapters::new();
     let path = fakes.path();
@@ -1243,8 +1450,7 @@ fn a_doctor_probe_stalled_at_shutdown_leaves_no_child_behind() {
         .is_empty()));
     let probes = fakes.started();
 
-    server.signal(nix::sys::signal::Signal::SIGTERM);
-    let exit = server.wait_for_exit();
+    let exit = stop(server);
 
     assert_eq!(exit.status.code(), Some(0), "stderr: {}", exit.stderr);
     for pid in probes {
@@ -1255,4 +1461,39 @@ fn a_doctor_probe_stalled_at_shutdown_leaves_no_child_behind() {
             "the doctor probe (pid {pid}) outlived the server"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_doctor_probe_stalled_at_shutdown_leaves_no_child_behind() {
+    assert_stalled_probes_die_with_the_server(|server| {
+        server.signal(nix::sys::signal::Signal::SIGTERM);
+        server.wait_for_exit()
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_doctor_probe_stalled_at_sigint_leaves_no_child_behind() {
+    assert_stalled_probes_die_with_the_server(|server| {
+        server.signal(nix::sys::signal::Signal::SIGINT);
+        server.wait_for_exit()
+    });
+}
+
+/// A closed terminal or a supervisor's hangup is a graceful stop too; the
+/// default HUP disposition would kill the server before its probes.
+#[cfg(unix)]
+#[test]
+fn a_doctor_probe_stalled_at_sighup_leaves_no_child_behind() {
+    assert_stalled_probes_die_with_the_server(|server| {
+        server.signal(nix::sys::signal::Signal::SIGHUP);
+        server.wait_for_exit()
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_doctor_probe_stalled_at_stdin_eof_leaves_no_child_behind() {
+    assert_stalled_probes_die_with_the_server(McpServer::shutdown);
 }

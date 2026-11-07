@@ -33,7 +33,8 @@ pub(crate) const AGENT_ENV: &str = "ORCH_AGENT_ID";
 
 /// How long the runtime may take to stop after the service has finished.
 /// Tokio's stdin read cannot be cancelled, so an unbounded shutdown would
-/// hang whenever the client keeps stdin open after a signal.
+/// hang whenever the client keeps stdin open after a signal or after the
+/// server has lost its stdout.
 const RUNTIME_SHUTDOWN: Duration = Duration::from_millis(250);
 
 /// Run `orch mcp`. Owns its runtime so the bounded shutdown applies to this

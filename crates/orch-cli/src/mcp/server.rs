@@ -16,11 +16,13 @@
 //! orchestrator, process manager or project lock.
 //!
 //! **Output.** stdout carries protocol frames only; diagnostics go to stderr
-//! through the CLI's tracing subscriber.
+//! through the CLI's tracing subscriber. A failed write to stdout is fatal:
+//! nothing can reach the client any more, so the server admits nothing new,
+//! stops, and exits with an error instead of serving into a dead pipe.
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -38,7 +40,7 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, ServerInitializeError};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::Value;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -213,6 +215,10 @@ pub(crate) struct McpServer {
     /// still running a few seconds later and a queued mutation could be cut
     /// off half-way.
     admissions: CancellationToken,
+    /// Cancelled when a write to stdout fails. From then on nothing is
+    /// admitted at all, not even into a free lane: its answer could not
+    /// reach anyone.
+    output_lost: CancellationToken,
     router: ToolRouter<McpServer>,
 }
 
@@ -229,6 +235,7 @@ impl McpServer {
             store: Lane::new("store", STORE_PERMITS, QUEUE_WAIT),
             diagnostic: Lane::new("diagnostic", DIAGNOSTIC_PERMITS, QUEUE_WAIT),
             admissions,
+            output_lost: CancellationToken::new(),
             router: registry.into_router(),
         }
     }
@@ -246,8 +253,17 @@ impl McpServer {
         lane: &Lane,
         cancelled: &CancellationToken,
     ) -> std::result::Result<Turn, NotExecuted> {
-        lane.admit(&self.seams.timer, cancelled, &self.admissions)
-            .await
+        if self.output_lost.is_cancelled() {
+            return Err(NotExecuted::ShuttingDown);
+        }
+        let turn = lane
+            .admit(&self.seams.timer, cancelled, &self.admissions)
+            .await?;
+        // Checked again: the output may have been lost while this call waited.
+        if self.output_lost.is_cancelled() {
+            return Err(NotExecuted::ShuttingDown);
+        }
+        Ok(turn)
     }
 
     async fn engine(&self) -> Result<Engine> {
@@ -451,21 +467,73 @@ impl<R: AsyncRead + Unpin> AsyncRead for EofWatch<R> {
     }
 }
 
-/// Serve `server` over this process's stdin/stdout until EOF or a signal.
+/// stdout that turns its first failed write, flush or shutdown into a stop.
+/// The SDK only logs a response it could not send and keeps reading
+/// requests, so without this a client that stops reading but keeps stdin
+/// open would leave a server that still runs every call it is sent.
+struct OutputWatch<W> {
+    inner: W,
+    failure: Arc<OnceLock<String>>,
+    lost: CancellationToken,
+    stop: CancellationToken,
+}
+
+impl<W> OutputWatch<W> {
+    fn watch<T>(&self, poll: Poll<std::io::Result<T>>) -> Poll<std::io::Result<T>> {
+        if let Poll::Ready(Err(err)) = &poll {
+            let _ = self.failure.set(err.to_string());
+            self.lost.cancel();
+            self.stop.cancel();
+        }
+        poll
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for OutputWatch<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.watch(poll)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        self.watch(poll)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let poll = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.watch(poll)
+    }
+}
+
+/// Serve `server` over this process's stdin/stdout until EOF, a signal or
+/// lost output.
 ///
-/// SIGINT/SIGTERM are installed before negotiation, so a signal stops a
-/// server still waiting for `initialize`. EOF before `initialize`, and a
-/// signal at any point, are clean exits; any other startup or transport
-/// failure is an error. The caller bounds runtime shutdown, because Tokio's
+/// SIGINT/SIGTERM/SIGHUP are installed before negotiation, so a signal stops
+/// a server still waiting for `initialize`. EOF before `initialize`, and a
+/// signal at any point, are clean exits. A failed write to stdout is an
+/// error whenever it happens: calls that already ran stay done, nothing new
+/// is admitted, and the server stops. Any other startup or transport failure
+/// is an error too. The caller bounds runtime shutdown, because Tokio's
 /// stdin read cannot be cancelled.
 pub(crate) async fn serve_stdio(server: McpServer, stop: CancellationToken) -> Result<()> {
     let signals = spawn_signal_task(stop.clone())?;
+    let failure = Arc::new(OnceLock::new());
     let transport = (
         EofWatch {
             inner: tokio::io::stdin(),
             eof: server.admissions.clone(),
         },
-        tokio::io::stdout(),
+        OutputWatch {
+            inner: tokio::io::stdout(),
+            failure: Arc::clone(&failure),
+            lost: server.output_lost.clone(),
+            stop: stop.clone(),
+        },
     );
     let outcome = match server.serve_with_ct(transport, stop.clone()).await {
         Ok(running) => running
@@ -479,6 +547,14 @@ pub(crate) async fn serve_stdio(server: McpServer, stop: CancellationToken) -> R
     };
     signals.abort();
     let _ = signals.await;
+    // Checked first: lost output also cancels `stop`, which alone reads as a
+    // clean signal exit.
+    if let Some(err) = failure.get() {
+        return Err(Error::other(format!(
+            "cannot write to stdout: {err}; the MCP client can no longer receive responses. \
+             Calls already started may have completed: inspect state before retrying"
+        )));
+    }
     outcome
 }
 
@@ -490,10 +566,12 @@ fn spawn_signal_task(stop: CancellationToken) -> Result<tokio::task::JoinHandle<
     };
     let mut terminate = install(SignalKind::terminate())?;
     let mut interrupt = install(SignalKind::interrupt())?;
+    let mut hangup = install(SignalKind::hangup())?;
     Ok(tokio::spawn(async move {
         tokio::select! {
             _ = terminate.recv() => {}
             _ = interrupt.recv() => {}
+            _ = hangup.recv() => {}
         }
         stop.cancel();
     }))
@@ -669,6 +747,43 @@ mod tests {
         );
         drop(free);
         assert_eq!(lane.available(), 16);
+    }
+
+    #[tokio::test]
+    async fn after_the_output_is_lost_nothing_is_admitted_even_into_a_free_lane() {
+        let clock = ManualClock::default();
+        let seams = Seams {
+            engines: Arc::new(|_root| Box::pin(async { Err(Error::other("an Engine was built")) })),
+            timer: clock.timer(),
+        };
+        let settings = Settings {
+            project_root: PathBuf::from("/nonexistent"),
+            project_name: "p".to_owned(),
+            identity: Identity::of(None),
+            mode: Mode::Default,
+        };
+        let server = McpServer::new(
+            settings,
+            seams,
+            Registry::new(Mode::Default),
+            CancellationToken::new(),
+        );
+        server.output_lost.cancel();
+        let none = CancellationToken::new();
+
+        for execution in [Execution::Store, Execution::Diagnostic] {
+            let refused = server
+                .run_call(execution, &none, |_cx| async { Ok(Value::Null) })
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                refused.to_string(),
+                NotExecuted::ShuttingDown.to_string(),
+                "{execution:?}"
+            );
+        }
+        assert_eq!(server.store.available(), STORE_PERMITS);
+        assert_eq!(server.diagnostic.available(), DIAGNOSTIC_PERMITS);
     }
 
     #[test]
