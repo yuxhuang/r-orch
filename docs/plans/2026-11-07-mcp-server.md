@@ -52,7 +52,7 @@ long-lived engine; full engine tier; rmcp macro default decoding; build-time plu
 ## Tasks
 
 All tasks land in one feature PR (PR 1). It may exceed the ~3,000-line guideline; the lead records the reason in
-the PR and reviews source in slices under 800 lines.
+the PR and reviews source in slices under 800 lines. Orch task ids are in [Status](#status).
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
@@ -72,17 +72,31 @@ the PR and reviews source in slices under 800 lines.
 
 ## Status
 
-| Item | State |
-|---|---|
-| P0 | implemented (`0412123`) |
-| SPEC | approved; reconciled (`87a1a62`, `50a56f1`) |
-| T0 | implemented, failing-first (`d7c5237`) |
-| B0a, B0b | implemented (`8e01479`, `de67de4`) |
-| B1 | implemented (`fb0f5b6`); only `status` and `doctor` advertised at that commit |
-| B2b | implemented (`5b06c5d`), review pending |
-| B2a, T1, T2 | pending |
-| W1 | drafted; examples not yet verified against the full catalogue |
-| I, W2, GATE | pending |
+Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_WpQVmPg`.
+
+| Wave | Item | Task | State |
+|---|---|---|---|
+| A: research and design | Research rmcp 3.9 and client configs, fact-checked | `tsk_Rfhsl4g`, `tsk_0Dq6FPt` | done (team working files) |
+| | Design v1, red team, rebuttal and design v2 | `tsk_3AthnJH`, `tsk_HYrE5s9`, `tsk_eEAHV_J` | done (team working files) |
+| | Lead decision-1 (CLI parity and safety gaps) | `tsk_ykx4hSN` | done |
+| | P0 | `tsk_rOxum7E` | implemented (`0412123`) |
+| | SPEC | `tsk_8BVlLkR` | approved (`0972369`) |
+| | T0 | `tsk_DrEEWc7` | implemented, failing-first (`d7c5237`) |
+| | SPEC reconciled with decision-1 | `tsk_qBhlLf6` | done (`87a1a62`) |
+| | Checkpoint CP1: adjudicate design v2, lead decision-2, create wave B | `tsk_iEG5dJg` (`tsk_KsG8tAT` cancelled and replaced) | done |
+| B: build | SPEC reconciled with decision-2 | `tsk_IDM084s` | done (`50a56f1`) |
+| | B0a, B0b | `tsk_sGmlgP1`, `tsk_qYsvC3z` | implemented (`8e01479`, `de67de4`) |
+| | B1 | `tsk_uYLw07I` | implemented (`fb0f5b6`) |
+| | B2b, then its security review | `tsk_cYZ7NCG`, `tsk_N0ew-Ms` | implemented (`5b06c5d`); review passed |
+| | W1 | `tsk_YqgQ81m` | drafted (`5bdaab5`) |
+| | T1 | `tsk_eozgGPK` | implemented (`e55e89c`) |
+| | B2a | `tsk_aqrHEPr` | implemented (`b422994`) |
+| | T2 | `tsk_Y1rc-mG` | implemented (`d0a134a`, `8bde6f0`) |
+| | Fix: stalled `doctor` probe left alive after SIGTERM/EOF | `tsk_588rI6O` | fixed; committed in I |
+| | Fix: `task_add` relative attachments resolve against the project root (D12) | `tsk_6HalWGX` | fixed in I; verified, no separate commit |
+| | I | `tsk_FxWZnjY` | integrated (`00450c9`): full CI set green, 50/45/18 tools by mode |
+| | W2 | `tsk_4SVACBX` | docs verified against `00450c9` |
+| C: review | Checkpoint CP2: freeze the integration commit, launch the review board (GATE) | `tsk_Brzri1x` | pending |
 
 ## Test plan
 - The spec's acceptance checks, R1–R11 on macOS and Linux CI; R12 (real client: Claude Code or MCP Inspector) on
