@@ -264,7 +264,7 @@ impl McpServer {
     }
 
     /// Admit and run one validated tool call in its lane.
-    pub(crate) async fn execute<F, Fut>(
+    pub(crate) async fn run_call<F, Fut>(
         &self,
         execution: Execution,
         cancelled: &CancellationToken,

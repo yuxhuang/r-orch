@@ -2258,12 +2258,9 @@ fn a_relative_definition_path_resolves_against_the_project_root_not_the_server_c
     );
 }
 
-// BUG (design D12): `task_add` hands `attach` to the task service untouched, so a
-// relative path is resolved against the server's working directory instead of
-// the fixed project root. Remove this `ignore` when the fix lands (it is the
-// regression test for it).
+// Design D12: a relative `attach` path resolves against the fixed project
+// root, not the server's working directory.
 #[test]
-#[ignore = "BUG D12: task_add attach is not resolved against the project root (fix task assigned to senior-eng-2)"]
 fn a_relative_attachment_path_resolves_against_the_project_root_not_the_server_cwd() {
     let (dir, mut server) = server_in_subdirectory();
     std::fs::write(dir.path().join("notes.txt"), "from the root").expect("attachment");

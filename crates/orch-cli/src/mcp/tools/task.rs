@@ -280,10 +280,13 @@ async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> Result<Value> {
             review_criteria,
             scope: args.scope.as_deref().map(csv),
             goal_id: args.goal_id,
+            // Relative paths name files under the project root, never the
+            // server's working directory (D12); absolute paths pass through.
             attachments: args.attach.as_deref().map(|raw| {
                 csv(raw)
                     .into_iter()
                     .filter(|part| !part.is_empty())
+                    .map(|part| cx.project_root.join(part).to_string_lossy().into_owned())
                     .collect()
             }),
         })

@@ -197,7 +197,7 @@ where
     args.validate(server.identity(), server.mode())?;
     let cancelled = call.request_context.ct.clone();
     let outcome = server
-        .execute(meta.execution, &cancelled, move |cx| handler(cx, args))
+        .run_call(meta.execution, &cancelled, move |cx| handler(cx, args))
         .await;
     Ok(encode(outcome).into())
 }
