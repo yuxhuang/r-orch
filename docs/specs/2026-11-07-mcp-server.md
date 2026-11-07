@@ -26,18 +26,21 @@ The questions it answers, as put in the approval request:
 - **q3** Dependency: adopt `rmcp` 3.9 (the official MCP Rust SDK) under the library-first policy, with an ADR.
   Answer: adopt (R10).
 
+Reconciled 2026-11-07 per lead decision-1: R2, R3, R4 and R8 carry the lead's rulings (R2: rulings 1 and 3a;
+R3: rulings 2a, 2b and 5; R4: rulings 2c and 3b; R8: ruling 3c). See Open questions.
+
 ## Requirements
 
 | Id | Requirement | Source | Priority | Acceptance check (test or command; platform) |
 |---|---|---|---|---|
 | R1 | When started as `orch mcp`, orch shall run an MCP server over stdio (JSON-RPC 2.0 framing per the MCP spec version `rmcp` 3.9 implements): stdout carries protocol frames only and logs go to stderr; it resolves the project from the working directory, `--project-root <path>` overrides that, and it refuses with exit 3 when the project is not initialised. | item 2 | must | `crates/orch-cli/tests/mcp_stdio.rs`: initialize handshake, stdout/stderr discipline, exit 3 uninitialised (cwd and `--project-root`); Linux CI + macOS |
-| R2 | The server shall expose a tool for every one-shot command that reads or mutates project state: task add/list/show/assign/cancel/approve/reject/retry/update/patch; goal add/list/show/status/update/delete; agent list/show (`status`)/add/update/patch/enable/disable/autonomous/remove; msg send/broadcast/inbox/list; context set/get/list/delete; team create/list/show/join/leave/add-task/set-lead/disband; status; logs (run events); doctor; config get/set; remote list/status. Tool inputs mirror the CLI flags and results are the same JSON the command prints with `--json`. | items 1, 3 | must | table-driven test: `tools/list` ⊇ the catalogue; per-tool round-trip tests on a temp project comparing with `orch --json <cmd>`; Linux CI + macOS |
+| R2 | The server shall expose a tool for every one-shot command that reads or mutates project state: task add/list/show/assign/cancel/approve/reject/retry/update/patch; goal add/list/show/status/update/delete; agent list/show (`status`)/add/update/patch/enable/disable/autonomous/remove; msg send/broadcast/inbox/list; context set/get/list/delete; team create/list/show/join/leave/add-task/set-lead/disband; status; logs (run events); doctor; config get/set/update/patch; remote list/status. Tool inputs mirror the CLI flags and results are the same JSON the command prints with `--json`; for the commands that print only a human message (task cancel/approve/reject/retry, agent enable/disable/remove, team join/leave/add-task/set-lead/disband, config set, context delete) the tool returns the documented MCP projection in [MCP-only result projections](#mcp-only-result-projections) (the mutated entity, `{key, value}` for config set, or `null` for a deletion), and `doctor` returns the CLI's JSON report without its header. | items 1, 3; decision-1 | must | table-driven test: `tools/list` ⊇ the catalogue; per-tool round-trip tests on a temp project comparing with `orch --json <cmd>`, and for each projection tool with `orch --json` reading the entity after the call; Linux CI + macOS |
 | R3 | The server shall not expose interactive, long-running, process-spawning or host-mutating commands as tools; each is listed with its reason in [R3 exclusions](#r3-exclusions). | item 1 | must | catalogue test asserts every excluded name is absent in all three modes (R4); Linux CI + macOS |
-| R4 | Destructive tools (agent remove, goal delete, team disband, context delete, task cancel) shall be registered only with `--allow-destructive`, and `--read-only` shall register read tools only; every tool shall carry `readOnlyHint`, `destructiveHint` and `idempotentHint` annotations consistent with that classification. | approval q1 | must | `tools/list` tests over default, `--read-only` and `--allow-destructive`, including the annotations; Linux CI + macOS |
+| R4 | Destructive tools (agent remove, goal delete, team disband, context delete, task cancel) shall be registered only with `--allow-destructive`, and `goal_status` with `force=true` is an argument-level destructive gate: without `--allow-destructive` the call is rejected as JSON-RPC invalid params before the goal is touched. `--read-only` shall register read tools only; every tool shall carry `readOnlyHint`, `destructiveHint` and `idempotentHint` annotations consistent with that classification. `destructiveHint=true` may also appear on mutate tools outside the destructive set, because the MCP annotation `destructiveHint=false` means additive updates only. | approval q1; decision-1 | must | `tools/list` tests over default, `--read-only` and `--allow-destructive`, including the annotations; `goal_status` with `force=true` rejected in default mode with the goal unchanged; Linux CI + macOS |
 | R5 | The server shall serve the resources `orch://status`, `orch://tasks`, `orch://tasks/{id}`, `orch://goals`, `orch://goals/{id}`, `orch://agents`, `orch://agents/{id}`, `orch://context` and `orch://inbox/{agent}` as `application/json`, listed by `resources/list` and `resources/templates/list`. | item 3 | should | resource tests: list, templates list, read of each URI on a temp project, unknown id; Linux CI + macOS |
 | R6 | When started with `--agent <id>` or with `ORCH_AGENT_ID` set, the server shall use that agent as the default `from` of msg send/broadcast and the default inbox agent, and the `initialize` result's `instructions` shall name the agent and the project; without either, `msg_send` shall require an explicit `from`. | approval q2; item 3 | must | tests with the flag, with the env var, and with neither; Linux CI + macOS |
 | R7 | When a tool call fails, the server shall return a tool result with `isError: true` carrying the CLI's error message and hint for an `orch_core::Error`, a JSON-RPC invalid-params error for a schema violation, and shall never panic or exit on a bad call. Inputs get the same validation as the CLI; frame size is bounded by `rmcp`. | item 3 | must | malformed-input tests (bad JSON, unknown tool, wrong types, unknown ids, oversized fields) followed by a successful call on the same session; Linux CI + macOS |
-| R8 | The server shall exit cleanly on stdin EOF and on SIGTERM/SIGINT, take no project lock, and the manual and RUNBOOK shall state the ARCHITECTURE §2.1 concurrent-mutator hazard of running it alongside `orch run --watch`. | item 2 | must | EOF and signal tests in `crates/orch-cli/tests/mcp_stdio.rs` (exit status, no leftover child); docs check by the fact-checker; Linux CI + macOS |
+| R8 | The server shall exit cleanly on stdin EOF and on SIGTERM/SIGINT, take no project lock, and the manual and RUNBOOK shall state the ARCHITECTURE §2.1 concurrent-mutator hazard of running it alongside `orch run --watch`, and that `--read-only` prevents authored mutations while storage maintenance writes (index rebuild, context expiry purge) still occur. | item 2; decision-1 | must | EOF and signal tests in `crates/orch-cli/tests/mcp_stdio.rs` (exit status, no leftover child); docs check by the fact-checker; Linux CI + macOS |
 | R9 | The PR shall ship an MCP chapter in `docs/manual/` (client configs: Claude Code `claude mcp add orch -- orch mcp`, Codex `config.toml`, generic), a README section, a CHANGELOG `[Unreleased]` entry, ADR `docs/decisions/0011-mcp-server.md`, this spec and its plan, ARCHITECTURE §3.3 module map and §4 dependency entry, and a RUNBOOK entry. | plan (AGENTS.md documentation duties) | must | fact-check report on the PR head; every listed file present in `git diff --stat main..HEAD`; macOS |
 | R10 | `rmcp` shall be adopted under ARCHITECTURE §4.8 (maintenance, MSRV, licence recorded), with `cargo deny check` and `cargo xtask crate-graph` green. | approval q3 | must | `cargo deny check`; `cargo xtask crate-graph`; Linux CI + macOS |
 | R11 | The CI set shall be green locally on macOS and on Linux CI, with a binary-level stdio test and unit tests per tool group. | plan (AGENTS.md pre-PR check) | must | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`; `cargo xtask crate-graph`; `cargo deny check`; Linux CI + macOS |
@@ -63,6 +66,27 @@ Every row is `won't` (no tool in any mode).
 | `remote add`, `remote remove` | Change remote-peer links; remote-peer control is a non-goal. |
 | `remote listen` | Changes the peer listen setting, and so the network exposure of later engines. |
 | `logs --follow` | Long-running live stream; `logs` without `--follow` is a tool (R2). Same class as R3. |
+| `--file -` (`task`/`agent`/`config` `update`, `patch`) | Reads the document from stdin, which is the MCP transport (R1). `file: "-"` is rejected as JSON-RPC invalid params before stdin is touched; a regular file path works. |
+
+Included tools whose behaviour R3 bounds:
+
+| Tool | Bound |
+|---|---|
+| `doctor` (adapter probes) | The one permitted bounded spawning exception. Each probe runs with stdin null and piped output, so it cannot touch the transport, and is capped at 10 s; the whole call is capped at 120 s and past that returns a tool error. A failed check is report data, not `isError`. |
+| `task_cancel` | Store-only: marks the task cancelled through the task service and never builds the full engine (no lock, R8). A live owner stops the run on reconciliation; with no live owner the tool does not kill an orphan agent process, as the CLI's `task cancel` would. |
+
+### MCP-only result projections
+
+For the R2 commands that print only a human message, the tool result is this projection (the CLI is unchanged):
+
+| Tool | Result |
+|---|---|
+| `task_cancel`, `task_approve`, `task_reject`, `task_retry` | The `Task` after the write. |
+| `agent_enable`, `agent_disable` | The `Agent` after the write. |
+| `team_join`, `team_leave`, `team_add_task`, `team_set_lead` | The `Team` after the write. |
+| `config_set` | `{key, value}`, the value as stored. |
+| `agent_remove`, `team_disband`, `context_delete` | `null`. |
+| `doctor` | The `orch --json doctor` report (`checks`, `adaptersReady`, `adaptersTotal`) without the header line. |
 
 ## Non-goals
 - HTTP or SSE transport.
@@ -106,12 +130,13 @@ Security checklist:
 - No dashboard behaviour changes; no tmux test is needed.
 
 ## Open questions
-- **`config update` and `config patch`.** They are one-shot and mutate project state, but appear in neither R2
-  nor R3. Best guess: add them to R2 as mutating tools (they mirror `task`/`agent` `update`/`patch`). Adding a
-  row is allowed after approval; the owner confirms when reviewing the PR.
-- **`doctor` and R3's "process-spawning" class.** `orch doctor` spawns bounded adapter probes, yet R2 lists it as
-  a tool. Reading: R3 excludes commands that spawn agent runs or long-lived children, not bounded probes. The
-  design states the probe bounds.
+- **Resolved by lead decision-1**, 2026-11-07
+  (`/Users/felix/workspaces/orch/.orchestry/ateam/goal_WpQVmPg/decision-1-cli-parity.md`): CLI parity for
+  commands without JSON output (MCP-only projections, R2), `task_cancel`, `doctor` probes and `--file -` (R3),
+  `goal_status` `force=true` and annotations (R4), `config update` and `config patch` (added to R2), and
+  read-only maintenance writes (R8).
+- R2, R3, R4 and R8 were amended by those rulings. The [specs README](README.md#lifecycle) says changing an
+  approved `must` row needs the owner: the owner confirms these amendments when reviewing the PR.
 - **`--read-only` together with `--allow-destructive`.** Not specified. Best guess: refused as a usage error
   (exit 1, as every orch usage error).
 
