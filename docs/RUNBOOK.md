@@ -35,6 +35,8 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | A task stays `todo` with `configuration preflight` or the eco/custom-template message, or a run fails before start with `effort preparation failed` | [Prompt mode and effort failures](#prompt-mode-and-effort-failures) |
 | Data lost or overwritten while `orch mcp` clients and other writers shared a project | [Recovering after concurrent MCP writers](#recovering-after-concurrent-mcp-writers) |
 | Every `orch mcp` tool and resource call fails with a configuration error | [Restoring a configuration broken through the MCP server](#restoring-a-configuration-broken-through-the-mcp-server) |
+| No trace of what an `orch mcp` server did, or its client discards stderr | [Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics) |
+| An `orch mcp` server does not answer, every call is `Not executed: timed out …`, or a server outlives its client | [A stuck or leftover `orch mcp` process](#a-stuck-or-leftover-orch-mcp-process) |
 
 ---
 
@@ -235,6 +237,9 @@ stream.
 ```bash
 ORCHESTRY_DEBUG=1 orch run <task-id> 2>debug.log
 ```
+
+For `orch mcp`, stderr belongs to the MCP client, which may discard it; see
+[Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics).
 
 Without `ORCHESTRY_DEBUG`, tracing output is suppressed entirely — including the one signal that
 distinguishes "another process holds the lock" from "I could not read the lock file", since both print
@@ -810,7 +815,8 @@ included: their context reads delete expired entries.
 
 1. Stop issuing work in every connected MCP client.
 2. Stop every writer: disconnect or quit each client (which ends its `orch mcp` child; check with
-   `pgrep -fl 'orch mcp'`), stop the orchestrator owner (`orch serve`, `orch run --watch` or the dashboard), and let
+   `pgrep -fl 'orch mcp'`, and stop a leftover one as in
+   [A stuck or leftover `orch mcp` process](#a-stuck-or-leftover-orch-mcp-process)), stop the orchestrator owner (`orch serve`, `orch run --watch` or the dashboard), and let
    one-off `orch` commands finish.
 3. Back up the state before you touch it:
 
@@ -859,3 +865,165 @@ it, because every tool needs a working configuration.
 **Prevention.** Back up `.orchestry/config.yml` before letting a client change configuration, or register clients
 that should not change it with `--read-only`. With Codex, `disabled_tools` can hide `config_set`, `config_update`
 and `config_patch`.
+
+## Capturing `orch mcp` diagnostics
+
+**Why.** `orch mcp` keeps no log file and no record of requests or errors. Its diagnostics go to stderr only, and
+they are off unless `RUST_LOG` or `ORCHESTRY_DEBUG` is set. Only startup errors and the fatal
+`cannot write to stdout` error are printed without them. The MCP client owns the server's stderr and may discard
+it, so by default there may be no trace at all. stdout cannot carry diagnostics: it is the protocol.
+
+**Recipe.** Register a wrapper instead of `orch mcp`. It appends the server's stderr to one file per server
+process and leaves stdout alone:
+
+```sh
+#!/bin/sh
+# orch-mcp-logged: run orch mcp with its stderr kept in one file per server.
+# stdout is left alone: it carries the protocol.
+umask 077                                   # logs can hold project content
+dir="$HOME/.local/state/orch-mcp"
+mkdir -p "$dir"
+log="$dir/orch-mcp-$$.log"                  # exec keeps the PID: $$ is the server's
+echo "start $(date -u +%Y-%m-%dT%H:%M:%SZ) pid $$ cwd $PWD args $*" >>"$log"
+export NO_COLOR=1                           # no colour codes in the file
+exec /path/to/orch mcp "$@" 2>>"$log"
+```
+
+1. Save it, for example as `~/bin/orch-mcp-logged`, replace `/path/to/orch` with `command -v orch`, and
+   `chmod +x` it.
+2. In the client's entry, replace `orch` and its `mcp` argument with the wrapper, and keep the other arguments:
+   `claude mcp add orch -- /path/to/orch-mcp-logged`, or `"command": "/path/to/orch-mcp-logged", "args":
+   ["--agent", "agt_example"]`.
+3. Choose how much to record in the entry's environment (`"env": {"RUST_LOG": "info"}`, or `[mcp_servers.orch.env]`
+   in Codex). The wrapper passes the environment through.
+
+The file name carries the server's PID, so it matches `ps` and the procedure below. Measured with the wrapper
+above, for a session with a `task_add`, a `task_show` of a missing task, an invalid JSON line and an unknown
+tool:
+
+| Setting | What the file records |
+|---|---|
+| none | The wrapper's `start` line, startup errors and the `cannot write to stdout` error |
+| `RUST_LOG=warn` | Also each JSON-RPC error sent to the client: `WARN rmcp::service: response error id=4 error=ErrorData { code: ErrorCode(-32602), message: "tool not found", data: None }` |
+| `RUST_LOG=info` | Also the connection's life: `Service initialized as server`, `client initialized`, `input stream terminated`, `serve finished quit_reason=Closed` |
+| `RUST_LOG=debug` or `ORCHESTRY_DEBUG=1` | Also every request and every response, **with their arguments and results** |
+
+- Tool errors (`isError: true`, such as `Task not found: tsk_nope`) and dropped invalid JSON lines leave no line
+  below `debug`.
+- `RUST_LOG` wins over `ORCHESTRY_DEBUG` when both are set.
+- Lines have no timestamps; the `start` line has one.
+- At `debug` the file holds project content: task descriptions, messages, configuration values. `umask 077` makes
+  it readable by you only (mode `600`). Nothing rotates or deletes these files.
+
+When the client stops reading the server's output, a file recorded at `RUST_LOG=info` ends like this (from a
+disposable project):
+
+```
+ERROR serve_inner: rmcp::service: fail to response message error=Broken pipe (os error 32)
+ INFO serve_inner: rmcp::service: task cancelled
+ INFO serve_inner: rmcp::service: serve finished quit_reason=Cancelled
+  ✕ cannot write to stdout: Broken pipe (os error 32); the MCP client can no longer receive responses. Calls already started may have completed: inspect state before retrying
+```
+
+The server then exits with code 1. In this example the `task_add` whose answer was lost had run: the task
+exists.
+
+## A stuck or leftover `orch mcp` process
+
+**Symptom.** A client shows the orch server as not responding; every call is refused with
+`Not executed: timed out after 10 s waiting for the store queue; retry later`; or an `orch mcp` process is still
+running after its client quit.
+
+**What normally happens.** Measured on macOS with disposable projects:
+
+| Event | Exit | Time to exit |
+|---|---|---|
+| SIGTERM, SIGINT or SIGHUP, also during a stalled `doctor` probe (SIGTERM also during a write waiting for a held `.index.lock`) | 0 | about 2.3 s |
+| The client closes stdin | 0 | up to about 5 s, while running calls finish |
+| The client stops reading stdout | 1, `cannot write to stdout` | 0.3 s |
+| SIGKILL | killed | at once; a running `doctor` probe is left behind |
+
+A call still running when the server stops gets no answer, and its change may be saved: in the `.index.lock` case
+the new task's file was written and the client got no reply. **A server still running 10 s after SIGTERM is
+stuck.** A server whose calls all time out has one call that never finishes, usually on a slow or hung file
+system: a running call has no time limit of its own.
+
+**Do not** use `pkill -f 'orch mcp'` or `killall orch`. Every client has its own server, and a pattern also stops
+the servers of other clients and projects, and `orch run` or `orch serve`.
+
+**Procedure.**
+
+1. Find the exact process:
+
+   ```bash
+   ps -o pid,ppid,pgid,stat,etime,command -p "$(pgrep -d, -f 'orch mcp')"
+   ```
+
+   ```
+     PID  PPID  PGID STAT ELAPSED COMMAND
+   62392 62297 62295 T      00:02 /path/to/orch mcp --project-root /path/to/project
+   ```
+
+   Pick the row by its parent (`PPID` is the client; `ps -o pid,command -p <ppid>` shows it, and `1` means the
+   client is gone), its age and its arguments. Then `PID=<pid>`.
+2. Note the server's `doctor` probes before you signal it. They are its only child processes; usually there are
+   none:
+
+   ```bash
+   pgrep -P "$PID"
+   ```
+
+3. Ask it to stop, and wait at most 10 s:
+
+   ```bash
+   kill -TERM "$PID"
+   for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+   ps -o pid,stat,etime,command -p "$PID"
+   ```
+
+   If only the header line prints, it has exited, and it stopped its own probes: go to step 7.
+4. Still listed? Read `STAT` before you escalate:
+
+   | `STAT` | Meaning | Do |
+   |---|---|---|
+   | `T` | Stopped, by job control or a debugger; it has not acted on the SIGTERM | `kill -CONT "$PID"`: it then finishes stopping (measured: within 1 s). Or go on to step 5 |
+   | `Z` | Already exited; its client has not collected it | Nothing to kill. Quit or restart the client |
+   | `D` (Linux) or `U` (macOS) | Waiting in the kernel, usually on storage | Fix the storage first. A SIGKILL takes effect only when that I/O returns (general Unix behaviour, not measured here) |
+   | anything else | It ignored the SIGTERM | Step 5 |
+
+5. Kill it: `kill -KILL "$PID"`. A SIGKILL gives the server no chance to stop its probes.
+6. Stop leftover probes. For each pid from step 2 that is still running, check that it is still the probe
+   (`PPID` 1, `PGID` equal to its pid), then signal its process group:
+
+   ```bash
+   ps -o pid,ppid,pgid,stat,etime,command -p <probe-pid>
+   kill -TERM -<probe-pid>      # leading minus: the probe's process group
+   ```
+
+   If you did not note them (the server was killed or crashed before you looked), search for probes left behind.
+   A probe is an adapter's version check, such as `claude --version`, or `opencode run --help`, leading its own
+   group, with parent 1:
+
+   ```bash
+   ps -eo pid,ppid,pgid,etime,args | awk 'NR == 1 || ($2 == 1 && $1 == $3 && / (--version|run --help)$/)'
+   ```
+
+   Check each row's command and age before you signal it: a recycled pid would make you kill an unrelated group.
+7. Inspect before anything is retried. Each call that was in flight, and each call whose answer was lost, may have
+   saved its change. Read the entities it touched (`orch --json task show <id>`, `orch --json task list`,
+   `orch --json context get <key>`, `orch --json agent status <id>`) and the captured log, if any. Retry only what
+   is missing. For a create, look in the list first: repeating it makes a second entity.
+8. If a list disagrees with the entity files (a task `task show` finds but `task list` omits), stop every writer,
+   back up and rebuild the index, as in steps 2 to 5 of
+   [Recovering after concurrent MCP writers](#recovering-after-concurrent-mcp-writers).
+9. Restart the client. It starts a new server.
+
+**Never delete `.index.lock` files** while you do this. A store's `.index.lock` stays after every write: that is
+normal, not a sign of a stuck process, and the file is locked only while a writer updates the index. Deleting it
+lets two writers update the same index at once. `orch mcp` never takes the orchestrator's PID lock,
+`.orchestry/orchestry.lock` ([Corrupt lock file](#corrupt-lock-file)), so there is no MCP lock to clear.
+
+**Prevention.** Keep the server's stderr ([Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics)).
+Treat a server still running 10 s after its client closed stdin or sent SIGTERM as stuck. Send a call that depends
+on an earlier one only after the earlier call's answer arrives
+([manual](manual/17-mcp-server.md#results-and-errors)).

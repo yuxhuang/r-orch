@@ -94,11 +94,26 @@ Every startup failure is printed to stderr, with stdout empty.
 | `--project-root` exists but cannot be read | `✕ cannot read --project-root` | 1 |
 | The project's config cannot be loaded | the CLI's error, for example `✕ parse <project>/.orchestry/config.yml` | 1 |
 | stdin closes, before or after `initialize` | none | 0 |
-| SIGINT or SIGTERM, before or after `initialize`, even while the client keeps stdin open | none | 0 |
+| SIGINT, SIGTERM or SIGHUP, before or after `initialize`, even while the client keeps stdin open | none | 0 |
+| A write to stdout fails, before or after `initialize`, for example because the client stopped reading | `✕ cannot write to stdout: Broken pipe (os error 32); the MCP client can no longer receive responses. Calls already started may have completed: inspect state before retrying` | 1 |
+| SIGKILL | none | killed by the signal (a shell shows 137) |
 
-`orch mcp` does not take the orchestrator's PID lock (`.orchestry/orchestry.lock`) and leaves no process behind
-when it exits. Calls that write a store create that store's `.index.lock` (for example
-`.orchestry/tasks/.index.lock`) and leave it in place; that file is normal and is not held after the call.
+After stdin closes or a signal arrives, the server gives calls that are already running up to 5 s (stdin closed)
+or 2 s (signal) to answer, then exits without answering the rest. A call left unanswered may still have saved its
+change; see [A lost response is not a failed change](#results-and-errors). After a failed write to stdout the
+server runs no further call, even one it has already read, and exits.
+
+**Processes.** When stdin closes, and on SIGTERM, SIGINT or SIGHUP, the server stops the `doctor` probes it
+started before it exits (see [`doctor` runs programs](#doctor-runs-programs)). A SIGKILL, or a crash, gives it no
+chance to: a probe that was running then keeps running, reparented to PID 1. Find and stop it with
+[A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process).
+
+**Lock files.** `orch mcp` does not take the orchestrator's PID lock (`.orchestry/orchestry.lock`), so it runs
+next to `orch serve` and the others. It does use the stores' own locks: a call that writes a store creates that
+store's `.index.lock` (for example `.orchestry/tasks/.index.lock`) and leaves the file in place. That is normal.
+Any orch process that writes the store locks the file while it updates the index and unlocks it afterwards. **Do not delete
+an `.index.lock` file**, even when it looks stale: a process that holds or waits for the lock keeps using the
+deleted file, and the next writer would lock a new one, so the two would no longer exclude each other.
 
 ### What the client sees on connect
 
@@ -592,6 +607,8 @@ parsed JSON (same keys, same order of list items), not the same whitespace as `o
 | orch refuses or fails a valid call (blank title, illegal transition, not found, unknown sender, locked definition, corrupt file, I/O error, index lock timeout) | Tool result with `isError: true`: the CLI's message, for example `Task not found: tsk_nope` or `Task title is required`, then `Hint: …` when the CLI has a hint | **Possibly, as with the CLI.** The error can come after the entity file was saved; see [Before you retry a tool error](#before-you-retry-a-tool-error) |
 | Too much work queued: 16 calls already admitted (2 for `doctor`), or 10 s waiting for a turn | Tool result with `isError: true`, `Not executed: …; retry later` | No |
 | The server is shutting down (stdin closed or a signal) and the call had to wait | Tool result with `isError: true`, `Not executed: the server is shutting down` | No |
+| The server stopped while the call was running, and the call did not finish in the shutdown time (5 s after stdin closed, 2 s after a signal), or the server was killed | No reply | **Possibly**: the change may have been saved |
+| The client stopped reading stdout | No reply to that call or any later one; the server exits with code 1 | Calls already running: **possibly**. Later calls: no, they are not run |
 | The client cancelled the call (`notifications/cancelled`) before it started | Tool result with `isError: true`, `Not executed: the request was cancelled` | No |
 | `doctor` runs longer than 120 s | Tool result with `isError: true`, `doctor did not finish within 120 s; its probes were stopped` | No |
 | Resource URI malformed, or a non-empty `cursor` | JSON-RPC error `-32602`, for example `Invalid resource URI "orch://tasks/../x": too many path segments` or `Unsupported cursor: this list is not paginated` | No |
@@ -607,10 +624,16 @@ was created, changed or deleted. Reads can still rebuild an index or purge expir
 A failed call never ends the session. Error texts carry no colours and no stack traces.
 
 **The server runs one project call at a time.** Tool calls and resource reads share one queue per server: one
-runs while up to 15 wait, and a call waits at most 10 s for its turn. The 10 s limit covers only the wait, not how
-long the call then runs. `doctor` has its own queue of 2. It joins the main queue only to load the project, then
-runs its probes outside it, so slow probes do not hold up other calls. A call refused as `Not executed` did nothing
+runs while up to 15 wait, and a call waits at most 10 s for its turn. A call refused as `Not executed` did nothing
 and can be retried.
+
+**The 10 s limit covers only the wait, not the call.** Once a tool call or resource read has its turn, it has no
+time limit of its own: it keeps the turn until orch's services return. A call held up by the file system, such as
+a slow or hung network mount, keeps everything behind it waiting, and those calls are refused after their 10 s,
+until the slow call ends or the server is stopped. Two waits inside the services do have limits: a write gives up
+after 5 s waiting for another process's `.index.lock` ([example below](#before-you-retry-a-tool-error)), and
+`doctor` stops each probe after 10 s and the whole call after 120 s. `doctor` has its own queue of 2. It joins the
+main queue only to load the project, then runs its probes outside it, so slow probes do not hold up other calls.
 
 **Calls you send together can run in any order.** Waiting calls run in the order they joined the queue, and that
 is not always the order you sent them: the server starts a separate task for each request it reads, and those
@@ -628,13 +651,16 @@ Both succeeded, but the read ran first:
 {"jsonrpc":"2.0","id":20,"result":{"content":[{"type":"text","text":"null"}],"isError":false}}
 ```
 
-If a call depends on an earlier one, such as a read of a value you just wrote, or a `task_show` of a task you
-just updated, **wait for the earlier call's response before you send it.** Calls that do not depend on each other
-can be sent together.
+Writes reorder the same way: several `context_set` calls to one key, sent together, can leave any of their values
+behind, not necessarily the one sent last.
 
-**A lost response is not a failed change.** If the connection drops, or the client gives up waiting, after a
-change has started, the change may already be saved. Read the entity (`task_show`, `agent_show`, `config_get`)
-before you retry. The server never retries for you and never rolls back.
+If a call depends on an earlier one, such as a read of a value you just wrote, a second write to the same key, or
+a `task_show` of a task you just updated, **wait for the earlier call's response before you send it.** Calls that
+do not depend on each other can be sent together.
+
+**A lost response is not a failed change.** If the connection drops, the client gives up waiting, or the server
+is stopped after a change has started, the change may already be saved. Read the entity (`task_show`,
+`agent_show`, `config_get`) before you retry. The server never retries for you and never rolls back.
 
 **Wait for answers before closing stdin.** After stdin closes or a signal arrives, a call that would have to wait
 is not executed. A script that writes several requests and then closes stdin at once can see later calls refused.
@@ -702,6 +728,14 @@ These are traced from the code, not observed failures. Make consistency-sensitiv
 configuration changes) while other writers are stopped. If something was lost, follow
 [Recovering after concurrent MCP writers](../RUNBOOK.md#recovering-after-concurrent-mcp-writers) in the runbook.
 
+### No log by default
+
+The server keeps no log file and no record of requests or errors. Its diagnostics go to stderr only, and they are
+off unless `RUST_LOG` or `ORCHESTRY_DEBUG` is set in its environment; only startup errors and the
+`cannot write to stdout` error are printed without them. What happens to stderr is up to the client, which may
+discard it. To keep it, start the server through a small wrapper that sends stderr to a file:
+[Capturing `orch mcp` diagnostics](../RUNBOOK.md#capturing-orch-mcp-diagnostics).
+
 ### Read-only mode still writes
 
 `--read-only` registers no tool that changes authored data. It is not a read-only file system:
@@ -733,7 +767,9 @@ kill an agent process left over from an earlier run, as `orch task cancel` can. 
 `doctor` is the one tool that starts processes: each adapter's version probe and the git checks, with stdin
 closed, output captured, 10 s per probe and 120 s for the whole call. The git checks run in the project root
 (`orch doctor` uses the directory it is started in). A failed check is part of the report, not an error. No tool
-runs an agent.
+runs an agent. A probe still running when the call ends is killed, also when the server stops because stdin closed
+or because of SIGTERM, SIGINT or SIGHUP. After a SIGKILL of the server it keeps running
+([Processes](#exit-codes-and-startup-errors)).
 
 ### Not available as tools
 
@@ -776,6 +812,10 @@ There is also no generic "run this orch command" tool and no file-reading or she
 | `Not executed: … retry later` | Too many calls queued, or a slow call ahead | Retry; send fewer calls at once |
 | A read sent right after a write returns `null` or the old value, with `isError: false` | The client sent both before the write's response arrived; the server can run them in either order | Wait for the write's response before sending the read ([Calls you send together can run in any order](#results-and-errors)) |
 | Calls fail after a directory under `.orchestry/` was removed or replaced | The server remembers directories it created | Restart every `orch mcp` session (restart the client) |
+| Every call is refused with `Not executed: timed out after 10 s waiting for the store queue` | A call ahead of them is stuck, for example on a hung file system | Fix the storage, or stop the server ([A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process)); inspect state before retrying |
+| The client reports the server gone; captured stderr ends with `cannot write to stdout` | The client stopped reading the server's output; the server exits with code 1 by design | Restart the client. Check the calls that were in flight before you repeat them |
+| An `orch mcp` process is still running after its client quit, or never answers | A stuck server, or a leftover after a hard kill | [A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process) |
+| There is no trace of what the server did | The server logs nothing by default | [Capture its stderr](../RUNBOOK.md#capturing-orch-mcp-diagnostics) |
 | A task created through the server never runs | Nothing runs the orchestrator | Start `orch run --watch`, `orch serve` or the dashboard |
 
 ## Appendix: CLI commands and their tools
