@@ -208,6 +208,145 @@ fn malformed_input_never_puts_non_json_on_stdout() {
     }
 }
 
+// ── diagnostics never carry payloads (design D13) ─────────────────────────
+
+/// A named setting and the environment that applies it to the child.
+type Setting = (
+    &'static str,
+    &'static [(&'static str, Option<&'static str>)],
+);
+
+/// Every way a user turns diagnostics up. The SDK's own `debug`/`trace`
+/// events print whole requests, results and rejected lines, so each of these
+/// must leave tool payloads off stderr — including a directive naming an SDK
+/// module more specifically than any cap would.
+const DIAGNOSTIC_ENVS: [Setting; 4] = [
+    (
+        "ORCHESTRY_DEBUG=1",
+        &[("ORCHESTRY_DEBUG", Some("1")), ("RUST_LOG", None)],
+    ),
+    ("RUST_LOG=debug", &[("RUST_LOG", Some("debug"))]),
+    (
+        "RUST_LOG=rmcp::service=trace",
+        &[("RUST_LOG", Some("rmcp::service=trace"))],
+    ),
+    (
+        "RUST_LOG=rmcp::transport::async_rw=trace",
+        &[("RUST_LOG", Some("rmcp::transport::async_rw=trace"))],
+    ),
+];
+
+/// A value no log line can contain by accident.
+fn sentinel(label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_nanos();
+    format!("sentinel-{label}-{}-{nanos}", std::process::id())
+}
+
+fn assert_only_json_rpc(lines: &[String], case: &str) {
+    for line in lines {
+        let frame: Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("{case}: stdout line is not JSON ({err}): {line:?}"));
+        assert_eq!(frame["jsonrpc"], json!("2.0"), "{case}: {line:?}");
+    }
+}
+
+#[test]
+fn debug_logging_keeps_tool_arguments_and_results_off_stderr() {
+    let mut leaks = Vec::new();
+    for (case, envs) in DIAGNOSTIC_ENVS {
+        let project = initialized_project();
+        let value = sentinel("value");
+        let mut server = McpServer::spawn_with(project.path(), &[], envs);
+        server.initialize();
+
+        let set = server.call_tool("context_set", json!({"key": "sec1", "value": value}));
+        assert_eq!(set["result"]["isError"], json!(false), "{case}: {set}");
+        let get = server.call_tool("context_get", json!({"key": "sec1"}));
+        assert!(
+            tool_text(&get).contains(&value),
+            "{case}: the result lost the value: {get}"
+        );
+
+        let exit = server.shutdown();
+        assert_eq!(exit.status.code(), Some(0), "{case}: {}", exit.stderr);
+        assert_only_json_rpc(&exit.stdout_lines, case);
+        if exit.stderr.contains(&value) {
+            leaks.push(format!("{case}:\n{}", exit.stderr));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "a tool argument or result reached stderr under {} of {} settings:\n{}",
+        leaks.len(),
+        DIAGNOSTIC_ENVS.len(),
+        leaks.join("\n")
+    );
+}
+
+#[test]
+fn debug_logging_keeps_a_rejected_line_off_stderr() {
+    let mut leaks = Vec::new();
+    for (case, envs) in DIAGNOSTIC_ENVS {
+        let project = initialized_project();
+        let secret = sentinel("frame");
+        let mut server = McpServer::spawn_with(project.path(), &[], envs);
+        server.initialize();
+
+        // Valid JSON, invalid JSON-RPC (the SDK answers Invalid Request), then
+        // a line that is not JSON at all (the SDK drops it): both are logged
+        // with the offending bytes when SDK debug is on.
+        server.send_raw_line(&format!(
+            "{{\"jsonrpc\": \"2.0\", \"bogus\": \"{secret}\"}}"
+        ));
+        server.send_raw_line(&format!("{{\"jsonrpc\": \"2.0\", \"id\": \"{secret}"));
+        server.expect_result("ping", json!({}));
+
+        let exit = server.shutdown();
+        assert_eq!(exit.status.code(), Some(0), "{case}: {}", exit.stderr);
+        assert_only_json_rpc(&exit.stdout_lines, case);
+        if exit.stderr.contains(&secret) {
+            leaks.push(format!("{case}:\n{}", exit.stderr));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "a rejected input line reached stderr under {} of {} settings:\n{}",
+        leaks.len(),
+        DIAGNOSTIC_ENVS.len(),
+        leaks.join("\n")
+    );
+}
+
+/// The cap removes the SDK's payload-bearing levels, not diagnostics: its
+/// warnings still arrive whenever a setting enables them.
+#[test]
+fn debug_logging_still_reports_sdk_warnings() {
+    let settings: [Setting; 4] = [
+        DIAGNOSTIC_ENVS[0],
+        DIAGNOSTIC_ENVS[1],
+        DIAGNOSTIC_ENVS[2],
+        ("RUST_LOG=warn", &[("RUST_LOG", Some("warn"))]),
+    ];
+    for (case, envs) in settings {
+        let project = initialized_project();
+        let mut server = McpServer::spawn_with(project.path(), &[], envs);
+        server.initialize();
+
+        let absent = server.call_tool("no_such_tool", json!({}));
+        assert_eq!(error_code(&absent), Some(-32602), "{case}: {absent}");
+
+        let exit = server.shutdown();
+        assert!(
+            exit.stderr.contains("WARN") && exit.stderr.contains("response error"),
+            "{case}: the SDK's warning for an error response is missing:\n{}",
+            exit.stderr
+        );
+    }
+}
+
 // ── catalogue (fails until B2a/B2b register their tools) ──────────────────
 
 #[test]
