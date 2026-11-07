@@ -606,9 +606,31 @@ was created, changed or deleted. Reads can still rebuild an index or purge expir
 
 A failed call never ends the session. Error texts carry no colours and no stack traces.
 
-**The server runs one call at a time.** Calls that change or read the project wait their turn in arrival order,
-up to 16 at once and for at most 10 s each; `doctor` has its own queue of 2 so that slow probes do not hold up
-other calls. A call refused as `Not executed` did nothing and can be retried.
+**The server runs one project call at a time.** Tool calls and resource reads share one queue per server: one
+runs while up to 15 wait, and a call waits at most 10 s for its turn. The 10 s limit covers only the wait, not how
+long the call then runs. `doctor` has its own queue of 2. It joins the main queue only to load the project, then
+runs its probes outside it, so slow probes do not hold up other calls. A call refused as `Not executed` did nothing
+and can be retried.
+
+**Calls you send together can run in any order.** Waiting calls run in the order they joined the queue, and that
+is not always the order you sent them: the server starts a separate task for each request it reads, and those
+tasks can reach the queue in a different order. Nothing reports the reordering. In a disposable project, a client
+sent these two requests back to back, without waiting for the first response:
+
+```json
+{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"context_set","arguments":{"key":"b1_k0","value":"set"}}}
+{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"context_get","arguments":{"key":"b1_k0"}}}
+```
+
+Both succeeded, but the read ran first:
+
+```json
+{"jsonrpc":"2.0","id":20,"result":{"content":[{"type":"text","text":"null"}],"isError":false}}
+```
+
+If a call depends on an earlier one, such as a read of a value you just wrote, or a `task_show` of a task you
+just updated, **wait for the earlier call's response before you send it.** Calls that do not depend on each other
+can be sent together.
 
 **A lost response is not a failed change.** If the connection drops, or the client gives up waiting, after a
 change has started, the change may already be saved. Read the entity (`task_show`, `agent_show`, `config_get`)
@@ -752,6 +774,7 @@ There is also no generic "run this orch command" tool and no file-reading or she
 | `goal_status` refused with `paused` or `force` | Default mode | Register a separate `--allow-destructive` entry for the lead |
 | Every call fails with a configuration error | `config.yml` is broken | [Restore the configuration](../RUNBOOK.md#restoring-a-configuration-broken-through-the-mcp-server) |
 | `Not executed: … retry later` | Too many calls queued, or a slow call ahead | Retry; send fewer calls at once |
+| A read sent right after a write returns `null` or the old value, with `isError: false` | The client sent both before the write's response arrived; the server can run them in either order | Wait for the write's response before sending the read ([Calls you send together can run in any order](#results-and-errors)) |
 | Calls fail after a directory under `.orchestry/` was removed or replaced | The server remembers directories it created | Restart every `orch mcp` session (restart the client) |
 | A task created through the server never runs | Nothing runs the orchestrator | Start `orch run --watch`, `orch serve` or the dashboard |
 
