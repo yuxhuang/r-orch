@@ -967,13 +967,20 @@ the servers of other clients and projects, and `orch run` or `orch serve`.
    62392 62297 62295 T      00:02 /path/to/orch mcp --project-root /path/to/project
    ```
 
-   Pick the row by its parent (`PPID` is the client; `ps -o pid,command -p <ppid>` shows it, and `1` means the
-   client is gone), its age and its arguments. Then `PID=<pid>`.
+   Pick the row by its parent (`PPID` is the client; `ps -o pid,command -p <ppid>` shows it, and `1`, or on
+   Linux a subreaper such as `systemd --user`, means the client is gone), its age and its arguments. Then
+   `PID=<pid>`.
 2. Note the server's `doctor` probes before you signal it. They are its only child processes; usually there are
-   none:
+   none. Keep each probe's `PID`, `PGID`, `STARTED` and `COMMAND`: after a SIGKILL its parent changes, so these
+   are what identify it later:
 
    ```bash
-   pgrep -P "$PID"
+   for p in $(pgrep -P "$PID"); do ps -o pid,pgid,lstart,command -p "$p"; done
+   ```
+
+   ```
+     PID  PGID STARTED                      COMMAND
+    5987  5987 Sat Nov  7 18:45:41 2026     /bin/sh /path/to/bin/claude --version
    ```
 
 3. Ask it to stop, and wait at most 10 s:
@@ -991,27 +998,35 @@ the servers of other clients and projects, and `orch run` or `orch serve`.
    |---|---|---|
    | `T` | Stopped, by job control or a debugger; it has not acted on the SIGTERM | `kill -CONT "$PID"`: it then finishes stopping (measured: within 1 s). Or go on to step 5 |
    | `Z` | Already exited; its client has not collected it | Nothing to kill. Quit or restart the client |
-   | `D` (Linux) or `U` (macOS) | Waiting in the kernel, usually on storage | Fix the storage first. A SIGKILL takes effect only when that I/O returns (general Unix behaviour, not measured here) |
+   | `D` (Linux) or `U` (macOS) | Waiting in the kernel, usually on storage | Fix the storage first. If the wait is truly uninterruptible, a SIGKILL takes effect only when it ends; the state letter alone does not tell you that (Linux also shows `D` for waits a SIGKILL can end). Not measured here |
    | anything else | It ignored the SIGTERM | Step 5 |
 
 5. Kill it: `kill -KILL "$PID"`. A SIGKILL gives the server no chance to stop its probes.
-6. Stop leftover probes. For each pid from step 2 that is still running, check that it is still the probe
-   (`PPID` 1, `PGID` equal to its pid), then signal its process group:
+6. Stop leftover probes. For each pid from step 2 that is still running, check that it is still the probe: the
+   same `PGID` (equal to its pid), `STARTED` and `COMMAND` as you noted. Do not require a particular parent. The
+   killed server's probes are adopted by a new parent: PID 1 on macOS (measured); on Linux, PID 1 or the nearest
+   ancestor that set `PR_SET_CHILD_SUBREAPER`, such as `systemd --user` or a container's init (checked in a
+   Linux container with a stand-in for the server, not with orch itself). Then signal its process group:
 
    ```bash
-   ps -o pid,ppid,pgid,stat,etime,command -p <probe-pid>
+   ps -o pid,ppid,pgid,lstart,command -p <probe-pid>
    kill -TERM -<probe-pid>      # leading minus: the probe's process group
    ```
 
    If you did not note them (the server was killed or crashed before you looked), search for probes left behind.
    A probe is an adapter's version check, such as `claude --version`, or `opencode run --help`, leading its own
-   group, with parent 1:
+   group. The search does not filter on the parent, so it can also list a version check that something else is
+   running now:
 
    ```bash
-   ps -eo pid,ppid,pgid,etime,args | awk 'NR == 1 || ($2 == 1 && $1 == $3 && / (--version|run --help)$/)'
+   ps -eo pid,ppid,pgid,etime,args | awk 'NR == 1 || ($1 == $3 && / (--version|run --help)$/)'
    ```
 
-   Check each row's command and age before you signal it: a recycled pid would make you kill an unrelated group.
+   Check each row before you signal it. Its command must be one of this project's adapters, and it must have
+   started before the server died; a probe never runs longer than 10 s while its server is alive. Look at its
+   parent (`ps -o pid,command -p <ppid>`): a leftover probe's parent is PID 1 or, on Linux, a subreaper, such as
+   a service manager, a container's init or a supervisor. A version check whose parent is a shell is someone's
+   current command, not a leftover. A recycled pid would make you kill an unrelated group.
 7. Inspect before anything is retried. Each call that was in flight, and each call whose answer was lost, may have
    saved its change. Read the entities it touched (`orch --json task show <id>`, `orch --json task list`,
    `orch --json context get <key>`, `orch --json agent status <id>`) and the captured log, if any. Retry only what

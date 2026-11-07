@@ -105,8 +105,11 @@ server runs no further call, even one it has already read, and exits.
 
 **Processes.** When stdin closes, and on SIGTERM, SIGINT or SIGHUP, the server stops the `doctor` probes it
 started before it exits (see [`doctor` runs programs](#doctor-runs-programs)). A SIGKILL, or a crash, gives it no
-chance to: a probe that was running then keeps running, reparented to PID 1. Find and stop it with
-[A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process).
+chance to: a probe that was running then keeps running, still the leader of its own process group, under a new
+parent. On macOS that parent is PID 1 (measured). On Linux it is PID 1 or, when an ancestor such as a service
+manager or a container's init has set `PR_SET_CHILD_SUBREAPER`, that ancestor (checked in a Linux container
+with a stand-in for the server, not with orch itself), so a parent of 1 does not identify a leftover probe.
+Find and stop it with [A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process).
 
 **Lock files.** `orch mcp` does not take the orchestrator's PID lock (`.orchestry/orchestry.lock`), so it runs
 next to `orch serve` and the others. It does use the stores' own locks: a call that writes a store creates that
@@ -704,7 +707,7 @@ Before you retry such an error:
    the error, and `task_list` can omit a task whose index entry is missing. Look for the new entity in the list
    first. If it is not there and a duplicate would matter, have an operator rebuild the index, as in
    [Rebuilding an index after a lost update](../RUNBOOK.md#rebuilding-an-index-after-a-lost-update), and list
-   again before you retry. No tool can rebuild an index.
+   again before you retry. No tool can force a rebuild of an index that is stale but still valid.
 
 ## Limitations
 
