@@ -381,6 +381,31 @@ inputs are in [examples/org-templates/](examples/org-templates/).
 
 ---
 
+## MCP server
+
+`orch mcp` serves the project to an MCP client (Claude Code, Codex, Cursor, the MCP Inspector) over stdin and
+stdout: typed tools for tasks, goals, agents, messages, context, teams, logs, `doctor` and configuration, and
+read-only `orch://` resources. No socket, no daemon, no orchestrator lock; the tools change stored state, and
+`orch run --watch`, `orch serve` or the dashboard still runs the work.
+
+```bash
+claude mcp add orch -- orch mcp                          # Claude Code, project from its working directory
+orch mcp --project-root /path/to/project                 # serve one project, from any directory
+orch mcp --agent agt_example                             # default message sender and inbox (or ORCH_AGENT_ID)
+orch mcp --read-only                                     # read tools only
+orch mcp --allow-destructive                             # also delete/cancel, and pause goals
+```
+
+The default mode registers read and ordinary change tools; `task_cancel`, `goal_delete`, `agent_remove`,
+`team_disband`, `context_delete`, and pausing or forcing a goal need `--allow-destructive`, because pausing a goal
+cancels its assignee's pending autonomous tasks in every goal. The identity is attribution, not authentication,
+and no mode is a sandbox. The server is not transactional: next to other writers it has the same hazards as two
+`orch` processes. Client configurations, the worker setup that passes on `ORCH_AGENT_ID`, the tool catalogue and
+the limitations are in [the manual](docs/manual/17-mcp-server.md); recovery is in the
+[runbook](docs/RUNBOOK.md#recovering-after-concurrent-mcp-writers).
+
+---
+
 ## Remote agents
 
 Peers use plain TCP on a trusted LAN, **without authentication or encryption**. Listening is off by
@@ -668,8 +693,8 @@ drafts last only for the dashboard session).
 
 | Document | For |
 |---|---|
-| **[docs/manual/](docs/manual/README.md)** | **Users.** The user manual: installing, concepts, every command, the dashboard and web dashboard, templates, remote agents and troubleshooting, with screenshots |
-| **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and known gotchas — corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
+| **[docs/manual/](docs/manual/README.md)** | **Users.** The user manual: installing, concepts, every command, the dashboard and web dashboard, templates, remote agents, the MCP server and troubleshooting, with screenshots |
+| **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and known gotchas — corrupt locks, hung `--once`, index rebuilds, state recovery, concurrent MCP writers, debugging, secrets |
 | [docs/file-mutations.md](docs/file-mutations.md) | `update` / `patch` from JSON or YAML files: input rules, writable fields, errors, locking |
 | [docs/org-templates.md](docs/org-templates.md) | Organization templates: directory format, rules, precedence, deploy, shop, `update`/`patch`, repair, the a-team and its prerequisites |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |

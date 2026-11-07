@@ -33,6 +33,8 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `update`/`patch` fails with `mutation lock timed out`, `read mutation input` or a `<stdin>:` error | [File mutations: update and patch failures](#file-mutations-update-and-patch-failures) |
 | `org deploy` failed half way, or a template will not load or change | [Organization templates: failures and recovery](#organization-templates-failures-and-recovery) |
 | A task stays `todo` with `configuration preflight` or the eco/custom-template message, or a run fails before start with `effort preparation failed` | [Prompt mode and effort failures](#prompt-mode-and-effort-failures) |
+| Data lost or overwritten while `orch mcp` clients and other writers shared a project | [Recovering after concurrent MCP writers](#recovering-after-concurrent-mcp-writers) |
+| Every `orch mcp` tool and resource call fails with a configuration error | [Restoring a configuration broken through the MCP server](#restoring-a-configuration-broken-through-the-mcp-server) |
 
 ---
 
@@ -122,12 +124,14 @@ fail it, which is the worse failure mode.
 **Symptom.** `orch task show <id>` returns the task, but `orch task list` and `orch status` do not show it,
 and the orchestrator never dispatches it. The entity's `.yml` file exists on disk.
 
-**Cause.** Each store keeps an `_index.json` cache alongside the individual entity files, maintained by a
-read-modify-write that is serialised **only within one process**. Two processes writing concurrently — the
-normal case, since one-shot commands never take the orchestrator lock — can drop an entry. See
-[ARCHITECTURE.md §2.1](ARCHITECTURE.md).
+**Cause.** Each store keeps an `_index.json` cache alongside the individual entity files. Current orch
+serialises every index read-modify-write across processes with `<store>/.index.lock` (waiting at most 5 s), so
+two current writers creating different entities keep both entries. The entity file and its index entry are still
+written as two separate steps, not one transaction, and a writer that does not take the lock (an older orch
+binary, a hand edit) can still overwrite the index. A crash between the two writes, or such a writer, leaves the
+index behind the files. See [ARCHITECTURE.md §2.1](ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer).
 
-Index writes are not locked across processes, so this is a documented hazard with a one-command recovery.
+This is a documented hazard with a one-command recovery.
 
 **Recovery.** Delete the index; the next read rebuilds it from the entity files, which are the source of
 truth:
@@ -140,8 +144,9 @@ orch task list                       # rebuilds
 Safe to run at any time. There is **no command that does this for you**, and nothing reports the divergence —
 the only symptom is the disagreement above.
 
-**Prevention.** Avoid running mutating commands (`task add`, `agent add`, `goal add`) concurrently with a
-`serve` or `run --watch`, and avoid two of them at once. `teams/` and `runs/` have no index and are immune.
+**Prevention.** Avoid running mutating commands (`task add`, `agent add`, `goal add`), or `orch mcp` clients that
+change the project, concurrently with a `serve` or `run --watch` during bulk changes, and do not mix orch
+versions on one project. `teams/` and `runs/` have no index and are immune.
 
 **The inverse case, worth knowing while you are here.** A listing reads only the index — it never opens the
 entity files — so the failure can run the other way too: a **corrupt or truncated** `tasks/<id>.yml` is
@@ -776,3 +781,81 @@ refused command leaves the template unchanged; `deploy` is the only command that
 A change made while another tool writes the same template, or a hand edit during a command, is not covered by the
 lock: the last writer wins. If a command was interrupted, run `orch org template show` before repeating it, because
 a crash after the file was renamed has still saved the change.
+
+## Recovering after concurrent MCP writers
+
+Applies to projects that `orch mcp` clients share with other writers: `orch run --watch`, `orch serve`, the
+dashboard, other `orch mcp` processes and one-off `orch` commands ([manual](manual/17-mcp-server.md#concurrent-writers)).
+
+**Symptom.** A field you set through a tool, the CLI or the orchestrator is back to an older value (a task's
+status or assignee, an agent setting); a context key that was just set or renewed is gone; a task exists as a file
+but is missing from `task list`; or, after a directory under `.orchestry/` was removed or replaced, calls keep
+failing with an I/O error.
+
+**Cause.** The server is not transactional, and its one-call-at-a-time queue covers only its own calls. It shares
+the hazards of any two orch processes on one project:
+
+| Boundary | Existing protection at source base | Remaining failure |
+|---|---|---|
+| IndexManager | Cross-process `.index.lock`, bounded 5-second wait, locked read-modify-publish and stable ordering | Entity+index are not one atomic transaction; old writers may ignore the protocol. Modern distinct-id creates must retain both index entries. |
+| Task/other whole-record updates | Single-file atomic writes; some authored-definition paths have `.definition.lock` | Concurrent owner status advancement and task assignment can overwrite one another's whole records. No compare-and-swap promise. |
+| Context expiry | list/get can delete expired entity files and list publishes a computed keep-list | Another writer's newly indexed key may disappear from that list; a renewal of an expired key may be deleted. Read-only sessions also participate. |
+| Messages | Store transaction holds its mutation lock across entity/index operations | Do not generalize weaker task/context guarantees to messages or imply a multi-service transaction. |
+| Process directory cache | Fresh Engines refresh config/service defaults, but `ensure_dir` retains a process-global set | Removing a cached directory can make later operations fail until process restart. |
+
+These interleavings are traced from the code; none is a measured failure rate. `--read-only` sessions are
+included: their context reads delete expired entries.
+
+**Recovery.**
+
+1. Stop issuing work in every connected MCP client.
+2. Stop every writer: disconnect or quit each client (which ends its `orch mcp` child; check with
+   `pgrep -fl 'orch mcp'`), stop the orchestrator owner (`orch serve`, `orch run --watch` or the dashboard), and let
+   one-off `orch` commands finish.
+3. Back up the state before you touch it:
+
+   ```bash
+   cp -R .orchestry ../orchestry-backup-$(date +%Y%m%d-%H%M%S)
+   ```
+
+4. Inspect what is wrong: `orch --json task show <id>`, `orch --json agent status <id>`,
+   `orch --json context list`, `orch logs --task <id>`.
+5. If a list disagrees with the entity files, rebuild the index as in
+   [Rebuilding an index after a lost update](#rebuilding-an-index-after-a-lost-update). A rebuild restores
+   entries for files that exist; it cannot bring back an overwritten field or a deleted context entry.
+6. Restore lost fields and entries from what you know is right: your backups, the run logs, the messages and the
+   agents' outputs. Use the normal commands (`orch task assign`, `orch agent update`, `orch context set`), one
+   writer at a time.
+7. Restart the orchestrator owner, then **every** MCP session (restart each client, or its MCP server). A restart
+   is required after a directory under `.orchestry/` was removed or replaced: each `orch mcp` process remembers the
+   directories it has created, and only a new process forgets them.
+
+**Prevention.** Do not remove or replace directories under `.orchestry/` while anything runs. Make bulk or
+consistency-sensitive changes (configuration, many tasks, team changes) while the other writers and any client
+that reads context are stopped. This is advice, not a lock: nothing enforces it.
+
+## Restoring a configuration broken through the MCP server
+
+**Symptom.** Every `orch mcp` tool and resource call fails with the same error,
+`parse <project>/.orchestry/config.yml`, while the session stays connected. A new `orch mcp` refuses to start with
+that error (exit 1), and the CLI fails the same way: `orch status` and even `orch config get` print it.
+
+**Cause.** `config_set`, like `orch config set`, validates only the prompt-related keys and stores any other value
+as given: a JSON-parsable string becomes a number, boolean or object, anything else a string. A wrongly typed value
+for a known key is saved, and from then on every engine build, and so every MCP call, fails. No tool can repair
+it, because every tool needs a working configuration.
+
+**Fix.**
+
+1. Find the bad key. The error does not name it: compare with a backup
+   (`diff <backup>/config.yml .orchestry/config.yml`), or look in the file for the value the client set last. For
+   example, `config_set` with key `scheduling.poll_interval_ms` and value `hello` stores the string `"hello"`
+   where a number belongs.
+2. Restore a valid file: copy back your backup, or edit `.orchestry/config.yml` by hand and put the value back to
+   the right type.
+3. Check with the CLI: `orch status` succeeds again.
+4. Call the tool again. The server reads the configuration for every call, so no restart is needed.
+
+**Prevention.** Back up `.orchestry/config.yml` before letting a client change configuration, or register clients
+that should not change it with `--read-only`. With Codex, `disabled_tools` can hide `config_set`, `config_update`
+and `config_patch`.

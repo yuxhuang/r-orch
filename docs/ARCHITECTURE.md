@@ -27,7 +27,7 @@ Load-bearing, stated so they can be challenged:
 | # | Assumption | If wrong |
 |---|---|---|
 | A1 | **Scale is small.** Tens of agents, hundreds of tasks, thousands of run events per run. The caps (16 KB lines, 8 KB events, 1024-event buffer, 500-entry LRU) are generous. | Nothing in the design changes; the file-per-entity store would need an index rework only at ~10⁵ tasks. |
-| A2 | **Single *orchestrator*, multiple concurrent mutators.** The PID lock serializes *orchestrators* only. One-shot commands never take it, and some "reads" write. See A2-detail below. | Not a hypothetical: it is true today, so it is documented rather than assumed away. |
+| A2 | **Single *orchestrator*, multiple concurrent mutators.** The PID lock serializes *orchestrators* only. One-shot commands and `orch mcp` never take it, and some "reads" write. See A2-detail below. | Not a hypothetical: it is true today, so it is documented rather than assumed away. |
 | A3 | **POSIX only.** r-orch uses process groups (`kill(-pid)`), `bash -lc`, `rsync`, and `O_APPEND` atomicity. Windows support is already partial at best. | Windows would need a separate process-group strategy (job objects) and no `bash`. Out of scope; keep platform code behind a `cfg` boundary so it can be added. |
 | A4 | **Latency budget is human-scale.** Tick interval 10 s; CLI commands should feel instant (<100 ms). The container tiering exists purely to keep read-only commands fast. | Rust startup is ~1 ms either way, so the tiering becomes an optional optimization rather than a requirement. |
 | A5 | **Prompt text must be byte-exact** because agents are prompt-sensitive and the system prompt is a cache key. | If approximate were acceptable, the Liquid risk (§4.3) would mostly evaporate. It is not acceptable. |
@@ -40,21 +40,41 @@ project directory is a normal workflow, which multiplies the exposure. Three fac
 
 1. **One-shot commands never take the lock.** Only one
    `orch run --watch` can run at a time; one-shot commands do not acquire the lock. So `orch task add` while
-   the orchestrator runs is a second mutator — and that is the *normal* workflow, not an edge case.
+   the orchestrator runs is a second mutator — and that is the *normal* workflow, not an edge case. A running
+   `orch mcp` server is a long-lived mutator of the same kind.
 2. **Some reads write.** Reading an index that is missing or corrupt rebuilds it and **writes `_index.json`**.
    `orch task list` on a fresh project therefore creates directories and writes
    a file.
 3. **The mutex is in-process only.** It is invisible to a second r-orch process.
 
-**Lost-update mechanism, stated plainly.** Two processes interleaving the `_index.json` read-modify-write can
-drop entries: `tasks/tsk_X.yml` exists on disk but is absent from the index, so `task list`, `status` and
-**dispatch** do not see the task, while `task show tsk_X` does. It self-heals only when the index is deleted or
-corrupted into a rebuild.
+**What is locked across processes, and what is not.** Every `_index.json` mutation (`IndexManager::update_index`,
+`write_index`, `rebuild_index` in `orch-infra/src/storage/index.rs`) takes `<store>/.index.lock`, an advisory file
+lock plus an in-process mutex, with a 5-second bounded wait, and holds it through read, modify and publish. Two
+current writers creating different entities therefore keep both entries. What remains:
 
-**This is not fixed by locking today.** Index writes take no cross-process lock, so the honest response is to
-**document the behaviour and verify that it is what we documented**, not to claim a guarantee we cannot provide.
-Concurrent mutation while an orchestrator is running is a **known, documented hazard**, written up for
-operators, with the one-command recovery, in [docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update).
+- **Entity and index are two writes, not one transaction.** A crash between them, or a writer that ignores the
+  lock (an older binary, a hand edit), leaves `tasks/tsk_X.yml` on disk but absent from the index, so `task list`,
+  `status` and **dispatch** do not see the task while `task show tsk_X` does. It self-heals only when the index is
+  deleted or corrupted into a rebuild.
+- **Whole-record saves have no compare-and-swap.** Two processes that read the same task (say, the orchestrator
+  advancing its status and a CLI or MCP call assigning it) and save it in turn: the later save wins whole.
+- **Context expiry publishes a computed keep-list.** A `context list`/`get` that purges expired entries can drop
+  a key another process has just indexed, or delete an expired key another process is renewing.
+- **`ensure_dir` remembers created directories per process.** Removing such a directory while a long-lived process
+  (the orchestrator, the dashboard, `orch mcp`) runs can make its later writes fail until it restarts.
+
+The honest response is to **document the behaviour and verify that it is what we documented**, not to claim a
+guarantee we cannot provide. Concurrent mutation while an orchestrator is running is a **known, documented
+hazard**, written up for operators, with recovery, in
+[docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update) and
+[Recovering after concurrent MCP writers](RUNBOOK.md#recovering-after-concurrent-mcp-writers).
+
+**`orch mcp` is one more long-lived mutator, not a new class of hazard.** It never takes the orchestrator's PID
+lock. Its per-server FIFO queue (one store operation at a time, at most 16 admitted, 10 s wait) serializes the
+calls of *that* server only and is invisible to every other process; one server per client connection is the
+supported shape. Accepting this residual risk for the MCP server, rather than repairing the stores first, is lead
+decision-2 (E2) of the [MCP server spec](specs/2026-11-07-mcp-server.md); storage repair (compare-and-swap for
+whole-record saves, expiry under the index lock) is separate follow-up work. See [ADR 0011](decisions/0011-mcp-server.md).
 
 **`update` and `patch` add one narrow, new lock — not a fix for the above.** `orch agent|task|config update|patch`
 ([guide](file-mutations.md)) take a stable advisory lock, `.orchestry/.definition.lock`, for at most 5 seconds
@@ -183,8 +203,32 @@ All three names are the same program:
 | `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
-| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}` |
+| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
+
+### 3.3.1 `orch mcp` (`orch-cli::mcp`)
+
+The stdio MCP server ([ADR 0011](decisions/0011-mcp-server.md), [manual](manual/17-mcp-server.md)). It lives
+entirely in `orch-cli`, above the engine, so the crate graph (§3.1) is unchanged. It calls the same `Engine`
+services as the CLI commands, never their printing wrappers.
+
+| Module | Owns |
+|---|---|
+| `mcp` (`mod.rs`) | `orch mcp` entry: identity, mode and project root resolved before anything reaches stdout; a first light-Engine build so a broken config is a startup error; its own Tokio runtime with a 250 ms bounded shutdown (Tokio's stdin read cannot be cancelled) |
+| `mcp::server` | `rmcp::ServerHandler`; per-call admission (store lane: 16 permits, FIFO `tokio::sync::Mutex`, 10 s wait; diagnostic lane for `doctor`: 2 permits, 120 s whole-call deadline); a fresh light `Engine` per admitted call; SIGINT/SIGTERM and EOF lifecycle; `initialize` instructions |
+| `mcp::registry` | `Registry::add` over rmcp's `ToolRouter`: one name, schema (`schemars`), annotations and class per tool; strict decode (unknown fields refused) and `ToolArgs::validate` before any Engine; mode filtering at registration and again at call |
+| `mcp::mode`, `mcp::identity` | Pure policy: `Default`/`ReadOnly`/`AllowDestructive` and the `Read`/`Mutate`/`Destructive` classes; `--agent` over `ORCH_AGENT_ID` |
+| `mcp::projections`, `mcp::resources` | Print-free read projections shared by tools and the `orch://` resources; strict URI grammar |
+| `mcp::system`, `mcp::tools::*` | `status`/`doctor`, and one leaf module per tool group, each exporting only `register` |
+
+Rules that keep it correct:
+- **Never the full tier.** No `FullEngine`, orchestrator, PID lock, scheduler or listener is built; `task_cancel` is
+  store-only. Short data-integrity locks (`.index.lock`, `.definition.lock`) are still taken.
+- **Shared validation, not copies.** Definition mutations and `config set` go through print-free helpers extracted
+  in `commands::{task, agent, config}`, which the CLI wrappers also call.
+- **stdout is the protocol.** Diagnostics go through the existing stderr `tracing` subscriber; no command wrapper
+  runs after the transport starts; `file: "-"` is refused so nothing reads stdin but the transport.
+- **Reads can write**, as everywhere (§2.1): read-only mode removes authored-mutation tools, not maintenance writes.
 
 ### 3.4 Organization templates
 
@@ -338,6 +382,17 @@ not open-ended work.
 
 Windows is out of scope: the cargo-deny graph is Linux-only (`deny.toml`) and `portable-pty` pulls in
 Windows-only crates the gate never resolves.
+
+### 4.5.2 `orch mcp` (`orch-cli` only)
+
+| Crate | Version | Why |
+|---|---|---|
+| `rmcp` | `3.9` (default features off; `server`, `macros`, `transport-io`) | The official MCP Rust SDK: JSON-RPC framing (lines bounded at 16 MiB), lifecycle and version negotiation, tool and resource routing, stdio transport. Apache-2.0, MSRV 1.88. Rejected: hand-rolled JSON-RPC and MCP lifecycle (no §4.8 exemption applies). [ADR 0011](decisions/0011-mcp-server.md). |
+| `schemars` | `1.2` | JSON Schemas for tool arguments, derived from the typed argument structs. Declared directly so `#[derive(JsonSchema)]` paths resolve. |
+| `tokio` (`io-std`) | `1` | Feature added to `orch-cli`'s existing Tokio for the stdin/stdout transport. `tokio-util` (already a dependency) supplies the `CancellationToken` that stops the service on SIGINT/SIGTERM. |
+
+Known duplicate: rmcp needs `sha2` 0.11 while `orch web`'s stack holds 0.10, so both are in the graph (see the
+comment in the workspace `Cargo.toml`).
 
 ### 4.6 Dev-dependencies
 

@@ -5,6 +5,9 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- `orch mcp` serves the project to MCP clients such as Claude Code, Codex and Cursor over stdio: typed tools for tasks, goals, agents, messages, context, teams, logs, `doctor` and configuration, plus read-only `orch://` resources. Read and ordinary change tools are on by default; `--read-only` keeps only the read tools, and `--allow-destructive` adds cancel, delete and remove and lets a client pause or force a goal. `--agent` or `ORCH_AGENT_ID` sets the default message sender and inbox. It takes no orchestrator lock, so it runs next to `orch run --watch`, `orch serve` and the dashboard. See [the MCP server](docs/manual/17-mcp-server.md).
+
 ## [0.11.1] - 2026-10-24
 
 Dashboard cursor and tab patch release. No peer-protocol change, so 0.5.x through 0.11.1 peers can be mixed.

@@ -7,10 +7,11 @@ right command; use the chapter for steps and examples. For every option of a com
 orch task add --help
 ```
 
-> **Note:** Only `orch --help`, `orch --version`, `orch init`, `orch doctor`, `orch update` and the
-> `orch org template` commands work outside a project. Every other command, even with `--help`, needs a project:
-> run it in a directory where `orch init` has run, or in a subdirectory of one. Otherwise it prints
-> `Not initialized` and exits with code 3.
+> **Note:** Only `orch --help`, `orch --version`, `orch init`, `orch doctor`, `orch update`, `orch mcp --help` and
+> the `orch org template` commands work outside a project. Every other command, even with `--help`, needs a
+> project: run it in a directory where `orch init` has run, or in a subdirectory of one. Otherwise it prints
+> `Not initialized` and exits with code 3. `orch mcp --project-root <path>` serves the project at `<path>` from
+> any directory.
 
 How to read the usage column:
 
@@ -180,11 +181,11 @@ Check adapters and dependencies. Explained in [Running and monitoring](07-runnin
 
 ### orch update
 
-Check for updates and install the latest version. Explained in [Running and monitoring](07-running-and-monitoring.md). In 0.9.4 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md).
+Check for updates and install the latest version. Explained in [Running and monitoring](07-running-and-monitoring.md). In 0.11.1 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md).
 
 | Command | What it does | Usage |
 |---|---|---|
-| `orch update` | Check for updates and install the latest version. In 0.9.4 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md). | `orch update [OPTIONS]` |
+| `orch update` | Check for updates and install the latest version. In 0.11.1 it does not install anything; it prints how to upgrade. See [Getting started](01-getting-started.md). | `orch update [OPTIONS]` |
 
 ### orch tui
 
@@ -201,6 +202,14 @@ Serve the TUI dashboard in a browser (xterm.js over a websocket). Explained in [
 | Command | What it does | Usage |
 |---|---|---|
 | `orch web` | Serve the TUI dashboard in a browser (xterm.js over a websocket) | `orch web [OPTIONS]` |
+
+### orch mcp
+
+Serve this project to MCP clients over stdio. Explained in [The MCP server](17-mcp-server.md).
+
+| Command | What it does | Usage |
+|---|---|---|
+| `orch mcp` | Serve this project to MCP clients over stdio | `orch mcp [OPTIONS]` |
 
 ### orch org
 
@@ -258,5 +267,5 @@ Manage configuration. Explained in [Configuration and output](12-configuration-a
 
 ---
 
-This page is generated from the `--help` output of orch 0.9.4. If it and `--help` ever disagree, `--help` is
+This page is generated from the `--help` output of orch 0.11.1. If it and `--help` ever disagree, `--help` is
 right; see [About this manual](about-this-manual.md#keeping-the-manual-accurate).
