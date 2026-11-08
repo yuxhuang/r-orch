@@ -1,6 +1,7 @@
 //! Dev tooling for r-orch. `cargo xtask <command>`.
 
 mod crate_graph;
+mod linux;
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,8 @@ struct Cli {
 enum Task {
     /// Assert the crate layering from ARCHITECTURE §3.1.
     CrateGraph,
+    /// Run the Linux checks from macOS in a linux/amd64 Docker container (AGENTS.md).
+    Linux(linux::LinuxArgs),
 }
 
 fn main() -> Result<()> {
@@ -26,6 +29,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Task::CrateGraph => crate_graph::run(&repo_root),
+        Task::Linux(args) => linux::run(&repo_root, args),
     }
 }
 

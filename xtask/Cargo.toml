@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Dev tooling for r-orch: crate-graph checks."
+description = "Dev tooling for r-orch: crate-graph checks and Linux container runs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

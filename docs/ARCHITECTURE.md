@@ -98,7 +98,7 @@ r-orch/
 │   ├── orch-peer/             # remote-peer protocol: links, mirrors, reconnect (core, domain, engine, infra)
 │   ├── orch-cli/              # clap command tree, human + JSON rendering, serve mode. bins live here.
 │   └── orch-tui/              # ratatui dashboard
-├── xtask/                     # dev tooling: crate-graph, gate.sh, mouse-e2e
+├── xtask/                     # dev tooling: crate-graph, linux, gate.sh, mouse-e2e
 ├── fixtures/                  # golden prompts, adapter stdout recordings, shop catalogue, fake agents
 └── skills/library/            # shipped skill markdown
 ```
