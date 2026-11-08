@@ -1169,6 +1169,12 @@ fn cli_json(project: &std::path::Path, args: &[&str]) -> Value {
         .unwrap_or_else(|err| panic!("orch {args:?} printed no JSON ({err}): {output:?}"))
 }
 
+/// `orch <args>` for a command that prints no JSON: asserts it succeeded.
+fn cli_ok(project: &std::path::Path, args: &[&str]) {
+    let output = mcp_common::output_of(orch_command(project).args(args));
+    assert!(output.status.success(), "orch {args:?} failed: {output:?}");
+}
+
 fn id_of(value: &Value) -> String {
     value["id"].as_str().expect("an id").to_owned()
 }
@@ -1316,6 +1322,191 @@ fn reading_the_inbox_resource_twice_does_not_consume_the_messages() {
     );
 }
 
+// ── qualified `agt@peer` resources (R5) ───────────────────────────────────
+
+/// A project with one registered remote peer `w1` whose cached snapshot holds
+/// one agent, plus one pending message addressed to that agent's qualified
+/// id. Built before any server starts, through the CLI and the same
+/// `remotes.yml` / `remotes/<alias>.json` files the live link publishes. The
+/// peer is offline (nothing owns the project), which is the legitimate state
+/// of a cached snapshot and does not change what a qualified read returns.
+struct PeerFixture {
+    project: tempfile::TempDir,
+    /// The peer's own id for the agent, without the alias.
+    bare: String,
+    /// `<bare>@w1`: the id every orch surface shows for it.
+    qualified: String,
+}
+
+fn peer_project() -> PeerFixture {
+    let project = initialized_project();
+    let path = project.path();
+    cli_ok(path, &["remote", "add", "w1", "127.0.0.1:1"]);
+    // Any well-formed agent record is a valid peer snapshot entry; borrow one
+    // from a real `agent add` and then drop the local copy so the qualified id
+    // can only resolve through the peer directory.
+    let agent = cli_json(
+        path,
+        &[
+            "agent",
+            "add",
+            "rx",
+            "--adapter",
+            "shell",
+            "--command",
+            "true",
+        ],
+    );
+    let bare = id_of(&agent);
+    let remotes = path.join(".orchestry/remotes");
+    std::fs::create_dir_all(&remotes).expect("remotes dir");
+    let status = json!({
+        "alias": "w1",
+        "addr": "127.0.0.1:1",
+        "online": false,
+        "last_seen": null,
+        "last_error": null,
+        "peer_name": "worker",
+        "instance_id": null,
+        "os": "linux",
+        "agents": [agent],
+    });
+    std::fs::write(
+        remotes.join("w1.json"),
+        serde_json::to_vec(&status).expect("status JSON"),
+    )
+    .expect("write the peer snapshot");
+    cli_ok(path, &["agent", "remove", &bare]);
+    let qualified = format!("{bare}@w1");
+    cli_ok(
+        path,
+        &["msg", "send", &qualified, "for the peer", "--from", "cli"],
+    );
+    PeerFixture {
+        project,
+        bare,
+        qualified,
+    }
+}
+
+#[test]
+fn a_qualified_agent_resource_returns_the_peer_agent_under_its_qualified_id() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+    let uri = format!("orch://agents/{}", fixture.qualified);
+
+    let agent = read_resource_json(&mut server, &uri);
+
+    assert_eq!(agent["id"], json!(fixture.qualified), "{agent}");
+    assert_eq!(agent["name"], json!("rx@w1"), "{agent}");
+    assert_eq!(agent["remote"]["alias"], json!("w1"), "{agent}");
+    assert_eq!(
+        agent,
+        tool_json(&mut server, "agent_show", json!({"id": fixture.qualified})),
+        "the resource is the agent_show projection"
+    );
+}
+
+#[test]
+fn a_qualified_agent_resource_is_listed_in_orch_agents() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    let agents = read_resource_json(&mut server, "orch://agents");
+
+    let ids: Vec<&str> = agents
+        .as_array()
+        .expect("an agent array")
+        .iter()
+        .map(|agent| agent["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, [fixture.qualified.as_str()]);
+}
+
+#[test]
+fn a_qualified_inbox_resource_returns_the_messages_addressed_to_the_qualified_id() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+    let uri = format!("orch://inbox/{}", fixture.qualified);
+
+    let inbox = read_resource_json(&mut server, &uri);
+
+    let messages = inbox.as_array().expect("an inbox array");
+    assert_eq!(messages.len(), 1, "{inbox}");
+    assert_eq!(messages[0]["to_agent_id"], json!(fixture.qualified));
+    assert_eq!(messages[0]["body"], json!("for the peer"));
+    assert_eq!(
+        inbox,
+        tool_json(
+            &mut server,
+            "msg_inbox",
+            json!({"agent_id": fixture.qualified})
+        ),
+        "the resource is the msg_inbox projection"
+    );
+}
+
+#[test]
+fn the_bare_id_does_not_read_the_qualified_agents_inbox() {
+    // `agt_x` and `agt_x@w1` are different recipients: a qualified message is
+    // addressed to the peer's agent, not to a local agent of the same bare id.
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    let inbox = read_resource_json(&mut server, &format!("orch://inbox/{}", fixture.bare));
+
+    assert_eq!(inbox, json!([]));
+}
+
+#[test]
+fn a_qualified_inbox_for_an_unknown_peer_is_an_empty_inbox() {
+    // An inbox read never needs the agent to exist (the CLI's `msg inbox`
+    // behaves the same): a qualified id with an unregistered alias is `[]`,
+    // not an error.
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    let inbox = read_resource_json(
+        &mut server,
+        &format!("orch://inbox/{}@nowhere", fixture.bare),
+    );
+
+    assert_eq!(inbox, json!([]));
+}
+
+#[test]
+fn a_qualified_agent_resource_for_an_unknown_peer_or_agent_is_resource_not_found() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    for uri in [
+        format!("orch://agents/{}@nowhere", fixture.bare),
+        "orch://agents/agt_missing@w1".to_owned(),
+    ] {
+        let response = server.request("resources/read", json!({"uri": uri}));
+        assert_eq!(error_code(&response), Some(-32002), "{uri}: {response}");
+    }
+}
+
+#[test]
+fn only_agents_and_inbox_accept_a_qualified_id() {
+    // Tasks and goals are local-only: `@` there is a syntax error, not a miss.
+    let project = initialized_project();
+    let mut server = McpServer::spawn(project.path());
+    server.initialize();
+
+    for uri in ["orch://tasks/tsk_a@w1", "orch://goals/goal_a@w1"] {
+        let response = server.request("resources/read", json!({"uri": uri}));
+        assert_eq!(error_code(&response), Some(-32602), "{uri}: {response}");
+    }
+}
+
 // ── lifecycle (R8) ────────────────────────────────────────────────────────
 
 #[test]
@@ -1419,6 +1610,72 @@ fn sighup_with_stdin_still_open_exits_zero_within_the_shutdown_bound() {
     let exit = server.wait_for_exit();
 
     assert_eq!(exit.status.code(), Some(0), "stderr: {}", exit.stderr);
+}
+
+/// The entry names directly under `<project>/.orchestry`, sorted.
+fn orchestry_entries(project: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(project.join(".orchestry"))
+        .expect("read .orchestry")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A signal stops the server the way EOF does: exit 0, only protocol frames on
+/// stdout, and the project directory exactly as it was (the server never took
+/// `.orchestry/orchestry.lock` or left any other file behind).
+#[cfg(unix)]
+fn assert_signal_stops_cleanly(signal: nix::sys::signal::Signal) {
+    let project = initialized_project();
+    let mut server = McpServer::spawn(project.path());
+    server.initialize();
+    status_ok(&mut server);
+    let before = orchestry_entries(project.path());
+    assert!(
+        !before.iter().any(|name| name == "orchestry.lock"),
+        "a running server holds the project lock: {before:?}"
+    );
+
+    server.signal(signal);
+    let exit = server.wait_for_exit();
+
+    assert_eq!(
+        exit.status.code(),
+        Some(0),
+        "{signal}: stderr: {}",
+        exit.stderr
+    );
+    for line in &exit.stdout_lines {
+        assert!(
+            serde_json::from_str::<Value>(line).is_ok(),
+            "{signal}: non-JSON line on stdout: {line:?}"
+        );
+    }
+    assert_eq!(
+        orchestry_entries(project.path()),
+        before,
+        "{signal}: the project directory changed across shutdown"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_leaves_clean_stdout_and_no_lock_or_file_behind() {
+    assert_signal_stops_cleanly(nix::sys::signal::Signal::SIGTERM);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_leaves_clean_stdout_and_no_lock_or_file_behind() {
+    assert_signal_stops_cleanly(nix::sys::signal::Signal::SIGINT);
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_leaves_clean_stdout_and_no_lock_or_file_behind() {
+    assert_signal_stops_cleanly(nix::sys::signal::Signal::SIGHUP);
 }
 
 // ── lost output: a client that stops reading but never hangs up ──────────
