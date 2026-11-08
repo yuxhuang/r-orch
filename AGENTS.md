@@ -16,7 +16,7 @@ The repo is **private**, being prepared for open source.
 | `orch-infra` | Implementations of the `orch-core` traits (files, adapters, processes). |
 | `orch-engine` | Services, orchestrator, event bus, container. |
 | `orch-peer` | Remote-peer protocol: links, mirrors, reconnect. |
-| `orch-cli` | clap command tree, human and `--json` rendering, serve mode, `orch web`. Binaries live here. |
+| `orch-cli` | clap command tree, human and `--json` rendering, serve mode, `orch web`, `orch mcp` (stdio MCP server, `src/mcp/`). Binaries live here. |
 | `orch-tui` | ratatui dashboard. |
 | `xtask` | Dev tooling: crate-graph. Run as `cargo xtask <cmd>`. |
 
