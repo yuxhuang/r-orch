@@ -127,7 +127,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
         ),
         show,
     )?;
-    registry.add(meta("goal_status", "Change goal lifecycle (orch goal status). Pausing cancels the assignee's todo/retrying autonomous tasks linked to this goal, not those of other goals or of none, and turns the assignee's autonomous mode off if this was its last active goal; force=true requires --allow-destructive.", Class::Mutate, true, false, true), status)?;
+    registry.add(meta("goal_status", "Change goal lifecycle (orch goal status). Pausing cancels the assignee's todo/retrying autonomous tasks linked to this goal, not those of other goals or of none, and turns the assignee's autonomous mode off if this was its last active goal; resume does not restore cancelled tasks (task_retry does); force=true requires --allow-destructive.", Class::Mutate, true, false, true), status)?;
     registry.add(meta("goal_update", "Update goal text or assignee (orch goal update). An empty assignee clears it; omission preserves it.", Class::Mutate, true, false, true), update)?;
     registry.add(
         meta(

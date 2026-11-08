@@ -346,7 +346,10 @@ impl McpServer {
             Mode::Default => text.push_str(
                 " In this mode goal_status force=true is unavailable. \
                  goal_status status=paused works: it cancels the assignee's todo/retrying \
-                 autonomous tasks of that goal only, not of other goals.",
+                 autonomous tasks of that goal only, not of other goals. \
+                 Tasks with another or no goal id, running work and ordinary queued tasks continue. \
+                 Resume does not restore cancelled tasks; use task_retry deliberately \
+                 to bring a cancelled continuation back.",
             ),
             Mode::ReadOnly => text.push_str(" In this mode only read tools are available."),
             Mode::AllowDestructive => {}
@@ -1000,6 +1003,8 @@ mod tests {
         assert!(instructions.contains("Default agent: \"agt_me\". Mode: default."));
         assert!(instructions.contains("goal_status force=true is unavailable."));
         assert!(instructions.contains("autonomous tasks of that goal only, not of other goals."));
+        assert!(instructions.contains("Tasks with another or no goal id, running work"));
+        assert!(instructions.contains("Resume does not restore cancelled tasks; use task_retry"));
         assert!(!instructions.contains("across goals"));
         assert!(!instructions.contains('\n'));
         h.server.abort();

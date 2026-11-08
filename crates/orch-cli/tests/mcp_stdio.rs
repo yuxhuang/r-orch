@@ -744,6 +744,37 @@ fn default_mode_instructions_say_pause_works_and_is_goal_scoped() {
 }
 
 #[test]
+fn default_mode_instructions_say_what_pause_spares_and_that_resume_does_not_restore() {
+    let project = initialized_project();
+
+    let text = instructions_for(project.path(), &[], &[]);
+
+    assert!(
+        text.contains(
+            "Tasks with another or no goal id, running work and ordinary queued tasks continue."
+        ) && text.contains("Resume does not restore cancelled tasks; use task_retry"),
+        "{text}"
+    );
+}
+
+#[test]
+fn goal_status_description_says_resume_does_not_restore_cancelled_tasks() {
+    let tools = list_tools(&[]);
+    let description = tools["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["name"] == "goal_status")
+        .and_then(|tool| tool["description"].as_str())
+        .expect("goal_status description");
+
+    assert!(
+        description.contains("resume does not restore cancelled tasks (task_retry does)"),
+        "{description}"
+    );
+}
+
+#[test]
 fn default_mode_instructions_do_not_describe_pause_as_cross_goal() {
     let project = initialized_project();
 
