@@ -164,13 +164,139 @@ impl Registry {
 /// failure. The wording deliberately avoids the SDK's
 /// `failed to deserialize parameters:` prefix, which its router would
 /// rewrite into a tool result.
-pub(crate) fn decode<A: DeserializeOwned>(
+pub(crate) fn decode<A: DeserializeOwned + JsonSchema + 'static>(
     name: &str,
     arguments: Option<JsonObject>,
 ) -> Result<A, ErrorData> {
-    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|err| {
-        ErrorData::invalid_params(format!("Invalid arguments for {name}: {err}"), None)
+    serde_path_to_error::deserialize(Value::Object(arguments.unwrap_or_default())).map_err(|err| {
+        let raw = err.inner().to_string();
+        let mut path = err.path().to_string();
+        // Serde reports a missing field at its parent object. The name comes
+        // from the argument definition, not from a supplied value.
+        let missing = raw
+            .strip_prefix("missing field `")
+            .and_then(|s| s.strip_suffix('`'));
+        if let Some(field) = missing {
+            if path == "." {
+                path = field.to_owned();
+            } else {
+                path.push('.');
+                path.push_str(field);
+            }
+        }
+        let field_path = path.escape_debug().to_string().replace('`', "\\`");
+        let detail = match missing {
+            Some(field) => format!(
+                "missing field `{field_path}`: expected {}",
+                missing_field_type::<A>(err.path(), field)
+                    .unwrap_or_else(|| "a required field".to_owned())
+            ),
+            None if raw.starts_with("unknown field ") => {
+                format!("unknown field `{field_path}`: expected a declared field")
+            }
+            None => format!("field `{field_path}`: {}", scrub_serde_error(&raw)),
+        };
+        ErrorData::invalid_params(format!("Invalid arguments for {name}: {detail}"), None)
     })
+}
+
+/// A missing field has no serde expected-type text. Use the same static
+/// schema advertised to clients, falling back when its shape is not simple.
+fn missing_field_type<A: JsonSchema + 'static>(
+    path: &serde_path_to_error::Path,
+    field: &str,
+) -> Option<String> {
+    let schema = schema_for_input::<A>().ok()?;
+    let root = Value::Object((*schema).clone());
+    let mut node = &root;
+    for segment in path {
+        node = schema_node(&root, node)?;
+        node = match segment {
+            serde_path_to_error::Segment::Map { key } => node.get("properties")?.get(key)?,
+            serde_path_to_error::Segment::Seq { .. } => node.get("items")?,
+            _ => return None,
+        };
+    }
+    let property = schema_node(&root, node)?.get("properties")?.get(field)?;
+    let property = schema_node(&root, property)?;
+    property
+        .get("format")
+        .or_else(|| property.get("type"))?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn schema_node<'a>(root: &'a Value, node: &'a Value) -> Option<&'a Value> {
+    let node = if let Some(choices) = node.get("anyOf").and_then(Value::as_array) {
+        choices
+            .iter()
+            .find(|choice| choice.get("type").and_then(Value::as_str) != Some("null"))?
+    } else {
+        node
+    };
+    match node.get("$ref").and_then(Value::as_str) {
+        Some(reference) => root.pointer(reference.strip_prefix('#')?),
+        None => Some(node),
+    }
+}
+
+/// Serde's diagnostics include argument literals. rmcp logs this message at
+/// WARN as well as returning it to the client, so neither may carry values.
+/// Only recognized serde diagnostics pass through; custom error prose is not
+/// guaranteed to quote its values and must use a fixed fallback.
+fn scrub_serde_error(raw: &str) -> String {
+    let diagnostic = if raw.starts_with("missing field ") {
+        return "missing field; expected a required field".to_owned();
+    } else if raw.starts_with("unknown field ") {
+        return "unknown field; expected a declared field".to_owned();
+    } else if raw.starts_with("duplicate field ") {
+        return "duplicate field; expected one occurrence".to_owned();
+    } else if raw.starts_with("invalid type:")
+        || raw.starts_with("invalid value:")
+        || raw.starts_with("invalid length")
+        || raw.starts_with("unknown variant")
+    {
+        // Ignore the unexpected value wholesale. Custom serde errors can
+        // include unquoted values too; only the expected side is useful.
+        raw.rsplit_once(", expected ").map(|(_, expected)| expected)
+    } else {
+        None
+    };
+    let Some(diagnostic) = diagnostic else {
+        return "invalid argument; expected the declared input schema".to_owned();
+    };
+    let mut safe = String::from("expected ");
+    let mut chars = diagnostic.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '\"' | '\'' | '`') {
+            safe.push_str("[redacted]");
+            while let Some(next) = chars.next() {
+                if next == '\\' {
+                    chars.next();
+                } else if next == ch {
+                    break;
+                }
+            }
+        } else if ch.is_alphanumeric() || ch == '_' {
+            let mut word = String::from(ch);
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            if ch.is_numeric() || matches!(word.as_str(), "true" | "false") {
+                safe.push_str("[redacted]");
+            } else {
+                safe.push_str(&word);
+            }
+        } else {
+            safe.push(ch);
+        }
+    }
+    safe
 }
 
 /// The `tool not found` error the SDK router gives an absent tool.
@@ -184,7 +310,7 @@ async fn dispatch<A, F, Fut>(
     call: ToolCallContext<'_, McpServer>,
 ) -> Result<CallToolResponse, ErrorData>
 where
-    A: ToolArgs + DeserializeOwned + Send + 'static,
+    A: ToolArgs + DeserializeOwned + JsonSchema + Send + 'static,
     F: Fn(Arc<CallContext>, A) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = orch_core::Result<Value>> + Send + 'static,
 {
@@ -278,15 +404,12 @@ mod tests {
         assert!(!args.effective);
 
         let cases = [
-            (serde_json::json!({}), "missing field `id`"),
-            (serde_json::json!({"id": 7}), "invalid type"),
-            (
-                serde_json::json!({"id": "x", "extra": 1}),
-                "unknown field `extra`",
-            ),
+            (serde_json::json!({}), "missing field"),
+            (serde_json::json!({"id": 7}), "expected"),
+            (serde_json::json!({"id": "x", "extra": 1}), "unknown field"),
             (
                 serde_json::json!({"id": "x", "effective": "yes"}),
-                "invalid type",
+                "expected",
             ),
         ];
         for (input, reason) in cases {
@@ -305,6 +428,86 @@ mod tests {
         decode::<EmptyArgs>("status", None).unwrap();
         assert!(decode::<ShowArgs>("task_show", None).is_err());
         assert!(decode::<EmptyArgs>("status", object(serde_json::json!({"x": 1}))).is_err());
+    }
+
+    #[derive(Debug, serde::Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code, reason = "arguments are only decoded in rejection tests")]
+    struct DiagnosticArgs {
+        id: String,
+        priority: i64,
+        nested: Option<DiagnosticNested>,
+    }
+
+    #[derive(Debug, serde::Deserialize, JsonSchema)]
+    #[allow(dead_code, reason = "arguments are only decoded in rejection tests")]
+    struct DiagnosticNested {
+        items: Vec<u8>,
+    }
+
+    #[test]
+    fn decoding_reports_fields_and_types_without_argument_values() {
+        for (input, field, expected, secret) in [
+            (
+                serde_json::json!({"id":"x", "priority":"high"}),
+                "priority",
+                "i64",
+                "high",
+            ),
+            (
+                serde_json::json!({"id":987654, "priority":3}),
+                "id",
+                "string",
+                "987654",
+            ),
+            (
+                serde_json::json!({"id":"x", "priority":"secret\" , expected \"injected\nvalue"}),
+                "priority",
+                "i64",
+                "secret",
+            ),
+            (
+                serde_json::json!({"id":true, "priority":3}),
+                "id",
+                "string",
+                "true",
+            ),
+            (
+                serde_json::json!({"id":"x", "priority":3, "extra":"private"}),
+                "extra",
+                "expected a declared field",
+                "private",
+            ),
+            (
+                serde_json::json!({"priority":3, "nested":null}),
+                "id",
+                "expected string",
+                "null",
+            ),
+            (
+                serde_json::json!({"id":"root-private", "priority":3, "nested":{}}),
+                "nested.items",
+                "expected array",
+                "root-private",
+            ),
+            (
+                serde_json::json!({"id":"x", "priority":3, "nested":{"items":["nested-secret"]}}),
+                "nested.items[0]",
+                "u8",
+                "nested-secret",
+            ),
+        ] {
+            let err = decode::<DiagnosticArgs>("task_add", object(input)).unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(err.data.is_none());
+            assert!(
+                err.message.contains(&format!("field `{field}`")),
+                "{}",
+                err.message
+            );
+            assert!(err.message.contains(expected), "{}", err.message);
+            assert!(!err.message.contains(secret), "{}", err.message);
+        }
     }
 
     async fn ok(_cx: Arc<CallContext>, _args: EmptyArgs) -> orch_core::Result<Value> {
