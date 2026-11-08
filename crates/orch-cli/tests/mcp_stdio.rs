@@ -719,13 +719,39 @@ fn the_flag_conflict_names_both_flags_on_stderr() {
 }
 
 #[test]
-fn default_mode_instructions_say_pause_and_force_are_unavailable() {
+fn default_mode_instructions_say_force_is_unavailable() {
     let project = initialized_project();
 
     let text = instructions_for(project.path(), &[], &[]);
 
     assert!(
-        text.contains("goal_status status=paused or force=true is unavailable"),
+        text.contains("goal_status force=true is unavailable."),
+        "{text}"
+    );
+}
+
+#[test]
+fn default_mode_instructions_say_pause_works_and_is_goal_scoped() {
+    let project = initialized_project();
+
+    let text = instructions_for(project.path(), &[], &[]);
+
+    assert!(
+        text.contains("goal_status status=paused works")
+            && text.contains("of that goal only, not of other goals"),
+        "{text}"
+    );
+}
+
+#[test]
+fn default_mode_instructions_do_not_describe_pause_as_cross_goal() {
+    let project = initialized_project();
+
+    let text = instructions_for(project.path(), &[], &[]);
+
+    assert!(!text.contains("across goals"), "{text}");
+    assert!(
+        !text.contains("status=paused or force=true is unavailable"),
         "{text}"
     );
 }
