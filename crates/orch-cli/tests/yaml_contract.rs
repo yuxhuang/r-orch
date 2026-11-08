@@ -282,6 +282,43 @@ fn id_of(value: &Value) -> String {
     value["id"].as_str().expect("an id").to_owned()
 }
 
+/// Give the repository `orch init` just created one (empty) commit. A task run
+/// in the default `worktree` workspace mode needs a commit to branch from:
+/// git before 2.42 cannot infer `--orphan` for `git worktree add` on a repo
+/// with no commits and exits 128, so without this the `logs` fixtures fail on
+/// Debian-bookworm's git 2.39. Hermetic: private HOME, no user or system git
+/// config, no signing, and an explicit identity.
+fn seed_commit(dir: &Path, root: &Path) {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.name=orch-test",
+            "-c",
+            "user.email=orch-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-q",
+            "-m",
+            "seed",
+        ])
+        .current_dir(root)
+        .env_clear()
+        .env("HOME", dir.join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "seed commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A project with two agents, a task per tricky title plus one plain task
 /// assigned to an agent, a goal, a team, a context entry and a message. With
 /// `with_run`, the assigned task is also run once so `logs` has data.
@@ -301,6 +338,7 @@ fn project(with_run: bool) -> Project {
         p.orch()
             .args(["init", "--name", "contract", "--adapter", "shell"]),
     );
+    seed_commit(p.dir.path(), &root);
     let agent = |name: &str, role: &str| {
         id_of(&parse_json(&success(orch_in(p.dir.path(), &root).args([
             "agent",
