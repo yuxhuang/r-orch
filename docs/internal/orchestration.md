@@ -499,7 +499,7 @@ an unassigned task may start a real AI CLI.
 | | Agent flag `autonomous: true` | Task label `autonomous` |
 |---|---|---|
 | Set by | `goal add --assignee`, `goal update --assignee`, resuming a goal, `orch agent autonomous` | the seeder, or anyone with `-l autonomous` |
-| Effect | The tick seeds `[auto]` tasks for the agent ([§5.2](#52-the-seeding-loop)) | (a) auto-approve on success (`orchestrator/collect.rs:381`); (b) ignored by the goal's achieved guard (`engine/goal_service.rs:257-271`); (c) cancelled, if `todo`/`retrying`, when a goal assigned to the task's agent pauses (`engine/goal_service.rs:336-356`); (d) adds the "Autonomous Goal Mode" section to the system prompt (`infra/template/system.liquid:19-35`) |
+| Effect | The tick seeds `[auto]` tasks for the agent ([§5.2](#52-the-seeding-loop)) | (a) auto-approve on success (`orchestrator/collect.rs:381`); (b) ignored by the goal's achieved guard (`engine/goal_service.rs:257-271`); (c) cancelled, if `todo`/`retrying`, when the goal it is linked to pauses and the task's agent is that goal's assignee (`engine/goal_service.rs:345-365` at `514560d`; at `40a6dc7`, lines `336-356` cancelled it whatever its goal, [§8](#8-known-gaps-pending-fixes) row 5); (d) adds the "Autonomous Goal Mode" section to the system prompt (`infra/template/system.liquid:19-35`) |
 | Cleared by | pausing, achieving, abandoning or deleting the agent's last `active` goal (`engine/goal_service.rs:312-319`) | nothing |
 
 **Prompt composition (pointer only).** Each dispatch renders a system and a user prompt from Liquid templates
@@ -800,13 +800,15 @@ the prompts of that goal's own tasks.
 
 ### 5.5 What pausing a goal does to its tasks
 
-`orch goal status <id> paused` (`engine/goal_service.rs:162-167`), verified in a throwaway project:
+`orch goal status <id> paused` (`engine/goal_service.rs:170-175`), verified in a throwaway project. In this
+section, `engine/goal_service.rs` lines are at `514560d`, the commit that scoped the cancel to the paused goal;
+other files are at `40a6dc7`.
 
 | Thing | Effect |
 |---|---|
 | The goal | `status: paused`; seeding ignores it (only `active` goals are offered, `orchestrator/tick.rs:449-457`) |
-| Assignee's `autonomous` flag | cleared, unless it has another `active` goal (`engine/goal_service.rs:312-319`) |
-| Assignee's `todo`/`retrying` tasks labelled `autonomous` | **cancelled if linked to the paused goal**; those linked to another goal or to none are left alone (`engine/goal_service.rs`, `cancel_pending_autonomous_tasks`) — see below |
+| Assignee's `autonomous` flag | cleared, unless it has another `active` goal (`engine/goal_service.rs:320-327`) |
+| Assignee's `todo`/`retrying` tasks labelled `autonomous` | **cancelled if linked to the paused goal**; those linked to another goal or to none are left alone (`engine/goal_service.rs:345-365`, `cancel_pending_autonomous_tasks`) — see below |
 | Running tasks, including the `[auto]` task | keep running to completion |
 | Non-autonomous tasks linked to the goal | **still dispatched**; dispatch does not check goal status |
 | Prompts | the Goal section shows `**Status:** paused` |
@@ -822,7 +824,7 @@ The same-goal case matters more in practice. The `a-team` lead schedules its nex
 that checkpoint; the checkpoints the lead has queued for its other goals stay queued.
 
 **Resume:** `orch goal status <id> active` re-enables the assignee's autonomous flag
-(`engine/goal_service.rs:168-169`). Cancelled tasks are **not** restored, and a task that depends on one stays
+(`engine/goal_service.rs:176-177`). Cancelled tasks are **not** restored, and a task that depends on one stays
 blocked, because a dependency must be `done` (`orch-domain/src/transitions.rs`, `is_blocked`). Bring one back
 with `orch task retry <id>` (MCP `task_retry`), which resets it to `todo` with a fresh attempt budget. The next
 tick seeds a fresh `[auto]` task only if the cooldown has passed and the agent has no non-terminal task assigned
@@ -1290,7 +1292,7 @@ every section that links to it.
 | 2 | Stall detection never fires for a run whose collector is live in this process, which is every run the process started (`orchestrator/tick.rs:201-206`) | manual [07](../manual/07-running-and-monitoring.md#stop-a-stalled-run), [02-concepts](../manual/02-concepts.md) lines 137 and 299, [RUNBOOK](../RUNBOOK.md) line 304 | code path in [§2.2](#22-reconcile-what-happened-to-running-work) · open |
 | 3 | `orch task cancel` of an `in_progress` task fails with exit 4 while another process owns the lock (`cli/commands/task.rs:486-488` → `orchestrator.rs:384-386`; `LockConflict` maps to 4 at `domain/error.rs:104`) | manual [04-tasks](../manual/04-tasks.md#cancel-a-task) line 370; the reconcile comment at `orchestrator/tick.rs:135-139` | [§6.3](#63-what-we-measured), last row · open |
 | 4 | Shell-adapter output never becomes `proof.agent_summary`: shell events carry a bare string and the collector reads only `text`/`message` (`orchestrator/collect.rs:193-204`, `infra/adapters/shell.rs:119`) | the fallback comment at `orchestrator/collect.rs:141-142` | worked example, task A's `proof` ([§7.3](#73-the-on-disk-trail)) · open |
-| 5 | Pausing a goal cancels the assignee's queued autonomous tasks of **every** goal (`engine/goal_service.rs:336-356`) | nothing explicit | [§6.3](#63-what-we-measured), second row · **fixed on `main` by the MCP follow-ups PR (`fix/mcp-followups`), after 0.12.0**: only the paused goal's own tasks are cancelled |
+| 5 | Pausing a goal cancels the assignee's queued autonomous tasks of **every** goal (`engine/goal_service.rs:336-356`) | nothing explicit | [§6.3](#63-what-we-measured), second row · **fixed on `main` by the MCP follow-ups PR (`fix/mcp-followups`), after 0.12.0**: only the paused goal's own tasks are cancelled (`engine/goal_service.rs:345-365` at `514560d`) |
 | 6 | `orch agent disable` on a running agent is undone when its run ends: success, failure and merge all write `idle` without checking (`orchestrator/collect.rs:508-511`, `589-593`, `811-815`), and the agent takes its next queued task | manual [03-agents](../manual/03-agents.md) line 288: "A disabled agent gets no new tasks" | [§6.3](#63-what-we-measured), agent-disable row · open |
 | 7 | Abandoning or achieving a goal cancels none of its queued tasks, autonomous-labelled ones included; they still run and auto-approve (`engine/goal_service.rs:170-171`) | the achieved guard's comment, "the side effects below cancel them afterwards" (`engine/goal_service.rs:259-261`) | [§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks) · intent unconfirmed |
 | 8 | Each prompt shows at most 15 shared-context entries, ranked by relevance to the task and agent; the rest are left out silently (`infra/template/context.rs:75-149`, `crates/orch-core/src/template.rs:214`) | manual [06-messages-and-context](../manual/06-messages-and-context.md#how-agents-see-the-context) lines 244 and 253: every entry is in every prompt | set 20 keys, dispatch one shell task: the prompt lists 15 ([§3](#3-q2-how-does-one-agent-connect-to-another-agent)) · open; not filed, reported to the owner |
