@@ -63,42 +63,121 @@ const CI_STEPS: &[&str] = &[
     "cargo test --workspace --no-fail-fast",
 ];
 
-/// Tests that fail only because the amd64 binaries run under Rosetta, with
-/// the file that holds each. Skipped by name, and only under Rosetta; Linux CI
-/// runs them. Two Rosetta behaviours, both seen with Docker Desktop (engine
-/// 29.9.2) on 2026-11-07:
-/// - glibc's `posix_spawnp` of a missing binary returns a pid and the child
-///   exits 127, where Linux reports ENOENT. Rust's `Command` uses
-///   `posix_spawn`, so "missing binary" tests see a started child.
-/// - Every translated process creates an empty `$HOME/.cache/rosetta`, even
-///   with `XDG_CACHE_HOME` set, so a test that asserts HOME stays empty fails.
-///   This is also why `./xtask/gate.sh`'s home-hygiene step cannot pass here.
-const ROSETTA_SKIPS: &[(&str, &str)] = &[
+/// A behaviour of the container's platform, not of orch, that breaks tests
+/// which pass on Linux CI. The default run probes for each one before the
+/// tests and skips only the tests that depend on what it finds, so it follows
+/// whatever amd64 emulator Docker uses instead of assuming one. Both were seen
+/// under Docker Desktop's amd64 emulation on Apple silicon (engine 29.9.2,
+/// 2026-11-07); neither shows in a native linux/arm64 container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quirk {
+    /// glibc's `posix_spawnp` of a missing binary returns a pid and the child
+    /// exits 127, where Linux reports ENOENT. Rust's `Command` uses
+    /// `posix_spawn`, so "missing binary" tests see a started child.
+    SpawnStartsMissingBinary,
+    /// Starting a process writes into `$HOME` (seen: an empty `.cache/…`
+    /// directory, even with `XDG_CACHE_HOME` set), so a test that asserts HOME
+    /// stays empty fails. `./xtask/gate.sh`'s home-hygiene step cannot pass on
+    /// such a platform either.
+    ProcessWritesHome,
+}
+
+impl Quirk {
+    const ALL: [Quirk; 2] = [Quirk::SpawnStartsMissingBinary, Quirk::ProcessWritesHome];
+
+    /// The shell variable its probe sets to 1 when the platform shows it.
+    fn var(self) -> &'static str {
+        match self {
+            Quirk::SpawnStartsMissingBinary => "spawn_quirk",
+            Quirk::ProcessWritesHome => "home_quirk",
+        }
+    }
+
+    /// What the run prints when the probe finds it.
+    fn found(self) -> &'static str {
+        match self {
+            Quirk::SpawnStartsMissingBinary => {
+                "spawning a missing binary starts a child here instead of failing"
+            }
+            Quirk::ProcessWritesHome => "starting a process here writes into HOME ($home_found)",
+        }
+    }
+
+    /// Shell that sets `var` to 1 when the platform shows the behaviour, else 0.
+    /// It tests the platform, never the code under test.
+    fn probe(self) -> &'static str {
+        match self {
+            Quirk::SpawnStartsMissingBinary => SPAWN_PROBE,
+            Quirk::ProcessWritesHome => HOME_PROBE,
+        }
+    }
+}
+
+/// `-I` (isolated mode): the probe runs in the checkout, so without it a
+/// `sitecustomize.py` there could decide the result.
+const SPAWN_PROBE: &str = r#"spawn_quirk=0
+if ! command -v python3 >/dev/null; then
+  echo "xtask linux: warning: no python3, so the spawn probe cannot run" >&2
+elif python3 -I -c '
+import os, sys
+name = "orch-xtask-no-such-binary"
+try:
+    pid = os.posix_spawnp(name, [name], {})
+except OSError:
+    sys.exit(1)
+os.waitpid(pid, 0)
+'; then
+  spawn_quirk=1
+fi
+"#;
+
+const HOME_PROBE: &str = r#"home_quirk=0
+home_found=''
+probe_home=$(mktemp -d)
+# `env` and `true` are both external programs, so two processes start here.
+HOME=$probe_home env true || true
+if [ -n "$(ls -A "$probe_home")" ]; then
+  home_quirk=1
+  home_found=$(cd "$probe_home" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C tr -c '[:print:]\n' '?' | paste -s -d ' ' -)
+fi
+rm -rf "$probe_home"
+"#;
+
+/// Tests skipped when the probe finds their behaviour, with the file that
+/// holds each. Skipped by exact name; Linux CI runs them all.
+const PLATFORM_SKIPS: &[(Quirk, &str, &str)] = &[
     (
+        Quirk::SpawnStartsMissingBinary,
         "editor::tests::a_missing_editor_binary_is_an_error",
         "crates/orch-cli/src/editor.rs",
     ),
     (
+        Quirk::ProcessWritesHome,
         "listing_showing_and_agent_listing_need_no_project_and_create_nothing",
         "crates/orch-cli/tests/org_templates.rs",
     ),
     (
+        Quirk::SpawnStartsMissingBinary,
         "review_runner::tests::the_process_runner_reports_a_missing_binary_as_a_failure",
         "crates/orch-engine/src/review_runner.rs",
     ),
     (
+        Quirk::SpawnStartsMissingBinary,
         "adapters::util::tests::the_version_probe_reports_a_missing_binary_the_way_node_does",
         "crates/orch-infra/src/adapters/util.rs",
     ),
     (
+        Quirk::SpawnStartsMissingBinary,
         "models::discovery::tests::the_real_runner_reports_a_missing_binary",
         "crates/orch-infra/src/models/discovery.rs",
     ),
     (
+        Quirk::SpawnStartsMissingBinary,
         "process::manager::tests::a_missing_binary_fails_with_the_ts_message",
         "crates/orch-infra/src/process/manager.rs",
     ),
     (
+        Quirk::SpawnStartsMissingBinary,
         "process::spawn::tests::a_spawn_failure_becomes_a_classified_adapter_error",
         "crates/orch-infra/src/process/spawn.rs",
     ),
@@ -200,39 +279,48 @@ exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs -- bash
 /// The script the container runs as the caller, and the arguments after its
 /// first, which is always the description of the source being tested.
 fn container_script(command: &LinuxCommand) -> (String, Vec<String>) {
-    // binfmt_misc is not visible in the container, but Rosetta names itself
-    // in /proc/cpuinfo. Anything else on an arm64 host is QEMU, which is far
-    // slower.
+    // Informational only: whether amd64 is emulated changes nothing here. What
+    // changes the run is what the probes find. `ARCH` is the xtask binary's, so
+    // an x86_64 xtask that is itself emulated would print `native`.
     let host = std::env::consts::ARCH;
     let header = format!(
         "set -euo pipefail\n\
          source=$1\nshift\n\
-         if [ {host} = x86_64 ]; then emulation=native\n\
-         elif grep -q VirtualApple /proc/cpuinfo; then emulation=rosetta\n\
-         else emulation=qemu\n\
-         echo \"xtask linux: warning: amd64 runs under QEMU; turn on Docker Desktop's Rosetta setting\" >&2\n\
-         fi\n\
-         echo \"xtask linux: $(uname -m) ($emulation), $source\"\n"
+         arch=$(uname -m)\n\
+         if [ \"$arch\" = {host} ]; then platform=\"$arch, native\"\n\
+         else platform=\"$arch, emulated on an {host} host\"; fi\n\
+         echo \"xtask linux: $platform, $source\"\n"
     );
     match command {
         LinuxCommand::Ci => {
-            let skips: Vec<String> = ROSETTA_SKIPS
-                .iter()
-                .map(|(test, _)| format!("--skip {test}"))
-                .collect();
-            let mut script = format!(
-                "{header}skips=''\nskipped=''\n\
-                 if [ \"$emulation\" = rosetta ]; then\n\
-                 skips='-- --exact {}'\n\
-                 skipped=', {} tests Rosetta breaks skipped (Linux CI runs them)'\n\
-                 echo 'xtask linux: under Rosetta, skipping:'\n",
-                skips.join(" "),
-                ROSETTA_SKIPS.len(),
-            );
-            for (test, _) in ROSETTA_SKIPS {
-                script.push_str(&format!("echo '  {test}'\n"));
+            let mut script = header;
+            script.push_str("skips=''\ncount=0\n");
+            for quirk in Quirk::ALL {
+                let tests: Vec<&str> = PLATFORM_SKIPS
+                    .iter()
+                    .filter(|(skip, _, _)| *skip == quirk)
+                    .map(|(_, test, _)| *test)
+                    .collect();
+                script.push_str(quirk.probe());
+                script.push_str(&format!(
+                    "if [ \"${}\" = 1 ]; then\n  echo \"xtask linux: {}; skipping:\"\n",
+                    quirk.var(),
+                    quirk.found(),
+                ));
+                for test in &tests {
+                    script.push_str(&format!(
+                        "  echo '  {test}'\n  skips=\"$skips --skip {test}\"\n"
+                    ));
+                }
+                script.push_str(&format!("  count=$((count + {}))\nfi\n", tests.len()));
             }
-            script.push_str("fi\n");
+            script.push_str(
+                "skipped=''\n\
+                 if [ \"$count\" -gt 0 ]; then\n  \
+                 skipped=\", $count tests skipped for platform behaviour (Linux CI runs them)\"\n  \
+                 skips=\"-- --exact$skips\"\n\
+                 fi\n",
+            );
             for step in CI_STEPS {
                 let quoted = step.replace('\'', "'\\''");
                 let command = if step.starts_with("cargo test ") {
@@ -244,9 +332,8 @@ fn container_script(command: &LinuxCommand) -> (String, Vec<String>) {
                     "echo '════ {quoted}'\n{command} || {{ echo '════ FAILED: {quoted}'; exit 1; }}\n"
                 ));
             }
-            script.push_str(
-                "echo \"════ linux/amd64 CI set passed$skipped ($(uname -m), $emulation), $source\"\n",
-            );
+            script
+                .push_str("echo \"════ linux/amd64 CI set passed$skipped ($platform), $source\"\n");
             (script, Vec::new())
         }
         LinuxCommand::Run { command } => (format!("{header}exec \"$@\"\n"), command.clone()),
@@ -743,9 +830,9 @@ mod tests {
     /// A renamed or removed test would leave a `--skip` that matches nothing,
     /// so each one must still exist where the list says.
     #[test]
-    fn every_rosetta_skip_names_a_test_that_exists() {
+    fn every_platform_skip_names_a_test_that_exists() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        for (test, file) in ROSETTA_SKIPS {
+        for (_, test, file) in PLATFORM_SKIPS {
             let source = std::fs::read_to_string(repo.join(file)).unwrap();
             let name = test.rsplit("::").next().unwrap();
             assert!(
@@ -753,17 +840,79 @@ mod tests {
                 "{test} is not in {file}"
             );
         }
+        for quirk in Quirk::ALL {
+            assert!(
+                PLATFORM_SKIPS.iter().any(|(skip, _, _)| *skip == quirk),
+                "{quirk:?} skips nothing"
+            );
+        }
     }
 
+    /// Each test is skipped only inside its own behaviour's `if`, and nothing
+    /// keys on a particular emulator.
     #[test]
-    fn only_rosetta_runs_skip_tests() {
+    fn skips_follow_the_probed_behaviours() {
         let script = container_script(&LinuxCommand::Ci).0;
-        assert!(script.contains("if [ \"$emulation\" = rosetta ]; then"));
-        assert!(script.contains("cargo test --workspace --no-fail-fast $skips"));
-        for (test, _) in ROSETTA_SKIPS {
-            assert!(script.contains(&format!("--skip {test}")), "{test}");
+        for quirk in Quirk::ALL {
+            assert!(script.contains(quirk.probe()), "{quirk:?} probe missing");
+            let open = format!("if [ \"${}\" = 1 ]; then\n", quirk.var());
+            let start = script.find(&open).expect("the quirk's if");
+            let block = &script[start..start + script[start..].find("\nfi\n").unwrap()];
+            for (skip, test, _) in PLATFORM_SKIPS {
+                assert_eq!(
+                    block.contains(&format!("--skip {test}\"")),
+                    *skip == quirk,
+                    "{test} under {quirk:?}"
+                );
+            }
         }
-        assert!(script.contains("skips='-- --exact --skip "));
+        assert!(script.contains("skips=\"-- --exact$skips\""));
+        assert!(script.contains("cargo test --workspace --no-fail-fast $skips"));
+        let lower = script.to_lowercase();
+        for emulator in ["rosetta", "virtualapple", "qemu"] {
+            assert!(
+                !lower.contains(emulator),
+                "the run must not key on {emulator}"
+            );
+        }
+    }
+
+    /// The probes must report what this platform really does, wherever the
+    /// test runs: nothing on macOS or Linux CI, both behaviours in an emulated
+    /// container. The ground truth is Rust's own `Command`, which is what the
+    /// skipped tests use. On a native platform this only checks the `0 0`
+    /// case; `cargo xtask linux run cargo test -p xtask` checks the other.
+    #[test]
+    fn the_probes_agree_with_what_this_platform_does() {
+        let spawn_starts = Command::new("orch-xtask-no-such-binary")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|mut child| child.wait())
+            .is_ok();
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("xtask-probe-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&home).unwrap();
+        let status = Command::new("env").arg("true").env("HOME", &home).status();
+        let writes_home = std::fs::read_dir(&home).unwrap().next().is_some();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(status.unwrap().success());
+
+        let script = format!(
+            "set -euo pipefail\n{SPAWN_PROBE}{HOME_PROBE}echo \"$spawn_quirk $home_quirk\"\n"
+        );
+        let output = Command::new("bash").args(["-c", &script]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = format!("{} {}", u8::from(spawn_starts), u8::from(writes_home));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
     }
 
     #[test]

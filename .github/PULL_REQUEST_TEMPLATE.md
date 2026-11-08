@@ -20,7 +20,7 @@
 - [ ] `cargo deny check` (if installed)
 - [ ] `./xtask/gate.sh` (needed for layering, process-handling or security-relevant changes)
 
-Ran on: <!-- macOS / Linux / Linux (Docker linux/amd64, Rosetta) / CI only. Name any check that is env-limited and failures that also occur on the base commit. -->
+Ran on: <!-- macOS / Linux / Linux (Docker linux/amd64) / CI only. Name any check that is env-limited and failures that also occur on the base commit. -->
 
 ## Docs updated
 

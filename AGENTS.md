@@ -130,14 +130,14 @@ cargo deny check          # only if cargo-deny is installed; CI always runs it
 security-relevant code. It is not a superset of CI: its `advisories` step silently passes when cargo-deny is
 missing. `--warm` reuses your `target/` and is not a gate. Its verdict is written to `target/gate-result.txt`. It runs on macOS and Linux.
 
-Say in the PR which platform each check ran on (macOS, Linux CI, `Linux (Docker linux/amd64, Rosetta)`, or a
-combination). A failure that also occurs on the base commit is still a failure. Report it as one; it is not a pass.
+Say in the PR which platform each check ran on (macOS, Linux CI, `Linux (Docker linux/amd64)`, or a combination). A
+failure that also occurs on the base commit is still a failure. Report it as one; it is not a pass.
 
 ### Linux checks on macOS (Docker)
 
 On macOS, when Docker is available, you may run the Linux checks before you push with `cargo xtask linux`, in a
-linux/amd64 container. It is optional: it does not replace the pre-PR check on your own platform, and Linux CI
-must still be green. Without Docker, report the Linux checks as `env-limited` (Linux CI), as before.
+linux/amd64 container. It is optional: it does not replace the pre-PR check on your own platform, and Linux CI must
+still be green. Without Docker, report the Linux checks as `env-limited` (Linux CI), as before.
 
 ```
 cargo xtask linux                                # the CI set, in linux/amd64
@@ -149,46 +149,52 @@ cargo xtask linux clean                          # delete this checkout's target
 - **Image.** The official `rust:<channel>-trixie` (Debian 13), with `<channel>` read from `rust-toolchain.toml`, so
   the container runs the toolchain CI installs. The xtask adds tmux, rustfmt and clippy and tags the result
   `orch-linux:<channel>` locally; it is never pushed. The base already has the git, gcc, pkg-config and python3 the
-  suite needs (the `slim` variant has no git, python3 or pkg-config). It differs from CI's `ubuntu-latest` runner
-  in the distribution (Debian 13, glibc 2.41), the tmux version (3.5a) and the user (your uid, not `runner`).
-- **What it runs.** CI's commands in CI's order: the `Cargo.lock` termwiz/terminfo check, `cargo fmt --all
-  --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask crate-graph` and `cargo test
-  --workspace --no-fail-fast`, stopping at the first failing step. Not cargo-deny: `deny.toml` already selects the
-  Linux target, so run `cargo deny check` on the host. Not `./xtask/gate.sh` (see Rosetta below).
-- **Setup.** On Apple silicon, turn on Docker Desktop's "Use Rosetta for x86_64/amd64 emulation on Apple
-  Silicon". Without it Docker emulates amd64 with QEMU, which is far slower, and the xtask prints a warning.
-  Tested with 8 GiB of memory for Docker. A cold run uses about 8.6 GB of Docker's disk: 2.4 GB of image, 6.0 GB
-  of target volume and 0.2 GB of cargo registry.
-- **Time.** On an M5 Max a run with empty target and registry volumes took 13 minutes (the image was already
-  built; a first run also pulls the base image) and a warm one 10: under emulation the test suite itself takes
-  about 10 minutes. Agents run it in the background: a cold run takes more than ten minutes, and some agent tools
-  stop a foreground command sooner. A narrower `run` (say `cargo test -p orch-infra`) can still rebuild some
-  crates, because cargo resolves features for what it builds.
+  suite needs (the `slim` variant has no git, python3 or pkg-config). It differs from CI's `ubuntu-latest` runner in
+  the distribution (Debian 13, glibc 2.41), the tmux version (3.5a) and the user (your uid, not `runner`).
+- **What it runs.** CI's commands in CI's order: the `Cargo.lock` termwiz/terminfo check, `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask crate-graph` and `cargo test --workspace
+  --no-fail-fast`, stopping at the first failing step. Not cargo-deny: `deny.toml` already selects the Linux target,
+  so run `cargo deny check` on the host. Not `./xtask/gate.sh` (see Platform behaviours below).
+- **Setup.** Docker must be able to run linux/amd64 containers. On Apple silicon Docker emulates amd64; the xtask
+  works with whichever emulator Docker uses, never configures or names one, and prints whether the run is native or
+  emulated. Tested with 8 GiB of memory for Docker. A cold run uses about 8.6 GB of Docker's disk: 2.4 GB of image,
+  6.0 GB of target volume and 0.2 GB of cargo registry.
+- **Time.** On an M5 Max, with Docker Desktop's emulation as of 2026-11 (Rosetta-based), a run with empty target and
+  registry volumes took 13 minutes (the image was already built; a first run also pulls the base image) and a warm
+  one 10: under emulation the test suite itself takes about 10 minutes. Another emulator may be much slower. Agents
+  run it in the background: a cold run takes more than ten minutes, and some agent tools stop a foreground command
+  sooner. A narrower `run` (say `cargo test -p orch-infra`) can still rebuild some crates, because cargo resolves
+  features for what it builds.
 - **Isolation.** The checkout is mounted read-only at its own path, and so is a linked worktree's main git
-  directory. The run tests your working tree as it is, uncommitted changes included, so do not edit files while
-  it runs. `target/` is a Docker volume per checkout, so Linux artifacts never mix with the macOS ones in your
-  `target/`, which gets only the macOS build of xtask itself; the cargo registry is one shared volume. The container gets no host environment and runs as your
-  uid, not root, because some tests expect a read-only directory to refuse a write and root ignores that. There
-  is one container per checkout (`orch-linux-<key>`): the xtask refuses to start a second, and warns when another
-  checkout's is running, since two at once can exhaust Docker's memory.
-- **Rosetta.** Two Rosetta behaviours break tests that pass on Linux. glibc's `posix_spawnp` of a missing binary
-  returns a pid and the child exits 127 instead of failing with ENOENT, and every translated process creates an
-  empty `$HOME/.cache/rosetta`. Under Rosetta the default run therefore skips the 7 affected tests by name
-  (`ROSETTA_SKIPS` in `xtask/src/linux.rs`) and prints them; each passes in a native linux/arm64 container, and
-  Linux CI still runs them. `run` skips nothing. For the same reason `./xtask/gate.sh` cannot pass in the
-  container (its test and home-hygiene steps): run the gate on macOS or on native Linux.
+  directory. The run tests your working tree as it is, uncommitted changes included, so do not edit files while it
+  runs. `target/` is a Docker volume per checkout, so Linux artifacts never mix with the macOS ones in your
+  `target/`, which gets only the macOS build of xtask itself; the cargo registry is one shared volume. The container
+  gets no host environment and runs as your uid, not root, because some tests expect a read-only directory to refuse
+  a write and root ignores that. There is one container per checkout (`orch-linux-<key>`): the xtask refuses to
+  start a second, and warns when another checkout's is running, since two at once can exhaust Docker's memory.
+- **Platform behaviours.** Two behaviours of an emulated platform, not of orch, break tests that pass on Linux:
+  glibc's `posix_spawnp` of a missing binary returns a pid and the child exits 127 instead of failing with ENOENT,
+  and starting any process writes into `$HOME` (an empty `.cache/rosetta`). Before the tests, the default run probes
+  the container for each behaviour and skips, by exact name, only the tests that depend on what it finds
+  (`PLATFORM_SKIPS` in `xtask/src/linux.rs`), printing what it found and what it skipped. Both were found under
+  Docker Desktop's amd64 emulation in 2026-11 (7 tests skipped); neither shows in a native linux/arm64 container,
+  and Linux CI runs all 7. Under another emulator the probes decide: a behaviour it lacks skips nothing, and a new
+  one shows up as an ordinary failure (see Reporting). `run` neither probes nor skips. Where `$HOME` gets written,
+  `./xtask/gate.sh` cannot pass in the container (its home-hygiene step, and its test step skips nothing): run the
+  gate on macOS or on native Linux.
 - **Reporting.** The run prints the commit, the tree, whether the tree was dirty and the base image digest. In the
-  PR, name the platform `Linux (Docker linux/amd64, Rosetta)`, never "Linux CI", with the commit it ran at and
-  `dirty no`, and say that the Rosetta tests were skipped. A failure seen only in the container is still a
-  failure: report it with the test name and re-run it once on the base commit, in a worktree of the base with
-  `cargo xtask linux run cargo test … -- --exact <test>`. Call it a Rosetta artifact only if it also fails there
-  while Linux CI passes it on that base; then add it to `ROSETTA_SKIPS` in its own PR, citing that passing
-  Linux CI run. A failure that mentions a read-only file system means a test or step writes into the checkout:
-  report it, do not work around it (the full suite ran without one).
+  PR, name the platform `Linux (Docker linux/amd64)`, never "Linux CI", with the commit it ran at, `dirty no`,
+  whether the run was native or emulated, and the tests it skipped. A failure seen only in the container is still a
+  failure: report it with the test name and re-run it once on the base commit, in a worktree of the base with `cargo
+  xtask linux run cargo test … -- --exact <test>`. Call it a platform artifact only if it also fails there while
+  Linux CI passes it on that base; then, in its own PR that cites that passing Linux CI run, add it to
+  `PLATFORM_SKIPS` under the behaviour that causes it, with a new probe if no existing one covers it. A failure that
+  mentions a read-only file system means a test or step writes into the checkout: report it, do not work around it
+  (the full suite ran without one).
 - **Exit status.** 0 when every step passed, 1 when one failed, the command's own status for `run`, and 2 when
   nothing ran: Docker missing or stopped, the image build failed (no network), or a toolchain pin that is not
-  `X.Y.Z` (all `env-limited`), a container left for this checkout (a killed run leaves one; the message gives
-  the `docker rm -f` command), or `shell` without a terminal.
+  `X.Y.Z` (all `env-limited`), a container left for this checkout (a killed run leaves one; the message gives the
+  `docker rm -f` command), or `shell` without a terminal.
 
 ### Broken tooling
 
