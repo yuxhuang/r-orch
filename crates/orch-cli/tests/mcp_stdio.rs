@@ -347,6 +347,149 @@ fn debug_logging_still_reports_sdk_warnings() {
     }
 }
 
+/// Invalid-params text that quotes the offending argument is the SDK's default;
+/// with warnings on it lands on stderr too (R1). The diagnostic names the field
+/// and the type it expected, and never the value that was sent.
+const WARN_ENV: &[(&str, Option<&str>)] = &[("RUST_LOG", Some("warn"))];
+
+#[test]
+fn a_mistyped_priority_is_invalid_params_naming_the_field_and_type_but_not_the_value() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+    assert_eq!(
+        response["error"]["message"],
+        json!("Invalid arguments for task_add: field `priority`: expected i64"),
+        "{response}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn a_mistyped_priority_warn_line_on_stderr_names_the_field_and_type_but_not_the_value() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+
+    let exit = server.shutdown();
+
+    assert_eq!(exit.status.code(), Some(0), "{}", exit.stderr);
+    let warn = exit
+        .stderr
+        .lines()
+        .find(|line| line.contains("WARN") && line.contains("response error"))
+        .unwrap_or_else(|| panic!("no WARN response-error line on stderr:\n{}", exit.stderr));
+    assert!(
+        warn.contains("field `priority`") && warn.contains("expected i64"),
+        "the WARN line must name the field and expected type: {warn}"
+    );
+}
+
+#[test]
+fn a_mistyped_priority_value_appears_in_neither_the_response_nor_stderr() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+    let exit = server.shutdown();
+
+    // The sent value is a short word, so look for it as a word: the field name
+    // and type text legitimately contain other letters, never `high`.
+    assert!(!response.to_string().contains("high"), "{response}");
+    assert!(!exit.stderr.contains("high"), "{}", exit.stderr);
+}
+
+#[test]
+fn the_connection_serves_requests_after_a_mistyped_argument_was_refused() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+
+    let status = status_ok(&mut server);
+
+    assert_eq!(status["tasks"], json!([]), "a refused call created a task");
+    let created = server.call_tool("task_add", json!({"title": "after", "priority": 2}));
+    assert_eq!(created["result"]["isError"], json!(false), "{created}");
+    assert_eq!(server.shutdown().status.code(), Some(0));
+}
+
+/// Other scalar mismatches, each with a value no log line contains by accident:
+/// a string where an unsigned integer belongs, an integer where a string
+/// belongs, and a boolean where a string belongs.
+#[test]
+fn other_mistyped_scalars_name_field_and_type_but_never_the_value() {
+    let string_sentinel = sentinel("ttl");
+    let cases: [(&str, &str, Value, &str, &str); 3] = [
+        (
+            "string for u64",
+            "context_set",
+            json!({"key": "k", "value": "v", "ttl": string_sentinel}),
+            "field `ttl`: expected u64",
+            &string_sentinel,
+        ),
+        (
+            "integer for string",
+            "context_set",
+            json!({"key": 918_273_645_u64, "value": "v"}),
+            "field `key`: expected a string",
+            "918273645",
+        ),
+        (
+            "boolean for string",
+            "context_get",
+            json!({"key": true}),
+            "field `key`: expected a string",
+            "true",
+        ),
+    ];
+    for (case, tool, arguments, expected, forbidden) in cases {
+        let project = initialized_project();
+        let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+        server.initialize();
+
+        let response = server.call_tool(tool, arguments);
+        assert_eq!(error_code(&response), Some(-32602), "{case}: {response}");
+        let message = response["error"]["message"].as_str().expect("message");
+        assert!(message.contains(expected), "{case}: {message}");
+        assert!(!message.contains(forbidden), "{case}: {message}");
+        assert!(status_ok(&mut server)["tasks"].is_array(), "{case}");
+
+        let exit = server.shutdown();
+        assert_eq!(exit.status.code(), Some(0), "{case}: {}", exit.stderr);
+        assert!(
+            exit.stderr.contains("WARN") && exit.stderr.contains(expected),
+            "{case}: the WARN line should carry the same diagnostic:\n{}",
+            exit.stderr
+        );
+        assert!(
+            !exit.stderr.contains(forbidden),
+            "{case}: the value reached stderr:\n{}",
+            exit.stderr
+        );
+    }
+}
+
 // ── catalogue (fails until B2a/B2b register their tools) ──────────────────
 
 #[test]
