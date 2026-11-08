@@ -168,6 +168,17 @@ base64 = "0.22"
 sha2 = "0.10"
 subtle = "2.6"
 
+# ── MCP (`orch mcp`) ───────────────────────────────────────────────────────
+# Stdio Model Context Protocol server: the official Rust SDK (modelcontextprotocol/rust-sdk),
+# Apache-2.0, MSRV 1.88. Defaults are off so its optional `base64` 0.23 stays out (the tree
+# is on 0.22); `server` already implies `schemars`. `transport-io` is the stdin/stdout transport.
+# Known duplicate: rmcp needs `sha2` 0.11 unconditionally while axum/`orch web` hold 0.10
+# (see the `sha2` note above), so both lines are in the graph until axum moves.
+rmcp = { version = "3.9", default-features = false, features = ["server", "macros", "transport-io"] }
+# Tool input schemas (`#[derive(JsonSchema)]`). Same major rmcp re-exports as `rmcp::schemars`;
+# declared directly so the derive's generated `schemars::` paths resolve.
+schemars = "1.2"
+
 # ── Dev (ARCHITECTURE §4.6) ────────────────────────────────────────────────
 insta = "1.49"
 assert_cmd = "2.2"

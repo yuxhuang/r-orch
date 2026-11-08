@@ -8,7 +8,8 @@
 //!    unknown command and an unknown global option — because
 //!    `NotInitializedError` is thrown while the container is constructed, which
 //!    happens before clap parses. Only `init`, `doctor` and `update` are
-//!    exempt.
+//!    exempt — plus `mcp`, which needs a project but resolves it itself,
+//!    because `--project-root` may name one the working directory is not in.
 //! 2. **`--help`/`--version` with no real subcommand** never builds a
 //!    container, so `orch --help` works in an empty directory.
 //! 3. **Usage errors exit `1`**, not clap's `2`, and carry fixed wording.
@@ -103,6 +104,10 @@ impl ArgvShape {
         match self.sub.as_deref() {
             None => true,
             Some("org") => self.org_requires_initialized_project,
+            // Not container-less: `orch mcp` always serves a project. It
+            // checks the root it resolves (`--project-root` or the walk up)
+            // after parsing, and exits 3 there.
+            Some("mcp") => false,
             Some(sub) => !CONTAINER_LESS_COMMANDS.contains(&sub),
         }
     }
@@ -255,6 +260,16 @@ mod tests {
         assert!(shape(&["orch", "help", "task"]).requires_initialized_project());
         // A bare `orch` is the first-run path, not a guarded command.
         assert!(!shape(&["orch"]).requires_initialized_project());
+    }
+
+    #[test]
+    fn mcp_resolves_its_own_project_after_parsing() {
+        assert!(!shape(&["orch", "mcp"]).requires_initialized_project());
+        assert!(!shape(&["orch", "mcp", "--project-root", "/p"]).requires_initialized_project());
+        assert!(!shape(&["orch", "--json", "mcp", "--help"]).requires_initialized_project());
+        assert!(!shape(&["orch", "mcp", "--help"]).is_help_fast_path());
+        // Still a command that needs a project, so not container-less.
+        assert!(!crate::tree::CONTAINER_LESS_COMMANDS.contains(&"mcp"));
     }
 
     #[test]

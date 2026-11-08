@@ -29,6 +29,7 @@ chapter = {
     'update': ('07-running-and-monitoring.md', 'Running and monitoring'),
     'tui': ('08-dashboard.md', 'The dashboard'),
     'web': ('09-web-dashboard.md', 'The web dashboard'),
+    'mcp': ('17-mcp-server.md', 'The MCP server'),
     'org': ('10-templates-and-shop.md', 'Templates and the agent shop'),
     'remote': ('11-remote-agents.md', 'Remote agents'),
     'config': ('12-configuration-and-output.md', 'Configuration and output'),
@@ -55,7 +56,7 @@ def cell(s):
     return s.replace('|', '\\|')
 
 order = ['init', 'agent', 'task', 'team', 'goal', 'msg', 'context', 'run', 'serve', 'status', 'logs',
-         'doctor', 'update', 'tui', 'web', 'org', 'remote', 'config']
+         'doctor', 'update', 'tui', 'web', 'mcp', 'org', 'remote', 'config']
 top = {c[0]: c for c in cmds if c[0] and ' ' not in c[0]}
 assert set(order) == set(top), sorted(set(top) ^ set(order))
 
@@ -70,10 +71,11 @@ w('```sh')
 w('orch task add --help')
 w('```')
 w('')
-w('> **Note:** Only `orch --help`, `orch --version`, `orch init`, `orch doctor`, `orch update` and the')
-w('> `orch org template` commands work outside a project. Every other command, even with `--help`, needs a project:')
-w('> run it in a directory where `orch init` has run, or in a subdirectory of one. Otherwise it prints')
-w('> `Not initialized` and exits with code 3.')
+w('> **Note:** Only `orch --help`, `orch --version`, `orch init`, `orch doctor`, `orch update`, `orch mcp --help` and')
+w('> the `orch org template` commands work outside a project. Every other command, even with `--help`, needs a')
+w('> project: run it in a directory where `orch init` has run, or in a subdirectory of one. Otherwise it prints')
+w('> `Not initialized` and exits with code 3. `orch mcp --project-root <path>` serves the project at `<path>` from')
+w('> any directory.')
 w('')
 w('How to read the usage column:')
 w('')

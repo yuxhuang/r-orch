@@ -22,6 +22,7 @@ pub mod doctor;
 pub mod document_input;
 pub mod editor;
 pub mod logs;
+mod mcp;
 pub mod output;
 pub mod routing;
 pub mod serve;
@@ -115,6 +116,12 @@ fn is_initialized(cwd: &std::path::Path) -> bool {
 
 fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     let styles = styles_for(&cli, env);
+
+    // `orch mcp` owns its runtime: its shutdown must be bounded, and nothing
+    // of the ordinary command path may write to stdout.
+    if let Some(Command::Mcp(args)) = &cli.command {
+        return mcp::run(args, &styles);
+    }
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -384,6 +391,9 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         Some(Command::Serve(args)) => run_serve(cli, env, &cwd, args).await,
 
         Some(Command::Web(args)) => run_web(cli, env, &cwd, args).await,
+
+        // Dispatched before the runtime is built, in `dispatch_parsed`.
+        Some(Command::Mcp(_)) => unreachable!("orch mcp is dispatched before the runtime"),
 
         Some(Command::Remote(args)) => {
             let Some(sub) = &args.command else {
@@ -867,8 +877,13 @@ fn version() -> &'static str {
 /// 3. `RUST_LOG` takes an `EnvFilter` for anyone who knows what they want;
 ///    `ORCHESTRY_DEBUG` — which already exists, as the flag that prints an
 ///    error's cause chain — turns on `debug` without one.
+///
+/// One cap sits above all three: the MCP SDK's `debug` and `trace` events are
+/// never recorded, whatever `RUST_LOG` says (see [`sdk_event_carries_no_payload`]).
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let filter = match std::env::var("RUST_LOG") {
         Ok(spec) if !spec.trim().is_empty() => EnvFilter::new(spec),
@@ -885,7 +900,30 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_target(true)
         .without_time()
+        .finish()
+        .with(tracing_subscriber::filter::filter_fn(
+            sdk_event_carries_no_payload,
+        ))
         .try_init();
+}
+
+/// Whether a span or event may be recorded at all, before any `RUST_LOG`
+/// directive is consulted.
+///
+/// `rmcp` logs every request, every result and every line it cannot parse, in
+/// full, at `debug`: with diagnostics on, `orch mcp` would copy tool arguments
+/// and results — task bodies, context values, message text — to stderr, which
+/// MCP clients commonly keep in a log file (design D13). This is a separate
+/// layer rather than a directive appended to the `EnvFilter` because a filter
+/// lets the most specific directive win, so `rmcp::service=trace` would
+/// re-enable what `rmcp=info` turned off; a layer that says no is final.
+/// The SDK's `info` and above stay: they carry lifecycle and failures, not
+/// payloads. Only `orch mcp` links the SDK, so every other command is
+/// unaffected.
+fn sdk_event_carries_no_payload(metadata: &tracing::Metadata<'_>) -> bool {
+    let target = metadata.target();
+    let from_sdk = target == "rmcp" || target.starts_with("rmcp::");
+    !from_sdk || *metadata.level() <= tracing::Level::INFO
 }
 
 fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {

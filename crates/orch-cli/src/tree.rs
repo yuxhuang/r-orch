@@ -20,9 +20,9 @@ use clap::{Args, Parser, Subcommand};
 ///
 /// Used by the pre-parse routing guard, which has to decide whether the first
 /// non-flag token is a real subcommand *before* clap sees the argv.
-pub const ALL_KNOWN_COMMANDS: [&str; 18] = [
+pub const ALL_KNOWN_COMMANDS: [&str; 19] = [
     "task", "agent", "status", "logs", "config", "context", "msg", "goal", "team", "org", "run",
-    "doctor", "tui", "serve", "web", "init", "update", "remote",
+    "doctor", "tui", "serve", "web", "init", "update", "remote", "mcp",
 ];
 
 /// The three commands that run without a container, and so without
@@ -167,6 +167,8 @@ pub enum Command {
     Serve(ServeCmd),
     /// Serve the TUI dashboard in a browser (xterm.js over a websocket)
     Web(WebCmd),
+    /// Serve this project to MCP clients over stdio
+    Mcp(McpCmd),
     /// Initialize .orchestry/ in the current directory
     Init(InitCmd),
     /// Check for updates and install the latest version
@@ -193,6 +195,7 @@ impl Command {
             Command::Tui(_) => "tui",
             Command::Serve(_) => "serve",
             Command::Web(_) => "web",
+            Command::Mcp(_) => "mcp",
             Command::Init(_) => "init",
             Command::Update(_) => "update",
         }
@@ -974,6 +977,35 @@ pub struct ServeCmd {
 }
 
 // ── web ────────────────────────────────────────────────────────────────────
+
+// ── mcp ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Args)]
+pub struct McpCmd {
+    #[arg(
+        long = "project-root",
+        value_name = "path",
+        help = "Serve this project directory (must contain .orchestry) instead of the one found from the working directory"
+    )]
+    pub project_root: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Default agent id for message sender and inbox attribution (overrides ORCH_AGENT_ID); not authentication"
+    )]
+    pub agent: Option<String>,
+    #[arg(
+        long = "read-only",
+        conflicts_with = "allow_destructive",
+        help = "Expose read tools only"
+    )]
+    pub read_only: bool,
+    #[arg(
+        long = "allow-destructive",
+        help = "Also expose destructive tools (task_cancel, goal_delete, agent_remove, team_disband, context_delete) and goal_status pause/force"
+    )]
+    pub allow_destructive: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct WebCmd {

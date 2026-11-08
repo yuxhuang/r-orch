@@ -51,9 +51,24 @@ struct EffectiveConfig {
 /// `agent show --effective` with `--json`/`--yaml`: the ordinary agent shape,
 /// unchanged, under `agent`, plus the resolution under `effective_config`.
 #[derive(Debug, Serialize)]
-struct EffectiveAgent<'a> {
+pub(crate) struct EffectiveAgent<'a> {
     agent: &'a Agent,
     effective_config: EffectiveConfig,
+}
+
+impl<'a> EffectiveAgent<'a> {
+    /// The agent with its prompt mode resolved against the project default.
+    pub(crate) fn of(engine: &Engine, agent: &'a Agent) -> Self {
+        let (prompt_mode, prompt_mode_source) =
+            effective_prompt_mode(&agent.config, &engine.config.defaults.agent);
+        EffectiveAgent {
+            agent,
+            effective_config: EffectiveConfig {
+                prompt_mode,
+                prompt_mode_source,
+            },
+        }
+    }
 }
 
 /// Human description of a resolved mode: `eco (agent override)`,
@@ -96,6 +111,34 @@ pub async fn add(
     styles: &Styles,
     args: AgentAddArgs,
 ) -> Result<()> {
+    let authored = create_authored(engine, args).await?;
+    let agent = authored.agent;
+
+    if let Some(format) = ctx.output {
+        format.print(&agent)?;
+    } else if ctx.quiet {
+        println!("{}", agent.id);
+    } else {
+        print_success(
+            styles,
+            &format!(
+                "Added agent {} ({}) → {}",
+                styles.agent_name(&agent.name),
+                agent.adapter,
+                agent.id
+            ),
+        );
+    }
+    report_diagnostics(ctx, styles, &authored.diagnostics);
+    Ok(())
+}
+
+/// The print-free half of `agent add`, shared with `orch mcp`: the authored
+/// create under the definition lock. Diagnostics are returned, not printed.
+pub(crate) async fn create_authored(
+    engine: &Engine,
+    args: AgentAddArgs,
+) -> Result<orch_engine::agent_service::AuthoredAgent> {
     // The final candidate is checked against the project config read inside
     // the definition lock, not the engine's construction snapshot.
     let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
@@ -132,25 +175,7 @@ pub async fn add(
         )
         .await?;
     drop(lock);
-    let agent = authored.agent;
-
-    if let Some(format) = ctx.output {
-        format.print(&agent)?;
-    } else if ctx.quiet {
-        println!("{}", agent.id);
-    } else {
-        print_success(
-            styles,
-            &format!(
-                "Added agent {} ({}) → {}",
-                styles.agent_name(&agent.name),
-                agent.adapter,
-                agent.id
-            ),
-        );
-    }
-    report_diagnostics(ctx, styles, &authored.diagnostics);
-    Ok(())
+    Ok(authored)
 }
 
 /// `orch agent list`.
@@ -282,15 +307,7 @@ pub async fn status(
 
     if let Some(format) = ctx.output {
         if effective {
-            let (prompt_mode, prompt_mode_source) =
-                effective_prompt_mode(&agent.config, &engine.config.defaults.agent);
-            format.print(&EffectiveAgent {
-                agent: &agent,
-                effective_config: EffectiveConfig {
-                    prompt_mode,
-                    prompt_mode_source,
-                },
-            })?;
+            format.print(&EffectiveAgent::of(engine, &agent))?;
         } else {
             format.print(&agent)?;
         }
@@ -662,8 +679,8 @@ fn print_updated(ctx: &CliContext, styles: &Styles, updated: &Agent) -> Result<(
 /// The service's final-candidate validation (effort table, eco versus custom
 /// templates) runs before the save, against the project config re-read
 /// inside the lock, so a rejection writes nothing and a concurrent project
-/// mode switch is never missed.
-async fn apply_definition(
+/// mode switch is never missed. Shared with `orch mcp`.
+pub(crate) async fn apply_definition(
     engine: &Engine,
     id: &str,
     input: &serde_json::Value,

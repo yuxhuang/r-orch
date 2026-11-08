@@ -646,21 +646,45 @@ pub async fn mutate(
     args: &crate::tree::EntityDefinitionInput,
     kind: crate::document_input::MutationKind,
 ) -> Result<()> {
-    use orch_core::Error;
     let input =
         crate::document_input::read_document(&args.input.file, args.input.input_format).await?;
+    let file = args.input.file.clone();
+    let source = move |err| crate::document_input::at_source(&file, err);
+    let updated = apply_definition(engine, &args.id, &input, kind, &source).await?;
+    if let Some(format) = ctx.output {
+        format.print(&updated)?;
+    } else if ctx.quiet {
+        println!("{}", updated.id);
+    } else {
+        print_success(styles, &format!("Updated task {}", updated.id));
+    }
+    Ok(())
+}
+
+/// The print-free half of `task update`/`task patch`, shared with `orch mcp`:
+/// the already-parsed (and size-bounded) document is merged into the stored
+/// definition under the definition lock, validated, then saved. `source`
+/// attributes the lock, candidate and save errors to the input document, as
+/// the CLI always has; a missing task is reported as it is.
+pub(crate) async fn apply_definition(
+    engine: &Engine,
+    id: &str,
+    input: &serde_json::Value,
+    kind: crate::document_input::MutationKind,
+    source: &(dyn Fn(orch_core::Error) -> orch_core::Error + Sync),
+) -> Result<Task> {
+    use orch_core::Error;
     let _lock =
         orch_infra::storage::fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock"))
             .await
-            .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
-    let current = engine.task_service.get(&args.id).await?;
+            .map_err(source)?;
+    let current = engine.task_service.get(id).await?;
     let value = serde_json::to_value(&current).map_err(|_| Error::other("serialize task"))?;
-    let candidate = definition_candidate(&value, &input, kind)
-        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
-    let updated = engine
+    let candidate = definition_candidate(&value, input, kind).map_err(source)?;
+    engine
         .task_service
         .update_definition(
-            &args.id,
+            id,
             orch_engine::task_service::UpdateTaskFields {
                 title: Some(candidate["title"].as_str().expect("validated").to_owned()),
                 description: Some(
@@ -677,15 +701,7 @@ pub async fn mutate(
             },
         )
         .await
-        .map_err(|err| crate::document_input::at_source(&args.input.file, err))?;
-    if let Some(format) = ctx.output {
-        format.print(&updated)?;
-    } else if ctx.quiet {
-        println!("{}", updated.id);
-    } else {
-        print_success(styles, &format!("Updated task {}", updated.id));
-    }
-    Ok(())
+        .map_err(source)
 }
 
 #[cfg(test)]

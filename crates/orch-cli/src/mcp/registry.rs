@@ -1,0 +1,388 @@
+//! The typed tool registry over the SDK router (design D3).
+//!
+//! Each tool group registers its tools here, once, with their metadata, an
+//! argument type and an async handler. The registry is the only place that
+//! knows how a call becomes work:
+//!
+//! 1. the class is re-checked against the launch mode (a route is only added
+//!    when the mode allows its class, so this is defence against a
+//!    registration mistake; a refused class looks exactly like an absent
+//!    tool);
+//! 2. the arguments are decoded **explicitly** — absent arguments are `{}`,
+//!    unknown fields are refused by the args type's `deny_unknown_fields` —
+//!    and a failure is JSON-RPC `-32602` `Invalid arguments for <tool>: …`.
+//!    The SDK's own decoder would turn that into a tool result instead,
+//!    because its router rewrites messages that start with its own prefix;
+//! 3. [`ToolArgs::validate`] runs, still before any Engine exists;
+//! 4. the call is admitted to its lane, a fresh Engine is built, the handler
+//!    runs, and its `Result<Value>` becomes the tool result: the value as one
+//!    JSON text block, or a core error as `isError` text with its hint.
+
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use futures::future::BoxFuture;
+use rmcp::ErrorData;
+use rmcp::handler::server::common::schema_for_input;
+use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
+use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::model::{
+    CallToolResponse, CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotations,
+};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+pub(crate) use super::identity::Identity;
+pub(crate) use super::mode::{Class, Mode};
+use super::server::McpServer;
+
+/// Which admission lane a tool runs in (design D8). Every tool is
+/// [`Execution::Store`] except `doctor`, the only [`Execution::Diagnostic`]
+/// registration the registry accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Execution {
+    Store,
+    Diagnostic,
+}
+
+/// A tool's static metadata. All four annotation hints are always emitted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolMeta {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) class: Class,
+    pub(crate) execution: Execution,
+    pub(crate) destructive_hint: bool,
+    pub(crate) idempotent_hint: bool,
+    pub(crate) open_world_hint: bool,
+}
+
+/// Argument-form validation that runs after decoding and before an Engine is
+/// built: cross-field forms, identity-dependent requirements, `file: "-"`,
+/// checked durations, mode-dependent argument gates. The default accepts.
+pub(crate) trait ToolArgs {
+    fn validate(&self, _identity: &Identity, _mode: Mode) -> Result<(), ErrorData> {
+        Ok(())
+    }
+}
+
+/// The arguments of a tool that takes none. Unknown fields are refused.
+#[derive(Debug, Clone, Default, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EmptyArgs {}
+
+impl ToolArgs for EmptyArgs {}
+
+/// What a handler receives: a fresh light Engine built for this call alone,
+/// and the server's fixed launch settings.
+#[allow(dead_code, reason = "seam consumed by the B2 tool groups")]
+pub(crate) struct CallContext {
+    pub(crate) engine: Arc<orch_engine::Engine>,
+    pub(crate) project_root: PathBuf,
+    pub(crate) identity: Identity,
+    pub(crate) mode: Mode,
+}
+
+/// The tools of one server, filtered by its mode.
+pub(crate) struct Registry {
+    mode: Mode,
+    /// Every name ever registered, allowed by the mode or not, so a duplicate
+    /// is a startup error in every mode.
+    names: BTreeSet<&'static str>,
+    router: ToolRouter<McpServer>,
+}
+
+impl Registry {
+    pub(crate) fn new(mode: Mode) -> Registry {
+        Registry {
+            mode,
+            names: BTreeSet::new(),
+            router: ToolRouter::new(),
+        }
+    }
+
+    /// Register one tool. A duplicate name, an unusable argument schema or a
+    /// diagnostic registration other than `doctor` is a startup error. A tool
+    /// whose class the mode does not allow is recorded but not routed, so it
+    /// is neither listed nor callable.
+    pub(crate) fn add<A, F, Fut>(&mut self, meta: ToolMeta, handler: F) -> orch_core::Result<()>
+    where
+        A: ToolArgs + DeserializeOwned + JsonSchema + Send + 'static,
+        F: Fn(Arc<CallContext>, A) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = orch_core::Result<Value>> + Send + 'static,
+    {
+        if !self.names.insert(meta.name) {
+            return Err(orch_core::Error::other(format!(
+                "MCP tool registered twice: {}",
+                meta.name
+            )));
+        }
+        if meta.execution == Execution::Diagnostic && meta.name != "doctor" {
+            return Err(orch_core::Error::other(format!(
+                "MCP tool {} cannot use the diagnostic lane",
+                meta.name
+            )));
+        }
+        let schema = schema_for_input::<A>().map_err(|err| {
+            orch_core::Error::other(format!(
+                "MCP tool {} has no usable schema: {err}",
+                meta.name
+            ))
+        })?;
+        if !self.mode.allows(meta.class) {
+            return Ok(());
+        }
+
+        let tool = Tool::new(meta.name, meta.description, schema).with_annotations(
+            ToolAnnotations::from_raw(
+                None,
+                Some(meta.class == Class::Read),
+                Some(meta.destructive_hint),
+                Some(meta.idempotent_hint),
+                Some(meta.open_world_hint),
+            ),
+        );
+        let route =
+            ToolRoute::<McpServer>::new_dyn(tool, move |call: ToolCallContext<'_, McpServer>| {
+                let handler = handler.clone();
+                Box::pin(dispatch::<A, F, Fut>(meta, handler, call))
+                    as BoxFuture<'_, Result<CallToolResponse, ErrorData>>
+            });
+        self.router.add_route(route);
+        Ok(())
+    }
+
+    pub(crate) fn into_router(self) -> ToolRouter<McpServer> {
+        self.router
+    }
+}
+
+/// Decode `arguments` (absent is `{}`) into `A`, as invalid params on
+/// failure. The wording deliberately avoids the SDK's
+/// `failed to deserialize parameters:` prefix, which its router would
+/// rewrite into a tool result.
+pub(crate) fn decode<A: DeserializeOwned>(
+    name: &str,
+    arguments: Option<JsonObject>,
+) -> Result<A, ErrorData> {
+    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|err| {
+        ErrorData::invalid_params(format!("Invalid arguments for {name}: {err}"), None)
+    })
+}
+
+/// The `tool not found` error the SDK router gives an absent tool.
+pub(crate) fn tool_not_found() -> ErrorData {
+    ErrorData::invalid_params("tool not found", None)
+}
+
+async fn dispatch<A, F, Fut>(
+    meta: ToolMeta,
+    handler: F,
+    call: ToolCallContext<'_, McpServer>,
+) -> Result<CallToolResponse, ErrorData>
+where
+    A: ToolArgs + DeserializeOwned + Send + 'static,
+    F: Fn(Arc<CallContext>, A) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = orch_core::Result<Value>> + Send + 'static,
+{
+    let server = call.service;
+    // Stored mode filtering is the gate; this repeats it before execution.
+    if !server.mode().allows(meta.class) {
+        return Err(tool_not_found());
+    }
+    let args: A = decode(meta.name, call.arguments)?;
+    args.validate(server.identity(), server.mode())?;
+    let cancelled = call.request_context.ct.clone();
+    let outcome = server
+        .run_call(meta.execution, &cancelled, move |cx| handler(cx, args))
+        .await;
+    Ok(encode(outcome).into())
+}
+
+/// The tool result for a handler outcome: the value as compact JSON text, or
+/// the error's message and hint as `isError` text.
+pub(crate) fn encode(outcome: orch_core::Result<Value>) -> CallToolResult {
+    match outcome {
+        Ok(value) => match serde_json::to_string(&value) {
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Err(err) => error_result(&format!("cannot serialize the result: {err}")),
+        },
+        Err(err) => {
+            log_error_chain(&err);
+            error_result(&error_text(&err))
+        }
+    }
+}
+
+/// `message` as an `isError` tool result.
+pub(crate) fn error_result(message: &str) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(message.to_owned())])
+}
+
+/// A core error as the CLI reports it: the message, then `Hint: …` when
+/// there is one. No source chain — that goes to stderr at debug level.
+pub(crate) fn error_text(err: &orch_core::Error) -> String {
+    match err.hint() {
+        Some(hint) => format!("{err}\nHint: {hint}"),
+        None => err.to_string(),
+    }
+}
+
+fn log_error_chain(err: &orch_core::Error) {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        tracing::debug!(target: "orch::mcp", "caused by: {cause}");
+        source = std::error::Error::source(cause);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct ShowArgs {
+        id: String,
+        #[serde(default)]
+        effective: bool,
+    }
+    impl ToolArgs for ShowArgs {}
+
+    fn meta(name: &'static str, class: Class) -> ToolMeta {
+        ToolMeta {
+            name,
+            description: "test tool",
+            class,
+            execution: Execution::Store,
+            destructive_hint: class != Class::Read,
+            idempotent_hint: class == Class::Read,
+            open_world_hint: false,
+        }
+    }
+
+    fn object(value: Value) -> Option<JsonObject> {
+        match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn decoding_is_strict_and_names_the_tool() {
+        let args: ShowArgs = decode("t", object(serde_json::json!({"id": "x"}))).unwrap();
+        assert_eq!(args.id, "x");
+        assert!(!args.effective);
+
+        let cases = [
+            (serde_json::json!({}), "missing field `id`"),
+            (serde_json::json!({"id": 7}), "invalid type"),
+            (
+                serde_json::json!({"id": "x", "extra": 1}),
+                "unknown field `extra`",
+            ),
+            (
+                serde_json::json!({"id": "x", "effective": "yes"}),
+                "invalid type",
+            ),
+        ];
+        for (input, reason) in cases {
+            let err = decode::<ShowArgs>("task_show", object(input.clone())).expect_err("rejected");
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{input}");
+            assert!(
+                err.message.starts_with("Invalid arguments for task_show: "),
+                "{}",
+                err.message
+            );
+            assert!(err.message.contains(reason), "{input}: {}", err.message);
+            assert!(!err.message.starts_with("failed to deserialize parameters:"));
+        }
+
+        // Absent arguments are `{}`: fine for EmptyArgs, a missing field otherwise.
+        decode::<EmptyArgs>("status", None).unwrap();
+        assert!(decode::<ShowArgs>("task_show", None).is_err());
+        assert!(decode::<EmptyArgs>("status", object(serde_json::json!({"x": 1}))).is_err());
+    }
+
+    async fn ok(_cx: Arc<CallContext>, _args: EmptyArgs) -> orch_core::Result<Value> {
+        Ok(Value::Null)
+    }
+
+    fn names(registry: Registry) -> Vec<String> {
+        registry
+            .into_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
+    }
+
+    fn populated(mode: Mode) -> Registry {
+        let mut registry = Registry::new(mode);
+        registry.add(meta("r", Class::Read), ok).unwrap();
+        registry.add(meta("m", Class::Mutate), ok).unwrap();
+        registry.add(meta("d", Class::Destructive), ok).unwrap();
+        registry
+    }
+
+    #[test]
+    fn the_mode_filters_registration() {
+        assert_eq!(names(populated(Mode::ReadOnly)), ["r"]);
+        assert_eq!(names(populated(Mode::Default)), ["m", "r"]);
+        assert_eq!(names(populated(Mode::AllowDestructive)), ["d", "m", "r"]);
+    }
+
+    #[test]
+    fn a_duplicate_name_is_a_startup_error_even_when_filtered() {
+        let mut registry = Registry::new(Mode::ReadOnly);
+        registry.add(meta("d", Class::Destructive), ok).unwrap();
+        let err = registry
+            .add(meta("d", Class::Destructive), ok)
+            .expect_err("duplicate");
+        assert_eq!(err.to_string(), "MCP tool registered twice: d");
+    }
+
+    #[test]
+    fn only_doctor_may_use_the_diagnostic_lane() {
+        let mut registry = Registry::new(Mode::Default);
+        let mut diagnostic = meta("logs", Class::Read);
+        diagnostic.execution = Execution::Diagnostic;
+        assert!(registry.add(diagnostic, ok).is_err());
+        diagnostic.name = "doctor";
+        registry.add(diagnostic, ok).unwrap();
+    }
+
+    #[test]
+    fn every_annotation_hint_is_emitted() {
+        let mut registry = Registry::new(Mode::Default);
+        registry.add(meta("m", Class::Mutate), ok).unwrap();
+        let tools = registry.into_router().list_all();
+        let json = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(
+            json["annotations"],
+            serde_json::json!({
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": false,
+            })
+        );
+        assert_eq!(json["inputSchema"]["type"], "object");
+        assert_eq!(json["description"], "test tool");
+    }
+
+    #[test]
+    fn errors_carry_their_hint() {
+        let err = orch_core::Error::from(orch_domain::DomainError::NotInitialized);
+        assert_eq!(error_text(&err), "Not initialized\nHint: Run: orch init");
+        let result = encode(Err(err));
+        assert_eq!(result.is_error, Some(true));
+        let result = encode(Ok(serde_json::json!([1, {"a": null}])));
+        assert_eq!(result.is_error, Some(false));
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["content"][0]["text"], "[1,{\"a\":null}]");
+    }
+}
