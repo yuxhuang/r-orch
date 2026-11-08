@@ -56,6 +56,6 @@ What gets easier, what gets harder, what must change as a result.
 | [0007](0007-hand-written-yaml-output-emitter.md) | A hand-written emitter for `--yaml` output | proposed |
 | [0008](0008-yaml-output-has-no-stream-form.md) | `--yaml` output has no stream form | accepted |
 | [0009](0009-remove-parity-tooling.md) | Remove parity validation and tooling | accepted |
-| [0011](0011-mcp-server.md) | A stdio MCP server in `orch-cli`, built on rmcp | proposed |
+| [0011](0011-mcp-server.md) | A stdio MCP server in `orch-cli`, built on rmcp | accepted |
 
 `docs/reviews/` holds historical gate reviews from the early port-era work; new material does not go there.

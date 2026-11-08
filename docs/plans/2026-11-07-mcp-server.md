@@ -11,6 +11,12 @@ project command (R2), the `orch://` resources (R5), three launch modes (R4), att
 CLI-equivalent validation and errors (R7) and clean lifecycle without the orchestrator lock (R8), documented (R9)
 and green on macOS and Linux CI (R10, R11), with a real-client smoke test (R12).
 
+PR 2, the follow-up of goal `goal_h-gIBCW` (owner, 2026-11-08), closes PR #69's accepted residuals and follow-ups
+except storage repair: goal-scoped pause cancellation with `goal_status status=paused` in default mode (R4
+re-amended, R13), value-free invalid-params diagnostics (R14), non-UTF-8 project roots in `task_add` attachments
+(R15), a stdio test of qualified resources (R16), SIGHUP named in R8, a host-git-independent `yaml_contract`
+fixture, and the docs (store-only `task_cancel`, design assumptions, the client-version claim).
+
 ## Non-goals
 HTTP/SSE transport, authentication, MCP prompts, orchestrator or remote-peer control, on-disk format changes,
 store repair for concurrent writers (follow-up), automatic injection of the server into spawned agents. See the
@@ -70,9 +76,28 @@ the PR and reviews source in slices under 800 lines. Orch task ids are in [Statu
 | W2 | Verify every doc example against the integration commit | R9 | as W1 | I, W1 | examples re-run on temp projects; fact-check | 1 |
 | GATE | Security, resilience, code, docs and real-client QA reviews; fixes | R7, R8, R9, R12 | per finding | W2 | reviewer verdicts; R12 capture | 1 |
 
+### PR 2: follow-ups (goal `goal_h-gIBCW`)
+
+Branch `fix/mcp-followups` from `main` at `6943c8b` (base `20e81f9` with the AGENTS.md row). D10 storage races
+and `crates/orch-infra` storage locking are out of scope.
+
+| Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
+|---|---|---|---|---|---|---|
+| F-B1 | Scope pause cancellation to the paused goal; `goal_status status=paused` in default mode, `force=true` gated; description and `initialize` instructions | R4, R13 | `crates/orch-engine/src/goal_service.rs`, `crates/orch-cli/src/mcp/tools/goal.rs`, `crates/orch-cli/src/mcp/server.rs`, `crates/orch-cli/tests/mcp_tools.rs` | — | `cargo test -p orch-engine goal_service`; `cargo test -p orch-cli --test mcp_tools` | 2 |
+| F-B2 | Value-free invalid-params text; non-UTF-8 project root in `task_add` attachments; `task_cancel` liveness decision | R14, R15, R3 | `crates/orch-cli/src/mcp/{registry,tools/task}.rs`, `crates/orch-cli/src/lib.rs`, `crates/orch-cli/Cargo.toml`, `Cargo.toml`, `Cargo.lock` | — | `cargo test -p orch-cli mcp::` | 2 |
+| F-T1a | Seed a commit in the `yaml_contract` fixture; qualified-resource stdio test; SIGHUP coverage audit | R8, R16 | `crates/orch-cli/tests/{mcp_stdio,yaml_contract}.rs`, `crates/orch-cli/tests/mcp_common/**` | — | `cargo test -p orch-cli --test mcp_stdio --test yaml_contract` | 2 |
+| F-W1 | Spec, plan, ADR 0011 (accepted), manual 17, README, CHANGELOG, internal orchestration notes | R4, R8, R9, R13–R16 | `docs/**`, `README.md`, `CHANGELOG.md` | — | links resolve; no stale cross-goal wording (`grep -rn "other goals\|across all goals\|across goals"`) | 2 |
+| F-FC | Fact-check the client-version load claim in manual 17 | R9 | reader | — | fact report | 2 |
+| F-RT | Red-team the goal-scoped pause decision | R4, R13 | reader | — | report; lead adjudicates at CP1 | 2 |
+| F-T1b | Stdio test of the R14 stderr under `RUST_LOG=warn` | R14 | as F-T1a | F-B2, F-T1a | `cargo test -p orch-cli --test mcp_stdio` | 2 |
+| F-I | Integration: CI set, cold `./xtask/gate.sh`, review packet, frozen commit | R11 | as F-B1, F-B2, F-T1a | F-T1b, CP1 changes | the CI set | 2 |
+| F-W2 | Client-version sentence from F-FC; docs reconciled with the frozen commit; Verification rows R4/R8 (amended), R13–R16; spec mirror | R9 | as F-W1 | F-I, F-FC | fact-check | 2 |
+| F-GATE | Code, security, resilience and docs reviews, cold gate; fixes | R4, R7, R8, R9, R13–R16 | per finding | F-W2 | reviewer verdicts | 2 |
+
 ## Status
 
-Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_WpQVmPg`.
+Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_WpQVmPg` (PR 1) and goal
+`goal_h-gIBCW` (PR 2).
 
 | Wave | Item | Task | State |
 |---|---|---|---|
@@ -96,7 +121,16 @@ Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_W
 | | Fix: `task_add` relative attachments resolve against the project root (D12) | `tsk_6HalWGX` | fixed in I; verified, no separate commit |
 | | I | `tsk_FxWZnjY` | integrated (`00450c9`): full CI set green, 50/45/18 tools by mode |
 | | W2 | `tsk_4SVACBX` | docs verified against `00450c9` |
-| C: review | Checkpoint CP2: freeze the integration commit, launch the review board (GATE) | `tsk_Brzri1x` | pending |
+| C: review | Checkpoint CP2: freeze the integration commit, launch the review board (GATE) | `tsk_Brzri1x` | done |
+| | GATE, fix rounds, PR #69 | goal `goal_WpQVmPg` | merged as `679011d`; head `42d2808`, CI green (Linux x86_64) |
+| D: PR 2, wave A | F-B1 | `tsk_uhm73p-` | pending |
+| | F-B2 | `tsk_zxG0McJ` | in progress |
+| | F-T1a | `tsk_6_gi7MU` | in progress |
+| | F-W1 | `tsk_gp6Ry0K` | drafted (this commit) |
+| | F-FC | `tsk_tkh0_l3` | done |
+| | F-RT | `tsk_AoDE3ZO` | done: ship with changes (disclosures), for CP1 |
+| | Checkpoint CP1: adjudicate wave A | `tsk_IUpXm7b` | pending |
+| E: PR 2, wave B and gate | F-T1b, F-I, F-W2, F-GATE, PR | not yet created | pending |
 
 ## Test plan
 - The spec's acceptance checks, R1–R11 on macOS and Linux CI; R12 (real client: Claude Code or MCP Inspector) on
@@ -117,6 +151,8 @@ README (MCP section), RUNBOOK (concurrent-writer recovery, config-poison restore
 §3.3.1, §4.5.2), CHANGELOG (`[Unreleased]`), ADR 0011, manual chapter 17 and the regenerated command reference.
 
 ## Open questions
+- PR 2: whether `task_cancel` reports in its result if a live orchestrator will reconcile the cancel (F-B2 decides;
+  docs-only unless a backward-compatible, reusable liveness check exists).
 - Store repair for concurrent writers (compare-and-swap for whole-record saves, context expiry under the index
   lock) is follow-up work outside this plan (decision-2, E2).
 - The pre-existing synchronous open in `fs_utils::mutation_lock` is accepted for v1 and recorded as a follow-up
