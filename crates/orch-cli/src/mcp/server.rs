@@ -344,8 +344,9 @@ impl McpServer {
         );
         match self.settings.mode {
             Mode::Default => text.push_str(
-                " In this mode goal_status status=paused or force=true is unavailable: \
-                 pausing can cancel the assignee's todo/retrying autonomous tasks across goals.",
+                " In this mode goal_status force=true is unavailable. \
+                 goal_status status=paused works: it cancels the assignee's todo/retrying \
+                 autonomous tasks of that goal only, not of other goals.",
             ),
             Mode::ReadOnly => text.push_str(" In this mode only read tools are available."),
             Mode::AllowDestructive => {}
@@ -997,7 +998,9 @@ mod tests {
             "{instructions}"
         );
         assert!(instructions.contains("Default agent: \"agt_me\". Mode: default."));
-        assert!(instructions.contains("goal_status status=paused or force=true is unavailable"));
+        assert!(instructions.contains("goal_status force=true is unavailable."));
+        assert!(instructions.contains("autonomous tasks of that goal only, not of other goals."));
+        assert!(!instructions.contains("across goals"));
         assert!(!instructions.contains('\n'));
         h.server.abort();
     }
