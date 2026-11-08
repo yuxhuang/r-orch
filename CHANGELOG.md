@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-07
+
+MCP server release. No peer-protocol change, so 0.5.x through 0.12.0 peers can be mixed.
+
 ### Added
 - `orch mcp` serves the project to MCP clients such as Claude Code, Codex and Cursor over stdio: typed tools for tasks, goals, agents, messages, context, teams, logs, `doctor` and configuration, plus read-only `orch://` resources. Each tool returns the same JSON as the matching `orch --json` command; for commands that print only a message, it returns the changed entity or `null`. Read and ordinary change tools are on by default (45 tools); `--read-only` keeps only the 18 read tools, and `--allow-destructive` (50 tools) adds cancel, delete and remove and lets a client pause or force a goal. `--agent` or `ORCH_AGENT_ID` sets the default message sender and inbox. It takes no orchestrator lock, so it runs next to `orch run --watch`, `orch serve` and the dashboard. See [the MCP server](docs/manual/17-mcp-server.md).
   The server exits cleanly on stdin EOF, SIGINT, SIGTERM and SIGHUP; if the client stops reading its stdout it runs no further call and exits 1 with the reason on stderr. With `RUST_LOG` or `ORCHESTRY_DEBUG` set, diagnostics go to stderr, and the MCP SDK's `debug` and `trace` events, which carry tool arguments and results, are never recorded.
@@ -276,7 +280,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/yuxhuang/r-orch/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/yuxhuang/r-orch/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/yuxhuang/r-orch/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/yuxhuang/r-orch/compare/v0.10.1...v0.10.2
