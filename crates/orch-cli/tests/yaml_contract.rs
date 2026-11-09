@@ -203,6 +203,10 @@ fn orch_in(dir: &Path, cwd: &Path) -> Command {
         .env("HOME", dir.join("home"))
         .env("ORCHESTRY_GLOBAL_CONFIG_PATH", dir.join("home/global.yml"))
         .env("NO_COLOR", "1")
+        // Pin the terminal mode: the error-glyph fixtures assert the Unicode
+        // `✕`, and `TERM=dumb` (CI shells, some containers) switches the CLI
+        // to its ASCII fallback. Production glyph selection is unchanged.
+        .env("TERM", "xterm-256color")
         // No agent CLIs on PATH: the only adapter used is `shell` running
         // `true`, and `doctor`-style probes find nothing real to exec.
         .env("PATH", "/usr/bin:/bin")
