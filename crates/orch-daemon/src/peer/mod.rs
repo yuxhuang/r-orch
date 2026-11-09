@@ -32,6 +32,11 @@ impl HostedPeer {
         })
     }
 
+    /// Drain peer state work while the daemon still owns the project.
+    pub(crate) async fn shutdown(self) {
+        self.runtime.shutdown().await;
+    }
+
     /// Begin inbound admission. Called once the daemon is READY, so a
     /// connection flood cannot exhaust descriptors during startup.
     pub(crate) fn open(&mut self) {

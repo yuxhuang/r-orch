@@ -382,3 +382,98 @@ async fn a_worker_outbox_tick_waits_for_the_held_operation() {
     drop(peer);
     daemon.shutdown().await.unwrap();
 }
+
+/// Stop drains admitted sessions and stalled handshakes alike. In particular,
+/// the invalid pre-Sync Ping from the original 8.19 failure may reach the
+/// session-end listener rewrite while shutdown is starting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_drains_peer_sessions_before_releasing_publication() {
+    for round in 0..20 {
+        let daemon = DaemonHarness::builder()
+            .maintenance_timer(false)
+            .listen("127.0.0.1:0")
+            .peer_name("shutdown-worker")
+            .start()
+            .await
+            .unwrap();
+        let addr = listener_addr(&daemon).await;
+        let mut peer = Peer::new(TcpStream::connect(&addr).await.unwrap());
+        peer.send(&Frame::Hello {
+            proto: PROTOCOL,
+            instance_id: "old".into(),
+            name: "old".into(),
+            os: "test".into(),
+            agents: vec![],
+            version: None,
+        })
+        .await;
+        peer.next(DEADLINE, |f| matches!(f, Frame::Welcome { .. }))
+            .await
+            .expect("welcome");
+        // This socket never supplies a hello; shutdown must cancel that
+        // network wait rather than wait out the handshake deadline.
+        let stalled = TcpStream::connect(&addr).await.unwrap();
+        peer.send(&Frame::Ping).await;
+        let root = daemon.project_root().to_owned();
+        let quiet = tokio::time::timeout(DEADLINE, daemon.quiesce())
+            .await
+            .expect("peer network waits prevented shutdown")
+            .unwrap();
+        let path = root.join(".orchestry/remotes/_listener.json");
+        assert!(
+            !path.exists(),
+            "listener record survived stop in round {round}"
+        );
+        assert!(
+            TcpStream::connect(&addr).await.is_err(),
+            "listener stayed open"
+        );
+        // Keep the old engine and sockets alive after clean stop. No peer
+        // task may publish again, even while a successor could own the root.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !path.exists(),
+            "listener record reappeared in round {round}"
+        );
+        drop((quiet, stalled, peer));
+    }
+}
+
+/// An outbound link awaiting Welcome must also join without waiting on the
+/// remote process. Keep its accepted socket open throughout the local stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_joins_an_outbound_link_waiting_for_its_peer() {
+    let daemon = link_daemon().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut raw = Raw::session(&daemon, "cli", "normal").await;
+    ok(&raw
+        .request(
+            1,
+            "remote.add",
+            json!({
+                "alias": "stalled", "addr": listener.local_addr().unwrap().to_string()
+            }),
+        )
+        .await);
+    let (socket, _) = tokio::time::timeout(DEADLINE, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut peer = Peer::new(socket);
+    peer.next(DEADLINE, |f| matches!(f, Frame::Hello { .. }))
+        .await
+        .expect("hello");
+    drop(raw);
+    let quiet = tokio::time::timeout(Duration::from_secs(2), daemon.quiesce())
+        .await
+        .expect("shutdown waited for a remote Welcome")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(DEADLINE, peer.frames.recv())
+            .await
+            .unwrap()
+            .is_none(),
+        "outbound session survived clean stop"
+    );
+    drop(quiet);
+}

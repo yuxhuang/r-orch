@@ -620,7 +620,9 @@ impl Running {
     /// exit when agent cleanup was incomplete, never a false clean stop.
     pub(crate) async fn shutdown(mut self) -> DaemonExit {
         let mut clean = self.stop_engine().await;
-        drop(self.peer.take());
+        if let Some(peer) = self.peer.take() {
+            peer.shutdown().await;
+        }
         self.server.begin_drain();
         self.handler.seal_requests();
         self.quit.send_replace(true);
