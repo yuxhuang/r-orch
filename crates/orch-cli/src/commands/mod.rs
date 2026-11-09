@@ -12,6 +12,7 @@ pub mod init;
 pub mod msg;
 pub mod org;
 pub mod org_template;
+pub mod rpc;
 pub mod run;
 pub mod status;
 pub mod task;

@@ -2,8 +2,6 @@
 
 use std::path::PathBuf;
 
-use orch_infra::storage::find_project_root;
-
 use crate::output::{StructuredFormat, Styles};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +70,7 @@ impl CliContext {
         env: EnvFlags,
     ) -> Self {
         CliContext::new(
-            find_project_root(start_dir),
+            project_root(start_dir),
             output,
             quiet,
             no_color_flag,
@@ -87,6 +85,19 @@ impl CliContext {
             ascii: self.ascii,
         }
     }
+}
+
+/// Root selection is discovery only; project state is read through the socket.
+pub fn project_root(start_dir: &std::path::Path) -> PathBuf {
+    std::env::var_os("ORCH_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            start_dir
+                .ancestors()
+                .find(|path| path.join(".orchestry").is_dir())
+                .unwrap_or(start_dir)
+                .to_path_buf()
+        })
 }
 
 #[cfg(test)]
