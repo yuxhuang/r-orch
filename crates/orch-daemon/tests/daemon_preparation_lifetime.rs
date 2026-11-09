@@ -15,6 +15,11 @@ use std::time::Duration;
 use support::Raw;
 use tokio::sync::Notify;
 
+/// Poll interval for waits on daemon-side state: a sleep, not a `yield_now`
+/// spin, so the test does not burn a worker while the daemon it waits on is
+/// starved.
+const POLL: Duration = Duration::from_millis(10);
+
 #[derive(Default)]
 struct DelayedProbe {
     entered: Notify,
@@ -50,10 +55,17 @@ impl ProcessManager for DelayedProbe {
         self.calls.lock().unwrap().push(args.to_vec());
         let output: &[u8] = if args == ["--version"] {
             self.entered.notify_one();
-            let mut open = self.gate.0.lock().unwrap();
-            while !*open {
-                open = self.gate.1.wait(open).unwrap();
-            }
+            // Block like a real synchronous call, but tell the scheduler. A
+            // bare wait strands any task this worker just woke into its LIFO
+            // slot, which no other worker may steal. When that task holds a
+            // lock engine shutdown needs (seen: the operation boundary), the
+            // CancelShutdown arm waits for `claimed` to clear until release.
+            tokio::task::block_in_place(|| {
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+            });
             if self.fail {
                 return Err(orch_core::Error::other("fake probe spawn failed"));
             }
@@ -146,9 +158,10 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
         .unwrap()
         .send_text(r#"{"id":1,"req":{"op":"dispatch.tick","args":{}}}"#)
         .await;
-    tokio::time::timeout(Duration::from_secs(3), processes.entered.notified())
+    // Completion guard for real daemon work: 30 s survives emulated, starved hosts.
+    tokio::time::timeout(Duration::from_secs(30), processes.entered.notified())
         .await
-        .unwrap();
+        .expect("dispatch.tick reaches blocked preparation (processes.entered)");
     let run = old.engine().runs.list_all().await.unwrap().pop().unwrap();
     assert_eq!(run.status, RunStatus::Preparing);
     if disconnect {
@@ -175,7 +188,7 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
         Stop::CancelShutdown => {
             let shutdown = tokio::spawn(old.shutdown());
             // Wait until engine shutdown has run and lifecycle is draining.
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     let state: serde_json::Value = serde_json::from_slice(
                         &std::fs::read(root.join(".orchestry/state.json")).unwrap(),
@@ -187,11 +200,11 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
                     {
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(POLL).await;
                 }
             })
             .await
-            .unwrap();
+            .expect("engine shutdown clears state.json claimed before cancel");
             shutdown.abort();
             assert!(shutdown.await.unwrap_err().is_cancelled());
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -216,7 +229,7 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
     if owned {
         tokio::time::timeout(Duration::from_secs(20), async {
             while root.exists() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(POLL).await;
             }
         })
         .await
@@ -232,7 +245,7 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
     } else {
         tokio::time::timeout(Duration::from_secs(20), async {
             while root.join(".orchestry/orchestry.lock").exists() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(POLL).await;
             }
         })
         .await
@@ -248,7 +261,7 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
                 .await
             {
                 Ok(successor) => break successor,
-                Err(orch_daemon::DaemonError::AlreadyRunning(_)) => tokio::task::yield_now().await,
+                Err(orch_daemon::DaemonError::AlreadyRunning(_)) => tokio::time::sleep(POLL).await,
                 Err(error) => panic!("successor start failed: {error}"),
             }
         }
