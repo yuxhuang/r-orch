@@ -12,7 +12,7 @@ pub struct DaemonCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonSub {
-    /// Start the project daemon explicitly (developmental)
+    /// Start the project daemon explicitly
     Start(StartArgs),
     /// Show live daemon status
     Status,
@@ -43,19 +43,36 @@ pub struct StartArgs {
     pub peer: crate::tree::PeerFlags,
 }
 
-const GATE_ERROR: &str =
-    "orch daemon is developmental in this build; set ORCH_DAEMON_DEVELOPMENTAL=1 to run it";
+pub fn foreground(
+    cli: &crate::tree::Cli,
+    peer: &crate::tree::PeerFlags,
+    cwd: &std::path::Path,
+) -> ExitCode {
+    let result = run(
+        cli,
+        &DaemonCmd {
+            command: DaemonSub::Start(StartArgs {
+                detach: false,
+                dispatch: Switch::On,
+                from_agent: false,
+                peer: crate::tree::PeerFlags {
+                    listen: peer.listen.clone(),
+                    peer_name: peer.peer_name.clone(),
+                },
+            }),
+        },
+        cwd,
+    );
+    if result == ExitCode::from(4) {
+        eprintln!("    Use: orch daemon dispatch on");
+    }
+    result
+}
 
 pub fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path) -> ExitCode {
-    // This check precedes discovery, connection and any lifecycle action, for
-    // every daemon verb. Existing serve/watch entry points are unchanged.
-    if std::env::var_os(orch_daemon::DEVELOPMENTAL_ENV).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
+    let config = match ClientConfig::from_env(cwd.to_path_buf())
+        .and_then(|cfg| cfg.with_agent(cli.agent.as_deref()))
     {
-        eprintln!("  ✕ {GATE_ERROR}");
-        return ExitCode::from(2);
-    }
-    let config = match ClientConfig::from_env(cwd.to_path_buf()) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("{}", error.render(false));

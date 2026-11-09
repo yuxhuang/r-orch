@@ -3,16 +3,21 @@
 //! an operator sees them in a real terminal (AGENTS.md, "TUI end-to-end
 //! tests").
 //!
-//! The real `orch` binary runs `orch tui --observe` in a private tmux server
-//! over a temp project seeded on disk: two tasks, one goal and one run record.
-//! Nothing here can start an agent — the project has no agents at all, the
-//! adapter default is `shell`, `--observe` never starts the orchestrator, and
-//! the session's `PATH` holds no AI CLI.
+//! The real `orch` binary runs `orch tui` in a private tmux server over a
+//! temp project seeded on disk: two tasks, one goal and one run record. The
+//! dashboard is a client of the project's explicit test daemon. Nothing here
+//! can start an agent — the project has no agents at all, the adapter default
+//! is `shell`, the test daemon's dispatch is off, and the session's `PATH`
+//! holds no AI CLI.
 //!
 //! Every timestamp is fixed, so the terminal task's `Elapsed*` is exactly the
 //! hour between its first run and its last update, whenever the test runs.
 
 #![cfg(unix)]
+
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::OwnedDir;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -152,16 +157,17 @@ impl Drop for Tmux {
 }
 
 fn orch(dir: &Path, args: &[&str]) {
-    let output = Command::new(orch_binary())
+    let mut command = Command::new(orch_binary());
+    command
         .args(args)
         .current_dir(dir)
         .env_clear()
         .env("HOME", dir.join("home"))
         .env("PATH", "/usr/bin:/bin")
         .env("ORCHESTRY_GLOBAL_CONFIG_PATH", global_config(dir))
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("orch runs");
+        .env("NO_COLOR", "1");
+    daemon::apply_for(dir, &mut command);
+    let output = command.output().expect("orch runs");
     assert!(
         output.status.success(),
         "orch {args:?} failed: {}",
@@ -180,7 +186,7 @@ fn global_config(dir: &Path) -> PathBuf {
 /// its remote fixtures: these timestamps have to be exact, and `task add`
 /// would stamp them with the wall clock. No `_index.json` exists yet, so the
 /// stores rebuild their index from these files on the first read.
-fn project() -> tempfile::TempDir {
+fn project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
@@ -222,7 +228,9 @@ fn project() -> tempfile::TempDir {
         ),
     )
     .expect("run_0001.json");
-    dir
+    // The daemon starts last, after every file the fixture writes by hand
+    // (a running daemon owns the state and may rewrite it).
+    OwnedDir::adopt(dir)
 }
 
 fn launch(dir: &Path, socket: String) -> Tmux {
@@ -238,10 +246,10 @@ fn launch(dir: &Path, socket: String) -> Tmux {
         global_config(dir).display()
     );
     let cwd = dir.display().to_string();
-    // `--observe`: the orchestrator is never started, so no agent can be
-    // dispatched from this session.
-    let command = format!("'{}' tui --observe", orch_binary().display());
-    tmux.run(&[
+    // A plain client of the project's test daemon (dispatch OFF), so no agent
+    // can be dispatched from this session.
+    let command = format!("'{}' tui", orch_binary().display());
+    let mut args: Vec<String> = [
         "start-server",
         ";",
         "set-option",
@@ -265,8 +273,15 @@ fn launch(dir: &Path, socket: String) -> Tmux {
         &global,
         "-e",
         "PATH=/usr/bin:/bin",
-        &command,
-    ]);
+    ]
+    .map(String::from)
+    .into();
+    // Point the dashboard at this project's test daemon.
+    for pair in daemon::env_pairs_for(dir) {
+        args.extend(["-e".to_owned(), pair]);
+    }
+    args.push(command);
+    tmux.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
     let path = tmux.run(&["display-message", "-p", "-t", "dash", "#{socket_path}"]);
     tmux.socket_path = Some(PathBuf::from(
         String::from_utf8_lossy(&path.stdout).trim().to_string(),
@@ -416,16 +431,17 @@ fn tables_headers_sort_and_elapsed_in_tmux() {
 
 /// `orch` with its trimmed stdout, for the ids `--quiet` prints.
 fn orch_out(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new(orch_binary())
+    let mut command = Command::new(orch_binary());
+    command
         .args(args)
         .current_dir(dir)
         .env_clear()
         .env("HOME", dir.join("home"))
         .env("PATH", "/usr/bin:/bin")
         .env("ORCHESTRY_GLOBAL_CONFIG_PATH", global_config(dir))
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("orch runs");
+        .env("NO_COLOR", "1");
+    daemon::apply_for(dir, &mut command);
+    let output = command.output().expect("orch runs");
     assert!(
         output.status.success(),
         "orch {args:?} failed: {}",
@@ -436,14 +452,16 @@ fn orch_out(dir: &Path, args: &[&str]) -> String {
 
 /// For the keyword filter: three cancelled tasks: `Alpha deploy` without a goal, `Bravo docs` and
 /// `Charlie deploy` in the goal `Release train`.
-fn keyword_project() -> tempfile::TempDir {
+fn keyword_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
-    let goal = orch_out(dir.path(), &["goal", "add", "Release train", "--quiet"]);
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let owned = OwnedDir::adopt(dir);
+    let goal = orch_out(owned.path(), &["goal", "add", "Release train", "--quiet"]);
     for (title, goal) in [
         ("Alpha deploy", None),
         ("Bravo docs", Some(goal.as_str())),
@@ -453,10 +471,10 @@ fn keyword_project() -> tempfile::TempDir {
         if let Some(goal) = goal {
             args.extend(["--goal-id", goal]);
         }
-        let id = orch_out(dir.path(), &args);
-        orch(dir.path(), &["task", "cancel", &id]);
+        let id = orch_out(owned.path(), &args);
+        orch(owned.path(), &["task", "cancel", &id]);
     }
-    dir
+    owned
 }
 
 /// Type `text` into the keyword prompt one key at a time, waiting for each
@@ -595,21 +613,23 @@ fn keyword_sort_group_and_reset() {
 
 /// Eleven cancelled tasks: `Item 01`..`Item 10`, then `Zulu shipit`, which
 /// sorts last by Title and so starts behind the ten-row cap.
-fn capped_keyword_project() -> tempfile::TempDir {
+fn capped_keyword_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let owned = OwnedDir::adopt(dir);
     let titles = (1..=10)
         .map(|i| format!("Item {i:02}"))
         .chain(["Zulu shipit".to_string()]);
     for title in titles {
-        let id = orch_out(dir.path(), &["task", "add", &title, "--quiet"]);
-        orch(dir.path(), &["task", "cancel", &id]);
+        let id = orch_out(owned.path(), &["task", "add", &title, "--quiet"]);
+        orch(owned.path(), &["task", "cancel", &id]);
     }
-    dir
+    owned
 }
 
 /// The keyword filters before the ten-row cap (R3, D1): a match that was
