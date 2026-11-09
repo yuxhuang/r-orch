@@ -26,11 +26,16 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tracing.workspace = true
 tempfile = { workspace = true, optional = true }
+# Owner guard (flock), private directories and descriptors, umask, euid,
+# setsid for the detached child. Already in the lockfile via orch-infra.
+nix = { workspace = true, features = ["fs", "process", "user"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -1755,6 +1755,7 @@ version = "0.13.0"
 dependencies = [
  "async-trait",
  "base64",
+ "nix 0.31.3",
  "orch-core",
  "orch-domain",
  "orch-engine",
@@ -1767,6 +1768,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
