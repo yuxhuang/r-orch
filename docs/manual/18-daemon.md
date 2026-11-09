@@ -66,7 +66,7 @@ unknown outcome; and another program that edits `.orchestry/` while the daemon r
 |---|---|
 | `--detach` | Run in the background in a session of its own. The command returns only after the daemon is ready, and fails if the daemon fails before that. |
 | `--dispatch on\|off` | Dispatch state at start. Default `off`, so you can queue work before anything runs. |
-| `--from-agent` | Allow the start from an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set). Without it the start refuses with exit 2. Use it only when you, the owner, deliberately start a daemon from such a shell. Only `orch daemon start` has this flag; `orch serve` and `orch run --watch` refuse from an agent's environment with no override, pending fix (task tsk_eda1yGZ). |
+| `--from-agent` | Allow the start from an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set). Without it the start refuses with exit 2. Use it only when you, the owner, deliberately start a daemon from such a shell. `orch serve` and `orch run --watch` take it too; `orch serve --once` and `orch run` without `--watch` reject it (exit 1). |
 
 `orch daemon` also needs a project: run it in the project or a subdirectory, or set `ORCH_PROJECT_ROOT` (see
 [Project selection](#sockets-project-selection-and-daemonjson)). Without an initialized project it exits 3.
@@ -131,7 +131,7 @@ before the first start anyway, because old one-off commands and old `orch mcp` s
 
 | Situation | Exit |
 |---|---|
-| `ORCH_TASK_ID` or `ORCH_AGENT_ID` is set (an agent's environment) and `--from-agent` is not given; `orch serve` and `orch run --watch` refuse there too, and have no `--from-agent` yet although the message names it (pending fix, task tsk_eda1yGZ) | 2 |
+| `ORCH_TASK_ID` or `ORCH_AGENT_ID` is set (an agent's environment) and `--from-agent` is not given; the same for `orch serve` and `orch run --watch` | 2 |
 | `orch serve` or `orch run --watch` is given an option of orch 0.13.0 that a daemon start cannot honour (`--tick-interval`, `--log-file`, `--verbose`, a `--log-format` other than `json`); see [below](#how-serve-run-and-the-dashboard-map-to-the-daemon) | 2, before any socket or lock is touched |
 | Your effective user is not the owner of `.orchestry/`, including `root` on a project another user owns | 2 |
 | `.orchestry/` is writable by group or others, or a pre-existing socket directory is not private to you | refuses; orch never changes the mode |

@@ -161,11 +161,9 @@ runs a batch in the running daemon instead and writes structured logs to stdout.
 
 | Command | What it does | Usage |
 |---|---|---|
-| `orch serve` | Headless daemon mode — structured logs to stdout | `orch serve [OPTIONS]` |
-
-The help text is unchanged from orch 0.13.0 and no longer true of a foreground `orch serve`, which logs no events;
-pending fix (task tsk_eda1yGZ).
-<!-- W2b: about-text verbatim from crates/orch-cli/src/tree.rs (Command::Serve doc comment) at 6acc62db. -->
+| `orch serve` | Start the daemon in the foreground with dispatch ON (--once: run a batch in the running daemon with structured logs) | `orch serve [OPTIONS]` |
+<!-- tsk_RP30qgK: about-text verbatim from crates/orch-cli/src/tree.rs (Command::Serve doc comment) at ecb5f1bd,
+and from `orch --help` / `orch serve --help` of a binary built at cb4e0042. -->
 
 ### orch daemon
 

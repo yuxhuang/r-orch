@@ -128,6 +128,7 @@ orch run --once
 | `--all` | Runs all `todo` tasks in the running daemon. |
 | `--once` | Runs one scheduling check in the running daemon. |
 | `--watch` | Starts the daemon in this terminal with dispatch on. See below. |
+| `--from-agent` | With `--watch` only (exit 1 otherwise). Allows the start from an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set), which otherwise refuses with exit 2 ([Refusals](18-daemon.md#start-the-daemon)). Use it only when you deliberately start a daemon from such a shell. |
 | `--verbose` | Refused with `--watch` (exit 2, below). Has no effect with a task ID, `--all` or `--once`, which print the agent's output anyway. |
 | `--listen [<ADDR>]` | With `--watch` only. Accepts connections from other machines. See [Remote agents](11-remote-agents.md). The default address is `127.0.0.1:7690`, which accepts only this machine. |
 | `--peer-name <NAME>` | The name this machine gives itself to peers. |
@@ -238,27 +239,34 @@ In orch 0.13.0 `serve:started` also had `pid` and `poll_interval_ms`; it no long
 exit_code) and serve/logger.rs log() (ts, level, event, fields) at 6acc62db. The 0.13.0 samples were removed
 because their serve:started fields no longer match; I2 captures a fresh sample. -->
 
-**Start-up warnings: pending fix (task tsk_eda1yGZ).** In orch 0.13.0, right after `serve:started` and before
-it started any work, `serve` logged one `serve:diagnostic` warning for each effort warning
+**Start-up warnings.** Right after `serve:started`, and before the batch starts any work, `serve --once` logs
+one `serve:diagnostic` warning for each effort warning
 ([Effort warnings](16-eco-mode-and-effort.md#effort-warnings)), and one for each agent whose eco mode conflicts with
-a custom template ([Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates)). In this
-build `serve --once` logs neither these records nor `serve:diagnostics_unavailable`. The 0.13.0 records were per
-warning, not per agent: an agent with two warnings got two records with the same `agentId`, like `pi1` here:
+a custom template ([Eco mode and custom templates](16-eco-mode-and-effort.md#eco-mode-and-custom-templates)): the
+same warnings `orch run` prints on standard error. The records are per warning, not per agent: an agent with two
+warnings gets two records with the same `agentId`, like `pi1` here:
 
 ```text
-05:49:17.128 INFO  serve:started  mode=once pid=83167 poll_interval_ms=10000
-05:49:17.129 WARN  serve:diagnostic  agentId=agt_bp3vdi0 agentName=cx message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
-05:49:17.129 WARN  serve:diagnostic  agentId=agt_WoYXdTJ agentName=oc message=local-override-possible: a local opencode variant with the same name can replace the catalog variant's settings
-05:49:17.129 WARN  serve:diagnostic  agentId=agt_Lt8wZYD agentName=pi1 message=clamp-possible: pi clamps the requested thinking level to the model's support; a non-reasoning model runs with thinking off
-05:49:17.129 WARN  serve:diagnostic  agentId=agt_Lt8wZYD agentName=pi1 message=request-only: the explicit --thinking level takes precedence over the model's :level suffix
-05:49:17.129 WARN  serve:diagnostic  agentId=agt_tlU9bxS agentName=sh message=legacy-ignored: this adapter exposes no generic effort; the stored value is ignored (clear it with --effort default)
+17:57:31.513 INFO  serve:started  mode=once
+17:57:31.514 WARN  serve:diagnostic  agentId=agt_3YgL3Wx agentName=cx message=capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this
+17:57:31.514 WARN  serve:diagnostic  agentId=agt_uuqDve1 agentName=pi1 message=clamp-possible: pi clamps the requested thinking level to the model's support; a non-reasoning model runs with thinking off
+17:57:31.514 WARN  serve:diagnostic  agentId=agt_uuqDve1 agentName=pi1 message=request-only: the explicit --thinking level takes precedence over the model's :level suffix
+17:57:31.521 INFO  serve:finished  result=all_done exit_code=0
 ```
 
-In JSON the fields were `agentId`, `agentName` and `message`; if `serve` could not read the agents to check them,
-it logged one `serve:diagnostics_unavailable` warning with an `error` field and carried on.
-<!-- W2b: 6acc62db commands/run.rs serve_once calls no diagnostics; the 0.13.0 path serve/mod.rs
-log_startup_diagnostics is no longer called. The orchestrator:error sentence below is UNCONFIRMED at the PR 2 head
-(the daemon streams events to serve --once; I2 checks). -->
+In JSON the fields are `agentId`, `agentName` and `message`:
+
+```json
+{"ts":"2026-11-09T17:57:31.498Z","level":"warn","event":"serve:diagnostic","agentId":"agt_3YgL3Wx","agentName":"cx","message":"capability-unknown: codex effort with no model: forwarding effort can bypass a managed new-thread model default, so codex may select a different model; set an explicit model to avoid this"}
+```
+
+If `serve --once` cannot read the warnings from the daemon, it logs one `serve:diagnostics_unavailable` warning
+with an `error` field and carries on. A foreground `orch serve` is the daemon and logs neither record.
+<!-- tsk_RP30qgK: crates/orch-cli/src/commands/run.rs log_startup_diagnostics (ui.bootstrap startup_warnings,
+agent split by exact "name (id): " prefix) at ecb5f1bd; warning set = orch-engine prompt_mode::startup_diagnostics
+(effort + eco-template), as in 0.13.0. Samples from `serve --once` and `--log-format text --log-file` with a binary
+built at cb4e0042 (contains ecb5f1bd), throwaway HOME, 2026-11-09. The orchestrator:error sentence below is
+UNCONFIRMED at the PR 2 head (the daemon streams events to serve --once; I2 checks). -->
 
 When a run starts
 for an agent with an effort, each effort warning for that run is logged once as an `orchestrator:error` warning
@@ -272,6 +280,7 @@ warning logs none ([Warnings when a run starts](16-eco-mode-and-effort.md#warnin
 | `--log-file <path>` | With `--once`: also appends the log to this file. Without `--once`: refused (exit 2). | None |
 | `--verbose` | With `--once`: adds the agent's output events, which are frequent. Without `--once`: refused (exit 2). | Off |
 | `--listen [<ADDR>]`, `--peer-name <NAME>` | Without `--once`: start options of the daemon, as for `orch run --watch`. | |
+| `--from-agent` | Without `--once`: allows the start from an agent's environment, as for `orch run --watch`. With `--once`: rejected (exit 1). | Off |
 
 No option sets the interval. The daemon checks every `scheduling.poll_interval_ms`; change it with
 `orch config set scheduling.poll_interval_ms <ms>`, which a running daemon picks up at its next check.

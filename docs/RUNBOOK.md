@@ -104,9 +104,8 @@ never delete its socket or `daemon.json`.
 `The orch daemon for <root> is not running. Do not start it; report this to the owner and stop.` The agent is
 meant to stop and report; you start the daemon, then inspect the task, its run and what it changed before you
 retry it. A restart does not resume the agent's conversation. `orch daemon start`, `orch serve` and
-`orch run --watch` refuse to start from such an environment (exit 2). Only `orch daemon start` accepts
-`--from-agent` to override that on purpose; `orch serve` and `orch run --watch` have no override yet, although
-their refusal names it (pending fix, task tsk_eda1yGZ).
+`orch run --watch` refuse to start from such an environment (exit 2); each accepts `--from-agent` to override
+that on purpose.
 
 **Not this entry:** `daemon_busy` (all sessions in use: close clients and retry), `wrong_project` (the socket
 belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`), `Cannot confirm the orch request outcome`

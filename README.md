@@ -678,8 +678,7 @@ What else changes
 - `orch doctor` is a client too: without a daemon it reports the no-daemon message and exits 7.
 - Agents get the agent variant of the message (`Do not start it; report this to the owner and stop.`), and
   `orch daemon start`, `orch serve` and `orch run --watch` refuse to start from an agent's environment (exit 2).
-  Only `orch daemon start` takes `--from-agent` to override that; `serve` and `run --watch` have no override yet,
-  pending fix (task tsk_eda1yGZ).
+  All three take `--from-agent` to override that on purpose.
 - A foreground `orch serve` or `orch run --watch` is the daemon, so it refuses `--tick-interval`, `--log-file`,
   `--verbose` and a `--log-format` other than `json` (exit 2); `serve --once` keeps its log options. The interval
   is `scheduling.poll_interval_ms` (`orch config set`), and events stream with `orch logs --follow`.
