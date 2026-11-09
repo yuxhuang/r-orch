@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use orch_core::adapter::AdapterRegistry;
 use orch_core::clock::Clock;
-use orch_core::error::Result;
+use orch_core::error::{Error, Result};
 use orch_core::ids::IdGenerator;
 use orch_core::process::ProcessManager;
 use orch_core::skills::SkillLoader;
@@ -28,7 +28,7 @@ use orch_core::storage::{
 };
 use orch_core::template::TemplateEngine;
 use orch_core::workspace::WorkspaceManager;
-use orch_domain::{GlobalConfig, OrchestratorConfig};
+use orch_domain::{GlobalConfig, OrchestratorConfig, OrchestratorEvent};
 use orch_infra::adapters::build_registry_with_clock;
 use orch_infra::storage::{
     FileAgentStore, FileConfigStore, FileContextStore, FileGlobalConfigStore, FileGoalStore,
@@ -57,6 +57,10 @@ pub struct ContextService {
 }
 
 impl ContextService {
+    async fn ensure_index(&self) -> Result<()> {
+        self.store.ensure_index().await
+    }
+
     /// Remove expired entries. Reads only filter them; daemon maintenance calls this.
     pub async fn expire_now(&self) -> Result<Vec<String>> {
         self.store.expire_now().await
@@ -116,8 +120,9 @@ pub struct FullEngine {
 }
 
 impl FullEngine {
-    /// Recover execution state and rebuild every missing/corrupt store index
-    /// before the listener admits a session.
+    /// Recover execution state and rebuild missing/corrupt store indexes
+    /// before the listener admits a session. Invalid context entities are reported
+    /// without blocking recovery (R11).
     pub async fn daemon_initialize(&self) -> Result<()> {
         self.orchestrator.daemon_initialize().await?;
         self.operation_boundary()
@@ -128,6 +133,19 @@ impl FullEngine {
                 self.goals.list(&Default::default()).await?;
                 self.teams.list().await?;
                 self.messages.list().await?;
+                if let Err(error) = self.context_service.ensure_index().await {
+                    // R11 keeps malformed context entities nonfatal. The scan
+                    // publishes nothing on parse failure; I/O errors still gate READY.
+                    if matches!(error, Error::Serde { .. }) {
+                        self.events.emit(OrchestratorEvent::OrchestratorError {
+                            error: "Context index rebuild skipped: invalid context entity".into(),
+                            context: "context index rebuild".into(),
+                            fatal: false,
+                        });
+                    } else {
+                        return Err(error);
+                    }
+                }
 
                 Ok(())
             })
