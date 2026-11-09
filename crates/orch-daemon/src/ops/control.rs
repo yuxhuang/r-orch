@@ -357,12 +357,12 @@ impl ServiceHandler {
         _: DispatchRunAllArgs,
     ) -> OpResult<RunOutcome> {
         let mut events = self.engine.events.subscribe();
-        let mut pending = self
-            .read_tasks()
-            .await?
-            .into_iter()
+        let mut settled = self.read_execution_snapshot().await?;
+        let mut pending = settled
+            .0
+            .iter()
             .filter(|task| is_dispatchable(task.status) && !task.awaits_approval())
-            .map(|task| task.id)
+            .map(|task| task.id.clone())
             .collect::<Vec<_>>();
         let mut targets = Vec::<(String, String)>::new();
         let mut n = 0;
@@ -414,14 +414,22 @@ impl ServiceHandler {
                     hook(progressed).await;
                 }
             }
-            let (tasks, runs, state) = self.read_execution_snapshot().await?;
-            if runs_finished(&targets, &runs)?
-                && (pending.is_empty()
-                    || !progressed && state.running.is_empty() && state.claimed.is_empty())
-            {
+            let snapshot = self.read_execution_snapshot().await?;
+            // A pass that launched nothing proves the rest ineligible only if
+            // the project stayed idle and unchanged since the previous snapshot:
+            // a run that ends mid-pass frees capacity (or a dependency) after
+            // the refusal was decided, so that work must be tried again.
+            let (_, runs, state) = &snapshot;
+            let exhausted = !progressed
+                && state.running.is_empty()
+                && state.claimed.is_empty()
+                && snapshot == settled;
+            if runs_finished(&targets, runs)? && (pending.is_empty() || exhausted) {
                 self.send_event_parts(ctx, &mut n, &mut events).await?;
+                let (tasks, runs, _) = snapshot;
                 return Ok(run_outcome(&targets, tasks, &runs));
             }
+            settled = snapshot;
             self.send_event_parts(ctx, &mut n, &mut events).await?;
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
