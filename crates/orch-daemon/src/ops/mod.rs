@@ -234,17 +234,24 @@ macro_rules! implement_handler {
         impl ServiceHandler {
             /// Accepted operations are daemon-owned tasks. Dropping the socket
             /// observer detaches this JoinHandle; it cannot abort a partial write.
-            pub async fn execute_request(&self, ctx: &OpContext, request: Request) -> OpResult<Committed<Box<RawValue>>> {
-                transport::authorize(ctx, &request)?;
+            pub fn execute_request(&self, ctx: &OpContext, request: Request) -> impl Future<Output = OpResult<Committed<Box<RawValue>>>> + Send + 'static + use<> {
                 let handler = self.clone();
                 let context = ctx.clone();
-                tokio::spawn(async move { handler.execute_inner(context, request).await }).await
-                    .map_err(|_| ErrorBody::new(orch_proto::error::ErrorCode::General,
-                        "daemon operation task failed", orch_proto::error::Execution::Unknown))?
+                // Register before returning the future: session teardown may run
+                // before either the socket observer or the operation is polled.
+                let observation = ObservationGuard::new(self, &context);
+                async move {
+                    transport::authorize(&context, &request)?;
+                    tokio::spawn(async move {
+                        let _observation = observation;
+                        handler.execute_inner(context, request).await
+                    }).await
+                        .map_err(|_| ErrorBody::new(orch_proto::error::ErrorCode::General,
+                            "daemon operation task failed", orch_proto::error::Execution::Unknown))?
+                }
             }
 
             async fn execute_inner(&self, ctx: OpContext, request: Request) -> OpResult<Committed<Box<RawValue>>> {
-                let _observation = ObservationGuard::new(self, &ctx);
                 if self.ownership_lost() && matches!(request,Request::DispatchTick(_) | Request::DispatchRunTask(_) | Request::DispatchRunAll(_) | Request::DispatchUntilTerminal(_)) {
                     return Err(ErrorBody::new(orch_proto::error::ErrorCode::Conflict,"daemon ownership was lost",orch_proto::error::Execution::NotExecuted));
                 }
