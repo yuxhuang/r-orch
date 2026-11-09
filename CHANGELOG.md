@@ -5,6 +5,14 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+- Developmental: `orch daemon start [--detach] [--dispatch on|off] [--from-agent]`, `orch daemon status`, `orch daemon stop` and `orch daemon dispatch on|off` run and manage the one process that owns a project, listening on a private Unix socket (`.orchestry/run/orch.sock`, or a short path under `$TMPDIR` for long project paths). A daemon starts with dispatch off unless you pass `--dispatch on`, and nothing ever starts one for you. The commands refuse to run unless `ORCH_DAEMON_DEVELOPMENTAL=1` is set: no other command, the dashboard, `orch web` or `orch mcp` uses the daemon yet, and they keep writing the project's files directly, so use it on test projects only. A command that finds no daemon exits with the new code 7. See [the daemon](docs/manual/18-daemon.md).
+
+### Changed
+- A task linked to a paused goal no longer starts: the orchestrator rereads the task and its goal just before it starts an agent, and a pause in the same process (`orch serve`, `orch run --watch` or the dashboard running the orchestrator) is ordered with that check, so a task the pause cancelled cannot start afterwards. A pause sent from another process can still race as before.
+- Cancelling a task in the process that runs it, such as the dashboard while it runs the orchestrator, now stops the task's agent before the cancel reports success.
+- Reading context (`orch context get` and `list`, and `orch mcp`'s `context_get` and `context_list`, read-only mode included) no longer deletes expired entries or rewrites the context index; it only hides them. The orchestrator removes expired entries on each of its checks; an error while doing so is reported and does not stop the rest of the check.
+
 ## [0.13.0] - 2026-11-09
 
 Goal-pause scope and MCP diagnostics release. No peer-protocol change, so 0.5.x through 0.13.0 peers can be mixed.

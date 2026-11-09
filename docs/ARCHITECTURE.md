@@ -96,6 +96,9 @@ r-orch/
 │   ├── orch-infra/            # implementations of orch-core traits
 │   ├── orch-engine/           # services + orchestrator + event bus + container
 │   ├── orch-peer/             # remote-peer protocol: links, mirrors, reconnect (core, domain, engine, infra)
+│   ├── orch-proto/            # local daemon protocol: wire types, versions, bounded NDJSON framing (domain only)
+│   ├── orch-daemon/           # the project daemon: ownership, socket, coordinator, hosted engine (developmental)
+│   ├── orch-client/           # daemon client: discovery, connect, handshake, typed calls (domain, proto)
 │   ├── orch-cli/              # clap command tree, human + JSON rendering, serve mode. bins live here.
 │   └── orch-tui/              # ratatui dashboard
 ├── xtask/                     # dev tooling: crate-graph, linux, gate.sh, mouse-e2e
@@ -116,13 +119,41 @@ r-orch/
         ▲                 ▲
         └────────┬────────┘
                  │
-             orch-peer                      (remote-peer protocol; composes engine + infra)
-                 │
-             orch-cli                       (top of the stack; may name anything below)
+             orch-peer ──────────► orch-proto        (remote-peer protocol; composes engine + infra;
+                 ▲                   ▲    ▲            uses orch-proto only for the shared framing)
+                 │                   │    │
+            orch-daemon ─────────────┘    │          (owns the project; composes engine, infra, peer, proto)
+                 ▲                        │
+                 │  daemon.rs, init.rs    │
+                 │                   orch-client     (domain + proto only; no store, no process API)
+                 │                        ▲
+             orch-cli ────────────────────┘          (top of the stack; may name anything below)
                  │
                  ▼  implements TuiBackend
              orch-tui                       (depends on orch-domain ONLY)
 ```
+
+Arrows mean "depends on". The diagram leaves out the direct `orch-domain` and `orch-core` edges that most
+crates also have; the exact edge set is the table in `xtask crate-graph` (below).
+
+**State at the head of PR 1 of the daemon-owned state work.** `orch-proto`, `orch-daemon` and the
+`orch daemon start|status|stop|dispatch` commands exist, but the daemon is **developmental**: `orch daemon`
+refuses to run unless `ORCH_DAEMON_DEVELOPMENTAL=1` is set, and no client uses it. The CLI's other commands, the
+dashboard, `orch web` and `orch mcp` still assemble the DI container themselves (`orch_engine::build_light` /
+`build_full_with_peer`) and read and write the stores directly, exactly as in v0.13.0, so §2.1's concurrency
+story still applies. What lands later, per the
+[plan](plans/2026-11-09-daemon-owned-state.md#tasks):
+
+| Edge or rule | Lands in | What it means |
+|---|---|---|
+| `orch-proto → orch-domain` (only workspace edge) | PR 1 | Local request/response DTOs, `LOCAL_PROTOCOL`, the hello/welcome/reject envelope, the `daemon.json` record type and the bounded NDJSON reader/writer. No filesystem store, service or process execution. |
+| `orch-daemon → orch-engine, orch-infra, orch-peer, orch-proto, orch-core, orch-domain` | PR 1 | The one owner of a project's stores and agent processes. The stores and their file formats stay behind this crate; it exposes `start`, `initialize` and a test harness, never a store implementation or an arbitrary execute closure. |
+| `orch-peer → orch-proto` | PR 1 | The generic bounded NDJSON framing moves out of `orch-peer` so both protocols share one reader. The peer `Frame` schema, `PROTOCOL` constant and 0.5.x tolerance are unchanged. |
+| `orch-client → orch-domain, orch-proto` | PR 1 (control plane), PR 2 (every operation) | Discovery, connect, kernel peer-uid check, handshake and the uniform NoDaemon error. PR 1 carries only what `orch daemon status`, `stop` and `dispatch` need; PR 2 adds every operation and converts the CLI, dashboard backend, `orch web` and `orch mcp` to it. The crate has no process API: it never spawns, forks or execs. |
+| `orch-cli → orch-daemon` only from `commands/daemon.rs` and `commands/init.rs` | PR 1 (the edge), PR 4 (the allowlist) | Only the explicit start and `init` may name `orch_daemon`. PR 4 adds a bidirectional source-site allowlist, like `ENGINE_INFRA_SITES` below, and removes `orch-cli`'s production edges to `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`, so a client file that names a store fails the gate. Until then this rule is a convention. |
+
+Every writer, remote peer callbacks included, is then owned by the daemon's coordination, not by a UI handle.
+[ADR 0012](decisions/0012-daemon-owned-state.md) records the decision.
 
 Two things in this diagram were wrong in earlier revisions, and both are now enforced rather than described.
 
@@ -161,8 +192,9 @@ stale-entry half is what caught the TUI inversion above — it turned "someone q
 into a failure somebody had to look at, rather than a diff nobody read. The table above keeps the *rationale*;
 the check keeps the *list*. If they disagree, the check is right.
 
-**Enforced invariant: `orch-engine` has zero dependency on `orch-cli` or `orch-tui`.** The core engine has no
-knowledge of the CLI or TUI layers.
+**Enforced invariant: `orch-engine` has zero dependency on `orch-cli`, `orch-tui`, `orch-client` or
+`orch-daemon`.** The core engine has no knowledge of the CLI, TUI or daemon layers; the daemon composes the engine,
+not the other way round.
 
 `xtask crate-graph` asserts the **whole edge set** against a table, not just that one forbidden edge —
 including build- and dev-dependencies, since a test-only edge still compiles the crate. A single
