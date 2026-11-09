@@ -210,11 +210,20 @@ mod tests {
             skip_autonomous_seeding: true,
             handle_signals: false,
         };
-        let status = || crate::commands::remote::listener_status(&paths, true);
+        // The published listener record (the daemon reports it through
+        // remote.status; this in-process runtime has no daemon to ask).
+        let record = paths.remotes_dir().join("_listener.json");
+        let published = || async {
+            let listener: Option<serde_json::Value> =
+                orch_infra::storage::fs_utils::read_json(&record)
+                    .await
+                    .unwrap();
+            listener.and_then(|value| value["listen_addr"].as_str().map(str::to_owned))
+        };
         let runtime = start_watch(Arc::clone(&engine), options()).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let addr = loop {
-            if let Some(addr) = status().await.unwrap().addr {
+            if let Some(addr) = published().await {
                 break addr;
             }
             assert!(
@@ -232,11 +241,8 @@ mod tests {
         // The TUI's `/pause`: stop the engine, then drop its peer runtime.
         engine.orchestrator.stop().await.unwrap();
         drop(runtime);
-        assert_eq!(
-            status().await.unwrap(),
-            crate::commands::remote::ListenerStatus::default()
-        );
-        assert!(!paths.remotes_dir().join("_listener.json").exists());
+        assert_eq!(published().await, None);
+        assert!(!record.exists());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::net::TcpStream::connect(&addr).await.is_ok() {
             assert!(tokio::time::Instant::now() < deadline, "socket stayed open");

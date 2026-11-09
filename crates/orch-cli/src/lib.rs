@@ -135,11 +135,12 @@ fn is_initialized(cwd: &std::path::Path) -> bool {
     root.join(".orchestry").is_dir()
 }
 
-fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
+fn dispatch_parsed(mut cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     let styles = styles_for(&cli, env);
 
     // `orch mcp` owns its runtime: its shutdown must be bounded, and nothing
     // of the ordinary command path may write to stdout.
+    inherit_root_agent(&mut cli);
     if let Some(Command::Mcp(args)) = &cli.command {
         return mcp::run(args, &styles);
     }
@@ -149,12 +150,18 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
         Some(Command::Daemon(args)) => Some(args),
         _ => None,
     };
-    let foreground_peer = match &cli.command {
-        Some(Command::Serve(args)) if !args.once => Some(&args.peer),
-        Some(Command::Run(args)) if args.watch => Some(&args.peer),
+    // Refused before any connect or lifecycle call, never silently ignored.
+    let rejected = match &cli.command {
+        Some(Command::Serve(args)) => args.rejected_flag(),
+        Some(Command::Run(args)) => args.rejected_flag(),
         _ => None,
     };
-    if owner_command.is_some() || foreground_peer.is_some() {
+    if let Some(message) = rejected {
+        print_error(&styles, message, None);
+        return ExitCode::from(2);
+    }
+    let foreground = foreground_start(cli.command.as_ref());
+    if owner_command.is_some() || foreground.is_some() {
         let cwd = match std::env::current_dir() {
             Ok(cwd) => cwd,
             Err(error) => {
@@ -169,8 +176,8 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
         if let Some(args) = owner_command {
             return commands::daemon::run(&cli, args, &cwd);
         }
-        if let Some(peer) = foreground_peer {
-            return commands::daemon::foreground(&cli, peer, &cwd);
+        if let Some((peer, from_agent)) = foreground {
+            return commands::daemon::foreground(&cli, peer, from_agent, &cwd);
         }
     }
 
@@ -215,11 +222,9 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
     match &cli.command {
         Some(Command::Init(args)) => run_init(cli, env, &cwd, args).await,
+        // Container-less: the version check reads no project state, so it
+        // needs neither a project nor a daemon.
         Some(Command::Update(args)) => {
-            let (_, _, client) = build(cli, env, &cwd).await?;
-            client
-                .request(orch_proto::ops::args::UpdateCheckArgs {})
-                .await?;
             update::run(&styles_for(cli, env), args.check);
             Ok(ExitCode::SUCCESS)
         }
@@ -704,7 +709,9 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             all,
             once,
             watch: _,
+            from_agent: _,
             verbose: _,
+            tick_interval: _,
             peer,
         })) => {
             if !*all && !*once && task_id.is_none() {
@@ -845,6 +852,26 @@ async fn run_web(
         }
     };
     web::run(web_args, cwd.to_path_buf()).await
+}
+
+/// `orch serve` (without `--once`) and `orch run --watch` are explicit
+/// foreground daemon starts: their peer flags and `--from-agent` override.
+fn foreground_start(command: Option<&Command>) -> Option<(&tree::PeerFlags, bool)> {
+    match command {
+        Some(Command::Serve(args)) if !args.once => Some((&args.peer, args.from_agent)),
+        Some(Command::Run(args)) if args.watch => Some((&args.peer, args.from_agent)),
+        _ => None,
+    }
+}
+
+/// Root `--agent` is the caller identity for every client (over
+/// ORCH_AGENT_ID); `mcp --agent` is the more specific spelling and wins.
+fn inherit_root_agent(cli: &mut Cli) {
+    if let Some(Command::Mcp(args)) = &mut cli.command
+        && args.agent.is_none()
+    {
+        args.agent.clone_from(&cli.agent);
+    }
 }
 
 /// The version the dashboard reports, which is the one `--version` prints.
@@ -1021,6 +1048,69 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp_agent(argv: &[&str]) -> Option<String> {
+        let mut cli = Cli::try_parse_from(argv).expect("parses");
+        inherit_root_agent(&mut cli);
+        match cli.command {
+            Some(Command::Mcp(args)) => args.agent,
+            _ => panic!("mcp"),
+        }
+    }
+
+    #[test]
+    fn root_agent_reaches_mcp_and_the_mcp_flag_is_more_specific() {
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp"]).as_deref(),
+            Some("agt_r")
+        );
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp", "--agent", "agt_m"]).as_deref(),
+            Some("agt_m")
+        );
+        assert_eq!(mcp_agent(&["orch", "mcp"]), None);
+    }
+
+    fn foreground(argv: &[&str]) -> Option<bool> {
+        let cli = Cli::try_parse_from(argv).expect("parses");
+        foreground_start(cli.command.as_ref()).map(|(_, from_agent)| from_agent)
+    }
+
+    /// W2b B1 / spec R31: `serve` and `run --watch` are explicit starts and
+    /// take `daemon start`'s `--from-agent`; it reaches the start the
+    /// agent-context guard checks. A batch or one-shot run is no start.
+    #[test]
+    fn foreground_starts_forward_from_agent_and_batches_refuse_it() {
+        assert_eq!(foreground(&["orch", "serve"]), Some(false));
+        assert_eq!(foreground(&["orch", "serve", "--from-agent"]), Some(true));
+        assert_eq!(foreground(&["orch", "run", "--watch"]), Some(false));
+        assert_eq!(
+            foreground(&["orch", "run", "--watch", "--from-agent"]),
+            Some(true)
+        );
+        assert_eq!(foreground(&["orch", "serve", "--once"]), None);
+        assert_eq!(foreground(&["orch", "run", "--once"]), None);
+        assert_eq!(foreground(&["orch", "run", "tsk_1"]), None);
+
+        use clap::error::ErrorKind;
+        for (refused, kind) in [
+            (
+                &["orch", "serve", "--once", "--from-agent"][..],
+                ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["orch", "run", "--from-agent", "tsk_1"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["orch", "run", "--once", "--from-agent"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+        ] {
+            let error = Cli::try_parse_from(refused).expect_err("refused");
+            assert_eq!(error.kind(), kind, "{refused:?}");
+        }
+    }
 
     #[test]
     fn parse_int_rejects_a_non_numeric_value_with_exit_2() {

@@ -1,12 +1,14 @@
-//! Team tools use the same services as the CLI; membership writes re-read.
+//! Team tools: one daemon request each; membership writes return the team
+//! as the daemon committed it.
+use crate::mcp::projections::id;
 use crate::mcp::registry::{
-    CallContext, Class, EmptyArgs, Execution, Registry, ToolArgs, ToolMeta,
+    CallContext, Class, EmptyArgs, Execution, Registry, ToolArgs, ToolMeta, ToolResult, json, wire,
 };
-use orch_core::{Error, Result};
-use orch_domain::{CreateTeamInput, PartialTeamConfig};
+use orch_core::Result;
+use orch_proto::ops::args as rpc;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -140,113 +142,96 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     )?;
     Ok(())
 }
-async fn create(cx: Arc<CallContext>, args: CreateArgs) -> Result<Value> {
+async fn create(cx: Arc<CallContext>, args: CreateArgs) -> ToolResult {
+    let members = args.members.map(|raw| {
+        raw.split(',')
+            .map(|part| part.trim().to_owned())
+            .collect::<Vec<_>>()
+    });
     let team = cx
-        .engine
-        .team_service
-        .create(CreateTeamInput {
-            name: args.name,
-            lead_agent_id: args.lead,
-            description: args.description,
-            member_agent_ids: args
-                .members
-                .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect()),
-            config: Some(PartialTeamConfig {
-                auto_claim: Some(!args.no_auto_claim),
-                ..Default::default()
-            }),
+        .request(wire::<rpc::TeamCreateArgs>(json!({
+            "name": args.name,
+            "lead_agent_id": args.lead,
+            "description": args.description,
+            "member_agent_ids": members,
+            "auto_claim": !args.no_auto_claim,
+        }))?)
+        .await?;
+    json(&team, "team")
+}
+async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> ToolResult {
+    json(&cx.request(rpc::TeamListArgs {}).await?, "teams")
+}
+async fn show(cx: Arc<CallContext>, args: IdArgs) -> ToolResult {
+    json(
+        &cx.request(rpc::TeamGetArgs { id: id(&args.id)? }).await?,
+        "team",
+    )
+}
+async fn join(cx: Arc<CallContext>, args: MemberArgs) -> ToolResult {
+    let team = cx
+        .request(rpc::TeamJoinArgs {
+            team_id: id(&args.team_id)?,
+            agent_id: id(&args.agent_id)?,
         })
         .await?;
-    serde_json::to_value(team).map_err(|_| Error::other("serialize team"))
+    json(&team, "team")
 }
-async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> Result<Value> {
-    serde_json::to_value(cx.engine.team_service.list().await?)
-        .map_err(|_| Error::other("serialize teams"))
-}
-async fn show(cx: Arc<CallContext>, args: IdArgs) -> Result<Value> {
-    serde_json::to_value(cx.engine.team_service.get(&args.id).await?)
-        .map_err(|_| Error::other("serialize team"))
-}
-async fn reread(cx: &CallContext, id: &str) -> Result<Value> {
-    let team = cx.engine.team_service.get(id).await.map_err(|err| {
-        Error::other(format!(
-            "Team mutation may already have committed; failed to re-read {id}: {err}"
-        ))
-    })?;
-    serde_json::to_value(team).map_err(|_| Error::other("serialize team"))
-}
-async fn join(cx: Arc<CallContext>, args: MemberArgs) -> Result<Value> {
-    cx.engine
-        .team_service
-        .join(&args.team_id, &args.agent_id)
+async fn leave(cx: Arc<CallContext>, args: MemberArgs) -> ToolResult {
+    let team = cx
+        .request(rpc::TeamLeaveArgs {
+            team_id: id(&args.team_id)?,
+            agent_id: id(&args.agent_id)?,
+        })
         .await?;
-    reread(&cx, &args.team_id).await
+    json(&team, "team")
 }
-async fn leave(cx: Arc<CallContext>, args: MemberArgs) -> Result<Value> {
-    cx.engine
-        .team_service
-        .leave(&args.team_id, &args.agent_id)
+async fn add_task(cx: Arc<CallContext>, args: TaskArgs) -> ToolResult {
+    let team = cx
+        .request(rpc::TeamAddTaskArgs {
+            team_id: id(&args.team_id)?,
+            task_id: id(&args.task_id)?,
+        })
         .await?;
-    reread(&cx, &args.team_id).await
+    json(&team, "team")
 }
-async fn add_task(cx: Arc<CallContext>, args: TaskArgs) -> Result<Value> {
-    cx.engine
-        .team_service
-        .add_task(&args.team_id, &args.task_id)
+async fn set_lead(cx: Arc<CallContext>, args: MemberArgs) -> ToolResult {
+    let team = cx
+        .request(rpc::TeamSetLeadArgs {
+            team_id: id(&args.team_id)?,
+            agent_id: id(&args.agent_id)?,
+        })
         .await?;
-    reread(&cx, &args.team_id).await
+    json(&team, "team")
 }
-async fn set_lead(cx: Arc<CallContext>, args: MemberArgs) -> Result<Value> {
-    cx.engine
-        .team_service
-        .set_lead(&args.team_id, &args.agent_id)
+async fn disband(cx: Arc<CallContext>, args: IdArgs) -> ToolResult {
+    cx.request(rpc::TeamDisbandArgs { id: id(&args.id)? })
         .await?;
-    reread(&cx, &args.team_id).await
-}
-async fn disband(cx: Arc<CallContext>, args: IdArgs) -> Result<Value> {
-    cx.engine.team_service.disband(&args.id).await?;
     Ok(Value::Null)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     use crate::mcp::registry::{Identity, Mode, ToolArgs};
-    use serde_json::json;
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
         let args: A = serde_json::from_value(value).unwrap();
         args.validate(&Identity::of(None), Mode::Default).unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(None),
-            mode: Mode::Default,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[tokio::test]
     async fn all_eight_team_tools_project_committed_entities() {
-        let (_dir, cx) = fixture().await;
-        let lead = cx
-            .engine
+        let (fx, cx) = fixture().await;
+        let lead = fx
+            .engine()
             .agent_service
             .create(orch_domain::CreateAgentInput {
                 name: "lead".into(),
@@ -256,8 +241,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let member = cx
-            .engine
+        let member = fx
+            .engine()
             .agent_service
             .create(orch_domain::CreateAgentInput {
                 name: "member".into(),
@@ -289,8 +274,8 @@ mod tests {
             joined,
             show(cx.clone(), args(json!({"id":id}))).await.unwrap()
         );
-        let task = cx
-            .engine
+        let task = fx
+            .engine()
             .task_service
             .create(orch_domain::CreateTaskInput {
                 title: "pooled".into(),

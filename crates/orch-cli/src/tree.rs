@@ -26,7 +26,7 @@ pub const ALL_KNOWN_COMMANDS: [&str; 20] = [
 ];
 
 /// Commands that bypass the legacy container guard. `daemon` performs its
-/// own discovery after parsing and the developmental gate; `doctor` also
+/// own discovery after parsing; `doctor` also
 /// takes a container when a project exists.
 pub const CONTAINER_LESS_COMMANDS: [&str; 4] = ["init", "update", "doctor", "daemon"];
 
@@ -173,7 +173,7 @@ pub enum Command {
     Doctor,
     /// Launch interactive TUI dashboard
     Tui(TuiCmd),
-    /// Headless daemon mode — structured logs to stdout
+    /// Start the daemon in the foreground with dispatch ON (--once: run a batch in the running daemon with structured logs)
     Serve(ServeCmd),
     /// Manage the project daemon
     Daemon(crate::commands::daemon::DaemonCmd),
@@ -942,8 +942,70 @@ pub struct RunCmd {
     pub once: bool,
     #[arg(long, help = "Start a foreground daemon with dispatch ON")]
     pub watch: bool,
-    #[arg(long, help = "Include agent output in watch mode")]
+    #[arg(long = "from-agent", requires = "watch", help = FROM_AGENT_HELP)]
+    pub from_agent: bool,
+    #[arg(
+        long,
+        help = "Not accepted with --watch (use RUST_LOG or orch logs --follow)"
+    )]
     pub verbose: bool,
+    /// Never accepted: parsed only so the refusal can name the config key.
+    #[arg(long = "tick-interval", value_name = "ms", hide = true)]
+    pub tick_interval: Option<String>,
+}
+
+/// A foreground `run --watch` / `serve` *is* the daemon start, so it takes the
+/// same agent-context override as `orch daemon start` (spec R31).
+const FROM_AGENT_HELP: &str = "Allow the daemon start from an agent's environment \
+(ORCH_TASK_ID or ORCH_AGENT_ID set); only when the owner deliberately intends this";
+
+/// A foreground `run --watch` / `serve` *is* the daemon start, so there is no
+/// client left to honour the legacy logging and interval flags (D8 refinement,
+/// s2a-cli-decisions §2). They are refused before any connect or lifecycle
+/// call rather than silently ignored; the first rejected flag wins.
+const REJECT_TICK_INTERVAL: &str = "--tick-interval is not accepted: the daemon uses \
+scheduling.poll_interval_ms from config.yml (orch config set scheduling.poll_interval_ms <ms>)";
+const REJECT_LOG_FILE: &str = "--log-file is not accepted by a daemon start; the foreground \
+daemon logs to stderr (RUST_LOG), a detached one to .orchestry/daemon.log. Follow events with: \
+orch logs --follow";
+const REJECT_LOG_FORMAT: &str = "--log-format is not accepted by a daemon start; the foreground \
+daemon logs to stderr (RUST_LOG), a detached one to .orchestry/daemon.log. Follow events with: \
+orch logs --follow";
+const REJECT_VERBOSE: &str =
+    "--verbose is not accepted by a daemon start; use RUST_LOG or orch logs --follow";
+
+impl RunCmd {
+    /// The exit-2 message for a flag this invocation cannot honour.
+    pub fn rejected_flag(&self) -> Option<&'static str> {
+        if self.tick_interval.is_some() {
+            Some(REJECT_TICK_INTERVAL)
+        } else {
+            (self.watch && self.verbose).then_some(REJECT_VERBOSE)
+        }
+    }
+}
+
+impl ServeCmd {
+    /// The exit-2 message for a flag this invocation cannot honour. A batch
+    /// (`--once`) keeps its client-rendered log flags; only the interval,
+    /// which the batch operation takes no argument for, is refused there.
+    pub fn rejected_flag(&self) -> Option<&'static str> {
+        if self.tick_interval.is_some() {
+            return Some(REJECT_TICK_INTERVAL);
+        }
+        if self.once {
+            return None;
+        }
+        if self.log_file.is_some() {
+            Some(REJECT_LOG_FILE)
+        } else if self.log_format != "json" {
+            Some(REJECT_LOG_FORMAT)
+        } else if self.verbose {
+            Some(REJECT_VERBOSE)
+        } else {
+            None
+        }
+    }
 }
 
 // ── tui ────────────────────────────────────────────────────────────────────
@@ -959,26 +1021,28 @@ pub struct ServeCmd {
     pub peer: PeerFlags,
     #[arg(long, help = "Process todo tasks and exit when all are terminal")]
     pub once: bool,
+    #[arg(long = "from-agent", conflicts_with = "once", help = FROM_AGENT_HELP)]
+    pub from_agent: bool,
     #[arg(
         long = "tick-interval",
         value_name = "ms",
-        help = "Override polling interval (ms)"
+        help = "Not accepted: the daemon uses scheduling.poll_interval_ms from config.yml"
     )]
     pub tick_interval: Option<String>,
     #[arg(
         long = "log-file",
         value_name = "path",
-        help = "Also write logs to file (append mode)"
+        help = "With --once: also write logs to file (append mode)"
     )]
     pub log_file: Option<String>,
     #[arg(
         long = "log-format",
         value_name = "format",
         default_value = "json",
-        help = "Log format: json or text (default: json)"
+        help = "With --once: log format json or text (default: json)"
     )]
     pub log_format: String,
-    #[arg(long, help = "Include high-frequency agent:output events")]
+    #[arg(long, help = "With --once: include high-frequency agent:output events")]
     pub verbose: bool,
 }
 
@@ -1245,7 +1309,9 @@ mod tests {
                 "--all",
                 "--once",
                 "--watch",
+                "--from-agent",
                 "--verbose",
+                "--tick-interval <ms>",
                 "--listen <ADDR>",
                 "--peer-name <NAME>",
             ],
@@ -1257,6 +1323,7 @@ mod tests {
             &[],
             &[
                 "--once",
+                "--from-agent",
                 "--tick-interval <ms>",
                 "--log-file <path>",
                 "--log-format <format>",
@@ -1799,5 +1866,87 @@ mod file_mutation_tests {
             panic!("agent add");
         };
         assert_eq!(flags.prompt_mode.as_deref(), Some("inherit"));
+    }
+
+    fn rejected(argv: &[&str]) -> Option<&'static str> {
+        match Cli::try_parse_from(argv).expect("parses").command {
+            Some(Command::Serve(args)) => args.rejected_flag(),
+            Some(Command::Run(args)) => args.rejected_flag(),
+            _ => panic!("serve or run"),
+        }
+    }
+
+    /// s2a-cli-decisions §2: one vector per rejected combination, plus the
+    /// accepted forms that must keep working.
+    #[test]
+    fn foreground_aliases_refuse_flags_a_daemon_start_cannot_honour() {
+        let interval = Some(REJECT_TICK_INTERVAL);
+        assert_eq!(
+            rejected(&["orch", "serve", "--tick-interval", "50"]),
+            interval
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--once", "--tick-interval", "x"]),
+            interval
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--log-file", "l"]),
+            Some(REJECT_LOG_FILE)
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--log-format", "text"]),
+            Some(REJECT_LOG_FORMAT)
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--verbose"]),
+            Some(REJECT_VERBOSE)
+        );
+        assert_eq!(
+            rejected(&["orch", "run", "--watch", "--verbose"]),
+            Some(REJECT_VERBOSE)
+        );
+        assert_eq!(
+            rejected(&["orch", "run", "--watch", "--tick-interval", "250"]),
+            interval
+        );
+        // The first rejected flag wins.
+        assert_eq!(
+            rejected(&[
+                "orch",
+                "serve",
+                "--verbose",
+                "--log-file",
+                "l",
+                "--tick-interval",
+                "1"
+            ]),
+            interval
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--verbose", "--log-file", "l"]),
+            Some(REJECT_LOG_FILE)
+        );
+
+        for accepted in [
+            &["orch", "serve"][..],
+            &["orch", "serve", "--log-format", "json"],
+            &["orch", "serve", "--listen", "--peer-name", "n"],
+            &["orch", "serve", "--once", "--log-file", "l"],
+            &[
+                "orch",
+                "serve",
+                "--once",
+                "--log-format",
+                "text",
+                "--verbose",
+            ],
+            &["orch", "run", "--watch"],
+            &["orch", "serve", "--from-agent"],
+            &["orch", "run", "--watch", "--from-agent"],
+            &["orch", "run", "--verbose", "tsk_1"],
+            &["orch", "run", "--once", "--verbose"],
+        ] {
+            assert_eq!(rejected(accepted), None, "{accepted:?}");
+        }
     }
 }

@@ -1,16 +1,21 @@
-//! Agent definition and scheduling tools. Authored writes retain the CLI locks.
+//! Agent definition and scheduling tools. Authored writes take the daemon's
+//! definition lock; the bridge only shapes the request.
 
-use crate::document_input::{self, MutationKind};
+use crate::document_input;
 use crate::mcp::{
-    projections,
+    projections::{self, id},
     registry::{
-        CallContext, Class, EmptyArgs, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta,
+        CallContext, Class, EmptyArgs, Execution, Identity, Mode, Registry, ToolArgs, ToolError,
+        ToolMeta, ToolResult, json, wire,
     },
+    tools::task::{at_source, definition_input},
 };
-use orch_core::{Error, Result};
+use orch_core::Result;
+use orch_proto::ops::args::{self as rpc, MutationKind};
+use orch_proto::ops::results::AuthoredAgent;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 // The domain crate does not depend on JSON Schema. Keep wire enums here and
@@ -256,94 +261,113 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     )?;
     Ok(())
 }
-async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> Result<Value> {
-    projections::agents(&cx.engine).await
+async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> ToolResult {
+    projections::agents(&cx).await
 }
-async fn show(cx: Arc<CallContext>, args: ShowArgs) -> Result<Value> {
-    projections::agent(&cx.engine, &args.id, args.effective).await
+async fn show(cx: Arc<CallContext>, args: ShowArgs) -> ToolResult {
+    projections::agent(&cx, &args.id, args.effective).await
 }
-fn diagnostics(authored: &orch_engine::agent_service::AuthoredAgent) {
+fn diagnostics(authored: &AuthoredAgent) {
     for diagnostic in &authored.diagnostics {
         tracing::warn!(target: "orch::mcp", diagnostic = ?diagnostic, "agent definition diagnostic");
     }
 }
-async fn reread(cx: &CallContext, id: &str) -> Result<Value> {
-    let agent = cx.engine.agent_service.get(id).await.map_err(|err| {
-        Error::other(format!(
-            "Agent mutation may already have committed; failed to re-read {id}: {err}"
-        ))
-    })?;
-    serde_json::to_value(agent).map_err(|_| Error::other("serialize agent"))
+fn authored(authored: &AuthoredAgent) -> ToolResult {
+    diagnostics(authored);
+    json(&authored.agent, "agent")
 }
 
-async fn add(cx: Arc<CallContext>, args: AddArgs) -> Result<Value> {
-    let authored = crate::commands::agent::create_authored(
-        &cx.engine,
-        crate::commands::agent::AgentAddArgs {
-            name: args.name,
-            adapter: args.adapter,
-            role: args.role,
-            command: args.command,
-            model: args.model,
-            effort: args.effort.map(Into::into),
-            prompt_mode: args.prompt_mode.map(Into::into),
-            role_summary: args.role_summary,
-            max_turns: args.max_turns,
-            timeout_ms: args.timeout,
-            approval_policy: args.approval_policy.map(Into::into),
-            workspace_mode: args.workspace_mode.map(Into::into),
-            skills: args.skills,
-        },
-    )
-    .await?;
-    diagnostics(&authored);
-    serde_json::to_value(authored.agent).map_err(|_| Error::other("serialize agent"))
+async fn add(cx: Arc<CallContext>, args: AddArgs) -> ToolResult {
+    let skills = args.skills.as_deref().map(|raw| {
+        raw.split(',')
+            .map(|part| part.trim().to_owned())
+            .collect::<Vec<_>>()
+    });
+    let created = cx
+        .request(wire::<rpc::AgentCreateArgs>(json!({
+            "name": args.name,
+            "adapter": args.adapter,
+            "role": args.role,
+            "command": args.command,
+            "model": args.model,
+            "effort": args.effort.map(orch_domain::ReasoningEffort::from),
+            // Absent means live inheritance of the project default: the
+            // default is never copied into the agent (design D1).
+            "prompt_mode": args
+                .prompt_mode
+                .map(orch_domain::PromptModeSelection::from)
+                .and_then(orch_domain::PromptModeSelection::into_override),
+            "role_summary": args.role_summary,
+            "max_turns": args.max_turns,
+            "timeout_ms": args.timeout,
+            "approval_policy": args.approval_policy.map(orch_domain::ApprovalPolicy::from),
+            "workspace_mode": args.workspace_mode.map(orch_domain::WorkspaceMode::from),
+            "skills": skills,
+        }))?)
+        .await?;
+    authored(&created)
 }
 async fn file_mutation(
     cx: &CallContext,
-    id: &str,
+    agent_id: &str,
     file: &str,
     format: Option<Format>,
     kind: MutationKind,
-) -> Result<Value> {
-    let path = cx.project_root.join(file);
-    let input = document_input::read_document(&path, format.map(Into::into)).await?;
-    let authored = crate::commands::agent::apply_definition(&cx.engine, id, &input, kind, &|err| {
-        document_input::at_source(&path, err)
-    })
-    .await?;
-    diagnostics(&authored);
-    serde_json::to_value(authored.agent).map_err(|_| Error::other("serialize agent"))
-}
-async fn update(cx: Arc<CallContext>, args: UpdateArgs) -> Result<Value> {
-    if let Some(file) = args.file {
-        file_mutation(
-            &cx,
-            &args.id,
-            &file,
-            args.input_format,
-            MutationKind::Update,
-        )
+) -> ToolResult {
+    let (path, definition) = definition_input(cx, file, format.map(Into::into), kind).await?;
+    let updated = cx
+        .request(rpc::AgentDefinitionApplyArgs {
+            id: id(agent_id)?,
+            definition,
+        })
         .await
-    } else {
-        let flags = crate::commands::agent::AgentFlagUpdate {
-            prompt_mode: args.prompt_mode.map(Into::into),
-            effort: args.effort.map(Into::into),
-            role_summary: args.role_summary,
-        };
-        let authored = crate::commands::agent::apply_definition(
-            &cx.engine,
-            &args.id,
-            &flags.to_patch(),
-            MutationKind::Patch,
-            &|err| err,
-        )
-        .await?;
-        diagnostics(&authored);
-        serde_json::to_value(authored.agent).map_err(|_| Error::other("serialize agent"))
-    }
+        .map_err(|err| at_source(&path, err))?;
+    authored(&updated)
 }
-async fn patch(cx: Arc<CallContext>, args: PatchArgs) -> Result<Value> {
+/// The flag form as the CLI compiles it: a merge patch of `{"config": …}`
+/// where `inherit`/`default` clear the override with `null`.
+fn flag_patch(args: &UpdateArgs) -> Value {
+    let mut config = serde_json::Map::new();
+    if let Some(mode) = args.prompt_mode {
+        let mode = orch_domain::PromptModeSelection::from(mode).into_override();
+        config.insert(
+            "prompt_mode".into(),
+            mode.map_or(Value::Null, |mode| Value::String(mode.as_str().to_owned())),
+        );
+    }
+    if let Some(effort) = args.effort {
+        let effort = orch_domain::EffortSelection::from(effort).into_effort();
+        config.insert(
+            "effort".into(),
+            effort.map_or(Value::Null, |effort| {
+                Value::String(effort.as_str().to_owned())
+            }),
+        );
+    }
+    if let Some(summary) = &args.role_summary {
+        config.insert("role_summary".into(), Value::String(summary.clone()));
+    }
+    json!({ "config": config })
+}
+async fn update(cx: Arc<CallContext>, args: UpdateArgs) -> ToolResult {
+    if let Some(file) = &args.file {
+        return file_mutation(&cx, &args.id, file, args.input_format, MutationKind::Update).await;
+    }
+    let document = serde_json::to_string(&flag_patch(&args))
+        .map_err(|_| ToolError::Text("serialize the definition".to_owned()))?;
+    let definition = wire(json!({
+        "input": {"document": document, "format": "json"},
+        "kind": MutationKind::Patch,
+    }))?;
+    let updated = cx
+        .request(rpc::AgentDefinitionApplyArgs {
+            id: id(&args.id)?,
+            definition,
+        })
+        .await?;
+    authored(&updated)
+}
+async fn patch(cx: Arc<CallContext>, args: PatchArgs) -> ToolResult {
     file_mutation(
         &cx,
         &args.id,
@@ -353,67 +377,55 @@ async fn patch(cx: Arc<CallContext>, args: PatchArgs) -> Result<Value> {
     )
     .await
 }
-async fn enabled(cx: Arc<CallContext>, args: IdArgs, enable: bool) -> Result<Value> {
-    if enable {
-        cx.engine.agent_service.enable(&args.id).await?;
+async fn enabled(cx: Arc<CallContext>, args: IdArgs, enable: bool) -> ToolResult {
+    let agent = if enable {
+        cx.request(rpc::AgentEnableArgs { id: id(&args.id)? })
+            .await?
     } else {
-        cx.engine.agent_service.disable(&args.id).await?;
-    }
-    reread(&cx, &args.id).await
+        cx.request(rpc::AgentDisableArgs { id: id(&args.id)? })
+            .await?
+    };
+    json(&agent, "agent")
 }
-async fn autonomous(cx: Arc<CallContext>, args: AutonomousArgs) -> Result<Value> {
-    let current = cx.engine.agent_service.get(&args.id).await?;
-    let enable = if args.on {
-        true
+async fn autonomous(cx: Arc<CallContext>, args: AutonomousArgs) -> ToolResult {
+    // `on` wins over `off`; neither toggles, resolved by the daemon inside
+    // the same operation.
+    let enabled = if args.on {
+        Some(true)
     } else if args.off {
-        false
+        Some(false)
     } else {
-        !current.autonomous.unwrap_or(false)
+        None
     };
     let agent = cx
-        .engine
-        .agent_service
-        .set_autonomous(&args.id, enable)
+        .request(rpc::AgentAutonomousArgs {
+            id: id(&args.id)?,
+            enabled,
+        })
         .await?;
-    serde_json::to_value(agent).map_err(|_| Error::other("serialize agent"))
+    json(&agent, "agent")
 }
-async fn remove(cx: Arc<CallContext>, args: IdArgs) -> Result<Value> {
-    cx.engine.agent_service.remove(&args.id).await?;
+async fn remove(cx: Arc<CallContext>, args: IdArgs) -> ToolResult {
+    cx.request(rpc::AgentRemoveArgs { id: id(&args.id)? })
+        .await?;
     Ok(Value::Null)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     use crate::mcp::registry::{Identity, Mode, ToolArgs};
-    use serde_json::json;
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
         let args: A = serde_json::from_value(value).unwrap();
         args.validate(&Identity::of(None), Mode::Default).unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(None),
-            mode: Mode::Default,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[test]
@@ -459,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_nine_tools_preserve_agent_shapes_and_scheduling_semantics() {
-        let (_dir, cx) = fixture().await;
+        let (_fx, cx) = fixture().await;
         let _: EmptyArgs = args(json!({}));
         assert_eq!(list(cx.clone(), args(json!({}))).await.unwrap(), json!([]));
         let created = add(cx.clone(), args(json!({"name":"one","adapter":"shell","command":"true","skills":" a, b ","prompt_mode":"eco"}))).await.unwrap();
@@ -522,7 +534,7 @@ mod tests {
             false
         );
         assert_eq!(
-            projections::agents(&cx.engine)
+            projections::agents(&cx)
                 .await
                 .unwrap()
                 .as_array()
@@ -539,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn definition_files_are_bounded_and_keep_error_provenance() {
-        let (_dir, cx) = fixture().await;
+        let (fx, cx) = fixture().await;
         let agent = add(
             cx.clone(),
             args(json!({"name":"one","adapter":"shell","command":"true"})),
@@ -547,7 +559,8 @@ mod tests {
         .await
         .unwrap();
         let id = agent["id"].as_str().unwrap();
-        let before = serde_json::to_value(cx.engine.agent_service.get(id).await.unwrap()).unwrap();
+        let before =
+            serde_json::to_value(fx.engine().agent_service.get(id).await.unwrap()).unwrap();
         let path = cx.project_root.join("bad.json");
         for input in [
             br#"{"unknown":null}"#.to_vec(),
@@ -560,7 +573,7 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("bad.json"), "{err}");
             assert_eq!(
-                serde_json::to_value(cx.engine.agent_service.get(id).await.unwrap()).unwrap(),
+                serde_json::to_value(fx.engine().agent_service.get(id).await.unwrap()).unwrap(),
                 before
             );
         }
