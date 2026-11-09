@@ -9,25 +9,29 @@
 //!   so a live TTL shows as a **negative** duration.
 
 use orch_core::error::Result;
-use orch_core::storage::ContextEntry;
-use orch_engine::Engine;
+use orch_proto::ops::args;
+use orch_proto::ops::results::ContextEntry;
+use serde_json::json;
+
+use crate::commands::rpc::Rpc;
 
 use crate::context::CliContext;
 use crate::output::{Styles, format_duration_since, print_error, print_success, print_table};
 
 pub async fn set(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     key: &str,
     value: &str,
     ttl_ms: Option<u64>,
 ) -> Result<()> {
-    engine.context.set(key, value, ttl_ms).await?;
+    let entry = engine
+        .call::<args::ContextSetArgs>(json!({"key":key,"value":value,"ttl_ms":ttl_ms}))
+        .await?;
 
     if let Some(format) = ctx.output {
-        // Re-read, so the printed entry carries the stored timestamps.
-        let entry = engine.context.get(key).await?;
+        // The coordinated mutation returns the stored timestamps.
         return format.print(&entry);
     }
     if ctx.quiet {
@@ -38,8 +42,11 @@ pub async fn set(
     Ok(())
 }
 
-pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
-    let Some(entry) = engine.context.get(key).await? else {
+pub async fn get(engine: &Rpc, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
+    let Some(entry) = engine
+        .call::<args::ContextGetArgs>(json!({"key":key}))
+        .await?
+    else {
         if let Some(format) = ctx.output {
             format.print(&serde_json::Value::Null)?;
         } else {
@@ -66,8 +73,8 @@ pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) 
     Ok(())
 }
 
-pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
-    let entries = engine.context.list().await?;
+pub async fn list(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<()> {
+    let entries = engine.request(args::ContextListArgs {}).await?;
 
     if let Some(format) = ctx.output {
         return format.print(&entries);
@@ -94,8 +101,10 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
     Ok(())
 }
 
-pub async fn delete(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
-    engine.context.delete(key).await?;
+pub async fn delete(engine: &Rpc, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
+    engine
+        .call::<args::ContextDeleteArgs>(json!({"key":key}))
+        .await?;
     if !ctx.quiet && ctx.output.is_none() {
         print_success(styles, &format!("Deleted context \"{key}\""));
     }
