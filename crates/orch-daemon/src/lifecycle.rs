@@ -61,11 +61,31 @@ pub struct StartOptions {
     /// (`ORCH_TASK_ID`/`ORCH_AGENT_ID` set). Without it such a start exits 2.
     pub from_agent: bool,
     /// `--listen <addr>`: accept remote peer connections on this address.
+    /// A busy address fails the start, as it fails `serve` (R19).
     pub listen: Option<String>,
+    /// `--peer-name <name>`: this instance's peer name, overriding
+    /// `peer.name` in config.yml for this run only.
+    pub peer_name: Option<String>,
+    /// The sanitized environment, captured with [`capture_environment`]
+    /// before the async runtime starts (D11). `None` captures it on entry to
+    /// [`start`], which is equivalent only while nothing has changed the
+    /// process environment since `main`.
+    pub environment: Option<EnvironmentSnapshot>,
     /// PR 1 developmental gate (SE-20): the caller read
     /// `ORCH_DAEMON_DEVELOPMENTAL=1`. Without it start refuses with exit 2;
     /// with it start prints the banner that legacy writers are not excluded.
     pub developmental: bool,
+}
+
+/// The environment agents inherit, minus the R21 denylist. Opaque: only
+/// [`capture_environment`] creates one.
+#[derive(Debug, Clone)]
+pub struct EnvironmentSnapshot(crate::env::Snapshot);
+
+/// Capture the sanitized environment. Call from `main` before building the
+/// tokio runtime (D11); the process environment is read, never written.
+pub fn capture_environment() -> EnvironmentSnapshot {
+    EnvironmentSnapshot(crate::env::capture(std::env::vars_os()))
 }
 
 /// How a daemon run ended. `code` is the process exit status for
@@ -109,7 +129,10 @@ const STOP_WAIT: Duration = Duration::from_secs(300);
 pub async fn start(options: StartOptions) -> Result<DaemonExit, DaemonError> {
     // R21: the agent environment is decided by what started the daemon, read
     // once and never written.
-    let snapshot = crate::env::capture(std::env::vars_os());
+    let snapshot = options
+        .environment
+        .clone()
+        .map_or_else(|| crate::env::capture(std::env::vars_os()), |env| env.0);
     if in_agent_context(|name| std::env::var_os(name)) && !options.from_agent {
         return Err(DaemonError::RefusedInAgentContext);
     }
@@ -141,6 +164,7 @@ pub async fn start(options: StartOptions) -> Result<DaemonExit, DaemonError> {
         socket: Some(socket.clone()),
         dispatch: options.dispatch,
         listen: options.listen.clone(),
+        peer_name: options.peer_name.clone(),
         seams: EngineSeams::default(),
         processes: None,
         versions: None,
@@ -231,6 +255,7 @@ pub(crate) struct BringUp {
     pub(crate) socket: Option<PathBuf>,
     pub(crate) dispatch: DispatchMode,
     pub(crate) listen: Option<String>,
+    pub(crate) peer_name: Option<String>,
     pub(crate) seams: EngineSeams,
     /// `None`: the system process manager over the environment snapshot.
     pub(crate) processes: Option<Arc<dyn ProcessManager>>,
@@ -261,6 +286,8 @@ pub(crate) struct Running {
     loops: Vec<tokio::task::JoinHandle<()>>,
     pid_lock: Arc<PidLock>,
     guard: Option<OwnerGuard>,
+    /// Dropped after the engine stops, as `serve` drops its runtime.
+    peer: Option<crate::peer::HostedPeer>,
 }
 
 impl Running {
@@ -305,7 +332,7 @@ impl Running {
             ))
         });
         let peer = orch_domain::PeerConfig {
-            name: None,
+            name: spec.peer_name,
             listen: spec.listen,
         };
         let engine = Arc::new(
@@ -327,6 +354,10 @@ impl Running {
         if let Err(error) = handler.expire_context().await {
             tracing::warn!(code = ?error.code, "startup context expiry failed");
         }
+
+        // Before anything is served and before the first link: the runtime
+        // re-registers remote runs recovery left registered (R19).
+        let peer = Some(crate::peer::HostedPeer::prepare(Arc::clone(&engine)).await?);
 
         // `.orchestry/run` is the private home of the default socket and of
         // transfer staging, whichever endpoint is used.
@@ -444,6 +475,7 @@ impl Running {
             loops: Vec::new(),
             pid_lock: Arc::clone(&pid_lock),
             guard: None,
+            peer,
         };
         if let Some(path) = &spec.socket {
             let record = orch_proto::discovery::DaemonRecord {
@@ -483,10 +515,13 @@ impl Running {
             handler.clone(),
             running.quit.subscribe(),
         )));
-        running.loops.push(tokio::spawn(dispatch_loop(
+        running.loops.push(tokio::spawn(crate::dispatch::run_loop(
             handler,
             running.quit.subscribe(),
         )));
+        if let Some(peer) = running.peer.as_mut() {
+            peer.open();
+        }
         Ok(running)
     }
 
@@ -511,6 +546,7 @@ impl Running {
     /// exit when agent cleanup was incomplete, never a false clean stop.
     pub(crate) async fn shutdown(mut self) -> DaemonExit {
         let clean = self.stop_engine().await;
+        drop(self.peer.take());
         // Stop-intent callers get their completion before the endpoint goes.
         self.server.stop.finish(clean);
         self.server.begin_drain();
@@ -583,6 +619,7 @@ impl Running {
     pub(crate) fn abort(&mut self) {
         self.server.begin_drain();
         self.handler.coordinator().stop_admission();
+        drop(self.peer.take());
         self.quit.send_replace(true);
         for task in self.loops.drain(..) {
             task.abort();
@@ -633,48 +670,6 @@ async fn heartbeat(lock: Arc<PidLock>, handler: ServiceHandler, mut quit: watch:
             }
             return;
         }
-    }
-}
-
-/// Automatic dispatch: one coordinated tick per configured poll interval
-/// while dispatch is on. The interval is read fresh each round.
-async fn dispatch_loop(handler: ServiceHandler, mut quit: watch::Receiver<bool>) {
-    loop {
-        let interval = poll_interval(&handler).await;
-        tokio::select! {
-            () = crate::session::until_set(&mut quit) => return,
-            () = tokio::time::sleep(interval) => {}
-        }
-        if handler.coordinator().is_stopping() {
-            return;
-        }
-        if let Err(error) = handler.automatic_tick().await {
-            tracing::warn!(code = ?error.code, "dispatch tick failed");
-        }
-    }
-}
-
-async fn poll_interval(handler: &ServiceHandler) -> Duration {
-    const DEFAULT: Duration = Duration::from_secs(10);
-    let engine = Arc::clone(&handler.engine);
-    let read = handler
-        .coordinator()
-        .run_op(crate::coordinator::Lane::Internal, move |_| {
-            Box::pin(async move {
-                Ok(engine
-                    .config_store
-                    .read()
-                    .await
-                    .map(|config| config.scheduling.poll_interval_ms)
-                    .ok())
-            })
-        })
-        .await;
-    match read {
-        Ok(committed) => committed
-            .value
-            .map_or(DEFAULT, |ms| Duration::from_millis(ms.max(100))),
-        Err(_) => DEFAULT,
     }
 }
 
@@ -751,6 +746,7 @@ pub(crate) mod test_support {
             socket: socket.then(|| scratch.join("s")),
             dispatch: DispatchMode::Off,
             listen: None,
+            peer_name: None,
             seams: EngineSeams {
                 global_config_path: Some(scratch.join("global.yml")),
                 ..EngineSeams::default()

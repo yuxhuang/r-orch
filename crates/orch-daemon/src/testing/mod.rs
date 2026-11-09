@@ -52,6 +52,8 @@ pub struct HarnessBuilder {
     dispatch: DispatchMode,
     versions: Option<(u32, String)>,
     on_socket: bool,
+    listen: Option<String>,
+    peer_name: Option<String>,
 }
 
 /// The duplex buffer per direction: comfortably above one 1 MiB frame so a
@@ -93,6 +95,19 @@ impl HarnessBuilder {
     /// the skew matrix. Affects the handshake only.
     pub fn versions(mut self, protocol: u32, binary: impl Into<String>) -> Self {
         self.versions = Some((protocol, binary.into()));
+        self
+    }
+
+    /// Start the peer runtime listening on `addr` (`--listen`), e.g.
+    /// `127.0.0.1:0`.
+    pub fn listen(mut self, addr: impl Into<String>) -> Self {
+        self.listen = Some(addr.into());
+        self
+    }
+
+    /// The peer name (`--peer-name`).
+    pub fn peer_name(mut self, name: impl Into<String>) -> Self {
+        self.peer_name = Some(name.into());
         self
     }
 
@@ -160,7 +175,8 @@ impl HarnessBuilder {
             project_root: root.clone(),
             socket: socket.clone(),
             dispatch: self.dispatch,
-            listen: None,
+            listen: self.listen,
+            peer_name: self.peer_name,
             seams,
             processes: self.processes,
             versions: self.versions,

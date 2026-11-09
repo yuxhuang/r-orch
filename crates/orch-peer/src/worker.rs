@@ -652,7 +652,7 @@ impl Worker {
                                 synced = true;
                                 sent.clear();
                             }
-                            self.handle(&instance_id, &name, frame).await?
+                            self.handle_ordered(&instance_id, &name, frame).await?
                         };
                         for frame in replies {
                             self.write(&mut write, &frame).await?;
@@ -855,6 +855,31 @@ impl Worker {
         } else {
             item
         })
+    }
+
+    /// [`Self::handle`] inside the project's operation boundary (design D2,
+    /// D10), so a peer's store writes order with every other writer while
+    /// the replies are written to the socket outside it. `Sync` and `Cancel`
+    /// reach `cancel_task`, whose daemon path takes and releases the permit
+    /// around the process kill itself; holding it here would stall every
+    /// operation for the kill grace. Their own writes go through
+    /// [`Self::cancel_mirror`], which enters the boundary for its feedback.
+    async fn handle_ordered(
+        &self,
+        controller: &str,
+        name: &str,
+        frame: Frame,
+    ) -> Result<Vec<Frame>> {
+        if matches!(frame, Frame::Sync { .. } | Frame::Cancel { .. }) {
+            return self.handle(controller, name, frame).await;
+        }
+        self.ctx
+            .engine
+            .events
+            .operation_boundary()
+            .run(true, self.handle(controller, name, frame))
+            .await
+            .value
     }
 
     async fn handle(&self, controller: &str, name: &str, frame: Frame) -> Result<Vec<Frame>> {
@@ -1209,15 +1234,23 @@ impl Worker {
         // Feedback first: `cancel_task` re-reads the record, so writing it
         // here survives the status change, and a failure below still leaves
         // the explanation behind.
-        let mut fresh = self
-            .ctx
+        self.ctx
             .engine
-            .tasks
-            .get(&task.id)
-            .await?
-            .unwrap_or_else(|| task.clone());
-        fresh.feedback = Some(reason);
-        self.ctx.engine.tasks.save(&fresh).await?;
+            .events
+            .operation_boundary()
+            .run(true, async {
+                let mut fresh = self
+                    .ctx
+                    .engine
+                    .tasks
+                    .get(&task.id)
+                    .await?
+                    .unwrap_or_else(|| task.clone());
+                fresh.feedback = Some(reason);
+                self.ctx.engine.tasks.save(&fresh).await
+            })
+            .await
+            .value?;
         self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
         // `cancel_task` reports success even when its final status write
         // failed, because a refused transition usually means the task was
