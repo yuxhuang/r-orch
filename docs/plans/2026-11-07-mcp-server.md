@@ -135,7 +135,7 @@ Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_W
 | | F-W2 | `tsk_NUnWRGF` | docs finished at the frozen code (`ca51c7e`) |
 | | F-GATE: code, security, resilience, facts, cold gate at `ca51c7e` | `tsk_v5FUQHQ`, `tsk_AauPKD9`, `tsk_irHNbOB`, `tsk_vDRoMF_`, `tsk_K3GBJR8` | done: all five pass with conditions, none blocking |
 | | Checkpoint CP2: governance verdicts | `tsk_rJCHWFp` | done: fix round authorised |
-| F: PR 2, CP2 fix round | F1: value-free `logs.since` form errors (R14), then its docs | `tsk_zt0J71i`, then `tsk_AUiHMlQ` (replaces cancelled `tsk_0Q4didm`) | pending |
+| F: PR 2, CP2 fix round | F1: value-free `logs.since` form errors (R14), then its docs | `tsk_zt0J71i`, then `tsk_AUiHMlQ` (replaces cancelled `tsk_0Q4didm`) | done: fix and tests `152c62c`; R14 row, manual 17, RUNBOOK and CHANGELOG reconciled |
 | | C2: qualify pause dispatch wording in code text, then docs (with SRE-2, F5) | `tsk_XQxdkEP`, then `tsk_cM9TgND` (replace cancelled `tsk_DG05bju`, `tsk_Kyg4A2e`) | pending |
 | | SRE-3: pin terminal mode in `yaml_contract` and `routing` glyph fixtures | `tsk_EDxaAMe` (replaces cancelled `tsk_4dskzEb`) | in progress |
 | | F2: non-UTF-8 attachment wording matches resolved-path behaviour | `tsk_yNNFDQg` | done (R15 row, manual 17, CHANGELOG) |

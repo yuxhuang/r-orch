@@ -8,7 +8,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ### Changed
 - Pausing a goal (`orch goal status <id> paused`, the dashboard, or the MCP `goal_status` tool) now cancels only the assignee's waiting (`todo` or `retrying`) autonomous tasks linked to that goal. It used to cancel the assignee's waiting autonomous tasks in every goal, such as the checkpoints an `a-team` lead had queued for its other goals; those, and autonomous tasks linked to no goal, are now left alone.
 - `orch mcp`: `goal_status` with `status: "paused"` now works in the default mode, so a lead client that pauses its goals no longer needs `--allow-destructive`. `force: true` still needs it.
-- `orch mcp`: an invalid-arguments error (`-32602`) names the argument and the type it expects but no longer quotes the value that was sent, in the response and in the server's stderr diagnostics (`RUST_LOG=warn`).
+- `orch mcp`: an invalid-arguments error (`-32602`) names the argument and the type or form it expects but no longer quotes the value that was sent, in the response and in the server's stderr diagnostics (`RUST_LOG=warn`). This includes a malformed `logs` `since` duration.
 
 ### Fixed
 - `orch mcp`: `task_add` with a relative `attach` path in a project whose path is not valid UTF-8 now fails with a tool error and creates no task. It used to replace the invalid bytes of the resolved path, so the attachment named a different path. Absolute `attach` paths are not affected.

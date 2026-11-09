@@ -915,8 +915,9 @@ tool:
 - Lines have no timestamps; the `start` line has one.
 - The file can still hold project content. `info` lines include the client's `initialize` parameters and each
   notification it sends; a `warn` line repeats the error sent to the client. An invalid-arguments error names the
-  argument and the type it expects, never the value sent (``field `priority`: expected i64``); for an unknown
-  argument it names that argument. `umask 077` makes it readable by you only
+  argument and the type or form it expects, never the value sent (``field `priority`: expected i64``, or
+  `Invalid since duration: expected ASCII digits followed by s, m, h, or d within the supported time range` for
+  a bad `logs` `since`); for an unknown argument it names that argument. `umask 077` makes it readable by you only
   (mode `600`). Nothing rotates or deletes these files.
 
 When the client stops reading the server's output, a file recorded at `RUST_LOG=info` ends like this (from a
