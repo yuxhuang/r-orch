@@ -97,7 +97,7 @@ r-orch/
 │   ├── orch-engine/           # services + orchestrator + event bus + container
 │   ├── orch-peer/             # remote-peer protocol: links, mirrors, reconnect (core, domain, engine, infra)
 │   ├── orch-proto/            # local daemon protocol: wire types, versions, bounded NDJSON framing (domain only)
-│   ├── orch-daemon/           # the project daemon: ownership, socket, coordinator, hosted engine (developmental)
+│   ├── orch-daemon/           # the project daemon: ownership, socket, coordinator, hosted engine
 │   ├── orch-client/           # daemon client: discovery, connect, handshake, typed calls (domain, proto)
 │   ├── orch-cli/              # clap command tree, human + JSON rendering, serve mode. bins live here.
 │   └── orch-tui/              # ratatui dashboard
@@ -136,13 +136,21 @@ r-orch/
 Arrows mean "depends on". The diagram leaves out the direct `orch-domain` and `orch-core` edges that most
 crates also have; the exact edge set is the table in `xtask crate-graph` (below).
 
-**State at the head of PR 1 of the daemon-owned state work.** `orch-proto`, `orch-daemon` and the
-`orch daemon start|status|stop|dispatch` commands exist, but the daemon is **developmental**: `orch daemon`
-refuses to run unless `ORCH_DAEMON_DEVELOPMENTAL=1` is set, and no client uses it. The CLI's other commands, the
-dashboard, `orch web` and `orch mcp` still assemble the DI container themselves (`orch_engine::build_light` /
-`build_full_with_peer`) and read and write the stores directly, exactly as in v0.13.0, so §2.1's concurrency
-story still applies. What lands later, per the
-[plan](plans/2026-11-09-daemon-owned-state.md#tasks):
+**State at the head of PR 2 of the daemon-owned state work.** The daemon is the one process that opens a project's
+stores once `orch init` has created them, and every stateful frontend is its client. `orch daemon` runs without
+any environment gate. Each CLI command connects one daemon session through `orch-client` and sends typed
+operations (`commands/rpc.rs`, `Rpc::connect`). `orch mcp` is a stdio-to-socket bridge, the dashboard backend
+reads over the socket on its existing tick, and `orch web` checks for a daemon before it listens and answers HTTP
+503 with the uniform message if the daemon goes away later. With no daemon, every client fails with that message
+and exit 7, and none of them starts one. `orch serve` and `orch run --watch` are a foreground `orch daemon start`
+with dispatch on (`commands/daemon.rs`, `foreground`); `orch run --once` and `orch run <id>` are requests to a
+running daemon. The commands that do not need a daemon are `init`, `update`, `daemon` and the local checks of
+`doctor` (`tree.rs`, `CONTAINER_LESS_COMMANDS`). Three things wait for PR 4: `orch-cli` keeps its production
+dependencies on `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`; `serve/` still holds the old
+container-building `serve::run`, which nothing calls, and its unit tests; and §2.1 still describes the v0.13.0
+multi-writer story. Until then "a client never names a store" is a convention, not a gate. Where each edge and
+rule lands, per the [plan](plans/2026-11-09-daemon-owned-state.md#tasks) (PR 1 and PR 2 are in place at this
+head):
 
 | Edge or rule | Lands in | What it means |
 |---|---|---|
