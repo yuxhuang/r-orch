@@ -28,9 +28,9 @@ const OUTPUT_DEPTH: usize = 64;
 /// At the page's 16 KiB chunks this is 2 MiB of paste backlog.
 pub const INPUT_DEPTH: usize = 128;
 
-/// How long a child gets between SIGHUP and SIGKILL. `orch tui` answers SIGHUP
-/// with `orchestrator.stop()`, which gives each agent 10 s of its own grace and
-/// then saves state and releases the lock, so this has to be longer.
+/// How long a child gets between SIGHUP and SIGKILL. `orch tui` is a daemon
+/// client and answers SIGHUP by restoring the terminal and exiting at once;
+/// the bound stays generous for a child that is mid-request.
 pub const KILL_GRACE: Duration = Duration::from_secs(15);
 
 /// The environment variable `orch web` reads the password from; the child
