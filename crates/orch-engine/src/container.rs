@@ -786,6 +786,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watch_starts_with_malformed_context_and_missing_index() {
+        for corrupt_index in [false, true] {
+            let temp = initialized();
+            let paths = Paths::new(temp.path());
+            std::fs::create_dir_all(paths.context_dir()).unwrap();
+            let bad = paths.context_dir().join("bad.json");
+            std::fs::write(&bad, "malformed json").unwrap();
+            let index = paths.context_dir().join("_index.json");
+            if corrupt_index {
+                std::fs::write(&index, "malformed index").unwrap();
+            }
+            let full = build_full_with(
+                temp.path(),
+                EngineSeams {
+                    global_config_path: Some(temp.path().join("global.yml")),
+                    ..deterministic_seams()
+                },
+            )
+            .await
+            .unwrap();
+            let mut agent = orch_core::test_support::make_agent();
+            agent.status = orch_domain::AgentStatus::Running;
+            full.agents.save(&agent).await.unwrap();
+            let mut events = full.events.subscribe();
+
+            let started = full
+                .orchestrator
+                .start_watch(crate::WatchOptions {
+                    skip_autonomous_seeding: true,
+                    handle_signals: false,
+                })
+                .await;
+            let status = full.agents.get(&agent.id).await.unwrap().unwrap().status;
+            let observed = events.try_drain();
+            full.orchestrator.stop().await.unwrap();
+
+            started.expect("corrupt context must not prevent an idle watch from starting");
+            assert_eq!(status, orch_domain::AgentStatus::Idle, "reconcile ran");
+            assert!(observed.iter().any(|event| matches!(
+                event.as_ref(),
+                orch_domain::OrchestratorEvent::OrchestratorError {
+                    error, context, fatal: false,
+                } if context == "context expiry" && error.contains("bad.json")
+            )));
+            assert_eq!(std::fs::read_to_string(&bad).unwrap(), "malformed json");
+            assert_eq!(index.exists(), corrupt_index);
+        }
+    }
+
+    #[tokio::test]
     async fn the_full_engine_expires_context_on_an_explicit_tick() {
         let temp = initialized();
         let clock = Arc::new(orch_core::test_support::FixedClock::at(1_760_000_000_000));

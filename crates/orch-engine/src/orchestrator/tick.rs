@@ -49,8 +49,12 @@ impl Orchestrator {
         self.load_state(&mut slot).await?;
         let state = slot.as_mut().expect("state loaded");
 
-        self.expire_context().await?;
         self.reconcile(state).await?;
+        // Context expiry is maintenance: a corrupt entry or failed write must
+        // not skip lifecycle work or count toward the fatal tick breaker.
+        if let Err(err) = self.expire_context().await {
+            self.emit_error(err, "context expiry");
+        }
         if !self.inner.skip_autonomous_seeding.load(Ordering::SeqCst) {
             self.seed_autonomous_tasks().await;
         }
