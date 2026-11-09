@@ -2425,7 +2425,6 @@ fn assert_stalled_probes_die_with_the_server(stop: impl FnOnce(McpServer) -> mcp
 
 #[cfg(unix)]
 #[test]
-#[ignore = "doctor probes are spawned by the daemon and outlive the bridge that asked for them; client disconnect does not cancel them. tsk_Gt0X3Br"]
 fn a_doctor_probe_stalled_at_shutdown_leaves_no_child_behind() {
     assert_stalled_probes_die_with_the_server(|server| {
         server.signal(nix::sys::signal::Signal::SIGTERM);
@@ -2435,7 +2434,6 @@ fn a_doctor_probe_stalled_at_shutdown_leaves_no_child_behind() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "doctor probes are spawned by the daemon and outlive the bridge that asked for them; client disconnect does not cancel them. tsk_Gt0X3Br"]
 fn a_doctor_probe_stalled_at_sigint_leaves_no_child_behind() {
     assert_stalled_probes_die_with_the_server(|server| {
         server.signal(nix::sys::signal::Signal::SIGINT);
@@ -2447,7 +2445,6 @@ fn a_doctor_probe_stalled_at_sigint_leaves_no_child_behind() {
 /// default HUP disposition would kill the server before its probes.
 #[cfg(unix)]
 #[test]
-#[ignore = "doctor probes are spawned by the daemon and outlive the bridge that asked for them; client disconnect does not cancel them. tsk_Gt0X3Br"]
 fn a_doctor_probe_stalled_at_sighup_leaves_no_child_behind() {
     assert_stalled_probes_die_with_the_server(|server| {
         server.signal(nix::sys::signal::Signal::SIGHUP);
@@ -2457,7 +2454,6 @@ fn a_doctor_probe_stalled_at_sighup_leaves_no_child_behind() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "doctor probes are spawned by the daemon and outlive the bridge that asked for them; client disconnect does not cancel them. tsk_Gt0X3Br"]
 fn a_doctor_probe_stalled_at_stdin_eof_leaves_no_child_behind() {
     assert_stalled_probes_die_with_the_server(McpServer::shutdown);
 }

@@ -212,6 +212,9 @@ pub async fn probe_version(
     let mut child = process_manager
         .spawn(command, &["--version".to_owned()], SpawnOptions::default())
         .map_err(|err| spawn_failure_message(command, &err))?;
+    // An abandoned probe (doctor deadline, cancelled request) takes its group
+    // with it.
+    let mut guard = crate::process::GroupKillGuard::new(process_manager, child.pid);
 
     // Both pipes are drained together: reading them in sequence would deadlock
     // on a chatty `--version`.
@@ -238,6 +241,7 @@ pub async fn probe_version(
     let stderr = String::from_utf8_lossy(&stderr);
 
     let outcome = child.exit.wait().await;
+    guard.disarm();
     if outcome.success() {
         return Ok(stdout.trim().to_owned());
     }
