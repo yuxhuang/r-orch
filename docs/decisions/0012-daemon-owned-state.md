@@ -1,8 +1,8 @@
 # 0012. One explicit project daemon owns state
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-09
-- Revision: 2, after round-1 challenge; owner gate 2 pending
+- Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09
 - Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance, when accepted and the client conversion is complete. Other MCP decisions remain except where the implementation is explicitly replaced below.
 
 ## Context

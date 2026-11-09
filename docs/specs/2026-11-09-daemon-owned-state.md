@@ -1,9 +1,9 @@
 # Daemon-owned state
 
-status: draft
+status: approved
 owner: architect; requirements approval: owner at gate 2
 date: 2026-11-09
-revision: 2 (round-1 challenge incorporated; owner approval pending)
+revision: 2 (round-1 challenge incorporated; approved by the owner at gate 2, 2026-11-09: spec=approved q2=stop-intent q5=regrouped)
 plan: [Daemon-owned state](../plans/2026-11-09-daemon-owned-state.md)
 
 ## Source
