@@ -10,10 +10,11 @@
 
 use indexmap::IndexMap;
 use orch_core::error::Result;
-use orch_core::storage::TaskFilter;
 use orch_domain::{Agent, OrchestratorState, Task, TaskStatus};
-use orch_engine::Engine;
+use orch_proto::ops::args;
 use serde::Serialize;
+
+use crate::commands::rpc::Rpc;
 
 use crate::context::CliContext;
 use crate::output::{Color, Styles, format_duration_since, format_tokens};
@@ -29,10 +30,13 @@ struct StatusJson<'a> {
     state: &'a OrchestratorState,
 }
 
-pub async fn run(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
-    let tasks = engine.task_service.list(&TaskFilter::default()).await?;
-    let agents = engine.agent_service.list().await?;
-    let state = engine.state.read().await?;
+pub async fn run(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<()> {
+    let orch_proto::ops::results::StatusSummary {
+        project_name,
+        tasks,
+        agents,
+        state,
+    } = engine.request(args::StatusGetArgs {}).await?;
 
     if let Some(format) = ctx.output {
         // `OrchestratorState` serializes `claimed` as the `IndexSet` it is,
@@ -44,10 +48,7 @@ pub async fn run(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<(
         });
     }
 
-    print!(
-        "{}",
-        render(styles, &engine.config.project.name, &tasks, &agents, &state)
-    );
+    print!("{}", render(styles, &project_name, &tasks, &agents, &state));
     Ok(())
 }
 

@@ -37,3 +37,5 @@ impl DiscoveryRuntime for OfflineDiscovery {
 pub fn offline_model_discovery() -> ModelDiscovery {
     ModelDiscovery::with_runtime(Arc::new(OfflineDiscovery))
 }
+
+pub mod daemon;

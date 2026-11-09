@@ -6,6 +6,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "tui_support/mod.rs"]
+mod tui_support;
+
 use futures::{SinkExt, StreamExt};
 use orch_cli::web::{Auth, HostPolicy, SpawnSpec, WebState, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,7 +22,13 @@ type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const ECHO: &str = "echo hello; cat";
 
+/// A server over a fresh project whose in-process test daemon answers the
+/// preflight (S2c): the daemon and the project live as long as the server
+/// task, so every session here sees a daemon.
 async fn start(auth: Auth, script: &str) -> (SocketAddr, Arc<WebState>) {
+    let project = tempfile::tempdir().expect("project");
+    std::fs::create_dir_all(project.path().join(".orchestry")).expect(".orchestry");
+    let daemon = tui_support::TestDaemon::start_default(project.path()).await;
     let state = Arc::new(WebState::new(
         &auth,
         HostPolicy::new(true, Vec::new()),
@@ -28,6 +37,7 @@ async fn start(auth: Auth, script: &str) -> (SocketAddr, Arc<WebState>) {
             args: vec!["-c".into(), script.into()],
             cwd: std::env::temp_dir(),
         },
+        daemon.web_connector(),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -35,6 +45,7 @@ async fn start(auth: Auth, script: &str) -> (SocketAddr, Arc<WebState>) {
     let addr = listener.local_addr().expect("addr");
     let service = router(Arc::clone(&state)).into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move {
+        let _daemon_then_project = (daemon, project);
         axum::serve(listener, service).await.expect("serve");
     });
     (addr, state)

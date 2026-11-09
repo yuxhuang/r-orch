@@ -35,21 +35,18 @@ pub mod update_check;
 pub mod web;
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
 use orch_core::error::{Error, Result};
-use orch_core::storage::RunStore;
 use orch_domain::{SUPPORTED_ADAPTERS, TaskStatus};
-use orch_infra::storage::FileRunStore;
 
 use crate::context::{CliContext, EnvFlags};
 use crate::output::{Styles, print_error};
 use crate::routing::ArgvShape;
 use crate::tree::{
     AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
-    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, RunCmd, ServeCmd, TaskCmd,
-    TaskSub, TeamCmd, TeamSub, WebCmd,
+    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, RunCmd, TaskCmd, TaskSub,
+    TeamCmd, TeamSub, WebCmd,
 };
 
 /// The single entry point behind the `orch`, `orchestry` and `ao` binaries.
@@ -57,7 +54,31 @@ pub fn run() -> ExitCode {
     init_tracing();
     let env = EnvFlags::from_env();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let shape = ArgvShape::of(&argv);
+    let mut routing_argv = Vec::new();
+    let mut skip_identity = false;
+    let mut before_command = true;
+    for (index, arg) in argv.iter().enumerate() {
+        if index == 0 {
+            routing_argv.push(arg);
+            continue;
+        }
+        if skip_identity {
+            skip_identity = false;
+            continue;
+        }
+        if before_command && arg == "--agent" {
+            skip_identity = true;
+            continue;
+        }
+        if before_command && arg.to_string_lossy().starts_with("--agent=") {
+            continue;
+        }
+        if !arg.to_string_lossy().starts_with('-') {
+            before_command = false;
+        }
+        routing_argv.push(arg);
+    }
+    let shape = ArgvShape::of(&routing_argv);
 
     // `--version` prints the bare version string, where clap would prefix it
     // with the program name.
@@ -110,33 +131,54 @@ pub fn run() -> ExitCode {
 /// Whether the project root is initialized, checked synchronously: this runs
 /// before the runtime exists.
 fn is_initialized(cwd: &std::path::Path) -> bool {
-    let root = orch_infra::storage::find_project_root(cwd);
-    root.join(orch_infra::storage::ORCHESTRY_DIR).is_dir()
+    let root = context::project_root(cwd);
+    root.join(".orchestry").is_dir()
 }
 
-fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
+fn dispatch_parsed(mut cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     let styles = styles_for(&cli, env);
 
     // `orch mcp` owns its runtime: its shutdown must be bounded, and nothing
     // of the ordinary command path may write to stdout.
+    inherit_root_agent(&mut cli);
     if let Some(Command::Mcp(args)) = &cli.command {
         return mcp::run(args, &styles);
     }
 
-    // Explicit daemon startup captures its sanitized environment before any
-    // runtime worker exists. Legacy serve/run --watch retain their own path.
-    if let Some(Command::Daemon(args)) = &cli.command {
-        return match std::env::current_dir() {
-            Ok(cwd) => commands::daemon::run(&cli, args, &cwd),
+    // Owner starts capture the environment before Tokio creates workers.
+    let owner_command = match &cli.command {
+        Some(Command::Daemon(args)) => Some(args),
+        _ => None,
+    };
+    // Refused before any connect or lifecycle call, never silently ignored.
+    let rejected = match &cli.command {
+        Some(Command::Serve(args)) => args.rejected_flag(),
+        Some(Command::Run(args)) => args.rejected_flag(),
+        _ => None,
+    };
+    if let Some(message) = rejected {
+        print_error(&styles, message, None);
+        return ExitCode::from(2);
+    }
+    let foreground = foreground_start(cli.command.as_ref());
+    if owner_command.is_some() || foreground.is_some() {
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
             Err(error) => {
                 print_error(
                     &styles,
                     &format!("cannot read the working directory: {error}"),
                     None,
                 );
-                ExitCode::from(1)
+                return ExitCode::from(1);
             }
         };
+        if let Some(args) = owner_command {
+            return commands::daemon::run(&cli, args, &cwd);
+        }
+        if let Some((peer, from_agent)) = foreground {
+            return commands::daemon::foreground(&cli, peer, from_agent, &cwd);
+        }
     }
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -154,6 +196,12 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     match runtime.block_on(dispatch(&cli, env, &shape)) {
         Ok(code) => code,
         Err(err) => {
+            if let Some(error) = commands::rpc::recover_client_error(&err) {
+                let agent_context = std::env::var_os("ORCH_TASK_ID").is_some()
+                    || std::env::var_os("ORCH_AGENT_ID").is_some();
+                eprintln!("{}", error.render(agent_context));
+                return ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1));
+            }
             print_error(&styles, &err.to_string(), err.hint().as_deref());
             if std::env::var_os("ORCHESTRY_DEBUG").is_some() {
                 eprintln!("{err:?}");
@@ -174,21 +222,15 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
     match &cli.command {
         Some(Command::Init(args)) => run_init(cli, env, &cwd, args).await,
+        // Container-less: the version check reads no project state, so it
+        // needs neither a project nor a daemon.
         Some(Command::Update(args)) => {
             update::run(&styles_for(cli, env), args.check);
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Doctor) => {
             let styles = styles_for(cli, env);
-            // `doctor` runs in either tier: container-less it probes five
-            // adapters, with a project it probes eight.
-            let project = if is_initialized(&cwd) {
-                let (ctx, _, engine) = build(cli, env, &cwd).await?;
-                Some((ctx, engine))
-            } else {
-                None
-            };
-            doctor::run(&styles, &cwd, cli.output(), project.as_ref()).await
+            commands::run::doctor(cli, &styles, &cwd).await
         }
 
         Some(Command::Task(TaskCmd { command })) => {
@@ -385,12 +427,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
         Some(Command::Logs(args)) => {
             let (ctx, styles, engine) = build(cli, env, &cwd).await?;
-            let runs: Arc<dyn RunStore> = Arc::new(FileRunStore::new(engine.paths.clone()));
-            logs::run(
-                &logs::LogsDeps {
-                    runs,
-                    events: Arc::clone(&engine.events),
-                },
+            commands::run::logs::run(
+                &engine,
                 &ctx,
                 &styles,
                 &logs::LogsArgs {
@@ -404,7 +442,10 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             .await
         }
 
-        Some(Command::Serve(args)) => run_serve(cli, env, &cwd, args).await,
+        Some(Command::Serve(args)) => {
+            let (_, _, client) = build(cli, env, &cwd).await?;
+            commands::run::serve_once(&client, args).await
+        }
 
         Some(Command::Web(args)) => run_web(cli, env, &cwd, args).await,
 
@@ -666,82 +707,48 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         Some(Command::Run(RunCmd {
             task_id,
             all,
-            watch,
-            verbose,
+            once,
+            watch: _,
+            from_agent: _,
+            verbose: _,
+            tick_interval: _,
             peer,
         })) => {
-            // The argument check is the command's own, and it exits 2 before
-            // anything else happens.
-            if !*watch && !*all && task_id.is_none() {
-                print_error(
-                    &styles_for(cli, env),
-                    "Specify a task ID, --all, or --watch",
-                    None,
-                );
-                return Ok(ExitCode::from(2));
-            }
-            // The full tier: every mode drives the orchestrator.
-            let ctx =
-                CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-            let styles = ctx.styles(env);
-            if peer.listen.is_some() && !*watch {
-                return Err(orch_core::Error::invalid_arguments(
-                    "--listen requires run --watch",
+            if !*all && !*once && task_id.is_none() {
+                return Err(Error::invalid_arguments(
+                    "Specify a task ID, --all, --once, or --watch",
                 ));
             }
-            let engine =
-                orch_engine::build_full_with_peer(ctx.project_root.clone(), peer.config()).await?;
-            // Read-only diagnostics before any unattended dispatch: legacy
-            // or uncertain effort requests and eco/custom-template conflicts,
-            // one line per affected agent, on stderr.
-            commands::run::report_startup_diagnostics(&engine, &styles).await;
-            // `--watch` wins over `--all`, which wins over a task id, as the
-            // original's if/else chain does.
-            if *watch {
-                if let Some(listen) = &engine.config.peer.listen {
-                    commands::remote::warn_if_exposed(&styles, listen);
-                }
-                commands::run::watch(std::sync::Arc::new(engine), &styles, *verbose).await
-            } else if *all {
+            if peer.listen.is_some() || peer.peer_name.is_some() {
+                return Err(Error::invalid_arguments(
+                    "--listen and --peer-name require run --watch",
+                ));
+            }
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            commands::run::report_startup_diagnostics(&engine, &styles).await?;
+            if *all {
                 commands::run::all(&engine, &styles).await
+            } else if *once {
+                commands::run::once(&engine, &ctx, &styles).await
             } else {
                 commands::run::single(&engine, &styles, task_id.as_deref().expect("checked above"))
                     .await
             }
         }
-        Some(Command::Tui(args)) => {
+
+        Some(Command::Tui(_args)) => {
             let ctx =
                 CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-            // The dashboard needs the orchestrator, so this is the one command
-            // that builds the full container up front.
-            tui::run_with_peer(
-                ctx.project_root,
-                version(),
-                args.observe,
-                args.peer.config(),
-                args.peer.listen.is_some(),
-            )
-            .await
+            // The dashboard is another socket client, as the root `--agent`.
+            tui::run_as_agent(ctx.project_root, version(), cli.agent.as_deref()).await
         }
 
-        // Bare `orch` is the first-run experience: it inits
-        // if needed and launches the dashboard. `is_bare` is the routing
-        // guard's own answer to "no arguments at all", which is what
-        // decides whether to append `tui` — the arm that
-        // landed on master guessed it from `args_os().count()` pending this.
+        // A bare invocation is another dashboard client. Initialization is
+        // explicit, so this path cannot create a project behind the owner.
         None if shape.is_bare => {
-            tui::first_run(
-                &styles_for(cli, env),
-                &cwd,
-                &commands::init::InitArgs {
-                    name: None,
-                    adapter: None,
-                    prompt_mode: None,
-                    interactive: env.stdout_is_tty && env.stdin_is_tty,
-                },
-                version(),
-            )
-            .await
+            let ctx =
+                CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
+            tui::run_as_agent(ctx.project_root, version(), cli.agent.as_deref()).await
         }
 
         // Flags but no subcommand (`orch --json`): `tui` is appended
@@ -810,46 +817,6 @@ async fn run_init(
     Ok(ExitCode::SUCCESS)
 }
 
-async fn run_serve(
-    cli: &Cli,
-    env: EnvFlags,
-    cwd: &std::path::Path,
-    args: &ServeCmd,
-) -> Result<ExitCode> {
-    let styles = styles_for(cli, env);
-
-    let Some(format) = serve::LogFormat::parse(&args.log_format) else {
-        print_error(
-            &styles,
-            &format!(
-                "Unknown --log-format \"{}\". Valid: json, text",
-                args.log_format
-            ),
-            None,
-        );
-        return Ok(ExitCode::from(2));
-    };
-
-    // The full tier: `serve` is the orchestrator.
-    let ctx = CliContext::resolve(cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-    let engine =
-        orch_engine::build_full_with_peer(ctx.project_root.clone(), args.peer.config()).await?;
-    if let Some(listen) = &engine.config.peer.listen {
-        commands::remote::warn_if_exposed(&styles, listen);
-    }
-    serve::run(
-        engine,
-        serve::ServeArgs {
-            once: args.once,
-            tick_interval: args.tick_interval.clone(),
-            log_file: args.log_file.clone(),
-            format,
-            verbose: args.verbose,
-        },
-    )
-    .await
-}
-
 async fn run_web(
     cli: &Cli,
     env: EnvFlags,
@@ -870,7 +837,27 @@ async fn run_web(
             return Ok(ExitCode::from(2));
         }
     };
-    web::run(web_args, cwd.to_path_buf()).await
+    web::run_as_agent(web_args, cwd.to_path_buf(), cli.agent.as_deref()).await
+}
+
+/// `orch serve` (without `--once`) and `orch run --watch` are explicit
+/// foreground daemon starts: their peer flags and `--from-agent` override.
+fn foreground_start(command: Option<&Command>) -> Option<(&tree::PeerFlags, bool)> {
+    match command {
+        Some(Command::Serve(args)) if !args.once => Some((&args.peer, args.from_agent)),
+        Some(Command::Run(args)) if args.watch => Some((&args.peer, args.from_agent)),
+        _ => None,
+    }
+}
+
+/// Root `--agent` is the caller identity for every client (over
+/// ORCH_AGENT_ID); `mcp --agent` is the more specific spelling and wins.
+fn inherit_root_agent(cli: &mut Cli) {
+    if let Some(Command::Mcp(args)) = &mut cli.command
+        && args.agent.is_none()
+    {
+        args.agent.clone_from(&cli.agent);
+    }
 }
 
 /// The version the dashboard reports, which is the one `--version` prints.
@@ -950,17 +937,15 @@ fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {
     }
 }
 
-/// Resolve the context and build the light engine. The `require_init` inside
-/// `build_light` is what produces exit 3 for an uninitialized directory, and
-/// the pre-parse guard in [`run`] is what makes that happen before parsing.
+/// Resolve presentation flags and connect one serialized daemon session.
 async fn build(
     cli: &Cli,
     env: EnvFlags,
     cwd: &std::path::Path,
-) -> Result<(CliContext, Styles, orch_engine::Engine)> {
+) -> Result<(CliContext, Styles, commands::rpc::Rpc)> {
     let ctx = CliContext::resolve(cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
     let styles = ctx.styles(env);
-    let engine = orch_engine::build_light(ctx.project_root.clone()).await?;
+    let engine = commands::rpc::Rpc::connect(cli, cwd).await?;
     Ok((ctx, styles, engine))
 }
 
@@ -1049,6 +1034,69 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp_agent(argv: &[&str]) -> Option<String> {
+        let mut cli = Cli::try_parse_from(argv).expect("parses");
+        inherit_root_agent(&mut cli);
+        match cli.command {
+            Some(Command::Mcp(args)) => args.agent,
+            _ => panic!("mcp"),
+        }
+    }
+
+    #[test]
+    fn root_agent_reaches_mcp_and_the_mcp_flag_is_more_specific() {
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp"]).as_deref(),
+            Some("agt_r")
+        );
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp", "--agent", "agt_m"]).as_deref(),
+            Some("agt_m")
+        );
+        assert_eq!(mcp_agent(&["orch", "mcp"]), None);
+    }
+
+    fn foreground(argv: &[&str]) -> Option<bool> {
+        let cli = Cli::try_parse_from(argv).expect("parses");
+        foreground_start(cli.command.as_ref()).map(|(_, from_agent)| from_agent)
+    }
+
+    /// W2b B1 / spec R31: `serve` and `run --watch` are explicit starts and
+    /// take `daemon start`'s `--from-agent`; it reaches the start the
+    /// agent-context guard checks. A batch or one-shot run is no start.
+    #[test]
+    fn foreground_starts_forward_from_agent_and_batches_refuse_it() {
+        assert_eq!(foreground(&["orch", "serve"]), Some(false));
+        assert_eq!(foreground(&["orch", "serve", "--from-agent"]), Some(true));
+        assert_eq!(foreground(&["orch", "run", "--watch"]), Some(false));
+        assert_eq!(
+            foreground(&["orch", "run", "--watch", "--from-agent"]),
+            Some(true)
+        );
+        assert_eq!(foreground(&["orch", "serve", "--once"]), None);
+        assert_eq!(foreground(&["orch", "run", "--once"]), None);
+        assert_eq!(foreground(&["orch", "run", "tsk_1"]), None);
+
+        use clap::error::ErrorKind;
+        for (refused, kind) in [
+            (
+                &["orch", "serve", "--once", "--from-agent"][..],
+                ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["orch", "run", "--from-agent", "tsk_1"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["orch", "run", "--once", "--from-agent"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+        ] {
+            let error = Cli::try_parse_from(refused).expect_err("refused");
+            assert_eq!(error.kind(), kind, "{refused:?}");
+        }
+    }
 
     #[test]
     fn parse_int_rejects_a_non_numeric_value_with_exit_2() {

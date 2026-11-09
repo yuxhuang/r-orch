@@ -103,7 +103,6 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
 
     if path_exists(&paths.root()).await {
         print_warning(styles, "Already initialized");
-        println!("  Start the daemon explicitly with: orch daemon start");
         return Ok(InitOutcome {
             already_initialized: true,
             adapter: args.adapter.clone().unwrap_or_else(|| "claude".to_owned()),
@@ -192,22 +191,16 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
     );
     println!();
 
-    println!("  Start the daemon explicitly with: orch daemon start");
     Ok(InitOutcome {
         already_initialized: false,
         adapter,
     })
 }
 
-/// The `Next:` hint, keyed on the **`--adapter` flag** rather than the adapter
-/// `init` settled on, and printed even when the project was already
-/// initialized.
-pub fn next_hint(adapter: Option<&str>) -> &'static str {
-    if adapter == Some("shell") {
-        "orch agent add \"Test Runner\" --adapter shell --command \"npm test\""
-    } else {
-        "orch task add \"Create backend agent\" --assignee agt_creator"
-    }
+/// Initialization never starts the daemon or suggests a stateful command
+/// before the owner starts one. Reinitialization prints the same hint.
+pub fn next_hint(_adapter: Option<&str>) -> &'static str {
+    "orch daemon start"
 }
 
 /// Probe each adapter's `--version` and pick one.
@@ -731,20 +724,9 @@ mod tests {
     }
 
     #[test]
-    fn the_next_hint_depends_on_the_adapter() {
-        assert_eq!(
-            next_hint(Some("shell")),
-            "orch agent add \"Test Runner\" --adapter shell --command \"npm test\""
-        );
-        assert_eq!(
-            next_hint(Some("claude")),
-            "orch task add \"Create backend agent\" --assignee agt_creator"
-        );
-        // No `--adapter` at all takes the task hint, whatever `init`
-        // auto-detected: the flag is read, not the outcome.
-        assert_eq!(
-            next_hint(None),
-            "orch task add \"Create backend agent\" --assignee agt_creator"
-        );
+    fn init_only_suggests_an_explicit_owner_start() {
+        for adapter in [None, Some("shell"), Some("claude")] {
+            assert_eq!(next_hint(adapter), "orch daemon start");
+        }
     }
 }

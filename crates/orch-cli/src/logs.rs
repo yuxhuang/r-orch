@@ -602,12 +602,6 @@ pub(crate) fn report_dropped_events(seen: &mut u64, subscription: &EventSubscrip
     true
 }
 
-/// The same clock at minute precision, which is what `run --watch` prints.
-pub(crate) fn now_time_minutes() -> String {
-    let zoned = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system());
-    format!("{:02}:{:02}", zoned.hour(), zoned.minute())
-}
-
 fn format_zoned(ts: jiff::Timestamp) -> String {
     let zoned = ts.to_zoned(jiff::tz::TimeZone::system());
     format!(

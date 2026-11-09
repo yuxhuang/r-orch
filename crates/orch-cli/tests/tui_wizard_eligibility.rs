@@ -1,28 +1,28 @@
 //! The dashboard wizards' final-submit eligibility check against the real
 //! engine and its files (R7, D7; decision DQ2).
 //!
-//! Each scenario has its own temp project with three shell agents. The
-//! dashboard runs on an observer `EngineBackend` (no orchestrator, nothing
-//! dispatched), and the chosen agent is disabled or removed by a second,
-//! independent engine over the same files, standing in for another process.
-//! The outcome is read back from storage, not from the dashboard.
+//! Each scenario has its own temp project with three shell agents, owned by an
+//! in-process test daemon (dispatch OFF). The dashboard runs on a
+//! `DaemonBackend` dialled through the production connector, and the chosen
+//! agent is disabled or removed through the daemon's own services, standing in
+//! for another client. The outcome is read back from storage through those
+//! services, not from the dashboard.
 
-mod common;
+mod tui_support;
 
-use std::path::Path;
 use std::sync::Arc;
 
-use orch_cli::tui::EngineBackend;
+use orch_cli::tui::DaemonBackend;
 use orch_core::storage::ConfigStore;
 use orch_domain::{CreateAgentInput, WorkspaceMode, default_config};
-use orch_engine::{EngineSeams, FullEngine, build_full_with};
 use orch_infra::storage::{FileConfigStore, Paths};
 use orch_tui::App;
 use orch_tui::clock::TestClock;
 use orch_tui::wizard::configs;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tui_support::TestDaemon;
 
-type Dashboard = App<EngineBackend, TestClock>;
+type Dashboard = App<DaemonBackend, TestClock>;
 
 fn key(app: &mut Dashboard, code: KeyCode) {
     app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -49,27 +49,11 @@ fn session_error(app: &Dashboard) -> String {
         .unwrap_or_default()
 }
 
-async fn engine_at(dir: &Path) -> Arc<FullEngine> {
-    Arc::new(
-        build_full_with(
-            dir,
-            EngineSeams {
-                global_config_path: Some(dir.join("home/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("engine"),
-    )
-}
-
 struct Project {
+    /// Dropped first: the daemon is stopped before its project is removed.
+    daemon: Arc<TestDaemon>,
     _dir: tempfile::TempDir,
     root: std::path::PathBuf,
-    /// The dashboard's engine.
-    engine: Arc<FullEngine>,
-    /// Another engine over the same files: "another process".
-    other: Arc<FullEngine>,
     zeta: String,
     alpha: String,
     mid: String,
@@ -77,7 +61,8 @@ struct Project {
 
 async fn project() -> Project {
     let dir = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::new(dir.path());
+    let root = dir.path().canonicalize().expect("canonical root");
+    let paths = Paths::new(&root);
     tokio::fs::create_dir_all(paths.root()).await.expect("root");
     let mut config = default_config();
     config.defaults.agent.adapter = "shell".into();
@@ -85,10 +70,10 @@ async fn project() -> Project {
     ConfigStore::write(&FileConfigStore::new(paths), &config)
         .await
         .expect("config");
-    let engine = engine_at(dir.path()).await;
+    let daemon = Arc::new(TestDaemon::start_default(&root).await);
     let mut ids = Vec::new();
     for name in ["zeta-builder", "alpha-ops", "mid-reviewer"] {
-        let agent = engine
+        let agent = daemon
             .agent_service
             .create(CreateAgentInput {
                 name: name.into(),
@@ -100,27 +85,21 @@ async fn project() -> Project {
             .expect("agent");
         ids.push(agent.id);
     }
-    let other = engine_at(dir.path()).await;
     Project {
-        root: dir.path().to_path_buf(),
+        root,
         _dir: dir,
-        engine,
-        other,
+        daemon,
         zeta: ids[0].clone(),
         alpha: ids[1].clone(),
         mid: ids[2].clone(),
     }
 }
 
-async fn backend(engine: &Arc<FullEngine>) -> EngineBackend {
-    let backend = EngineBackend::launch_with(Arc::clone(engine), "r7", true)
-        .await
-        .with_model_discovery(common::offline_model_discovery());
-    assert!(!backend.is_watch_active(), "observer: nothing dispatches");
-    backend
+async fn backend(daemon: &TestDaemon) -> DaemonBackend {
+    daemon.launch().await
 }
 
-fn dashboard(backend: EngineBackend) -> Dashboard {
+fn dashboard(backend: DaemonBackend) -> Dashboard {
     let mut app = App::new(backend, TestClock::new(1_000_000));
     app.state.width = 120;
     app.state.height = 40;
@@ -135,9 +114,9 @@ enum Change {
     Removed,
 }
 
-/// Change `id` through the other engine, synchronously from the dashboard's
-/// blocking thread.
-fn change(handle: &tokio::runtime::Handle, other: &Arc<FullEngine>, id: &str, how: Change) {
+/// Change `id` through the daemon's services (another client), synchronously
+/// from the dashboard's blocking thread.
+fn change(handle: &tokio::runtime::Handle, other: &Arc<TestDaemon>, id: &str, how: Change) {
     match how {
         Change::Disabled => {
             handle
@@ -154,9 +133,9 @@ fn change(handle: &tokio::runtime::Handle, other: &Arc<FullEngine>, id: &str, ho
 async fn new_task_with_an_assignee_changed_elsewhere_writes_nothing_until_corrected() {
     for how in [Change::Disabled, Change::Removed] {
         let p = project().await;
-        let backend = backend(&p.engine).await;
+        let backend = backend(&p.daemon).await;
         let handle = tokio::runtime::Handle::current();
-        let (other, alpha, mid) = (Arc::clone(&p.other), p.alpha.clone(), p.mid.clone());
+        let (other, alpha, mid) = (Arc::clone(&p.daemon), p.alpha.clone(), p.mid.clone());
         let after_refusal = tokio::task::spawn_blocking(move || {
             let mut app = dashboard(backend);
             app.open_task_wizard();
@@ -189,7 +168,7 @@ async fn new_task_with_an_assignee_changed_elsewhere_writes_nothing_until_correc
         assert!(error.starts_with("Nothing was saved"), "{how:?}: {error}");
         assert_eq!(persisted_after_refusal, 0, "{how:?}: nothing written");
         let tasks = p
-            .engine
+            .daemon
             .task_service
             .list(&Default::default())
             .await
@@ -203,9 +182,9 @@ async fn new_task_with_an_assignee_changed_elsewhere_writes_nothing_until_correc
 #[tokio::test(flavor = "multi_thread")]
 async fn new_goal_with_a_removed_assignee_is_not_created() {
     let p = project().await;
-    let backend = backend(&p.engine).await;
+    let backend = backend(&p.daemon).await;
     let handle = tokio::runtime::Handle::current();
-    let (other, alpha) = (Arc::clone(&p.other), p.alpha.clone());
+    let (other, alpha) = (Arc::clone(&p.daemon), p.alpha.clone());
     let (step_after, error) = tokio::task::spawn_blocking(move || {
         let mut app = dashboard(backend);
         app.open_goal_wizard();
@@ -222,7 +201,7 @@ async fn new_goal_with_a_removed_assignee_is_not_created() {
     assert_eq!(step_after, "assignee");
     assert!(error.contains("alpha-ops no longer exists"), "{error}");
     let goals = p
-        .engine
+        .daemon
         .goal_service
         .list(&Default::default())
         .await
@@ -233,9 +212,9 @@ async fn new_goal_with_a_removed_assignee_is_not_created() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hidden_team_member_disabled_elsewhere_blocks_the_team_until_unticked() {
     let p = project().await;
-    let backend = backend(&p.engine).await;
+    let backend = backend(&p.daemon).await;
     let handle = tokio::runtime::Handle::current();
-    let (other, alpha) = (Arc::clone(&p.other), p.alpha.clone());
+    let (other, alpha) = (Arc::clone(&p.daemon), p.alpha.clone());
     let (refused_step, teams_after_refusal) = tokio::task::spawn_blocking(move || {
         let mut app = dashboard(backend);
         app.open_team_wizard();
@@ -269,7 +248,7 @@ async fn a_hidden_team_member_disabled_elsewhere_blocks_the_team_until_unticked(
     .expect("dashboard thread");
     assert_eq!(refused_step, "members");
     assert_eq!(teams_after_refusal, 0);
-    let teams = p.engine.team_service.list().await.expect("teams");
+    let teams = p.daemon.team_service.list().await.expect("teams");
     assert_eq!(teams.len(), 1);
     let members: Vec<&str> = teams[0]
         .members
@@ -289,10 +268,10 @@ async fn editing_a_task_whose_assignee_changed_elsewhere_saves_and_leaves_the_as
     // title fix neither re-sends a disabled agent nor fails on a removed one.
     for how in [Change::Disabled, Change::Removed] {
         let p = project().await;
-        let backend = backend(&p.engine).await;
+        let backend = backend(&p.daemon).await;
         let alpha = p.alpha.clone();
         let task = p
-            .engine
+            .daemon
             .task_service
             .create(orch_domain::CreateTaskInput {
                 title: "Original".into(),
@@ -300,13 +279,13 @@ async fn editing_a_task_whose_assignee_changed_elsewhere_saves_and_leaves_the_as
             })
             .await
             .expect("task");
-        p.engine
+        p.daemon
             .task_service
             .assign(&task.id, &alpha)
             .await
             .expect("assign");
         let handle = tokio::runtime::Handle::current();
-        let (other, task_id) = (Arc::clone(&p.other), task.id.clone());
+        let (other, task_id) = (Arc::clone(&p.daemon), task.id.clone());
         let (closed, failures) = tokio::task::spawn_blocking(move || {
             let mut app = dashboard(backend);
             let task = app
@@ -337,7 +316,7 @@ async fn editing_a_task_whose_assignee_changed_elsewhere_saves_and_leaves_the_as
         .expect("dashboard thread");
         assert_eq!(closed, "<closed>", "{how:?}");
         assert_eq!(failures, Vec::<String>::new(), "{how:?}");
-        let saved = p.engine.task_service.get(&task.id).await.expect("task");
+        let saved = p.daemon.task_service.get(&task.id).await.expect("task");
         assert_eq!(saved.title, "Original v2", "{how:?}");
         assert_eq!(saved.assignee.as_deref(), Some(p.alpha.as_str()), "{how:?}");
     }
@@ -346,7 +325,7 @@ async fn editing_a_task_whose_assignee_changed_elsewhere_saves_and_leaves_the_as
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreadable_remote_registry_fails_closed_only_when_an_agent_is_chosen() {
     let p = project().await;
-    let backend = backend(&p.engine).await;
+    let backend = backend(&p.daemon).await;
     let registry = p.root.join(".orchestry").join("remotes.yml");
     let (assigned, unassigned) = tokio::task::spawn_blocking(move || {
         let mut app = dashboard(backend);
@@ -375,7 +354,7 @@ async fn an_unreadable_remote_registry_fails_closed_only_when_an_agent_is_chosen
     );
     assert_eq!(unassigned.0, "<closed>", "{unassigned:?}");
     let tasks = p
-        .engine
+        .daemon
         .task_service
         .list(&Default::default())
         .await

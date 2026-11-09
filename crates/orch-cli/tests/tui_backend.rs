@@ -1,19 +1,18 @@
-//! `EngineBackend` against a real project tree.
+//! `DaemonBackend` against a real project tree and its test daemon.
 //!
 //! Every case drives the backend the way the dashboard will: constructed on
-//! the runtime, then used from a plain thread that is **not** driving it, so
-//! the `Handle::block_on` inside each method is legal. A test that called the
-//! methods directly from `#[tokio::test]` would panic, which is precisely the
-//! mistake this file exists to make impossible.
+//! the runtime against a daemon reached over its Unix socket, then used from
+//! a plain thread that is **not** driving the runtime, so the
+//! `Handle::block_on` inside each method is legal. The daemon's engine is
+//! used only to seed and to peek; every assertion about the dashboard goes
+//! through the backend.
 
-mod common;
+mod tui_support;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use orch_cli::context::{CliContext, EnvFlags};
-use orch_cli::output::Styles;
-use orch_cli::tui::EngineBackend;
+use orch_cli::tui::DaemonBackend;
 use orch_core::clock::epoch_ms_from_iso;
 use orch_core::storage::ConfigStore;
 use orch_domain::{
@@ -22,37 +21,29 @@ use orch_domain::{
     ReasoningEffort, Run, RunEvent, RunEventType, RunStatus, TaskStatus, TuiPaletteName,
     WorkspaceMode, default_config,
 };
-use orch_engine::{EngineSeams, FullEngine, build_full_with};
+use orch_engine::FullEngine;
 use orch_infra::storage::{FileConfigStore, Paths};
 use orch_tui::backend::{
     AgentFields, AgentOpts, CreateTaskOpts, GoalFields, HistoryEntry, MessageTarget, TaskFields,
     TuiBackend,
 };
+use tui_support::{TestDaemon, on_draw_thread};
 
-/// Serializes the two cases that touch the **global** config.
-///
-/// Everything else here is isolated by its own tempdir, but `global.yml` is a
-/// single file per machine — `~/.orchestry/global.yml`, or wherever
-/// `ORCHESTRY_GLOBAL_CONFIG_PATH` points. Two `multi_thread` tests in this
-/// binary write it, so they raced: observed as `palette: Ocean` where `Forest`
-/// was expected, about 1 in 20 full-workspace runs.
-///
-/// A mutex rather than per-test isolation because `std::env::set_var` is
-/// process-global and racy — the same class of bug. The *path* is redirected
-/// into `target/` for the whole workspace by `[env]` in `.cargo/config.toml`,
-/// which is what stops these tests from rewriting the developer's own
-/// preferences; this only stops them from fighting each other.
+/// Serializes the cases that touch a `global.yml`. Each project keeps its own
+/// (inside the project directory), so this only guards against a future case
+/// sharing one.
 static GLOBAL_CONFIG_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// A project with a written `config.yml`, which is what `require_init` wants.
-async fn project() -> (tempfile::TempDir, Arc<FullEngine>) {
+/// A project with a written `config.yml` and its test daemon (dispatch OFF,
+/// no maintenance timer, `global.yml` inside the project).
+async fn project() -> (tempfile::TempDir, Arc<TestDaemon>) {
     let temp = project_tree().await;
-    let engine = Arc::new(build_isolated(temp.path()).await.expect("build_full"));
-    (temp, engine)
+    let daemon = Arc::new(TestDaemon::start_default(temp.path()).await);
+    (temp, daemon)
 }
 
-/// [`project`]'s tree, so a test that needs its own engine seams can build one
-/// over it.
+/// [`project`]'s tree, so a test that needs its own daemon seams can start
+/// one over it.
 async fn project_tree() -> tempfile::TempDir {
     let temp = tempfile::tempdir().expect("tempdir");
     orch_core::test_support::assert_hermetic(temp.path());
@@ -65,7 +56,6 @@ async fn project_tree() -> tempfile::TempDir {
     let mut config = default_config();
     config.project.name = "tui-e2e".into();
     config.defaults.agent.workspace_mode = WorkspaceMode::Shared;
-    // Long enough that the watch loop started by `launch` never self-fires.
     config.scheduling.poll_interval_ms = 100_000;
     ConfigStore::write(&FileConfigStore::new(paths.clone()), &config)
         .await
@@ -74,66 +64,39 @@ async fn project_tree() -> tempfile::TempDir {
     temp
 }
 
-/// `build_full`, with `global.yml` kept inside the project directory.
-///
-/// Every build in this file goes through here. The default resolution is
-/// `~/.orchestry/global.yml` — one file per machine — and two tests below
-/// write it, so using `build_full` directly meant rewriting the developer's
-/// own preferences. An env var does not fix it: set through `[env]` in
-/// `.cargo/config.toml` it only applies when cargo is run from inside the
-/// workspace, and the writer came straight back for any other cwd (verified).
-/// A seam passed explicitly cannot be bypassed.
-async fn build_isolated(root: &std::path::Path) -> orch_core::error::Result<FullEngine> {
-    build_isolated_with(root, EngineSeams::default()).await
+async fn launch(daemon: Arc<TestDaemon>) -> DaemonBackend {
+    daemon.launch().await
 }
 
-/// [`build_isolated`] with the rest of the seams chosen by the caller — a
-/// [`FixedClock`](orch_core::test_support::FixedClock), for a test that
-/// asserts the exact `updated_at` a service writes.
-async fn build_isolated_with(
-    root: &std::path::Path,
-    seams: EngineSeams,
-) -> orch_core::error::Result<FullEngine> {
-    build_full_with(
-        root,
-        EngineSeams {
-            global_config_path: Some(root.join(".orchestry/global.yml")),
-            ..seams
-        },
-    )
-    .await
-}
-
-/// Run `body` on a thread that is not driving the runtime, as the draw loop
-/// is, and hand back whatever it returns.
-async fn on_draw_thread<T, F>(mut backend: EngineBackend, body: F) -> (EngineBackend, T)
+/// Poll the backend until `ready` holds for something it returned, or fail.
+async fn poll_until<T, F, P>(
+    mut backend: DaemonBackend,
+    what: &str,
+    poll: F,
+    ready: P,
+) -> (DaemonBackend, Vec<T>)
 where
     T: Send + 'static,
-    F: FnOnce(&mut EngineBackend) -> T + Send + 'static,
+    F: Fn(&mut DaemonBackend) -> Vec<T> + Send + Sync + Copy + 'static,
+    P: Fn(&[T]) -> bool,
 {
-    tokio::task::spawn_blocking(move || {
-        let value = std::thread::scope(|scope| {
-            scope
-                .spawn(|| body(&mut backend))
-                .join()
-                .expect("the draw thread panicked")
-        });
-        (backend, value)
-    })
-    .await
-    .expect("the blocking task panicked")
-}
-
-async fn launch(engine: Arc<FullEngine>) -> EngineBackend {
-    EngineBackend::launch(engine, "9.9.9")
-        .await
-        .with_model_discovery(common::offline_model_discovery())
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        let (returned, polled) = on_draw_thread(backend, move |backend| poll(backend)).await;
+        backend = returned;
+        seen.extend(polled);
+        if ready(&seen) {
+            return (backend, seen);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what} never arrived");
 }
 
 // ── launch ───────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn launch_starts_watch_mode_and_reports_the_project_context() {
+async fn launch_reports_the_project_context_and_leaves_dispatch_alone() {
     let (temp, engine) = project().await;
     let backend = launch(Arc::clone(&engine)).await;
 
@@ -142,39 +105,40 @@ async fn launch_starts_watch_mode_and_reports_the_project_context() {
     assert_eq!(context.version, "9.9.9");
     assert_eq!(context.default_adapter, "claude");
     assert_eq!(context.initial_max_concurrent, 6);
-    assert!(context.initial_watch_active);
-    assert!(!context.observer_mode);
+    // A fresh daemon starts with dispatch OFF, and opening the dashboard
+    // does not change it: the header shows IDLE.
+    assert!(!context.initial_watch_active);
+    assert!(!context.observer_mode, "there is no observer mode");
     assert_eq!(context.watch_error, None);
-    assert!(backend.is_watch_active());
-    // Watch mode really did take the lock.
-    assert!(engine.orchestrator.is_owner());
 
-    engine.orchestrator.stop().await.expect("stop");
+    let mut probe = orch_client::Client::connect(&engine.client_config())
+        .await
+        .expect("a second client");
+    let status = probe.status().await.expect("daemon status");
+    assert!(
+        !status.dispatch.dispatch_on,
+        "the dashboard turned dispatch on"
+    );
+
+    drop(backend);
     drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn launch_falls_back_to_observer_mode_when_the_lock_is_held() {
-    let (temp, engine) = project().await;
-    // Another process owns the orchestrator.
-    let held = orch_engine::FileLock::new(engine.paths.lock_path());
-    assert!(
-        orch_engine::ProjectLock::acquire(&held).await.acquired,
-        "the test could not take the lock"
+async fn launch_against_a_daemon_with_dispatch_on_shows_watching() {
+    let temp = project_tree().await;
+    let engine = Arc::new(
+        TestDaemon::start(
+            temp.path(),
+            orch_daemon::testing::DaemonHarness::builder()
+                .maintenance_timer(false)
+                .dispatch(orch_daemon::DispatchMode::On),
+        )
+        .await,
     );
-
     let backend = launch(Arc::clone(&engine)).await;
-
-    let context = backend.context();
-    assert!(context.observer_mode);
-    assert!(!context.initial_watch_active);
-    // Suppressed: observer mode is not a failure state, so the header shows
-    // the observer badge rather than an error.
-    assert_eq!(context.watch_error, None);
-    assert!(!backend.is_watch_active());
-    assert!(!engine.orchestrator.is_owner());
-
-    orch_engine::ProjectLock::release(&held).await;
+    assert!(backend.context().initial_watch_active);
+    drop(backend);
     drop(temp);
 }
 
@@ -199,9 +163,7 @@ async fn launch_reads_the_tui_preferences_out_of_the_global_config() {
         .await
         .expect("write global");
 
-    // `build_full` reads `global.yml`, so a fresh engine is what the dashboard
-    // would see on its next launch.
-    let engine = Arc::new(build_isolated(temp.path()).await.expect("rebuild"));
+    // `ui.bootstrap` reads `global.yml` when the dashboard opens.
     let backend = launch(Arc::clone(&engine)).await;
 
     let context = backend.context();
@@ -210,7 +172,6 @@ async fn launch_reads_the_tui_preferences_out_of_the_global_config() {
     assert!(!context.initial_notifications.toast);
     assert!(context.initial_notifications.bell);
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -296,7 +257,6 @@ async fn the_task_lifecycle_round_trips_through_the_real_stores() {
             .is_empty()
     );
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -333,7 +293,6 @@ async fn rejecting_a_reviewed_task_records_the_feedback() {
     assert_eq!(after.status, TaskStatus::Todo);
     assert_eq!(after.feedback.as_deref(), Some("add tests"));
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -350,7 +309,6 @@ async fn a_failing_call_reports_a_message_rather_than_an_exit_code() {
     .await;
     assert_eq!(err, "Task not found: tsk_nope");
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -449,7 +407,6 @@ async fn the_agent_lifecycle_round_trips_and_parses_its_stringly_typed_fields() 
     .await;
     assert!(engine.agent_service.list().await.expect("list").is_empty());
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -490,7 +447,6 @@ async fn an_unparseable_enum_is_reported_before_anything_is_written() {
     // Nothing was created by either attempt.
     assert!(engine.agent_service.list().await.expect("list").is_empty());
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -625,7 +581,6 @@ async fn teams_and_goals_round_trip() {
             .is_empty()
     );
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -692,7 +647,6 @@ async fn a_direct_message_lands_in_the_recipients_inbox_with_the_cli_defaults() 
             .is_empty()
     );
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -772,16 +726,17 @@ async fn a_broadcast_fans_out_to_every_enabled_agent() {
         1
     );
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
 /// The CLI and the on-disk format must not change: the same body sent through
 /// the dashboard and through `orch msg send` has to produce the same record.
 ///
-/// This drives `commands::msg::send` rather than the `orch` binary on purpose
-/// — it is the code path that builds the CLI's `CreateMessageInput`, so this
-/// compares the two inputs where they differ, with no process to spawn.
+/// The CLI side is the real `orch msg send` binary, a daemon client like the
+/// dashboard, pointed at this test's in-process daemon through the socket
+/// environment a fixture gives it (`ORCH_SOCKET`, refused outside
+/// `ORCH_TEST_SOCKET_ROOT`). It is a client process only: nothing it does can
+/// start a daemon.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tui_sent_message_is_byte_identical_on_disk_to_a_cli_sent_one() {
     let (temp, engine) = project().await;
@@ -796,28 +751,30 @@ async fn a_tui_sent_message_is_byte_identical_on_disk_to_a_cli_sent_one() {
     })
     .await;
 
-    orch_cli::commands::msg::send(
-        &engine,
-        &CliContext::new(
-            temp.path().to_path_buf(),
-            None,
-            true,
-            true,
-            false,
-            EnvFlags::default(),
-        ),
-        &Styles::plain(),
-        orch_cli::commands::msg::MsgSendArgs {
-            to_agent_id: &one.id,
-            body: "same body, same record",
-            subject: None,
-            from: None,
-            ttl_ms: None,
-            reply_to: None,
-        },
-    )
-    .await
-    .expect("cli send");
+    let socket = engine.harness().socket().expect("bound socket");
+    let home = tempfile::tempdir().expect("home");
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_orch"))
+        .args(["msg", "send", one.id.as_str(), "same body, same record"])
+        .current_dir(temp.path())
+        .env_remove("ORCH_AGENT_ID")
+        .env_remove("ORCH_AGENT_NAME")
+        .env_remove("ORCH_TASK_ID")
+        .env("HOME", home.path())
+        .env("ORCH_PROJECT_ROOT", temp.path())
+        .env("ORCH_SOCKET", socket)
+        .env(
+            "ORCH_TEST_SOCKET_ROOT",
+            socket.parent().expect("socket dir"),
+        )
+        .output()
+        .await
+        .expect("run orch msg send");
+    assert!(
+        output.status.success(),
+        "orch msg send failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stored = engine.message_service.list_all().await.expect("list");
     assert_eq!(stored.len(), 2, "one from each path");
@@ -840,7 +797,6 @@ async fn a_tui_sent_message_is_byte_identical_on_disk_to_a_cli_sent_one() {
     }
     assert_eq!(without_volatile(from_tui), without_volatile(from_cli));
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -885,7 +841,6 @@ async fn a_body_over_the_cap_is_cut_by_the_service_and_not_by_the_backend() {
     let utf16_len: usize = inbox[0].body.chars().map(char::len_utf16).sum();
     assert_eq!(utf16_len, 4_000);
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -938,45 +893,6 @@ async fn a_refused_message_reports_the_services_own_text_and_writes_nothing() {
     .await;
     assert!(ids.is_empty());
 
-    engine.orchestrator.stop().await.expect("stop");
-    drop(temp);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn in_observer_mode_a_message_still_reaches_the_other_processs_tree() {
-    // Messaging is the one mutation that needs no orchestrator: `send` writes
-    // files and takes no project lock, so an observer-mode dashboard can post
-    // to a mailbox the *other* process will drain.
-    let (temp, engine) = project().await;
-    let one = shell_agent(&engine, "one").await;
-    let held = orch_engine::FileLock::new(engine.paths.lock_path());
-    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
-
-    let backend = launch(Arc::clone(&engine)).await;
-    assert!(backend.context().observer_mode, "expected observer mode");
-
-    let to = one.id.clone();
-    let (_backend, ids) = on_draw_thread(backend, move |backend| {
-        backend
-            .send_message(MessageTarget::Agent(to), "from the observer")
-            .expect("observer mode must still send")
-    })
-    .await;
-
-    // Read back through a second engine on the same tree — the stand-in for
-    // the process that owns the orchestrator. The message is on disk, not just
-    // in this process's memory.
-    let external = build_isolated(temp.path()).await.expect("second engine");
-    let inbox = external
-        .message_service
-        .list_pending_for_agent(&one.id)
-        .await
-        .expect("inbox");
-    assert_eq!(inbox.len(), 1);
-    assert_eq!(inbox[0].id, ids[0]);
-    assert_eq!(inbox[0].body, "from the observer");
-
-    orch_engine::ProjectLock::release(&held).await;
     drop(temp);
 }
 
@@ -1037,17 +953,12 @@ async fn the_settings_writes_persist_where_the_next_launch_will_read_them() {
     );
     assert_eq!(backend.context().initial_max_concurrent, 6);
 
-    let reopened = Arc::new(build_isolated(temp.path()).await.expect("rebuild"));
-    assert_eq!(reopened.config.scheduling.max_concurrent_agents, 3);
-
-    // An unrecognized preset is *stored*, not refused: the field is a plain
-    // string and is not validated.
-    let (_backend, _) = on_draw_thread(backend, |backend| {
-        backend
-            .save_activity_filter("nonsense")
-            .expect("stored as given");
-    })
-    .await;
+    // An unrecognized preset is refused by the daemon now (it was stored as
+    // given when the dashboard wrote the file itself), and nothing changes.
+    let (_backend, refused) =
+        on_draw_thread(backend, |backend| backend.save_activity_filter("nonsense")).await;
+    let error = refused.expect_err("an unknown preset is refused");
+    assert!(error.contains("unknown preset"), "{error}");
     assert_eq!(
         engine
             .global_config_store
@@ -1056,23 +967,20 @@ async fn the_settings_writes_persist_where_the_next_launch_will_read_them() {
             .expect("read global")
             .tui
             .activity_filter,
-        "nonsense"
+        "tools"
     );
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
 // ── polled streams ───────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn poll_events_surfaces_what_the_engine_emitted() {
+async fn poll_events_surfaces_what_the_daemon_emitted() {
     let (temp, engine) = project().await;
     let backend = launch(Arc::clone(&engine)).await;
 
     let (backend, _) = on_draw_thread(backend, |backend| {
-        // Drain whatever the launch tick produced, so the assertion below is
-        // about this create alone.
         backend.poll_events();
         backend
             .create_task("Observed", CreateTaskOpts::default())
@@ -1080,31 +988,20 @@ async fn poll_events_surfaces_what_the_engine_emitted() {
     })
     .await;
 
-    let (backend, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
-    assert!(
-        events
-            .iter()
-            .any(|event| event.event_type() == OrchestratorEventType::TaskCreated),
-        "events were {:?}",
-        events
-            .iter()
-            .map(|event| event.event_type())
-            .collect::<Vec<_>>()
-    );
-
-    // An externally observed event — what the disk observer will push — comes
-    // out of the same queue.
-    backend.push_observed_event(orch_domain::OrchestratorEvent::OrchestratorTick {
-        running: 1,
-        queued: 2,
-    });
-    let (_backend, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
-    assert_eq!(
-        events.iter().map(|e| e.event_type()).collect::<Vec<_>>(),
-        vec![OrchestratorEventType::OrchestratorTick]
-    );
-
-    engine.orchestrator.stop().await.expect("stop");
+    // The feed is a second session (`logs.follow`), so the event arrives a
+    // moment after the reply that created it.
+    let (_backend, events) = poll_until(
+        backend,
+        "task:created",
+        |backend| backend.poll_events(),
+        |events| {
+            events
+                .iter()
+                .any(|event| event.event_type() == OrchestratorEventType::TaskCreated)
+        },
+    )
+    .await;
+    assert!(!events.is_empty());
     drop(temp);
 }
 
@@ -1219,7 +1116,6 @@ async fn poll_history_delivers_the_two_batches_newest_runs_first() {
     // value.
     assert_eq!(entry.data, "line 11");
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -1232,7 +1128,6 @@ async fn poll_history_is_empty_for_a_project_with_no_finished_runs() {
     let (_backend, batches) = on_draw_thread(backend, |backend| backend.poll_history()).await;
     assert!(batches.is_empty());
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -1244,251 +1139,263 @@ async fn poll_history_is_empty_for_a_project_with_no_finished_runs() {
 // and `App::tick` polls on the very first tick, so the
 // deferral only spares a facade consumer that never polls at all.
 
-// ── watch mode ───────────────────────────────────────────────────────────
+// ── watch mode = the daemon's dispatch switch (design D8) ────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stop_watch_waits_for_the_stop_and_releases_the_lock() {
+async fn watch_and_pause_move_the_daemons_dispatch_switch() {
     let (temp, engine) = project().await;
     let backend = launch(Arc::clone(&engine)).await;
-    assert!(engine.orchestrator.is_owner());
-
-    let (backend, _) = on_draw_thread(backend, |backend| {
-        backend.poll_events();
-        backend.stop_watch().expect("stop watch");
-    })
-    .await;
-
-    // Awaited, not spawned: by the time the call returns the orchestrator has
-    // stopped and the lock is gone. Spawning would mean a failed stop could only
-    // be reported as `orchestrator:error`, which nothing renders — so `/pause` would claim to
-    // have paused a loop that is still running.
-    assert!(
-        !engine.orchestrator.is_owner(),
-        "stop_watch returned before the lock was released"
-    );
-    assert!(!backend.is_watch_active());
-
-    drop(temp);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_stop_watch_reports_the_error_and_keeps_the_watch_flag() {
-    let (temp, engine) = project().await;
-    let backend = launch(Arc::clone(&engine)).await;
-    assert!(backend.is_watch_active());
-
-    // `stop()` persists the cleared state, so a state file that cannot be
-    // written is the one way it fails. A *directory* in its place is the
-    // cheapest unwritable file: the running orchestrator would simply
-    // recreate a deleted one.
-    let state_path = engine.paths.state_path();
-    let _ = tokio::fs::remove_file(&state_path).await;
-    tokio::fs::create_dir_all(&state_path)
+    let mut probe = orch_client::Client::connect(&engine.client_config())
         .await
-        .expect("block state.json");
+        .expect("a second client");
 
-    let (backend, result) = on_draw_thread(backend, |backend| backend.stop_watch()).await;
+    let (backend, started) = on_draw_thread(backend, |backend| backend.start_watch()).await;
+    started.expect("/watch");
+    assert!(probe.status().await.expect("status").dispatch.dispatch_on);
 
-    let err = result.expect_err("a failed stop must reach the caller");
-    assert!(!err.is_empty(), "the message is the whole contract");
-    // The flag describes the watch loop, so it must not claim a pause that
-    // did not happen.
-    assert!(
-        backend.is_watch_active(),
-        "watch_active was cleared despite the failure"
-    );
-
+    let (_backend, paused) = on_draw_thread(backend, |backend| backend.stop_watch()).await;
+    paused.expect("/pause");
+    assert!(!probe.status().await.expect("status").dispatch.dispatch_on);
     drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dispatch_that_cannot_take_the_lock_fails_the_call_with_the_holders_pid() {
+async fn a_refused_run_comes_back_to_the_caller() {
     let (temp, engine) = project().await;
-    // Another process owns the orchestrator, so this one launches as observer.
-    let held = orch_engine::FileLock::new(engine.paths.lock_path());
-    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
-
     let backend = launch(Arc::clone(&engine)).await;
-    assert!(backend.context().observer_mode);
 
-    // A lock conflict is knowable before any agent starts, so it must come
-    // back to the caller: the dashboard has no renderer for
-    // `orchestrator:error`, and an error delivered only on the event stream
-    // would be invisible (BACKEND.md §3).
-    let (backend, results) = on_draw_thread(backend, |backend| {
-        [
-            ("run_all", backend.run_all()),
-            ("run_task", backend.run_task("tsk_missing")),
-            ("start_watch", backend.start_watch()),
-        ]
-        .map(|(name, result)| (name, result.err()))
-    })
-    .await;
-
-    for (name, error) in &results {
-        let error = error
-            .as_deref()
-            .unwrap_or_else(|| panic!("{name} returned Ok while the lock was held"));
-        assert!(
-            error.starts_with("Orchestrator already running (PID:"),
-            "{name} reported {error:?}"
-        );
-    }
-    // A refused `start_watch` must not leave the dashboard claiming otherwise.
-    assert!(!backend.is_watch_active());
-
-    orch_engine::ProjectLock::release(&held).await;
+    // The dashboard has no renderer for `orchestrator:error`, so a refusal
+    // that is knowable before any agent starts must be this call's result
+    // (BACKEND.md §3).
+    let (backend, refused) =
+        on_draw_thread(backend, |backend| backend.run_task("tsk_missing")).await;
+    let error = refused.expect_err("a missing task cannot run");
+    assert!(error.contains("tsk_missing"), "{error}");
+    // An ordinary refusal does not end the session.
+    assert_eq!(backend.session_loss().failure(), None);
     drop(temp);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn in_observer_mode_a_cancel_reaches_the_store_while_the_lock_is_held() {
-    let (temp, engine) = project().await;
-    // Another process (`serve`, `run --watch`) owns the orchestrator.
-    let held = orch_engine::FileLock::new(engine.paths.lock_path());
-    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
-
-    let backend = launch(Arc::clone(&engine)).await;
-    assert!(backend.context().observer_mode);
-
-    let (backend, ids) = on_draw_thread(backend, |backend| {
-        ["Queued", "Running"].map(|title| {
-            backend
-                .create_task(title, CreateTaskOpts::default())
-                .expect("create")
-                .id
-        })
-    })
-    .await;
-    let [todo, running] = ids;
-    // Dispatched by the owner, which is the case that has a child to stop.
-    engine
-        .task_service
-        .update_status(&running, TaskStatus::InProgress)
+/// The shell agent the dispatch tests launch: a real child that waits.
+async fn sleeper(engine: &TestDaemon) -> (orch_domain::Agent, orch_domain::Task) {
+    let mut client = orch_client::Client::connect(&engine.client_config())
         .await
-        .expect("to in_progress");
-
-    // The owner's reconcile stops the run of a task it finds terminal, so the
-    // dashboard only has to cancel it in the store. Taking the lock itself
-    // would fail with "Orchestrator already running".
-    let ids = [todo.clone(), running.clone()];
-    let (_backend, results) = on_draw_thread(backend, move |backend| {
-        ids.map(|id| backend.cancel_task(&id))
-    })
-    .await;
-    for result in results {
-        result.expect("cancel while another process holds the lock");
-    }
-    for id in [&todo, &running] {
-        assert_eq!(
-            engine.task_service.get(id).await.expect("read").status,
-            TaskStatus::Cancelled,
-            "{id}"
-        );
-    }
-    // Still the other process's lock: the fallback must not have taken it.
-    assert!(!engine.orchestrator.is_owner());
-
-    orch_engine::ProjectLock::release(&held).await;
-    drop(temp);
+        .expect("seeding client");
+    let root = engine.root().to_str().expect("utf-8 root").to_owned();
+    let agent = client
+        .agent_create(
+            serde_json::from_value(serde_json::json!({
+                "name": "sleeper", "adapter": "shell", "command": "exec /bin/sleep 60",
+                "workspace_mode": "shared",
+                "env": [{"name": "HOME", "value": root},
+                        {"name": "PATH", "value": "/usr/bin:/bin"}]
+            }))
+            .expect("agent args"),
+        )
+        .await
+        .expect("create the sleeper")
+        .agent;
+    let task = client
+        .task_create(
+            serde_json::from_value(serde_json::json!({"title": "sleep", "assignee": agent.id}))
+                .expect("task args"),
+        )
+        .await
+        .expect("create the task");
+    (agent, task)
 }
 
+/// R10 through the dashboard: `run` launches a real child in the daemon and
+/// returns without waiting for it; `cancel` stops that live process before it
+/// answers, whichever client asked.
 #[tokio::test(flavor = "multi_thread")]
-async fn in_observer_mode_a_refresh_sees_another_process_writing_state() {
+async fn a_cancel_from_the_dashboard_kills_the_live_agent_process() {
     let (temp, engine) = project().await;
-    // Another process owns the orchestrator and the lock.
-    let held = orch_engine::FileLock::new(engine.paths.lock_path());
-    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
-
+    let (_agent, task) = sleeper(&engine).await;
     let backend = launch(Arc::clone(&engine)).await;
-    assert!(backend.context().observer_mode);
 
-    // A second engine on the same tree stands in for that other process.
-    let external = build_isolated(temp.path()).await.expect("second engine");
-    let mut state = external.state.read().await.expect("read state");
-    state.pid = Some(4242);
-    external.state.write(&state).await.expect("write state");
-
-    let (_backend, observed) =
-        on_draw_thread(backend, |backend| backend.refresh_state().expect("refresh")).await;
-
-    // `refresh_state` must re-read `state.json` on every call and never cache:
-    // in observer mode the periodic poll is the only thing moving, so a cached
-    // read would freeze the dashboard at launch for as long as it is open.
-    assert_eq!(observed.pid, Some(4242));
-
-    orch_engine::ProjectLock::release(&held).await;
-    drop(temp);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn in_observer_mode_the_disk_observer_feeds_the_event_queue() {
-    // The wiring `tui::command::run` does when watch mode is refused. Without
-    // it an observer-mode dashboard re-reads the stores on every refresh but
-    // never sees a live event.
-    let (temp, engine) = project().await;
-    let held = orch_engine::FileLock::new(engine.paths.lock_path());
-    assert!(orch_engine::ProjectLock::acquire(&held).await.acquired);
-
-    let backend = launch(Arc::clone(&engine)).await;
-    assert!(backend.context().observer_mode, "expected observer mode");
-    let observer = orch_cli::tui::command::attach_observer(&engine, backend.observer_sink());
-
-    // Another process starts a run: a `running` entry appears in state.json,
-    // which is all the observer needs to announce it.
-    let external = build_isolated(temp.path()).await.expect("second engine");
-    let mut state = external.state.read().await.expect("read state");
-    state.running.insert(
-        "tsk_watched".to_owned(),
-        orch_domain::RunningEntry {
-            remote: None,
-            run_id: "run_watched".to_owned(),
-            agent_id: "agt_watched".to_owned(),
-            task_id: "tsk_watched".to_owned(),
-            pid: 4242,
-            started_at: "2026-10-13T16:00:00.000Z".to_owned(),
-            last_event_at: "2026-10-13T16:00:00.000Z".to_owned(),
-        },
-    );
-    external.state.write(&state).await.expect("write state");
-
-    // The observer polls on its own interval, so this waits rather than
-    // assuming the first poll has already happened.
-    let mut backend = backend;
-    let mut started = None;
-    for _ in 0..80 {
-        let (returned, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
-        backend = returned;
-        started = events.into_iter().find(|event| {
-            matches!(
-                event,
-                orch_domain::OrchestratorEvent::AgentStarted { run_id, .. }
-                    if run_id == "run_watched"
-            )
-        });
-        if started.is_some() {
+    let id = task.id.clone();
+    let (backend, ran) = on_draw_thread(backend, move |backend| backend.run_task(&id)).await;
+    ran.expect("run the task");
+    let mut pid = None;
+    for _ in 0..500 {
+        if let Some(entry) = engine
+            .state
+            .read()
+            .await
+            .expect("state")
+            .running
+            .get(&task.id)
+        {
+            pid = Some(entry.pid);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid = pid.expect("the daemon launched the task");
+    assert!(engine.processes.is_alive(pid), "the agent is running");
+
+    let id = task.id.clone();
+    let (_backend, cancelled) =
+        on_draw_thread(backend, move |backend| backend.cancel_task(&id)).await;
+    cancelled.expect("cancel");
+    assert!(
+        !engine.processes.is_alive(pid),
+        "cancel answered while the agent process was still alive"
+    );
+    assert_eq!(
+        engine
+            .task_service
+            .get(&task.id)
+            .await
+            .expect("read")
+            .status,
+        TaskStatus::Cancelled
+    );
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_reads_the_daemons_current_state_every_time() {
+    let (temp, engine) = project().await;
+    let backend = launch(Arc::clone(&engine)).await;
+    let (backend, before) = on_draw_thread(backend, |backend| backend.refresh_state()).await;
+    assert_ne!(before.expect("state").onboarding_completed, Some(true));
+
+    // Another client changes it.
+    let mut other = orch_client::Client::connect(&engine.client_config())
+        .await
+        .expect("another client");
+    other
+        .state_complete_onboarding(orch_proto::ops::args::StateCompleteOnboardingArgs {})
+        .await
+        .expect("complete onboarding");
+
+    let (_backend, after) = on_draw_thread(backend, |backend| backend.refresh_state()).await;
+    assert_eq!(after.expect("state").onboarding_completed, Some(true));
+    drop(temp);
+}
+
+// ── no daemon (goal row 3; spec R4–R6) ───────────────────────────────────
+
+/// The daemon going away under an open dashboard ends the session: the next
+/// call fails, the loss latch holds the frozen message, and the draw loop's
+/// stop flag is up so `tui::command` can show the no-daemon screen. Nothing
+/// is retried and nothing is started.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_going_away_ends_the_session_with_the_frozen_message() {
+    let temp = project_tree().await;
+    let daemon = TestDaemon::start_default(temp.path()).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let backend = DaemonBackend::launch(
+        daemon.connector(),
+        "9.9.9",
+        daemon.root().to_path_buf(),
+        Arc::clone(&stop),
+    )
+    .await
+    .expect("launch");
+    let root = daemon.root().display().to_string();
+    let loss = backend.session_loss();
+    daemon.shutdown().await;
+
+    let (backend, refreshed) = on_draw_thread(backend, |backend| backend.refresh_tasks()).await;
+    let refreshed = refreshed.expect_err("a call after the daemon stopped succeeded");
+    eprintln!("after stop: {refreshed}");
+    // The feed notices too, even with no call in flight.
+    for _ in 0..300 {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        started.is_some(),
-        "the observer never reported the external run"
+        stop.load(std::sync::atomic::Ordering::SeqCst),
+        "the draw loop was not stopped"
     );
-
-    // Dropping the handle is the `unsubscribe`: nothing more arrives.
-    drop(observer);
-    let mut state = external.state.read().await.expect("read state");
-    state.running.clear();
-    external.state.write(&state).await.expect("write state");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let (_backend, events) = on_draw_thread(backend, |backend| backend.poll_events()).await;
+    let message = loss.failure().expect("the loss is recorded");
     assert!(
-        events.is_empty(),
-        "the observer kept polling after its handle was dropped: {events:?}"
+        message.starts_with(&format!("  ✕ No orch daemon is running for {root} (")),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("Start it with: orch daemon start"),
+        "{message}"
     );
 
-    orch_engine::ProjectLock::release(&held).await;
+    // Every later call fails fast without touching a socket.
+    let (_backend, later) = on_draw_thread(backend, |backend| backend.refresh_goals()).await;
+    assert_eq!(later.unwrap_err(), "the orch daemon is no longer reachable");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn launching_with_no_daemon_is_the_frozen_message_and_exit_seven() {
+    let temp = project_tree().await;
+    let scratch = tui_support::short_scratch();
+    let root = temp.path().canonicalize().expect("root");
+    let connector = tui_support::absent_daemon_connector(&root, scratch.path());
+
+    let error = DaemonBackend::launch(
+        connector,
+        "9.9.9",
+        root.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await
+    .expect_err("no daemon answers");
+    assert_eq!(error.exit_code(), 7);
+    assert_eq!(
+        error.render(false),
+        format!(
+            "  ✕ No orch daemon is running for {} (no socket)\n    Start it with: orch daemon start",
+            root.display()
+        )
+    );
+    // A stale socket file (nothing accepts on it) is the same message with
+    // its own detail.
+    let stale = std::os::unix::net::UnixListener::bind(scratch.path().join("s")).expect("bind");
+    drop(stale);
+    let error = DaemonBackend::launch(
+        tui_support::absent_daemon_connector(&root, scratch.path()),
+        "9.9.9",
+        root.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await
+    .expect_err("a stale socket answers nothing");
+    assert_eq!(error.exit_code(), 7);
+    let text = error.render(false);
+    assert!(text.contains("No orch daemon is running for"), "{text}");
+    assert!(text.ends_with("Start it with: orch daemon start"), "{text}");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_of_another_protocol_names_both_versions_and_the_restart() {
+    let temp = project_tree().await;
+    let daemon = TestDaemon::start(
+        temp.path(),
+        orch_daemon::testing::DaemonHarness::builder()
+            .maintenance_timer(false)
+            .versions(orch_proto::LOCAL_PROTOCOL + 1, "0.99.0"),
+    )
+    .await;
+    let error = DaemonBackend::launch(
+        daemon.connector(),
+        "9.9.9",
+        daemon.root().to_path_buf(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await
+    .expect_err("skew is refused");
+    assert_eq!(error.exit_code(), 7);
+    let text = error.render(false);
+    assert!(text.contains("daemon is orch 0.99.0 protocol"), "{text}");
+    assert!(
+        text.ends_with("Start it with: orch daemon stop, then orch daemon start"),
+        "{text}"
+    );
     drop(temp);
 }
 
@@ -1545,7 +1452,18 @@ fn running_entry(task_id: &str, started_at: &str) -> orch_domain::RunningEntry {
 /// which cannot see an old first attempt.
 #[tokio::test(flavor = "multi_thread")]
 async fn task_start_times() {
-    let (temp, engine) = project().await;
+    let temp = project_tree().await;
+    // `run.timings` samples the daemon's clock, so the test holds it.
+    let clock = Arc::new(orch_core::test_support::FixedClock::at(TIMING_BASE + 9_000));
+    let engine = Arc::new(
+        TestDaemon::start(
+            temp.path(),
+            orch_daemon::testing::DaemonHarness::builder()
+                .maintenance_timer(false)
+                .clock(Arc::clone(&clock) as Arc<dyn orch_core::clock::Clock>),
+        )
+        .await,
+    );
 
     // A retried task: two runs, and a third attempt live in state.json.
     for offset in [1_000, 3_000] {
@@ -1605,15 +1523,21 @@ async fn task_start_times() {
         .running
         .insert("tsk_live".into(), running_entry("tsk_live", &at(4_000)));
 
+    // The daemon derives timings from its own tasks and state in one
+    // coordinated read, so they go into the stores.
+    for task in &tasks {
+        engine.tasks.save(task).await.expect("save task");
+    }
+    engine.state.write(&state).await.expect("write state");
+
     let backend = launch(Arc::clone(&engine)).await;
-    let (_backend, (near, far)) = on_draw_thread(backend, move |backend| {
-        let near = backend
-            .refresh_timings(&tasks, &[], Some(&state), TIMING_BASE + 9_000)
-            .expect("timings");
-        let far = backend
-            .refresh_timings(&tasks, &[], Some(&state), TIMING_BASE + 9_000_000)
-            .expect("timings");
-        (near, far)
+    let (backend, near) = on_draw_thread(backend, |backend| {
+        backend.refresh_timings(&[], &[], None, 0).expect("timings")
+    })
+    .await;
+    clock.set_ms(TIMING_BASE + 9_000_000);
+    let (_backend, far) = on_draw_thread(backend, |backend| {
+        backend.refresh_timings(&[], &[], None, 0).expect("timings")
     })
     .await;
     assert_eq!(near.sampled_at_ms, TIMING_BASE + 9_000);
@@ -1644,7 +1568,6 @@ async fn task_start_times() {
     assert_eq!(timing(&near, "tsk_future"), (Some(9_500), Some(0)));
     assert_eq!(timing(&far, "tsk_future"), (Some(9_500), Some(8_990_500)));
 
-    engine.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
@@ -1661,15 +1584,13 @@ async fn terminal_elapsed_follows_last_update_edits() {
     let temp = project_tree().await;
     let clock = Arc::new(orch_core::test_support::FixedClock::at(START));
     let engine = Arc::new(
-        build_isolated_with(
+        TestDaemon::start(
             temp.path(),
-            EngineSeams {
-                clock: Arc::clone(&clock) as Arc<dyn orch_core::clock::Clock>,
-                ..EngineSeams::default()
-            },
+            orch_daemon::testing::DaemonHarness::builder()
+                .maintenance_timer(false)
+                .clock(Arc::clone(&clock) as Arc<dyn orch_core::clock::Clock>),
         )
-        .await
-        .expect("build_full"),
+        .await,
     );
 
     // Created at START, so the goal starts there; the task's start is its run
@@ -1758,33 +1679,20 @@ async fn terminal_elapsed_follows_last_update_edits() {
         "the edit moved the last update, so the span follows it"
     );
     drop(backend);
-    engine.orchestrator.stop().await.expect("stop");
 
-    // A fresh dashboard over the same files reads the same spans: the value
-    // comes from `updated_at` on disk, not from anything the session held.
-    let reopened = Arc::new(
-        build_isolated_with(
-            temp.path(),
-            EngineSeams {
-                clock: Arc::clone(&clock) as Arc<dyn orch_core::clock::Clock>,
-                ..EngineSeams::default()
-            },
-        )
-        .await
-        .expect("rebuild"),
-    );
-    let backend = launch(Arc::clone(&reopened)).await;
+    // A fresh dashboard over the same daemon reads the same spans: the value
+    // comes from `updated_at` in the store, not from anything the session held.
+    let backend = launch(Arc::clone(&engine)).await;
     let (_backend, reread) =
         on_draw_thread(backend, move |backend| timing_spans(backend, EDITED)).await;
     assert_eq!(reread, edited, "a fresh backend over the same store");
 
-    reopened.orchestrator.stop().await.expect("stop");
     drop(temp);
 }
 
 /// The one task's and the one goal's `Elapsed*` span at `now_ms`, read the way
 /// a refresh does: entities first, then the timings for them.
-fn timing_spans(backend: &mut EngineBackend, now_ms: i64) -> (Option<i64>, Option<i64>) {
+fn timing_spans(backend: &mut DaemonBackend, now_ms: i64) -> (Option<i64>, Option<i64>) {
     let tasks = backend.refresh_tasks().expect("tasks");
     let goals = backend.refresh_goals().expect("goals");
     let state = backend.refresh_state().expect("state");
@@ -1823,6 +1731,167 @@ async fn refresh_timings_reports_an_unreadable_run_store() {
     let error = error.expect("an unreadable run store is an error");
     assert!(error.contains("broken.json"), "{error}");
 
-    engine.orchestrator.stop().await.expect("stop");
+    drop(temp);
+}
+
+// ---------------------------------------------------------------------------
+// `orch web`'s daemon preflight (plan Q0b): the page and the websocket answer
+// 503 with the frozen text while no daemon answers. Served over a real TCP
+// listener exactly as `orch web` serves it; the pty command is never reached.
+// ---------------------------------------------------------------------------
+
+const WEB_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+async fn serve_web(
+    auth: orch_cli::web::Auth,
+    connector: orch_cli::tui::Connector,
+) -> std::net::SocketAddr {
+    use orch_cli::web::{HostPolicy, SpawnSpec, WebState, router};
+    let state = Arc::new(WebState::new(
+        &auth,
+        HostPolicy::new(true, Vec::new()),
+        SpawnSpec {
+            program: "/nonexistent/never-run".into(),
+            args: Vec::new(),
+            cwd: std::env::temp_dir(),
+        },
+        connector,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let service = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, service).await;
+    });
+    addr
+}
+
+/// One HTTP/1.1 GET; the whole raw response.
+async fn web_get(addr: std::net::SocketAddr, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.expect("read");
+    raw
+}
+
+fn status_line(raw: &str) -> &str {
+    raw.lines().next().unwrap_or_default()
+}
+
+fn body(raw: &str) -> &str {
+    raw.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_without_a_daemon_answers_503_with_the_frozen_message() {
+    let temp = project_tree().await;
+    let scratch = tui_support::short_scratch();
+    let root = temp.path().canonicalize().expect("root");
+    let addr = serve_web(
+        orch_cli::web::Auth::Token(WEB_TOKEN.into()),
+        tui_support::absent_daemon_web_connector(&root, scratch.path()),
+    )
+    .await;
+
+    let raw = web_get(addr, &format!("/?token={WEB_TOKEN}")).await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+    assert!(
+        raw.to_ascii_lowercase()
+            .contains("content-type: text/plain; charset=utf-8"),
+        "{raw}"
+    );
+    assert_eq!(
+        body(&raw),
+        format!(
+            "  ✕ No orch daemon is running for {} (no socket)\n    Start it with: orch daemon start\n",
+            root.display()
+        )
+    );
+    // The websocket route is behind the same preflight.
+    let raw = web_get(addr, &format!("/ws?token={WEB_TOKEN}")).await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+
+    // Without the credential the answer is the credential failure: the
+    // project path is never shown to a request that did not authenticate.
+    let raw = web_get(addr, "/?token=wrong").await;
+    assert_eq!(status_line(&raw), "HTTP/1.1 401 Unauthorized", "{raw}");
+    assert!(!raw.contains(&root.display().to_string()), "{raw}");
+    // The static assets carry no state and stay reachable.
+    let raw = web_get(addr, "/xterm.css").await;
+    assert_eq!(status_line(&raw), "HTTP/1.1 200 OK");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_web_server_answers_503_without_naming_the_project() {
+    let temp = project_tree().await;
+    let scratch = tui_support::short_scratch();
+    let root = temp.path().canonicalize().expect("root");
+    let addr = serve_web(
+        orch_cli::web::Auth::Open,
+        tui_support::absent_daemon_web_connector(&root, scratch.path()),
+    )
+    .await;
+    let raw = web_get(addr, "/").await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+    assert_eq!(body(&raw), "orch daemon unavailable\n");
+    assert!(!raw.contains(&root.display().to_string()), "{raw}");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_serves_the_page_while_the_daemon_answers_and_503_once_it_stops() {
+    let (temp, daemon) = project().await;
+    let addr = serve_web(
+        orch_cli::web::Auth::Token(WEB_TOKEN.into()),
+        daemon.web_connector(),
+    )
+    .await;
+    let raw = web_get(addr, &format!("/?token={WEB_TOKEN}")).await;
+    assert_eq!(status_line(&raw), "HTTP/1.1 200 OK", "{raw}");
+
+    let socket_dir = daemon
+        .harness()
+        .socket()
+        .and_then(std::path::Path::parent)
+        .expect("socket dir")
+        .to_path_buf();
+    let daemon = Arc::try_unwrap(daemon).unwrap_or_else(|_| panic!("one owner"));
+    daemon.shutdown().await;
+    // The harness removes its private socket directory on stop; a real
+    // project's socket directory outlives its daemon, so put it back (empty)
+    // to leave exactly "the daemon went away".
+    std::fs::create_dir_all(&socket_dir).expect("recreate the socket dir");
+    let raw = web_get(addr, &format!("/?token={WEB_TOKEN}")).await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+    let text = body(&raw);
+    assert!(text.contains("No orch daemon is running for"), "{text}");
+    assert!(
+        text.trim_end()
+            .ends_with("Start it with: orch daemon start"),
+        "{text}"
+    );
+    std::fs::remove_dir(&socket_dir).expect("remove the recreated socket dir");
     drop(temp);
 }

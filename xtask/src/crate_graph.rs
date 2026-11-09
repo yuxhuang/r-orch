@@ -182,6 +182,110 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Paths and tokens that would give `orch-client` a process capability.
+///
+/// No client code path may spawn, fork or exec anything — in particular a
+/// daemon (spec R4, plan Q6: the owner starts the daemon, never a client).
+/// The crate edge table keeps `orch-client` to `orch-domain` + `orch-proto`;
+/// this keeps the crate's own source and dependency features free of the
+/// standard, Tokio, nix and libc process APIs. Comments count, as they do
+/// for `orch_infra` above: the crate has no reason to name them at all.
+/// Tasks (`tokio::spawn`, `spawn_blocking`) are not processes and are fine.
+const CLIENT_PROCESS_PATHS: &[&str] = &["std::process", "tokio::process"];
+const CLIENT_PROCESS_TOKENS: &[&str] = &[
+    "Command",
+    "fork",
+    "vfork",
+    "exec",
+    "execl",
+    "execle",
+    "execlp",
+    "execv",
+    "execve",
+    "execvp",
+    "execvpe",
+    "fexecve",
+    "posix_spawn",
+    "posix_spawnp",
+];
+const CLIENT_PROCESS_FEATURES: &[(&str, &[&str])] =
+    &[("tokio", &["process", "full"]), ("nix", &["process"])];
+
+/// The process paths and tokens `text` names, in order of appearance.
+fn process_capabilities(text: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = CLIENT_PROCESS_PATHS
+        .iter()
+        .copied()
+        .filter(|path| text.contains(path))
+        .collect();
+    for token in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if let Some(forbidden) = CLIENT_PROCESS_TOKENS.iter().find(|t| **t == token)
+            && !found.contains(forbidden)
+        {
+            found.push(forbidden);
+        }
+    }
+    found
+}
+
+/// The spawn-token gate: `orch-client` sources and declared features.
+fn client_process_capabilities(repo_root: &Path, metadata: &Value) -> Result<Vec<String>> {
+    let src = repo_root.join("crates/orch-client/src");
+    let mut files = Vec::new();
+    collect_rust_files(&src, &mut files)?;
+    let mut problems = Vec::new();
+    for path in files {
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        for capability in process_capabilities(&text) {
+            let relative = path.strip_prefix(repo_root).unwrap_or(&path);
+            problems.push(format!(
+                "`{}` names `{capability}`. orch-client must not spawn, fork or exec \
+                 anything (spec R4: no client ever starts a daemon); move process work \
+                 to the daemon or the CLI entry point",
+                relative.display()
+            ));
+        }
+    }
+    let client = metadata["packages"]
+        .as_array()
+        .and_then(|packages| packages.iter().find(|p| p["name"] == "orch-client"))
+        .context("cargo metadata has no orch-client package")?;
+    for dep in client["dependencies"].as_array().into_iter().flatten() {
+        let kind = dep["kind"].as_str();
+        let Some(name) = dep["name"].as_str() else {
+            continue;
+        };
+        let Some((_, forbidden)) = CLIENT_PROCESS_FEATURES.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
+        for feature in dep["features"].as_array().into_iter().flatten() {
+            if let Some(feature) = feature.as_str().filter(|f| forbidden.contains(f))
+                && kind.is_none()
+            {
+                problems.push(format!(
+                    "orch-client enables `{name}/{feature}`, a process capability \
+                     (spec R4); the client crate must not declare it"
+                ));
+            }
+        }
+    }
+    Ok(problems)
+}
+
+fn collect_rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_rust_files(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(())
+}
+
 /// Check which `orch-engine` sources name `orch_infra` against the allowlist.
 fn engine_infra_sites(repo_root: &Path) -> Result<Vec<String>> {
     let src = repo_root.join("crates/orch-engine/src");
@@ -239,7 +343,8 @@ fn collect_infra_users(root: &Path, dir: &Path, out: &mut BTreeSet<String>) -> R
 }
 
 pub fn run(repo_root: &Path) -> Result<()> {
-    let actual = workspace_edges(repo_root)?;
+    let metadata = cargo_metadata(repo_root)?;
+    let actual = workspace_edges(&metadata)?;
     let allowed: BTreeMap<&str, BTreeSet<&str>> = ALLOWED
         .iter()
         .map(|(crate_name, deps)| (*crate_name, deps.iter().copied().collect()))
@@ -281,6 +386,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
     }
 
     problems.extend(engine_infra_sites(repo_root)?);
+    problems.extend(client_process_capabilities(repo_root, &metadata)?);
 
     // Stated separately because it is the one rule the contract puts in bold,
     // and it should fail by name rather than as one row of a table.
@@ -316,13 +422,11 @@ pub fn run(repo_root: &Path) -> Result<()> {
         }
         bail!("{} layering problem(s)", problems.len());
     }
-    println!("layering matches ARCHITECTURE §3.1");
+    println!("layering matches ARCHITECTURE §3.1; orch-client has no process capability");
     Ok(())
 }
 
-/// Each workspace crate's direct dependencies on other workspace crates,
-/// including dev- and build-dependencies.
-fn workspace_edges(repo_root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>> {
+fn cargo_metadata(repo_root: &Path) -> Result<Value> {
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(repo_root)
@@ -335,8 +439,12 @@ fn workspace_edges(repo_root: &Path) -> Result<BTreeMap<String, BTreeSet<String>
         );
     }
 
-    let metadata: Value =
-        serde_json::from_slice(&output.stdout).context("parse cargo metadata output")?;
+    serde_json::from_slice(&output.stdout).context("parse cargo metadata output")
+}
+
+/// Each workspace crate's direct dependencies on other workspace crates,
+/// including dev- and build-dependencies.
+fn workspace_edges(metadata: &Value) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let packages = metadata["packages"]
         .as_array()
         .context("cargo metadata has no `packages` array")?;
@@ -413,6 +521,34 @@ mod tests {
             .1;
         assert!(!engine.contains(&"orch-cli"));
         assert!(!engine.contains(&"orch-tui"));
+    }
+
+    #[test]
+    fn the_spawn_gate_names_every_process_capability() {
+        for (text, expected) in [
+            (
+                "let c = std::process::Command::new(\"orch\");",
+                vec!["std::process", "Command"],
+            ),
+            (
+                "use tokio::process::Command as C;",
+                vec!["tokio::process", "Command"],
+            ),
+            ("unsafe { nix::unistd::fork() }", vec!["fork"]),
+            ("nix::unistd::execv(&path, &argv)", vec!["execv"]),
+            ("libc::posix_spawn(..)", vec!["posix_spawn"]),
+            ("// exec the daemon", vec!["exec"]),
+        ] {
+            assert_eq!(process_capabilities(text), expected, "{text}");
+        }
+        // Tasks and words that merely contain a token are not processes.
+        for text in [
+            "tokio::spawn(async {})",
+            "tokio::task::spawn_blocking(f)",
+            "executes, forks, Commands, process exit",
+        ] {
+            assert!(process_capabilities(text).is_empty(), "{text}");
+        }
     }
 
     #[test]

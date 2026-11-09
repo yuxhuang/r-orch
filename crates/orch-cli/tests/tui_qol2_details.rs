@@ -18,6 +18,10 @@
 
 #![cfg(unix)]
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::OwnedDir;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -151,16 +155,17 @@ impl Drop for Tmux {
 }
 
 fn orch(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new(orch_binary())
+    let mut command = Command::new(orch_binary());
+    command
         .args(args)
         .current_dir(dir)
         .env_clear()
         .env("HOME", dir.join("home"))
         .env("PATH", "/usr/bin:/bin")
         .env("ORCHESTRY_GLOBAL_CONFIG_PATH", global_config(dir))
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("orch runs");
+        .env("NO_COLOR", "1");
+    daemon::apply_for(dir, &mut command);
+    let output = command.output().expect("orch runs");
     assert!(
         output.status.success(),
         "orch {args:?} failed: {}",
@@ -182,15 +187,17 @@ fn json_id(stdout: &str) -> String {
 /// the task (the dashboard
 /// loads succeeded and failed runs into the feed) whose events are three and
 /// a half hours old, so the time column reads a stable `3h`.
-fn project() -> tempfile::TempDir {
+fn project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let mut owned = OwnedDir::adopt(dir);
     let agent = json_id(&orch(
-        dir.path(),
+        owned.path(),
         &[
             "--json",
             "agent",
@@ -202,45 +209,49 @@ fn project() -> tempfile::TempDir {
             "true",
         ],
     ));
-    let goal = json_id(&orch(dir.path(), &["--json", "goal", "add", "Launch"]));
+    let goal = json_id(&orch(owned.path(), &["--json", "goal", "add", "Launch"]));
     let task = json_id(&orch(
-        dir.path(),
+        owned.path(),
         &["--json", "task", "add", "Ship it", "--goal-id", &goal],
     ));
-    orch(dir.path(), &["task", "cancel", &task]);
+    orch(owned.path(), &["task", "cancel", &task]);
 
     let at = |seconds: i64| {
         (jiff::Timestamp::now() - jiff::SignedDuration::from_mins(210)
             + jiff::SignedDuration::from_secs(seconds))
         .to_string()
     };
-    let runs = dir.path().join(".orchestry").join("runs");
-    std::fs::create_dir_all(&runs).expect("runs dir");
-    let run = serde_json::json!({
-        "id": "run_e2e1",
-        "task_id": task,
-        "agent_id": agent,
-        "attempt": 1,
-        "status": "failed",
-        "started_at": at(0),
-        "finished_at": at(60),
-        "workspace_path": dir.path().display().to_string(),
-        "prompt": "p",
+    // The run record is hand-written (exact timestamps), so it goes in while
+    // no daemon owns the state; the fresh daemon reads it at start.
+    owned.with_daemon_stopped(|project| {
+        let runs = project.join(".orchestry").join("runs");
+        std::fs::create_dir_all(&runs).expect("runs dir");
+        let run = serde_json::json!({
+            "id": "run_e2e1",
+            "task_id": task,
+            "agent_id": agent,
+            "attempt": 1,
+            "status": "failed",
+            "started_at": at(0),
+            "finished_at": at(60),
+            "workspace_path": project.display().to_string(),
+            "prompt": "p",
+        });
+        std::fs::write(runs.join("run_e2e1.json"), run.to_string()).expect("run");
+        let events: Vec<String> = [
+            ("agent_output", "planning the change", 1),
+            ("file_changed", "src/lib.rs", 2),
+            ("error", "lint failed once", 3),
+            ("done", "", 60),
+        ]
+        .into_iter()
+        .map(|(kind, data, seconds)| {
+            serde_json::json!({"timestamp": at(seconds), "type": kind, "data": data}).to_string()
+        })
+        .collect();
+        std::fs::write(runs.join("run_e2e1.jsonl"), events.join("\n") + "\n").expect("events");
     });
-    std::fs::write(runs.join("run_e2e1.json"), run.to_string()).expect("run");
-    let events: Vec<String> = [
-        ("agent_output", "planning the change", 1),
-        ("file_changed", "src/lib.rs", 2),
-        ("error", "lint failed once", 3),
-        ("done", "", 60),
-    ]
-    .into_iter()
-    .map(|(kind, data, seconds)| {
-        serde_json::json!({"timestamp": at(seconds), "type": kind, "data": data}).to_string()
-    })
-    .collect();
-    std::fs::write(runs.join("run_e2e1.jsonl"), events.join("\n") + "\n").expect("events");
-    dir
+    owned
 }
 
 fn launch(dir: &Path, socket: String) -> Tmux {
@@ -262,7 +273,7 @@ fn launch_tui(dir: &Path, socket: String, subcommand: &str) -> Tmux {
     );
     let cwd = dir.display().to_string();
     let command = format!("'{}' {subcommand}", orch_binary().display());
-    tmux.run(&[
+    let mut args: Vec<String> = [
         "start-server",
         ";",
         "set-option",
@@ -286,8 +297,15 @@ fn launch_tui(dir: &Path, socket: String, subcommand: &str) -> Tmux {
         &global,
         "-e",
         "PATH=/usr/bin:/bin",
-        &command,
-    ]);
+    ]
+    .map(String::from)
+    .into();
+    // Point the dashboard at this project's test daemon.
+    for pair in daemon::env_pairs_for(dir) {
+        args.extend(["-e".to_owned(), pair]);
+    }
+    args.push(command);
+    tmux.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
     let path = tmux.run(&["display-message", "-p", "-t", "dash", "#{socket_path}"]);
     tmux.socket_path = Some(PathBuf::from(
         String::from_utf8_lossy(&path.stdout).trim().to_string(),
@@ -586,20 +604,22 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
 
 /// Three shell agents and nothing to dispatch: no task exists, and the wizard
 /// below is never submitted.
-fn picker_project() -> tempfile::TempDir {
+fn picker_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let owned = OwnedDir::adopt(dir);
     for (name, role) in [
         ("zeta-builder", "Builds the release"),
         ("alpha-ops", "Keeps the lights on"),
         ("mid-reviewer", "Code reviewer"),
     ] {
         orch(
-            dir.path(),
+            owned.path(),
             &[
                 "agent",
                 "add",
@@ -613,7 +633,7 @@ fn picker_project() -> tempfile::TempDir {
             ],
         );
     }
-    dir
+    owned
 }
 
 /// The Assignee step's numbered rows, in screen order: every line that
@@ -738,9 +758,11 @@ fn agent_overview_wraps_a_long_skills_list_onto_value_column_rows() {
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let owned = OwnedDir::adopt(dir);
     let skills: Vec<String> = (0..14).map(|n| format!("skill-number-{n}")).collect();
     orch(
-        dir.path(),
+        owned.path(),
         &[
             "agent",
             "add",
@@ -754,7 +776,7 @@ fn agent_overview_wraps_a_long_skills_list_onto_value_column_rows() {
         ],
     );
     let tmux = launch(
-        dir.path(),
+        owned.path(),
         format!("orch-x3-{}-{}", std::process::id(), line!()),
     );
     tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
@@ -921,24 +943,26 @@ fn wizard_final_submit_refuses_an_agent_disabled_by_another_process() {
 
 /// Goal `Launch` with three tasks of distinct priority, title and
 /// description (`Alpha build` cancelled), goal `Other` with one task and an
-/// ungrouped task. No agent exists and the dashboard runs `--observe`, so
+/// ungrouped task. No agent exists and the test daemon's dispatch is off, so
 /// nothing can be dispatched.
-fn goal_tasks_project() -> tempfile::TempDir {
+fn goal_tasks_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
-    let launch = json_id(&orch(dir.path(), &["--json", "goal", "add", "Launch"]));
-    let other = json_id(&orch(dir.path(), &["--json", "goal", "add", "Other"]));
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let owned = OwnedDir::adopt(dir);
+    let launch = json_id(&orch(owned.path(), &["--json", "goal", "add", "Launch"]));
+    let other = json_id(&orch(owned.path(), &["--json", "goal", "add", "Other"]));
     for (title, priority, description) in [
         ("Zulu deploy", "2", "DESC-ZULU"),
         ("Alpha build", "3", "DESC-ALPHA"),
         ("Mike review", "1", "DESC-MIKE"),
     ] {
         let id = json_id(&orch(
-            dir.path(),
+            owned.path(),
             &[
                 "--json",
                 "task",
@@ -953,15 +977,15 @@ fn goal_tasks_project() -> tempfile::TempDir {
             ],
         ));
         if title == "Alpha build" {
-            orch(dir.path(), &["task", "cancel", &id]);
+            orch(owned.path(), &["task", "cancel", &id]);
         }
     }
     orch(
-        dir.path(),
+        owned.path(),
         &["task", "add", "Foreign work", "--goal-id", &other],
     );
-    orch(dir.path(), &["task", "add", "Loose end"]);
-    dir
+    orch(owned.path(), &["task", "add", "Loose end"]);
+    owned
 }
 
 const GOAL_TASKS: [&str; 3] = ["Zulu deploy", "Alpha build", "Mike review"];
@@ -1013,7 +1037,7 @@ fn goal_detail_tasks_section_is_the_tasks_table_for_the_goal() {
     let tmux = launch_tui(
         dir.path(),
         format!("orch-gt-{}-{}", std::process::id(), line!()),
-        "tui --observe",
+        "tui",
     );
     tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
     tmux.keys(&["Left"]);
