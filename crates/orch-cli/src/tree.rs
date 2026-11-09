@@ -20,15 +20,15 @@ use clap::{Args, Parser, Subcommand};
 ///
 /// Used by the pre-parse routing guard, which has to decide whether the first
 /// non-flag token is a real subcommand *before* clap sees the argv.
-pub const ALL_KNOWN_COMMANDS: [&str; 19] = [
+pub const ALL_KNOWN_COMMANDS: [&str; 20] = [
     "task", "agent", "status", "logs", "config", "context", "msg", "goal", "team", "org", "run",
-    "doctor", "tui", "serve", "web", "init", "update", "remote", "mcp",
+    "doctor", "tui", "serve", "web", "init", "update", "remote", "mcp", "daemon",
 ];
 
-/// The three commands that run without a container, and so without
-/// an initialized project. `doctor` additionally runs in either
-/// tier, which is why it is here *and* takes a container when one exists.
-pub const CONTAINER_LESS_COMMANDS: [&str; 3] = ["init", "update", "doctor"];
+/// Commands that bypass the legacy container guard. `daemon` performs its
+/// own discovery after parsing and the developmental gate; `doctor` also
+/// takes a container when a project exists.
+pub const CONTAINER_LESS_COMMANDS: [&str; 4] = ["init", "update", "doctor", "daemon"];
 
 /// The version `--version` prints and the dashboard reports: this crate's own
 /// release version.
@@ -165,6 +165,8 @@ pub enum Command {
     Tui(TuiCmd),
     /// Headless daemon mode — structured logs to stdout
     Serve(ServeCmd),
+    /// Manage the developmental project daemon
+    Daemon(crate::commands::daemon::DaemonCmd),
     /// Serve the TUI dashboard in a browser (xterm.js over a websocket)
     Web(WebCmd),
     /// Serve this project to MCP clients over stdio
@@ -194,6 +196,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Tui(_) => "tui",
             Command::Serve(_) => "serve",
+            Command::Daemon(_) => "daemon",
             Command::Web(_) => "web",
             Command::Mcp(_) => "mcp",
             Command::Init(_) => "init",
@@ -1654,6 +1657,7 @@ mod tests {
             // Every command parses from its own name, with required args
             // supplied where the tree demands them.
             let argv: Vec<&str> = match name {
+                "daemon" => vec!["orch", name, "status"],
                 "task" | "agent" | "config" | "context" | "msg" | "goal" | "team" | "org" => {
                     vec!["orch", name]
                 }

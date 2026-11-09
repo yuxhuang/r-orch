@@ -157,6 +157,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         .map_err(|err| Error::other(format!("cannot read the working directory: {err}")))?;
 
     match &cli.command {
+        Some(Command::Daemon(args)) => Ok(commands::daemon::run(cli, args, &cwd).await),
         Some(Command::Init(args)) => run_init(cli, env, &cwd, args).await,
         Some(Command::Update(args)) => {
             update::run(&styles_for(cli, env), args.check);
