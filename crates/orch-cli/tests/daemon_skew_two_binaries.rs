@@ -22,9 +22,17 @@ use daemon_support::frontends::*;
 use daemon_support::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const SEAM_PROTOCOL: u32 = 2;
+
+/// The process-table watch in `assert_clients_refuse` sees every `orch` process
+/// of the binary under test, including another test's daemon, so the vectors
+/// run one at a time (a poisoned lock is still a lock).
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Build (once per run; incremental across runs) the protocol-2 binary.
 fn skewed_binary() -> &'static Path {
@@ -181,6 +189,7 @@ fn assert_clients_refuse(pair: &mut Pair, client: &Path, client_protocol: u32) {
 
 #[test]
 fn protocol_2_clients_against_a_protocol_1_daemon_print_the_skew_message_and_change_nothing() {
+    let _serial = serial();
     let skewed = skewed_binary();
     let mut pair = Pair::start(normal(), orch_proto::LOCAL_PROTOCOL);
     assert_clients_refuse(&mut pair, skewed, SEAM_PROTOCOL);
@@ -188,6 +197,7 @@ fn protocol_2_clients_against_a_protocol_1_daemon_print_the_skew_message_and_cha
 
 #[test]
 fn protocol_1_clients_against_a_protocol_2_daemon_print_the_skew_message_and_change_nothing() {
+    let _serial = serial();
     let skewed = skewed_binary();
     let mut pair = Pair::start(skewed, SEAM_PROTOCOL);
     assert_clients_refuse(&mut pair, normal(), orch_proto::LOCAL_PROTOCOL);
@@ -195,6 +205,7 @@ fn protocol_1_clients_against_a_protocol_2_daemon_print_the_skew_message_and_cha
 
 #[test]
 fn the_other_binarys_daemon_stop_crosses_the_skew_so_the_printed_restart_advice_works() {
+    let _serial = serial();
     let skewed = skewed_binary();
     let mut pair = Pair::start(normal(), orch_proto::LOCAL_PROTOCOL);
     // `orch daemon stop` of the NEWER binary stops the OLDER daemon...
