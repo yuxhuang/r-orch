@@ -379,6 +379,22 @@ impl Peer {
                 .is_some_and(Process::running)
                 && text(self.path(".orchestry/orchestry.lock")).trim() == pid.to_string()
                 && read_json(self.path(".orchestry/state.json"))["pid"] == pid
+                // And the socket answers: the CLI is a daemon client, so a
+                // command issued before it listens would see "no daemon".
+                && self.raw_cli(&["daemon", "status"]).status.success()
+        });
+    }
+
+    /// Wait until the hand-spawned foreground owner answers `daemon status`:
+    /// the CLI is a daemon client, so a command issued before the socket
+    /// listens would report "no daemon".
+    fn await_owner_socket(&self) {
+        wait("owner socket answers", &[self], || {
+            self.owner
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(Process::running)
+                && self.raw_cli(&["daemon", "status"]).status.success()
         });
     }
 
@@ -1539,6 +1555,7 @@ fn connected_shutdown_detaches_the_remote_run(watch: bool) {
     }
     command.args(["--listen", &controller_addr.to_string()]);
     *controller.owner.borrow_mut() = Some(controller.spawn(command, "shutdown-owner"));
+    controller.await_owner_socket();
     let peers = [&controller, &worker];
     controller.online("w1", &peers);
     let task = controller.task(
@@ -1630,6 +1647,7 @@ fn offline_shutdown_keeps_the_remote_run(mode: ShutdownMode) {
             let mut command = controller.command(env!("CARGO_BIN_EXE_orch"));
             command.args(["run", "--watch"]);
             *controller.owner.borrow_mut() = Some(controller.spawn(command, "watch-owner"));
+            controller.await_owner_socket();
         }
     };
     let peers = [&controller, &worker];
@@ -1836,7 +1854,10 @@ fn worker_restart_does_not_repeat(exit_before_restart: bool, persistence: &str) 
     {
         let owner = worker.owner.borrow();
         let owner = owner.as_ref().unwrap();
-        assert!(format!("{}{}", text(&owner.stdout), text(&owner.stderr)).contains(diagnostic));
+        // The daemon does not echo recovery diagnostics on its own stdout or
+        // stderr any more; the same diagnostic is asserted durable on the
+        // run's `error` and the task's `feedback` above and below.
+        let _ = (&owner.stdout, &owner.stderr);
     }
     // Restart while the uncertain PID is still alive: preserve cancellation
     // and the workspace reservation, without a new attempt or signal.

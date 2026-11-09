@@ -156,17 +156,7 @@ impl Sandbox {
     /// immediately.
     pub fn new_owned_with_version(init_reader: &Reader, version: &str) -> Sandbox {
         let mut sb = Sandbox::new(init_reader);
-        let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", sb.bin.path().display()));
-        let path = PathBuf::from(path);
-        sb.daemon = Some(TestDaemon::start_with_env(
-            &sb.project,
-            sb.home.path(),
-            &[
-                ("PATH", path.as_path()),
-                ("ORCH_T1_REC", sb.rec.path()),
-                ("ORCH_FAKE_VERSION", Path::new(version)),
-            ],
-        ));
+        sb.start_daemon(version);
         let out = sb.run(
             init_reader,
             &["config", "set", "scheduling.retry_base_delay_ms", "1"],
@@ -174,6 +164,43 @@ impl Sandbox {
         );
         assert!(out.ok(), "retry back-off: {}", out.all());
         sb
+    }
+
+    fn start_daemon(&mut self, version: &str) {
+        let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", self.bin.path().display()));
+        let path = PathBuf::from(path);
+        self.daemon = Some(TestDaemon::start_with_env(
+            &self.project,
+            self.home.path(),
+            &[
+                ("PATH", path.as_path()),
+                ("ORCH_T1_REC", self.rec.path()),
+                ("ORCH_FAKE_VERSION", Path::new(version)),
+            ],
+        ));
+    }
+
+    /// Stop the sandbox's daemon (process table checked) and leave none, for a
+    /// fixture that then starts a foreground `serve` / `run --watch` (itself a
+    /// daemon start) on its own socket.
+    pub fn stop_daemon(&mut self) {
+        self.daemon
+            .take()
+            .expect("this sandbox owns a daemon")
+            .shutdown();
+    }
+
+    /// Stop the daemon (process table checked), run `edit` on the quiescent
+    /// project, and start a fresh daemon that reads what `edit` wrote. For
+    /// state a test writes by hand under `.orchestry/`: a running daemon owns
+    /// it and would not see the edit.
+    pub fn with_daemon_stopped(&mut self, edit: impl FnOnce()) {
+        self.daemon
+            .take()
+            .expect("this sandbox owns a daemon")
+            .shutdown();
+        edit();
+        self.start_daemon("2.1.2");
     }
 
     fn install_fakes(&self) {

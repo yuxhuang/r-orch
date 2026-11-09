@@ -26,6 +26,17 @@ use assert_cmd::prelude::*;
 mod daemon;
 use daemon::TestDaemon;
 
+/// `orch daemon status` against `daemon`: whether it is still serving.
+fn status_of(daemon: &TestDaemon, dir: &Path) -> std::process::ExitStatus {
+    let mut status = orch(dir);
+    daemon.apply(&mut status);
+    status
+        .args(["daemon", "status"])
+        .stdout(Stdio::null())
+        .status()
+        .expect("daemon status")
+}
+
 fn orch(dir: &Path) -> Command {
     let mut command = Command::cargo_bin("orch").expect("the orch binary");
     command
@@ -119,16 +130,18 @@ fn a_signal_with_work_outstanding_reports_interrupted_and_exits_one() {
          achieve. stdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The client dies of the signal it was sent (the conventional 128 + 15);
+    // it no longer exits 1 as the in-process orchestrator did.
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "every non-success --once outcome exits 1"
+        Some(143),
+        "an interrupted --once client exits 128 + the signal"
     );
-    // The lock is the reason the wind-down runs on this path at all: an
-    // interrupted run must not wedge the project.
+    // The daemon, not the client, owns `orchestry.lock`: interrupting the
+    // client must neither wedge the project nor stop the daemon.
     assert!(
-        !dir.path().join(".orchestry/orchestry.lock").exists(),
-        "orchestry.lock was left behind by an interrupted run"
+        status_of(&daemon, dir.path()).success(),
+        "the daemon stopped when its client was interrupted"
     );
 }
 
@@ -154,5 +167,8 @@ fn a_finished_project_still_reports_all_done_and_exits_zero() {
         "a completed run must still say all_done. stdout:\n{stdout}"
     );
     assert_eq!(output.status.code(), Some(0));
-    assert!(!dir.path().join(".orchestry/orchestry.lock").exists());
+    assert!(
+        status_of(&daemon, dir.path()).success(),
+        "the daemon stopped when its client finished"
+    );
 }

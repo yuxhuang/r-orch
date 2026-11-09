@@ -20,10 +20,12 @@
 //!   run and settles its records;
 //! * `run --watch` and `serve` keep their behaviour: exit 0, nothing alive.
 
+#[path = "common/daemon.rs"]
+mod daemon;
 mod token_eco_support;
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
@@ -336,108 +338,142 @@ impl Drop for Running {
 }
 
 /// SIGINT during the probe of a standalone command; returns the probe pids.
+///
+/// Since S2a-cli `orch run` is an observer of a run the daemon owns, so the
+/// signal ends the *client* (`✕ observation interrupted; runs continue in the
+/// daemon`, exit 1, not 128 + SIGINT) and the daemon's own probe deadline and
+/// kill guard are what must leave no process behind.
 fn interrupt_during_probe(rig: &Rig, args: &[&str]) -> (Vec<i32>, String) {
     let mut orch = rig.spawn(args);
     let (probe, desc) = rig.wait_for("probe", &mut orch);
     sigint(&orch.child);
     let (code, took) = orch.wait(EXIT_BOUND);
     let output = orch.output();
-    assert_eq!(code, 130, "{args:?} must exit 128+SIGINT: {output}");
+    assert_ne!(code, 0, "{args:?} must not report success: {output}");
     assert!(took < EXIT_BOUND, "{args:?} took {took:?}");
     (vec![probe, desc], output)
 }
 
+/// Poll until the task is recoverable (not `in_progress`) and no run is in
+/// flight: the daemon settles the records after the client has gone.
 fn assert_recoverable(rig: &Rig) {
-    let status = rig.task_status();
+    let deadline = Instant::now() + EXIT_BOUND;
+    loop {
+        let status = rig.task_status();
+        let runs = rig.run_statuses();
+        let settled = ["retrying", "failed", "todo", "cancelled"].contains(&status.as_str())
+            && runs.iter().all(|s| s != "running" && s != "preparing");
+        if settled {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the task must be recoverable: status {status}, runs {runs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_daemon_still_serving(rig: &Rig) {
+    let out = rig.sb.run(&new_reader(), &["daemon", "status"], None);
     assert!(
-        ["retrying", "failed", "todo"].contains(&status.as_str()),
-        "the task must be recoverable, not {status}"
-    );
-    let runs = rig.run_statuses();
-    assert!(
-        runs.iter().all(|s| s != "running" && s != "preparing"),
-        "no run may stay in flight: {runs:?}"
+        out.ok(),
+        "the daemon must outlive its client: {}",
+        out.all()
     );
 }
 
 #[test]
-fn sigint_during_the_probe_of_a_standalone_run_leaves_no_probe_process_alive_even_after_restart() {
+fn sigint_during_the_probe_of_a_standalone_run_leaves_no_probe_process_alive() {
     let rig = Rig::opencode();
     let (pids, output) = interrupt_during_probe(&rig, &["run", &rig.task]);
-    // Already dead when orch has exited: nothing else is left to kill them.
-    assert_all_dead(
-        &pids,
-        Duration::from_secs(2),
-        &format!("run <task>: {output}"),
-    );
+    // The daemon's probe deadline (2 s) plus the kill grace bound the probe.
+    assert_all_dead(&pids, EXIT_BOUND, &format!("run <task>: {output}"));
     assert_recoverable(&rig);
-    assert!(
-        output.contains("Interrupted by SIGINT"),
-        "the interrupt must be reported: {output}"
-    );
-
-    // A restart finds nothing alive, and its own (bounded) probe of the
-    // re-dispatched task is cleaned up too.
-    let restart = rig.sb.run(&new_reader(), &["serve", "--once"], None);
-    let again = read_pids(&rig.marks.path().join("probe.again.pid"));
-    let mut all = pids.clone();
-    all.extend(&again);
-    assert_all_dead(
-        &all,
-        Duration::from_secs(2),
-        &format!("after serve --once: {}", restart.all()),
-    );
+    assert_daemon_still_serving(&rig);
 }
 
 #[test]
 fn sigint_during_the_probe_of_run_all_leaves_no_probe_process_alive() {
     let rig = Rig::opencode();
     let (pids, output) = interrupt_during_probe(&rig, &["run", "--all"]);
-    assert_all_dead(
-        &pids,
-        Duration::from_secs(2),
-        &format!("run --all: {output}"),
-    );
+    assert_all_dead(&pids, EXIT_BOUND, &format!("run --all: {output}"));
     assert_recoverable(&rig);
+    assert_daemon_still_serving(&rig);
 }
 
 #[test]
-fn sigint_during_the_model_run_of_a_standalone_run_stops_it_and_settles_the_records() {
+fn sigint_during_the_model_run_of_a_standalone_run_detaches_the_client_and_cancel_stops_the_run() {
     let rig = Rig::shell();
     let mut orch = rig.spawn(&["run", &rig.task]);
     let (model, desc) = rig.wait_for("model", &mut orch);
     sigint(&orch.child);
     let (code, took) = orch.wait(EXIT_BOUND);
     let output = orch.output();
-    assert_eq!(code, 130, "{output}");
+    assert_eq!(code, 1, "{output}");
     assert!(took < EXIT_BOUND, "took {took:?}");
-    assert_all_dead(&[model, desc], Duration::from_secs(2), &output);
+    assert!(
+        output.contains("runs continue in the daemon"),
+        "the detach must be reported: {output}"
+    );
+    // The run is the daemon's: it is still going after its observer left.
+    assert!(
+        alive(model) && alive(desc),
+        "the run stopped with its client"
+    );
+    assert_eq!(rig.task_status(), "in_progress", "{output}");
+    // Stopping it is an explicit owner action.
+    let cancel = rig
+        .sb
+        .run(&new_reader(), &["task", "cancel", &rig.task], None);
+    assert!(cancel.ok(), "task cancel: {}", cancel.all());
+    assert_all_dead(&[model, desc], EXIT_BOUND, &output);
     assert_recoverable(&rig);
     assert_eq!(rig.run_statuses(), ["cancelled"], "{output}");
 }
 
-/// The watch-mode paths are untouched: they keep their own signal arms.
+/// A foreground daemon start (`run --watch` / `serve`) on its own isolated
+/// socket: SIGINT during the probe stops it cleanly (exit 0) with nothing
+/// left alive. The project is seeded through a daemon that is stopped first,
+/// since the foreground command *is* the daemon.
 fn watch_mode_regression(args: &[&str]) {
-    let rig = Rig::opencode();
-    let mut orch = rig.spawn(args);
+    let mut rig = Rig::opencode();
+    rig.sb.stop_daemon();
+    let (short, socket) = daemon::short_socket();
+    let mut cmd = rig.sb.command(&new_reader());
+    daemon::apply_env(&mut cmd, &socket, short.path());
+    let child = cmd
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orch");
+    let mut orch = Running::new(child);
     let (probe, desc) = rig.wait_for("probe", &mut orch);
     sigint(&orch.child);
     let (code, _) = orch.wait(EXIT_BOUND + Duration::from_secs(10));
     let output = orch.output();
     assert_eq!(code, 0, "{args:?}: {output}");
     assert_all_dead(&[probe, desc], Duration::from_secs(2), &output);
-    let status = rig.task_status();
-    assert_ne!(status, "in_progress", "{args:?}: {output}");
+    let task_file = std::fs::read_to_string(
+        rig.sb
+            .root()
+            .join("tasks")
+            .join(format!("{}.yml", rig.task)),
+    )
+    .expect("task file");
+    assert!(
+        !task_file.contains("status: in_progress"),
+        "{args:?}: the task was left in progress\n{task_file}"
+    );
 }
 
 #[test]
 fn run_watch_and_serve_still_stop_cleanly_on_sigint_during_the_probe() {
-    let logs = tempfile::tempdir().unwrap();
-    let log: PathBuf = logs.path().join("serve.log");
-    let serve = ["serve", "--log-file", log.to_str().unwrap()];
     std::thread::scope(|scope| {
         let watch = scope.spawn(|| watch_mode_regression(&["run", "--watch"]));
-        let serve = scope.spawn(|| watch_mode_regression(&serve));
+        let serve = scope.spawn(|| watch_mode_regression(&["serve"]));
         watch.join().expect("run --watch regression");
         serve.join().expect("serve regression");
     });

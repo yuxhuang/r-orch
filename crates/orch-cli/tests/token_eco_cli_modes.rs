@@ -568,13 +568,17 @@ fn an_agent_edit_that_would_make_a_custom_template_agent_eco_is_refused_with_byt
 #[test]
 fn a_hand_edited_eco_plus_custom_template_project_fails_dispatch_before_any_model_child() {
     let new = new_reader();
-    let sb = Sandbox::new_owned(&new);
+    let mut sb = Sandbox::new_owned(&new);
     let a = sb.seed_agent(&new, "Alpha", "codex", Some("gpt-6.1-sol"), None);
     with_custom_template(&sb, "template");
-    let edited = String::from_utf8(config_bytes(&sb))
-        .unwrap()
-        .replace("prompt_mode: normal", "prompt_mode: eco");
-    fs::write(sb.root().join("config.yml"), edited).unwrap();
+    // The hand edit goes in with the daemon stopped; the fresh daemon reads it.
+    let root = sb.root();
+    sb.with_daemon_stopped(|| {
+        let edited = String::from_utf8(fs::read(root.join("config.yml")).unwrap())
+            .unwrap()
+            .replace("prompt_mode: normal", "prompt_mode: eco");
+        fs::write(root.join("config.yml"), edited).unwrap();
+    });
     let task = sb
         .run(
             &new,
