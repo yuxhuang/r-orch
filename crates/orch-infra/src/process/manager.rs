@@ -13,9 +13,11 @@
 //! comes from `Command::process_group(0)`, which is a safe std API, so
 //! nothing here needs `unsafe` (the crate forbids it).
 
+use std::ffi::OsString;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -127,68 +129,156 @@ impl ProcessManager for SystemProcessManager {
     }
 
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild> {
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(match opts.stdin {
-                StdioMode::Ignore => Stdio::null(),
-                StdioMode::Pipe => Stdio::piped(),
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        spawn_with(command, args, opts, None)
+    }
+}
 
-        if !opts.cwd.as_os_str().is_empty() {
-            cmd.current_dir(&opts.cwd);
+/// A [`SystemProcessManager`] whose children never see this process's live
+/// environment: every spawn starts from `env_clear()`, then the immutable
+/// snapshot taken at daemon start, then the per-spawn overlay
+/// ([`SpawnOptions::env`]), then `forced` (the daemon's own routing keys,
+/// which an inherited shell variable must not redirect). Signals and
+/// liveness are exactly [`SystemProcessManager`]'s.
+///
+/// The daemon uses this so that what an agent's child inherits is decided
+/// once, at the owner's explicit start, and never by a later `set_var` or by
+/// variables that only configured the daemon's own listener.
+#[derive(Debug, Clone)]
+pub struct SnapshotEnvProcessManager {
+    snapshot: Arc<EnvSnapshot>,
+}
+
+/// The environment a [`SnapshotEnvProcessManager`] spawns with.
+#[derive(Debug, Clone, Default)]
+pub struct EnvSnapshot {
+    /// Inherited variables, already filtered by the daemon's denylist.
+    pub base: Vec<(OsString, OsString)>,
+    /// Applied last, over the per-spawn overlay.
+    pub forced: Vec<(String, String)>,
+}
+
+impl SnapshotEnvProcessManager {
+    pub fn new(snapshot: EnvSnapshot) -> Self {
+        SnapshotEnvProcessManager {
+            snapshot: Arc::new(snapshot),
         }
-        if opts.inherit_env == EnvInheritance::WithoutSecrets {
-            let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
-            for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
-                cmd.env_remove(name);
+    }
+}
+
+#[async_trait]
+impl ProcessManager for SnapshotEnvProcessManager {
+    fn is_alive(&self, pid: u32) -> bool {
+        SystemProcessManager.is_alive(pid)
+    }
+
+    fn kill(&self, pid: u32, signal: Signal) {
+        SystemProcessManager.kill(pid, signal);
+    }
+
+    async fn kill_with_grace(&self, pid: u32, grace: Duration) {
+        SystemProcessManager.kill_with_grace(pid, grace).await;
+    }
+
+    fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild> {
+        spawn_with(command, args, opts, Some(&self.snapshot))
+    }
+}
+
+/// `snapshot: None` inherits this process's environment, as orch always has.
+fn spawn_with(
+    command: &str,
+    args: &[String],
+    opts: SpawnOptions,
+    snapshot: Option<&EnvSnapshot>,
+) -> Result<SpawnedChild> {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args)
+        .stdin(match opts.stdin {
+            StdioMode::Ignore => Stdio::null(),
+            StdioMode::Pipe => Stdio::piped(),
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if !opts.cwd.as_os_str().is_empty() {
+        cmd.current_dir(&opts.cwd);
+    }
+    match snapshot {
+        None => {
+            if opts.inherit_env == EnvInheritance::WithoutSecrets {
+                let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
+                for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
+                    cmd.env_remove(name);
+                }
             }
         }
-        for (key, value) in &opts.env {
+        Some(snapshot) => {
+            cmd.env_clear();
+            let removed = if opts.inherit_env == EnvInheritance::WithoutSecrets {
+                let passthrough = snapshot
+                    .base
+                    .iter()
+                    .find(|(name, _)| name == REMOTE_ENV_PASSTHROUGH)
+                    .map(|(_, value)| value.as_os_str());
+                secret_env_names(snapshot.base.iter().cloned(), passthrough)
+            } else {
+                Vec::new()
+            };
+            for (name, value) in &snapshot.base {
+                if !removed.contains(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
+    }
+    for (key, value) in &opts.env {
+        cmd.env(key, value);
+    }
+    if let Some(snapshot) = snapshot {
+        for (key, value) in &snapshot.forced {
             cmd.env(key, value);
         }
-
-        // node's `detached: true`: a new process group whose pgid is the
-        // child's pid, which is what makes `kill(-pid)` reach the whole tree.
-        cmd.process_group(0);
-
-        let mut child = cmd.spawn().map_err(|source| spawn_error(command, source))?;
-        // A child with no pid is reported as `Failed to spawn process: <command>`;
-        // here that case is the `Err` above, and
-        // a successfully spawned child always has one until it is reaped.
-        let pid = child
-            .id()
-            .ok_or_else(|| Error::other(format!("Failed to spawn process: {command}")))?;
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
-
-        // Reap in the background. This is both the `ExitSignal` source and
-        // what keeps `is_alive` honest: an unreaped child stays a zombie and
-        // `kill(pid, 0)` would keep answering "alive". No `kill_on_drop`, so
-        // the child outlives us exactly as node's `proc.unref()` allows.
-        let (notifier, exit) = ExitSignal::channel();
-        tokio::spawn(async move {
-            let outcome = match child.wait().await {
-                Ok(status) => ExitOutcome {
-                    code: status.code(),
-                    signal: status.signal(),
-                },
-                Err(err) => {
-                    tracing::warn!(pid, error = %err, "failed to reap child");
-                    ExitOutcome {
-                        code: None,
-                        signal: None,
-                    }
-                }
-            };
-            notifier.notify(outcome);
-        });
-
-        Ok(SpawnedChild::from_tokio(pid, stdout, stderr, stdin, exit))
     }
+
+    // node's `detached: true`: a new process group whose pgid is the
+    // child's pid, which is what makes `kill(-pid)` reach the whole tree.
+    cmd.process_group(0);
+
+    let mut child = cmd.spawn().map_err(|source| spawn_error(command, source))?;
+    // A child with no pid is reported as `Failed to spawn process: <command>`;
+    // here that case is the `Err` above, and
+    // a successfully spawned child always has one until it is reaped.
+    let pid = child
+        .id()
+        .ok_or_else(|| Error::other(format!("Failed to spawn process: {command}")))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdin = child.stdin.take();
+
+    // Reap in the background. This is both the `ExitSignal` source and
+    // what keeps `is_alive` honest: an unreaped child stays a zombie and
+    // `kill(pid, 0)` would keep answering "alive". No `kill_on_drop`, so
+    // the child outlives us exactly as node's `proc.unref()` allows.
+    let (notifier, exit) = ExitSignal::channel();
+    tokio::spawn(async move {
+        let outcome = match child.wait().await {
+            Ok(status) => ExitOutcome {
+                code: status.code(),
+                signal: status.signal(),
+            },
+            Err(err) => {
+                tracing::warn!(pid, error = %err, "failed to reap child");
+                ExitOutcome {
+                    code: None,
+                    signal: None,
+                }
+            }
+        };
+        notifier.notify(outcome);
+    });
+
+    Ok(SpawnedChild::from_tokio(pid, stdout, stderr, stdin, exit))
 }
 
 fn spawn_error(command: &str, source: std::io::Error) -> Error {
@@ -312,6 +402,65 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(out, "overlaid has-path");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_spawn_sees_only_the_snapshot_overlay_and_forced_routing() {
+        // HOME is in this process's environment but not in the snapshot; the
+        // overlay cannot override forced routing.
+        let pm = SnapshotEnvProcessManager::new(EnvSnapshot {
+            base: vec![
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+                (OsString::from("HF_TOKEN"), OsString::from("owner-token")),
+            ],
+            forced: vec![(
+                "ORCH_SOCKET".to_owned(),
+                "/p/.orchestry/run/orch.sock".to_owned(),
+            )],
+        });
+        let mut env = BTreeMap::new();
+        env.insert("ORCH_AGENT_ID".to_owned(), "agt_1".to_owned());
+        env.insert("ORCH_SOCKET".to_owned(), "/elsewhere.sock".to_owned());
+        let script = "printf '%s|%s|%s|%s|%s' \"${HOME:-unset}\" \"$PATH\" \"$ORCH_AGENT_ID\" \"$ORCH_SOCKET\" \"${HF_TOKEN:-unset}\"";
+        let read = |mut child: SpawnedChild| async move {
+            let mut out = String::new();
+            child
+                .stdout
+                .take()
+                .expect("stdout")
+                .read_to_string(&mut out)
+                .await
+                .expect("read");
+            out
+        };
+        let child = pm
+            .spawn(
+                "/bin/sh",
+                &sh(script),
+                SpawnOptions {
+                    env: env.clone(),
+                    ..Default::default()
+                },
+            )
+            .expect("spawn");
+        assert_eq!(
+            read(child).await,
+            "unset|/usr/bin:/bin|agt_1|/p/.orchestry/run/orch.sock|owner-token"
+        );
+
+        // Remote-submitted work still drops secrets, from the snapshot.
+        let child = pm
+            .spawn(
+                "/bin/sh",
+                &sh(script),
+                SpawnOptions {
+                    env,
+                    inherit_env: EnvInheritance::WithoutSecrets,
+                    ..Default::default()
+                },
+            )
+            .expect("spawn");
+        assert!(read(child).await.ends_with("|unset"));
     }
 
     #[tokio::test]
