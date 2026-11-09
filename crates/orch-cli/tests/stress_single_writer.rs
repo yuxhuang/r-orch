@@ -775,12 +775,17 @@ fn spawn_tui_driver(pane: Arc<TuiPane>, shared: Arc<Shared>) -> JoinHandle<()> {
 }
 
 /// How long a leg may take to get going before the run is declared broken.
-const LEGS_READY: Duration = Duration::from_secs(90);
+const LEGS_READY: Duration = Duration::from_secs(60);
 
 /// Block until the run has evidence from every leg its assertions speak
 /// about: the TUI has created a task (processes fleet), a never-renewed short
 /// key has been set, and `live` has been renewed at least once.
-fn wait_until_every_leg_works(shared: &Shared, pane: Option<&TuiPane>, fleet: Fleet) {
+fn wait_until_every_leg_works(
+    shared: &Shared,
+    pane: Option<&TuiPane>,
+    fleet: Fleet,
+    daemon: &DaemonChild,
+) {
     let deadline = Instant::now() + LEGS_READY;
     loop {
         let (tui, short, live) = {
@@ -812,8 +817,21 @@ fn wait_until_every_leg_works(shared: &Shared, pane: Option<&TuiPane>, fleet: Fl
         assert!(
             Instant::now() < deadline,
             "after {LEGS_READY:?} not every leg was working (tui created a task: {tui}, \
-             short key set: {short}, live renewed: {live}); TUI screen:\n{}",
-            pane.map_or_else(|| "(no TUI)".to_owned(), TuiPane::screen)
+             short key set: {short}, live renewed: {live}); TUI screen:\n{}\n\
+             orch processes:\n{}\ndaemon log tail:\n{}",
+            pane.map_or_else(|| "(no TUI)".to_owned(), TuiPane::screen),
+            orch_processes(&process_table())
+                .iter()
+                .map(|p| format!("  pid {} ppid {} {}", p.pid, p.ppid, p.command))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            daemon
+                .stderr()
+                .lines()
+                .rev()
+                .take(30)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1099,7 +1117,7 @@ fn run_stress(fleet: Fleet) {
     // a task, that a short key outlived its TTL and that `live` was renewed,
     // so the run is `duration` of ALL of them working, not of whoever was
     // ready first.
-    wait_until_every_leg_works(&shared, pane.as_deref(), fleet);
+    wait_until_every_leg_works(&shared, pane.as_deref(), fleet, &daemon);
     marks.note("legs_ready");
     let started = Instant::now();
     let observer = spawn_observer(&sandbox, shared.clone(), hot.clone());
