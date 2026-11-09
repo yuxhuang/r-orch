@@ -347,7 +347,7 @@ the warnings share standard output with the table or confirmation, so `2>/dev/nu
 > `--all` or `--once` still prints the start-up warnings on standard error, and `orch serve --once` logs the
 > `serve:diagnostic` records described next.
 <!-- W2b/tsk_RP30qgK: crates/orch-cli/src/commands/run.rs report_startup_diagnostics (run forms) and serve_once
-log_startup_diagnostics at ecb5f1bd. Whether run-start orchestrator:error records reach serve --once is UNCONFIRMED. -->
+log_startup_diagnostics at ecb5f1bd. -->
 
 `orch serve --once` writes them to its log instead, right after `serve:started`, as one `serve:diagnostic` record
 per warning, so an agent with two warnings gets two records. Each record has the fields `agentId`, `agentName` and

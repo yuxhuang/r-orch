@@ -4,8 +4,8 @@ Tasks do nothing until the orchestrator starts them, and the orchestrator runs i
 
 <!-- W2 (PR 2, tsk_M9AsDfP): command semantics follow design D8 and wave-c-brief.md "PR 2 contract" item 1, written
 ahead of S2a-cli. Output samples below that predate PR 2 are marked in comments; I2 re-captures them. -->
-Every command in this chapter except `orch update` and `orch doctor`'s offline part needs a running daemon. Without
-one it prints `No orch daemon is running for <project root>` and exits 7 ([When no daemon answers](18-daemon.md#when-no-daemon-answers)).
+Every command in this chapter needs a running daemon, except `orch update`, the daemon starts `orch run --watch` and
+`orch serve` (without `--once`), and the local checks of `orch doctor`. Without one it prints `No orch daemon is running for <project root>` and exits 7 ([When no daemon answers](18-daemon.md#when-no-daemon-answers)).
 
 ## In this chapter
 
@@ -57,19 +57,18 @@ orch run tsk_lICHVKV
 ```
 
 ```text
-  orch · running tsk_lICHVKV "Build the report"
-  19:07:21  ▸ working on: tsk_lICHVKV
+  orch · running tsk_Fi_TstG "Say hello"
 
+  15:08:32  ▸ hello from greeter
   ✓ Done
 ```
 
 The daemon starts the run, and the command follows it: it prints the agent's output as it arrives, each line cut to 80 characters, then `Done` or `Failed`. The exit code is 0 for success and 1 for failure, so scripts can test it. Dispatch does not need to be on.
-<!-- Samples captured at 0.13.0; D8 keeps the result semantics ("observe until terminal"); I2 re-captures. -->
 
 ```text
-  orch · running tsk_wsk8eC3 "Break on purpose"
-  19:07:21  ✕ disk full
+  orch · running tsk_glJT-SE "Fail"
 
+  15:08:33  ▸ going to fail
   ✕ Failed
 ```
 
@@ -103,12 +102,9 @@ orch run --all
   orch · running all todo tasks
 ```
 
-`--all` asks the daemon to start every `todo` task that can start, as one batch, within the concurrency limit (default 6, set by `scheduling.max_concurrent_agents`), and waits until no run is in progress. A task that depends on another starts after it is `done`. It prints nothing for each event, and its exit code is 0 even when tasks fail. Use `orch task list` afterwards to see the results.
+`--all` asks the daemon to start every `todo` task that can start, as one batch, within the concurrency limit (default 6, set by `scheduling.max_concurrent_agents`), and waits until no run is in progress. A task that depends on another starts after it is `done`. It prints nothing for each event, and its exit code is 1 if any of its runs failed or was cancelled, otherwise 0. Use `orch task list` afterwards to see the results.
 
-> **Note:** If the agent produces no output, `orch run <task-id>` waits for it. Stopping the command (`Ctrl+C`, or `timeout 3600 orch run <task-id>` on Linux) stops following the run, not the run itself: the agent keeps running in the daemon. To stop it, cancel the task: `orch task cancel <task-id>`.
-<!-- design D8: "Disconnecting observer does not kill the run". UNCONFIRMED at the S2a-cli head (asked senior-eng
-msg_4Kc7aF8): the exit code after Ctrl+C, whether run --all behaves the same, and whether the daemon's stall check now
-covers these runs. -->
+> **Note:** If the agent produces no output, `orch run <task-id>` waits for it. Stopping the command (`Ctrl+C`, or `timeout 3600 orch run <task-id>` on Linux) stops following the run, not the run itself: the agent keeps running in the daemon. To stop it, cancel the task: `orch task cancel <task-id>`. `orch run` then prints `✕ observation interrupted; runs continue in the daemon` and exits 1. `orch run --all` behaves the same.
 
 ### Run one scheduling check
 
@@ -131,7 +127,7 @@ orch run --once
 | `--from-agent` | With `--watch` only (exit 1 otherwise). Allows the start from an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set), which otherwise refuses with exit 2 ([Refusals](18-daemon.md#start-the-daemon)). Use it only when you deliberately start a daemon from such a shell. |
 | `--verbose` | Refused with `--watch` (exit 2, below). Has no effect with a task ID, `--all` or `--once`, which print the agent's output anyway. |
 | `--listen [<ADDR>]` | With `--watch` only. Accepts connections from other machines. See [Remote agents](11-remote-agents.md). The default address is `127.0.0.1:7690`, which accepts only this machine. |
-| `--peer-name <NAME>` | The name this machine gives itself to peers. |
+| `--peer-name <NAME>` | With `--watch` only. The name this machine gives itself to peers. |
 | `--json`, `--yaml`, `--quiet`, `--no-color`, `--ascii` | Output options for every command ([Choose the output format](12-configuration-and-output.md#choose-the-output-format)). |
 
 If a daemon already runs for the project, `orch run --watch` refuses with exit 4: it does not resume a daemon whose dispatch is off. `orch run <task-id>`, `--all` and `--once` need that running daemon instead.
@@ -265,8 +261,7 @@ with an `error` field and carries on. A foreground `orch serve` is the daemon an
 <!-- tsk_RP30qgK: crates/orch-cli/src/commands/run.rs log_startup_diagnostics (ui.bootstrap startup_warnings,
 agent split by exact "name (id): " prefix) at ecb5f1bd; warning set = orch-engine prompt_mode::startup_diagnostics
 (effort + eco-template), as in 0.13.0. Samples from `serve --once` and `--log-format text --log-file` with a binary
-built at cb4e0042 (contains ecb5f1bd), throwaway HOME, 2026-11-09. The orchestrator:error sentence below is
-UNCONFIRMED at the PR 2 head (the daemon streams events to serve --once; I2 checks). -->
+built at cb4e0042 (contains ecb5f1bd), throwaway HOME, 2026-11-09. -->
 
 When a run starts
 for an agent with an effort, each effort warning for that run is logged once as an `orchestrator:error` warning
@@ -321,9 +316,8 @@ To stop one task and keep the daemon running, cancel the task: `orch task cancel
 
 A **stall** is a run whose agent produces no output for a while. The agent's setting `stall_timeout_ms` sets how long; the default is 600000 ms (10 minutes). When the time passes, orch stops the run. The task then goes to `retrying` or, if no attempts remain, to `failed` ([Task lifecycle](02-concepts.md#task-lifecycle)).
 
-- **Where it works:** in the daemon, for the runs it dispatches while dispatch is on.
-- **Where it may not:** runs started by `orch run <task-id>` and `orch run --all`. In orch 0.13.0 they were not checked; whether the daemon checks them now is not yet confirmed. Cancel a hung task with `orch task cancel <task-id>`.
-<!-- UNCONFIRMED (asked senior-eng msg_4Kc7aF8): stall coverage of dispatch.run_task / run_all at the PR 2 head. -->
+- **Where it works:** in the daemon, at each of its scheduling checks: every poll interval while dispatch is on, at each `orch run --once`, and throughout an `orch serve --once` batch. Each check covers every running run, including those started by `orch run <task-id>` and `orch run --all`.
+- **Where it does not:** while dispatch is off and none of those checks runs, nothing stops a silent run; cancel it with `orch task cancel <task-id>`.
 - **What it does not catch:** an agent that keeps printing output never stalls, however long it runs.
 - **Not a time limit:** the agent setting `timeout_ms` (`--timeout`) is stored but not enforced.
 
@@ -340,16 +334,14 @@ orch status
 ```
 
 ```text
-orch · proj · idle
+orch · proj · watching
 
   done        2
   failed      2
   cancelled   1
 ```
 
-The first line names the project and says `idle` or `watching`. The lines below count tasks by status. While runs are in progress, orch lists them too, with their agent and elapsed time. `orch status` asks the daemon, so it needs one; without a daemon it exits 7.
-<!-- UNCONFIRMED (asked senior-eng msg_4Kc7aF8): at PR 2 `watching` is expected to mean dispatch ON, from the live
-daemon (design D7 status.get); I2 confirms and re-captures. -->
+The first line names the project and says `watching`, because a daemon is answering; it does not show whether dispatch is on (use `orch daemon status`). The lines below count tasks by status. While runs are in progress, orch lists them too, with their agent and elapsed time. `orch status` asks the daemon, so it needs one; without a daemon it exits 7.
 
 `orch status --json` (or `--yaml`) prints `tasks`, `agents` and `state`, which is the data a script needs.
 
@@ -432,10 +424,7 @@ orch doctor
 
 A `✕` next to an adapter matters only if you use that adapter. A `✕` next to `git repo` means the `worktree` and `isolated` modes fail; run `git init` or use `--workspace-mode shared`.
 
-`orch doctor` is a client of the daemon. With a daemon it exits with 0, even when it reports problems. Without one it prints the [no-daemon message](18-daemon.md#when-no-daemon-answers) and what it can safely read from `.orchestry/daemon.json`, never the project's state, and exits 7. It does not check locks, saved state or disk space.
-<!-- spec R38; design D5/D8. UNCONFIRMED (asked senior-eng msg_4Kc7aF8): which adapter/git checks still print without
-a daemon (S2a-cli brief: "offline checks run without a daemon"), and what it prints outside a project. The sample
-above is 0.13.0 output. -->
+`orch doctor` is a client of the daemon. With a daemon it exits with 0, even when it reports problems. Without one it runs its local checks (five adapters instead of eight, git, the git repository, `.gitignore`, the toolchain) in the current directory, without the `.orchestry/` line, then prints the [no-daemon message](18-daemon.md#when-no-daemon-answers) and exits 7. Outside a project it prints the checks and `.orchestry/ not found — run: orch init`, and exits 0. Without a daemon, `--json` prints text. It never reads the project's state. It does not check locks, saved state or disk space.
 
 > **Note:** `orch --json doctor` prints its header line before the JSON, so the output is not one JSON document.
 

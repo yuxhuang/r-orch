@@ -96,9 +96,7 @@ Every command after `orch init` needs the running daemon: without one it prints
 work first; `orch serve` or `orch run --watch` instead starts one in the foreground with dispatch on. See
 [the orch daemon](docs/manual/18-daemon.md).
 
-Bare `orch` launches the dashboard. In a directory with no `.orchestry/`, it initialises one first.
-<!-- W2: UNCONFIRMED at the PR 2 head (asked frontend-eng msg_HiixZC4) whether bare `orch` still initialises first;
-without a daemon the dashboard shows the no-daemon message, `r` to retry, `q` to quit (PR 2 contract item 3). -->
+Bare `orch` launches the dashboard, like `orch tui`. It never creates a project: with no `.orchestry/` in the current directory or a parent it prints `Not initialized` and exits 3. Without a daemon it shows the no-daemon message; `r` retries and `q` quits.
 
 **Mouse.** Click tabs, list rows, `+ add …` rows, filter chips and the footer hint buttons;
 double-click a row to open its detail; the wheel moves the selection. Everything is also a key —

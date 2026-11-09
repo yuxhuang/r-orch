@@ -45,9 +45,7 @@ The server listens on `127.0.0.1:7681` by default. That address is reachable onl
 
 The token is new every time you start `orch web`. Keep the terminal open; the server stops when you close it.
 
-**If the daemon goes away** while `orch web` runs, the server keeps running and answers HTTP 503 with the no-daemon message as a banner. A request that has not logged in gets only `orch daemon unavailable`, without the project or socket path. Start the daemon again and reload the page.
-<!-- UNCONFIRMED (asked frontend-eng msg_HiixZC4): exact 503 body text and whether open tabs show the dashboard's own
-no-daemon screen (r/q) instead of a page banner. -->
+**If the daemon goes away** while `orch web` runs, the server keeps running. A new page or tab gets HTTP 503 with the no-daemon message as plain text; with `--no-auth` it gets only `orch daemon unavailable`, without the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen (`r` retry, `q` quit). Start the daemon again and reload the page.
 
 ## Log in
 
@@ -161,8 +159,7 @@ Each tab runs a dashboard that is a client of the daemon, so the web dashboard n
 
 > **Warning:** Anyone with the login can turn dispatch on, or press `R` on a task, and so start real, paid agent runs.
 
-`orch web --observe` was removed with `orch tui --observe`: there is no dashboard that owns the orchestrator, so there is nothing to observe instead.
-<!-- UNCONFIRMED (asked frontend-eng msg_HiixZC4): removal of web --observe at the S2c head. -->
+`orch web --observe` was removed with `orch tui --observe`: there is no dashboard that owns the orchestrator, so there is nothing to observe instead. `orch web --observe` now refuses with `orch web --observe was removed: every dashboard is a client of the project's daemon` and exits 2.
 
 ## Use tabs and sessions
 

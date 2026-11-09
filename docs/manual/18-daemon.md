@@ -361,9 +361,9 @@ R5/R6; PR 2 contract item 3). -->
 |---|---|
 | A CLI command | Prints the message on stderr and exits 7. |
 | The dashboard (`orch`, `orch tui`) | Shows the message full-screen. `r` tries to connect again, `q` quits with exit 7. It never starts anything. |
-| `orch web` | At start: prints the message and exits 7. If the daemon goes away while it serves: answers HTTP 503 with the message as a banner. A request that has not logged in gets only `orch daemon unavailable`, never the project or socket path. |
+| `orch web` | At start: prints the message and exits 7. If the daemon goes away while it serves: a new page or tab gets HTTP 503 with the message as plain text, after the usual login; with `--no-auth` it gets only `orch daemon unavailable`, never the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen. |
 | `orch mcp` | Stays running. `initialize` and every tool call return the message as an MCP error with `exit_code` 7, so a new MCP session's first call fails until you start the daemon. It exits 0 when its client closes stdin. See [the MCP chapter](17-mcp-server.md#when-no-daemon-is-running). |
-| `orch doctor` | Prints the message and what it can safely read from `daemon.json`, never the project's state, and exits 7. <!-- UNCONFIRMED (asked senior-eng msg_4Kc7aF8): which adapter/git checks still run without a daemon; brief item 1 says "offline checks run", spec R38 says discovery-only diagnosis. --> |
+| `orch doctor` | Runs its local checks (five adapters, git, the git repository, `.gitignore`, the toolchain) in the current directory, then prints the message and exits 7. It never reads the project's state. Outside a project it prints the checks and `.orchestry/ not found — run: orch init`, and exits 0. |
 
 `orch --help`, `orch --version` and `orch init` never need a daemon.
 

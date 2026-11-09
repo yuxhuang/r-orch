@@ -34,10 +34,7 @@ This chapter helps you when something does not work. Find your symptom, read the
 ```
 
 - **Cause.** The current directory, and every parent directory, has no `.orchestry/` folder. Almost every command needs a project. The exit code is 3.
-- **Do.** Run `orch init` in your project directory, then start its daemon (`orch daemon start`). `orch --help`, `orch --version`, `orch init` and `orch update` work anywhere.
-<!-- W2: design D7 ("All other commands require a daemon for their stateful work, including commands formerly runnable
-without a project (global config/catalog/template helpers)"). UNCONFIRMED at the S2a-cli head: what `orch doctor` and
-`orch org template` print outside a project. -->
+- **Do.** Run `orch init` in your project directory, then start its daemon (`orch daemon start`). `orch --help`, `orch --version`, `orch init` and `orch update` work anywhere; `orch doctor` runs its local checks anywhere. `orch org template` needs a project like every other command.
 
 ### orch acts on the wrong project
 
@@ -96,7 +93,7 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ### An agent has run for hours
 
-- **Cause.** The agent setting `timeout_ms` is stored but never enforced. Only `stall_timeout_ms` (default 600000, ten minutes) stops a run that produces no output, in the daemon. In orch 0.13.0 `orch run <task-id>` had no stall detection; whether the daemon now checks those runs is not yet confirmed. <!-- UNCONFIRMED (asked senior-eng msg_4Kc7aF8). -->
+- **Cause.** The agent setting `timeout_ms` is stored but never enforced. Only `stall_timeout_ms` (default 600000, ten minutes) stops a run that produces no output, in the daemon. The daemon checks `orch run <task-id>` runs only at its scheduling checks: while dispatch is on, at `orch run --once`, or during `orch serve --once`. With dispatch off, a silent run is never stopped.
 - **Do.** Cancel the task with `orch task cancel <task-id>`; stopping `orch run <task-id>` does not stop the run. Prefer dispatch for unattended work. Details: [`timeout_ms` is not a timeout](../RUNBOOK.md#timeout_ms-is-not-a-timeout).
 
 ### Agent processes still run after I cancelled a task
@@ -190,9 +187,8 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ### The page answers `503` or shows `orch daemon unavailable`
 
-- **Cause.** The project's daemon stopped while `orch web` was running. Before you log in, the page shows only `orch daemon unavailable`; after you log in it shows the no-daemon message with the project.
+- **Cause.** The project's daemon stopped while `orch web` was running. The page answers 503 with the no-daemon message, as plain text, after the usual login; with `--no-auth` it answers only `orch daemon unavailable`. A tab whose dashboard is already open shows the dashboard's no-daemon screen (`r` retry, `q` quit).
 - **Do.** Start the daemon (`orch daemon start`) and reload the page. `orch web` itself keeps running and never starts a daemon.
-<!-- W2 (PR 2): plan Q0b, spec R18, SE-17. UNCONFIRMED exact page text (asked frontend-eng msg_HiixZC4). -->
 
 ### The browser asks for a password
 

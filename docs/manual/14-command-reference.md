@@ -12,12 +12,10 @@ orch task add --help
 > prints `Not initialized` and exits with code 3; without a daemon it prints `No orch daemon is running for
 > <project root>` and exits with code 7 ([The orch daemon](18-daemon.md)). This now includes commands that used to
 > work outside a project, such as `orch org template` and `orch config global`. `orch --help`, `orch --version`,
-> `orch init` and `orch update` need neither. `orch mcp --project-root <path>` serves the project at `<path>` from
+> `orch init` and `orch update` need neither, and `orch doctor` runs its local checks anywhere
+> ([Check your setup](07-running-and-monitoring.md#check-your-setup)). `orch <command> --help` needs a project but no
+> daemon, except for `init`, `update`, `doctor`, `daemon`, `mcp` and `org template`, whose help works anywhere. `orch mcp --project-root <path>` serves the project at `<path>` from
 > any directory, through that project's daemon.
-<!-- W2 (PR 2): design D7 ("All other commands require a daemon for their stateful work, including commands
-formerly runnable without a project (global config/catalog/template helpers); make that intentional behaviour change
-visible in the manual"); spec R3, R38. UNCONFIRMED at the S2a-cli head: whether `--help` of a subcommand still needs a
-project, and `orch doctor` outside a project. -->
 
 How to read the usage column:
 
@@ -175,8 +173,6 @@ Start, check, stop and toggle dispatch in the project's daemon. Explained in [Th
 | `orch daemon status` | Show live daemon status | `orch daemon status [OPTIONS]` |
 | `orch daemon stop` | Stop and reconcile the project daemon, including across version skew | `orch daemon stop [OPTIONS]` |
 | `orch daemon dispatch` | Enable or disable future automatic dispatch | `orch daemon dispatch [OPTIONS] <MODE>` (`on` or `off`) |
-<!-- W2: help texts from `orch daemon --help` at the PR 1 frozen binary 6a7a6481, minus "(developmental)", which PR 2
-removes (contract item 4); I2 checks the PR 2 help. -->
 
 ### orch status
 

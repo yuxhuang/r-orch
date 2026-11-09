@@ -90,8 +90,6 @@ Before you start: the worker has the project initialized (`orch init`), its agen
    ```
 
    Without an address, `on` saves `127.0.0.1:7690`. `orch remote listen off` turns it off. Both take effect the next time the daemon starts, not on one that is running.
-   <!-- UNCONFIRMED: design D7 remote.listen "Listener toggling only if existing command supports it"; I2 checks
-   that a running daemon still only saves the preference. -->
 
 3. Check with `orch remote status`. The `Listen:` line shows the address.
 

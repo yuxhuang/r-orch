@@ -183,9 +183,13 @@ A **project** is a directory with a `.orchestry/` folder. Make a new directory a
      ├── templates/default.md
      └── .gitignore
 
-     Start the daemon explicitly with: orch daemon start
-     Next: orch task add "Create backend agent" --assignee agt_creator
+     Prompt mode: normal (change with `orch config set defaults.agent.prompt_mode eco|normal`)
+
+     Next: orch daemon start
    ```
+
+   If orch finds an AI CLI on your `PATH`, one line before `✓ initialized` names it, for example
+   `Detected: claude (<version>)`; with none it prints `No AI adapters detected — defaulting to claude`.
 
 3. Start the project's daemon. Every orch command after `orch init` asks this one process to do its work, and
    nothing starts it but you ([The orch daemon](18-daemon.md)).
@@ -206,9 +210,6 @@ A **project** is a directory with a `.orchestry/` folder. Make a new directory a
    by itself yet. If you skip this step, the next command prints
    `No orch daemon is running for <project root> (no daemon.json)` and `Start it with: orch daemon start`, and
    exits 7.
-   <!-- W2: init, start and the no-daemon line captured with the PR 1 frozen binary (6a7a6481) in a throwaway
-   project and HOME; the PR 1 start also printed the developmental banner line, which PR 2 removes (contract item
-   4). Path shortened from /private/tmp/w2init.0HpJ/hello-orch. I2 re-captures at the PR 2 head. -->
 
 orch also created an agent called Agent Creator. It uses the `claude` adapter, so it is a real AI agent.
 

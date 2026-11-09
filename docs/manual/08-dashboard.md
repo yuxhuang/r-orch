@@ -30,14 +30,11 @@ Before you start: run the command inside a project (a directory with `.orchestry
 orch tui
 ```
 
-Bare `orch` also starts the dashboard. In a directory with no `.orchestry/`, bare `orch` creates one first. `orch tui` does not; it stops with `Not initialized`.
+Bare `orch` also starts the dashboard. Neither creates a project: in a directory with no `.orchestry/`, here or in a parent, both stop with `Not initialized` (exit 3).
 
 The dashboard is a client of the project's [daemon](18-daemon.md): it shows and changes the project through the daemon and never runs the orchestrator itself. Start the daemon first (`orch daemon start --detach`, or `orch serve` in another terminal). Quitting the dashboard leaves the daemon and its agents running.
 
-<!-- W2 (PR 2, tsk_M9AsDfP): PR 2 contract items 1-3; design D5, D8; spec R18, R38. Written ahead of S2c; I2 verifies.
-UNCONFIRMED (asked frontend-eng msg_HiixZC4): whether opening the dashboard changes dispatch (expected: no), the
-exact header chip texts for dispatch on/off, and whether `/pause` maps to `orch daemon dispatch off`. -->
-> **Warning:** Dispatch belongs to the daemon. While it is on, the daemon dispatches `todo` tasks to idle agents straight away, from whichever client created them, and real agents cost money. The header shows whether dispatch is on or off. The dashboard's watch toggle turns the daemon's dispatch on and off for every client, not just for this dashboard; `orch daemon dispatch off` does the same from a shell.
+> **Warning:** Dispatch belongs to the daemon. While it is on, the daemon dispatches `todo` tasks to idle agents straight away, from whichever client created them, and real agents cost money. The header shows whether dispatch is on or off (`● WATCHING` or `○ IDLE`); `/watch` and `/pause` turn it on and off. The dashboard's watch toggle turns the daemon's dispatch on and off for every client, not just for this dashboard; `orch daemon dispatch off` does the same from a shell.
 
 **When no daemon answers**, the dashboard shows the [no-daemon message](18-daemon.md#when-no-daemon-answers) full screen:
 
@@ -48,13 +45,7 @@ exact header chip texts for dispatch on/off, and whether `/pause` maps to `orch 
 
 Press `r` to try to connect again once you have started the daemon, or `q` to quit (exit code 7). The dashboard never starts a daemon. If the daemon is a different orch version, the message names both versions and says `Start it with: orch daemon stop, then orch daemon start`. If the daemon goes away while the dashboard is open, it shows the same screen.
 
-| Option | What it does | Default |
-|---|---|---|
-| `--peer-name NAME` | Sets the name other machines see for this one. | the short host name |
-
-`orch tui --observe` and `orch tui --listen` were removed: the dashboard never dispatches by itself, so there is nothing to observe instead, and only the daemon listens for other machines. Start the daemon with `--listen` ([Remote agents](11-remote-agents.md)).
-<!-- UNCONFIRMED: whether --peer-name stays a dashboard option at the S2c head (it names this machine to peers, which
-the daemon now does). -->
+`orch tui --observe`, `--listen` and `--peer-name` were removed: the dashboard never dispatches by itself, so there is nothing to observe instead, and only the daemon listens for other machines and names this one to them. Start the daemon with `--listen` and `--peer-name` ([Remote agents](11-remote-agents.md)).
 
 ![The dashboard's Tasks view: nine tasks in review, to-do, done and failed states, sorted by STATUS with an up arrow, in columns for status, priority, title, goal, assignee, Started and Elapsed*, with the activity feed below](images/dashboard-overview.png)
 
@@ -88,9 +79,7 @@ listen off · controller none
 
 | Part | What it shows |
 |---|---|
-<!-- W2: the status chip wording (WATCHING/OBSERVING/IDLE) below is 0.13.0; S2c shows the daemon's dispatch state.
-I2 rewrites this row from the PR 2 head (asked frontend-eng msg_HiixZC4). -->
-| Header | The version, the project name and the four view tabs on the left. On the right, ending at the last column: how long the orchestrator has been up, how many agents are running and how many tasks are `todo` (`12:05 · 2 running │ 5 todo`), the project prompt mode, `normal` or `eco` (see [Switch the prompt mode](#switch-the-prompt-mode)), and a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`. On a narrow terminal the uptime goes first, then the counts; if the prompt mode still does not fit it moves to the start of the second header line. |
+| Header | The version, the project name and the four view tabs on the left. On the right, ending at the last column: how long the orchestrator has been up, how many agents are running and how many tasks are `todo` (`12:05 · 2 running │ 5 todo`), the project prompt mode, `normal` or `eco` (see [Switch the prompt mode](#switch-the-prompt-mode)), and a status chip: `● WATCHING` (the daemon's dispatch is on) or `○ IDLE` (dispatch is off). On a narrow terminal the uptime goes first, then the counts; if the prompt mode still does not fit it moves to the start of the second header line. |
 | Second header line | The peer listen address, the connected controller and each remote's online state. See [Remote agents](11-remote-agents.md). |
 | Status counts | One chip for each task status that has tasks, except cancelled, such as `○ TODO 2`, and a `TEAMS` chip with the number of teams. |
 | Main list | The list for the current view: a column header row (the sort column is marked `↑` or `↓`), the rows, and a `+ add …` row at the end. In a new project a hint under the list suggests the next step, such as `◆ Press R to run task`. |

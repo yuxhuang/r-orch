@@ -22,7 +22,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `task show <id>` works but `task list` omits the task | [Rebuilding an index](#rebuilding-an-index-after-a-lost-update) (legacy procedure) |
 | Every command fails after a crash or power loss | [state.json recovery](#statejson-parse-failure) |
 | `.state.json.*.tmp` files piling up | [Temp-file litter](#state-file-temp-litter) |
-| `serve:started` logged but the daemon is not up | [serve:started ordering](#servestarted-precedes-the-lock-check) |
+| `serve:started` logged but the daemon is not up | [serve:started ordering](#servestarted-precedes-the-batch-check) |
 | Need to see what r-orch is doing internally | [Debugging](#debugging) |
 | Agent processes still running after a cancel | [Stray agent subprocesses](#stray-agent-subprocesses-after-a-cancel) |
 | An agent has run for hours and nothing stopped it | [`timeout_ms` is not a timeout](#timeout_ms-is-not-a-timeout) |
@@ -377,19 +377,15 @@ long-lived deployment.
 
 ---
 
-## `serve:started` precedes the lock check
+## `serve:started` precedes the batch check
 
-> With the daemon, `orch serve` and `orch run --watch` are daemon starts: treat the daemon as up once it prints
-> `listening <socket>`, or once `orch daemon status` exits 0. The 0.13.0 text below is kept until it is checked
-> against this release. <!-- W2: spec R5 (readiness line only after readiness); I2 checks whether serve still logs
-> serve:started before the ownership check and rewrites or removes this entry. -->
+A foreground `orch serve` is the daemon and writes no `serve:started` record; treat it as up once it prints
+`listening <socket>`, or once `orch daemon status` exits 0.
 
-**Do not treat `serve:started` as "the daemon is up."** `orch serve` emits that record **before** acquiring
-the lock, so a `serve` that is about to exit 4 on a lock conflict still logs exactly one `serve:started` and
-no error record — the failure leaves by a path that bypasses the log pump.
-
-For monitoring, treat the daemon as up only once you see a record that implies the loop is running — an
-`orchestrator:tick`, or any `agent:*` record. The shape of the log contract is the reason this was not changed.
+`orch serve --once` logs `serve:started` after it has reached the daemon but before the daemon accepts the batch.
+When dispatch is on (exit 2) or another batch runs (exit 4) you get one `serve:started`, possibly `serve:diagnostic`
+records, no `serve:finished`, and the refusal on stderr. Treat a batch as running only after a later record, and
+check the exit code.
 
 ---
 
@@ -1073,8 +1069,8 @@ that reads context are stopped. This is advice, not a lock: nothing enforces it.
 ## Restoring a configuration broken through the MCP server
 
 **Symptom.** Every `orch mcp` tool and resource call fails with the same error,
-`parse <project>/.orchestry/config.yml`, while the session stays connected. A new `orch mcp` refuses to start with
-that error (exit 1), and the CLI fails the same way: `orch status` and even `orch config get` print it.
+`parse <project>/.orchestry/config.yml`, while the session stays connected. A new `orch mcp` starts but answers every
+request, `initialize` included, with that error (JSON-RPC `-32001`), and the CLI fails the same way: `orch status` and even `orch config get` print it.
 
 **Cause.** `config_set`, like `orch config set`, validates only the prompt-related keys and stores any other value
 as given: a JSON-parsable string becomes a number, boolean or object, anything else a string. A wrongly typed value

@@ -106,8 +106,6 @@ orch does not know.
 The daemon reads `config.yml` when it starts, and again after a change made with `orch config set`, `update` or
 `patch`. After you edit the file by hand, stop and start the daemon (`orch daemon stop`, then `orch daemon start`)
 to be sure it uses the new value.
-<!-- W2 (PR 2): design D2 (config writes refresh daemon defaults before the next operation; ADR A3: external edits
-while the daemon runs are unsupported). UNCONFIRMED at the PR 2 head. -->
 
 ### Replace or patch from a file
 

@@ -28,7 +28,7 @@ project by looking for `.orchestry/` in the current directory and then in each p
 commands from any subdirectory.
 
 Outside a project, most commands print `Not initialized` and exit with code 3. Only `orch --help`,
-`orch --version`, `orch init`, `orch doctor`, `orch update` and the `orch org template` commands work anywhere.
+`orch --version`, `orch init`, `orch doctor` (local checks only) and `orch update` work anywhere.
 
 Everything orch knows about the project is stored as plain files in `.orchestry/`:
 
@@ -299,11 +299,11 @@ itself only while its **dispatch** is on; a daemon starts with dispatch off unle
 | `orch serve --once` | Asks the daemon for a batch that ends when every tracked task is final; dispatch must be off. |
 | `orch tui` | Opens the terminal dashboard, a client of the daemon. Its watch toggle turns dispatch on and off. |
 | `orch web` | Serves the dashboard to a browser. Each browser tab runs its own dashboard, a client of the daemon. |
-| `orch` (no command) | Same as `orch tui`, with one difference: if the current directory has no `.orchestry/`, it first runs `orch init` there and then opens the dashboard (see the [warning about `init`](01-getting-started.md#create-a-project)). It checks only the current directory, not its parents, so in a subdirectory of a project it creates a nested project. <!-- UNCONFIRMED at the S2c head (asked frontend-eng msg_HiixZC4). --> |
+| `orch` (no command) | Same as `orch tui`. It never creates a project: with no `.orchestry/` in the current directory or a parent it prints `Not initialized` and exits 3; in a subdirectory of a project it opens that project. |
 
-Stall detection works in the daemon for the runs it dispatches. In orch 0.13.0 a single `orch run <task-id>` had
-no stall detection; whether the daemon checks those runs now is not yet confirmed.
-<!-- UNCONFIRMED (asked senior-eng msg_4Kc7aF8). --> `timeout_ms` in the agent and project settings is stored but orch
+Stall detection runs in the daemon at each scheduling check (every poll interval while dispatch is on, `orch run --once`,
+`orch serve --once`) and covers every running run, including `orch run <task-id>` and `--all`. With dispatch off and no
+such check, a silent run is not stopped. `timeout_ms` in the agent and project settings is stored but orch
 does not enforce it. See the [runbook](../RUNBOOK.md#timeout_ms-is-not-a-timeout).
 
 > **Note:** `orch serve --once` waits until every task is `done`, `failed` or `cancelled`. A task in `review`
