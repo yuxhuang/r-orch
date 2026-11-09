@@ -144,87 +144,106 @@ impl GoalService {
         new_status: GoalStatus,
         force: bool,
     ) -> Result<Goal> {
-        let mut goal = self.get(id).await?;
-        let old_status = goal.status;
+        self.events
+            .operation_boundary()
+            .run(true, async {
+                // Lock order: orchestrator state -> dispatch gate. Pause never takes state.
+                let _dispatch = match &self.task_service {
+                    Some(tasks) => Some(tasks.dispatch_gate.lock().await),
+                    None => None,
+                };
+                let mut goal = self.get(id).await?;
+                let old_status = goal.status;
 
-        if !old_status.can_transition_to(new_status) {
-            return Err(Error::invalid_arguments(format!(
-                "Cannot transition goal from '{old_status}' to '{new_status}'"
-            )));
-        }
+                if !old_status.can_transition_to(new_status) {
+                    return Err(Error::invalid_arguments(format!(
+                        "Cannot transition goal from '{old_status}' to '{new_status}'"
+                    )));
+                }
 
-        if new_status == GoalStatus::Achieved {
-            self.enforce_achieved_guard(id, force).await?;
-        }
+                if new_status == GoalStatus::Achieved {
+                    self.enforce_achieved_guard(id, force).await?;
+                }
 
-        goal.status = new_status;
-        goal.updated_at = Some(self.clock.now_iso());
-        self.goals.save(&goal).await?;
+                goal.status = new_status;
+                goal.updated_at = Some(self.clock.now_iso());
+                self.goals.save(&goal).await?;
 
-        self.events.emit(OrchestratorEvent::GoalStatusChanged {
-            goal_id: id.to_owned(),
-            from: old_status,
-            to: new_status,
-        });
+                self.events.emit(OrchestratorEvent::GoalStatusChanged {
+                    goal_id: id.to_owned(),
+                    from: old_status,
+                    to: new_status,
+                });
 
-        if let Some(assignee) = assignee_of(&goal) {
-            if new_status == GoalStatus::Paused {
-                // Autonomous is disabled first so this agent's idle seeding
-                // stops proposing new work before the cancel. Best-effort
-                // only: the flag gates seeding, not dispatch, and stays on if
-                // another active goal keeps it. There is no cross-process
-                // dispatch fence, so a concurrent orchestrator can still start
-                // a listed task before its cancel lands (and then lose it).
-                self.maybe_disable_autonomous(assignee).await;
-                self.cancel_pending_autonomous_tasks(id, assignee).await;
-            } else if new_status == GoalStatus::Active && old_status == GoalStatus::Paused {
-                self.enable_autonomous(assignee).await;
-            } else if is_goal_terminal(new_status) {
-                self.maybe_disable_autonomous(assignee).await;
-            }
-        }
+                if let Some(assignee) = assignee_of(&goal) {
+                    if new_status == GoalStatus::Paused {
+                        // Autonomous is disabled first so this agent's idle seeding
+                        // stops proposing new work before the cancel. Best-effort
+                        // only: another active goal may keep it enabled. The dispatch
+                        // gate fences the status save and these cancellations against spawn.
+                        self.maybe_disable_autonomous(assignee).await;
+                        self.cancel_pending_autonomous_tasks(id, assignee).await;
+                    } else if new_status == GoalStatus::Active && old_status == GoalStatus::Paused {
+                        self.enable_autonomous(assignee).await;
+                    } else if is_goal_terminal(new_status) {
+                        self.maybe_disable_autonomous(assignee).await;
+                    }
+                }
 
-        Ok(goal)
+                Ok(goal)
+            })
+            .await
+            .value
     }
 
     /// Edit a goal's fields. Reassigning enables autonomous mode on the new
     /// agent and maybe-disables it on the old one.
     pub async fn update(&self, id: &str, fields: &UpdateGoalFields) -> Result<Goal> {
-        let mut goal = self.get(id).await?;
-        let old_assignee = goal.assignee.clone();
+        self.events
+            .operation_boundary()
+            .run(true, async {
+                let _dispatch = match &self.task_service {
+                    Some(tasks) => Some(tasks.dispatch_gate.lock().await),
+                    None => None,
+                };
+                let mut goal = self.get(id).await?;
+                let old_assignee = goal.assignee.clone();
 
-        if let Some(title) = &fields.title {
-            if title.trim().is_empty() {
-                return Err(Error::invalid_arguments("Goal title cannot be empty"));
-            }
-            goal.title = title.trim().to_owned();
-        }
-        if let Some(description) = &fields.description {
-            goal.description = description.trim().to_owned();
-        }
-        if let Some(assignee) = &fields.assignee {
-            // `--assignee ""` clears it, which is the only way to unassign.
-            goal.assignee = Some(assignee.clone()).filter(|a| !a.is_empty());
-        }
+                if let Some(title) = &fields.title {
+                    if title.trim().is_empty() {
+                        return Err(Error::invalid_arguments("Goal title cannot be empty"));
+                    }
+                    goal.title = title.trim().to_owned();
+                }
+                if let Some(description) = &fields.description {
+                    goal.description = description.trim().to_owned();
+                }
+                if let Some(assignee) = &fields.assignee {
+                    // `--assignee ""` clears it, which is the only way to unassign.
+                    goal.assignee = Some(assignee.clone()).filter(|a| !a.is_empty());
+                }
 
-        goal.updated_at = Some(self.clock.now_iso());
-        self.goals.save(&goal).await?;
-        self.events.emit(OrchestratorEvent::GoalUpdated {
-            goal_id: id.to_owned(),
-        });
+                goal.updated_at = Some(self.clock.now_iso());
+                self.goals.save(&goal).await?;
+                self.events.emit(OrchestratorEvent::GoalUpdated {
+                    goal_id: id.to_owned(),
+                });
 
-        // The two toggles concern different agents, so running them in
-        // sequence changes nothing observable.
-        if goal.assignee != old_assignee {
-            if let Some(new_assignee) = assignee_of(&goal) {
-                self.enable_autonomous(new_assignee).await;
-            }
-            if let Some(old) = old_assignee.as_deref().filter(|a| !a.is_empty()) {
-                self.maybe_disable_autonomous(old).await;
-            }
-        }
+                // The two toggles concern different agents, so running them in
+                // sequence changes nothing observable.
+                if goal.assignee != old_assignee {
+                    if let Some(new_assignee) = assignee_of(&goal) {
+                        self.enable_autonomous(new_assignee).await;
+                    }
+                    if let Some(old) = old_assignee.as_deref().filter(|a| !a.is_empty()) {
+                        self.maybe_disable_autonomous(old).await;
+                    }
+                }
 
-        Ok(goal)
+                Ok(goal)
+            })
+            .await
+            .value
     }
 
     /// Delete a goal. Child tasks keep their now-dangling `goalId`; deletion is not
@@ -297,7 +316,7 @@ impl GoalService {
         {
             // A task that refuses to cancel must not abort the whole force, so
             // per-task failures are dropped.
-            let _ = tasks.cancel(&task.id).await;
+            let _ = tasks.cancel_record(&task.id).await;
         }
 
         let running: Vec<Task> = pending
@@ -364,7 +383,7 @@ impl GoalService {
         }
 
         for task in pending {
-            let _ = tasks.cancel(&task.id).await;
+            let _ = tasks.cancel_record(&task.id).await;
         }
     }
 }

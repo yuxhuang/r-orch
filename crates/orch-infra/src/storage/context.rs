@@ -1,8 +1,8 @@
 //! File-based shared context store.
 //!
 //! Entries are individual JSON files plus an `_index.json`. TTL is optional
-//! and expiry is **lazy**: `get` deletes the one entry it was asked for, and
-//! `list` purges every expired entry in a batch with a single index rewrite.
+//! and reads filter expired entries without writing. [`FileContextStore::expire_now`]
+//! explicitly removes expired entries and publishes the retained index.
 //!
 //! The clock is injected rather than read from the wall, because expiry is
 //! otherwise untestable without sleeping (ARCHITECTURE §5.6).
@@ -26,6 +26,7 @@ pub struct FileContextStore {
     paths: Paths,
     index: IndexManager<ContextEntry>,
     clock: Arc<dyn Clock>,
+    mutation: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for FileContextStore {
@@ -43,7 +44,27 @@ impl FileContextStore {
             paths,
             index,
             clock,
+            mutation: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Remove expired entries explicitly, returning their keys in stable key order.
+    /// Serialized with set/delete so an in-process renewal cannot be removed.
+    pub async fn expire_now(&self) -> Result<Vec<String>> {
+        let _mutation = self.mutation.lock().await;
+        let entries = self.index.read_index_no_persist().await?;
+        let (mut expired, valid): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| self.is_expired(entry));
+        if expired.is_empty() {
+            return Ok(Vec::new());
+        }
+        expired.sort_by(|a, b| a.key.cmp(&b.key));
+        for entry in &expired {
+            self.delete_file(&entry.key).await?;
+        }
+        self.index.write_index(&valid).await?;
+        Ok(expired.into_iter().map(|entry| entry.key).collect())
     }
 
     fn is_expired(&self, entry: &ContextEntry) -> bool {
@@ -75,13 +96,13 @@ impl ContextStore for FileContextStore {
             return Ok(None);
         };
         if self.is_expired(&entry) {
-            self.delete(key).await?;
             return Ok(None);
         }
         Ok(Some(entry))
     }
 
     async fn set(&self, key: &str, value: &str, ttl_ms: Option<u64>) -> Result<()> {
+        let _mutation = self.mutation.lock().await;
         if let Some(ttl) = ttl_ms
             && (ttl == 0 || ttl > MAX_TTL_MS)
         {
@@ -116,6 +137,7 @@ impl ContextStore for FileContextStore {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
+        let _mutation = self.mutation.lock().await;
         self.delete_file(key).await?;
         let key = key.to_owned();
         self.index
@@ -123,22 +145,15 @@ impl ContextStore for FileContextStore {
             .await
     }
 
-    /// Sorted by key ascending, with every expired entry purged first.
+    /// Sorted by key ascending, excluding expired entries without changing disk.
     async fn list(&self) -> Result<Vec<ContextEntry>> {
-        let entries = self.index.read_index().await?;
-
-        let (expired, mut valid): (Vec<_>, Vec<_>) = entries
+        let mut valid: Vec<_> = self
+            .index
+            .read_index_no_persist()
+            .await?
             .into_iter()
-            .partition(|entry| self.is_expired(entry));
-
-        if !expired.is_empty() {
-            for entry in &expired {
-                self.delete_file(&entry.key).await?;
-            }
-            // One rewrite for the whole batch, not one per entry.
-            let keep = valid.clone();
-            self.index.write_index(&keep).await?;
-        }
+            .filter(|entry| !self.is_expired(entry))
+            .collect();
 
         // `localeCompare` on the fixed key alphabet (`^[A-Za-z0-9._-]+$`,
         // enforced by sanitize_id) agrees with a byte comparison.
@@ -236,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_lazily_deletes_an_expired_entry() {
+    async fn get_filters_an_expired_entry_without_deleting_it() {
         let temp = tempfile::tempdir().unwrap();
         let (store, clock) = store(temp.path());
         store.set("k", "v", Some(1_000)).await.unwrap();
@@ -244,8 +259,8 @@ mod tests {
 
         clock.advance_ms(1_001);
         assert!(store.get("k").await.unwrap().is_none());
-        // And the file is gone, not merely hidden.
-        assert!(!path_exists(&store.paths.context_path("k").unwrap()).await);
+        // Expiry is maintenance, never a read side effect.
+        assert!(path_exists(&store.paths.context_path("k").unwrap()).await);
         assert!(store.list().await.unwrap().is_empty());
     }
 
@@ -260,7 +275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_purges_every_expired_entry_in_one_pass() {
+    async fn list_filters_expired_entries_without_deleting_them() {
         let temp = tempfile::tempdir().unwrap();
         let (store, clock) = store(temp.path());
         store.set("keep", "v", None).await.unwrap();
@@ -275,11 +290,11 @@ mod tests {
 
         for key in ["gone1", "gone2"] {
             assert!(
-                !path_exists(&store.paths.context_path(key).unwrap()).await,
+                path_exists(&store.paths.context_path(key).unwrap()).await,
                 "{key}"
             );
         }
-        // The index was rewritten once, so a re-read agrees.
+        // Repeated reads continue filtering the same stored index.
         assert_eq!(store.list().await.unwrap().len(), 2);
     }
 
@@ -350,7 +365,7 @@ mod tests {
             .await
             .unwrap();
         files.sort();
-        assert_eq!(files, vec!["_index.json", "a.json", "b.json"]);
+        assert_eq!(files, vec!["a.json", "b.json"]);
     }
 
     #[tokio::test]
@@ -361,5 +376,23 @@ mod tests {
             assert!(store.set(key, "v", None).await.is_err(), "{key}");
             assert!(store.get(key).await.is_err(), "{key}");
         }
+    }
+
+    #[tokio::test]
+    async fn reads_with_a_missing_or_corrupt_index_do_not_publish_a_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, clock) = store(temp.path());
+        store.set("expired", "old", Some(1000)).await.unwrap();
+        store.set("keep", "new", None).await.unwrap();
+        clock.advance_ms(1001);
+        let index = store.index.index_path();
+        tokio::fs::remove_file(&index).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        assert!(store.get("expired").await.unwrap().is_none());
+        assert!(!index.exists());
+        tokio::fs::write(&index, b"broken index").await.unwrap();
+        assert_eq!(store.get_all().await.unwrap().len(), 1);
+        assert_eq!(tokio::fs::read(&index).await.unwrap(), b"broken index");
+        assert!(store.paths.context_path("expired").unwrap().exists());
     }
 }

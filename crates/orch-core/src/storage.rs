@@ -179,12 +179,12 @@ pub struct ContextEntry {
 
 #[async_trait]
 pub trait ContextStore: Send + Sync {
-    /// Lazily deletes an expired entry and returns `None` for it.
+    /// Returns `None` for expired entries without changing the store.
     async fn get(&self, key: &str) -> Result<Option<ContextEntry>>;
     async fn set(&self, key: &str, value: &str, ttl_ms: Option<u64>) -> Result<()>;
     async fn delete(&self, key: &str) -> Result<()>;
-    /// Lazily purges every expired entry (batched, one index rewrite) and
-    /// returns the rest sorted by `key` ascending.
+    /// Returns unexpired entries sorted by `key` ascending without changing the store.
+    /// Expiry maintenance runs explicitly outside this read interface.
     async fn list(&self) -> Result<Vec<ContextEntry>>;
     /// `list()` projected to `{ key: value }`, in `list()` order.
     async fn get_all(&self) -> Result<IndexMap<String, String>>;

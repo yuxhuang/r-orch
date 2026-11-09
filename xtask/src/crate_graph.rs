@@ -41,9 +41,16 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("orch-engine", &["orch-core", "orch-domain", "orch-infra"]),
     // Transport composes the engine and concrete peer persistence; the engine
     // reaches it only through the network-independent bridge in orch-core.
+    // orch-proto supplies the shared bounded NDJSON framing only (design D10).
     (
         "orch-peer",
-        &["orch-core", "orch-domain", "orch-engine", "orch-infra"],
+        &[
+            "orch-core",
+            "orch-domain",
+            "orch-engine",
+            "orch-infra",
+            "orch-proto",
+        ],
     ),
     // **Tighter than ARCHITECTURE §3.1's diagram**, which has the TUI
     // depending on the engine. WP-6 inverted it: everything the dashboard
@@ -57,15 +64,36 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // "someone quietly improved the layering" into a failure that had to be
     // looked at rather than a diff nobody read.
     ("orch-tui", &["orch-domain"]),
-    // The CLI is the top of the stack and may name anything below it.
+    // The local daemon protocol: data and pure codecs only, so a client crate
+    // can depend on it without gaining a store capability (design D1).
+    ("orch-proto", &["orch-domain"]),
+    ("orch-client", &["orch-domain", "orch-proto"]),
+    // The per-project daemon composes everything that owns state.
     (
-        "orch-cli",
+        "orch-daemon",
         &[
             "orch-core",
             "orch-domain",
             "orch-engine",
             "orch-infra",
             "orch-peer",
+            "orch-proto",
+        ],
+    ),
+    // The CLI is the top of the stack and may name anything below it. The
+    // proto/daemon edges serve `orch daemon` in PR 1; PR 4 tightens this row
+    // to the client-only set (design D1).
+    (
+        "orch-cli",
+        &[
+            "orch-client",
+            "orch-core",
+            "orch-daemon",
+            "orch-domain",
+            "orch-engine",
+            "orch-infra",
+            "orch-peer",
+            "orch-proto",
             "orch-tui",
         ],
     ),

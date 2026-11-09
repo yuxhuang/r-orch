@@ -10,6 +10,9 @@
 //! in Rust there are no dynamic imports to avoid, so each tier simply
 //! constructs what it needs (ARCHITECTURE §7).
 
+pub mod operation;
+pub use operation::{OperationBoundary, OperationOutcome};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -47,6 +50,19 @@ use crate::run_service::RunService;
 use crate::task_service::TaskService;
 use crate::team_service::TeamService;
 
+/// Explicit context maintenance over the same store used by engine readers.
+/// Keeping the concrete handle here leaves the existing core store trait intact.
+pub struct ContextService {
+    store: Arc<FileContextStore>,
+}
+
+impl ContextService {
+    /// Remove expired entries. Reads only filter them; daemon maintenance calls this.
+    pub async fn expire_now(&self) -> Result<Vec<String>> {
+        self.store.expire_now().await
+    }
+}
+
 /// Everything a read-only command needs.
 pub struct Engine {
     pub paths: Paths,
@@ -60,6 +76,7 @@ pub struct Engine {
     pub config_store: Arc<dyn ConfigStore>,
     pub global_config_store: Arc<dyn GlobalConfigStore>,
     pub context: Arc<dyn ContextStore>,
+    pub context_service: Arc<ContextService>,
     pub messages: Arc<dyn MessageStore>,
     pub goals: Arc<dyn GoalStore>,
     pub teams: Arc<dyn TeamStore>,
@@ -96,6 +113,40 @@ pub struct FullEngine {
     pub lock: Arc<dyn ProjectLock>,
     pub doctor_service: Arc<DoctorService>,
     pub orchestrator: Arc<Orchestrator>,
+}
+
+impl FullEngine {
+    /// Recover execution state and rebuild every missing/corrupt store index
+    /// before the listener admits a session.
+    pub async fn daemon_initialize(&self) -> Result<()> {
+        self.orchestrator.daemon_initialize().await?;
+        self.operation_boundary()
+            .run(false, async {
+                self.tasks.list(&Default::default()).await?;
+                self.agents.list().await?;
+                self.runs.list_all().await?;
+                self.goals.list(&Default::default()).await?;
+                self.teams.list().await?;
+                self.messages.list().await?;
+
+                Ok(())
+            })
+            .await
+            .value
+    }
+
+    pub fn operation_boundary(&self) -> Arc<OperationBoundary> {
+        self.events.operation_boundary()
+    }
+
+    /// Refresh future launches without replacing process ownership or collectors.
+    pub async fn refresh_config(&self) -> Result<OrchestratorConfig> {
+        let config = self.config_store.read().await?;
+        self.task_service.refresh_config(config.clone());
+        self.agent_service.refresh_config(config.clone());
+        self.orchestrator.refresh_config(config.clone());
+        Ok(config)
+    }
 }
 
 impl std::fmt::Debug for FullEngine {
@@ -180,10 +231,14 @@ pub async fn build_light_with(
     let agents: Arc<dyn AgentStore> = Arc::new(FileAgentStore::new(paths.clone()));
     let runs: Arc<dyn RunStore> = Arc::new(FileRunStore::new(paths.clone()));
     let state: Arc<dyn StateStore> = Arc::new(FileStateStore::new(paths.clone()));
-    let context: Arc<dyn ContextStore> = Arc::new(FileContextStore::new(
+    let context_store = Arc::new(FileContextStore::new(
         paths.clone(),
         Arc::clone(&seams.clock),
     ));
+    let context_service = Arc::new(ContextService {
+        store: Arc::clone(&context_store),
+    });
+    let context: Arc<dyn ContextStore> = context_store;
     let messages: Arc<dyn MessageStore> = Arc::new(FileMessageStore::new(
         paths.clone(),
         Arc::clone(&seams.clock),
@@ -261,6 +316,7 @@ pub async fn build_light_with(
         config_store,
         global_config_store,
         context,
+        context_service,
         messages,
         goals,
         teams,
@@ -290,6 +346,7 @@ pub async fn build_full_with(
         project_root.into(),
         seams,
         orch_domain::PeerConfig::default(),
+        None,
     )
     .await
 }
@@ -298,13 +355,27 @@ pub async fn build_full_with_peer(
     project_root: impl Into<PathBuf>,
     peer: orch_domain::PeerConfig,
 ) -> Result<FullEngine> {
-    build_full_internal(project_root.into(), EngineSeams::default(), peer).await
+    build_full_internal(project_root.into(), EngineSeams::default(), peer, None).await
+}
+
+/// The daemon's build: one engine whose every child process — agents, git,
+/// adapters — goes through `processes`. The daemon passes a manager that
+/// spawns from its start-time environment snapshot; its test harness passes a
+/// scripted one.
+pub async fn build_full_with_processes(
+    project_root: impl Into<PathBuf>,
+    seams: EngineSeams,
+    peer: orch_domain::PeerConfig,
+    processes: Arc<dyn ProcessManager>,
+) -> Result<FullEngine> {
+    build_full_internal(project_root.into(), seams, peer, Some(processes)).await
 }
 
 async fn build_full_internal(
     project_root: PathBuf,
     seams: EngineSeams,
     peer: orch_domain::PeerConfig,
+    processes: Option<Arc<dyn ProcessManager>>,
 ) -> Result<FullEngine> {
     let mut engine = build_light_with(project_root.clone(), seams).await?;
     if peer.name.is_some() {
@@ -315,7 +386,8 @@ async fn build_full_internal(
     }
     engine.global_config = engine.global_config_store.read().await?;
 
-    let processes: Arc<dyn ProcessManager> = Arc::new(orch_infra::process::SystemProcessManager);
+    let processes: Arc<dyn ProcessManager> =
+        processes.unwrap_or_else(|| Arc::new(orch_infra::process::SystemProcessManager));
     // Adapters stamp the events they parse out of a child's stdout, so they
     // get the injected clock too — otherwise the seam would reach every
     // timestamp except the ones the adapters actually read.
@@ -361,6 +433,7 @@ async fn build_full_internal(
         skill_loader: Some(Arc::clone(&skills)),
     }));
     orchestrator.set_config_store(Arc::clone(&engine.config_store));
+    orchestrator.set_context_service(Arc::clone(&engine.context_service));
 
     Ok(FullEngine {
         engine,
@@ -628,5 +701,227 @@ mod tests {
         // needs the light tier does not have to know about the split.
         assert_eq!(full.config.project.name, "my-project");
         assert_eq!(full.paths.root(), Paths::new(temp.path()).root());
+    }
+
+    #[tokio::test]
+    async fn service_cancel_stops_a_live_child_owned_by_the_full_engine() {
+        use orch_core::process::{Signal, SpawnOptions};
+        use orch_core::test_support::{make_agent, make_run, make_task};
+        use orch_domain::{AgentStatus, RunStatus, TaskStatus};
+
+        struct Cleanup(Arc<dyn ProcessManager>, u32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.kill(self.1, Signal::Kill);
+            }
+        }
+
+        let temp = initialized();
+        let full = build_full_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..deterministic_seams()
+            },
+        )
+        .await
+        .unwrap();
+        let task = orch_domain::Task {
+            status: TaskStatus::InProgress,
+            ..make_task()
+        };
+        let agent = orch_domain::Agent {
+            status: AgentStatus::Running,
+            ..make_agent()
+        };
+        let run = orch_domain::Run {
+            task_id: task.id.clone(),
+            status: RunStatus::Running,
+            ..make_run()
+        };
+        full.tasks.save(&task).await.unwrap();
+        full.agents.save(&agent).await.unwrap();
+        full.runs.save(&run).await.unwrap();
+        let child = full
+            .processes
+            .spawn(
+                "sleep",
+                &["60".into()],
+                SpawnOptions {
+                    cwd: temp.path().to_path_buf(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cleanup = Cleanup(Arc::clone(&full.processes), child.pid);
+        let mut state = orch_domain::OrchestratorState::default();
+        state.running.insert(
+            task.id.clone(),
+            orch_domain::RunningEntry {
+                run_id: run.id.clone(),
+                agent_id: agent.id.clone(),
+                pid: child.pid,
+                started_at: full.clock.now_iso(),
+                last_event_at: full.clock.now_iso(),
+                task_id: task.id.clone(),
+                remote: None,
+            },
+        );
+        full.state.write(&state).await.unwrap();
+        assert!(full.processes.is_alive(child.pid));
+        let cancelled = full.task_service.cancel(&task.id).await.unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), child.exit.wait())
+            .await
+            .expect("child should exit after service cancellation");
+        assert!(!outcome.success());
+        assert!(!full.processes.is_alive(child.pid));
+        assert!(full.state.read().await.unwrap().running.is_empty());
+        assert_eq!(
+            full.runs.get(&run.id).await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            full.agents.get(&agent.id).await.unwrap().unwrap().status,
+            AgentStatus::Idle
+        );
+        drop(cleanup);
+    }
+
+    #[tokio::test]
+    async fn context_reads_leave_expiry_to_the_explicit_engine_step() {
+        let temp = initialized();
+        let clock = Arc::new(orch_core::test_support::FixedClock::at(1_760_000_000_000));
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                ..deterministic_seams()
+            },
+        )
+        .await
+        .unwrap();
+        engine
+            .context
+            .set("expired", "value", Some(1000))
+            .await
+            .unwrap();
+        engine.context.set("kept", "value", None).await.unwrap();
+        let path = engine.paths.context_path("expired").unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+        clock.advance_ms(1001);
+        assert!(engine.context.get("expired").await.unwrap().is_none());
+        assert_eq!(engine.context.list().await.unwrap().len(), 1);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert_eq!(
+            engine.context_service.expire_now().await.unwrap(),
+            vec!["expired"]
+        );
+        assert!(!path.exists());
+        assert!(
+            engine
+                .context_service
+                .expire_now()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_context_read_creates_no_files_or_directories() {
+        let temp = initialized();
+        let engine = build_light(temp.path()).await.unwrap();
+        assert!(engine.context.get("missing").await.unwrap().is_none());
+        assert!(engine.context.list().await.unwrap().is_empty());
+        assert!(engine.context.get_all().await.unwrap().is_empty());
+        assert!(!engine.paths.context_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn watch_starts_with_malformed_context_and_missing_index() {
+        for corrupt_index in [false, true] {
+            let temp = initialized();
+            let paths = Paths::new(temp.path());
+            std::fs::create_dir_all(paths.context_dir()).unwrap();
+            let bad = paths.context_dir().join("bad.json");
+            std::fs::write(&bad, "malformed json").unwrap();
+            let index = paths.context_dir().join("_index.json");
+            if corrupt_index {
+                std::fs::write(&index, "malformed index").unwrap();
+            }
+            let full = build_full_with(
+                temp.path(),
+                EngineSeams {
+                    global_config_path: Some(temp.path().join("global.yml")),
+                    ..deterministic_seams()
+                },
+            )
+            .await
+            .unwrap();
+            let mut agent = orch_core::test_support::make_agent();
+            agent.status = orch_domain::AgentStatus::Running;
+            full.agents.save(&agent).await.unwrap();
+            let mut events = full.events.subscribe();
+
+            let started = full
+                .orchestrator
+                .start_watch(crate::WatchOptions {
+                    skip_autonomous_seeding: true,
+                    handle_signals: false,
+                })
+                .await;
+            let status = full.agents.get(&agent.id).await.unwrap().unwrap().status;
+            let observed = events.try_drain();
+            full.orchestrator.stop().await.unwrap();
+
+            started.expect("corrupt context must not prevent an idle watch from starting");
+            assert_eq!(status, orch_domain::AgentStatus::Idle, "reconcile ran");
+            assert!(observed.iter().any(|event| matches!(
+                event.as_ref(),
+                orch_domain::OrchestratorEvent::OrchestratorError {
+                    error, context, fatal: false,
+                } if context == "context expiry" && error.contains("bad.json")
+            )));
+            assert_eq!(std::fs::read_to_string(&bad).unwrap(), "malformed json");
+            assert_eq!(index.exists(), corrupt_index);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_full_engine_expires_context_on_an_explicit_tick() {
+        let temp = initialized();
+        let clock = Arc::new(orch_core::test_support::FixedClock::at(1_760_000_000_000));
+        let full = build_full_with(
+            temp.path(),
+            EngineSeams {
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..deterministic_seams()
+            },
+        )
+        .await
+        .unwrap();
+        full.context
+            .set("expired", "value", Some(1000))
+            .await
+            .unwrap();
+        clock.advance_ms(1001);
+        let path = full.paths.context_path("expired").unwrap();
+        assert!(full.context.list().await.unwrap().is_empty());
+        assert!(path.exists());
+        full.orchestrator
+            .start_watch(crate::WatchOptions {
+                skip_autonomous_seeding: true,
+                handle_signals: false,
+            })
+            .await
+            .unwrap();
+        let removed = !path.exists();
+        full.orchestrator.stop().await.unwrap();
+        assert!(
+            removed,
+            "initial tick should run explicit context maintenance"
+        );
     }
 }

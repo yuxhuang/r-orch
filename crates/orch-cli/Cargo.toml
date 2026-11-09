@@ -32,6 +32,11 @@ orch-engine.workspace = true
 orch-infra.workspace = true
 orch-peer.workspace = true
 orch-tui.workspace = true
+# `orch daemon start|stop|status|dispatch` (PR 1, S1c). Only
+# `commands/daemon.rs` and `commands/init.rs` may name `orch_daemon` (design D1).
+orch-client.workspace = true
+orch-proto.workspace = true
+orch-daemon.workspace = true
 
 # anyhow is allowed here and in xtask only — never in a library signature.
 anyhow.workspace = true
@@ -84,6 +89,7 @@ tracing-subscriber.workspace = true
 nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
+orch-daemon = { workspace = true, features = ["testing"] }
 orch-core = { workspace = true, features = ["test-support"] }
 assert_cmd.workspace = true
 insta.workspace = true

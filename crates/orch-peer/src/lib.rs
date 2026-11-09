@@ -233,7 +233,8 @@ impl PeerRuntime {
     /// Call `start_listener` only after watch startup succeeds: accepting a flood
     /// earlier can exhaust descriptors during startup's fallible filesystem work.
     pub async fn prepare(engine: Arc<FullEngine>) -> Result<Self> {
-        if !engine.orchestrator.is_owner() {
+        // A daemon owns the project through its own locks, not watch mode.
+        if !engine.orchestrator.is_owner() && !engine.orchestrator.is_daemon_mode() {
             return Err(Error::invalid_arguments(
                 "Peer runtime requires the engine owner",
             ));

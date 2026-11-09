@@ -1,7 +1,8 @@
 //! The event bus.
 //!
-//! The bus is **synchronous**: `emit()` runs every handler inline and
-//! swallows their exceptions. Two layers serve that contract here, because two
+//! Outside a project operation the bus is **synchronous**: `emit()` runs every handler inline and
+//! swallows their exceptions. Inside an operation events are buffered until
+//! commit and permit release. Two layers serve that contract here, because two
 //! different consumers need two different things:
 //!
 //! 1. **Synchronous handlers** ([`EventBus::on`], [`EventBus::once`],
@@ -96,6 +97,7 @@ impl Registry {
 pub struct EventBus {
     tx: broadcast::Sender<Arc<OrchestratorEvent>>,
     registry: Arc<Mutex<Registry>>,
+    operation: Arc<crate::container::OperationBoundary>,
 }
 
 impl Default for EventBus {
@@ -135,6 +137,7 @@ impl EventBus {
         EventBus {
             tx,
             registry: Arc::new(Mutex::new(Registry::new())),
+            operation: Arc::new(crate::container::OperationBoundary::new()),
         }
     }
 
@@ -146,6 +149,16 @@ impl EventBus {
     /// then run before the wildcard ones, which is the dispatch order.
     /// An event emitted with no subscribers is dropped.
     pub fn emit(&self, event: OrchestratorEvent) {
+        if let Some(event) = crate::container::operation::buffer_event(self, event) {
+            self.emit_immediate(event);
+        }
+    }
+
+    pub fn operation_boundary(&self) -> Arc<crate::container::OperationBoundary> {
+        Arc::clone(&self.operation)
+    }
+
+    pub(crate) fn emit_immediate(&self, event: OrchestratorEvent) {
         let event = Arc::new(event);
         let _ = self.tx.send(Arc::clone(&event));
 

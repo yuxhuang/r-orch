@@ -1,0 +1,41 @@
+[package]
+name = "orch-daemon"
+description = "The per-project orch daemon: sole owner of .orchestry/, its stores and agent processes."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# The in-process `DaemonHarness` (design D12). A dev-dependency feature for
+# orch-cli and this crate's own tests; production builds never compile it.
+testing = ["dep:tempfile"]
+
+[dependencies]
+orch-domain.workspace = true
+orch-core.workspace = true
+orch-infra.workspace = true
+orch-engine.workspace = true
+orch-peer.workspace = true
+orch-proto.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tracing.workspace = true
+tempfile = { workspace = true, optional = true }
+# Owner guard (flock), private directories and descriptors, umask, euid,
+# setsid for the detached child. Already in the lockfile via orch-infra.
+nix = { workspace = true, features = ["fs", "process", "user"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

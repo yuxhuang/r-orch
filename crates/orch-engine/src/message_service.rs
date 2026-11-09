@@ -292,6 +292,34 @@ impl MessageService {
         Ok(pending)
     }
 
+    /// Mark only the pending messages captured in a prompt whose local child
+    /// has now launched. Later arrivals remain queued for a future prompt.
+    pub async fn mark_snapshot_delivered(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        self.events
+            .operation_boundary()
+            .run(true, async {
+                let selected: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
+                for message in self.messages.list_pending(agent_id).await? {
+                    if selected.contains(message.id.as_str()) {
+                        self.messages.mark_delivered(&message.id).await?;
+                        self.events.emit(OrchestratorEvent::MessageDelivered {
+                            message_id: message.id,
+                            to_agent_id: agent_id.to_owned(),
+                            task_id: task_id.to_owned(),
+                        });
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .value
+    }
+
     pub async fn list_all(&self) -> Result<Vec<Message>> {
         self.messages.list().await
     }

@@ -1050,12 +1050,13 @@ fn context_get_returns_the_entry_and_null_for_a_missing_key() {
 }
 
 #[test]
-fn context_get_of_an_expired_key_is_null_and_purges_the_entry() {
+fn context_get_of_an_expired_key_is_null_and_leaves_the_entry_on_disk() {
     let mut fx = Fx::new();
     fx.cli(&["context", "set", "k", "v", "--ttl", "60000"]);
     expire_context(fx.root(), "k");
     assert_eq!(fx.ok("context_get", json!({"key": "k"})), Value::Null);
-    assert!(!fx.root().join(".orchestry/context/k.json").exists());
+    // Daemon goal row 5c: client reads filter expiry without deleting files.
+    assert!(fx.root().join(".orchestry/context/k.json").exists());
 }
 
 #[test]

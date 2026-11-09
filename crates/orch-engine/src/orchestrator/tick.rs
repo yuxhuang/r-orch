@@ -50,6 +50,11 @@ impl Orchestrator {
         let state = slot.as_mut().expect("state loaded");
 
         self.reconcile(state).await?;
+        // Context expiry is maintenance: a corrupt entry or failed write must
+        // not skip lifecycle work or count toward the fatal tick breaker.
+        if let Err(err) = self.expire_context().await {
+            self.emit_error(err, "context expiry");
+        }
         if !self.inner.skip_autonomous_seeding.load(Ordering::SeqCst) {
             self.seed_autonomous_tasks().await;
         }
@@ -285,6 +290,19 @@ impl Orchestrator {
                 run_id: entry.run_id.clone(),
             });
             self.take_cancel(task_id).await;
+            if self.is_daemon_mode() {
+                self.inner
+                    .terminal_intents
+                    .lock()
+                    .await
+                    .insert(entry.run_id.clone());
+                self.inner.deferred_kills.lock().await.push((
+                    task_id.clone(),
+                    entry.clone(),
+                    "Agent stalled (no events)".to_owned(),
+                ));
+                continue;
+            }
             self.deps()
                 .processes
                 .kill_with_grace(entry.pid, super::STALL_KILL_GRACE)
@@ -315,7 +333,9 @@ impl Orchestrator {
 
         self.reconcile_stale_agents(state).await?;
         self.reconcile_orphaned_tasks(state).await?;
-        self.process_retry_queue(state).await?;
+        if !self.is_daemon_mode() {
+            self.process_retry_queue(state).await?;
+        }
         self.prune_remote_clocks(state).await;
         self.save_state(state).await
     }
@@ -433,10 +453,10 @@ impl Orchestrator {
 
         for task_id in due {
             let task = self.deps().task_store.get(&task_id).await?;
-            let Some(task) = task.filter(|task| is_dispatchable(task.status)) else {
+            if task.is_none_or(|task| !is_dispatchable(task.status)) {
                 continue;
-            };
-            self.dispatch_task(state, &task_id, Some(task)).await?;
+            }
+            self.dispatch_task(state, &task_id).await?;
         }
         Ok(())
     }
@@ -572,7 +592,7 @@ impl Orchestrator {
     /// it stays even though the `select!` arms already reduce the contention
     /// the retry loop was written for.
     pub(super) fn schedule_immediate_dispatch(&self, retries: u32) {
-        if self.is_shutting_down() {
+        if self.is_daemon_mode() || self.is_shutting_down() {
             return;
         }
         let orchestrator = self.clone();
