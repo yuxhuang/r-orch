@@ -46,6 +46,7 @@ impl ClientEndpoint {
 #[derive(Default)]
 pub struct HarnessBuilder {
     clock: Option<Arc<dyn Clock>>,
+    maintenance_timer: Option<bool>,
     ids: Option<Arc<dyn IdGenerator>>,
     processes: Option<Arc<dyn ProcessManager>>,
     global_config_path: Option<PathBuf>,
@@ -64,6 +65,14 @@ impl HarnessBuilder {
     /// Inject the clock (context expiry, retry timing).
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Enable periodic context expiry and transfer sweeps (enabled by default).
+    /// Disable with an injected clock to drive expiry explicitly via
+    /// [`DaemonHarness::step_expiry`] or `maintenance.expire_context`.
+    pub fn maintenance_timer(mut self, enabled: bool) -> Self {
+        self.maintenance_timer = Some(enabled);
         self
     }
 
@@ -171,17 +180,20 @@ impl HarnessBuilder {
                     .unwrap_or_else(|| scratch.path().join("global.yml")),
             ),
         };
-        let running = Running::bring_up(BringUp {
-            project_root: root.clone(),
-            socket: socket.clone(),
-            dispatch: self.dispatch,
-            listen: self.listen,
-            peer_name: self.peer_name,
-            seams,
-            processes: self.processes,
-            versions: self.versions,
-            snapshot: crate::env::capture(std::env::vars_os()),
-        })
+        let running = Running::bring_up_with_maintenance_timer(
+            BringUp {
+                project_root: root.clone(),
+                socket: socket.clone(),
+                dispatch: self.dispatch,
+                listen: self.listen,
+                peer_name: self.peer_name,
+                seams,
+                processes: self.processes,
+                versions: self.versions,
+                snapshot: crate::env::capture(std::env::vars_os()),
+            },
+            self.maintenance_timer.unwrap_or(true),
+        )
         .await?;
         let mut running = running;
         running.honour_stop_intent();

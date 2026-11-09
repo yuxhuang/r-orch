@@ -292,6 +292,14 @@ pub(crate) struct Running {
 
 impl Running {
     pub(crate) async fn bring_up(spec: BringUp) -> Result<Running, DaemonError> {
+        Self::bring_up_with_maintenance_timer(spec, true).await
+    }
+
+    /// The harness may disable periodic expiry and transfer sweeps.
+    pub(crate) async fn bring_up_with_maintenance_timer(
+        spec: BringUp,
+        maintenance_timer: bool,
+    ) -> Result<Running, DaemonError> {
         let root = spec.project_root.clone();
         let state_dir = root.join(".orchestry");
         let (project_id, meta) = discovery::project_identity(&root)?;
@@ -303,7 +311,16 @@ impl Running {
         let pid_lock = Arc::new(
             PidLock::acquire(orch_infra::storage::paths::Paths::new(&root).lock_path()).await?,
         );
-        match Self::build(root, state_dir, project_id, spec, Arc::clone(&pid_lock)).await {
+        match Self::build(
+            root,
+            state_dir,
+            project_id,
+            spec,
+            Arc::clone(&pid_lock),
+            maintenance_timer,
+        )
+        .await
+        {
             Ok(mut running) => {
                 running.guard = Some(guard);
                 Ok(running)
@@ -322,6 +339,7 @@ impl Running {
         project_id: ProjectId,
         spec: BringUp,
         pid_lock: Arc<PidLock>,
+        maintenance_timer: bool,
     ) -> Result<Running, DaemonError> {
         let processes = spec.processes.unwrap_or_else(|| {
             Arc::new(orch_infra::process::SnapshotEnvProcessManager::new(
@@ -506,10 +524,12 @@ impl Running {
         }
         // Maintenance (expiry, transfer sweeps) runs whatever the dispatch
         // switch says; it ends itself once admission stops.
-        let maintenance = handler.clone();
-        running.loops.push(tokio::spawn(
-            async move { maintenance.run_maintenance().await },
-        ));
+        if maintenance_timer {
+            let maintenance = handler.clone();
+            running.loops.push(tokio::spawn(
+                async move { maintenance.run_maintenance().await },
+            ));
+        }
         running.loops.push(tokio::spawn(heartbeat(
             pid_lock,
             handler.clone(),

@@ -194,6 +194,7 @@ async fn off_keeps_cancel_expiry_and_status_alive() {
     let clock = support::TestClock::new();
     let daemon = DaemonHarness::builder()
         .clock(clock.clone())
+        .maintenance_timer(false)
         .start()
         .await
         .unwrap();
@@ -224,12 +225,10 @@ async fn off_keeps_cancel_expiry_and_status_alive() {
         )
         .await);
     clock.advance_ms(1_000);
-    // The daemon's own 1 s maintenance timer may have removed the key already;
-    // either way, with dispatch OFF the key must end up expired and gone.
     let expired = raw
         .request(5, "maintenance.expire_context", json!({}))
         .await;
-    assert!(ok(&expired)["removed"].as_u64().unwrap() <= 1, "{expired}");
+    assert_eq!(ok(&expired)["removed"], 1, "{expired}");
     let listed = raw.request(7, "context.list", json!({})).await;
     assert_eq!(ok(&listed), &json!([]), "expiry did not run while OFF");
 

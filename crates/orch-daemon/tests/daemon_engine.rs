@@ -266,20 +266,39 @@ fn context_fingerprint(root: &std::path::Path) -> Vec<(String, u64, std::time::S
     out
 }
 
+/// Advancing the runtime past maintenance ticks must leave expiry to the
+/// explicit step when the harness disables the timer.
+#[tokio::test(start_paused = true)]
+async fn maintenance_timer_off_leaves_expiry_to_the_explicit_step() {
+    let clock = TestClock::new();
+    let daemon = DaemonHarness::builder()
+        .clock(clock.clone())
+        .maintenance_timer(false)
+        .start()
+        .await
+        .unwrap();
+    daemon
+        .engine()
+        .context
+        .set("lapsing", "v", Some(1000))
+        .await
+        .unwrap();
+    clock.advance_ms(2_000);
+    // Virtual Tokio time: cross multiple maintenance ticks without a real wait.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(daemon.step_expiry().await.unwrap(), 1);
+    assert_eq!(daemon.step_expiry().await.unwrap(), 0);
+    daemon.shutdown().await.unwrap();
+}
+
 /// Reads filter but never delete; an explicit expiry sees the renewal; and
 /// expiry runs with dispatch OFF (R10, R11).
-///
-/// The daemon also runs a 1 s maintenance timer against the injected clock, so
-/// in the rare run where it ticks inside the few milliseconds between the
-/// clock advance and the read check, the file vanishes for a legitimate
-/// reason. A read-triggered deletion would happen on *every* attempt, so the
-/// test passes when any of 3 fresh attempts leaves the directory untouched
-/// (a harness seam to disable the timer is requested in the T1 report).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_do_not_expire_and_renewal_survives() {
     let clock = TestClock::new();
     let daemon = DaemonHarness::builder()
         .clock(clock.clone())
+        .maintenance_timer(false)
         .start()
         .await
         .unwrap();
@@ -291,67 +310,42 @@ async fn reads_do_not_expire_and_renewal_survives() {
         "expiry must not need dispatch"
     );
 
-    let mut untouched = false;
-    let mut failures = Vec::new();
-    for attempt in 0..3u64 {
-        let key = format!("lapsing{attempt}");
-        ok(&raw
-            .request(
-                2,
-                "context.set",
-                json!({"key": key, "value": "v1", "ttl_ms": 1000}),
-            )
-            .await);
-        ok(&raw
-            .request(3, "context.set", json!({"key": "forever", "value": "keep"}))
-            .await);
+    ok(&raw
+        .request(
+            2,
+            "context.set",
+            json!({"key": "lapsing", "value": "v1", "ttl_ms": 1000}),
+        )
+        .await);
+    ok(&raw
+        .request(3, "context.set", json!({"key": "forever", "value": "keep"}))
+        .await);
 
-        // Time passes: the short key is now expired but still on disk.
-        clock.advance_ms(2_000);
-        let before = context_fingerprint(daemon.project_root());
-        for round in 0..3 {
-            let listed = raw.request(10 + round, "context.list", json!({})).await;
-            let keys: Vec<&str> = ok(&listed)
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|e| e["key"].as_str().unwrap())
-                .collect();
-            assert!(
-                !keys.contains(&key.as_str()),
-                "expired value served: {keys:?}"
-            );
-            let got = raw
-                .request(20 + round, "context.get", json!({"key": key}))
-                .await;
-            assert!(ok(&got).is_null(), "{got}");
-            let got = raw
-                .request(30 + round, "context.get", json!({"key": "forever"}))
-                .await;
-            assert_eq!(ok(&got)["value"], "keep");
-        }
-        let after = context_fingerprint(daemon.project_root());
-        let had_expired_file = before
+    // Time passes: the short key is now expired but still on disk.
+    clock.advance_ms(2_000);
+    let before = context_fingerprint(daemon.project_root());
+    assert!(before.iter().any(|(name, _, _)| name == "lapsing.json"));
+    for round in 0..3 {
+        let listed = raw.request(10 + round, "context.list", json!({})).await;
+        let keys: Vec<&str> = ok(&listed)
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|(name, _, _)| *name == format!("{key}.json"));
-        if had_expired_file && after == before {
-            untouched = true;
-            break;
-        }
-        failures.push((before, after));
-        // Clear this attempt's key before trying again.
-        ok(&raw
-            .request(40, "maintenance.expire_context", json!({}))
-            .await);
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert!(!keys.contains(&"lapsing"), "expired value served: {keys:?}");
+        let got = raw
+            .request(20 + round, "context.get", json!({"key": "lapsing"}))
+            .await;
+        assert!(ok(&got).is_null(), "{got}");
+        let got = raw
+            .request(30 + round, "context.get", json!({"key": "forever"}))
+            .await;
+        assert_eq!(ok(&got)["value"], "keep");
     }
-    assert!(
-        untouched,
-        "every attempt changed the context directory across plain reads: {failures:?}"
-    );
+    assert_eq!(context_fingerprint(daemon.project_root()), before);
 
-    // `renewed` lapses and is renewed before an explicit expiry runs (or the
-    // timer won the race and it is simply re-created): either way it must
-    // survive the explicit expiry, and the lapsed key must not.
+    // Renew an expired value before explicit expiry: only `lapsing` is removed.
     ok(&raw
         .request(
             50,
@@ -370,7 +364,7 @@ async fn reads_do_not_expire_and_renewal_survives() {
     let report = raw
         .request(52, "maintenance.expire_context", json!({}))
         .await;
-    assert!(ok(&report)["removed"].is_u64(), "{report}");
+    assert_eq!(ok(&report)["removed"], 1, "{report}");
     let listed = raw.request(53, "context.list", json!({})).await;
     let mut kept: Vec<(String, String)> = ok(&listed)
         .as_array()
@@ -397,7 +391,7 @@ async fn reads_do_not_expire_and_renewal_survives() {
     // step as well (the same coordinated handler the timer uses).
     clock.advance_ms(61_000);
     let first = daemon.step_expiry().await.unwrap();
-    assert!(first <= 1, "{first}");
+    assert_eq!(first, 1);
     assert_eq!(daemon.step_expiry().await.unwrap(), 0, "idempotent");
     let listed = raw.request(60, "context.list", json!({})).await;
     let keys: Vec<&str> = ok(&listed)
