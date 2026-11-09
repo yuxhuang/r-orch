@@ -125,7 +125,7 @@ Task ids are created when the previous PR freezes; scopes are disjoint within a 
 
 ## Status
 
-Snapshot of goal `goal_zX0WXev` at 2026-11-09, taken by W1. Not updated automatically; I1 and later writers edit
+Snapshot of goal `goal_zX0WXev` at 2026-11-09, taken by W1; wave-B rows updated by I1. Not updated automatically; I1 and later writers edit
 it.
 
 | Item | Task | State |
@@ -136,15 +136,15 @@ it.
 | T0 | `tsk_YXbg6QP` | implemented, failing-first (`d0da296d`) |
 | W0 | `tsk_hcfxtAc` | drafted (`a2dab502`, `50409748`) |
 | CP1, CP2, gate 2 (spec) | `tsk_Yvrqc9i`, `tsk_W2m3n_b` | spec approved, ADR 0012 accepted (`c14698fb`) |
-| S1a-api | `tsk_K8xOIZl` | in progress |
-| S1a-impl | `tsk_sStUSpy` | pending |
-| S1b | `tsk_8wgBbdh` | pending |
-| S1c | `tsk_fiC9flm` | pending |
-| S1d | `tsk__4ahant` | pending |
-| T1 | `tsk_UtDGaCh` | pending |
-| T1b | `tsk_AWRlxx9` | pending |
-| W1 | `tsk_ArQCbkH` | drafted (the commit that changes this table); written ahead of the code, so the facts board checks it at I1 |
-| I1 | `tsk_vNn_rPy` | pending |
+| S1a-api | `tsk_K8xOIZl` | done (`f91ff25f`); integrated by I1 |
+| S1a-impl | `tsk_sStUSpy` | done (`d0b657e5`, startup seams `fab0fa1a` via `tsk_x8pp05Z`); integrated by I1 |
+| S1b | `tsk_8wgBbdh` | done (`2d2f5f05`); integrated by I1 |
+| S1c | `tsk_fiC9flm` | done (`ba0c7037`, continuations `tsk_fssJiFW`, `tsk_MqrS4Yx`); integrated by I1 |
+| S1d | `tsk__4ahant` | done (`959001ad`); integrated by I1 |
+| T1 | `tsk_UtDGaCh` | done (`ca5492d9`; maintenance-timer seam `14ecefbb` via `tsk_HnLcpiw`, observation fix `2d097798` via `tsk_cVJbOAK`); integrated by I1 |
+| T1b | `tsk_AWRlxx9` | done (`e5216b2f`); integrated by I1 |
+| W1 | `tsk_ArQCbkH` | done (`05d55220`); written ahead of the code, so the facts board checks it at the I1 SHA |
+| I1 | `tsk_vNn_rPy` | integrated on `feature/daemon-core`; the frozen SHA is the commit that changes this row (recorded in the I1 report) |
 | G1: code, security, resilience, facts, cold gate | `tsk_Gc_B8Ya`, `tsk_mQszv9B`, `tsk_jeSSHfY`, `tsk_Zt3JSh7`, `tsk_JpO4CUF` | pending |
 | CP3 | `tsk__g95cwZ` | pending |
 | PR 2–4 | — | pending |

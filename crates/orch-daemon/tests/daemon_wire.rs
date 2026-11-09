@@ -222,13 +222,11 @@ async fn premature_eof_mid_frame_ends_only_that_session_and_executes_nothing() {
     daemon.shutdown().await.unwrap();
 }
 
-/// BUG repro (see the fix task named in the ignore reason): when a session is
-/// torn down before the `logs.follow` task has registered its observation, the
-/// teardown cannot cancel it, so the follow loops until the daemon stops and
-/// the connection's writer is never released: the client never sees EOF.
-/// This is the same exchange as the test above without the scheduler point.
+/// Regression (tsk_cVJbOAK): when a session is torn down before the
+/// `logs.follow` task has registered its observation, the teardown must still
+/// cancel it, so the follow stops and the connection's writer is released: the
+/// client sees EOF. Same exchange as the test above without the scheduler point.
 #[tokio::test]
-#[ignore = "BUG tsk_cVJbOAK: disconnect before observation registration leaks logs.follow and leaves the connection half-open"]
 async fn a_session_closed_immediately_after_logs_follow_is_fully_torn_down() {
     let daemon = daemon().await;
     let mut raw = Raw::session(&daemon, "cli", "normal").await;
