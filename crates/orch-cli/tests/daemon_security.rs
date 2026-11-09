@@ -96,6 +96,86 @@ fn files_are_private_under_any_umask_and_the_state_dir_is_not_chmodded() {
     }
 }
 
+/// Start `cmd` under umask 000 and return the endpoint it reports.
+fn start_under_open_umask(
+    cmd: &Command,
+    err: std::path::PathBuf,
+) -> (DaemonChild, std::path::PathBuf) {
+    let mut daemon = DaemonChild::spawn(under_umask(cmd, "000"), err);
+    let socket = match daemon.outcome(READY) {
+        Outcome::Ready(line) => std::path::PathBuf::from(line.strip_prefix("listening ").unwrap()),
+        Outcome::Exited(status) => panic!("exited ({status}): {}", daemon.stderr()),
+    };
+    (daemon, socket)
+}
+
+/// An `ORCH_SOCKET` whose parent does not exist yet: the daemon creates that
+/// parent 0700, binds, and leaves the socket 0600 and the record 0600 even
+/// under umask 000 (sec-eng F2 equivalence, conformance condition: every
+/// endpoint parent passes `prepare_private_dir` before bind).
+#[test]
+fn an_orch_socket_override_in_a_new_parent_is_private_under_umask_000() {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let parent = sandbox.short_dir().join("fresh");
+    let wanted = parent.join("s");
+    let mut cmd = sandbox.start_cmd(&[]);
+    cmd.env("ORCH_SOCKET", &wanted);
+    assert!(!parent.exists());
+    let (_daemon, socket) = start_under_open_umask(&cmd, sandbox.short_dir().join("d.err"));
+    assert_eq!(socket, wanted);
+    assert_eq!(mode(&parent), 0o700, "override parent");
+    assert_eq!(mode(&socket), 0o600, "override socket");
+    assert_eq!(
+        mode(&sandbox.state_dir().join("daemon.json")),
+        0o600,
+        "record"
+    );
+}
+
+/// A root too long for the in-project default falls back to
+/// `$TMPDIR/orch-<hash>/orch.sock`: the fallback parent is created 0700, the
+/// socket ends 0600 and the record 0600 under umask 000.
+#[test]
+fn a_tmpdir_fallback_endpoint_is_private_under_umask_000() {
+    let base = tempfile::Builder::new()
+        .prefix("dq-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .unwrap();
+    let canonical = base.path().canonicalize().unwrap();
+    // One byte past the in-project budget: `<root>/.orchestry/run/orch.sock` > 100.
+    let root_len = 100 - "/.orchestry/run/orch.sock".len() + 1;
+    let pad = root_len - (canonical.as_os_str().len() + 1);
+    let root = canonical.join("x".repeat(pad));
+    let tmp = canonical.join("tmp");
+    for dir in [&root, &tmp, &root.join("home")] {
+        fs::create_dir(dir).unwrap();
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cmd = orch_command(&root, Path::new("/unused"), &canonical);
+    cmd.env_remove("ORCH_SOCKET").env("TMPDIR", &tmp);
+    let mut init = Command::new(cmd.get_program());
+    init.env_clear()
+        .current_dir(&root)
+        .args(["init", "--name", "proj", "--adapter", "shell"]);
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            init.env(key, value);
+        }
+    }
+    let out = output_with_deadline(init, CALL);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    cmd.args(["daemon", "start"]);
+    let (_daemon, socket) = start_under_open_umask(&cmd, canonical.join("d.err"));
+    let parent = socket.parent().unwrap();
+    assert_eq!(parent.parent().unwrap(), tmp, "not the TMPDIR fallback");
+    assert_eq!(mode(parent), 0o700, "fallback parent");
+    assert_eq!(mode(&socket), 0o600, "fallback socket");
+    assert_eq!(mode(&root.join(".orchestry/daemon.json")), 0o600, "record");
+}
+
 /// A group- or world-writable `.orchestry` is refused (exit 2) and left as it
 /// was: the daemon will not guess which bits the owner meant.
 #[test]

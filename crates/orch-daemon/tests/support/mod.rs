@@ -12,6 +12,7 @@
 
 use orch_daemon::testing::{ClientStream, DaemonHarness};
 use serde_json::{Value, json};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
@@ -31,13 +32,28 @@ pub fn project_id(root: &Path) -> Value {
     json!({"dev": meta.dev(), "ino": meta.ino()})
 }
 
+/// `root` in the wire's lossless path form: `{"utf8": …}` when the bytes are
+/// valid UTF-8, otherwise `{"hex": …}` (lowercase hex of the raw bytes), as
+/// `orch-proto`'s `WirePath` does.
+pub fn wire_path(root: &Path) -> Value {
+    match root.to_str() {
+        Some(text) => json!({"utf8": text}),
+        None => json!({"hex": root
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()}),
+    }
+}
+
 /// A hello for `root` at the given versions. `extra` fields are merged into
 /// the hello object (caller, mode, intent, unknown future fields …).
 pub fn hello(root: &Path, protocol: u32, binary: &str, extra: Value) -> Value {
     let mut hello = json!({
         "protocol": protocol,
         "binary": binary,
-        "project_root": {"utf8": root.to_str().unwrap()},
+        "project_root": wire_path(root),
         "project_id": project_id(root),
     });
     for (key, value) in extra.as_object().cloned().unwrap_or_default() {

@@ -13,6 +13,7 @@ use nix::sys::signal::Signal;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -64,6 +65,22 @@ fn race_two_starts(sandbox: &Sandbox) -> (DaemonChild, DaemonChild) {
         winner.expect("no start won the race"),
         loser.expect("both starts reported READY"),
     )
+}
+
+/// Exit is seen through the child's status, not only through EOF on its
+/// stdout: a stray process that inherited the pipe write end (the macOS
+/// spawn race behind `race_two_starts` flaking under load) must not hide it.
+#[test]
+fn outcome_reports_exit_while_a_stray_process_holds_the_stdout_pipe() {
+    let sandbox = Sandbox::new();
+    let mut cmd = Command::new("/bin/sh");
+    // The backgrounded `sleep` inherits stdout, so the pipe outlives the shell.
+    cmd.args(["-c", "sleep 600 & exit 4"]).process_group(0);
+    let mut child = DaemonChild::spawn(cmd, sandbox.short_dir().join("stray.err"));
+    match child.outcome(Duration::from_secs(20)) {
+        Outcome::Exited(status) => assert_eq!(status.code(), Some(4)),
+        Outcome::Ready(line) => panic!("unexpected readiness line: {line}"),
+    }
 }
 
 #[test]
