@@ -31,6 +31,7 @@ pub use discovery::Project;
 pub use orch_proto::error::ConnectFailure as NoDaemon;
 
 use orch_proto::error::{ErrorBody, NoDaemonDetail};
+use orch_proto::frame::limits;
 use orch_proto::handshake::{
     self, Caller, CallerKind, HandshakeReply, Hello, HelloFrame, Intent, Reply, SessionMode,
     StopState, VersionSkew, Welcome,
@@ -41,6 +42,7 @@ use orch_proto::path::WirePath;
 use serde::de::DeserializeOwned;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
 
 use tokio::net::UnixStream;
@@ -184,8 +186,36 @@ pub struct Client {
     request_may_have_been_sent: bool,
 }
 
+/// How long `connect` keeps retrying a daemon that answers busy before it
+/// returns `daemon_busy`: the spec's admission deadline. One budget covers
+/// every attempt; a slow or absent daemon is never retried.
+pub const BUSY_WAIT: Duration = limits::ADMISSION_TIMEOUT;
+const BUSY_BACKOFF_FIRST: Duration = Duration::from_millis(25);
+const BUSY_BACKOFF_CAP: Duration = Duration::from_millis(500);
+
 impl Client {
+    /// Busy (session cap, or the pre-handshake budget full and the connection
+    /// dropped before any reply) is decided before a request frame exists, so
+    /// redialling cannot apply anything twice. Every other failure returns at
+    /// once, with the latency it had before.
     pub async fn connect(config: &ClientConfig) -> Result<Self, ClientError> {
+        let deadline = tokio::time::Instant::now() + BUSY_WAIT;
+        let mut backoff = BUSY_BACKOFF_FIRST;
+        loop {
+            let busy = match Self::connect_once(config).await {
+                Err(busy @ ClientError::Connection(NoDaemon::Busy { .. })) => busy,
+                other => return other,
+            };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(busy);
+            }
+            tokio::time::sleep(jittered(backoff).min(left)).await;
+            backoff = (backoff * 2).min(BUSY_BACKOFF_CAP);
+        }
+    }
+
+    async fn connect_once(config: &ClientConfig) -> Result<Self, ClientError> {
         let (project, stream, pid) = dial(config).await?;
         Self::handshake(
             project,
@@ -381,6 +411,16 @@ pub async fn stop(config: &ClientConfig) -> Result<results::StopOutcome, ClientE
     drop(client.writer);
     wait_for_owner_release(project, owner_pid, deadline).await?;
     Ok(results::StopOutcome { clean: true })
+}
+
+/// Equal jitter: half of `delay` plus a random share of the other half, so a
+/// burst of clients turned away together does not redial in lockstep.
+fn jittered(delay: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let half = delay / 2;
+    let span = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX).max(1);
+    let random = std::collections::hash_map::RandomState::new().hash_one(std::time::Instant::now());
+    half + Duration::from_nanos(random % span)
 }
 
 fn unknown_outcome(error: ClientError, project: &Project, detail: NoDaemonDetail) -> ClientError {

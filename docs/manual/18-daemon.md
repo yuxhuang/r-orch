@@ -334,14 +334,18 @@ Three cases are not "no daemon" and say so:
 
   In an agent's environment the second line ends with ` Report this to the owner and stop.` Look at what the
   request would have changed before you send it again; orch never sends it again for you.
-- **Busy.** All client sessions are in use. Exit 7, with no start hint:
+- **Busy.** The daemon is running but has no room for another client: all sessions are in use, or too many
+  clients are connecting at the same moment. A client waits up to 10 s for room before it gives up (no request has
+  been sent by then, so waiting cannot run anything twice), then exits 7, with no start hint:
 
   ```text
     ✕ daemon_busy for <project root> (orch daemon PID <pid or unavailable> is running; <n>/<cap> sessions)
       Retry when a session closes.
   ```
 
-  Close some clients and try again. `orch daemon stop` does not need a session slot, so it still gets through.
+  When the connections, not the sessions, were full the count can be well under the cap (`1/64 sessions`). Close
+  some clients and try again. `orch daemon stop` does not need a session slot and never waits, so it still gets
+  through.
 - **Wrong project.** The daemon that answered belongs to another project than the one you selected. Exit 7:
 
   ```text

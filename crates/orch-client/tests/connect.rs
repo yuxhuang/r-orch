@@ -182,7 +182,8 @@ async fn garbage_handshake_is_handshake_failed() {
 /// `connect` succeeded, so a listener is alive: a connection dropped before
 /// any reply (the daemon's pre-handshake budget is full, SE-6) is capacity.
 /// Depending on timing the client sees a lost peer credential, a failed hello
-/// write or EOF; every one of them must render as busy, never as absence.
+/// write or EOF; every one of them is busy, which `connect` redials, never
+/// absence (which it would report at once). `busy_wait.rs` covers the text.
 #[tokio::test]
 async fn connection_closed_after_accept_before_any_reply_is_busy_not_absence() {
     for read_hello_first in [false, true] {
@@ -194,17 +195,15 @@ async fn connection_closed_after_accept_before_any_reply_is_busy_not_absence() {
             if read_hello_first {
                 let mut read = FrameReader::new(BufReader::new(stream));
                 let _: HelloFrame = read.read(MAX_HANDSHAKE_BYTES).await.unwrap().unwrap();
+            } else {
+                drop(stream);
             }
+            answer(listener, welcome).await.unwrap()
         });
-        let error = connect_err(&config(dir.path(), Some(socket))).await;
-        assert_eq!(error.exit_code(), 7, "{error}");
-        for agent_context in [false, true] {
-            let text = error.render(agent_context);
-            assert!(text.contains("daemon_busy"), "{text}");
-            assert!(!text.contains("No orch daemon is running"), "{text}");
-            assert!(!text.contains("not running"), "{text}");
-            assert!(!text.contains("Start it"), "{text}");
-        }
+        let client = Client::connect(&config(dir.path(), Some(socket)))
+            .await
+            .unwrap_or_else(|e| panic!("read_hello_first={read_hello_first}: {e}"));
+        assert_eq!(client.welcome.pid, 42);
         server.await.unwrap();
     }
 }

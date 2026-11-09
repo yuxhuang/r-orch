@@ -21,6 +21,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - A task linked to a paused goal no longer starts: the daemon rereads the task and its goal just before it starts an agent, and a pause from any client (`orch goal status <id> paused`, the dashboard or `orch mcp`'s `goal_status`) is ordered with that check, so a task the pause cancelled cannot start afterwards.
 - Cancelling a task from any client now stops the task's agent before the cancel reports success.
 - Reading context (`orch context get` and `list`, and `orch mcp`'s `context_get` and `context_list`, read-only mode included) no longer deletes expired entries or rewrites the context index; it only hides them. The daemon removes expired entries itself, at start and on a timer, also with dispatch off; an error while doing so is reported and does not stop the rest of its work.
+- A client that finds the daemon running but busy (all sessions in use, or too many clients connecting at once) waits up to 10 s for room before it fails with `daemon_busy` (exit 7); a missing, stopped or hung daemon is still reported as fast as before.
 
 ### Removed
 - `orch tui --observe` and `orch tui --listen`: the dashboard is always a client of the daemon, and listening is a start option of the daemon.

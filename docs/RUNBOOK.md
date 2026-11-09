@@ -107,7 +107,8 @@ retry it. A restart does not resume the agent's conversation. `orch daemon start
 `orch run --watch` refuse to start from such an environment (exit 2); each accepts `--from-agent` to override
 that on purpose.
 
-**Not this entry:** `daemon_busy` (all sessions in use: close clients and retry), `wrong_project` (the socket
+**Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within 10 s, for a session
+or for the connection itself, so the count can read `1/64 sessions`: close clients and retry), `wrong_project` (the socket
 belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`), `Cannot confirm the orch request outcome`
 (the reply was lost: read the state before you retry; see
 [the manual](manual/18-daemon.md#when-no-daemon-answers)).
