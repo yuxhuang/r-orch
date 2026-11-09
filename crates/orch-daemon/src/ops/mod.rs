@@ -114,11 +114,7 @@ impl ServiceHandler {
 
     /// Session teardown discards transfers/observers; accepted state work is
     /// owned by the dispatcher task and is allowed to finish.
-    pub fn disconnect(&self, session_id: u64) {
-        self.transfers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove_session(session_id);
+    pub async fn disconnect(&self, session_id: u64) -> OpResult<()> {
         self.subscriptions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -134,6 +130,22 @@ impl ServiceHandler {
                     true
                 }
             });
+        let transfers = Arc::clone(&self.transfers);
+        // Started writes retain their state permit through attachment copying.
+        // Cleanup queues behind that work; pending observations are cancelled
+        // immediately, and no socket owns the write's lifetime.
+        self.coordinator
+            .run_op(Lane::Control, move |_| {
+                Box::pin(async move {
+                    transfers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove_session(session_id);
+                    Ok(())
+                })
+            })
+            .await
+            .map(|_| ())
     }
 }
 

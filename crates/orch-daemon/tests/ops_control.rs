@@ -131,7 +131,7 @@ async fn initial_on_rejects_batch_and_later_on_interrupts_without_restoring_off(
     );
     assert!(h.dispatch_state().dispatch_on);
     assert!(!h.dispatch_state().batch_active);
-    h.disconnect(ctx.session_id);
+    h.disconnect(ctx.session_id).await.unwrap();
     assert!(h.dispatch_state().dispatch_on);
 }
 #[tokio::test]
@@ -357,7 +357,7 @@ async fn transfers_are_connection_local_bounded_and_cleaned_on_disconnect() {
             .count(),
         1
     );
-    h.disconnect(ctx.session_id);
+    h.disconnect(ctx.session_id).await.unwrap();
     assert_eq!(
         std::fs::read_dir(temp.path().join(".orchestry/run/transfers"))
             .unwrap()
@@ -537,7 +537,7 @@ async fn disconnect_ends_batch_scheduling_and_preserves_queued_work_and_dispatch
         !batch.is_finished(),
         "new nonterminal work is included in the batch"
     );
-    h.disconnect(ctx.session_id);
+    h.disconnect(ctx.session_id).await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), batch)
             .await
@@ -760,7 +760,7 @@ async fn staged_images_keep_budget_and_are_cleaned_on_consumption_disconnect_and
         .is_err(),
         "staged image still owns its budget"
     );
-    h.disconnect(ctx.session_id);
+    h.disconnect(ctx.session_id).await.unwrap();
     assert!(!path.exists());
     Handler::transfer_begin(
         &h,
@@ -773,9 +773,9 @@ async fn staged_images_keep_budget_and_are_cleaned_on_consumption_disconnect_and
     .await
     .unwrap();
     for peer in peers {
-        h.disconnect(peer.session_id);
+        h.disconnect(peer.session_id).await.unwrap();
     }
-    h.disconnect(fourth.session_id);
+    h.disconnect(fourth.session_id).await.unwrap();
     let owner = OpContext::new(ctx.session.clone());
     let path = image(&h, &owner).await;
     Handler::task_create(
@@ -793,4 +793,101 @@ async fn staged_images_keep_budget_and_are_cleaned_on_consumption_disconnect_and
     std::fs::write(&stale, b"fixture").unwrap();
     h.cleanup_stale_transfers().unwrap();
     assert!(!stale.exists());
+}
+
+#[tokio::test]
+async fn disconnect_waits_for_a_started_attachment_copy_under_the_state_permit() {
+    use base64::Engine as _;
+    use sha2::Digest;
+    let (_temp, h, ctx, _clock, engine) = fixture().await;
+    let bytes = b"\x89PNG\r\n\x1a\n";
+    let token = Handler::transfer_begin(
+        &h,
+        &ctx,
+        TransferBeginArgs {
+            purpose: TransferPurpose::ClipboardImage,
+            total_bytes: 8,
+        },
+    )
+    .await
+    .unwrap()
+    .token;
+    Handler::transfer_chunk(
+        &h,
+        &ctx,
+        TransferChunkArgs {
+            token: token.clone(),
+            n: 0,
+            data_base64: base64::engine::general_purpose::STANDARD
+                .encode(bytes)
+                .try_into()
+                .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    Handler::transfer_finish(
+        &h,
+        &ctx,
+        TransferFinishArgs {
+            token: token.clone(),
+            sha256: format!("{:x}", sha2::Sha256::digest(bytes))
+                .try_into()
+                .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let path = Handler::attachment_stage_image(
+        &h,
+        &ctx,
+        AttachmentStageImageArgs {
+            input_transfer: token,
+            format: ImageFormat::Png,
+        },
+    )
+    .await
+    .unwrap()
+    .path
+    .into_path_buf();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let ready = entered.clone();
+    let go = release.clone();
+    let source = path.clone();
+    let hc = h.clone();
+    let write = tokio::spawn(async move {
+        hc.coordinator()
+            .run_op(orch_daemon::coordinator::Lane::Ordinary, move |permit| {
+                Box::pin(async move {
+                    permit.invalidate(orch_proto::frame::Store::Tasks);
+                    ready.notify_one();
+                    go.notified().await;
+                    // Same outer permit and real service copying used by task.create.
+                    Ok(engine
+                        .task_service
+                        .create(orch_domain::CreateTaskInput {
+                            title: "copy survives disconnect".into(),
+                            attachments: Some(vec![source.to_str().unwrap().into()]),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap())
+                })
+            })
+            .await
+            .unwrap()
+    });
+    entered.notified().await;
+    let hc = h.clone();
+    let sid = ctx.session_id;
+    let cleanup = tokio::spawn(async move { hc.disconnect(sid).await });
+    tokio::task::yield_now().await;
+    assert!(path.exists(), "started operation retains its source");
+    assert!(!cleanup.is_finished(), "cleanup is ordered after the write");
+    release.notify_one();
+    let task = write.await.unwrap().value;
+    cleanup.await.unwrap().unwrap();
+    assert_eq!(task.attachments.unwrap().len(), 1);
+    assert!(!path.exists());
 }
