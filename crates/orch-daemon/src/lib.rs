@@ -50,6 +50,6 @@ pub use gitignore::{
     ensure_runtime_gitignore,
 };
 pub use lifecycle::{
-    DaemonExit, DispatchMode, InitOptions, InitOutcome, PreparedStart,
-    StartOptions, initialize, prepare_start, start,
+    DaemonExit, DispatchMode, InitOptions, InitOutcome, PreparedStart, StartOptions, initialize,
+    prepare_start, start,
 };
