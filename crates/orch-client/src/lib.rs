@@ -449,3 +449,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/tripwire.rs"]
+mod process_tripwire;
