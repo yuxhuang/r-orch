@@ -548,7 +548,7 @@ pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tick.tick().await;
-        let configs = match ctx.store.list().await {
+        let configs = match ctx.ordered(false, ctx.store.list()).await {
             Ok(configs) => configs,
             Err(error) => {
                 tracing::error!(%error,"Read peer registry");
@@ -620,8 +620,7 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
     // is aborted, panics, or is replaced by registry reconciliation.
     ctx.store = orch_infra::storage::remote::FileRemoteStore::new(ctx.engine.paths.clone());
     let mut status = ctx
-        .store
-        .read_status(&config.alias)
+        .ordered(false, ctx.store.read_status(&config.alias))
         .await
         .ok()
         .flatten()
@@ -713,7 +712,11 @@ async fn persist_status(ctx: &Context, config: &RemoteConfig, status: &RemoteSta
     // re-add with another address, revokes this link's publication and its
     // health, and the revocation is ordered against the command by the
     // registry lock. Revocation is expected; only real failures are reported.
-    if let Err(error) = ctx.store.publish_registered_status(config, status).await {
+    // The publication is a project write like any other (design D2).
+    let published = ctx
+        .ordered(true, ctx.store.publish_registered_status(config, status))
+        .await;
+    if let Err(error) = published {
         ctx.engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
             error: error.to_string(),
             context: format!("Write peer status for {}; remote dispatch unavailable. Check permissions and free space in {}", status.alias, ctx.engine.paths.remotes_dir().display()),

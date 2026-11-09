@@ -22,6 +22,7 @@ use orch_infra::storage::remote::{
     FileRemoteStore, default_peer_name, public_snapshot, validate_snapshot,
 };
 use protocol::Frame;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,15 @@ async fn expire_messages(messages: Arc<dyn MessageStore>, events: Arc<EventBus>)
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        if let Err(error) = messages.purge_expired().await {
+        // A purge is a complete state operation (design D2): it orders with
+        // every other reader and writer of the project and advances the
+        // commit sequence, instead of rewriting the store under one of them.
+        let purged = events
+            .operation_boundary()
+            .run(true, messages.purge_expired())
+            .await
+            .value;
+        if let Err(error) = purged {
             events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
                 error: error.to_string(),
                 context: "Expire queued messages; check message storage permissions and free space. Cleanup will retry in 30 seconds".into(),
@@ -55,8 +64,24 @@ pub(crate) struct Context {
 }
 
 impl Context {
+    /// Run one complete peer state phase — read, validate and write — inside
+    /// the project's operation boundary (design D2, spec R12), so it orders
+    /// with RPC handlers, dispatch and every other writer and its commit is
+    /// sequenced. Callers keep network writes, acknowledgement waits and
+    /// process kills outside: the permit is never held across a peer. A
+    /// phase reached from an operation that already holds the permit (the
+    /// worker's [`handle_ordered`](worker::Worker)) reuses it.
+    pub(crate) async fn ordered<T>(&self, mutation: bool, phase: impl Future<Output = T>) -> T {
+        self.engine
+            .events
+            .operation_boundary()
+            .run(mutation, phase)
+            .await
+            .value
+    }
+
     pub(crate) async fn local_agents(&self) -> Result<Vec<Agent>> {
-        let agents = self.engine.agents.list().await?;
+        let agents = self.ordered(false, self.engine.agents.list()).await?;
         validate_snapshot(&agents)?;
         Ok(public_snapshot::project(&agents))
     }
@@ -87,10 +112,13 @@ impl Context {
             delivered_at: None,
             team_id: None,
         };
+        // The acknowledgement is returned, not written: the caller sends it
+        // after the permit is released, and only once the message committed.
         let reason = match self
-            .engine
-            .message_service
-            .ingest_incoming(peer, message)
+            .ordered(
+                true,
+                self.engine.message_service.ingest_incoming(peer, message),
+            )
             .await
         {
             Ok(_) => None,
@@ -127,7 +155,13 @@ impl Context {
             });
     }
 
+    /// The frames to send `peer` now. Expiry, the read and oversize
+    /// rejections are one ordered phase; the caller writes the frames after.
     pub(crate) async fn outbox(&self, peer: &str) -> Result<Vec<Frame>> {
+        self.ordered(true, self.outbox_phase(peer)).await
+    }
+
+    async fn outbox_phase(&self, peer: &str) -> Result<Vec<Frame>> {
         if let Err(error) = self.engine.messages.purge_expired().await {
             self.message_error(peer, "expire outbox", &error);
             return Ok(vec![]);
@@ -177,27 +211,28 @@ impl Context {
     }
 
     pub(crate) async fn msg_ack(&self, peer: &str, id: &str, reason: Option<&str>) -> Result<()> {
-        let result = async {
-            if let Some(reason) = reason {
-                let reason = orch_infra::storage::remote::metadata_text(reason, 256);
-                orch_infra::storage::message::FileMessageStore::new(
-                    self.engine.paths.clone(),
-                    self.engine.clock.clone(),
-                )
-                .reject_remote_message(id, peer, &reason)
-                .await?;
-            } else if let Some(message) = self.engine.messages.get(id).await?
-                && message
-                    .to_agent_id
-                    .as_deref()
-                    .and_then(|to| to.rsplit_once('@'))
-                    .is_some_and(|(_, alias)| alias == peer)
-            {
-                self.engine.messages.mark_delivered(id).await?;
-            }
-            Ok(())
-        }
-        .await;
+        let result = self
+            .ordered(true, async {
+                if let Some(reason) = reason {
+                    let reason = orch_infra::storage::remote::metadata_text(reason, 256);
+                    orch_infra::storage::message::FileMessageStore::new(
+                        self.engine.paths.clone(),
+                        self.engine.clock.clone(),
+                    )
+                    .reject_remote_message(id, peer, &reason)
+                    .await?;
+                } else if let Some(message) = self.engine.messages.get(id).await?
+                    && message
+                        .to_agent_id
+                        .as_deref()
+                        .and_then(|to| to.rsplit_once('@'))
+                        .is_some_and(|(_, alias)| alias == peer)
+                {
+                    self.engine.messages.mark_delivered(id).await?;
+                }
+                Ok(())
+            })
+            .await;
         if let Err(error) = result {
             self.message_error(peer, "acknowledge", &error);
         }
@@ -240,6 +275,67 @@ impl PeerRuntime {
             ));
         }
         let store = FileRemoteStore::new(engine.paths.clone());
+        // Status reset, inbound refresh and the listener record are one
+        // ordered phase (design D2); binding and linking happen after it.
+        let boundary = engine.events.operation_boundary();
+        let (instance_id, name) = boundary
+            .run(true, async {
+                Self::reset_published_state(&engine, &store).await?;
+                let name = engine
+                    .config
+                    .peer
+                    .name
+                    .clone()
+                    .unwrap_or_else(default_peer_name);
+                if name.is_empty() || name.contains('@') {
+                    return Err(Error::invalid_arguments(
+                        "Peer name must be nonempty and contain no @",
+                    ));
+                }
+                Ok((store.peer_id().await?, name))
+            })
+            .await
+            .value?;
+        let ctx = Context {
+            instance_id,
+            name,
+            store,
+            engine: engine.clone(),
+        };
+        let listener = if let Some(addr) = &engine.config.peer.listen {
+            Some(
+                tokio::net::TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| Error::other(format!("Listen on {addr}: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let hub = Arc::new(link::LinkHub::new(engine.messages.clone()));
+        let worker = worker::Worker::new(ctx.clone());
+        engine.orchestrator.set_remote_bridge(hub.clone());
+        engine.orchestrator.set_run_event_tap(worker.clone());
+        // Before the first link: an execution this controller does not
+        // re-register is missing from the first `Sync`, and the worker reads
+        // a live mirror absent from that list as an orphan and cancels it.
+        engine.orchestrator.rehydrate_remote_runs().await?;
+        let tasks = vec![
+            AbortOnDrop(tokio::spawn(expire_messages(
+                engine.messages.clone(),
+                engine.events.clone(),
+            ))),
+            AbortOnDrop(tokio::spawn(link::manage(ctx, hub))),
+        ];
+        Ok(Self {
+            listener_status: engine.paths.remotes_dir().join("_listener.json"),
+            engine,
+            tasks,
+            listener: listener.map(|listener| (worker, listener)),
+        })
+    }
+
+    /// Withdraw what a previous owner published about its peers.
+    async fn reset_published_state(engine: &FullEngine, store: &FileRemoteStore) -> Result<()> {
         for config in store.list().await? {
             if let Some(mut status) = store.read_status(&config.alias).await? {
                 status.online = false;
@@ -279,64 +375,22 @@ impl PeerRuntime {
                 ));
             }
         }
-        let name = engine
-            .config
-            .peer
-            .name
-            .clone()
-            .unwrap_or_else(default_peer_name);
-        if name.is_empty() || name.contains('@') {
-            return Err(Error::invalid_arguments(
-                "Peer name must be nonempty and contain no @",
-            ));
-        }
-        let ctx = Context {
-            instance_id: store.peer_id().await?,
-            name,
-            store,
-            engine: engine.clone(),
-        };
-        let listener = if let Some(addr) = &engine.config.peer.listen {
-            Some(
-                tokio::net::TcpListener::bind(addr)
-                    .await
-                    .map_err(|e| Error::other(format!("Listen on {addr}: {e}")))?,
-            )
-        } else {
-            None
-        };
-        let hub = Arc::new(link::LinkHub::new(engine.messages.clone()));
-        let worker = worker::Worker::new(ctx.clone());
-        engine.orchestrator.set_remote_bridge(hub.clone());
-        engine.orchestrator.set_run_event_tap(worker.clone());
-        // Before the first link: an execution this controller does not
-        // re-register is missing from the first `Sync`, and the worker reads
-        // a live mirror absent from that list as an orphan and cancels it.
-        engine.orchestrator.rehydrate_remote_runs().await?;
-        let tasks = vec![
-            AbortOnDrop(tokio::spawn(expire_messages(
-                engine.messages.clone(),
-                engine.events.clone(),
-            ))),
-            AbortOnDrop(tokio::spawn(link::manage(ctx, hub))),
-        ];
-        Ok(Self {
-            engine,
-            tasks,
-            listener_status,
-            listener: listener.map(|listener| (worker, listener)),
-        })
+        Ok(())
     }
 
     /// Begin inbound admission after the owner's initial tick has completed.
     pub fn start_listener(&mut self) {
         if let Some((worker, listener)) = self.listener.take() {
             let status = self.listener_status.clone();
+            let events = self.engine.events.clone();
             self.tasks.push(AbortOnDrop(tokio::spawn(async move {
                 if let Err(error) = worker.listen(listener).await {
                     tracing::error!(%error, "Peer listener stopped");
                 }
-                clear_listener_status(&status);
+                events
+                    .operation_boundary()
+                    .run(true, async { clear_listener_status(&status) })
+                    .await;
             })));
         }
     }
@@ -439,5 +493,50 @@ mod tests {
         tokio::time::advance(MESSAGE_EXPIRY_INTERVAL).await;
         tokio::task::yield_now().await;
         assert_eq!(store.0.load(Ordering::SeqCst), 3);
+    }
+
+    /// The standalone sweep is a complete operation (design D2): it never
+    /// purges while another operation holds the project permit, and its purge
+    /// commits with an advanced sequence once the permit is free.
+    #[tokio::test(start_paused = true)]
+    async fn expiry_waits_for_a_held_operation_and_commits_after_it() {
+        let store = Arc::new(ExpiryStore(AtomicUsize::new(1)));
+        let events = Arc::new(EventBus::new());
+        let boundary = events.operation_boundary();
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let held = {
+            let (boundary, entered, release) = (boundary.clone(), entered.clone(), release.clone());
+            tokio::spawn(async move {
+                boundary
+                    .run(false, async {
+                        entered.notify_one();
+                        release.notified().await;
+                    })
+                    .await;
+            })
+        };
+        entered.notified().await;
+        let seq = boundary.current_commit_seq();
+        let cleanup = AbortOnDrop(tokio::spawn(expire_messages(store.clone(), events)));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store.0.load(Ordering::SeqCst),
+            1,
+            "purged under a held permit"
+        );
+        assert_eq!(boundary.current_commit_seq(), seq);
+        release.notify_one();
+        held.await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.0.load(Ordering::SeqCst), 2);
+        assert_eq!(boundary.current_commit_seq(), seq + 1);
+        drop(cleanup);
     }
 }
