@@ -123,14 +123,32 @@ Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_W
 | | W2 | `tsk_4SVACBX` | docs verified against `00450c9` |
 | C: review | Checkpoint CP2: freeze the integration commit, launch the review board (GATE) | `tsk_Brzri1x` | done |
 | | GATE, fix rounds, PR #69 | goal `goal_WpQVmPg` | merged as `679011d`; head `42d2808`, CI green (Linux x86_64) |
-| D: PR 2, wave A | F-B1 | `tsk_uhm73p-` | pending |
-| | F-B2 | `tsk_zxG0McJ` | in progress |
-| | F-T1a | `tsk_6_gi7MU` | in progress |
-| | F-W1 | `tsk_gp6Ry0K` | drafted (this commit) |
-| | F-FC | `tsk_tkh0_l3` | done |
+| D: PR 2, wave A | F-B1 | `tsk_uhm73p-`; default-mode instructions test `tsk_z4gifpJ` | implemented (`a9a8bf9`, `1e731c2`) |
+| | F-B2 | `tsk_zxG0McJ` | implemented (`64d1e3e`); `task_cancel` liveness decided docs-only at CP1 |
+| | F-T1a | `tsk_6_gi7MU` | implemented (`072d6b7`, `2b70c31`) |
+| | F-W1 | `tsk_gp6Ry0K` | drafted (`5c83712`) |
+| | F-FC | `tsk_tkh0_l3` | done: claim verified, dated sentence for F-W2 |
 | | F-RT | `tsk_AoDE3ZO` | done: ship with changes (disclosures), for CP1 |
-| | Checkpoint CP1: adjudicate wave A | `tsk_IUpXm7b` | pending |
-| E: PR 2, wave B and gate | F-T1b, F-I, F-W2, F-GATE, PR | not yet created | pending |
+| | Checkpoint CP1: adjudicate wave A | `tsk_IUpXm7b` | done: RT1/RT2 accepted as disclosures (B1b) |
+| E: PR 2, wave B and gate | F-T1b | `tsk_UhK4OPS` | implemented (`eb735ac`) |
+| | B1b (CP1 disclosures, stale `--allow-destructive` help) and F-I | `tsk_WVInOdA` | integrated and code frozen (`514560d`) |
+| | F-W2 | `tsk_NUnWRGF` | docs finished at the frozen code (`ca51c7e`) |
+| | F-GATE: code, security, resilience, facts, cold gate at `ca51c7e` | `tsk_v5FUQHQ`, `tsk_AauPKD9`, `tsk_irHNbOB`, `tsk_vDRoMF_`, `tsk_K3GBJR8` | done: all five pass with conditions, none blocking |
+| | Checkpoint CP2: governance verdicts | `tsk_rJCHWFp` | done: fix round authorised |
+| F: PR 2, CP2 fix round | F1: value-free `logs.since` form errors (R14), then its docs | `tsk_zt0J71i`, then `tsk_AUiHMlQ` (replaces cancelled `tsk_0Q4didm`) | pending |
+| | C2: qualify pause dispatch wording in code text, then docs (with SRE-2, F5) | `tsk_XQxdkEP`, then `tsk_cM9TgND` (replace cancelled `tsk_DG05bju`, `tsk_Kyg4A2e`) | pending |
+| | SRE-3: pin terminal mode in `yaml_contract` and `routing` glyph fixtures | `tsk_EDxaAMe` (replaces cancelled `tsk_4dskzEb`) | in progress |
+| | F2: non-UTF-8 attachment wording matches resolved-path behaviour | `tsk_yNNFDQg` | pending |
+| | F3: this status table and the liveness decision | `tsk_CFNaK07` | this commit |
+| | I2: integrate the fix round, full gate set, re-freeze | `tsk_MACcZj4` | pending |
+| G: PR 2, re-gate and PR (future) | Re-reviews at the re-frozen SHA: code, security, resilience, facts | `tsk_QKJV45G`, `tsk_WBWDCzh`, `tsk_P-mM5Cp`, `tsk_3bHsl13` | pending |
+| | PR: push, open the single PR against `main`, Linux CI green | `tsk_5TRHZoX` | pending; not pushed, no PR yet |
+| | Checkpoint CP3: re-gate verdicts and PR | `tsk_65sIOO0` | pending |
+
+Decided at CP1 (`tsk_IUpXm7b`): `task_cancel` reports no liveness field and stays store-only. A live PID on the
+lock is not proof that a live orchestrator will reconcile the cancel (one-shot holders, PID reuse, the race
+between observing and acting), and the owner asked for docs only. The tool description and manual 17 state that
+the tool does not stop an orphan agent process when no live orchestrator owns the run.
 
 ## Test plan
 - The spec's acceptance checks, R1–R11 on macOS and Linux CI; R12 (real client: Claude Code or MCP Inspector) on
@@ -151,8 +169,6 @@ README (MCP section), RUNBOOK (concurrent-writer recovery, config-poison restore
 §3.3.1, §4.5.2), CHANGELOG (`[Unreleased]`), ADR 0011, manual chapter 17 and the regenerated command reference.
 
 ## Open questions
-- PR 2: whether `task_cancel` reports in its result if a live orchestrator will reconcile the cancel (F-B2 decides;
-  docs-only unless a backward-compatible, reusable liveness check exists).
 - Store repair for concurrent writers (compare-and-swap for whole-record saves, context expiry under the index
   lock) is follow-up work outside this plan (decision-2, E2).
 - The pre-existing synchronous open in `fs_utils::mutation_lock` is accepted for v1 and recorded as a follow-up
