@@ -48,6 +48,14 @@ impl FileContextStore {
         }
     }
 
+    /// Publish a missing or corrupt index during explicit daemon startup.
+    /// Share the mutation lock with set/delete/expiry so a scan cannot lose a renewal.
+    pub async fn ensure_index(&self) -> Result<()> {
+        let _mutation = self.mutation.lock().await;
+        self.index.read_index().await?;
+        Ok(())
+    }
+
     /// Remove expired entries explicitly, returning their keys in stable key order.
     /// Serialized with set/delete so an in-process renewal cannot be removed.
     pub async fn expire_now(&self) -> Result<Vec<String>> {
