@@ -118,7 +118,11 @@ async fn a_non_utf8_root_is_selected_served_and_echoed_losslessly() {
         .unwrap()
         .join(std::ffi::OsStr::from_bytes(b"proj-\xff\xfe"));
     if std::fs::create_dir(&odd).is_err() {
-        eprintln!("skipped: this filesystem rejects non-UTF-8 names");
+        eprintln!(
+            "SKIPPED a_non_utf8_root_is_selected_served_and_echoed_losslessly: \
+             this filesystem rejects non-UTF-8 names (expected on macOS APFS); \
+             Linux CI and `cargo xtask linux` run it for real"
+        );
         return;
     }
     std::fs::create_dir(odd.join(".orchestry")).unwrap();
@@ -126,19 +130,23 @@ async fn a_non_utf8_root_is_selected_served_and_echoed_losslessly() {
 
     let daemon = DaemonHarness::builder().start_in(&odd).await.unwrap();
     let mut raw = Raw::open(&daemon).await;
-    let mut frame = hello(
+    let frame = hello(
         &odd,
         LOCAL_PROTOCOL,
         BINARY_VERSION,
         json!({"caller": {"kind": "cli"}, "mode": "normal"}),
     );
-    // The client sends the root in the tagged-bytes form.
-    frame["hello"]["project_root"] = json!({"hex": odd.as_os_str().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>()});
+    // The helper sends the non-UTF-8 root in the tagged-bytes form.
+    assert!(
+        frame["hello"]["project_root"].get("hex").is_some(),
+        "{frame}"
+    );
     raw.send(&frame).await;
     let welcome = raw.recv().await.unwrap();
     assert_eq!(welcome["welcome"]["compatible"], true, "{welcome}");
-    assert!(
-        welcome["welcome"]["project_root"].get("hex").is_some(),
+    assert_eq!(
+        welcome["welcome"]["project_root"],
+        support::wire_path(&odd),
         "{welcome}"
     );
     daemon.shutdown().await.unwrap();

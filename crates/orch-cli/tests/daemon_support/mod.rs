@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 
 pub const READY: Duration = Duration::from_secs(30);
 pub const CALL: Duration = Duration::from_secs(30);
+/// Slice between `try_wait` checks while waiting for a line (an upper bound
+/// on exit-detection latency, not a pacing delay).
+const EXIT_POLL: Duration = Duration::from_millis(50);
 
 /// An isolated project dir + short socket dir.
 pub struct Sandbox {
@@ -322,21 +325,38 @@ impl DaemonChild {
     }
 
     /// Block until `listening ...` or exit, under a deadline.
+    ///
+    /// Exit is detected two ways: EOF on the stdout pipe, and `try_wait` on
+    /// the child itself. The second matters when a concurrently spawned
+    /// sibling inherited this child's pipe write end (macOS has no `pipe2`,
+    /// so `FD_CLOEXEC` lands after `pipe()`): the pipe then stays open after
+    /// this child exits and EOF never arrives.
     pub fn outcome(&mut self, within: Duration) -> Outcome {
         let deadline = Instant::now() + within;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match self.lines.recv_timeout(left) {
+            match self.lines.recv_timeout(left.min(EXIT_POLL)) {
                 Ok(Some(line)) if line.starts_with("listening ") => return Outcome::Ready(line),
                 Ok(Some(_)) => {}
                 Ok(None) | Err(RecvTimeoutError::Disconnected) => {
                     return Outcome::Exited(self.wait_exit(left.max(CALL)));
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    panic!(
+                    if let Some(status) = self.child.try_wait().unwrap() {
+                        // Exited. A readiness line printed just before exit may
+                        // still be queued: prefer it over the exit.
+                        while let Ok(Some(line)) = self.lines.recv_timeout(EXIT_POLL) {
+                            if line.starts_with("listening ") {
+                                return Outcome::Ready(line);
+                            }
+                        }
+                        return Outcome::Exited(status);
+                    }
+                    assert!(
+                        left > Duration::ZERO,
                         "no readiness line or exit within {within:?}: {}",
                         self.stderr()
-                    )
+                    );
                 }
             }
         }
