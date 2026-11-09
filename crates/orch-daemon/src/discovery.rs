@@ -232,13 +232,19 @@ pub(crate) enum SocketState {
     },
     /// Something accepts connections: never removed.
     Live,
+    /// A same-owner socket the probe could not reach for a reason other than
+    /// "nobody listens" (permission, resources, ...): it may still be live,
+    /// so it is never removed. Carries the probe's error kind.
+    Indeterminate(io::ErrorKind),
     /// A symlink, regular file, other file type or another user's socket:
     /// never removed.
     Unsafe(&'static str),
 }
 
 /// Classify `path` by `lstat` plus a connect probe (D4: only a proven stale
-/// same-owner socket may be replaced).
+/// same-owner socket may be replaced). Only `ECONNREFUSED` proves that nobody
+/// listens; `EACCES` on a live listener whose socket mode denies us, or a
+/// full backlog, says nothing about staleness and is `Indeterminate`.
 pub(crate) async fn classify_socket(path: &Path) -> Result<SocketState, DaemonError> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -267,10 +273,13 @@ pub(crate) async fn classify_socket(path: &Path) -> Result<SocketState, DaemonEr
     Ok(match probe {
         // A timeout means a listener exists but is slow: treat it as live.
         Err(_) | Ok(Ok(_)) => SocketState::Live,
-        Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => SocketState::Absent,
-        Ok(Err(_)) => SocketState::Stale {
-            dev: meta.dev(),
-            ino: meta.ino(),
+        Ok(Err(error)) => match error.kind() {
+            io::ErrorKind::NotFound => SocketState::Absent,
+            io::ErrorKind::ConnectionRefused => SocketState::Stale {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            },
+            kind => SocketState::Indeterminate(kind),
         },
     })
 }
@@ -558,15 +567,37 @@ mod tests {
         );
     }
 
+    /// `EACCES` from a live listener whose socket mode denies the probe is
+    /// not proof that nobody listens (board 1 C2 / security F4).
+    #[tokio::test]
+    async fn an_unreachable_live_listener_is_indeterminate_not_stale() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipped: euid 0 ignores socket permissions (EACCES is unreachable)");
+            return;
+        }
+        let dir = short_dir();
+        let path = dir.path().join("s");
+        let (_listener, _, _) = bind_private(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            classify_socket(&path).await.unwrap(),
+            SocketState::Indeterminate(io::ErrorKind::PermissionDenied)
+        );
+    }
+
     #[test]
     fn remove_if_same_leaves_a_replaced_inode_alone() {
         let dir = short_dir();
         let path = dir.path().join("s");
         let (first, dev, ino) = bind_private(&path).unwrap();
         drop(first);
+        // A second name keeps the first inode allocated while the successor
+        // binds; Linux ext4 would otherwise hand the freed number straight
+        // back and the successor would look like the probed socket.
+        std::fs::hard_link(&path, dir.path().join("keep")).unwrap();
         std::fs::remove_file(&path).unwrap();
         let (_second, _, ino2) = bind_private(&path).unwrap();
-        assert_ne!(ino, ino2);
+        assert_ne!(ino, ino2, "precondition: the successor is a new inode");
         remove_if_same(&path, dev, ino).unwrap();
         assert!(path.exists(), "a successor's socket must survive");
     }
