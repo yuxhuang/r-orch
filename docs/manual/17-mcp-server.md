@@ -502,9 +502,11 @@ document from `file`, with the rules of [Updating definitions from files](../fil
 depth at most 64, no duplicate keys, read-only fields refused. Specifics for the server:
 
 - `file` is a path on the machine the server runs on. A relative path is resolved against the **project root**,
-  not the client's directory. Attachment paths in `task_add` are resolved the same way. If the project root's
-  path is not valid UTF-8, `task_add` with `attach` fails with a tool error (`project root is not valid UTF-8;
-  attachments cannot be resolved`) and creates no task.
+  not the client's directory. Relative attachment paths in `task_add` are resolved the same way; absolute ones
+  are used as given. If the project root's path is not valid UTF-8, a relative attachment path cannot be
+  resolved intact, so `task_add` fails with a tool error (`project root is not valid UTF-8; attachments cannot
+  be resolved`) and creates no task, even when other paths in the list are absolute. Absolute paths, and an
+  `attach` with no nonempty path, do not depend on the root and work as usual.
 - `file: "-"` is refused, because the server's stdin is the protocol. Write the document to a file instead.
 - Nothing opens an editor; there are no `edit` tools.
 

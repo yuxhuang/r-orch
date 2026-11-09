@@ -11,7 +11,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - `orch mcp`: an invalid-arguments error (`-32602`) names the argument and the type it expects but no longer quotes the value that was sent, in the response and in the server's stderr diagnostics (`RUST_LOG=warn`).
 
 ### Fixed
-- `orch mcp`: `task_add` with `attach` in a project whose path is not valid UTF-8 now fails with a tool error and creates no task. It used to replace the path's invalid bytes, so the attachment named a different path.
+- `orch mcp`: `task_add` with a relative `attach` path in a project whose path is not valid UTF-8 now fails with a tool error and creates no task. It used to replace the invalid bytes of the resolved path, so the attachment named a different path. Absolute `attach` paths are not affected.
 
 ## [0.12.0] - 2026-11-07
 

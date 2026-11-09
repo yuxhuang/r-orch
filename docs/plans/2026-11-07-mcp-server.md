@@ -138,7 +138,7 @@ Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_W
 | F: PR 2, CP2 fix round | F1: value-free `logs.since` form errors (R14), then its docs | `tsk_zt0J71i`, then `tsk_AUiHMlQ` (replaces cancelled `tsk_0Q4didm`) | pending |
 | | C2: qualify pause dispatch wording in code text, then docs (with SRE-2, F5) | `tsk_XQxdkEP`, then `tsk_cM9TgND` (replace cancelled `tsk_DG05bju`, `tsk_Kyg4A2e`) | pending |
 | | SRE-3: pin terminal mode in `yaml_contract` and `routing` glyph fixtures | `tsk_EDxaAMe` (replaces cancelled `tsk_4dskzEb`) | in progress |
-| | F2: non-UTF-8 attachment wording matches resolved-path behaviour | `tsk_yNNFDQg` | pending |
+| | F2: non-UTF-8 attachment wording matches resolved-path behaviour | `tsk_yNNFDQg` | done (R15 row, manual 17, CHANGELOG) |
 | | F3: this status table and the liveness decision | `tsk_CFNaK07` | this commit |
 | | I2: integrate the fix round, full gate set, re-freeze | `tsk_MACcZj4` | pending |
 | G: PR 2, re-gate and PR (future) | Re-reviews at the re-frozen SHA: code, security, resilience, facts | `tsk_QKJV45G`, `tsk_WBWDCzh`, `tsk_P-mM5Cp`, `tsk_3bHsl13` | pending |

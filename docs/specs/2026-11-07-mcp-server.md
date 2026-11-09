@@ -63,7 +63,7 @@ changed, R13–R16 added. The goal items that authorise the changes to approved 
 | R12 | A real MCP client (Claude Code or MCP Inspector) shall initialise against `orch mcp`, list its tools and run `task_add` then `task_show` on a temp project. | item 3 | should | qa-engineer capture (transcript + `orch --json task show <id>`); macOS only, env-limited to the owner's Mac |
 | R13 | When a goal with an assignee is paused (`orch goal status <id> paused`, the dashboard, or the `goal_status` tool), orch shall cancel only the assignee's `todo`/`retrying` autonomous tasks linked to that goal; the assignee's autonomous tasks linked to another goal, or to no goal, shall stay unchanged. | goal `goal_h-gIBCW` item 1 | must | engine unit tests in `crates/orch-engine/src/goal_service.rs`: `pausing_one_goal_spares_the_assignees_tasks_of_other_goals`, `pausing_the_last_active_goal_disables_autonomous_but_spares_other_goals_tasks`; the G1/G2 shared-assignee fixture through `goal_status` in default mode and in allow-destructive mode (`crates/orch-cli/tests/mcp_tools.rs`: `default_mode_pausing_g1_cancels_only_g1s_own_autonomous_tasks`, `allow_destructive_pausing_g1_is_scoped_to_g1_as_well`; R4); Linux CI + macOS |
 | R14 | When a tool call is rejected as JSON-RPC invalid params because an argument has the wrong type or form, the error text, both in the client's response and in the server's stderr under `RUST_LOG=warn`, shall name the argument and the expected type and shall not contain the argument's value. | goal `goal_h-gIBCW` item 2; owner's plan answer q3=A (value-free in both) | must | unit test `mcp::registry::tests::decoding_reports_fields_and_types_without_argument_values`; stdio test under `RUST_LOG=warn` with a mistyped scalar carrying a sentinel value: response `-32602` names the field and expected type, and neither the response nor stderr contains the sentinel (`crates/orch-cli/tests/mcp_stdio.rs`: `a_mistyped_priority_is_invalid_params_naming_the_field_and_type_but_not_the_value`, `a_mistyped_priority_warn_line_on_stderr_names_the_field_and_type_but_not_the_value`, `a_mistyped_priority_value_appears_in_neither_the_response_nor_stderr`, `other_mistyped_scalars_name_field_and_type_but_never_the_value`, and `the_connection_serves_requests_after_a_mistyped_argument_was_refused` for the session afterwards); Linux CI + macOS |
-| R15 | When `task_add` is called with `attach` and the project root path is not valid UTF-8, the tool shall return an error and create no task; it shall not panic, alter the path or drop the attachment. | goal `goal_h-gIBCW` item 6 | must | unit test `mcp::tools::task::tests::task_add_rejects_non_utf8_attachment_root_without_creating_a_task` (non-UTF-8 project root, Unix): the error, and no task created; Linux CI + macOS |
+| R15 | When `task_add` is called with `attach` and a nonempty entry resolves to a path that is not valid UTF-8, the tool shall return an error and create no task; it shall not panic, alter the path or drop the attachment. A relative entry is joined to the project root (D12), so this happens when the project root's path is not valid UTF-8 and the list has at least one relative entry; one such entry rejects the whole call. An absolute entry is used as given and does not depend on the root. Empty entries are dropped, so a list with no nonempty entry attaches nothing. | goal `goal_h-gIBCW` item 6; wording corrected 2026-11-08 by the CP2 ruling on fact-gate F2 (see [Open questions](#open-questions)) | must | unit test `mcp::tools::task::tests::task_add_rejects_non_utf8_attachment_root_without_creating_a_task` (Unix; a synthetic non-UTF-8 project root and one relative entry, `relative.txt`): an invalid-arguments tool error (`isError: true`) and no task created. The test does not cover absolute or empty entries under a non-UTF-8 root; that behaviour follows from `add` in `crates/orch-cli/src/mcp/tools/task.rs` and was checked once with a throwaway probe on 2026-11-08, which is not kept in the suite; Linux CI + macOS |
 | R16 | When a client reads `orch://agents/{id}@{alias}` or `orch://inbox/{id}@{alias}`, the server shall return the resource as `application/json`, as for the unqualified form (R5). | goal `goal_h-gIBCW` item 7 | must | binary-level stdio tests against a seeded offline peer (`crates/orch-cli/tests/mcp_stdio.rs`): `a_qualified_agent_resource_returns_the_peer_agent_under_its_qualified_id`, `a_qualified_inbox_resource_returns_the_messages_addressed_to_the_qualified_id`; Linux CI + macOS |
 
 ### R3 exclusions
@@ -176,6 +176,12 @@ Security checklist:
   confirmed this behaviour on 2026-11-08 (goal `goal_h-gIBCW` item 4) and R8 names it.
 - **`--read-only` together with `--allow-destructive`.** Resolved by lead decision-2 (F): a usage error,
   exit 1 (R8).
+- **R15 wording corrected**, 2026-11-08, by the lead's CP2 ruling on fact-gate finding F2, under goal
+  `goal_h-gIBCW` item 6 ("handle it (error cleanly, never panic or silently drop) with a test"). The first
+  wording said every `attach` call fails when the project root is not valid UTF-8. The code fails only when a
+  nonempty entry *resolves* to a non-UTF-8 path, which means a relative entry under such a root; absolute
+  entries keep their D12 authority and a list with no nonempty entry attaches nothing. The guarantee item 6 asks
+  for (a clean error, no panic, no silent drop, no task when a path is rejected) is unchanged. No code change.
 
 ## Verification
 R1–R12: PR #69 ([yuxhuang/r-orch#69](https://github.com/yuxhuang/r-orch/pull/69), merged as `679011d`), head
@@ -207,13 +213,13 @@ review packet. Linux CI runs when the PR is opened; the PR records that run.
 | R8 (amended 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
 | R13 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
 | R14 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
-| R15 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
+| R15 (wording corrected 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); the corrected wording matches what the cited test checks, and `task.rs` is unchanged since `514560d`; Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
 | R16 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
 
 Defects found outside the requirements:
 - PR #69 carried these as accepted residuals or follow-ups; goal `goal_h-gIBCW` handles them. Cross-goal
   cancellation on pause (E1): fixed, R13 and R4. Invalid-params text echoing a mistyped value on stderr: fixed,
-  R14. Non-UTF-8 project root in `task_add` attachments: fixed, R15. No stdio success test for qualified
+  R14. Relative `task_add` attachments under a non-UTF-8 project root: fixed, R15. No stdio success test for qualified
   resources: added, R16. `yaml_contract` needing git ≥ 2.42 (gate-ci N4): test fixture fixed, no requirement row.
   An unverified client-version claim in the manual: rechecked by the fact-checker. The non-transactional store
   (D10) stays outside both goals.
