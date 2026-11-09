@@ -672,55 +672,59 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut write: W, mut queued: mpsc::Recei
     let _ = write.shutdown().await;
 }
 
-async fn run_request(
+fn run_request(
     handler: ServiceHandler,
     base: OpContext,
     frame: RequestFrame,
     outbox: Outbox,
     outstanding: Arc<Mutex<HashSet<RequestId>>>,
-) {
+) -> impl Future<Output = ()> + Send + 'static {
     let RequestFrame { id, req } = frame;
     let name = req.name();
     let class: OpClass = req.class();
     let started = Instant::now();
     let (parts, mut part_rx) = mpsc::channel::<Part>(16);
     let ctx = base.for_request(id, class, Some(parts));
-    let mut next_part = 0u64;
-    let result = {
-        let execution = handler.execute_request(&ctx, req);
-        tokio::pin!(execution);
-        loop {
-            tokio::select! {
-                biased;
-                Some(part) = part_rx.recv() => forward_part(&outbox, id, part, &mut next_part).await,
-                result = &mut execution => break result,
+    // Construct execution synchronously, before inflight.spawn can race with
+    // disconnect. The handler registers observation when this future is made.
+    let execution = handler.execute_request(&ctx, req);
+    async move {
+        let mut next_part = 0u64;
+        let result = {
+            tokio::pin!(execution);
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(part) = part_rx.recv() => forward_part(&outbox, id, part, &mut next_part).await,
+                    result = &mut execution => break result,
+                }
+            }
+        };
+        drop(ctx);
+        part_rx.close();
+        while let Ok(part) = part_rx.try_recv() {
+            forward_part(&outbox, id, part, &mut next_part).await;
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(committed) => {
+                tracing::debug!(op = name, id = id.0.get(), elapsed_ms, "ok");
+                send_ok(
+                    &outbox,
+                    id,
+                    committed.value,
+                    committed.commit_seq,
+                    next_part,
+                )
+                .await;
+            }
+            Err(err) => {
+                tracing::debug!(op = name, id = id.0.get(), code = ?err.code, execution = ?err.execution, elapsed_ms, "err");
+                outbox.frame(&ErrFrame { id, err }).await;
             }
         }
-    };
-    drop(ctx);
-    part_rx.close();
-    while let Ok(part) = part_rx.try_recv() {
-        forward_part(&outbox, id, part, &mut next_part).await;
+        lock(&outstanding).remove(&id);
     }
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match result {
-        Ok(committed) => {
-            tracing::debug!(op = name, id = id.0.get(), elapsed_ms, "ok");
-            send_ok(
-                &outbox,
-                id,
-                committed.value,
-                committed.commit_seq,
-                next_part,
-            )
-            .await;
-        }
-        Err(err) => {
-            tracing::debug!(op = name, id = id.0.get(), code = ?err.code, execution = ?err.execution, elapsed_ms, "err");
-            outbox.frame(&ErrFrame { id, err }).await;
-        }
-    }
-    lock(&outstanding).remove(&id);
 }
 
 async fn forward_part(outbox: &Outbox, id: RequestId, part: Part, next: &mut u64) {
