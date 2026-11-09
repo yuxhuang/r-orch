@@ -90,10 +90,22 @@ A foreground daemon runs until you stop it. `Ctrl+C` (SIGINT), SIGTERM and SIGHU
 you close its window or tmux pane, all stop it cleanly, like [`orch daemon stop`](#stop).
 
 **`--detach`** starts the daemon in a session of its own with stdin from `/dev/null`, and sends its stdout and
-stderr to `.orchestry/daemon.log` (mode 0600). The log rotates at 10 MiB and keeps one 0600 backup, so it never
-takes more than 20 MiB. The command returns success only after the daemon has published its socket; if the daemon
-fails first, the command fails too. A detached daemon survives closing the terminal or tmux pane, but not logout
-or a reboot: start it again yourself after either.
+stderr to `.orchestry/daemon.log` (mode 0600). The command returns success only after the daemon has published
+its socket; if the daemon fails first, the command fails too. A detached daemon survives closing the terminal or
+tmux pane, but not logout or a reboot: start it again yourself after either.
+
+**Log size: not yet capped.** Pending fix (task `tsk_sYQF8NH`). The approved limit is 10 MiB for `daemon.log`
+plus one 10 MiB backup, 20 MiB in all; this build does not enforce it. It checks the log's size when a detached
+start opens it and every 30 s while the daemon runs. When the log is over 10 MiB, the whole file is renamed to
+`.orchestry/daemon.log.1` (mode 0600, replacing any older backup) and a new log is started. So:
+
+- between checks the log keeps growing past 10 MiB;
+- the backup is as large as the log was when it moved, so the two files together can exceed 20 MiB;
+- a rotation that fails while the daemon runs is not reported, and the daemon keeps writing to the file it had.
+
+At the default log level a detached start and stop write only the one-line developmental banner (175 bytes).
+With `RUST_LOG` or `ORCHESTRY_DEBUG` set, the log grows with the daemon's activity and nothing limits it between
+checks. To reclaim the space, stop the daemon and delete `daemon.log.1`.
 
 **One daemon per project.** Ownership is decided by a lock that the daemon holds for its whole life
 (`.orchestry/.daemon-owner.lock`, never deleted) and by the project's existing orchestrator lock, which it
