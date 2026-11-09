@@ -7,6 +7,13 @@
 //! `SIGTERM` is followed by `SIGKILL`, leaving `.orchestry/orchestry.lock`
 //! behind and the agents orphaned.
 //!
+//! Since S2a-cli both commands are a foreground daemon start. Each scenario
+//! runs one on an isolated short socket (`tests/common/daemon.rs`), signals
+//! it, and requires: a prompt exit, status 0, the PID lock released and the
+//! socket file removed. The legacy "Shutting down" / `orchestrator:shutdown`
+//! progress lines are no longer printed by the daemon; the shutdown is
+//! proved by what it leaves on disk instead.
+//!
 //! This is a binary-level test because that is the only level where it is
 //! real: the in-memory fakes never make `stop()` wait for anything, so the
 //! orchestrator's own tests cannot see it.
@@ -14,6 +21,9 @@
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "common/daemon.rs"]
+mod daemon;
 
 fn orch_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().expect("test binary path");
@@ -65,7 +75,10 @@ fn signal_and_wait(
 #[test]
 fn run_watch_exits_on_sigint() {
     let dir = initialized_project();
-    let mut child = Command::new(orch_binary())
+    let (short, socket) = daemon::short_socket();
+    let mut command = Command::new(orch_binary());
+    daemon::apply_env(&mut command, &socket, short.path());
+    let mut child = command
         .args(["run", "--watch"])
         .current_dir(dir.path())
         .env("HOME", dir.path().join("home"))
@@ -90,8 +103,8 @@ fn run_watch_exits_on_sigint() {
         "run --watch ignored SIGINT and had to be killed; stdout so far:\n{stdout}"
     );
     assert!(
-        stdout.contains("Shutting down"),
-        "the shutdown was never reported:\n{stdout}"
+        !socket.exists(),
+        "the socket file outlived the daemon:\n{stdout}"
     );
     // The lock is released on the way out, so the next invocation is not
     // locked out by a corpse.
@@ -107,7 +120,10 @@ fn serve_exits_on_sigterm() {
     // `SIGTERM` and escalates to `SIGKILL` if the process does not go, which
     // would leave the lock file behind for every later invocation.
     let dir = initialized_project();
-    let mut child = Command::new(orch_binary())
+    let (short, socket) = daemon::short_socket();
+    let mut command = Command::new(orch_binary());
+    daemon::apply_env(&mut command, &socket, short.path());
+    let mut child = command
         .args(["serve", "--log-format", "json"])
         .current_dir(dir.path())
         .env("HOME", dir.path().join("home"))
@@ -129,8 +145,8 @@ fn serve_exits_on_sigterm() {
         "serve ignored SIGTERM and had to be killed; stdout so far:\n{stdout}"
     );
     assert!(
-        stdout.contains("\"event\":\"orchestrator:shutdown\""),
-        "the shutdown was never logged:\n{stdout}"
+        !socket.exists(),
+        "the socket file outlived the daemon:\n{stdout}"
     );
     assert!(
         !dir.path().join(".orchestry/orchestry.lock").exists(),

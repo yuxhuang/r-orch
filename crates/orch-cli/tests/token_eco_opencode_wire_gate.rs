@@ -44,8 +44,11 @@ fn seeded(effort: &str) -> Dispatched {
 
 /// [`seeded`], with the project's own test daemon: for [`dispatch`], which
 /// sends `orch run` — a daemon RPC since S2a-cli — rather than starting one.
-fn seeded_owned(effort: &str) -> Dispatched {
-    seeded_in(Sandbox::new_owned(&new_reader()), effort)
+fn seeded_owned(effort: &str, version: &str) -> Dispatched {
+    seeded_in(
+        Sandbox::new_owned_with_version(&new_reader(), version),
+        effort,
+    )
 }
 
 fn seeded_in(sb: Sandbox, effort: &str) -> Dispatched {
@@ -72,13 +75,10 @@ fn seeded_in(sb: Sandbox, effort: &str) -> Dispatched {
 fn dispatch(version: &str, effort: &str) -> Dispatched {
     let new = new_reader();
     // `orch run` below is a daemon RPC since S2a-cli.
-    let Dispatched { sb, task, .. } = seeded_owned(effort);
-    let out = sb.run_env(
-        &new,
-        &["run", &task],
-        None,
-        &[("ORCH_FAKE_VERSION", version)],
-    );
+    let Dispatched { sb, task, .. } = seeded_owned(effort, version);
+    // The agent CLI is spawned and probed by the daemon, which was started
+    // with `version` in its environment.
+    let out = sb.run(&new, &["run", &task], None);
     let model_argv = sb.recorded("opencode");
     Dispatched {
         sb,

@@ -236,8 +236,11 @@ fn a_bomb_in_an_agent_file_is_refused_and_the_daemon_stays_bounded() {
     )
     .unwrap();
 
+    // `agent list` is served from `_index.json` and never opens the per-agent
+    // files (like `task list`, see above), so the read is forced with
+    // `agent status`.
     let mut command = orch(project.path());
-    command.args(["agent", "list"]);
+    command.args(["agent", "status", "agt_creator"]);
     let (code, elapsed, peak_mib) =
         run_sampling_daemon_rss(&mut command, project.daemon.pid(), Duration::from_secs(20));
     assert_eq!(code, Some(1), "exit code 1");

@@ -6,10 +6,9 @@
 //! and `--json` has to stay parseable, so a diagnostic must never land there.
 //!
 //! `task add` and `task list --json` are daemon RPCs since S2a-cli, so
-//! [`project`] adopts a test daemon right after `init` (the
-//! `tui`-based tests still build the full engine directly — `orch tui` has no
-//! RPC client path — but `task add` in the shared fixture does, and running
-//! it needs the project's own daemon registered either way).
+//! [`project`] adopts a test daemon right after `init`. The two tests about
+//! *our own* warnings read the daemon's stderr, because the global config is
+//! read in the daemon, not in any client.
 
 #[path = "common/daemon.rs"]
 mod daemon;
@@ -96,82 +95,93 @@ fn stdout_is_byte_identical_whether_or_not_tracing_is_on() {
     );
 }
 
-/// Silence by default is a *choice*, so the test has to tell it apart from a
-/// subscriber that was never installed — which an earlier version of this test
-/// could not: asserting an empty stderr passes identically whether the
-/// subscriber is silent or absent, and the name claimed more than the body
-/// established.
+/// The diagnostics a daemon wrote to its stderr after serving one global
+/// config read, with the global config unreadable and `extra` added to the
+/// daemon's environment.
 ///
-/// It is driven through a *warning we own*, for a reason worth recording:
-/// `task list --json` logs nothing of ours at any level, and what
-/// `RUST_LOG=trace` produces for it comes from `mio`. A test that turned
-/// logging up on that command and asserted "something appeared" would be
-/// measuring a dependency. So this uses the unreadable global config — one of
-/// the deliberate degradations — and asserts that *its* warning is absent by
+/// The warning is emitted where the global config is read, and since S2a-cli
+/// only the daemon reads it (`orch tui` and the CLI are clients), so the
+/// warning is looked for on the daemon's stderr, not on a client's. The
+/// unreadable file is one of the deliberate degradations:
+/// `FileGlobalConfigStore::read` warns and returns the defaults.
+fn daemon_stderr_with_an_unreadable_global_config(extra: &[(&str, &str)]) -> (String, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    let status = Command::cargo_bin("orch")
+        .expect("the orch binary")
+        .current_dir(&root)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root.join("home"))
+        .args(["init", "--name", "p", "--adapter", "claude"])
+        .status()
+        .expect("init");
+    assert!(status.success(), "init failed");
+    let broken = root.join("broken-global.yml");
+    std::fs::write(&broken, b"\x00\x01 not: [valid").expect("write a broken global config");
+    let extra: Vec<(&str, std::path::PathBuf)> =
+        std::iter::once(("ORCHESTRY_GLOBAL_CONFIG_PATH", broken.clone()))
+            .chain(extra.iter().map(|(k, v)| (*k, std::path::PathBuf::from(v))))
+            .collect();
+    let extra_refs: Vec<(&str, &Path)> = extra.iter().map(|(k, v)| (*k, v.as_path())).collect();
+    let daemon = daemon::TestDaemon::start_with_env(&root, &root.join("home"), &extra_refs);
+    let mut show_config = Command::cargo_bin("orch").expect("the orch binary");
+    show_config
+        .current_dir(&root)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root.join("home"))
+        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", &broken)
+        .env_remove("RUST_LOG")
+        .env_remove("ORCHESTRY_DEBUG")
+        .args(["config", "global", "show"]);
+    daemon.apply(&mut show_config);
+    let client = show_config.output().expect("run the client");
+    let client_stderr = show(&client.stderr);
+    let daemon_stderr =
+        std::fs::read_to_string(daemon.socket_dir().join("daemon.err")).unwrap_or_default();
+    drop(daemon);
+    (daemon_stderr, client_stderr)
+}
+
+/// Silence by default is a *choice*, so the test has to tell it apart from a
+/// subscriber that was never installed: asserting an empty stderr passes
+/// identically whether the subscriber is silent or absent. It is driven
+/// through a *warning we own* (see
+/// [`daemon_stderr_with_an_unreadable_global_config`]), asserted absent by
 /// default and present with `ORCHESTRY_DEBUG`, which is also the only coverage
 /// that path has.
 #[test]
 fn nothing_is_logged_by_default_but_orchestry_debug_turns_it_on() {
-    let dir = project();
-    let broken = dir.path().join("broken-global.yml");
-    std::fs::write(&broken, b"\x00\x01 not: [valid").expect("write a broken global config");
-
-    // Stderr is not empty here — the dashboard still fails to open a terminal,
-    // and that error is reported — so the assertion is about the *warning*,
-    // which is the thing logging controls.
-    let quiet = orch(dir.path())
-        .arg("tui")
-        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", &broken)
-        .output()
-        .expect("run");
+    let (quiet, _) = daemon_stderr_with_an_unreadable_global_config(&[]);
     assert!(
-        !show(&quiet.stderr).contains("unreadable global config"),
-        "an ordinary invocation logged a warning:\n{}",
-        show(&quiet.stderr)
+        !quiet.contains("unreadable global config"),
+        "an ordinary daemon logged a warning:\n{quiet}"
     );
 
     // Same command, same tree, one environment variable. `ORCHESTRY_DEBUG`
-    // takes no filter spec — it means `debug`.
-    let debug = orch(dir.path())
-        .arg("tui")
-        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", &broken)
-        .env("ORCHESTRY_DEBUG", "1")
-        .output()
-        .expect("run");
+    // takes no filter spec: it means `debug`.
+    let (debug, _) = daemon_stderr_with_an_unreadable_global_config(&[("ORCHESTRY_DEBUG", "1")]);
     assert!(
-        show(&debug.stderr).contains("unreadable global config"),
+        debug.contains("unreadable global config"),
         "ORCHESTRY_DEBUG logged nothing, so the silence above proves nothing \
-         about the subscriber:\n{}",
-        show(&debug.stderr)
+         about the subscriber:\n{debug}"
     );
 }
 
 #[test]
 fn a_swallowed_error_reaches_stderr_when_logging_is_on() {
-    let dir = project();
-    // An unreadable global config is one of the deliberate degradations:
-    // `FileGlobalConfigStore::read` warns and returns the defaults. Reading it
-    // needs the full tier, so this uses `tui`, which builds it and then fails
-    // to open a terminal — after the read, which is all this needs.
-    let broken = dir.path().join("broken-global.yml");
-    std::fs::write(&broken, b"\x00\x01 not: [valid").expect("write a broken global config");
-
-    let output = orch(dir.path())
-        .arg("tui")
-        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", &broken)
-        .env("RUST_LOG", "warn")
-        .output()
-        .expect("run");
-
-    let stderr = show(&output.stderr);
+    let (daemon_stderr, client_stderr) =
+        daemon_stderr_with_an_unreadable_global_config(&[("RUST_LOG", "warn")]);
     assert!(
-        stderr.contains("unreadable global config"),
-        "the warning never surfaced:\n{stderr}"
+        daemon_stderr.contains("unreadable global config"),
+        "the warning never surfaced:\n{daemon_stderr}"
     );
-    // Still on stderr, not mixed into the command's own output.
+    // Diagnostics stay on the daemon's stderr; the client's own output is not
+    // polluted by a daemon-side warning.
     assert!(
-        !show(&output.stdout).contains("unreadable global config"),
-        "the warning leaked into stdout"
+        !client_stderr.contains("unreadable global config"),
+        "the daemon's warning leaked into the client's stderr:\n{client_stderr}"
     );
 }
 

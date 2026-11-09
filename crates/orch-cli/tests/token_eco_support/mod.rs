@@ -143,6 +143,18 @@ impl Sandbox {
     /// directory, so an agent it spawns after the CLI cutover finds the same
     /// fakes the CLI used to.
     pub fn new_owned(init_reader: &Reader) -> Sandbox {
+        Self::new_owned_with_version(init_reader, "2.1.2")
+    }
+
+    /// [`Sandbox::new_owned`] whose daemon (the process that spawns agents and
+    /// probes their CLI) sees the fake CLIs at `version`. A version is a
+    /// property of the *daemon's* environment now, not of the CLI command.
+    ///
+    /// The project's retry back-off is set to 1 ms: `orch run <id>` on a task
+    /// that is still inside its (default 10 s) back-off window is refused as
+    /// "not eligible for launch", and these fixtures re-run failed tasks
+    /// immediately.
+    pub fn new_owned_with_version(init_reader: &Reader, version: &str) -> Sandbox {
         let mut sb = Sandbox::new(init_reader);
         let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", sb.bin.path().display()));
         let path = PathBuf::from(path);
@@ -152,9 +164,15 @@ impl Sandbox {
             &[
                 ("PATH", path.as_path()),
                 ("ORCH_T1_REC", sb.rec.path()),
-                ("ORCH_FAKE_VERSION", Path::new("2.1.2")),
+                ("ORCH_FAKE_VERSION", Path::new(version)),
             ],
         ));
+        let out = sb.run(
+            init_reader,
+            &["config", "set", "scheduling.retry_base_delay_ms", "1"],
+            None,
+        );
+        assert!(out.ok(), "retry back-off: {}", out.all());
         sb
     }
 

@@ -175,6 +175,10 @@ impl Peer {
             seed: RefCell::new(None),
             sockets: tempfile::Builder::new()
                 .prefix("otd-")
+                // 0700: the daemon refuses a group- or world-accessible socket dir.
+                .permissions(
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+                )
                 .tempdir_in("/tmp")
                 .expect("short socket dir"),
         };

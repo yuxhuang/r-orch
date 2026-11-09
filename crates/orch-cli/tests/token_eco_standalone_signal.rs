@@ -46,7 +46,7 @@ struct Rig {
 impl Rig {
     fn opencode() -> Rig {
         let new = new_reader();
-        let sb = Sandbox::new(&new);
+        let sb = Sandbox::new_owned(&new);
         let marks = tempfile::tempdir().unwrap();
         let agent = sb.seed_agent(&new, "Oc", "opencode", Some(MODEL), Some("xhigh"));
         let rig = Rig::with_task(sb, marks, &agent);
@@ -62,7 +62,7 @@ impl Rig {
     /// A shell agent whose model run is the hanging script.
     fn shell() -> Rig {
         let new = new_reader();
-        let sb = Sandbox::new(&new);
+        let sb = Sandbox::new_owned(&new);
         let marks = tempfile::tempdir().unwrap();
         let script = marks.path().join("model.sh");
         write_script(&script, &hanging_script(marks.path(), "model"));
