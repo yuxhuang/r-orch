@@ -166,19 +166,45 @@ async fn silent_daemon_times_out_the_handshake() {
 }
 
 #[tokio::test]
-async fn garbage_or_closed_handshake_is_handshake_failed() {
-    for reply in [Some(&b"not json\n"[..]), None] {
+async fn garbage_handshake_is_handshake_failed() {
+    let dir = project_dir();
+    let socket = dir.path().join("s");
+    let listener = bind(&socket);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream.write_all(b"not json\n").await.unwrap();
+    });
+    let error = connect_err(&config(dir.path(), Some(socket))).await;
+    assert_no_daemon(&error, dir.path(), "handshake failed");
+    server.await.unwrap();
+}
+
+/// `connect` succeeded, so a listener is alive: a connection dropped before
+/// any reply (the daemon's pre-handshake budget is full, SE-6) is capacity.
+/// Depending on timing the client sees a lost peer credential, a failed hello
+/// write or EOF; every one of them must render as busy, never as absence.
+#[tokio::test]
+async fn connection_closed_after_accept_before_any_reply_is_busy_not_absence() {
+    for read_hello_first in [false, true] {
         let dir = project_dir();
         let socket = dir.path().join("s");
         let listener = bind(&socket);
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            if let Some(reply) = reply {
-                stream.write_all(reply).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            if read_hello_first {
+                let mut read = FrameReader::new(BufReader::new(stream));
+                let _: HelloFrame = read.read(MAX_HANDSHAKE_BYTES).await.unwrap().unwrap();
             }
         });
         let error = connect_err(&config(dir.path(), Some(socket))).await;
-        assert_no_daemon(&error, dir.path(), "handshake failed");
+        assert_eq!(error.exit_code(), 7, "{error}");
+        for agent_context in [false, true] {
+            let text = error.render(agent_context);
+            assert!(text.contains("daemon_busy"), "{text}");
+            assert!(!text.contains("No orch daemon is running"), "{text}");
+            assert!(!text.contains("not running"), "{text}");
+            assert!(!text.contains("Start it"), "{text}");
+        }
         server.await.unwrap();
     }
 }

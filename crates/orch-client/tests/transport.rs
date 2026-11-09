@@ -225,6 +225,48 @@ async fn busy_is_capacity_not_absence_and_reject_text_is_not_echoed() {
     task.await.unwrap();
 }
 
+/// A live listener that drops the connection before any reply (the daemon's
+/// pre-handshake budget is full) is capacity, never absence.
+fn assert_closed_before_reply_is_busy(error: &orch_client::ClientError) {
+    assert_eq!(error.exit_code(), 7, "{error}");
+    for agent_context in [false, true] {
+        let text = error.render(agent_context);
+        assert!(text.contains("daemon_busy"), "{text}");
+        assert!(text.contains("PID unavailable"), "{text}");
+        assert!(!text.contains("No orch daemon is running"), "{text}");
+        assert!(!text.contains("not running"), "{text}");
+        assert!(!text.contains("Start it"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn hello_write_to_a_closed_peer_is_busy_not_absence() {
+    let (_dir, p) = project();
+    let (client, server) = tokio::io::duplex(65536);
+    drop(server);
+    let error = Client::from_stream(p, client, caller(), SessionMode::Normal)
+        .await
+        .err()
+        .unwrap();
+    assert_closed_before_reply_is_busy(&error);
+}
+
+#[tokio::test]
+async fn peer_closing_after_the_hello_without_a_reply_is_busy_not_absence() {
+    let (_dir, p) = project();
+    let (client, server) = tokio::io::duplex(65536);
+    let task = tokio::spawn(async move {
+        let mut read = FrameReader::new(BufReader::new(server));
+        let _: HelloFrame = read.read(MAX_HANDSHAKE_BYTES).await.unwrap().unwrap();
+    });
+    let error = Client::from_stream(p, client, caller(), SessionMode::Normal)
+        .await
+        .err()
+        .unwrap();
+    assert_closed_before_reply_is_busy(&error);
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn malformed_handshake_uses_uniform_diagnosis_without_peer_text() {
     let (_dir, p) = project();
