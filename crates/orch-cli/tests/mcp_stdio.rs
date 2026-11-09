@@ -2114,16 +2114,15 @@ fn a_client_that_stops_reading_ends_the_server_with_an_error_within_the_shutdown
     );
 }
 
-/// A mutation still waiting for the store lane when the output is lost is
-/// refused, never run: nobody could learn that it happened. The lane is held
-/// by a call stalled in its Engine build (`ConfigStall`), and the first frame
-/// the server writes is the `ping` answer that finds the pipe closed.
+/// A mutation still waiting in the daemon when the output is lost is refused,
+/// never run: nobody could learn that it happened. The daemon's state permit
+/// is held by a `status` call stalled reading `config.yml` (`ConfigStall`),
+/// and `task_add` is sent only once that read has begun, so it queues behind
+/// it. The first frame the server writes is the `ping` answer that finds the
+/// pipe closed; the server exits, its daemon sessions close, and the daemon
+/// refuses the queued call when its turn comes.
 #[cfg(unix)]
 #[test]
-#[ignore = "bridge no longer queues (S2b-finish removed the FIFO lane): a task_add \
-            sent before the output was lost is forwarded to the daemon at once and runs, \
-            so the documented 'refused, never run' guarantee no longer holds. Needs the \
-            bridge owner's decision/fix (tsk_Gt0X3Br)."]
 fn once_the_output_is_lost_a_queued_mutation_never_runs() {
     let project = initialized_project();
     let mut client = DeafClient::handshake(project.path());
@@ -2131,6 +2130,7 @@ fn once_the_output_is_lost_a_queued_mutation_never_runs() {
     client.stop_reading();
 
     client.send_request("tools/call", json!({"name": "status", "arguments": {}}));
+    stall.await_reader();
     client.send_request(
         "tools/call",
         json!({"name": "task_add", "arguments": {"title": "queued when the output was lost"}}),

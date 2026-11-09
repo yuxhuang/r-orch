@@ -113,6 +113,7 @@ struct Rig {
     messages: Arc<FakeMessageStore>,
     goals: Arc<FakeGoalStore>,
     runs: Arc<FakeRunStore>,
+    state: Arc<FakeStateStore>,
     bus: Arc<EventBus>,
     processes: Arc<common::ScriptedProcessManager>,
     gate: Arc<Gate>,
@@ -202,7 +203,7 @@ impl Rig {
             task_store: tasks.clone(),
             agent_store: agents.clone(),
             run_store: runs.clone(),
-            state_store: state,
+            state_store: state.clone(),
             adapters: Arc::new(adapters),
             workspace: Arc::new(GatedWorkspace {
                 inner: workspace.clone(),
@@ -235,6 +236,7 @@ impl Rig {
             messages,
             goals,
             runs,
+            state,
             bus,
             processes,
             gate,
@@ -289,6 +291,60 @@ async fn goal_edit_cannot_resurrect_active_and_pause_vetoes_prepared_launch() {
             .iter()
             .all(|run| run.status == RunStatus::Cancelled)
     );
+}
+
+/// `orch run <id>` starts a `retrying` task before its back-off is due, as
+/// v0.13 did, and consumes the queued retry; a batch launch leaves it queued.
+#[tokio::test]
+async fn an_explicit_launch_overrides_the_retry_wait_and_a_batch_launch_honours_it() {
+    let rig = Rig::new();
+    rig.tasks.seed(orch_domain::Task {
+        status: TaskStatus::Retrying,
+        ..rig.tasks.peek("tsk_one").unwrap()
+    });
+    rig.state.seed(orch_domain::OrchestratorState {
+        retry_queue: vec![orch_domain::RetryEntry {
+            task_id: "tsk_one".into(),
+            attempt: 1,
+            due_at: "2099-01-01T00:00:00.000Z".into(),
+            error: "scripted".into(),
+        }],
+        ..Default::default()
+    });
+
+    rig.orchestrator
+        .daemon_launch_task_with_guard("tsk_one", Arc::new(AtomicBool::new(false)), false)
+        .await
+        .unwrap();
+    assert!(rig.runs.snapshot().is_empty(), "a batch launch waited");
+    assert_eq!(rig.state.peek().retry_queue.len(), 1);
+
+    // A refused launch returns without preparing, so the gate never opens.
+    let launch = rig.orchestrator.daemon_launch_task("tsk_one");
+    let release = async {
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rig.gate.entered.notified(),
+        )
+        .await
+        .is_ok();
+        rig.gate.release.notify_one();
+        entered
+    };
+    let (result, entered) = tokio::join!(launch, release);
+    result.unwrap();
+    assert!(entered, "the explicit launch did not start preparing");
+    assert_eq!(rig.processes.spawns().len(), 1);
+    assert_eq!(
+        rig.tasks.peek("tsk_one").unwrap().status,
+        TaskStatus::InProgress
+    );
+    assert!(
+        rig.state.peek().retry_queue.is_empty(),
+        "the retry was consumed"
+    );
+    rig.processes.close_stdout();
+    rig.orchestrator.daemon_stop().await.unwrap();
 }
 
 #[tokio::test]

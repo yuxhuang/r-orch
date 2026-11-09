@@ -1246,7 +1246,6 @@ fn agent_count(sb: &Sandbox, new: &Reader) -> usize {
 /// switch to eco that landed while it waited refuses the deploy and creates
 /// no agent.
 #[test]
-#[ignore = "production bug tsk_Gt0X3Br: the refusal surfaces as an opaque 'daemon request failed' without 'inherits project eco'"]
 fn a_builtin_org_deploy_waits_on_the_definition_lock_and_is_refused_after_a_concurrent_switch_to_eco()
  {
     let new = new_reader();

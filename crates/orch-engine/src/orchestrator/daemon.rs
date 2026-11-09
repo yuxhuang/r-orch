@@ -118,7 +118,7 @@ impl Orchestrator {
                 break;
             }
             if let Err(error) = self
-                .daemon_launch_task_with_guard(&task_id, Arc::clone(&cancelled))
+                .daemon_launch_task_with_guard(&task_id, Arc::clone(&cancelled), false)
                 .await
             {
                 self.emit_error(error, format!("dispatch task {task_id}"));
@@ -237,14 +237,18 @@ impl Orchestrator {
 
     /// A deliberate dispatch request, independent of the persistent switch.
     pub async fn daemon_launch_task(&self, task_id: &str) -> Result<()> {
-        self.daemon_launch_task_with_guard(task_id, Arc::new(AtomicBool::new(false)))
+        self.daemon_launch_task_with_guard(task_id, Arc::new(AtomicBool::new(false)), true)
             .await
     }
 
+    /// `override_retry_wait` is the explicit `orch run <id>`: like v0.13 it
+    /// starts a `retrying` task before its back-off is due (the launch
+    /// consumes the queued retry). Batch launches leave the wait to the tick.
     pub async fn daemon_launch_task_with_guard(
         &self,
         task_id: &str,
         cancelled: Arc<AtomicBool>,
+        override_retry_wait: bool,
     ) -> Result<()> {
         let boundary = self.deps().events.operation_boundary();
         let selected = boundary
@@ -263,7 +267,10 @@ impl Orchestrator {
                     return Ok(None);
                 }
                 let task = self.deps().task_service.get(task_id).await?;
-                if !self.daemon_task_eligible(&task, state).await? {
+                if !self
+                    .daemon_task_eligible(&task, state, override_retry_wait)
+                    .await?
+                {
                     return Ok(None);
                 }
                 let agents = self.dispatch_agent_directory().await?;
@@ -703,7 +710,12 @@ impl Orchestrator {
         result
     }
 
-    async fn daemon_task_eligible(&self, task: &Task, state: &OrchestratorState) -> Result<bool> {
+    async fn daemon_task_eligible(
+        &self,
+        task: &Task,
+        state: &OrchestratorState,
+        override_retry_wait: bool,
+    ) -> Result<bool> {
         if !is_dispatchable(task.status) || task.awaits_approval() {
             return Ok(false);
         }
@@ -714,11 +726,8 @@ impl Orchestrator {
         }
 
         if task.status == TaskStatus::Retrying
-            && state.retry_queue.iter().any(|retry| {
-                retry.task_id == task.id
-                    && super::tick::epoch_ms_from_iso(&retry.due_at)
-                        .is_none_or(|due| self.deps().clock.now_ms() < due)
-            })
+            && !override_retry_wait
+            && super::dispatch::retry_pending(state, &task.id, self.deps().clock.now_ms())
         {
             return Ok(false);
         }

@@ -198,6 +198,14 @@ fn external_operation(name: &str) -> bool {
             | "dispatch.run_all"
             | "dispatch.until_terminal"
             | "logs.follow"
+            // Template edits write only the template directory, serialised by
+            // its own `.template.lock`, which another project's daemon may
+            // hold for up to its 5 s budget. Waiting for it under the project
+            // permit would starve every other caller into `Overloaded`.
+            | "org.template.definition.apply"
+            | "org.template.agent.add"
+            | "org.template.agent.definition.apply"
+            | "org.template.agent.delete"
     )
 }
 

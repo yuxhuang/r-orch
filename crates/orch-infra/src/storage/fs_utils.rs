@@ -77,7 +77,7 @@ pub async fn atomic_write_with_mode(path: &Path, content: &str, mode: Option<u32
     // truncating something that is already there. The name has 8 random hex
     // characters, so a collision means another writer is mid-flight on the
     // same path and failing is the right answer (sre C5, security).
-    let write_result = async {
+    let write = || async {
         let mut options = tokio::fs::OpenOptions::new();
         options.write(true).create_new(true);
         // `tokio::fs::OpenOptions::mode` on unix; the mode lands on the
@@ -96,8 +96,16 @@ pub async fn atomic_write_with_mode(path: &Path, content: &str, mode: Option<u32
         // is the one place it has to be right.
         file.sync_all().await?;
         Ok::<(), std::io::Error>(())
+    };
+    let mut write_result = write().await;
+    if matches!(&write_result, Err(err) if err.kind() == std::io::ErrorKind::NotFound) {
+        // The directory was removed after `ensure_dir` cached it. Forget it
+        // and recreate it once, so a long-lived process (the daemon) recovers
+        // without a restart.
+        forget_ensured_dir(dir);
+        ensure_dir(dir).await?;
+        write_result = write().await;
     }
-    .await;
 
     if let Err(err) = write_result {
         let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -1255,9 +1263,9 @@ fn parse_jsonl_lines<'l, T: DeserializeOwned>(lines: impl Iterator<Item = &'l st
 
 /// Directories already created in this process.
 ///
-/// The cache skips ~50 redundant `mkdir` syscalls per tick. It means a
-/// directory deleted underneath a long-running process is not recreated, which
-/// is why `clear_ensured_dirs` exists.
+/// The cache skips ~50 redundant `mkdir` syscalls per tick. A directory
+/// deleted underneath a long-running process is recreated by the next
+/// [`atomic_write`] into it, which forgets the stale entry on `NotFound`.
 fn ensured_dirs() -> &'static Mutex<HashSet<PathBuf>> {
     static ENSURED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     ENSURED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -1278,6 +1286,13 @@ pub async fn ensure_dir(dir: &Path) -> Result<()> {
         .unwrap_or_else(|e| e.into_inner())
         .insert(dir.to_path_buf());
     Ok(())
+}
+
+fn forget_ensured_dir(dir: &Path) {
+    ensured_dirs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(dir);
 }
 
 /// Clear the [`ensure_dir`] cache. Tests only.
@@ -2196,6 +2211,16 @@ mod tests {
         ensure_dir(&dir).await.unwrap();
         ensure_dir(&dir).await.unwrap();
         assert!(path_exists(&dir).await);
+    }
+
+    #[tokio::test]
+    async fn an_atomic_write_recreates_a_cached_directory_removed_underneath_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("context");
+        atomic_write(&dir.join("a.json"), "1").await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        atomic_write(&dir.join("b.json"), "2").await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b.json")).unwrap(), "2");
     }
 
     #[tokio::test]
