@@ -259,3 +259,54 @@ pub async fn running_pid(daemon: &DaemonHarness, task: &str) -> Option<u32> {
     let state = daemon.engine().state.read().await.unwrap();
     state.running.get(task).map(|run| run.pid)
 }
+
+/// Poll a condition (cooperatively, with no delay) until it holds. The
+/// deadline is a hang guard only. The condition may `.await`.
+#[macro_export]
+macro_rules! eventually {
+    ($what:expr, $condition:expr) => {{
+        let wait = async {
+            loop {
+                if $condition {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout($crate::support::DEADLINE, wait)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {}", $what));
+    }};
+}
+
+/// A shell agent that exits at once with `code` and needs no human approval.
+pub async fn quick_agent(raw: &mut Raw, daemon: &DaemonHarness, name: &str, code: i32) -> String {
+    let reply = raw
+        .request(
+            1_000_010,
+            "agent.create",
+            json!({
+                "name": name,
+                "adapter": "shell",
+                "command": format!("exit {code}"),
+                "approval_policy": "manual",
+                "workspace_mode": "shared",
+                "env": [
+                    {"name": "HOME", "value": daemon.project_root().to_str().unwrap()},
+                    {"name": "PATH", "value": "/usr/bin:/bin"},
+                ],
+            }),
+        )
+        .await;
+    ok(&reply)["agent"]["id"].as_str().unwrap().to_owned()
+}
+
+/// `daemon.status.dispatch` as `(dispatch_on, batch_active)`.
+pub async fn dispatch_state(raw: &mut Raw) -> (bool, bool) {
+    let status = raw.request(1_000_020, "daemon.status", json!({})).await;
+    let state = &ok(&status)["dispatch"];
+    (
+        state["dispatch_on"].as_bool().unwrap(),
+        state["batch_active"].as_bool().unwrap(),
+    )
+}
