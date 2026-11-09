@@ -151,8 +151,9 @@ $ orch --yaml task list
   `--yaml`, `--json` and neither; stdout stays empty. Passing both flags is a usage error (exit 1, nothing on
   stdout): `error: the argument '--yaml' cannot be used with '--json'`.
 - **Commands that never printed JSON ignore `--yaml` too** (for example `agent shop`, which prints its table).
-  `logs --follow` still streams text and `serve` still writes JSON Lines; `serve --log-format` is unrelated to
-  `--yaml`, and persisted logs do not change format.
+  `logs --follow` still streams text and `serve --once` writes JSON Lines; `serve --log-format` is unrelated to
+  `--yaml`, and persisted logs do not change format. A foreground `serve` is the daemon and writes no event lines;
+  its diagnostics go to stderr via `RUST_LOG`.
 - **`orch doctor` is the exception.** Inside a project it prints its human header line on stdout before the
   structured document, under `--json` as well as `--yaml`, so the output does not parse as one document.
   Outside a project it prints text only. See the [runbook](docs/RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve).
@@ -676,8 +677,12 @@ What else changes
 - A cancel, from any client, stops the running agent; a goal pause, from any client, is ordered with dispatch.
 - `orch doctor` is a client too: without a daemon it reports the no-daemon message and exits 7.
 - Agents get the agent variant of the message (`Do not start it; report this to the owner and stop.`), and
-  `orch daemon start`, `orch serve` and `orch run --watch` refuse to start from an agent's environment unless you
-  pass `--from-agent`.
+  `orch daemon start`, `orch serve` and `orch run --watch` refuse to start from an agent's environment (exit 2).
+  Only `orch daemon start` takes `--from-agent` to override that; `serve` and `run --watch` have no override yet,
+  pending fix (task tsk_eda1yGZ).
+- A foreground `orch serve` or `orch run --watch` is the daemon, so it refuses `--tick-interval`, `--log-file`,
+  `--verbose` and a `--log-format` other than `json` (exit 2); `serve --once` keeps its log options. The interval
+  is `scheduling.poll_interval_ms` (`orch config set`), and events stream with `orch logs --follow`.
 - Scripts and cron jobs must start the daemon themselves, or fail visibly; see
   [Recovery](docs/manual/18-daemon.md#recovery).
 

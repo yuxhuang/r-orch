@@ -104,7 +104,9 @@ never delete its socket or `daemon.json`.
 `The orch daemon for <root> is not running. Do not start it; report this to the owner and stop.` The agent is
 meant to stop and report; you start the daemon, then inspect the task, its run and what it changed before you
 retry it. A restart does not resume the agent's conversation. `orch daemon start`, `orch serve` and
-`orch run --watch` refuse to start from such an environment (exit 2) unless you pass `--from-agent` on purpose.
+`orch run --watch` refuse to start from such an environment (exit 2). Only `orch daemon start` accepts
+`--from-agent` to override that on purpose; `orch serve` and `orch run --watch` have no override yet, although
+their refusal names it (pending fix, task tsk_eda1yGZ).
 
 **Not this entry:** `daemon_busy` (all sessions in use: close clients and retry), `wrong_project` (the socket
 belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`), `Cannot confirm the orch request outcome`
@@ -865,19 +867,21 @@ correction for a resize received together with a keypress; heading state-machine
 ## Structured output for `doctor`, `logs --follow` and `serve`
 
 **Symptom.** `orch --json doctor` (or `--yaml doctor`) piped into a parser fails on the first line;
-`orch --yaml logs --follow` or `orch --yaml serve` prints text or JSON Lines, not YAML.
+`orch --yaml logs --follow` or `orch --yaml serve --once` prints text or JSON Lines, not YAML.
 
 **Cause.**
 - `doctor` prints its human header (`  orch doctor · checking adapters and dependencies`) to **stdout** before the
   structured document, whichever of `--json` or `--yaml` is given. The header is older than `--yaml` (master
   prints it under `--json` too), and `--yaml` does not change it. Outside a project, `doctor` ignores both flags
   and prints the text report.
-- `logs --follow` prints a text banner and then live events; `serve` writes JSON Lines (`--log-format json`, the
-  default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl` logs.
+- `logs --follow` prints a text banner and then live events; `serve --once` writes JSON Lines
+  (`--log-format json`, the default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl`
+  logs. A foreground `serve` is the daemon: it prints `listening <socket>` and `dispatch on`, no event lines, and
+  its diagnostics go to stderr only with `RUST_LOG` (to `.orchestry/daemon.log` when detached).
 - A failing command prints its error as text on stderr under every output flag; stdout is empty.
 
 **Fix.** For `doctor`, drop the leading header lines before parsing: `orch --json doctor | sed '1,2d'`. For
-streams, parse the JSON Lines `serve` writes, or poll `orch --yaml logs --task <id>` for run metadata. To tell an
+streams, parse the JSON Lines `serve --once` writes, or poll `orch --yaml logs --task <id>` for run metadata. To tell an
 error from output, check the exit code; never parse stderr as YAML or JSON.
 
 ## File mutations: `update` and `patch` failures
@@ -1015,7 +1019,8 @@ work to continue.
 <!-- W2: goal row 9; ADR 0012 supersedes ADR 0011 decision 7 / D10; PR 2 contract item 7 (deletion is PR 4). -->
 
 Applies to projects that `orch mcp` clients share with other writers: `orch run --watch`, `orch serve`, the
-dashboard, other `orch mcp` processes and one-off `orch` commands ([manual](manual/17-mcp-server.md#concurrent-writers)).
+dashboard, other `orch mcp` processes and one-off `orch` commands of orch 0.13.0 (the 0.13.0 manual's "Concurrent
+writers" section; this release replaces it with [One writer: the daemon](manual/17-mcp-server.md#one-writer-the-daemon)).
 
 **Symptom.** A field you set through a tool, the CLI or the orchestrator is back to an older value (a task's
 status or assignee, an agent setting); a context key that was just set or renewed is gone; a task exists as a file

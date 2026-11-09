@@ -66,7 +66,7 @@ unknown outcome; and another program that edits `.orchestry/` while the daemon r
 |---|---|
 | `--detach` | Run in the background in a session of its own. The command returns only after the daemon is ready, and fails if the daemon fails before that. |
 | `--dispatch on\|off` | Dispatch state at start. Default `off`, so you can queue work before anything runs. |
-| `--from-agent` | Allow the start from an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set). Without it the start refuses with exit 2. Use it only when you, the owner, deliberately start a daemon from such a shell. |
+| `--from-agent` | Allow the start from an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set). Without it the start refuses with exit 2. Use it only when you, the owner, deliberately start a daemon from such a shell. Only `orch daemon start` has this flag; `orch serve` and `orch run --watch` refuse from an agent's environment with no override, pending fix (task tsk_eda1yGZ). |
 
 `orch daemon` also needs a project: run it in the project or a subdirectory, or set `ORCH_PROJECT_ROOT` (see
 [Project selection](#sockets-project-selection-and-daemonjson)). Without an initialized project it exits 3.
@@ -131,7 +131,8 @@ before the first start anyway, because old one-off commands and old `orch mcp` s
 
 | Situation | Exit |
 |---|---|
-| `ORCH_TASK_ID` or `ORCH_AGENT_ID` is set (an agent's environment) and `--from-agent` is not given; the same applies to `orch serve` and `orch run --watch` | 2 |
+| `ORCH_TASK_ID` or `ORCH_AGENT_ID` is set (an agent's environment) and `--from-agent` is not given; `orch serve` and `orch run --watch` refuse there too, and have no `--from-agent` yet although the message names it (pending fix, task tsk_eda1yGZ) | 2 |
+| `orch serve` or `orch run --watch` is given an option of orch 0.13.0 that a daemon start cannot honour (`--tick-interval`, `--log-file`, `--verbose`, a `--log-format` other than `json`); see [below](#how-serve-run-and-the-dashboard-map-to-the-daemon) | 2, before any socket or lock is touched |
 | Your effective user is not the owner of `.orchestry/`, including `root` on a project another user owns | 2 |
 | `.orchestry/` is writable by group or others, or a pre-existing socket directory is not private to you | refuses; orch never changes the mode |
 | `ORCH_SOCKET` or the computed socket path is empty, relative, contains a NUL byte or is over the [100-byte budget](#sockets-project-selection-and-daemonjson) | refuses with a short `ORCH_SOCKET` hint; the path is never truncated |
@@ -261,7 +262,7 @@ orch's exit codes, with the one this work adds:
 |---|---|
 | 0 | Success |
 | 1 | General error |
-| 2 | Invalid arguments; for a daemon start (`orch daemon start`, `orch serve`, `orch run --watch`): agent context without `--from-agent`, a user who does not own the project, or a socket that the start cannot prove stale; also `orch serve --once` while dispatch is on |
+| 2 | Invalid arguments; for a daemon start (`orch daemon start`, `orch serve`, `orch run --watch`): agent context without `--from-agent`, a user who does not own the project, or a socket that the start cannot prove stale; a foreground `orch serve` or `orch run --watch` given `--tick-interval`, `--log-file`, `--verbose` or a non-`json` `--log-format`, and `--tick-interval` on any `serve` or `run`; also `orch serve --once` while dispatch is on |
 | 3 | Not initialized: no project found |
 | 4 | Lock conflict: another daemon or live orchestrator owns the project, including `orch serve` or `orch run --watch` while a daemon runs; a second `orch serve --once` batch |
 | 5 | Adapter error |
@@ -482,6 +483,33 @@ other way of running work asks the running daemon:
 | `orch tui --observe`, `orch tui --listen` | Removed: the dashboard is always a client; peer listening is a start option of the daemon. |
 | `orch doctor` | A client: with no daemon it prints the no-daemon message and the discovery facts and exits 7. |
 | `orch init`, `--help`, `--version` | Need no daemon. `orch init` prints how to start one and never starts it; running it again changes nothing in an existing project. |
+
+**Options a daemon start refuses.** A foreground `orch serve` or `orch run --watch` *is* the daemon, so the
+options orch 0.13.0 used to shape that process's log or interval have nothing left to apply to. The command refuses
+them with exit 2 before it opens a socket or a lock, and prints the first that applies; nothing is ignored silently:
+
+| Option | Refused on | Use instead |
+|---|---|---|
+| `--tick-interval <ms>` | every `orch serve` (with `--once` too) and every `orch run` | `orch config set scheduling.poll_interval_ms <ms>`; the daemon reads it before every check |
+| `--log-file <path>` | `orch serve` without `--once` | the foreground daemon's stderr (`RUST_LOG`), `.orchestry/daemon.log` when detached, `orch logs --follow` for events |
+| `--log-format` other than `json` | `orch serve` without `--once` (`json`, the default, is accepted) | as for `--log-file` |
+| `--verbose` | `orch serve` without `--once`, `orch run --watch` | `RUST_LOG` or `orch logs --follow` |
+
+The messages, after `✕`:
+
+```text
+--tick-interval is not accepted: the daemon uses scheduling.poll_interval_ms from config.yml (orch config set scheduling.poll_interval_ms <ms>)
+--log-file is not accepted by a daemon start; the foreground daemon logs to stderr (RUST_LOG), a detached one to .orchestry/daemon.log. Follow events with: orch logs --follow
+--log-format is not accepted by a daemon start; the foreground daemon logs to stderr (RUST_LOG), a detached one to .orchestry/daemon.log. Follow events with: orch logs --follow
+--verbose is not accepted by a daemon start; use RUST_LOG or orch logs --follow
+```
+
+`orch serve --once` keeps `--log-format json|text`, `--log-file` and `--verbose`: it is a client, and it renders
+the batch's events itself ([Logs of `serve --once`](07-running-and-monitoring.md#logs-of-serve---once)).
+`orch run <task-id>`, `--all` and `--once` accept `--verbose` and ignore it.
+<!-- W2b (tsk_s5fpInN): crates/orch-cli/src/tree.rs REJECT_* constants, RunCmd/ServeCmd::rejected_flag and
+lib.rs dispatch_parsed (refusal before the foreground daemon path) at feature/daemon-clients-cli 6acc62db;
+s2a-cli-decisions.md §2. Not captured: that head does not compile (12 errors in orch-cli mcp/tui). -->
 
 **`orch serve --once` is a batch.** While global dispatch is on it refuses with
 `dispatch is ON; serve --once needs dispatch OFF` (exit 2). With dispatch off it runs one batch at a time (a second
