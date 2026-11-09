@@ -87,6 +87,9 @@ pub async fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path
             },
             from_agent: args.from_agent,
             listen: args.peer.listen.clone(),
+            peer_name: args.peer.peer_name.clone(),
+            // D11 pre-runtime capture belongs in main (tsk_fssJiFW).
+            environment: None,
             developmental: true,
         })
         .await;
