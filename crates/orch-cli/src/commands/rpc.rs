@@ -54,6 +54,16 @@ impl Rpc {
     pub(crate) async fn lane(&self) -> MutexGuard<'_, Client> {
         self.client.lock().await
     }
+
+    /// Wrap an already-connected client (the in-process daemon harness).
+    #[cfg(test)]
+    pub(crate) fn from_client(project_root: PathBuf, client: Client) -> Self {
+        Self {
+            project_root,
+            agent_id: None,
+            client: Mutex::new(client),
+        }
+    }
 }
 
 pub fn arguments<T: DeserializeOwned>(input: impl Serialize) -> Result<T> {

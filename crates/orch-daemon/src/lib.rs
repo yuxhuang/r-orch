@@ -50,10 +50,6 @@ pub use gitignore::{
     ensure_runtime_gitignore,
 };
 pub use lifecycle::{
-    DEVELOPMENTAL_BANNER, DaemonExit, DispatchMode, InitOptions, InitOutcome, PreparedStart,
+    DaemonExit, DispatchMode, InitOptions, InitOutcome, PreparedStart,
     StartOptions, initialize, prepare_start, start,
 };
-
-/// The environment variable that must be `1` for `orch daemon start` in PR 1
-/// (SE-20): until clients are converted, legacy writers are not excluded.
-pub const DEVELOPMENTAL_ENV: &str = "ORCH_DAEMON_DEVELOPMENTAL";

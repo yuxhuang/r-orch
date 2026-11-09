@@ -149,6 +149,16 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
         Some(Command::Daemon(args)) => Some(args),
         _ => None,
     };
+    // Refused before any connect or lifecycle call, never silently ignored.
+    let rejected = match &cli.command {
+        Some(Command::Serve(args)) => args.rejected_flag(),
+        Some(Command::Run(args)) => args.rejected_flag(),
+        _ => None,
+    };
+    if let Some(message) = rejected {
+        print_error(&styles, message, None);
+        return ExitCode::from(2);
+    }
     let foreground_peer = match &cli.command {
         Some(Command::Serve(args)) if !args.once => Some(&args.peer),
         Some(Command::Run(args)) if args.watch => Some(&args.peer),
