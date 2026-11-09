@@ -1723,11 +1723,13 @@ dependencies = [
 name = "orch-client"
 version = "0.13.0"
 dependencies = [
+ "base64",
  "nix 0.31.3",
  "orch-domain",
  "orch-proto",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

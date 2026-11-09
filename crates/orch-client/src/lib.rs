@@ -1,5 +1,21 @@
-//! Local daemon control plane. No store fallback and no lifecycle side effects.
-//! Production connections verify kernel credentials before sending any bytes.
+//! The daemon client every frontend uses: discovery, the connect state
+//! machine (design D5), the typed operation surface (D7, in `api`) and the
+//! frozen stop. No store fallback and no lifecycle side effects: nothing here
+//! starts, forks or executes a process (R4, enforced by `cargo xtask
+//! crate-graph`). Production connections verify kernel credentials before
+//! sending any bytes.
+//!
+//! ```ignore
+//! let config = ClientConfig::from_env(cwd)?.with_agent(cli.agent.as_deref())?;
+//! let mut client = match Client::connect(&config).await {
+//!     Ok(client) => client,
+//!     Err(error) => {
+//!         eprintln!("{}", error.render(config.agent_context));
+//!         return Err(error.exit_code()); // 7 for every NoDaemon form
+//!     }
+//! };
+//! let task = client.task_get(args::TaskGetArgs { id: Id::new("tsk_1")? }).await?;
+//! ```
 #![deny(
     unreachable_pub,
     clippy::unwrap_used,
@@ -7,12 +23,14 @@
     clippy::print_stderr
 )]
 
+mod api;
+mod call;
 mod discovery;
+pub use call::{Call, MAX_STREAMED_RESULT_BYTES, Progress};
 pub use discovery::Project;
 pub use orch_proto::error::ConnectFailure as NoDaemon;
 
 use orch_proto::error::{ErrorBody, NoDaemonDetail};
-use orch_proto::frame::{MAX_FRAME_BYTES, RequestFrame, RequestId, ServerFrame};
 use orch_proto::handshake::{
     self, Caller, CallerKind, HandshakeReply, Hello, HelloFrame, Intent, Reply, SessionMode,
     StopState, VersionSkew, Welcome,
@@ -21,7 +39,6 @@ use orch_proto::ndjson::{self, FrameReader};
 use orch_proto::ops::{Request, args, results};
 use orch_proto::path::WirePath;
 use serde::de::DeserializeOwned;
-use std::num::NonZeroU64;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
@@ -116,6 +133,35 @@ impl ClientConfig {
     pub fn project(&self) -> Result<Project, ClientError> {
         Project::discover(&self.cwd, self.project_root.as_deref())
     }
+
+    /// R8: an explicit `--agent` wins over `ORCH_AGENT_ID`; `None` keeps the
+    /// environment's identity. Identity is fixed for the session's lifetime.
+    pub fn with_agent(mut self, flag: Option<&str>) -> Result<Self, ClientError> {
+        if let Some(flag) = flag {
+            let id = orch_proto::bounded::Id::new(flag)
+                .map_err(|_| ClientError::InvalidArguments("invalid --agent".into()))?;
+            self.caller.agent_id = Some(id);
+        }
+        let kind = self.caller.kind;
+        Ok(self.with_frontend(kind))
+    }
+
+    /// The frontend opening the session. The daemon admits an MCP session
+    /// only to the MCP surface, so the bridge must say so. An MCP bridge with
+    /// a resolved agent identity renders failures in the agent variant.
+    pub fn with_frontend(mut self, kind: CallerKind) -> Self {
+        self.caller.kind = kind;
+        if kind == CallerKind::Mcp && self.caller.agent_id.is_some() {
+            self.agent_context = true;
+        }
+        self
+    }
+
+    /// Session admission mode; only MCP uses anything but `Normal`.
+    pub fn with_mode(mut self, mode: SessionMode) -> Self {
+        self.mode = mode;
+        self
+    }
 }
 
 /// Injectable byte stream for an explicitly constructed test transport. Real
@@ -132,6 +178,7 @@ pub struct Client {
     project: Project,
     pub welcome: Welcome,
     next_id: u64,
+    last_commit_seq: Option<u64>,
     // Set before writing: cancellation or a partial write leaves the outcome
     // unknown and the lane poisoned until a correlated terminal reply arrives.
     request_may_have_been_sent: bool,
@@ -249,8 +296,20 @@ impl Client {
             project,
             welcome,
             next_id: 1,
+            last_commit_seq: None,
             request_may_have_been_sent: false,
         })
+    }
+
+    /// The project this session is bound to.
+    pub fn project(&self) -> &Project {
+        &self.project
+    }
+
+    /// The daemon-instance-scoped commit ordinal of the last completed
+    /// request: the one assigned to a mutation or observed by a read.
+    pub fn last_commit_seq(&self) -> Option<u64> {
+        self.last_commit_seq
     }
 
     pub async fn status(&mut self) -> Result<results::DaemonStatus, ClientError> {
@@ -277,56 +336,6 @@ impl Client {
         tokio::time::timeout(handshake::STOP_COMPLETION_TIMEOUT, self.call(req))
             .await
             .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?
-    }
-
-    /// Generic terminal response plumbing for closed D7 requests. Streaming
-    /// and subscription APIs are added with their consumers in PR 2/3.
-    pub async fn call<T: DeserializeOwned>(&mut self, req: Request) -> Result<T, ClientError> {
-        if self.request_may_have_been_sent {
-            return Err(self
-                .project
-                .failure(NoDaemonDetail::RequestOutcomeUnknown)
-                .into());
-        }
-        // Reserve the id and poison the lane before the first await: cancelling
-        // this future must never let a later call consume its unknown reply.
-        let id = NonZeroU64::new(self.next_id)
-            .ok_or_else(|| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        self.next_id = self.next_id.checked_add(1).unwrap_or(0);
-        self.request_may_have_been_sent = true;
-        let frame = RequestFrame {
-            id: RequestId(id),
-            req,
-        };
-        ndjson::write_frame(&mut self.writer, &frame, MAX_FRAME_BYTES)
-            .await
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        let bytes = self
-            .io
-            .read_line(MAX_FRAME_BYTES)
-            .await
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?
-            .ok_or_else(|| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        ndjson::check_depth(&bytes, orch_proto::frame::MAX_DEPTH)
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        let frame = ServerFrame::decode(&bytes)
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        match frame {
-            ServerFrame::Ok(frame) if frame.id.0 == id => {
-                let result = ndjson::decode(frame.ok.get().as_bytes())
-                    .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-                self.request_may_have_been_sent = false;
-                Ok(result)
-            }
-            ServerFrame::Err(frame) if frame.id.0 == id => {
-                self.request_may_have_been_sent = false;
-                Err(ClientError::Remote(frame.err))
-            }
-            _ => Err(self
-                .project
-                .failure(NoDaemonDetail::RequestOutcomeUnknown)
-                .into()),
-        }
     }
 }
 
