@@ -14,12 +14,28 @@
 //! Every YAML read goes through the same chokepoint, so a bomb is planted in
 //! each of the three kinds of file ORCH reads on a plain command: the project
 //! config, a task and an agent.
+//!
+//! Since S2a-cli every one of those reads (`config_store.read()`,
+//! `task_service` / `agent_service` lookups) happens **inside the daemon
+//! process** answering the RPC, not inside the short-lived client the test
+//! spawns: the client is a thin socket client with nothing of its own to
+//! balloon. `project()` therefore starts an explicit test daemon right after
+//! `orch init` (`tests/common/daemon.rs`), and the RSS sampler below watches
+//! the daemon's pid while it waits for the client to get its answer: a
+//! regression of the C0 bug would now mean the daemon's RPC handler never
+//! returns (its request task is stuck on the still-ballooning
+//! `spawn_blocking`), so the client hangs waiting on the socket exactly as
+//! the single binary used to hang waiting on its own stuck task.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
+
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
 
 /// `shapeD_6000_30` from gate-security-rereview.md §1: a 6,000-element leaf,
 /// then 30 levels of `[*prev, *prev]`. 60 aliases — under any sane alias cap —
@@ -53,36 +69,73 @@ fn orch(dir: &Path) -> Command {
         .env("PATH", "/usr/bin:/bin")
         .env_remove("RUST_LOG")
         .env_remove("ORCHESTRY_DEBUG");
+    daemon::apply_for(dir, &mut command);
     command
 }
 
-fn project() -> tempfile::TempDir {
+/// A throwaway initialised project with its own explicit test daemon.
+struct Project {
+    // Dropped first: the daemon stops before its project directory goes.
+    daemon: TestDaemon,
+    dir: tempfile::TempDir,
+}
+
+impl Project {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        daemon::unregister_project(self.dir.path());
+    }
+}
+
+fn project() -> Project {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir(dir.path().join("home")).unwrap();
     orch(dir.path())
         .args(["init", "--name", "p", "--adapter", "claude"])
         .assert()
         .success();
-    dir
+    // Every command that can trip the bomb (`status`, `task show`, `agent
+    // list`) is a daemon RPC: the explicit test daemon runs before any of
+    // them is issued.
+    let daemon = TestDaemon::start(dir.path(), &dir.path().join("home"));
+    daemon::register_project(dir.path(), &daemon);
+    Project { daemon, dir }
 }
 
-/// Peak RSS in MiB while the command runs, sampled from `/proc/<pid>/status`.
+/// Run the client `command` to completion, sampling the *daemon's* peak RSS
+/// in MiB throughout (sampled from `/proc/<daemon_pid>/status`): the bomb is
+/// read inside the daemon process that answers the RPC, not inside the
+/// one-shot client this spawns.
 ///
-/// Returned alongside the exit code and the wall time, because the three
-/// together are the finding: the broken build exited **non**-zero quickly in
-/// one sense (it printed an error) while RSS climbed without bound.
-fn run_sampling_rss(command: &mut Command, budget: Duration) -> (Option<i32>, Duration, u64) {
+/// Returned alongside the client's exit code and wall time, because the
+/// three together are the finding: a broken build would answer the client
+/// quickly in one sense (an error prints, the client exits) while the
+/// daemon's RSS climbs without bound in the background, invisible to anyone
+/// watching only the one-shot command — or, if the stuck `spawn_blocking` task
+/// also wedges the connection handler answering this very request, the client
+/// never gets a response at all, which this function treats the same way the
+/// original single-process test treated a process that never exited: a
+/// panic, not a passing test with a lucky timeout.
+fn run_sampling_daemon_rss(
+    command: &mut Command,
+    daemon_pid: u32,
+    budget: Duration,
+) -> (Option<i32>, Duration, u64) {
     let started = Instant::now();
     let mut child = command
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn orch");
-    let pid = child.id();
     let mut peak_kib = 0u64;
 
     loop {
-        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{daemon_pid}/status")) {
             for line in status.lines() {
                 if let Some(kib) = line
                     .strip_prefix("VmRSS:")
@@ -97,13 +150,16 @@ fn run_sampling_rss(command: &mut Command, budget: Duration) -> (Option<i32>, Du
             Some(status) => return (status.code(), started.elapsed(), peak_kib / 1024),
             None => {
                 if started.elapsed() > budget {
-                    // The thing this test exists to catch. Kill it so the
-                    // suite does not leave a process eating the machine.
+                    // The thing this test exists to catch. Kill the client so
+                    // the suite does not hang; the daemon is cleaned up by
+                    // `Project`'s drop, which will also flag it as a survivor
+                    // if it cannot be stopped.
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
-                        "did not exit within {budget:?} — peak RSS {} MiB. This is the C0 \
-                         failure: the error is printed and the process keeps allocating.",
+                        "the client never got a response within {budget:?} — daemon peak RSS \
+                         {} MiB. This is the C0 failure: the daemon keeps allocating and the \
+                         request that hit the bomb never completes.",
                         peak_kib / 1024
                     );
                 }
@@ -114,12 +170,14 @@ fn run_sampling_rss(command: &mut Command, budget: Duration) -> (Option<i32>, Du
 }
 
 #[test]
-fn a_bomb_in_config_is_refused_and_the_process_exits() {
-    let dir = project();
-    std::fs::write(dir.path().join(".orchestry/config.yml"), shape_d()).unwrap();
+fn a_bomb_in_config_is_refused_and_the_daemon_stays_bounded() {
+    let project = project();
+    std::fs::write(project.path().join(".orchestry/config.yml"), shape_d()).unwrap();
 
+    let mut command = orch(project.path());
+    command.arg("status");
     let (code, elapsed, peak_mib) =
-        run_sampling_rss(orch(dir.path()).arg("status"), Duration::from_secs(20));
+        run_sampling_daemon_rss(&mut command, project.daemon.pid(), Duration::from_secs(20));
 
     assert_eq!(
         code,
@@ -131,7 +189,7 @@ fn a_bomb_in_config_is_refused_and_the_process_exits() {
     // A rejected document is never built, so RSS stays at ordinary levels.
     assert!(
         peak_mib < 200,
-        "peak RSS {peak_mib} MiB: the document is being expanded"
+        "peak daemon RSS {peak_mib} MiB: the document is being expanded"
     );
 }
 
@@ -142,9 +200,9 @@ fn a_bomb_in_config_is_refused_and_the_process_exits() {
 /// Worth knowing in its own right: a corrupt task file is invisible to
 /// `task list`.
 #[test]
-fn a_bomb_in_a_task_file_is_refused_and_the_process_exits() {
-    let dir = project();
-    let added = orch(dir.path())
+fn a_bomb_in_a_task_file_is_refused_and_the_daemon_stays_bounded() {
+    let project = project();
+    let added = orch(project.path())
         .args(["task", "add", "a task", "--quiet"])
         .output()
         .expect("task add");
@@ -155,67 +213,52 @@ fn a_bomb_in_a_task_file_is_refused_and_the_process_exits() {
     );
 
     std::fs::write(
-        dir.path().join(format!(".orchestry/tasks/{id}.yml")),
+        project.path().join(format!(".orchestry/tasks/{id}.yml")),
         shape_d(),
     )
     .unwrap();
 
-    let (code, elapsed, peak_mib) = run_sampling_rss(
-        orch(dir.path()).args(["task", "show", &id]),
-        Duration::from_secs(20),
-    );
+    let mut command = orch(project.path());
+    command.args(["task", "show", &id]);
+    let (code, elapsed, peak_mib) =
+        run_sampling_daemon_rss(&mut command, project.daemon.pid(), Duration::from_secs(20));
     assert_eq!(code, Some(1), "exit code 1");
     assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
-    assert!(peak_mib < 200, "peak RSS {peak_mib} MiB");
+    assert!(peak_mib < 200, "peak daemon RSS {peak_mib} MiB");
 }
 
 #[test]
-fn a_bomb_in_an_agent_file_is_refused_and_the_process_exits() {
-    let dir = project();
+fn a_bomb_in_an_agent_file_is_refused_and_the_daemon_stays_bounded() {
+    let project = project();
     std::fs::write(
-        dir.path().join(".orchestry/agents/agt_creator.yml"),
+        project
+            .path()
+            .join(".orchestry/agents/agt_creator.yml"),
         shape_d(),
     )
     .unwrap();
 
-    let (code, elapsed, peak_mib) = run_sampling_rss(
-        orch(dir.path()).args(["agent", "list"]),
-        Duration::from_secs(20),
-    );
+    let mut command = orch(project.path());
+    command.args(["agent", "list"]);
+    let (code, elapsed, peak_mib) =
+        run_sampling_daemon_rss(&mut command, project.daemon.pid(), Duration::from_secs(20));
     assert_eq!(code, Some(1), "exit code 1");
     assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
-    assert!(peak_mib < 200, "peak RSS {peak_mib} MiB");
-}
-
-/// The lock is the reason the backstop may not be a `process::exit` inside
-/// `orch-infra` (gate-security's dissent): `read_yaml_value` is the chokepoint
-/// for every YAML read, so exiting there could strand `orchestry.lock`.
-/// Rejecting through the ordinary error path leaves no lock behind.
-#[test]
-fn refusing_a_bomb_leaves_no_lock_behind() {
-    let dir = project();
-    std::fs::write(dir.path().join(".orchestry/config.yml"), shape_d()).unwrap();
-
-    let (code, _, _) = run_sampling_rss(orch(dir.path()).arg("status"), Duration::from_secs(20));
-    assert_eq!(code, Some(1));
-    assert!(
-        !dir.path().join(".orchestry/orchestry.lock").exists(),
-        "a refused read must not strand the lock"
-    );
+    assert!(peak_mib < 200, "peak daemon RSS {peak_mib} MiB");
 }
 
 /// T-E2E: Markdown stars in a task description are text, not YAML aliases.
 #[test]
 fn task_show_prints_markdown_in_a_literal_block_scalar() {
-    let dir = project();
-    let added = orch(dir.path())
+    let project = project();
+    let added = orch(project.path())
         .args(["task", "add", "a markdown task", "--quiet"])
         .output()
         .expect("task add");
     assert!(added.status.success(), "{added:?}");
     let id = String::from_utf8(added.stdout).unwrap().trim().to_string();
     assert!(id.starts_with("tsk_"), "expected task id, got {id:?}");
-    let path = dir.path().join(format!(".orchestry/tasks/{id}.yml"));
+    let path = project.path().join(format!(".orchestry/tasks/{id}.yml"));
     let task = std::fs::read_to_string(&path).unwrap();
     let body = (0..40)
         .map(|n| format!("- **Role {n}:** be *efficient*"))
@@ -233,7 +276,7 @@ fn task_show_prints_markdown_in_a_literal_block_scalar() {
     }
     std::fs::write(&path, doc).unwrap();
 
-    let shown = orch(dir.path())
+    let shown = orch(project.path())
         .args(["task", "show", &id])
         .output()
         .expect("task show");
@@ -242,4 +285,39 @@ fn task_show_prints_markdown_in_a_literal_block_scalar() {
     for line in body {
         assert!(output.contains(&line), "missing {line:?}: {output}");
     }
+}
+
+/// S2a-cli: `orchestry.lock` is now the daemon's own single-instance marker
+/// (`crates/orch-daemon/src/guard.rs`), held for the daemon's whole
+/// lifetime — not a transient per-command lock a *client* could strand by
+/// hitting the bomb mid-read. With an explicit test daemon running (required
+/// for `status` to work at all under S2a-cli), the file exists throughout for
+/// reasons unrelated to this test, so the original "a refused read leaves no
+/// lock behind" assertion is now unconditionally false and proves nothing.
+///
+/// The regression this guarded — a rejected read wedging the thing that was
+/// holding the lock — plausibly still matters, but now as "the daemon stays
+/// responsive after refusing a bomb", which needs a decision on how to probe
+/// a specific RPC connection's health (a follow-up request on the same
+/// daemon, once its config is restored to something readable?) rather than a
+/// file-existence check.
+#[test]
+#[ignore = "S2a-cli: orchestry.lock is now the daemon's permanent single-instance \
+            marker, not a transient per-command lock; the file existing while a test \
+            daemon runs is expected and no longer signals a stranded lock. Needs a \
+            decision on what \"the daemon stays healthy after refusing a bomb\" should \
+            assert instead."]
+fn refusing_a_bomb_leaves_no_lock_behind() {
+    let project = project();
+    std::fs::write(project.path().join(".orchestry/config.yml"), shape_d()).unwrap();
+
+    let mut command = orch(project.path());
+    command.arg("status");
+    let (code, _, _) =
+        run_sampling_daemon_rss(&mut command, project.daemon.pid(), Duration::from_secs(20));
+    assert_eq!(code, Some(1));
+    assert!(
+        !project.path().join(".orchestry/orchestry.lock").exists(),
+        "a refused read must not strand the lock"
+    );
 }

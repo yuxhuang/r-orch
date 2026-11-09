@@ -114,12 +114,6 @@ fn seeded(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String)
     seeded_in(Sandbox::new_owned(reader), reader, row, effort)
 }
 
-/// [`seeded`] without a daemon, for the dispatch cells that run `orch run`
-/// (an in-process orchestrator until S2a-cli; see [`Sandbox::new`]).
-fn seeded_unowned(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String) {
-    seeded_in(Sandbox::new(reader), reader, row, effort)
-}
-
 fn seeded_in(sb: Sandbox, reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String) {
     let id = sb.seed_agent(reader, "Subject", row.adapter, row.model, effort);
     (sb, id)
@@ -664,7 +658,9 @@ struct Dispatched {
 }
 
 fn dispatch(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, Dispatched) {
-    let (sb, id) = seeded_unowned(&new_reader(), row, effort);
+    // `orch run` below is a daemon RPC since S2a-cli, so this cell needs an
+    // owned daemon rather than the old unowned-until-S2a-cli sandbox.
+    let (sb, id) = seeded(&new_reader(), row, effort);
     let task = sb.run(
         reader,
         &["task", "add", "matrix task", "--assignee", &id, "--quiet"],

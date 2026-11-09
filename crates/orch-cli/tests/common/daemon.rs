@@ -103,17 +103,7 @@ impl TestDaemon {
         let root = root.canonicalize().expect("project root exists");
         fs::create_dir_all(home).expect("fixture HOME");
         let home = home.canonicalize().expect("fixture HOME exists");
-        let short = tempfile::Builder::new()
-            .prefix("otd-")
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in("/tmp")
-            .expect("short socket dir under /tmp");
-        let socket = short.path().join("s");
-        assert!(
-            socket.as_os_str().len() <= MAX_SOCKET_BYTES,
-            "socket path {} exceeds {MAX_SOCKET_BYTES} bytes",
-            socket.display()
-        );
+        let (short, socket) = short_socket();
         let err_path = short.path().join("daemon.err");
         let mut command = Command::new(env!("CARGO_BIN_EXE_orch"));
         command
@@ -455,6 +445,29 @@ impl Drop for OwnedDir {
     fn drop(&mut self) {
         unregister_project(self.dir.path());
     }
+}
+
+/// A fresh `0700` directory under `/tmp` (`/tmp/otd-XXXXXX`) and the `<dir>/s`
+/// socket path inside it, short enough for macOS's 104-byte `sun_path` even
+/// once joined to a long `$TMPDIR` project path (see the module docs).
+///
+/// For a fixture that starts its *own* foreground `orch serve` / `orch run
+/// --watch` (itself a daemon start, so it must not go through
+/// [`TestDaemon::start`], which would spawn a second, separate daemon): apply
+/// the returned socket with [`apply_env`] to that one command instead.
+pub fn short_socket() -> (tempfile::TempDir, PathBuf) {
+    let short = tempfile::Builder::new()
+        .prefix("otd-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .expect("short socket dir under /tmp");
+    let socket = short.path().join("s");
+    assert!(
+        socket.as_os_str().len() <= MAX_SOCKET_BYTES,
+        "socket path {} exceeds {MAX_SOCKET_BYTES} bytes",
+        socket.display()
+    );
+    (short, socket)
 }
 
 /// Set the two variables that aim a command at `socket`. Free-standing so a

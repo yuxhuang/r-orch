@@ -4,6 +4,16 @@
 //! swallowed error in the engine, the adapters and the stores was invisible.
 //! Installing one risks the opposite problem: stdout is the contract,
 //! and `--json` has to stay parseable, so a diagnostic must never land there.
+//!
+//! `task add` and `task list --json` are daemon RPCs since S2a-cli, so
+//! [`project`] adopts a test daemon right after `init` (the
+//! `tui`-based tests still build the full engine directly — `orch tui` has no
+//! RPC client path — but `task add` in the shared fixture does, and running
+//! it needs the project's own daemon registered either way).
+
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::OwnedDir;
 
 use std::path::Path;
 use std::process::Command;
@@ -20,20 +30,33 @@ fn orch(dir: &Path) -> Command {
         .env("PATH", "/usr/bin:/bin")
         .env_remove("RUST_LOG")
         .env_remove("ORCHESTRY_DEBUG");
+    daemon::apply_for(dir, &mut command);
     command
 }
 
-fn project() -> tempfile::TempDir {
+fn project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    orch(dir.path())
+    // No daemon yet: `init` is the one command that still runs bare.
+    let status = Command::cargo_bin("orch")
+        .expect("the orch binary")
+        .current_dir(dir.path())
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
         .args(["init", "--name", "p", "--adapter", "claude"])
-        .output()
+        .status()
         .expect("init");
-    orch(dir.path())
+    assert!(status.success(), "init failed");
+    let owned = OwnedDir::adopt(dir);
+    let added = orch(owned.path())
         .args(["task", "add", "a task", "--quiet"])
         .output()
         .expect("task add");
-    dir
+    assert!(
+        added.status.success(),
+        "task add failed: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    owned
 }
 
 #[test]

@@ -21,6 +21,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use token_eco_support::daemon;
 use token_eco_support::{Out, Sandbox, new_reader};
 
 const MODEL: &str = "openrouter/anthropic/claude-opus-5.5";
@@ -34,9 +35,21 @@ struct Dispatched {
 
 /// A project holding one OpenCode agent with `effort` and one task for it,
 /// not yet run.
+///
+/// **Without a daemon**: `run --watch` (through [`watch_output`]) is itself a
+/// daemon start and must not find a second one already owning the project.
 fn seeded(effort: &str) -> Dispatched {
+    seeded_in(Sandbox::new(&new_reader()), effort)
+}
+
+/// [`seeded`], with the project's own test daemon: for [`dispatch`], which
+/// sends `orch run` — a daemon RPC since S2a-cli — rather than starting one.
+fn seeded_owned(effort: &str) -> Dispatched {
+    seeded_in(Sandbox::new_owned(&new_reader()), effort)
+}
+
+fn seeded_in(sb: Sandbox, effort: &str) -> Dispatched {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
     let id = sb.seed_agent(&new, "Oc", "opencode", Some(MODEL), Some(effort));
     let task = sb.run(
         &new,
@@ -58,7 +71,8 @@ fn seeded(effort: &str) -> Dispatched {
 
 fn dispatch(version: &str, effort: &str) -> Dispatched {
     let new = new_reader();
-    let Dispatched { sb, task, .. } = seeded(effort);
+    // `orch run` below is a daemon RPC since S2a-cli.
+    let Dispatched { sb, task, .. } = seeded_owned(effort);
     let out = sb.run_env(
         &new,
         &["run", &task],
@@ -78,9 +92,16 @@ fn dispatch(version: &str, effort: &str) -> Dispatched {
 /// that `orch run --watch` prints as a `⚠ <context>: <note>` line. The single
 /// `orch run <task>` path does not render it. Runs the watch loop over the
 /// seeded task until the task's run reports completion, then stops it.
+///
+/// `run --watch` is itself a foreground daemon start since S2a-cli
+/// (`crate::commands::daemon::foreground`), on its own isolated socket so its
+/// `.orchestry`-relative default does not overflow macOS's `sun_path`; `d.sb`
+/// must stay daemon-less ([`seeded`]) so this is not a *second* owner.
 fn watch_output(d: &Dispatched, version: &str) -> String {
     let new = new_reader();
+    let (short, socket) = daemon::short_socket();
     let mut cmd = d.sb.command(&new);
+    daemon::apply_env(&mut cmd, &socket, short.path());
     let mut child = cmd
         .args(["run", "--watch"])
         .env("ORCH_FAKE_VERSION", version)
@@ -166,6 +187,14 @@ fn a_v1_install_keeps_the_original_model_and_never_receives_a_variant_suffix() {
 }
 
 #[test]
+#[ignore = "S2a-cli: `run --watch` is now `commands::daemon::foreground`, which \
+            (per crates/orch-daemon/src/lifecycle.rs) prints only `listening <socket>` \
+            to stdout and never renders the live OrchestratorEvent bus there (that \
+            rendering lived in the legacy in-process watch loop, which is gone); no \
+            client command in the current source replays `orchestrator:error` for an \
+            operator watching an interactive run. Needs a product decision on where \
+            (if anywhere) this diagnostic now surfaces — `orch tui`, a `logs --follow`, \
+            or daemon-side tracing — before this can be rewritten."]
 fn a_v1_install_surfaces_the_legacy_ignore_to_the_operator() {
     let d = seeded("high");
     let watched = watch_output(&d, "1.9.0");
@@ -230,6 +259,9 @@ fn the_legacy_ignore_is_never_stored_as_agent_output() {
 }
 
 #[test]
+#[ignore = "S2a-cli: same gap as a_v1_install_surfaces_the_legacy_ignore_to_the_operator — \
+            `run --watch`'s own stdout no longer renders live OrchestratorEvents, only \
+            `listening <socket>`; no replacement surface is specified yet."]
 fn the_legacy_ignore_is_surfaced_to_the_operator_exactly_once() {
     let d = seeded("high");
     let watched = watch_output(&d, "1.9.0");

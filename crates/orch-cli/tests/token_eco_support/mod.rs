@@ -72,8 +72,10 @@ use daemon::TestDaemon;
 /// recording directory.
 pub struct Sandbox {
     /// Dropped first: stopped, with a process-table check, before the project
-    /// directory it serves is removed. `None` for a sandbox that runs a legacy
-    /// in-process orchestrator (`orch run`) until S2a-cli; see [`Sandbox::new`].
+    /// directory it serves is removed. `None` only for a sandbox that has not
+    /// yet adopted a daemon ([`Sandbox::new`]); every `orch` command but
+    /// `init` is a daemon client since S2a-cli, so a sandbox that runs one
+    /// needs [`Sandbox::new_owned`].
     daemon: Option<TestDaemon>,
     _parent: tempfile::TempDir,
     /// Always `<canonical tmp>/proj`, so the project name in a prompt is stable.
@@ -111,9 +113,13 @@ impl Sandbox {
     /// A fresh initialised project **without a daemon**. `init` always runs
     /// with `init_reader`.
     ///
-    /// Use this only where the test runs `orch run` / `orch serve`: until
-    /// S2a-cli those are in-process orchestrators that take the PID lock a
-    /// test daemon holds. Everything else uses [`Sandbox::new_owned`].
+    /// Every other `orch` command is a daemon client since S2a-cli, so a test
+    /// that goes on to run one (including `orch run` / `orch serve --once`)
+    /// needs [`Sandbox::new_owned`] instead. This constructor exists for the
+    /// rare fixture that wants a bare initialised project (for example, to
+    /// exercise the "no daemon running" exit 7) or that starts a foreground
+    /// `orch serve` / `orch run --watch` itself, which *is* a daemon start and
+    /// must not also own this one.
     pub fn new(init_reader: &Reader) -> Sandbox {
         let parent = tempfile::tempdir().unwrap();
         let project = parent.path().canonicalize().unwrap().join("proj");
