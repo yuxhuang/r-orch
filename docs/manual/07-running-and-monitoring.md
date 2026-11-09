@@ -108,7 +108,7 @@ orch run --once
 
 `--once` asks the running daemon for one scheduling check, as dispatch would make it, prints that check's events and exits. It does not stop the daemon, and it does not turn dispatch on or off.
 
-`orch run` needs a task ID, `--all`, `--once` or `--watch`. With none of them it prints an error and exits with 2. <!-- UNCONFIRMED: the 0.13.0 text was `✕ Specify a task ID, --all, or --watch`; I2 quotes the PR 2 text. --> If you combine them, `--watch` wins over `--all`, and `--all` wins over a task ID. So `orch run --all --watch` is the same as `orch run --watch`. Some commands, such as `orch org deploy`, print `Next: orch run --all --watch`. That starts the daemon with dispatch on, which also dispatches everything that waits; if a daemon already runs, use `orch daemon dispatch on` instead.
+`orch run` needs a task ID, `--all`, `--once` or `--watch`. With none of them it prints `✕ Specify a task ID, --all, --once, or --watch` and exits with 2. <!-- W2b: lib.rs Command::Run branch (Error::invalid_arguments, exit 2) at 6acc62db. --> If you combine them, `--watch` wins over `--all`, and `--all` wins over a task ID. So `orch run --all --watch` is the same as `orch run --watch`. Some commands, such as `orch org deploy`, print `Next: orch run --all --watch`. That starts the daemon with dispatch on, which also dispatches everything that waits; if a daemon already runs, use `orch daemon dispatch on` instead.
 
 ### Options for `orch run`
 
