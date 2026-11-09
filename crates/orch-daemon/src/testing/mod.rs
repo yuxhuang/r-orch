@@ -183,6 +183,8 @@ impl HarnessBuilder {
             snapshot: crate::env::capture(std::env::vars_os()),
         })
         .await?;
+        let mut running = running;
+        running.honour_stop_intent();
         Ok(DaemonHarness {
             project_root: root,
             socket,
@@ -455,8 +457,8 @@ mod tests {
         };
         let mut frame = serde_json::to_vec(&hello).unwrap();
         frame.push(b'\n');
-        // A stop intent is answered with the advertised versions; the
-        // harness is not stopped until its own shutdown runs.
+        // A stop intent is answered with the advertised versions, then
+        // stops the engine; the harness's shutdown stays idempotent.
         stream.get_mut().write_all(&frame).await.unwrap();
         let mut line = String::new();
         stream.read_line(&mut line).await.unwrap();

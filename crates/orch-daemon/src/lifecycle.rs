@@ -578,29 +578,28 @@ impl Running {
     }
 
     async fn stop_engine(&self) -> bool {
-        if self.handler.coordinator().is_stopping() {
-            // `daemon.stop` is already running the same handler.
-            let mut stopped = self.handler.stopped();
-            return match tokio::time::timeout(STOP_WAIT, stopped.wait_for(Option::is_some)).await {
-                Ok(Ok(value)) => value.unwrap_or(false),
-                _ => false,
-            };
-        }
-        match self
-            .handler
-            .execute_request(&internal_context(), Request::DaemonStop(DaemonStopArgs {}))
-            .await
-        {
-            Ok(committed) => serde_json::from_str::<StopOutcome>(committed.value.get())
-                .map(|outcome| outcome.clean)
-                .unwrap_or(false),
-            Err(error) => {
-                tracing::warn!(code = ?error.code, execution = ?error.execution, "shutdown cleanup failed");
-                false
-            }
-        }
+        stop_engine(&self.handler).await
     }
 
+    /// The harness's stand-in for [`start`]'s wait: a frozen stop intent
+    /// runs the engine stop and answers its caller, as in production. The
+    /// listener stays up until the harness's own (then idempotent)
+    /// `shutdown` finishes the teardown.
+    #[cfg(feature = "testing")]
+    pub(crate) fn honour_stop_intent(&mut self) {
+        let server = Arc::clone(&self.server);
+        let handler = self.handler.clone();
+        let mut quit = self.quit.subscribe();
+        self.loops.push(tokio::spawn(async move {
+            let mut requested = server.stop.requested();
+            tokio::select! {
+                () = crate::session::until_set(&mut quit) => return,
+                () = crate::session::until_set(&mut requested) => {}
+            }
+            let clean = stop_engine(&handler).await;
+            server.stop.finish(clean);
+        }));
+    }
     fn remove_endpoint(&mut self) {
         if let Some(endpoint) = self.endpoint.take()
             && let Err(error) =
@@ -628,6 +627,30 @@ impl Running {
         discovery::remove_own_record(&self.project_root, &self.instance);
         self.pid_lock.release();
         drop(self.guard.take());
+    }
+}
+
+/// Run `daemon.stop` once; a stop already in progress is awaited instead.
+async fn stop_engine(handler: &ServiceHandler) -> bool {
+    if handler.coordinator().is_stopping() {
+        // `daemon.stop` is already running the same handler.
+        let mut stopped = handler.stopped();
+        return match tokio::time::timeout(STOP_WAIT, stopped.wait_for(Option::is_some)).await {
+            Ok(Ok(value)) => value.unwrap_or(false),
+            _ => false,
+        };
+    }
+    match handler
+        .execute_request(&internal_context(), Request::DaemonStop(DaemonStopArgs {}))
+        .await
+    {
+        Ok(committed) => serde_json::from_str::<StopOutcome>(committed.value.get())
+            .map(|outcome| outcome.clean)
+            .unwrap_or(false),
+        Err(error) => {
+            tracing::warn!(code = ?error.code, execution = ?error.execution, "shutdown cleanup failed");
+            false
+        }
     }
 }
 
