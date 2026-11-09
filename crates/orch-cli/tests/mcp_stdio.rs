@@ -783,10 +783,9 @@ fn default_mode_instructions_say_what_pause_spares_and_that_resume_does_not_rest
 
     assert!(
         text.contains(
-            "Tasks with another or no goal id, running work and ordinary queued tasks \
-             normally continue, but pause is not an atomic execution barrier: \
-             a concurrent dispatch can start a listed task and the pause then cancels it. \
-             Success does not prove all execution of that goal stopped."
+            "Running tasks, tasks with another or no goal id and ordinary queued tasks \
+             continue. The pause is atomic with dispatch: \
+             no task it cancels can start afterwards."
         ) && text.contains("Resume does not restore cancelled tasks; use task_retry"),
         "{text}"
     );
@@ -1574,9 +1573,11 @@ struct PeerFixture {
 }
 
 fn peer_project() -> PeerFixture {
-    // Unowned while the snapshot is hand-written: the daemon's peer runtime
-    // would otherwise link `w1` (refused) and rewrite `remotes/w1.json`.
-    let mut project = initialized_project_unowned("p");
+    // Every CLI command is a daemon client, so the seeding runs against a
+    // daemon. That daemon is stopped before the snapshot is hand-written,
+    // because a running daemon's peer runtime links `w1` (refused) and
+    // rewrites `remotes/w1.json`; a fresh daemon is started afterwards.
+    let mut project = initialized_project_named("p");
     let path = project.path();
     cli_ok(path, &["remote", "add", "w1", "127.0.0.1:1"]);
     // Any well-formed agent record is a valid peer snapshot entry; borrow one
@@ -1596,7 +1597,6 @@ fn peer_project() -> PeerFixture {
     );
     let bare = id_of(&agent);
     let remotes = path.join(".orchestry/remotes");
-    std::fs::create_dir_all(&remotes).expect("remotes dir");
     let status = json!({
         "alias": "w1",
         "addr": "127.0.0.1:1",
@@ -1608,17 +1608,19 @@ fn peer_project() -> PeerFixture {
         "os": "linux",
         "agents": [agent],
     });
-    std::fs::write(
-        remotes.join("w1.json"),
-        serde_json::to_vec(&status).expect("status JSON"),
-    )
-    .expect("write the peer snapshot");
     cli_ok(path, &["agent", "remove", &bare]);
     let qualified = format!("{bare}@w1");
     cli_ok(
         path,
         &["msg", "send", &qualified, "for the peer", "--from", "cli"],
     );
+    project.stop_daemon();
+    std::fs::create_dir_all(&remotes).expect("remotes dir");
+    std::fs::write(
+        remotes.join("w1.json"),
+        serde_json::to_vec(&status).expect("status JSON"),
+    )
+    .expect("write the peer snapshot");
     project.start_daemon();
     PeerFixture {
         project,

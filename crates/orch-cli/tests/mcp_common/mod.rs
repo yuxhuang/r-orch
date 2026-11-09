@@ -402,6 +402,16 @@ impl ProjectDir {
         daemon::register_project(self.dir.path(), &daemon);
         self.daemon = Some(daemon);
     }
+
+    /// Stop the project's test daemon cleanly (process-table checked), so a
+    /// fixture can write owner-managed state by hand and start a fresh one.
+    pub fn stop_daemon(&mut self) {
+        self.daemon
+            .take()
+            .expect("this project's daemon is not started")
+            .shutdown();
+        daemon::unregister_project(self.dir.path());
+    }
 }
 
 impl Drop for ProjectDir {

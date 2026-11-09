@@ -22,7 +22,7 @@ use daemon::TestDaemon;
 
 struct Project {
     // Dropped first: the daemon stops before its project directory goes.
-    daemon: Option<TestDaemon>,
+    _daemon: Option<TestDaemon>,
     root: tempfile::TempDir,
 }
 
@@ -67,7 +67,7 @@ fn project() -> Project {
     let daemon = TestDaemon::start(&project_root, &root.path().join("home"));
     daemon::register_project(&project_root, &daemon);
     Project {
-        daemon: Some(daemon),
+        _daemon: Some(daemon),
         root,
     }
 }

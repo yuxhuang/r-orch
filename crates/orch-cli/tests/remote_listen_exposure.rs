@@ -141,11 +141,9 @@ fn foreground_start(
     done: impl Fn(&str, &str) -> bool,
 ) -> (String, String) {
     const BUDGET: Duration = Duration::from_secs(30);
-    let short = tempfile::Builder::new()
-        .prefix("otd-")
-        .tempdir_in("/tmp")
-        .expect("short socket dir");
-    let socket = short.path().join("s");
+    // The shared helper's 0700 directory: the daemon refuses a group- or
+    // world-accessible socket directory.
+    let (short, socket) = daemon::short_socket();
     let mut command = orch(project.dir.path(), project.home.path());
     command
         .args(args)

@@ -2691,7 +2691,10 @@ fn a_failure_creating_the_team_reports_every_surviving_agent_id_and_the_stage() 
     // Hand-written corruption under `.orchestry/`: the running daemon owns
     // that state, so it is edited with the daemon stopped.
     sb.with_daemon_stopped(|root| {
-        fs::write(root.join(".orchestry/teams"), "not a directory").unwrap();
+        // The daemon created the (empty) directory when it started.
+        let teams = root.join(".orchestry/teams");
+        fs::remove_dir_all(&teams).unwrap();
+        fs::write(&teams, "not a directory").unwrap();
     });
     let output = sb.fail(&["org", "deploy", "--template", "builtin:a-team"]);
     let message = stderr(&output);
@@ -2725,7 +2728,7 @@ fn a_failure_creating_the_goal_reports_the_agents_and_the_team_that_survive() {
     // stopped, which owns that state.
     sb.with_daemon_stopped(|root| {
         let goals = root.join(".orchestry/goals");
-        fs::remove_dir(&goals).unwrap();
+        fs::remove_dir_all(&goals).unwrap();
         fs::write(&goals, "not a directory").unwrap();
     });
     let root = valid_dir(&sb, "trio");

@@ -150,7 +150,12 @@ fn cancel_through_the_daemon_kills_the_live_agent_process() {
         &test_daemon,
         dir,
         &[
-            "task", "add", "long job", "--assignee", &agent_id, "--quiet",
+            "task",
+            "add",
+            "long job",
+            "--assignee",
+            &agent_id,
+            "--quiet",
         ],
     ));
 
@@ -196,10 +201,8 @@ fn cancel_through_the_daemon_kills_the_live_agent_process() {
     let settled = wait_for(Duration::from_secs(10), || {
         let run = read_json(&run_path)?;
         let state = read_json(&state_path)?;
-        (run["status"] == "cancelled"
-            && state["running"].get(&task_id).is_none()
-            && !is_alive(pid))
-        .then_some(())
+        (run["status"] == "cancelled" && state["running"].get(&task_id).is_none() && !is_alive(pid))
+            .then_some(())
     });
     assert!(
         settled.is_some(),

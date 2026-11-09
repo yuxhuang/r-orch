@@ -2651,9 +2651,11 @@ fn two_servers_creating_distinct_tasks_at_once_both_keep_every_index_entry() {
 }
 
 #[test]
-fn a_removed_context_directory_keeps_failing_in_the_same_process_and_a_restart_recovers() {
+fn a_removed_context_directory_keeps_failing_until_the_daemon_restarts() {
     // Design D10: the ensured-directory cache is process-global, so removing a
-    // directory a running server has used breaks that server until it restarts.
+    // directory the daemon has used breaks it until it restarts. The cache
+    // lives in the daemon now, so restarting only the MCP bridge (which owns
+    // no state) does not recover it; restarting the daemon does.
     let mut fx = Fx::new();
     fx.ok("context_set", json!({"key": "k", "value": "v"}));
     std::fs::remove_dir_all(fx.root().join(".orchestry/context")).expect("remove context dir");
@@ -2667,29 +2669,63 @@ fn a_removed_context_directory_keeps_failing_in_the_same_process_and_a_restart_r
         fx.ok("status", json!({})).is_object(),
         "the process itself lives"
     );
-    let Fx { server, dir } = fx;
+    let Fx { server, mut dir } = fx;
     drop(server);
+    let mut bridge_only = McpServer::spawn(dir.path());
+    bridge_only.initialize();
+    let still_broken = bridge_only.call_tool("context_set", json!({"key": "k3", "value": "v"}));
+    assert_eq!(
+        still_broken["result"]["isError"],
+        json!(true),
+        "a new bridge talks to the same daemon: {still_broken}"
+    );
+    drop(bridge_only);
+    dir.stop_daemon();
+    dir.start_daemon();
     let mut restarted = McpServer::spawn(dir.path());
     restarted.initialize();
-    let response = restarted.call_tool("context_set", json!({"key": "k3", "value": "v"}));
+    let response = restarted.call_tool("context_set", json!({"key": "k4", "value": "v"}));
     assert_eq!(response["result"]["isError"], json!(false), "{response}");
 }
 
 #[test]
-fn a_wrong_typed_known_config_key_poisons_later_calls_but_not_the_process_and_a_restore_heals() {
+fn a_wrong_typed_known_config_key_is_refused_and_leaves_the_config_and_the_server_working() {
+    // The daemon validates `config_set` (it owns the only writer), so the old
+    // "accepted, then poisons every later call" state cannot be reached
+    // through the tool any more.
     let mut fx = Fx::new();
     let config = fx.root().join(".orchestry/config.yml");
-    let backup = std::fs::read(&config).expect("config backup");
-    // config_set accepts the raw value for a non-prompt key (design D10).
-    fx.ok(
+    let before = std::fs::read(&config).expect("config before");
+    let response = fx.call(
         "config_set",
         json!({"key": "defaults.task.max_attempts", "value": "not-a-number"}),
     );
+    assert_eq!(response["result"]["isError"], json!(true), "{response}");
+    assert_eq!(
+        std::fs::read(&config).expect("config after"),
+        before,
+        "a refused config_set must leave config.yml byte-identical"
+    );
     for tool in ["task_list", "status", "agent_list"] {
-        let message = fx.tool_error(tool, json!({}));
-        assert!(!message.is_empty(), "{tool}");
+        fx.ok(tool, json!({}));
     }
-    // Catalogue requests need no Engine and still work.
+}
+
+#[test]
+fn a_config_poisoned_outside_the_daemon_fails_later_calls_and_a_restore_heals() {
+    let mut fx = Fx::new();
+    let config = fx.root().join(".orchestry/config.yml");
+    let backup = std::fs::read(&config).expect("config backup");
+    let text = String::from_utf8(backup.clone()).expect("utf-8 config");
+    let poisoned = text.replacen("max_attempts:", "max_attempts: not-a-number #", 1);
+    assert_ne!(poisoned, text, "the fixture config names max_attempts");
+    std::fs::write(&config, poisoned).expect("poison config");
+    let failures: Vec<String> = ["task_list", "status", "agent_list"]
+        .into_iter()
+        .map(|tool| fx.tool_error(tool, json!({})))
+        .collect();
+    assert!(failures.iter().all(|m| !m.is_empty()), "{failures:?}");
+    // Catalogue requests need no daemon and still work.
     let listed = fx.server.request("tools/list", json!({}));
     assert!(
         listed["result"]["tools"]
@@ -2700,22 +2736,6 @@ fn a_wrong_typed_known_config_key_poisons_later_calls_but_not_the_process_and_a_
     // The operator restores the file outside the server; no restart needed.
     std::fs::write(&config, backup).expect("restore config");
     assert!(fx.ok("task_list", json!({})).is_array());
-}
-
-#[test]
-fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
-    let mut fx = Fx::new();
-    let config = fx.root().join(".orchestry/config.yml");
-    let backup = std::fs::read(&config).expect("config backup");
-    fx.ok(
-        "config_set",
-        json!({"key": "defaults.task.max_attempts", "value": "x"}),
-    );
-    std::fs::write(&config, backup).expect("restore config");
-    let mut fresh = McpServer::spawn(fx.root());
-    fresh.initialize();
-    let response = fresh.call_tool("task_list", json!({}));
-    assert_eq!(response["result"]["isError"], json!(false), "{response}");
 }
 
 // ── worker matrix (design D19) ────────────────────────────────────────────
@@ -2731,13 +2751,11 @@ fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
 /// A project that also works as a git repository, so `worktree` and
 /// `isolated` workspaces can be created.
 ///
-/// **No daemon yet (legacy `orch run <task>`).** Every user of this project
-/// runs a worker through `orch run`, which until S2a-cli is an in-process
-/// orchestrator that takes the PID lock a test daemon would already hold
-/// ("Orchestrator already running"). After the cutover `run <id>` is an RPC to
-/// the daemon: start one here with `dir.start_daemon()` and delete this note.
+/// The project's explicit test daemon is started last, after the git
+/// repository exists: workers run through `orch run <id>`, an RPC to that
+/// daemon, which prepares the workspace and spawns the worker.
 fn git_project(name: &str) -> ProjectDir {
-    let dir = initialized_project_unowned(name);
+    let mut dir = initialized_project_unowned(name);
     let git = |args: &[&str]| {
         // The fixture's own private HOME and the system directories only: no
         // developer-machine PATH entry, no inherited user git config.
@@ -2769,6 +2787,7 @@ fn git_project(name: &str) -> ProjectDir {
         "-m",
         "init",
     ]);
+    dir.start_daemon();
     dir
 }
 

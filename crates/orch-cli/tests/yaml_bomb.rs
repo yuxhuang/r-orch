@@ -231,9 +231,7 @@ fn a_bomb_in_a_task_file_is_refused_and_the_daemon_stays_bounded() {
 fn a_bomb_in_an_agent_file_is_refused_and_the_daemon_stays_bounded() {
     let project = project();
     std::fs::write(
-        project
-            .path()
-            .join(".orchestry/agents/agt_creator.yml"),
+        project.path().join(".orchestry/agents/agt_creator.yml"),
         shape_d(),
     )
     .unwrap();
