@@ -32,29 +32,36 @@ orch tui
 
 Bare `orch` also starts the dashboard. In a directory with no `.orchestry/`, bare `orch` creates one first. `orch tui` does not; it stops with `Not initialized`.
 
-> **Warning:** By default the dashboard also starts the orchestrator for the project (watch mode). It dispatches `todo` tasks to idle agents straight away, and real agents cost money. The header shows `WATCHING` while this is on. To look without dispatching from this process, use `--observe`. To stop dispatching, type `/pause`.
+The dashboard is a client of the project's [daemon](18-daemon.md): it shows and changes the project through the daemon and never runs the orchestrator itself. Start the daemon first (`orch daemon start --detach`, or `orch serve` in another terminal). Quitting the dashboard leaves the daemon and its agents running.
+
+<!-- W2 (PR 2, tsk_M9AsDfP): PR 2 contract items 1-3; design D5, D8; spec R18, R38. Written ahead of S2c; I2 verifies.
+UNCONFIRMED (asked frontend-eng msg_HiixZC4): whether opening the dashboard changes dispatch (expected: no), the
+exact header chip texts for dispatch on/off, and whether `/pause` maps to `orch daemon dispatch off`. -->
+> **Warning:** Dispatch belongs to the daemon. While it is on, the daemon dispatches `todo` tasks to idle agents straight away, from whichever client created them, and real agents cost money. The header shows whether dispatch is on or off. The dashboard's watch toggle turns the daemon's dispatch on and off for every client, not just for this dashboard; `orch daemon dispatch off` does the same from a shell.
+
+**When no daemon answers**, the dashboard shows the [no-daemon message](18-daemon.md#when-no-daemon-answers) full screen:
+
+```text
+  ✕ No orch daemon is running for <project root> (<detail>)
+    Start it with: orch daemon start
+```
+
+Press `r` to try to connect again once you have started the daemon, or `q` to quit (exit code 7). The dashboard never starts a daemon. If the daemon is a different orch version, the message names both versions and says `Start it with: orch daemon stop, then orch daemon start`. If the daemon goes away while the dashboard is open, it shows the same screen.
 
 | Option | What it does | Default |
 |---|---|---|
-| `--observe` | Does not start the orchestrator. The header shows `OBSERVING`. You can still create, change and run things from the dashboard. | off |
-| `--listen [ADDR]` | Accepts connections from other orch machines. See [Remote agents](11-remote-agents.md). Only the orch process that runs the orchestrator for the project can listen. | off; a bare `--listen` binds `127.0.0.1:7690` |
 | `--peer-name NAME` | Sets the name other machines see for this one. | the short host name |
 
-`--observe` is not read-only. It only means this process does not start the orchestrator's watch loop. If you press `R` on a task, or click run, the dashboard still dispatches that task from this process, so it can start a real, paid agent run while the header says `OBSERVING`.
-
-If another process already runs the orchestrator for the project (for example `orch serve`), the dashboard becomes an observer on its own. `--listen` then fails. The message says "engine owner", which means the orch process that runs the orchestrator:
-
-```text
-  ✕ --listen requires the engine owner; another orchestrator holds the lock
-```
-
-`orch tui --observe --listen` is refused at once with exit code 2 and the message `--listen requires the engine owner; --observe cannot listen`.
+`orch tui --observe` and `orch tui --listen` were removed: the dashboard never dispatches by itself, so there is nothing to observe instead, and only the daemon listens for other machines. Start the daemon with `--listen` ([Remote agents](11-remote-agents.md)).
+<!-- UNCONFIRMED: whether --peer-name stays a dashboard option at the S2c head (it names this machine to peers, which
+the daemon now does). -->
 
 ![The dashboard's Tasks view: nine tasks in review, to-do, done and failed states, sorted by STATUS with an up arrow, in columns for status, priority, title, goal, assignee, Started and Elapsed*, with the activity feed below](images/dashboard-overview.png)
 
 *The Tasks view, which the dashboard opens on. Under the header, chips count tasks by status and count the teams. The `↑` after STATUS marks the sort column.*
 
-The screenshots in this chapter were taken in observe mode, so the header shows `OBSERVING` and the second header line reads `listen off · controller none`. When you run `orch tui` yourself, the header shows `WATCHING` instead. The second line tells you about peer connections: whether this machine listens for other orch machines (`listen off` or an address), which machine controls it (`controller none`), and the state of each remote you registered. See [Remote agents](11-remote-agents.md).
+The screenshots in this chapter were taken with orch 0.13.0 in observe mode, so the header shows `OBSERVING` and the second header line reads `listen off · controller none`. With the daemon the header shows the daemon's dispatch state instead.
+<!-- W2: screenshots predate PR 2; re-take after S2c (PR 3/4 QA). --> The second line tells you about peer connections: whether this machine listens for other orch machines (`listen off` or an address), which machine controls it (`controller none`), and the state of each remote you registered. See [Remote agents](11-remote-agents.md).
 
 ## Read the screen
 
@@ -81,6 +88,8 @@ listen off · controller none
 
 | Part | What it shows |
 |---|---|
+<!-- W2: the status chip wording (WATCHING/OBSERVING/IDLE) below is 0.13.0; S2c shows the daemon's dispatch state.
+I2 rewrites this row from the PR 2 head (asked frontend-eng msg_HiixZC4). -->
 | Header | The version, the project name and the four view tabs on the left. On the right, ending at the last column: how long the orchestrator has been up, how many agents are running and how many tasks are `todo` (`12:05 · 2 running │ 5 todo`), the project prompt mode, `normal` or `eco` (see [Switch the prompt mode](#switch-the-prompt-mode)), and a status chip: `WATCHING` (this process dispatches work), `OBSERVING` (another process does, or you used `--observe`) or `IDLE`. On a narrow terminal the uptime goes first, then the counts; if the prompt mode still does not fit it moves to the start of the second header line. |
 | Second header line | The peer listen address, the connected controller and each remote's online state. See [Remote agents](11-remote-agents.md). |
 | Status counts | One chip for each task status that has tasks, except cancelled, such as `○ TODO 2`, and a `TEAMS` chip with the number of teams. |
@@ -497,7 +506,7 @@ Rules:
 - The text after the name is sent as it is. `/msg reviewer /quit now` sends that text; it does not quit.
 - The dashboard never guesses. A prefix, an ambiguous name or a name that could be read two ways is refused, and the message tells you the exact form to use.
 - `all` sends to every enabled agent. Type it in lower case, bare. The dashboard asks you to press `Enter` a second time straight away. Any edit or other key cancels the confirmation. `ALL`, `All` and `@all` are treated as agent names.
-- A queued message expires after 24 hours if the agent never runs, and nothing reports it. Check that `WATCHING` or `OBSERVING` is in the header.
+- A queued message expires after 24 hours if the agent never runs, and nothing reports it. Check that the daemon's dispatch is on.
 - The orchestrator cuts a body at 4000 characters; the dashboard tells you when this happens.
 - Without bracketed paste (the legacy Windows console, or tmux with the mode off) a pasted newline sends the message early. Paste one line, or use `orch msg send`.
 

@@ -114,9 +114,9 @@ orch org template list
 
 ## Deploy an organization
 
-Before you start: run `orch init`, and install the agent CLIs the organization uses. `orch doctor` shows which are ready. See [Running and monitoring](07-running-and-monitoring.md).
+Before you start: run `orch init`, start the daemon (`orch daemon start`), and install the agent CLIs the organization uses. `orch doctor` shows which are ready. See [Running and monitoring](07-running-and-monitoring.md).
 
-> **Warning:** Deploying creates real agents that can spend money. With `--goal`, the goal is assigned to the team lead, who is then set to work on it. Once an orchestrator runs (the dashboard, `orch serve` or `orch run --watch`), the lead creates tasks and agents start working. In a test, the lead created and ran a task within a second of `orch serve` starting. Deploy without `--goal` if you want to look first.
+> **Warning:** Deploying creates real agents that can spend money. With `--goal`, the goal is assigned to the team lead, who is then set to work on it. Once the daemon's dispatch is on (`orch daemon dispatch on`, the dashboard's watch toggle, `orch serve` or `orch run --watch`), the lead creates tasks and agents start working. In a test with orch 0.13.0, the lead created and ran a task within a second of `orch serve` starting. Deploy without `--goal` if you want to look first.
 
 1. Deploy a preset or template:
 
@@ -135,7 +135,7 @@ Before you start: run `orch init`, and install the agent CLIs the organization u
      Next: orch run --all --watch
    ```
 
-   > **Warning:** The last line is a suggestion, not something that has happened. As in the warning above, running `orch run --all --watch` starts the deployed agents (for example `claude` and `codex`) on their tasks, and that is a paid run. Run it only when `orch doctor` shows the adapters ready and you intend to spend.
+   > **Warning:** The last line is a suggestion, not something that has happened. As in the warning above, running `orch run --all --watch` starts the daemon with dispatch on (or, if a daemon already runs, exits 4 with `Use: orch daemon dispatch on`), and dispatch starts the deployed agents (for example `claude` and `codex`) on their tasks, and that is a paid run. Run it only when `orch doctor` shows the adapters ready and you intend to spend.
 
 2. Check the result with `orch team list` and `orch agent list`. See [Teams and goals](05-teams-and-goals.md).
 

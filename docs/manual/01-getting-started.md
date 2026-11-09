@@ -183,8 +183,32 @@ A **project** is a directory with a `.orchestry/` folder. Make a new directory a
      ├── templates/default.md
      └── .gitignore
 
+     Start the daemon explicitly with: orch daemon start
      Next: orch task add "Create backend agent" --assignee agt_creator
    ```
+
+3. Start the project's daemon. Every orch command after `orch init` asks this one process to do its work, and
+   nothing starts it but you ([The orch daemon](18-daemon.md)).
+
+   ```sh
+   orch daemon start --detach
+   ```
+
+   You should see, with your own path:
+
+   ```text
+   listening /private/tmp/hello-orch/.orchestry/run/orch.sock
+   dispatch off
+   log /private/tmp/hello-orch/.orchestry/daemon.log
+   ```
+
+   The daemon runs in the background until you stop it with `orch daemon stop`. Dispatch is off, so nothing runs
+   by itself yet. If you skip this step, the next command prints
+   `No orch daemon is running for <project root> (no daemon.json)` and `Start it with: orch daemon start`, and
+   exits 7.
+   <!-- W2: init, start and the no-daemon line captured with the PR 1 frozen binary (6a7a6481) in a throwaway
+   project and HOME; the PR 1 start also printed the developmental banner line, which PR 2 removes (contract item
+   4). Path shortened from /private/tmp/w2init.0HpJ/hello-orch. I2 re-captures at the PR 2 head. -->
 
 orch also created an agent called Agent Creator. It uses the `claude` adapter, so it is a real AI agent.
 
@@ -201,8 +225,8 @@ orch also created an agent called Agent Creator. It uses the `claude` adapter, s
    ```
 
 > **Warning:** Agent Creator is a real AI agent, and its runs can cost money. If it is enabled, any of these
-> can start a paid run: `orch run --watch`, `orch serve`, the dashboard (`orch tui`, which watches by default,
-> and even `orch tui --observe` when you press `r` on a task), and `orch web`. Disabling it keeps this
+> can start a paid run: `orch run --watch`, `orch serve`, `orch daemon dispatch on`, the dashboard's watch toggle
+> or its `r` on a task, and `orch web`. Disabling it keeps this
 > tutorial free of AI tools. Do not follow the `Next:` hint that `orch init` printed:
 > it assigns work to Agent Creator.
 
@@ -334,29 +358,27 @@ name and a row of view tabs. Use `Left` and `Right` to switch views and `Tab` to
 
 *The Tasks view, which the dashboard opens on. The header counts tasks by status.*
 
-The screenshot was taken with `orch tui --observe`, so its header reads `OBSERVING`. In your terminal the header
-reads `WATCHING`, because `orch tui` also starts the orchestrator. It dispatches `todo` tasks to idle agents.
+The screenshot was taken with orch 0.13.0, so its header reads `OBSERVING`. With the daemon the header shows
+whether the daemon's dispatch is on. The dashboard never dispatches by itself; its watch toggle turns the daemon's
+dispatch on and off.
 
-Press `q` to leave the dashboard. Chapter [Dashboard](08-dashboard.md) explains the layout and every key.
+Press `q` to leave the dashboard; the daemon keeps running. Chapter [Dashboard](08-dashboard.md) explains the layout and every key.
 
 To watch the project in a browser instead, run `orch web`. See [Web dashboard](09-web-dashboard.md).
 
 ### Run tasks continuously
 
-`orch run <task-id>` runs one task and exits. To keep orch working through your task list, start the
-orchestrator and leave it running:
+`orch run <task-id>` runs one task and exits. To keep orch working through your task list, turn dispatch on in
+the daemon:
 
 ```sh
-orch run --watch
+orch daemon dispatch on
 ```
 
-Or run it without a terminal UI, as a background-friendly process that writes structured logs:
-
-```sh
-orch serve
-```
-
-Both pick up new `todo` tasks as you add them. See [Running and monitoring](07-running-and-monitoring.md).
+The daemon now picks up new `todo` tasks as you add them, until you run `orch daemon dispatch off` or stop it with
+`orch daemon stop`. Instead of a background daemon you can also start one in the foreground with dispatch on,
+with `orch run --watch` or `orch serve` (the two are the same), and follow what happens with `orch logs --follow`
+in another terminal. See [Running and monitoring](07-running-and-monitoring.md).
 
 ## Use a real AI agent instead
 
@@ -368,10 +390,10 @@ this only when you want a real AI run.
 ```sh
 orch agent add builder --adapter claude --model claude-sonnet-4-6 --approval-policy auto
 orch task add "Add input validation to the signup form" --assignee builder
-orch run --watch
+orch daemon dispatch on
 ```
 
-Notes on the options:
+These commands need the daemon you started above. Notes on the options:
 
 - `--model` is the model name the tool accepts. It does not apply to the `shell` adapter.
 - `--approval-policy` is `suggest`, `auto` or `manual`. With `auto`, a finished task goes straight to `done`.
@@ -380,7 +402,7 @@ Notes on the options:
 - Use `--role` to describe what the agent is for, and `--skills` to give it a comma-separated list of skills.
 
 > **Warning:** Agent Creator is disabled in the tutorial above. Enable it again (`orch agent enable agt_creator`)
-> only on purpose, because any orchestrator can then start a paid run with it.
+> only on purpose, because the daemon can then start a paid run with it whenever dispatch is on.
 
 > **Warning:** Keep API keys in your environment, not in an agent's `env:` map. orch writes an agent's `env:`
 > values to `.orchestry/agents/<id>.yml` as plain text. Only the file's owner can read it, and `orch init` adds

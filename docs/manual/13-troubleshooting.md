@@ -15,6 +15,17 @@ This chapter helps you when something does not work. Find your symptom, read the
 
 ## Setup and project
 
+### `No orch daemon is running for <project root>`
+
+```text
+  ✕ No orch daemon is running for <project root> (<detail>)
+    Start it with: orch daemon start
+```
+
+- **Cause.** Every orch command after `orch init`, the dashboard, `orch web` and `orch mcp` need the project's daemon, and nothing starts it but you. The detail says why none answered, for example `no daemon.json` (never started, or stopped cleanly) or `connection refused` (it crashed or was killed). The exit code is 7.
+- **Do.** Start it: `orch daemon start` (or `orch daemon start --detach`), then repeat the command. If the hint reads `orch daemon stop, then orch daemon start`, the daemon is a different orch version: stop it, then start the new one. In an agent's environment the message says `Do not start it; report this to the owner and stop.` More detail: [The orch daemon](../RUNBOOK.md#the-orch-daemon) in the runbook and [When no daemon answers](18-daemon.md#when-no-daemon-answers).
+<!-- W2 (PR 2): PR 2 contract item 3; spec "Uniform failure contract"; texts from orch-proto error.rs at 6a7a6481. -->
+
 ### `Not initialized` and `Run: orch init`
 
 ```text
@@ -23,12 +34,15 @@ This chapter helps you when something does not work. Find your symptom, read the
 ```
 
 - **Cause.** The current directory, and every parent directory, has no `.orchestry/` folder. Almost every command needs a project. The exit code is 3.
-- **Do.** Run `orch init` in your project directory. `orch --help`, `orch --version`, `orch init`, `orch doctor`, `orch update` and the `orch org template` commands work anywhere.
+- **Do.** Run `orch init` in your project directory, then start its daemon (`orch daemon start`). `orch --help`, `orch --version`, `orch init` and `orch update` work anywhere.
+<!-- W2: design D7 ("All other commands require a daemon for their stateful work, including commands formerly runnable
+without a project (global config/catalog/template helpers)"). UNCONFIRMED at the S2a-cli head: what `orch doctor` and
+`orch org template` print outside a project. -->
 
 ### orch acts on the wrong project
 
 - **Cause.** orch uses the nearest `.orchestry/` in the current directory or any parent. If you run it in a subdirectory of a project, it acts on that project. If your home directory is itself a project, every directory under it belongs to that project.
-- **Do.** Check where you are with `pwd`, and run `orch status` to see which project answers. Run `orch init` in the directory you want as its own project. Use a sandbox directory outside your home directory when you experiment.
+- **Do.** Check where you are with `pwd`, and run `orch daemon status` or `orch status` to see which project answers; the no-daemon message also names the project. `ORCH_PROJECT_ROOT` overrides the current directory ([Which project](18-daemon.md#which-project)). Run `orch init` in the directory you want as its own project. Use a sandbox directory outside your home directory when you experiment.
 
 ### An adapter is not found
 
@@ -39,12 +53,12 @@ This chapter helps you when something does not work. Find your symptom, read the
   ```
 
 - **Cause.** orch starts the agent's own command-line program (the adapter). It does not install it, and the program must be on your `PATH`.
-- **Do.** Run `orch doctor`. It lists each adapter, `git` and your project, and ends with a line such as `4 of 8 adapters ready`. Install the missing CLI and sign in to it, or use a different adapter. The `shell` adapter needs only `bash`. `orch doctor` always exits with code 0, so do not use the exit code to test it.
+- **Do.** Run `orch doctor`. It lists each adapter, `git` and your project, and ends with a line such as `4 of 8 adapters ready`. Install the missing CLI and sign in to it, or use a different adapter. The `shell` adapter needs only `bash`. With a daemon, `orch doctor` exits with code 0 even when it reports problems, so do not use the exit code to test it; without a daemon it exits 7.
 
 ### Every `claude` agent fails at once inside an agent session
 
-- **Cause.** You started orch from inside a Claude Code session. The `claude` program refuses to start a nested session.
-- **Do.** Run orch from a plain shell. See [Nested agent sessions](../RUNBOOK.md#nested-agent-sessions).
+- **Cause.** You started the daemon (`orch daemon start`, `orch serve` or `orch run --watch`) from inside a Claude Code session; its agents inherit that environment. The `claude` program refuses to start a nested session.
+- **Do.** Stop the daemon and start it again from a plain shell. See [Nested agent sessions](../RUNBOOK.md#nested-agent-sessions).
 
 ### Secrets in agent config
 
@@ -54,26 +68,26 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ### `Orchestrator already running (PID: undefined)` and nothing is running
 
-- **Cause.** The lock file `.orchestry/orchestry.lock` holds something that is not a process number, for example after an interrupted write. orch refuses it and never cleans it up. `orch status` does not warn you, and the dashboard silently becomes an observer.
+- **Cause.** The lock file `.orchestry/orchestry.lock` holds something that is not a process number, for example after an interrupted write. orch refuses it and never cleans it up, so a daemon cannot start (exit 4).
 - **Do.**
-  1. Check that no orchestrator is running: `pgrep -af 'orch (run|serve)'` should print nothing for this project. Do not delete the lock of a live orchestrator, or two orchestrators dispatch the same tasks.
+  1. Check that no daemon or older orchestrator is running: `orch daemon status` exits 7 and `pgrep -fl orch` shows no `orch daemon start`, `orch serve` or `orch run --watch` for this project. Do not delete the lock of a live process, or two orchestrators dispatch the same tasks.
   2. Look at the file: `cat .orchestry/orchestry.lock`. A number is a real process; anything else is damage.
   3. If it is damaged, delete it: `rm .orchestry/orchestry.lock`, then run your command again.
 
   More detail: [Corrupt lock file](../RUNBOOK.md#corrupt-lock-file).
 
-### The dashboard says `OBSERVING` but I did not use `--observe`
+### `orch serve` or `orch run --watch` exits 4 with `Use: orch daemon dispatch on`
 
-- **Cause.** Another process, for example `orch serve`, holds the lock. The dashboard watches that process instead of dispatching.
-- **Do.** This is normal if you started `orch serve`. If you did not, check for the corrupt lock above.
+- **Cause.** A daemon already runs for the project. `serve` and `run --watch` start a daemon; they do not join or resume one.
+- **Do.** Use the running daemon: `orch daemon dispatch on` to dispatch, `orch daemon status` to see it. To restart it with other options, such as `--listen`, run `orch daemon stop` first.
 
 ### A task sits in `todo` and nothing happens
 
 - **Cause.** One of these:
-  1. Nothing is dispatching. orch runs tasks only while an orchestrator runs (`orch serve`, `orch run --watch`, or the dashboard in `WATCHING` mode), or when you run a task by hand.
+  1. Nothing is dispatching. The daemon runs tasks by itself only while its dispatch is on (`orch daemon status` shows `dispatch ON`), or when you run a task by hand.
   2. The task has no enabled agent, or its agent is busy or disabled.
-  3. Another `todo` task is assigned to the same agent. In 0.9.3 `orch run <task-id>` then does nothing.
-- **Do.** Start an orchestrator, or run `orch run <task-id>`. In the dashboard, type `/watch`. For the third cause, cancel or reassign the other task, or use `orch run --all`. See [Run one task](07-running-and-monitoring.md#run-one-task).
+  3. It waits for approval, has a dependency that is not `done`, or belongs to a paused goal.
+- **Do.** Turn dispatch on with `orch daemon dispatch on` (or the dashboard's watch toggle), or run `orch run <task-id>`, which exits 1 with `task is not eligible for launch` when the task cannot start. See [Run one task](07-running-and-monitoring.md#run-one-task).
 
 ### A task stays in `review` and `orch serve --once` never exits
 
@@ -82,8 +96,8 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ### An agent has run for hours
 
-- **Cause.** The agent setting `timeout_ms` is stored but never enforced. Only `stall_timeout_ms` (default 600000, ten minutes) stops a run that produces no output, and only under `orch serve` or `orch run --watch`. `orch run <task-id>` has no stall detection at all.
-- **Do.** Cancel the task with `orch task cancel <task-id>`. For one-shot runs, wrap the command: `timeout 3600 orch run <task-id>`. Prefer `serve` for unattended work. Details: [`timeout_ms` is not a timeout](../RUNBOOK.md#timeout_ms-is-not-a-timeout).
+- **Cause.** The agent setting `timeout_ms` is stored but never enforced. Only `stall_timeout_ms` (default 600000, ten minutes) stops a run that produces no output, in the daemon. In orch 0.13.0 `orch run <task-id>` had no stall detection; whether the daemon now checks those runs is not yet confirmed. <!-- UNCONFIRMED (asked senior-eng msg_4Kc7aF8). -->
+- **Do.** Cancel the task with `orch task cancel <task-id>`; stopping `orch run <task-id>` does not stop the run. Prefer dispatch for unattended work. Details: [`timeout_ms` is not a timeout](../RUNBOOK.md#timeout_ms-is-not-a-timeout).
 
 ### Agent processes still run after I cancelled a task
 
@@ -97,13 +111,13 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 ### A message never reached the agent
 
 - **Cause.** A message is delivered on the agent's next run. If nothing is dispatching, it waits. It expires after 24 hours and nothing reports that.
-- **Do.** Start `orch serve` or type `/watch` in the dashboard. See [Messages and context](06-messages-and-context.md).
+- **Do.** Turn dispatch on (`orch daemon dispatch on`, or the dashboard's watch toggle). See [Messages and context](06-messages-and-context.md).
 
 ### `task show` finds a task that `task list` omits, or every command fails after a crash
 
 - **Cause.** The task index or the state file is damaged, for example after a crash or a power loss.
 - **Do.**
-  1. Stop every orch process for the project.
+  1. Stop the daemon (`orch daemon stop`) and every other orch process for the project. The daemon rebuilds a missing or corrupt index when it starts.
   2. Back up the folder: `cp -R .orchestry .orchestry.bak`.
   3. Follow the repair steps in [Rebuilding an index after a lost update](../RUNBOOK.md#rebuilding-an-index-after-a-lost-update) or [`state.json` parse failure](../RUNBOOK.md#statejson-parse-failure).
 
@@ -174,6 +188,12 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ## The web dashboard
 
+### The page answers `503` or shows `orch daemon unavailable`
+
+- **Cause.** The project's daemon stopped while `orch web` was running. Before you log in, the page shows only `orch daemon unavailable`; after you log in it shows the no-daemon message with the project.
+- **Do.** Start the daemon (`orch daemon start`) and reload the page. `orch web` itself keeps running and never starts a daemon.
+<!-- W2 (PR 2): plan Q0b, spec R18, SE-17. UNCONFIRMED exact page text (asked frontend-eng msg_HiixZC4). -->
+
 ### The browser asks for a password
 
 - **Cause.** The server needs a credential. The default is a token that changes at every start.
@@ -200,7 +220,7 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 - **Cause.** Several possible causes. `orch remote status` gives the reason in brackets: `(connecting)`, `(Peer closed connection; retry in 12s, attempt 5)`, `(Worker busy: controlled by mac …)` or `(Inbound controller name collides with a configured outbound alias)`.
 - **Do.**
-  1. On the worker, check that the orchestrator runs with `--listen` and a LAN address, and that `orch remote status` shows `Listen:`.
+  1. On the worker, check that the daemon was started with `--listen` and a LAN address, and that `orch remote status` shows `Listen:`.
   2. Check the address and port you gave to `orch remote add`, and the firewall.
   3. If the reason mentions a name collision, give each side a different `--peer-name`. See [Set up two machines that control each other](11-remote-agents.md#set-up-two-machines-that-control-each-other).
   4. If it is `Worker busy`, the worker has another controller. A worker accepts one controller at a time.

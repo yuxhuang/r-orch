@@ -341,8 +341,16 @@ command and the output mode:
 JSON and YAML output never contains a warning, so a script can parse standard output as it is. In normal output
 the warnings share standard output with the table or confirmation, so `2>/dev/null` does not hide them.
 
-`orch serve` writes them to its log instead, right after `serve:started`, as one `serve:diagnostic` record per
-warning, so an agent with two warnings gets two records. Each record has the fields `agentId`, `agentName` and
+> **Note:** The `orch serve` and `orch run --watch` output in this section, and its samples, is orch 0.13.0's. A
+> foreground `orch serve` or `orch run --watch` is now the daemon and prints no events or warnings
+> ([Daemon logs and events](07-running-and-monitoring.md#daemon-logs-and-events)). `orch run` with a task ID,
+> `--all` or `--once` still prints the start-up warnings on standard error, and `orch serve --once` logs the
+> `serve:diagnostic` records described next.
+<!-- W2b/tsk_RP30qgK: crates/orch-cli/src/commands/run.rs report_startup_diagnostics (run forms) and serve_once
+log_startup_diagnostics at ecb5f1bd. Whether run-start orchestrator:error records reach serve --once is UNCONFIRMED. -->
+
+`orch serve --once` writes them to its log instead, right after `serve:started`, as one `serve:diagnostic` record
+per warning, so an agent with two warnings gets two records. Each record has the fields `agentId`, `agentName` and
 `message`
 ([Run orch without a terminal](07-running-and-monitoring.md#run-orch-without-a-terminal)). When a run starts,
 orch reports that run's warnings again ([Warnings when a run starts](#warnings-when-a-run-starts)).
