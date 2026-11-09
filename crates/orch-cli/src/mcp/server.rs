@@ -344,8 +344,15 @@ impl McpServer {
         );
         match self.settings.mode {
             Mode::Default => text.push_str(
-                " In this mode goal_status status=paused or force=true is unavailable: \
-                 pausing can cancel the assignee's todo/retrying autonomous tasks across goals.",
+                " In this mode goal_status force=true is unavailable. \
+                 goal_status status=paused works: it cancels the assignee's todo/retrying \
+                 autonomous tasks of that goal only, not of other goals. \
+                 Tasks with another or no goal id, running work and ordinary queued tasks \
+                 normally continue, but pause is not an atomic execution barrier: \
+                 a concurrent dispatch can start a listed task and the pause then cancels it. \
+                 Success does not prove all execution of that goal stopped. \
+                 Resume does not restore cancelled tasks; use task_retry deliberately \
+                 to bring a cancelled continuation back.",
             ),
             Mode::ReadOnly => text.push_str(" In this mode only read tools are available."),
             Mode::AllowDestructive => {}
@@ -997,7 +1004,15 @@ mod tests {
             "{instructions}"
         );
         assert!(instructions.contains("Default agent: \"agt_me\". Mode: default."));
-        assert!(instructions.contains("goal_status status=paused or force=true is unavailable"));
+        assert!(instructions.contains("goal_status force=true is unavailable."));
+        assert!(instructions.contains("autonomous tasks of that goal only, not of other goals."));
+        assert!(instructions.contains("Tasks with another or no goal id, running work"));
+        assert!(instructions.contains("pause is not an atomic execution barrier"));
+        assert!(
+            instructions.contains("Success does not prove all execution of that goal stopped.")
+        );
+        assert!(instructions.contains("Resume does not restore cancelled tasks; use task_retry"));
+        assert!(!instructions.contains("across goals"));
         assert!(!instructions.contains('\n'));
         h.server.abort();
     }

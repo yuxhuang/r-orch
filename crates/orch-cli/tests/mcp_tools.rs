@@ -1772,6 +1772,26 @@ fn logs_with_a_non_ascii_or_overflowing_duration_is_invalid_params_and_the_serve
 }
 
 #[test]
+fn an_invalid_since_diagnostic_omits_the_supplied_value() {
+    let mut fx = Fx::new();
+    for since in [
+        "SECRET_SINCE_918273",
+        "1é",
+        "99999999999999999999d",
+        "9223372036854775807d",
+        "-1s",
+        "1w",
+    ] {
+        let response = fx.rpc_error("logs", json!({"since": since}));
+        assert_eq!(error_code(&response), Some(-32602), "{response}");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("since"), "{message}");
+        assert!(message.contains("ASCII digits"), "{message}");
+        assert!(!message.contains(since), "{message}");
+    }
+}
+
+#[test]
 fn logs_since_is_validated_even_when_another_selector_takes_precedence() {
     let mut fx = Fx::new();
     assert_eq!(
@@ -1987,8 +2007,9 @@ fn remote_tools_reject_an_argument_they_do_not_declare() {
 
 // ── mode gates ────────────────────────────────────────────────────────────
 
-/// Two goals sharing an assignee, and an autonomous todo task on the second
-/// (decision-2 E1: pausing G1 sweeps the assignee's tasks, whatever their goal).
+/// Two goals sharing an assignee, each with queued autonomous tasks, plus a
+/// goal-less autonomous task and non-autonomous tasks (spec R4/R13: pausing G1
+/// cancels G1's own autonomous tasks only).
 struct SharedAssignee {
     agent: String,
     g1: String,
@@ -1997,64 +2018,87 @@ struct SharedAssignee {
     autonomous_task: String,
     /// Autonomous, todo, in the paused goal G1 itself.
     autonomous_in_g1: String,
+    /// Autonomous, `retrying`, in the paused goal G1 itself.
+    retrying_in_g1: String,
     /// Autonomous, `retrying`, in goal G2.
     retrying_autonomous_task: String,
     /// Not autonomous, todo, in goal G2.
     plain_task: String,
+    /// Not autonomous, todo, in the paused goal G1 itself.
+    plain_in_g1: String,
+    /// Autonomous, todo, linked to no goal.
+    goalless_autonomous: String,
 }
 
 fn shared_assignee(fx: &mut Fx) -> SharedAssignee {
     let agent = fx.agent("lead");
     let g1 = fx.ok("goal_add", json!({"title": "G1", "assignee": agent}));
     let g2 = fx.ok("goal_add", json!({"title": "G2", "assignee": agent}));
-    let g2_id = g2["id"].as_str().expect("id").to_owned();
-    let autonomous = fx.ok(
-        "task_add",
-        json!({"title": "auto", "labels": "autonomous", "assignee": agent, "goal_id": g2_id}),
-    );
     let g1_id = g1["id"].as_str().expect("id").to_owned();
-    let in_g1 = fx.ok(
-        "task_add",
-        json!({"title": "auto-g1", "labels": "autonomous", "assignee": agent, "goal_id": g1_id}),
-    );
-    let retrying = fx.ok(
-        "task_add",
-        json!({"title": "auto-retrying", "labels": "autonomous", "assignee": agent, "goal_id": g2_id}),
-    );
-    let retrying_id = retrying["id"].as_str().expect("id").to_owned();
-    fx.force_task(&retrying_id, "retrying", None);
-    let plain = fx.ok(
-        "task_add",
-        json!({"title": "plain", "assignee": agent, "goal_id": g2_id}),
-    );
+    let g2_id = g2["id"].as_str().expect("id").to_owned();
+    let mut add = |title: &str, autonomous: bool, goal: Option<&str>| {
+        let mut arguments = json!({"title": title, "assignee": agent});
+        if autonomous {
+            arguments["labels"] = json!("autonomous");
+        }
+        if let Some(goal) = goal {
+            arguments["goal_id"] = json!(goal);
+        }
+        fx.ok("task_add", arguments)["id"]
+            .as_str()
+            .expect("id")
+            .to_owned()
+    };
+    let autonomous_task = add("auto", true, Some(&g2_id));
+    let autonomous_in_g1 = add("auto-g1", true, Some(&g1_id));
+    let retrying_in_g1 = add("auto-g1-retrying", true, Some(&g1_id));
+    let retrying_autonomous_task = add("auto-retrying", true, Some(&g2_id));
+    let plain_task = add("plain", false, Some(&g2_id));
+    let plain_in_g1 = add("plain-g1", false, Some(&g1_id));
+    let goalless_autonomous = add("auto-goalless", true, None);
+    fx.force_task(&retrying_in_g1, "retrying", None);
+    fx.force_task(&retrying_autonomous_task, "retrying", None);
     SharedAssignee {
         agent,
         g1: g1_id,
         g2: g2_id,
-        autonomous_task: autonomous["id"].as_str().expect("id").to_owned(),
-        autonomous_in_g1: in_g1["id"].as_str().expect("id").to_owned(),
-        retrying_autonomous_task: retrying_id,
-        plain_task: plain["id"].as_str().expect("id").to_owned(),
+        autonomous_task,
+        autonomous_in_g1,
+        retrying_in_g1,
+        retrying_autonomous_task,
+        plain_task,
+        plain_in_g1,
+        goalless_autonomous,
+    }
+}
+
+/// After G1 was paused: G1's queued autonomous tasks are cancelled, and
+/// everything else of the shared assignee is as it was.
+fn assert_only_g1s_autonomous_tasks_were_cancelled(fx: &Fx, s: &SharedAssignee) {
+    assert_eq!(fx.cli(&["goal", "show", &s.g1])["status"], "paused");
+    assert_eq!(fx.cli(&["goal", "show", &s.g2])["status"], "active");
+    for (task, status) in [
+        (&s.autonomous_in_g1, "cancelled"),
+        (&s.retrying_in_g1, "cancelled"),
+        (&s.plain_in_g1, "todo"),
+        (&s.autonomous_task, "todo"),
+        (&s.retrying_autonomous_task, "retrying"),
+        (&s.plain_task, "todo"),
+        (&s.goalless_autonomous, "todo"),
+    ] {
+        assert_eq!(fx.cli(&["task", "show", task])["status"], status, "{task}");
     }
 }
 
 #[test]
-fn default_mode_refuses_pausing_a_goal_and_leaves_every_stored_file_untouched() {
+fn default_mode_pausing_g1_cancels_only_g1s_own_autonomous_tasks() {
     let mut fx = Fx::new();
     let s = shared_assignee(&mut fx);
-    let before = snapshot(&fx.root().join(".orchestry"));
-    let response = fx.rpc_error("goal_status", json!({"id": s.g1, "status": "paused"}));
-    assert_eq!(error_code(&response), Some(-32602));
-    let message = response["error"]["message"].as_str().expect("message");
-    assert!(message.contains("--allow-destructive"), "{message}");
-    assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
-    for (task, status) in [
-        (&s.autonomous_task, "todo"),
-        (&s.autonomous_in_g1, "todo"),
-        (&s.retrying_autonomous_task, "retrying"),
-    ] {
-        assert_eq!(fx.cli(&["task", "show", task])["status"], status, "{task}");
-    }
+    let paused = fx.ok("goal_status", json!({"id": s.g1, "status": "paused"}));
+    assert_eq!(paused["status"], "paused");
+    assert_only_g1s_autonomous_tasks_were_cancelled(&fx, &s);
+    let agent = fx.cli(&["agent", "status", &s.agent]);
+    assert_eq!(agent["id"], json!(s.agent));
 }
 
 #[test]
@@ -2067,26 +2111,31 @@ fn default_mode_refuses_force_even_on_a_status_that_does_not_pause() {
         json!({"id": s.g1, "status": "abandoned", "force": true}),
         json!({"id": s.g1, "status": "paused", "force": true}),
     ] {
+        let response = fx.rpc_error("goal_status", arguments.clone());
+        assert_eq!(error_code(&response), Some(-32602), "{arguments}");
         assert_eq!(
-            fx.rpc_code("goal_status", arguments.clone()),
-            -32602,
+            response["error"]["message"], "force=true requires --allow-destructive",
             "{arguments}"
         );
     }
     assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
+    for goal in [&s.g1, &s.g2] {
+        assert_eq!(
+            fx.cli(&["goal", "show", goal])["status"],
+            "active",
+            "{goal}"
+        );
+    }
 }
 
 #[test]
-fn default_mode_refuses_pausing_a_goal_that_has_no_assignee_too() {
+fn default_mode_pauses_a_goal_that_has_no_assignee_too() {
     let mut fx = Fx::new();
     let goal = fx.ok("goal_add", json!({"title": "unassigned"}));
     let id = goal["id"].as_str().expect("id").to_owned();
-    let before = snapshot(&fx.root().join(".orchestry"));
-    assert_eq!(
-        fx.rpc_code("goal_status", json!({"id": id, "status": "paused"})),
-        -32602
-    );
-    assert_eq!(snapshot(&fx.root().join(".orchestry")), before);
+    let paused = fx.ok("goal_status", json!({"id": id, "status": "paused"}));
+    assert_eq!(paused["status"], "paused");
+    assert_eq!(fx.cli(&["goal", "show", &id])["status"], "paused");
 }
 
 #[test]
@@ -2098,34 +2147,13 @@ fn default_mode_still_allows_the_other_goal_transitions_without_force() {
 }
 
 #[test]
-fn allow_destructive_pausing_g1_also_cancels_the_autonomous_todo_task_of_goal_g2() {
-    // The cross-goal effect decision-2 E1 gates: the sweep is by assignee.
+fn allow_destructive_pausing_g1_is_scoped_to_g1_as_well() {
+    // The mode changes only the gate; the engine's pause is goal-scoped.
     let mut fx = Fx::destructive();
     let s = shared_assignee(&mut fx);
     let paused = fx.ok("goal_status", json!({"id": s.g1, "status": "paused"}));
     assert_eq!(paused["status"], "paused");
-    for task in [
-        &s.autonomous_task,
-        &s.autonomous_in_g1,
-        &s.retrying_autonomous_task,
-    ] {
-        assert_eq!(
-            fx.cli(&["task", "show", task])["status"],
-            "cancelled",
-            "{task}: the sweep covers todo and retrying autonomous tasks of both goals"
-        );
-    }
-}
-
-#[test]
-fn allow_destructive_pausing_g1_leaves_goal_g2_and_a_non_autonomous_task_alone() {
-    let mut fx = Fx::destructive();
-    let s = shared_assignee(&mut fx);
-    fx.ok("goal_status", json!({"id": s.g1, "status": "paused"}));
-    assert_eq!(fx.cli(&["goal", "show", &s.g2])["status"], "active");
-    assert_eq!(fx.cli(&["task", "show", &s.plain_task])["status"], "todo");
-    let agent = fx.cli(&["agent", "status", &s.agent]);
-    assert_eq!(agent["id"], json!(s.agent));
+    assert_only_g1s_autonomous_tasks_were_cancelled(&fx, &s);
 }
 
 #[test]

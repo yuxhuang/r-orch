@@ -11,6 +11,12 @@ project command (R2), the `orch://` resources (R5), three launch modes (R4), att
 CLI-equivalent validation and errors (R7) and clean lifecycle without the orchestrator lock (R8), documented (R9)
 and green on macOS and Linux CI (R10, R11), with a real-client smoke test (R12).
 
+PR 2, the follow-up of goal `goal_h-gIBCW` (owner, 2026-11-08), closes PR #69's accepted residuals and follow-ups
+except storage repair: goal-scoped pause cancellation with `goal_status status=paused` in default mode (R4
+re-amended, R13), value-free invalid-params diagnostics (R14), non-UTF-8 project roots in `task_add` attachments
+(R15), a stdio test of qualified resources (R16), SIGHUP named in R8, a host-git-independent `yaml_contract`
+fixture, and the docs (store-only `task_cancel`, design assumptions, the client-version claim).
+
 ## Non-goals
 HTTP/SSE transport, authentication, MCP prompts, orchestrator or remote-peer control, on-disk format changes,
 store repair for concurrent writers (follow-up), automatic injection of the server into spawned agents. See the
@@ -70,9 +76,30 @@ the PR and reviews source in slices under 800 lines. Orch task ids are in [Statu
 | W2 | Verify every doc example against the integration commit | R9 | as W1 | I, W1 | examples re-run on temp projects; fact-check | 1 |
 | GATE | Security, resilience, code, docs and real-client QA reviews; fixes | R7, R8, R9, R12 | per finding | W2 | reviewer verdicts; R12 capture | 1 |
 
+### PR 2: follow-ups (goal `goal_h-gIBCW`)
+
+Branch `fix/mcp-followups` from `main` at `6943c8b` (base `20e81f9` with the AGENTS.md row). D10 storage races
+and `crates/orch-infra` storage locking are out of scope.
+
+| Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
+|---|---|---|---|---|---|---|
+| F-B1 | Scope pause cancellation to the paused goal; `goal_status status=paused` in default mode, `force=true` gated; description and `initialize` instructions | R4, R13 | `crates/orch-engine/src/goal_service.rs`, `crates/orch-cli/src/mcp/tools/goal.rs`, `crates/orch-cli/src/mcp/server.rs`, `crates/orch-cli/tests/mcp_tools.rs` | — | `cargo test -p orch-engine goal_service`; `cargo test -p orch-cli --test mcp_tools` | 2 |
+| F-B2 | Value-free invalid-params text; non-UTF-8 project root in `task_add` attachments; `task_cancel` liveness decision | R14, R15, R3 | `crates/orch-cli/src/mcp/{registry,tools/task}.rs`, `crates/orch-cli/src/lib.rs`, `crates/orch-cli/Cargo.toml`, `Cargo.toml`, `Cargo.lock` | — | `cargo test -p orch-cli mcp::` | 2 |
+| F-T1a | Seed a commit in the `yaml_contract` fixture; qualified-resource stdio test; SIGHUP coverage audit | R8, R16 | `crates/orch-cli/tests/{mcp_stdio,yaml_contract}.rs`, `crates/orch-cli/tests/mcp_common/**` | — | `cargo test -p orch-cli --test mcp_stdio --test yaml_contract` | 2 |
+| F-W1 | Spec, plan, ADR 0011 (accepted), manual 17, README, CHANGELOG, internal orchestration notes | R4, R8, R9, R13–R16 | `docs/**`, `README.md`, `CHANGELOG.md` | — | links resolve; no stale cross-goal wording (`grep -rn "other goals\|across all goals\|across goals"`) | 2 |
+| F-FC | Fact-check the client-version load claim in manual 17 | R9 | reader | — | fact report | 2 |
+| F-RT | Red-team the goal-scoped pause decision | R4, R13 | reader | — | report; lead adjudicates at CP1 | 2 |
+| F-T1b | Stdio test of the R14 stderr under `RUST_LOG=warn` | R14 | as F-T1a | F-B2, F-T1a | `cargo test -p orch-cli --test mcp_stdio` | 2 |
+| F-I | Integration: CI set, cold `./xtask/gate.sh`, review packet, frozen commit | R11 | as F-B1, F-B2, F-T1a | F-T1b, CP1 changes | the CI set | 2 |
+| F-W2 | Client-version sentence from F-FC; docs reconciled with the frozen commit; Verification rows R4/R8 (amended), R13–R16; spec mirror | R9 | as F-W1 | F-I, F-FC | fact-check | 2 |
+| F-GATE | Code, security, resilience and docs reviews, cold gate; fixes | R4, R7, R8, R9, R13–R16 | per finding | F-W2 | reviewer verdicts | 2 |
+
 ## Status
 
-Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_WpQVmPg`.
+Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_WpQVmPg` (PR 1) and goal
+`goal_h-gIBCW` (PR 2). States are a snapshot of the `goal_h-gIBCW` task graph at 2026-11-09 02:02 UTC, plus the
+`tsk_2YEYhOL` row, which the commit that adds it completes. A row marked pending was still open then; this table
+is not updated after that.
 
 | Wave | Item | Task | State |
 |---|---|---|---|
@@ -96,7 +123,38 @@ Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_W
 | | Fix: `task_add` relative attachments resolve against the project root (D12) | `tsk_6HalWGX` | fixed in I; verified, no separate commit |
 | | I | `tsk_FxWZnjY` | integrated (`00450c9`): full CI set green, 50/45/18 tools by mode |
 | | W2 | `tsk_4SVACBX` | docs verified against `00450c9` |
-| C: review | Checkpoint CP2: freeze the integration commit, launch the review board (GATE) | `tsk_Brzri1x` | pending |
+| C: review | Checkpoint CP2: freeze the integration commit, launch the review board (GATE) | `tsk_Brzri1x` | done |
+| | GATE, fix rounds, PR #69 | goal `goal_WpQVmPg` | merged as `679011d`; head `42d2808`, CI green (Linux x86_64) |
+| D: PR 2, wave A | F-B1 | `tsk_uhm73p-`; default-mode instructions test `tsk_z4gifpJ` | implemented (`a9a8bf9`, `1e731c2`) |
+| | F-B2 | `tsk_zxG0McJ` | implemented (`64d1e3e`); `task_cancel` liveness decided docs-only at CP1 |
+| | F-T1a | `tsk_6_gi7MU` | implemented (`072d6b7`, `2b70c31`) |
+| | F-W1 | `tsk_gp6Ry0K` | drafted (`5c83712`) |
+| | F-FC | `tsk_tkh0_l3` | done: claim verified, dated sentence for F-W2 |
+| | F-RT | `tsk_AoDE3ZO` | done: ship with changes (disclosures), for CP1 |
+| | Checkpoint CP1: adjudicate wave A | `tsk_IUpXm7b` | done: RT1/RT2 accepted as disclosures (B1b) |
+| E: PR 2, wave B and gate | F-T1b | `tsk_UhK4OPS` | implemented (`eb735ac`) |
+| | B1b (CP1 disclosures, stale `--allow-destructive` help) and F-I | `tsk_WVInOdA` | integrated and code frozen (`514560d`) |
+| | F-W2 | `tsk_NUnWRGF` | docs finished at the frozen code (`ca51c7e`) |
+| | F-GATE: code, security, resilience, facts, cold gate at `ca51c7e` | `tsk_v5FUQHQ`, `tsk_AauPKD9`, `tsk_irHNbOB`, `tsk_vDRoMF_`, `tsk_K3GBJR8` | done: all five pass with conditions, none blocking |
+| | Checkpoint CP2: governance verdicts | `tsk_rJCHWFp` | done: fix round authorised |
+| F: PR 2, CP2 fix round | F1: value-free `logs.since` form errors (R14), then its docs | `tsk_zt0J71i`, then `tsk_AUiHMlQ` (replaces cancelled `tsk_0Q4didm`) | done: fix and tests `152c62c`; R14 row, manual 17, RUNBOOK and CHANGELOG reconciled (`08c3237`) |
+| | C2: qualify pause dispatch wording in code text, then docs (with SRE-2, F5) | `tsk_XQxdkEP`, then `tsk_cM9TgND` (replace cancelled `tsk_DG05bju`, `tsk_Kyg4A2e`) | done: code text `c134e52`, docs `d3dace0` |
+| | SRE-3: pin terminal mode in `yaml_contract` and `routing` glyph fixtures | `tsk_EDxaAMe` (replaces cancelled `tsk_4dskzEb`) | done (`1898dd3`) |
+| | F2: non-UTF-8 attachment wording matches resolved-path behaviour | `tsk_yNNFDQg` | done (`d68002f`): R15 row, manual 17, CHANGELOG |
+| | F3, first pass: this status table and the liveness decision | `tsk_CFNaK07` | done (`9f6ef6c`); remaining rows refreshed in wave H |
+| | I2: integrate the fix round, full gate set, re-freeze | `tsk_MACcZj4` | done: full gate set run, re-frozen at `d3dace0`; no integration commit |
+| G: PR 2, re-gate and PR | Re-reviews at the re-frozen SHA: code, security, resilience, facts | `tsk_QKJV45G`, `tsk_WBWDCzh`, `tsk_P-mM5Cp`, `tsk_3bHsl13` | done at `d3dace0`: code, security and resilience pass; facts pass with conditions (F3: this table) |
+| | PR: push, open the single PR against `main`, Linux CI green | `tsk_5TRHZoX` | PR [#72](https://github.com/yuxhuang/r-orch/pull/72) opened at `d3dace0`; Linux CI green, run 42547054498; owner merges (squash) |
+| | Checkpoint CP3: re-gate verdicts and PR | `tsk_65sIOO0` | done 2026-11-09: fix F3, then CP4 |
+| H: PR 2, F3 fix and close | F3, second pass: refresh the remaining statuses after CP3 | `tsk_2YEYhOL` | done: the commit that adds this row, on top of `e8af27e` |
+| | Push that commit to PR #72 (fast-forward), Linux CI green | `tsk_Ls5_1Ug` | pending |
+| | Scoped fact re-check of this table at the final SHA | `tsk__eHJeUN` | pending |
+| | Checkpoint CP4: final SHA, CI, F3 verdict, report | `tsk_rGkc9H4` | pending |
+
+Decided at CP1 (`tsk_IUpXm7b`): `task_cancel` reports no liveness field and stays store-only. A live PID on the
+lock is not proof that a live orchestrator will reconcile the cancel (one-shot holders, PID reuse, the race
+between observing and acting), and the owner asked for docs only. The tool description and manual 17 state that
+the tool does not stop an orphan agent process when no live orchestrator owns the run.
 
 ## Test plan
 - The spec's acceptance checks, R1–R11 on macOS and Linux CI; R12 (real client: Claude Code or MCP Inspector) on

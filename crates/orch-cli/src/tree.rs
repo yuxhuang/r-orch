@@ -1002,7 +1002,7 @@ pub struct McpCmd {
     pub read_only: bool,
     #[arg(
         long = "allow-destructive",
-        help = "Also expose destructive tools (task_cancel, goal_delete, agent_remove, team_disband, context_delete) and goal_status pause/force"
+        help = "Also expose destructive tools (task_cancel, goal_delete, agent_remove, team_disband, context_delete) and goal_status force"
     )]
     pub allow_destructive: bool,
 }

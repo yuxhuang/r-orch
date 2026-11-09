@@ -40,9 +40,7 @@ impl ToolArgs for LogsArgs {
 fn checked_duration(raw: &str, now: i64) -> std::result::Result<i64, rmcp::ErrorData> {
     let invalid = || {
         rmcp::ErrorData::invalid_params(
-            format!(
-                "Invalid since duration: {raw:?}. Use ASCII digits followed by s, m, h, or d within the supported time range"
-            ),
+            "Invalid since duration: expected ASCII digits followed by s, m, h, or d within the supported time range",
             None,
         )
     };

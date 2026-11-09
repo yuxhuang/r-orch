@@ -32,6 +32,10 @@ fn orch(cwd: &Path) -> Command {
     command
         .current_dir(cwd)
         .env("NO_COLOR", "1")
+        // Pin the terminal mode: the exact-glyph assertions expect the Unicode
+        // `✕`, and an inherited `TERM=dumb` switches the CLI to its ASCII
+        // fallback. Production glyph selection is unchanged.
+        .env("TERM", "xterm-256color")
         // A `PATH` with no agent CLIs on it. `doctor` probes all eight by
         // exec'ing them, and on a developer's machine several resolve — which
         // made these tests spawn the real `claude`, `cursor-agent` and

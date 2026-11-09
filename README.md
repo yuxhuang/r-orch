@@ -393,14 +393,15 @@ claude mcp add orch -- orch mcp                          # Claude Code, project 
 orch mcp --project-root /path/to/project                 # serve one project, from any directory
 orch mcp --agent agt_example                             # default message sender and inbox (or ORCH_AGENT_ID)
 orch mcp --read-only                                     # read tools only
-orch mcp --allow-destructive                             # also delete/cancel, and pause goals
+orch mcp --allow-destructive                             # also cancel/delete/remove, and force goals
 ```
 
 The default mode registers 45 read and ordinary change tools (`--read-only`: 18, `--allow-destructive`: 50), with
 the same JSON as `orch --json` (or the changed entity, for commands that print only a message); `task_cancel`,
-`goal_delete`, `agent_remove`, `team_disband`, `context_delete`, and pausing or forcing a goal need
-`--allow-destructive`, because pausing a goal cancels its assignee's pending autonomous tasks in every goal. The
-identity is attribution, not authentication, and no mode is a sandbox. The server is not transactional: next to
+`goal_delete`, `agent_remove`, `team_disband`, `context_delete`, and forcing a goal (`force`) need
+`--allow-destructive`; pausing a goal works in the default mode and cancels only that goal's pending autonomous
+tasks. `task_cancel` only marks the task: it does not stop an orphan agent process when no orchestrator is
+running. The identity is attribution, not authentication, and no mode is a sandbox. The server is not transactional: next to
 other writers it has the same hazards as two `orch` processes. Client configurations, the worker setup that passes
 on `ORCH_AGENT_ID`, the tool catalogue and the limitations are in [the manual](docs/manual/17-mcp-server.md);
 recovery is in the [runbook](docs/RUNBOOK.md#recovering-after-concurrent-mcp-writers).

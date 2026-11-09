@@ -347,6 +347,181 @@ fn debug_logging_still_reports_sdk_warnings() {
     }
 }
 
+/// Invalid-params text that quotes the offending argument is the SDK's default;
+/// with warnings on it lands on stderr too (R1). The diagnostic names the field
+/// and the type it expected, and never the value that was sent.
+const WARN_ENV: &[(&str, Option<&str>)] = &[("RUST_LOG", Some("warn"))];
+
+#[test]
+fn a_mistyped_priority_is_invalid_params_naming_the_field_and_type_but_not_the_value() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+    assert_eq!(
+        response["error"]["message"],
+        json!("Invalid arguments for task_add: field `priority`: expected i64"),
+        "{response}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn a_mistyped_priority_warn_line_on_stderr_names_the_field_and_type_but_not_the_value() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+
+    let exit = server.shutdown();
+
+    assert_eq!(exit.status.code(), Some(0), "{}", exit.stderr);
+    let warn = exit
+        .stderr
+        .lines()
+        .find(|line| line.contains("WARN") && line.contains("response error"))
+        .unwrap_or_else(|| panic!("no WARN response-error line on stderr:\n{}", exit.stderr));
+    assert!(
+        warn.contains("field `priority`") && warn.contains("expected i64"),
+        "the WARN line must name the field and expected type: {warn}"
+    );
+}
+
+#[test]
+fn a_mistyped_priority_value_appears_in_neither_the_response_nor_stderr() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+    let exit = server.shutdown();
+
+    // The sent value is a short word, so look for it as a word: the field name
+    // and type text legitimately contain other letters, never `high`.
+    assert!(!response.to_string().contains("high"), "{response}");
+    assert!(!exit.stderr.contains("high"), "{}", exit.stderr);
+}
+
+#[test]
+fn an_invalid_since_diagnostic_omits_the_value_from_response_and_warn_stderr() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+    let value = format!("SECRET_SINCE_{}", sentinel("since"));
+
+    let response = server.call_tool("logs", json!({"since": value}));
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.contains("since"), "{message}");
+    assert!(message.contains("ASCII digits"), "{message}");
+    assert!(status_ok(&mut server).is_object(), "server still serves");
+
+    let exit = server.shutdown();
+    assert_eq!(exit.status.code(), Some(0), "{}", exit.stderr);
+    let warn = exit
+        .stderr
+        .lines()
+        .find(|line| line.contains("WARN") && line.contains("response error"))
+        .unwrap_or_else(|| panic!("no WARN response-error line on stderr:\n{}", exit.stderr));
+    assert!(
+        warn.contains("since") && warn.contains("ASCII digits"),
+        "the WARN line must name the field and expected grammar: {warn}"
+    );
+    assert!(
+        !response.to_string().contains(&value) && !exit.stderr.contains(&value),
+        "since value leaked; response: {response}; stderr: {}",
+        exit.stderr
+    );
+}
+
+#[test]
+fn the_connection_serves_requests_after_a_mistyped_argument_was_refused() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+    let response = server.call_tool(
+        "task_add",
+        json!({"title": "temporary", "priority": "high"}),
+    );
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+
+    let status = status_ok(&mut server);
+
+    assert_eq!(status["tasks"], json!([]), "a refused call created a task");
+    let created = server.call_tool("task_add", json!({"title": "after", "priority": 2}));
+    assert_eq!(created["result"]["isError"], json!(false), "{created}");
+    assert_eq!(server.shutdown().status.code(), Some(0));
+}
+
+/// Other scalar mismatches, each with a value no log line contains by accident:
+/// a string where an unsigned integer belongs, an integer where a string
+/// belongs, and a boolean where a string belongs.
+#[test]
+fn other_mistyped_scalars_name_field_and_type_but_never_the_value() {
+    let string_sentinel = sentinel("ttl");
+    let cases: [(&str, &str, Value, &str, &str); 3] = [
+        (
+            "string for u64",
+            "context_set",
+            json!({"key": "k", "value": "v", "ttl": string_sentinel}),
+            "field `ttl`: expected u64",
+            &string_sentinel,
+        ),
+        (
+            "integer for string",
+            "context_set",
+            json!({"key": 918_273_645_u64, "value": "v"}),
+            "field `key`: expected a string",
+            "918273645",
+        ),
+        (
+            "boolean for string",
+            "context_get",
+            json!({"key": true}),
+            "field `key`: expected a string",
+            "true",
+        ),
+    ];
+    for (case, tool, arguments, expected, forbidden) in cases {
+        let project = initialized_project();
+        let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+        server.initialize();
+
+        let response = server.call_tool(tool, arguments);
+        assert_eq!(error_code(&response), Some(-32602), "{case}: {response}");
+        let message = response["error"]["message"].as_str().expect("message");
+        assert!(message.contains(expected), "{case}: {message}");
+        assert!(!message.contains(forbidden), "{case}: {message}");
+        assert!(status_ok(&mut server)["tasks"].is_array(), "{case}");
+
+        let exit = server.shutdown();
+        assert_eq!(exit.status.code(), Some(0), "{case}: {}", exit.stderr);
+        assert!(
+            exit.stderr.contains("WARN") && exit.stderr.contains(expected),
+            "{case}: the WARN line should carry the same diagnostic:\n{}",
+            exit.stderr
+        );
+        assert!(
+            !exit.stderr.contains(forbidden),
+            "{case}: the value reached stderr:\n{}",
+            exit.stderr
+        );
+    }
+}
+
 // ── catalogue (fails until B2a/B2b register their tools) ──────────────────
 
 #[test]
@@ -576,13 +751,73 @@ fn the_flag_conflict_names_both_flags_on_stderr() {
 }
 
 #[test]
-fn default_mode_instructions_say_pause_and_force_are_unavailable() {
+fn default_mode_instructions_say_force_is_unavailable() {
     let project = initialized_project();
 
     let text = instructions_for(project.path(), &[], &[]);
 
     assert!(
-        text.contains("goal_status status=paused or force=true is unavailable"),
+        text.contains("goal_status force=true is unavailable."),
+        "{text}"
+    );
+}
+
+#[test]
+fn default_mode_instructions_say_pause_works_and_is_goal_scoped() {
+    let project = initialized_project();
+
+    let text = instructions_for(project.path(), &[], &[]);
+
+    assert!(
+        text.contains("goal_status status=paused works")
+            && text.contains("of that goal only, not of other goals"),
+        "{text}"
+    );
+}
+
+#[test]
+fn default_mode_instructions_say_what_pause_spares_and_that_resume_does_not_restore() {
+    let project = initialized_project();
+
+    let text = instructions_for(project.path(), &[], &[]);
+
+    assert!(
+        text.contains(
+            "Tasks with another or no goal id, running work and ordinary queued tasks \
+             normally continue, but pause is not an atomic execution barrier: \
+             a concurrent dispatch can start a listed task and the pause then cancels it. \
+             Success does not prove all execution of that goal stopped."
+        ) && text.contains("Resume does not restore cancelled tasks; use task_retry"),
+        "{text}"
+    );
+}
+
+#[test]
+fn goal_status_description_says_resume_does_not_restore_cancelled_tasks() {
+    let tools = list_tools(&[]);
+    let description = tools["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|tool| tool["name"] == "goal_status")
+        .and_then(|tool| tool["description"].as_str())
+        .expect("goal_status description");
+
+    assert!(
+        description.contains("resume does not restore cancelled tasks (task_retry does)"),
+        "{description}"
+    );
+}
+
+#[test]
+fn default_mode_instructions_do_not_describe_pause_as_cross_goal() {
+    let project = initialized_project();
+
+    let text = instructions_for(project.path(), &[], &[]);
+
+    assert!(!text.contains("across goals"), "{text}");
+    assert!(
+        !text.contains("status=paused or force=true is unavailable"),
         "{text}"
     );
 }
@@ -1169,6 +1404,12 @@ fn cli_json(project: &std::path::Path, args: &[&str]) -> Value {
         .unwrap_or_else(|err| panic!("orch {args:?} printed no JSON ({err}): {output:?}"))
 }
 
+/// `orch <args>` for a command that prints no JSON: asserts it succeeded.
+fn cli_ok(project: &std::path::Path, args: &[&str]) {
+    let output = mcp_common::output_of(orch_command(project).args(args));
+    assert!(output.status.success(), "orch {args:?} failed: {output:?}");
+}
+
 fn id_of(value: &Value) -> String {
     value["id"].as_str().expect("an id").to_owned()
 }
@@ -1316,6 +1557,191 @@ fn reading_the_inbox_resource_twice_does_not_consume_the_messages() {
     );
 }
 
+// ── qualified `agt@peer` resources (R5) ───────────────────────────────────
+
+/// A project with one registered remote peer `w1` whose cached snapshot holds
+/// one agent, plus one pending message addressed to that agent's qualified
+/// id. Built before any server starts, through the CLI and the same
+/// `remotes.yml` / `remotes/<alias>.json` files the live link publishes. The
+/// peer is offline (nothing owns the project), which is the legitimate state
+/// of a cached snapshot and does not change what a qualified read returns.
+struct PeerFixture {
+    project: tempfile::TempDir,
+    /// The peer's own id for the agent, without the alias.
+    bare: String,
+    /// `<bare>@w1`: the id every orch surface shows for it.
+    qualified: String,
+}
+
+fn peer_project() -> PeerFixture {
+    let project = initialized_project();
+    let path = project.path();
+    cli_ok(path, &["remote", "add", "w1", "127.0.0.1:1"]);
+    // Any well-formed agent record is a valid peer snapshot entry; borrow one
+    // from a real `agent add` and then drop the local copy so the qualified id
+    // can only resolve through the peer directory.
+    let agent = cli_json(
+        path,
+        &[
+            "agent",
+            "add",
+            "rx",
+            "--adapter",
+            "shell",
+            "--command",
+            "true",
+        ],
+    );
+    let bare = id_of(&agent);
+    let remotes = path.join(".orchestry/remotes");
+    std::fs::create_dir_all(&remotes).expect("remotes dir");
+    let status = json!({
+        "alias": "w1",
+        "addr": "127.0.0.1:1",
+        "online": false,
+        "last_seen": null,
+        "last_error": null,
+        "peer_name": "worker",
+        "instance_id": null,
+        "os": "linux",
+        "agents": [agent],
+    });
+    std::fs::write(
+        remotes.join("w1.json"),
+        serde_json::to_vec(&status).expect("status JSON"),
+    )
+    .expect("write the peer snapshot");
+    cli_ok(path, &["agent", "remove", &bare]);
+    let qualified = format!("{bare}@w1");
+    cli_ok(
+        path,
+        &["msg", "send", &qualified, "for the peer", "--from", "cli"],
+    );
+    PeerFixture {
+        project,
+        bare,
+        qualified,
+    }
+}
+
+#[test]
+fn a_qualified_agent_resource_returns_the_peer_agent_under_its_qualified_id() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+    let uri = format!("orch://agents/{}", fixture.qualified);
+
+    let agent = read_resource_json(&mut server, &uri);
+
+    assert_eq!(agent["id"], json!(fixture.qualified), "{agent}");
+    assert_eq!(agent["name"], json!("rx@w1"), "{agent}");
+    assert_eq!(agent["remote"]["alias"], json!("w1"), "{agent}");
+    assert_eq!(
+        agent,
+        tool_json(&mut server, "agent_show", json!({"id": fixture.qualified})),
+        "the resource is the agent_show projection"
+    );
+}
+
+#[test]
+fn a_qualified_agent_resource_is_listed_in_orch_agents() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    let agents = read_resource_json(&mut server, "orch://agents");
+
+    let ids: Vec<&str> = agents
+        .as_array()
+        .expect("an agent array")
+        .iter()
+        .map(|agent| agent["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, [fixture.qualified.as_str()]);
+}
+
+#[test]
+fn a_qualified_inbox_resource_returns_the_messages_addressed_to_the_qualified_id() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+    let uri = format!("orch://inbox/{}", fixture.qualified);
+
+    let inbox = read_resource_json(&mut server, &uri);
+
+    let messages = inbox.as_array().expect("an inbox array");
+    assert_eq!(messages.len(), 1, "{inbox}");
+    assert_eq!(messages[0]["to_agent_id"], json!(fixture.qualified));
+    assert_eq!(messages[0]["body"], json!("for the peer"));
+    assert_eq!(
+        inbox,
+        tool_json(
+            &mut server,
+            "msg_inbox",
+            json!({"agent_id": fixture.qualified})
+        ),
+        "the resource is the msg_inbox projection"
+    );
+}
+
+#[test]
+fn the_bare_id_does_not_read_the_qualified_agents_inbox() {
+    // `agt_x` and `agt_x@w1` are different recipients: a qualified message is
+    // addressed to the peer's agent, not to a local agent of the same bare id.
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    let inbox = read_resource_json(&mut server, &format!("orch://inbox/{}", fixture.bare));
+
+    assert_eq!(inbox, json!([]));
+}
+
+#[test]
+fn a_qualified_inbox_for_an_unknown_peer_is_an_empty_inbox() {
+    // An inbox read never needs the agent to exist (the CLI's `msg inbox`
+    // behaves the same): a qualified id with an unregistered alias is `[]`,
+    // not an error.
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    let inbox = read_resource_json(
+        &mut server,
+        &format!("orch://inbox/{}@nowhere", fixture.bare),
+    );
+
+    assert_eq!(inbox, json!([]));
+}
+
+#[test]
+fn a_qualified_agent_resource_for_an_unknown_peer_or_agent_is_resource_not_found() {
+    let fixture = peer_project();
+    let mut server = McpServer::spawn(fixture.project.path());
+    server.initialize();
+
+    for uri in [
+        format!("orch://agents/{}@nowhere", fixture.bare),
+        "orch://agents/agt_missing@w1".to_owned(),
+    ] {
+        let response = server.request("resources/read", json!({"uri": uri}));
+        assert_eq!(error_code(&response), Some(-32002), "{uri}: {response}");
+    }
+}
+
+#[test]
+fn only_agents_and_inbox_accept_a_qualified_id() {
+    // Tasks and goals are local-only: `@` there is a syntax error, not a miss.
+    let project = initialized_project();
+    let mut server = McpServer::spawn(project.path());
+    server.initialize();
+
+    for uri in ["orch://tasks/tsk_a@w1", "orch://goals/goal_a@w1"] {
+        let response = server.request("resources/read", json!({"uri": uri}));
+        assert_eq!(error_code(&response), Some(-32602), "{uri}: {response}");
+    }
+}
+
 // ── lifecycle (R8) ────────────────────────────────────────────────────────
 
 #[test]
@@ -1419,6 +1845,72 @@ fn sighup_with_stdin_still_open_exits_zero_within_the_shutdown_bound() {
     let exit = server.wait_for_exit();
 
     assert_eq!(exit.status.code(), Some(0), "stderr: {}", exit.stderr);
+}
+
+/// The entry names directly under `<project>/.orchestry`, sorted.
+fn orchestry_entries(project: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(project.join(".orchestry"))
+        .expect("read .orchestry")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A signal stops the server the way EOF does: exit 0, only protocol frames on
+/// stdout, and the project directory exactly as it was (the server never took
+/// `.orchestry/orchestry.lock` or left any other file behind).
+#[cfg(unix)]
+fn assert_signal_stops_cleanly(signal: nix::sys::signal::Signal) {
+    let project = initialized_project();
+    let mut server = McpServer::spawn(project.path());
+    server.initialize();
+    status_ok(&mut server);
+    let before = orchestry_entries(project.path());
+    assert!(
+        !before.iter().any(|name| name == "orchestry.lock"),
+        "a running server holds the project lock: {before:?}"
+    );
+
+    server.signal(signal);
+    let exit = server.wait_for_exit();
+
+    assert_eq!(
+        exit.status.code(),
+        Some(0),
+        "{signal}: stderr: {}",
+        exit.stderr
+    );
+    for line in &exit.stdout_lines {
+        assert!(
+            serde_json::from_str::<Value>(line).is_ok(),
+            "{signal}: non-JSON line on stdout: {line:?}"
+        );
+    }
+    assert_eq!(
+        orchestry_entries(project.path()),
+        before,
+        "{signal}: the project directory changed across shutdown"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_leaves_clean_stdout_and_no_lock_or_file_behind() {
+    assert_signal_stops_cleanly(nix::sys::signal::Signal::SIGTERM);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_leaves_clean_stdout_and_no_lock_or_file_behind() {
+    assert_signal_stops_cleanly(nix::sys::signal::Signal::SIGINT);
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_leaves_clean_stdout_and_no_lock_or_file_behind() {
+    assert_signal_stops_cleanly(nix::sys::signal::Signal::SIGHUP);
 }
 
 // ── lost output: a client that stops reading but never hangs up ──────────

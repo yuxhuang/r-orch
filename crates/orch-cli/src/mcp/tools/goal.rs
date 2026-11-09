@@ -1,4 +1,4 @@
-//! Goal tools preserve CLI projections and gate pause/force before Engine creation.
+//! Goal tools preserve CLI projections and gate `force` before Engine creation.
 use crate::mcp::{
     projections,
     registry::{CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta},
@@ -58,19 +58,13 @@ struct GoalStatusArgs {
 }
 impl ToolArgs for GoalStatusArgs {
     fn validate(&self, _: &Identity, mode: Mode) -> std::result::Result<(), rmcp::ErrorData> {
-        if mode != Mode::AllowDestructive {
-            let restricted = match (matches!(self.status, GoalStatus::Paused), self.force) {
-                (true, true) => Some("status=paused and force=true"),
-                (true, false) => Some("status=paused"),
-                (false, true) => Some("force=true"),
-                (false, false) => None,
-            };
-            if let Some(argument) = restricted {
-                return Err(rmcp::ErrorData::invalid_params(
-                    format!("{argument} requires --allow-destructive"),
-                    None,
-                ));
-            }
+        // A pause cancels only the paused goal's own autonomous tasks, so it
+        // is an ordinary change; `force` cancels the goal's pending tasks.
+        if mode != Mode::AllowDestructive && self.force {
+            return Err(rmcp::ErrorData::invalid_params(
+                "force=true requires --allow-destructive",
+                None,
+            ));
         }
         Ok(())
     }
@@ -133,7 +127,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
         ),
         show,
     )?;
-    registry.add(meta("goal_status", "Change goal lifecycle. Pausing can cancel all todo/retrying autonomous tasks for the goal's assignee, including other goals; pause and force require --allow-destructive.", Class::Mutate, true, false, true), status)?;
+    registry.add(meta("goal_status", "Change goal lifecycle (orch goal status). Pausing cancels the assignee's todo/retrying autonomous tasks linked to this goal, not those of other goals or of none, and turns the assignee's autonomous mode off if this was its last active goal; resume does not restore cancelled tasks (task_retry does); force=true requires --allow-destructive.", Class::Mutate, true, false, true), status)?;
     registry.add(meta("goal_update", "Update goal text or assignee (orch goal update). An empty assignee clears it; omission preserves it.", Class::Mutate, true, false, true), update)?;
     registry.add(
         meta(
@@ -294,7 +288,7 @@ mod tests {
         assert!(show(cx, args(json!({"id":id}))).await.is_err());
     }
     #[test]
-    fn status_pause_or_force_gate_is_static_and_names_each_restriction() {
+    fn status_force_gate_is_static_and_pause_is_an_ordinary_change() {
         for mode in [Mode::ReadOnly, Mode::Default, Mode::AllowDestructive] {
             for status in ["active", "paused", "achieved", "abandoned"] {
                 for force in [false, true] {
@@ -303,16 +297,10 @@ mod tests {
                     )
                     .unwrap();
                     let result = args.validate(&Identity::of(None), mode);
-                    if mode != Mode::AllowDestructive && (status == "paused" || force) {
+                    if mode != Mode::AllowDestructive && force {
                         let err = result.unwrap_err();
                         assert_eq!(err.code.0, -32602);
-                        assert!(err.message.contains("--allow-destructive"));
-                        if status == "paused" {
-                            assert!(err.message.contains("status=paused"));
-                        }
-                        if force {
-                            assert!(err.message.contains("force=true"));
-                        }
+                        assert_eq!(err.message, "force=true requires --allow-destructive");
                     } else {
                         result.unwrap();
                     }

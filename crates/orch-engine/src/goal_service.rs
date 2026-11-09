@@ -20,6 +20,14 @@
 //! found" must not fail `goal update`, so every such toggle swallows the error
 //! (including "agent not found") and carries on. The
 //! `*_swallows_a_set_autonomous_failure` tests pin this.
+//!
+//! # What a pause cancels
+//!
+//! Pausing a goal cancels the dispatchable (`todo`/`retrying`) autonomous
+//! tasks that are both assigned to the goal's assignee **and** linked to the
+//! paused goal. The assignee's autonomous tasks of other goals, and those
+//! linked to no goal, are left queued: one agent can lead several goals, and
+//! pausing one must not withdraw the others' work.
 
 use std::sync::Arc;
 
@@ -161,10 +169,14 @@ impl GoalService {
 
         if let Some(assignee) = assignee_of(&goal) {
             if new_status == GoalStatus::Paused {
-                // Order matters: autonomous is disabled first so the
-                // orchestrator cannot dispatch a replacement task in between.
+                // Autonomous is disabled first so this agent's idle seeding
+                // stops proposing new work before the cancel. Best-effort
+                // only: the flag gates seeding, not dispatch, and stays on if
+                // another active goal keeps it. There is no cross-process
+                // dispatch fence, so a concurrent orchestrator can still start
+                // a listed task before its cancel lands (and then lose it).
                 self.maybe_disable_autonomous(assignee).await;
-                self.cancel_pending_autonomous_tasks(assignee).await;
+                self.cancel_pending_autonomous_tasks(id, assignee).await;
             } else if new_status == GoalStatus::Active && old_status == GoalStatus::Paused {
                 self.enable_autonomous(assignee).await;
             } else if is_goal_terminal(new_status) {
@@ -327,13 +339,14 @@ impl GoalService {
             .any(|g| g.assignee.as_deref() == Some(agent_id)))
     }
 
-    /// Cancel the agent's dispatchable (`todo`/`retrying`) autonomous tasks, so
-    /// pausing a goal does not leave work queued that would start the moment
-    /// autonomous mode came back.
+    /// Cancel the paused goal's dispatchable (`todo`/`retrying`) autonomous
+    /// tasks assigned to `agent_id`, so pausing a goal does not leave its own
+    /// work queued. The agent's autonomous tasks of other goals, or of none,
+    /// are not touched.
     ///
     /// Best-effort: a failed
     /// listing cancels nothing at all rather than cancelling part of the set.
-    async fn cancel_pending_autonomous_tasks(&self, agent_id: &str) {
+    async fn cancel_pending_autonomous_tasks(&self, goal_id: &str, agent_id: &str) {
         let Some(tasks) = &self.task_service else {
             return;
         };
@@ -341,11 +354,11 @@ impl GoalService {
         let mut pending = Vec::new();
         for status in [TaskStatus::Todo, TaskStatus::Retrying] {
             match tasks.list(&TaskFilter::with_status(status)).await {
-                Ok(listed) => pending.extend(
-                    listed
-                        .into_iter()
-                        .filter(|t| t.assignee.as_deref() == Some(agent_id) && t.is_autonomous()),
-                ),
+                Ok(listed) => pending.extend(listed.into_iter().filter(|t| {
+                    t.goal_id.as_deref() == Some(goal_id)
+                        && t.assignee.as_deref() == Some(agent_id)
+                        && t.is_autonomous()
+                })),
                 Err(_) => return,
             }
         }
@@ -857,6 +870,105 @@ mod tests {
         assert_eq!(status_of(&h, "tsk_running"), Some(TaskStatus::InProgress));
         assert_eq!(status_of(&h, "tsk_other"), Some(TaskStatus::Todo));
         assert_eq!(status_of(&h, "tsk_manual"), Some(TaskStatus::Todo));
+    }
+
+    /// Two goals sharing one assignee: autonomous `todo` and `retrying` tasks
+    /// in each, a non-autonomous `todo` in each, and one goal-less autonomous
+    /// `todo`. `g2_status` is the second goal's status.
+    fn seed_shared_assignee(h: &Harness, g2_status: GoalStatus) {
+        h.goals.seed(assigned_goal("goal_g1", "agt_lead"));
+        h.goals.seed(Goal {
+            status: g2_status,
+            ..assigned_goal("goal_g2", "agt_lead")
+        });
+        h.seed_agent("agt_lead", true);
+        for goal_id in ["goal_g1", "goal_g2"] {
+            for (suffix, status) in [("todo", TaskStatus::Todo), ("retry", TaskStatus::Retrying)] {
+                h.tasks.seed(Task {
+                    assignee: Some("agt_lead".into()),
+                    labels: vec![AUTONOMOUS_LABEL.to_owned()],
+                    ..child_task(&format!("tsk_{goal_id}_{suffix}"), status, goal_id)
+                });
+            }
+            h.tasks.seed(Task {
+                assignee: Some("agt_lead".into()),
+                ..child_task(&format!("tsk_{goal_id}_manual"), TaskStatus::Todo, goal_id)
+            });
+        }
+        h.tasks.seed(Task {
+            assignee: Some("agt_lead".into()),
+            labels: vec![AUTONOMOUS_LABEL.to_owned()],
+            goal_id: None,
+            ..child_task("tsk_goalless", TaskStatus::Todo, "unused")
+        });
+    }
+
+    /// The G1/G2 shared-assignee case: pausing G1 cancels only G1's own
+    /// queued autonomous tasks; G2's, the goal-less one and every
+    /// non-autonomous task stay queued, and G2 keeps the agent autonomous.
+    #[tokio::test]
+    async fn pausing_one_goal_spares_the_assignees_tasks_of_other_goals() {
+        let h = Harness::full();
+        seed_shared_assignee(&h, GoalStatus::Active);
+
+        h.service
+            .update_status("goal_g1", GoalStatus::Paused, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_of(&h, "tsk_goal_g1_todo"),
+            Some(TaskStatus::Cancelled)
+        );
+        assert_eq!(
+            status_of(&h, "tsk_goal_g1_retry"),
+            Some(TaskStatus::Cancelled)
+        );
+        assert_eq!(status_of(&h, "tsk_goal_g1_manual"), Some(TaskStatus::Todo));
+        assert_eq!(status_of(&h, "tsk_goal_g2_todo"), Some(TaskStatus::Todo));
+        assert_eq!(
+            status_of(&h, "tsk_goal_g2_retry"),
+            Some(TaskStatus::Retrying)
+        );
+        assert_eq!(status_of(&h, "tsk_goal_g2_manual"), Some(TaskStatus::Todo));
+        assert_eq!(status_of(&h, "tsk_goalless"), Some(TaskStatus::Todo));
+        assert_eq!(
+            h.goals.peek("goal_g2").map(|g| g.status),
+            Some(GoalStatus::Active)
+        );
+        // G2 is still active, so autonomous mode is left on.
+        assert_eq!(h.autonomous_calls(), 0);
+        assert_eq!(h.autonomous_of("agt_lead"), Some(true));
+    }
+
+    /// When the paused goal was the assignee's last active one, autonomous
+    /// mode still goes off, and the cancellation is still scoped: the queued
+    /// autonomous tasks of the (already paused) G2 and the goal-less one stay.
+    #[tokio::test]
+    async fn pausing_the_last_active_goal_disables_autonomous_but_spares_other_goals_tasks() {
+        let h = Harness::full();
+        seed_shared_assignee(&h, GoalStatus::Paused);
+
+        h.service
+            .update_status("goal_g1", GoalStatus::Paused, false)
+            .await
+            .unwrap();
+
+        assert_eq!(h.autonomous_of("agt_lead"), Some(false));
+        assert_eq!(
+            status_of(&h, "tsk_goal_g1_todo"),
+            Some(TaskStatus::Cancelled)
+        );
+        assert_eq!(
+            status_of(&h, "tsk_goal_g1_retry"),
+            Some(TaskStatus::Cancelled)
+        );
+        assert_eq!(status_of(&h, "tsk_goal_g2_todo"), Some(TaskStatus::Todo));
+        assert_eq!(
+            status_of(&h, "tsk_goal_g2_retry"),
+            Some(TaskStatus::Retrying)
+        );
+        assert_eq!(status_of(&h, "tsk_goalless"), Some(TaskStatus::Todo));
     }
 
     // ── update (assignee change) ───────────────────────────────────────────

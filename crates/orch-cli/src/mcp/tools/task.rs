@@ -221,7 +221,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
         ),
         assign,
     )?;
-    registry.add(meta("task_cancel", "Mark a task cancelled in storage (orch task cancel). A live owner stops the run on reconciliation; without an owner this does not kill an orphan process.", Class::Destructive, true, false, true), cancel)?;
+    registry.add(meta("task_cancel", "Mark a task cancelled in storage (orch task cancel). Store-only; does not stop an orphan agent process when no live orchestrator owns the run; a live owner stops the run on reconciliation.", Class::Destructive, true, false, true), cancel)?;
     registry.add(
         meta(
             "task_approve",
@@ -265,6 +265,30 @@ fn csv(raw: &str) -> Vec<String> {
 }
 async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> Result<Value> {
     let review_criteria = args.review_criteria.as_deref().map(|raw| csv(raw).into_iter().map(|value| value.parse::<ReviewCriterion>().map_err(|()| Error::invalid_arguments(format!("Unknown review criterion: \"{value}\". Use test_pass, typecheck or lint.")))).collect::<Result<Vec<_>>>()).transpose()?;
+    // Relative paths name files under the project root, never the server's
+    // working directory (D12); absolute paths pass through. Resolve before
+    // creating anything, and reject paths that cannot be represented intact.
+    let attachments = args
+        .attach
+        .as_deref()
+        .map(|raw| {
+            csv(raw)
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    cx.project_root
+                        .join(part)
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| {
+                            Error::invalid_arguments(
+                                "project root is not valid UTF-8; attachments cannot be resolved",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
     let task = cx
         .engine
         .task_service
@@ -280,15 +304,7 @@ async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> Result<Value> {
             review_criteria,
             scope: args.scope.as_deref().map(csv),
             goal_id: args.goal_id,
-            // Relative paths name files under the project root, never the
-            // server's working directory (D12); absolute paths pass through.
-            attachments: args.attach.as_deref().map(|raw| {
-                csv(raw)
-                    .into_iter()
-                    .filter(|part| !part.is_empty())
-                    .map(|part| cx.project_root.join(part).to_string_lossy().into_owned())
-                    .collect()
-            }),
+            attachments,
         })
         .await?;
     serde_json::to_value(task).map_err(|_| Error::other("serialize task"))
@@ -398,6 +414,44 @@ mod tests {
             mode: Mode::AllowDestructive,
         });
         (dir, cx)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_add_rejects_non_utf8_attachment_root_without_creating_a_task() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, mut cx) = fixture().await;
+        Arc::get_mut(&mut cx).unwrap().project_root =
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff-project"));
+        let result = add(
+            cx.clone(),
+            args(json!({"title":"t", "attach":"relative.txt"})),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Domain(orch_domain::DomainError::InvalidArguments(_))
+        ));
+        let message = err.to_string();
+        assert_eq!(crate::mcp::registry::encode(Err(err)).is_error, Some(true));
+        assert!(
+            message.contains("project root is not valid UTF-8"),
+            "{message}"
+        );
+        assert!(
+            message.contains("attachments cannot be resolved"),
+            "{message}"
+        );
+        assert!(
+            cx.engine
+                .tasks
+                .list(&Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

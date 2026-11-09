@@ -259,7 +259,7 @@ orch task add "Goal task" --goal-id goal_2aXRjKK
 | Status | Meaning | Side effect |
 |---|---|---|
 | `active` | Agents work toward it. | From `paused`, it turns the assignee's autonomous mode back on. |
-| `paused` | On hold. | Turns off the assignee's autonomous mode and cancels the assignee's waiting autonomous tasks. |
+| `paused` | On hold. | Turns off the assignee's autonomous mode and cancels the assignee's waiting autonomous tasks linked to this goal. Its tasks in other goals are left alone. |
 | `achieved` | Done. Final. | Turns off the assignee's autonomous mode. |
 | `abandoned` | Dropped. Final. | Turns off the assignee's autonomous mode. |
 

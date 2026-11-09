@@ -53,6 +53,8 @@ async-trait = "0.1"
 # keep pull-based semantics (ARCHITECTURE §4.8).
 async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
+# Diagnostic paths only; serde_json remains the argument parser.
+serde_path_to_error = "0.1.20"
 # preserve_order keeps Value key order on round-trip (ARCHITECTURE §5.2 rule 2).
 serde_json = { version = "1.0", features = ["preserve_order"] }
 thiserror = "2.0"
