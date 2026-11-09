@@ -8,6 +8,7 @@ members = [
     "crates/orch-peer",
     "crates/orch-proto",
     "crates/orch-daemon",
+    "crates/orch-client",
     "crates/orch-cli",
     "crates/orch-tui",
     "xtask",
@@ -46,6 +47,7 @@ orch-engine = { path = "crates/orch-engine" }
 orch-peer = { path = "crates/orch-peer" }
 orch-proto = { path = "crates/orch-proto" }
 orch-daemon = { path = "crates/orch-daemon" }
+orch-client = { path = "crates/orch-client" }
 orch-tui = { path = "crates/orch-tui" }
 
 # ── Core (ARCHITECTURE §4.1) ───────────────────────────────────────────────

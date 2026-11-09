@@ -1692,6 +1692,7 @@ dependencies = [
  "json-patch",
  "nanoid",
  "nix 0.31.3",
+ "orch-client",
  "orch-core",
  "orch-daemon",
  "orch-domain",
@@ -1716,6 +1717,20 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "orch-client"
+version = "0.13.0"
+dependencies = [
+ "nix 0.31.3",
+ "orch-domain",
+ "orch-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

@@ -88,6 +88,7 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
 
     if path_exists(&paths.root()).await {
         print_warning(styles, "Already initialized");
+        println!("  Start the daemon explicitly with: orch daemon start");
         return Ok(InitOutcome {
             already_initialized: true,
             adapter: args.adapter.clone().unwrap_or_else(|| "claude".to_owned()),
@@ -176,6 +177,7 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
     );
     println!();
 
+    println!("  Start the daemon explicitly with: orch daemon start");
     Ok(InitOutcome {
         already_initialized: false,
         adapter,
