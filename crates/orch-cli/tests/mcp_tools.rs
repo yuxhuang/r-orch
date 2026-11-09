@@ -1772,6 +1772,26 @@ fn logs_with_a_non_ascii_or_overflowing_duration_is_invalid_params_and_the_serve
 }
 
 #[test]
+fn an_invalid_since_diagnostic_omits_the_supplied_value() {
+    let mut fx = Fx::new();
+    for since in [
+        "SECRET_SINCE_918273",
+        "1é",
+        "99999999999999999999d",
+        "9223372036854775807d",
+        "-1s",
+        "1w",
+    ] {
+        let response = fx.rpc_error("logs", json!({"since": since}));
+        assert_eq!(error_code(&response), Some(-32602), "{response}");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("since"), "{message}");
+        assert!(message.contains("ASCII digits"), "{message}");
+        assert!(!message.contains(since), "{message}");
+    }
+}
+
+#[test]
 fn logs_since_is_validated_even_when_another_selector_takes_precedence() {
     let mut fx = Fx::new();
     assert_eq!(

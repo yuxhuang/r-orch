@@ -416,6 +416,38 @@ fn a_mistyped_priority_value_appears_in_neither_the_response_nor_stderr() {
 }
 
 #[test]
+fn an_invalid_since_diagnostic_omits_the_value_from_response_and_warn_stderr() {
+    let project = initialized_project();
+    let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
+    server.initialize();
+    let value = format!("SECRET_SINCE_{}", sentinel("since"));
+
+    let response = server.call_tool("logs", json!({"since": value}));
+    assert_eq!(error_code(&response), Some(-32602), "{response}");
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.contains("since"), "{message}");
+    assert!(message.contains("ASCII digits"), "{message}");
+    assert!(status_ok(&mut server).is_object(), "server still serves");
+
+    let exit = server.shutdown();
+    assert_eq!(exit.status.code(), Some(0), "{}", exit.stderr);
+    let warn = exit
+        .stderr
+        .lines()
+        .find(|line| line.contains("WARN") && line.contains("response error"))
+        .unwrap_or_else(|| panic!("no WARN response-error line on stderr:\n{}", exit.stderr));
+    assert!(
+        warn.contains("since") && warn.contains("ASCII digits"),
+        "the WARN line must name the field and expected grammar: {warn}"
+    );
+    assert!(
+        !response.to_string().contains(&value) && !exit.stderr.contains(&value),
+        "since value leaked; response: {response}; stderr: {}",
+        exit.stderr
+    );
+}
+
+#[test]
 fn the_connection_serves_requests_after_a_mistyped_argument_was_refused() {
     let project = initialized_project();
     let mut server = McpServer::spawn_with(project.path(), &[], WARN_ENV);
