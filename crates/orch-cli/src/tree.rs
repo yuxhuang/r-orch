@@ -1301,6 +1301,7 @@ mod tests {
                 "--once",
                 "--watch",
                 "--verbose",
+                "--tick-interval <ms>",
                 "--listen <ADDR>",
                 "--peer-name <NAME>",
             ],
