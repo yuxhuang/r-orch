@@ -347,7 +347,10 @@ impl McpServer {
                 " In this mode goal_status force=true is unavailable. \
                  goal_status status=paused works: it cancels the assignee's todo/retrying \
                  autonomous tasks of that goal only, not of other goals. \
-                 Tasks with another or no goal id, running work and ordinary queued tasks continue. \
+                 Tasks with another or no goal id, running work and ordinary queued tasks \
+                 normally continue, but pause is not an atomic execution barrier: \
+                 a concurrent dispatch can start a listed task and the pause then cancels it. \
+                 Success does not prove all execution of that goal stopped. \
                  Resume does not restore cancelled tasks; use task_retry deliberately \
                  to bring a cancelled continuation back.",
             ),
@@ -1004,6 +1007,10 @@ mod tests {
         assert!(instructions.contains("goal_status force=true is unavailable."));
         assert!(instructions.contains("autonomous tasks of that goal only, not of other goals."));
         assert!(instructions.contains("Tasks with another or no goal id, running work"));
+        assert!(instructions.contains("pause is not an atomic execution barrier"));
+        assert!(
+            instructions.contains("Success does not prove all execution of that goal stopped.")
+        );
         assert!(instructions.contains("Resume does not restore cancelled tasks; use task_retry"));
         assert!(!instructions.contains("across goals"));
         assert!(!instructions.contains('\n'));

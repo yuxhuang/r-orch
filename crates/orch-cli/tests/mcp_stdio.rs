@@ -783,7 +783,10 @@ fn default_mode_instructions_say_what_pause_spares_and_that_resume_does_not_rest
 
     assert!(
         text.contains(
-            "Tasks with another or no goal id, running work and ordinary queued tasks continue."
+            "Tasks with another or no goal id, running work and ordinary queued tasks \
+             normally continue, but pause is not an atomic execution barrier: \
+             a concurrent dispatch can start a listed task and the pause then cancels it. \
+             Success does not prove all execution of that goal stopped."
         ) && text.contains("Resume does not restore cancelled tasks; use task_retry"),
         "{text}"
     );

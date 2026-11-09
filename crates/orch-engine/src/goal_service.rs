@@ -169,8 +169,12 @@ impl GoalService {
 
         if let Some(assignee) = assignee_of(&goal) {
             if new_status == GoalStatus::Paused {
-                // Order matters: autonomous is disabled first so the
-                // orchestrator cannot dispatch a replacement task in between.
+                // Autonomous is disabled first so this agent's idle seeding
+                // stops proposing new work before the cancel. Best-effort
+                // only: the flag gates seeding, not dispatch, and stays on if
+                // another active goal keeps it. There is no cross-process
+                // dispatch fence, so a concurrent orchestrator can still start
+                // a listed task before its cancel lands (and then lose it).
                 self.maybe_disable_autonomous(assignee).await;
                 self.cancel_pending_autonomous_tasks(id, assignee).await;
             } else if new_status == GoalStatus::Active && old_status == GoalStatus::Paused {
