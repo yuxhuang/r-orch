@@ -27,7 +27,9 @@
 )]
 
 pub mod coordinator;
+mod detach;
 mod discovery;
+mod env;
 mod error;
 mod guard;
 pub mod lifecycle;
@@ -37,9 +39,11 @@ mod session;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+pub use discovery::select_project_root;
 pub use error::DaemonError;
 pub use lifecycle::{
-    DaemonExit, DispatchMode, InitOptions, InitOutcome, StartOptions, initialize, start,
+    DEVELOPMENTAL_BANNER, DaemonExit, DispatchMode, InitOptions, InitOutcome, StartOptions,
+    initialize, start,
 };
 
 /// The environment variable that must be `1` for `orch daemon start` in PR 1
