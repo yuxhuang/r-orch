@@ -79,6 +79,7 @@ pub async fn serve_once(engine: &Rpc, flags: &crate::tree::ServeCmd) -> Result<E
         "serve:started",
         vec![("mode", serde_json::json!("once"))],
     );
+    log_startup_diagnostics(engine, &logger).await;
     let (result, signal) = stream(engine, args::DispatchUntilTerminalArgs {}, |event| {
         logger.handle(event)
     })
@@ -97,6 +98,66 @@ pub async fn serve_once(engine: &Rpc, flags: &crate::tree::ServeCmd) -> Result<E
     );
     logger.flush();
     Ok(code(exit, signal))
+}
+
+/// The daemon's startup diagnostics as `warn` records, one `serve:diagnostic`
+/// per warning, before the batch starts any work: the set `run` prints to
+/// stderr, in the chosen `--log-format` so they reach the `--log-file` and
+/// never break the JSON stream. A failed read is logged and does not stop the
+/// batch; dispatch's own preflight decides.
+async fn log_startup_diagnostics(engine: &Rpc, logger: &crate::serve::StructuredLogger) {
+    let warnings = match engine.request(args::UiBootstrapArgs {}).await {
+        Ok(bootstrap) => bootstrap.startup_warnings,
+        Err(error) => {
+            logger.log(
+                crate::serve::LogLevel::Warn,
+                "serve:diagnostics_unavailable",
+                vec![("error", serde_json::json!(error.to_string()))],
+            );
+            return;
+        }
+    };
+    if warnings.is_empty() {
+        return;
+    }
+    // Only for the agentId/agentName split; without it each record still
+    // carries the whole warning as its message.
+    let agents = engine
+        .request(args::AgentListArgs {})
+        .await
+        .unwrap_or_default();
+    for warning in &warnings {
+        logger.log(
+            crate::serve::LogLevel::Warn,
+            "serve:diagnostic",
+            diagnostic_fields(warning, &agents),
+        );
+    }
+}
+
+/// Split a `ui.bootstrap` startup warning, `"{agent_name} ({agent_id}):
+/// {message}"`, back into the 0.13.0 record fields. The agent is matched by
+/// its exact prefix, never guessed from the text; the longest match wins.
+fn diagnostic_fields(
+    warning: &str,
+    agents: &[orch_domain::Agent],
+) -> Vec<(&'static str, serde_json::Value)> {
+    let matched = agents
+        .iter()
+        .filter_map(|agent| {
+            warning
+                .strip_prefix(&format!("{} ({}): ", agent.name, agent.id))
+                .map(|message| (agent, message))
+        })
+        .min_by_key(|(_, message)| message.len());
+    match matched {
+        Some((agent, message)) => vec![
+            ("agentId", serde_json::json!(agent.id)),
+            ("agentName", serde_json::json!(agent.name)),
+            ("message", serde_json::json!(message)),
+        ],
+        None => vec![("message", serde_json::json!(warning))],
+    }
 }
 
 fn code(exit: i32, signal: Option<u8>) -> ExitCode {
@@ -263,4 +324,122 @@ fn slice_utf16(data: &str, max_units: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_daemon::testing::DaemonHarness;
+    use orch_proto::handshake::{Caller, CallerKind, SessionMode};
+    use serde_json::Value;
+
+    fn agent(id: &str, name: &str) -> orch_domain::Agent {
+        let mut agent = orch_core::test_support::make_agent();
+        agent.id = id.into();
+        agent.name = name.into();
+        agent
+    }
+
+    /// Runs `serve --once`'s startup step against an in-process daemon
+    /// holding `agents` and returns the JSON records it wrote.
+    async fn startup_records(agents: Vec<orch_domain::Agent>) -> Vec<Value> {
+        let daemon = DaemonHarness::builder()
+            .maintenance_timer(false)
+            .start()
+            .await
+            .expect("harness daemon");
+        for agent in &agents {
+            daemon
+                .engine()
+                .agents
+                .save(agent)
+                .await
+                .expect("save agent");
+        }
+        let endpoint = daemon.connect().await.expect("connect");
+        let project = orch_client::Project::discover(daemon.project_root(), None).expect("project");
+        let caller = Caller {
+            kind: CallerKind::Cli,
+            agent_id: None,
+            pid: None,
+        };
+        let client = orch_client::Client::from_stream(
+            project,
+            endpoint.into_stream(),
+            caller,
+            SessionMode::Normal,
+        )
+        .await
+        .expect("handshake");
+        let engine = Rpc::from_client(daemon.project_root().to_path_buf(), client);
+
+        let log = tempfile::tempdir().expect("tempdir");
+        let path = log.path().join("serve.log");
+        let logger = crate::serve::StructuredLogger::new(
+            crate::serve::LogFormat::Json,
+            false,
+            std::sync::Arc::new(orch_infra::clock::SystemClock),
+            crate::serve::open_sinks(Some(&path.to_string_lossy())).expect("sink"),
+        );
+        log_startup_diagnostics(&engine, &logger).await;
+        logger.flush();
+        std::fs::read_to_string(&path)
+            .expect("read log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every record is JSON"))
+            .collect()
+    }
+
+    /// W2b B2: `serve --once` logs the 0.13.0 `serve:diagnostic` record per
+    /// startup warning, with the agent split back out of the bootstrap line.
+    #[tokio::test]
+    async fn serve_once_logs_one_diagnostic_record_per_startup_warning() {
+        let mut cursor = agent("agt_cur2", "cur2");
+        cursor.adapter = "cursor".into();
+        cursor.config.effort = Some(orch_domain::ReasoningEffort::High);
+        let records = startup_records(vec![cursor, agent("agt_clean", "clean")]).await;
+
+        assert_eq!(records.len(), 1, "one warning, for cur2 only: {records:#?}");
+        let record = &records[0];
+        assert_eq!(record["event"], "serve:diagnostic");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["agentId"], "agt_cur2");
+        assert_eq!(record["agentName"], "cur2");
+        let message = record["message"].as_str().expect("message");
+        assert!(message.starts_with("legacy-ignored"), "{record}");
+    }
+
+    #[tokio::test]
+    async fn serve_once_logs_no_diagnostic_when_no_agent_is_affected() {
+        let records = startup_records(vec![agent("agt_clean", "clean")]).await;
+        assert!(records.is_empty(), "{records:#?}");
+    }
+
+    #[test]
+    fn a_warning_is_split_only_at_an_exact_agent_prefix() {
+        let agents = [agent("agt_a", "a"), agent("agt_b", "a (agt_a): x")];
+        let fields = |warning| -> Vec<(&str, Value)> { diagnostic_fields(warning, &agents) };
+        assert_eq!(
+            fields("a (agt_a): legacy-ignored: m"),
+            vec![
+                ("agentId", Value::from("agt_a")),
+                ("agentName", Value::from("a")),
+                ("message", Value::from("legacy-ignored: m")),
+            ]
+        );
+        // The longest (most specific) prefix wins over a shorter one.
+        assert_eq!(
+            fields("a (agt_a): x (agt_b): m"),
+            vec![
+                ("agentId", Value::from("agt_b")),
+                ("agentName", Value::from("a (agt_a): x")),
+                ("message", Value::from("m")),
+            ]
+        );
+        // No known agent: the whole line is the message, nothing is guessed.
+        assert_eq!(
+            fields("gone (agt_gone): m"),
+            vec![("message", Value::from("gone (agt_gone): m"))]
+        );
+    }
 }

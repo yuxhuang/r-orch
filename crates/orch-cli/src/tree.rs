@@ -173,7 +173,7 @@ pub enum Command {
     Doctor,
     /// Launch interactive TUI dashboard
     Tui(TuiCmd),
-    /// Headless daemon mode — structured logs to stdout
+    /// Start the daemon in the foreground with dispatch ON (--once: run a batch in the running daemon with structured logs)
     Serve(ServeCmd),
     /// Manage the project daemon
     Daemon(crate::commands::daemon::DaemonCmd),
@@ -942,6 +942,8 @@ pub struct RunCmd {
     pub once: bool,
     #[arg(long, help = "Start a foreground daemon with dispatch ON")]
     pub watch: bool,
+    #[arg(long = "from-agent", requires = "watch", help = FROM_AGENT_HELP)]
+    pub from_agent: bool,
     #[arg(
         long,
         help = "Not accepted with --watch (use RUST_LOG or orch logs --follow)"
@@ -951,6 +953,11 @@ pub struct RunCmd {
     #[arg(long = "tick-interval", value_name = "ms", hide = true)]
     pub tick_interval: Option<String>,
 }
+
+/// A foreground `run --watch` / `serve` *is* the daemon start, so it takes the
+/// same agent-context override as `orch daemon start` (spec R31).
+const FROM_AGENT_HELP: &str = "Allow the daemon start from an agent's environment \
+(ORCH_TASK_ID or ORCH_AGENT_ID set); only when the owner deliberately intends this";
 
 /// A foreground `run --watch` / `serve` *is* the daemon start, so there is no
 /// client left to honour the legacy logging and interval flags (D8 refinement,
@@ -1014,6 +1021,8 @@ pub struct ServeCmd {
     pub peer: PeerFlags,
     #[arg(long, help = "Process todo tasks and exit when all are terminal")]
     pub once: bool,
+    #[arg(long = "from-agent", conflicts_with = "once", help = FROM_AGENT_HELP)]
+    pub from_agent: bool,
     #[arg(
         long = "tick-interval",
         value_name = "ms",
@@ -1300,6 +1309,7 @@ mod tests {
                 "--all",
                 "--once",
                 "--watch",
+                "--from-agent",
                 "--verbose",
                 "--tick-interval <ms>",
                 "--listen <ADDR>",
@@ -1313,6 +1323,7 @@ mod tests {
             &[],
             &[
                 "--once",
+                "--from-agent",
                 "--tick-interval <ms>",
                 "--log-file <path>",
                 "--log-format <format>",
@@ -1930,6 +1941,8 @@ mod file_mutation_tests {
                 "--verbose",
             ],
             &["orch", "run", "--watch"],
+            &["orch", "serve", "--from-agent"],
+            &["orch", "run", "--watch", "--from-agent"],
             &["orch", "run", "--verbose", "tsk_1"],
             &["orch", "run", "--once", "--verbose"],
         ] {
