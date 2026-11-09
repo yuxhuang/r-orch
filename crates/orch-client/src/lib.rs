@@ -132,7 +132,9 @@ pub struct Client {
     project: Project,
     pub welcome: Welcome,
     next_id: u64,
-    failed: bool,
+    // Set before writing: cancellation or a partial write leaves the outcome
+    // unknown and the lane poisoned until a correlated terminal reply arrives.
+    request_may_have_been_sent: bool,
 }
 
 impl Client {
@@ -193,11 +195,29 @@ impl Client {
                 handshake::MAX_HANDSHAKE_BYTES,
             )
             .await
-            .map_err(|_| project.failure(NoDaemonDetail::HandshakeFailed))?;
-            read_reply(&mut io, &project, pid).await
+            .map_err(|_| {
+                project.failure(if intent == Intent::Stop {
+                    NoDaemonDetail::RequestOutcomeUnknown
+                } else {
+                    NoDaemonDetail::HandshakeFailed
+                })
+            })?;
+            read_reply(&mut io, &project, pid).await.map_err(|error| {
+                if intent == Intent::Stop {
+                    unknown_outcome(error, &project, NoDaemonDetail::RequestOutcomeUnknown)
+                } else {
+                    error
+                }
+            })
         })
         .await
-        .map_err(|_| project.failure(NoDaemonDetail::Timeout))??;
+        .map_err(|_| {
+            project.failure(if intent == Intent::Stop {
+                NoDaemonDetail::RequestOutcomeUnknown
+            } else {
+                NoDaemonDetail::Timeout
+            })
+        })??;
         if intent == Intent::Session {
             if welcome.protocol != orch_proto::LOCAL_PROTOCOL
                 || welcome.binary.as_str() != orch_proto::BINARY_VERSION
@@ -219,7 +239,9 @@ impl Client {
                 return Err(project.failure(NoDaemonDetail::HandshakeFailed).into());
             }
         } else if welcome.stop_state != Some(StopState::Accepted) {
-            return Err(project.failure(NoDaemonDetail::HandshakeFailed).into());
+            return Err(project
+                .failure(NoDaemonDetail::RequestOutcomeUnknown)
+                .into());
         }
         Ok(Self {
             io,
@@ -227,7 +249,7 @@ impl Client {
             project,
             welcome,
             next_id: 1,
-            failed: false,
+            request_may_have_been_sent: false,
         })
     }
 
@@ -254,50 +276,56 @@ impl Client {
     async fn control_call<T: DeserializeOwned>(&mut self, req: Request) -> Result<T, ClientError> {
         tokio::time::timeout(handshake::STOP_COMPLETION_TIMEOUT, self.call(req))
             .await
-            .map_err(|_| self.project.failure(NoDaemonDetail::Timeout))?
+            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?
     }
 
     /// Generic terminal response plumbing for closed D7 requests. Streaming
     /// and subscription APIs are added with their consumers in PR 2/3.
     pub async fn call<T: DeserializeOwned>(&mut self, req: Request) -> Result<T, ClientError> {
-        if self.failed {
-            return Err(self.project.failure(NoDaemonDetail::ConnectionLost).into());
+        if self.request_may_have_been_sent {
+            return Err(self
+                .project
+                .failure(NoDaemonDetail::RequestOutcomeUnknown)
+                .into());
         }
         // Reserve the id and poison the lane before the first await: cancelling
         // this future must never let a later call consume its unknown reply.
         let id = NonZeroU64::new(self.next_id)
-            .ok_or_else(|| self.project.failure(NoDaemonDetail::ConnectionLost))?;
+            .ok_or_else(|| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
         self.next_id = self.next_id.checked_add(1).unwrap_or(0);
-        self.failed = true;
+        self.request_may_have_been_sent = true;
         let frame = RequestFrame {
             id: RequestId(id),
             req,
         };
         ndjson::write_frame(&mut self.writer, &frame, MAX_FRAME_BYTES)
             .await
-            .map_err(|_| self.project.failure(NoDaemonDetail::ConnectionLost))?;
+            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
         let bytes = self
             .io
             .read_line(MAX_FRAME_BYTES)
             .await
-            .map_err(|_| self.project.failure(NoDaemonDetail::ConnectionLost))?
-            .ok_or_else(|| self.project.failure(NoDaemonDetail::ConnectionLost))?;
+            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?
+            .ok_or_else(|| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
         ndjson::check_depth(&bytes, orch_proto::frame::MAX_DEPTH)
-            .map_err(|_| self.project.failure(NoDaemonDetail::ConnectionLost))?;
+            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
         let frame = ServerFrame::decode(&bytes)
-            .map_err(|_| self.project.failure(NoDaemonDetail::ConnectionLost))?;
+            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
         match frame {
             ServerFrame::Ok(frame) if frame.id.0 == id => {
                 let result = ndjson::decode(frame.ok.get().as_bytes())
-                    .map_err(|_| self.project.failure(NoDaemonDetail::ConnectionLost))?;
-                self.failed = false;
+                    .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
+                self.request_may_have_been_sent = false;
                 Ok(result)
             }
             ServerFrame::Err(frame) if frame.id.0 == id => {
-                self.failed = false;
+                self.request_may_have_been_sent = false;
                 Err(ClientError::Remote(frame.err))
             }
-            _ => Err(self.project.failure(NoDaemonDetail::ConnectionLost).into()),
+            _ => Err(self
+                .project
+                .failure(NoDaemonDetail::RequestOutcomeUnknown)
+                .into()),
         }
     }
 }
@@ -314,21 +342,76 @@ pub async fn stop(config: &ClientConfig) -> Result<results::StopOutcome, ClientE
         Intent::Stop,
     )
     .await?;
-    let completed = tokio::time::timeout(
-        handshake::STOP_COMPLETION_TIMEOUT,
-        read_reply(&mut client.io, &client.project, pid),
-    )
-    .await
-    .map_err(|_| client.project.failure(NoDaemonDetail::Timeout))??;
+    // One deadline covers both the terminal frame and release of ownership.
+    let deadline = tokio::time::Instant::now() + handshake::STOP_COMPLETION_TIMEOUT;
+    let owner_pid = client.welcome.pid;
+    let completed =
+        tokio::time::timeout_at(deadline, read_reply(&mut client.io, &client.project, pid))
+            .await
+            .map_err(|_| stop_timeout(&client.project, owner_pid))?
+            .map_err(|error| {
+                unknown_outcome(error, &client.project, NoDaemonDetail::StopOutcomeUnknown)
+            })?;
     if completed.instance != client.welcome.instance
+        || completed.pid != owner_pid
         || completed.stop_state != Some(StopState::Completed)
     {
         return Err(client
             .project
-            .failure(NoDaemonDetail::HandshakeFailed)
+            .failure(NoDaemonDetail::StopOutcomeUnknown)
             .into());
     }
+    let project = client.project;
+    // Closing both halves lets the daemon drain this session before it drops
+    // the owner guard. Waiting with the lane open would delay shutdown itself.
+    drop(client.io);
+    drop(client.writer);
+    wait_for_owner_release(project, owner_pid, deadline).await?;
     Ok(results::StopOutcome { clean: true })
+}
+
+fn unknown_outcome(error: ClientError, project: &Project, detail: NoDaemonDetail) -> ClientError {
+    match error {
+        ClientError::Connection(NoDaemon::NoDaemon { .. }) => project.failure(detail).into(),
+        // Explicit rejections preserve their definite execution classification.
+        other => other,
+    }
+}
+
+fn stop_timeout(project: &Project, pid: u32) -> ClientError {
+    NoDaemon::StopTimeout {
+        project_root: orch_proto::path::escape_controls(&project.root.to_string_lossy()),
+        pid,
+    }
+    .into()
+}
+
+async fn wait_for_owner_release(
+    mut project: Project,
+    pid: u32,
+    deadline: tokio::time::Instant,
+) -> Result<(), ClientError> {
+    let timeout = stop_timeout(&project, pid);
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            // Nonblocking flock and PID inspection still use filesystem/syscall
+            // APIs; keep them off Tokio's executor threads.
+            let probe_error = project.failure(NoDaemonDetail::StopOutcomeUnknown);
+            let (returned, released) = tokio::task::spawn_blocking(move || {
+                let released = project.owner_released(pid);
+                (project, released)
+            })
+            .await
+            .map_err(|_| probe_error)?;
+            project = returned;
+            if released {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| timeout)?
 }
 
 async fn dial(config: &ClientConfig) -> Result<(Project, UnixStream, Option<u32>), ClientError> {

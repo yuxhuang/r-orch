@@ -1,4 +1,4 @@
-//! The only client filesystem read is the bounded discovery record (D1/D4).
+//! Bounded discovery (D1/D4) and the explicit stop owner-release check.
 use crate::{ClientError, NoDaemon};
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
@@ -64,6 +64,34 @@ impl Project {
             expected: escape_controls(&self.root.to_string_lossy()),
             actual: actual.display_escaped(),
         }
+    }
+
+    /// Explicit stop only: observe process exit or briefly probe the stable
+    /// guard inode. Never create/unlink the guard or touch its PID contents.
+    pub(crate) fn owner_released(&self, pid: u32) -> bool {
+        use nix::fcntl::{Flock, FlockArg};
+        if let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 0)
+            && nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                == Err(nix::errno::Errno::ESRCH)
+        {
+            return true;
+        }
+        let Ok(fd) = openat(
+            &self.state_dir,
+            ".daemon-owner.lock",
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let file = File::from(fd);
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        if !meta.is_file() || meta.uid() != geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+            return false;
+        }
+        Flock::lock(file, FlockArg::LockExclusiveNonblock).is_ok()
     }
 
     /// Read once, without following a substituted directory or discovery

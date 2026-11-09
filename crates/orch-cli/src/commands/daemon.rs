@@ -140,7 +140,7 @@ async fn control(
         DaemonSub::Status => {
             let status = Client::connect(config).await?.status().await?;
             let text = format!(
-                "orch daemon PID {} · dispatch {}\n  executable: {}\n  started: {}\n  version: orch {} protocol {}\n  sessions: {}/{}",
+                "orch daemon PID {} · dispatch {}\n  executable: {}\n  started: {}\n  version: orch {} protocol {}\n  sessions: {}/{}\n  ownership: {}\n  socket: {}\n  instance: {}\n  running tasks: {}",
                 status.pid,
                 if status.dispatch.dispatch_on {
                     "ON"
@@ -152,7 +152,15 @@ async fn control(
                 orch_proto::path::escape_controls(&status.binary),
                 status.protocol,
                 status.sessions,
-                status.session_cap
+                status.session_cap,
+                match status.ownership {
+                    orch_proto::ops::results::OwnershipStatus::Held => "held",
+                    orch_proto::ops::results::OwnershipStatus::Lost =>
+                        "LOST — stop and restart the daemon",
+                },
+                status.socket.display_escaped(),
+                orch_proto::path::escape_controls(&status.instance),
+                status.running_tasks.len()
             );
             render(cli, &status, &text)?;
         }
