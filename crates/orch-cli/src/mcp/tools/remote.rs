@@ -33,7 +33,10 @@ async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> ToolResult {
     json(&cx.request(rpc::RemoteListArgs {}).await?, "remotes")
 }
 async fn status(cx: Arc<CallContext>, _: EmptyArgs) -> ToolResult {
-    json(&cx.request(rpc::RemoteStatusArgs {}).await?, "remote status")
+    json(
+        &cx.request(rpc::RemoteStatusArgs {}).await?,
+        "remote status",
+    )
 }
 
 #[cfg(test)]

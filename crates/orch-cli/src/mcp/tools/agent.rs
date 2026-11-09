@@ -278,10 +278,11 @@ fn authored(authored: &AuthoredAgent) -> ToolResult {
 }
 
 async fn add(cx: Arc<CallContext>, args: AddArgs) -> ToolResult {
-    let skills = args
-        .skills
-        .as_deref()
-        .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect::<Vec<_>>());
+    let skills = args.skills.as_deref().map(|raw| {
+        raw.split(',')
+            .map(|part| part.trim().to_owned())
+            .collect::<Vec<_>>()
+    });
     let created = cx
         .request(wire::<rpc::AgentCreateArgs>(json!({
             "name": args.name,
@@ -338,7 +339,9 @@ fn flag_patch(args: &UpdateArgs) -> Value {
         let effort = orch_domain::EffortSelection::from(effort).into_effort();
         config.insert(
             "effort".into(),
-            effort.map_or(Value::Null, |effort| Value::String(effort.as_str().to_owned())),
+            effort.map_or(Value::Null, |effort| {
+                Value::String(effort.as_str().to_owned())
+            }),
         );
     }
     if let Some(summary) = &args.role_summary {
@@ -376,9 +379,11 @@ async fn patch(cx: Arc<CallContext>, args: PatchArgs) -> ToolResult {
 }
 async fn enabled(cx: Arc<CallContext>, args: IdArgs, enable: bool) -> ToolResult {
     let agent = if enable {
-        cx.request(rpc::AgentEnableArgs { id: id(&args.id)? }).await?
+        cx.request(rpc::AgentEnableArgs { id: id(&args.id)? })
+            .await?
     } else {
-        cx.request(rpc::AgentDisableArgs { id: id(&args.id)? }).await?
+        cx.request(rpc::AgentDisableArgs { id: id(&args.id)? })
+            .await?
     };
     json(&agent, "agent")
 }
@@ -466,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_nine_tools_preserve_agent_shapes_and_scheduling_semantics() {
-        let (fx, cx) = fixture().await;
+        let (_fx, cx) = fixture().await;
         let _: EmptyArgs = args(json!({}));
         assert_eq!(list(cx.clone(), args(json!({}))).await.unwrap(), json!([]));
         let created = add(cx.clone(), args(json!({"name":"one","adapter":"shell","command":"true","skills":" a, b ","prompt_mode":"eco"}))).await.unwrap();
@@ -554,7 +559,8 @@ mod tests {
         .await
         .unwrap();
         let id = agent["id"].as_str().unwrap();
-        let before = serde_json::to_value(fx.engine().agent_service.get(id).await.unwrap()).unwrap();
+        let before =
+            serde_json::to_value(fx.engine().agent_service.get(id).await.unwrap()).unwrap();
         let path = cx.project_root.join("bad.json");
         for input in [
             br#"{"unknown":null}"#.to_vec(),

@@ -146,7 +146,8 @@ pub(crate) type ToolResult<T = Value> = Result<T, ToolError>;
 /// tool's arguments. The DTO's own bounds and closed shape apply here,
 /// before anything is sent.
 pub(crate) fn wire<A: DeserializeOwned>(value: Value) -> ToolResult<A> {
-    serde_json::from_value(value).map_err(|err| ToolError::Text(format!("Invalid arguments: {err}")))
+    serde_json::from_value(value)
+        .map_err(|err| ToolError::Text(format!("Invalid arguments: {err}")))
 }
 
 /// A daemon result as JSON.
@@ -215,7 +216,13 @@ impl CallContext {
         purpose: orch_proto::ops::args::TransferPurpose,
         bytes: &[u8],
     ) -> ToolResult<orch_proto::ops::args::TransferToken> {
-        Ok(self.session().await?.lock().await.upload(purpose, bytes).await?)
+        Ok(self
+            .session()
+            .await?
+            .lock()
+            .await
+            .upload(purpose, bytes)
+            .await?)
     }
 }
 
@@ -739,10 +746,8 @@ mod tests {
 
     #[test]
     fn no_daemon_is_the_uniform_text_with_exit_code_seven_in_both_variants() {
-        let failure = orch_client::NoDaemon::no_daemon(
-            "/p",
-            orch_proto::error::NoDaemonDetail::NoSocket,
-        );
+        let failure =
+            orch_client::NoDaemon::no_daemon("/p", orch_proto::error::NoDaemonDetail::NoSocket);
         for agent_context in [false, true] {
             let result = encode(
                 Err(ToolError::Client(failure.clone().into())),
@@ -751,7 +756,10 @@ mod tests {
             let json = serde_json::to_value(&result).unwrap();
             assert_eq!(json["isError"], true);
             assert_eq!(json["content"][0]["text"], failure.render(agent_context));
-            assert_eq!(json["structuredContent"], serde_json::json!({"exit_code": 7}));
+            assert_eq!(
+                json["structuredContent"],
+                serde_json::json!({"exit_code": 7})
+            );
         }
         assert!(failure.render(true).contains("Do not start it"));
         assert!(failure.render(false).contains("orch daemon start"));

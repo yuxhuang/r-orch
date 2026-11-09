@@ -157,7 +157,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_four_context_tools_validate_and_project() {
-        let (fx, cx) = fixture().await;
+        let (_fx, cx) = fixture().await;
         assert_eq!(
             get(cx.clone(), args(json!({"key":"missing"})))
                 .await

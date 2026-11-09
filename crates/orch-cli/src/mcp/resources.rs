@@ -323,7 +323,11 @@ mod tests {
         let missing = daemon(DomainError::TaskNotFound("tsk_x".into()));
         let err = read_error("orch://tasks/tsk_x", &task, &missing, false);
         assert_eq!(err.code, ErrorCode::RESOURCE_NOT_FOUND);
-        assert!(err.message.ends_with("(orch://tasks/tsk_x)"), "{}", err.message);
+        assert!(
+            err.message.ends_with("(orch://tasks/tsk_x)"),
+            "{}",
+            err.message
+        );
 
         let agent = Target::Agent("agt_x".into());
         let missing = daemon(DomainError::AgentNotFound("agt_x".into()));

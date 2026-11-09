@@ -3,7 +3,7 @@
 use crate::document_input;
 use crate::mcp::registry::{
     CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolError, ToolMeta,
-    ToolResult, json, wire,
+    ToolResult, wire,
 };
 use crate::mcp::tools::task::{at_source, definition_input};
 use orch_core::Result;

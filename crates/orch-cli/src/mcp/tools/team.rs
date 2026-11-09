@@ -2,8 +2,7 @@
 //! as the daemon committed it.
 use crate::mcp::projections::id;
 use crate::mcp::registry::{
-    CallContext, Class, EmptyArgs, Execution, Registry, ToolArgs, ToolMeta, ToolResult, json,
-    wire,
+    CallContext, Class, EmptyArgs, Execution, Registry, ToolArgs, ToolMeta, ToolResult, json, wire,
 };
 use orch_core::Result;
 use orch_proto::ops::args as rpc;
@@ -144,9 +143,11 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     Ok(())
 }
 async fn create(cx: Arc<CallContext>, args: CreateArgs) -> ToolResult {
-    let members = args
-        .members
-        .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect::<Vec<_>>());
+    let members = args.members.map(|raw| {
+        raw.split(',')
+            .map(|part| part.trim().to_owned())
+            .collect::<Vec<_>>()
+    });
     let team = cx
         .request(wire::<rpc::TeamCreateArgs>(json!({
             "name": args.name,
@@ -229,7 +230,8 @@ mod tests {
     #[tokio::test]
     async fn all_eight_team_tools_project_committed_entities() {
         let (fx, cx) = fixture().await;
-        let lead = fx.engine()
+        let lead = fx
+            .engine()
             .agent_service
             .create(orch_domain::CreateAgentInput {
                 name: "lead".into(),
@@ -239,7 +241,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let member = fx.engine()
+        let member = fx
+            .engine()
             .agent_service
             .create(orch_domain::CreateAgentInput {
                 name: "member".into(),
@@ -271,7 +274,8 @@ mod tests {
             joined,
             show(cx.clone(), args(json!({"id":id}))).await.unwrap()
         );
-        let task = fx.engine()
+        let task = fx
+            .engine()
             .task_service
             .create(orch_domain::CreateTaskInput {
                 title: "pooled".into(),

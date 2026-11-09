@@ -103,6 +103,9 @@ mod tests {
         use orch_proto::handshake::SessionMode;
         assert_eq!(Mode::Default.session(), SessionMode::Normal);
         assert_eq!(Mode::ReadOnly.session(), SessionMode::ReadOnly);
-        assert_eq!(Mode::AllowDestructive.session(), SessionMode::AllowDestructive);
+        assert_eq!(
+            Mode::AllowDestructive.session(),
+            SessionMode::AllowDestructive
+        );
     }
 }

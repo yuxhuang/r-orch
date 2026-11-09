@@ -218,7 +218,10 @@ impl McpServer {
         ))
     }
 
-    fn refuse_new_work(&self, cancelled: &CancellationToken) -> std::result::Result<(), NotExecuted> {
+    fn refuse_new_work(
+        &self,
+        cancelled: &CancellationToken,
+    ) -> std::result::Result<(), NotExecuted> {
         if self.output_lost.is_cancelled() {
             return Err(NotExecuted::ShuttingDown);
         }
@@ -529,14 +532,19 @@ where
                 continue;
             }
         };
-        let (Some(method), Some(id)) = (message.get("method").and_then(Value::as_str), message.get("id"))
-        else {
+        let (Some(method), Some(id)) = (
+            message.get("method").and_then(Value::as_str),
+            message.get("id"),
+        ) else {
             // A notification or a stray response: nothing to answer.
             continue;
         };
         if method == "ping" {
-            write_message(writer, &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}))
-                .await?;
+            write_message(
+                writer,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            )
+            .await?;
             continue;
         }
         match server.probe().await {
@@ -639,4 +647,443 @@ fn spawn_signal_task(stop: CancellationToken) -> Result<tokio::task::JoinHandle<
         let _ = tokio::signal::ctrl_c().await;
         stop.cancel();
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::registry::{Class, EmptyArgs, ToolMeta};
+    use crate::mcp::testing::{Fixture, no_daemon};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::{Notify, mpsc};
+
+    /// A timer that only fires when the test says so.
+    #[derive(Clone, Default)]
+    struct ManualClock {
+        fired: Arc<Notify>,
+    }
+
+    impl ManualClock {
+        fn timer(&self) -> Timer {
+            let fired = Arc::clone(&self.fired);
+            Arc::new(move |_duration| Box::pin(Arc::clone(&fired).notified_owned()))
+        }
+
+        fn fire(&self) {
+            self.fired.notify_waiters();
+        }
+    }
+
+    /// Yield until `ready` holds; no wall-clock sleeps.
+    async fn until(mut ready: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if ready() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition never held");
+    }
+
+    /// A connector the test can repoint, as the owner starting or killing
+    /// the daemon would.
+    #[derive(Clone)]
+    struct Switch(Arc<Mutex<Connector>>);
+
+    impl Switch {
+        fn new(first: Connector) -> Switch {
+            Switch(Arc::new(Mutex::new(first)))
+        }
+
+        fn set(&self, next: Connector) {
+            *self.0.lock().unwrap() = next;
+        }
+
+        fn connector(&self) -> Connector {
+            let inner = Arc::clone(&self.0);
+            Arc::new(move || (inner.lock().unwrap())())
+        }
+    }
+
+    fn test_meta(name: &'static str) -> ToolMeta {
+        ToolMeta {
+            name,
+            description: "test",
+            class: Class::Read,
+            execution: Execution::Store,
+            destructive_hint: false,
+            idempotent_hint: true,
+            open_world_hint: false,
+        }
+    }
+
+    struct Harness {
+        fixture: Fixture,
+        switch: Switch,
+        entered: mpsc::UnboundedReceiver<()>,
+        gate: Arc<Semaphore>,
+        store_permits: Arc<Semaphore>,
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        next_id: u64,
+        server: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    /// A bridge in `mode` over an in-memory duplex. With `daemon` false the
+    /// connector starts out finding no daemon.
+    async fn harness(mode: Mode, daemon: bool) -> Harness {
+        let fixture = Fixture::start().await;
+        let switch = Switch::new(if daemon {
+            fixture.connector(mode, Some("agt_me"))
+        } else {
+            no_daemon(fixture.root())
+        });
+        let mut registry = crate::mcp::build_registry(mode).unwrap();
+        let (entered_tx, entered) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let block_gate = Arc::clone(&gate);
+        registry
+            .add(
+                test_meta("block"),
+                move |_cx: Arc<CallContext>, _args: EmptyArgs| {
+                    let (entered_tx, gate) = (entered_tx.clone(), Arc::clone(&block_gate));
+                    async move {
+                        entered_tx.send(()).unwrap();
+                        gate.acquire().await.unwrap().forget();
+                        Ok(Value::Null)
+                    }
+                },
+            )
+            .unwrap();
+        let settings = Settings {
+            project_root: fixture.root().to_path_buf(),
+            identity: Identity::of(Some("agt_me")),
+            mode,
+            agent_context: false,
+        };
+        let seams = Seams {
+            connector: switch.connector(),
+            timer: ManualClock::default().timer(),
+        };
+        let server = McpServer::new(settings, seams, registry);
+        let store_permits = Arc::clone(&server.store.permits);
+        let (client, server_io) = tokio::io::duplex(1 << 20);
+        let (input, output) = tokio::io::split(server_io);
+        let server = tokio::spawn(serve_transport(
+            server,
+            input,
+            output,
+            CancellationToken::new(),
+        ));
+        let (reader, writer) = tokio::io::split(client);
+        Harness {
+            fixture,
+            switch,
+            entered,
+            gate,
+            store_permits,
+            writer,
+            lines: BufReader::new(reader).lines(),
+            next_id: 1,
+            server,
+        }
+    }
+
+    impl Harness {
+        async fn send(&mut self, frame: Value) {
+            let mut line = serde_json::to_string(&frame).unwrap();
+            line.push('\n');
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> u64 {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.send(
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+            )
+            .await;
+            id
+        }
+
+        async fn response(&mut self, id: u64) -> Value {
+            loop {
+                let line = self.lines.next_line().await.unwrap().expect("a frame");
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                if frame["id"] == serde_json::json!(id) {
+                    return frame;
+                }
+            }
+        }
+
+        async fn call(&mut self, method: &str, params: Value) -> Value {
+            let id = self.request(method, params).await;
+            self.response(id).await
+        }
+
+        async fn initialize(&mut self) -> Value {
+            let result = self
+                .call(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "claude-code", "version": "0"},
+                    }),
+                )
+                .await;
+            if result.get("result").is_some() {
+                self.send(
+                    serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                )
+                .await;
+            }
+            result
+        }
+    }
+
+    fn text(response: &Value) -> &str {
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+    }
+
+    fn assert_no_daemon(error: &Value, root: &std::path::Path) {
+        assert_eq!(error["code"], DAEMON_UNAVAILABLE_CODE.0, "{error}");
+        assert_eq!(
+            error["data"],
+            serde_json::json!({"exit_code": 7}),
+            "{error}"
+        );
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("No orch daemon is running for {}", root.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains("Start it with: orch daemon start"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_daemon_initialize_fails_uniformly_until_the_owner_starts_one() {
+        let mut h = harness(Mode::Default, false).await;
+        let root = h.fixture.root().to_path_buf();
+
+        let ping = h.call("ping", serde_json::json!({})).await;
+        assert_eq!(ping["result"], serde_json::json!({}), "{ping}");
+        let first = h.initialize().await;
+        assert_no_daemon(&first["error"], &root);
+        // Any other request before a successful initialize says the same.
+        let listed = h.call("tools/list", serde_json::json!({})).await;
+        assert_no_daemon(&listed["error"], &root);
+        let garbage = {
+            h.writer.write_all(b"not json\n").await.unwrap();
+            let line = h.lines.next_line().await.unwrap().unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        assert_eq!(garbage["error"]["code"], -32700, "{garbage}");
+
+        // The owner starts the daemon: the same bridge initializes now.
+        h.switch
+            .set(h.fixture.connector(Mode::Default, Some("agt_me")));
+        let ok = h.initialize().await;
+        assert_eq!(ok["result"]["serverInfo"]["name"], "orch", "{ok}");
+        let status = h
+            .call("tools/call", serde_json::json!({"name": "status"}))
+            .await;
+        assert_eq!(status["result"]["isError"], false, "{status}");
+        h.server.abort();
+    }
+
+    #[tokio::test]
+    async fn initialize_tools_list_and_a_call_reach_the_daemon() {
+        for mode in [Mode::ReadOnly, Mode::Default, Mode::AllowDestructive] {
+            let mut h = harness(mode, true).await;
+            let result = h.initialize().await["result"].clone();
+            assert_eq!(result["serverInfo"]["name"], "orch");
+            assert_eq!(result["serverInfo"]["version"], crate::tree::VERSION);
+            assert!(result["capabilities"]["tools"].is_object());
+            assert!(result["capabilities"]["resources"].is_object());
+            let instructions = result["instructions"].as_str().unwrap();
+            assert!(
+                instructions.starts_with("orch project: \""),
+                "{instructions}"
+            );
+            assert!(instructions.contains("Default agent: \"agt_me\"."));
+            assert!(instructions.contains("this server never starts a daemon"));
+            assert!(instructions.contains("Reads never expire or delete entries"));
+            assert!(!instructions.contains("purge"), "{instructions}");
+            assert!(!instructions.contains("not an atomic execution barrier"));
+            assert!(!instructions.contains('\n'));
+
+            let listed = h.call("tools/list", serde_json::json!({})).await;
+            let count = listed["result"]["tools"].as_array().unwrap().len();
+            // The full catalogue plus the test's `block` tool.
+            let expected = match mode {
+                Mode::ReadOnly => 18,
+                Mode::Default => 45,
+                Mode::AllowDestructive => 50,
+            };
+            assert_eq!(count, expected + 1, "{mode:?}");
+
+            let added = h
+                .call(
+                    "tools/call",
+                    serde_json::json!({"name": "context_set", "arguments": {"key": "k", "value": "v"}}),
+                )
+                .await;
+            if mode == Mode::ReadOnly {
+                assert_eq!(added["error"]["code"], -32602, "{added}");
+            } else {
+                assert_eq!(added["result"]["isError"], false, "{added}");
+                let entry: Value = serde_json::from_str(text(&added)).unwrap();
+                assert_eq!(entry["key"], "k");
+            }
+            let status = h
+                .call("tools/call", serde_json::json!({"name": "status"}))
+                .await;
+            assert_eq!(status["result"]["isError"], false, "{status}");
+            h.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn after_the_daemon_is_gone_calls_and_reads_carry_the_uniform_message() {
+        let mut h = harness(Mode::Default, true).await;
+        let root = h.fixture.root().to_path_buf();
+        h.initialize().await;
+        h.switch.set(no_daemon(&root));
+
+        let call = h
+            .call("tools/call", serde_json::json!({"name": "status"}))
+            .await;
+        assert_eq!(call["result"]["isError"], true, "{call}");
+        assert!(
+            text(&call).contains(&format!("No orch daemon is running for {}", root.display())),
+            "{call}"
+        );
+        let read = h
+            .call(
+                "resources/read",
+                serde_json::json!({"uri": "orch://status"}),
+            )
+            .await;
+        assert_no_daemon(&read["error"], &root);
+        // Listing needs no daemon.
+        let listed = h.call("tools/list", serde_json::json!({})).await;
+        assert!(listed["result"]["tools"].is_array(), "{listed}");
+        h.server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_seventeenth_store_call_is_refused_at_once_and_admitted_calls_complete() {
+        let mut h = harness(Mode::Default, true).await;
+        h.initialize().await;
+        let mut ids = Vec::new();
+        for admitted in 1..=STORE_PERMITS {
+            ids.push(
+                h.request("tools/call", serde_json::json!({"name": "block"}))
+                    .await,
+            );
+            let permits = Arc::clone(&h.store_permits);
+            until(|| permits.available_permits() == STORE_PERMITS - admitted).await;
+        }
+        for _ in 0..STORE_PERMITS {
+            assert_eq!(h.entered.recv().await, Some(()), "no bridge FIFO: all run");
+        }
+        let refused = h
+            .call("tools/call", serde_json::json!({"name": "status"}))
+            .await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(
+            text(&refused),
+            "Not executed: the store queue is full (16 operations admitted); retry later"
+        );
+        h.gate.add_permits(STORE_PERMITS);
+        for id in ids {
+            let done = h.response(id).await;
+            assert_eq!(done["result"]["isError"], false, "{done}");
+        }
+        assert_eq!(h.store_permits.available_permits(), STORE_PERMITS);
+        h.server.abort();
+    }
+
+    fn bare_server() -> (McpServer, ManualClock) {
+        let clock = ManualClock::default();
+        let settings = Settings {
+            project_root: PathBuf::from("/nonexistent"),
+            identity: Identity::of(None),
+            mode: Mode::Default,
+            agent_context: false,
+        };
+        let seams = Seams {
+            connector: no_daemon(std::path::Path::new("/nonexistent")),
+            timer: clock.timer(),
+        };
+        let server = McpServer::new(settings, seams, Registry::new(Mode::Default));
+        (server, clock)
+    }
+
+    #[tokio::test]
+    async fn a_stalled_doctor_is_bounded_and_its_lane_is_separate() {
+        let (server, clock) = bare_server();
+        let server = Arc::new(server);
+        let none = CancellationToken::new();
+        let stalled = {
+            let (server, none) = (Arc::clone(&server), none.clone());
+            tokio::spawn(async move {
+                server
+                    .run_call(Execution::Diagnostic, &none, |_cx| {
+                        std::future::pending::<ToolResult>()
+                    })
+                    .await
+            })
+        };
+        until(|| server.diagnostic.available() == DIAGNOSTIC_PERMITS - 1).await;
+        assert_eq!(server.store.available(), STORE_PERMITS);
+        let ok = server
+            .run_call(Execution::Store, &none, |_cx| async { Ok(Value::Null) })
+            .await;
+        assert!(ok.is_ok());
+        clock.fire();
+        let err = stalled.await.unwrap().unwrap_err();
+        assert_eq!(err.text(false), "doctor did not finish within 120 s");
+        assert_eq!(server.diagnostic.available(), DIAGNOSTIC_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn after_the_output_is_lost_nothing_is_admitted_even_into_a_free_lane() {
+        let (server, _clock) = bare_server();
+        server.output_lost.cancel();
+        let none = CancellationToken::new();
+        for execution in [Execution::Store, Execution::Diagnostic] {
+            let refused = server
+                .run_call(execution, &none, |_cx| async { Ok(Value::Null) })
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                refused.text(false),
+                NotExecuted::ShuttingDown.to_string(),
+                "{execution:?}"
+            );
+        }
+        assert_eq!(server.store.available(), STORE_PERMITS);
+        assert_eq!(server.diagnostic.available(), DIAGNOSTIC_PERMITS);
+    }
+
+    #[test]
+    fn not_executed_messages_say_so() {
+        for reason in [
+            NotExecuted::Overloaded {
+                lane: "store",
+                capacity: 16,
+            },
+            NotExecuted::Cancelled,
+            NotExecuted::ShuttingDown,
+        ] {
+            assert!(reason.to_string().starts_with("Not executed:"), "{reason}");
+        }
+    }
 }

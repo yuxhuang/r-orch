@@ -68,8 +68,8 @@ pub(crate) fn run(args: &McpCmd, styles: &Styles) -> ExitCode {
     let (settings, config) = match launch(&cwd, args.project_root.as_deref(), identity, mode) {
         Ok(launch) => launch,
         Err(err) => {
-            let agent_context = std::env::var_os("ORCH_TASK_ID").is_some()
-                || std::env::var_os(AGENT_ENV).is_some();
+            let agent_context =
+                std::env::var_os("ORCH_TASK_ID").is_some() || std::env::var_os(AGENT_ENV).is_some();
             eprintln!("{}", err.render(agent_context));
             return ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(1));
         }
@@ -123,7 +123,9 @@ pub(crate) fn launch(
         .transpose()
         .map_err(|err| ClientError::InvalidArguments(format!("--agent: {err}")))?;
     // An MCP session with an identity renders the agent variant.
-    let config = config.with_frontend(CallerKind::Mcp).with_mode(mode.session());
+    let config = config
+        .with_frontend(CallerKind::Mcp)
+        .with_mode(mode.session());
     let settings = server::Settings {
         project_root: root,
         agent_context: config.agent_context,
@@ -153,11 +155,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn root_of(cwd: &Path, requested: Option<&Path>) -> std::result::Result<PathBuf, ClientError> {
-        launch(cwd, requested, Identity::of(None), Mode::Default)
-            .map(|(settings, config)| {
-                assert_eq!(config.project_root.as_deref(), Some(settings.project_root.as_path()));
-                settings.project_root
-            })
+        launch(cwd, requested, Identity::of(None), Mode::Default).map(|(settings, config)| {
+            assert_eq!(
+                config.project_root.as_deref(),
+                Some(settings.project_root.as_path())
+            );
+            settings.project_root
+        })
     }
 
     #[test]

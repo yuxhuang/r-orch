@@ -132,7 +132,9 @@ async fn inbox(cx: Arc<CallContext>, args: MsgInboxArgs) -> ToolResult {
 }
 async fn list(cx: Arc<CallContext>, args: MsgListArgs) -> ToolResult {
     let messages = cx
-        .request(wire::<rpc::MessageListArgs>(json!({"agent_id": args.agent}))?)
+        .request(wire::<rpc::MessageListArgs>(
+            json!({"agent_id": args.agent}),
+        )?)
         .await?;
     json(&messages, "messages")
 }

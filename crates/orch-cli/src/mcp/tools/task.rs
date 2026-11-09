@@ -346,13 +346,15 @@ async fn assign(cx: Arc<CallContext>, args: TaskAssignArgs) -> ToolResult {
 }
 async fn cancel(cx: Arc<CallContext>, args: TaskCancelArgs) -> ToolResult {
     json(
-        &cx.request(rpc::TaskCancelArgs { id: id(&args.id)? }).await?,
+        &cx.request(rpc::TaskCancelArgs { id: id(&args.id)? })
+            .await?,
         "task",
     )
 }
 async fn approve(cx: Arc<CallContext>, args: TaskApproveArgs) -> ToolResult {
     json(
-        &cx.request(rpc::TaskApproveArgs { id: id(&args.id)? }).await?,
+        &cx.request(rpc::TaskApproveArgs { id: id(&args.id)? })
+            .await?,
         "task",
     )
 }
@@ -407,7 +409,9 @@ pub(crate) fn at_source(path: &std::path::Path, err: ToolError) -> ToolError {
     use orch_client::ClientError;
     use orch_proto::error::ErrorCode;
     match err {
-        ToolError::Client(ClientError::Remote(body)) if body.code == ErrorCode::InvalidArguments => {
+        ToolError::Client(ClientError::Remote(body))
+            if body.code == ErrorCode::InvalidArguments =>
+        {
             ToolError::Text(format!("{}: {}", path.display(), body.message.as_str()))
         }
         ToolError::Text(text) => ToolError::Text(format!("{}: {text}", path.display())),
@@ -540,7 +544,8 @@ mod tests {
                 .unwrap(),
             json!([])
         );
-        let agent = fx.engine()
+        let agent = fx
+            .engine()
             .agent_service
             .create(orch_domain::CreateAgentInput {
                 name: "worker".into(),
@@ -620,12 +625,14 @@ mod tests {
             approve(cx.clone(), args(json!({"id":id}))).await.unwrap()["status"],
             "done"
         );
-        let done = cancel(cx.clone(), args(json!({"id":id}))).await.unwrap_err();
+        let done = cancel(cx.clone(), args(json!({"id":id})))
+            .await
+            .unwrap_err();
         assert!(matches!(done, ToolError::Client(_)), "{done:?}");
     }
     #[tokio::test]
     async fn update_and_patch_use_fixed_project_relative_files_and_shared_validation() {
-        let (fx, cx) = fixture().await;
+        let (_fx, cx) = fixture().await;
         let task = add(
             cx.clone(),
             args(json!({"title":"old","description":"old","labels":"old"})),

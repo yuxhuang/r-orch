@@ -42,7 +42,10 @@ pub(crate) async fn tasks(cx: &CallContext, status: Option<TaskStatus>) -> ToolR
 
 /// `orch task show ID`.
 pub(crate) async fn task(cx: &CallContext, task_id: &str) -> ToolResult {
-    json(&cx.request(args::TaskGetArgs { id: id(task_id)? }).await?, "task")
+    json(
+        &cx.request(args::TaskGetArgs { id: id(task_id)? }).await?,
+        "task",
+    )
 }
 
 /// `orch goal list [--status]`, with the CLI's filter semantics: absent or

@@ -83,9 +83,8 @@ async fn logs(cx: Arc<CallContext>, args: LogsArgs) -> ToolResult {
         .transpose()?;
     let cutoff = since
         .map(|duration| {
-            now.checked_sub(duration).ok_or_else(|| {
-                ToolError::Text("since exceeds the supported time range".to_owned())
-            })
+            now.checked_sub(duration)
+                .ok_or_else(|| ToolError::Text("since exceeds the supported time range".to_owned()))
         })
         .transpose()?;
     if let Some(run_id) = args.run_id {

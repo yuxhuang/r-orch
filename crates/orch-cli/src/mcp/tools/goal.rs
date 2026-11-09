@@ -225,7 +225,8 @@ mod tests {
                 .unwrap(),
             json!([])
         );
-        let task = fx.engine()
+        let task = fx
+            .engine()
             .task_service
             .create(orch_domain::CreateTaskInput {
                 title: "child".into(),
