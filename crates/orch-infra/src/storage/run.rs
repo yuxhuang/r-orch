@@ -232,7 +232,7 @@ async fn read_events_file(path: &Path) -> Result<Vec<RunEvent>> {
 
     let content = if size > MAX_EVENTS_READ_SIZE {
         tracing::warn!(
-            path = %path.display(),
+            error_kind = "oversize_jsonl",
             megabytes = size / 1024 / 1024,
             "run events file too large, reading the tail only"
         );
@@ -256,8 +256,7 @@ async fn read_events_file(path: &Path) -> Result<Vec<RunEvent>> {
         match serde_json::from_str(&capped) {
             Ok(event) => events.push(event),
             Err(_) => {
-                let preview: String = capped.chars().take(200).collect();
-                tracing::warn!(line = %preview, "skipping corrupt jsonl line");
+                tracing::warn!(error_kind = "invalid_json", "skipping corrupt jsonl line");
             }
         }
     }

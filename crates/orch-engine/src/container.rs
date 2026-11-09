@@ -111,7 +111,7 @@ pub struct FullEngine {
     pub templates: Arc<dyn TemplateEngine>,
     pub skills: Arc<dyn SkillLoader>,
     pub lock: Arc<dyn ProjectLock>,
-    pub doctor_service: Arc<DoctorService>,
+    pub doctor_service: Arc<DoctorService<Arc<dyn CommandRunner>>>,
     pub orchestrator: Arc<Orchestrator>,
 }
 
@@ -347,6 +347,7 @@ pub async fn build_full_with(
         seams,
         orch_domain::PeerConfig::default(),
         None,
+        None,
     )
     .await
 }
@@ -355,11 +356,18 @@ pub async fn build_full_with_peer(
     project_root: impl Into<PathBuf>,
     peer: orch_domain::PeerConfig,
 ) -> Result<FullEngine> {
-    build_full_internal(project_root.into(), EngineSeams::default(), peer, None).await
+    build_full_internal(
+        project_root.into(),
+        EngineSeams::default(),
+        peer,
+        None,
+        None,
+    )
+    .await
 }
 
-/// The daemon's build: one engine whose every child process — agents, git,
-/// adapters — goes through `processes`. The daemon passes a manager that
+/// Build with an injected process manager for agents, workspace git and
+/// adapters. The caller passes a manager that
 /// spawns from its start-time environment snapshot; its test harness passes a
 /// scripted one.
 pub async fn build_full_with_processes(
@@ -368,7 +376,26 @@ pub async fn build_full_with_processes(
     peer: orch_domain::PeerConfig,
     processes: Arc<dyn ProcessManager>,
 ) -> Result<FullEngine> {
-    build_full_internal(project_root.into(), seams, peer, Some(processes)).await
+    build_full_internal(project_root.into(), seams, peer, Some(processes), None).await
+}
+
+/// The daemon also supplies its command runner for doctor and automatic
+/// review, so these children use the same startup snapshot as agent children.
+pub async fn build_full_with_children(
+    project_root: impl Into<PathBuf>,
+    seams: EngineSeams,
+    peer: orch_domain::PeerConfig,
+    processes: Arc<dyn ProcessManager>,
+    command_runner: Arc<dyn CommandRunner>,
+) -> Result<FullEngine> {
+    build_full_internal(
+        project_root.into(),
+        seams,
+        peer,
+        Some(processes),
+        Some(command_runner),
+    )
+    .await
 }
 
 async fn build_full_internal(
@@ -376,6 +403,7 @@ async fn build_full_internal(
     seams: EngineSeams,
     peer: orch_domain::PeerConfig,
     processes: Option<Arc<dyn ProcessManager>>,
+    command_runner: Option<Arc<dyn CommandRunner>>,
 ) -> Result<FullEngine> {
     let mut engine = build_light_with(project_root.clone(), seams).await?;
     if peer.name.is_some() {
@@ -403,11 +431,13 @@ async fn build_full_internal(
     let templates: Arc<dyn TemplateEngine> = Arc::new(LiquidTemplateEngine::new());
     let skills: Arc<dyn SkillLoader> = Arc::new(orch_infra::skills::FileSkillLoader::new());
     let lock: Arc<dyn ProjectLock> = Arc::new(FileLock::new(engine.paths.lock_path()));
-    let doctor_service = Arc::new(DoctorService::new(
+    let command_runner: Arc<dyn CommandRunner> =
+        command_runner.unwrap_or_else(|| Arc::new(ProcessCommandRunner));
+    let doctor_service = Arc::new(DoctorService::with_runner(
         Arc::clone(&adapters),
         project_root.clone(),
+        Arc::clone(&command_runner),
     ));
-    let command_runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
 
     let orchestrator = Arc::new(Orchestrator::new(OrchestratorDeps {
         task_store: Arc::clone(&engine.tasks),

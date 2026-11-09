@@ -28,6 +28,27 @@ pub const MAX_LINE_LEN: usize = 16384;
 /// pipe.
 const READ_CHUNK: usize = 16384;
 
+/// Maximum retained bytes per diagnostic stdout/stderr stream.
+pub const DIAGNOSTIC_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Retain a bounded prefix while draining the rest so a full pipe cannot
+/// deadlock a child. Both child streams must be drained concurrently.
+pub async fn read_bounded_output(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(output);
+        }
+        let keep = n.min(limit - output.len());
+        output.extend_from_slice(&chunk[..keep]);
+    }
+}
+
 /// Truncate to [`MAX_LINE_LEN`] **UTF-16 code units**, because the cap counts
 /// code units rather than bytes or chars.
 ///
