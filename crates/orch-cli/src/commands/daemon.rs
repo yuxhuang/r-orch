@@ -110,7 +110,6 @@ pub fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path) -> E
             from_agent: args.from_agent,
             listen: args.peer.listen.clone(),
             peer_name: args.peer.peer_name.clone(),
-            developmental: true,
         });
         match result {
             Ok(prepared) => {

@@ -67,8 +67,6 @@ pub struct StartOptions {
     /// `--peer-name <name>`: this instance's peer name, overriding
     /// `peer.name` in config.yml for this run only.
     pub peer_name: Option<String>,
-    /// No effect since PR 2 (gate removed); the field is deleted at integration.
-    pub developmental: bool,
 }
 
 /// How a daemon run ended. `code` is the process exit status for
@@ -1076,7 +1074,6 @@ mod tests {
                 from_agent: true,
                 listen: Some("127.0.0.1:0".into()),
                 peer_name: Some("worker".into()),
-                developmental: true,
                 ..Default::default()
             },
             env.clone(),
@@ -1099,7 +1096,6 @@ mod tests {
         let project = project();
         let options = || StartOptions {
             project_root: project.path().to_path_buf(),
-            developmental: true,
             ..Default::default()
         };
         let agent = vars(&[("ORCH_AGENT_ID", "agt_1")]);
