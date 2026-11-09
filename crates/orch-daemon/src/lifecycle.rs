@@ -370,12 +370,17 @@ impl Running {
         pid_lock: Arc<PidLock>,
         maintenance_timer: bool,
     ) -> Result<Running, DaemonError> {
+        let child_env = orch_infra::process::EnvSnapshot {
+            base: spec.snapshot.base.clone(),
+            forced: crate::env::forced(&root, spec.socket.as_deref()),
+        };
+        let diagnostics = Arc::new(orch_infra::models::SnapshotDiscoveryRuntime::new(
+            child_env.clone(),
+        ));
+        let command_runner = Arc::new(crate::ops::SnapshotCommandRunner(Arc::clone(&diagnostics)));
         let processes = spec.processes.unwrap_or_else(|| {
             Arc::new(orch_infra::process::SnapshotEnvProcessManager::new(
-                orch_infra::process::EnvSnapshot {
-                    base: spec.snapshot.base.clone(),
-                    forced: crate::env::forced(&root, spec.socket.as_deref()),
-                },
+                child_env,
             ))
         });
         let peer = orch_domain::PeerConfig {
@@ -383,11 +388,12 @@ impl Running {
             listen: spec.listen,
         };
         let engine = Arc::new(
-            orch_engine::container::build_full_with_processes(
+            orch_engine::container::build_full_with_children(
                 root.clone(),
                 spec.seams,
                 peer,
                 processes,
+                command_runner,
             )
             .await?,
         );
@@ -395,7 +401,8 @@ impl Running {
         // Startup recovery (claims, running entries, orphan runs) and the
         // index read/rebuild, before anything is served. Fatal on error.
         engine.daemon_initialize().await?;
-        let handler = ServiceHandler::new(Arc::clone(&engine), coordinator);
+        let handler =
+            ServiceHandler::with_diagnostics(Arc::clone(&engine), coordinator, diagnostics);
         // Explicit expiry after reconciliation; its failure is reported and
         // never blocks READY (B0d).
         if let Err(error) = handler.expire_context().await {

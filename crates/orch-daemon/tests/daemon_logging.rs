@@ -141,6 +141,72 @@ async fn no_request_text_reaches_the_logs_at_any_level() {
     drop((raw, owner, dup));
     daemon.shutdown().await.unwrap();
 
+    // Diagnostic errors and corrupt persisted payloads are reachable through
+    // models.catalog and run log/history operations too.
+    struct FailedDiagnostic;
+    #[async_trait::async_trait]
+    impl orch_infra::models::DiscoveryRuntime for FailedDiagnostic {
+        async fn run_command(
+            &self,
+            _: &str,
+            _: &[&str],
+        ) -> orch_core::Result<orch_infra::models::CommandOutput> {
+            Err(orch_core::Error::other(CANARY))
+        }
+        async fn read_text_file(&self, _: &std::path::Path) -> orch_core::Result<String> {
+            Err(orch_core::Error::other(CANARY))
+        }
+        fn codex_home(&self) -> std::path::PathBuf {
+            Default::default()
+        }
+    }
+    orch_infra::models::ModelDiscovery::with_runtime(Arc::new(FailedDiagnostic))
+        .discover(orch_domain::AdapterKind::Opencode)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let corrupt = temp.path().join("corrupt.jsonl");
+    tokio::fs::write(&corrupt, CANARY).await.unwrap();
+    let _: Vec<serde_json::Value> = orch_infra::storage::fs_utils::read_jsonl(&corrupt)
+        .await
+        .unwrap();
+    let _: Vec<serde_json::Value> = orch_infra::storage::fs_utils::read_jsonl_tail(&corrupt, 10)
+        .await
+        .unwrap();
+    use orch_core::storage::RunStore;
+    let paths = orch_infra::storage::paths::Paths::new(temp.path());
+    tokio::fs::create_dir_all(paths.runs_dir()).await.unwrap();
+    tokio::fs::write(paths.runs_dir().join("corrupt.jsonl"), CANARY)
+        .await
+        .unwrap();
+    let store = orch_infra::storage::run::FileRunStore::new(paths);
+    store.read_events("corrupt").await.unwrap();
+    let mut stream = store.stream_events("corrupt", Default::default());
+    assert!(
+        std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
+            .await
+            .is_none()
+    );
+
+    // Oversize warnings must not publish a caller-controlled file name either.
+    let paths = orch_infra::storage::paths::Paths::new(temp.path());
+    let canary_path = paths.runs_dir().join(format!("{CANARY}.jsonl"));
+    tokio::fs::File::create(&canary_path)
+        .await
+        .unwrap()
+        .set_len(51 * 1024 * 1024)
+        .await
+        .unwrap();
+    let _: Vec<serde_json::Value> = orch_infra::storage::fs_utils::read_jsonl(&canary_path)
+        .await
+        .unwrap();
+    let store = orch_infra::storage::run::FileRunStore::new(paths);
+    let mut stream = store.stream_events(CANARY, Default::default());
+    assert!(
+        std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))
+            .await
+            .is_none()
+    );
+
     let lines = capture.0.lock().unwrap().clone();
     assert!(
         lines.len() >= 10,

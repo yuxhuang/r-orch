@@ -17,6 +17,50 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// Doctor and review commands share the daemon's startup snapshot. Capture
+/// at most the review budget plus one byte to detect overflow while preserving
+/// the existing review failure semantics. No child output is logged.
+pub(crate) struct SnapshotCommandRunner(
+    pub(crate) std::sync::Arc<orch_infra::models::SnapshotDiscoveryRuntime>,
+);
+
+#[async_trait::async_trait]
+impl orch_engine::review_runner::CommandRunner for SnapshotCommandRunner {
+    async fn run(
+        &self,
+        command: &str,
+        args: &[&str],
+        cwd: &Path,
+        timeout: std::time::Duration,
+    ) -> orch_engine::review_runner::CommandOutcome {
+        use orch_engine::review_runner::{CommandOutcome, MAX_OUTPUT_BYTES};
+        match self
+            .0
+            .output(command, args, cwd, timeout, MAX_OUTPUT_BYTES + 1)
+            .await
+        {
+            Ok(output) => CommandOutcome {
+                failed: !output.status.success()
+                    || output.stdout.len() > MAX_OUTPUT_BYTES
+                    || output.stderr.len() > MAX_OUTPUT_BYTES,
+                stdout: String::from_utf8_lossy(
+                    &output.stdout[..output.stdout.len().min(MAX_OUTPUT_BYTES)],
+                )
+                .into_owned(),
+                stderr: String::from_utf8_lossy(
+                    &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)],
+                )
+                .into_owned(),
+            },
+            Err(error) => CommandOutcome {
+                failed: true,
+                stdout: String::new(),
+                stderr: error.to_string(),
+            },
+        }
+    }
+}
+
 impl ServiceHandler {
     pub(super) async fn run_history(
         &self,
@@ -254,7 +298,7 @@ impl ServiceHandler {
             .adapters
             .map(|values| values.into_inner())
             .unwrap_or_else(|| orch_domain::SUPPORTED_ADAPTERS.to_vec());
-        let catalog = orch_infra::models::ModelDiscovery::new()
+        let catalog = orch_infra::models::ModelDiscovery::with_runtime(self.diagnostics.clone())
             .load_catalog(&adapters, |_, _| {})
             .await;
         Ok(catalog
@@ -1051,6 +1095,41 @@ mod tests {
         assert!(entries[0].error.is_some());
         assert!(entries[1].error.is_none());
     }
+    #[tokio::test]
+    async fn snapshot_command_runner_preserves_review_output_and_overflow_failure() {
+        use orch_engine::review_runner::{CommandRunner, MAX_OUTPUT_BYTES};
+        let runner = SnapshotCommandRunner(std::sync::Arc::new(
+            orch_infra::models::SnapshotDiscoveryRuntime::new(orch_infra::process::EnvSnapshot {
+                base: vec![("SNAPSHOT_VALUE".into(), "base".into())],
+                forced: vec![("SNAPSHOT_VALUE".into(), "trusted".into())],
+            }),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let timeout = std::time::Duration::from_secs(10);
+        let output = runner
+            .run(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "printf '%s' \"$SNAPSHOT_VALUE\"; printf caller-detail >&2",
+                ],
+                temp.path(),
+                timeout,
+            )
+            .await;
+        assert!(!output.failed);
+        assert_eq!(output.stdout, "trusted");
+        assert_eq!(output.stderr, "caller-detail");
+        let output = runner.run("/bin/sh", &["-c", "/usr/bin/yes o | /usr/bin/head -c 12582912; printf REVIEW_STDERR_CANARY >&2; /usr/bin/yes e | /usr/bin/head -c 12582912 >&2"], temp.path(), timeout).await;
+        assert!(
+            output.failed,
+            "review output overflow must remain a failure"
+        );
+        assert_eq!(output.stdout.len(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.stderr.len(), MAX_OUTPUT_BYTES);
+        assert!(output.stderr.contains("REVIEW_STDERR_CANARY"));
+    }
+
     async fn fixture() -> (TestRoot, ServiceHandler, OpContext) {
         let root = TestRoot::new();
         std::fs::create_dir(root.0.join(".orchestry")).unwrap();

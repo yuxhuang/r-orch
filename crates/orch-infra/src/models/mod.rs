@@ -5,5 +5,5 @@ pub mod parsers;
 
 pub use discovery::{
     CommandOutput, DiscoveryRuntime, ModelCatalog, ModelDiscovery, ModelOption,
-    SystemDiscoveryRuntime, fallback_model_options, fallback_model_table,
+    SnapshotDiscoveryRuntime, SystemDiscoveryRuntime, fallback_model_options, fallback_model_table,
 };

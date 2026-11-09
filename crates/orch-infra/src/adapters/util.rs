@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
+use crate::process::line_reader::{DIAGNOSTIC_OUTPUT_BYTES, read_bounded_output};
 use futures::stream::{BoxStream, StreamExt};
 use orch_core::adapter::{AdapterError, AgentEvent, AgentEventKind};
 use orch_core::clock::{Clock, iso_from_epoch_ms};
 use orch_core::process::{ProcessManager, SpawnOptions};
 use orch_domain::{AdapterErrorKind, TokenUsage, TokenUsageOpts, create_token_usage};
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::process::line_reader::read_lines;
@@ -215,21 +215,27 @@ pub async fn probe_version(
 
     // Both pipes are drained together: reading them in sequence would deadlock
     // on a chatty `--version`.
-    let mut stdout = String::new();
-    let mut stderr = String::new();
     let (out, err) = (child.stdout.take(), child.stderr.take());
-    tokio::join!(
+    let (stdout, stderr) = tokio::join!(
         async {
-            if let Some(mut out) = out {
-                let _ = out.read_to_string(&mut stdout).await;
+            match out {
+                Some(out) => read_bounded_output(out, DIAGNOSTIC_OUTPUT_BYTES)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
             }
         },
         async {
-            if let Some(mut err) = err {
-                let _ = err.read_to_string(&mut stderr).await;
+            match err {
+                Some(err) => read_bounded_output(err, DIAGNOSTIC_OUTPUT_BYTES)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
             }
         }
     );
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
 
     let outcome = child.exit.wait().await;
     if outcome.success() {
@@ -549,5 +555,32 @@ mod tests {
         let iso = SystemClock.now_iso();
         assert_eq!(iso.len(), 24, "{iso}");
         assert!(iso.ends_with('Z'));
+    }
+    #[tokio::test]
+    async fn version_probe_capture_bounds_both_streams_and_keeps_error_detail() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("probe");
+        let pm = crate::process::SystemProcessManager::new();
+        for code in [0, 2] {
+            std::fs::write(&path, format!(
+                "#!/bin/sh\nprintf VERSION_CANARY\n/usr/bin/yes v | /usr/bin/head -c 12582912\nprintf STDERR_CANARY >&2\n/usr/bin/yes e | /usr/bin/head -c 12582912 >&2\nexit {code}\n"
+            )).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = probe_version(&pm, path.to_str().unwrap()).await;
+            if code == 0 {
+                let version = result.unwrap();
+                assert!(version.starts_with("VERSION_CANARY"));
+                assert!(
+                    version.len() <= 64 * 1024,
+                    "retained {} bytes",
+                    version.len()
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("STDERR_CANARY"));
+                assert!(error.len() < 66 * 1024, "retained {} bytes", error.len());
+            }
+        }
     }
 }

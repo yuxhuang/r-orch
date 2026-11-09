@@ -12,6 +12,7 @@ mod control;
 mod core;
 mod peripheral;
 mod transport;
+pub(crate) use peripheral::SnapshotCommandRunner;
 
 use crate::coordinator::{Committed, Lane, ProjectCoordinator};
 use orch_engine::container::FullEngine;
@@ -88,6 +89,7 @@ type Observations = HashMap<(u64, RequestId), Arc<AtomicBool>>;
 #[derive(Clone)]
 pub struct ServiceHandler {
     pub(crate) engine: Arc<FullEngine>,
+    diagnostics: Arc<orch_infra::models::SnapshotDiscoveryRuntime>,
     pub(crate) coordinator: Arc<ProjectCoordinator>,
     control: Arc<control::ControlState>,
     transfers: Arc<Mutex<transport::Transfers>>,
@@ -97,9 +99,25 @@ pub struct ServiceHandler {
 
 impl ServiceHandler {
     pub fn new(engine: Arc<FullEngine>, coordinator: Arc<ProjectCoordinator>) -> Self {
+        let snapshot = crate::env::capture(std::env::vars_os());
+        let diagnostics = Arc::new(orch_infra::models::SnapshotDiscoveryRuntime::new(
+            orch_infra::process::EnvSnapshot {
+                base: snapshot.base,
+                forced: crate::env::forced(engine.paths.project_root(), None),
+            },
+        ));
+        Self::with_diagnostics(engine, coordinator, diagnostics)
+    }
+
+    pub(crate) fn with_diagnostics(
+        engine: Arc<FullEngine>,
+        coordinator: Arc<ProjectCoordinator>,
+        diagnostics: Arc<orch_infra::models::SnapshotDiscoveryRuntime>,
+    ) -> Self {
         engine.orchestrator.enable_daemon_mode();
         Self {
             engine: Arc::clone(&engine),
+            diagnostics,
             coordinator,
             control: Arc::new(control::ControlState::new(&engine)),
             transfers: Arc::new(Mutex::new(transport::Transfers::default())),

@@ -1153,7 +1153,7 @@ pub async fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
 
     if size > MAX_JSONL_READ_SIZE {
         tracing::warn!(
-            path = %path.display(),
+            error_kind = "oversize_jsonl",
             megabytes = size / 1024 / 1024,
             "jsonl file too large, reading tail only"
         );
@@ -1246,8 +1246,7 @@ fn parse_jsonl_lines<'l, T: DeserializeOwned>(lines: impl Iterator<Item = &'l st
         match serde_json::from_str(line) {
             Ok(record) => out.push(record),
             Err(_) => {
-                let preview: String = line.chars().take(200).collect();
-                tracing::warn!(line = %preview, "skipping corrupt jsonl line");
+                tracing::warn!(error_kind = "invalid_json", "skipping corrupt jsonl line");
             }
         }
     }
