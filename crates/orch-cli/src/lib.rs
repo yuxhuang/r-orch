@@ -739,15 +739,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         Some(Command::Tui(_args)) => {
             let ctx =
                 CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-            // The dashboard is another socket client.
-            tui::run_with_peer(
-                ctx.project_root,
-                version(),
-                false,
-                orch_domain::PeerConfig::default(),
-                false,
-            )
-            .await
+            // The dashboard is another socket client, as the root `--agent`.
+            tui::run_as_agent(ctx.project_root, version(), cli.agent.as_deref()).await
         }
 
         // A bare invocation is another dashboard client. Initialization is
@@ -755,14 +748,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         None if shape.is_bare => {
             let ctx =
                 CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-            tui::run_with_peer(
-                ctx.project_root,
-                version(),
-                false,
-                orch_domain::PeerConfig::default(),
-                false,
-            )
-            .await
+            tui::run_as_agent(ctx.project_root, version(), cli.agent.as_deref()).await
         }
 
         // Flags but no subcommand (`orch --json`): `tui` is appended
@@ -851,7 +837,7 @@ async fn run_web(
             return Ok(ExitCode::from(2));
         }
     };
-    web::run(web_args, cwd.to_path_buf()).await
+    web::run_as_agent(web_args, cwd.to_path_buf(), cli.agent.as_deref()).await
 }
 
 /// `orch serve` (without `--once`) and `orch run --watch` are explicit
