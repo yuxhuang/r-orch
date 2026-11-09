@@ -1981,8 +1981,24 @@ fn remote_list_and_status_read_the_registry_without_connecting_to_a_registered_p
         .set_nonblocking(true)
         .expect("non-blocking observer");
     let address = observer.local_addr().expect("observer address").to_string();
-    let mut fx = Fx::new();
+    // The daemon's own peer runtime links to every registered remote, dispatch
+    // on or off, within a registry tick of `remote add`; that dial is not the
+    // tools'. The link hook parks the link before its first dial, so the only
+    // dial left to observe is one the tools make.
+    let mut dir = initialized_project_unowned("p");
+    let block = dir.path().join("peer-block");
+    std::fs::write(&block, b"").expect("write the peer block file");
+    dir.start_daemon_with_env(&[("ORCH_TEST_PEER_BLOCK_FILE", &block)]);
+    let mut fx = Fx::on(dir, &[], &[]);
     fx.cli_plain(&["remote", "add", "peer", &address]);
+    // The link has picked the registration up and is parked, not yet to come.
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || {
+            fx.ok("remote_status", json!({}))["remotes"][0]["last_error"]
+                == "Peer link blocked by test hook"
+        }),
+        "the daemon's link to the registered peer never parked on the test hook"
+    );
     assert_eq!(fx.ok("remote_list", json!({}))[0]["alias"], "peer");
     assert_eq!(
         fx.ok("remote_status", json!({}))["remotes"][0]["alias"],
