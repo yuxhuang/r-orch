@@ -139,6 +139,7 @@ impl Gate {
 struct GatedAdapter {
     inner: PiAdapter,
     gate: Option<Arc<Gate>>,
+    fail: bool,
 }
 
 #[async_trait]
@@ -157,6 +158,12 @@ impl Adapter for GatedAdapter {
     ) -> std::result::Result<EffortPreparation, orch_core::adapter::AdapterError> {
         if let Some(gate) = &self.gate {
             gate.pass().await;
+        }
+        if self.fail {
+            return Err(orch_core::adapter::AdapterError::new(
+                "fake preparation failed",
+                None,
+            ));
         }
         self.inner.prepare_effort(params).await
     }
@@ -223,6 +230,7 @@ enum GateAt {
     /// Effort preparation: the task is `in_progress`, the run exists, the child
     /// is not yet spawned.
     BeforeSpawn,
+    BeforeSpawnError,
 }
 
 struct Harness {
@@ -294,8 +302,9 @@ impl Harness {
         let clock: Arc<dyn Clock> = Arc::new(FixedClock::new());
         let ids = Arc::new(SeqIdGenerator::new());
 
+        let fail = matches!(gate, Some((GateAt::BeforeSpawnError, _)));
         let (adapter_gate, workspace_gate) = match gate {
-            Some((GateAt::BeforeSpawn, gate)) => (Some(gate), None),
+            Some((GateAt::BeforeSpawn | GateAt::BeforeSpawnError, gate)) => (Some(gate), None),
             Some((GateAt::WorkspacePrepare, gate)) => (None, Some(gate)),
             None => (None, None),
         };
@@ -303,6 +312,7 @@ impl Harness {
         registry.register(Arc::new(GatedAdapter {
             inner: PiAdapter::new(Arc::clone(&processes)),
             gate: adapter_gate,
+            fail,
         }));
 
         let log_for_events = Arc::clone(&log);
@@ -897,4 +907,62 @@ mod context_expiry {
             "renewed"
         );
     }
+}
+
+// Permanent continuation fence, independently of the daemon's request drain.
+// Deliberately retain a direct engine future past daemon_stop, then simulate a
+// successor record. Neither success nor failure may publish old cached state.
+async fn stopped_preparation_cannot_commit(at: GateAt) {
+    let gate = Gate::armed();
+    let harness = Harness::new(vec![autonomous_task("tsk_a")], Some((at, gate.clone())));
+    harness.orchestrator.enable_daemon_mode();
+    let launch = harness.orchestrator.daemon_launch_task("tsk_a");
+    let stop = async {
+        gate.wait_until_entered().await;
+        harness.orchestrator.daemon_stop().await.unwrap();
+        for mut run in harness.runs.list_all().await.unwrap() {
+            run.error = Some("successor-owned sentinel".into());
+            harness.runs.save(&run).await.unwrap();
+        }
+        let mut state = harness.state.read().await.unwrap();
+        state.pid = Some(424242);
+        harness.state.write(&state).await.unwrap();
+        let before = serde_json::to_string(&(
+            harness.runs.list_all().await.unwrap(),
+            harness.tasks.list(&Default::default()).await.unwrap(),
+            harness.agents.list().await.unwrap(),
+            harness.state.read().await.unwrap(),
+        ))
+        .unwrap();
+        gate.open();
+        before
+    };
+    let (_, before) = tokio::join!(launch, stop);
+    let after = serde_json::to_string(&(
+        harness.runs.list_all().await.unwrap(),
+        harness.tasks.list(&Default::default()).await.unwrap(),
+        harness.agents.list().await.unwrap(),
+        harness.state.read().await.unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "stopped continuation changed successor records"
+    );
+    assert_eq!(harness.spawn_count(), 0);
+}
+
+#[tokio::test]
+async fn stopped_successful_preparation_cannot_commit() {
+    stopped_preparation_cannot_commit(GateAt::BeforeSpawn).await;
+}
+
+#[tokio::test]
+async fn stopped_failed_preparation_cannot_commit() {
+    stopped_preparation_cannot_commit(GateAt::BeforeSpawnError).await;
+}
+
+#[tokio::test]
+async fn stopped_workspace_preparation_cannot_commit() {
+    stopped_preparation_cannot_commit(GateAt::WorkspacePrepare).await;
 }

@@ -10,6 +10,7 @@
 mod authored;
 mod control;
 mod core;
+mod lifetime;
 mod peripheral;
 mod transport;
 pub(crate) use peripheral::SnapshotCommandRunner;
@@ -95,6 +96,7 @@ pub struct ServiceHandler {
     transfers: Arc<Mutex<transport::Transfers>>,
     pub(crate) subscriptions: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     observations: Arc<Mutex<Observations>>,
+    requests: Arc<lifetime::Requests>,
 }
 
 impl ServiceHandler {
@@ -123,11 +125,22 @@ impl ServiceHandler {
             transfers: Arc::new(Mutex::new(transport::Transfers::default())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             observations: Arc::new(Mutex::new(HashMap::new())),
+            requests: Arc::default(),
         }
     }
 
     pub fn coordinator(&self) -> &Arc<ProjectCoordinator> {
         &self.coordinator
+    }
+
+    /// Permanently reject new requests before releasing project ownership.
+    pub(crate) fn seal_requests(&self) {
+        self.requests.seal();
+    }
+
+    /// Includes detached operation tasks, not just their socket observers.
+    pub(crate) async fn drain_requests(&self) {
+        self.requests.wait_idle().await;
     }
 
     /// Session teardown discards transfers/observers; accepted state work is
@@ -258,9 +271,14 @@ macro_rules! implement_handler {
                 // Register before returning the future: session teardown may run
                 // before either the socket observer or the operation is polled.
                 let observation = ObservationGuard::new(self, &context);
+                let lease = self.requests.enter();
                 async move {
+                    let lease = lease.ok_or_else(|| ErrorBody::new(
+                        orch_proto::error::ErrorCode::ShuttingDown, "daemon is stopping",
+                        orch_proto::error::Execution::NotExecuted))?;
                     transport::authorize(&context, &request)?;
                     tokio::spawn(async move {
+                        let _lease = lease;
                         let _observation = observation;
                         handler.execute_inner(context, request).await
                     }).await

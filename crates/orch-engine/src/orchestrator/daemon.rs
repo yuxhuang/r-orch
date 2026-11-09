@@ -489,6 +489,9 @@ impl Orchestrator {
 
             let launched = boundary
                 .run(true, async {
+                    if self.is_shutting_down() {
+                        return Ok(false);
+                    }
                     let mut slot = self.inner.state.lock().await;
                     self.load_state(&mut slot).await?;
                     let state = slot.as_mut().expect("state loaded");
@@ -801,6 +804,9 @@ impl Orchestrator {
             .events
             .operation_boundary()
             .run(true, async {
+                if self.is_shutting_down() {
+                    return Ok(());
+                }
                 if !self
                     .inner
                     .preparing_agents
@@ -846,6 +852,10 @@ impl Orchestrator {
             .events
             .operation_boundary()
             .run(true, async {
+                if self.is_shutting_down() {
+                    return Ok(());
+                }
+
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");

@@ -283,8 +283,8 @@ impl Drop for Lifecycle {
     }
 }
 
-/// A running in-process daemon. Drop without [`DaemonHarness::shutdown`]
-/// aborts it; tests that check cleanup call `shutdown`.
+/// A running in-process daemon. Drop schedules a drain that retains project
+/// ownership; tests that need to await cleanup call [`DaemonHarness::shutdown`].
 pub struct DaemonHarness {
     project_root: PathBuf,
     socket: Option<PathBuf>,
@@ -434,8 +434,8 @@ impl DaemonHarness {
     }
 }
 
-/// Dropping without [`DaemonHarness::shutdown`] aborts the daemon via
-/// [`Lifecycle`]'s `Drop`; a stop already tearing down is cancelled with it.
+/// Dropping stops admission and drains in the background via [`Lifecycle`].
+/// Cancelling an in-progress shutdown also retains ownership until work ends.
 impl Drop for DaemonHarness {
     fn drop(&mut self) {
         drop(self.lifecycle.take());
@@ -529,8 +529,17 @@ mod tests {
         // Keep the temp project alive past the drop.
         let held = first.project.take();
         drop(first);
-        assert!(!root.join(".orchestry/orchestry.lock").exists());
-        let second = DaemonHarness::builder().start_in(&root).await.unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match DaemonHarness::builder().start_in(&root).await {
+                    Ok(second) => break second,
+                    Err(DaemonError::AlreadyRunning(_)) => tokio::task::yield_now().await,
+                    Err(error) => panic!("successor start failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the dropped owner releases its guard after draining");
         second.shutdown().await.unwrap();
         drop(held);
     }
