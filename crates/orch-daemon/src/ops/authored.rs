@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 impl ServiceHandler {
     pub(super) async fn task_definition_get(
@@ -524,59 +524,8 @@ impl ServiceHandler {
         ctx: &OpContext,
         args: AttachmentStageImageArgs,
     ) -> OpResult<results::StagedAttachment> {
-        let bytes = self
-            .take_transfer_for(ctx, &args.input_transfer, TransferPurpose::ClipboardImage)
-            .await?;
-        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            return Err(invalid("image: expected PNG bytes"));
-        }
-        let run_directory = self.engine.paths.root().join("run");
-        ensure_private_directory(&run_directory).await?;
-        let directory = run_directory.join("staged");
-        ensure_private_directory(&directory).await?;
-        let path = directory.join(format!("{}.png", self.engine.ids.generate("img")));
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .await
-            .map_err(|err| service_error(Error::io("stage image", &path, err)))?;
-        file.write_all(&bytes)
-            .await
-            .map_err(|err| service_error(Error::io("write staged image", &path, err)))?;
-        file.flush()
-            .await
-            .map_err(|err| service_error(Error::io("flush staged image", &path, err)))?;
-        let path = orch_proto::path::WirePath::new(path)
-            .map_err(|_| invalid("staged image path exceeds protocol limit"))?;
-        Ok(results::StagedAttachment {
-            path,
-            bytes: bytes.len() as u64,
-        })
+        self.stage_image_transfer(ctx, &args.input_transfer).await
     }
-}
-
-async fn ensure_private_directory(directory: &Path) -> OpResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(error) = tokio::fs::create_dir(directory).await
-        && error.kind() != std::io::ErrorKind::AlreadyExists
-    {
-        return Err(service_error(Error::io(
-            "create staging directory",
-            directory,
-            error,
-        )));
-    }
-    let metadata = tokio::fs::symlink_metadata(directory)
-        .await
-        .map_err(|error| service_error(Error::io("inspect staging directory", directory, error)))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(invalid("staging directory must be a real directory"));
-    }
-    tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|error| service_error(Error::io("set staging permissions", directory, error)))
 }
 
 fn field_patch<T>(patch: FieldPatch<T>) -> Option<T> {

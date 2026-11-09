@@ -233,6 +233,9 @@ macro_rules! implement_handler {
 
             async fn execute_inner(&self, ctx: OpContext, request: Request) -> OpResult<Committed<Box<RawValue>>> {
                 let _observation = ObservationGuard::new(self, &ctx);
+                if self.ownership_lost() && matches!(request,Request::DispatchTick(_) | Request::DispatchRunTask(_) | Request::DispatchRunAll(_) | Request::DispatchUntilTerminal(_)) {
+                    return Err(ErrorBody::new(orch_proto::error::ErrorCode::Conflict,"daemon ownership was lost",orch_proto::error::Execution::NotExecuted));
+                }
                 let name = request.name();
                 if external_operation(name) {
                     let bytes = serde_json::to_vec(&request).map_err(|_| invalid("invalid request"))?.len();

@@ -265,7 +265,17 @@ impl TaskService {
             .and_then(WeakOrchestrator::upgrade);
         if let Some(orchestrator) = orchestrator {
             match orchestrator.cancel_service_task(id).await {
-                Ok(()) => return self.get(id).await,
+                Ok(()) => {
+                    return if orchestrator.is_daemon_mode() {
+                        self.events
+                            .operation_boundary()
+                            .run(false, self.get(id))
+                            .await
+                            .value
+                    } else {
+                        self.get(id).await
+                    };
+                }
                 // An observer has no process ownership. Preserve its existing
                 // record cancellation until clients move into the daemon.
                 Err(Error::Domain(DomainError::LockConflict(_))) => {}

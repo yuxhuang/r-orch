@@ -96,7 +96,9 @@ impl ServiceHandler {
     }
     pub(super) async fn task_create(&self, _: &OpContext, a: TaskCreateArgs) -> OpResult<Task> {
         let attachments = attachment_paths(a.attachments)?;
-        self.engine
+        let sources = attachments.clone().unwrap_or_default();
+        let task = self
+            .engine
             .task_service
             .create(CreateTaskInput {
                 title: a.title.into_inner(),
@@ -124,7 +126,9 @@ impl ServiceHandler {
                     .transpose()?,
             })
             .await
-            .map_err(service_error)
+            .map_err(service_error)?;
+        self.finish_staged_paths(&sources);
+        Ok(task)
     }
     pub(super) async fn task_list(&self, _: &OpContext, a: TaskListArgs) -> OpResult<Vec<Task>> {
         self.engine
@@ -201,7 +205,10 @@ impl ServiceHandler {
         _: &OpContext,
         a: TaskUpdateFieldsArgs,
     ) -> OpResult<Task> {
-        self.engine
+        let attachments = attachment_paths(a.attachments)?;
+        let sources = attachments.clone().unwrap_or_default();
+        let task = self
+            .engine
             .task_service
             .update(
                 &a.id,
@@ -210,11 +217,13 @@ impl ServiceHandler {
                     description: a.description.map(|s| s.into_inner()),
                     priority: a.priority,
                     labels: a.labels.map(strings),
-                    attachments: attachment_paths(a.attachments)?,
+                    attachments,
                 },
             )
             .await
-            .map_err(service_error)
+            .map_err(service_error)?;
+        self.finish_staged_paths(&sources);
+        Ok(task)
     }
     pub(super) async fn agent_list(&self, _: &OpContext, _: AgentListArgs) -> OpResult<Vec<Agent>> {
         let agents = self

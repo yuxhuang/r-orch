@@ -15,7 +15,9 @@ use orch_domain::{
     Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
 };
 
-use super::dispatch::{PREPARATION_OWNS_EFFORT_DIAGNOSTICS, PreparedPrompt, check_preparation};
+use super::dispatch::{
+    MailboxMode, PREPARATION_OWNS_EFFORT_DIAGNOSTICS, PreparedPrompt, check_preparation,
+};
 use super::{CANCEL_KILL_GRACE, Orchestrator};
 
 impl Orchestrator {
@@ -339,18 +341,39 @@ impl Orchestrator {
             };
 
             let prompt = boundary
-                .run(
-                    true,
-                    self.prepare_prompt(&task, &agent, &agents, &workspace.path),
-                )
+                .run(false, async {
+                    if cancelled.load(Ordering::SeqCst)
+                        || self.config() != launch_config
+                        || cancel.is_cancelled()
+                        || !self
+                            .daemon_preparation_valid(&task, &agent, generation)
+                            .await?
+                    {
+                        return Ok(None);
+                    }
+                    self.prepare_prompt(
+                        &task,
+                        &agent,
+                        &agents,
+                        &workspace.path,
+                        MailboxMode::Snapshot,
+                    )
+                    .await
+                    .map(Some)
+                })
                 .await
                 .value;
             let PreparedPrompt {
                 prompt,
                 system_prompt,
                 captured_mode,
+                message_ids,
             } = match prompt {
-                Ok(prompt) => prompt,
+                Ok(Some(prompt)) => prompt,
+                Ok(None) => {
+                    self.daemon_release_preparation(task_id, generation).await?;
+                    return Ok(());
+                }
                 Err(error) => {
                     self.daemon_release_preparation(task_id, generation).await?;
                     return Err(error);
@@ -657,6 +680,11 @@ impl Orchestrator {
                     self.deps().agent_store.save(&current).await?;
                     self.deps().run_service.start(&run.id, child_pid).await?;
                     self.save_state(state).await?;
+                    if let Some(messages) = &self.deps().message_service {
+                        messages
+                            .mark_snapshot_delivered(&agent.id, task_id, &message_ids)
+                            .await?;
+                    }
                     Ok::<_, Error>(true)
                 })
                 .await
@@ -754,7 +782,14 @@ impl Orchestrator {
             let Some(current_agent) = self.deps().agent_store.get(&agent.id).await? else {
                 return Ok(false);
             };
-            if current_agent.config != agent.config || current_agent.status != AgentStatus::Idle {
+            if current_agent.name != agent.name
+                || current_agent.adapter != agent.adapter
+                || current_agent.role != agent.role
+                || current_agent.config != agent.config
+                || current_agent.autonomous != agent.autonomous
+                || current_agent.capabilities != agent.capabilities
+                || current_agent.status != AgentStatus::Idle
+            {
                 return Ok(false);
             }
         }

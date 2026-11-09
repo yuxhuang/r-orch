@@ -563,3 +563,234 @@ async fn disconnect_ends_batch_scheduling_and_preserves_queued_work_and_dispatch
     );
     assert!(engine.state.read().await.unwrap().running.is_empty());
 }
+
+async fn short_shell_agent(
+    h: &ServiceHandler,
+    ctx: &OpContext,
+    temp: &tempfile::TempDir,
+    approval: &str,
+) -> String {
+    Handler::agent_create(h,ctx,serde_json::from_value(serde_json::json!({
+        "name":"short fixture","adapter":"shell","command":"exec /usr/bin/true","approval_policy":approval,"workspace_mode":"shared",
+        "env":[{"name":"HOME","value":temp.path().to_str().unwrap()},{"name":"PATH","value":"/usr/bin:/bin"}]
+    })).unwrap()).await.unwrap().agent.id
+}
+
+#[tokio::test]
+async fn finite_run_task_finishes_at_run_completion_before_human_review() {
+    let (temp, h, ctx, _clock, _engine) = fixture().await;
+    let agent = short_shell_agent(&h, &ctx, &temp, "manual").await;
+    let task = Handler::task_create(
+        &h,
+        &ctx,
+        serde_json::from_value(serde_json::json!({"title":"manual review","assignee":agent}))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        Handler::dispatch_run_task(
+            &h,
+            &ctx,
+            DispatchRunTaskArgs {
+                task_id: task.id.try_into().unwrap(),
+            },
+        ),
+    )
+    .await;
+    ctx.cancel_observation();
+    let outcome = result
+        .expect("run RPC must finish before human task approval")
+        .unwrap();
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.tasks[0].status, orch_domain::TaskStatus::Review);
+}
+
+#[tokio::test]
+async fn finite_run_all_revisits_captured_work_when_capacity_frees() {
+    let (temp, h, ctx, _clock, _engine) = fixture().await;
+    let agent = short_shell_agent(&h, &ctx, &temp, "auto").await;
+    Handler::agent_update_fields(
+        &h,
+        &ctx,
+        serde_json::from_value(serde_json::json!({"id":agent,"command":"exec /bin/sleep 0.2"}))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    Handler::agent_update_fields(
+        &h,
+        &ctx,
+        serde_json::from_value(serde_json::json!({"id":agent,"command":"exec /bin/sleep 0.2"}))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    for title in ["first", "second"] {
+        Handler::task_create(
+            &h,
+            &ctx,
+            serde_json::from_value(serde_json::json!({"title":title,"assignee":agent})).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        Handler::dispatch_run_all(&h, &ctx, DispatchRunAllArgs {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.tasks.len(), 2);
+    assert!(
+        outcome
+            .tasks
+            .iter()
+            .all(|task| task.status == orch_domain::TaskStatus::Done)
+    );
+    assert!(!h.dispatch_state().dispatch_on);
+}
+
+#[tokio::test]
+async fn lost_ownership_rejects_manual_dispatch_but_status_remains_live() {
+    let (_temp, h, ctx, _clock, _engine) = fixture().await;
+    h.set_ownership_lost().await.unwrap();
+    let error = Handler::dispatch_tick(&h, &ctx, DispatchTickArgs {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.execution, orch_proto::error::Execution::NotExecuted);
+    let status = Handler::daemon_status(&h, &ctx, DaemonStatusArgs {})
+        .await
+        .unwrap();
+    assert_eq!(
+        status.ownership,
+        orch_proto::ops::results::OwnershipStatus::Lost
+    );
+    assert!(!status.dispatch.dispatch_on);
+}
+
+#[tokio::test]
+async fn staged_images_keep_budget_and_are_cleaned_on_consumption_disconnect_and_startup() {
+    use base64::Engine as _;
+    use sha2::Digest;
+    async fn image(h: &ServiceHandler, ctx: &OpContext) -> std::path::PathBuf {
+        let bytes = b"\x89PNG\r\n\x1a\n";
+        let token = Handler::transfer_begin(
+            h,
+            ctx,
+            TransferBeginArgs {
+                purpose: TransferPurpose::ClipboardImage,
+                total_bytes: bytes.len() as u64,
+            },
+        )
+        .await
+        .unwrap()
+        .token;
+        Handler::transfer_chunk(
+            h,
+            ctx,
+            TransferChunkArgs {
+                token: token.clone(),
+                n: 0,
+                data_base64: base64::engine::general_purpose::STANDARD
+                    .encode(bytes)
+                    .try_into()
+                    .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        Handler::transfer_finish(
+            h,
+            ctx,
+            TransferFinishArgs {
+                token: token.clone(),
+                sha256: format!("{:x}", sha2::Sha256::digest(bytes))
+                    .try_into()
+                    .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        Handler::attachment_stage_image(
+            h,
+            ctx,
+            AttachmentStageImageArgs {
+                input_transfer: token,
+                format: ImageFormat::Png,
+            },
+        )
+        .await
+        .unwrap()
+        .path
+        .into_path_buf()
+    }
+    let (temp, h, ctx, _clock, _engine) = fixture().await;
+    let path = image(&h, &ctx).await;
+    assert!(path.exists());
+    let mut peers = Vec::new();
+    for _ in 0..3 {
+        let peer = OpContext::new(ctx.session.clone());
+        Handler::transfer_begin(
+            &h,
+            &peer,
+            TransferBeginArgs {
+                purpose: TransferPurpose::Document,
+                total_bytes: orch_proto::frame::limits::MAX_TRANSFER_BYTES as u64,
+            },
+        )
+        .await
+        .unwrap();
+        peers.push(peer);
+    }
+    let fourth = OpContext::new(ctx.session.clone());
+    assert!(
+        Handler::transfer_begin(
+            &h,
+            &fourth,
+            TransferBeginArgs {
+                purpose: TransferPurpose::Document,
+                total_bytes: orch_proto::frame::limits::MAX_TRANSFER_BYTES as u64
+            }
+        )
+        .await
+        .is_err(),
+        "staged image still owns its budget"
+    );
+    h.disconnect(ctx.session_id);
+    assert!(!path.exists());
+    Handler::transfer_begin(
+        &h,
+        &fourth,
+        TransferBeginArgs {
+            purpose: TransferPurpose::Document,
+            total_bytes: orch_proto::frame::limits::MAX_TRANSFER_BYTES as u64,
+        },
+    )
+    .await
+    .unwrap();
+    for peer in peers {
+        h.disconnect(peer.session_id);
+    }
+    h.disconnect(fourth.session_id);
+    let owner = OpContext::new(ctx.session.clone());
+    let path = image(&h, &owner).await;
+    Handler::task_create(
+        &h,
+        &owner,
+        serde_json::from_value(
+            serde_json::json!({"title":"copied","attachments":[{"utf8":path.to_str().unwrap()}]}),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(!path.exists(), "copying into task consumes staging source");
+    let stale = temp.path().join(".orchestry/run/staged/stale.png");
+    std::fs::write(&stale, b"fixture").unwrap();
+    h.cleanup_stale_transfers().unwrap();
+    assert!(!stale.exists());
+}

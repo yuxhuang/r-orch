@@ -20,7 +20,14 @@ use orch_infra::template::{
 use super::tick::epoch_ms_from_iso;
 use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator};
 
+#[derive(Clone, Copy)]
+pub(super) enum MailboxMode {
+    Drain,
+    Snapshot,
+}
+
 pub(super) struct PreparedPrompt {
+    pub message_ids: Vec<String>,
     pub prompt: String,
     pub system_prompt: Option<String>,
     pub captured_mode: Option<PromptMode>,
@@ -469,8 +476,15 @@ impl Orchestrator {
             prompt,
             system_prompt,
             captured_mode,
+            ..
         } = self
-            .prepare_prompt(&task, &agent, &all_agents, &workspace_path)
+            .prepare_prompt(
+                &task,
+                &agent,
+                &all_agents,
+                &workspace_path,
+                MailboxMode::Drain,
+            )
             .await?;
 
         let run = self
@@ -787,6 +801,7 @@ impl Orchestrator {
         agent: &orch_domain::Agent,
         all_agents: &[orch_domain::Agent],
         workspace_path: &str,
+        mailbox: MailboxMode,
     ) -> Result<PreparedPrompt> {
         let task_id = task.id.clone();
         let attempt = task.attempts + 1;
@@ -829,14 +844,17 @@ impl Orchestrator {
             },
             async {
                 if agent.remote.is_some() {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
-                match self.deps().message_service.as_ref() {
-                    Some(messages) => messages
+                match (self.deps().message_service.as_ref(), mailbox) {
+                    (Some(messages), MailboxMode::Drain) => Ok(messages
                         .drain_mailbox(&agent.id, &task_id)
                         .await
-                        .unwrap_or_default(),
-                    None => Vec::new(),
+                        .unwrap_or_default()),
+                    (Some(messages), MailboxMode::Snapshot) => {
+                        messages.list_pending_for_agent(&agent.id).await
+                    }
+                    (None, _) => Ok(Vec::new()),
                 }
             },
             async {
@@ -847,6 +865,7 @@ impl Orchestrator {
             },
         )
         .await;
+        let pending_messages = pending_messages?;
 
         let goal_context = match goal {
             Some(goal) => {
@@ -990,6 +1009,10 @@ impl Orchestrator {
         };
 
         Ok(PreparedPrompt {
+            message_ids: pending_messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect(),
             prompt,
             system_prompt,
             captured_mode,

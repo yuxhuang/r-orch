@@ -14,6 +14,21 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+fn private_directory(path: &std::path::Path) -> OpResult<()> {
+    if let Err(error) = std::fs::create_dir(path)
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(invalid("cannot create staging directory"));
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| invalid("cannot inspect staging directory"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid("staging directory must be a real directory"));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| invalid("cannot protect staging directory"))
+}
+
 pub(super) fn authorize(ctx: &OpContext, request: &Request) -> OpResult<()> {
     let refuse = || {
         ErrorBody::new(
@@ -139,9 +154,20 @@ impl Drop for Transfer {
     }
 }
 
+struct StagedImage {
+    path: PathBuf,
+    bytes: usize,
+}
+impl Drop for StagedImage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Transfers {
     entries: HashMap<(u64, String), Transfer>,
+    images: HashMap<(u64, PathBuf), StagedImage>,
     reserved: usize,
     next: u64,
 }
@@ -149,12 +175,17 @@ pub(super) struct Transfers {
 impl Transfers {
     pub(super) fn remove_session(&mut self, session: u64) {
         self.entries.retain(|(id, _), _| *id != session);
-        self.reserved = self.entries.values().map(|t| t.total).sum();
+        self.images.retain(|(id, _), _| *id != session);
+        self.recount();
     }
     pub(super) fn expire(&mut self) {
         self.entries
             .retain(|_, t| t.touched.elapsed() < limits::TRANSFER_INACTIVITY);
-        self.reserved = self.entries.values().map(|t| t.total).sum();
+        self.recount();
+    }
+    fn recount(&mut self) {
+        self.reserved = self.entries.values().map(|t| t.total).sum::<usize>()
+            + self.images.values().map(|image| image.bytes).sum::<usize>();
     }
     fn remove(&mut self, key: &(u64, String)) -> Option<Transfer> {
         let transfer = self.entries.remove(key)?;
@@ -167,20 +198,79 @@ impl ServiceHandler {
     /// Call once after acquiring project ownership, before admitting sessions.
     /// Only this daemon's private transfer files are startup scratch space.
     pub fn cleanup_stale_transfers(&self) -> OpResult<()> {
-        let dir = self.engine.paths.root().join("run/transfers");
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(_) => return Err(invalid("cannot inspect stale transfer directory")),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|_| invalid("cannot inspect stale transfer"))?;
-            if entry.file_name().to_string_lossy().ends_with(".part") {
-                std::fs::remove_file(entry.path())
-                    .map_err(|_| invalid("cannot remove stale transfer"))?;
+        for (directory, extension) in [("run/transfers", "part"), ("run/staged", "png")] {
+            let entries = match std::fs::read_dir(self.engine.paths.root().join(directory)) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(invalid("cannot inspect stale transfer directory")),
+            };
+            for entry in entries {
+                let entry = entry.map_err(|_| invalid("cannot inspect stale transfer"))?;
+                if entry.path().extension().is_some_and(|ext| ext == extension) {
+                    std::fs::remove_file(entry.path())
+                        .map_err(|_| invalid("cannot remove stale transfer"))?;
+                }
             }
         }
         Ok(())
+    }
+
+    pub(super) fn finish_staged_paths(&self, paths: &[PathBuf]) {
+        let mut transfers = self.transfers.lock().unwrap_or_else(|e| e.into_inner());
+        transfers
+            .images
+            .retain(|(_, path), _| !paths.contains(path));
+        transfers.recount();
+    }
+
+    pub(super) async fn stage_image_transfer(
+        &self,
+        ctx: &OpContext,
+        token: &TransferToken,
+    ) -> OpResult<StagedAttachment> {
+        let mut transfers = self.transfers.lock().unwrap_or_else(|e| e.into_inner());
+        transfers.expire();
+        let key = (ctx.session_id, token.0.to_string());
+        let transfer = transfers
+            .entries
+            .get(&key)
+            .ok_or_else(|| invalid("transfer does not exist or expired"))?;
+        if !transfer.sealed || transfer.purpose != TransferPurpose::ClipboardImage {
+            return Err(invalid("sealed clipboard-image transfer required"));
+        }
+        let bytes = transfer.read()?;
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(invalid("image: expected PNG bytes"));
+        }
+        let directory = self.engine.paths.root().join("run/staged");
+        private_directory(&directory)?;
+        let path = directory.join(format!("{}.png", self.engine.ids.generate("img")));
+        let wire = orch_proto::path::WirePath::new(path.clone())
+            .map_err(|_| invalid("staged image path exceeds protocol limit"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|_| invalid("cannot stage image"))?;
+        if file.write_all(&bytes).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return Err(invalid("cannot write staged image"));
+        }
+        let transfer = transfers.entries.remove(&key).expect("transfer checked");
+        // Ownership changes from sealed upload to attachment source. Its byte
+        // reservation survives until copying into a task or session cleanup.
+        transfers.images.insert(
+            (ctx.session_id, path.clone()),
+            StagedImage {
+                path,
+                bytes: transfer.total,
+            },
+        );
+        Ok(StagedAttachment {
+            path: wire,
+            bytes: transfer.total as u64,
+        })
     }
 
     pub(super) async fn take_transfer(
@@ -226,7 +316,7 @@ impl ServiceHandler {
         }
         let mut transfers = self.transfers.lock().unwrap_or_else(|e| e.into_inner());
         transfers.expire();
-        if transfers.entries.len() >= limits::MAX_QUEUED_OPERATIONS
+        if transfers.entries.len() + transfers.images.len() >= limits::MAX_QUEUED_OPERATIONS
             || transfers
                 .entries
                 .keys()
@@ -255,10 +345,7 @@ impl ServiceHandler {
         );
         let dir = self.engine.paths.root().join("run/transfers");
         for path in [self.engine.paths.root().join("run"), dir.clone()] {
-            std::fs::create_dir_all(&path)
-                .map_err(|_| invalid("cannot create transfer directory"))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| invalid("cannot protect transfer directory"))?;
+            private_directory(&path)?;
         }
         let path = dir.join(format!("{}-{}.part", std::process::id(), &*token.0));
         std::fs::OpenOptions::new()

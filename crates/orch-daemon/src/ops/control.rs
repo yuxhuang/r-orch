@@ -113,7 +113,28 @@ impl ServiceHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = status;
     }
-    pub fn set_ownership_lost(&self) {
+    pub(crate) fn ownership_lost(&self) -> bool {
+        self.control
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ownership
+            == OwnershipStatus::Lost
+    }
+    pub async fn set_ownership_lost(&self) -> OpResult<()> {
+        let handler = self.clone();
+        self.coordinator
+            .run_op(Lane::Control, move |permit| {
+                Box::pin(async move {
+                    permit.invalidate(Store::State);
+                    handler.apply_ownership_lost();
+                    Ok(())
+                })
+            })
+            .await
+            .map(|_| ())
+    }
+    fn apply_ownership_lost(&self) {
         self.control.dispatch_on.store(false, Ordering::SeqCst);
         self.end_batch();
         self.control
@@ -126,6 +147,14 @@ impl ServiceHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .ownership = OwnershipStatus::Lost;
+        for cancelled in self
+            .observations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            cancelled.store(true, Ordering::SeqCst);
+        }
     }
     pub fn update_session_counts(&self, sessions: u32, busy_rejections: u64) {
         let mut status = self
@@ -279,16 +308,26 @@ impl ServiceHandler {
         a: DispatchRunTaskArgs,
     ) -> OpResult<RunOutcome> {
         let events = self.engine.events.subscribe();
+        let (_, before, _) = self.read_execution_snapshot().await?;
         self.engine
             .orchestrator
             .daemon_launch_task_with_guard(&a.task_id, Arc::clone(&ctx.cancelled))
             .await
             .map_err(service_error)?;
-        let task = self.read_task(&a.task_id).await?;
-        if is_dispatchable(task.status) {
-            return Err(conflict("task is not eligible for launch"));
-        }
-        self.observe_tasks(ctx, vec![a.task_id.into_inner()], events)
+        let (_, runs, state) = self.read_execution_snapshot().await?;
+        let run = runs
+            .iter()
+            .find(|run| {
+                run.task_id == a.task_id.as_str() && !before.iter().any(|old| old.id == run.id)
+            })
+            .or_else(|| {
+                state
+                    .running
+                    .get(&*a.task_id)
+                    .and_then(|entry| runs.iter().find(|run| run.id == entry.run_id))
+            })
+            .ok_or_else(|| conflict("task is not eligible for launch"))?;
+        self.observe_runs(ctx, vec![(a.task_id.into_inner(), run.id.clone())], events)
             .await
     }
     pub(super) async fn dispatch_run_all(
@@ -296,23 +335,63 @@ impl ServiceHandler {
         ctx: &OpContext,
         _: DispatchRunAllArgs,
     ) -> OpResult<RunOutcome> {
-        let events = self.engine.events.subscribe();
-        let tasks = self.read_tasks().await?;
-        let mut ids = Vec::new();
-        for task in tasks
+        let mut events = self.engine.events.subscribe();
+        let mut pending = self
+            .read_tasks()
+            .await?
             .into_iter()
-            .filter(|task| is_dispatchable(task.status))
-        {
-            self.engine
-                .orchestrator
-                .daemon_launch_task_with_guard(&task.id, Arc::clone(&ctx.cancelled))
-                .await
-                .map_err(service_error)?;
-            if !is_dispatchable(self.read_task(&task.id).await?.status) {
-                ids.push(task.id);
+            .filter(|task| is_dispatchable(task.status) && !task.awaits_approval())
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        let mut targets = Vec::<(String, String)>::new();
+        let mut n = 0;
+        loop {
+            if ctx.is_cancelled() || self.coordinator.is_stopping() {
+                return Err(conflict(
+                    "observation interrupted; runs continue in the daemon",
+                ));
             }
+            let mut progressed = false;
+            for id in pending.clone() {
+                let (_, before, _) = self.read_execution_snapshot().await?;
+                self.engine
+                    .orchestrator
+                    .daemon_launch_task_with_guard(&id, Arc::clone(&ctx.cancelled))
+                    .await
+                    .map_err(service_error)?;
+                let (tasks, runs, state) = self.read_execution_snapshot().await?;
+                let run = runs
+                    .iter()
+                    .find(|run| run.task_id == id && !before.iter().any(|old| old.id == run.id))
+                    .or_else(|| {
+                        state
+                            .running
+                            .get(&id)
+                            .and_then(|entry| runs.iter().find(|run| run.id == entry.run_id))
+                    });
+                if let Some(run) = run {
+                    targets.push((id.clone(), run.id.clone()));
+                    pending.retain(|task| task != &id);
+                    progressed = true;
+                } else if tasks
+                    .iter()
+                    .find(|task| task.id == id)
+                    .is_none_or(|task| !is_dispatchable(task.status))
+                {
+                    pending.retain(|task| task != &id);
+                }
+            }
+            let (tasks, runs, state) = self.read_execution_snapshot().await?;
+            if runs_finished(&targets, &runs)?
+                && (pending.is_empty()
+                    || !progressed && state.running.is_empty() && state.claimed.is_empty())
+            {
+                self.send_event_parts(ctx, &mut n, &mut events).await?;
+                return Ok(run_outcome(&targets, tasks, &runs));
+            }
+            self.send_event_parts(ctx, &mut n, &mut events).await?;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        self.observe_tasks(ctx, ids, events).await
     }
     pub(super) async fn dispatch_until_terminal(
         &self,
@@ -516,48 +595,50 @@ impl ServiceHandler {
             .await?
             .value)
     }
-    async fn read_task(&self, id: &str) -> OpResult<Task> {
+    async fn read_execution_snapshot(
+        &self,
+    ) -> OpResult<(
+        Vec<Task>,
+        Vec<orch_domain::Run>,
+        orch_domain::OrchestratorState,
+    )> {
         let engine = Arc::clone(&self.engine);
-        let id = id.to_owned();
         Ok(self
             .coordinator
             .run_op(Lane::Internal, move |_| {
-                Box::pin(async move { engine.task_service.get(&id).await.map_err(service_error) })
+                Box::pin(async move {
+                    Ok((
+                        engine
+                            .task_service
+                            .list(&Default::default())
+                            .await
+                            .map_err(service_error)?,
+                        engine.run_service.list_all().await.map_err(service_error)?,
+                        engine.state.read().await.map_err(service_error)?,
+                    ))
+                })
             })
             .await?
             .value)
     }
-    async fn observe_tasks(
+    async fn observe_runs(
         &self,
         ctx: &OpContext,
-        ids: Vec<String>,
+        targets: Vec<(String, String)>,
         mut events: orch_engine::events::EventSubscription,
     ) -> OpResult<RunOutcome> {
         let mut n = 0;
         loop {
-            let tasks = self
-                .read_tasks()
-                .await?
-                .into_iter()
-                .filter(|task| ids.contains(&task.id))
-                .collect::<Vec<_>>();
-            if tasks.iter().all(|task| is_terminal(task.status)) {
-                return Ok(RunOutcome {
-                    exit_code: i32::from(tasks.iter().any(|task| {
-                        matches!(
-                            task.status,
-                            orch_domain::TaskStatus::Failed | orch_domain::TaskStatus::Cancelled
-                        )
-                    })),
-                    tasks,
-                });
+            let (tasks, runs, _) = self.read_execution_snapshot().await?;
+            self.send_event_parts(ctx, &mut n, &mut events).await?;
+            if runs_finished(&targets, &runs)? {
+                return Ok(run_outcome(&targets, tasks, &runs));
             }
-            if ctx.is_cancelled() {
+            if ctx.is_cancelled() || self.coordinator.is_stopping() {
                 return Err(conflict(
                     "observation interrupted; runs continue in the daemon",
                 ));
             }
-            self.send_event_parts(ctx, &mut n, &mut events).await?;
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -604,4 +685,37 @@ impl ServiceHandler {
 }
 fn conflict(message: &str) -> ErrorBody {
     ErrorBody::new(ErrorCode::Conflict, message, Execution::NotExecuted)
+}
+
+fn runs_finished(targets: &[(String, String)], runs: &[orch_domain::Run]) -> OpResult<bool> {
+    for (_, id) in targets {
+        let run = runs
+            .iter()
+            .find(|run| &run.id == id)
+            .ok_or_else(|| conflict("observed run record disappeared"))?;
+        if matches!(
+            run.status,
+            orch_domain::RunStatus::Preparing | orch_domain::RunStatus::Running
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+fn run_outcome(
+    targets: &[(String, String)],
+    tasks: Vec<Task>,
+    runs: &[orch_domain::Run],
+) -> RunOutcome {
+    RunOutcome {
+        tasks: tasks
+            .into_iter()
+            .filter(|task| targets.iter().any(|(id, _)| id == &task.id))
+            .collect(),
+        exit_code: i32::from(targets.iter().any(|(_, id)| {
+            runs.iter()
+                .find(|run| &run.id == id)
+                .is_some_and(|run| run.status != orch_domain::RunStatus::Succeeded)
+        })),
+    }
 }
