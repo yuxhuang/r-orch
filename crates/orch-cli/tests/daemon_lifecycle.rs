@@ -3,11 +3,12 @@
 //! isolated short socket and judges it by exit status, files and the process
 //! table; protocol detail belongs to the in-process harness tests.
 //!
-//! PR 1 is developmental: `orch daemon *` needs `ORCH_DAEMON_DEVELOPMENTAL=1`,
-//! which `Sandbox::orch` puts in the child env only.
+//! `orch daemon *` needs no gate or opt-in env since S2a-cli removed the PR 1
+//! developmental gate.
 
 mod daemon_support;
 
+use daemon_support::frontends::{Mcp, Watch, mcp_failure, normalize, tree};
 use daemon_support::*;
 use nix::sys::signal::Signal;
 use std::fs;
@@ -414,6 +415,132 @@ fn state_run_ids(sandbox: &Sandbox) -> Vec<String> {
         .collect()
 }
 
+// ── kill -9 mid-run: every client reports it, nothing restarts (T2a) ──────
+
+/// The central text every client prints when the owner is gone.
+fn assert_no_daemon_text(who: &str, stderr: &str, root: &std::path::Path) {
+    let seen = normalize(stderr);
+    assert!(
+        seen.contains(&format!(
+            "No orch daemon is running for {} (",
+            root.display()
+        )),
+        "{who}: {stderr}"
+    );
+    assert!(
+        seen.contains("Start it with: orch daemon start"),
+        "{who}: {stderr}"
+    );
+}
+
+#[test]
+fn daemon_killed_mid_run_next_cli_read_write_and_mcp_call_report_no_daemon_and_nothing_restarts() {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let (_agent, task) = sandbox.seed_sleeper();
+    let mut daemon = start_ready(&sandbox, &["--dispatch", "on"], "first");
+    let agent_pid = wait_for(READY, "the dispatched agent", || sandbox.running_pid(&task));
+    let _reap = KillOnDrop(agent_pid);
+    let dead_owner = daemon.pid;
+
+    daemon.crash();
+
+    // From here on the process table and the tree must not move except by
+    // an explicit owner act: take the baseline after the kill.
+    let watch = Watch::begin();
+    let before = tree(&sandbox.root());
+    let root = sandbox.root();
+    let mut cli_pids = Vec::new();
+    for args in [
+        vec!["task", "list"],
+        vec!["task", "show", task.as_str()],
+        vec!["status"],
+        vec!["task", "add", "added while the owner was down"],
+        vec!["task", "cancel", task.as_str()],
+    ] {
+        let mut cmd = sandbox.orch();
+        cmd.args(&args);
+        let (out, pid) = output_and_pid(cmd, CALL);
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{args:?} wrote: {}",
+            text(&out.stdout)
+        );
+        assert_no_daemon_text(&format!("{args:?}"), &text(&out.stderr), &root);
+        cli_pids.push(pid);
+    }
+
+    let mut mcp = Mcp::spawn(sandbox.orch(), &[]);
+    let response = mcp.initialize();
+    let failure = mcp_failure("mcp initialize", &response);
+    assert_no_daemon_text("mcp initialize", &failure, &root);
+    assert_eq!(mcp.finish(), Some(0));
+
+    // Nothing started anything, repaired anything, or wrote anything.
+    assert!(
+        watch.new_orch_of(&sandbox).is_empty(),
+        "{:?}",
+        watch.new_orch_of(&sandbox)
+    );
+    assert!(cli_pids.iter().all(|pid| process_group_empty(*pid)));
+    assert_eq!(
+        tree(&sandbox.root()),
+        before,
+        "a client changed the project"
+    );
+    assert_eq!(sandbox.daemon_json().unwrap()["pid"], dead_owner);
+    assert!(!is_alive(dead_owner));
+    assert!(is_alive(agent_pid), "a client touched the orphaned agent");
+}
+
+#[test]
+fn explicit_restart_after_a_kill_lets_every_client_read_the_reconciled_run() {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let (_agent, task) = sandbox.seed_sleeper();
+    let mut daemon = start_ready(&sandbox, &["--dispatch", "on"], "first");
+    let agent_pid = wait_for(READY, "the dispatched agent", || sandbox.running_pid(&task));
+    let run_id = sandbox.running_run_id(&task).unwrap();
+    daemon.crash();
+    force_kill(agent_pid);
+    wait_dead(agent_pid, "the agent stand-in");
+    let task_status = |sandbox: &Sandbox| {
+        let out = sandbox.run(&["task", "show", &task, "--json"]);
+        (
+            out.status.code(),
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .map(|task| task["status"].as_str().unwrap_or_default().to_owned())
+                .unwrap_or_default(),
+        )
+    };
+    // Down: the client cannot answer, so it cannot show a stale "in_progress".
+    assert_eq!(task_status(&sandbox).0, Some(7));
+
+    let second = start_ready(&sandbox, &[], "second");
+
+    // Reconciled by the explicit start, visible to a client call.
+    assert_eq!(task_status(&sandbox), (Some(0), "cancelled".to_owned()));
+    assert_eq!(sandbox.run_status(&run_id).as_deref(), Some("cancelled"));
+    let status = sandbox.status().unwrap();
+    assert_eq!(status.pid, second.pid);
+    assert!(
+        !status.dispatch.dispatch_on,
+        "a restart must not resume dispatch"
+    );
+    let out = sandbox.run(&["--json", "status"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        !sandbox.run(&["task", "list"]).stdout.is_empty(),
+        "the restarted daemon serves reads"
+    );
+}
+
 // ── stale / hostile socket paths ──────────────────────────────────────────
 
 #[test]
@@ -728,7 +855,7 @@ impl Tmux {
             format!(
                 "#!/bin/sh\ncd '{root}'\nexec env -i HOME='{root}/home' PATH=/usr/bin:/bin NO_COLOR=1 \
                  ORCHESTRY_GLOBAL_CONFIG_PATH='{root}/global.yml' ORCH_PROJECT_ROOT='{root}' \
-                 ORCH_SOCKET='{sock}' ORCH_DAEMON_DEVELOPMENTAL=1 /bin/sh -c \"{script}\"\n",
+                 ORCH_SOCKET='{sock}' /bin/sh -c \"{script}\"\n",
                 root = root.display(),
                 sock = self.sandbox.socket().display(),
             ),

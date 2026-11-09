@@ -6,14 +6,14 @@
 //!   isolated `HOME`, `ORCHESTRY_GLOBAL_CONFIG_PATH` and a short
 //!   `ORCH_SOCKET` (≤100 bytes, under a 0700 `/tmp/dl-*` dir), so it cannot
 //!   reach a developer's daemon, `~/.orchestry` or a real project;
-//! * `ORCH_DAEMON_DEVELOPMENTAL=1` exists only in the child env, never in
-//!   the test process;
 //! * agents are `sleep` stand-ins on `PATH=/usr/bin:/bin`, never a real AI CLI;
 //! * every spawned daemon is owned by a [`DaemonChild`] whose `Drop` kills its
 //!   process group, so a failed assertion cannot leak a daemon;
 //! * every wait has a deadline and is driven by an observable event (the
 //!   `listening <socket>` line, an exit status, a file), never a fixed sleep.
 #![allow(dead_code, reason = "each daemon_lifecycle* test crate uses a subset")]
+
+pub mod frontends;
 
 use serde_json::Value;
 use std::fs;
@@ -105,25 +105,38 @@ impl Sandbox {
         .unwrap();
     }
 
-    /// Seed one task assigned to a `sleep 120` stand-in, with the legacy
-    /// direct-store CLI (no daemon exists yet). Returns `(agent, task)` ids.
+    /// Seed one task assigned to a `sleep 120` stand-in through a throwaway
+    /// daemon (dispatch OFF), then stop it. The CLI is a daemon client, so
+    /// seeding goes through a running daemon. Returns `(agent, task)` ids.
     pub fn seed_sleeper(&self) -> (String, String) {
+        self.seed_agent_task("sleeper", "sleep 120", "long job")
+    }
+
+    /// Seed one shell agent running `command` plus one task assigned to it,
+    /// through a throwaway daemon (dispatch OFF) that is stopped afterwards.
+    /// Returns `(agent, task)` ids.
+    pub fn seed_agent_task(&self, name: &str, command: &str, title: &str) -> (String, String) {
+        let mut seeder = start_ready(self, &[], "seed");
         let out = self.run(&[
             "agent",
             "add",
-            "sleeper",
+            name,
             "--adapter",
             "shell",
             "--command",
-            "sleep 120",
+            command,
             "--json",
         ]);
         assert!(out.status.success(), "{}", text(&out.stderr));
         let agent: Value = serde_json::from_slice(&out.stdout).unwrap();
         let agent = agent["id"].as_str().unwrap().to_owned();
-        let out = self.run(&["task", "add", "long job", "--assignee", &agent, "--quiet"]);
+        let out = self.run(&["task", "add", title, "--assignee", &agent, "--quiet"]);
         assert!(out.status.success(), "{}", text(&out.stderr));
-        (agent, text(&out.stdout).trim().to_owned())
+        let task = text(&out.stdout).trim().to_owned();
+        let stop = self.run(&["daemon", "stop"]);
+        assert!(stop.status.success(), "{}", text(&stop.stderr));
+        assert_eq!(seeder.wait_exit(READY).code(), Some(0));
+        (agent, task)
     }
 
     pub fn state_json(&self) -> Option<Value> {
@@ -165,7 +178,17 @@ impl Sandbox {
 /// An `orch` command with an explicit, cleared environment aimed at `socket`
 /// and confined to `test_root`. `root` also receives `HOME`.
 pub fn orch_command(root: &Path, socket: &Path, test_root: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_orch"));
+    orch_command_with(
+        Path::new(env!("CARGO_BIN_EXE_orch")),
+        root,
+        socket,
+        test_root,
+    )
+}
+
+/// [`orch_command`] for another `orch` executable (the two-binary skew test).
+pub fn orch_command_with(exe: &Path, root: &Path, socket: &Path, test_root: &Path) -> Command {
+    let mut cmd = Command::new(exe);
     cmd.env_clear()
         .current_dir(root)
         .env("HOME", root.join("home"))
@@ -176,7 +199,6 @@ pub fn orch_command(root: &Path, socket: &Path, test_root: &Path) -> Command {
         .env("ORCH_PROJECT_ROOT", root)
         .env("ORCH_SOCKET", socket)
         .env("ORCH_TEST_SOCKET_ROOT", test_root)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .process_group(0);
     cmd
 }

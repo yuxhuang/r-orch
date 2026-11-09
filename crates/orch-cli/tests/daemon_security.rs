@@ -234,27 +234,11 @@ fn the_start_environment_is_sanitised_before_any_agent_sees_it() {
     let sandbox = Sandbox::new();
     sandbox.init_project();
     let out_file = sandbox.short_dir().join("child-env");
-    let agent = sandbox.run(&[
-        "agent",
-        "add",
+    sandbox.seed_agent_task(
         "envdump",
-        "--adapter",
-        "shell",
-        "--command",
         &format!("/usr/bin/env > '{}'", out_file.display()),
-        "--json",
-    ]);
-    assert!(agent.status.success(), "{}", text(&agent.stderr));
-    let agent: serde_json::Value = serde_json::from_slice(&agent.stdout).unwrap();
-    let task = sandbox.run(&[
-        "task",
-        "add",
         "dump env",
-        "--assignee",
-        agent["id"].as_str().unwrap(),
-        "--quiet",
-    ]);
-    assert!(task.status.success(), "{}", text(&task.stderr));
+    );
 
     let mut cmd = sandbox.start_cmd(&["--dispatch", "on"]);
     cmd.env("DEBUG", "*")
