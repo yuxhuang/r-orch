@@ -136,7 +136,8 @@ pub struct PreparedStart {
     root: PathBuf,
     socket: PathBuf,
     snapshot: crate::env::Snapshot,
-    detached_child: bool,
+    /// The detached child's capped log; `None` in any other start.
+    log: Option<crate::detach::DetachedLog>,
 }
 
 fn prepare(
@@ -153,10 +154,12 @@ fn prepare(
     if !options.developmental {
         return Err(DaemonError::DevelopmentalGateClosed);
     }
-    let detached_child = var(crate::detach::DETACHED_CHILD_ENV).is_some();
-    if detached_child {
+    let log = if var(crate::detach::DETACHED_CHILD_ENV).is_some() {
         crate::detach::enter_own_session();
-    }
+        Some(crate::detach::DetachedLog::capture(&options.project_root)?)
+    } else {
+        None
+    };
     {
         let mut err = std::io::stderr().lock();
         let _ = writeln!(err, "{DEVELOPMENTAL_BANNER}");
@@ -174,19 +177,20 @@ fn prepare(
         root,
         socket,
         snapshot,
-        detached_child,
+        log,
     })
 }
 
 impl PreparedStart {
     /// Detach, or bring the daemon up in the foreground and serve until a
     /// stop trigger; see [`start`].
-    pub async fn run(self) -> Result<DaemonExit, DaemonError> {
+    pub async fn run(mut self) -> Result<DaemonExit, DaemonError> {
         if self.options.detach {
             return crate::detach::spawn_detached(&self.options, &self.root).await;
         }
-        let (root, socket, detached_child) =
-            (self.root.clone(), self.socket.clone(), self.detached_child);
+        // Dropped last, on every path: drains the log before the exit.
+        let mut log = self.log.take();
+        let socket = self.socket.clone();
         let running = Running::bring_up(self.bring_up()).await?;
 
         let mut signals = Signals::install()?;
@@ -200,22 +204,14 @@ impl PreparedStart {
             );
             let _ = out.flush();
         }
-        let (quit_log, quit_log_rx) = watch::channel(false);
-        let log_task = detached_child.then(|| {
-            crate::detach::release_readiness_pipe();
-            tokio::spawn(crate::detach::rotate_log_while_running(
-                root.clone(),
-                quit_log_rx,
-            ))
-        });
+        if let Some(log) = log.as_mut() {
+            log.release_readiness_pipe();
+        }
 
         let reason = running.wait_for_stop(Some(&mut signals)).await;
         tracing::info!(reason, "stopping");
         let exit = running.shutdown().await;
-        quit_log.send_replace(true);
-        if let Some(task) = log_task {
-            let _ = task.await;
-        }
+        drop(log);
         Ok(exit)
     }
 
@@ -1047,7 +1043,7 @@ mod tests {
             lookup(env),
         )
         .unwrap();
-        assert!(!prepared.detached_child);
+        assert!(prepared.log.is_none());
         let spec = prepared.bring_up();
         assert_eq!(spec.project_root, project.path().canonicalize().unwrap());
         assert_eq!(spec.socket, Some(scratch.path().join("s")));

@@ -547,6 +547,127 @@ fn detach_failure_is_the_parents_failure() {
     assert_eq!(sandbox.status().unwrap().pid, owner.pid);
 }
 
+const LOG_CAP: u64 = 10 * 1024 * 1024;
+
+/// A file of `len` bytes, mode 0600: a log left by an earlier daemon.
+fn preseed_log(path: &std::path::Path, len: u64) {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
+        .set_len(len)
+        .unwrap();
+}
+
+/// Start detached at debug level, send `calls` status requests on one
+/// session, and return the owner (stopped by the caller).
+fn detached_status_burst(sandbox: Sandbox, calls: usize) -> DetachedOwner {
+    use orch_proto::handshake::{Caller, CallerKind, SessionMode};
+    let mut start = sandbox.start_cmd(&["--detach"]);
+    start.env("RUST_LOG", "orch_daemon=debug");
+    let out = output_with_deadline(start, READY);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let pid = u32::try_from(sandbox.daemon_json().unwrap()["pid"].as_u64().unwrap()).unwrap();
+    let owner = DetachedOwner(sandbox, pid);
+    let sandbox = &owner.0;
+    let config = orch_client::ClientConfig {
+        cwd: sandbox.root(),
+        project_root: Some(sandbox.root()),
+        socket: Some(sandbox.socket()),
+        test_socket_root: Some(sandbox.short_dir().to_path_buf()),
+        caller: Caller {
+            kind: CallerKind::Cli,
+            agent_id: None,
+            pid: None,
+        },
+        mode: SessionMode::Normal,
+        agent_context: false,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut client = orch_client::Client::connect(&config).await.unwrap();
+        for _ in 0..calls {
+            client.status().await.unwrap();
+        }
+    });
+    owner
+}
+
+fn stop_detached(owner: &DetachedOwner) {
+    let stop = owner.0.run(&["daemon", "stop"]);
+    assert!(stop.status.success(), "{}", text(&stop.stderr));
+    wait_dead(owner.1, "the detached daemon");
+}
+
+fn size(path: &std::path::Path) -> u64 {
+    fs::metadata(path).unwrap().len()
+}
+
+/// R20/R35: the detached log is capped as it is written, not by a periodic
+/// check. Both files start just under 10 MiB; a burst of debug-level status
+/// calls crosses the cap within seconds, and neither file may pass it.
+#[test]
+fn detached_log_stays_capped_under_live_writes() {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let log = sandbox.state_dir().join("daemon.log");
+    let backup = sandbox.state_dir().join("daemon.log.1");
+    preseed_log(&log, LOG_CAP - 4096);
+    preseed_log(&backup, LOG_CAP - 4096);
+
+    let owner = detached_status_burst(sandbox, 1000);
+    let (current, old) = (size(&log), size(&backup));
+    assert!(current <= LOG_CAP, "daemon.log is {current} bytes");
+    assert!(old <= LOG_CAP, "daemon.log.1 is {old} bytes");
+    assert!(current < LOG_CAP / 2, "the burst must have rotated the log");
+    for path in [&log, &backup] {
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+    }
+    stop_detached(&owner);
+    assert!(size(&log) <= LOG_CAP && size(&backup) <= LOG_CAP);
+}
+
+/// A rotation that cannot happen drops output with one fixed notice instead
+/// of growing the log; the daemon keeps serving.
+#[test]
+fn detached_log_failed_rotation_stays_capped_and_says_so() {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let log = sandbox.state_dir().join("daemon.log");
+    preseed_log(&log, LOG_CAP - 4096);
+    // rename(2) cannot replace a non-empty directory.
+    let backup = sandbox.state_dir().join("daemon.log.1");
+    fs::create_dir(&backup).unwrap();
+    fs::write(backup.join("keep"), b"").unwrap();
+
+    let owner = detached_status_burst(sandbox, 1000);
+    assert!(size(&log) <= LOG_CAP, "daemon.log is {} bytes", size(&log));
+    let tail = {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(&log).unwrap();
+        file.seek(SeekFrom::End(-8192)).unwrap();
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).unwrap();
+        text(&tail)
+    };
+    assert_eq!(
+        tail.matches("orch daemon: cannot rotate daemon.log")
+            .count(),
+        1,
+        "{tail}"
+    );
+    assert_eq!(owner.0.status().unwrap().pid, owner.1);
+    stop_detached(&owner);
+    assert!(size(&log) <= LOG_CAP);
+}
+
 // ── terminal hang-up (tmux) ───────────────────────────────────────────────
 
 struct Tmux {
