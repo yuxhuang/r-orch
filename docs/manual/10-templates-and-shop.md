@@ -180,7 +180,7 @@ The a-team cannot use `--adapter shell`, because shell members need a command.
 
 A template is a directory with an `org.yml`, one YAML file per member and optional shared rules. Your templates live in `~/.orchestry/templates/`. If you set `ORCHESTRY_GLOBAL_CONFIG_PATH`, they live in a `templates` folder next to that file.
 
-The `orch org template` commands need no project, except that `show --resolved` uses the project defaults when there is one. Deploy and the shop need a project.
+The `orch org template` commands, like deploy and the shop, need a project and its running [daemon](18-daemon.md): run them inside a project after `orch daemon start`. Outside a project they print `Not initialized` and exit 3; without a daemon they exit 7. `show --resolved` uses the project's defaults.
 
 You choose a template by name, or by directory with `--template-dir PATH`. Use one of them, not both. A name is `KEY`, `builtin:KEY` or `user:KEY`. A plain `KEY` finds your template first, then the a-team, then a legacy preset.
 

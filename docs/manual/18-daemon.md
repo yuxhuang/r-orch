@@ -233,8 +233,9 @@ recreate the lock. Plain `orch daemon status` then prints `ownership: LOST — s
 
 `orch daemon dispatch on` lets the daemon start waiting tasks, as `orch run --watch` does; `orch daemon dispatch
 off` stops it starting new ones. Turning dispatch off does **not** stop agents that are already running, release
-the project or stop the daemon's other work: it still answers requests, removes expired context entries and talks
-to remote peers. A daemon always starts with dispatch off unless you pass `--dispatch on`, also after a restart.
+the project or stop the daemon's other work: it still answers requests and removes expired context entries. A
+running daemon keeps its links to the remote peers registered with `orch remote add` whatever the dispatch state:
+dispatch off stops automatic task starts only. A daemon always starts with dispatch off unless you pass `--dispatch on`, also after a restart.
 
 ### Stop
 
