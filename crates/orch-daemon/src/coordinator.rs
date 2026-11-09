@@ -22,67 +22,170 @@
 //!
 //! [`run_op`]: ProjectCoordinator::run_op
 
-use orch_proto::error::ErrorBody;
+use orch_engine::container::OperationBoundary;
+use orch_proto::error::{ErrorBody, ErrorCode, Execution};
+use orch_proto::frame::{Store, limits};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Semaphore, SemaphorePermit, broadcast};
 
-/// The result of a coordinated operation, as handlers return it.
 pub type OpResult<T> = Result<T, ErrorBody>;
-
-/// The future an operation body returns; it may borrow the permit.
 pub type OpFuture<'p, T> = Pin<Box<dyn Future<Output = OpResult<T>> + Send + 'p>>;
 
-/// Admission lane of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
-    /// Client RPCs: bounded by the admission queue and byte budget
-    /// (`orch_proto::frame::limits`), `not_executed` when full.
     Ordinary,
-    /// Stop, `task.cancel`, `dispatch.set`: reserved capacity.
     Control,
-    /// Engine-internal completions, ticks, collectors, peer callbacks and
-    /// expiry: reserved capacity, never rejected for client saturation.
     Internal,
 }
 
-/// A committed operation's value and its commit ordinal: the ordinal assigned
-/// to this mutation, or the one a read observed. Monotonic per daemon
-/// instance, in memory only (it is T0's `write_seq`, not a stored revision).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Committed<T> {
     pub value: T,
     pub commit_seq: u64,
 }
 
-/// Proof that the holder is inside the project operation. Handlers reach the
-/// engine services through it; there is no other path to the stores.
+/// The outer operation's context. Nested service operations reuse the engine
+/// task-local context, so there is only one state permit, including for ticks.
 pub struct OpPermit {
-    _private: (),
+    boundary: Arc<OperationBoundary>,
 }
 
-/// The per-project coordinator. One instance per daemon, shared by every
-/// writer.
+impl OpPermit {
+    /// Call before a potentially partial write. The coarse subscriber seam
+    /// invalidates all views; the push hub may refine this by domain events.
+    pub fn invalidate(&mut self, _store: Store) {
+        self.boundary.mark_changed();
+    }
+}
+
 pub struct ProjectCoordinator {
-    _private: (),
+    boundary: Arc<OperationBoundary>,
+    ordinary: Semaphore,
+    bytes: Semaphore,
+    stopping: AtomicBool,
+}
+
+impl Default for ProjectCoordinator {
+    fn default() -> Self {
+        Self::new(Arc::new(OperationBoundary::new()))
+    }
+}
+
+/// Admission capacity, independent of the state permit. Phased work may hold
+/// this across external preparation/observation while the state gate is free.
+pub struct Admission<'a> {
+    _slot: Option<SemaphorePermit<'a>>,
+    _bytes: Option<SemaphorePermit<'a>>,
 }
 
 impl ProjectCoordinator {
-    /// Run one complete operation under the project permit. `op` receives the
-    /// permit for its whole duration; the return value is committed with an
-    /// ordinal, and invalidations are published after the permit is released.
+    /// Use the engine's EventBus::operation_boundary(), never a separate gate
+    /// for the same project. Internal work shares it without RPC admission.
+    pub fn new(boundary: Arc<OperationBoundary>) -> Self {
+        Self {
+            boundary,
+            ordinary: Semaphore::new(limits::MAX_QUEUED_OPERATIONS),
+            bytes: Semaphore::new(limits::MAX_QUEUED_REQUEST_BYTES),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    pub fn stop_admission(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    pub fn admit(&self, lane: Lane, bytes: usize) -> OpResult<Admission<'_>> {
+        if self.is_stopping() && lane == Lane::Ordinary {
+            return Err(ErrorBody::new(
+                ErrorCode::ShuttingDown,
+                "daemon is stopping",
+                Execution::NotExecuted,
+            ));
+        }
+        if lane != Lane::Ordinary {
+            return Ok(Admission {
+                _slot: None,
+                _bytes: None,
+            });
+        }
+        let slot = self.ordinary.try_acquire().map_err(|_| overloaded())?;
+        let count = u32::try_from(bytes).map_err(|_| overloaded())?;
+        let bytes = self
+            .bytes
+            .try_acquire_many(count)
+            .map_err(|_| overloaded())?;
+        Ok(Admission {
+            _slot: Some(slot),
+            _bytes: Some(bytes),
+        })
+    }
+
     pub async fn run_op<T, F>(&self, lane: Lane, op: F) -> OpResult<Committed<T>>
     where
         T: Send,
         F: for<'p> FnOnce(&'p mut OpPermit) -> OpFuture<'p, T> + Send,
     {
-        // S1b (senior-eng-2) implements the permit, queue and commit ordinal.
-        let _ = (lane, op);
-        Err(ErrorBody::unimplemented("ProjectCoordinator::run_op"))
+        self.run_op_sized(lane, 0, op).await
     }
 
-    /// The last assigned commit ordinal, for subscription baselines (D9).
-    pub fn current_commit_seq(&self) -> u64 {
-        // S1b (senior-eng-2).
-        0
+    /// Admission owns both a slot and the encoded request's byte budget until
+    /// completion. Control/internal work does not consume ordinary capacity.
+    /// Socket dispatch must own the task independently of its observer.
+    pub async fn run_op_sized<T, F>(
+        &self,
+        lane: Lane,
+        bytes: usize,
+        op: F,
+    ) -> OpResult<Committed<T>>
+    where
+        T: Send,
+        F: for<'p> FnOnce(&'p mut OpPermit) -> OpFuture<'p, T> + Send,
+    {
+        let _admission = self.admit(lane, bytes)?;
+        let started = AtomicBool::new(false);
+        let boundary = Arc::clone(&self.boundary);
+        let work = self.boundary.run(false, async {
+            started.store(true, Ordering::SeqCst);
+            let mut permit = OpPermit { boundary };
+            op(&mut permit).await
+        });
+        tokio::pin!(work);
+        let outcome = if lane == Lane::Ordinary {
+            tokio::select! {
+                biased;
+                result = &mut work => result,
+                () = tokio::time::sleep(limits::ADMISSION_TIMEOUT) => {
+                    if !started.load(Ordering::SeqCst) { return Err(overloaded()); }
+                    work.await
+                }
+            }
+        } else {
+            work.await
+        };
+        outcome.value.map(|value| Committed {
+            value,
+            commit_seq: outcome.commit_seq,
+        })
     }
+
+    pub fn current_commit_seq(&self) -> u64 {
+        self.boundary.current_commit_seq()
+    }
+    pub fn subscribe_invalidations(&self) -> broadcast::Receiver<u64> {
+        self.boundary.subscribe_commits()
+    }
+}
+
+fn overloaded() -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Overloaded,
+        "daemon operation queue is full or admission timed out",
+        Execution::NotExecuted,
+    )
 }

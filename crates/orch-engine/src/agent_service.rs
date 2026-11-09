@@ -73,7 +73,7 @@ pub struct AgentService {
     agents: Arc<dyn AgentStore>,
     state: Arc<dyn StateStore>,
     events: Arc<EventBus>,
-    config: OrchestratorConfig,
+    config: std::sync::RwLock<OrchestratorConfig>,
     ids: Arc<dyn IdGenerator>,
 }
 
@@ -89,9 +89,20 @@ impl AgentService {
             agents,
             state,
             events,
-            config,
+            config: std::sync::RwLock::new(config),
             ids,
         }
+    }
+
+    pub fn refresh_config(&self, config: OrchestratorConfig) {
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    fn config(&self) -> OrchestratorConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// `create` emits **no event**, which is
@@ -101,7 +112,7 @@ impl AgentService {
     /// snapshot of the project config; interactive and CLI authoring use
     /// [`AgentService::create_locked`] instead.
     pub async fn create(&self, input: CreateAgentInput) -> Result<Agent> {
-        Ok(self.create_against(&self.config, input).await?.agent)
+        Ok(self.create_against(&self.config(), input).await?.agent)
     }
 
     /// [`AgentService::create`] under the held definition lock: defaults and
@@ -247,7 +258,7 @@ impl AgentService {
     /// Flag/wizard update, checked against the engine's construction snapshot
     /// of the project config; see [`AgentService::update_locked`].
     pub async fn update(&self, id: &str, fields: UpdateAgentFields) -> Result<Agent> {
-        Ok(self.update_against(&self.config, id, fields).await?.agent)
+        Ok(self.update_against(&self.config(), id, fields).await?.agent)
     }
 
     /// [`AgentService::update`] under the held definition lock: the final
@@ -380,7 +391,7 @@ impl AgentService {
         config: AgentConfig,
     ) -> Result<Agent> {
         Ok(self
-            .replace_definition_against(&self.config, id, name, adapter, role, config)
+            .replace_definition_against(&self.config(), id, name, adapter, role, config)
             .await?
             .agent)
     }
@@ -504,7 +515,7 @@ impl AgentService {
         adapter: &str,
         config: &AgentConfig,
     ) -> Result<()> {
-        Self::validate_candidate_with(&self.config, id, name, adapter, config)
+        Self::validate_candidate_with(&self.config(), id, name, adapter, config)
     }
 
     /// [`AgentService::validate_candidate`] against an explicit project

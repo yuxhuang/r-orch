@@ -37,6 +37,7 @@
 //! their queued-task cancellations use `cancel_record` to avoid re-entry.
 
 mod collect;
+mod daemon;
 mod dispatch;
 mod recovery;
 mod remote;
@@ -193,6 +194,7 @@ impl Drop for StopNotification {
 }
 
 struct Inner {
+    config: std::sync::RwLock<OrchestratorConfig>,
     deps: OrchestratorDeps,
 
     /// `stateMutex` **and** `this.state`. See the module docs.
@@ -237,6 +239,14 @@ struct Inner {
     watch_start: Mutex<()>,
     /// Serializes startup with the selection of a stop owner.
     lifecycle: Mutex<()>,
+    daemon_mode: AtomicBool,
+    daemon_batch_active: AtomicBool,
+    preparing_agents: Mutex<HashMap<String, (u64, String)>>,
+    preparation_seq: std::sync::atomic::AtomicU64,
+    deferred_kills: Mutex<Vec<(String, orch_domain::RunningEntry, String)>>,
+    terminal_intents: Mutex<HashSet<String>>,
+    deferred_cleanups: Mutex<Vec<(String, String)>>,
+    cleanup_draining: Mutex<()>,
     lock_acquired: AtomicBool,
     shutting_down: AtomicBool,
     tick_in_progress: AtomicBool,
@@ -304,6 +314,7 @@ impl Orchestrator {
                 config_store: std::sync::RwLock::new(None),
                 event_tap: std::sync::RwLock::new(None),
                 inbound_controller: std::sync::RwLock::new(None),
+                config: std::sync::RwLock::new(deps.config.clone()),
                 deps,
                 state: Mutex::new(None),
                 context_service: std::sync::RwLock::new(None),
@@ -318,6 +329,14 @@ impl Orchestrator {
                 watch_task: Mutex::new(None),
                 watch_start: Mutex::new(()),
                 lifecycle: Mutex::new(()),
+                daemon_mode: AtomicBool::new(false),
+                daemon_batch_active: AtomicBool::new(false),
+                preparing_agents: Mutex::new(HashMap::new()),
+                preparation_seq: std::sync::atomic::AtomicU64::new(0),
+                deferred_kills: Mutex::new(Vec::new()),
+                terminal_intents: Mutex::new(HashSet::new()),
+                deferred_cleanups: Mutex::new(Vec::new()),
+                cleanup_draining: Mutex::new(()),
                 lock_acquired: AtomicBool::new(false),
                 shutting_down: AtomicBool::new(false),
                 tick_in_progress: AtomicBool::new(false),
@@ -364,8 +383,16 @@ impl Orchestrator {
         &self.inner.deps
     }
 
-    fn config(&self) -> &OrchestratorConfig {
-        &self.inner.deps.config
+    fn config(&self) -> OrchestratorConfig {
+        self.inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn refresh_config(&self, config: OrchestratorConfig) {
+        *self.inner.config.write().unwrap_or_else(|e| e.into_inner()) = config;
     }
 
     /// Let dispatch re-read `defaults.agent.prompt_mode` from the project
@@ -444,6 +471,9 @@ impl Orchestrator {
     /// Replace the in-memory state from the store. Always called at the start
     /// of a critical section, never outside one.
     async fn load_state(&self, slot: &mut Option<OrchestratorState>) -> Result<()> {
+        if let Some(state) = slot.as_ref() {
+            self.flush_state_lazy(state).await;
+        }
         // Do not reload an old running entry after an outcome's final write
         // failed. Persist the in-memory removal before any tick can replace it.
         if self.inner.remote_state_dirty.load(Ordering::SeqCst)
@@ -486,12 +516,19 @@ impl Orchestrator {
             if !dirty {
                 return;
             }
-            let state = orchestrator.inner.state.lock().await;
-            if let Some(state) = state.as_ref()
-                && let Err(err) = orchestrator.save_state(state).await
-            {
-                orchestrator.emit_error(err, "debounced state save");
-            }
+            orchestrator
+                .deps()
+                .events
+                .operation_boundary()
+                .run(true, async {
+                    let state = orchestrator.inner.state.lock().await;
+                    if let Some(state) = state.as_ref()
+                        && let Err(err) = orchestrator.save_state(state).await
+                    {
+                        orchestrator.emit_error(err, "debounced state save");
+                    }
+                })
+                .await;
         }));
     }
 
@@ -970,6 +1007,9 @@ impl Orchestrator {
 
     /// Cancel a running task: abort, kill, finish the run, mark cancelled.
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
+        if self.is_daemon_mode() {
+            return self.daemon_cancel_task(task_id, false).await;
+        }
         if !self.is_owner() {
             return self
                 .with_temporary_lock(|| self.cancel_task_locked(task_id, false))
@@ -979,6 +1019,9 @@ impl Orchestrator {
     }
 
     pub(crate) async fn cancel_service_task(&self, task_id: &str) -> Result<()> {
+        if self.is_daemon_mode() {
+            return self.daemon_cancel_task(task_id, true).await;
+        }
         if !self.is_owner() {
             return self
                 .with_temporary_lock(|| self.cancel_task_locked(task_id, true))
@@ -1065,6 +1108,9 @@ impl Orchestrator {
     /// Force-stop one agent: kill each of its runs, fail their tasks, release
     /// the agent.
     pub async fn force_stop_agent(&self, agent_id: &str) -> Result<()> {
+        if self.is_daemon_mode() {
+            return self.daemon_force_stop_agent(agent_id).await;
+        }
         if !self.is_owner() {
             return self
                 .with_temporary_lock(|| self.force_stop_agent_locked(agent_id))

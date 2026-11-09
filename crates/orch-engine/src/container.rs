@@ -10,6 +10,9 @@
 //! in Rust there are no dynamic imports to avoid, so each tier simply
 //! constructs what it needs (ARCHITECTURE §7).
 
+pub mod operation;
+pub use operation::{OperationBoundary, OperationOutcome};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -110,6 +113,40 @@ pub struct FullEngine {
     pub lock: Arc<dyn ProjectLock>,
     pub doctor_service: Arc<DoctorService>,
     pub orchestrator: Arc<Orchestrator>,
+}
+
+impl FullEngine {
+    /// Recover execution state and rebuild every missing/corrupt store index
+    /// before the listener admits a session.
+    pub async fn daemon_initialize(&self) -> Result<()> {
+        self.orchestrator.daemon_initialize().await?;
+        self.operation_boundary()
+            .run(false, async {
+                self.tasks.list(&Default::default()).await?;
+                self.agents.list().await?;
+                self.runs.list_all().await?;
+                self.goals.list(&Default::default()).await?;
+                self.teams.list().await?;
+                self.messages.list().await?;
+
+                Ok(())
+            })
+            .await
+            .value
+    }
+
+    pub fn operation_boundary(&self) -> Arc<OperationBoundary> {
+        self.events.operation_boundary()
+    }
+
+    /// Refresh future launches without replacing process ownership or collectors.
+    pub async fn refresh_config(&self) -> Result<OrchestratorConfig> {
+        let config = self.config_store.read().await?;
+        self.task_service.refresh_config(config.clone());
+        self.agent_service.refresh_config(config.clone());
+        self.orchestrator.refresh_config(config.clone());
+        Ok(config)
+    }
 }
 
 impl std::fmt::Debug for FullEngine {

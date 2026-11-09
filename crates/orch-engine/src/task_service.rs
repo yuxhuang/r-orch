@@ -44,7 +44,7 @@ pub struct TaskService {
     tasks: Arc<dyn TaskStore>,
     agents: Arc<dyn AgentStore>,
     events: Arc<EventBus>,
-    config: OrchestratorConfig,
+    config: RwLock<OrchestratorConfig>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
     /// `None` disables attachment handling, exactly as the optional `paths`
@@ -70,11 +70,22 @@ impl TaskService {
             tasks,
             agents,
             events,
-            config,
+            config: RwLock::new(config),
             clock,
             ids,
             paths,
         }
+    }
+
+    pub fn refresh_config(&self, config: OrchestratorConfig) {
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    fn config(&self) -> OrchestratorConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn with_remote_directory(mut self, directory: RemoteAgentDirectory) -> Self {
@@ -87,7 +98,9 @@ impl TaskService {
             return Err(Error::invalid_arguments("Task title is required"));
         }
 
-        let priority = input.priority.unwrap_or(self.config.defaults.task.priority);
+        let priority = input
+            .priority
+            .unwrap_or(self.config().defaults.task.priority);
         if !(1..=4).contains(&priority) {
             return Err(Error::invalid_arguments(
                 "Priority must be an integer between 1 and 4",
@@ -139,7 +152,7 @@ impl TaskService {
             attempts: 0,
             max_attempts: input
                 .max_attempts
-                .unwrap_or(self.config.defaults.task.max_attempts),
+                .unwrap_or(self.config().defaults.task.max_attempts),
             workspace_mode: input.workspace_mode,
             workspace: None,
             proof: None,
