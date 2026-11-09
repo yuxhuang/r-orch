@@ -800,6 +800,15 @@ fn wait_until_every_leg_works(shared: &Shared, pane: Option<&TuiPane>, fleet: Fl
             failures.is_empty(),
             "a client failed before every leg was running: {failures:#?}"
         );
+        if let Some(pane) = pane
+            && pane.has_exited()
+        {
+            panic!(
+                "the TUI exited with status {} before it created a task; screen:\n{}",
+                pane.exit_code(),
+                pane.screen()
+            );
+        }
         assert!(
             Instant::now() < deadline,
             "after {LEGS_READY:?} not every leg was working (tui created a task: {tui}, \
