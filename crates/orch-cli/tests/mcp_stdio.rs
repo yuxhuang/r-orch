@@ -2238,12 +2238,19 @@ fn differing_paths(
         .collect()
 }
 
-/// Seventeen `task_add` calls while the store lane is stalled: sixteen are
-/// admitted, one is refused as `Not executed`. Which one is the server's
+/// A `status` call stalls in the daemon on `config.yml`, holding its state
+/// permit; once that read has begun, sixteen `task_add` calls arrive. The
+/// bridge admits sixteen calls in all — the `status` and fifteen `task_add`s —
+/// and refuses one `task_add` as `Not executed`. Which one is the server's
 /// choice (calls sent together may run in any order), so the oracle names it
 /// by response id. The refusal must have written nothing — the project bytes
-/// are identical when it arrives — and once the lane drains, exactly the
-/// sixteen admitted titles exist and the refused one does not.
+/// are identical when it arrives — and once the stall ends, exactly the
+/// fifteen admitted titles exist and the refused one does not.
+///
+/// The stall is only a stall once something holds the permit. `task_add` does
+/// not read `config.yml` itself, so the test waits for the `status` read to
+/// block on the FIFO (`await_reader`) before sending the writes; otherwise a
+/// `task_add` that reaches the daemon first runs to completion.
 #[cfg(unix)]
 #[test]
 fn a_refused_store_call_changes_nothing_and_the_lane_serves_again_afterwards() {
@@ -2253,7 +2260,9 @@ fn a_refused_store_call_changes_nothing_and_the_lane_serves_again_afterwards() {
     status_ok(&mut server);
     let before = orchestry_state(project.path());
     let mut stall = mcp_common::ConfigStall::engage(project.path());
-    let titles: Vec<String> = (0..17).map(|n| format!("queued-{n}")).collect();
+    let holder = server.send_request("tools/call", json!({"name": "status", "arguments": {}}));
+    stall.await_reader();
+    let titles: Vec<String> = (0..16).map(|n| format!("queued-{n}")).collect();
     let ids: Vec<u64> = titles
         .iter()
         .map(|title| {
@@ -2267,12 +2276,17 @@ fn a_refused_store_call_changes_nothing_and_the_lane_serves_again_afterwards() {
     let (refused_id, refused) = server.next_response("the overflow refusal");
     let at_refusal = orchestry_state(project.path());
     stall.release();
+    let held = server.read_response(holder);
     let mut completed = Vec::new();
     for id in ids.iter().filter(|id| **id != refused_id) {
         completed.push(server.read_response(*id));
     }
     stall.finish();
 
+    assert!(
+        ids.contains(&refused_id),
+        "the refusal must be a task_add, not the stalled status: {refused}"
+    );
     assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
     assert!(
         tool_text(&refused).starts_with("Not executed: the store queue is full"),
@@ -2283,6 +2297,8 @@ fn a_refused_store_call_changes_nothing_and_the_lane_serves_again_afterwards() {
         Vec::<String>::new(),
         "the refusal and the stall must leave every byte under .orchestry as it was"
     );
+    assert_ne!(held["result"]["isError"], json!(true), "{held}");
+    assert_eq!(completed.len(), 15);
     for response in &completed {
         assert_ne!(response["result"]["isError"], json!(true), "{response}");
     }
@@ -2298,7 +2314,7 @@ fn a_refused_store_call_changes_nothing_and_the_lane_serves_again_afterwards() {
     want.sort();
     let mut got = task_titles(project.path());
     got.sort();
-    assert_eq!(got, want, "only the sixteen admitted calls ran");
+    assert_eq!(got, want, "only the fifteen admitted calls ran");
 
     let after = tool_json(
         &mut server,

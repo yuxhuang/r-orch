@@ -867,10 +867,12 @@ pub fn tool_text(response: &Value) -> &str {
         .unwrap_or_else(|| panic!("no text content in {response}"))
 }
 
-/// A deterministic stall for the server's store lane: while engaged, reading
-/// `.orchestry/config.yml` blocks, and every tool/resource call reads it when
-/// it builds its Engine. Nothing here is a timing oracle — the file is a FIFO
-/// with no writer until [`Self::release`].
+/// A deterministic stall for the daemon's state permit: while engaged, reading
+/// `.orchestry/config.yml` blocks. Only some daemon operations read it (a
+/// `status` call, the dispatch loop's interval poll; not `task_add`), so a test
+/// that needs the permit held calls [`Self::await_reader`] after sending one of
+/// those. Nothing here is a timing oracle — the file is a FIFO with no writer
+/// until [`Self::release`].
 #[cfg(unix)]
 pub struct ConfigStall {
     config: std::path::PathBuf,
@@ -878,6 +880,9 @@ pub struct ConfigStall {
     fifo: std::path::PathBuf,
     content: Vec<u8>,
     writer: Option<Worker>,
+    /// The write end [`Self::await_reader`] opened; it keeps the stalled
+    /// reader blocked in `read` until [`Self::release`] feeds it.
+    held: Option<std::fs::File>,
 }
 
 #[cfg(unix)]
@@ -900,6 +905,36 @@ impl ConfigStall {
             fifo,
             content,
             writer: None,
+            held: None,
+        }
+    }
+
+    /// Block until a read of `config.yml` has opened the FIFO, so the call
+    /// performing it holds the daemon's state permit and every later call
+    /// queues behind it. A write end opened without blocking succeeds only
+    /// once a reader exists (ENXIO before); it is kept as the feeder.
+    pub fn await_reader(&mut self) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&self.fifo)
+            {
+                Ok(file) => {
+                    self.held = Some(file);
+                    return;
+                }
+                Err(err) if err.raw_os_error() == Some(nix::libc::ENXIO) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "nothing read the stalled config.yml within {TIMEOUT:?}"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("open the config fifo for writing: {err}"),
+            }
         }
     }
 
@@ -907,6 +942,11 @@ impl ConfigStall {
     /// that may already be blocked on the FIFO.
     pub fn release(&mut self) {
         std::fs::rename(&self.real, &self.config).expect("restore the real config");
+        if let Some(mut held) = self.held.take() {
+            held.write_all(&self.content)
+                .expect("feed the stalled reader");
+            return;
+        }
         let (fifo, content) = (self.fifo.clone(), self.content.clone());
         self.writer = Some(Worker::spawn(move || {
             // Blocks until the stalled reader (if any) opens its end.
