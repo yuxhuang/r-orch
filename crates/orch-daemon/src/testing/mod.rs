@@ -182,7 +182,7 @@ impl HarnessBuilder {
                     .unwrap_or_else(|| scratch.path().join("global.yml")),
             ),
         };
-        let running = Running::bring_up_with_maintenance_timer(
+        let mut running = Running::bring_up_with_maintenance_timer(
             BringUp {
                 project_root: root.clone(),
                 socket: socket.clone(),
@@ -197,6 +197,12 @@ impl HarnessBuilder {
             self.maintenance_timer.unwrap_or(true),
         )
         .await?;
+        let scratch = Arc::new(scratch);
+        let project = project.map(Arc::new);
+        running.test_directories.push(Arc::clone(&scratch));
+        if let Some(project) = &project {
+            running.test_directories.push(Arc::clone(project));
+        }
         Ok(DaemonHarness {
             project_root: root,
             socket,
@@ -293,8 +299,8 @@ pub struct DaemonHarness {
     server: Arc<Server>,
     /// `None` once [`DaemonHarness::shutdown`] consumed it.
     lifecycle: Option<Lifecycle>,
-    _scratch: tempfile::TempDir,
-    project: Option<tempfile::TempDir>,
+    _scratch: Arc<tempfile::TempDir>,
+    project: Option<Arc<tempfile::TempDir>>,
 }
 
 /// What one [`DaemonHarness::step_dispatch`] tick did.
@@ -308,7 +314,7 @@ pub struct TickReport {
 /// cleanly and released ownership, so a test may open the files offline.
 pub struct QuiescedProject {
     project_root: PathBuf,
-    _project: Option<tempfile::TempDir>,
+    _project: Option<Arc<tempfile::TempDir>>,
 }
 
 impl QuiescedProject {

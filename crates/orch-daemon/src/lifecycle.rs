@@ -312,6 +312,9 @@ pub(crate) struct Running {
     quit: watch::Sender<bool>,
     loops: Vec<tokio::task::JoinHandle<()>>,
     runtime: tokio::runtime::Handle,
+    /// Harness-owned directories must outlive even an asynchronous drop drain.
+    #[cfg(feature = "testing")]
+    pub(crate) test_directories: Vec<Arc<tempfile::TempDir>>,
     pid_lock: Arc<PidLock>,
     guard: Option<OwnerGuard>,
     /// Dropped after the engine stops, as `serve` drops its runtime.
@@ -535,6 +538,8 @@ impl Running {
             quit,
             loops: Vec::new(),
             runtime: tokio::runtime::Handle::current(),
+            #[cfg(feature = "testing")]
+            test_directories: Vec::new(),
             pid_lock: Arc::clone(&pid_lock),
             guard: None,
             peer,
@@ -702,9 +707,13 @@ impl Running {
         discovery::remove_own_record(&self.project_root, &self.instance);
         let pid_lock = Arc::clone(&self.pid_lock);
         let guard = self.guard.take();
+        #[cfg(feature = "testing")]
+        let directories = std::mem::take(&mut self.test_directories);
         // A synchronous drop cannot join asynchronous work. Move the ownership
         // resources into the drain instead of making a successor race old writes.
         self.runtime.spawn(async move {
+            #[cfg(feature = "testing")]
+            let _directories = directories;
             let _ = handler.engine.orchestrator.daemon_stop().await;
             for task in loops {
                 let _ = task.await;

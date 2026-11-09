@@ -104,7 +104,7 @@ enum Stop {
     CancelShutdown,
 }
 
-async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop) {
+async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bool) {
     let project = tempfile::tempdir().unwrap();
     let root = project.path().canonicalize().unwrap();
     std::fs::create_dir(root.join(".orchestry")).unwrap();
@@ -113,12 +113,15 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop) {
         ..Default::default()
     });
     let _release = Release(processes.clone());
-    let old = DaemonHarness::builder()
+    let builder = DaemonHarness::builder()
         .processes(processes.clone())
-        .maintenance_timer(false)
-        .start_in(&root)
-        .await
-        .unwrap();
+        .maintenance_timer(false);
+    let old = if owned {
+        builder.start().await.unwrap()
+    } else {
+        builder.start_in(&root).await.unwrap()
+    };
+    let root = old.project_root().to_path_buf();
     let mut owner = Raw::session(&old, "cli", "normal").await;
     let created = owner
         .request(
@@ -195,6 +198,10 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop) {
             None
         }
     };
+    assert!(
+        root.exists(),
+        "owned temporary project was removed before preparation drained"
+    );
     let busy = DaemonHarness::builder()
         .maintenance_timer(false)
         .start_in(&root)
@@ -206,6 +213,16 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop) {
         "{busy:?}"
     );
     processes.release();
+    if owned {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while root.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned project is removed after drain");
+        return;
+    }
     if let Some(shutdown) = shutdown {
         tokio::time::timeout(Duration::from_secs(20), shutdown)
             .await
@@ -268,20 +285,25 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn successful_probe_is_drained_before_owner_release() {
-    delayed_preparation(false, false, Stop::Shutdown).await;
+    delayed_preparation(false, false, Stop::Shutdown, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_probe_after_disconnect_is_drained_before_owner_release() {
-    delayed_preparation(true, true, Stop::Shutdown).await;
+    delayed_preparation(true, true, Stop::Shutdown, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_harness_retains_owner_until_preparation_ends() {
-    delayed_preparation(false, true, Stop::Drop).await;
+    delayed_preparation(false, true, Stop::Drop, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_shutdown_retains_owner_until_preparation_ends() {
-    delayed_preparation(true, false, Stop::CancelShutdown).await;
+    delayed_preparation(true, false, Stop::CancelShutdown, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_owned_project_retains_guard_inode_until_preparation_ends() {
+    delayed_preparation(false, true, Stop::Drop, true).await;
 }
