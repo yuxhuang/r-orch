@@ -112,7 +112,6 @@ fn a_client_with_the_applied_env_reaches_the_daemon_and_one_without_it_does_not(
         .current_dir(fx.root())
         .env("HOME", fx.home())
         .env("PATH", "/usr/bin:/bin")
-        .env(daemon::GATE_ENV, "1")
         .env("ORCH_SOCKET", "/tmp/otd-nonexistent/s")
         .args(["daemon", "status"]);
     assert!(

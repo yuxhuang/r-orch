@@ -135,16 +135,17 @@ impl Drop for Tmux {
 }
 
 fn orch(dir: &Path, args: &[&str]) {
-    let output = Command::new(orch_binary())
+    let mut command = Command::new(orch_binary());
+    command
         .args(args)
         .current_dir(dir)
         .env_clear()
         .env("HOME", dir.join("home"))
         .env("PATH", "/usr/bin:/bin")
         .env("ORCHESTRY_GLOBAL_CONFIG_PATH", global_config(dir))
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("orch runs");
+        .env("NO_COLOR", "1");
+    daemon::apply_for(dir, &mut command);
+    let output = command.output().expect("orch runs");
     assert!(
         output.status.success(),
         "orch {args:?} failed: {}",
@@ -165,8 +166,10 @@ fn project() -> OwnedDir {
         dir.path(),
         &["init", "--name", "proj", "--adapter", "claude"],
     );
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let mut owned = OwnedDir::adopt(dir);
     orch(
-        dir.path(),
+        owned.path(),
         &[
             "agent",
             "add",
@@ -177,21 +180,23 @@ fn project() -> OwnedDir {
             "true",
         ],
     );
-    let root = dir.path().join(".orchestry");
-    std::fs::write(
-        root.join("remotes.yml"),
-        "- alias: w1\n  addr: 127.0.0.1:9\n  added_at: '2026-10-18T00:00:00Z'\n",
-    )
-    .expect("remotes.yml");
-    std::fs::create_dir_all(root.join("remotes")).expect("remotes dir");
-    std::fs::write(
-        root.join("remotes").join("w1.json"),
-        r#"{"alias":"w1","addr":"127.0.0.1:9","online":false,"last_seen":null,"last_error":null,"peer_name":null,"instance_id":null,"os":null,"agents":[{"id":"rover","name":"rover","adapter":"claude","status":"idle"}]}"#,
-    )
-    .expect("w1 status");
-    // The daemon starts last, after every file the fixture writes by hand
-    // (a running daemon owns the state and may rewrite it).
-    OwnedDir::adopt(dir)
+    // Hand-written files go in while no daemon owns the state; the fresh
+    // daemon reads them at start.
+    owned.with_daemon_stopped(|project| {
+        let root = project.join(".orchestry");
+        std::fs::write(
+            root.join("remotes.yml"),
+            "- alias: w1\n  addr: 127.0.0.1:9\n  added_at: '2026-10-18T00:00:00Z'\n",
+        )
+        .expect("remotes.yml");
+        std::fs::create_dir_all(root.join("remotes")).expect("remotes dir");
+        std::fs::write(
+            root.join("remotes").join("w1.json"),
+            r#"{"alias":"w1","addr":"127.0.0.1:9","online":false,"last_seen":null,"last_error":null,"peer_name":null,"instance_id":null,"os":null,"agents":[{"id":"rover","name":"rover","adapter":"claude","status":"idle"}]}"#,
+        )
+        .expect("w1 status");
+    });
+    owned
 }
 
 fn launch(dir: &Path, socket: String) -> Tmux {

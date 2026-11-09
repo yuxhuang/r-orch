@@ -15,9 +15,8 @@
 //!   clients dial. `ORCH_TEST_SOCKET_ROOT=<short>` makes the client refuse any
 //!   socket outside that directory, so a stray environment cannot send a
 //!   fixture to someone else's daemon.
-//! * A fixture's child commands get exactly those two variables (plus the
-//!   developmental gate) through [`TestDaemon::apply`]; nothing else about
-//!   their environment is changed.
+//! * A fixture's child commands get exactly those two variables through
+//!   [`TestDaemon::apply`]; nothing else about their environment is changed.
 //!
 //! # Lifecycle
 //!
@@ -42,22 +41,14 @@
 //! * Fixtures keyed by working directory (`orch(cwd)`) call
 //!   [`register_project`] once and [`apply_for`] in their command constructor;
 //!   launchers that take an env list (tmux `-e`) use [`env_pairs_for`].
-//! * A fixture that still runs a legacy in-process orchestrator
-//!   (`orch run <id>`, `run --all`, `serve`) must not own a daemon yet: both
-//!   take the PID lock ("Orchestrator already running"). Those fixtures start
-//!   the daemon after S2a-cli turns the commands into daemon RPCs.
-//!
-//! # Gate env
-//!
-//! `ORCH_DAEMON_DEVELOPMENTAL=1` is set on the **children only**, never in
-//! the test process, and only until S2a-cli removes the gate (then delete
-//! [`GATE_ENV`] and its use in [`TestDaemon::apply`] / [`TestDaemon::start`]).
-//!
-//! # Until the CLI is converted (S2a-cli)
-//!
-//! The legacy commands still go straight to the store, so a fixture that has a
-//! daemon running keeps passing through the legacy path; the daemon is idle
-//! (dispatch OFF) beside it. That is expected and not asserted on.
+//! * Every command is a daemon client since S2a-cli (`orch run <id>`, `run
+//!   --all`, `run --once`, `serve --once` dispatch through the socket), so a
+//!   fixture that runs agents needs the daemon, and a fixture that runs
+//!   `orch serve` / `run --watch` in the foreground *is* its own daemon and
+//!   must not own a second one ("already running", exit 4).
+//! * A fixture that builds a command before it has a daemon uses
+//!   [`apply_env`]; a fixture that wants "no daemon" simply does not apply
+//!   the socket env.
 #![allow(dead_code, reason = "each test crate uses a subset of this module")]
 
 use std::fs;
@@ -71,9 +62,6 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-
-/// The developmental gate PR 1 puts on `orch daemon …`; removed with S2a-cli.
-pub const GATE_ENV: &str = "ORCH_DAEMON_DEVELOPMENTAL";
 
 /// Upper bound on readiness, `daemon stop` and group exit. Finite so a daemon
 /// regression fails the test instead of hanging CI; generous because the whole
@@ -139,7 +127,6 @@ impl TestDaemon {
             .env("ORCH_PROJECT_ROOT", &root)
             .env("ORCH_SOCKET", &socket)
             .env("ORCH_TEST_SOCKET_ROOT", short.path())
-            .env(GATE_ENV, "1")
             .envs(extra.iter().copied())
             .args(["daemon", "start"])
             .stdin(Stdio::null())
@@ -225,7 +212,6 @@ impl TestDaemon {
         vec![
             format!("ORCH_SOCKET={}", self.socket.display()),
             format!("ORCH_TEST_SOCKET_ROOT={}", self.short.path().display()),
-            format!("{GATE_ENV}=1"),
         ]
     }
 
@@ -400,7 +386,6 @@ pub fn env_pairs_for(cwd: &Path) -> Vec<String> {
             vec![
                 format!("ORCH_SOCKET={}", socket.display()),
                 format!("ORCH_TEST_SOCKET_ROOT={}", dir.display()),
-                format!("{GATE_ENV}=1"),
             ]
         })
         .unwrap_or_default()
@@ -409,9 +394,17 @@ pub fn env_pairs_for(cwd: &Path) -> Vec<String> {
 /// A throwaway project directory that owns its test daemon. `path()` is the
 /// project root, as for a `TempDir`; the daemon is stopped (and the process
 /// table checked) before the directory is removed.
+///
+/// Every `orch` command is a daemon client, so a fixture that seeds its
+/// project with `orch goal add …` / `orch task add …` adopts the daemon right
+/// after `orch init` and seeds through [`apply_for`]-aware commands. Files a
+/// fixture writes **by hand** (run records, a cached peer snapshot) go in
+/// through [`OwnedDir::with_daemon_stopped`]: a daemon owns the state and
+/// would not see, or would overwrite, an edit made behind its back.
 pub struct OwnedDir {
     // Declared first: dropped first.
-    daemon: TestDaemon,
+    daemon: Option<TestDaemon>,
+    home: PathBuf,
     dir: tempfile::TempDir,
 }
 
@@ -424,9 +417,14 @@ impl OwnedDir {
 
     /// [`adopt`](Self::adopt) with the HOME at `<dir>/<home>`.
     pub fn adopt_with_home(dir: tempfile::TempDir, home: &str) -> OwnedDir {
-        let daemon = TestDaemon::start(dir.path(), &dir.path().join(home));
+        let home = dir.path().join(home);
+        let daemon = TestDaemon::start(dir.path(), &home);
         register_project(dir.path(), &daemon);
-        OwnedDir { daemon, dir }
+        OwnedDir {
+            daemon: Some(daemon),
+            home,
+            dir,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -434,7 +432,22 @@ impl OwnedDir {
     }
 
     pub fn daemon(&self) -> &TestDaemon {
-        &self.daemon
+        self.daemon.as_ref().expect("the daemon is running")
+    }
+
+    /// Stop the daemon (process table checked), run `edit` on the quiescent
+    /// project, then start a fresh daemon on a new isolated socket and
+    /// re-register it. The new daemon re-reads everything `edit` wrote.
+    pub fn with_daemon_stopped(&mut self, edit: impl FnOnce(&Path)) {
+        unregister_project(self.dir.path());
+        self.daemon
+            .take()
+            .expect("the daemon is running")
+            .shutdown();
+        edit(self.dir.path());
+        let daemon = TestDaemon::start(self.dir.path(), &self.home);
+        register_project(self.dir.path(), &daemon);
+        self.daemon = Some(daemon);
     }
 }
 
@@ -444,13 +457,12 @@ impl Drop for OwnedDir {
     }
 }
 
-/// Set the three variables that aim a command at `socket`. Free-standing so a
+/// Set the two variables that aim a command at `socket`. Free-standing so a
 /// fixture that builds its command before it has a daemon can still use it.
 pub fn apply_env(command: &mut Command, socket: &Path, socket_dir: &Path) {
     command
         .env("ORCH_SOCKET", socket)
-        .env("ORCH_TEST_SOCKET_ROOT", socket_dir)
-        .env(GATE_ENV, "1");
+        .env("ORCH_TEST_SOCKET_ROOT", socket_dir);
 }
 
 fn read_lines(stdout: std::process::ChildStdout) -> Receiver<Option<String>> {
