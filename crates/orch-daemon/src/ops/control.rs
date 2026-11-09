@@ -332,7 +332,7 @@ impl ServiceHandler {
         let (_, before, _) = self.read_execution_snapshot().await?;
         self.engine
             .orchestrator
-            .daemon_launch_task_with_guard(&a.task_id, Arc::clone(&ctx.cancelled))
+            .daemon_launch_task_with_guard(&a.task_id, Arc::clone(&ctx.cancelled), true)
             .await
             .map_err(service_error)?;
         let (_, runs, state) = self.read_execution_snapshot().await?;
@@ -377,7 +377,7 @@ impl ServiceHandler {
                 let (_, before, _) = self.read_execution_snapshot().await?;
                 self.engine
                     .orchestrator
-                    .daemon_launch_task_with_guard(&id, Arc::clone(&ctx.cancelled))
+                    .daemon_launch_task_with_guard(&id, Arc::clone(&ctx.cancelled), false)
                     .await
                     .map_err(service_error)?;
                 let (tasks, runs, state) = self.read_execution_snapshot().await?;

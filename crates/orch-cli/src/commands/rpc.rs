@@ -76,9 +76,11 @@ pub fn argument_error(error: impl std::fmt::Display) -> Error {
     Error::invalid_arguments(error.to_string())
 }
 
+/// The display keeps the client's own text, so a command that reports a
+/// failure inline (`Failed to create agent "x": …`) still says why.
 pub fn client_error(error: ClientError) -> Error {
     Error::Io {
-        context: "daemon request failed".into(),
+        context: error.to_string(),
         path: None,
         source: std::io::Error::other(error),
     }
@@ -108,6 +110,18 @@ mod tests {
         assert_eq!(recovered.exit_code(), 7);
         assert_eq!(recovered.render(true), expected);
         assert!(recover_client_error(&Error::other("daemon request failed")).is_none());
+    }
+
+    #[test]
+    fn an_inline_report_of_a_daemon_refusal_keeps_the_daemon_text() {
+        let refusal = ClientError::Remote(orch_proto::error::ErrorBody::new(
+            orch_proto::error::ErrorCode::Conflict,
+            "agent \"x\" inherits project eco",
+            orch_proto::error::Execution::NotExecuted,
+        ));
+        let error = client_error(refusal);
+        assert_eq!(error.to_string(), "agent \"x\" inherits project eco");
+        assert_eq!(recover_client_error(&error).unwrap().exit_code(), 1);
     }
 
     #[test]

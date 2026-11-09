@@ -3148,7 +3148,6 @@ fn hold_lock(root: &Path) -> fs::File {
 }
 
 #[test]
-#[ignore = "with the template lock held outside the daemon, the writers fail with exit 7 'daemon operation queue is full or admission timed out' (the no-daemon exit code) instead of exit 1-3 naming the lock. tsk_Gt0X3Br."]
 fn update_and_patch_fail_after_the_lock_budget_while_another_writer_holds_the_lock() {
     let sb = sandbox();
     let root = small_team(&sb, "locked");

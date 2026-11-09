@@ -1272,7 +1272,7 @@ pub(super) fn mirror_controller(task: &Task) -> Option<&str> {
 /// `due_at` does not parse never comes due in `process_retry_queue`, so it
 /// does not hold the task back here either: that would strand it in
 /// `retrying` for good.
-fn retry_pending(state: &OrchestratorState, task_id: &str, now_ms: i64) -> bool {
+pub(super) fn retry_pending(state: &OrchestratorState, task_id: &str, now_ms: i64) -> bool {
     state.retry_queue.iter().any(|retry| {
         retry.task_id == task_id
             && epoch_ms_from_iso(&retry.due_at).is_some_and(|due_at| now_ms < due_at)

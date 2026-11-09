@@ -2652,41 +2652,16 @@ fn two_servers_creating_distinct_tasks_at_once_both_keep_every_index_entry() {
 }
 
 #[test]
-fn a_removed_context_directory_keeps_failing_until_the_daemon_restarts() {
-    // Design D10: the ensured-directory cache is process-global, so removing a
-    // directory the daemon has used breaks it until it restarts. The cache
-    // lives in the daemon now, so restarting only the MCP bridge (which owns
-    // no state) does not recover it; restarting the daemon does.
+fn a_removed_context_directory_is_recreated_by_the_next_write() {
+    // Design D10 residual, closed: the daemon's ensured-directory cache
+    // forgets a directory that vanished underneath it, so the next write
+    // recreates it instead of failing until the daemon restarts.
     let mut fx = Fx::new();
     fx.ok("context_set", json!({"key": "k", "value": "v"}));
     std::fs::remove_dir_all(fx.root().join(".orchestry/context")).expect("remove context dir");
-    let broken = fx.call("context_set", json!({"key": "k2", "value": "v"}));
-    assert_eq!(
-        broken["result"]["isError"],
-        json!(true),
-        "the failure is visible as a tool error: {broken}"
-    );
-    assert!(
-        fx.ok("status", json!({})).is_object(),
-        "the process itself lives"
-    );
-    let Fx { server, mut dir } = fx;
-    drop(server);
-    let mut bridge_only = McpServer::spawn(dir.path());
-    bridge_only.initialize();
-    let still_broken = bridge_only.call_tool("context_set", json!({"key": "k3", "value": "v"}));
-    assert_eq!(
-        still_broken["result"]["isError"],
-        json!(true),
-        "a new bridge talks to the same daemon: {still_broken}"
-    );
-    drop(bridge_only);
-    dir.stop_daemon();
-    dir.start_daemon();
-    let mut restarted = McpServer::spawn(dir.path());
-    restarted.initialize();
-    let response = restarted.call_tool("context_set", json!({"key": "k4", "value": "v"}));
-    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+    fx.ok("context_set", json!({"key": "k2", "value": "v"}));
+    let got = fx.ok("context_get", json!({"key": "k2"}));
+    assert_eq!(got["value"], json!("v"), "{got}");
 }
 
 #[test]
