@@ -142,7 +142,7 @@ Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_W
 | | F3: this status table and the liveness decision | `tsk_CFNaK07` | this commit |
 | | I2: integrate the fix round, full gate set, re-freeze | `tsk_MACcZj4` | pending |
 | G: PR 2, re-gate and PR (future) | Re-reviews at the re-frozen SHA: code, security, resilience, facts | `tsk_QKJV45G`, `tsk_WBWDCzh`, `tsk_P-mM5Cp`, `tsk_3bHsl13` | pending |
-| | PR: push, open the single PR against `main`, Linux CI green | `tsk_5TRHZoX` | pending; not pushed, no PR yet |
+| | PR: push, open the single PR against `main`, Linux CI green | `tsk_5TRHZoX` | PR [#72](https://github.com/yuxhuang/r-orch/pull/72) opened at `d3dace0`; Linux CI green, run 42547054498; owner merges (squash) |
 | | Checkpoint CP3: re-gate verdicts and PR | `tsk_65sIOO0` | pending |
 
 Decided at CP1 (`tsk_IUpXm7b`): `task_cancel` reports no liveness field and stays store-only. A live PID on the

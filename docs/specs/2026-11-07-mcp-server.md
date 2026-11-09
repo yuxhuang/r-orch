@@ -193,7 +193,9 @@ amendments that lead decision-1 and decision-2 made to R2, R3, R4 and R8 were **
 R4 (amended 2026-11-08), R8 (amended 2026-11-08) and R13–R16: the follow-up PR of goal `goal_h-gIBCW`, branch
 `fix/mcp-followups`, frozen code commit `514560d`. "macOS" is `cargo test --workspace` (5,618 passed, 0 failed, 4
 ignored) and the cold `./xtask/gate.sh` (all 9 steps pass) on macOS 27.2 arm64 at `514560d`, recorded in the goal's
-review packet. Linux CI runs when the PR is opened; the PR records that run. R14 was rechecked after the CP2 fix
+review packet. "Linux CI" is GitHub Actions `ubuntu-latest` x86_64 on PR #72
+([yuxhuang/r-orch#72](https://github.com/yuxhuang/r-orch/pull/72)), run 42547054498, jobs `check` and `test` passed at
+the re-frozen commit `d3dace0`. R14 was rechecked after the CP2 fix
 round at `152c62c` on the same Mac; its row records what ran there.
 
 | Id | Result (`pass` / `env-limited` / `waived by owner`) | Commit the check ran at | Platform |
@@ -210,12 +212,12 @@ round at `152c62c` on the same Mac; its row records what ran there.
 | R10 | pass: `cargo deny check` (0.20.2) and `cargo xtask crate-graph` | `42d2808` | macOS + Linux CI (`check` job) |
 | R11 | pass: the CI set and the cold gate | `42d2808` | macOS + Linux CI |
 | R12 | pass: qa-engineer ran MCP Inspector 2.14.0 (CLI mode, no model) against the built binary: initialise, `tools/list`, `task_add`, `task_show`, compared with `orch --json task show` | `847d823` | macOS arm64 only (the owner's Mac; not run on Linux) |
-| R4 (amended 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
-| R8 (amended 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
-| R13 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
-| R14 (form errors fixed 2026-11-08) | pass on macOS: the CP2 fact gate found that a malformed `logs` `since` still quoted its value at `514560d`; `152c62c` made that text value-free and added the two `since` tests in the R14 row. At `152c62c`: all eight R14 tests, `mcp_stdio` (110 passed) and `mcp_tools` (186 passed), `cargo test --workspace` (5,620 passed, 0 failed, 4 ignored), and a `RUST_LOG=warn` stdio probe with `since: "SECRET_SINCE_918273"` (sentinel in neither the response nor stderr). `./xtask/gate.sh` runs at the re-frozen commit; Linux CI pending the PR | `152c62c` | macOS 27.2 arm64; Linux CI pending the PR |
-| R15 (wording corrected 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); the corrected wording matches what the cited test checks, and `task.rs` is unchanged since `514560d`; Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
-| R16 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pending the PR | `514560d` | macOS; Linux CI pending the PR |
+| R4 (amended 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pass, run 42547054498 at `d3dace0` (PR #72) | `514560d` | macOS + Linux CI |
+| R8 (amended 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pass, run 42547054498 at `d3dace0` (PR #72) | `514560d` | macOS + Linux CI |
+| R13 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pass, run 42547054498 at `d3dace0` (PR #72) | `514560d` | macOS + Linux CI |
+| R14 (form errors fixed 2026-11-08) | pass on macOS: the CP2 fact gate found that a malformed `logs` `since` still quoted its value at `514560d`; `152c62c` made that text value-free and added the two `since` tests in the R14 row. At `152c62c`: all eight R14 tests, `mcp_stdio` (110 passed) and `mcp_tools` (186 passed), `cargo test --workspace` (5,620 passed, 0 failed, 4 ignored), and a `RUST_LOG=warn` stdio probe with `since: "SECRET_SINCE_918273"` (sentinel in neither the response nor stderr). `./xtask/gate.sh` passed at the re-frozen commit `d3dace0` (review packet 2); Linux CI pass, run 42547054498 at `d3dace0` (PR #72) | `152c62c` | macOS 27.2 arm64 + Linux CI |
+| R15 (wording corrected 2026-11-08) | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); the corrected wording matches what the cited test checks, and `task.rs` is unchanged since `514560d`; Linux CI pass, run 42547054498 at `d3dace0` (PR #72) | `514560d` | macOS + Linux CI |
+| R16 | pass on macOS (`cargo test --workspace` and `./xtask/gate.sh`, review packet); Linux CI pass, run 42547054498 at `d3dace0` (PR #72) | `514560d` | macOS + Linux CI |
 
 Defects found outside the requirements:
 - PR #69 carried these as accepted residuals or follow-ups; goal `goal_h-gIBCW` handles them. Cross-goal
