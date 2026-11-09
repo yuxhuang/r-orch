@@ -459,8 +459,7 @@ impl ServiceHandler {
         _ctx: &OpContext,
         args: OrgTemplateDefinitionGetArgs,
     ) -> OpResult<DefinitionDocument> {
-        let loaded = load_template(&args.selector).await?;
-        definition_document(&serde_json::to_value(&loaded.bundle.org).map_err(json_error)?)
+        edit_base(&args.selector, &Target::Org).await
     }
 
     pub(super) async fn org_template_definition_apply(
@@ -507,14 +506,8 @@ impl ServiceHandler {
         _ctx: &OpContext,
         args: OrgTemplateAgentDefinitionGetArgs,
     ) -> OpResult<DefinitionDocument> {
-        let loaded = load_template(&args.selector).await?;
-        let agent = loaded
-            .bundle
-            .agents
-            .iter()
-            .find(|agent| agent.name == args.agent.as_str())
-            .ok_or_else(|| invalid("Template agent not found"))?;
-        definition_document(&serde_json::to_value(agent).map_err(json_error)?)
+        validate_id(&args.agent).map_err(invalid)?;
+        edit_base(&args.selector, &Target::Agent(args.agent.into_inner())).await
     }
 
     pub(super) async fn org_template_agent_definition_apply(
@@ -594,10 +587,10 @@ impl ServiceHandler {
         let input = read_document(self, ctx, definition.input.clone()).await?;
         validate_fields(&input, &target)?;
         if definition.kind == MutationKind::Update {
-            reject_nulls(&input)?;
+            reject_nulls(&input, "definition")?;
         }
         let candidate = definition_candidate(&current, &input, &definition)?;
-        reject_nulls(&candidate)?;
+        reject_nulls(&candidate, "definition")?;
         locked
             .publish(
                 target,
@@ -696,6 +689,24 @@ fn canonical_definition(value: Value, target: &Target) -> OpResult<Value> {
         )
         .map_err(json_error),
     }
+}
+
+/// The base an edit starts from: the selected file alone, read the way
+/// [`ServiceHandler::template_apply`] reads it, so the digest matches and a
+/// malformed file names the full-update repair instead of opening an editor.
+async fn edit_base(selector: &TemplateSelector, target: &Target) -> OpResult<DefinitionDocument> {
+    let (root, expected) = writable(selector)?;
+    let locked = LockedTemplate::open(&root, expected.as_deref())
+        .await
+        .map_err(service_error)?;
+    let value = locked.document(target).await.map_err(service_error)?;
+    let canonical = canonical_definition(value, target).map_err(|error| {
+        invalid(format!(
+            "{}; use template update with a full valid definition to repair",
+            error.message.as_str()
+        ))
+    })?;
+    definition_document(&canonical)
 }
 
 fn invalid(message: impl Into<String>) -> ErrorBody {
@@ -965,18 +976,20 @@ fn validate_fields(input: &Value, target: &Target) -> OpResult<()> {
     Ok(())
 }
 
-fn reject_nulls(value: &Value) -> OpResult<()> {
+fn reject_nulls(value: &Value, path: &str) -> OpResult<()> {
     match value {
-        Value::Null => Err(invalid("definition: explicit null is not allowed")),
+        Value::Null => Err(invalid(format!(
+            "{path}: null is not allowed; omit the field"
+        ))),
         Value::Object(fields) => {
-            for value in fields.values() {
-                reject_nulls(value)?;
+            for (key, value) in fields {
+                reject_nulls(value, &format!("{path}.{key}"))?;
             }
             Ok(())
         }
         Value::Array(values) => {
             for value in values {
-                reject_nulls(value)?;
+                reject_nulls(value, path)?;
             }
             Ok(())
         }
@@ -1029,7 +1042,16 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(reject_nulls(&serde_json::json!({"role": null})).is_err());
+        let error = reject_nulls(
+            &serde_json::json!({"defaults": {"skills": null}}),
+            "definition",
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("definition.defaults.skills"),
+            "{}",
+            error.message.as_str()
+        );
     }
 
     #[tokio::test]
