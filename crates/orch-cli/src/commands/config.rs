@@ -20,13 +20,11 @@
 //! itself is written key-only, so unknown extension keys and unset defaults
 //! stay exactly as they were.
 
+use super::rpc::Rpc;
 use orch_core::error::{Error, Result};
-use orch_domain::{
-    ACTIVITY_FILTER_PRESETS, GlobalConfig, PromptMode, TUI_PALETTE_NAMES, TuiPaletteName,
-    set_by_path,
-};
-use orch_engine::Engine;
-use serde::Serialize;
+use orch_domain::{ACTIVITY_FILTER_PRESETS, TUI_PALETTE_NAMES, TuiPaletteName};
+use orch_proto::ops::{Op, OpClass, Request, args};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::context::CliContext;
@@ -40,6 +38,43 @@ struct KeyValue<'a> {
     value: Option<&'a Value>,
 }
 
+/// Unlike `Option<Value>`'s default deserializer, retain a present JSON null.
+#[derive(Serialize, Deserialize)]
+struct ConfigValue {
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    value: Option<Value>,
+}
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+// Reuse the closed request DTO and wire operation; only the presentation
+// result reader differs so an authored null does not become a missing key.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct ConfigRead(args::ConfigGetArgs);
+impl Op for ConfigRead {
+    const NAME: &'static str = <args::ConfigGetArgs as Op>::NAME;
+    const CLASS: OpClass = <args::ConfigGetArgs as Op>::CLASS;
+    type Output = ConfigValue;
+    fn into_request(self) -> Request {
+        self.0.into_request()
+    }
+}
+
+pub(crate) async fn get_value(engine: &Rpc, key: &str) -> Result<Option<Value>> {
+    Ok(engine
+        .call::<ConfigRead>(serde_json::json!({"key":key}))
+        .await?
+        .value)
+}
+
 /// `JSON.stringify(value)` for the human line: a string keeps its quotes, and
 /// an absent value prints `undefined`.
 fn render_value(value: Option<&Value>) -> String {
@@ -49,8 +84,8 @@ fn render_value(value: Option<&Value>) -> String {
     }
 }
 
-pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
-    let value = engine.config_store.get(key).await?;
+pub async fn get(engine: &Rpc, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
+    let value = get_value(engine, key).await?;
 
     if let Some(format) = ctx.output {
         return format.print_compact(&KeyValue {
@@ -63,7 +98,7 @@ pub async fn get(engine: &Engine, ctx: &CliContext, styles: &Styles, key: &str) 
 }
 
 pub async fn set(
-    engine: &Engine,
+    engine: &Rpc,
     _ctx: &CliContext,
     styles: &Styles,
     key: &str,
@@ -81,53 +116,33 @@ pub async fn set(
     Ok(())
 }
 
-/// The print-free half of `config set`, shared with `orch mcp`: parse `raw`
-/// as JSON or keep it as a string, then write it with exactly the existing
-/// validation branches. Only the prompt mode key and keys that affect prompt
-/// rendering are validated (under the definition lock); every other key is a
-/// raw store set. Returns the parsed value.
-pub(crate) async fn set_value(engine: &Engine, key: &str, raw: &str) -> Result<Value> {
-    // `JSON.parse` first, the raw string as the fallback.
-    let parsed: Value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
-    if key == PROMPT_MODE_KEY {
-        let mode = parsed
-            .as_str()
-            .and_then(|value| value.parse::<PromptMode>().ok())
-            .ok_or_else(|| {
-                Error::invalid_arguments(format!(
-                    "{PROMPT_MODE_KEY}: expected normal or eco, got {}",
-                    serde_json::to_string(&parsed).unwrap_or_default()
-                ))
-            })?;
-        orch_engine::prompt_mode::set_project_prompt_mode(
-            engine.paths.project_root(),
-            engine.agents.as_ref(),
-            mode,
-        )
+/// Parse and validate the value in the daemon, which owns the definition lock.
+pub(crate) async fn set_value(engine: &Rpc, key: &str, raw: &str) -> Result<Value> {
+    engine
+        .call::<args::ConfigSetArgs>(serde_json::json!({"key":key,"value":raw}))
         .await?;
-    } else if affects_prompt_rendering(key) {
-        use orch_infra::storage::fs_utils;
-        let _lock = fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock")).await?;
-        // The same merged candidate `ConfigStore::set` writes, checked first.
-        let mut candidate = orch_infra::storage::FileConfigStore::new(engine.paths.clone())
-            .read_merged()
-            .await?;
-        set_by_path(&mut candidate, key, parsed.clone());
-        validate_prompt_candidate(engine, &candidate).await?;
-        engine.config_store.set(key, parsed.clone()).await?;
-    } else {
-        engine.config_store.set(key, parsed.clone()).await?;
-    }
-    Ok(parsed)
+    Ok(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())))
 }
 
-/// `config edit` spawns the editor on the real file and prints nothing.
-pub async fn edit(engine: &Engine) -> Result<()> {
-    crate::editor::edit_file(&engine.paths.config_path()).await
+/// Edit an authored snapshot; a concurrent edit is a conflict, never overwritten.
+pub async fn edit(engine: &Rpc) -> Result<()> {
+    let base = engine.request(args::ConfigDefinitionGetArgs {}).await?;
+    let input = super::org_template::edit_document(&base.document).await?;
+    super::org_template::document_request(engine, &input, |input| {
+        args::ConfigDefinitionApplyArgs {
+            definition: args::DefinitionInput {
+                input,
+                kind: args::MutationKind::Update,
+                base_digest: Some(base.digest),
+            },
+        }
+    })
+    .await?;
+    Ok(())
 }
 
 pub async fn mutate(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: &crate::tree::DefinitionInput,
@@ -135,7 +150,7 @@ pub async fn mutate(
 ) -> Result<()> {
     let input = crate::document_input::read_document(&args.file, args.input_format).await?;
     let file = args.file.clone();
-    let source = move |err| crate::document_input::at_source(&file, err);
+    let source = move |err| super::org_template::at_source(&file, err);
     let candidate = apply_definition(engine, &input, kind, &source).await?;
     if let Some(format) = ctx.output {
         format.print(&candidate)?;
@@ -145,81 +160,36 @@ pub async fn mutate(
     Ok(())
 }
 
-/// The print-free half of `config update`/`config patch`, shared with
-/// `orch mcp`: under the definition lock, merge the already-parsed document
-/// into the raw project config, validate it (complete for an update) and the
-/// prompt candidate, and write it if it changed. Returns the raw candidate.
-/// `source` attributes errors to the input document, as the CLI always has.
+/// Apply the document under the daemon's definition lock; validation and
+/// publication run in one operation.
 pub(crate) async fn apply_definition(
-    engine: &Engine,
+    engine: &Rpc,
     input: &Value,
     kind: crate::document_input::MutationKind,
     source: &(dyn Fn(Error) -> Error + Sync),
 ) -> Result<Value> {
-    use crate::document_input::{MutationKind, apply_mutation};
-    use orch_infra::storage::{FileConfigStore, fs_utils};
-    let _lock = fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock"))
-        .await
-        .map_err(source)?;
-    let store = FileConfigStore::new(engine.paths.clone());
-    let current = store.read_raw().await?;
-    let candidate = apply_mutation(&current, input, kind).map_err(source)?;
-    let complete = kind == MutationKind::Update;
-    orch_infra::storage::config::validate_raw_config(&candidate, complete).map_err(source)?;
-    validate_prompt_candidate(engine, &candidate)
-        .await
-        .map_err(source)?;
-    if candidate != current {
-        store
-            .write_raw(&candidate, complete)
-            .await
-            .map_err(source)?;
-    }
-    Ok(candidate)
+    let result = super::org_template::document_request(engine, input, |input| {
+        args::ConfigDefinitionApplyArgs {
+            definition: args::DefinitionInput {
+                input,
+                kind: super::org_template::wire_kind(kind),
+                base_digest: None,
+            },
+        }
+    })
+    .await
+    .map_err(source)?;
+    serde_json::from_str(&result.document).map_err(|error| Error::other(error.to_string()))
 }
 
 /// The project prompt-mode key.
 pub const PROMPT_MODE_KEY: &str = "defaults.agent.prompt_mode";
 
-/// Whether setting `key` can change the project prompt mode or the custom
-/// templates: an ancestor of `defaults.agent.prompt_mode`, or anything under
-/// `prompt`. Only these sets take the lock and the candidate check; every
-/// other key keeps `config set`'s existing behaviour.
-fn affects_prompt_rendering(key: &str) -> bool {
-    let segments: Vec<&str> = key.split('.').collect();
-    let mode: Vec<&str> = PROMPT_MODE_KEY.split('.').collect();
-    segments.first() == Some(&"prompt")
-        || (segments.len() <= mode.len() && segments[..] == mode[..segments.len()])
-}
-
-/// Reject a raw config candidate whose known fields do not parse (including a
-/// prompt mode other than `normal`/`eco`) or under which an agent would render
-/// eco against a custom template. Lists every offender and both remedies.
-async fn validate_prompt_candidate(engine: &Engine, candidate: &Value) -> Result<()> {
-    let typed = orch_engine::prompt_mode::effective_config_of_raw(candidate)?;
-    let agents = engine.agent_service.list().await?;
-    orch_engine::prompt_mode::validate_project_config_candidate(&typed, &agents)
-}
-
-/// The two keys `config global get`/`set` understand.
-fn global_value(config: &GlobalConfig, key: &str) -> Option<Value> {
-    match key {
-        "activity_filter" => Some(Value::String(
-            config.tui.activity_filter.as_str().to_owned(),
-        )),
-        "palette" => Some(Value::String(config.tui.palette.as_str().to_owned())),
-        _ => None,
-    }
-}
-
-pub async fn global_get(
-    engine: &Engine,
-    ctx: &CliContext,
-    styles: &Styles,
-    key: &str,
-) -> Result<()> {
-    let config = engine.global_config_store.read().await?;
-    let value = global_value(&config, key);
+pub async fn global_get(engine: &Rpc, ctx: &CliContext, styles: &Styles, key: &str) -> Result<()> {
+    let value = engine
+        .call::<args::ConfigGlobalGetArgs>(serde_json::json!({"key":key}))
+        .await?
+        .value;
 
     if let Some(format) = ctx.output {
         return format.print_compact(&KeyValue {
@@ -233,14 +203,12 @@ pub async fn global_get(
 
 /// An invalid value and an unknown key both print an error and **exit 0**.
 pub async fn global_set(
-    engine: &Engine,
+    engine: &Rpc,
     _ctx: &CliContext,
     styles: &Styles,
     key: &str,
     value: &str,
 ) -> Result<()> {
-    let mut config = engine.global_config_store.read().await?;
-
     match key {
         "activity_filter" => {
             if !ACTIVITY_FILTER_PRESETS.contains(&value) {
@@ -254,15 +222,16 @@ pub async fn global_set(
                 );
                 return Ok(());
             }
-            config.tui.activity_filter = value.to_owned();
-            engine.global_config_store.write(&config).await?;
+            engine
+                .call::<args::ConfigGlobalSetArgs>(serde_json::json!({"key":key,"value":value}))
+                .await?;
             print_success(styles, &format!("{key} = {value}"));
         }
         "palette" => {
             // Lowercased before validation, and the **lowercased** form is
             // what gets stored and echoed.
             let palette = value.to_lowercase();
-            let Ok(parsed) = palette.parse::<TuiPaletteName>() else {
+            let Ok(_) = palette.parse::<TuiPaletteName>() else {
                 print_error(
                     styles,
                     &format!(
@@ -277,8 +246,9 @@ pub async fn global_set(
                 );
                 return Ok(());
             };
-            config.tui.palette = parsed;
-            engine.global_config_store.write(&config).await?;
+            engine
+                .call::<args::ConfigGlobalSetArgs>(serde_json::json!({"key":key,"value":palette}))
+                .await?;
             print_success(styles, &format!("{key} = {palette}"));
         }
         _ => print_error(styles, &format!("Unknown global config key: {key}"), None),
@@ -286,8 +256,8 @@ pub async fn global_set(
     Ok(())
 }
 
-pub async fn global_show(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
-    let config = engine.global_config_store.read().await?;
+pub async fn global_show(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<()> {
+    let config = engine.request(args::ConfigGlobalShowArgs {}).await?;
 
     if let Some(format) = ctx.output {
         return format.print_compact(&config);
@@ -309,7 +279,6 @@ pub async fn global_show(engine: &Engine, ctx: &CliContext, styles: &Styles) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orch_domain::default_global_config;
     use serde_json::json;
 
     #[test]
@@ -339,47 +308,6 @@ mod tests {
         assert_eq!(render_value(Some(&value)), "10000");
         // A string value keeps its quotes, as `JSON.stringify` gives.
         assert_eq!(render_value(Some(&json!("amber"))), "\"amber\"");
-    }
-
-    #[test]
-    fn only_prompt_related_keys_take_the_candidate_check() {
-        for key in [
-            "defaults",
-            "defaults.agent",
-            "defaults.agent.prompt_mode",
-            "prompt",
-            "prompt.template",
-            "prompt.system_template",
-            "prompt.user_template",
-        ] {
-            assert!(affects_prompt_rendering(key), "{key}");
-        }
-        for key in [
-            "defaults.agent.max_turns",
-            "defaults.task",
-            "scheduling.max_concurrent_agents",
-            "project.name",
-            "prompts",
-            "defaults.agent.prompt_mode.deeper",
-        ] {
-            assert!(!affects_prompt_rendering(key), "{key}");
-        }
-    }
-
-    #[test]
-    fn global_get_knows_exactly_two_keys() {
-        let config = default_global_config();
-        assert_eq!(
-            global_value(&config, "palette"),
-            Some(json!(config.tui.palette.as_str()))
-        );
-        assert_eq!(
-            global_value(&config, "activity_filter"),
-            Some(json!(config.tui.activity_filter.as_str()))
-        );
-        for unknown in ["tui.palette", "notifications", "", "Palette"] {
-            assert_eq!(global_value(&config, unknown), None, "{unknown}");
-        }
     }
 
     #[test]

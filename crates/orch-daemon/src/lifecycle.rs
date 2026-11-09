@@ -3,7 +3,7 @@
 //! `orch daemon start`, `serve`/`run --watch` (PR 2) and `orch init` do.
 //!
 //! ```text
-//! explicit start → agent-context / developmental gates → root, euid, endpoint
+//! explicit start → agent-context gate → root, euid, endpoint
 //!  → owner guard → legacy PID lock → engine + recovery + index rebuild
 //!  → context expiry → private run/ dir → stale-socket check → bind (0600)
 //!  → runtime .gitignore entries → daemon.json → `listening <socket>`
@@ -67,9 +67,7 @@ pub struct StartOptions {
     /// `--peer-name <name>`: this instance's peer name, overriding
     /// `peer.name` in config.yml for this run only.
     pub peer_name: Option<String>,
-    /// PR 1 developmental gate (SE-20): the caller read
-    /// `ORCH_DAEMON_DEVELOPMENTAL=1`. Without it start refuses with exit 2;
-    /// with it start prints the banner that legacy writers are not excluded.
+    /// No effect since PR 2 (gate removed); the field is deleted at integration.
     pub developmental: bool,
 }
 
@@ -89,11 +87,6 @@ impl DaemonExit {
         clean: true,
     };
 }
-
-/// The banner every developmental start prints on stderr (SE-20).
-pub const DEVELOPMENTAL_BANNER: &str = "orch daemon: developmental build. The CLI, TUI, web \
-and MCP still write .orchestry/ directly and are NOT excluded by this daemon; use it only on \
-development or test projects.";
 
 /// How long shutdown waits for sessions to deliver terminal frames.
 const SESSION_DRAIN: Duration = Duration::from_secs(10);
@@ -121,7 +114,7 @@ pub async fn start(options: StartOptions) -> Result<DaemonExit, DaemonError> {
 
 /// The synchronous half of an explicit start (D11): call it before building
 /// the tokio runtime. It captures the sanitized agent environment, enforces
-/// the agent-context and developmental gates, prints the banner and resolves
+/// the agent-context gate and resolves
 /// the root, its ownership and the endpoint. The process environment is
 /// read, never written. Nothing is locked, bound or spawned until
 /// [`PreparedStart::run`].
@@ -152,19 +145,12 @@ fn prepare(
     if in_agent_context(&var) && !options.from_agent {
         return Err(DaemonError::RefusedInAgentContext);
     }
-    if !options.developmental {
-        return Err(DaemonError::DevelopmentalGateClosed);
-    }
     let log = if var(crate::detach::DETACHED_CHILD_ENV).is_some() {
         crate::detach::enter_own_session();
         Some(crate::detach::DetachedLog::capture(&options.project_root)?)
     } else {
         None
     };
-    {
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "{DEVELOPMENTAL_BANNER}");
-    }
 
     let root = options
         .project_root
@@ -1009,19 +995,11 @@ mod tests {
         assert!(!in_agent_context(env(&[("ORCH_AGENT_ID", "")])));
     }
 
-    #[tokio::test]
-    async fn agent_context_and_developmental_gate_refuse_with_exit_2() {
-        let refused = start(StartOptions {
-            developmental: false,
-            from_agent: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
-        assert!(matches!(refused, DaemonError::DevelopmentalGateClosed));
+    #[test]
+    fn agent_context_refusal_is_exit_2_and_no_gate_remains() {
+        let refused = DaemonError::RefusedInAgentContext;
         assert_eq!(refused.exit_code(), 2);
-        assert!(refused.to_string().contains("ORCH_DAEMON_DEVELOPMENTAL=1"));
-        assert_eq!(DaemonError::RefusedInAgentContext.exit_code(), 2);
+        assert!(!refused.to_string().contains("DEVELOPMENTAL"));
     }
 
     fn vars(pairs: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
@@ -1087,17 +1065,6 @@ mod tests {
         assert!(matches!(
             prepare(options(), agent.clone(), lookup(agent)),
             Err(DaemonError::RefusedInAgentContext)
-        ));
-        assert!(matches!(
-            prepare(
-                StartOptions {
-                    developmental: false,
-                    ..options()
-                },
-                Vec::new(),
-                lookup(Vec::new())
-            ),
-            Err(DaemonError::DevelopmentalGateClosed)
         ));
         assert!(matches!(
             prepare(

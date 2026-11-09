@@ -10,14 +10,14 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 
+use super::rpc::Rpc;
 use orch_core::error::Result;
 use orch_domain::{
-    CreateGoalInput, CreateTeamInput, ORG_TEMPLATES, OrgTemplate, get_org_template_by_key,
+    CreateGoalInput, CreateTeamInput, OrgTemplate, get_org_template_by_key,
     get_shop_template_by_key,
 };
-use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
-use orch_engine::prompt_mode::DefinitionLock;
+use orch_proto::ops::{args, results};
 use serde::Serialize;
 
 use crate::context::{CliContext, EnvFlags};
@@ -67,8 +67,7 @@ pub(crate) fn requires_initialized_project(args: &[String]) -> bool {
     }
 }
 
-/// Keep nested dispatch here so template operations can choose whether they
-/// need an engine before the project container is built.
+/// Keep nested template dispatch here; each stateful path opens a daemon session.
 pub(crate) async fn dispatch(
     cli: &Cli,
     env: EnvFlags,
@@ -84,7 +83,7 @@ pub(crate) async fn dispatch(
     let (ctx, styles, engine) = crate::build(cli, env, cwd).await?;
     match sub {
         OrgSub::List => {
-            list(&ctx, &styles).await?;
+            list(&engine, &ctx, &styles).await?;
             Ok(ExitCode::SUCCESS)
         }
         OrgSub::Deploy {
@@ -100,22 +99,28 @@ pub(crate) async fn dispatch(
                 && !key.contains(':')
                 && adapter.is_none()
                 && model.is_none()
-                && !orch_infra::storage::org_templates::user_template_exists(key)?
+                && !engine
+                    .request(args::OrgTemplateListArgs { template_dir: None })
+                    .await?
+                    .iter()
+                    .any(|entry| {
+                        entry.name == key
+                            && matches!(entry.source, results::TemplateSource::User { .. })
+                    })
             {
                 return deploy(&engine, &ctx, &styles, key, goal.as_deref()).await;
             }
             let name = template_name.as_deref().or(template.as_deref());
-            let loaded =
-                orch_infra::storage::org_templates::resolve(name, template_dir.as_deref()).await?;
-            let deployed = orch_engine::org_templates::deploy_bundle(
-                &engine,
-                &loaded.bundle,
-                adapter.as_deref(),
-                model.as_deref(),
-                goal.as_deref(),
-                orch_infra::storage::org_templates::validate_record_size,
-            )
-            .await?;
+            let selector = super::org_template::Selector {
+                name: name.map(str::to_owned),
+                template_dir: template_dir.clone(),
+            }
+            .wire(cwd)?;
+            let deployed = engine
+                .call::<args::OrgDeployArgs>(serde_json::json!({
+                    "selector":selector,"adapter":adapter,"model":model,"goal_id":goal,
+                }))
+                .await?;
             if ctx.quiet && ctx.output.is_none() {
                 println!("{}", deployed.team.id);
             } else {
@@ -123,7 +128,7 @@ pub(crate) async fn dispatch(
             }
             Ok(ExitCode::SUCCESS)
         }
-        OrgSub::Template(_) => unreachable!("dispatched before engine construction"),
+        OrgSub::Template(_) => unreachable!("dispatched before connecting"),
     }
 }
 
@@ -138,33 +143,24 @@ struct DeployJson<'a> {
     goal_id: Option<&'a str>,
 }
 
-pub async fn list(ctx: &CliContext, styles: &Styles) -> Result<()> {
-    let builtin = orch_infra::storage::org_templates::builtin("a-team").await?;
+pub async fn list(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<()> {
+    let templates = engine.request(args::OrgListArgs {}).await?;
     if let Some(format) = ctx.output {
-        let mut values = serde_json::to_value(&ORG_TEMPLATES)
-            .map_err(|e| orch_core::Error::other(e.to_string()))?;
-        values.as_array_mut().expect("catalogue array").push(serde_json::json!({"key":"a-team","name":"a-team","description":builtin.org.description,"agents":builtin.agents.iter().map(|a|serde_json::json!({"shop_key":format!("a-team/{}",a.name),"name":a.name})).collect::<Vec<_>>(),"lead_index":builtin.agents.iter().position(|a|a.name==builtin.org.lead).expect("lead")}));
-        return format.print(&values);
+        return format.print(&templates);
     }
 
     println!();
-    let mut rows: Vec<Vec<String>> = ORG_TEMPLATES
+    let rows: Vec<Vec<String>> = templates
         .iter()
         .map(|template| {
             vec![
-                template.key.to_owned(),
-                template.name.to_owned(),
+                template.key.clone(),
+                template.name.clone(),
                 template.agents.len().to_string(),
-                template.description.to_owned(),
+                template.description.clone(),
             ]
         })
         .collect();
-    rows.push(vec![
-        "a-team".into(),
-        "a-team".into(),
-        builtin.agents.len().to_string(),
-        builtin.org.description,
-    ]);
     print_table(styles, &["KEY", "NAME", "AGENTS", "DESCRIPTION"], &rows, 2);
     println!();
     println!(
@@ -176,7 +172,7 @@ pub async fn list(ctx: &CliContext, styles: &Styles) -> Result<()> {
 }
 
 pub async fn deploy(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     template_key: &str,
@@ -197,8 +193,7 @@ pub async fn deploy(
 
     let lead_id = agent_ids[template.lead_index].clone();
     let team = engine
-        .team_service
-        .create(CreateTeamInput {
+        .call::<args::TeamCreateArgs>(CreateTeamInput {
             name: template.name.to_owned(),
             description: Some(template.description.to_owned()),
             lead_agent_id: lead_id.clone(),
@@ -218,8 +213,7 @@ pub async fn deploy(
     let goal_id = match goal {
         Some(title) => Some(
             engine
-                .goal_service
-                .create(CreateGoalInput {
+                .call::<args::GoalCreateArgs>(CreateGoalInput {
                     title: title.to_owned(),
                     description: None,
                     assignee: Some(lead_id),
@@ -283,15 +277,17 @@ pub async fn deploy(
 /// the agents created before the failure are deliberately left in place, which
 /// is what the hint tells the user to clean up.
 ///
-/// Every candidate is checked against the project config read inside the
-/// definition lock, held across the whole roster, not the engine's
-/// construction snapshot.
+/// The daemon checks each candidate under its definition lock. Deployment is
+/// deliberately a sequence of ordinary typed service calls, not a transaction.
 async fn create_agents(
-    engine: &Engine,
+    engine: &Rpc,
     styles: &Styles,
     template: &OrgTemplate,
 ) -> Result<Option<Vec<String>>> {
-    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
+    let default_adapter = engine
+        .request(args::UiBootstrapArgs {})
+        .await?
+        .default_adapter;
     let mut agent_ids: Vec<String> = Vec::new();
 
     for entry in template.agents {
@@ -304,13 +300,14 @@ async fn create_agents(
             return Ok(None);
         };
 
-        let input = template_to_agent_input(shop_template, &engine.config.defaults.agent.adapter)
-            .map(|input| orch_domain::CreateAgentInput {
+        let input = template_to_agent_input(shop_template, &default_adapter).map(|input| {
+            orch_domain::CreateAgentInput {
                 name: entry.name.to_owned(),
                 ..input
-            });
+            }
+        });
         let created = match input {
-            Ok(input) => engine.agent_service.create_locked(&lock, input).await,
+            Ok(input) => engine.call::<args::AgentCreateArgs>(input).await,
             Err(err) => Err(err),
         };
         match created {
@@ -342,7 +339,7 @@ mod tests {
 
     #[test]
     fn every_template_has_a_lead_inside_its_own_roster() {
-        for template in &ORG_TEMPLATES {
+        for template in &orch_domain::ORG_TEMPLATES {
             assert!(
                 template.lead_index < template.agents.len(),
                 "{} has lead_index {} for {} agents",
@@ -444,94 +441,6 @@ mod resolver_tests {
 }
 
 #[cfg(test)]
-mod deployment_tests {
-    use orch_core::storage::AgentStore;
-    use orch_core::{Error, Result};
-    use orch_domain::Agent;
-    use orch_engine::org_templates::deploy_bundle;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    struct PersistThenFail {
-        inner: orch_core::test_support::FakeAgentStore,
-        saves: AtomicUsize,
-    }
-    #[async_trait::async_trait]
-    impl AgentStore for PersistThenFail {
-        async fn list(&self) -> Result<Vec<Agent>> {
-            self.inner.list().await
-        }
-        async fn get(&self, id: &str) -> Result<Option<Agent>> {
-            self.inner.get(id).await
-        }
-        async fn get_by_name(&self, name: &str) -> Result<Option<Agent>> {
-            self.inner.get_by_name(name).await
-        }
-        async fn save(&self, agent: &Agent) -> Result<()> {
-            self.inner.save(agent).await?;
-            if self.saves.fetch_add(1, Ordering::SeqCst) == 3 {
-                Err(Error::other("injected index publication failure"))
-            } else {
-                Ok(())
-            }
-        }
-        async fn delete(&self, id: &str) -> Result<()> {
-            self.inner.delete(id).await
-        }
-    }
-    #[tokio::test]
-    async fn partial_failure_includes_the_entity_persisted_before_index_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".orchestry")).unwrap();
-        let mut engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                clock: Arc::new(orch_core::test_support::FixedClock::new()),
-                ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
-                global_config_path: Some(dir.path().join("global.yml")),
-            },
-        )
-        .await
-        .unwrap();
-        engine.agents = Arc::new(PersistThenFail {
-            inner: Default::default(),
-            saves: AtomicUsize::new(0),
-        });
-        engine.agent_service = Arc::new(orch_engine::AgentService::new(
-            engine.agents.clone(),
-            engine.state.clone(),
-            engine.events.clone(),
-            engine.config.clone(),
-            engine.ids.clone(),
-        ));
-        let bundle = orch_infra::storage::org_templates::builtin("a-team")
-            .await
-            .unwrap();
-        let error = deploy_bundle(
-            &engine,
-            &bundle,
-            None,
-            None,
-            None,
-            orch_infra::storage::org_templates::validate_record_size,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        let survivors = engine.agents.list().await.unwrap();
-        assert_eq!(survivors.len(), 4);
-        for agent in survivors {
-            assert!(
-                error.contains(&format!("\"{}\"", agent.id)),
-                "missing {} in {error}",
-                agent.id
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod measurement_tests {
     use orch_core::template::{PromptContext, TemplateEngine};
     use orch_engine::org_templates::resolve_inputs;
@@ -609,56 +518,5 @@ mod measurement_tests {
             .to_string()
             .contains("1 MiB")
         );
-    }
-}
-
-#[cfg(test)]
-mod selector_tests {
-    use super::*;
-    use clap::Parser;
-    #[tokio::test]
-    async fn explicit_legacy_template_selector_uses_the_same_inputs_as_preview_and_shop() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".orchestry")).unwrap();
-        std::fs::write(
-            dir.path().join(".orchestry/config.yml"),
-            "defaults:\n  agent:\n    adapter: shell\n",
-        )
-        .unwrap();
-        let cli = Cli::try_parse_from([
-            "orch",
-            "--json",
-            "org",
-            "deploy",
-            "--template",
-            "builtin:data-lab",
-        ])
-        .unwrap();
-        let Some(crate::tree::Command::Org(args)) = &cli.command else {
-            panic!("org command");
-        };
-        let code = dispatch(&cli, EnvFlags::default(), dir.path(), args)
-            .await
-            .unwrap();
-        assert_eq!(code, ExitCode::SUCCESS);
-        let engine = orch_engine::build_light(dir.path()).await.unwrap();
-        let loaded = orch_infra::storage::org_templates::resolve(Some("builtin:data-lab"), None)
-            .await
-            .unwrap();
-        let expected = orch_engine::org_templates::resolve_inputs(
-            &loaded.bundle,
-            &engine.config,
-            None,
-            None,
-            orch_infra::storage::org_templates::validate_record_size,
-        )
-        .unwrap();
-        let agents = engine.agent_service.list().await.unwrap();
-        assert_eq!(agents.len(), expected.len());
-        for (actual, expected) in agents.iter().zip(expected) {
-            assert_eq!(actual.name, expected.name);
-            assert_eq!(actual.role, expected.role);
-            assert_eq!(actual.adapter, expected.adapter);
-        }
     }
 }

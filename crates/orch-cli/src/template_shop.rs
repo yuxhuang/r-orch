@@ -1,12 +1,12 @@
 //! Legacy shop forwarding and directory-template installation.
+use crate::commands::rpc::{Rpc, arguments};
 use crate::context::CliContext;
 use crate::output::{Styles, print_table};
 use crate::shop_picker::{ShopEntryView, pick_index};
 use clap::Args;
 use orch_core::Result;
 use orch_domain::CreateAgentInput;
-use orch_engine::Engine;
-use orch_engine::prompt_mode::DefinitionLock;
+use orch_proto::ops::args;
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -20,7 +20,7 @@ pub struct ShopArgs {
 }
 
 pub async fn run(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: &ShopArgs,
@@ -37,18 +37,30 @@ pub async fn run(
         )
         .await;
     }
-    let loaded = orch_infra::storage::org_templates::resolve(
-        args.template.as_deref(),
-        args.template_dir.as_deref(),
-    )
-    .await?;
-    let inputs = orch_engine::org_templates::resolve_inputs(
-        &loaded.bundle,
-        &engine.config,
-        None,
-        None,
-        orch_infra::storage::org_templates::validate_record_size,
-    )?;
+    // Relative to the caller's cwd, never the daemon's, and lossless on the
+    // wire (the protocol's tagged path, not a display string).
+    let template_dir = args
+        .template_dir
+        .as_deref()
+        .map(|path| {
+            std::path::absolute(path)
+                .map_err(crate::commands::rpc::argument_error)
+                .and_then(|path| {
+                    orch_proto::path::WirePath::new(path)
+                        .map_err(crate::commands::rpc::argument_error)
+                })
+        })
+        .transpose()?;
+    let loaded = engine
+        .call::<args::OrgTemplateShowArgs>(serde_json::json!({
+            "selector": { "name":args.template, "template_dir":template_dir },
+            "resolved":true,
+        }))
+        .await?;
+    let inputs = loaded
+        .resolved_agents
+        .clone()
+        .ok_or_else(|| orch_core::Error::other("daemon omitted resolved template agents"))?;
     if let Some(format) = ctx.output {
         return format.print(&loaded.bundle.agents);
     }
@@ -118,19 +130,15 @@ pub async fn run(
 /// against the project config read inside the lock, not the engine's
 /// construction snapshot taken before the (human-scale) pick.
 pub async fn install(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     input: CreateAgentInput,
 ) -> Result<()> {
-    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
-    orch_engine::org_templates::preflight(engine, std::slice::from_ref(&input)).await?;
     let agent = engine
-        .agent_service
-        .create_locked(&lock, input)
+        .request(arguments::<args::AgentCreateArgs>(input)?)
         .await?
         .agent;
-    drop(lock);
     if ctx.quiet {
         println!("{}", agent.id);
     } else {

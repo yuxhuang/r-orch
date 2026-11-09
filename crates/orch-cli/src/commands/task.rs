@@ -6,16 +6,16 @@
 //!   its field is non-empty, and `--json` prints the task and nothing else;
 //! - `edit` compares the edited buffer against the existing task and prints
 //!   `  No changes.` when nothing differs, without touching the store;
-//! - `cancel` builds the **full** container only when the task is
-//!   `in_progress`, because only then is there a process to kill, and falls
-//!   back to a store-only cancel when another process holds the lock;
+//! - `cancel` reaches the daemon, which owns and stops any live process;
 //! - none of `cancel`/`approve`/`reject`/`retry` honours `--json` or
 //!   `--quiet`: they always print their success line.
 
 use orch_core::error::Result;
-use orch_core::storage::TaskFilter;
-use orch_domain::{CreateTaskInput, RemoteRunRef, Task, TaskStatus};
-use orch_engine::Engine;
+use orch_domain::{RemoteRunRef, Task, TaskStatus};
+use orch_proto::ops::args;
+use serde_json::json;
+
+use crate::commands::rpc::{Rpc, argument_error, arguments, client_error};
 
 use crate::context::CliContext;
 use crate::editor;
@@ -57,12 +57,20 @@ pub struct TaskAddArgs {
     pub attach: Option<String>,
 }
 
-pub async fn add(
-    engine: &Engine,
-    ctx: &CliContext,
-    styles: &Styles,
-    args: TaskAddArgs,
-) -> Result<()> {
+pub async fn add(engine: &Rpc, ctx: &CliContext, styles: &Styles, args: TaskAddArgs) -> Result<()> {
+    let task = engine.request(create_args(args)?).await?;
+
+    if let Some(format) = ctx.output {
+        format.print(&task)?;
+    } else if ctx.quiet {
+        println!("{}", task.id);
+    } else {
+        print_success(styles, &format!("Created {} \"{}\"", task.id, task.title));
+    }
+    Ok(())
+}
+
+fn create_args(args: TaskAddArgs) -> Result<args::TaskCreateArgs> {
     let review_criteria = match args.review_criteria.as_deref() {
         Some(raw) => Some(
             split_list(raw)
@@ -79,45 +87,37 @@ pub async fn add(
         None => None,
     };
 
-    let task = engine
-        .task_service
-        .create(CreateTaskInput {
-            title: args.title,
-            description: args.description,
-            priority: Some(args.priority),
-            assignee: args.assignee,
-            labels: args.labels.as_deref().map(split_list),
-            depends_on: args.depends_on.as_deref().map(split_list),
-            max_attempts: args.max_attempts,
-            workspace_mode: args.workspace_mode,
-            review_criteria,
-            scope: args.scope.as_deref().map(split_list),
-            goal_id: args.goal_id,
-            attachments: args.attach.as_deref().map(attachment_list),
-        })
-        .await?;
-
-    if let Some(format) = ctx.output {
-        format.print(&task)?;
-    } else if ctx.quiet {
-        println!("{}", task.id);
-    } else {
-        print_success(styles, &format!("Created {} \"{}\"", task.id, task.title));
-    }
-    Ok(())
+    // Paths are interpreted by the caller, never against the daemon's cwd.
+    let attachments = args
+        .attach
+        .as_deref()
+        .map(absolute_attachments)
+        .transpose()?;
+    arguments::<args::TaskCreateArgs>(json!({
+        "title": args.title,
+        "description": args.description,
+        "priority": args.priority,
+        "assignee": args.assignee,
+        "labels": args.labels.as_deref().map(split_list),
+        "depends_on": args.depends_on.as_deref().map(split_list),
+        "max_attempts": args.max_attempts,
+        "workspace_mode": args.workspace_mode,
+        "review_criteria": review_criteria,
+        "scope": args.scope.as_deref().map(split_list),
+        "goal_id": args.goal_id,
+        "attachments": attachments,
+    }))
 }
 
 pub async fn list(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     status: Option<TaskStatus>,
 ) -> Result<()> {
-    let filter = TaskFilter {
-        status,
-        goal_id: None,
-    };
-    let tasks = engine.task_service.list(&filter).await?;
+    let tasks = engine
+        .call::<args::TaskListArgs>(json!({"status": status}))
+        .await?;
 
     if let Some(format) = ctx.output {
         return format.print(&tasks);
@@ -136,18 +136,16 @@ pub async fn list(
         return Ok(());
     }
 
-    let running = engine.state.read().await?.running;
+    let running = engine.request(args::StateGetArgs {}).await?.running;
+    let remotes = engine.request(args::RemoteStatusArgs {}).await?.remotes;
+    let agents = engine.request(args::AgentListArgs {}).await?;
     let mut rows = Vec::new();
     for task in &tasks {
         let remote = running
             .get(&task.id)
             .and_then(|entry| entry.remote.as_ref());
         let mut row = task_row(styles, task, remote);
-        row.push(
-            waiting_reason(engine, task, remote)
-                .await?
-                .unwrap_or_default(),
-        );
+        row.push(waiting_reason(task, remote, &remotes, &agents).unwrap_or_default());
         rows.push(row);
     }
     println!();
@@ -161,37 +159,35 @@ pub async fn list(
     Ok(())
 }
 
-/// Describe dispatch blockers from persisted peer snapshots; this is display
-/// only and does not expand the directory's six permitted consumers.
-async fn waiting_reason(
-    engine: &Engine,
+/// Infer display-only blockers from daemon snapshots.
+fn waiting_reason(
     task: &Task,
     remote: Option<&RemoteRunRef>,
-) -> Result<Option<String>> {
-    use orch_infra::storage::remote::FileRemoteStore;
+    remotes: &[orch_domain::RemoteStatus],
+    candidates: &[orch_domain::Agent],
+) -> Option<String> {
     if !matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress) {
-        return Ok(None);
+        return None;
     }
-    // The worker's own explanation beats anything inferred from a snapshot:
-    // only it can say which `orch task approve` a mirror is waiting for.
     if let Some(hint) = remote.and_then(|remote| remote.hint()) {
-        return Ok(Some(hint));
+        return Some(hint);
     }
-    let store = FileRemoteStore::new(engine.paths.clone());
     if let Some((_, alias)) = task.assignee.as_deref().and_then(|id| id.split_once('@'))
-        && !store.read_status(alias).await?.is_some_and(|s| s.online)
+        && !remotes
+            .iter()
+            .any(|status| status.alias == alias && status.online)
     {
-        return Ok(Some(format!(
+        return Some(format!(
             "remote {alias} offline{}",
             if task.status == TaskStatus::InProgress {
                 " (outcome pending)"
             } else {
                 ""
             }
-        )));
+        ));
     }
     if task.status != TaskStatus::Todo {
-        return Ok(None);
+        return None;
     }
     let caps: Vec<_> = task
         .labels
@@ -199,21 +195,11 @@ async fn waiting_reason(
         .filter_map(|l| l.strip_prefix("cap:"))
         .collect();
     if caps.is_empty() {
-        return Ok(None);
-    }
-    let mut candidates = engine.agents.list().await?;
-    for remote in store.list().await? {
-        if let Some(status) = store.read_status(&remote.alias).await?
-            && status.online
-        {
-            for mut agent in status.agents {
-                agent.id = format!("{}@{}", agent.id, remote.alias);
-                candidates.push(agent);
-            }
-        }
+        return None;
     }
     let eligible = candidates.iter().any(|agent| {
         task.assignee.as_ref().is_none_or(|id| id == &agent.id)
+            && agent.remote.as_ref().is_none_or(|remote| remote.online)
             && !matches!(
                 agent.status,
                 orch_domain::AgentStatus::Disabled | orch_domain::AgentStatus::Offline
@@ -222,7 +208,19 @@ async fn waiting_reason(
                 .iter()
                 .all(|cap| agent.capabilities.iter().any(|c| c == cap))
     });
-    Ok((!eligible).then(|| format!("no online agent with cap {}", caps.join(", "))))
+    (!eligible).then(|| format!("no online agent with cap {}", caps.join(", ")))
+}
+
+fn absolute_attachments(value: &str) -> Result<Vec<orch_proto::path::WirePath>> {
+    attachment_list(value)
+        .into_iter()
+        .map(|path| {
+            let absolute = std::path::absolute(path).map_err(|error| {
+                orch_core::Error::other(format!("resolve attachment path: {error}"))
+            })?;
+            orch_proto::path::WirePath::new(absolute).map_err(argument_error)
+        })
+        .collect()
 }
 
 /// `remote` is the task's entry in `state.running`, when its run is on a peer.
@@ -259,13 +257,15 @@ fn task_row(styles: &Styles, task: &Task, remote: Option<&RemoteRunRef>) -> Vec<
 /// when the task ended up with no assignee at all. **Not** `--quiet`-aware:
 /// `task assign` is in the ignored half of the matrix.
 pub async fn assign(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     task_id: &str,
     agent_id: &str,
 ) -> Result<()> {
-    let task = engine.task_service.assign(task_id, agent_id).await?;
+    let task = engine
+        .call::<args::TaskAssignArgs>(json!({"id": task_id, "agent_id": agent_id}))
+        .await?;
 
     if let Some(format) = ctx.output {
         return format.print(&task);
@@ -281,8 +281,8 @@ pub async fn assign(
     Ok(())
 }
 
-pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
-    let task = engine.task_service.get(id).await?;
+pub async fn show(engine: &Rpc, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
+    let task = engine.call::<args::TaskGetArgs>(json!({"id": id})).await?;
 
     if let Some(format) = ctx.output {
         return format.print(&task);
@@ -293,8 +293,7 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
     println!();
 
     let remote = engine
-        .state
-        .read()
+        .request(args::StateGetArgs {})
         .await?
         .running
         .get(&task.id)
@@ -315,7 +314,9 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
         ),
         ("Priority".to_owned(), styles.priority_label(task.priority)),
     ];
-    if let Some(reason) = waiting_reason(engine, &task, remote.as_ref()).await? {
+    let remotes = engine.request(args::RemoteStatusArgs {}).await?.remotes;
+    let agents = engine.request(args::AgentListArgs {}).await?;
+    if let Some(reason) = waiting_reason(&task, remote.as_ref(), &remotes, &agents) {
         pairs.push(("Waiting".to_owned(), reason));
     }
     if let Some(assignee) = &task.assignee {
@@ -428,8 +429,24 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
 
 /// `task edit` — round-trip the task through `$EDITOR` and write back only
 /// what changed.
-pub async fn edit(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
-    let existing = engine.task_service.get(id).await?;
+pub async fn edit(engine: &Rpc, styles: &Styles, id: &str) -> Result<()> {
+    let base = engine
+        .call::<args::TaskDefinitionGetArgs>(json!({"id": id}))
+        .await?;
+    let authored: serde_json::Value =
+        serde_json::from_str(&base.document).map_err(argument_error)?;
+    let mut existing = engine.call::<args::TaskGetArgs>(json!({"id": id})).await?;
+    existing.title = authored["title"]
+        .as_str()
+        .expect("task definition title")
+        .to_owned();
+    existing.description = authored["description"]
+        .as_str()
+        .expect("task definition description")
+        .to_owned();
+    existing.priority = authored["priority"]
+        .as_i64()
+        .expect("task definition priority");
 
     // Informational only: the note is a comment line, so it comes back as
     // part of the description unless the user deletes it — which is what the
@@ -450,26 +467,32 @@ pub async fn edit(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
     let edited = editor::open_in_editor(&initial, ".yml").await?;
     let parsed = editor::parse_task_content(&edited);
 
-    let mut fields = orch_engine::task_service::UpdateTaskFields::default();
+    let mut patch = serde_json::Map::new();
     if let Some(title) = parsed.title.filter(|title| *title != existing.title) {
-        fields.title = Some(title);
+        patch.insert("title".into(), json!(title));
     }
     if let Some(priority) = parsed.priority.filter(|p| *p != existing.priority) {
-        fields.priority = Some(priority);
+        patch.insert("priority".into(), json!(priority));
     }
     if let Some(description) = parsed
         .description
         .filter(|description| *description != existing.description)
     {
-        fields.description = Some(description);
+        patch.insert("description".into(), json!(description));
     }
-
-    if fields == orch_engine::task_service::UpdateTaskFields::default() {
+    if patch.is_empty() {
         println!("  No changes.");
         return Ok(());
     }
 
-    let updated = engine.task_service.update(id, fields).await?;
+    let updated = definition_request(
+        engine,
+        id,
+        &serde_json::Value::Object(patch),
+        crate::document_input::MutationKind::Patch,
+        Some(base.digest),
+    )
+    .await?;
     print_success(
         styles,
         &format!("Updated {} \"{}\"", updated.id, updated.title),
@@ -477,35 +500,19 @@ pub async fn edit(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `task cancel` — the one command that upgrades to the full container
-/// mid-flight, and only for an `in_progress` task: cancelling that one has to
-/// kill the agent process, release the claim and finish the run, which lives
-/// on the orchestrator.
-///
-/// When another process owns the project (`serve`, `run --watch`, the TUI),
-/// the orchestrator cannot take the lock. The task is then cancelled in the
-/// store only, and the owner's next reconcile sees it terminal and stops the
-/// run itself.
-pub async fn cancel(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
-    let task = engine.task_service.get(id).await?;
-
-    if task.status == TaskStatus::InProgress {
-        let full = orch_engine::build_full(engine.paths.project_root().to_path_buf()).await?;
-        match full.orchestrator.cancel_task(id).await {
-            Err(orch_core::Error::Domain(orch_domain::DomainError::LockConflict(_))) => {
-                engine.task_service.cancel(id).await?;
-            }
-            result => result?,
-        }
-    } else {
-        engine.task_service.cancel(id).await?;
-    }
+/// `task cancel` stops a live process through the daemon's coordinator.
+pub async fn cancel(engine: &Rpc, styles: &Styles, id: &str) -> Result<()> {
+    engine
+        .call::<args::TaskCancelArgs>(json!({"id": id}))
+        .await?;
     print_success(styles, &format!("Cancelled {id}"));
     Ok(())
 }
 
-pub async fn approve(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
-    let task = engine.task_service.approve(id).await?;
+pub async fn approve(engine: &Rpc, styles: &Styles, id: &str) -> Result<()> {
+    let task = engine
+        .call::<args::TaskApproveArgs>(json!({"id": id}))
+        .await?;
     if task.status == TaskStatus::Done {
         print_success(styles, &format!("Approved {id}"));
     } else {
@@ -514,15 +521,9 @@ pub async fn approve(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn reject(
-    engine: &Engine,
-    styles: &Styles,
-    id: &str,
-    reason: Option<&str>,
-) -> Result<()> {
+pub async fn reject(engine: &Rpc, styles: &Styles, id: &str, reason: Option<&str>) -> Result<()> {
     engine
-        .task_service
-        .reject(id, reason.map(str::to_owned))
+        .call::<args::TaskRejectArgs>(json!({"id": id, "feedback": reason}))
         .await?;
     let suffix = match reason {
         Some(reason) => format!(" (reason: {reason})"),
@@ -532,8 +533,10 @@ pub async fn reject(
     Ok(())
 }
 
-pub async fn retry(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
-    engine.task_service.retry(id).await?;
+pub async fn retry(engine: &Rpc, styles: &Styles, id: &str) -> Result<()> {
+    engine
+        .call::<args::TaskRetryArgs>(json!({"id": id}))
+        .await?;
     print_success(styles, &format!("Reset {id} to todo"));
     Ok(())
 }
@@ -559,88 +562,8 @@ fn summary_line(tasks: &[Task]) -> String {
     line
 }
 
-const WRITABLE: &[&str] = &["title", "description", "priority", "labels"];
-const READONLY: &[&str] = &[
-    "id",
-    "status",
-    "assignee",
-    "depends_on",
-    "created_at",
-    "updated_at",
-    "attempts",
-    "max_attempts",
-    "workspace_mode",
-    "workspace",
-    "proof",
-    "review_criteria",
-    "review_results",
-    "scope",
-    "feedback",
-    "goalId",
-    "attachments",
-];
-
-fn definition_candidate(
-    current: &serde_json::Value,
-    input: &serde_json::Value,
-    kind: crate::document_input::MutationKind,
-) -> Result<serde_json::Value> {
-    use crate::document_input::{MutationKind, apply_mutation, reject_nulls, writable_input};
-    use orch_core::Error;
-    let input = writable_input(input, current, WRITABLE, READONLY, kind)?;
-    if kind == MutationKind::Update {
-        reject_nulls(&input, "task")?;
-    }
-    let base = serde_json::Value::Object(
-        current
-            .as_object()
-            .expect("serialized task")
-            .iter()
-            .filter(|(key, _)| WRITABLE.contains(&key.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    );
-    let mut candidate = apply_mutation(&base, &input, kind)?;
-    for field in ["title", "description"] {
-        if candidate.get(field).and_then(|v| v.as_str()).is_none() {
-            return Err(Error::invalid_arguments(format!(
-                "{field}: required string"
-            )));
-        }
-    }
-    if candidate["title"]
-        .as_str()
-        .expect("validated")
-        .trim()
-        .is_empty()
-    {
-        return Err(Error::invalid_arguments("title: cannot be blank"));
-    }
-    if !candidate
-        .get("priority")
-        .and_then(|v| v.as_i64())
-        .is_some_and(|v| (1..=4).contains(&v))
-    {
-        return Err(Error::invalid_arguments(
-            "priority: required integer between 1 and 4",
-        ));
-    }
-    if candidate.get("labels").is_none() {
-        candidate["labels"] = serde_json::json!([]);
-    }
-    if !candidate["labels"]
-        .as_array()
-        .is_some_and(|items| items.iter().all(|v| v.is_string()))
-    {
-        return Err(Error::invalid_arguments(
-            "labels: expected an array of strings",
-        ));
-    }
-    Ok(candidate)
-}
-
 pub async fn mutate(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: &crate::tree::EntityDefinitionInput,
@@ -661,47 +584,49 @@ pub async fn mutate(
     Ok(())
 }
 
-/// The print-free half of `task update`/`task patch`, shared with `orch mcp`:
-/// the already-parsed (and size-bounded) document is merged into the stored
-/// definition under the definition lock, validated, then saved. `source`
-/// attributes the lock, candidate and save errors to the input document, as
-/// the CLI always has; a missing task is reported as it is.
+/// The daemon applies and validates the bounded definition atomically.
+/// Input-source attribution retains the typed transport error at the exit boundary.
 pub(crate) async fn apply_definition(
-    engine: &Engine,
+    engine: &Rpc,
     id: &str,
     input: &serde_json::Value,
     kind: crate::document_input::MutationKind,
     source: &(dyn Fn(orch_core::Error) -> orch_core::Error + Sync),
 ) -> Result<Task> {
-    use orch_core::Error;
-    let _lock =
-        orch_infra::storage::fs_utils::mutation_lock(&engine.paths.root().join(".definition.lock"))
-            .await
-            .map_err(source)?;
-    let current = engine.task_service.get(id).await?;
-    let value = serde_json::to_value(&current).map_err(|_| Error::other("serialize task"))?;
-    let candidate = definition_candidate(&value, input, kind).map_err(source)?;
-    engine
-        .task_service
-        .update_definition(
-            id,
-            orch_engine::task_service::UpdateTaskFields {
-                title: Some(candidate["title"].as_str().expect("validated").to_owned()),
-                description: Some(
-                    candidate["description"]
-                        .as_str()
-                        .expect("validated")
-                        .to_owned(),
-                ),
-                priority: candidate["priority"].as_i64(),
-                labels: Some(
-                    serde_json::from_value(candidate["labels"].clone()).expect("validated"),
-                ),
-                attachments: None,
-            },
-        )
+    definition_request(engine, id, input, kind, None)
         .await
         .map_err(source)
+}
+
+/// Keep large authored JSON out of the single-frame lane. Upload and apply
+/// share one session lock because transfer tokens are connection-local.
+async fn definition_request(
+    engine: &Rpc,
+    id: &str,
+    input: &serde_json::Value,
+    kind: crate::document_input::MutationKind,
+    base_digest: Option<orch_proto::bounded::Id>,
+) -> Result<Task> {
+    let document = serde_json::to_string(input).map_err(argument_error)?;
+    let large = document.len() > orch_proto::frame::MAX_FRAME_BYTES / 4;
+    let mut request: args::TaskDefinitionApplyArgs = arguments(json!({
+        "id": id,
+        "definition": {
+            "input": {"document": if large { None } else { Some(&document) }, "format": "json"},
+            "kind": match kind { crate::document_input::MutationKind::Update => "update", crate::document_input::MutationKind::Patch => "patch" },
+            "base_digest": base_digest,
+        }
+    }))?;
+    if !large {
+        return engine.request(request).await;
+    }
+    let mut lane = engine.lane().await;
+    request.definition.input.input_transfer = Some(
+        lane.upload(args::TransferPurpose::Document, document.as_bytes())
+            .await
+            .map_err(client_error)?,
+    );
+    lane.request(request).await.map_err(client_error)
 }
 
 #[cfg(test)]
@@ -716,47 +641,26 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn waiting_reasons_distinguish_missing_cap_and_pending_outcome() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = orch_infra::storage::Paths::new(temp.path());
-        std::fs::create_dir_all(paths.root()).unwrap();
-        let engine = orch_engine::build_light_with(
-            temp.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(paths.root().join("global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn waiting_reasons_distinguish_missing_cap_and_pending_outcome() {
         let mut task = task(TaskStatus::Todo);
         task.labels = vec!["cap:freebsd".into()];
         assert_eq!(
-            waiting_reason(&engine, &task, None)
-                .await
-                .unwrap()
-                .as_deref(),
+            waiting_reason(&task, None, &[], &[]).as_deref(),
             Some("no online agent with cap freebsd")
         );
         task.assignee = Some("agt_worker@w1".into());
         assert_eq!(
-            waiting_reason(&engine, &task, None)
-                .await
-                .unwrap()
-                .as_deref(),
+            waiting_reason(&task, None, &[], &[]).as_deref(),
             Some("remote w1 offline")
         );
         task.status = TaskStatus::InProgress;
         assert_eq!(
-            waiting_reason(&engine, &task, None)
-                .await
-                .unwrap()
-                .as_deref(),
+            waiting_reason(&task, None, &[], &[]).as_deref(),
             Some("remote w1 offline (outcome pending)")
         );
         task.status = TaskStatus::Done;
-        assert_eq!(waiting_reason(&engine, &task, None).await.unwrap(), None);
+        assert_eq!(waiting_reason(&task, None, &[], &[]), None);
         // A worker's own reason outranks anything inferred from a snapshot.
         task.status = TaskStatus::InProgress;
         let remote = RemoteRunRef {
@@ -769,11 +673,50 @@ mod tests {
             ..RemoteRunRef::new("w1", "run_1")
         };
         assert_eq!(
-            waiting_reason(&engine, &task, Some(&remote))
-                .await
-                .unwrap()
-                .as_deref(),
+            waiting_reason(&task, Some(&remote), &[], &[]).as_deref(),
             Some("awaiting approval: orch task approve tsk_mirror on w1")
+        );
+    }
+
+    #[test]
+    fn task_create_uses_protocol_goal_id_and_absolute_caller_paths() {
+        let wire = create_args(TaskAddArgs {
+            title: "a task".into(),
+            priority: 2,
+            goal_id: Some("goal_1".into()),
+            attach: Some(" ./relative.md , /tmp/absolute.png,".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(wire.goal_id.as_deref(), Some("goal_1"));
+        let paths = wire.attachments.unwrap().into_inner();
+        assert_eq!(
+            paths[0].as_path(),
+            std::path::absolute("relative.md").unwrap()
+        );
+        assert_eq!(
+            paths[1].as_path(),
+            std::path::Path::new("/tmp/absolute.png")
+        );
+        assert!(paths.iter().all(|path| path.as_path().is_absolute()));
+    }
+
+    #[test]
+    fn task_create_rejects_bad_criteria_and_unbounded_ids_before_sending() {
+        let bad = create_args(TaskAddArgs {
+            title: "task".into(),
+            review_criteria: Some("unknown".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(bad.exit_code(), 2);
+        assert!(
+            create_args(TaskAddArgs {
+                title: "task".into(),
+                goal_id: Some("x".repeat(257)),
+                ..Default::default()
+            })
+            .is_err()
         );
     }
 
@@ -908,40 +851,5 @@ mod tests {
             ),
             "  STATUS  PRI  TASK       AGENT  TIME  \n  ○ todo  P3   Test task  —      —     \n"
         );
-    }
-}
-
-#[cfg(test)]
-mod definition_tests {
-    use super::*;
-    use crate::document_input::MutationKind;
-    use serde_json::json;
-    #[test]
-    fn definition_projection_requires_title_description_priority_and_replaces_labels() {
-        let current = json!({"id":"tsk_1", "title":"old", "description":"body", "priority":2, "labels":["a","b"], "status":"todo"});
-        let candidate =
-            definition_candidate(&current, &json!({"labels":["c"]}), MutationKind::Patch).unwrap();
-        assert_eq!(candidate["labels"], json!(["c"]));
-        assert!(
-            definition_candidate(&current, &json!({"priority":null}), MutationKind::Patch).is_err()
-        );
-        assert!(
-            definition_candidate(&current, &json!({"status":"todo"}), MutationKind::Patch).is_err()
-        );
-        assert!(
-            definition_candidate(
-                &current,
-                &json!({"title":"x", "description":"y"}),
-                MutationKind::Update
-            )
-            .is_err()
-        );
-        let candidate = definition_candidate(
-            &current,
-            &json!({"title":"x", "description":"y", "priority":1}),
-            MutationKind::Update,
-        )
-        .unwrap();
-        assert_eq!(candidate["labels"], json!([]));
     }
 }

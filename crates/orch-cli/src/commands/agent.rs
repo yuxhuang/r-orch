@@ -1,18 +1,18 @@
 //! `orch agent`.
 //!
-//! WP-0b covers `add`; WP-5a adds `shop`. The remaining subcommands
-//! (`list`, `status`, `edit`, `remove`, `disable`, `enable`, `autonomous`)
-//! need WP-4's service methods.
+//! State and lifecycle operations run through the daemon. Pure rendering and
+//! shop-template expansion remain in this presentation layer.
 
+use crate::commands::rpc::{Rpc, argument_error, arguments, client_error};
 use orch_core::error::Result;
 use orch_domain::{
     AGENT_SHOP_TEMPLATES, Agent, CreateAgentInput, EFFORT_REQUEST_ONLY_NOTE, EffortSelection,
-    PromptModeSelection, PromptModeSource, effective_prompt_mode,
+    PromptModeSelection, PromptModeSource,
 };
-use orch_engine::Engine;
 use orch_engine::agent_factory::template_to_agent_input;
-use orch_engine::prompt_mode::{AgentDiagnostic, DefinitionLock, agent_effort_diagnostics};
-use serde::Serialize;
+use orch_proto::ops::results::AgentDiagnostic;
+use orch_proto::ops::{args, results};
+use serde_json::json;
 
 use crate::context::CliContext;
 use crate::output::{
@@ -41,40 +41,21 @@ pub(crate) fn report_diagnostics(
     }
 }
 
-/// The resolved prompt mode of an agent for `agent show --effective`.
-#[derive(Debug, Serialize)]
-struct EffectiveConfig {
-    prompt_mode: orch_domain::PromptMode,
-    prompt_mode_source: PromptModeSource,
+fn effort_diagnostics(agents: &[Agent]) -> Vec<AgentDiagnostic> {
+    orch_engine::prompt_mode::agent_effort_diagnostics(agents)
+        .into_iter()
+        .map(|d| AgentDiagnostic {
+            agent_id: d.agent_id,
+            agent_name: d.agent_name,
+            message: d.message,
+        })
+        .collect()
 }
 
-/// `agent show --effective` with `--json`/`--yaml`: the ordinary agent shape,
-/// unchanged, under `agent`, plus the resolution under `effective_config`.
-#[derive(Debug, Serialize)]
-pub(crate) struct EffectiveAgent<'a> {
-    agent: &'a Agent,
-    effective_config: EffectiveConfig,
-}
-
-impl<'a> EffectiveAgent<'a> {
-    /// The agent with its prompt mode resolved against the project default.
-    pub(crate) fn of(engine: &Engine, agent: &'a Agent) -> Self {
-        let (prompt_mode, prompt_mode_source) =
-            effective_prompt_mode(&agent.config, &engine.config.defaults.agent);
-        EffectiveAgent {
-            agent,
-            effective_config: EffectiveConfig {
-                prompt_mode,
-                prompt_mode_source,
-            },
-        }
-    }
-}
-
-/// Human description of a resolved mode: `eco (agent override)`,
-/// `normal (project default)`.
-fn describe_mode(engine: &Engine, agent: &Agent) -> String {
-    let (mode, source) = effective_prompt_mode(&agent.config, &engine.config.defaults.agent);
+/// Human description of the mode resolved by the daemon.
+fn describe_mode(config: results::EffectiveConfig, agent: &Agent) -> String {
+    let mode = config.prompt_mode;
+    let source = config.prompt_mode_source;
     let origin = match source {
         PromptModeSource::Agent => "agent override",
         PromptModeSource::Project => "project default",
@@ -106,7 +87,7 @@ pub struct AgentAddArgs {
 }
 
 pub async fn add(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: AgentAddArgs,
@@ -133,59 +114,51 @@ pub async fn add(
     Ok(())
 }
 
-/// The print-free half of `agent add`, shared with `orch mcp`: the authored
-/// create under the definition lock. Diagnostics are returned, not printed.
+/// Create through the daemon's definition-validation lane, without printing.
 pub(crate) async fn create_authored(
-    engine: &Engine,
+    engine: &Rpc,
     args: AgentAddArgs,
-) -> Result<orch_engine::agent_service::AuthoredAgent> {
-    // The final candidate is checked against the project config read inside
-    // the definition lock, not the engine's construction snapshot.
-    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
-    let authored = engine
-        .agent_service
-        .create_locked(
-            &lock,
-            CreateAgentInput {
-                name: args.name,
-                adapter: args.adapter,
-                role: args.role,
-                command: args.command,
-                model: args.model,
-                effort: args.effort,
-                approval_policy: args.approval_policy,
-                max_turns: args.max_turns,
-                timeout_ms: args.timeout_ms,
-                // `agent add` has no `--stall-timeout` flag; the default applies.
-                stall_timeout_ms: None,
-                env: None,
-                system_prompt: None,
-                workspace_mode: args.workspace_mode,
-                skills: args
-                    .skills
-                    .as_deref()
-                    .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect()),
-                // Absent means live inheritance of the project default: the
-                // default is never copied into the agent (design D1).
-                prompt_mode: args
-                    .prompt_mode
-                    .and_then(PromptModeSelection::into_override),
-                role_summary: args.role_summary,
-            },
-        )
-        .await?;
-    drop(lock);
-    Ok(authored)
+) -> Result<results::AuthoredAgent> {
+    engine
+        .call::<args::AgentCreateArgs>(agent_input(args))
+        .await
+}
+
+fn agent_input(args: AgentAddArgs) -> CreateAgentInput {
+    CreateAgentInput {
+        name: args.name,
+        adapter: args.adapter,
+        role: args.role,
+        command: args.command,
+        model: args.model,
+        effort: args.effort,
+        approval_policy: args.approval_policy,
+        max_turns: args.max_turns,
+        timeout_ms: args.timeout_ms,
+        // `agent add` has no `--stall-timeout` flag; the default applies.
+        stall_timeout_ms: None,
+        env: None,
+        system_prompt: None,
+        workspace_mode: args.workspace_mode,
+        skills: args
+            .skills
+            .as_deref()
+            .map(|raw| raw.split(',').map(|part| part.trim().to_owned()).collect()),
+        // Absent means live inheritance of the project default: the
+        // default is never copied into the agent (design D1).
+        prompt_mode: args
+            .prompt_mode
+            .and_then(PromptModeSelection::into_override),
+        role_summary: args.role_summary,
+    }
 }
 
 /// `orch agent list`.
 ///
 /// The TIME column is **hard-coded** to a dim em dash: it is never
 /// computed.
-pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
-    let agents = orch_infra::storage::remote::RemoteAgentDirectory::new(engine.paths.clone())
-        .list(engine.agent_service.list().await?)
-        .await?;
+pub async fn list(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<()> {
+    let agents = engine.request(args::AgentListArgs {}).await?;
 
     if let Some(format) = ctx.output {
         return format.print(&agents);
@@ -218,7 +191,7 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
         2,
     );
     println!("\n  {}\n", summary_line(styles, &agents));
-    let diagnostics = agent_effort_diagnostics(&agents);
+    let diagnostics = effort_diagnostics(&agents);
     if !diagnostics.is_empty() {
         report_diagnostics(ctx, styles, &diagnostics);
         println!();
@@ -275,12 +248,16 @@ fn summary_line(_styles: &Styles, agents: &[orch_domain::Agent]) -> String {
 }
 
 /// `orch agent disable` / `orch agent enable`. Neither honours `--quiet`.
-pub async fn set_enabled(engine: &Engine, styles: &Styles, id: &str, enabled: bool) -> Result<()> {
+pub async fn set_enabled(engine: &Rpc, styles: &Styles, id: &str, enabled: bool) -> Result<()> {
     if enabled {
-        engine.agent_service.enable(id).await?;
+        engine
+            .call::<args::AgentEnableArgs>(json!({"id": id}))
+            .await?;
         print_success(styles, &format!("Enabled agent {id}"));
     } else {
-        engine.agent_service.disable(id).await?;
+        engine
+            .call::<args::AgentDisableArgs>(json!({"id": id}))
+            .await?;
         print_success(styles, &format!("Disabled agent {id}"));
     }
     Ok(())
@@ -293,23 +270,24 @@ pub async fn set_enabled(engine: &Engine, styles: &Styles, id: &str, enabled: bo
 /// order is adapter/command/status/policy for shell and
 /// adapter/status/effort/policy otherwise.
 pub async fn status(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     id: &str,
     effective: bool,
 ) -> Result<()> {
-    let agent = orch_infra::storage::remote::RemoteAgentDirectory::new(engine.paths.clone())
-        .resolve(id, engine.agent_service.list().await?)
-        .await?
-        .ok_or_else(|| orch_core::Error::invalid_arguments(format!("Agent not found: {id}")))?;
-    let diagnostics = agent_effort_diagnostics(std::slice::from_ref(&agent));
+    // Human output always includes the resolved prompt mode.
+    let view = engine
+        .call::<args::AgentGetArgs>(json!({"id": id, "effective": true}))
+        .await?;
+    let agent = &view.agent;
+    let diagnostics = effort_diagnostics(std::slice::from_ref(agent));
 
     if let Some(format) = ctx.output {
         if effective {
-            format.print(&EffectiveAgent::of(engine, &agent))?;
+            format.print(&view)?;
         } else {
-            format.print(&agent)?;
+            format.print(agent)?;
         }
         report_diagnostics(ctx, styles, &diagnostics);
         return Ok(());
@@ -357,7 +335,13 @@ pub async fn status(
                 .unwrap_or_else(|| "default".to_owned()),
         ));
     }
-    pairs.push(("Prompt mode".to_owned(), describe_mode(engine, &agent)));
+    pairs.push((
+        "Prompt mode".to_owned(),
+        describe_mode(
+            view.effective_config.expect("requested effective config"),
+            agent,
+        ),
+    ));
     if !is_shell {
         pairs.push((
             "Role hint".to_owned(),
@@ -365,7 +349,7 @@ pub async fn status(
                 Some(summary) => summary.to_owned(),
                 None => format!(
                     "{} {}",
-                    orch_domain::role_summary_for(&agent),
+                    orch_domain::role_summary_for(agent),
                     styles.dim("(derived)")
                 ),
             },
@@ -437,34 +421,31 @@ pub async fn status(
 /// `orch agent edit` — round-trip name, command, model and role through
 /// `$EDITOR`.
 ///
-/// Unlike `task edit` this does **not** compare against the existing agent: it
-/// passes whatever came back straight to the service, where `None` means
-/// "unchanged" and `Some("")` clears the field.
-pub async fn edit(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
-    let agent = engine.agent_service.get(id).await?;
+/// Omitted fields stay unchanged; empty optional fields are cleared. A digest
+/// check rejects a save if another editor changed the authored definition.
+pub async fn edit(engine: &Rpc, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
+    let base = engine
+        .call::<args::AgentDefinitionGetArgs>(json!({"id": id}))
+        .await?;
+    let value: serde_json::Value = serde_json::from_str(&base.document).map_err(argument_error)?;
     let initial = crate::editor::agent_buffer(
-        &agent.name,
-        agent.config.command.as_deref().unwrap_or_default(),
-        agent.config.model.as_deref().unwrap_or_default(),
-        agent.role.as_deref().unwrap_or_default(),
+        value["name"].as_str().expect("agent definition name"),
+        value["config"]["command"].as_str().unwrap_or_default(),
+        value["config"]["model"].as_str().unwrap_or_default(),
+        value["role"].as_str().unwrap_or_default(),
     );
-
     let edited = crate::editor::open_in_editor(&initial, ".yml").await?;
     let parsed = crate::editor::parse_agent_content(&edited);
-
-    let updated = engine
-        .agent_service
-        .update(
-            id,
-            orch_engine::agent_service::UpdateAgentFields {
-                name: parsed.name,
-                role: parsed.role,
-                command: parsed.command,
-                model: parsed.model,
-                ..Default::default()
-            },
-        )
-        .await?;
+    let patch = editor_patch(parsed);
+    let updated = definition_request(
+        engine,
+        id,
+        &patch,
+        crate::document_input::MutationKind::Patch,
+        Some(base.digest),
+    )
+    .await?
+    .agent;
 
     if let Some(format) = ctx.output {
         format.print(&updated)?;
@@ -483,95 +464,48 @@ pub async fn edit(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
     Ok(())
 }
 
-const WRITABLE: &[&str] = &["name", "adapter", "role", "config"];
-const READONLY: &[&str] = &[
-    "id",
-    "status",
-    "current_task",
-    "autonomous",
-    "stats",
-    "last_error",
-    "capabilities",
-    "remote",
-];
-const CONFIG_FIELDS: &[&str] = &[
-    "command",
-    "model",
-    "effort",
-    "approval_policy",
-    "max_turns",
-    "timeout_ms",
-    "stall_timeout_ms",
-    "env",
-    "system_prompt",
-    "workspace_mode",
-    "skills",
-    "prompt_mode",
-    "role_summary",
-];
-
-fn definition_candidate(
-    current: &serde_json::Value,
-    input: &serde_json::Value,
-    kind: crate::document_input::MutationKind,
-) -> Result<serde_json::Value> {
-    use crate::document_input::{MutationKind, apply_mutation, reject_nulls, writable_input};
-    use orch_core::Error;
-    let input = writable_input(input, current, WRITABLE, READONLY, kind)?;
-    // Check keys before merge: an unknown null would otherwise disappear.
-    if let Some(config) = input.get("config").and_then(|v| v.as_object()) {
-        for key in config.keys() {
-            if !CONFIG_FIELDS.contains(&key.as_str()) {
-                return Err(Error::invalid_arguments(format!(
-                    "config.{key}: unknown field"
-                )));
-            }
-        }
+fn editor_patch(parsed: crate::editor::AgentEdit) -> serde_json::Value {
+    let mut patch = serde_json::Map::new();
+    let mut config = serde_json::Map::new();
+    if let Some(name) = parsed.name {
+        patch.insert("name".into(), json!(name.trim()));
     }
-    let base = serde_json::Value::Object(
-        current
-            .as_object()
-            .expect("serialized agent")
-            .iter()
-            .filter(|(key, _)| WRITABLE.contains(&key.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    );
-    if kind == MutationKind::Update {
-        reject_nulls(&input, "agent")?;
+    if let Some(role) = parsed.role {
+        patch.insert(
+            "role".into(),
+            if role.is_empty() {
+                serde_json::Value::Null
+            } else {
+                json!(role)
+            },
+        );
     }
-    let candidate = apply_mutation(&base, &input, kind)?;
-    reject_nulls(&candidate, "agent")?;
-    for field in ["name", "adapter"] {
-        if !candidate
-            .get(field)
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            return Err(Error::invalid_arguments(format!(
-                "{field}: required nonblank string"
-            )));
-        }
+    if let Some(command) = parsed.command {
+        config.insert(
+            "command".into(),
+            if command.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                json!(command.trim())
+            },
+        );
     }
-    if candidate.get("role").is_some_and(|v| !v.is_string()) {
-        return Err(Error::invalid_arguments("role: expected a string"));
+    if let Some(model) = parsed.model {
+        config.insert(
+            "model".into(),
+            if model.is_empty() {
+                serde_json::Value::Null
+            } else {
+                json!(model)
+            },
+        );
     }
-    let config = candidate
-        .get("config")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| Error::invalid_arguments("config: required object"))?;
-    for (field, value) in config {
-        let mut single = serde_json::Map::new();
-        single.insert(field.clone(), value.clone());
-        serde_json::from_value::<orch_domain::AgentConfig>(single.into()).map_err(|_| {
-            Error::invalid_arguments(format!("config.{field}: invalid field type or enum"))
-        })?;
-    }
-    Ok(candidate)
+    patch.insert("config".into(), config.into());
+    patch.into()
 }
 
 pub async fn mutate(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: &crate::tree::EntityDefinitionInput,
@@ -637,7 +571,7 @@ impl AgentFlagUpdate {
 }
 
 pub async fn update_flags(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     id: &str,
@@ -674,66 +608,62 @@ fn print_updated(ctx: &CliContext, styles: &Styles, updated: &Agent) -> Result<(
     Ok(())
 }
 
-/// The locked read → candidate → validate → single save path shared by the
-/// file and flag forms. `source` attributes errors to the input document.
-/// The service's final-candidate validation (effort table, eco versus custom
-/// templates) runs before the save, against the project config re-read
-/// inside the lock, so a rejection writes nothing and a concurrent project
-/// mode switch is never missed. Shared with `orch mcp`.
+/// The daemon merges and validates the authored definition atomically.
+/// `source` attributes input failures while retaining typed transport errors.
 pub(crate) async fn apply_definition(
-    engine: &Engine,
+    engine: &Rpc,
     id: &str,
     input: &serde_json::Value,
     kind: crate::document_input::MutationKind,
     source: &(dyn Fn(orch_core::Error) -> orch_core::Error + Sync),
-) -> Result<orch_engine::agent_service::AuthoredAgent> {
+) -> Result<results::AuthoredAgent> {
     use orch_core::Error;
     if id.contains('@') {
         return Err(source(Error::invalid_arguments(
             "id: remote agents cannot be mutated",
         )));
     }
-    // One stable project lock also serializes duplicate-name validation between
-    // new agent mutations. Existing edit/runtime writes retain their old race.
-    let lock = DefinitionLock::acquire(engine.paths.project_root())
-        .await
-        .map_err(source)?;
-    let current = engine.agent_service.get(id).await?;
-    let value = serde_json::to_value(&current).map_err(|_| Error::other("serialize agent"))?;
-    let candidate = definition_candidate(&value, input, kind).map_err(source)?;
-    let config: orch_domain::AgentConfig = serde_json::from_value(candidate["config"].clone())
-        .map_err(|_| Error::invalid_arguments("config: invalid definition"))?;
-    let mut authored = current.clone();
-    authored.name = candidate["name"].as_str().expect("validated").to_owned();
-    authored.adapter = candidate["adapter"].as_str().expect("validated").to_owned();
-    authored.role = candidate
-        .get("role")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-    authored.config = config.clone();
-    // Serialization belongs to the CLI/infra boundary, not AgentService. The
-    // service re-reads runtime state before saving; legacy writers may still race.
-    orch_infra::storage::fs_utils::check_definition_write_size(&authored).map_err(source)?;
-    engine
-        .agent_service
-        .replace_definition_locked(
-            &lock,
-            id,
-            candidate["name"].as_str().expect("validated").to_owned(),
-            candidate["adapter"].as_str().expect("validated").to_owned(),
-            candidate
-                .get("role")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned),
-            config,
-        )
+    definition_request(engine, id, input, kind, None)
         .await
         .map_err(source)
 }
 
+/// Keep large authored JSON out of the single-frame lane. Upload and apply
+/// share one session lock because transfer tokens are connection-local.
+async fn definition_request(
+    engine: &Rpc,
+    id: &str,
+    input: &serde_json::Value,
+    kind: crate::document_input::MutationKind,
+    base_digest: Option<orch_proto::bounded::Id>,
+) -> Result<results::AuthoredAgent> {
+    let document = serde_json::to_string(input).map_err(argument_error)?;
+    let large = document.len() > orch_proto::frame::MAX_FRAME_BYTES / 4;
+    let mut request: args::AgentDefinitionApplyArgs = arguments(json!({
+        "id": id,
+        "definition": {
+            "input": {"document": if large { None } else { Some(&document) }, "format": "json"},
+            "kind": match kind { crate::document_input::MutationKind::Update => "update", crate::document_input::MutationKind::Patch => "patch" },
+            "base_digest": base_digest,
+        }
+    }))?;
+    if !large {
+        return engine.request(request).await;
+    }
+    let mut lane = engine.lane().await;
+    request.definition.input.input_transfer = Some(
+        lane.upload(args::TransferPurpose::Document, document.as_bytes())
+            .await
+            .map_err(client_error)?,
+    );
+    lane.request(request).await.map_err(client_error)
+}
+
 /// `orch agent remove`. Ignores `--json` and `--quiet`.
-pub async fn remove(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
-    engine.agent_service.remove(id).await?;
+pub async fn remove(engine: &Rpc, styles: &Styles, id: &str) -> Result<()> {
+    engine
+        .call::<args::AgentRemoveArgs>(json!({"id": id}))
+        .await?;
     print_success(styles, &format!("Removed agent {id}"));
     Ok(())
 }
@@ -742,23 +672,24 @@ pub async fn remove(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
 ///
 /// `--on` wins when both are given.
 pub async fn autonomous(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     id: &str,
     on: bool,
     off: bool,
 ) -> Result<()> {
-    let current = engine.agent_service.get(id).await?;
-    let enable = if on {
-        true
+    let enabled = if on {
+        Some(true)
     } else if off {
-        false
+        Some(false)
     } else {
-        !current.autonomous.unwrap_or(false)
+        None
     };
-
-    let agent = engine.agent_service.set_autonomous(id, enable).await?;
+    let agent = engine
+        .call::<args::AgentAutonomousArgs>(json!({"id": id, "enabled": enabled}))
+        .await?;
+    let enable = agent.autonomous.unwrap_or(false);
 
     if let Some(format) = ctx.output {
         format.print(&agent)?;
@@ -784,7 +715,7 @@ pub async fn autonomous(
 /// otherwise the picker runs. A cancelled pick prints `  Cancelled.` and is
 /// still exit 0. No `--json`, and `--quiet` is ignored.
 pub async fn shop(
-    engine: &Engine,
+    engine: &Rpc,
     styles: &Styles,
     list: bool,
     stdout_is_tty: bool,
@@ -803,14 +734,16 @@ pub async fn shop(
         return Ok(());
     };
 
-    let input = template_to_agent_input(template, &engine.config.defaults.agent.adapter)?;
-    let lock = DefinitionLock::acquire(engine.paths.project_root()).await?;
-    let agent = engine
-        .agent_service
-        .create_locked(&lock, input)
-        .await?
-        .agent;
-    drop(lock);
+    let config = engine
+        .call::<args::ConfigGetArgs>(json!({"key": "defaults.agent.adapter"}))
+        .await?;
+    let adapter = config
+        .value
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| orch_core::Error::other("project default agent adapter is missing"))?;
+    let input = template_to_agent_input(template, adapter)?;
+    let agent = engine.call::<args::AgentCreateArgs>(input).await?.agent;
     print_success(
         styles,
         &format!(
@@ -826,37 +759,7 @@ pub async fn shop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::EnvFlags;
-    use orch_engine::{EngineSeams, build_light_with};
-    use std::path::Path;
-    use std::sync::Arc;
-
-    async fn engine(root: &Path) -> Engine {
-        orch_infra::storage::fs_utils::clear_ensured_dirs();
-        std::fs::create_dir_all(orch_infra::storage::Paths::new(root).root()).unwrap();
-        build_light_with(
-            root,
-            EngineSeams {
-                clock: Arc::new(orch_core::test_support::FixedClock::new()),
-                ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
-                // Light tier only, so no global-config store is built.
-                global_config_path: None,
-            },
-        )
-        .await
-        .unwrap()
-    }
-
-    fn ctx(root: &Path) -> CliContext {
-        CliContext::new(
-            root.to_path_buf(),
-            None,
-            false,
-            true,
-            false,
-            EnvFlags::default(),
-        )
-    }
+    use crate::commands::rpc::arguments;
 
     fn args(name: &str, adapter: &str) -> AgentAddArgs {
         AgentAddArgs {
@@ -866,103 +769,56 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn add_persists_a_shell_agent() {
-        let temp = tempfile::tempdir().unwrap();
-        let engine = engine(temp.path()).await;
-        add(
-            &engine,
-            &ctx(temp.path()),
-            &Styles::plain(),
-            AgentAddArgs {
-                command: Some("echo hello".into()),
-                ..args("shelly", "shell")
-            },
-        )
-        .await
-        .unwrap();
-
-        let agent = engine.agent_service.get("agt_0000001").await.unwrap();
-        assert_eq!(agent.name, "shelly");
-        assert_eq!(agent.config.command.as_deref(), Some("echo hello"));
-    }
-
-    #[tokio::test]
-    async fn skills_are_split_on_commas_and_trimmed() {
-        let temp = tempfile::tempdir().unwrap();
-        let engine = engine(temp.path()).await;
-        add(
-            &engine,
-            &ctx(temp.path()),
-            &Styles::plain(),
-            AgentAddArgs {
-                skills: Some("review, feature-dev:code-explorer".into()),
-                ..args("claudia", "claude")
-            },
-        )
-        .await
-        .unwrap();
-
-        let agent = engine.agent_service.get("agt_0000001").await.unwrap();
-        assert_eq!(
-            agent.config.skills.as_deref(),
-            Some(["review".to_owned(), "feature-dev:code-explorer".to_owned()].as_slice())
-        );
-    }
-
-    #[tokio::test]
-    async fn a_shell_agent_without_a_command_fails_with_exit_2() {
-        let temp = tempfile::tempdir().unwrap();
-        let engine = engine(temp.path()).await;
-        let err = add(
-            &engine,
-            &ctx(temp.path()),
-            &Styles::plain(),
-            args("shelly", "shell"),
-        )
-        .await
-        .expect_err("rejected");
-        assert_eq!(err.to_string(), "Shell agents require a command");
-        assert_eq!(err.exit_code(), 2);
-    }
-}
-
-#[cfg(test)]
-mod definition_tests {
-    use super::*;
-    use crate::document_input::MutationKind;
-    use serde_json::json;
     #[test]
-    fn definition_projection_checks_unknown_null_and_equal_readonly_echoes() {
-        let current = json!({"id":"agt_1", "status":"idle", "name":"old", "adapter":"codex", "config":{"model":"old"}, "role":"old"});
-        let update = json!({"id":"agt_1", "name":"new", "adapter":"codex", "config":{}});
-        let value = definition_candidate(&current, &update, MutationKind::Update).unwrap();
-        assert!(value.get("role").is_none());
-        assert!(value.get("id").is_none());
-        for bad in [
-            json!({"id":"agt_1"}),
-            json!({"config":{"typo":null}}),
-            json!({"typo":null}),
-        ] {
-            assert!(definition_candidate(&current, &bad, MutationKind::Patch).is_err());
-        }
-        assert!(
-            definition_candidate(
-                &current,
-                &json!({"config":{"model":null}}),
-                MutationKind::Patch
-            )
-            .unwrap()["config"]
-                .get("model")
-                .is_none()
+    fn a_shell_command_survives_bounded_rpc_conversion() {
+        let input = agent_input(AgentAddArgs {
+            command: Some("echo hello".into()),
+            ..args("shelly", "shell")
+        });
+        let wire: args::AgentCreateArgs = arguments(input).unwrap();
+        assert_eq!(wire.name.as_str(), "shelly");
+        assert_eq!(wire.adapter.as_str(), "shell");
+        assert_eq!(wire.command.as_deref(), Some("echo hello"));
+    }
+
+    #[test]
+    fn skills_are_split_on_commas_and_trimmed() {
+        let input = agent_input(AgentAddArgs {
+            skills: Some("review, feature-dev:code-explorer".into()),
+            ..args("claudia", "claude")
+        });
+        let wire: args::AgentCreateArgs = arguments(input).unwrap();
+        let skills: Vec<_> = wire
+            .skills
+            .unwrap()
+            .into_inner()
+            .into_iter()
+            .map(|s| s.into_inner())
+            .collect();
+        assert_eq!(skills, ["review", "feature-dev:code-explorer"]);
+    }
+
+    #[test]
+    fn agent_input_is_bounded_before_the_daemon_request() {
+        let input = agent_input(args(
+            &"a".repeat(orch_proto::bounded::MAX_SHORT_TEXT_BYTES + 1),
+            "codex",
+        ));
+        assert!(arguments::<args::AgentCreateArgs>(input).is_err());
+    }
+
+    #[test]
+    fn editor_patch_clears_optional_fields_and_preserves_omissions() {
+        let patch = editor_patch(crate::editor::parse_agent_content(
+            "---\nname: renamed\ncommand:\nmodel:\n---\n",
+        ));
+        assert_eq!(
+            patch,
+            json!({"name":"renamed", "role":null, "config":{"command":null,"model":null}})
         );
-        assert!(
-            definition_candidate(
-                &current,
-                &json!({"name":"n", "adapter":"a", "config":{"model":null}}),
-                MutationKind::Update
-            )
-            .is_err()
+        assert_eq!(
+            editor_patch(crate::editor::AgentEdit::default()),
+            json!({"config":{}})
         );
     }
 }
