@@ -288,7 +288,7 @@ async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> ToolResult {
     // Relative paths name files under the project root, never the bridge's
     // working directory (D12); absolute paths pass through. The daemon reads
     // them; resolve here, before creating anything, and reject paths that
-    // cannot be represented intact.
+    // cannot be represented intact. The wire wants tagged `WirePath`s.
     let attachments = args
         .attach
         .as_deref()
@@ -297,16 +297,15 @@ async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> ToolResult {
                 .into_iter()
                 .filter(|part| !part.is_empty())
                 .map(|part| {
-                    cx.project_root
-                        .join(part)
-                        .into_os_string()
-                        .into_string()
-                        .map_err(|_| {
-                            ToolError::Text(
-                                "project root is not valid UTF-8; attachments cannot be resolved"
-                                    .to_owned(),
-                            )
-                        })
+                    let path = cx.project_root.join(part);
+                    if path.to_str().is_none() {
+                        return Err(ToolError::Text(
+                            "project root is not valid UTF-8; attachments cannot be resolved"
+                                .to_owned(),
+                        ));
+                    }
+                    orch_proto::path::WirePath::new(path)
+                        .map_err(|err| ToolError::Text(format!("Invalid arguments: {err}")))
                 })
                 .collect::<ToolResult<Vec<_>>>()
         })
@@ -514,6 +513,18 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // The wire carries attachment sources as tagged `WirePath`s; a plain
+    // string is rejected as an unknown variant (tsk_ml1V-uw).
+    #[tokio::test]
+    async fn task_add_sends_a_relative_attachment_as_a_project_root_wire_path() {
+        let (fx, cx) = fixture().await;
+        std::fs::write(fx.root().join("notes.txt"), "from the root").unwrap();
+        let task = add(cx.clone(), args(json!({"title":"t", "attach":"notes.txt"})))
+            .await
+            .unwrap();
+        assert_eq!(task["attachments"], json!(["notes.txt"]), "{task}");
     }
 
     #[tokio::test]
