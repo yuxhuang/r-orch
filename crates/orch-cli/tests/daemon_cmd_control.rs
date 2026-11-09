@@ -267,6 +267,6 @@ fn init_and_rerun_print_start_hint_without_creating_runtime_files() {
         );
         assert!(!socket.exists());
         assert!(!root.path().join(".orchestry/daemon.json").exists());
-        assert!(!root.path().join(".orchestry/orchestrator.lock").exists());
+        assert!(!root.path().join(".orchestry/orchestry.lock").exists());
     }
 }
