@@ -7,11 +7,17 @@ right command; use the chapter for steps and examples. For every option of a com
 orch task add --help
 ```
 
-> **Note:** Only `orch --help`, `orch --version`, `orch init`, `orch doctor`, `orch update`, `orch mcp --help` and
-> the `orch org template` commands work outside a project. Every other command, even with `--help`, needs a
-> project: run it in a directory where `orch init` has run, or in a subdirectory of one. Otherwise it prints
-> `Not initialized` and exits with code 3. `orch mcp --project-root <path>` serves the project at `<path>` from
-> any directory.
+> **Note:** Every command that reads or changes state needs a project **and its running daemon**: run it in a
+> directory where `orch init` has run, or in a subdirectory of one, after `orch daemon start`. Without a project it
+> prints `Not initialized` and exits with code 3; without a daemon it prints `No orch daemon is running for
+> <project root>` and exits with code 7 ([The orch daemon](18-daemon.md)). This now includes commands that used to
+> work outside a project, such as `orch org template` and `orch config global`. `orch --help`, `orch --version`,
+> `orch init` and `orch update` need neither. `orch mcp --project-root <path>` serves the project at `<path>` from
+> any directory, through that project's daemon.
+<!-- W2 (PR 2): design D7 ("All other commands require a daemon for their stateful work, including commands
+formerly runnable without a project (global config/catalog/template helpers); make that intentional behaviour change
+visible in the manual"); spec R3, R38. UNCONFIRMED at the S2a-cli head: whether `--help` of a subcommand still needs a
+project, and `orch doctor` outside a project. -->
 
 How to read the usage column:
 
@@ -149,11 +155,30 @@ Run tasks. Explained in [Running and monitoring](07-running-and-monitoring.md).
 
 ### orch serve
 
-Headless daemon mode — structured logs to stdout. Explained in [Running and monitoring](07-running-and-monitoring.md).
+Start the daemon in the foreground with dispatch on, like `orch run --watch`; it writes no event log. `--once`
+runs a batch in the running daemon instead and writes structured logs to stdout. Explained in
+[Running and monitoring](07-running-and-monitoring.md).
 
 | Command | What it does | Usage |
 |---|---|---|
 | `orch serve` | Headless daemon mode — structured logs to stdout | `orch serve [OPTIONS]` |
+
+The help text is unchanged from orch 0.13.0 and no longer true of a foreground `orch serve`, which logs no events;
+pending fix (task tsk_eda1yGZ).
+<!-- W2b: about-text verbatim from crates/orch-cli/src/tree.rs (Command::Serve doc comment) at 6acc62db. -->
+
+### orch daemon
+
+Start, check, stop and toggle dispatch in the project's daemon. Explained in [The orch daemon](18-daemon.md).
+
+| Command | What it does | Usage |
+|---|---|---|
+| `orch daemon start` | Start the project daemon explicitly | `orch daemon start [OPTIONS]` |
+| `orch daemon status` | Show live daemon status | `orch daemon status [OPTIONS]` |
+| `orch daemon stop` | Stop and reconcile the project daemon, including across version skew | `orch daemon stop [OPTIONS]` |
+| `orch daemon dispatch` | Enable or disable future automatic dispatch | `orch daemon dispatch [OPTIONS] <MODE>` (`on` or `off`) |
+<!-- W2: help texts from `orch daemon --help` at the PR 1 frozen binary 6a7a6481, minus "(developmental)", which PR 2
+removes (contract item 4); I2 checks the PR 2 help. -->
 
 ### orch status
 

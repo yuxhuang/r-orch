@@ -157,7 +157,7 @@ A `shell` agent that prints its prompt shows the delivery:
 19:09:42  ▸ **From:** cli · **Subject:** Style
 ```
 
-For anything that must arrive soon, check that something is starting runs: the orchestrator is running (`orch status` says `watching`), and the agent is not disabled ([Running and monitoring](07-running-and-monitoring.md)).
+For anything that must arrive soon, check that something is starting runs: the daemon's dispatch is on (`orch daemon status` says `dispatch ON`), and the agent is not disabled ([Running and monitoring](07-running-and-monitoring.md)).
 
 ### Limits
 

@@ -33,7 +33,7 @@ orch task add "Build the report" --assignee builder -p 2 \
 
 `tsk_lICHVKV` is the task ID. `--assignee` accepts an agent's ID or its exact name. Without `--assignee`, orch gives the task to any idle agent that fits ([Who runs a task](#who-runs-a-task)).
 
-Starting a task is a separate step: `orch run <task-id>`, or the orchestrator in [Running and monitoring](07-running-and-monitoring.md).
+Starting a task is a separate step: `orch run <task-id>`, or the daemon's dispatch in [Running and monitoring](07-running-and-monitoring.md).
 
 > **Note:** In orch 0.9.3, `orch run <task-id>` prints its header line and silently does nothing when another `todo` task is assigned to the same agent. Cancel or reassign the other task, or use `orch run --all`. See [Run one task](07-running-and-monitoring.md#run-one-task). The examples in this chapter give each task its own agent for that reason.
 
@@ -367,7 +367,7 @@ orch task cancel tsk_OTg9w5a
   ✓ Cancelled tsk_OTg9w5a
 ```
 
-You can cancel a task in any status except `done`, `failed` and `cancelled`. If an agent is running the task, orch stops the run. When `orch serve`, `orch run --watch` or the dashboard has the project open, the task is cancelled at once and that process stops the run at its next check (`scheduling.poll_interval_ms`, 10 seconds by default). A task that is already cancelled gives an error:
+You can cancel a task in any status except `done`, `failed` and `cancelled`. If an agent is running the task, the daemon stops it (each agent gets a 10 s grace before it is killed) and only then reports the cancel as done, whichever client sent it. <!-- W2 (PR 2): goal row 5, spec R10, design D2. --> A task that is already cancelled gives an error:
 
 ```text
   ✕ Invalid transition for tsk_PjBRFEn: cancelled → cancelled
@@ -415,7 +415,7 @@ When a run fails, orch does not give up at once. A task has `max_attempts` attem
 2. The next attempt gets the previous error and output in its prompt.
 3. After the last attempt the task is `failed`, and every task that depends on it fails as well.
 
-A task with `--max-attempts 1` fails on its first error, as `Break on purpose` did above. The retry delays apply while the orchestrator runs (`orch run --watch`, `orch serve` or the dashboard). It starts a retry at its first check after the delay is up, and it checks every `scheduling.poll_interval_ms` (10 seconds by default), so a retry can start up to that much later than the delay. `orch run --all` does not wait for a retry: it leaves the task in `retrying`, and the orchestrator retries it once the delay is up. `orch run <task-id>` on a `retrying` task starts it at once. `orch task show` prints the attempt count as `attempt 2/3`.
+A task with `--max-attempts 1` fails on its first error, as `Break on purpose` did above. The retry delays apply while the daemon's dispatch is on. It starts a retry at its first check after the delay is up, and it checks every `scheduling.poll_interval_ms` (10 seconds by default), so a retry can start up to that much later than the delay. `orch run --all` does not wait for a retry: it leaves the task in `retrying`, and the orchestrator retries it once the delay is up. `orch run <task-id>` on a `retrying` task starts it at once. `orch task show` prints the attempt count as `attempt 2/3`.
 
 ## See a task in the dashboard
 

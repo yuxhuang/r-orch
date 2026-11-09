@@ -279,25 +279,31 @@ See [Agents](03-agents.md#autonomous-agents).
 
 The **orchestrator** is orch's scheduling loop. It checks the project on a timer (every 10 seconds by default),
 and again soon after a run ends. It starts ready tasks on idle agents, retries failures and stops stalled runs.
-Only one orchestrator can run per project.
 
-Different commands start the orchestrator in different ways:
+The orchestrator runs inside the project's **daemon**: the one orch process that owns `.orchestry/`, starts and stops
+the agents and makes every change. Every other orch command, the dashboard, `orch web` and `orch mcp` is a
+**client** that asks the daemon over a private socket. You start the daemon yourself; nothing else ever does, and
+without it every client reports `No orch daemon is running` and exits 7. The daemon dispatches waiting tasks by
+itself only while its **dispatch** is on; a daemon starts with dispatch off unless you ask for it. See
+[The orch daemon](18-daemon.md).
+<!-- W2 (PR 2): goal rows 1-3, 6; design D1, D8; PR 2 contract items 1-3. -->
 
 | Command | What it does |
 |---|---|
-| `orch run <task-id>` | Starts one task, shows its output, and exits when the run ends. |
-| `orch run --all` | Starts every `todo` task and exits when they finish. |
-| `orch run --watch` | Keeps the orchestrator running in your terminal and prints what happens. `--verbose` adds agent output. |
-| `orch serve` | Keeps the orchestrator running without a terminal UI and writes structured logs (JSON Lines by default). `--once` processes the `todo` tasks and exits. |
-| `orch tui` | Opens the terminal dashboard and runs the orchestrator inside it. `--observe` opens the dashboard without starting the orchestrator. |
-| `orch web` | Serves the dashboard to a browser. Each browser tab runs its own dashboard. |
-| `orch` (no command) | Same as `orch tui`, with one difference: if the current directory has no `.orchestry/`, it first runs `orch init` there and then opens the dashboard (see the [warning about `init`](01-getting-started.md#create-a-project)). It checks only the current directory, not its parents, so in a subdirectory of a project it creates a nested project. |
+| `orch daemon start` | Starts the daemon, dispatch off (`--dispatch on` to dispatch at once, `--detach` for the background). |
+| `orch run --watch` | Starts the daemon in your terminal with dispatch on, like `orch daemon start --dispatch on`. It prints its socket and dispatch state, not the events; follow those with `orch logs --follow`. |
+| `orch serve` | The same as `orch run --watch`. Only `orch serve --once` writes structured logs (JSON Lines by default). |
+| `orch daemon dispatch on` / `off` | Turns dispatch on or off in the running daemon. |
+| `orch run <task-id>` | Asks the daemon to start one task, shows its output, and exits when the run ends. |
+| `orch run --all` | Asks the daemon to start every `todo` task and exits when they finish. |
+| `orch serve --once` | Asks the daemon for a batch that ends when every tracked task is final; dispatch must be off. |
+| `orch tui` | Opens the terminal dashboard, a client of the daemon. Its watch toggle turns dispatch on and off. |
+| `orch web` | Serves the dashboard to a browser. Each browser tab runs its own dashboard, a client of the daemon. |
+| `orch` (no command) | Same as `orch tui`, with one difference: if the current directory has no `.orchestry/`, it first runs `orch init` there and then opens the dashboard (see the [warning about `init`](01-getting-started.md#create-a-project)). It checks only the current directory, not its parents, so in a subdirectory of a project it creates a nested project. <!-- UNCONFIRMED at the S2c head (asked frontend-eng msg_HiixZC4). --> |
 
-The dashboard works as an **observer** when another process already holds the lock: it shows the project and
-lets you change tasks and agents, but does not schedule work itself.
-
-Stall detection only works while the orchestrator loop runs (`run --watch`, `serve` and the dashboard). A single
-`orch run <task-id>` has no stall detection. `timeout_ms` in the agent and project settings is stored but orch
+Stall detection works in the daemon for the runs it dispatches. In orch 0.13.0 a single `orch run <task-id>` had
+no stall detection; whether the daemon checks those runs now is not yet confirmed.
+<!-- UNCONFIRMED (asked senior-eng msg_4Kc7aF8). --> `timeout_ms` in the agent and project settings is stored but orch
 does not enforce it. See the [runbook](../RUNBOOK.md#timeout_ms-is-not-a-timeout).
 
 > **Note:** `orch serve --once` waits until every task is `done`, `failed` or `cancelled`. A task in `review`
@@ -313,7 +319,7 @@ You do not need this section to use orch.
   `stall_timeout_ms`, creates tasks for autonomous agents, then starts ready tasks. It starts tasks with the lowest
   priority number first, up to `scheduling.max_concurrent_agents` local runs (6 by default). Remote runs do not
   count toward that limit.
-- **Lock file.** The running orchestrator holds `.orchestry/orchestry.lock`. A second orchestrator in the same
-  project cannot start. See the [runbook](../RUNBOOK.md#corrupt-lock-file) if the lock is damaged.
+- **Lock file.** The running daemon holds `.orchestry/orchestry.lock` and `.orchestry/.daemon-owner.lock`. A
+  second daemon in the same project cannot start; it exits 4. See the [runbook](../RUNBOOK.md#corrupt-lock-file) if the lock is damaged.
 - **Run files.** A run leaves `.orchestry/runs/<run-id>.json` (the summary: task, agent and outcome) and
   `<run-id>.jsonl` (the event log, to which orch only appends).
