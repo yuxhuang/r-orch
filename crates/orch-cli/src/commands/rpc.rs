@@ -72,6 +72,23 @@ pub fn arguments<T: DeserializeOwned>(input: impl Serialize) -> Result<T> {
     serde_json::from_value(value).map_err(|error| Error::invalid_arguments(error.to_string()))
 }
 
+/// `agent.create` arguments for a domain create input. The domain keeps `env`
+/// as a map; the wire carries it as a bounded list of `{name, value}` pairs.
+pub fn agent_create_args(
+    mut input: orch_domain::CreateAgentInput,
+) -> Result<orch_proto::ops::args::AgentCreateArgs> {
+    let env = input.env.take();
+    let mut value = serde_json::to_value(input)
+        .map_err(|error| Error::other(format!("cannot encode daemon arguments: {error}")))?;
+    if let Some(env) = env {
+        value["env"] = env
+            .into_iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect();
+    }
+    arguments(value)
+}
+
 pub fn argument_error(error: impl std::fmt::Display) -> Error {
     Error::invalid_arguments(error.to_string())
 }
@@ -132,5 +149,36 @@ mod tests {
                 .unwrap_err();
         assert_eq!(invalid.exit_code(), 2);
         assert!(arguments::<args::TaskGetArgs>(serde_json::json!({"id":"a".repeat(257)})).is_err());
+    }
+
+    #[test]
+    fn a_created_agent_env_map_crosses_the_wire_as_ordered_pairs() {
+        let input = orch_domain::CreateAgentInput {
+            name: "boss".into(),
+            adapter: "claude".into(),
+            env: Some(
+                [("B", "2"), ("A", "1")]
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .into(),
+            ),
+            skills: Some(vec!["boss-only".into()]),
+            ..Default::default()
+        };
+        let wire = agent_create_args(input).unwrap();
+        let env: Vec<_> = wire
+            .env
+            .unwrap()
+            .into_inner()
+            .into_iter()
+            .map(|e| (e.name.into_inner(), e.value.into_inner()))
+            .collect();
+        assert_eq!(env, [("B".into(), "2".into()), ("A".into(), "1".into())]);
+        assert_eq!(wire.skills.unwrap().into_inner().len(), 1);
+        let bare = orch_domain::CreateAgentInput {
+            name: "plain".into(),
+            adapter: "claude".into(),
+            ..Default::default()
+        };
+        assert!(agent_create_args(bare).unwrap().env.is_none());
     }
 }
