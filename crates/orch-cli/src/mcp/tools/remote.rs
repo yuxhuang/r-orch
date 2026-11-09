@@ -1,9 +1,10 @@
-//! Stored remote snapshots only: no connection, listener or owner runtime.
-use crate::mcp::registry::{CallContext, Class, EmptyArgs, Execution, Registry, ToolMeta};
-use orch_core::{Error, Result};
-use orch_domain::RemoteStatus;
-use orch_infra::storage::remote::FileRemoteStore;
-use serde_json::{Value, json};
+//! Remote snapshots as the daemon's peer runtime records them; these tools
+//! never connect to a peer or open a listener.
+use crate::mcp::registry::{
+    CallContext, Class, EmptyArgs, Execution, Registry, ToolMeta, ToolResult, json,
+};
+use orch_core::Result;
+use orch_proto::ops::args as rpc;
 use std::sync::Arc;
 
 fn meta(name: &'static str, description: &'static str) -> ToolMeta {
@@ -28,96 +29,52 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     registry.add(meta("remote_status", "Read stored remote and live-owner listener snapshots (orch remote status); does not connect or listen."), status)?;
     Ok(())
 }
-async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> Result<Value> {
-    serde_json::to_value(FileRemoteStore::new(cx.engine.paths.clone()).list().await?)
-        .map_err(|_| Error::other("serialize remotes"))
+async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> ToolResult {
+    json(&cx.request(rpc::RemoteListArgs {}).await?, "remotes")
 }
-async fn status(cx: Arc<CallContext>, _: EmptyArgs) -> Result<Value> {
-    let store = FileRemoteStore::new(cx.engine.paths.clone());
-    let config = cx.engine.config_store.read().await?;
-    let inbound = store.read_inbound().await?;
-    let listener = crate::commands::remote::listener_status(&cx.engine.paths, false).await?;
-    let mut remotes = Vec::new();
-    for entry in store.list().await? {
-        remotes.push(
-            store
-                .read_status(&entry.alias)
-                .await?
-                .unwrap_or(RemoteStatus {
-                    alias: entry.alias,
-                    addr: entry.addr,
-                    online: false,
-                    last_seen: None,
-                    last_error: None,
-                    peer_name: None,
-                    instance_id: None,
-                    os: None,
-                    agents: Vec::new(),
-                    peer_version: None,
-                    link_state: orch_domain::LinkState::Connecting,
-                    next_retry_at: None,
-                    attempts: 0,
-                }),
-        );
-    }
-    Ok(
-        json!({"listen": listener.addr, "listen_configured": config.peer.listen,
-        "controller": listener.controller, "last_session_error": listener.last_session_error,
-        "inbound": inbound, "remotes": remotes}),
+async fn status(cx: Arc<CallContext>, _: EmptyArgs) -> ToolResult {
+    json(
+        &cx.request(rpc::RemoteStatusArgs {}).await?,
+        "remote status",
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     use crate::mcp::registry::{Identity, Mode, ToolArgs};
+    use orch_infra::storage::remote::FileRemoteStore;
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
         let args: A = serde_json::from_value(value).unwrap();
         args.validate(&Identity::of(None), Mode::Default).unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(None),
-            mode: Mode::Default,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[tokio::test]
     async fn both_remote_tools_are_snapshot_projections_with_offline_fallbacks() {
-        let (_dir, cx) = fixture().await;
+        let (fx, cx) = fixture().await;
         assert!(serde_json::from_value::<EmptyArgs>(json!({"alias":"x"})).is_err());
         assert_eq!(list(cx.clone(), args(json!({}))).await.unwrap(), json!([]));
-        let store = FileRemoteStore::new(cx.engine.paths.clone());
+        let store = FileRemoteStore::new(fx.engine().paths.clone());
         store
             .add(orch_domain::RemoteConfig {
                 alias: "peer".into(),
                 addr: "127.0.0.1:9".into(),
-                added_at: cx.engine.clock.now_iso(),
+                added_at: fx.engine().clock.now_iso(),
             })
             .await
             .unwrap();
         let listed = list(cx.clone(), args(json!({}))).await.unwrap();
         assert_eq!(listed[0]["alias"], "peer");
         assert!(listed[0].get("online").is_none());
-        cx.engine
+        fx.engine()
             .config_store
             .set("peer.listen", json!("127.0.0.1:0"))
             .await
