@@ -615,7 +615,9 @@ impl Running {
     /// exit when agent cleanup was incomplete, never a false clean stop.
     pub(crate) async fn shutdown(mut self) -> DaemonExit {
         let clean = self.stop_engine().await;
-        drop(self.peer.take());
+        if let Some(peer) = self.peer.take() {
+            peer.shutdown().await;
+        }
         // Stop-intent callers get their completion before the endpoint goes.
         self.server.stop.finish(clean);
         self.server.begin_drain();

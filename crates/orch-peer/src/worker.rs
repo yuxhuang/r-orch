@@ -36,7 +36,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 
-use crate::codec::{read_frame, write_frame};
+use crate::codec::read_frame;
 use crate::protocol::{Frame, PROTOCOL, SyncItem};
 use crate::{AbortOnDrop, Context};
 
@@ -197,6 +197,8 @@ pub(crate) struct Worker {
     /// cannot mutate a mirror after the new controller's sync.
     session: tokio::sync::Mutex<SessionSlot>,
     faults: Mutex<Faults>,
+    #[cfg(test)]
+    pub(crate) publication_pause: Mutex<Option<crate::tests::PublicationPause>>,
 }
 
 impl Worker {
@@ -208,6 +210,8 @@ impl Worker {
             events,
             session: tokio::sync::Mutex::new(SessionSlot::default()),
             faults: Mutex::new(Faults::default()),
+            #[cfg(test)]
+            publication_pause: Mutex::new(None),
         })
     }
 
@@ -383,18 +387,26 @@ impl Worker {
     async fn listener_status(&self, addr: &str, controller: Option<&str>) -> Result<()> {
         let last_error = self.faults().last_session_error.clone();
         // Owner-only like every file under remotes/ (security review F7).
-        write_json_with_mode(
-            &self.ctx.engine.paths.remotes_dir().join("_listener.json"),
-            &serde_json::json!({
-                "listen_addr": addr,
-                "controller_name": controller,
-                "pid": std::process::id(),
-                "last_session_error": last_error.as_ref().map(|(error, _)| error),
-                "last_session_error_at": last_error.as_ref().map(|(_, at)| at),
-            }),
-            owner_only(),
-        )
-        .await
+        let path = self.ctx.engine.paths.remotes_dir().join("_listener.json");
+        let status = serde_json::json!({
+            "listen_addr": addr,
+            "controller_name": controller,
+            "pid": std::process::id(),
+            "last_session_error": last_error.as_ref().map(|(error, _)| error),
+            "last_session_error_at": last_error.as_ref().map(|(_, at)| at),
+        });
+        #[cfg(test)]
+        {
+            let pause = self
+                .publication_pause
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(pause) = pause {
+                return pause.publish(path, status).await;
+            }
+        }
+        write_json_with_mode(&path, &status, owner_only()).await
     }
 
     /// Record and report why a controller session ended. The session error is
@@ -441,6 +453,7 @@ impl Worker {
         loop {
             tokio::select! {
                 biased;
+                () = self.ctx.stop.cancelled() => break,
                 // Reap completed tasks before accepting more, including under
                 // a constant stream of short-lived connections.
                 Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
@@ -485,6 +498,11 @@ impl Worker {
                 }
             }
         }
+        drop(listener);
+        // Every session observes the same stop signal between state phases.
+        // JoinSet::drop would only abort them and abandon blocking fs work.
+        while sessions.join_next().await.is_some() {}
+        Ok(())
     }
 
     async fn connection(&self, socket: TcpStream, addr: &str) -> Result<()> {
@@ -493,7 +511,7 @@ impl Worker {
             .map_err(|e| Error::other(format!("peer socket: {e}")))?;
         let (read, mut write) = socket.into_split();
         let mut read = BufReader::new(read);
-        let hello = timeout(DEAD_AFTER, read_frame(&mut read))
+        let hello = timeout(DEAD_AFTER, self.ctx.stop.io(read_frame(&mut read)))
             .await
             .map_err(|_| Error::other("peer handshake timed out"))?
             .map_err(|e| Error::other(format!("peer hello: {e}")))?;
@@ -623,7 +641,7 @@ impl Worker {
             .await?;
             // The reader owns its partial line across timer/notification wakeups.
             let (incoming, mut frames) = mpsc::channel(32);
-            let _reader = AbortOnDrop(tokio::spawn(async move {
+            let mut reader_task = AbortOnDrop(tokio::spawn(async move {
                 loop {
                     let frame = read_frame(&mut read).await;
                     let ended = !matches!(&frame, Ok(Some(_)));
@@ -639,109 +657,118 @@ impl Worker {
             let mut last_ping = Instant::now();
             let mut synced = false;
             let mut sent = HashMap::<String, String>::new();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancelled.changed() => return Ok(()),
-                    frame = frames.recv() => {
-                        let Some(frame) = frame else {
-                            return Ok(());
-                        };
-                        let Some(frame) = frame
-                            .map_err(|e| Error::other(format!("peer frame: {e}")))?
-                        else {
-                            return Ok(());
-                        };
-                        last_frame = Instant::now();
-                        if !synced && !matches!(&frame, Frame::Sync { .. }) {
-                            self.write(
-                                &mut write,
-                                &Frame::Error {
-                                    msg: "expected sync".into(),
-                                },
-                            )
-                            .await?;
-                            return Ok(());
-                        }
-                        let replies = {
-                            let slot = self.session.lock().await;
-                            if !slot.is_current(generation) {
+            let result = async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = self.ctx.stop.cancelled() => return Ok(()),
+                        _ = cancelled.changed() => return Ok(()),
+                        frame = frames.recv() => {
+                            let Some(frame) = frame else {
                                 return Ok(());
-                            }
-                            if matches!(&frame, Frame::Sync { .. }) {
-                                synced = true;
-                                sent.clear();
-                            }
-                            self.handle_ordered(&instance_id, &name, frame).await?
-                        };
-                        for frame in replies {
-                            self.write(&mut write, &frame).await?;
-                        }
-                    }
-                    event = events.recv(), if synced => {
-                        match event {
-                            Ok((controller, frame)) if controller == instance_id => {
-                                self.write(&mut write, &frame).await?;
-                            }
-                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                        }
-                    }
-                    _ = ticker.tick() => {
-                        if last_frame.elapsed() >= DEAD_AFTER {
-                            return Err(Error::other("peer heartbeat timed out"));
-                        }
-                        if last_ping.elapsed() >= PING_EVERY {
-                            self.write(&mut write, &Frame::Ping).await?;
-                            last_ping = Instant::now();
-                        }
-                        if !synced {
-                            continue;
-                        }
-                        // Everything below reads this instance's own records.
-                        // A fault there skips the tick, never the session.
-                        match self.ctx.local_agents().await {
-                            Ok(snapshot) if snapshot != agents => {
+                            };
+                            let Some(frame) = frame
+                                .map_err(|e| Error::other(format!("peer frame: {e}")))?
+                            else {
+                                return Ok(());
+                            };
+                            last_frame = Instant::now();
+                            if !synced && !matches!(&frame, Frame::Sync { .. }) {
                                 self.write(
                                     &mut write,
-                                    &Frame::Agents {
-                                        agents: snapshot.clone(),
+                                    &Frame::Error {
+                                        msg: "expected sync".into(),
                                     },
                                 )
                                 .await?;
-                                agents = snapshot;
-                            }
-                            Ok(_) => {}
-                            Err(error) => self.session_fault("read local agents", &error),
-                        }
-                        let updates = {
-                            let slot = self.session.lock().await;
-                            if !slot.is_current(generation) {
                                 return Ok(());
                             }
-                            self.updates(&instance_id, &mut sent).await
-                        };
-                        for frame in updates {
-                            self.write(&mut write, &frame).await?;
+                            let replies = {
+                                let slot = self.session.lock().await;
+                                if !slot.is_current(generation) {
+                                    return Ok(());
+                                }
+                                if matches!(&frame, Frame::Sync { .. }) {
+                                    synced = true;
+                                    sent.clear();
+                                }
+                                self.handle_ordered(&instance_id, &name, frame).await?
+                            };
+                            for frame in replies {
+                                self.write(&mut write, &frame).await?;
+                            }
                         }
-                        match self.ctx.outbox(&name).await {
-                            Ok(frames) => {
-                                for frame in frames {
+                        event = events.recv(), if synced => {
+                            match event {
+                                Ok((controller, frame)) if controller == instance_id => {
                                     self.write(&mut write, &frame).await?;
                                 }
+                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(broadcast::error::RecvError::Closed) => return Ok(()),
                             }
-                            Err(error) => self.session_fault("read outbox", &error),
                         }
-                        // A cancel that could not be applied when it arrived.
-                        for frame in self.retry_cancels(&instance_id, &name).await {
-                            self.write(&mut write, &frame).await?;
+                        _ = ticker.tick() => {
+                            if last_frame.elapsed() >= DEAD_AFTER {
+                                return Err(Error::other("peer heartbeat timed out"));
+                            }
+                            if last_ping.elapsed() >= PING_EVERY {
+                                self.write(&mut write, &Frame::Ping).await?;
+                                last_ping = Instant::now();
+                            }
+                            if !synced {
+                                continue;
+                            }
+                            // Everything below reads this instance's own records.
+                            // A fault there skips the tick, never the session.
+                            match self.ctx.local_agents().await {
+                                Ok(snapshot) if snapshot != agents => {
+                                    self.write(
+                                        &mut write,
+                                        &Frame::Agents {
+                                            agents: snapshot.clone(),
+                                        },
+                                    )
+                                    .await?;
+                                    agents = snapshot;
+                                }
+                                Ok(_) => {}
+                                Err(error) => self.session_fault("read local agents", &error),
+                            }
+                            let updates = {
+                                let slot = self.session.lock().await;
+                                if !slot.is_current(generation) {
+                                    return Ok(());
+                                }
+                                self.updates(&instance_id, &mut sent).await
+                            };
+                            for frame in updates {
+                                self.write(&mut write, &frame).await?;
+                            }
+                            match self.ctx.outbox(&name).await {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        self.write(&mut write, &frame).await?;
+                                    }
+                                }
+                                Err(error) => self.session_fault("read outbox", &error),
+                            }
+                            // A cancel that could not be applied when it arrived.
+                            for frame in self.retry_cancels(&instance_id, &name).await {
+                                self.write(&mut write, &frame).await?;
+                            }
                         }
                     }
                 }
             }
+            .await;
+            reader_task.0.abort();
+            let _ = (&mut reader_task.0).await;
+            result
         }
         .await;
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && !self.ctx.stop.is_stopping()
+        {
             self.session_ended(&instance_id, &name, generation, error)
                 .await;
         }
@@ -763,7 +790,7 @@ impl Worker {
         write: &mut W,
         frame: &Frame,
     ) -> Result<()> {
-        timeout(DEAD_AFTER, write_frame(write, frame))
+        timeout(DEAD_AFTER, self.ctx.write(write, frame))
             .await
             .map_err(|_| Error::other("peer write timed out"))?
             .map_err(|e| Error::other(format!("peer write: {e}")))
@@ -1608,6 +1635,7 @@ fn derive_outcome(task: &Task, run: Option<&Run>) -> Option<RemoteOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::write_frame;
     use orch_core::adapter::AgentEventKind;
     use orch_domain::{CreateAgentInput, ReviewCriterion, ReviewResult, TaskProof, TokenUsage};
     use orch_engine::{EngineSeams, build_full_with};
@@ -1644,6 +1672,7 @@ mod tests {
             .await
             .unwrap();
         let worker = Worker::new(Context {
+            stop: crate::Shutdown::default(),
             store: FileRemoteStore::new(engine.paths.clone()),
             engine,
             instance_id: "worker-instance".into(),
