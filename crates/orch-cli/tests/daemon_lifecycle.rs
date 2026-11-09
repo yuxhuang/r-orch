@@ -3,8 +3,8 @@
 //! isolated short socket and judges it by exit status, files and the process
 //! table; protocol detail belongs to the in-process harness tests.
 //!
-//! PR 1 is developmental: `orch daemon *` needs `ORCH_DAEMON_DEVELOPMENTAL=1`,
-//! which `Sandbox::orch` puts in the child env only.
+//! `orch daemon *` needs no gate or opt-in env since S2a-cli removed the PR 1
+//! developmental gate.
 
 mod daemon_support;
 
@@ -853,7 +853,7 @@ impl Tmux {
             format!(
                 "#!/bin/sh\ncd '{root}'\nexec env -i HOME='{root}/home' PATH=/usr/bin:/bin NO_COLOR=1 \
                  ORCHESTRY_GLOBAL_CONFIG_PATH='{root}/global.yml' ORCH_PROJECT_ROOT='{root}' \
-                 ORCH_SOCKET='{sock}' ORCH_DAEMON_DEVELOPMENTAL=1 /bin/sh -c \"{script}\"\n",
+                 ORCH_SOCKET='{sock}' /bin/sh -c \"{script}\"\n",
                 root = root.display(),
                 sock = self.sandbox.socket().display(),
             ),

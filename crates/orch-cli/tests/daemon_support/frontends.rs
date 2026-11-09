@@ -595,7 +595,7 @@ impl TuiPane {
                 "#!/bin/sh\ncd '{root}'\nenv -i HOME='{root}/home' PATH=/usr/bin:/bin NO_COLOR=1 \
                  LANG=en_US.UTF-8 TERM=tmux-256color \
                  ORCHESTRY_GLOBAL_CONFIG_PATH='{root}/global.yml' ORCH_PROJECT_ROOT='{root}' \
-                 ORCH_SOCKET='{sock}' ORCH_TEST_SOCKET_ROOT='{dir}' ORCH_DAEMON_DEVELOPMENTAL=1{extra} \
+                 ORCH_SOCKET='{sock}' ORCH_TEST_SOCKET_ROOT='{dir}'{extra} \
                  '{exe}' {args}\nstatus=$?\necho $status > '{exit}.tmp' && mv '{exit}.tmp' '{exit}'\n\
                  exec sleep 600\n",
                 root = root.display(),

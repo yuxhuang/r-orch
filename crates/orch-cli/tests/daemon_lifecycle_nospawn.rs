@@ -303,7 +303,7 @@ fn refused_starts_spawn_nothing() {
 
     let mut pids = Vec::new();
     type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<&'a str>);
-    let cases: [Case<'_>; 3] = [
+    let cases: [Case<'_>; 2] = [
         (
             "agent task id",
             vec![("ORCH_TASK_ID", "t-1")],
@@ -314,16 +314,12 @@ fn refused_starts_spawn_nothing() {
             vec![("ORCH_AGENT_ID", "a-1")],
             vec!["daemon", "start", "--detach"],
         ),
-        ("gate closed", vec![], vec!["daemon", "start"]),
     ];
     for (name, env, args) in cases {
         let mut cmd = sandbox.orch();
         cmd.args(&args);
         for (key, value) in env {
             cmd.env(key, value);
-        }
-        if name == "gate closed" {
-            cmd.env_remove("ORCH_DAEMON_DEVELOPMENTAL");
         }
         let (out, pid) = output_and_pid(cmd, CALL);
         assert_eq!(out.status.code(), Some(2), "{name}: {}", text(&out.stderr));
@@ -357,7 +353,7 @@ fn init_prints_the_hint_and_spawns_and_binds_nothing() {
         CALL,
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(text(&out.stdout).contains("Start the daemon explicitly with: orch daemon start"));
+    assert!(text(&out.stdout).contains("Next: orch daemon start"));
     let after = process_table();
     assert!(
         orch_processes(&after)
