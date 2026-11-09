@@ -153,7 +153,7 @@ const PLATFORM_SKIPS: &[(Quirk, &str, &str)] = &[
     ),
     (
         Quirk::ProcessWritesHome,
-        "listing_showing_and_agent_listing_need_no_project_and_create_nothing",
+        "listing_showing_and_agent_listing_are_read_only_and_create_nothing_new",
         "crates/orch-cli/tests/org_templates.rs",
     ),
     (
