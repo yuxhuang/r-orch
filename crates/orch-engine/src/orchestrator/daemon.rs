@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
 use orch_domain::{
-    Agent, AgentStatus, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry,
-    Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
+    Agent, AgentStatus, DomainError, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus,
+    RunningEntry, Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
 };
 
 use super::dispatch::{
@@ -301,8 +301,24 @@ impl Orchestrator {
                 else {
                     return Ok(None);
                 };
+                // The directory comes from the agent index; the pre-spawn
+                // re-validation reads the agent file. Launch from the file, so
+                // an index entry older than its file (hand edit, or a crash
+                // between the two writes) cannot invalidate every preparation.
+                let agent = if agent.remote.is_none() {
+                    match self.deps().agent_store.get(&agent.id).await? {
+                        Some(current) if current.status == AgentStatus::Idle => current,
+                        _ => return Ok(None),
+                    }
+                } else {
+                    agent
+                };
                 drop(preparing);
                 state.claimed.insert(task_id.to_owned());
+                // Starting consumes the due retry, as in v0.13: `enqueue_retry`
+                // deduplicates by task id, so a leftover entry would swallow
+                // the back-off of a failure before spawn.
+                state.retry_queue.retain(|retry| retry.task_id != task_id);
                 let generation = self.inner.preparation_seq.fetch_add(1, Ordering::SeqCst) + 1;
                 self.inner
                     .preparing_agents
@@ -342,6 +358,13 @@ impl Orchestrator {
             let workspace = match prepared {
                 Ok(workspace) => workspace,
                 Err(error) => {
+                    // As in v0.13: a workspace that cannot be prepared costs an
+                    // attempt and backs off. Released with no record, the task
+                    // stays dispatchable and every tick repeats the failure.
+                    if matches!(error, Error::Domain(DomainError::Workspace { .. })) {
+                        self.daemon_record_workspace_failure(task_id, generation, &error)
+                            .await?;
+                    }
                     self.daemon_release_preparation(task_id, generation).await?;
                     return Err(error);
                 }
@@ -841,6 +864,40 @@ impl Orchestrator {
                 self.inner.preparing_agents.lock().await.remove(task_id);
                 self.drop_cancel(task_id).await;
                 self.save_state(state).await
+            })
+            .await
+            .value
+    }
+
+    /// Account a workspace failure for the preparation this call still owns.
+    async fn daemon_record_workspace_failure(
+        &self,
+        task_id: &str,
+        generation: u64,
+        error: &Error,
+    ) -> Result<()> {
+        self.deps()
+            .events
+            .operation_boundary()
+            .run(true, async {
+                if self.is_shutting_down()
+                    || !self
+                        .inner
+                        .preparing_agents
+                        .lock()
+                        .await
+                        .get(task_id)
+                        .is_some_and(|(current, _)| *current == generation)
+                {
+                    return Ok(());
+                }
+                let mut slot = self.inner.state.lock().await;
+                self.load_state(&mut slot).await?;
+                let state = slot.as_mut().expect("state loaded");
+                let tasks = self.deps().task_store.list(&Default::default()).await?;
+                self.record_workspace_dispatch_failure(state, task_id, &tasks, error)
+                    .await;
+                Ok(())
             })
             .await
             .value

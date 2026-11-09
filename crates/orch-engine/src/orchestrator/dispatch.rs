@@ -214,8 +214,9 @@ impl Orchestrator {
     /// Increment the attempt, apply `resolve_failure_status`, and either
     /// enqueue a retry or cascade-fail dependents. Every failure here is
     /// swallowed: being unable to *record* a dispatch error must not stop the
-    /// remaining dispatches.
-    async fn record_workspace_dispatch_failure(
+    /// remaining dispatches. The daemon's phased launch records through it
+    /// too, so both dispatch paths account a failed workspace the same way.
+    pub(super) async fn record_workspace_dispatch_failure(
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
