@@ -46,7 +46,7 @@ pub struct StartArgs {
 const GATE_ERROR: &str =
     "orch daemon is developmental in this build; set ORCH_DAEMON_DEVELOPMENTAL=1 to run it";
 
-pub async fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path) -> ExitCode {
+pub fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path) -> ExitCode {
     // This check precedes discovery, connection and any lifecycle action, for
     // every daemon verb. Existing serve/watch entry points are unchanged.
     if std::env::var_os(orch_daemon::DEVELOPMENTAL_ENV).as_deref()
@@ -62,21 +62,21 @@ pub async fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path
             return code(error.exit_code());
         }
     };
-    if let DaemonSub::Start(args) = &args.command {
+    // The lifecycle owns sanitization. Prepare before constructing Tokio so
+    // every daemon child uses the owner's fixed environment snapshot (R21).
+    let prepared = if let DaemonSub::Start(args) = &args.command {
         if config.agent_context && !args.from_agent {
             eprintln!("  ✕ {}", orch_proto::error::START_REFUSED_IN_AGENT_CONTEXT);
             return ExitCode::from(2);
         }
-        let project = match config.project() {
-            Ok(project) => project,
-            Err(error) => {
-                eprintln!("{}", error.render(config.agent_context));
-                return code(error.exit_code());
-            }
-        };
-        let result = orch_daemon::start(orch_daemon::StartOptions {
-            project_root: project.root,
-            socket: config.socket,
+        let project_root =
+            match orch_daemon::select_project_root(config.project_root.as_deref(), cwd) {
+                Ok(root) => root,
+                Err(error) => return lifecycle_result(Err(error)),
+            };
+        let result = orch_daemon::prepare_start(orch_daemon::StartOptions {
+            project_root,
+            socket: config.socket.clone(),
             detach: args.detach,
             dispatch: match args.dispatch {
                 Switch::On => orch_daemon::DispatchMode::On,
@@ -86,24 +86,42 @@ pub async fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path
             listen: args.peer.listen.clone(),
             peer_name: args.peer.peer_name.clone(),
             developmental: true,
-        })
-        .await;
-        return match result {
-            Ok(exit) => code(exit.code),
-            Err(error) => {
-                eprintln!(
-                    "  ✕ {}",
-                    orch_proto::path::escape_controls(&error.to_string())
-                );
-                code(error.exit_code())
-            }
-        };
+        });
+        match result {
+            Ok(prepared) => Some(prepared),
+            Err(error) => return lifecycle_result(Err(error)),
+        }
+    } else {
+        None
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("  ✕ failed to start the async runtime: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(prepared) = prepared {
+        return lifecycle_result(runtime.block_on(prepared.run()));
     }
-    let result = control(cli, &args.command, &config).await;
+    let result = runtime.block_on(control(cli, &args.command, &config));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}", error.render(config.agent_context));
+            code(error.exit_code())
+        }
+    }
+}
+
+fn lifecycle_result(result: Result<orch_daemon::DaemonExit, orch_daemon::DaemonError>) -> ExitCode {
+    match result {
+        Ok(exit) => code(exit.code),
+        Err(error) => {
+            eprintln!(
+                "  ✕ {}",
+                orch_proto::path::escape_controls(&error.to_string())
+            );
             code(error.exit_code())
         }
     }
