@@ -174,6 +174,22 @@ const DISPOSITION: &[(&str, Disposition)] = &[
     ("doctor", Tool("doctor")),
     ("tui", Excluded("interactive UI")),
     ("serve", Excluded("starts an orchestrator")),
+    (
+        "daemon start",
+        Excluded("developmental owner control plane; PR 1 leaves MCP unchanged"),
+    ),
+    (
+        "daemon status",
+        Excluded("developmental owner control plane; PR 1 leaves MCP unchanged"),
+    ),
+    (
+        "daemon stop",
+        Excluded("developmental owner control plane; PR 1 leaves MCP unchanged"),
+    ),
+    (
+        "daemon dispatch",
+        Excluded("developmental owner control plane; PR 1 leaves MCP unchanged"),
+    ),
     ("web", Excluded("network server")),
     ("mcp", Excluded("is the server itself")),
     (
@@ -479,6 +495,17 @@ LEAF serve
   --peer-name
   --tick-interval
   --verbose flag
+GROUP daemon
+LEAF daemon start
+  --detach flag
+  --dispatch default=off values=on|off
+  --from-agent flag
+  --listen
+  --peer-name
+LEAF daemon status
+LEAF daemon stop
+LEAF daemon dispatch
+  <mode> required values=on|off
 LEAF web
   --allow-host multi
   --bind default=127.0.0.1:7681
