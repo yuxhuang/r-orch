@@ -346,6 +346,7 @@ pub async fn build_full_with(
         project_root.into(),
         seams,
         orch_domain::PeerConfig::default(),
+        None,
     )
     .await
 }
@@ -354,13 +355,27 @@ pub async fn build_full_with_peer(
     project_root: impl Into<PathBuf>,
     peer: orch_domain::PeerConfig,
 ) -> Result<FullEngine> {
-    build_full_internal(project_root.into(), EngineSeams::default(), peer).await
+    build_full_internal(project_root.into(), EngineSeams::default(), peer, None).await
+}
+
+/// The daemon's build: one engine whose every child process — agents, git,
+/// adapters — goes through `processes`. The daemon passes a manager that
+/// spawns from its start-time environment snapshot; its test harness passes a
+/// scripted one.
+pub async fn build_full_with_processes(
+    project_root: impl Into<PathBuf>,
+    seams: EngineSeams,
+    peer: orch_domain::PeerConfig,
+    processes: Arc<dyn ProcessManager>,
+) -> Result<FullEngine> {
+    build_full_internal(project_root.into(), seams, peer, Some(processes)).await
 }
 
 async fn build_full_internal(
     project_root: PathBuf,
     seams: EngineSeams,
     peer: orch_domain::PeerConfig,
+    processes: Option<Arc<dyn ProcessManager>>,
 ) -> Result<FullEngine> {
     let mut engine = build_light_with(project_root.clone(), seams).await?;
     if peer.name.is_some() {
@@ -371,7 +386,8 @@ async fn build_full_internal(
     }
     engine.global_config = engine.global_config_store.read().await?;
 
-    let processes: Arc<dyn ProcessManager> = Arc::new(orch_infra::process::SystemProcessManager);
+    let processes: Arc<dyn ProcessManager> =
+        processes.unwrap_or_else(|| Arc::new(orch_infra::process::SystemProcessManager));
     // Adapters stamp the events they parse out of a child's stdout, so they
     // get the injected clock too — otherwise the seam would reach every
     // timestamp except the ones the adapters actually read.

@@ -34,7 +34,7 @@ pub use agent_factory::{is_mcp_skill, template_to_agent_input};
 pub use agent_service::{AgentService, AgentStatsUpdate, UpdateAgentFields};
 pub use container::{
     ContextService, Engine, EngineSeams, FullEngine, build_full, build_full_with,
-    build_full_with_peer, build_light, build_light_with,
+    build_full_with_peer, build_full_with_processes, build_light, build_light_with,
 };
 pub use doctor_service::{CheckStatus, DoctorCheck, DoctorReport, DoctorService};
 pub use events::{EventBus, EventHandler, EventSubscription, Unsubscribe};
