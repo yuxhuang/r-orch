@@ -31,7 +31,7 @@ tracing.workspace = true
 tempfile = { workspace = true, optional = true }
 # Owner guard (flock), private directories and descriptors, umask, euid,
 # setsid for the detached child. Already in the lockfile via orch-infra.
-nix = { workspace = true, features = ["fs", "process", "user"] }
+nix = { workspace = true, features = ["dir", "fs", "process", "user"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

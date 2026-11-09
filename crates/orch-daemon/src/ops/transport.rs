@@ -2,31 +2,89 @@
 use super::{OpContext, ServiceHandler, invalid};
 use crate::coordinator::OpResult;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use nix::dir::Dir;
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
+use nix::unistd::{UnlinkatFlags, unlinkat};
 use orch_proto::error::{ErrorBody, ErrorCode, Execution};
 use orch_proto::frame::limits;
 use orch_proto::handshake::{CallerKind, SessionMode};
 use orch_proto::ops::{OpClass, Request, args::*, results::*};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-fn private_directory(path: &std::path::Path) -> OpResult<()> {
-    if let Err(error) = std::fs::create_dir(path)
+fn validate_private_directory(file: &File) -> OpResult<()> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| invalid("cannot inspect staging directory"))?;
+    if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+        return Err(invalid(
+            "staging directory must be owned by this uid and private",
+        ));
+    }
+    Ok(())
+}
+
+fn private_directory(path: &Path) -> OpResult<()> {
+    if let Err(error) = DirBuilder::new().mode(0o700).create(path)
         && error.kind() != std::io::ErrorKind::AlreadyExists
     {
         return Err(invalid("cannot create staging directory"));
     }
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|_| invalid("cannot inspect staging directory"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(invalid("staging directory must be a real directory"));
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| invalid("staging directory must be a real directory"))?;
+    // Never repair permissions on an unverified pre-existing directory.
+    validate_private_directory(&file)
+}
+
+fn private_directory_at(parent: &File, name: &str) -> OpResult<Option<File>> {
+    let fd = match openat(
+        parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(_) => return Err(invalid("cannot open private staging directory")),
+    };
+    let file = File::from(fd);
+    validate_private_directory(&file)?;
+    Ok(Some(file))
+}
+
+fn cleanup_stale_directory(file: File, extension: &str) -> OpResult<()> {
+    let fd = file
+        .try_clone()
+        .map_err(|_| invalid("cannot inspect stale transfer directory"))?;
+    let mut directory =
+        Dir::from_fd(fd.into()).map_err(|_| invalid("cannot inspect stale transfer directory"))?;
+    for entry in directory.iter() {
+        let entry = entry.map_err(|_| invalid("cannot inspect stale transfer"))?;
+        let name = entry.file_name();
+        if Path::new(OsStr::from_bytes(name.to_bytes()))
+            .extension()
+            .is_some_and(|ext| ext == extension)
+        {
+            // Names come from the pinned directory; unlinkat never follows a
+            // final symlink, and a renamed ancestor cannot redirect removal.
+            unlinkat(&file, name, UnlinkatFlags::NoRemoveDir)
+                .map_err(|_| invalid("cannot remove stale transfer"))?;
+        }
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| invalid("cannot protect staging directory"))
+    Ok(())
 }
 
 pub(super) fn authorize(ctx: &OpContext, request: &Request) -> OpResult<()> {
@@ -198,18 +256,17 @@ impl ServiceHandler {
     /// Call once after acquiring project ownership, before admitting sessions.
     /// Only this daemon's private transfer files are startup scratch space.
     pub fn cleanup_stale_transfers(&self) -> OpResult<()> {
-        for (directory, extension) in [("run/transfers", "part"), ("run/staged", "png")] {
-            let entries = match std::fs::read_dir(self.engine.paths.root().join(directory)) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return Err(invalid("cannot inspect stale transfer directory")),
-            };
-            for entry in entries {
-                let entry = entry.map_err(|_| invalid("cannot inspect stale transfer"))?;
-                if entry.path().extension().is_some_and(|ext| ext == extension) {
-                    std::fs::remove_file(entry.path())
-                        .map_err(|_| invalid("cannot remove stale transfer"))?;
-                }
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+            .open(self.engine.paths.root())
+            .map_err(|_| invalid("cannot inspect staging root"))?;
+        let Some(run) = private_directory_at(&root, "run")? else {
+            return Ok(());
+        };
+        for (name, extension) in [("transfers", "part"), ("staged", "png")] {
+            if let Some(directory) = private_directory_at(&run, name)? {
+                cleanup_stale_directory(directory, extension)?;
             }
         }
         Ok(())
@@ -545,5 +602,72 @@ mod tests {
             total_bytes: 1,
         });
         assert!(authorize(&ctx(SessionMode::ReadOnly), &r).is_err());
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn cleanup_keeps_using_checked_descriptors_after_directory_swaps() {
+        for swap_run in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let run_path = root.join("run");
+            let staging_path = run_path.join("transfers");
+            private_directory(&run_path).unwrap();
+            private_directory(&staging_path).unwrap();
+            std::fs::write(staging_path.join("old.part"), b"stale").unwrap();
+            let outside = root.join("outside");
+            private_directory(&outside).unwrap();
+            private_directory(&outside.join("transfers")).unwrap();
+            std::fs::write(outside.join("keep.part"), b"sentinel").unwrap();
+            std::fs::write(outside.join("transfers/keep.part"), b"sentinel").unwrap();
+            let root_fd = File::open(root).unwrap();
+            let run = private_directory_at(&root_fd, "run").unwrap().unwrap();
+            if swap_run {
+                std::fs::rename(&run_path, root.join("saved-run")).unwrap();
+                symlink(&outside, &run_path).unwrap();
+            }
+            let staging = private_directory_at(&run, "transfers").unwrap().unwrap();
+            if !swap_run {
+                std::fs::rename(&staging_path, root.join("saved-staging")).unwrap();
+                symlink(&outside, &staging_path).unwrap();
+            }
+            cleanup_stale_directory(staging, "part").unwrap();
+            let old = if swap_run {
+                root.join("saved-run/transfers/old.part")
+            } else {
+                root.join("saved-staging/old.part")
+            };
+            assert!(!old.exists(), "cleanup must use the checked directory");
+            assert_eq!(
+                std::fs::read(outside.join("keep.part")).unwrap(),
+                b"sentinel"
+            );
+            assert_eq!(
+                std::fs::read(outside.join("transfers/keep.part")).unwrap(),
+                b"sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_creation_never_chmods_preexisting_directories_or_symlink_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staging");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_directory(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+        let link = temp.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(private_directory(&link).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+        let created = temp.path().join("created");
+        private_directory(&created).unwrap();
+        assert_eq!(std::fs::metadata(&created).unwrap().mode() & 0o777, 0o700);
     }
 }
