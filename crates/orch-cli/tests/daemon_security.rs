@@ -89,6 +89,7 @@ fn files_are_private_under_any_umask_and_the_state_dir_is_not_chmodded() {
         let mut client = sandbox.orch();
         client
             .env_remove("ORCH_SOCKET")
+            .env("ORCH_TEST_SOCKET_ROOT", sandbox.root())
             .args(["--json", "daemon", "status"]);
         let out = output_with_deadline(client, CALL);
         assert!(out.status.success(), "umask {umask}: {}", text(&out.stderr));
