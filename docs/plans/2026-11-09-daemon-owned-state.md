@@ -23,8 +23,8 @@ version bump (0.14.0 is separate).
 
 ## Context
 - Base: `main` at `8bab8d1c` (v0.13.0). Owner's request: the goal text, quoted in the spec's Source.
-- Today `orch_engine::build_light` / `build_full_with_peer` are called from 22 files in `orch-cli` (every command,
-  `mcp/tools/*`, `tui/backend.rs`, `web/mod.rs`, `serve/`). The PID lock (`crates/orch-engine/src/lock.rs`)
+- Today `orch_engine::build_light` / `build_full_with_peer` are called from 19 files in `orch-cli` (every command,
+  `mcp/tools/*`, `tui/backend.rs`, `web/mod.rs`, `serve/`; counted with `git grep -l -E 'build_light|build_full_with_peer' b1216ce4 -- crates/orch-cli/src`). The PID lock (`crates/orch-engine/src/lock.rs`)
   serialises orchestrators only; each store has its own `.index.lock`.
 - Documented races: entity and index written as two steps; whole-record saves with no compare-and-swap; context
   expiry publishing a keep-list from `list`/`get`, also from `--read-only` MCP sessions; a per-process
@@ -87,16 +87,16 @@ rebase of a shared branch. Owners are roles; the orch task ids are in [Status](#
 |---|---|---|---|---|---|---|
 | A1, A1b | Design, spec, ADR 0012; rebuttal v2 (architect) | R1–R39 | `docs/specs/2026-11-09-*`, `docs/decisions/0012-*` | — | owner approves the spec at gate 2 | 1 |
 | SE, RT | Threat model; red team of the decision set (sec-eng; red-team-guy) | R6, R20, R21, R29, R31 | reader | A1 | lead adjudicates at CP1 | 1 |
-| B0, B0c, B0d | Engine guarantees: pause ordered with spawn, cancel stops the live process, explicit context expiry; expiry errors never skip reconciliation (senior-eng-2) | R9–R11 | `crates/orch-engine/src/**`, `crates/orch-infra/src/storage/{context,index}.rs` | — | `cargo test -p orch-engine --test daemon_guarantees`; code review pass at `f44d60b7` | 1 |
-| T0 | Failing-first tests for B0; harness design (test-engineer) | R9–R11, R25 | `crates/orch-engine/tests/**` | — | tests fail before B0, pass after | 1 |
+| B0, B0c, B0d | Engine guarantees: pause ordered with spawn, cancel stops the live process, explicit context expiry; expiry errors never skip reconciliation (senior-eng-2) | R9–R11 | `crates/orch-engine/src/**`, `crates/orch-infra/src/storage/{context,index}.rs` | — | `cargo test -p orch-engine --test daemon_guarantees`; `cargo test -p orch-engine --lib orchestrator::tests::resilience::expiry_write_failure_does_not_skip_reconciliation -- --exact`; B0 code review at `f44d60b7` | 1 |
+| T0 | Failing-first tests for B0; harness design (test-engineer) | R9–R11, R25 | `crates/orch-engine/tests/**` | — | `cargo test -p orch-engine --test daemon_guarantees`; failing-first evidence retained in T0/B0 reports; R9–R11 exact functions in spec | 1 |
 | W0 | Plan, manual 18 skeleton, doc stubs (tech-writer) | R22 | `docs/plans/**`, `docs/manual/**` | — | links resolve | 1 |
-| S1a-api | `orch-proto` and `orch-daemon` skeleton with public seams; workspace members; crate-graph table (senior-eng) | R6, R7 | `crates/orch-proto/**`, `crates/orch-daemon/**`, `Cargo.toml`, `Cargo.lock`, `xtask/src/crate_graph.rs` | gate 2 | `cargo test -p orch-proto`; `cargo xtask crate-graph`; `cargo deny check` | 1 |
-| S1a-impl | Lifecycle, discovery, listener, handshake, sessions, env snapshot, harness (senior-eng) | R1, R2, R4–R8, R14, R15, R20, R21, R25, R31–R33, R35–R37 | `crates/orch-daemon/src/{lifecycle,server,discovery,testing}/**`, `crates/orch-daemon/src/lib.rs`, `crates/orch-daemon/Cargo.toml`, `crates/orch-proto/**` | S1a-api | `cargo test -p orch-daemon -p orch-proto` | 1 |
-| S1b | State-operation coordinator (D2) and the D7 operation handlers (senior-eng-2) | R9–R13, R20, R30, R34 | `crates/orch-daemon/src/{ops/**,coordinator.rs}`, `crates/orch-daemon/tests/ops_*.rs`, `crates/orch-engine/**` | S1a-api, B0d | `cargo test -p orch-daemon`; `goal_edit_cannot_resurrect_active` | 1 |
-| S1c | `orch-client` control plane; `orch daemon start\|status\|stop\|dispatch` behind the developmental gate; `init` start hint (senior-eng-2) | R3–R5, R8, R14, R29, R31 | `crates/orch-client/**`, `crates/orch-cli/src/commands/{daemon,mod,init}.rs`, `crates/orch-cli/src/lib.rs`, `crates/orch-cli/Cargo.toml`, `crates/orch-cli/tests/daemon_cmd_*.rs` | S1a-api | `cargo test -p orch-client -p orch-cli` | 1 |
-| S1d | Hosted dispatch loop and peer runtime in the daemon; lift the NDJSON framing from `orch-peer` (senior-eng) | R1, R13, R19, R30 | `crates/orch-daemon/src/{dispatch,peer}/**`, `crates/orch-peer/src/{codec,lib}.rs`, `crates/orch-proto/**` | S1a-impl | `cargo test -p orch-daemon -p orch-peer -p orch-proto`; peer byte fixtures unchanged | 1 |
-| T1 | Integration vectors against the harness and protocol, failing first (test-engineer) | R2, R6, R7, R12, R20, R25, R32, R33, R36, R37 | `crates/orch-daemon/tests/daemon_*.rs`, `crates/orch-daemon/tests/common/**`, `crates/orch-proto/tests/**` | S1a-api | `cargo test -p orch-daemon --tests`; `cargo test -p orch-proto --tests` | 1 |
-| T1b | Binary lifecycle tests: racing starts, signals, crash then NoDaemon, stale socket, no-spawn proof (test-engineer) | R4, R5, R14, R15, R27, R31, R37 | `crates/orch-cli/tests/daemon_lifecycle*.rs`, `crates/orch-cli/tests/daemon_common/**` | S1a-impl, S1c | `cargo test -p orch-cli --test daemon_lifecycle` | 1 |
+| S1a-api | `orch-proto` and `orch-daemon` skeleton with public seams; workspace members; crate-graph table (senior-eng) | R6, R7 | `crates/orch-proto/**`, `crates/orch-daemon/**`, `Cargo.toml`, `Cargo.lock`, `xtask/src/crate_graph.rs` | gate 2 | `cargo test -p orch-proto --test daemon_protocol --test envelope`; R6/R7 exact functions in spec; `cargo xtask crate-graph`; `cargo deny check` | 1 |
+| S1a-impl | Lifecycle, discovery, listener, handshake, sessions, env snapshot, harness (senior-eng) | R1, R2, R4–R8, R14, R15, R20, R21, R25, R31–R33, R35–R37 | `crates/orch-daemon/src/{lifecycle,server,discovery,testing}/**`, `crates/orch-daemon/src/lib.rs`, `crates/orch-daemon/Cargo.toml`, `crates/orch-proto/**` | S1a-api | `cargo test -p orch-daemon --features testing --lib --test daemon_lifecycle --test daemon_paths --test daemon_security --test daemon_wire`; R1/R2/R6/R8/R14/R25/R36/R37 exact functions in spec | 1 |
+| S1b | State-operation coordinator (D2) and the D7 operation handlers (senior-eng-2) | R9–R13, R20, R30, R34 | `crates/orch-daemon/src/{ops/**,coordinator.rs}`, `crates/orch-daemon/tests/ops_*.rs`, `crates/orch-engine/**` | S1a-api, B0d | `cargo test -p orch-daemon --features testing --test daemon_engine --test ops_control --test ops_coordinator`; `cargo test -p orch-engine --test ops_daemon`; includes `orch-daemon/daemon_engine::goal_edit_cannot_resurrect_active` and `orch-daemon/ops_coordinator::mutations_and_reads_observe_one_commit_order` | 1 |
+| S1c | `orch-client` control plane; `orch daemon start\|status\|stop\|dispatch` behind the developmental gate; `init` start hint (senior-eng-2) | R3–R5, R8, R14, R29, R31 | `crates/orch-client/**`, `crates/orch-cli/src/commands/{daemon,mod,init}.rs`, `crates/orch-cli/src/lib.rs`, `crates/orch-cli/Cargo.toml`, `crates/orch-cli/tests/daemon_cmd_*.rs` | S1a-api | `cargo test -p orch-client`; `cargo test -p orch-cli --test daemon_cmd_control`; includes `orch-cli/daemon_cmd_control::status_dispatch_and_stop_use_the_explicit_harness_socket` and `protocol_skew_names_both_versions_and_frozen_stop_still_works` | 1 |
+| S1d | Hosted dispatch loop and peer runtime in the daemon; lift the NDJSON framing from `orch-peer` (senior-eng) | R1, R13, R19, R30 | `crates/orch-daemon/src/{dispatch,peer}/**`, `crates/orch-peer/src/{codec,lib}.rs`, `crates/orch-proto/**` | S1a-impl | `cargo test -p orch-daemon --features testing --test daemon_dispatch`; `cargo test -p orch-daemon --features testing --lib peer::tests::listen_is_a_start_option_and_speaks_the_unchanged_peer_protocol -- --exact`; `cargo test -p orch-peer`; peer byte fixture `orch-peer/lib::codec::tests::wire_bytes_are_unchanged_by_the_framing_lift` | 1 |
+| T1 | Integration vectors against the harness and protocol, failing first (test-engineer) | R2, R6, R7, R12, R20, R25, R32, R33, R36, R37 | `crates/orch-daemon/tests/daemon_*.rs`, `crates/orch-daemon/tests/common/**`, `crates/orch-proto/tests/**` | S1a-api | `cargo test -p orch-daemon --features testing --tests`; `cargo test -p orch-proto --tests`; spec command index and R-row functions identify the exact targets; two-executable R6/R32 acceptance remains UNMET | 1 |
+| T1b | Binary lifecycle tests: racing starts, signals, crash then NoDaemon, stale socket, no-spawn proof (test-engineer) | R4, R5, R14, R15, R27, R31, R37 | `crates/orch-cli/tests/daemon_lifecycle*.rs`, `crates/orch-cli/tests/daemon_common/**` | S1a-impl, S1c | `cargo test -p orch-cli --test daemon_lifecycle --test daemon_lifecycle_nospawn --test daemon_paths --test daemon_security`; includes `orch-cli/daemon_lifecycle::two_explicit_starts_one_owner`, `foreground_sighup_stops`, `crash_requires_explicit_start`; ignored empty `two_executable_stale_dev_instance` is not evidence (T2a owns replacement) | 1 |
 | W1 | This plan's task table and status; ARCHITECTURE §3.1; manual 18 command reference; manual 17 expiry wording; CHANGELOG `[Unreleased]` (tech-writer) | R22, R29 | `docs/plans/2026-11-09-daemon-owned-state.md`, `docs/ARCHITECTURE.md`, `docs/manual/{17-mcp-server,18-daemon}.md`, `CHANGELOG.md` | gate 2 | links resolve; every documented command, flag, exit code and path matches the spec and D8 | 1 |
 | I1 | Integrate PR 1 into `feature/daemon-core`; full CI set; freeze the commit (senior-eng) | R24, R29 | `crates/**`, `xtask/**`, `Cargo.toml`, `Cargo.lock`, `docs/**`, `CHANGELOG.md` | S1b, S1c, S1d, T1, T1b, W1 | the CI set; cold `./xtask/gate.sh` | 1 |
 | G1 | Board 1 at the frozen commit: code (code-reviewer), security (sec-reviewer-codex), resilience (sre), facts (fact-checker-2), cold gate and Linux (release-eng) | R20, R21, R22, R24 | reader | I1 | reviewer verdicts | 1 |
@@ -104,14 +104,14 @@ rebase of a shared branch. Owners are roles; the orch task ids are in [Status](#
 
 ### PR 2 (wave C), PR 3 (wave D), PR 4 (wave E)
 
-Task ids are created when the previous PR freezes; scopes are disjoint within a wave.
+**All targets and commands in this PR 2–4 table are planned acceptance, not PR 1 coverage.** Existing suite names will gain cutover assertions. Task ids are created when the previous PR freezes; scopes are disjoint within a wave.
 
 | Id | Task (owner) | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
-| S2a | Every D7 operation in `orch-client`; convert every CLI command; `init`; D8 command remap; remove the developmental gate (senior-eng) | R3–R5, R13, R29, R31, R38 | `crates/orch-client/**`, `crates/orch-cli/src/commands/**`, `context.rs`, `lib.rs` | PR 1 frozen | `cargo test -p orch-client -p orch-cli` | 2 |
+| S2a | Every D7 operation in `orch-client`; convert every CLI command; `init`; D8 command remap; remove the developmental gate; R39 pgid-derived stop/off acknowledgement hardening (senior-eng) | R3–R5, R13, R29, R31, R38, R39 | `crates/orch-client/**`, `crates/orch-cli/src/commands/**`, `context.rs`, `lib.rs`, `crates/orch-daemon/src/session.rs`, `crates/orch-daemon/src/ops/control.rs` | PR 1 frozen | `cargo test -p orch-client -p orch-cli`; planned `cargo test -p orch-daemon --features testing --test daemon_security agent_control_requires_explicit_override -- --exact` (R39) | 2 |
 | S2b | `orch mcp` as a stdio-to-socket bridge; NoDaemon as `initialize` and tool error (senior-eng-2) | R17, R18 | `crates/orch-cli/src/mcp/**` | S2a client API | `cargo test -p orch-cli --test mcp_stdio --test mcp_contract --test mcp_tools` | 2 |
 | S2c | TUI backend over RPC (refresh tick, no disk observer); `orch web` preflight, 503 and PTY env (frontend-eng) | R16, R18, R26 | `crates/orch-cli/src/{tui,web}/**` | S2a client API | `cargo test -p orch-cli`; tmux end-to-end tests | 2 |
-| T2a | No-daemon matrix, lifecycle, stress with the real `orch tui` in tmux + 4 CLI + 2 MCP clients (test-engineer) | R4, R12, R26, R27, R35 | `crates/orch-cli/tests/daemon_*.rs` | S2a | `cargo test -p orch-cli --test daemon_no_daemon --test daemon_lifecycle --test daemon_stress` | 2 |
+| T2a | No-daemon matrix, lifecycle, two-executable skew (replace ignored T1b placeholder), R39 hardening vectors, stress with the real `orch tui` in tmux + 4 CLI + 2 MCP clients (test-engineer) | R4, R6, R12, R26, R27, R32, R35, R39 | `crates/orch-cli/tests/daemon_*.rs`, `crates/orch-daemon/tests/daemon_security.rs` | S2a | `cargo test -p orch-cli --test daemon_no_daemon --test daemon_lifecycle --test daemon_stress`; build two binaries with different LOCAL_PROTOCOL constants, same package semver, then run the non-ignored `daemon_lifecycle::two_executable_stale_dev_instance` in both directions (old executable removed in one case); build/run fixture must be committed by T2a | 2 |
 | T2b | Move binary tests to an explicit test daemon on an isolated `ORCH_SOCKET` (test-eng-2) | R25 | `crates/orch-cli/tests/common/**`, `crates/orch-cli/tests/mcp_common/**` | S2a | `cargo test -p orch-cli --tests` | 2 |
 | W2 | README "Upgrading from v0.13.0"; CHANGELOG; every changed command chapter; command reference; remove manual 18's developmental notice (tech-writer) | R22, R35 | `README.md`, `CHANGELOG.md`, `docs/manual/**` | S2a | links resolve; `docs/manual/tools/gen-command-reference.sh` output committed | 2 |
 | I2, G2, CP4 | Integrate, board 2 with CLI round-trip latency, adjudicate, PR 2 | R24 | per finding | S2b, S2c, T2a, T2b, W2 | the CI set; cold gate; latency report | 2 |
@@ -153,14 +153,24 @@ it.
 - The spec's [requirements table](../specs/2026-11-09-daemon-owned-state.md#requirements) names the acceptance
   check and platform of every R-row; its [Verification](../specs/2026-11-09-daemon-owned-state.md#verification)
   table is filled at PR 4 with commit and platform. Blank is not pass.
-- PR 1: protocol and bounds (`daemon_protocol::*`), paths and security (`daemon_paths::*`, `daemon_security::*`),
-  lifecycle (`daemon_lifecycle::*` in `orch-daemon` and the binary tests in `orch-cli`), coordinator ordering
-  (`goal_edit_cannot_resurrect_active`, pause vs spawn, cancel vs finish, expiry vs renewal), the B0 suite
-  `crates/orch-engine/tests/daemon_guarantees.rs`, and `cargo test -p orch-peer` unchanged.
-- PR 2: `daemon_no_daemon::all_frontends_matrix` with process-table and spawn assertions;
-  `daemon_stress::real_tui_cli_mcp_share_state_order` (60 s acceptance run). The stress test is the evidence
-  that D10 is closed and replaces the runbook hazard.
-- PR 3: `daemon_push::*`, `tui_daemon::*`, `web_daemon::*`; QA pass 1 on the owner's Mac (R28).
+- PR 1: exact package/target/function pointers and runnable commands are in the spec's
+  [acceptance command index](../specs/2026-11-09-daemon-owned-state.md#pr-1-acceptance-command-index).
+  Protocol: `orch-proto/daemon_protocol` + `envelope`; wire: `orch-daemon/daemon_wire`;
+  lifecycle/path/security: both crate-specific targets listed there; engine: `orch-engine/daemon_guarantees`
+  + `ops_daemon`, `orch-daemon/daemon_engine` + `ops_control` + `ops_coordinator`.
+  **Every standalone orch-daemon run uses `--features testing`** (including `--tests` and `--lib`).
+  `cargo test -p orch-peer` remains required. The ignored empty two-executable placeholder does not count.
+- Fix round 1, verify at I1b: `crates/orch-daemon/tests/daemon_peer_boundary.rs`,
+  `daemon_endpoint_safety.rs`, `staging_cleanup.rs`; `crates/orch-cli/tests/daemon_stop_wait.rs`;
+  `crates/orch-engine/tests/daemon_startup_index.rs`, `daemon_recovery_errors.rs`. The spec has one
+  runnable command per target. I1b verifies the integrated function names/counts, the extensions to existing
+  security/lifecycle/path targets, diagnostic env/stderr and client unknown-outcome regressions, and repeats
+  the peer suites 3×. These fixes are not claimed present or passing at `b1216ce4`.
+- PR 2 planned: `daemon_no_daemon::all_frontends_matrix` with process-table and spawn assertions;
+  `daemon_stress::real_tui_cli_mcp_share_state_order` (60 s acceptance run); two compiled executables with
+  different `LOCAL_PROTOCOL` constants under T2a (R6/R32); pgid-derived acknowledgement under S2a/T2a (R39).
+  The stress test is the evidence that D10 is closed and replaces the runbook hazard.
+- PR 3 planned: `daemon_push::*`, `tui_daemon::*`, `web_daemon::*`; QA pass 1 on the owner's Mac (R28).
 - Hermeticity: no test touches a real project's daemon or `~/.orchestry`; sockets live under a per-test temp
   directory on a path of at most 100 bytes; fake shell agents only.
 - CI set on every PR: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
@@ -191,6 +201,21 @@ troubleshooting; README "Upgrading from v0.13.0" (PR 2); CHANGELOG `[Unreleased]
 mirrored to Pensieve's `specs/` directory.
 
 ## Open questions
-None blocking. The spec's gate-2 questions (Q2 stop intent, Q5 regrouping) were approved on 2026-11-09. R39
-(kernel-pgid acknowledgement for agent-originated stop and dispatch off) is should-hardening; PR 1 or PR 2 review
-records it as done or deferred with a reason.
+Gate 2's Q2 stop intent and Q5 regrouping were approved on 2026-11-09. CP3 rulings 8.17/8.20 record:
+
+1. **R39 deferred to PR 2 hardening, S2a implementation / T2a tests.** Kernel-pgid-derived acknowledgement
+   for agent-originated stop/dispatch off is absent at PR 1. It prevents same-UID accidents rather than
+   providing authorization; existing kernel-UID/project checks remain mandatory. The developmental PR 1
+   converts no stateful frontend, so implementing attribution with PR 2's final control paths avoids doing
+   the cutover work twice. PR 2 must test matching live-run pgids, unrelated owner pgids, explicit
+   `--from-agent`, and spoofed caller-pid rejection. This is a reasoned should-row deferral, not a pass.
+2. **R6/R32 two-executable skew acceptance is UNMET at PR 1.** T1b's
+   `orch-cli/daemon_lifecycle::two_executable_stale_dev_instance` is ignored and has an empty body; it does
+   not supply acceptance even if run with `--ignored`. Harness-advertised versions cover wire behavior only.
+   T2a must build two real binaries with different `LOCAL_PROTOCOL` constants and the same package semver,
+   prove ordinary calls fail before mutation and frozen stop completes in both directions, and remove the
+   old executable in one case. Keep the existing binary-semver mismatch vectors. The PR 1 body must state
+   this unmet acceptance explicitly; no owner waiver is implied. Same semver/protocol with a different build
+   remains an intentional detection limit.
+
+I1b/board 1b must still verify the fix round before PR 1 can advance; these dispositions do not certify it.

@@ -3,15 +3,14 @@
 - Status: accepted
 - Date: 2026-11-09
 - Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09
-- Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance, when accepted and the client conversion is complete. Other MCP decisions remain except where the implementation is explicitly replaced below.
+- Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance, when the client conversion is complete. Other MCP decisions remain except where the implementation is explicitly replaced below.
 
 ## Context
 
 The owner chose daemon-owned state instead of accepting multiple independent file-store writers
 ([spec](../specs/2026-11-09-daemon-owned-state.md), [plan](../plans/2026-11-09-daemon-owned-state.md)). The
 owner amended the request on 2026-11-09: clients never start a daemon, and never fall back to direct stores.
-The approved v2 plan retains an owner requirements approval at gate 2; this proposed ADR does not replace
-it.
+The owner approved the requirements and accepted this ADR at gate 2 on 2026-11-09.
 
 Today `build_light` creates file stores for one-shot commands and each MCP call. The full engine separately
 owns dispatch and live processes. The PID lock protects orchestrators, not all writers. Existing store locks
@@ -23,9 +22,9 @@ also share an operation boundary.
 Round 1 found mixed ownership in the old PR split (RT1), an unusable skew-stop instruction (RT2/SE-8),
 indistinguishable development builds (RT3), incomplete workflow recovery (RT4), conflicting batch/global
 scheduling intent (RT5), and an unstated single-host boundary (RT6). The lead accepted these and the
-security conditions. This revision incorporates those rulings; the owner must still confirm the Q2 stop
-refinement and Q5 PR regrouping at gate 2. No client recovery side effect or implementation approval follows
-from this draft.
+security conditions. This revision incorporates those rulings; the owner confirmed Q2=stop-intent and
+Q5=regrouped at gate 2 on 2026-11-09. That approval permits implementation under the plan; it does not
+authorize client recovery side effects, release or merge.
 
 ## Decision
 
@@ -94,8 +93,7 @@ from this draft.
    executable, even when the old installed executable has been removed (RT2/G1). SE-8's reasoning: same-uid
    callers already have SIGTERM authority; the socket avoids asking an owner to select a potentially reused
    PID by hand. For a hung daemon only, the RUNBOOK retains independently verified owner SIGTERM, never an
-   automated fallback from a stale metadata PID. This Q2 refinement remains for owner confirmation at gate
-   2.
+   automated fallback from a stale metadata PID. The owner approved this Q2 refinement at gate 2 on 2026-11-09.
 
    Developer contract (RT3): stop before switching builds; start the intended absolute executable. Discovery
    and live status include current_exe() captured at start and started_at. Any wire or operation-semantic
@@ -134,12 +132,23 @@ from this draft.
 9. **Explicit ownership precedes stale-file replacement.** Default socket is `.orchestry/run/orch.sock`;
    absolute paths over 100 bytes use `$TMPDIR/orch-<sha256(canonical root)[..16]>/orch.sock`. Validate the
    final path including /run; ORCH_SOCKET is an absolute override, never a different authority boundary.
-   run/fallback directories are 0700, socket bound under umask 0177 is 0600. Do not chmod `.orchestry`; it
+   Bind the socket inside the daemon-created 0700 run/fallback directory (or an existing directory
+   verified as euid-only and never chmodded), set it to 0600 and re-check socket type and mode before
+   publishing daemon.json; the actual parent of every endpoint, including ORCH_SOCKET, must pass the
+   same directory checks. Do not chmod `.orchestry`; it
    must be euid-owned and not group/world-writable. Foreign-euid start refuses, including root on a
    user-owned project. Create fallback with mkdir, then O_DIRECTORY/O_NOFOLLOW + fstat on existing paths;
    never chmod/chown an existing unsafe directory. Discovery open uses O_NOFOLLOW/O_NONBLOCK then fstat and
    16 KiB bound, preventing FIFO hangs and symlink redirection. Metadata is 0600 and records project
    identity, endpoint, versions, pid, executable, started_at, instance; runtime files are gitignored.
+
+   **Recorded deviation from gate-2-approved R2 wording (fact F2, lead option A):** this adopts
+   SE-3's in-directory bind alternative, confirmed security-equivalent by the security engineer
+   (`VERDICT: pass`); only the mechanism changes, with the outcome and acceptance tests unchanged.
+   The owner may reverse this decision to option B: bind before runtime under a temporarily restricted
+   creation mask, then restore it.
+
+   Why: the process umask is never changed because setting umask 0177 before runtime makes mkdir(0700) yield untraversable 0600 directories (run/, workspaces and logs unusable; bind fails EACCES), while bind runs on the Tokio runtime (crates/orch-daemon/src/lifecycle.rs:455), where a process-wide change races other threads; the private 0700 parent closes the bind-to-chmod window measured by SE-3 (confirmed by the fact F2 security probes), and same-uid remains the trust boundary (R8/R38).
 
    Hold stable `.orchestry/.daemon-owner.lock` advisory guard throughout startup to shutdown; never unlink
    or inherit its fd into agent children. Winner writes PID after lock, loser re-reads ≤2 s; any lock error
@@ -149,6 +158,8 @@ from this draft.
    reports ownership_lost, never silently recreates. Timer cannot protect a suspended daemon from
    uncooperative old writers; stop all old processes including persistent MCP before upgrade. Only explicit
    start holding ownership replaces a proven stale own socket; clients never unlink or decide ownership.
+   `(dev,ino)` identity is weaker on inode-reusing filesystems; `remove_if_same` is safe under the project
+   guard, while the residual ABA window is two different projects sharing one misconfigured `ORCH_SOCKET` path.
 
 10. **Stop and signals preserve existing reconciliation semantics.** A compatible socket stop,
     version-invariant hello stop intent and SIGTERM/SIGINT/SIGHUP stop admission/dispatch, kill live
@@ -203,7 +214,7 @@ from this draft.
     README upgrade and CHANGELOG; PR 3 subscriptions/TUI+web push/MCP resources/delete disk observer/QA1; PR
     4 crate/source capability gates, remove obsolete dependencies/FIFO/dead code, architecture/runbook/
     manual sweep/QA2. PR 2's >3,000-line size is justified by the mixed-writer failure of splitting it. The
-    single-writer behavior must hold at PR 2 head; PR 4 enforces it structurally. Owner confirms regrouping
+    single-writer behavior must hold at PR 2 head; PR 4 enforces it structurally. The owner approved regrouping
     at gate 2 and merges each green PR. SE-20 developmental gating ends in PR 2, not the old PR 4 proposal.
 
 ## Alternatives considered
@@ -243,7 +254,8 @@ from this draft.
   ownership are outside the guarantee. Live directory deletion remains unsupported. Offline repair guidance
   remains necessary, clearly separated from obsolete concurrent-MCP advice.
 - The owner must explicitly start a daemon before state commands or the first MCP call succeed. Strict ordinary skew
-  increases upgrade cost, but the frozen stop makes recovery executable with either binary; gate 2 confirms it.
+  increases upgrade cost, but the approved frozen stop defines recovery with either binary; two-executable acceptance remains unmet at
+  PR 1 and is assigned to PR 2 T2a (harness skew is not that evidence).
 - Tests mostly retain their in-process model. Binary tests explicitly start an isolated test daemon and never
   connect to a real project or real global configuration. Mac QA and Linux CI cover different OS boundaries.
 - Four stacked PRs deliver the transition under decision 13. PR 1 is explicitly developmental; PR 2 has no
