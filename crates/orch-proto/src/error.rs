@@ -22,7 +22,7 @@ pub mod exit {
     pub const LOCK_CONFLICT: i32 = 4;
     pub const AGENT_ADAPTER: i32 = 5;
     pub const WORKSPACE: i32 = 6;
-    /// No daemon, incompatible daemon, busy daemon or wrong project.
+    /// No daemon, incompatible/busy daemon, wrong project or unknown request outcome.
     pub const NO_DAEMON: i32 = 7;
 }
 
@@ -179,6 +179,10 @@ pub enum NoDaemonDetail {
     HandshakeFailed,
     /// An established session lost its connection.
     ConnectionLost,
+    /// A request may have reached the daemon, but no valid terminal reply arrived.
+    RequestOutcomeUnknown,
+    /// A frozen stop was accepted, but its completion could not be confirmed.
+    StopOutcomeUnknown,
     /// The daemon is stopping.
     Stopping,
 }
@@ -194,6 +198,8 @@ impl NoDaemonDetail {
             NoDaemonDetail::PermissionDenied => "permission denied",
             NoDaemonDetail::HandshakeFailed => "handshake failed",
             NoDaemonDetail::ConnectionLost => "connection lost",
+            NoDaemonDetail::RequestOutcomeUnknown => "request outcome unknown",
+            NoDaemonDetail::StopOutcomeUnknown => "daemon accepted stop; completion is unknown",
             NoDaemonDetail::Stopping => "daemon is stopping",
         }
     }
@@ -221,6 +227,8 @@ pub enum ConnectFailure {
     },
     /// The endpoint's daemon owns a different project. No delete/kill hint.
     WrongProject { expected: String, actual: String },
+    /// Stop was accepted but the owner did not finish within the completion deadline.
+    StopTimeout { project_root: String, pid: u32 },
     /// No initialized project was found for this caller.
     NotInitialized,
 }
@@ -266,6 +274,9 @@ impl ConnectFailure {
             ConnectFailure::WrongProject { expected, actual } => {
                 format!("expected {expected}, daemon serves {actual}")
             }
+            ConnectFailure::StopTimeout { pid, .. } => {
+                format!("daemon accepted stop but PID {pid} is still running after 30 s")
+            }
             ConnectFailure::NotInitialized => "not initialized".to_owned(),
         }
     }
@@ -277,6 +288,21 @@ impl ConnectFailure {
     /// start/restart hint with an instruction to stop and report.
     pub fn render(&self, agent_context: bool) -> String {
         match self {
+            ConnectFailure::StopTimeout { project_root, .. }
+            | ConnectFailure::NoDaemon {
+                project_root,
+                detail: NoDaemonDetail::RequestOutcomeUnknown | NoDaemonDetail::StopOutcomeUnknown,
+            } => {
+                let agent_hint = if agent_context {
+                    " Report this to the owner and stop."
+                } else {
+                    ""
+                };
+                format!(
+                    "  ✕ Cannot confirm the orch request outcome for {project_root} ({})\n    the request may have been applied; inspect state before retrying.{agent_hint}",
+                    self.detail()
+                )
+            }
             ConnectFailure::NotInitialized => {
                 let error = DomainError::NotInitialized;
                 format!("  ✕ {error}\n    {}", error.hint().unwrap_or_default())
