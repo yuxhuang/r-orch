@@ -14,6 +14,10 @@
 
 #![cfg(unix)]
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::OwnedDir;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -180,7 +184,7 @@ fn global_config(dir: &Path) -> PathBuf {
 /// its remote fixtures: these timestamps have to be exact, and `task add`
 /// would stamp them with the wall clock. No `_index.json` exists yet, so the
 /// stores rebuild their index from these files on the first read.
-fn project() -> tempfile::TempDir {
+fn project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
@@ -222,7 +226,9 @@ fn project() -> tempfile::TempDir {
         ),
     )
     .expect("run_0001.json");
-    dir
+    // The daemon starts last, after every file the fixture writes by hand
+    // (a running daemon owns the state and may rewrite it).
+    OwnedDir::adopt(dir)
 }
 
 fn launch(dir: &Path, socket: String) -> Tmux {
@@ -241,7 +247,7 @@ fn launch(dir: &Path, socket: String) -> Tmux {
     // `--observe`: the orchestrator is never started, so no agent can be
     // dispatched from this session.
     let command = format!("'{}' tui --observe", orch_binary().display());
-    tmux.run(&[
+    let mut args: Vec<String> = [
         "start-server",
         ";",
         "set-option",
@@ -265,8 +271,15 @@ fn launch(dir: &Path, socket: String) -> Tmux {
         &global,
         "-e",
         "PATH=/usr/bin:/bin",
-        &command,
-    ]);
+    ]
+    .map(String::from)
+    .into();
+    // Point the dashboard at this project's test daemon.
+    for pair in daemon::env_pairs_for(dir) {
+        args.extend(["-e".to_owned(), pair]);
+    }
+    args.push(command);
+    tmux.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
     let path = tmux.run(&["display-message", "-p", "-t", "dash", "#{socket_path}"]);
     tmux.socket_path = Some(PathBuf::from(
         String::from_utf8_lossy(&path.stdout).trim().to_string(),
@@ -436,7 +449,7 @@ fn orch_out(dir: &Path, args: &[&str]) -> String {
 
 /// For the keyword filter: three cancelled tasks: `Alpha deploy` without a goal, `Bravo docs` and
 /// `Charlie deploy` in the goal `Release train`.
-fn keyword_project() -> tempfile::TempDir {
+fn keyword_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
@@ -456,7 +469,9 @@ fn keyword_project() -> tempfile::TempDir {
         let id = orch_out(dir.path(), &args);
         orch(dir.path(), &["task", "cancel", &id]);
     }
-    dir
+    // The daemon starts last, after every file the fixture writes by hand
+    // (a running daemon owns the state and may rewrite it).
+    OwnedDir::adopt(dir)
 }
 
 /// Type `text` into the keyword prompt one key at a time, waiting for each
@@ -595,7 +610,7 @@ fn keyword_sort_group_and_reset() {
 
 /// Eleven cancelled tasks: `Item 01`..`Item 10`, then `Zulu shipit`, which
 /// sorts last by Title and so starts behind the ten-row cap.
-fn capped_keyword_project() -> tempfile::TempDir {
+fn capped_keyword_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
@@ -609,7 +624,9 @@ fn capped_keyword_project() -> tempfile::TempDir {
         let id = orch_out(dir.path(), &["task", "add", &title, "--quiet"]);
         orch(dir.path(), &["task", "cancel", &id]);
     }
-    dir
+    // The daemon starts last, after every file the fixture writes by hand
+    // (a running daemon owns the state and may rewrite it).
+    OwnedDir::adopt(dir)
 }
 
 /// The keyword filters before the ten-row cap (R3, D1): a match that was

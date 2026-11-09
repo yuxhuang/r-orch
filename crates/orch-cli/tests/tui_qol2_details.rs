@@ -18,6 +18,10 @@
 
 #![cfg(unix)]
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::OwnedDir;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -182,7 +186,7 @@ fn json_id(stdout: &str) -> String {
 /// the task (the dashboard
 /// loads succeeded and failed runs into the feed) whose events are three and
 /// a half hours old, so the time column reads a stable `3h`.
-fn project() -> tempfile::TempDir {
+fn project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
@@ -240,7 +244,9 @@ fn project() -> tempfile::TempDir {
     })
     .collect();
     std::fs::write(runs.join("run_e2e1.jsonl"), events.join("\n") + "\n").expect("events");
-    dir
+    // The daemon starts last, after every file the fixture writes by hand
+    // (a running daemon owns the state and may rewrite it).
+    OwnedDir::adopt(dir)
 }
 
 fn launch(dir: &Path, socket: String) -> Tmux {
@@ -262,7 +268,7 @@ fn launch_tui(dir: &Path, socket: String, subcommand: &str) -> Tmux {
     );
     let cwd = dir.display().to_string();
     let command = format!("'{}' {subcommand}", orch_binary().display());
-    tmux.run(&[
+    let mut args: Vec<String> = [
         "start-server",
         ";",
         "set-option",
@@ -286,8 +292,15 @@ fn launch_tui(dir: &Path, socket: String, subcommand: &str) -> Tmux {
         &global,
         "-e",
         "PATH=/usr/bin:/bin",
-        &command,
-    ]);
+    ]
+    .map(String::from)
+    .into();
+    // Point the dashboard at this project's test daemon.
+    for pair in daemon::env_pairs_for(dir) {
+        args.extend(["-e".to_owned(), pair]);
+    }
+    args.push(command);
+    tmux.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
     let path = tmux.run(&["display-message", "-p", "-t", "dash", "#{socket_path}"]);
     tmux.socket_path = Some(PathBuf::from(
         String::from_utf8_lossy(&path.stdout).trim().to_string(),
@@ -586,7 +599,7 @@ fn goal_and_agent_detail_activity_rows_are_newest_first_in_feed_format() {
 
 /// Three shell agents and nothing to dispatch: no task exists, and the wizard
 /// below is never submitted.
-fn picker_project() -> tempfile::TempDir {
+fn picker_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
@@ -613,7 +626,9 @@ fn picker_project() -> tempfile::TempDir {
             ],
         );
     }
-    dir
+    // The daemon starts last, after every file the fixture writes by hand
+    // (a running daemon owns the state and may rewrite it).
+    OwnedDir::adopt(dir)
 }
 
 /// The Assignee step's numbered rows, in screen order: every line that
@@ -923,7 +938,7 @@ fn wizard_final_submit_refuses_an_agent_disabled_by_another_process() {
 /// description (`Alpha build` cancelled), goal `Other` with one task and an
 /// ungrouped task. No agent exists and the dashboard runs `--observe`, so
 /// nothing can be dispatched.
-fn goal_tasks_project() -> tempfile::TempDir {
+fn goal_tasks_project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
@@ -961,7 +976,9 @@ fn goal_tasks_project() -> tempfile::TempDir {
         &["task", "add", "Foreign work", "--goal-id", &other],
     );
     orch(dir.path(), &["task", "add", "Loose end"]);
-    dir
+    // The daemon starts last, after every file the fixture writes by hand
+    // (a running daemon owns the state and may rewrite it).
+    OwnedDir::adopt(dir)
 }
 
 const GOAL_TASKS: [&str; 3] = ["Zulu deploy", "Alpha build", "Mike review"];

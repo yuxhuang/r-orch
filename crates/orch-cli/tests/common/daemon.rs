@@ -202,6 +202,16 @@ impl TestDaemon {
         apply_env(command, &self.socket, self.short.path());
     }
 
+    /// The variables [`apply`](Self::apply) sets, as `KEY=value` strings, for
+    /// launchers that take an environment list (`tmux new-session -e`).
+    pub fn env_pairs(&self) -> Vec<String> {
+        vec![
+            format!("ORCH_SOCKET={}", self.socket.display()),
+            format!("ORCH_TEST_SOCKET_ROOT={}", self.short.path().display()),
+            format!("{GATE_ENV}=1"),
+        ]
+    }
+
     /// `orch <args>` against this daemon, with the same cleared environment
     /// the daemon runs in (for control calls such as `daemon status`).
     pub fn control(&self, args: &[&str]) -> std::process::Output {
@@ -357,6 +367,63 @@ pub fn apply_for(cwd: &Path, command: &mut Command) {
         .map(|(_, socket, dir)| (socket.clone(), dir.clone()));
     if let Some((socket, dir)) = found {
         apply_env(command, &socket, &dir);
+    }
+}
+
+/// [`TestDaemon::env_pairs`] for the registered project containing `cwd`
+/// (empty if it has none), for launchers keyed by directory.
+pub fn env_pairs_for(cwd: &Path) -> Vec<String> {
+    let cwd = canonical(cwd);
+    REGISTRY
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(root, _, _)| cwd.starts_with(root))
+        .map(|(_, socket, dir)| {
+            vec![
+                format!("ORCH_SOCKET={}", socket.display()),
+                format!("ORCH_TEST_SOCKET_ROOT={}", dir.display()),
+                format!("{GATE_ENV}=1"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+/// A throwaway project directory that owns its test daemon. `path()` is the
+/// project root, as for a `TempDir`; the daemon is stopped (and the process
+/// table checked) before the directory is removed.
+pub struct OwnedDir {
+    // Declared first: dropped first.
+    daemon: TestDaemon,
+    dir: tempfile::TempDir,
+}
+
+impl OwnedDir {
+    /// Start a daemon for the already initialised project in `dir`, with
+    /// `<dir>/home` as the fixture's HOME (created if absent).
+    pub fn adopt(dir: tempfile::TempDir) -> OwnedDir {
+        Self::adopt_with_home(dir, "home")
+    }
+
+    /// [`adopt`](Self::adopt) with the HOME at `<dir>/<home>`.
+    pub fn adopt_with_home(dir: tempfile::TempDir, home: &str) -> OwnedDir {
+        let daemon = TestDaemon::start(dir.path(), &dir.path().join(home));
+        register_project(dir.path(), &daemon);
+        OwnedDir { daemon, dir }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    pub fn daemon(&self) -> &TestDaemon {
+        &self.daemon
+    }
+}
+
+impl Drop for OwnedDir {
+    fn drop(&mut self) {
+        unregister_project(self.dir.path());
     }
 }
 
