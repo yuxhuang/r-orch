@@ -397,10 +397,28 @@ impl ProjectDir {
     /// [`initialized_project_unowned`]). Call it once the fixture's seeding is
     /// done, so the daemon never races state the fixture writes by hand.
     pub fn start_daemon(&mut self) {
+        self.start_daemon_with_env(&[]);
+    }
+
+    /// [`start_daemon`](Self::start_daemon) with extra daemon environment (for
+    /// example a `PATH` that puts fake adapters first): agents and doctor
+    /// probes are spawned by the daemon, so their environment is the daemon's.
+    pub fn start_daemon_with_env(&mut self, extra: &[(&str, &Path)]) {
         assert!(self.daemon.is_none(), "daemon already started");
-        let daemon = TestDaemon::start(self.dir.path(), &self.dir.path().join(".test-home"));
+        let daemon =
+            TestDaemon::start_with_env(self.dir.path(), &self.dir.path().join(".test-home"), extra);
         daemon::register_project(self.dir.path(), &daemon);
         self.daemon = Some(daemon);
+    }
+
+    /// Stop the project's test daemon cleanly (process-table checked), so a
+    /// fixture can write owner-managed state by hand and start a fresh one.
+    pub fn stop_daemon(&mut self) {
+        self.daemon
+            .take()
+            .expect("this project's daemon is not started")
+            .shutdown();
+        daemon::unregister_project(self.dir.path());
     }
 }
 

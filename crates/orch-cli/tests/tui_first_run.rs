@@ -51,6 +51,8 @@ fn bare_without_daemon(
 ) -> (std::process::Output, std::path::PathBuf, tempfile::TempDir) {
     let short = tempfile::Builder::new()
         .prefix("otd-")
+        // 0700: the daemon refuses a group- or world-accessible socket dir.
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
         .tempdir_in("/tmp")
         .expect("short socket dir");
     let socket = short.path().join("s");
@@ -72,7 +74,7 @@ fn tree(dir: &Path) -> Vec<String> {
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             // The fixture's private HOME is not the project's state.
-            if prefix.is_empty() && entry.file_name() == ".first-run-home" {
+            if entry.file_name() == ".first-run-home" {
                 continue;
             }
             let name = format!("{prefix}{}", entry.file_name().to_string_lossy());

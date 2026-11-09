@@ -568,13 +568,17 @@ fn an_agent_edit_that_would_make_a_custom_template_agent_eco_is_refused_with_byt
 #[test]
 fn a_hand_edited_eco_plus_custom_template_project_fails_dispatch_before_any_model_child() {
     let new = new_reader();
-    let sb = Sandbox::new_owned(&new);
+    let mut sb = Sandbox::new_owned(&new);
     let a = sb.seed_agent(&new, "Alpha", "codex", Some("gpt-6.1-sol"), None);
     with_custom_template(&sb, "template");
-    let edited = String::from_utf8(config_bytes(&sb))
-        .unwrap()
-        .replace("prompt_mode: normal", "prompt_mode: eco");
-    fs::write(sb.root().join("config.yml"), edited).unwrap();
+    // The hand edit goes in with the daemon stopped; the fresh daemon reads it.
+    let root = sb.root();
+    sb.with_daemon_stopped(|| {
+        let edited = String::from_utf8(fs::read(root.join("config.yml")).unwrap())
+            .unwrap()
+            .replace("prompt_mode: normal", "prompt_mode: eco");
+        fs::write(root.join("config.yml"), edited).unwrap();
+    });
     let task = sb
         .run(
             &new,
@@ -693,7 +697,8 @@ fn concurrent_mode_toggles_and_unrelated_patches_never_corrupt_or_lose_either_wr
 #[test]
 fn an_agent_override_wins_over_the_project_mode_and_an_inheriting_agent_follows_the_next_switch() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    // `dispatch` below runs `orch run`, a daemon RPC since S2a-cli.
+    let sb = Sandbox::new_owned(&new);
     let fixed = sb.seed_agent(&new, "Fixed", "codex", Some("gpt-6.1-sol"), None);
     let follower = sb.seed_agent(&new, "Follower", "codex", Some("gpt-6.1-sol"), None);
     assert!(

@@ -7,6 +7,17 @@
 //! directories, so no agent CLI can be found, let alone run. Agents are
 //! created but never started.
 //!
+//! Every `orch` command is a daemon client (S2a-cli): `sandbox()` runs `orch
+//! init` and then starts an explicit test daemon on an isolated socket (see
+//! `tests/common/daemon.rs`), stopped with a process-table check when the
+//! sandbox drops. The few cases about behaviour *before* `orch init` use
+//! `bare_sandbox()`, which owns neither a project nor a daemon. Corruption a
+//! test plants by hand under the project's `.orchestry/` is done in place under
+//! the *running* daemon (a restart would refuse to start over it). Template
+//! roots themselves (`--template-dir`, the user template root) are read by
+//! the daemon fresh on every request, so writing to them directly needs no
+//! such care.
+//!
 //! Layers, by the decision in `docs/decisions/0006-org-templates.md` they pin:
 //!
 //! * D1  one file per member, the embedded 27-member `a-team`
@@ -32,6 +43,10 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
 use assert_cmd::prelude::*;
 use serde_json::{Value, json};
 
@@ -42,10 +57,26 @@ use serde_json::{Value, json};
 const RUN_BUDGET: Duration = Duration::from_secs(60);
 
 struct Sandbox {
+    // Declared first: dropped first, so the daemon stops before its project
+    // directory is removed.
+    daemon: Option<TestDaemon>,
     dir: tempfile::TempDir,
 }
 
+/// An initialized project with its own test daemon already running:
+/// every `org template` / `org deploy` / `agent shop` command needs both.
 fn sandbox() -> Sandbox {
+    let mut sb = bare_sandbox();
+    sb.ok(&["init", "--name", "proj", "--adapter", "claude"]);
+    let daemon = TestDaemon::start(&sb.project(), &sb.home());
+    daemon::register_project(&sb.project(), &daemon);
+    sb.daemon = Some(daemon);
+    sb
+}
+
+/// A sandbox whose project directory is never initialized and owns no
+/// daemon: for the handful of cases about what happens before `orch init`.
+fn bare_sandbox() -> Sandbox {
     let dir = tempfile::Builder::new()
         .prefix("orch-org-templates-")
         .tempdir()
@@ -59,7 +90,13 @@ fn sandbox() -> Sandbox {
     for sub in ["home", "project", "work"] {
         fs::create_dir_all(dir.path().join(sub)).expect("sandbox dirs");
     }
-    Sandbox { dir }
+    Sandbox { daemon: None, dir }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        daemon::unregister_project(&self.project());
+    }
 }
 
 impl Sandbox {
@@ -95,6 +132,7 @@ impl Sandbox {
             .env("TERM", "xterm-256color")
             // No agent CLI exists on this PATH.
             .env("PATH", "/usr/bin:/bin");
+        daemon::apply_for(cwd, &mut command);
         command
     }
 
@@ -142,11 +180,6 @@ impl Sandbox {
         let output = self.ok(&all);
         serde_yaml_ng::from_str(&stdout(&output))
             .unwrap_or_else(|e| panic!("stdout is not YAML ({e}):\n{}", stdout(&output)))
-    }
-
-    /// `orch init` with a real adapter name. Agents are created, never run.
-    fn init_project(&self) {
-        self.ok(&["init", "--name", "proj", "--adapter", "claude"]);
     }
 
     /// Names of the agents in the project, sorted.
@@ -874,7 +907,6 @@ fn corruptions() -> Vec<Corruption> {
 fn every_invalid_bundle_is_rejected_by_show_and_by_deploy_with_nothing_created() {
     for corruption in corruptions() {
         let sb = sandbox();
-        sb.init_project();
         let root = valid_dir(&sb, "bad");
         (corruption.apply)(&root);
         let agents_before = sb.agent_names();
@@ -925,21 +957,21 @@ fn readme_and_dotfiles_beside_members_are_ignored_not_deployed() {
 fn hostile_documents() -> Vec<(&'static str, Vec<u8>, &'static str)> {
     let deep = format!("{}1{}", "[".repeat(80), "]".repeat(80));
     vec![
-        ("empty file", Vec::new(), "bytes"),
+        ("empty file", Vec::new(), "expected an object"),
         (
             "two YAML documents",
             b"name: extra\nrole: x\n---\nname: extra\nrole: y\n".to_vec(),
-            "more than one document",
+            "exactly one YAML document",
         ),
         (
             "duplicate YAML keys",
             b"name: extra\nrole: x\nrole: y\n".to_vec(),
-            "duplicate entry with key \"role\"",
+            "duplicate keys",
         ),
         (
             "duplicate JSON keys",
             br#"{"name":"extra","role":"x","role":"y"}"#.to_vec(),
-            "duplicate entry with key \"role\"",
+            "duplicate keys",
         ),
         (
             "explicit YAML tag",
@@ -1320,7 +1352,6 @@ fn the_authored_role_text_survives_resolution_unchanged() {
 #[test]
 fn deploying_embeds_rules_without_touching_the_workspace_rule_files() {
     let sb = sandbox();
-    sb.init_project();
     let rules_dir = sb.project().join(".claude/agent-rules");
     fs::create_dir_all(&rules_dir).unwrap();
     fs::write(rules_dir.join("stance.md"), "LOCAL OVERRIDE stance").unwrap();
@@ -1472,7 +1503,6 @@ fn a_corrupt_user_template_is_an_error_row_and_the_listing_exits_nonzero() {
 #[test]
 fn a_corrupt_user_template_is_never_replaced_by_the_builtin_it_shadows() {
     let sb = sandbox();
-    sb.init_project();
     sb.ok(&[
         "org",
         "template",
@@ -1508,7 +1538,6 @@ fn the_builtin_selector_still_works_while_the_user_copy_is_corrupt() {
 #[test]
 fn a_dangling_user_template_symlink_does_not_fall_back_to_the_legacy_preset() {
     let sb = sandbox();
-    sb.init_project();
     fs::create_dir_all(sb.user_templates()).unwrap();
     symlink(
         sb.home().join("nowhere"),
@@ -1546,7 +1575,6 @@ fn a_user_template_whose_org_name_differs_from_its_directory_is_rejected() {
 #[test]
 fn an_explicit_directory_may_have_any_name_and_its_org_name_stays_the_key() {
     let sb = sandbox();
-    sb.init_project();
     let root = sb.work().join("whatever-dir");
     small_team("keyed").write(&root);
     let deployed = sb.json(&["org", "deploy", "--template-dir", path_arg(&root)]);
@@ -1563,7 +1591,6 @@ fn an_unknown_template_name_fails_and_names_it() {
 #[test]
 fn a_template_dir_conflicts_with_a_name_selector_and_with_the_legacy_positional() {
     let sb = sandbox();
-    sb.init_project();
     let root = valid_dir(&sb, "dir");
     let dir = path_arg(&root);
     let agents_before = sb.agent_names();
@@ -1590,24 +1617,33 @@ fn a_template_dir_conflicts_with_a_name_selector_and_with_the_legacy_positional(
 // ═══ D5 — grammar, CRUD, read-only builtins, nothing clobbered ═════════════
 
 #[test]
-fn listing_showing_and_agent_listing_need_no_project_and_create_nothing() {
+fn listing_showing_and_agent_listing_are_read_only_and_create_nothing_new() {
+    // S2a-cli: every `org template` command is now a daemon RPC, which needs
+    // an initialized project to dial (`Project::discover` requires
+    // `.orchestry`); the old "no project at all" premise no longer holds, so
+    // this pins the surviving contract instead — these reads touch neither
+    // the project nor the template directories they inspect.
     let sb = sandbox();
     let root = valid_dir(&sb, "dir");
-    let work_before = snapshot(&sb.work());
+    let (project_before, home_before, work_before) = (
+        snapshot(&sb.project()),
+        snapshot(&sb.home()),
+        snapshot(&sb.work()),
+    );
     sb.ok(&["org", "template", "list"]);
     sb.ok(&["org", "template", "show", "builtin:a-team", "--resolved"]);
     sb.ok(&["org", "template", "show", "--template-dir", path_arg(&root)]);
     sb.ok(&["org", "template", "agent", "list", "builtin:a-team"]);
     let untouched = (
-        snapshot(&sb.project()).is_empty(),
-        snapshot(&sb.home()).is_empty(),
+        snapshot(&sb.project()) == project_before,
+        snapshot(&sb.home()) == home_before,
         snapshot(&sb.work()) == work_before,
     );
     assert_eq!(untouched, (true, true, true));
 }
 
 #[test]
-fn global_output_flags_may_precede_the_template_subgroup_without_a_project() {
+fn global_output_flags_may_precede_the_template_subgroup() {
     let sb = sandbox();
     let placements: [&[&str]; 3] = [
         &["--json", "org", "template", "list"],
@@ -1623,7 +1659,9 @@ fn global_output_flags_may_precede_the_template_subgroup_without_a_project() {
 
 #[test]
 fn deploy_and_install_need_an_initialized_project_and_create_nothing_without_one() {
-    let sb = sandbox();
+    // Deliberately `bare_sandbox()`: unlike every other test in this file,
+    // this one is about the absence of a project (and so of a daemon).
+    let sb = bare_sandbox();
     let deploy = sb.run(&["org", "deploy", "--template", "builtin:a-team"]);
     let shop = sb.run(&["agent", "shop", "--template", "builtin:a-team", "--list"]);
     assert_eq!(
@@ -2264,7 +2302,6 @@ fn dep(adapter: &str, model: Option<&str>, skills: Option<&[&str]>) -> Deployed 
 #[test]
 fn deploying_a_template_creates_one_agent_per_member_and_a_team_led_by_the_lead() {
     let sb = sandbox();
-    sb.init_project();
     let root = valid_dir(&sb, "trio");
     let before = sb.agent_names();
     let out = sb.json(&["org", "deploy", "--template-dir", path_arg(&root)]);
@@ -2294,7 +2331,6 @@ fn deploying_a_template_creates_one_agent_per_member_and_a_team_led_by_the_lead(
 #[test]
 fn deploying_with_a_goal_creates_it_and_without_a_goal_creates_none() {
     let sb = sandbox();
-    sb.init_project();
     let root = valid_dir(&sb, "trio");
     let with_goal = sb.json(&[
         "org",
@@ -2321,7 +2357,6 @@ fn deploying_with_a_goal_creates_it_and_without_a_goal_creates_none() {
 #[test]
 fn deployed_agents_equal_the_resolved_preview_for_every_member() {
     let sb = sandbox();
-    sb.init_project();
     let root = mix_team(&sb);
     let preview = sb.json(&[
         "org",
@@ -2359,7 +2394,6 @@ fn deployed_agents_equal_the_resolved_preview_for_every_member() {
 #[test]
 fn without_overrides_each_member_takes_its_own_adapter_and_inherits_the_rest() {
     let sb = sandbox();
-    sb.init_project();
     let root = mix_team(&sb);
     sb.ok(&["org", "deploy", "--template-dir", path_arg(&root)]);
     let got = [
@@ -2380,7 +2414,6 @@ fn without_overrides_each_member_takes_its_own_adapter_and_inherits_the_rest() {
 #[test]
 fn an_adapter_override_drops_models_bound_to_the_old_adapter_and_keeps_skills() {
     let sb = sandbox();
-    sb.init_project();
     let root = mix_team(&sb);
     sb.ok(&[
         "org",
@@ -2410,7 +2443,6 @@ fn an_adapter_override_drops_models_bound_to_the_old_adapter_and_keeps_skills() 
 #[test]
 fn an_adapter_override_drops_a_members_own_model_when_it_belonged_to_another_adapter() {
     let sb = sandbox();
-    sb.init_project();
     let root = mix_team(&sb);
     // `cx` is codex with a codex-only model. Forcing claude must not hand
     // `gpt-x` to claude; the claude-bound org model is what applies instead.
@@ -2431,7 +2463,6 @@ fn an_adapter_override_drops_a_members_own_model_when_it_belonged_to_another_ada
 #[test]
 fn an_explicit_model_override_wins_for_every_member_that_takes_a_model() {
     let sb = sandbox();
-    sb.init_project();
     let root = mix_team(&sb);
     sb.ok(&[
         "org",
@@ -2461,7 +2492,6 @@ fn an_explicit_model_override_wins_for_every_member_that_takes_a_model() {
 #[test]
 fn a_model_override_alone_is_not_forced_onto_a_shell_member() {
     let sb = sandbox();
-    sb.init_project();
     let root = mix_team(&sb);
     sb.ok(&[
         "org",
@@ -2483,7 +2513,6 @@ fn a_model_override_alone_is_not_forced_onto_a_shell_member() {
 #[test]
 fn skills_absent_empty_and_nonempty_deploy_as_inherit_disable_and_replace() {
     let sb = sandbox();
-    sb.init_project();
     let root = mix_team(&sb);
     sb.ok(&["org", "deploy", "--template-dir", path_arg(&root)]);
     let got = [
@@ -2504,7 +2533,6 @@ fn skills_absent_empty_and_nonempty_deploy_as_inherit_disable_and_replace() {
 #[test]
 fn skills_absent_at_both_levels_deploy_without_a_skills_key() {
     let sb = sandbox();
-    sb.init_project();
     let root = sb.work().join("plain");
     Bundle::new("plain", "a").agent("a", json!({})).write(&root);
     sb.ok(&["org", "deploy", "--template-dir", path_arg(&root)]);
@@ -2514,7 +2542,6 @@ fn skills_absent_at_both_levels_deploy_without_a_skills_key() {
 #[test]
 fn a_second_deploy_of_the_same_template_fails_and_adds_nothing() {
     let sb = sandbox();
-    sb.init_project();
     let root = valid_dir(&sb, "trio");
     sb.ok(&["org", "deploy", "--template-dir", path_arg(&root)]);
     let (agents, entries) = (sb.agent_names(), sb.orchestry_entries());
@@ -2530,7 +2557,6 @@ fn a_second_deploy_of_the_same_template_fails_and_adds_nothing() {
 #[test]
 fn a_name_collision_with_a_later_member_creates_nothing_at_all() {
     let sb = sandbox();
-    sb.init_project();
     // `sec-reviewer` sorts mid-roster: 17 members are earlier in order.
     sb.ok(&[
         "agent",
@@ -2563,7 +2589,6 @@ fn an_invalid_member_input_fails_preflight_before_the_first_agent_is_created() {
     ];
     for (case, extra) in cases {
         let sb = sandbox();
-        sb.init_project();
         let root = sb.work().join("pre");
         // The offender is the *last* member: earlier ones would be created
         // first by a deploy that validated lazily.
@@ -2608,7 +2633,6 @@ fn an_unusable_cli_override_fails_before_anything_is_created() {
     ];
     for args in cases {
         let sb = sandbox();
-        sb.init_project();
         let (agents, entries) = (sb.agent_names(), sb.orchestry_entries());
         sb.fail(args);
         assert_eq!(
@@ -2634,7 +2658,6 @@ fn survivor_report(message: &str) -> Value {
 #[test]
 fn a_failure_creating_the_team_reports_every_surviving_agent_id_and_the_stage() {
     let sb = sandbox();
-    sb.init_project();
     let ids = |sb: &Sandbox| -> Vec<String> {
         let mut ids: Vec<String> = sb
             .json(&["agent", "list"])
@@ -2647,7 +2670,11 @@ fn a_failure_creating_the_team_reports_every_surviving_agent_id_and_the_stage() 
         ids
     };
     let before = ids(&sb);
-    fs::write(sb.project().join(".orchestry/teams"), "not a directory").unwrap();
+    // Corruption planted under the *running* daemon (a restart would refuse
+    // to start over it): its `teams` directory becomes a plain file.
+    let teams = sb.project().join(".orchestry/teams");
+    fs::remove_dir_all(&teams).unwrap();
+    fs::write(&teams, "not a directory").unwrap();
     let output = sb.fail(&["org", "deploy", "--template", "builtin:a-team"]);
     let message = stderr(&output);
 
@@ -2676,9 +2703,10 @@ fn a_failure_creating_the_team_reports_every_surviving_agent_id_and_the_stage() 
 #[test]
 fn a_failure_creating_the_goal_reports_the_agents_and_the_team_that_survive() {
     let sb = sandbox();
-    sb.init_project();
+    // Corruption planted under the *running* daemon (a restart would refuse
+    // to start over it): its `goals` directory becomes a plain file.
     let goals = sb.project().join(".orchestry/goals");
-    fs::remove_dir(&goals).unwrap();
+    fs::remove_dir_all(&goals).unwrap();
     fs::write(&goals, "not a directory").unwrap();
     let root = valid_dir(&sb, "trio");
     let output = sb.fail(&[
@@ -2705,7 +2733,6 @@ fn a_failure_creating_the_goal_reports_the_agents_and_the_team_that_survive() {
 #[test]
 fn legacy_positional_deploy_still_deploys_the_legacy_preset() {
     let sb = sandbox();
-    sb.init_project();
     let out = sb.json(&["org", "deploy", "startup-mvp"]);
     assert_eq!(out["agentIds"].as_array().unwrap().len(), 6);
 }
@@ -2713,7 +2740,6 @@ fn legacy_positional_deploy_still_deploys_the_legacy_preset() {
 #[test]
 fn legacy_positional_deploy_of_an_unknown_preset_fails_and_creates_nothing() {
     let sb = sandbox();
-    sb.init_project();
     let entries = sb.orchestry_entries();
     sb.fail(&["org", "deploy", "no-such-preset"]);
     assert_eq!(sb.orchestry_entries(), entries);
@@ -2722,7 +2748,6 @@ fn legacy_positional_deploy_of_an_unknown_preset_fails_and_creates_nothing() {
 #[test]
 fn org_list_keeps_the_ten_legacy_records_in_order_and_appends_a_team() {
     let sb = sandbox();
-    sb.init_project();
     let listing = sb.json(&["org", "list"]);
     let keys: Vec<&str> = listing
         .as_array()
@@ -2751,7 +2776,6 @@ fn org_list_keeps_the_ten_legacy_records_in_order_and_appends_a_team() {
 #[test]
 fn the_a_team_record_in_org_list_namespaces_its_shop_keys_and_points_at_the_lead() {
     let sb = sandbox();
-    sb.init_project();
     let listing = sb.json(&["org", "list"]);
     let record = listing.as_array().unwrap().last().unwrap();
     let keys: Vec<&str> = record["agents"]
@@ -2777,7 +2801,6 @@ fn the_a_team_record_in_org_list_namespaces_its_shop_keys_and_points_at_the_lead
 #[test]
 fn a_legacy_preset_selected_by_the_new_flag_deploys_what_its_preview_shows() {
     let sb = sandbox();
-    sb.init_project();
     let preview = sb.json(&["org", "template", "show", "builtin:data-lab", "--resolved"]);
     sb.ok(&["org", "deploy", "--template", "builtin:data-lab"]);
     let agents = sb.json(&["agent", "list"]);
@@ -2801,7 +2824,6 @@ fn a_legacy_preset_selected_by_the_new_flag_deploys_what_its_preview_shows() {
 #[test]
 fn deploying_the_a_team_creates_27_agents_and_an_orchestrator_led_team() {
     let sb = sandbox();
-    sb.init_project();
     let out = sb.json(&["org", "deploy", "--template", "builtin:a-team"]);
     let lead_id = out["team"]["lead_agent_id"].as_str().unwrap();
     let agents = sb.json(&["agent", "list"]);
@@ -2893,6 +2915,13 @@ fn pty_orch(sb: &Sandbox, args: &[&str], rows: u16, cols: u16) -> Pty {
     command.env("TERM", "xterm-256color");
     command.env("PATH", "/usr/bin:/bin");
     command.env("NO_COLOR", "1");
+    // `CommandBuilder` is not a `std::process::Command`, so it cannot use
+    // `daemon::apply_for`; aim it at the registered daemon by hand.
+    for env_pair in daemon::env_pairs_for(&sb.project()) {
+        if let Some((key, value)) = env_pair.split_once('=') {
+            command.env(key, value);
+        }
+    }
     let child = pair
         .slave
         .spawn_command(command)
@@ -3075,7 +3104,6 @@ fn shop_dir(sb: &Sandbox) -> PathBuf {
 #[test]
 fn selecting_a_row_installs_exactly_that_agent_as_its_resolved_input() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     let preview = sb.json(&[
         "org",
@@ -3136,7 +3164,6 @@ fn selecting_a_row_installs_exactly_that_agent_as_its_resolved_input() {
 #[test]
 fn selecting_from_a_template_shop_creates_no_team_and_no_goal() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     let mut pty = pty_orch(
         &sb,
@@ -3153,7 +3180,6 @@ fn selecting_from_a_template_shop_creates_no_team_and_no_goal() {
 #[test]
 fn cancelling_the_template_shop_writes_nothing_and_restores_the_terminal() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     let (agents, entries, tree) = (sb.agent_names(), sb.orchestry_entries(), snapshot(&root));
     let mut pty = pty_orch(
@@ -3181,7 +3207,6 @@ fn cancelling_the_template_shop_writes_nothing_and_restores_the_terminal() {
 #[test]
 fn installing_from_the_a_team_shop_creates_the_resolved_member_and_only_that_member() {
     let sb = sandbox();
-    sb.init_project();
     let preview = sb.json(&["org", "template", "show", "builtin:a-team", "--resolved"]);
     let before = sb.agent_names();
     let mut pty = pty_orch(
@@ -3222,7 +3247,6 @@ fn installing_from_the_a_team_shop_creates_the_resolved_member_and_only_that_mem
 #[test]
 fn installing_a_name_that_already_exists_fails_clearly_and_adds_nothing() {
     let sb = sandbox();
-    sb.init_project();
     sb.ok(&[
         "agent",
         "add",
@@ -3258,7 +3282,6 @@ fn installing_a_name_that_already_exists_fails_clearly_and_adds_nothing() {
 #[test]
 fn a_narrow_terminal_gets_rows_clipped_to_its_width_and_height() {
     let sb = sandbox();
-    sb.init_project();
     let root = sb.work().join("hostile");
     let long = "界".repeat(60);
     Bundle::new("hostile", "lead")
@@ -3289,7 +3312,6 @@ fn a_narrow_terminal_gets_rows_clipped_to_its_width_and_height() {
 #[test]
 fn control_characters_in_a_stored_description_never_reach_the_terminal() {
     let sb = sandbox();
-    sb.init_project();
     let root = sb.work().join("hostile");
     Bundle::new("hostile", "lead")
         .agent(
@@ -3317,7 +3339,6 @@ fn control_characters_in_a_stored_description_never_reach_the_terminal() {
 #[test]
 fn picker_rows_start_with_a_carriage_return_so_raw_mode_never_staircases() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     let mut pty = pty_orch(
         &sb,
@@ -3340,7 +3361,6 @@ fn picker_rows_start_with_a_carriage_return_so_raw_mode_never_staircases() {
 #[test]
 fn a_tall_template_stays_within_the_terminal_height_with_the_cursor_row_visible() {
     let sb = sandbox();
-    sb.init_project();
     let mut pty = pty_orch(
         &sb,
         &["agent", "shop", "--template", "builtin:a-team"],
@@ -3369,7 +3389,6 @@ fn a_tall_template_stays_within_the_terminal_height_with_the_cursor_row_visible(
 #[test]
 fn resizing_narrower_redraws_within_the_new_width() {
     let sb = sandbox();
-    sb.init_project();
     let root = sb.work().join("wide");
     Bundle::new("wide", "lead")
         .agent("lead", json!({"description": "x".repeat(200)}))
@@ -3420,7 +3439,6 @@ fn crowded_template(sb: &Sandbox, members: usize) -> PathBuf {
 #[test]
 fn a_shrink_delivered_together_with_a_key_still_draws_the_next_frame_at_the_new_size() {
     let sb = sandbox();
-    sb.init_project();
     let root = crowded_template(&sb, 30);
     let mut pty = pty_orch(
         &sb,
@@ -3451,7 +3469,6 @@ fn a_shrink_delivered_together_with_a_key_still_draws_the_next_frame_at_the_new_
 #[test]
 fn a_grow_delivered_together_with_a_key_still_draws_the_next_frame_at_the_new_size() {
     let sb = sandbox();
-    sb.init_project();
     let root = crowded_template(&sb, 30);
     let mut pty = pty_orch(
         &sb,
@@ -3483,7 +3500,6 @@ fn a_grow_delivered_together_with_a_key_still_draws_the_next_frame_at_the_new_si
 #[test]
 fn a_key_sent_with_every_resize_is_never_left_unread() {
     let sb = sandbox();
-    sb.init_project();
     let root = crowded_template(&sb, 30);
     let mut pty = pty_orch(
         &sb,
@@ -3506,7 +3522,6 @@ fn a_key_sent_with_every_resize_is_never_left_unread() {
 #[test]
 fn an_invalid_template_fails_before_the_picker_starts() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     fs::write(root.join("agents/worker.yml"), "broken: [").unwrap();
     let agents = sb.agent_names();
@@ -3533,7 +3548,6 @@ fn an_invalid_template_fails_before_the_picker_starts() {
 #[test]
 fn shop_list_on_a_terminal_prints_the_table_without_entering_the_picker() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     let agents = sb.agent_names();
     let mut pty = pty_orch(
@@ -3558,7 +3572,6 @@ fn shop_list_on_a_terminal_prints_the_table_without_entering_the_picker() {
 #[test]
 fn shop_list_as_json_serializes_the_authoring_members_and_creates_nothing() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     let (agents, entries) = (sb.agent_names(), sb.orchestry_entries());
     let listing = sb.json(&["agent", "shop", "--template-dir", path_arg(&root), "--list"]);
@@ -3579,7 +3592,6 @@ fn shop_list_as_json_serializes_the_authoring_members_and_creates_nothing() {
 #[test]
 fn shop_list_yaml_and_json_describe_the_same_members() {
     let sb = sandbox();
-    sb.init_project();
     let args = ["agent", "shop", "--template", "builtin:a-team", "--list"];
     assert_eq!(sb.yaml(&args), sb.json(&args));
 }
@@ -3587,7 +3599,6 @@ fn shop_list_yaml_and_json_describe_the_same_members() {
 #[test]
 fn without_a_terminal_the_template_shop_prints_a_table_and_installs_nothing() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     let agents = sb.agent_names();
     let output = sb.ok(&["agent", "shop", "--template-dir", path_arg(&root)]);
@@ -3600,7 +3611,6 @@ fn without_a_terminal_the_template_shop_prints_a_table_and_installs_nothing() {
 #[test]
 fn a_template_shop_rejects_a_broken_template_without_a_terminal_too() {
     let sb = sandbox();
-    sb.init_project();
     let root = shop_dir(&sb);
     fs::write(root.join("org.yml"), "x: [").unwrap();
     let output = sb.fail(&["agent", "shop", "--template-dir", path_arg(&root), "--list"]);
@@ -3610,7 +3620,6 @@ fn a_template_shop_rejects_a_broken_template_without_a_terminal_too() {
 #[test]
 fn the_shop_without_a_selector_still_lists_the_legacy_catalogue() {
     let sb = sandbox();
-    sb.init_project();
     let output = sb.ok(&["agent", "shop", "--list"]);
     let text = stdout(&output);
     assert_eq!(

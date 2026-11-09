@@ -67,7 +67,8 @@ fn add_task(sb: &Sandbox, reader: &Reader, title: &str, assignee: &str) -> Strin
 /// The init, seeding and dispatch all use the same binary so each reader is
 /// judged on its own store.
 fn observe(reader: &Reader, effort: Option<&str>) -> Observed {
-    let sb = Sandbox::new(reader);
+    // `orch run` below is a daemon RPC since S2a-cli.
+    let sb = Sandbox::new_owned(reader);
     // The model is the same literal in every run, so the only variable is
     // the stored effort.
     let first = sb.seed_agent(reader, "First", "claude", Some("claude-sonnet-4-6"), effort);

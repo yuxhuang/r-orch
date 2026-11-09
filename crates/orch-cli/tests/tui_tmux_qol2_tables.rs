@@ -323,8 +323,11 @@ fn tables_headers_sort_and_elapsed_in_tmux() {
     let screen = tmux.wait_for("the dashboard", |s| {
         s.contains("ORCH") && s.contains("Finished task")
     });
-    // No orchestrator, so nothing in this session can dispatch an agent.
-    assert!(screen.contains("OBSERVING"), "{screen}");
+    // The test daemon's dispatch is OFF, so nothing in this session can
+    // dispatch an agent; the header says so ("IDLE", not the retired
+    // in-process "OBSERVING").
+    assert!(screen.contains("IDLE"), "{screen}");
+    assert!(!screen.contains("WATCHING"), "{screen}");
 
     // The Tasks table has a header row, with the default sort marked on it.
     let header = row(&screen, "STATUS");

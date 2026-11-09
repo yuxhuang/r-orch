@@ -2,28 +2,28 @@
 //! the roster taken when the wizard opened, so the final submission must
 //! re-check the agents it is about to write, before its first write.
 //!
-//! The dashboard here is the real `App` over a real `EngineBackend` launched
-//! with `observe = true`, over a real file-backed project in a temp directory
-//! with shell agents, offline model discovery and a throwaway global config.
-//! The scheduler is never started (asserted). The unit-level contract, with a
+//! The dashboard here is the real `App` over a `DaemonBackend` dialled through
+//! the production connector to an in-process test daemon (dispatch OFF) over a
+//! real file-backed project in a temp directory with shell agents and a
+//! throwaway global config. The scheduler is never started (asserted). The unit-level contract, with a
 //! recording fake, is in `crates/orch-tui/tests/qol2_picker_eligibility.rs`.
 //!
 //! Every assertion reads the store through the engine services, not the
 //! wizard's own idea of what it wrote: a refused submission must leave the
 //! tasks, goals, teams and agents exactly as they were.
 
-mod common;
+mod tui_support;
 
 use std::sync::Arc;
 
-use orch_cli::tui::EngineBackend;
+use orch_cli::tui::DaemonBackend;
 use orch_core::storage::ConfigStore;
 use orch_domain::{
     Agent, AgentStatus, CreateAgentInput, CreateGoalInput, CreateTaskInput, CreateTeamInput, Goal,
     GoalStatus, NotificationPreferences, OrchestratorEvent, OrchestratorState, Task, Team,
     TuiPaletteName, WorkspaceMode, default_config,
 };
-use orch_engine::{EngineSeams, FullEngine, build_full_with};
+use orch_engine::FullEngine;
 use orch_infra::storage::{FileConfigStore, Paths};
 use orch_tui::App;
 use orch_tui::backend::{
@@ -33,14 +33,16 @@ use orch_tui::backend::{
 use orch_tui::clock::TestClock;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::runtime::Handle;
+use tui_support::TestDaemon;
 
 const DESC: &str = "retained draft text";
 
 // ── A project with shell agents ──────────────────────────────────────────────
 
 struct Env {
+    /// Dropped first: the daemon stops before its project directory goes.
+    engine: Arc<TestDaemon>,
     temp: tempfile::TempDir,
-    engine: Arc<FullEngine>,
     zeta: Agent,
     alpha: Agent,
     mid: Agent,
@@ -62,15 +64,7 @@ async fn env(existing: bool) -> Env {
         .await
         .expect("config");
     let engine = Arc::new(
-        build_full_with(
-            temp.path(),
-            EngineSeams {
-                global_config_path: Some(temp.path().join("home/.orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("engine"),
+        TestDaemon::start_default(&temp.path().canonicalize().expect("canonical root")).await,
     );
     let mut made = Vec::new();
     for name in ["zeta-builder", "alpha-ops", "mid-reviewer"] {
@@ -119,12 +113,8 @@ async fn shell_agent(engine: &FullEngine, name: &str) -> Agent {
         .expect("shell agent")
 }
 
-async fn backend(env: &Env) -> EngineBackend {
-    let backend = EngineBackend::launch_with(Arc::clone(&env.engine), "qol2", true)
-        .await
-        .with_model_discovery(common::offline_model_discovery());
-    assert!(!backend.is_watch_active(), "no scheduler may start");
-    backend
+async fn backend(env: &Env) -> DaemonBackend {
+    env.engine.launch().await
 }
 
 // ── Driving the real App ────────────────────────────────────────────────────
@@ -133,7 +123,7 @@ async fn backend(env: &Env) -> EngineBackend {
 /// back and read the store.
 struct Ui<B: TuiBackend> {
     app: App<B, TestClock>,
-    engine: Arc<FullEngine>,
+    engine: Arc<TestDaemon>,
     handle: Handle,
 }
 
@@ -553,7 +543,7 @@ refused_before_any_write! {
 async fn with_ui<T, F>(existing: bool, body: F) -> T
 where
     T: Send + 'static,
-    F: FnOnce(Ui<EngineBackend>, Env) -> T + Send + 'static,
+    F: FnOnce(Ui<DaemonBackend>, Env) -> T + Send + 'static,
 {
     let env = env(existing).await;
     let backend = backend(&env).await;
@@ -1082,8 +1072,8 @@ async fn enabled_team_lead_and_member_persist_one_team_with_exactly_those_ids() 
 /// after a task is created: the validating read has already passed, so the
 /// primary write lands and the assignment that follows then fails for real.
 struct RemoveAfterCreate {
-    inner: EngineBackend,
-    engine: Arc<FullEngine>,
+    inner: DaemonBackend,
+    engine: Arc<TestDaemon>,
     handle: Handle,
     remove: Option<String>,
 }

@@ -758,9 +758,11 @@ fn agent_overview_wraps_a_long_skills_list_onto_value_column_rows() {
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let owned = OwnedDir::adopt(dir);
     let skills: Vec<String> = (0..14).map(|n| format!("skill-number-{n}")).collect();
     orch(
-        dir.path(),
+        owned.path(),
         &[
             "agent",
             "add",
@@ -774,7 +776,7 @@ fn agent_overview_wraps_a_long_skills_list_onto_value_column_rows() {
         ],
     );
     let tmux = launch(
-        dir.path(),
+        owned.path(),
         format!("orch-x3-{}-{}", std::process::id(), line!()),
     );
     tmux.wait_for("the dashboard", |s| s.contains("ORCH"));

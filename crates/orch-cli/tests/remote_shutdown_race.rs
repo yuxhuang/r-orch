@@ -1,10 +1,12 @@
-//! Regression: a second `stop()` must wait for the owner's shutdown.
+//! Regression: a SIGTERM'd owner must not exit before its own shutdown ends.
 //!
-//! On SIGTERM the TUI's engine signal arm owns `stop()`; the dashboard then
-//! exits and calls `stop()` again before dropping the peer runtime. When the
-//! second call returned at once, the TUI exited mid-shutdown: the owner lock
-//! was left behind and the wind-down was cut short (SRE H1 / code review
-//! I-1, measured 2026-10-15).
+//! Originally (SRE H1 / code review I-1, measured 2026-10-15) the TUI's engine
+//! signal arm owned `stop()` and the dashboard then called `stop()` again; the
+//! second call returned at once, so the TUI exited mid-shutdown with the owner
+//! lock left behind. Since S2a-cli the dashboard is a client and the engine
+//! lives in the daemon, so the same property is pinned where it now lives: the
+//! daemon's SIGTERM exit comes only after its wind-down (lock released, task
+//! settled, child killed), not at the first return of any stop path.
 //!
 //! The lever is an agent whose child ignores SIGTERM, so the owner's own
 //! wind-down sits in `kill_with_grace` for its full ten seconds — long
@@ -119,6 +121,10 @@ struct Peer {
     home: PathBuf,
     serial: Cell<usize>,
     owner: RefCell<Option<Process>>,
+    /// Dispatch-off explicit daemon serving the CLI until the owner starts.
+    seed: RefCell<Option<Process>>,
+    /// Short, private socket directory (`sun_path` is 104 bytes on macOS).
+    sockets: tempfile::TempDir,
 }
 
 impl Peer {
@@ -135,6 +141,15 @@ impl Peer {
             home,
             serial: Cell::new(0),
             owner: RefCell::new(None),
+            seed: RefCell::new(None),
+            sockets: tempfile::Builder::new()
+                .prefix("otd-")
+                // 0700: the daemon refuses a group- or world-accessible socket dir.
+                .permissions(
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+                )
+                .tempdir_in("/tmp")
+                .expect("short socket dir"),
         };
         peer.ok(&["init", "--name", name, "--adapter", "shell"]);
         let mut config = serde_json::to_value(orch_domain::default_config()).unwrap();
@@ -175,6 +190,8 @@ impl Peer {
             .env("ORCHESTRY_GLOBAL_CONFIG_PATH", self.home.join("global.yml"))
             .env("ORCH_TEST_OS_CAP", std::env::consts::OS)
             .env("ORCH_TEST_PEER_BLOCK_FILE", self.path("peer-block"))
+            .env("ORCH_SOCKET", self.sockets.path().join("s"))
+            .env("ORCH_TEST_SOCKET_ROOT", self.sockets.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("NO_COLOR", "1")
@@ -193,7 +210,45 @@ impl Peer {
         )
     }
 
+    fn raw(&self, args: &[&str]) -> Output {
+        let mut command = self.command();
+        command.args(args);
+        self.spawn(command, "cli").output(Duration::from_secs(15))
+    }
+
+    /// Every command but `init` is a daemon client: serve the CLI from a
+    /// dispatch-off seed daemon until the fixture starts its own owner.
+    fn ensure_daemon(&self) {
+        let running = |slot: &RefCell<Option<Process>>| {
+            slot.borrow_mut()
+                .as_mut()
+                .is_some_and(|process| process.child.try_wait().expect("poll").is_none())
+        };
+        if running(&self.owner) || running(&self.seed) {
+            return;
+        }
+        let mut command = self.command();
+        command.args(["daemon", "start"]);
+        *self.seed.borrow_mut() = Some(self.spawn(command, "seed"));
+        wait("seed daemon answers", &[self], || {
+            running(&self.seed) && self.raw(&["daemon", "status"]).status.success()
+        });
+    }
+
+    fn release_seed(&self) {
+        if let Some(mut seed) = self.seed.borrow_mut().take() {
+            signal_group(seed.child.id(), Signal::SIGTERM);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while seed.child.try_wait().expect("poll").is_none() && Instant::now() < deadline {
+                thread::sleep(POLL);
+            }
+        }
+    }
+
     fn ok(&self, args: &[&str]) -> String {
+        if args.first() != Some(&"init") {
+            self.ensure_daemon();
+        }
         let mut command = self.command();
         command.args(args);
         let output = self.spawn(command, "cli").output(Duration::from_secs(15));
@@ -289,6 +344,7 @@ impl Peer {
 impl Drop for Peer {
     fn drop(&mut self) {
         self.owner.borrow_mut().take();
+        self.seed.borrow_mut().take();
         // Adapters start their own process groups; each fixture records its
         // group before doing work.
         for group in text(self.path("adapter-groups"))
@@ -340,68 +396,20 @@ fn slow_ack_body(peer: &Peer) -> String {
 }
 
 #[test]
-fn tui_sigterm_exits_only_after_the_owners_own_shutdown() {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-
-    struct Dashboard {
-        child: Box<dyn portable_pty::Child + Send + Sync>,
-        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-    }
-    impl Drop for Dashboard {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.master.take();
-        }
-    }
-
+fn daemon_sigterm_exits_only_after_the_owners_own_shutdown() {
     let controller = Peer::new("race-controller");
     let agent = controller.add_agent("executor", &slow_ack_body(&controller));
+    let task = controller.task("slow shutdown under the daemon", &agent);
     let controller_addr = port();
 
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 30,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let fixture = controller.command();
-    let mut command = CommandBuilder::new(fixture.get_program());
-    for (key, value) in fixture.get_envs() {
-        if let Some(value) = value {
-            command.env(key, value);
-        } else {
-            command.env_remove(key);
-        }
-    }
-    command.env("TERM", "xterm-256color");
-    // The dashboard probes every adapter CLI for its model list on the first
-    // tick: keep the developer's own agent CLIs off its PATH.
-    command.env("PATH", "/usr/bin:/bin");
-    command.cwd(controller.dir.path());
-    command.args(["tui", "--listen", &controller_addr.to_string()]);
-    let mut dashboard = Dashboard {
-        child: pair.slave.spawn_command(command).unwrap(),
-        master: Some(pair.master),
-    };
-    drop(pair.slave);
-    let mut reader = dashboard
-        .master
-        .as_ref()
-        .unwrap()
-        .try_clone_reader()
-        .unwrap();
-    let capture = controller.path("tui-capture");
-    let mut log = File::create(&capture).unwrap();
-    let reading = thread::spawn(move || {
-        let _ = std::io::copy(&mut reader, &mut log);
-    });
-
+    // The explicit owner: a foreground `serve` is a daemon start with dispatch
+    // ON, so it picks the queued task up and runs the TERM-ignoring shell.
+    controller.release_seed();
+    let mut command = controller.command();
+    command.args(["serve", "--listen", &controller_addr.to_string()]);
+    let mut daemon = controller.spawn(command, "owner");
     let peers = [&controller];
-    let task = controller.task("slow shutdown under TUI", &agent);
-    wait("running shell under TUI", &peers, || {
+    wait("running shell under the daemon", &peers, || {
         controller.path("started").exists()
     });
     let pid = text(controller.path("started"))
@@ -409,17 +417,16 @@ fn tui_sigterm_exits_only_after_the_owners_own_shutdown() {
         .parse::<i32>()
         .unwrap();
 
-    let owner = dashboard.child.process_id().unwrap();
-    kill(Pid::from_raw(owner as i32), Signal::SIGTERM).unwrap();
+    kill(Pid::from_raw(daemon.child.id() as i32), Signal::SIGTERM).unwrap();
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = dashboard.child.try_wait().unwrap() {
+        if let Some(status) = daemon.child.try_wait().unwrap() {
             break status;
         }
         assert!(
             started.elapsed() < Duration::from_secs(25),
-            "TUI SIGTERM did not exit within 25 s: {}",
-            text(&capture)
+            "daemon SIGTERM did not exit within 25 s: {}",
+            text(&daemon.stderr)
         );
         thread::sleep(POLL);
     };
@@ -429,21 +436,25 @@ fn tui_sigterm_exits_only_after_the_owners_own_shutdown() {
     let lock_left = controller.path(".orchestry/orchestry.lock").exists();
     let task_at_exit = controller.task_status(&task);
     eprintln!(
-        "TUI SIGTERM exit in {elapsed:?}, status {status:?}, lock left {lock_left}, \
+        "daemon SIGTERM exit in {elapsed:?}, status {status:?}, lock left {lock_left}, \
          task at exit {task_at_exit}"
     );
 
-    assert!(status.success(), "TUI exit {status:?}: {}", text(&capture));
+    assert!(
+        status.success(),
+        "daemon exit {status:?}: {}",
+        text(&daemon.stderr)
+    );
     assert!(
         !lock_left,
-        "TUI exited after {elapsed:?} with the owner lock still on disk"
+        "the daemon exited after {elapsed:?} with the owner lock still on disk"
     );
     // The wind-down cannot be quick: the child ignores TERM, so the owner
-    // sits in its kill grace. Exiting sooner means the dashboard left while
-    // the owner was still stopping.
+    // sits in its kill grace. Exiting sooner means the process left while
+    // its shutdown was still running.
     assert!(
         elapsed >= MIN_WIND_DOWN,
-        "TUI exited after {elapsed:?}, before the owner's wind-down could finish"
+        "the daemon exited after {elapsed:?}, before its wind-down could finish"
     );
     assert!(
         matches!(task_at_exit.as_str(), Some("retrying") | Some("failed")),
@@ -460,7 +471,5 @@ fn tui_sigterm_exits_only_after_the_owners_own_shutdown() {
         "the shell produced its effect after the owner killed it"
     );
 
-    drop(TcpListener::bind(controller_addr).expect("TUI listener released"));
-    dashboard.master.take();
-    reading.join().unwrap();
+    drop(TcpListener::bind(controller_addr).expect("daemon listener released"));
 }

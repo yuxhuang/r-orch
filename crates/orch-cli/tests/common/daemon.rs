@@ -46,6 +46,24 @@
 //!   fixture that runs agents needs the daemon, and a fixture that runs
 //!   `orch serve` / `run --watch` in the foreground *is* its own daemon and
 //!   must not own a second one ("already running", exit 4).
+//! * The socket directory **must** be `0700` (the daemon refuses a group- or
+//!   world-accessible one, exit 7 "must be owned by uid … with no group or
+//!   world access"): `tempfile::Builder::tempdir_in("/tmp")` alone creates
+//!   `0755`, so fixtures that need their own directory use [`short_socket`]
+//!   (or add `.permissions(0o700)`).
+//! * Agents, doctor probes and agent-CLI version probes run **in the daemon**,
+//!   so a fake agent `PATH`, a recording directory or `ORCH_FAKE_VERSION`
+//!   belong in the daemon's environment ([`TestDaemon::start_with_env`]), not
+//!   on the client command.
+//! * State a fixture writes by hand under `.orchestry/` goes in while no
+//!   daemon runs ([`OwnedDir::with_daemon_stopped`], or `stop_daemon` /
+//!   `start_daemon` on the fixture's own wrapper); a running daemon neither
+//!   sees nor keeps it. Corruption that must be planted under a running
+//!   daemon (a directory replaced by a file) is done in place.
+//! * A fixture that spawns a foreground `serve` / `run --watch` / `daemon
+//!   start` by hand waits for `orch daemon status` to succeed before it
+//!   issues a client command: the socket listens a moment after the PID lock
+//!   is taken.
 //! * A fixture that builds a command before it has a daemon uses
 //!   [`apply_env`]; a fixture that wants "no daemon" simply does not apply
 //!   the socket env.
@@ -103,17 +121,7 @@ impl TestDaemon {
         let root = root.canonicalize().expect("project root exists");
         fs::create_dir_all(home).expect("fixture HOME");
         let home = home.canonicalize().expect("fixture HOME exists");
-        let short = tempfile::Builder::new()
-            .prefix("otd-")
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in("/tmp")
-            .expect("short socket dir under /tmp");
-        let socket = short.path().join("s");
-        assert!(
-            socket.as_os_str().len() <= MAX_SOCKET_BYTES,
-            "socket path {} exceeds {MAX_SOCKET_BYTES} bytes",
-            socket.display()
-        );
+        let (short, socket) = short_socket();
         let err_path = short.path().join("daemon.err");
         let mut command = Command::new(env!("CARGO_BIN_EXE_orch"));
         command
@@ -455,6 +463,29 @@ impl Drop for OwnedDir {
     fn drop(&mut self) {
         unregister_project(self.dir.path());
     }
+}
+
+/// A fresh `0700` directory under `/tmp` (`/tmp/otd-XXXXXX`) and the `<dir>/s`
+/// socket path inside it, short enough for macOS's 104-byte `sun_path` even
+/// once joined to a long `$TMPDIR` project path (see the module docs).
+///
+/// For a fixture that starts its *own* foreground `orch serve` / `orch run
+/// --watch` (itself a daemon start, so it must not go through
+/// [`TestDaemon::start`], which would spawn a second, separate daemon): apply
+/// the returned socket with [`apply_env`] to that one command instead.
+pub fn short_socket() -> (tempfile::TempDir, PathBuf) {
+    let short = tempfile::Builder::new()
+        .prefix("otd-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .expect("short socket dir under /tmp");
+    let socket = short.path().join("s");
+    assert!(
+        socket.as_os_str().len() <= MAX_SOCKET_BYTES,
+        "socket path {} exceeds {MAX_SOCKET_BYTES} bytes",
+        socket.display()
+    );
+    (short, socket)
 }
 
 /// Set the two variables that aim a command at `socket`. Free-standing so a
