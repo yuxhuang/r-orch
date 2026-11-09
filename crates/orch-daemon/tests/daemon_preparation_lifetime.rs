@@ -55,10 +55,17 @@ impl ProcessManager for DelayedProbe {
         self.calls.lock().unwrap().push(args.to_vec());
         let output: &[u8] = if args == ["--version"] {
             self.entered.notify_one();
-            let mut open = self.gate.0.lock().unwrap();
-            while !*open {
-                open = self.gate.1.wait(open).unwrap();
-            }
+            // Block like a real synchronous call, but tell the scheduler. A
+            // bare wait strands any task this worker just woke into its LIFO
+            // slot, which no other worker may steal. When that task holds a
+            // lock engine shutdown needs (seen: the operation boundary), the
+            // CancelShutdown arm waits for `claimed` to clear until release.
+            tokio::task::block_in_place(|| {
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+            });
             if self.fail {
                 return Err(orch_core::Error::other("fake probe spawn failed"));
             }
