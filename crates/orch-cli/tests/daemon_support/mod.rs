@@ -15,6 +15,8 @@
 //!   `listening <socket>` line, an exit status, a file), never a fixed sleep.
 #![allow(dead_code, reason = "each daemon_lifecycle* test crate uses a subset")]
 
+pub mod frontends;
+
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -105,9 +107,12 @@ impl Sandbox {
         .unwrap();
     }
 
-    /// Seed one task assigned to a `sleep 120` stand-in, with the legacy
-    /// direct-store CLI (no daemon exists yet). Returns `(agent, task)` ids.
+    /// Seed one task assigned to a `sleep 120` stand-in through a throwaway
+    /// daemon (dispatch OFF), then stop it. Since the CLI is a daemon client
+    /// this is the only way to write state; it also runs unchanged against the
+    /// legacy direct-store CLI. Returns `(agent, task)` ids.
     pub fn seed_sleeper(&self) -> (String, String) {
+        let mut seeder = start_ready(self, &[], "seed");
         let out = self.run(&[
             "agent",
             "add",
@@ -123,7 +128,11 @@ impl Sandbox {
         let agent = agent["id"].as_str().unwrap().to_owned();
         let out = self.run(&["task", "add", "long job", "--assignee", &agent, "--quiet"]);
         assert!(out.status.success(), "{}", text(&out.stderr));
-        (agent, text(&out.stdout).trim().to_owned())
+        let task = text(&out.stdout).trim().to_owned();
+        let stop = self.run(&["daemon", "stop"]);
+        assert!(stop.status.success(), "{}", text(&stop.stderr));
+        assert_eq!(seeder.wait_exit(READY).code(), Some(0));
+        (agent, task)
     }
 
     pub fn state_json(&self) -> Option<Value> {
