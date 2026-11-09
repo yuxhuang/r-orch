@@ -180,7 +180,6 @@ fn assert_clients_refuse(pair: &mut Pair, client: &Path, client_protocol: u32) {
 }
 
 #[test]
-#[ignore = "SEAM: needs the orch-proto/orch-cli 'skew-seam' feature (requested from the lead, T2a)"]
 fn protocol_2_clients_against_a_protocol_1_daemon_print_the_skew_message_and_change_nothing() {
     let skewed = skewed_binary();
     let mut pair = Pair::start(normal(), orch_proto::LOCAL_PROTOCOL);
@@ -188,7 +187,6 @@ fn protocol_2_clients_against_a_protocol_1_daemon_print_the_skew_message_and_cha
 }
 
 #[test]
-#[ignore = "SEAM: needs the orch-proto/orch-cli 'skew-seam' feature (requested from the lead, T2a)"]
 fn protocol_1_clients_against_a_protocol_2_daemon_print_the_skew_message_and_change_nothing() {
     let skewed = skewed_binary();
     let mut pair = Pair::start(skewed, SEAM_PROTOCOL);
@@ -196,7 +194,6 @@ fn protocol_1_clients_against_a_protocol_2_daemon_print_the_skew_message_and_cha
 }
 
 #[test]
-#[ignore = "SEAM: needs the orch-proto/orch-cli 'skew-seam' feature (requested from the lead, T2a)"]
 fn the_other_binarys_daemon_stop_crosses_the_skew_so_the_printed_restart_advice_works() {
     let skewed = skewed_binary();
     let mut pair = Pair::start(normal(), orch_proto::LOCAL_PROTOCOL);
