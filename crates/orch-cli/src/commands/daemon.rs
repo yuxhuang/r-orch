@@ -74,9 +74,6 @@ pub async fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path
                 return code(error.exit_code());
             }
         };
-        eprintln!(
-            "  ⚠ Developmental daemon: legacy writers are not excluded in this build. Stop legacy orch writers before using it."
-        );
         let result = orch_daemon::start(orch_daemon::StartOptions {
             project_root: project.root,
             socket: config.socket,

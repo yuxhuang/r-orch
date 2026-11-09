@@ -28,6 +28,7 @@ fn project() -> tempfile::TempDir {
 fn short_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("dc-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
         .unwrap()
 }
@@ -269,4 +270,76 @@ fn init_and_rerun_print_start_hint_without_creating_runtime_files() {
         assert!(!root.path().join(".orchestry/daemon.json").exists());
         assert!(!root.path().join(".orchestry/orchestry.lock").exists());
     }
+}
+
+// Own only this child: a failed readiness/status assertion must still reap it.
+struct ForegroundDaemon(std::process::Child);
+impl Drop for ForegroundDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn explicit_foreground_start_has_one_banner_and_sanitized_environment() {
+    use std::io::BufRead;
+    use std::time::Duration;
+
+    let root = project();
+    let short = short_dir();
+    let socket = short.path().join("s");
+    let errors = short.path().join("stderr");
+    let mut daemon = ForegroundDaemon(
+        orch(root.path(), &socket, short.path())
+            .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
+            .env("DEBUG", "private-debug-value")
+            .args(["daemon", "start", "--peer-name", "test-owner"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(fs::File::create(&errors).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = daemon.0.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if line.starts_with("listening ") {
+                let _ = ready_tx.send(line);
+            }
+        }
+    });
+    assert_eq!(
+        ready_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap_or_else(|error| {
+                panic!("{error}: {}", fs::read_to_string(&errors).unwrap())
+            }),
+        format!("listening {}", socket.display())
+    );
+    let out = orch(root.path(), &socket, short.path())
+        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
+        .args(["--json", "daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let status: orch_proto::ops::results::DaemonStatus =
+        serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!status.dispatch.dispatch_on);
+    assert!(status.removed_env.iter().any(|name| name == "DEBUG"));
+    let out = orch(root.path(), &socket, short.path())
+        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
+        .args(["daemon", "stop"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(daemon.0.wait().unwrap().success());
+    reader.join().unwrap();
+    let errors = fs::read_to_string(errors).unwrap();
+    assert_eq!(errors.lines().count(), 1, "{errors}");
+    assert_eq!(errors.trim(), orch_daemon::lifecycle::DEVELOPMENTAL_BANNER);
+    assert!(!errors.contains("private-debug-value"));
+    assert!(!socket.exists());
+    assert!(!root.path().join(".orchestry/daemon.json").exists());
 }
