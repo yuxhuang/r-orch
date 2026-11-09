@@ -47,6 +47,19 @@ use crate::run_service::RunService;
 use crate::task_service::TaskService;
 use crate::team_service::TeamService;
 
+/// Explicit context maintenance over the same store used by engine readers.
+/// Keeping the concrete handle here leaves the existing core store trait intact.
+pub struct ContextService {
+    store: Arc<FileContextStore>,
+}
+
+impl ContextService {
+    /// Remove expired entries. Reads only filter them; daemon maintenance calls this.
+    pub async fn expire_now(&self) -> Result<Vec<String>> {
+        self.store.expire_now().await
+    }
+}
+
 /// Everything a read-only command needs.
 pub struct Engine {
     pub paths: Paths,
@@ -60,6 +73,7 @@ pub struct Engine {
     pub config_store: Arc<dyn ConfigStore>,
     pub global_config_store: Arc<dyn GlobalConfigStore>,
     pub context: Arc<dyn ContextStore>,
+    pub context_service: Arc<ContextService>,
     pub messages: Arc<dyn MessageStore>,
     pub goals: Arc<dyn GoalStore>,
     pub teams: Arc<dyn TeamStore>,
@@ -180,10 +194,14 @@ pub async fn build_light_with(
     let agents: Arc<dyn AgentStore> = Arc::new(FileAgentStore::new(paths.clone()));
     let runs: Arc<dyn RunStore> = Arc::new(FileRunStore::new(paths.clone()));
     let state: Arc<dyn StateStore> = Arc::new(FileStateStore::new(paths.clone()));
-    let context: Arc<dyn ContextStore> = Arc::new(FileContextStore::new(
+    let context_store = Arc::new(FileContextStore::new(
         paths.clone(),
         Arc::clone(&seams.clock),
     ));
+    let context_service = Arc::new(ContextService {
+        store: Arc::clone(&context_store),
+    });
+    let context: Arc<dyn ContextStore> = context_store;
     let messages: Arc<dyn MessageStore> = Arc::new(FileMessageStore::new(
         paths.clone(),
         Arc::clone(&seams.clock),
@@ -261,6 +279,7 @@ pub async fn build_light_with(
         config_store,
         global_config_store,
         context,
+        context_service,
         messages,
         goals,
         teams,
@@ -361,6 +380,7 @@ async fn build_full_internal(
         skill_loader: Some(Arc::clone(&skills)),
     }));
     orchestrator.set_config_store(Arc::clone(&engine.config_store));
+    orchestrator.set_context_service(Arc::clone(&engine.context_service));
 
     Ok(FullEngine {
         engine,
@@ -628,5 +648,177 @@ mod tests {
         // needs the light tier does not have to know about the split.
         assert_eq!(full.config.project.name, "my-project");
         assert_eq!(full.paths.root(), Paths::new(temp.path()).root());
+    }
+
+    #[tokio::test]
+    async fn service_cancel_stops_a_live_child_owned_by_the_full_engine() {
+        use orch_core::process::{Signal, SpawnOptions};
+        use orch_core::test_support::{make_agent, make_run, make_task};
+        use orch_domain::{AgentStatus, RunStatus, TaskStatus};
+
+        struct Cleanup(Arc<dyn ProcessManager>, u32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.0.kill(self.1, Signal::Kill);
+            }
+        }
+
+        let temp = initialized();
+        let full = build_full_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..deterministic_seams()
+            },
+        )
+        .await
+        .unwrap();
+        let task = orch_domain::Task {
+            status: TaskStatus::InProgress,
+            ..make_task()
+        };
+        let agent = orch_domain::Agent {
+            status: AgentStatus::Running,
+            ..make_agent()
+        };
+        let run = orch_domain::Run {
+            task_id: task.id.clone(),
+            status: RunStatus::Running,
+            ..make_run()
+        };
+        full.tasks.save(&task).await.unwrap();
+        full.agents.save(&agent).await.unwrap();
+        full.runs.save(&run).await.unwrap();
+        let child = full
+            .processes
+            .spawn(
+                "sleep",
+                &["60".into()],
+                SpawnOptions {
+                    cwd: temp.path().to_path_buf(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cleanup = Cleanup(Arc::clone(&full.processes), child.pid);
+        let mut state = orch_domain::OrchestratorState::default();
+        state.running.insert(
+            task.id.clone(),
+            orch_domain::RunningEntry {
+                run_id: run.id.clone(),
+                agent_id: agent.id.clone(),
+                pid: child.pid,
+                started_at: full.clock.now_iso(),
+                last_event_at: full.clock.now_iso(),
+                task_id: task.id.clone(),
+                remote: None,
+            },
+        );
+        full.state.write(&state).await.unwrap();
+        assert!(full.processes.is_alive(child.pid));
+        let cancelled = full.task_service.cancel(&task.id).await.unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), child.exit.wait())
+            .await
+            .expect("child should exit after service cancellation");
+        assert!(!outcome.success());
+        assert!(!full.processes.is_alive(child.pid));
+        assert!(full.state.read().await.unwrap().running.is_empty());
+        assert_eq!(
+            full.runs.get(&run.id).await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            full.agents.get(&agent.id).await.unwrap().unwrap().status,
+            AgentStatus::Idle
+        );
+        drop(cleanup);
+    }
+
+    #[tokio::test]
+    async fn context_reads_leave_expiry_to_the_explicit_engine_step() {
+        let temp = initialized();
+        let clock = Arc::new(orch_core::test_support::FixedClock::at(1_760_000_000_000));
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                ..deterministic_seams()
+            },
+        )
+        .await
+        .unwrap();
+        engine
+            .context
+            .set("expired", "value", Some(1000))
+            .await
+            .unwrap();
+        engine.context.set("kept", "value", None).await.unwrap();
+        let path = engine.paths.context_path("expired").unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+        clock.advance_ms(1001);
+        assert!(engine.context.get("expired").await.unwrap().is_none());
+        assert_eq!(engine.context.list().await.unwrap().len(), 1);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert_eq!(
+            engine.context_service.expire_now().await.unwrap(),
+            vec!["expired"]
+        );
+        assert!(!path.exists());
+        assert!(
+            engine
+                .context_service
+                .expire_now()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_context_read_creates_no_files_or_directories() {
+        let temp = initialized();
+        let engine = build_light(temp.path()).await.unwrap();
+        assert!(engine.context.get("missing").await.unwrap().is_none());
+        assert!(engine.context.list().await.unwrap().is_empty());
+        assert!(engine.context.get_all().await.unwrap().is_empty());
+        assert!(!engine.paths.context_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn the_full_engine_expires_context_on_an_explicit_tick() {
+        let temp = initialized();
+        let clock = Arc::new(orch_core::test_support::FixedClock::at(1_760_000_000_000));
+        let full = build_full_with(
+            temp.path(),
+            EngineSeams {
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..deterministic_seams()
+            },
+        )
+        .await
+        .unwrap();
+        full.context
+            .set("expired", "value", Some(1000))
+            .await
+            .unwrap();
+        clock.advance_ms(1001);
+        let path = full.paths.context_path("expired").unwrap();
+        assert!(full.context.list().await.unwrap().is_empty());
+        assert!(path.exists());
+        full.orchestrator
+            .start_watch(crate::WatchOptions {
+                skip_autonomous_seeding: true,
+                handle_signals: false,
+            })
+            .await
+            .unwrap();
+        let removed = !path.exists();
+        full.orchestrator.stop().await.unwrap();
+        assert!(
+            removed,
+            "initial tick should run explicit context maintenance"
+        );
     }
 }

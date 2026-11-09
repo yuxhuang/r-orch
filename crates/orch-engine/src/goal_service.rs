@@ -144,6 +144,11 @@ impl GoalService {
         new_status: GoalStatus,
         force: bool,
     ) -> Result<Goal> {
+        // Lock order: orchestrator state -> dispatch gate. Pause never takes state.
+        let _dispatch = match &self.task_service {
+            Some(tasks) => Some(tasks.dispatch_gate.lock().await),
+            None => None,
+        };
         let mut goal = self.get(id).await?;
         let old_status = goal.status;
 
@@ -171,10 +176,8 @@ impl GoalService {
             if new_status == GoalStatus::Paused {
                 // Autonomous is disabled first so this agent's idle seeding
                 // stops proposing new work before the cancel. Best-effort
-                // only: the flag gates seeding, not dispatch, and stays on if
-                // another active goal keeps it. There is no cross-process
-                // dispatch fence, so a concurrent orchestrator can still start
-                // a listed task before its cancel lands (and then lose it).
+                // only: another active goal may keep it enabled. The dispatch
+                // gate fences the status save and these cancellations against spawn.
                 self.maybe_disable_autonomous(assignee).await;
                 self.cancel_pending_autonomous_tasks(id, assignee).await;
             } else if new_status == GoalStatus::Active && old_status == GoalStatus::Paused {
@@ -297,7 +300,7 @@ impl GoalService {
         {
             // A task that refuses to cancel must not abort the whole force, so
             // per-task failures are dropped.
-            let _ = tasks.cancel(&task.id).await;
+            let _ = tasks.cancel_record(&task.id).await;
         }
 
         let running: Vec<Task> = pending
@@ -364,7 +367,7 @@ impl GoalService {
         }
 
         for task in pending {
-            let _ = tasks.cancel(&task.id).await;
+            let _ = tasks.cancel_record(&task.id).await;
         }
     }
 }

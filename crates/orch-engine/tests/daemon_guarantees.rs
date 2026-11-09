@@ -13,17 +13,8 @@
 //! and a current-thread runtime where "is this future blocked?" is answered by
 //! polling it a bounded number of times — never by sleeping.
 //!
-//! ## Pending API (section marked `B0 PROPOSED API`)
-//!
-//! `ContextStore::expire_now` does not exist yet; its test sits behind
-//! `#[cfg(daemon_engine_b0)]` so the rest of this file builds and runs. B0
-//! removes the attribute when it lands the method (compile it first with
-//! `RUSTFLAGS='--cfg daemon_engine_b0'` to see the missing-API error).
-
-#![allow(
-    unexpected_cfgs,
-    reason = "daemon_engine_b0 marks the not-yet-implemented expire_now test"
-)]
+//! Explicit expiry uses the inherent `FileContextStore::expire_now` API;
+//! the existing core store trait remains unchanged.
 
 #[allow(
     dead_code,
@@ -385,7 +376,7 @@ impl Harness {
             skill_loader: None,
         };
 
-        let harness = Harness {
+        Harness {
             orchestrator: Arc::new(Orchestrator::new(deps)),
             tasks: task_store,
             agents: agent_store,
@@ -396,18 +387,8 @@ impl Harness {
             processes: scripted,
             log,
             _recorder: recorder,
-        };
-        harness.wire_dispatch_fence();
-        harness
+        }
     }
-
-    /// B0 WIRING POINT. Today the goal service and the orchestrator share no
-    /// state, which is the defect under test. When B0 introduces whatever
-    /// serialises pause with dispatch (proposal sent to B0:
-    /// `Orchestrator::dispatch_fence()` handed to
-    /// `GoalService::with_dispatch_fence(..)`), connect it **here** — this is
-    /// the only place the tests depend on the mechanism.
-    fn wire_dispatch_fence(&self) {}
 
     fn log(&self) -> Vec<Mark> {
         lock(&self.log).clone()
@@ -849,16 +830,14 @@ mod context_expiry {
         assert_untouched(&f.root, &before, "a read with nothing expired");
     }
 
-    // ── B0 PROPOSED API ─────────────────────────────────────────────────
+    // ── Explicit expiry ─────────────────────────────────────────────────
     //
-    // `ContextStore::expire_now(&self) -> Result<Vec<String>>`: remove every
+    // `FileContextStore::expire_now(&self) -> Result<Vec<String>>`: remove every
     // expired entry file, rewrite the index once, return the removed keys
     // sorted. Idempotent; a call with nothing expired changes nothing on disk.
     //
-    // Does not compile until B0 adds the method. B0: delete the
-    // `#[cfg(daemon_engine_b0)]` attributes below when it lands.
+    // This API is inherent, so existing core store trait implementations stay unchanged.
 
-    #[cfg(daemon_engine_b0)]
     #[tokio::test]
     async fn expire_now_removes_exactly_the_expired_entries_and_reports_them() {
         let f = fixture().await;
@@ -877,7 +856,6 @@ mod context_expiry {
         );
     }
 
-    #[cfg(daemon_engine_b0)]
     #[tokio::test]
     async fn expire_now_with_nothing_expired_changes_nothing_on_disk() {
         let f = fixture().await;
@@ -890,7 +868,6 @@ mod context_expiry {
         assert_untouched(&f.root, &before, "a read with nothing expired");
     }
 
-    #[cfg(daemon_engine_b0)]
     #[tokio::test]
     async fn expire_now_twice_removes_nothing_the_second_time() {
         let f = fixture().await;
@@ -901,7 +878,6 @@ mod context_expiry {
         assert!(second.is_empty());
     }
 
-    #[cfg(daemon_engine_b0)]
     #[tokio::test]
     async fn a_key_renewed_before_the_expiry_step_survives_it() {
         // The lost-renewal race: `set` after the key expired but before the

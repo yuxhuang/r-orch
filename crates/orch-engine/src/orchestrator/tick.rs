@@ -49,6 +49,7 @@ impl Orchestrator {
         self.load_state(&mut slot).await?;
         let state = slot.as_mut().expect("state loaded");
 
+        self.expire_context().await?;
         self.reconcile(state).await?;
         if !self.inner.skip_autonomous_seeding.load(Ordering::SeqCst) {
             self.seed_autonomous_tasks().await;
@@ -433,10 +434,10 @@ impl Orchestrator {
 
         for task_id in due {
             let task = self.deps().task_store.get(&task_id).await?;
-            let Some(task) = task.filter(|task| is_dispatchable(task.status)) else {
+            if task.is_none_or(|task| !is_dispatchable(task.status)) {
                 continue;
-            };
-            self.dispatch_task(state, &task_id, Some(task)).await?;
+            }
+            self.dispatch_task(state, &task_id).await?;
         }
         Ok(())
     }

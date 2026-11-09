@@ -134,10 +134,7 @@ impl Orchestrator {
                 });
                 continue;
             }
-            if let Err(err) = self
-                .dispatch_task_to(state, &task.id, None, remote_only)
-                .await
-            {
+            if let Err(err) = self.dispatch_task_to(state, &task.id, remote_only).await {
                 if matches!(err, Error::Domain(DomainError::Workspace { .. })) {
                     self.record_workspace_dispatch_failure(state, &task.id, &all_tasks, &err)
                         .await;
@@ -288,7 +285,7 @@ impl Orchestrator {
             }
         }
 
-        let result = self.dispatch_task(state, task_id, None).await;
+        let result = self.dispatch_task(state, task_id).await;
 
         state.claimed = original_claimed;
         if !state.running.contains_key(task_id) {
@@ -307,10 +304,8 @@ impl Orchestrator {
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
-        prefetched: Option<Task>,
     ) -> Result<()> {
-        self.dispatch_task_to(state, task_id, prefetched, false)
-            .await
+        self.dispatch_task_to(state, task_id, false).await
     }
 
     /// [`Self::dispatch_task`], optionally limited to remote agents: the
@@ -319,7 +314,6 @@ impl Orchestrator {
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
-        prefetched: Option<Task>,
         remote_only: bool,
     ) -> Result<()> {
         // After a standalone signal nothing new is claimed (ruling 19).
@@ -341,10 +335,19 @@ impl Orchestrator {
             return Ok(());
         }
 
-        let task = match prefetched {
-            Some(task) => task,
-            None => self.deps().task_service.get(task_id).await?,
-        };
+        // A prefetched candidate may predate a pause/cancel. Keep the gate
+        // through execute, and read current records after entering it.
+        let _dispatch = self.deps().task_service.dispatch_gate.lock().await;
+        let task = self.deps().task_service.get(task_id).await?;
+        if let (Some(goal_id), Some(goals)) =
+            (task.goal_id.as_deref(), self.deps().goal_store.as_ref())
+            && goals
+                .get(goal_id)
+                .await?
+                .is_some_and(|goal| goal.status == orch_domain::GoalStatus::Paused)
+        {
+            return Ok(());
+        }
         // It may have finished through another path while it sat in a queue.
         // A task held for the owner's approval waits like a blocked one.
         if !is_dispatchable(task.status) || task.awaits_approval() {
