@@ -57,15 +57,34 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // "someone quietly improved the layering" into a failure that had to be
     // looked at rather than a diff nobody read.
     ("orch-tui", &["orch-domain"]),
-    // The CLI is the top of the stack and may name anything below it.
+    // The local daemon protocol: data and pure codecs only, so a client crate
+    // can depend on it without gaining a store capability (design D1).
+    ("orch-proto", &["orch-domain"]),
+    // The per-project daemon composes everything that owns state.
     (
-        "orch-cli",
+        "orch-daemon",
         &[
             "orch-core",
             "orch-domain",
             "orch-engine",
             "orch-infra",
             "orch-peer",
+            "orch-proto",
+        ],
+    ),
+    // The CLI is the top of the stack and may name anything below it. The
+    // proto/daemon edges serve `orch daemon` in PR 1; PR 4 tightens this row
+    // to the client-only set (design D1).
+    (
+        "orch-cli",
+        &[
+            "orch-core",
+            "orch-daemon",
+            "orch-domain",
+            "orch-engine",
+            "orch-infra",
+            "orch-peer",
+            "orch-proto",
             "orch-tui",
         ],
     ),
