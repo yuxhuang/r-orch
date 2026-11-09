@@ -46,6 +46,24 @@
 //!   fixture that runs agents needs the daemon, and a fixture that runs
 //!   `orch serve` / `run --watch` in the foreground *is* its own daemon and
 //!   must not own a second one ("already running", exit 4).
+//! * The socket directory **must** be `0700` (the daemon refuses a group- or
+//!   world-accessible one, exit 7 "must be owned by uid … with no group or
+//!   world access"): `tempfile::Builder::tempdir_in("/tmp")` alone creates
+//!   `0755`, so fixtures that need their own directory use [`short_socket`]
+//!   (or add `.permissions(0o700)`).
+//! * Agents, doctor probes and agent-CLI version probes run **in the daemon**,
+//!   so a fake agent `PATH`, a recording directory or `ORCH_FAKE_VERSION`
+//!   belong in the daemon's environment ([`TestDaemon::start_with_env`]), not
+//!   on the client command.
+//! * State a fixture writes by hand under `.orchestry/` goes in while no
+//!   daemon runs ([`OwnedDir::with_daemon_stopped`], or `stop_daemon` /
+//!   `start_daemon` on the fixture's own wrapper); a running daemon neither
+//!   sees nor keeps it. Corruption that must be planted under a running
+//!   daemon (a directory replaced by a file) is done in place.
+//! * A fixture that spawns a foreground `serve` / `run --watch` / `daemon
+//!   start` by hand waits for `orch daemon status` to succeed before it
+//!   issues a client command: the socket listens a moment after the PID lock
+//!   is taken.
 //! * A fixture that builds a command before it has a daemon uses
 //!   [`apply_env`]; a fixture that wants "no daemon" simply does not apply
 //!   the socket env.

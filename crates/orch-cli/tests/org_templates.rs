@@ -979,7 +979,7 @@ fn hostile_documents() -> Vec<(&'static str, Vec<u8>, &'static str)> {
         (
             "two YAML documents",
             b"name: extra\nrole: x\n---\nname: extra\nrole: y\n".to_vec(),
-            "more than one document",
+            "exactly one YAML document",
         ),
         (
             "duplicate YAML keys",
