@@ -441,6 +441,14 @@ impl Running {
                         path.display()
                     )));
                 }
+                SocketState::Indeterminate(kind) => {
+                    return Err(DaemonError::InvalidArguments(format!(
+                        "{} could not be probed ({kind}), so it may still have a live listener; \
+                         it was left alone. Check its owner and mode, or set ORCH_SOCKET to a \
+                         different path",
+                        path.display()
+                    )));
+                }
                 SocketState::Unsafe(what) => {
                     return Err(DaemonError::InvalidArguments(format!(
                         "{} is {what}; it is never removed automatically. Remove it yourself \
