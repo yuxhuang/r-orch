@@ -39,6 +39,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `parse`, the tests) gets it.
 #[derive(Debug)]
 pub struct Cli {
+    /// Caller identity; supplied before the command to distinguish filter flags.
+    pub agent: Option<String>,
     pub json: bool,
     pub yaml: bool,
     pub quiet: bool,
@@ -59,6 +61,12 @@ pub struct Cli {
     disable_help_flag = false
 )]
 struct RawCli {
+    #[arg(
+        long,
+        value_name = "agent-id",
+        help = "Caller identity (overrides ORCH_AGENT_ID; place before the command)"
+    )]
+    agent: Option<String>,
     #[arg(long, global = true, help = "Output as JSON")]
     json: bool,
     #[arg(long, global = true, conflicts_with = "json", help = "Output as YAML")]
@@ -95,6 +103,7 @@ impl clap::FromArgMatches for Cli {
     /// all visible here, after parsing.
     fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
         let RawCli {
+            agent,
             json,
             yaml,
             quiet,
@@ -109,6 +118,7 @@ impl clap::FromArgMatches for Cli {
             ));
         }
         Ok(Cli {
+            agent,
             json,
             yaml,
             quiet,
@@ -165,7 +175,7 @@ pub enum Command {
     Tui(TuiCmd),
     /// Headless daemon mode — structured logs to stdout
     Serve(ServeCmd),
-    /// Manage the developmental project daemon
+    /// Manage the project daemon
     Daemon(crate::commands::daemon::DaemonCmd),
     /// Serve the TUI dashboard in a browser (xterm.js over a websocket)
     Web(WebCmd),
@@ -928,7 +938,9 @@ pub struct RunCmd {
     pub task_id: Option<String>,
     #[arg(long, help = "Run all todo tasks")]
     pub all: bool,
-    #[arg(long, help = "Watch mode: continuous orchestration")]
+    #[arg(long, help = "Run one scheduling tick through the running daemon")]
+    pub once: bool,
+    #[arg(long, help = "Start a foreground daemon with dispatch ON")]
     pub watch: bool,
     #[arg(long, help = "Include agent output in watch mode")]
     pub verbose: bool,
@@ -937,16 +949,7 @@ pub struct RunCmd {
 // ── tui ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Args)]
-pub struct TuiCmd {
-    #[command(flatten)]
-    pub peer: PeerFlags,
-    #[arg(
-        long,
-        help = "Do not start the orchestrator; watch the project as an observer. \
-                Not read-only: tasks and agents can still be changed and run from here"
-    )]
-    pub observe: bool,
-}
+pub struct TuiCmd {}
 
 // ── serve ──────────────────────────────────────────────────────────────────
 
@@ -1240,6 +1243,7 @@ mod tests {
             &["[task-id]"],
             &[
                 "--all",
+                "--once",
                 "--watch",
                 "--verbose",
                 "--listen <ADDR>",
@@ -1247,11 +1251,7 @@ mod tests {
             ],
         ),
         ("doctor", &[], &[]),
-        (
-            "tui",
-            &[],
-            &["--observe", "--listen <ADDR>", "--peer-name <NAME>"],
-        ),
+        ("tui", &[], &[]),
         (
             "serve",
             &[],
@@ -1278,6 +1278,35 @@ mod tests {
         ),
         ("update", &[], &["--check"]),
     ];
+
+    #[test]
+    fn caller_identity_precedes_the_command_and_does_not_replace_log_filters() {
+        let cli = Cli::try_parse_from([
+            "orch",
+            "--agent",
+            "agt_caller",
+            "logs",
+            "--agent",
+            "agt_filter",
+        ])
+        .unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("agt_caller"));
+        let Some(Command::Logs(args)) = cli.command else {
+            panic!("logs command")
+        };
+        assert_eq!(args.agent.as_deref(), Some("agt_filter"));
+    }
+
+    #[test]
+    fn run_once_is_a_parsed_rpc_mode_and_the_dashboard_has_no_owner_flags() {
+        let cli = Cli::try_parse_from(["orch", "run", "--once"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run(RunCmd { once: true, .. }))
+        ));
+        assert!(Cli::try_parse_from(["orch", "tui", "--observe"]).is_err());
+        assert!(Cli::try_parse_from(["orch", "tui", "--listen"]).is_err());
+    }
 
     /// Walk to the clap subcommand a dotted path names.
     fn find(path: &str) -> clap::Command {
@@ -1306,11 +1335,7 @@ mod tests {
             panic!("run")
         };
         assert_eq!(args.peer.listen.as_deref(), Some("127.0.0.1:1234"));
-        let cli = Cli::try_parse_from(["orch", "tui", "--listen"]).unwrap();
-        let Some(Command::Tui(args)) = cli.command else {
-            panic!("tui")
-        };
-        assert_eq!(args.peer.listen.as_deref(), Some("127.0.0.1:7690"));
+        assert!(Cli::try_parse_from(["orch", "tui", "--listen"]).is_err());
     }
 
     #[test]
