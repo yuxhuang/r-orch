@@ -27,6 +27,20 @@ impl HostedPeer {
     /// link and resets stale peer status. `--listen` / `--peer-name` were
     /// applied to the engine's peer config at build.
     pub(crate) async fn prepare(engine: Arc<FullEngine>) -> Result<HostedPeer, DaemonError> {
+        // Before the bind, on stderr and not through `tracing` (silent unless
+        // RUST_LOG): an unauthenticated listener beyond loopback must always
+        // be announced, whether `--listen` or config.yml chose it (security
+        // review F1). Detached, it lands in `.orchestry/daemon.log`.
+        if let Some(warning) = engine
+            .config
+            .peer
+            .listen
+            .as_deref()
+            .and_then(orch_peer::exposure_warning)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr().lock(), "  ⚠ {warning}");
+        }
         Ok(HostedPeer {
             runtime: PeerRuntime::prepare(engine).await?,
         })

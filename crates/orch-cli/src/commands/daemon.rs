@@ -113,7 +113,20 @@ pub fn run(cli: &crate::tree::Cli, args: &DaemonCmd, cwd: &std::path::Path) -> E
             developmental: true,
         });
         match result {
-            Ok(prepared) => Some(prepared),
+            Ok(prepared) => {
+                // A detached daemon's own warning goes to daemon.log; repeat
+                // an explicit --listen here, where the owner sees it.
+                if args.detach
+                    && let Some(warning) = args
+                        .peer
+                        .listen
+                        .as_deref()
+                        .and_then(crate::commands::remote::exposure_warning)
+                {
+                    eprintln!("  ⚠ {warning}");
+                }
+                Some(prepared)
+            }
             Err(error) => return lifecycle_result(Err(error)),
         }
     } else {
