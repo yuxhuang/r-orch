@@ -187,7 +187,9 @@ async fn run_output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        // Its own group, so an abandoned probe's kill reaches what it forked.
+        .process_group(0);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -203,7 +205,11 @@ async fn run_output(
             source,
         })?;
         // Both pipes were requested above. Keep the child in this future so
-        // timeout/cancellation drops it with kill_on_drop, without detached tasks.
+        // timeout/cancellation drops it with kill_on_drop, without detached
+        // tasks; the guard takes the rest of its group too.
+        let mut guard = child.id().map(|pid| {
+            crate::process::GroupKillGuard::new(&crate::process::SystemProcessManager, pid)
+        });
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let (stdout, stderr, status) = tokio::try_join!(
@@ -216,6 +222,9 @@ async fn run_output(
             path: None,
             source,
         })?;
+        if let Some(guard) = guard.as_mut() {
+            guard.disarm();
+        }
         Ok(std::process::Output {
             status,
             stdout,
@@ -755,5 +764,40 @@ mod tests {
         ]).await.unwrap_err().to_string();
         assert!(error.contains("CALLER_STDERR_CANARY"));
         assert!(error.len() < 66 * 1024, "captured {} bytes", error.len());
+    }
+
+    /// A cancelled request drops its probe future: the probe's own children
+    /// must go with it, not only the direct child `kill_on_drop` reaches.
+    #[tokio::test]
+    async fn an_abandoned_probe_takes_what_it_forked_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("forked");
+        let script = format!("/bin/sleep 60 & echo $! > '{}'; wait", pid_file.display());
+        let forked = async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let args = ["-c", script.as_str()];
+        let pid = tokio::select! {
+            _ = SystemDiscoveryRuntime.run_command("/bin/sh", &args) => {
+                panic!("the probe cannot finish on its own")
+            }
+            pid = forked => nix::unistd::Pid::from_raw(pid),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while nix::sys::signal::kill(pid, None).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe's forked child {pid} outlived it"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

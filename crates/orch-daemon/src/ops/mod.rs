@@ -130,6 +130,37 @@ impl ServiceHandler {
         &self.coordinator
     }
 
+    /// Run a probe under its deadline, and end it as soon as nobody waits
+    /// for it: its request was cancelled, its session closed, or the daemon
+    /// is stopping. A probe has no state effect, so it ends with its caller
+    /// rather than holding the session drain and shutdown for its full
+    /// deadline; dropping the probe future kills its child's process group.
+    /// Callers box this: inlined in every generated arm it would grow each
+    /// operation's future.
+    async fn diagnostic<T>(
+        &self,
+        ctx: &OpContext,
+        probe: impl Future<Output = OpResult<T>>,
+    ) -> OpResult<T> {
+        use orch_proto::error::{ErrorCode, Execution};
+        let abandoned = async {
+            while !ctx.is_cancelled() && !self.coordinator.is_stopping() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+        let deadline = tokio::time::timeout(std::time::Duration::from_secs(120), probe);
+        tokio::select! {
+            output = deadline => output.map_err(|_| {
+                ErrorBody::new(ErrorCode::General, "diagnostic deadline exceeded", Execution::Unknown)
+            })?,
+            () = abandoned => Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "diagnostic cancelled",
+                Execution::Unknown,
+            )),
+        }
+    }
+
     /// Session teardown discards transfers/observers; accepted state work is
     /// owned by the dispatcher task and is allowed to finish.
     pub async fn disconnect(&self, session_id: u64) -> OpResult<()> {
@@ -294,8 +325,7 @@ macro_rules! implement_handler {
                         match request {
                             $( Request::$variant(args) => {
                                 let output = if matches!(name,"doctor.run" | "models.catalog") {
-                                    tokio::time::timeout(std::time::Duration::from_secs(120), ServiceHandler::$method(self,&ctx,args)).await
-                                        .map_err(|_| ErrorBody::new(orch_proto::error::ErrorCode::General,"diagnostic deadline exceeded",orch_proto::error::Execution::Unknown))??
+                                    Box::pin(self.diagnostic(&ctx, ServiceHandler::$method(self,&ctx,args))).await?
                                 } else { ServiceHandler::$method(self,&ctx,args).await? };
                                 encode(output)
                             }, )*

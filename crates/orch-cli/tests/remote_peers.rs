@@ -351,6 +351,11 @@ impl Peer {
     }
 
     fn start(&self, listen: Option<SocketAddr>) {
+        self.start_with_path(listen, None);
+    }
+
+    /// [`Peer::start`] with the owner's `PATH` replaced.
+    fn start_with_path(&self, listen: Option<SocketAddr>, path: Option<&std::ffi::OsStr>) {
         assert!(self.owner.borrow().is_none(), "already running");
         self.release_seed();
         let copied = self.home.join("orch-copy");
@@ -362,6 +367,9 @@ impl Peer {
         let mut command = self.command(executable);
         // A foreground `serve` is an explicit daemon start with dispatch ON.
         command.args(["serve", "--peer-name", &self.name]);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
         if let Some(addr) = listen {
             command.args(["--listen", &addr.to_string()]);
         }
@@ -1397,7 +1405,10 @@ fn s22c_sigterm_tui_leaves_the_daemon_and_its_remote_run_untouched() {
     let controller_addr = port();
     controller.ok(&["remote", "add", "w1", &worker_addr.to_string()]);
     worker.start(Some(worker_addr));
-    controller.start(Some(controller_addr));
+    // The dashboard asks the daemon for every adapter's model list on its
+    // first tick, and the daemon runs those probes: keep the developer's own
+    // agent CLIs off the daemon's PATH.
+    controller.start_with_path(Some(controller_addr), Some(&controller.dashboard_path()));
     let peers = [&controller, &worker];
     controller.online("w1", &peers);
     let task = controller.task(
@@ -1431,8 +1442,6 @@ fn s22c_sigterm_tui_leaves_the_daemon_and_its_remote_run_untouched() {
         }
     }
     command.env("TERM", "xterm-256color");
-    // The dashboard probes every adapter CLI for its model list on the first
-    // tick: keep the developer's own agent CLIs off its PATH.
     command.env("PATH", controller.dashboard_path());
     command.cwd(controller.dir.path());
     command.args(["tui"]);
@@ -1499,10 +1508,7 @@ fn s22c_sigterm_tui_leaves_the_daemon_and_its_remote_run_untouched() {
     let value = controller.wait_task(&task, "done", &peers);
     assert_eq!(value["attempts"], 1);
     assert_eq!(text(worker.path("effect")), "effect\n");
-    // After a dashboard session the daemon takes ~6 s to exit on SIGTERM
-    // (0.7 s without one): reported to the daemon owner (tsk_Gt0X3Br); the
-    // bound is widened for this one case rather than for every shutdown.
-    sigterm_owner_within(&controller, Duration::from_secs(15));
+    sigterm_owner(&controller);
     sigterm_owner(&worker);
 }
 

@@ -281,6 +281,40 @@ fn spawn_with(
     Ok(SpawnedChild::from_tokio(pid, stdout, stderr, stdin, exit))
 }
 
+/// SIGKILLs a probe child's whole process group when dropped before
+/// [`GroupKillGuard::disarm`]. A diagnostic whose caller gave up (deadline,
+/// cancelled request, closed session) drops its future; without this the
+/// child, and anything it forked, would outlive the request that asked for
+/// it. The kill goes through `manager`, so a fake manager never sees a real
+/// signal for its fake pids.
+pub struct GroupKillGuard<'a> {
+    manager: &'a dyn ProcessManager,
+    pid: Option<u32>,
+}
+
+impl<'a> GroupKillGuard<'a> {
+    /// Arm for `pid`, which must lead its own process group.
+    pub fn new(manager: &'a dyn ProcessManager, pid: u32) -> Self {
+        Self {
+            manager,
+            pid: Some(pid),
+        }
+    }
+
+    /// The child has been waited for: nothing is left to kill.
+    pub fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupKillGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            self.manager.kill(pid, Signal::Kill);
+        }
+    }
+}
+
 fn spawn_error(command: &str, source: std::io::Error) -> Error {
     // `Display` is exactly the user-facing message; the io error stays in the source
     // chain for `ORCHESTRY_DEBUG`.
