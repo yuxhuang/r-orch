@@ -25,10 +25,27 @@
 //! own process group (dispatch stays OFF, the daemon default), waits for its
 //! `listening <socket>` line, and fails fast if the child exits first.
 //! [`TestDaemon::shutdown`] (also run by `Drop`) sends SIGTERM (the daemon's
-//! documented clean exit), falls back to SIGKILL of the process group, and then takes a **process
-//! table** snapshot: nothing in the daemon's group and nothing whose command
-//! line names the socket directory may survive. A survivor is killed and the
-//! teardown panics (unless the test is already unwinding).
+//! documented clean exit, ~0.1 s; `orch daemon stop` polls for ~1 s, which adds
+//! minutes to fixtures that start hundreds of daemons), falls back to SIGKILL
+//! of the process group, and then takes a **process-table** snapshot: nothing
+//! in the daemon's group and nothing whose command line names the unique
+//! socket directory may survive. A survivor is killed and the teardown panics
+//! (unless the test is already unwinding).
+//!
+//! # Using it from a fixture
+//!
+//! * Start the daemon **last**, after everything the fixture writes by hand
+//!   (a cached peer snapshot, a `remotes.yml`): a running daemon owns the
+//!   state and its peer runtime rewrites `remotes/<alias>.json`.
+//! * Own it next to the project directory so it is dropped first
+//!   ([`OwnedDir`], or a struct with the daemon declared before the `TempDir`).
+//! * Fixtures keyed by working directory (`orch(cwd)`) call
+//!   [`register_project`] once and [`apply_for`] in their command constructor;
+//!   launchers that take an env list (tmux `-e`) use [`env_pairs_for`].
+//! * A fixture that still runs a legacy in-process orchestrator
+//!   (`orch run <id>`, `run --all`, `serve`) must not own a daemon yet: both
+//!   take the PID lock ("Orchestrator already running"). Those fixtures start
+//!   the daemon after S2a-cli turns the commands into daemon RPCs.
 //!
 //! # Gate env
 //!

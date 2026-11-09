@@ -172,8 +172,12 @@ fn teardown_fails_loudly_when_a_process_naming_the_socket_dir_survives() {
         .spawn()
         .expect("spawn leak");
     let leaked = catch_unwind(AssertUnwindSafe(|| daemon.shutdown()));
-    // The teardown killed it, but only after reporting it.
-    let reaped = leak.wait().expect("reap leak");
+    // Teardown must have killed the survivor itself, after reporting it. Check
+    // before cleaning up ourselves, and never block on a survivor that a
+    // broken teardown left alive.
+    let killed_by_teardown = leak.try_wait().expect("poll leak").is_some();
+    let _ = leak.kill();
+    let _ = leak.wait();
     assert!(leaked.is_err(), "a survivor must fail the teardown");
-    assert!(!reaped.success(), "survivor was killed: {reaped}");
+    assert!(killed_by_teardown, "the teardown must kill what it reports");
 }
