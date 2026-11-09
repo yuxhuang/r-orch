@@ -1978,34 +1978,82 @@ fn builtin_and_unknown_templates_are_read_only_for_update_and_patch() {
 }
 
 #[test]
-#[ignore = "S2a-cli: org template mutations now go through Rpc::connect, and \
-            Rpc::connect dials a project daemon via Project::discover, which \
-            requires `.orchestry` to exist; mutating a template with no \
-            project at all is no longer possible. Needs a decision on \
-            whether template authoring should get a projectless/local \
-            daemon mode, or whether this contract should simply be dropped."]
-fn mutations_need_no_project_and_create_no_project_state() {
+fn template_commands_require_a_project_before_parsing_or_contacting_a_daemon() {
+    use std::os::unix::net::UnixListener;
+
     let sb = bare_sandbox();
-    let root = small_team(&sb, "noproj");
-    echoed(patch_agent(
-        &sb,
-        &root,
-        "worker",
-        &json!({"description": "x"}),
-    ));
-    echoed(update_agent(
-        &sb,
-        &root,
-        "worker",
-        &json!({"name": "worker", "role": "r"}),
-    ));
-    echoed(patch_org(&sb, &root, &json!({"description": "x"})));
-    echoed(update_org(
-        &sb,
-        &root,
-        &json!({"schema_version": 1, "name": "noproj", "lead": "lead"}),
-    ));
-    assert!(!sb.project().join(".orchestry").exists());
+    let sockets = tempfile::Builder::new()
+        .prefix("ot-")
+        .tempdir_in("/tmp")
+        .expect("short socket directory");
+    let socket = sockets.path().join("s");
+    let listener = UnixListener::bind(&socket).expect("listen for unexpected daemon contact");
+    listener.set_nonblocking(true).expect("nonblocking socket");
+
+    for args in [
+        vec!["list"],
+        vec!["show", "a-team"],
+        vec!["init", "new-team"],
+        vec!["edit", "a-team"],
+        vec!["update", "a-team", "--file", "-"],
+        vec!["patch", "a-team", "--file", "-"],
+        vec!["agent", "list", "a-team"],
+        vec!["agent", "add", "a-team", "--file", "-"],
+        vec!["agent", "edit", "a-team", "worker"],
+        vec!["agent", "update", "a-team", "worker", "--file", "-"],
+        vec!["agent", "patch", "a-team", "worker", "--file", "-"],
+        vec!["agent", "delete", "a-team", "worker"],
+        // The routing guard must also precede help and usage errors. These
+        // distinguish it from the project lookup inside Rpc::connect.
+        vec!["--help"],
+        vec!["patch", "--unknown-option"],
+    ] {
+        let output = run_bounded(
+            sb.command()
+                .env("ORCH_SOCKET", &socket)
+                .env("ORCH_TEST_SOCKET_ROOT", sockets.path())
+                .args(["org", "template"])
+                .args(&args),
+            None,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "org template {args:?}: {}",
+            transcript(&output)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "  ✕ Not initialized\n    Run: orch init\n",
+            "org template {args:?}"
+        );
+        assert!(output.stdout.is_empty(), "{}", transcript(&output));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "org template {args:?} contacted a daemon before rejecting the missing project"
+        );
+        assert!(
+            fs::read_dir(sb.home())
+                .expect("sandbox directory")
+                .next()
+                .is_none(),
+            "org template {args:?} created home state"
+        );
+        assert!(
+            fs::read_dir(sb.project())
+                .expect("sandbox directory")
+                .next()
+                .is_none(),
+            "org template {args:?} created project state"
+        );
+        assert!(
+            fs::read_dir(sb.work())
+                .expect("sandbox directory")
+                .next()
+                .is_none(),
+            "org template {args:?} created template state"
+        );
+    }
 }
 
 #[test]
