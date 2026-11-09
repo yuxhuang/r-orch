@@ -1,0 +1,407 @@
+//! The one place binary-level fixtures get an explicit test daemon (T2b).
+//!
+//! Every fixture that runs the `orch` binary against a throwaway project
+//! starts its own daemon here, on an isolated socket, and stops it before the
+//! test ends. No test may reach a real project's daemon or `~/.orchestry`.
+//!
+//! # Socket-path scheme
+//!
+//! * The socket lives at `<short>/s`, where `<short>` is a fresh `0700`
+//!   directory `/tmp/otd-XXXXXX` (`mkdtemp`-style, 11 characters after
+//!   `/tmp/`), so the full path is ≈ 19 bytes — far under the 100-byte
+//!   budget (macOS `sun_path` is 104). The project directory is *not* used:
+//!   `$TMPDIR` on macOS (`/var/folders/…`) plus a project path overflows it.
+//! * `ORCH_SOCKET=<short>/s` is the only endpoint the daemon binds and the
+//!   clients dial. `ORCH_TEST_SOCKET_ROOT=<short>` makes the client refuse any
+//!   socket outside that directory, so a stray environment cannot send a
+//!   fixture to someone else's daemon.
+//! * A fixture's child commands get exactly those two variables (plus the
+//!   developmental gate) through [`TestDaemon::apply`]; nothing else about
+//!   their environment is changed.
+//!
+//! # Lifecycle
+//!
+//! [`TestDaemon::start`] spawns a **foreground** `orch daemon start` in its
+//! own process group (dispatch stays OFF, the daemon default), waits for its
+//! `listening <socket>` line, and fails fast if the child exits first.
+//! [`TestDaemon::shutdown`] (also run by `Drop`) runs `orch daemon stop`,
+//! falls back to SIGKILL of the process group, and then takes a **process
+//! table** snapshot: nothing in the daemon's group and nothing whose command
+//! line names the socket directory may survive. A survivor is killed and the
+//! teardown panics (unless the test is already unwinding).
+//!
+//! # Gate env
+//!
+//! `ORCH_DAEMON_DEVELOPMENTAL=1` is set on the **children only**, never in
+//! the test process, and only until S2a-cli removes the gate (then delete
+//! [`GATE_ENV`] and its use in [`TestDaemon::apply`] / [`TestDaemon::start`]).
+//!
+//! # Until the CLI is converted (S2a-cli)
+//!
+//! The legacy commands still go straight to the store, so a fixture that has a
+//! daemon running keeps passing through the legacy path; the daemon is idle
+//! (dispatch OFF) beside it. That is expected and not asserted on.
+#![allow(dead_code, reason = "each test crate uses a subset of this module")]
+
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
+
+/// The developmental gate PR 1 puts on `orch daemon …`; removed with S2a-cli.
+pub const GATE_ENV: &str = "ORCH_DAEMON_DEVELOPMENTAL";
+
+/// Upper bound on readiness, `daemon stop` and group exit. Finite so a daemon
+/// regression fails the test instead of hanging CI; generous because the whole
+/// test binary shares the machine with other threads.
+const WAIT: Duration = Duration::from_secs(30);
+/// Slice between `try_wait` checks (an upper bound on exit-detection latency,
+/// not a pacing delay).
+const POLL: Duration = Duration::from_millis(20);
+/// The longest socket path the daemon accepts.
+const MAX_SOCKET_BYTES: usize = 100;
+
+/// A running foreground test daemon plus its isolated socket directory.
+pub struct TestDaemon {
+    child: Child,
+    pgid: i32,
+    root: PathBuf,
+    home: PathBuf,
+    socket: PathBuf,
+    short: tempfile::TempDir,
+    /// Set once [`TestDaemon::shutdown`] has run to completion.
+    done: bool,
+}
+
+impl TestDaemon {
+    /// Start `orch daemon start` for the initialised project at `root`.
+    ///
+    /// `home` is the fixture's private `HOME`; the daemon also gets
+    /// `ORCHESTRY_GLOBAL_CONFIG_PATH=<home>/global.yml` so it cannot read the
+    /// developer's global config. The environment is otherwise cleared, with a
+    /// `PATH` that holds no agent CLI (dispatch is OFF, so none is run).
+    pub fn start(root: &Path, home: &Path) -> TestDaemon {
+        let root = root.canonicalize().expect("project root exists");
+        fs::create_dir_all(home).expect("fixture HOME");
+        let home = home.canonicalize().expect("fixture HOME exists");
+        let short = tempfile::Builder::new()
+            .prefix("otd-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .expect("short socket dir under /tmp");
+        let socket = short.path().join("s");
+        assert!(
+            socket.as_os_str().len() <= MAX_SOCKET_BYTES,
+            "socket path {} exceeds {MAX_SOCKET_BYTES} bytes",
+            socket.display()
+        );
+        let err_path = short.path().join("daemon.err");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orch"));
+        command
+            .env_clear()
+            .current_dir(&root)
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("NO_COLOR", "1")
+            .env("TERM", "xterm-256color")
+            .env("ORCHESTRY_GLOBAL_CONFIG_PATH", home.join("global.yml"))
+            .env("ORCH_PROJECT_ROOT", &root)
+            .env("ORCH_SOCKET", &socket)
+            .env("ORCH_TEST_SOCKET_ROOT", short.path())
+            .env(GATE_ENV, "1")
+            .args(["daemon", "start"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&err_path).expect("daemon stderr file"))
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn `orch daemon start`");
+        let pgid = i32::try_from(child.id()).expect("pid fits i32");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let lines = read_lines(stdout);
+        let mut daemon = TestDaemon {
+            child,
+            pgid,
+            root,
+            home,
+            socket,
+            short,
+            done: false,
+        };
+        daemon.await_ready(&lines, &err_path);
+        daemon
+    }
+
+    fn await_ready(&mut self, lines: &Receiver<Option<String>>, err_path: &Path) {
+        let deadline = Instant::now() + WAIT;
+        let want = format!("listening {}", self.socket.display());
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match lines.recv_timeout(left.min(POLL)) {
+                Ok(Some(line)) if line == want => return,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.child.try_wait().expect("try_wait").is_some() {
+                        // A readiness line printed just before exit may still
+                        // be queued; the loop above would have taken it.
+                        break;
+                    }
+                    assert!(
+                        left > Duration::ZERO,
+                        "test daemon not ready within {WAIT:?}: {}",
+                        fs::read_to_string(err_path).unwrap_or_default()
+                    );
+                }
+            }
+        }
+        let status = self.child.wait().expect("wait for the daemon child");
+        self.kill_group();
+        panic!(
+            "test daemon exited before readiness ({status}): {}",
+            fs::read_to_string(err_path).unwrap_or_default()
+        );
+    }
+
+    /// The isolated socket every client of this daemon must dial.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// The directory holding the socket (`ORCH_TEST_SOCKET_ROOT`).
+    pub fn socket_dir(&self) -> &Path {
+        self.short.path()
+    }
+
+    /// The canonical project root the daemon owns.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Point `command` at this daemon: `ORCH_SOCKET`, `ORCH_TEST_SOCKET_ROOT`
+    /// and the developmental gate. Touches nothing else in its environment.
+    pub fn apply(&self, command: &mut Command) {
+        apply_env(command, &self.socket, self.short.path());
+    }
+
+    /// `orch <args>` against this daemon, with the same cleared environment
+    /// the daemon runs in (for control calls such as `daemon status`).
+    pub fn control(&self, args: &[&str]) -> std::process::Output {
+        self.try_control(args).unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// [`control`](Self::control) that reports a timeout instead of panicking
+    /// (teardown must not panic while a test is already unwinding).
+    fn try_control(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orch"));
+        command
+            .env_clear()
+            .current_dir(&self.root)
+            .env("HOME", &self.home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("NO_COLOR", "1")
+            .env("TERM", "xterm-256color")
+            .env("ORCHESTRY_GLOBAL_CONFIG_PATH", self.home.join("global.yml"))
+            .env("ORCH_PROJECT_ROOT", &self.root)
+            .args(args)
+            .stdin(Stdio::null())
+            .process_group(0);
+        self.apply(&mut command);
+        output_within(command, WAIT)
+    }
+
+    /// Stop the daemon and prove nothing survived. Panics on a survivor.
+    pub fn shutdown(mut self) {
+        self.teardown(true);
+    }
+
+    fn teardown(&mut self, may_panic: bool) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        // Polite stop first. Its exit status is not the verdict: a daemon that
+        // already died (a test that crashed it on purpose) is a valid end state.
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.try_control(&["daemon", "stop"]);
+        }
+        if !self.wait_exit(WAIT) {
+            self.kill_group();
+            let _ = self.child.wait();
+        }
+        let survivors = self.survivors();
+        if !survivors.is_empty() {
+            for pid in &survivors {
+                let _ = nix::sys::signal::kill(Pid::from_raw(*pid), Signal::SIGKILL);
+            }
+            if may_panic && !std::thread::panicking() {
+                panic!(
+                    "processes survived the test daemon teardown (pids {survivors:?}, \
+                     socket dir {})",
+                    self.short.path().display()
+                );
+            }
+            eprintln!("test daemon teardown: killed survivors {survivors:?}");
+        }
+    }
+
+    fn wait_exit(&mut self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.child.try_wait().expect("try_wait").is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn kill_group(&self) {
+        let _ = killpg(Pid::from_raw(self.pgid), Signal::SIGKILL);
+    }
+
+    /// Pids of every process still in the daemon's group, or whose command line
+    /// names the unique socket directory. The leader is reaped, so a surviving
+    /// pgid member is a real leak, not the daemon itself.
+    fn survivors(&self) -> Vec<i32> {
+        let marker = self.short.path().to_string_lossy().into_owned();
+        let leader = self.pgid;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let found: Vec<i32> = process_table()
+                .into_iter()
+                .filter(|p| p.pgid == leader || p.command.contains(&marker))
+                // Never count the `ps` that took this very snapshot.
+                .filter(|p| !p.command.starts_with("/bin/ps") && !p.command.starts_with("ps "))
+                .map(|p| p.pid)
+                .collect();
+            // Group members may still be mid-exit right after SIGKILL: give the
+            // kernel a bounded window to reap them before calling it a leak.
+            if found.is_empty() || Instant::now() >= deadline {
+                return found;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        self.teardown(true);
+    }
+}
+
+/// Set the three variables that aim a command at `socket`. Free-standing so a
+/// fixture that builds its command before it has a daemon can still use it.
+pub fn apply_env(command: &mut Command, socket: &Path, socket_dir: &Path) {
+    command
+        .env("ORCH_SOCKET", socket)
+        .env("ORCH_TEST_SOCKET_ROOT", socket_dir)
+        .env(GATE_ENV, "1");
+}
+
+fn read_lines(stdout: std::process::ChildStdout) -> Receiver<Option<String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(Some(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(None);
+    });
+    rx
+}
+
+/// Run to completion under a deadline; on timeout kill the whole group.
+fn output_within(mut command: Command, within: Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let mut child = command.spawn().expect("spawn orch");
+    let pid = i32::try_from(child.id()).expect("pid fits i32");
+    let mut out = child.stdout.take().expect("piped");
+    let mut err = child.stderr.take().expect("piped");
+    let out = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out.read_to_end(&mut buf);
+        buf
+    });
+    let err = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + within;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+            let _ = child.wait();
+            return Err(format!("orch control call exceeded {within:?}"));
+        }
+        std::thread::sleep(POLL);
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().expect("stdout reader"),
+        stderr: err.join().expect("stderr reader"),
+    })
+}
+
+/// One row of `ps -axo pid=,ppid=,pgid=,command=`.
+#[derive(Debug, Clone)]
+pub struct Proc {
+    pub pid: i32,
+    pub pgid: i32,
+    pub command: String,
+}
+
+/// The whole process table (`ps` is the portable macOS/Linux reader).
+pub fn process_table() -> Vec<Proc> {
+    let out = Command::new("/bin/ps")
+        .args(["-axo", "pid=,pgid=,command="])
+        .output()
+        .expect("ps runs");
+    assert!(out.status.success(), "ps failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut rest = line.trim_start();
+            let mut number = || {
+                let end = rest.find(char::is_whitespace)?;
+                let (head, tail) = rest.split_at(end);
+                rest = tail.trim_start();
+                head.parse::<i32>().ok()
+            };
+            let pid = number()?;
+            let pgid = number()?;
+            Some(Proc {
+                pid,
+                pgid,
+                command: rest.to_owned(),
+            })
+        })
+        .collect()
+}
