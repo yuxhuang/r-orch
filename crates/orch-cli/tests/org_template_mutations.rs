@@ -1118,7 +1118,6 @@ impl Drop for Pty {
 }
 
 #[test]
-#[ignore = "production bug tsk_zEJDZyv: agent shop install sends skills the daemon rejects ('invalid type: map, expected a list')"]
 fn shop_installs_equal_the_resolved_preview_after_skills_were_mutated() {
     let sb = sandbox();
     let root = skills_team(&sb);

@@ -2474,7 +2474,6 @@ fn a_relative_definition_path_resolves_against_the_project_root_not_the_server_c
 // Design D12: a relative `attach` path resolves against the fixed project
 // root, not the server's working directory.
 #[test]
-#[ignore = "production bug tsk_ml1V-uw: the MCP bridge sends task_add attachments as plain strings, the wire wants tagged WirePath"]
 fn a_relative_attachment_path_resolves_against_the_project_root_not_the_server_cwd() {
     let (dir, mut server) = server_in_subdirectory();
     std::fs::write(dir.path().join("notes.txt"), "from the root").expect("attachment");
