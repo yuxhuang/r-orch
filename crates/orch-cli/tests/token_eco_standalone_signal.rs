@@ -20,9 +20,8 @@
 //!   run and settles its records;
 //! * `run --watch` and `serve` keep their behaviour: exit 0, nothing alive.
 
-#[path = "common/daemon.rs"]
-mod daemon;
 mod token_eco_support;
+use token_eco_support::daemon;
 
 use std::io::Read;
 use std::path::Path;

@@ -11,10 +11,9 @@
 //! init` and then starts an explicit test daemon on an isolated socket (see
 //! `tests/common/daemon.rs`), stopped with a process-table check when the
 //! sandbox drops. The few cases about behaviour *before* `orch init` use
-//! `bare_sandbox()`, which owns neither a project nor a daemon. A file a test
-//! writes by hand under the project's `.orchestry/` goes through
-//! `Sandbox::with_daemon_stopped`: the running daemon owns that state and
-//! would not see, or would overwrite, an edit made behind its back. Template
+//! `bare_sandbox()`, which owns neither a project nor a daemon. Corruption a
+//! test plants by hand under the project's `.orchestry/` is done in place under
+//! the *running* daemon (a restart would refuse to start over it). Template
 //! roots themselves (`--template-dir`, the user template root) are read by
 //! the daemon fresh on every request, so writing to them directly needs no
 //! such care.
@@ -181,23 +180,6 @@ impl Sandbox {
         let output = self.ok(&all);
         serde_yaml_ng::from_str(&stdout(&output))
             .unwrap_or_else(|e| panic!("stdout is not YAML ({e}):\n{}", stdout(&output)))
-    }
-
-    /// Stop the daemon (process table checked), run `edit` on the quiescent
-    /// project, then start a fresh daemon and re-register it. For a file a
-    /// test writes by hand under `.orchestry/`: a running daemon owns that
-    /// state and would not see, or would overwrite, an edit made behind its
-    /// back.
-    fn with_daemon_stopped(&mut self, edit: impl FnOnce(&Path)) {
-        daemon::unregister_project(&self.project());
-        self.daemon
-            .take()
-            .expect("the daemon is running")
-            .shutdown();
-        edit(&self.project());
-        let daemon = TestDaemon::start(&self.project(), &self.home());
-        daemon::register_project(&self.project(), &daemon);
-        self.daemon = Some(daemon);
     }
 
     /// Names of the agents in the project, sorted.
