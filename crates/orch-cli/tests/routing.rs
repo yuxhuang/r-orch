@@ -9,6 +9,10 @@ use std::process::Command;
 
 use assert_cmd::prelude::*;
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
 /// A directory with no `.orchestry` anywhere above it, which is what makes
 /// the exit-3 assertions mean anything — the project-root lookup walks up.
 fn empty_project() -> tempfile::TempDir {
@@ -31,6 +35,13 @@ fn orch(cwd: &Path) -> Command {
     let mut command = Command::cargo_bin("orch").expect("the orch binary");
     command
         .current_dir(cwd)
+        // Private HOME and global config under the throwaway directory, so no
+        // command here can read or write the developer's `~/.orchestry`.
+        .env("HOME", cwd.join(".test-home"))
+        .env(
+            "ORCHESTRY_GLOBAL_CONFIG_PATH",
+            cwd.join(".test-home").join("global.yml"),
+        )
         .env("NO_COLOR", "1")
         // Pin the terminal mode: the exact-glyph assertions expect the Unicode
         // `✕`, and an inherited `TERM=dumb` switches the CLI to its ASCII
@@ -46,18 +57,51 @@ fn orch(cwd: &Path) -> Command {
         // because `doctor` reports on those too.
         .env("PATH", "/usr/bin:/bin")
         .env_remove("ORCHESTRY_DEBUG");
+    daemon::apply_for(cwd, &mut command);
     command
 }
 
-/// `orch init` in a fresh directory, so the initialized-project cases have
-/// something to run against.
-fn initialized_project() -> tempfile::TempDir {
+/// An initialised project and its explicit test daemon (isolated short
+/// socket, `tests/common/daemon.rs`). `path()` is the project root.
+struct ProjectDir {
+    // Dropped first: the daemon stops before its directory is removed.
+    daemon: Option<TestDaemon>,
+    dir: tempfile::TempDir,
+}
+
+impl ProjectDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for ProjectDir {
+    fn drop(&mut self) {
+        daemon::unregister_project(self.dir.path());
+    }
+}
+
+/// `orch init` in a fresh directory, then a test daemon, so the
+/// initialized-project cases have something to run against.
+fn initialized_project() -> ProjectDir {
+    let mut project = initialized_project_unowned();
+    let home = project.path().join(".test-home");
+    let daemon = TestDaemon::start(project.path(), &home);
+    daemon::register_project(project.path(), &daemon);
+    project.daemon = Some(daemon);
+    project
+}
+
+/// Initialised, **no daemon**: for the cases that run a legacy in-process
+/// orchestrator (`run --all`, `serve`), which takes the PID lock a daemon
+/// holds, until S2a-cli turns those into daemon RPCs.
+fn initialized_project_unowned() -> ProjectDir {
     let dir = empty_project();
     orch(dir.path())
         .args(["init", "--name", "p", "--adapter", "shell"])
         .assert()
         .success();
-    dir
+    ProjectDir { daemon: None, dir }
 }
 
 fn stdout_of(output: &std::process::Output) -> String {
@@ -475,7 +519,9 @@ fn every_declared_command_is_wired() {
     // command any more, so the assertion is that no command *claims* to be
     // unwired. `orch tui` was the last one, and it needs a TTY, so it is
     // checked for the message rather than for success.
-    let dir = initialized_project();
+    // `run --all` is a legacy in-process orchestrator: no daemon (see
+    // `initialized_project_unowned`).
+    let dir = initialized_project_unowned();
     for argv in [vec!["tui"], vec!["run", "--all"], vec!["org", "list"]] {
         let output = orch(dir.path()).args(&argv).output().expect("run");
         let stderr = stderr_of(&output);

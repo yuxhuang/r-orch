@@ -314,6 +314,52 @@ impl Drop for TestDaemon {
     }
 }
 
+// ── per-project registry ───────────────────────────────────────────────────
+//
+// Fixtures whose command constructors are keyed by the working directory
+// (`orch(cwd)`, `orch_command(cwd)`) register their project's daemon here, so
+// the constructors keep their signatures and still aim every child under that
+// project at its own socket. Keys are unique temp roots, so concurrent tests
+// never see each other's entries.
+
+use std::sync::Mutex;
+
+/// `(canonical project root, socket, socket dir)`.
+static REGISTRY: Mutex<Vec<(PathBuf, PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Make [`apply_for`] aim commands under `root` at `daemon`.
+pub fn register_project(root: &Path, daemon: &TestDaemon) {
+    REGISTRY.lock().unwrap().push((
+        canonical(root),
+        daemon.socket().to_path_buf(),
+        daemon.socket_dir().to_path_buf(),
+    ));
+}
+
+/// Forget `root` (call before its daemon is dropped).
+pub fn unregister_project(root: &Path) {
+    let root = canonical(root);
+    REGISTRY.lock().unwrap().retain(|(r, _, _)| *r != root);
+}
+
+/// If `cwd` is inside a registered project, point `command` at its daemon.
+pub fn apply_for(cwd: &Path, command: &mut Command) {
+    let cwd = canonical(cwd);
+    let found = REGISTRY
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(root, _, _)| cwd.starts_with(root))
+        .map(|(_, socket, dir)| (socket.clone(), dir.clone()));
+    if let Some((socket, dir)) = found {
+        apply_env(command, &socket, &dir);
+    }
+}
+
 /// Set the three variables that aim a command at `socket`. Free-standing so a
 /// fixture that builds its command before it has a daemon can still use it.
 pub fn apply_env(command: &mut Command, socket: &Path, socket_dir: &Path) {

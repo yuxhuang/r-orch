@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -399,49 +399,15 @@ impl ProjectDir {
     pub fn start_daemon(&mut self) {
         assert!(self.daemon.is_none(), "daemon already started");
         let daemon = TestDaemon::start(self.dir.path(), &self.dir.path().join(".test-home"));
-        register(self.dir.path(), &daemon);
+        daemon::register_project(self.dir.path(), &daemon);
         self.daemon = Some(daemon);
     }
 }
 
 impl Drop for ProjectDir {
     fn drop(&mut self) {
-        unregister(self.dir.path());
+        daemon::unregister_project(self.dir.path());
     }
-}
-
-/// The socket every command under a registered project root must dial:
-/// `(canonical project root, socket, socket dir)`. Keyed by root so the
-/// cwd-based [`orch_command`] / [`McpServer::spawn`] signatures stay as they
-/// were; unique temp roots make concurrent tests independent.
-static DAEMONS: Mutex<Vec<(PathBuf, PathBuf, PathBuf)>> = Mutex::new(Vec::new());
-
-fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn register(root: &Path, daemon: &TestDaemon) {
-    DAEMONS.lock().unwrap().push((
-        canonical(root),
-        daemon.socket().to_path_buf(),
-        daemon.socket_dir().to_path_buf(),
-    ));
-}
-
-fn unregister(root: &Path) {
-    let root = canonical(root);
-    DAEMONS.lock().unwrap().retain(|(r, _, _)| *r != root);
-}
-
-/// The daemon endpoint for the project `cwd` is inside, if it has one.
-fn daemon_for(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
-    let cwd = canonical(cwd);
-    DAEMONS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|(root, _, _)| cwd.starts_with(root))
-        .map(|(_, socket, dir)| (socket.clone(), dir.clone()))
 }
 
 /// `orch init` in a fresh directory, then an explicit test daemon, so the
@@ -488,9 +454,7 @@ pub fn orch_command(cwd: &Path) -> Command {
         .env("PATH", "/usr/bin:/bin")
         .env_remove("ORCHESTRY_DEBUG")
         .env_remove("ORCH_AGENT_ID");
-    if let Some((socket, dir)) = daemon_for(cwd) {
-        daemon::apply_env(&mut command, &socket, &dir);
-    }
+    daemon::apply_for(cwd, &mut command);
     command
 }
 
