@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use mcp_common::{
     DESTRUCTIVE, EXPECTED, McpServer, ProjectDir, READ_ONLY, Rendezvous, error_code,
-    initialized_project, initialized_project_named, orch_command, output_of, spawn_bounded,
-    tool_text,
+    initialized_project, initialized_project_named, initialized_project_unowned, orch_command,
+    output_of, spawn_bounded, tool_text,
 };
 use serde_json::{Value, json};
 
@@ -433,10 +433,19 @@ fn task_cancel_of_a_finished_task_is_a_tool_error_and_keeps_its_status() {
 fn task_cancel_never_starts_an_orchestrator_or_leaves_a_project_lock() {
     let mut fx = Fx::destructive();
     let id = fx.task("t");
-    fx.ok("task_cancel", json!({"id": id}));
     let lock = fx.root().join(".orchestry/orchestrator.lock");
-    assert!(!lock.exists(), "task_cancel must be store-only");
-    assert!(!fx.root().join(".orchestry/state.json").exists());
+    let state = fx.root().join(".orchestry/state.json");
+    let read = |path: &Path| std::fs::read(path).ok();
+    let (lock_before, state_before) = (read(&lock), read(&state));
+    fx.ok("task_cancel", json!({"id": id}));
+    // The project's test daemon owns the lock and state; the cancel must not
+    // touch either (it is store-only until the daemon-routed cancel lands).
+    assert_eq!(
+        read(&lock),
+        lock_before,
+        "task_cancel changed the project lock"
+    );
+    assert_eq!(read(&state), state_before, "task_cancel changed state.json");
 }
 
 #[test]
@@ -2721,8 +2730,14 @@ fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
 
 /// A project that also works as a git repository, so `worktree` and
 /// `isolated` workspaces can be created.
+///
+/// **No daemon yet (legacy `orch run <task>`).** Every user of this project
+/// runs a worker through `orch run`, which until S2a-cli is an in-process
+/// orchestrator that takes the PID lock a test daemon would already hold
+/// ("Orchestrator already running"). After the cutover `run <id>` is an RPC to
+/// the daemon: start one here with `dir.start_daemon()` and delete this note.
 fn git_project(name: &str) -> ProjectDir {
-    let dir = initialized_project_named(name);
+    let dir = initialized_project_unowned(name);
     let git = |args: &[&str]| {
         // The fixture's own private HOME and the system directories only: no
         // developer-machine PATH entry, no inherited user git config.
