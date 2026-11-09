@@ -1,14 +1,17 @@
-//! Goal tools preserve CLI projections and gate `force` before Engine creation.
+//! Goal tools preserve CLI projections and gate `force` before the daemon
+//! is contacted (the daemon checks it again).
 use crate::mcp::{
-    projections,
-    registry::{CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta},
+    projections::{self, id},
+    registry::{
+        CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta, ToolResult,
+        json, wire,
+    },
 };
-use orch_core::{Error, Result};
-use orch_domain::CreateGoalInput;
-use orch_engine::goal_service::UpdateGoalFields;
+use orch_core::Result;
+use orch_proto::ops::args as rpc;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -143,88 +146,68 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     Ok(())
 }
 
-async fn add(cx: Arc<CallContext>, args: GoalAddArgs) -> Result<Value> {
+async fn add(cx: Arc<CallContext>, args: GoalAddArgs) -> ToolResult {
     let goal = cx
-        .engine
-        .goal_service
-        .create(CreateGoalInput {
-            title: args.title,
-            description: args.description,
-            assignee: args.assignee,
+        .request(wire::<rpc::GoalCreateArgs>(json!({
+            "title": args.title,
+            "description": args.description,
+            "assignee": args.assignee,
+        }))?)
+        .await?;
+    json(&goal, "goal")
+}
+async fn list(cx: Arc<CallContext>, args: GoalListArgs) -> ToolResult {
+    projections::goals(&cx, args.status.as_deref()).await
+}
+async fn show(cx: Arc<CallContext>, args: GoalShowArgs) -> ToolResult {
+    projections::goal(&cx, &args.id).await
+}
+async fn status(cx: Arc<CallContext>, args: GoalStatusArgs) -> ToolResult {
+    let goal = cx
+        .request(rpc::GoalStatusArgs {
+            id: id(&args.id)?,
+            status: args.status.into(),
+            force: args.force,
         })
         .await?;
-    serde_json::to_value(goal).map_err(|_| Error::other("serialize goal"))
+    json(&goal, "goal")
 }
-async fn list(cx: Arc<CallContext>, args: GoalListArgs) -> Result<Value> {
-    projections::goals(&cx.engine, args.status.as_deref()).await
-}
-async fn show(cx: Arc<CallContext>, args: GoalShowArgs) -> Result<Value> {
-    projections::goal(&cx.engine, &args.id).await
-}
-async fn status(cx: Arc<CallContext>, args: GoalStatusArgs) -> Result<Value> {
+async fn update(cx: Arc<CallContext>, args: GoalUpdateArgs) -> ToolResult {
     let goal = cx
-        .engine
-        .goal_service
-        .update_status(&args.id, args.status.into(), args.force)
+        .request(wire::<rpc::GoalUpdateArgs>(json!({
+            "id": args.id,
+            "title": args.title,
+            "description": args.description,
+            "assignee": args.assignee,
+        }))?)
         .await?;
-    serde_json::to_value(goal).map_err(|_| Error::other("serialize goal"))
+    json(&goal, "goal")
 }
-async fn update(cx: Arc<CallContext>, args: GoalUpdateArgs) -> Result<Value> {
-    let goal = cx
-        .engine
-        .goal_service
-        .update(
-            &args.id,
-            &UpdateGoalFields {
-                title: args.title,
-                description: args.description,
-                assignee: args.assignee,
-            },
-        )
+async fn delete(cx: Arc<CallContext>, args: GoalDeleteArgs) -> ToolResult {
+    cx.request(rpc::GoalDeleteArgs { id: id(&args.id)? })
         .await?;
-    serde_json::to_value(goal).map_err(|_| Error::other("serialize goal"))
-}
-async fn delete(cx: Arc<CallContext>, args: GoalDeleteArgs) -> Result<Value> {
-    cx.engine.goal_service.delete(&args.id).await?;
-    Ok(serde_json::json!({"deleted": args.id}))
+    Ok(json!({"deleted": args.id}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
         let args: A = serde_json::from_value(value).unwrap();
         args.validate(&Identity::of(Some("cli")), Mode::AllowDestructive)
             .unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(Some("cli")),
-            mode: Mode::AllowDestructive,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[tokio::test]
     async fn all_six_goal_tools_validate_and_project_cli_shapes() {
-        let (_dir, cx) = fixture().await;
+        let (fx, cx) = fixture().await;
         let goal = add(cx.clone(), args(json!({"title":"Ship","description":"g"})))
             .await
             .unwrap();
@@ -242,8 +225,8 @@ mod tests {
                 .unwrap(),
             json!([])
         );
-        let task = cx
-            .engine
+        let task = fx
+            .engine()
             .task_service
             .create(orch_domain::CreateTaskInput {
                 title: "child".into(),
@@ -255,7 +238,7 @@ mod tests {
         let shown = show(cx.clone(), args(json!({"id":id}))).await.unwrap();
         assert_eq!(shown["tasks"][0]["id"], task.id);
         assert!(shown.get("progress").is_none());
-        cx.engine
+        fx.engine()
             .context
             .set(&format!("{id}-progress"), "progress", None)
             .await

@@ -1,6 +1,8 @@
 //! The launch mode and the operation classes it admits (design D6).
 //!
 //! The mode is fixed when the process starts; nothing changes it afterwards.
+//! The bridge filters its catalogue by mode, and the daemon admits the
+//! session only to the same subset (its own check, independent of this one).
 //! A class is an access-policy category, not the meaning of the SDK's
 //! `destructiveHint`: an overwrite can carry `destructiveHint: true` and still
 //! be an ordinary [`Class::Mutate`] tool.
@@ -8,11 +10,10 @@
 /// What a tool does to the project, for the mode gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Class {
-    /// Reads stored state. Reads can still maintain storage (index rebuild,
-    /// context expiry purge); read-only is not an immutable filesystem.
+    /// Reads project state through the daemon. A read never expires or
+    /// deletes anything; expiry is the daemon's own step.
     Read,
     /// An ordinary authored mutation.
-    #[allow(dead_code, reason = "seam consumed by the B2 tool groups")]
     Mutate,
     /// One of the expressly approved destructive operations.
     Destructive,
@@ -47,6 +48,16 @@ impl Mode {
             Mode::ReadOnly => class == Class::Read,
             Mode::Default => class != Class::Destructive,
             Mode::AllowDestructive => true,
+        }
+    }
+
+    /// The session mode the daemon enforces for this launch mode.
+    pub(crate) fn session(self) -> orch_proto::handshake::SessionMode {
+        use orch_proto::handshake::SessionMode;
+        match self {
+            Mode::Default => SessionMode::Normal,
+            Mode::ReadOnly => SessionMode::ReadOnly,
+            Mode::AllowDestructive => SessionMode::AllowDestructive,
         }
     }
 
@@ -85,5 +96,16 @@ mod tests {
         assert_eq!(Mode::Default.label(), "default");
         assert_eq!(Mode::ReadOnly.label(), "read-only");
         assert_eq!(Mode::AllowDestructive.label(), "allow-destructive");
+    }
+
+    #[test]
+    fn each_mode_opens_the_matching_daemon_session() {
+        use orch_proto::handshake::SessionMode;
+        assert_eq!(Mode::Default.session(), SessionMode::Normal);
+        assert_eq!(Mode::ReadOnly.session(), SessionMode::ReadOnly);
+        assert_eq!(
+            Mode::AllowDestructive.session(),
+            SessionMode::AllowDestructive
+        );
     }
 }
