@@ -60,6 +60,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     // The local daemon protocol: data and pure codecs only, so a client crate
     // can depend on it without gaining a store capability (design D1).
     ("orch-proto", &["orch-domain"]),
+    ("orch-client", &["orch-domain", "orch-proto"]),
     // The per-project daemon composes everything that owns state.
     (
         "orch-daemon",
@@ -78,6 +79,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     (
         "orch-cli",
         &[
+            "orch-client",
             "orch-core",
             "orch-daemon",
             "orch-domain",
