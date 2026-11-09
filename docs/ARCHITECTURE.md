@@ -143,17 +143,21 @@ crates also have; the exact edge set is the table in `xtask crate-graph` (below)
 stores once `orch init` has created them, and every stateful frontend is its client. `orch daemon` runs without
 any environment gate. Each CLI command connects one daemon session through `orch-client` and sends typed
 operations (`commands/rpc.rs`, `Rpc::connect`). `orch mcp` is a stdio-to-socket bridge, the dashboard backend
-reads over the socket on its existing tick, and `orch web` checks for a daemon before it listens and answers HTTP
-503 with the uniform message if the daemon goes away later. With no daemon, every client fails with that message
-and exit 7, and none of them starts one. `orch serve` and `orch run --watch` are a foreground `orch daemon start`
-with dispatch on (`commands/daemon.rs`, `foreground`); `orch run --once` and `orch run <id>` are requests to a
-running daemon. The commands that do not need a daemon are `init`, `update`, `daemon` and the local checks of
-`doctor` (`tree.rs`, `CONTAINER_LESS_COMMANDS`). Three things wait for PR 4: `orch-cli` keeps its production
-dependencies on `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`; `serve/` still holds the old
-container-building `serve::run`, which nothing calls, and its unit tests; and §2.1 still describes the v0.13.0
-multi-writer story. Until then "a client never names a store" is a convention, not a gate. Where each edge and
-rule lands, per the [plan](plans/2026-11-09-daemon-owned-state.md#tasks) (PR 1 and PR 2 are in place at this
-head):
+reads over the socket on its existing tick, and `orch web` checks for a daemon before it listens and again before
+every page and websocket, answering HTTP 503 if the daemon has gone away (`web/mod.rs`, `daemon_guard`). With no
+daemon, every client reports the uniform no-daemon message, and none of them starts one: a CLI command and
+`orch web` exit 7; the dashboard shows the message with `r retry · q quit`, and `q` exits 7; `orch mcp` keeps
+reading stdin and answers each request with a JSON-RPC error (`-32001`, `data.exit_code` 7); the 503 body is the
+message for a request that presented the credential and `orch daemon unavailable` under `--no-auth`. `orch serve`
+without `--once` and `orch run --watch` are a foreground `orch daemon start` with dispatch on that forwards
+`--from-agent` and the peer flags (`commands/daemon.rs`, `foreground`); `orch serve --once`, `orch run --once` and
+`orch run <id>` are requests to a running daemon. The commands that do not need a daemon are `init`, `update`,
+`daemon` and the local checks of `doctor` (`tree.rs`, `CONTAINER_LESS_COMMANDS`). Three things wait for PR 4:
+`orch-cli` keeps its production dependencies on `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`; `serve/`
+still holds the old container-building `serve::run`, which nothing calls, and its unit tests; and §2.1 still
+describes the v0.13.0 multi-writer story. Until then "a client never names a store" is a convention, not a gate.
+Where each edge and rule lands, per the [plan](plans/2026-11-09-daemon-owned-state.md#tasks) (PR 1 and PR 2 are in
+place at this head):
 
 | Edge or rule | Lands in | What it means |
 |---|---|---|
