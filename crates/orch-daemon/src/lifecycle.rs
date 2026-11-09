@@ -621,7 +621,9 @@ impl Running {
     pub(crate) async fn shutdown(mut self) -> DaemonExit {
         let mut clean = self.stop_engine().await;
         if let Some(peer) = self.peer.take() {
-            peer.shutdown().await;
+            // Keep the join handle in Running so cancelling shutdown transfers
+            // the peer drain to the ownership-retaining Drop path too.
+            self.loops.push(self.runtime.spawn(peer.shutdown()));
         }
         self.server.begin_drain();
         self.handler.seal_requests();
@@ -701,7 +703,9 @@ impl Running {
         self.server.begin_drain();
         self.handler.coordinator().stop_admission();
         self.handler.seal_requests();
-        drop(self.peer.take());
+        if let Some(peer) = self.peer.take() {
+            self.loops.push(self.runtime.spawn(peer.shutdown()));
+        }
         self.quit.send_replace(true);
         let loops = std::mem::take(&mut self.loops);
         let handler = self.handler.clone();

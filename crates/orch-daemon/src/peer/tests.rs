@@ -85,3 +85,84 @@ async fn a_busy_listen_address_fails_the_start_and_releases_ownership() {
     let running = Running::bring_up(bring_up(&root, None)).await.unwrap();
     assert!(running.shutdown().await.clean);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_daemon_retains_peer_publication_until_ordered_drain() {
+    peer_drain_retains_ownership(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_shutdown_retains_the_pending_peer_drain() {
+    peer_drain_retains_ownership(true).await;
+}
+
+async fn peer_drain_retains_ownership(cancel_shutdown: bool) {
+    let (_temp, root) = project().await;
+    let mut spec = bring_up(&root, None);
+    spec.listen = Some("127.0.0.1:0".into());
+    let running = Running::bring_up(spec).await.unwrap();
+    let addr = listener_addr(&root).await;
+    let status = root.join(".orchestry/remotes/_listener.json");
+    if cancel_shutdown {
+        // Complete engine stop before holding D2, so the cancelled shutdown
+        // is waiting on peer cleanup rather than engine cleanup.
+        running
+            .handler
+            .execute_request(
+                &crate::lifecycle::internal_context(),
+                orch_proto::ops::Request::DaemonStop(orch_proto::ops::args::DaemonStopArgs {}),
+            )
+            .await
+            .unwrap();
+    }
+    let boundary = running.engine.operation_boundary();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let held = tokio::spawn(async move {
+        boundary
+            .run(false, async {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.await;
+            })
+            .await;
+    });
+    held_rx.await.unwrap();
+    if cancel_shutdown {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), running.shutdown())
+                .await
+                .is_err()
+        );
+    } else {
+        drop(running);
+    }
+    // Removal is a peer state phase too. Dropping the owner must not run
+    // the synchronous abort-only peer fallback outside the held boundary.
+    assert!(
+        status.exists(),
+        "peer publication removed outside its ordered drain"
+    );
+    assert!(matches!(
+        crate::guard::OwnerGuard::acquire(&root.join(".orchestry")).await,
+        Err(crate::DaemonError::AlreadyRunning(_))
+    ));
+    release_tx.send(()).unwrap();
+    held.await.unwrap();
+    let guard = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match crate::guard::OwnerGuard::acquire(&root.join(".orchestry")).await {
+                Ok(guard) => break guard,
+                Err(crate::DaemonError::AlreadyRunning(_)) => tokio::task::yield_now().await,
+                Err(error) => panic!("successor guard: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("peer drain releases ownership");
+    assert!(!status.exists(), "listener publication outlived ownership");
+    assert!(
+        TcpStream::connect(&addr).await.is_err(),
+        "peer admission outlived ownership"
+    );
+    drop(guard);
+}
