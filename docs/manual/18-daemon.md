@@ -5,7 +5,7 @@ checks every command, flag, exit code and path against the frozen PR 1 commit. N
 output: W4 replaces the placeholders with real output from the frozen commit. PR 2's writer (W2) removes the
 developmental notice and turns each "Planned (PR 2)" into current behaviour. -->
 
-> **Developmental in 0.14.0-pre: requires `ORCH_DAEMON_DEVELOPMENTAL=1`; no client uses the daemon until PR 2.**
+> **Developmental in this build (PR 1 of the daemon work; the package version is still 0.13.0): requires `ORCH_DAEMON_DEVELOPMENTAL=1`; no client uses the daemon until PR 2.**
 > In this build only the four `orch daemon` commands talk to the daemon. Every other command, the dashboard,
 > `orch web` and `orch mcp` still read and write `.orchestry/` directly, as in orch 0.13.0, so a running daemon
 > does **not** keep them out: the start banner says that legacy writers are not excluded. Try the daemon on a
@@ -62,7 +62,7 @@ All four commands refuse to run unless `ORCH_DAEMON_DEVELOPMENTAL=1` is set in t
 |---|---|---|
 | `orch daemon start [--detach] [--dispatch on\|off] [--from-agent]` | Starts the daemon for the project, in the foreground unless `--detach`. Dispatch is **off** unless `--dispatch on`. Peer-link listener options are start options too; `orch daemon start --help` lists them. | 0 after a clean stop (foreground) or after readiness (`--detach`); 2, 3, 4 on refusal |
 | `orch daemon status` | Asks the running daemon for its live status. | 0; 7 when no compatible daemon answers |
-| `orch daemon stop` | Asks the daemon to shut down cleanly and waits for the result. Works across a version mismatch. | 0 on a completed clean stop; 7 when no daemon answers |
+| `orch daemon stop` | Asks the daemon to shut down cleanly and waits until its process has exited, for at most 30 s. Works across a version mismatch. | 0 on a completed clean stop; 7 when no daemon answers or the outcome is unknown; a timeout has its own message |
 | `orch daemon dispatch on\|off` | Turns dispatching of future work on or off in the running daemon. | 0; 7 when no compatible daemon answers |
 
 | Flag | Meaning |
@@ -82,18 +82,41 @@ ORCH_DAEMON_DEVELOPMENTAL=1 orch daemon start
 
 The daemon first checks the project and your user, takes ownership of the project, recovers the state a previous
 orchestrator left (the same reconciliation `orch serve` does at start, and a rebuild of any missing or corrupt
-`_index.json`), removes expired context entries, binds the socket and writes `.orchestry/daemon.json`. Only then
-does it print its readiness line, exactly `listening <socket>`, followed by its dispatch state. The banner on
-stderr says that the daemon is developmental and that legacy writers are not excluded.
+`_index.json`, the context index included), removes expired context entries, binds the socket, adds any missing
+[runtime entries](#runtime-files-and-gitignore) to `.orchestry/.gitignore` and writes `.orchestry/daemon.json`.
+A failed context expiry does not stop the start. Only then does it print its readiness line, exactly
+`listening <socket>`, followed by its dispatch state. The banner on stderr says that the daemon is developmental
+and that legacy writers are not excluded.
+
+If recovery cannot save a change to a task, run or agent, for example because a store directory is not
+writable, the start fails with exit 1 and names the write that failed. Nothing listens, so `orch daemon status`
+exits 7, and the state the next start needs to finish the recovery is kept. Fix the cause and start again.
 
 A foreground daemon runs until you stop it. `Ctrl+C` (SIGINT), SIGTERM and SIGHUP, which a terminal sends when
 you close its window or tmux pane, all stop it cleanly, like [`orch daemon stop`](#stop).
 
 **`--detach`** starts the daemon in a session of its own with stdin from `/dev/null`, and sends its stdout and
-stderr to `.orchestry/daemon.log` (mode 0600). The log rotates at 10 MiB and keeps one 0600 backup, so it never
-takes more than 20 MiB. The command returns success only after the daemon has published its socket; if the daemon
-fails first, the command fails too. A detached daemon survives closing the terminal or tmux pane, but not logout
-or a reboot: start it again yourself after either.
+stderr to `.orchestry/daemon.log` (mode 0600). The command returns success only after the daemon has published
+its socket; if the daemon fails first, the command fails too. A detached daemon keeps running when you close
+the terminal or tmux pane you started it from. A reboot ends it, and orch does not test what happens at logout;
+afterwards run `orch daemon status` and start it again yourself if no daemon answers.
+
+**Log size.** `daemon.log` never grows past 10 MiB, and orch keeps exactly one backup, `.orchestry/daemon.log.1`
+(mode 0600), of at most 10 MiB: 20 MiB in all. The limit is applied as the daemon writes, not by a periodic
+check, and covers everything written to the detached daemon's output:
+
+- Before a write would take the log past its limit, the daemon renames the log to `daemon.log.1`, replacing any
+  older backup, and starts a new log.
+- A detached start that finds a log over 10 MiB moves it to the backup first, and cuts a backup over 10 MiB
+  (left by an earlier build) to 10 MiB.
+- If a rotation, or opening or writing the log, fails, the daemon drops that output rather than let the log grow,
+  and writes one fixed notice that names the failed step and the error kind, never a path or the dropped text:
+  `orch daemon: cannot <rotate|open|write> daemon.log (<error kind>); output is dropped to keep it under 10 MiB`.
+  Once a write succeeds again, the log starts with a line that counts the bytes dropped.
+
+At the default log level a detached start and stop write only the one-line developmental banner (175 bytes).
+With `RUST_LOG` or `ORCHESTRY_DEBUG` set, the log fills faster and rotates more often, within the same limit. To
+reclaim the space, stop the daemon and delete `daemon.log.1`.
 
 **One daemon per project.** Ownership is decided by a lock that the daemon holds for its whole life
 (`.orchestry/.daemon-owner.lock`, never deleted) and by the project's existing orchestrator lock, which it
@@ -114,6 +137,7 @@ dashboard of this build cannot become the orchestrator while it runs.
 | Your effective user is not the owner of `.orchestry/`, including `root` on a project another user owns | 2 |
 | `.orchestry/` is writable by group or others, or a pre-existing socket directory is not private to you | refuses; orch never changes the mode |
 | `ORCH_SOCKET` or the computed socket path is empty, relative, contains a NUL byte or is over the [100-byte budget](#sockets-project-selection-and-daemonjson) | refuses with a short `ORCH_SOCKET` hint; the path is never truncated |
+| A socket exists at the path and connecting to it fails with permission denied or any error other than connection refused, so orch cannot prove it stale | 2, with a diagnostic; the socket is left in place |
 | No initialized project is found | 3 |
 | Another daemon or another live orchestrator owns the project | 4 |
 | The lock cannot be taken for any reason other than another holder (for example a file system without locking) | fails; it never falls back to a PID-only lock |
@@ -122,22 +146,79 @@ dashboard of this build cannot become the orchestrator while it runs.
 `ORCH_AGENT_ID`, `ORCH_AGENT_NAME`, `ORCH_TASK_ID`, `ORCH_TUI_CLIENT`, `ORCH_WEB_PASSWORD`, `ORCH_SOCKET`,
 `ORCH_PROJECT_ROOT`, `DEBUG`, `PWDEBUG`, and `NODE_OPTIONS` when it contains `--inspect`. Every agent it starts
 gets that snapshot, the agent's configured environment and the project root and socket that orch sets for it;
-no request can add environment variables, a command or a working directory. Credentials therefore come from the
-shell you started the daemon in: after you refresh a token in your shell, stop the daemon and start it again.
-`orch daemon status` lists the names it removed, never their values.
+no request can add environment variables, a command or a working directory. The diagnostic programs the daemon
+runs for the model catalog and `orch doctor` checks get the same cleaned environment, and their stderr never
+reaches `daemon.log`. Credentials therefore come from the shell you started the daemon in: after you refresh a token in your shell, stop the daemon and start it again.
+`orch --json daemon status` lists the names it removed, never their values.
 
 ## Check, toggle dispatch and stop
 
 ### Status
 
-`orch daemon status` asks the running daemon, never a file, so it cannot report a daemon that has died. It shows
-the daemon's PID, socket path, orch version and protocol version, its instance id, the executable it was started
-from and when, whether dispatch is on or off, the running tasks, the number of client sessions and the cap,
-whether it still owns the project's lock, and the environment names it removed.
-<!-- W4: replace with captured `orch daemon status` output from the frozen commit. -->
+`orch daemon status` asks the running daemon, never a file, so it cannot report a daemon that has died. The plain
+output shows the daemon's PID, whether dispatch is on or off, its socket path, its instance id, how many tasks it
+is running, whether it still owns the project, the executable it was started from and when, its orch and protocol
+versions, and the number of client sessions and the cap. Ownership is one line:
 
-If the daemon has lost the orchestrator lock (its PID file was removed or replaced), status shows
-`ownership_lost` and the daemon turns dispatch off. It does not recreate the lock. Stop it and start it again.
+```text
+ownership: held
+ownership: LOST — stop and restart the daemon
+```
+
+<!-- W1b: the plain capture taken at b1216ce4 was removed because ruling 8.12 adds lines to it; re-capture the
+full plain output from the I1b frozen commit (task tsk_bCS2Fyj owns the exact lines). -->
+
+The plain output does **not** list the ids of the running tasks or the environment names the daemon removed. Ask
+for JSON or YAML to see them, with the global flag before or after the command (`orch --json daemon status`,
+`orch daemon status --yaml`):
+
+```console
+$ orch --json daemon status
+{
+  "pid": 13566,
+  "project_root": {
+    "utf8": "/private/tmp/twn-v0vgwbe_/p"
+  },
+  "socket": {
+    "utf8": "/tmp/twn-v0vgwbe_/o.sock"
+  },
+  "protocol": 1,
+  "binary": "0.13.0",
+  "instance": "daemon_hPQDKpz",
+  "executable": {
+    "utf8": "/…/target/debug/orch"
+  },
+  "started_at": "2026-11-09T08:44:11.673Z",
+  "dispatch": {
+    "dispatch_on": false,
+    "batch_active": false
+  },
+  "running_tasks": [],
+  "sessions": 1,
+  "session_cap": 64,
+  "busy_rejections": 0,
+  "ownership": "held",
+  "removed_env": [
+    "DEBUG",
+    "ORCH_SOCKET"
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `socket`, `project_root`, `executable` | Paths, each as `{"utf8": "…"}`, or `{"hex": "…"}` for a path that is not valid UTF-8 |
+| `instance` | This daemon's id; a restarted daemon has a new one |
+| `running_tasks` | Ids of the tasks whose agents the daemon is running |
+| `busy_rejections` | Connections refused with `busy` since start, because the handshake or session capacity was full |
+| `ownership` | `held`, or `lost` when the daemon no longer owns the orchestrator lock |
+| `removed_env` | Names, never values, removed from the agents' environment |
+
+**Lost ownership.** The daemon re-checks the orchestrator lock (`.orchestry/orchestry.lock`) every 10 seconds,
+whether dispatch is on or off. If the file is gone or names another PID, the daemon sets `ownership` to `lost`,
+turns dispatch off and refuses `orch daemon dispatch on` with `daemon ownership was lost` (exit 1). It does not
+recreate the lock. Plain `orch daemon status` then prints `ownership: LOST — stop and restart the daemon`;
+`--json` and `--yaml` show `ownership` as `lost`. To recover, stop the daemon and start it again.
 
 ### Dispatch on and off
 
@@ -148,7 +229,9 @@ to remote peers. A daemon always starts with dispatch off unless you pass `--dis
 
 ### Stop
 
-`orch daemon stop` asks the daemon to shut down and waits up to 30 s for it to finish. Shutting down, the daemon
+`orch daemon stop` asks the daemon to shut down and returns only after the daemon's process has exited, so
+`orch daemon stop` followed by `orch daemon start` works. The wait is at most 30 s; if the process is still
+there after that, the command says that the wait timed out, with a message of its own. Shutting down, the daemon
 stops taking requests and dispatching, stops its running agents (each gets the usual 10 s grace before it is
 killed), records their runs as cancelled and settles their tasks' retries, removes its own socket and
 `daemon.json`, and releases ownership last. SIGTERM, SIGINT and SIGHUP do the same.
@@ -157,9 +240,10 @@ killed), records their runs as cancelled and settles their tasks' retries, remov
   It is checked against your user and the project, and does nothing else.
 - If cleanup fails, the command reports the failure instead of a clean stop, and the daemon keeps the evidence
   needed for recovery.
-- If the daemon accepted the stop but did not confirm that it finished before the connection closed or the wait
-  ran out, the outcome is unknown. `orch daemon stop` never kills, restarts or retries anything; run
-  `orch daemon status` to see whether the daemon is still there.
+- If the daemon accepted the stop but the connection closed before it confirmed that it finished, the outcome is
+  unknown: the message says that the stop may have been applied and to inspect state before retrying, and the
+  command exits 7 (see [Reply lost](#when-no-daemon-answers)). `orch daemon stop` never kills, restarts or
+  retries anything; run `orch daemon status` to see whether the daemon is still there.
 
 ## Exit codes
 
@@ -169,12 +253,12 @@ orch's exit codes, with the one this work adds:
 |---|---|
 | 0 | Success |
 | 1 | General error |
-| 2 | Invalid arguments; for `orch daemon`: developmental gate not set, agent context without `--from-agent`, or a user who does not own the project |
+| 2 | Invalid arguments; for `orch daemon`: developmental gate not set, agent context without `--from-agent`, a user who does not own the project, or a socket that `orch daemon start` cannot prove stale |
 | 3 | Not initialized: no project found |
 | 4 | Lock conflict: another daemon or live orchestrator owns the project |
 | 5 | Adapter error |
 | 6 | Workspace error |
-| **7** | **No usable daemon**: none answers, a stale socket, a refused connection, a failed handshake, a version mismatch, the daemon is busy (`daemon_busy`) or belongs to another project (`wrong_project`) |
+| **7** | **No usable daemon**: none answers, a stale socket, a refused connection, a failed handshake, a version mismatch, the daemon is busy (`daemon_busy`) or belongs to another project (`wrong_project`); also a request whose reply was lost, so its outcome is unknown |
 
 In this build only `orch daemon status`, `stop` and `dispatch` can exit 7. From PR 2 (planned) every command that
 reads or changes project state exits 7 the same way. The [MCP chapter](17-mcp-server.md#exit-codes-and-startup-errors)
@@ -191,9 +275,11 @@ start nothing, and print one message that names the project and what went wrong,
 ```
 
 The detail says why: no socket, a stale socket left by a daemon that exited, connection refused, the handshake
-failed, permission denied or the connection was lost. A client never deletes a stale socket or `daemon.json`
-and never takes over the project; only the next explicit `orch daemon start` replaces a stale socket, after
-proving that nothing listens on it.
+failed, permission denied or the connection was lost before the request was sent. A client never deletes a
+stale socket or `daemon.json` and never takes over the project. Only the next explicit `orch daemon start`
+replaces a stale socket, and only when connecting to it is refused (connection refused). When the connect fails
+in any other way, such as permission denied, the start cannot tell whether a daemon is listening: it leaves the
+socket alone and exits 2 with a diagnostic.
 
 **In an agent's environment** (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set) the same failure never tells the agent to
 start a daemon:
@@ -203,7 +289,12 @@ start a daemon:
     Detail: <safe detail, including both versions on skew>
 ```
 
-Two cases are not "no daemon" and say so:
+Three cases are not "no daemon" and say so:
+
+- **Reply lost.** The connection broke after the request was sent, so orch cannot know whether the daemon applied
+  it. The message says that the request may have been applied and that you should inspect state before retrying,
+  instead of the plain no-daemon message; exit 7. Look at what the request would have changed before you send it
+  again.
 
 - **Busy.** All client sessions are in use. The message is
   `daemon_busy (orch daemon PID <kernel peer pid or unavailable> is running; N/N sessions)`, exit 7, with no start
@@ -261,8 +352,13 @@ binary the daemon was started from), `started_at` and `instance`. Clients read i
 find the socket; it is never proof that a daemon is alive. Do not edit or delete it, or the socket, while a
 daemon runs.
 
-`.orchestry/run/`, `daemon.json`, `daemon.log` and its rotation file are runtime files. Keep them out of version
-control.
+### Runtime files and `.gitignore`
+
+`run/`, `daemon.json`, `daemon.log` and `daemon.log.1` in `.orchestry/` are runtime files. `orch init` lists them
+in `.orchestry/.gitignore` under `# Daemon runtime`, and every `orch daemon start` appends whichever of these
+lines are missing, so a project created with orch 0.13.0 gets them at its first start. Existing lines are never
+rewritten or reordered. If the start cannot update the file (for example it is a symbolic link or not yours), it
+logs a warning and starts anyway: the entries never block readiness.
 
 ### Who can use the socket
 
@@ -300,10 +396,11 @@ client start, restart or repair a daemon; every recovery is something you do.
 |---|---|---|---|
 | The daemon crashed or was killed (`kill -9`) | The next `orch daemon status` reports no daemon (exit 7). The stale socket and `daemon.json` stay until the next start. | Start it again. The new daemon has dispatch off, clears stale claims, records runs whose agent died as cancelled and their agents as idle, and leaves remote work as unknown until the peer syncs. Check tasks and runs before you retry anything or turn dispatch on. | now |
 | A foreground daemon's terminal or pane closed | SIGHUP: a clean stop, the same as `orch daemon stop`; its agents are stopped. | Start it again in a new pane, or use `--detach`. | now |
-| A detached daemon after logout or a reboot | No daemon answers. | Start it again. orch supplies no launchd job, watchdog or restart. | now |
+| A detached daemon after a reboot (logout is untested) | No daemon answers. | Start it again. orch supplies no launchd job, watchdog or restart. | now |
+| Recovery at start cannot save a task, run or agent change | The start exits 1 and names the write that failed; `orch daemon status` exits 7. | Fix the cause (permissions, disk space), then start again; the state needed to finish the recovery is kept. | now |
 | You upgraded orch and the old daemon still runs | Version skew message, exit 7. | `orch daemon stop` (either binary), then start the new one. Running agents are stopped and reconciled; this is not a transparent upgrade. | now |
 | The daemon hangs, or its socket was removed | Commands time out or report no daemon; status never claims liveness from files. | Read the PID in `daemon.json` as an untrusted hint. Only if `ps -p <pid> -o command=` shows an orch daemon for this project, send `kill -TERM <pid>`. If you cannot verify the process, do not signal it. | now |
-| orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index, but cannot detect every stale one. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. | now |
+| orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index of tasks, agents, runs, goals, teams, messages or context, but cannot detect a stale index that is still valid. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. | now |
 | Re-running `orch init` | It does not overwrite the project and prints how to start the daemon. It never starts one. | Start the daemon yourself. | now |
 | An agent loses the daemon mid-task | Exit 7 with the agent-context message. The outcome of a change whose reply was lost is unknown. | The agent stops and reports to you. Start the daemon, inspect the task, run and state, then decide on a retry. A restart does not resume the agent's conversation. | planned (PR 2) |
 | An MCP client's first call fails | The `initialize` error with the no-daemon message; the `orch mcp` process stays up. | Start the daemon, then reconnect, re-enable or restart the MCP session; not every MCP client retries by itself. | planned (PR 2) |
