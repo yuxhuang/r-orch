@@ -115,7 +115,7 @@ r-orch/
              orch-core                      (traits only; depends on orch-domain)
                  ▲
         ┌────────┴────────┐
-    orch-infra ◄───── orch-engine           (engine → infra: 5 sites, see below)
+    orch-infra ◄───── orch-engine           (engine → infra: 10 source files + 4 test files, see below)
         ▲                 ▲
         └────────┬────────┘
                  │
@@ -158,24 +158,46 @@ Every writer, remote peer callbacks included, is then owned by the daemon's coor
 Two things in this diagram were wrong in earlier revisions, and both are now enforced rather than described.
 
 **1. `orch-engine` does depend on `orch-infra`.** An earlier revision said "engine depends on core, NOT on
-infra". The edge is real, and it is **five** non-test sites:
+infra". The edge is real. `ENGINE_INFRA_SITES` allows **14** files under `crates/orch-engine/src/` to name
+`orch_infra`: **10** source files and **4** files under `orchestrator/tests/`. The check matches any mention of
+`orch_infra` in a file, doc comments and in-file `#[cfg(test)]` modules included.
 
 | Site | What it names | Why it is acceptable |
 |---|---|---|
-| `container.rs` | every concrete infra type it assembles — stores, adapters, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `FileSkillLoader`, `NanoIdGenerator`, `SystemClock`, `REGISTRATION_ORDER` | Assembly has to name implementations somewhere. The composition root. |
+| `container.rs` | every concrete infra type it assembles — the `File*Store` stores, `Paths`, `build_registry_with_clock`, `REGISTRATION_ORDER`, `LiquidTemplateEngine`, `GitWorkspaceManager`, `SystemProcessManager`, `FileSkillLoader`, `NanoIdGenerator`, `SystemClock` — plus `RemoteAgentDirectory`, `default_peer_name` and `fs_utils::clear_ensured_dirs` | Assembly has to name implementations somewhere. The composition root. |
 | `orchestrator.rs` | `CachedTaskStore`, `CachedAgentStore`, `CachedGoalStore` | The orchestrator constructs the tick-scoped cache wrappers itself. |
-| `orchestrator/dispatch.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE`, `build_prompt_context`, `BuildPromptOptions` | The orchestrator builds the default prompt from exactly these. |
-| `task_service.rs` | `Paths`, `fs_utils` — for attachment paths | Attachment paths need the project layout. |
+| `orchestrator/dispatch.rs` | `build_prompt_context`, `build_eco_prompt_context`, `render_prompt`, `BuildPromptOptions`, `RenderedPrompt`; `RemoteAgentDirectory` and `Paths`; `adapters::effort_diagnostics` | Dispatch renders the prompt with the template engine's builders, lists local plus remote agents to pick an assignee, and checks the adapter's effort settings. |
+| `orchestrator/tick.rs` | `FileRemoteStore`, `Paths` | Reconcile reads the remote registry so it can fail a remote run whose peer was removed, without a retry. |
+| `orchestrator/recovery.rs` | `FileRemoteStore`, `Paths` | Startup cleanup reads the same registry, to keep remote runs whose peer is still registered. |
+| `orchestrator/remote.rs` | `RemoteAgentDirectory`, `Paths` | Rehydrating remote runs at startup reads the persisted remote-agent snapshot. |
+| `task_service.rs` | `Paths`, `fs_utils` — for attachment paths; `RemoteAgentDirectory` | Attachment paths need the project layout. The optional remote directory lets assignment accept a remote agent. |
+| `message_service.rs` | `RemoteAgentDirectory` (its test module also names `Paths` and `FileRemoteStore`) | Remote recipient validation goes through the opt-in remote directory; the local `AgentStore` stays a trait. |
+| `prompt_mode.rs` | `FileConfigStore`, `Paths`, `fs_utils` | The project prompt-mode toggle edits one key of the raw config under `.definition.lock`, with `FileConfigStore::read_raw`/`write_raw`, which the `orch-core` `ConfigStore` trait does not expose. |
 | `lock.rs` | `storage::lock`, re-exporting `LOCK_STALE` and `LockResult` | The lock *mechanism* is infra; `ProjectLock` is a thin wrapper over it. |
+| `orchestrator/tests/harness.rs` | `RemoteAgentDirectory`, `Paths` | Test assembly wires the remote directory to `TaskService`. |
+| `orchestrator/tests/remote.rs` | `FileRemoteStore`, `Paths`, `FileConfigStore`, `storage::lock::acquire_lock` | Remote lifecycle tests use the real registry and status files and stale-lock guards. |
+| `orchestrator/tests/skills.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE` | A test asserting the dispatch templates are the real ones. |
+| `orchestrator/tests/token_eco.rs` | `DEFAULT_USER_TEMPLATE` | A test asserting that a normal-mode agent with only a custom system template still renders the real default user template. |
 
-**What actually holds is the narrower, more useful property: every *service* takes only `orch-core` traits.**
-Concrete types appear at assembly and in the four modules above. So
-`orch-engine` remains unit-testable against `test_support` fakes, and `orch-infra` is still swappable
-wholesale — which is what the boundary was for.
+**What actually holds is narrower: every service's injected stores, clock and ID generator are `orch-core`
+trait objects (`Arc<dyn …>`), and the only concrete infra types a service constructor or builder accepts are
+optional.** `TaskService::new` takes `Option<Paths>`, and `TaskService::with_remote_directory` and
+`MessageService::with_remote_directory` take a concrete `RemoteAgentDirectory`; without them the services
+start with `None`. The service files that do not appear in the table (`agent_service.rs`, `goal_service.rs`,
+`run_service.rs` and the rest) do not name `orch_infra` at all. Elsewhere, the orchestrator and
+`prompt_mode.rs` construct concrete infra types (`FileRemoteStore`, `RemoteAgentDirectory`, `FileConfigStore`)
+from the project root at the moment they need them, rather than having them injected.
 
-If the edge ever needs severing, the moves are known: lift `storage::cached` into `orch-core` (already
-generic over the traits) and the two template constants into `orch-domain`. Neither is worth doing — both
-would add churn for no behavioural gain.
+What that buys: services remain unit-testable against `test_support` fakes, with the optional infra values left
+unset. What it does not: `orch-infra` cannot be swapped wholesale through the container alone, because the
+remote registry, the remote-agent directory, the raw config edit and the project layout are reached directly
+at the sites above.
+
+If the edge ever needs severing, each site needs its own move. `storage::cached` lifts into `orch-core` (it is
+already generic over the traits). The remote registry and remote-agent directory need an `orch-core` trait
+injected through the container. The raw config edit needs `ConfigStore` to expose it. The prompt builders and
+`effort_diagnostics` need a home outside `orch-infra`. None of this is planned: it would add churn for no
+behavioural gain.
 
 **2. `orch-tui` depends on `orch-domain` alone — not on the engine.** An earlier revision of this diagram had
 the TUI depending on `orch-engine`. WP-6 **inverted** it: everything the dashboard needs crosses a single
