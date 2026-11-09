@@ -27,7 +27,8 @@ differ on your machine.
 ## What the server is
 
 <!-- PR 2 contract item 1 (orch mcp = thin stdio-to-socket bridge, same tools/results/modes/identity), goal row 9,
-design D7/D9, spec R18. W2 wrote this ahead of S2b; I2 verifies. -->
+design D7/D9, spec R18. W2 wrote this ahead of S2b; checked at run time at f70fc707 (board-2 fact-check
+tsk_eVo3agZ). -->
 - **A child process of the client, and a client of the daemon.** The client starts `orch mcp`, writes JSON-RPC
   requests to its stdin and reads responses from its stdout. `orch mcp` passes each tool call and resource read to
   the project's [daemon](18-daemon.md) over its private Unix socket and returns the answer. It opens no port and
@@ -109,8 +110,8 @@ So **the first call of a new MCP session fails until you start the daemon.** To 
 
 1. Start the daemon yourself: `orch daemon start` (see [The orch daemon](18-daemon.md#start-the-daemon)).
 2. Let the client initialise again. Not every MCP client retries by itself: reconnect the server, re-enable it, or
-   restart the client's session.
-   <!-- The exact Claude Code action is recorded by owner-Mac QA (spec R28, PR 3/4); add it here then. -->
+   restart the client's session. Which of these Claude Code needs has not been checked for this release.
+   <!-- Owner-Mac QA (spec R28, PR 3/4) records the exact Claude Code action; replace the sentence above then. -->
 
 A call whose reply was lost because the daemon went away mid-call gets the
 [reply-lost message](18-daemon.md#when-no-daemon-answers) instead: the change may have been applied, so read the
@@ -124,17 +125,20 @@ Every startup failure is printed to stderr, with stdout empty.
 | Situation | stderr | Exit code |
 |---|---|---|
 | `orch mcp --help` (works outside a project) | none; help on stdout | 0 |
-| No project found, or `--project-root` is missing or not a project | `✕ Not initialized` / `Run: orch init` | 3 |
+| No project found, or `--project-root` is missing, cannot be read or is not a project | `✕ Not initialized` / `Run: orch init` | 3 |
 | `--read-only` together with `--allow-destructive` (checked before the project, so also outside one) | `error: the argument '--read-only' cannot be used with '--allow-destructive'`, then the usage line | 1 |
 | `--agent` is empty or only spaces | `✕ --agent must not be blank` | 2 |
-| `--project-root` exists but cannot be read | `✕ cannot read --project-root` | 1 |
-| The project's config cannot be loaded | the CLI's error, for example `✕ parse <project>/.orchestry/config.yml` | 1 |
 | stdin closes, before or after `initialize` | none | 0 |
 | SIGINT, SIGTERM or SIGHUP, before or after `initialize`, even while the client keeps stdin open | none | 0 |
 | A write to stdout fails, before or after `initialize`, for example because the client stopped reading | `✕ cannot write to stdout: Broken pipe (os error 32); the MCP client can no longer receive responses. Calls already started may have completed: inspect state before retrying` | 1 |
 | SIGKILL | none | killed by the signal (a shell shows 137) |
 
-<!-- I2: unverified, see unconfirmed-doc-markers.md (rows `--project-root` cannot be read and config cannot be loaded) -->
+A `config.yml` that cannot be loaded does not stop the server from starting, and it still exits 0 when stdin
+closes. Each request reports the error instead: see
+[Each call sees current configuration](#each-call-sees-current-configuration).
+<!-- Captured at f70fc707 (fact-check tsk_eVo3agZ, tsk_J8tJF2x): --project-root dir mode 000 and .orchestry mode 000
+both print Not initialized, exit 3; broken config.yml, `orch mcp </dev/null` prints nothing, exit 0. launch() in
+crates/orch-cli/src/mcp.rs:108 does discovery only. -->
 
 After stdin closes or a signal arrives, the server gives calls that are already running up to 5 s (stdin closed)
 or 2 s (signal) to answer, then exits without answering the rest. A call left unanswered may still have saved its
@@ -828,17 +832,27 @@ whatever `RUST_LOG` says (`RUST_LOG=trace` and `RUST_LOG=rmcp=trace` included); 
 ### Each call sees current configuration
 
 A change made by `config_set` or the CLI applies to the next call: the daemon refreshes its configuration after
-each configuration change, before it runs the next one. A broken `config.yml` breaks every call.
-<!-- UNCONFIRMED (asked senior-eng-2 msg_hEu9k9C): whether *every* call fails in an open session after a broken
-config.yml. Services keep their cached configuration, so calls that do not re-read config.yml may still work.
-Needs a capture: config_set with a wrongly typed known key, then task_list, status and config_get. -->
+each configuration change, before it runs the next one.
 
-`config_set`, like `orch config set`, checks only the prompt-related keys. It can store a wrongly typed value for
-another known key; after that every tool and resource call fails with `parse <project>/.orchestry/config.yml`,
-while the session stays open, and a new `orch mcp` starts but answers every request, `initialize` included, with that error (JSON-RPC `-32001`). No tool can repair it, because every tool
-needs the configuration. Restore a valid
-`.orchestry/config.yml` (see [Restoring a configuration broken through the MCP server](../RUNBOOK.md#restoring-a-configuration-broken-through-the-mcp-server))
-and call again; the next call sees the repair.
+`config_set`, like `orch config set`, rejects a value of the wrong type for a known key with
+`config: missing required field or invalid known field type/enum` (the CLI exits 2) and stores nothing.
+
+A `config.yml` broken some other way, for example by a hand edit, does not break every call:
+
+- In an open session, `status` and the `orch://status` resource fail with `parse <project>/.orchestry/config.yml`,
+  and `config_set` of another key is rejected; `config_set` of the broken key with a valid value is accepted and
+  repairs the file. Other calls, such as `task_list`, `task_add`,
+  `agent_list`, `goal_list`, `context_list` and `config_get` (which shows the bad value), keep working on the
+  configuration the daemon already loaded.
+- A new `orch mcp` starts, but answers every request, `initialize` included, with that error (JSON-RPC `-32001`,
+  `exit_code` 1).
+
+Repair the file (see [Restoring a broken configuration](../RUNBOOK.md#restoring-a-broken-configuration)). An open
+session sees the repair at its next call; a session whose `initialize` failed must initialise again.
+<!-- Captured at f70fc707 (fact-check tsk_eVo3agZ evidence/mcp-badcfg.txt, mcp-handcfg.txt; tsk_J8tJF2x):
+poll_interval_ms set to "hello" by hand in an open session; status + orch://status (-32603) fail, config_set
+max_concurrent_agents rejected, config_set poll_interval_ms 5000 accepted and repairs the file. -->
+
 
 ### `task_cancel` stops the agent
 
@@ -852,12 +866,14 @@ the daemon cannot promise that its process has died.
 ### `doctor` runs programs
 
 `doctor` is the one tool that starts processes: each adapter's version probe and the git checks, with stdin
-closed, output captured, 10 s per probe and 120 s for the whole call. The daemon runs them, with the environment it
+closed and output captured. Each git check is limited to 10 s; an adapter probe has no limit of its own; the whole
+call is limited to 120 s. The daemon runs them, with the environment it
 was started with, not `orch mcp`. The git checks run in the project root, as they do for `orch doctor` when a daemon
 answers (without one, `orch doctor` checks the directory it is started in). A failed check is part of the report, not an error. No tool runs an agent directly.
-<!-- UNCONFIRMED (asked senior-eng-2 msg_hEu9k9C): "10 s per probe" for adapter version probes. probe_version
-(orch-infra adapters/util.rs:208-250) has no timeout; only the git checks are bounded to 10 s
-(doctor_service.rs:21, 134). Settle with a fake `claude` that sleeps on `--version`, called via MCP `doctor`. -->
+<!-- probe_version (crates/orch-infra/src/adapters/util.rs:208) has no timeout; PROBE_TIMEOUT 10 s
+(crates/orch-engine/src/doctor_service.rs:21, used at :134 and :158) bounds the git checks only; 120 s is
+crates/orch-daemon/src/ops/mod.rs:166, all at f70fc707. A fake `claude` sleeping 25 s (fact-check) and 15 s
+(tsk_J8tJF2x) on --version was reported ok by MCP doctor. -->
 
 ### Not available as tools
 
@@ -921,7 +937,7 @@ The owner accepted them as designed; there is no flag to change them.
 | `Default agent: unset.` and `msg_send` is refused | No `--agent`, and `ORCH_AGENT_ID` did not reach the server | Pass `from`, add `--agent`, or forward the variable (`env_vars` in Codex) |
 | `tool not found` for `task_cancel` or another tool | The mode does not register it | Restart with `--allow-destructive` (or without `--read-only`) |
 | `goal_status` refused with `force` | Default mode | Register a separate `--allow-destructive` entry for the client that forces goals, or cancel or finish the goal's pending tasks first |
-| Every call fails with a configuration error | `config.yml` is broken | [Restore the configuration](../RUNBOOK.md#restoring-a-configuration-broken-through-the-mcp-server) |
+| `status` fails, or every call of a new session fails, with `parse <project>/.orchestry/config.yml` | `config.yml` is broken | [Restore the configuration](../RUNBOOK.md#restoring-a-broken-configuration) |
 | `Not executed: … retry later` | Too many calls queued, or a slow call ahead | Retry; send fewer calls at once |
 | A read sent right after a write returns `null` or the old value, with `isError: false` | The client sent both before the write's response arrived; the server can run them in either order | Wait for the write's response before sending the read ([Calls you send together can run in any order](#results-and-errors)) |
 | Tasks, context entries or other records are gone after a directory under `.orchestry/` was removed | The files went with the directory. The daemon recreates the directory at its next write into it, so later calls work without a restart, but nothing brings the old files back | Restore the lost records from a backup with the normal commands. Do not remove directories under `.orchestry/` while the daemon runs |

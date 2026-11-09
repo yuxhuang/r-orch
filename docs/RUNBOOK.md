@@ -41,7 +41,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | A task stays `todo` with `configuration preflight` or the eco/custom-template message, or a run fails before start with `effort preparation failed` | [Prompt mode and effort failures](#prompt-mode-and-effort-failures) |
 | A goal was resumed but its checkpoint or continuation stays `cancelled` and the tasks after it never start | [A resumed goal leaves cancelled tasks cancelled](#a-resumed-goal-leaves-cancelled-tasks-cancelled) |
 | Data lost or overwritten while orch 0.13.0 `orch mcp` clients and other writers shared a project | [Recovering after concurrent MCP writers](#recovering-after-concurrent-mcp-writers) (legacy) |
-| Every `orch mcp` tool and resource call fails with a configuration error | [Restoring a configuration broken through the MCP server](#restoring-a-configuration-broken-through-the-mcp-server) |
+| `orch status`, `orch task list` or the MCP `status` tool fails with `parse <project>/.orchestry/config.yml`, or a new `orch mcp` session fails `initialize` with it | [Restoring a broken configuration](#restoring-a-broken-configuration) |
 | No trace of what an `orch mcp` server did, or its client discards stderr | [Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics) |
 | An `orch mcp` server does not answer, every call is `Not executed: timed out …`, or a server outlives its client | [A stuck or leftover `orch mcp` process](#a-stuck-or-leftover-orch-mcp-process) |
 
@@ -52,7 +52,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 <!-- W2 (PR 2, tsk_M9AsDfP): written to wave-c-brief.md "PR 2 contract" items 1-4 and 7, spec "Normative recovery
 table" and "Uniform failure contract" (R5, R6, R14, R18, R35), design D3/D5/D13 and ADR 0012. Refusal texts are
 from crates/orch-daemon/src/lifecycle.rs and crates/orch-proto/src/error.rs at the PR 1 frozen SHA 6a7a6481.
-I2 and the board-2 fact-check verify the rest against the PR 2 head. -->
+The board-2 fact-check (tsk_eVo3agZ) checked the rest at run time at the PR 2 head f70fc707. -->
 
 Every orch command that reads or changes a project, the dashboard, `orch web` and `orch mcp` talk to the project's
 daemon. **Nothing starts the daemon but you.** The operator's reference is [manual chapter 18](manual/18-daemon.md);
@@ -182,17 +182,36 @@ the daemon's locks. `pgrep -fl orch` must show none. See the [README](../README.
 
 ### A hung daemon
 
-**Symptom.** Commands time out (`timed out`) or `orch daemon stop` reports
-`daemon accepted stop but PID <pid> is still running after 30 s`.
+orch never kills a daemon for you, and the PID in `daemon.json` is only a hint. Which fix applies depends on
+whether you already asked it to stop.
 
-**Fix.** orch never kills a daemon for you, and the PID in `daemon.json` is only a hint. Signal it yourself, only
-after you verify it:
+**Symptom A.** Commands time out (`timed out`), and you have not run `orch daemon stop`.
 
-1. Read the candidate PID: the `pid` field of `.orchestry/daemon.json`, or the PID in the stop message.
+**Fix.** Signal it yourself, only after you verify it:
+
+1. Read the candidate PID: the `pid` field of `.orchestry/daemon.json`.
 2. `ps -p <pid> -o command=` must show an orch daemon (`orch daemon start`, `orch serve` or `orch run --watch`) for
    this project. If it does not, or you cannot tell, **do not signal it**.
 3. `kill -TERM <pid>`: the same clean stop as `orch daemon stop`.
 4. When it has exited, `orch daemon start`.
+
+**Symptom B.** `orch daemon stop` reports `daemon accepted stop but PID <pid> is still running after 30 s`
+(exit 7), and `orch daemon start` then exits 4 with `orch daemon already running (PID <pid>)`.
+
+**Cause.** The daemon is finishing an operation it already accepted, such as a hung `git worktree add`, and owns
+the project until that call returns. Its shutdown is already under way, so **`kill -TERM` does nothing**.
+
+**Fix.** Wait: the daemon exits by itself when the call returns. To end it now, follow
+[manual 18, Recovery, row "`orch daemon stop` timed out"](manual/18-daemon.md#recovery):
+
+1. `ps -p <pid> -o command=` must show an orch daemon for this project. If it does not, **do not signal it**.
+2. List its child processes: `pgrep -P <pid>`.
+3. `kill -KILL <pid>`. Its children are not killed with it.
+4. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited.
+5. `orch daemon start`. The new daemon reconciles the killed one's work as after a crash.
+<!-- Symptom B: N1 06a4ae1e (manual 18 "After a timeout the daemon can still own the project" and the Recovery
+row); stop-timeout text crates/orch-proto/src/error.rs:278 at f70fc707; release-eng measured the extra SIGTERM
+at cd0fd4c0 (tech-writer-stop-timeout-n1-ba1c717.md). Not reproduced at f70fc707 (needs a hung git worktree add). -->
 
 ---
 
@@ -1066,31 +1085,38 @@ included: their context reads delete expired entries.
 consistency-sensitive changes (configuration, many tasks, team changes) while the other writers and any client
 that reads context are stopped. This is advice, not a lock: nothing enforces it.
 
-## Restoring a configuration broken through the MCP server
+## Restoring a broken configuration
 
-**Symptom.** Every `orch mcp` tool and resource call fails with the same error,
-`parse <project>/.orchestry/config.yml`, while the session stays connected. A new `orch mcp` starts but answers every
-request, `initialize` included, with that error (JSON-RPC `-32001`), and the CLI fails the same way: `orch status` and even `orch config get` print it.
+**Symptom.** `orch status` and `orch task list` fail with `✕ parse <project>/.orchestry/config.yml` (exit 1), while
+other commands such as `orch agent list`, `orch context list` and `orch config get` still work. In an open
+`orch mcp` session, `status` and the `orch://status` resource fail with the same error and other tools still
+answer. A new `orch mcp` starts but answers every request, `initialize` included, with that error (JSON-RPC
+`-32001`, `exit_code` 1). If the file is not valid YAML at all, the error reads
+`<project>/.orchestry/config.yml is not valid YAML: …` instead.
 
-**Cause.** `config_set`, like `orch config set`, validates only the prompt-related keys and stores any other value
-as given: a JSON-parsable string becomes a number, boolean or object, anything else a string. A wrongly typed value
-for a known key is saved, and from then on every engine build, and so every MCP call, fails. No tool can repair
-it, because every tool needs a working configuration.
+**Cause.** `config.yml` holds a value of the wrong type for a known key, or invalid YAML, written by a hand edit
+or another program. orch's own writers do not store a wrongly typed value: `orch config set` and `config_set`
+reject it with `config: missing required field or invalid known field type/enum` (the CLI exits 2), `config_patch`
+with `<file>: config.<key>: invalid field type`, and the file is left unchanged.
 
 **Fix.**
 
 1. Find the bad key. The error does not name it: compare with a backup
-   (`diff <backup>/config.yml .orchestry/config.yml`), or look in the file for the value the client set last. For
-   example, `config_set` with key `scheduling.poll_interval_ms` and value `hello` stores the string `"hello"`
-   where a number belongs.
-2. Restore a valid file: copy back your backup, or edit `.orchestry/config.yml` by hand and put the value back to
-   the right type.
-3. Check with the CLI: `orch status` succeeds again.
-4. Call the tool again. The server reads the configuration for every call, so no restart is needed.
+   (`diff <backup>/config.yml .orchestry/config.yml`), or check the values you edited last. `orch config get <key>`
+   still prints the stored value, for example `scheduling.poll_interval_ms = "hello"` where a number belongs.
+2. Restore a valid file: copy back your backup, or edit `.orchestry/config.yml` by hand. For a wrongly typed value
+   you can also set that key to a valid value, `orch config set scheduling.poll_interval_ms 10000`; setting any other
+   key fails while the file is broken, and on invalid YAML `orch config set` fails too.
+3. Check with the CLI: `orch status` succeeds again. The daemon needs no restart.
+4. An open MCP session sees the repair at its next call. A session whose `initialize` failed must initialise
+   again: reconnect the server, or restart the client's session.
 
-**Prevention.** Back up `.orchestry/config.yml` before letting a client change configuration, or register clients
-that should not change it with `--read-only`. With Codex, `disabled_tools` can hide `config_set`, `config_update`
-and `config_patch`.
+**Prevention.** Change configuration with `orch config set` (or `config_set`) rather than by hand, and back up
+`.orchestry/config.yml` before a hand edit.
+<!-- Captured at f70fc707 (fact-check tsk_eVo3agZ evidence/mcp-badcfg.txt, mcp-handcfg.txt; tsk_J8tJF2x): CLI and MCP
+config_set "hello" rejected, file byte-identical; config_patch {scheduling: {poll_interval_ms: hello}} rejected
+`invalid field type`; hand-broken file: status/task list exit 1, agent/context/goal list and config get exit 0;
+config set of the broken key repairs it, of max_concurrent_agents exit 2; invalid YAML: status and config set exit 1. -->
 
 ## Capturing `orch mcp` diagnostics
 

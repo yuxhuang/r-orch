@@ -2,7 +2,7 @@
 
 <!-- W1 (PR 1) wrote this chapter from the approved spec; W2 (PR 2, tsk_M9AsDfP) removed the developmental
 gate and made the PR 2 cutover current, written to wave-c-brief.md "PR 2 contract" items 1-4 and design.md
-D5/D8/D13 ahead of the code. I2 and the board-2 fact-check verify it against the PR 2 head. Examples without a
+D5/D8/D13; the board-2 fact-check (tsk_eVo3agZ) checked it at run time at f70fc707. Examples without a
 "$" prompt are contract text, not captures. -->
 
 The **daemon** is the one orch process that owns a project. It reads and writes everything under `.orchestry/`,
@@ -113,8 +113,8 @@ check, and covers everything written to the detached daemon's output:
 
 With `RUST_LOG` or `ORCHESTRY_DEBUG` set, the log fills faster and rotates more often, within the same limit. To
 reclaim the space, stop the daemon and delete `daemon.log.1`.
-<!-- W2: the PR 1 text measured 175 bytes at the default level, all of it the developmental banner that PR 2
-removes; I2 to record the default-level size at the PR 2 head if it is worth stating. -->
+<!-- At f70fc707 a detached daemon's log stayed at 0 bytes at the default level over several starts and stops
+(tsk_J8tJF2x); PR 1's 175 bytes were the developmental banner that PR 2 removed. -->
 
 **One daemon per project.** Ownership is decided by a lock that the daemon holds from start until the last
 step of its shutdown (`.orchestry/.daemon-owner.lock`, never deleted) and by the project's existing orchestrator
@@ -426,8 +426,7 @@ socket to an environment you would not trust as yourself.
 
 A client and a daemon talk only when they are the same orch version **and** the same local protocol version
 (`LOCAL_PROTOCOL`).
-<!-- W2: PR 1 shipped LOCAL_PROTOCOL 1; RT3(c) bumps it for any wire/semantic change in the stack, so I2 states
-the PR 2 value here if it changed. --> When they differ, in either direction, the client stops before any request
+<!-- LOCAL_PROTOCOL is still 1 at the PR 2 head (crates/orch-proto/src/lib.rs:46 at f70fc707). --> When they differ, in either direction, the client stops before any request
 is decoded, so nothing in your project changes. The message names the daemon's and this orch's versions and
 protocols in `<detail>` and changes the hint:
 
@@ -492,15 +491,27 @@ other way of running work asks the running daemon:
 | Command | What it does now |
 |---|---|
 | `orch serve`, `orch run --watch` | Start the daemon in the foreground with dispatch **on**, like `orch daemon start --dispatch on`, with the same refusals. If a daemon already runs, exit 4 with `Use: orch daemon dispatch on`; a daemon that runs with dispatch off is not resumed for you. |
-| `orch serve --listen`, `orch run --watch --listen` | The same, with the peer-link listener on. Against a running daemon: exit 4 and a hint to stop it and start again with `--listen`; a listener is never added to a running daemon. |
+| `orch serve --listen`, `orch run --watch --listen` | The same, with the peer-link listener on. Against a running daemon: exit 4, with the same `Use: orch daemon dispatch on` hint as without `--listen`; a listener is never added to a running daemon. To listen, `orch daemon stop`, then start again with `--listen`. |
 | `orch run --once` | One scheduling check in the running daemon, with that check's events; it does not stop the daemon or change dispatch. |
 | `orch run <task-id>` | Start that task in the running daemon and follow it until it ends. Disconnecting stops following, not the run. The usual eligibility, capacity and cancel checks apply, except that a `retrying` task starts at once instead of waiting out its retry delay, as in orch 0.13.0. A task that cannot start exits 1 with `task is not eligible for launch`. |
 | `orch run --all` | One finite batch of the currently eligible tasks in the running daemon, with the same results as before. |
 | `orch serve --once` | Run in the running daemon until every tracked task is final (below). Needs dispatch off. |
 | Dashboard start and stop watch | `orch daemon dispatch on` and `off`; never starts or stops a process. |
 | `orch tui --observe`, `orch tui --listen` | Removed: the dashboard is always a client; peer listening is a start option of the daemon. |
-| `orch doctor` | A client: with no daemon it prints the no-daemon message and the discovery facts and exits 7. |
+| `orch doctor` | A client: with no daemon it runs its local checks, then prints the no-daemon message and exits 7; outside a project it exits 0. |
 | `orch init`, `--help`, `--version` | Need no daemon. `orch init` prints how to start one and never starts it; running it again changes nothing in an existing project. |
+
+**Dispatch waits for the next check.** With dispatch on, the daemon starts waiting work only at its scheduling
+checks, every `scheduling.poll_interval_ms` (10 s by default). A new task, or a task unblocked by a finished run, can
+wait up to that long before its agent starts, and a task queued behind another task of the same agent waits for the
+first check after that run ends. orch 0.13.0 dispatched within about half a second. To shorten the wait, lower the
+interval, for example `orch config set scheduling.poll_interval_ms 2000` (values under 100 ms count as 100 ms); the
+daemon uses the new value from its next check. A later release restores immediate dispatch.
+<!-- Dissent 10.9 (dissent-log-cp5.md). crates/orch-engine/src/orchestrator/tick.rs:595 (no reactive dispatch in
+daemon mode), crates/orch-daemon/src/dispatch/mod.rs:24-67 (plain sleep, DEFAULT_POLL 10 s, MIN_POLL 100 ms) at
+f70fc707; 0.13.0 debounce 500 ms (orchestrator.rs:83, TaskCreated at :618-620 at 8bab8d1c). Measured at f70fc707,
+default interval, one shell agent: created->done 0.6/8.9/10.0 s (fact-check), 3.6/8.0/23.2 s (tsk_J8tJF2x; the
+23.2 s task waited behind another task of the same agent). -->
 
 **Options a daemon start refuses.** A foreground `orch serve` or `orch run --watch` *is* the daemon, so the
 options orch 0.13.0 used to shape that process's log or interval have nothing left to apply to. The command refuses
@@ -527,7 +538,8 @@ the batch's events itself ([Logs of `serve --once`](07-running-and-monitoring.md
 `orch run <task-id>`, `--all` and `--once` accept `--verbose` and ignore it.
 <!-- W2b (tsk_s5fpInN): crates/orch-cli/src/tree.rs REJECT_* constants, RunCmd/ServeCmd::rejected_flag and
 lib.rs dispatch_parsed (refusal before the foreground daemon path) at feature/daemon-clients-cli 6acc62db;
-s2a-cli-decisions.md §2. Not captured: that head does not compile (12 errors in orch-cli mcp/tui). -->
+s2a-cli-decisions.md §2. Captured at f70fc707 by the board-2 fact-check (fact-checker-pr2-review-f70fc70-evidence/
+flags.txt): every row and message matches. -->
 
 **`orch serve --once` is a batch.** While global dispatch is on it refuses with
 `dispatch is ON; serve --once needs dispatch OFF` (exit 2). With dispatch off it runs one batch at a time (a second
