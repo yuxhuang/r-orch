@@ -4,7 +4,7 @@ pub mod logs;
 
 use super::rpc::{Rpc, client_error};
 use crate::context::CliContext;
-use crate::output::{Color, Styles};
+use crate::output::{Color, Icon, Styles, print_error, print_success};
 use orch_client::Progress;
 use orch_core::error::{Error, Result};
 use orch_domain::OrchestratorEvent;
@@ -30,7 +30,12 @@ pub async fn single(engine: &Rpc, styles: &Styles, task_id: &str) -> Result<Exit
     );
     let args =
         super::rpc::arguments::<args::DispatchRunTaskArgs>(serde_json::json!({"task_id":task_id}))?;
-    let (outcome, signal) = stream(engine, args, |event| print_event(styles, event)).await?;
+    let mut target_run = None;
+    let mut failed = false;
+    let (outcome, signal) = stream(engine, args, |event| {
+        handle_single(styles, event, task_id, &mut target_run, &mut failed);
+    })
+    .await?;
     Ok(code(outcome.exit_code, signal))
 }
 
@@ -39,16 +44,15 @@ pub async fn all(engine: &Rpc, styles: &Styles) -> Result<ExitCode> {
         "\n  {} · running all todo tasks\n",
         styles.paint(Color::Amber, "orch")
     );
-    let (outcome, signal) = stream(engine, args::DispatchRunAllArgs {}, |event| {
-        print_event(styles, event)
-    })
-    .await?;
+    let (outcome, signal) = stream(engine, args::DispatchRunAllArgs {}, |_| {}).await?;
     Ok(code(outcome.exit_code, signal))
 }
 
 pub async fn once(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<ExitCode> {
     let (outcome, signal) = stream(engine, args::DispatchTickArgs {}, |event| {
-        print_event(styles, event)
+        if ctx.output.is_none() && !ctx.quiet {
+            print_event(styles, event);
+        }
     })
     .await?;
     if let Some(format) = ctx.output {
@@ -184,4 +188,79 @@ pub async fn doctor(
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn handle_single(
+    styles: &Styles,
+    event: &OrchestratorEvent,
+    task_id: &str,
+    target_run: &mut Option<String>,
+    failed: &mut bool,
+) -> bool {
+    let time = styles.dim(&crate::logs::now_time());
+    match event {
+        OrchestratorEvent::AgentStarted {
+            task_id: started,
+            run_id,
+            ..
+        } => {
+            if started == task_id {
+                *target_run = Some(run_id.clone());
+            }
+        }
+        // Printed for every run, not just this task's.
+        OrchestratorEvent::AgentOutput { data, .. } => {
+            println!(
+                "  {time}  {} {}",
+                styles.icon(Icon::AgentAction),
+                slice_80(data)
+            );
+        }
+        OrchestratorEvent::AgentFileChanged { path, .. } => {
+            println!(
+                "  {time}  {} Modified {path}",
+                styles.icon(Icon::AgentAction)
+            );
+        }
+        OrchestratorEvent::AgentError { error, .. } => {
+            println!("  {time}  {} {error}", styles.icon(Icon::Failed));
+        }
+        OrchestratorEvent::AgentCompleted {
+            run_id, success, ..
+        } => {
+            if target_run.as_deref() != Some(run_id.as_str()) {
+                return false;
+            }
+            if *success {
+                print_success(styles, "Done");
+            } else {
+                print_error(styles, "Failed", None);
+                *failed = true;
+            }
+            return true;
+        }
+        _ => {}
+    }
+    false
+}
+
+fn slice_80(data: &str) -> String {
+    slice_utf16(data, 80)
+}
+
+fn slice_utf16(data: &str, max_units: usize) -> String {
+    if data.len() <= max_units {
+        return data.to_owned();
+    }
+    let mut units = 0;
+    let mut out = String::new();
+    for ch in data.chars() {
+        let width = ch.len_utf16();
+        if units + width > max_units {
+            break;
+        }
+        units += width;
+        out.push(ch);
+    }
+    out
 }
