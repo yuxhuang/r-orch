@@ -20,7 +20,16 @@ pub(super) struct ControlState {
     status: Mutex<DaemonStatus>,
     stopped: watch::Sender<Option<bool>>,
     probes: tokio::sync::Semaphore,
+    #[cfg(feature = "testing")]
+    run_all_pass_hook: Mutex<Option<RunAllPassHook>>,
 }
+/// Test seam awaited after every finite run-all pass, before the snapshot that
+/// decides whether the batch is finished. The argument is whether the pass
+/// launched anything.
+#[cfg(feature = "testing")]
+pub type RunAllPassHook = Arc<
+    dyn Fn(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
 struct Batch {
     id: u64,
     cancelled: Arc<AtomicBool>,
@@ -37,6 +46,8 @@ impl ControlState {
             automatic_guard: Mutex::new(Arc::new(AtomicBool::new(false))),
             stopped: watch::channel(None).0,
             probes: tokio::sync::Semaphore::new(2),
+            #[cfg(feature = "testing")]
+            run_all_pass_hook: Mutex::new(None),
             status: Mutex::new(DaemonStatus {
                 pid: std::process::id(),
                 project_root: path(engine.paths.project_root().to_path_buf()),
@@ -92,6 +103,16 @@ impl Drop for BatchGuard {
     }
 }
 
+#[cfg(feature = "testing")]
+impl ServiceHandler {
+    pub fn set_run_all_pass_hook(&self, hook: RunAllPassHook) {
+        *self
+            .control
+            .run_all_pass_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+}
 impl ServiceHandler {
     pub fn dispatch_state(&self) -> DispatchState {
         DispatchState {
@@ -379,6 +400,18 @@ impl ServiceHandler {
                     .is_none_or(|task| !is_dispatchable(task.status))
                 {
                     pending.retain(|task| task != &id);
+                }
+            }
+            #[cfg(feature = "testing")]
+            {
+                let hook = self
+                    .control
+                    .run_all_pass_hook
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(progressed).await;
                 }
             }
             let (tasks, runs, state) = self.read_execution_snapshot().await?;
