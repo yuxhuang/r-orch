@@ -97,7 +97,9 @@ and `crates/orch-infra` storage locking are out of scope.
 ## Status
 
 Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_WpQVmPg` (PR 1) and goal
-`goal_h-gIBCW` (PR 2).
+`goal_h-gIBCW` (PR 2). States are a snapshot of the `goal_h-gIBCW` task graph at 2026-11-09 02:02 UTC, plus the
+`tsk_2YEYhOL` row, which the commit that adds it completes. A row marked pending was still open then; this table
+is not updated after that.
 
 | Wave | Item | Task | State |
 |---|---|---|---|
@@ -135,15 +137,19 @@ Waves as run, in order. Ids in parentheses are the orch task ids of goal `goal_W
 | | F-W2 | `tsk_NUnWRGF` | docs finished at the frozen code (`ca51c7e`) |
 | | F-GATE: code, security, resilience, facts, cold gate at `ca51c7e` | `tsk_v5FUQHQ`, `tsk_AauPKD9`, `tsk_irHNbOB`, `tsk_vDRoMF_`, `tsk_K3GBJR8` | done: all five pass with conditions, none blocking |
 | | Checkpoint CP2: governance verdicts | `tsk_rJCHWFp` | done: fix round authorised |
-| F: PR 2, CP2 fix round | F1: value-free `logs.since` form errors (R14), then its docs | `tsk_zt0J71i`, then `tsk_AUiHMlQ` (replaces cancelled `tsk_0Q4didm`) | done: fix and tests `152c62c`; R14 row, manual 17, RUNBOOK and CHANGELOG reconciled |
-| | C2: qualify pause dispatch wording in code text, then docs (with SRE-2, F5) | `tsk_XQxdkEP`, then `tsk_cM9TgND` (replace cancelled `tsk_DG05bju`, `tsk_Kyg4A2e`) | pending |
-| | SRE-3: pin terminal mode in `yaml_contract` and `routing` glyph fixtures | `tsk_EDxaAMe` (replaces cancelled `tsk_4dskzEb`) | in progress |
-| | F2: non-UTF-8 attachment wording matches resolved-path behaviour | `tsk_yNNFDQg` | done (R15 row, manual 17, CHANGELOG) |
-| | F3: this status table and the liveness decision | `tsk_CFNaK07` | this commit |
-| | I2: integrate the fix round, full gate set, re-freeze | `tsk_MACcZj4` | pending |
-| G: PR 2, re-gate and PR (future) | Re-reviews at the re-frozen SHA: code, security, resilience, facts | `tsk_QKJV45G`, `tsk_WBWDCzh`, `tsk_P-mM5Cp`, `tsk_3bHsl13` | pending |
+| F: PR 2, CP2 fix round | F1: value-free `logs.since` form errors (R14), then its docs | `tsk_zt0J71i`, then `tsk_AUiHMlQ` (replaces cancelled `tsk_0Q4didm`) | done: fix and tests `152c62c`; R14 row, manual 17, RUNBOOK and CHANGELOG reconciled (`08c3237`) |
+| | C2: qualify pause dispatch wording in code text, then docs (with SRE-2, F5) | `tsk_XQxdkEP`, then `tsk_cM9TgND` (replace cancelled `tsk_DG05bju`, `tsk_Kyg4A2e`) | done: code text `c134e52`, docs `d3dace0` |
+| | SRE-3: pin terminal mode in `yaml_contract` and `routing` glyph fixtures | `tsk_EDxaAMe` (replaces cancelled `tsk_4dskzEb`) | done (`1898dd3`) |
+| | F2: non-UTF-8 attachment wording matches resolved-path behaviour | `tsk_yNNFDQg` | done (`d68002f`): R15 row, manual 17, CHANGELOG |
+| | F3, first pass: this status table and the liveness decision | `tsk_CFNaK07` | done (`9f6ef6c`); remaining rows refreshed in wave H |
+| | I2: integrate the fix round, full gate set, re-freeze | `tsk_MACcZj4` | done: full gate set run, re-frozen at `d3dace0`; no integration commit |
+| G: PR 2, re-gate and PR | Re-reviews at the re-frozen SHA: code, security, resilience, facts | `tsk_QKJV45G`, `tsk_WBWDCzh`, `tsk_P-mM5Cp`, `tsk_3bHsl13` | done at `d3dace0`: code, security and resilience pass; facts pass with conditions (F3: this table) |
 | | PR: push, open the single PR against `main`, Linux CI green | `tsk_5TRHZoX` | PR [#72](https://github.com/yuxhuang/r-orch/pull/72) opened at `d3dace0`; Linux CI green, run 42547054498; owner merges (squash) |
-| | Checkpoint CP3: re-gate verdicts and PR | `tsk_65sIOO0` | pending |
+| | Checkpoint CP3: re-gate verdicts and PR | `tsk_65sIOO0` | done 2026-11-09: fix F3, then CP4 |
+| H: PR 2, F3 fix and close | F3, second pass: refresh the remaining statuses after CP3 | `tsk_2YEYhOL` | done: the commit that adds this row, on top of `e8af27e` |
+| | Push that commit to PR #72 (fast-forward), Linux CI green | `tsk_Ls5_1Ug` | pending |
+| | Scoped fact re-check of this table at the final SHA | `tsk__eHJeUN` | pending |
+| | Checkpoint CP4: final SHA, CI, F3 verdict, report | `tsk_rGkc9H4` | pending |
 
 Decided at CP1 (`tsk_IUpXm7b`): `task_cancel` reports no liveness field and stays store-only. A live PID on the
 lock is not proof that a live orchestrator will reconcile the cancel (one-shot holders, PID reuse, the race
