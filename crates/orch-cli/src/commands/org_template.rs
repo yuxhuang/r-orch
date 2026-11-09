@@ -242,6 +242,7 @@ pub(crate) async fn dispatch(
         }
         TemplateSub::Edit { selector } => {
             let selector = selector.wire(cwd)?;
+            refuse_builtin_edit(&engine, &selector).await?;
             let base = definition_get(&engine, selector.clone(), &Target::Org).await?;
             let input = edit_document(&base.document).await?;
             let updated = definition_apply(
@@ -287,6 +288,7 @@ pub(crate) async fn dispatch(
             MemberSub::Edit { selector } => {
                 let target = selector.target()?;
                 let selector = selector.selector().wire(cwd)?;
+                refuse_builtin_edit(&engine, &selector).await?;
                 let base = definition_get(&engine, selector.clone(), &target).await?;
                 let input = edit_document(&base.document).await?;
                 let updated = definition_apply(
@@ -331,6 +333,25 @@ pub(crate) async fn dispatch(
         },
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// A builtin is read-only. The daemon refuses its apply, but only after the
+/// editor would have opened; refuse first, as the pre-daemon CLI did.
+async fn refuse_builtin_edit(engine: &Rpc, selector: &args::TemplateSelector) -> Result<()> {
+    let view = engine
+        .request(args::OrgTemplateShowArgs {
+            selector: selector.clone(),
+            resolved: false,
+        })
+        .await?;
+    if !matches!(view.source, results::TemplateSource::Builtin) {
+        return Ok(());
+    }
+    let name = selector.name.as_ref().map_or("", |name| name.as_str());
+    let key = name.split_once(':').map_or(name, |(_, key)| key);
+    Err(Error::invalid_arguments(format!(
+        "Builtins are read-only; run orch org template init {key}-copy --from builtin:{key}"
+    )))
 }
 
 async fn definition_get(

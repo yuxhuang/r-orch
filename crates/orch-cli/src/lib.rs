@@ -226,11 +226,9 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
     match &cli.command {
         Some(Command::Init(args)) => run_init(cli, env, &cwd, args).await,
+        // Container-less: the version check reads no project state, so it
+        // needs neither a project nor a daemon.
         Some(Command::Update(args)) => {
-            let (_, _, client) = build(cli, env, &cwd).await?;
-            client
-                .request(orch_proto::ops::args::UpdateCheckArgs {})
-                .await?;
             update::run(&styles_for(cli, env), args.check);
             Ok(ExitCode::SUCCESS)
         }
@@ -716,6 +714,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             once,
             watch: _,
             verbose: _,
+            tick_interval: _,
             peer,
         })) => {
             if !*all && !*once && task_id.is_none() {

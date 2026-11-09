@@ -947,6 +947,9 @@ pub struct RunCmd {
         help = "Not accepted with --watch (use RUST_LOG or orch logs --follow)"
     )]
     pub verbose: bool,
+    /// Never accepted: parsed only so the refusal can name the config key.
+    #[arg(long = "tick-interval", value_name = "ms", hide = true)]
+    pub tick_interval: Option<String>,
 }
 
 /// A foreground `run --watch` / `serve` *is* the daemon start, so there is no
@@ -967,7 +970,11 @@ const REJECT_VERBOSE: &str =
 impl RunCmd {
     /// The exit-2 message for a flag this invocation cannot honour.
     pub fn rejected_flag(&self) -> Option<&'static str> {
-        (self.watch && self.verbose).then_some(REJECT_VERBOSE)
+        if self.tick_interval.is_some() {
+            Some(REJECT_TICK_INTERVAL)
+        } else {
+            (self.watch && self.verbose).then_some(REJECT_VERBOSE)
+        }
     }
 }
 
@@ -1885,6 +1892,10 @@ mod file_mutation_tests {
         assert_eq!(
             rejected(&["orch", "run", "--watch", "--verbose"]),
             Some(REJECT_VERBOSE)
+        );
+        assert_eq!(
+            rejected(&["orch", "run", "--watch", "--tick-interval", "250"]),
+            interval
         );
         // The first rejected flag wins.
         assert_eq!(

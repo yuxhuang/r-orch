@@ -37,15 +37,20 @@ pub async fn run(
         )
         .await;
     }
-    let template_dir = args.template_dir.as_ref().map(|path| {
-        if path.is_absolute() {
-            path.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| engine.project_root.clone())
-                .join(path)
-        }
-    });
+    // Relative to the caller's cwd, never the daemon's, and lossless on the
+    // wire (the protocol's tagged path, not a display string).
+    let template_dir = args
+        .template_dir
+        .as_deref()
+        .map(|path| {
+            std::path::absolute(path)
+                .map_err(crate::commands::rpc::argument_error)
+                .and_then(|path| {
+                    orch_proto::path::WirePath::new(path)
+                        .map_err(crate::commands::rpc::argument_error)
+                })
+        })
+        .transpose()?;
     let loaded = engine
         .call::<args::OrgTemplateShowArgs>(serde_json::json!({
             "selector": { "name":args.template, "template_dir":template_dir },
