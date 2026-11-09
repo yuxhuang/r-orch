@@ -222,6 +222,12 @@ fn orch_in(dir: &Path, cwd: &Path, daemon: Option<&TestDaemon>) -> Command {
         // `true`, and `doctor`-style probes find nothing real to exec.
         .env("PATH", "/usr/bin:/bin")
         .env_remove("RUST_LOG")
+        // The test runner can itself be an orchestrated agent: do not inherit
+        // its identity (the daemon refuses an agent context; `msg send` uses
+        // it as the sender).
+        .env_remove("ORCH_AGENT_ID")
+        .env_remove("ORCH_AGENT_NAME")
+        .env_remove("ORCH_TASK_ID")
         .env_remove("ORCHESTRY_DEBUG");
     if let Some(daemon) = daemon {
         daemon.apply(&mut command);

@@ -56,6 +56,12 @@ fn orch(cwd: &Path) -> Command {
         // sufficient and machine-independent. `git` and `bash` stay reachable
         // because `doctor` reports on those too.
         .env("PATH", "/usr/bin:/bin")
+        // The test runner can itself be an orchestrated agent: do not inherit
+        // its identity (the daemon refuses an agent context; `msg send` uses
+        // it as the sender).
+        .env_remove("ORCH_AGENT_ID")
+        .env_remove("ORCH_AGENT_NAME")
+        .env_remove("ORCH_TASK_ID")
         .env_remove("ORCHESTRY_DEBUG");
     daemon::apply_for(cwd, &mut command);
     command

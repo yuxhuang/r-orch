@@ -33,6 +33,12 @@ fn orch(project: &Path, home: &Path) -> Command {
         .env("NO_COLOR", "1")
         // No agent CLIs on PATH: nothing here may spawn a real one.
         .env("PATH", "/usr/bin:/bin")
+        // The test runner can itself be an orchestrated agent: do not inherit
+        // its identity (the daemon refuses an agent context; `msg send` uses
+        // it as the sender).
+        .env_remove("ORCH_AGENT_ID")
+        .env_remove("ORCH_AGENT_NAME")
+        .env_remove("ORCH_TASK_ID")
         .env_remove("ORCHESTRY_DEBUG");
     command
 }
