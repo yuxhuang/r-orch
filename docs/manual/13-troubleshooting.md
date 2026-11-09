@@ -86,8 +86,8 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 - **Cause.** One of these:
   1. Nothing is dispatching. The daemon runs tasks by itself only while its dispatch is on (`orch daemon status` shows `dispatch ON`), or when you run a task by hand.
   2. The task has no enabled agent, or its agent is busy or disabled.
-  3. Another `todo` task is assigned to the same agent. In 0.9.3 `orch run <task-id>` then does nothing.
-- **Do.** Turn dispatch on with `orch daemon dispatch on` (or the dashboard's watch toggle), or run `orch run <task-id>`. For the third cause, cancel or reassign the other task, or use `orch run --all`. See [Run one task](07-running-and-monitoring.md#run-one-task).
+  3. It waits for approval, has a dependency that is not `done`, or belongs to a paused goal.
+- **Do.** Turn dispatch on with `orch daemon dispatch on` (or the dashboard's watch toggle), or run `orch run <task-id>`, which exits 1 with `task is not eligible for launch` when the task cannot start. See [Run one task](07-running-and-monitoring.md#run-one-task).
 
 ### A task stays in `review` and `orch serve --once` never exits
 

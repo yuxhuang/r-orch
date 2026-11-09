@@ -75,13 +75,23 @@ The daemon starts the run, and the command follows it: it prints the agent's out
 
 After a successful run the task is `done`, or `review` if the agent's policy asks for your approval ([Review a task](04-tasks.md#review-a-task-approve-or-reject)).
 
-`orch run <task-id>` starts only that task, with the usual checks. Three situations make it start nothing. The command then prints only its header line and exits 0:
+`orch run <task-id>` starts only that task, with the usual checks. A `retrying` task starts at once, without waiting for its retry delay; that attempt replaces the queued retry ([How orch retries by itself](04-tasks.md#how-orch-retries-by-itself)).
 
-- The task is not `todo` or `retrying`. Run `orch task retry` first for a `failed` task.
-- The task is assigned to an agent that is busy or disabled.
-- Another `todo` task is assigned to the same agent. In orch 0.9.3 the agent counts as taken, and the run does nothing. Cancel or finish the other task, reassign one of them, or use `orch run --all`.
+When the task cannot start, the command prints its header line and the refusal, and exits 1:
 
-To see why, run `orch task list --status todo` and `orch agent list`.
+```text
+  orch · running tsk_6joYwaY "C2"
+
+  ✕ task is not eligible for launch
+```
+
+The task cannot start when:
+
+- It is not `todo` or `retrying`, for example `done` or `cancelled`. Run `orch task retry` first for a `failed` or `cancelled` task.
+- Its agent is disabled, or busy with another run, or the concurrency limit is reached.
+- It waits for approval, has a dependency that is not `done`, belongs to a paused goal, or its scope overlaps a running task.
+
+Other `todo` tasks of the same agent do not stop it. To see why a task cannot start, run `orch task show <task-id>` and `orch agent list`.
 
 ### Run all waiting tasks
 

@@ -1036,7 +1036,7 @@ the hazards of any two orch processes on one project:
 | Task/other whole-record updates | Single-file atomic writes; some authored-definition paths have `.definition.lock` | Concurrent owner status advancement and task assignment can overwrite one another's whole records. No compare-and-swap promise. |
 | Context expiry | list/get can delete expired entity files and list publishes a computed keep-list | Another writer's newly indexed key may disappear from that list; a renewal of an expired key may be deleted. Read-only sessions also participate. |
 | Messages | Store transaction holds its mutation lock across entity/index operations | Do not generalize weaker task/context guarantees to messages or imply a multi-service transaction. |
-| Process directory cache | Fresh Engines refresh config/service defaults, but `ensure_dir` retains a process-global set | Removing a cached directory can make later operations fail until process restart. |
+| Process directory cache | Fresh Engines refresh config/service defaults, but `ensure_dir` retains a process-global set | In orch 0.13.0, removing a cached directory can make later operations fail until process restart. The daemon of this release recreates the directory at its next write into it and needs no restart. |
 
 These interleavings are traced from the code; none is a measured failure rate. `--read-only` sessions are
 included: their context reads delete expired entries.
@@ -1063,8 +1063,9 @@ included: their context reads delete expired entries.
    agents' outputs. Use the normal commands (`orch task assign`, `orch agent update`, `orch context set`), one
    writer at a time.
 7. Restart the orchestrator owner, then **every** MCP session (restart each client, or its MCP server). A restart
-   is required after a directory under `.orchestry/` was removed or replaced: each `orch mcp` process remembers the
-   directories it has created, and only a new process forgets them.
+   is required after a directory under `.orchestry/` was removed or replaced: each orch 0.13.0 `orch mcp` process
+   remembers the directories it has created, and only a new process forgets them. (The daemon of this release
+   recreates such a directory at its next write into it.)
 
 **Prevention.** Do not remove or replace directories under `.orchestry/` while anything runs. Make bulk or
 consistency-sensitive changes (configuration, many tasks, team changes) while the other writers and any client

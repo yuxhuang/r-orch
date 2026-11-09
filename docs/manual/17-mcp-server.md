@@ -789,6 +789,9 @@ one daemon of the project, and the daemon orders every change. Inside it:
 - An entity and its `_index.json` are written by the same process, so another writer cannot make them disagree.
 - Expired context entries are removed only by the daemon itself, never as a side effect of a read, so a renewal is
   not lost.
+- A store directory removed under `.orchestry/` while the daemon runs is recreated at the daemon's next write into
+  it, so calls keep working without a restart. In orch 0.13.0 such writes could fail in a long-lived process
+  until it restarted.
 
 What it does not do:
 
@@ -924,7 +927,7 @@ The owner accepted them as designed; there is no flag to change them.
 | Every call fails with a configuration error | `config.yml` is broken | [Restore the configuration](../RUNBOOK.md#restoring-a-configuration-broken-through-the-mcp-server) |
 | `Not executed: … retry later` | Too many calls queued, or a slow call ahead | Retry; send fewer calls at once |
 | A read sent right after a write returns `null` or the old value, with `isError: false` | The client sent both before the write's response arrived; the server can run them in either order | Wait for the write's response before sending the read ([Calls you send together can run in any order](#results-and-errors)) |
-| Calls fail after a directory under `.orchestry/` was removed or replaced | The daemon remembers directories it created | Stop the daemon and start it again. Do not remove directories under `.orchestry/` while it runs <!-- UNCONFIRMED: design D1/D2 put the process directory cache in the daemon; verify at I2 --> |
+| Tasks, context entries or other records are gone after a directory under `.orchestry/` was removed | The files went with the directory. The daemon recreates the directory at its next write into it, so later calls work without a restart, but nothing brings the old files back | Restore the lost records from a backup with the normal commands. Do not remove directories under `.orchestry/` while the daemon runs |
 | Every call is refused with `Not executed: timed out after 10 s waiting for the store queue` | A call ahead of them is stuck, for example on a hung file system | Fix the storage, or stop the server ([A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process)); inspect state before retrying |
 | The client reports the server gone; captured stderr ends with `cannot write to stdout` | The client stopped reading the server's output; the server exits with code 1 by design | Restart the client. Check the calls that were in flight before you repeat them |
 | An `orch mcp` process is still running after its client quit, or never answers | A stuck server, or a leftover after a hard kill | [A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process) |

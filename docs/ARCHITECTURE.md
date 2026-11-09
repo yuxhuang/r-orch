@@ -60,8 +60,11 @@ current writers creating different entities therefore keep both entries. What re
   advancing its status and a CLI or MCP call assigning it) and save it in turn: the later save wins whole.
 - **Context expiry publishes a computed keep-list.** A `context list`/`get` that purges expired entries can drop
   a key another process has just indexed, or delete an expired key another process is renewing.
-- **`ensure_dir` remembers created directories per process.** Removing such a directory while a long-lived process
-  (the orchestrator, the dashboard, `orch mcp`) runs can make its later writes fail until it restarts.
+
+The per-process directory cache is no longer a residual. `ensure_dir` still remembers the directories it created,
+per process, but a write into a remembered directory that was removed underneath the process no longer fails until a
+restart: `fs_utils::atomic_write_with_mode` forgets the directory on `NotFound`, recreates it and retries the write
+once, so the daemon recovers on its own. The files that were in the removed directory are not brought back.
 
 The honest response is to **document the behaviour and verify that it is what we documented**, not to claim a
 guarantee we cannot provide. Concurrent mutation while an orchestrator is running is a **known, documented

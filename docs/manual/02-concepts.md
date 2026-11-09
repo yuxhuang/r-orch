@@ -135,7 +135,7 @@ What moves a task:
 | Start | The orchestrator moves a `todo` or `retrying` task to `in_progress` when it starts a run. A task with unfinished dependencies is **blocked** and does not start. |
 | Success | The task always goes to `review`. If the agent's approval policy is `auto`, orch then approves it at once, so you see `done`. |
 | Failure | The agent's command exits with an error, or orch stops it because it produced no output for `stall_timeout_ms`. If attempts remain, the task goes to `retrying`. Otherwise it goes to `failed`, and tasks that depend on it fail too. |
-| Retry delay | The first retry waits `scheduling.retry_base_delay_ms` (10 seconds by default). Each further retry doubles the wait, up to `scheduling.retry_max_delay_ms` (300 seconds by default). |
+| Retry delay | The first retry waits `scheduling.retry_base_delay_ms` (10 seconds by default). Each further retry doubles the wait, up to `scheduling.retry_max_delay_ms` (300 seconds by default). `orch run <task-id>` starts a `retrying` task at once, without the wait. |
 | `orch task approve` | Moves a `review` task to `done`. |
 | `orch task reject --reason "..."` | Moves a `review` task back to `todo`, sets its attempts to 0, and gives your reason to the agent in the next prompt. |
 | `orch task cancel` | Moves any task that is not terminal to `cancelled`. |
