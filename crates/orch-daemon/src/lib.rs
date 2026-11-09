@@ -5,7 +5,8 @@
 //! is a client over the local socket using `orch-proto`.
 //!
 //! The public surface is deliberately narrow: [`prepare_start`] (and its
-//! async wrapper [`start`]), [`initialize`] and, behind the `testing`
+//! async wrapper [`start`]), [`initialize`], the runtime `.gitignore` entries
+//! `orch init` shares ([`RUNTIME_GITIGNORE_ENTRIES`]) and, behind the `testing`
 //! feature, [`testing::DaemonHarness`]. Nothing here re-exports a store implementation or an arbitrary execute closure.
 //!
 //! **PR 1 skeleton (S1a-api).** Signatures only; bodies return
@@ -32,6 +33,7 @@ mod discovery;
 mod dispatch;
 mod env;
 mod error;
+mod gitignore;
 mod guard;
 pub mod lifecycle;
 mod listener;
@@ -43,6 +45,10 @@ pub mod testing;
 
 pub use discovery::select_project_root;
 pub use error::DaemonError;
+pub use gitignore::{
+    GitignoreError, GitignoreErrorCode, RUNTIME_GITIGNORE_ENTRIES, RUNTIME_GITIGNORE_HEADER,
+    ensure_runtime_gitignore,
+};
 pub use lifecycle::{
     DEVELOPMENTAL_BANNER, DaemonExit, DispatchMode, InitOptions, InitOutcome, PreparedStart,
     StartOptions, initialize, prepare_start, start,
