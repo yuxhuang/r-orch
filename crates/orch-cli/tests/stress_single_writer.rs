@@ -95,6 +95,8 @@ struct Shared {
     /// stopped: the renewer outlives `stop` so the renewed key's last
     /// renewal is as close to the stop as possible (see `judge`).
     renew_stop: AtomicBool,
+    /// What the CLI creator is doing and since when (for a stuck-run report).
+    creator_stage: Mutex<(String, Instant)>,
     /// `(n, sent, acked)` of the last acknowledged renewal of `live`: the
     /// renewal number and the instants it was sent and acknowledged.
     live_times: Mutex<Option<(u64, Instant, Instant)>>,
@@ -199,10 +201,13 @@ fn spawn_cli_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>, worker: String)
         while !shared.stopped() {
             n += 1;
             let step = |what: &str, result: Result<String, String>| -> Option<String> {
+                *shared.creator_stage.lock().unwrap() =
+                    (format!("#{n} after {what}"), Instant::now());
                 result
                     .map_err(|err| shared.fail(format!("cli creator {what} #{n}: {err}")))
                     .ok()
             };
+            *shared.creator_stage.lock().unwrap() = (format!("#{n} starting"), Instant::now());
             // Every third task is runnable by the worker, so the tick and
             // the collector write too.
             let title = format!("c4-{n}");
@@ -818,8 +823,12 @@ fn wait_until_every_leg_works(
             Instant::now() < deadline,
             "after {LEGS_READY:?} not every leg was working (tui created a task: {tui}, \
              short key set: {short}, live renewed: {live}); TUI screen:\n{}\n\
-             orch processes:\n{}\ndaemon log tail:\n{}",
+             CLI creator: {}; orch processes:\n{}\ndaemon log tail:\n{}",
             pane.map_or_else(|| "(no TUI)".to_owned(), TuiPane::screen),
+            {
+                let (stage, since) = &*shared.creator_stage.lock().unwrap();
+                format!("{stage} {}ms ago", since.elapsed().as_millis())
+            },
             orch_processes(&process_table())
                 .iter()
                 .map(|p| format!("  pid {} ppid {} {}", p.pid, p.ppid, p.command))
@@ -1034,6 +1043,7 @@ fn run_stress(fleet: Fleet) {
         priority: Writer::default(),
         live: Writer::default(),
         renew_stop: AtomicBool::new(false),
+        creator_stage: Mutex::new(("not started".into(), Instant::now())),
         live_times: Mutex::new(None),
         failures: Mutex::default(),
         created: Mutex::default(),
