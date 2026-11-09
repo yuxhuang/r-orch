@@ -176,6 +176,21 @@ async fn status_dispatch_and_stop_use_the_explicit_harness_socket() {
     let status: orch_proto::ops::results::DaemonStatus =
         serde_json::from_slice(&out.stdout).unwrap();
     assert!(!status.dispatch.dispatch_on);
+    let out = orch(root, socket, parent)
+        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
+        .args(["daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(human.contains("dispatch OFF"));
+    assert!(human.contains(&format!(
+        "version: orch {} protocol {}",
+        status.binary, status.protocol
+    )));
+    assert!(human.contains(&status.executable.display_escaped()));
+    assert!(human.contains(&status.started_at));
+
     // Keep automatic dispatch OFF: this binary fixture never admits an
     // agent launch. Both switches are covered with a private fake transport
     // in orch-client/tests/transport.rs.

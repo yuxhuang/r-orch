@@ -124,7 +124,7 @@ async fn control(
         DaemonSub::Status => {
             let status = Client::connect(config).await?.status().await?;
             let text = format!(
-                "orch daemon PID {} · dispatch {}\n  executable: {}\n  started: {}\n  sessions: {}/{}",
+                "orch daemon PID {} · dispatch {}\n  executable: {}\n  started: {}\n  version: orch {} protocol {}\n  sessions: {}/{}",
                 status.pid,
                 if status.dispatch.dispatch_on {
                     "ON"
@@ -133,6 +133,8 @@ async fn control(
                 },
                 status.executable.display_escaped(),
                 orch_proto::path::escape_controls(&status.started_at),
+                orch_proto::path::escape_controls(&status.binary),
+                status.protocol,
                 status.sessions,
                 status.session_cap
             );
