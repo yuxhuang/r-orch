@@ -183,15 +183,13 @@ fn check_tui(cond: Cond) {
 
 // ── the cells ──────────────────────────────────────────────────────────────
 
-/// One `#[test]` per cell. Every cell fails at the I1b base (the CLI, TUI,
-/// web and MCP still read and write the store directly there) and passes once
-/// the cutover slices land; the single `ignore` below is the only line to
-/// delete when they have (`rg 'CUTOVER:' crates/orch-cli/tests`).
+/// One `#[test]` per cell. Every cell failed at the I1b base (the CLI, TUI,
+/// web and MCP still read and wrote the store directly there) and passes now
+/// that the cutover slices (S2a-cli, S2b, S2c) have landed.
 macro_rules! cells {
     ($( $name:ident => $body:expr; )*) => {
         $(
             #[test]
-            #[ignore = "CUTOVER: needs S2a-cli, S2b (MCP) and S2c (TUI/web); fails at the I1b base"]
             fn $name() {
                 $body
             }
@@ -288,7 +286,6 @@ fn cli_checklist_rejects_a_client_that_answers_without_a_daemon() {
 /// `r` in the disconnected TUI is the retry: once the owner starts the daemon
 /// the next `r` reaches it and the dashboard replaces the message.
 #[test]
-#[ignore = "CUTOVER: needs S2c (TUI/web); fails at the I1b base"]
 fn tui_retry_reaches_the_daemon_after_the_owner_starts_it() {
     let _serial = serial();
     let scene = Scene::new(Cond::NoSocket);
@@ -321,7 +318,6 @@ fn tui_retry_reaches_the_daemon_after_the_owner_starts_it() {
 /// Web has no way to retry a closed tab's page, so an outage while serving is
 /// an HTTP 503 with the generic text, not a silent hang and not a restart.
 #[test]
-#[ignore = "CUTOVER: needs S2c (TUI/web); fails at the I1b base"]
 fn web_answers_503_when_the_daemon_dies_while_serving_and_starts_nothing() {
     let _serial = serial();
     let scene = Scene::new(Cond::NoSocket);

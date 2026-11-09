@@ -434,7 +434,6 @@ fn assert_no_daemon_text(who: &str, stderr: &str, root: &std::path::Path) {
 }
 
 #[test]
-#[ignore = "CUTOVER: needs S2a-cli and S2b; the base CLI/MCP still answer from the store"]
 fn daemon_killed_mid_run_next_cli_read_write_and_mcp_call_report_no_daemon_and_nothing_restarts() {
     let sandbox = Sandbox::new();
     sandbox.init_project();
@@ -484,7 +483,11 @@ fn daemon_killed_mid_run_next_cli_read_write_and_mcp_call_report_no_daemon_and_n
     assert_eq!(mcp.finish(), Some(0));
 
     // Nothing started anything, repaired anything, or wrote anything.
-    assert!(watch.new_orch().is_empty(), "{:?}", watch.new_orch());
+    assert!(
+        watch.new_orch_of(&sandbox).is_empty(),
+        "{:?}",
+        watch.new_orch_of(&sandbox)
+    );
     assert!(cli_pids.iter().all(|pid| process_group_empty(*pid)));
     assert_eq!(
         tree(&sandbox.root()),
@@ -497,7 +500,6 @@ fn daemon_killed_mid_run_next_cli_read_write_and_mcp_call_report_no_daemon_and_n
 }
 
 #[test]
-#[ignore = "CUTOVER: needs S2a-cli and S2b; the base CLI/MCP still answer from the store"]
 fn explicit_restart_after_a_kill_lets_every_client_read_the_reconciled_run() {
     let sandbox = Sandbox::new();
     sandbox.init_project();

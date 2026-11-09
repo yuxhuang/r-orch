@@ -1094,8 +1094,6 @@ fn judge(
 }
 
 #[test]
-#[ignore = "CUTOVER: needs S2a-cli, S2b and S2c; at the I1b base the direct-store CLI/MCP \
-            lose field updates (the D10 race this test exists to close)"]
 fn tui_cli_and_mcp_clients_mutating_one_project_leave_files_equal_to_the_index_and_lose_nothing() {
     run_stress(Fleet::Processes);
 }

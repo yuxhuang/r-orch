@@ -159,7 +159,7 @@ impl Scene {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             project: tree(&self.root),
-            sockets: tree(self.socket.parent().unwrap()),
+            sockets: harness_free(tree(self.socket.parent().unwrap())),
             endpoint: endpoint_identity(&self.socket),
         }
     }
@@ -189,6 +189,16 @@ impl Drop for Scene {
             let _ = keep.runtime.block_on(daemon.shutdown());
         }
     }
+}
+
+/// The TUI pane fixture (`TuiPane`) writes its own wrapper, exit file and tmux
+/// server socket into the socket directory; those are the harness's, not the
+/// client's, so they are not part of "the client changed nothing".
+fn harness_free(mut tree: BTreeMap<String, (bool, u64)>) -> BTreeMap<String, (bool, u64)> {
+    tree.retain(|name, _| {
+        !(name == "pane.sh" || name.starts_with("tui.exit") || name.starts_with("tmux-"))
+    });
+    tree
 }
 
 pub struct Snapshot {
@@ -238,6 +248,17 @@ pub fn endpoint_identity(socket: &Path) -> Option<(u64, u32, u64, i64)> {
 
 // ── the no-spawn proof ─────────────────────────────────────────────────────
 
+/// The command line plus environment of a live process (`ps` can show both
+/// for the caller's own processes); `None` once it has exited.
+fn process_env_line(pid: u32) -> Option<String> {
+    let flag = if cfg!(target_os = "macos") { "-E" } else { "e" };
+    let out = std::process::Command::new("/bin/ps")
+        .args([flag, "-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    out.status.success().then(|| text(&out.stdout))
+}
+
 /// A process-table baseline taken before a client runs.
 pub struct Watch {
     known: HashSet<u32>,
@@ -255,6 +276,17 @@ impl Watch {
         orch_processes(&process_table())
             .into_iter()
             .filter(|p| !self.known.contains(&p.pid))
+            .collect()
+    }
+
+    /// [`Watch::new_orch`] restricted to processes carrying this sandbox's
+    /// `ORCH_SOCKET` in their environment, for tests that run beside siblings
+    /// in one binary (a sibling's daemon or `init` is not this test's spawn).
+    pub fn new_orch_of(&self, sandbox: &Sandbox) -> Vec<Proc> {
+        let marker = format!("ORCH_SOCKET={}", sandbox.socket().display());
+        self.new_orch()
+            .into_iter()
+            .filter(|p| process_env_line(p.pid).is_some_and(|env| env.contains(&marker)))
             .collect()
     }
 
