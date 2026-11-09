@@ -62,7 +62,7 @@ All four commands refuse to run unless `ORCH_DAEMON_DEVELOPMENTAL=1` is set in t
 |---|---|---|
 | `orch daemon start [--detach] [--dispatch on\|off] [--from-agent]` | Starts the daemon for the project, in the foreground unless `--detach`. Dispatch is **off** unless `--dispatch on`. Peer-link listener options are start options too; `orch daemon start --help` lists them. | 0 after a clean stop (foreground) or after readiness (`--detach`); 2, 3, 4 on refusal |
 | `orch daemon status` | Asks the running daemon for its live status. | 0; 7 when no compatible daemon answers |
-| `orch daemon stop` | Asks the daemon to shut down cleanly and waits until its process has exited, for at most 30 s. Works across a version mismatch. | 0 on a completed clean stop; 7 when no daemon answers or the outcome is unknown; a timeout has its own message |
+| `orch daemon stop` | Asks the daemon to shut down cleanly and waits until its process has exited, for at most 30 s. Works across a version mismatch. | 0 on a completed clean stop; 7 when no daemon answers, the outcome is unknown or the wait times out (with a message of its own) |
 | `orch daemon dispatch on\|off` | Turns dispatching of future work on or off in the running daemon. | 0; 7 when no compatible daemon answers |
 
 | Flag | Meaning |
@@ -231,7 +231,7 @@ to remote peers. A daemon always starts with dispatch off unless you pass `--dis
 
 `orch daemon stop` asks the daemon to shut down and returns only after the daemon's process has exited, so
 `orch daemon stop` followed by `orch daemon start` works. The wait is at most 30 s; if the process is still
-there after that, the command says that the wait timed out, with a message of its own. Shutting down, the daemon
+there after that, the command says `daemon accepted stop but PID <pid> is still running after 30 s` and exits 7. Shutting down, the daemon
 stops taking requests and dispatching, stops its running agents (each gets the usual 10 s grace before it is
 killed), records their runs as cancelled and settles their tasks' retries, removes its own socket and
 `daemon.json`, and releases ownership last. SIGTERM, SIGINT and SIGHUP do the same.
@@ -258,7 +258,7 @@ orch's exit codes, with the one this work adds:
 | 4 | Lock conflict: another daemon or live orchestrator owns the project |
 | 5 | Adapter error |
 | 6 | Workspace error |
-| **7** | **No usable daemon**: none answers, a stale socket, a refused connection, a failed handshake, a version mismatch, the daemon is busy (`daemon_busy`) or belongs to another project (`wrong_project`); also a request whose reply was lost, so its outcome is unknown |
+| **7** | **No usable daemon**: none answers, a stale socket, a refused connection, a failed handshake, a version mismatch, the daemon is busy (`daemon_busy`) or belongs to another project (`wrong_project`); also a request whose reply was lost, so its outcome is unknown, and an `orch daemon stop` whose wait for the process to exit timed out |
 
 In this build only `orch daemon status`, `stop` and `dispatch` can exit 7. From PR 2 (planned) every command that
 reads or changes project state exits 7 the same way. The [MCP chapter](17-mcp-server.md#exit-codes-and-startup-errors)
