@@ -20,7 +20,16 @@ pub(super) struct ControlState {
     status: Mutex<DaemonStatus>,
     stopped: watch::Sender<Option<bool>>,
     probes: tokio::sync::Semaphore,
+    #[cfg(feature = "testing")]
+    run_all_pass_hook: Mutex<Option<RunAllPassHook>>,
 }
+/// Test seam awaited after every finite run-all pass, before the snapshot that
+/// decides whether the batch is finished. The argument is whether the pass
+/// launched anything.
+#[cfg(feature = "testing")]
+pub type RunAllPassHook = Arc<
+    dyn Fn(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
 struct Batch {
     id: u64,
     cancelled: Arc<AtomicBool>,
@@ -37,6 +46,8 @@ impl ControlState {
             automatic_guard: Mutex::new(Arc::new(AtomicBool::new(false))),
             stopped: watch::channel(None).0,
             probes: tokio::sync::Semaphore::new(2),
+            #[cfg(feature = "testing")]
+            run_all_pass_hook: Mutex::new(None),
             status: Mutex::new(DaemonStatus {
                 pid: std::process::id(),
                 project_root: path(engine.paths.project_root().to_path_buf()),
@@ -92,6 +103,16 @@ impl Drop for BatchGuard {
     }
 }
 
+#[cfg(feature = "testing")]
+impl ServiceHandler {
+    pub fn set_run_all_pass_hook(&self, hook: RunAllPassHook) {
+        *self
+            .control
+            .run_all_pass_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+}
 impl ServiceHandler {
     pub fn dispatch_state(&self) -> DispatchState {
         DispatchState {
@@ -336,12 +357,12 @@ impl ServiceHandler {
         _: DispatchRunAllArgs,
     ) -> OpResult<RunOutcome> {
         let mut events = self.engine.events.subscribe();
-        let mut pending = self
-            .read_tasks()
-            .await?
-            .into_iter()
+        let mut settled = self.read_execution_snapshot().await?;
+        let mut pending = settled
+            .0
+            .iter()
             .filter(|task| is_dispatchable(task.status) && !task.awaits_approval())
-            .map(|task| task.id)
+            .map(|task| task.id.clone())
             .collect::<Vec<_>>();
         let mut targets = Vec::<(String, String)>::new();
         let mut n = 0;
@@ -381,14 +402,34 @@ impl ServiceHandler {
                     pending.retain(|task| task != &id);
                 }
             }
-            let (tasks, runs, state) = self.read_execution_snapshot().await?;
-            if runs_finished(&targets, &runs)?
-                && (pending.is_empty()
-                    || !progressed && state.running.is_empty() && state.claimed.is_empty())
+            #[cfg(feature = "testing")]
             {
+                let hook = self
+                    .control
+                    .run_all_pass_hook
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(hook) = hook {
+                    hook(progressed).await;
+                }
+            }
+            let snapshot = self.read_execution_snapshot().await?;
+            // A pass that launched nothing proves the rest ineligible only if
+            // the project stayed idle and unchanged since the previous snapshot:
+            // a run that ends mid-pass frees capacity (or a dependency) after
+            // the refusal was decided, so that work must be tried again.
+            let (_, runs, state) = &snapshot;
+            let exhausted = !progressed
+                && state.running.is_empty()
+                && state.claimed.is_empty()
+                && snapshot == settled;
+            if runs_finished(&targets, runs)? && (pending.is_empty() || exhausted) {
                 self.send_event_parts(ctx, &mut n, &mut events).await?;
+                let (tasks, runs, _) = snapshot;
                 return Ok(run_outcome(&targets, tasks, &runs));
             }
+            settled = snapshot;
             self.send_event_parts(ctx, &mut n, &mut events).await?;
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

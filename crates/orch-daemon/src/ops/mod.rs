@@ -13,6 +13,8 @@ mod core;
 mod lifetime;
 mod peripheral;
 mod transport;
+#[cfg(feature = "testing")]
+pub use control::RunAllPassHook;
 pub(crate) use peripheral::SnapshotCommandRunner;
 
 use crate::coordinator::{Committed, Lane, ProjectCoordinator};

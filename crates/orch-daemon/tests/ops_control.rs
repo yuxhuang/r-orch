@@ -654,6 +654,110 @@ async fn finite_run_all_revisits_captured_work_when_capacity_frees() {
     assert!(!h.dispatch_state().dispatch_on);
 }
 
+/// Deterministic F-I1b-1: the first run occupies the agent's only slot while a
+/// pass refuses the second task, then finishes before the pass's final
+/// snapshot. The refusal is stale; the handler must retry, not report success.
+#[tokio::test]
+async fn finite_run_all_retries_work_refused_while_capacity_freed_mid_pass() {
+    let (temp, h, ctx, _clock, engine) = fixture().await;
+    let agent = short_shell_agent(&h, &ctx, &temp, "auto").await;
+    let gate = temp.path().join("gate");
+    Handler::agent_update_fields(
+        &h,
+        &ctx,
+        serde_json::from_value(serde_json::json!({
+            "id":agent,
+            "command":format!("while [ ! -e '{}' ]; do sleep 0.01; done", gate.display())
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    for title in ["first", "second"] {
+        Handler::task_create(
+            &h,
+            &ctx,
+            serde_json::from_value(serde_json::json!({"title":title,"assignee":agent})).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    h.set_run_all_pass_hook(Arc::new({
+        let (engine, gate, released) = (Arc::clone(&engine), gate.clone(), Arc::clone(&released));
+        move |progressed| {
+            let (engine, gate, released) =
+                (Arc::clone(&engine), gate.clone(), Arc::clone(&released));
+            Box::pin(async move {
+                // Only the first pass that refused work while the first run
+                // held the slot: let that run finish and wait for its commit.
+                if progressed || released.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                assert_eq!(engine.state.read().await.unwrap().running.len(), 1);
+                std::fs::write(&gate, b"").unwrap();
+                while !engine.state.read().await.unwrap().running.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        }
+    }));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        Handler::dispatch_run_all(&h, &ctx, DispatchRunAllArgs {}),
+    )
+    .await
+    .expect("run-all must finish once both runs end")
+    .unwrap();
+    assert!(released.load(Ordering::SeqCst), "the race was not staged");
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.tasks.len(), 2, "captured work was left unrun");
+    assert!(
+        outcome
+            .tasks
+            .iter()
+            .all(|task| task.status == orch_domain::TaskStatus::Done)
+    );
+}
+
+/// The retry must not turn finite run-all into a wait: work that stays
+/// ineligible once the project is idle (here blocked behind a task that ends
+/// in human review) finishes the batch without it.
+#[tokio::test]
+async fn finite_run_all_finishes_when_remaining_work_stays_ineligible() {
+    let (temp, h, ctx, _clock, _engine) = fixture().await;
+    let agent = short_shell_agent(&h, &ctx, &temp, "manual").await;
+    let first = Handler::task_create(
+        &h,
+        &ctx,
+        serde_json::from_value(serde_json::json!({"title":"first","assignee":agent})).unwrap(),
+    )
+    .await
+    .unwrap()
+    .id;
+    Handler::task_create(
+        &h,
+        &ctx,
+        serde_json::from_value(
+            serde_json::json!({"title":"blocked","assignee":agent,"depends_on":[first]}),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        Handler::dispatch_run_all(&h, &ctx, DispatchRunAllArgs {}),
+    )
+    .await
+    .expect("run-all must finish when the rest can never launch")
+    .unwrap();
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.tasks.len(), 1);
+    assert_eq!(outcome.tasks[0].id, first);
+    assert_eq!(outcome.tasks[0].status, orch_domain::TaskStatus::Review);
+}
+
 #[tokio::test]
 async fn lost_ownership_rejects_manual_dispatch_but_status_remains_live() {
     let (_temp, h, ctx, _clock, _engine) = fixture().await;
