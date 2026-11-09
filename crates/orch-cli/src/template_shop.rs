@@ -1,5 +1,5 @@
 //! Legacy shop forwarding and directory-template installation.
-use crate::commands::rpc::{Rpc, arguments};
+use crate::commands::rpc::{Rpc, agent_create_args};
 use crate::context::CliContext;
 use crate::output::{Styles, print_table};
 use crate::shop_picker::{ShopEntryView, pick_index};
@@ -135,10 +135,7 @@ pub async fn install(
     styles: &Styles,
     input: CreateAgentInput,
 ) -> Result<()> {
-    let agent = engine
-        .request(arguments::<args::AgentCreateArgs>(input)?)
-        .await?
-        .agent;
+    let agent = engine.request(agent_create_args(input)?).await?.agent;
     if ctx.quiet {
         println!("{}", agent.id);
     } else {
