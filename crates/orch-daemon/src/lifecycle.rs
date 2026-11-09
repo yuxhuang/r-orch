@@ -97,8 +97,6 @@ development or test projects.";
 
 /// How long shutdown waits for sessions to deliver terminal frames.
 const SESSION_DRAIN: Duration = Duration::from_secs(10);
-/// How long shutdown waits for background loops to notice STOPPING.
-const LOOP_DRAIN: Duration = Duration::from_secs(5);
 /// How long a stop already started by `daemon.stop` may take to report.
 const STOP_WAIT: Duration = Duration::from_secs(300);
 
@@ -313,6 +311,10 @@ pub(crate) struct Running {
     endpoint: Option<Endpoint>,
     quit: watch::Sender<bool>,
     loops: Vec<tokio::task::JoinHandle<()>>,
+    runtime: tokio::runtime::Handle,
+    /// Harness-owned directories must outlive even an asynchronous drop drain.
+    #[cfg(feature = "testing")]
+    pub(crate) test_directories: Vec<Arc<tempfile::TempDir>>,
     pid_lock: Arc<PidLock>,
     guard: Option<OwnerGuard>,
     /// Dropped after the engine stops, as `serve` drops its runtime.
@@ -535,6 +537,9 @@ impl Running {
             endpoint,
             quit,
             loops: Vec::new(),
+            runtime: tokio::runtime::Handle::current(),
+            #[cfg(feature = "testing")]
+            test_directories: Vec::new(),
             pid_lock: Arc::clone(&pid_lock),
             guard: None,
             peer,
@@ -614,20 +619,25 @@ impl Running {
     /// The one clean path for every stop trigger (R14). Returns a failure
     /// exit when agent cleanup was incomplete, never a false clean stop.
     pub(crate) async fn shutdown(mut self) -> DaemonExit {
-        let clean = self.stop_engine().await;
+        let mut clean = self.stop_engine().await;
         drop(self.peer.take());
-        // Stop-intent callers get their completion before the endpoint goes.
-        self.server.stop.finish(clean);
         self.server.begin_drain();
+        self.handler.seal_requests();
+        self.quit.send_replace(true);
+        // These loops can be inside external preparation or a partial commit.
+        // Aborting or detaching them on a deadline cannot revoke that authority.
+        while let Some(task) = self.loops.last_mut() {
+            if let Err(error) = task.await {
+                clean = false;
+                tracing::warn!(%error, "daemon background task failed during drain");
+            }
+            self.loops.pop();
+        }
+        self.handler.drain_requests().await;
+        // Stop-intent callers get completion only after accepted work is gone.
+        self.server.stop.finish(clean);
         if !self.server.wait_idle(SESSION_DRAIN).await {
             tracing::warn!("sessions did not close within the drain deadline");
-        }
-        self.quit.send_replace(true);
-        for task in std::mem::take(&mut self.loops) {
-            let abort = task.abort_handle();
-            if tokio::time::timeout(LOOP_DRAIN, task).await.is_err() {
-                abort.abort();
-            }
         }
         self.remove_endpoint();
         discovery::remove_own_record(&self.project_root, &self.instance);
@@ -680,7 +690,7 @@ impl Running {
     }
 
     /// Best-effort teardown for a harness dropped without `shutdown`:
-    /// nothing is reconciled, only this process's files and locks go.
+    /// ownership is retained by an asynchronous drain until accepted work ends.
     #[cfg_attr(
         not(feature = "testing"),
         allow(dead_code, reason = "used by the testing harness only")
@@ -688,15 +698,40 @@ impl Running {
     pub(crate) fn abort(&mut self) {
         self.server.begin_drain();
         self.handler.coordinator().stop_admission();
+        self.handler.seal_requests();
         drop(self.peer.take());
         self.quit.send_replace(true);
-        for task in self.loops.drain(..) {
-            task.abort();
-        }
+        let loops = std::mem::take(&mut self.loops);
+        let handler = self.handler.clone();
         self.remove_endpoint();
         discovery::remove_own_record(&self.project_root, &self.instance);
-        self.pid_lock.release();
-        drop(self.guard.take());
+        let pid_lock = Arc::clone(&self.pid_lock);
+        let guard = self.guard.take();
+        #[cfg(feature = "testing")]
+        let directories = std::mem::take(&mut self.test_directories);
+        // A synchronous drop cannot join asynchronous work. Move the ownership
+        // resources into the drain instead of making a successor race old writes.
+        self.runtime.spawn(async move {
+            #[cfg(feature = "testing")]
+            let _directories = directories;
+            let _ = handler.engine.orchestrator.daemon_stop().await;
+            for task in loops {
+                let _ = task.await;
+            }
+            handler.drain_requests().await;
+            pid_lock.release();
+            drop(guard);
+        });
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        // Includes cancellation of the shutdown future itself. Joined loop
+        // handles stay in `self` until drain completes so this fallback owns them.
+        if self.guard.is_some() {
+            self.abort();
+        }
     }
 }
 
