@@ -177,7 +177,7 @@ fn spawn_cli_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>, worker: String)
             let title = format!("c4-{n}");
             let mut task_args = vec!["task", "add", &title, "-d", "created by cli 4", "--quiet"];
             let assignee_title = format!("w-{n}");
-            if n % 3 == 0 {
+            if n.is_multiple_of(3) {
                 task_args = vec![
                     "task",
                     "add",
@@ -447,7 +447,7 @@ fn spawn_client_creator(sandbox: &Sandbox, shared: Arc<Shared>, worker: String) 
                 let task = client
                     .task_create(new_task(
                         &format!("c4-{n}"),
-                        (n % 3 == 0).then_some(worker.as_str()),
+                        n.is_multiple_of(3).then_some(worker.as_str()),
                     ))
                     .await?;
                 let goal = client
@@ -475,14 +475,15 @@ fn spawn_client_creator(sandbox: &Sandbox, shared: Arc<Shared>, worker: String) 
                         ttl_ms: Some(SHORT_TTL_MS),
                     })
                     .await?;
-                let mut created = shared.created.lock().unwrap();
-                created.tasks.insert(task.id);
-                created.goals.insert(goal.id);
-                created
-                    .messages
-                    .extend(messages.into_iter().map(|message| message.id));
-                created.short_keys.push((key, Instant::now()));
-                drop(created);
+                {
+                    let mut created = shared.created.lock().unwrap();
+                    created.tasks.insert(task.id);
+                    created.goals.insert(goal.id);
+                    created
+                        .messages
+                        .extend(messages.into_iter().map(|message| message.id));
+                    created.short_keys.push((key, Instant::now()));
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Ok(())
@@ -518,10 +519,11 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
                     })
                     .await?;
                 shared.live.acked.store(n, Ordering::SeqCst);
-                let mut created = shared.created.lock().unwrap();
-                created.tasks.insert(task.id);
-                created.context.insert(key);
-                drop(created);
+                {
+                    let mut created = shared.created.lock().unwrap();
+                    created.tasks.insert(task.id);
+                    created.context.insert(key);
+                }
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
             Ok(())
