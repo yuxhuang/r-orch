@@ -304,7 +304,7 @@ To check that `serve` is working, wait for the `listening <socket>` line, or run
 
 ## Stop orch safely
 
-Stop the daemon with `orch daemon stop`, from any terminal. A daemon in the foreground (`orch daemon start`, `orch serve`, `orch run --watch`) also stops on `Ctrl+C`, SIGTERM (`kill <pid>`) or SIGHUP (closing its terminal or tmux pane). Each way stops it in an orderly way: it stops its running agents (each gets a 10 s grace before it is killed), records their runs as `cancelled`, settles their tasks' retries and releases the project. `orch daemon stop` returns once the process has exited ([Stop](18-daemon.md#stop)).
+Stop the daemon with `orch daemon stop`, from any terminal. A daemon in the foreground (`orch daemon start`, `orch serve`, `orch run --watch`) also stops on `Ctrl+C`, SIGTERM (`kill <pid>`) or SIGHUP (closing its terminal or tmux pane). Each way stops it in an orderly way: it stops its running agents (each gets a 10 s grace before it is killed), records their runs as `cancelled`, settles their tasks' retries and releases the project. `orch daemon stop` returns once the daemon has confirmed its cleanup and released the project, by exiting or by releasing its ownership lock ([Stop](18-daemon.md#stop)).
 
 To stop dispatching new work but keep the daemon, and the agents that already run, use `orch daemon dispatch off`.
 

@@ -69,7 +69,7 @@ procedures.
 | Start it with dispatch on | `orch serve`, `orch run --watch` or `orch daemon start --dispatch on` | As above, dispatch on |
 | See it | `orch daemon status` | `orch daemon PID <pid> · dispatch ON\|OFF`, then its socket, instance, running tasks and ownership; exit 7 if none answers |
 | Turn dispatch on or off | `orch daemon dispatch on` / `off` | Off does not stop running agents |
-| Stop it | `orch daemon stop` | Returns once the process has exited (at most 30 s); agents get the usual 10 s grace and their runs end `cancelled` |
+| Stop it | `orch daemon stop` | Returns once the daemon has confirmed its cleanup and released the project, by exiting or by releasing its ownership lock (at most 30 s); agents get the usual 10 s grace and their runs end `cancelled` |
 
 `Ctrl+C`, SIGTERM and SIGHUP (closing the terminal or tmux pane of a foreground daemon) stop it cleanly, like
 `orch daemon stop`. A detached daemon survives closing its terminal or pane; it does not survive a reboot, and orch
