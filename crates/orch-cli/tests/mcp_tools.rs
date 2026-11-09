@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use mcp_common::{
     DESTRUCTIVE, EXPECTED, McpServer, ProjectDir, READ_ONLY, Rendezvous, error_code,
-    initialized_project, initialized_project_named, initialized_project_unowned, orch_command,
-    output_of, spawn_bounded, tool_text,
+    initialized_project, initialized_project_unowned, orch_command, output_of, spawn_bounded,
+    tool_text,
 };
 use serde_json::{Value, json};
 
