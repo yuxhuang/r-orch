@@ -134,12 +134,23 @@ from this draft.
 9. **Explicit ownership precedes stale-file replacement.** Default socket is `.orchestry/run/orch.sock`;
    absolute paths over 100 bytes use `$TMPDIR/orch-<sha256(canonical root)[..16]>/orch.sock`. Validate the
    final path including /run; ORCH_SOCKET is an absolute override, never a different authority boundary.
-   run/fallback directories are 0700, socket bound under umask 0177 is 0600. Do not chmod `.orchestry`; it
+   Bind the socket inside the daemon-created 0700 run/fallback directory (or an existing directory
+   verified as euid-only and never chmodded), set it to 0600 and re-check socket type and mode before
+   publishing daemon.json; the actual parent of every endpoint, including ORCH_SOCKET, must pass the
+   same directory checks. Do not chmod `.orchestry`; it
    must be euid-owned and not group/world-writable. Foreign-euid start refuses, including root on a
    user-owned project. Create fallback with mkdir, then O_DIRECTORY/O_NOFOLLOW + fstat on existing paths;
    never chmod/chown an existing unsafe directory. Discovery open uses O_NOFOLLOW/O_NONBLOCK then fstat and
    16 KiB bound, preventing FIFO hangs and symlink redirection. Metadata is 0600 and records project
    identity, endpoint, versions, pid, executable, started_at, instance; runtime files are gitignored.
+
+   **Recorded deviation from gate-2-approved R2 wording (fact F2, lead option A):** this adopts
+   SE-3's in-directory bind alternative, confirmed security-equivalent by the security engineer
+   (`VERDICT: pass`); only the mechanism changes, with the outcome and acceptance tests unchanged.
+   The owner may reverse this decision to option B: bind before runtime under a temporarily restricted
+   creation mask, then restore it.
+
+   Why: the process umask is never changed because setting umask 0177 before runtime makes mkdir(0700) yield untraversable 0600 directories (run/, workspaces and logs unusable; bind fails EACCES), while bind runs on the Tokio runtime (crates/orch-daemon/src/lifecycle.rs:455), where a process-wide change races other threads; the private 0700 parent closes the bind-to-chmod window measured by SE-3 (confirmed by the fact F2 security probes), and same-uid remains the trust boundary (R8/R38).
 
    Hold stable `.orchestry/.daemon-owner.lock` advisory guard throughout startup to shutdown; never unlink
    or inherit its fd into agent children. Winner writes PID after lock, loser re-reads ≤2 s; any lock error
