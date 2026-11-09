@@ -77,6 +77,8 @@ struct Shared {
     labels: Writer,
     priority: Writer,
     live: Writer,
+    /// `(sent, acked)` instants of the last acknowledged renewal of `live`.
+    live_times: Mutex<Option<(Instant, Instant)>>,
     failures: Mutex<Vec<String>>,
     created: Mutex<Created>,
 }
@@ -98,6 +100,11 @@ impl Shared {
     }
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+    /// Record that the renewal sent at `sent` has just been acknowledged.
+    fn live_acked(&self, n: u64, sent: Instant) {
+        self.live.acked.store(n, Ordering::SeqCst);
+        *self.live_times.lock().unwrap() = Some((sent, Instant::now()));
     }
 }
 
@@ -294,11 +301,12 @@ fn spawn_mcp_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>) -> JoinHandle<(
                 // The renewal under test: a TTL'd key re-set before each sweep
                 // could collect it.
                 shared.live.attempted.store(n, Ordering::SeqCst);
+                let sent = Instant::now();
                 mcp_ok(&mcp.call_tool(
                     "context_set",
                     json!({"key": "live", "value": format!("live-{n}"), "ttl": LIVE_TTL_MS}),
                 ))?;
-                shared.live.acked.store(n, Ordering::SeqCst);
+                shared.live_acked(n, sent);
                 let mut created = shared.created.lock().unwrap();
                 created.tasks.insert(id);
                 created.context.insert(key);
@@ -511,6 +519,7 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
                     })
                     .await?;
                 shared.live.attempted.store(n, Ordering::SeqCst);
+                let sent = Instant::now();
                 client
                     .context_set(ContextSetArgs {
                         key: Id::new("live").unwrap(),
@@ -518,7 +527,7 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
                         ttl_ms: Some(LIVE_TTL_MS),
                     })
                     .await?;
-                shared.live.acked.store(n, Ordering::SeqCst);
+                shared.live_acked(n, sent);
                 {
                     let mut created = shared.created.lock().unwrap();
                     created.tasks.insert(task.id);
@@ -674,6 +683,40 @@ fn spawn_tui_driver(pane: Arc<TuiPane>, shared: Arc<Shared>) -> JoinHandle<()> {
             std::thread::sleep(Duration::from_millis(800));
         }
     })
+}
+
+/// Named instants of one run, for the failure messages: a judgement that
+/// depends on elapsed time must say how much elapsed.
+struct Marks {
+    started: Instant,
+    marks: Vec<(&'static str, Instant)>,
+}
+
+impl Marks {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            marks: Vec::new(),
+        }
+    }
+    fn note(&mut self, name: &'static str) {
+        self.marks.push((name, Instant::now()));
+    }
+    fn at(&self, name: &str) -> Instant {
+        self.marks
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("mark {name} was never taken"))
+            .1
+    }
+    /// `name=+ms` since the clients started, in the order taken.
+    fn render(&self) -> String {
+        self.marks
+            .iter()
+            .map(|(name, at)| format!("{name}=+{}ms", at.duration_since(self.started).as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 // ── offline judgement ──────────────────────────────────────────────────────
@@ -841,6 +884,7 @@ fn run_stress(fleet: Fleet) {
         labels: Writer::default(),
         priority: Writer::default(),
         live: Writer::default(),
+        live_times: Mutex::new(None),
         failures: Mutex::default(),
         created: Mutex::default(),
     });
@@ -915,6 +959,7 @@ fn run_stress(fleet: Fleet) {
         }
     }
     let started = Instant::now();
+    let mut marks = Marks::new(started);
     let observer = spawn_observer(&sandbox, shared.clone(), hot.clone());
 
     // ── let them fight ──
@@ -923,6 +968,7 @@ fn run_stress(fleet: Fleet) {
         std::thread::sleep(Duration::from_millis(100));
     }
     shared.stop.store(true, Ordering::SeqCst);
+    marks.note("stop_flag");
     let mut panicked = Vec::new();
     for thread in threads {
         if let Err(payload) = thread.join() {
@@ -930,6 +976,7 @@ fn run_stress(fleet: Fleet) {
         }
     }
     let report = observer.join().unwrap();
+    marks.note("clients_joined");
 
     // The TUI survived the whole run on the daemon.
     if let Some(pane) = &pane {
@@ -947,10 +994,15 @@ fn run_stress(fleet: Fleet) {
         );
     }
 
+    marks.note("tui_quit");
+
     // ── stop the owner so every write is on disk, then judge offline ──
+    marks.note("daemon_stop_sent");
     let stop = sandbox.run(&["daemon", "stop"]);
     assert!(stop.status.success(), "{}", text(&stop.stderr));
+    marks.note("daemon_stop_acked");
     let status = daemon.wait_exit(READY);
+    marks.note("daemon_exited");
     assert_eq!(status.code(), Some(0), "daemon: {}", daemon.stderr());
 
     let failures = shared.failures.lock().unwrap().clone();
@@ -972,7 +1024,7 @@ fn run_stress(fleet: Fleet) {
         &report.violations[..report.violations.len().min(10)]
     );
 
-    judge(&sandbox, &shared, &hot, &worker, &parked, duration, fleet);
+    judge(&sandbox, &shared, &hot, &worker, &parked, duration, fleet, &marks);
     let log = daemon.stderr();
     let bad: Vec<_> = log
         .lines()
@@ -992,6 +1044,7 @@ fn judge(
     parked: &str,
     duration: Duration,
     fleet: Fleet,
+    marks: &Marks,
 ) {
     let state = sandbox.state_dir();
     let tasks = assert_store_consistent(&state, "tasks", ".yml", "id");
@@ -1071,10 +1124,17 @@ fn judge(
         assert!(context.contains_key(key), "no-TTL key {key} lost");
     }
     let live_acked = acked(&shared.live);
+    let (live_sent, live_ack_at) = shared.live_times.lock().unwrap().expect("live was never renewed");
+    let rel = |at: Instant| at.duration_since(marks.started).as_millis();
     assert_eq!(
         context.get("live").map(|record| record["value"].clone()),
         Some(json!(format!("live-{live_acked}"))),
-        "the renewed key was lost or rolled back"
+        "the renewed key was lost or rolled back: last renewal live-{live_acked} sent +{}ms \
+         acked +{}ms (ttl {LIVE_TTL_MS}ms); stop-sent minus last-ack = {}ms; {}",
+        rel(live_sent),
+        rel(live_ack_at),
+        marks.at("daemon_stop_sent").saturating_duration_since(live_ack_at).as_millis(),
+        marks.render()
     );
     let ended = Instant::now();
     let expired: Vec<_> = created
