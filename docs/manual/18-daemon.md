@@ -165,8 +165,18 @@ ownership: held
 ownership: LOST — stop and restart the daemon
 ```
 
-<!-- W1b: the plain capture taken at b1216ce4 was removed because ruling 8.12 adds lines to it; re-capture the
-full plain output from the I1b frozen commit (task tsk_bCS2Fyj owns the exact lines). -->
+```console
+$ orch daemon status
+orch daemon PID 76126 · dispatch OFF
+  executable: /…/target/debug/orch
+  started: 2026-11-09T12:07:26.840Z
+  version: orch 0.13.0 protocol 1
+  sessions: 1/64
+  ownership: held
+  socket: /private/tmp/i1b-status-demo/sk/s
+  instance: daemon_Fc-nomx
+  running tasks: 0
+```
 
 The plain output does **not** list the ids of the running tasks or the environment names the daemon removed. Ask
 for JSON or YAML to see them, with the global flag before or after the command (`orch --json daemon status`,
