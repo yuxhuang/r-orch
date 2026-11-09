@@ -7,8 +7,11 @@
 //! failing.
 
 use orch_core::error::Result;
-use orch_domain::{CreateMessageInput, Message, MessageChannel};
-use orch_engine::Engine;
+use orch_domain::Message;
+use orch_proto::ops::args;
+use serde_json::json;
+
+use crate::commands::rpc::Rpc;
 
 use crate::context::CliContext;
 use crate::output::{Styles, format_duration_since, print_success, print_table};
@@ -31,23 +34,20 @@ pub struct MsgBroadcastArgs<'a> {
 }
 
 pub async fn send(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: MsgSendArgs<'_>,
 ) -> Result<()> {
     let messages = engine
-        .message_service
-        .send(CreateMessageInput {
-            channel: MessageChannel::Direct,
-            from_agent_id: args.from.unwrap_or("cli").to_owned(),
-            to_agent_id: Some(args.to_agent_id.to_owned()),
-            subject: args.subject.unwrap_or_default().to_owned(),
-            body: args.body.to_owned(),
-            ttl_ms: args.ttl_ms,
-            team_id: None,
-            reply_to: args.reply_to.map(str::to_owned),
-        })
+        .call::<args::MessageSendArgs>(json!({
+            "from_agent_id": sender(args.from, engine.agent_id.as_deref()),
+            "subject": args.subject.unwrap_or_default(),
+            "body": args.body,
+            "ttl_ms": args.ttl_ms,
+            "to_agent_id": args.to_agent_id,
+            "reply_to": args.reply_to,
+        }))
         .await?;
 
     if let Some(format) = ctx.output {
@@ -67,23 +67,19 @@ pub async fn send(
 }
 
 pub async fn broadcast(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: MsgBroadcastArgs<'_>,
 ) -> Result<()> {
     let messages = engine
-        .message_service
-        .send(CreateMessageInput {
-            channel: MessageChannel::Broadcast,
-            from_agent_id: args.from.unwrap_or("cli").to_owned(),
-            to_agent_id: None,
-            subject: args.subject.unwrap_or_default().to_owned(),
-            body: args.body.to_owned(),
-            ttl_ms: args.ttl_ms,
-            team_id: args.team.map(str::to_owned),
-            reply_to: None,
-        })
+        .call::<args::MessageBroadcastArgs>(json!({
+            "from_agent_id": sender(args.from, engine.agent_id.as_deref()),
+            "subject": args.subject.unwrap_or_default(),
+            "body": args.body,
+            "ttl_ms": args.ttl_ms,
+            "team_id": args.team,
+        }))
         .await?;
 
     if let Some(format) = ctx.output {
@@ -108,15 +104,9 @@ pub async fn broadcast(
     Ok(())
 }
 
-pub async fn inbox(
-    engine: &Engine,
-    ctx: &CliContext,
-    styles: &Styles,
-    agent_id: &str,
-) -> Result<()> {
+pub async fn inbox(engine: &Rpc, ctx: &CliContext, styles: &Styles, agent_id: &str) -> Result<()> {
     let pending = engine
-        .message_service
-        .list_pending_for_agent(agent_id)
+        .call::<args::MessageInboxArgs>(json!({"agent_id": agent_id}))
         .await?;
 
     if let Some(format) = ctx.output {
@@ -146,15 +136,14 @@ pub async fn inbox(
 }
 
 pub async fn list(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     agent: Option<&str>,
 ) -> Result<()> {
-    let messages = match agent {
-        Some(agent_id) => engine.message_service.list_for_agent(agent_id).await?,
-        None => engine.message_service.list_all().await?,
-    };
+    let messages = engine
+        .call::<args::MessageListArgs>(json!({"agent_id": agent}))
+        .await?;
 
     if let Some(format) = ctx.output {
         return format.print(&messages);
@@ -174,6 +163,11 @@ pub async fn list(
     );
     println!("\n  {} message(s)\n", messages.len());
     Ok(())
+}
+
+/// Explicit `--from` wins; the session caller is the default sender.
+fn sender<'a>(explicit: Option<&'a str>, caller: Option<&'a str>) -> &'a str {
+    explicit.or(caller).unwrap_or("cli")
 }
 
 /// `messages[0]?.id` — `undefined` when the fan-out produced nothing, which
@@ -202,7 +196,7 @@ fn row(message: &Message) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orch_domain::MessageStatus;
+    use orch_domain::{MessageChannel, MessageStatus};
 
     fn message(to: Option<&str>) -> Message {
         Message {
@@ -223,6 +217,13 @@ mod tests {
             team_id: None,
             reply_to: None,
         }
+    }
+
+    #[test]
+    fn explicit_sender_overrides_caller_and_cli_is_the_last_default() {
+        assert_eq!(sender(Some("explicit"), Some("caller")), "explicit");
+        assert_eq!(sender(None, Some("caller")), "caller");
+        assert_eq!(sender(None, None), "cli");
     }
 
     #[test]
