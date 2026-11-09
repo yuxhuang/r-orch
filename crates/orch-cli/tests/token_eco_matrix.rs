@@ -111,7 +111,16 @@ fn cell(row: &Row, effort: Option<&str>) -> String {
 }
 
 fn seeded(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String) {
-    let sb = Sandbox::new(reader);
+    seeded_in(Sandbox::new_owned(reader), reader, row, effort)
+}
+
+/// [`seeded`] without a daemon, for the dispatch cells that run `orch run`
+/// (an in-process orchestrator until S2a-cli; see [`Sandbox::new`]).
+fn seeded_unowned(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String) {
+    seeded_in(Sandbox::new(reader), reader, row, effort)
+}
+
+fn seeded_in(sb: Sandbox, reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String) {
     let id = sb.seed_agent(reader, "Subject", row.adapter, row.model, effort);
     (sb, id)
 }
@@ -461,7 +470,7 @@ fn downgrade_of_new_spellings_fails_in_the_old_reader_and_repairs_by_clearing_ef
     ] {
         total += 1;
         let c = format!("{adapter}/{effort}");
-        let sb = Sandbox::new(&new);
+        let sb = Sandbox::new_owned(&new);
         let add = sb.run(
             &new,
             &[
@@ -655,7 +664,7 @@ struct Dispatched {
 }
 
 fn dispatch(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, Dispatched) {
-    let (sb, id) = seeded(&new_reader(), row, effort);
+    let (sb, id) = seeded_unowned(&new_reader(), row, effort);
     let task = sb.run(
         reader,
         &["task", "add", "matrix task", "--assignee", &id, "--quiet"],
@@ -1054,7 +1063,7 @@ fn an_inherit_update_waiting_on_the_definition_lock_is_refused_after_a_concurren
     use std::process::Stdio;
 
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let list = sb.run(&new, &["--json", "agent", "list"], None);
     let listed: serde_json::Value = serde_json::from_str(&list.stdout).expect("agent list json");
     for agent in listed.as_array().expect("array") {
@@ -1151,7 +1160,7 @@ fn an_inherit_update_waiting_on_the_definition_lock_is_refused_after_a_concurren
 /// agent created now inherits normal and is accepted; the same agent under
 /// project eco renders eco against the custom template and is refused.
 fn empty_project_with_custom_template(new: &Reader) -> Sandbox {
-    let sb = Sandbox::new(new);
+    let sb = Sandbox::new_owned(new);
     let list = sb.run(new, &["--json", "agent", "list"], None);
     let listed: serde_json::Value = serde_json::from_str(&list.stdout).expect("agent list json");
     for agent in listed.as_array().expect("array") {

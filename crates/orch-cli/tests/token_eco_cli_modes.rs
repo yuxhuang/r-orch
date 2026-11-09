@@ -55,7 +55,7 @@ fn dispatch(sb: &Sandbox, agent: &str, title: &str) -> String {
 #[test]
 fn an_omitted_project_mode_reads_as_normal_and_init_writes_it_explicitly() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     assert_eq!(project_mode(&sb), "normal");
     assert!(
         String::from_utf8(config_bytes(&sb))
@@ -82,7 +82,7 @@ fn an_omitted_project_mode_reads_as_normal_and_init_writes_it_explicitly() {
 fn init_with_a_mode_flag_stores_it_and_an_existing_project_keeps_its_mode() {
     let new = new_reader();
     for flag in ["--prompt-mode", "--mode"] {
-        let sb = Sandbox::new(&new);
+        let sb = Sandbox::new_owned(&new);
         let fresh = tempfile::tempdir().unwrap();
         let proj = fresh.path().canonicalize().unwrap().join("p");
         fs::create_dir(&proj).unwrap();
@@ -130,7 +130,7 @@ fn init_with_a_mode_flag_stores_it_and_an_existing_project_keeps_its_mode() {
 #[test]
 fn agent_add_stores_only_an_explicit_override_never_a_copy_of_the_project_mode() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     sb.run(
         &new,
         &["config", "set", "defaults.agent.prompt_mode", "eco"],
@@ -175,7 +175,7 @@ fn agent_add_stores_only_an_explicit_override_never_a_copy_of_the_project_mode()
 #[test]
 fn flag_only_update_is_a_locked_merge_patch_that_touches_only_the_named_fields() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let id = sb
         .run(
             &new,
@@ -249,7 +249,7 @@ fn flag_only_update_is_a_locked_merge_patch_that_touches_only_the_named_fields()
 #[test]
 fn mixing_a_file_with_flags_fails_before_any_io_and_neither_form_fails_too() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let id = sb
         .run(
             &new,
@@ -299,7 +299,7 @@ fn file_update_keeps_its_full_replacement_semantics_exactly_as_the_baseline() {
     let normalised = |sb: &Sandbox, id: &str| agent_file(sb, id).replace(id, "<id>");
     let mut results = Vec::new();
     for reader in [&old, &new] {
-        let sb = Sandbox::new(reader);
+        let sb = Sandbox::new_owned(reader);
         let id = sb
             .run(
                 reader,
@@ -349,7 +349,7 @@ fn ordinary_status_and_list_json_keep_the_baseline_shape() {
     let new = new_reader();
     let mut shapes = Vec::new();
     for reader in [&old, &new] {
-        let sb = Sandbox::new(reader);
+        let sb = Sandbox::new_owned(reader);
         let id = sb
             .run(
                 reader,
@@ -403,7 +403,7 @@ fn ordinary_status_and_list_json_keep_the_baseline_shape() {
 #[test]
 fn effective_json_reports_the_resolved_mode_and_its_source_without_touching_the_stored_agent() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     sb.run(
         &new,
         &["config", "set", "defaults.agent.prompt_mode", "eco"],
@@ -486,7 +486,7 @@ fn with_custom_template(sb: &Sandbox, field: &str) {
 fn switching_the_project_to_eco_with_custom_templates_lists_every_offender_and_writes_nothing() {
     let new = new_reader();
     for field in ["template", "system_template", "user_template"] {
-        let sb = Sandbox::new(&new);
+        let sb = Sandbox::new_owned(&new);
         let a = sb.seed_agent(&new, "Alpha", "codex", Some("gpt-6.1-sol"), None);
         let b = sb.seed_agent(&new, "Beta", "claude", Some("claude-sonnet-5-5"), None);
         let c = sb.seed_agent(&new, "Gamma", "codex", Some("gpt-6.1-sol"), None);
@@ -545,7 +545,7 @@ fn switching_the_project_to_eco_with_custom_templates_lists_every_offender_and_w
 #[test]
 fn an_agent_edit_that_would_make_a_custom_template_agent_eco_is_refused_with_bytes_preserved() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let a = sb.seed_agent(&new, "Alpha", "codex", Some("gpt-6.1-sol"), None);
     with_custom_template(&sb, "template");
     let before = sb.agent_bytes();
@@ -568,7 +568,7 @@ fn an_agent_edit_that_would_make_a_custom_template_agent_eco_is_refused_with_byt
 #[test]
 fn a_hand_edited_eco_plus_custom_template_project_fails_dispatch_before_any_model_child() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let a = sb.seed_agent(&new, "Alpha", "codex", Some("gpt-6.1-sol"), None);
     with_custom_template(&sb, "template");
     let edited = String::from_utf8(config_bytes(&sb))
@@ -605,7 +605,7 @@ fn a_hand_edited_eco_plus_custom_template_project_fails_dispatch_before_any_mode
 #[test]
 fn config_set_and_patch_preserve_unknown_extension_keys_and_round_trip_through_get() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let path = sb.root().join("config.yml");
     let mut config = fs::read_to_string(&path).unwrap();
     config.push_str("x_extension:\n  keep: me\n");
@@ -646,7 +646,7 @@ fn config_set_and_patch_preserve_unknown_extension_keys_and_round_trip_through_g
 #[test]
 fn concurrent_mode_toggles_and_unrelated_patches_never_corrupt_or_lose_either_write() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let path = sb.root().join("config.yml");
     let mut config = fs::read_to_string(&path).unwrap();
     config.push_str("x_extension:\n  keep: me\n");
@@ -746,7 +746,7 @@ fn an_agent_override_wins_over_the_project_mode_and_an_inheriting_agent_follows_
 #[test]
 fn clearing_the_generic_effort_keeps_a_native_model_suffix_and_never_resurrects_an_override() {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let model = "openrouter/anthropic/claude-opus-5.5#high";
     let id = sb
         .run(
@@ -810,7 +810,7 @@ fn clearing_the_generic_effort_keeps_a_native_model_suffix_and_never_resurrects_
 fn changing_adapter_while_keeping_an_incompatible_effort_is_refused_and_clearing_it_in_the_same_edit_succeeds()
  {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let id = sb
         .run(
             &new,

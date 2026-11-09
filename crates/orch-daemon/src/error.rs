@@ -18,12 +18,6 @@ pub enum DaemonError {
     /// Explicit start from an agent context without `--from-agent` (exit 2).
     #[error("{}", orch_proto::error::START_REFUSED_IN_AGENT_CONTEXT)]
     RefusedInAgentContext,
-    /// PR 1 only: `ORCH_DAEMON_DEVELOPMENTAL=1` is not set (exit 2).
-    #[error(
-        "orch daemon start is developmental in this build; set {}=1 to run it",
-        crate::DEVELOPMENTAL_ENV
-    )]
-    DevelopmentalGateClosed,
     /// Invalid options, paths or ownership (exit 2).
     #[error("{0}")]
     InvalidArguments(String),
@@ -58,9 +52,9 @@ impl DaemonError {
     pub fn exit_code(&self) -> i32 {
         match self {
             DaemonError::AlreadyRunning(_) | DaemonError::LegacyLockHeld(_) => exit::LOCK_CONFLICT,
-            DaemonError::RefusedInAgentContext
-            | DaemonError::DevelopmentalGateClosed
-            | DaemonError::InvalidArguments(_) => exit::INVALID_ARGUMENTS,
+            DaemonError::RefusedInAgentContext | DaemonError::InvalidArguments(_) => {
+                exit::INVALID_ARGUMENTS
+            }
             DaemonError::NotInitialized => exit::NOT_INITIALIZED,
             DaemonError::Core(error) => error.exit_code(),
             DaemonError::Operation(body) => body.exit_code,
@@ -82,9 +76,9 @@ impl From<&DaemonError> for ErrorBody {
             DaemonError::AlreadyRunning(_) | DaemonError::LegacyLockHeld(_) => {
                 ErrorCode::LockConflict
             }
-            DaemonError::RefusedInAgentContext
-            | DaemonError::DevelopmentalGateClosed
-            | DaemonError::InvalidArguments(_) => ErrorCode::InvalidArguments,
+            DaemonError::RefusedInAgentContext | DaemonError::InvalidArguments(_) => {
+                ErrorCode::InvalidArguments
+            }
             DaemonError::NotInitialized => ErrorCode::NotInitialized,
             DaemonError::Unimplemented { .. } => ErrorCode::Unimplemented,
             DaemonError::Operation(body) => return (**body).clone(),

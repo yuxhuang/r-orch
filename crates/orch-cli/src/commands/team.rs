@@ -5,8 +5,11 @@
 //! success line, which is intended and not an oversight.
 
 use orch_core::error::Result;
-use orch_domain::{CreateTeamInput, PartialTeamConfig, Team};
-use orch_engine::Engine;
+use orch_domain::Team;
+use orch_proto::ops::args;
+use serde_json::json;
+
+use crate::commands::rpc::Rpc;
 
 use crate::context::CliContext;
 use crate::output::{Styles, print_key_value, print_success, print_table};
@@ -20,27 +23,21 @@ pub struct TeamCreateArgs<'a> {
 }
 
 pub async fn create(
-    engine: &Engine,
+    engine: &Rpc,
     ctx: &CliContext,
     styles: &Styles,
     args: TeamCreateArgs<'_>,
 ) -> Result<()> {
     let team = engine
-        .team_service
-        .create(CreateTeamInput {
-            name: args.name.to_owned(),
-            description: args.description.map(str::to_owned),
-            lead_agent_id: args.lead.to_owned(),
-            member_agent_ids: args.members.map(|raw| {
-                raw.split(',')
-                    .map(|part| part.trim().to_owned())
-                    .collect::<Vec<_>>()
+        .call::<args::TeamCreateArgs>(json!({
+            "name": args.name,
+            "description": args.description,
+            "lead_agent_id": args.lead,
+            "member_agent_ids": args.members.map(|raw| {
+                raw.split(',').map(str::trim).collect::<Vec<_>>()
             }),
-            config: Some(PartialTeamConfig {
-                auto_claim: Some(!args.no_auto_claim),
-                ..PartialTeamConfig::default()
-            }),
-        })
+            "auto_claim": !args.no_auto_claim,
+        }))
         .await?;
 
     if let Some(format) = ctx.output {
@@ -56,8 +53,8 @@ pub async fn create(
     Ok(())
 }
 
-pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<()> {
-    let teams = engine.team_service.list().await?;
+pub async fn list(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<()> {
+    let teams = engine.request(args::TeamListArgs {}).await?;
 
     if let Some(format) = ctx.output {
         return format.print(&teams);
@@ -82,8 +79,8 @@ pub async fn list(engine: &Engine, ctx: &CliContext, styles: &Styles) -> Result<
     Ok(())
 }
 
-pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
-    let team = engine.team_service.get(id).await?;
+pub async fn show(engine: &Rpc, ctx: &CliContext, styles: &Styles, id: &str) -> Result<()> {
+    let team = engine.call::<args::TeamGetArgs>(json!({"id":id})).await?;
 
     if let Some(format) = ctx.output {
         return format.print(&team);
@@ -121,25 +118,26 @@ pub async fn show(engine: &Engine, ctx: &CliContext, styles: &Styles, id: &str) 
     Ok(())
 }
 
-pub async fn join(engine: &Engine, styles: &Styles, team_id: &str, agent_id: &str) -> Result<()> {
-    engine.team_service.join(team_id, agent_id).await?;
+pub async fn join(engine: &Rpc, styles: &Styles, team_id: &str, agent_id: &str) -> Result<()> {
+    engine
+        .call::<args::TeamJoinArgs>(json!({"team_id":team_id,"agent_id":agent_id}))
+        .await?;
     print_success(styles, &format!("Agent {agent_id} joined team {team_id}"));
     Ok(())
 }
 
-pub async fn leave(engine: &Engine, styles: &Styles, team_id: &str, agent_id: &str) -> Result<()> {
-    engine.team_service.leave(team_id, agent_id).await?;
+pub async fn leave(engine: &Rpc, styles: &Styles, team_id: &str, agent_id: &str) -> Result<()> {
+    engine
+        .call::<args::TeamLeaveArgs>(json!({"team_id":team_id,"agent_id":agent_id}))
+        .await?;
     print_success(styles, &format!("Agent {agent_id} left team {team_id}"));
     Ok(())
 }
 
-pub async fn add_task(
-    engine: &Engine,
-    styles: &Styles,
-    team_id: &str,
-    task_id: &str,
-) -> Result<()> {
-    engine.team_service.add_task(team_id, task_id).await?;
+pub async fn add_task(engine: &Rpc, styles: &Styles, team_id: &str, task_id: &str) -> Result<()> {
+    engine
+        .call::<args::TeamAddTaskArgs>(json!({"team_id":team_id,"task_id":task_id}))
+        .await?;
     print_success(
         styles,
         &format!("Task {task_id} added to team {team_id} pool"),
@@ -147,19 +145,18 @@ pub async fn add_task(
     Ok(())
 }
 
-pub async fn set_lead(
-    engine: &Engine,
-    styles: &Styles,
-    team_id: &str,
-    agent_id: &str,
-) -> Result<()> {
-    engine.team_service.set_lead(team_id, agent_id).await?;
+pub async fn set_lead(engine: &Rpc, styles: &Styles, team_id: &str, agent_id: &str) -> Result<()> {
+    engine
+        .call::<args::TeamSetLeadArgs>(json!({"team_id":team_id,"agent_id":agent_id}))
+        .await?;
     print_success(styles, &format!("{agent_id} is now lead of team {team_id}"));
     Ok(())
 }
 
-pub async fn disband(engine: &Engine, styles: &Styles, id: &str) -> Result<()> {
-    engine.team_service.disband(id).await?;
+pub async fn disband(engine: &Rpc, styles: &Styles, id: &str) -> Result<()> {
+    engine
+        .call::<args::TeamDisbandArgs>(json!({"id":id}))
+        .await?;
     print_success(styles, &format!("Team {id} disbanded"));
     Ok(())
 }

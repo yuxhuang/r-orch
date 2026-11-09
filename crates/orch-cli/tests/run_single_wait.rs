@@ -1,162 +1,174 @@
-//! `run <id>` must terminate when the target run's completion is already in
-//! the batch the dispatch buffered.
+//! `run <id>` must terminate once the target run completes.
 //!
-//! `single` drains those buffered events, then waits for `agent:completed` if
-//! a run started. If the completion is *in* the drained batch and the drain
-//! ignores that, the wait blocks on a second completion that never arrives and
-//! the command hangs after printing its result.
+//! Since S2a-cli `run <id>` is a daemon client: the daemon dispatches the task
+//! and streams its events until the run is terminal. The client must follow
+//! that stream to its end and report the run's outcome, not hang after the
+//! completion nor return before it.
 
-use std::sync::Arc;
+#[path = "common/daemon.rs"]
+mod daemon;
 
-use orch_core::storage::ConfigStore;
-use orch_domain::{
-    CreateAgentInput, CreateTaskInput, OrchestratorEvent, OrchestratorEventType, WorkspaceMode,
-    default_config,
-};
-use orch_infra::storage::{FileConfigStore, Paths};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
-async fn project() -> (tempfile::TempDir, orch_engine::FullEngine) {
-    let temp = tempfile::tempdir().expect("tempdir");
-    orch_infra::storage::fs_utils::clear_ensured_dirs();
-    let paths = Paths::new(temp.path());
-    tokio::fs::create_dir_all(paths.root())
-        .await
-        .expect("create .orchestry");
+use daemon::TestDaemon;
 
-    let mut config = default_config();
-    config.project.name = "run-wait".into();
-    config.defaults.agent.workspace_mode = WorkspaceMode::Shared;
-    // There is no watch loop in `run <id>`; a long poll keeps anything else
-    // from dispatching behind the test's back.
-    config.scheduling.poll_interval_ms = 100_000;
-    ConfigStore::write(&FileConfigStore::new(paths.clone()), &config)
-        .await
-        .expect("write config.yml");
-
-    let engine = orch_engine::build_full_with(
-        temp.path(),
-        orch_engine::EngineSeams {
-            // Never the developer's real `~/.orchestry/global.yml`.
-            global_config_path: Some(paths.root().join("global.yml")),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("build_full");
-    (temp, engine)
+struct Fixture {
+    dir: tempfile::TempDir,
 }
 
-/// A todo task assigned to a shell agent whose command fails at once.
-async fn doomed_task(engine: &orch_engine::FullEngine) -> String {
-    let agent = engine
-        .agent_service
-        .create(CreateAgentInput {
-            name: "doomed".into(),
-            adapter: "shell".into(),
-            command: Some("exit 7".into()),
-            ..Default::default()
-        })
-        .await
-        .expect("create agent");
-    engine
-        .task_service
-        .create(CreateTaskInput {
-            title: "fails at once".into(),
-            assignee: Some(agent.id),
-            ..Default::default()
-        })
-        .await
-        .expect("create task")
-        .id
-}
+impl Fixture {
+    fn new() -> Fixture {
+        let dir = tempfile::Builder::new()
+            .prefix("orch-run-wait-")
+            .tempdir()
+            .expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("home")).expect("home");
+        std::fs::create_dir_all(dir.path().join("p")).expect("project");
+        let fx = Fixture { dir };
+        let init = fx.orch(None, &["init", "--name", "run-wait", "--adapter", "shell"]);
+        assert!(init.status.success(), "init: {}", stderr(&init));
+        fx
+    }
 
-/// The ordering that hangs, forced deterministically.
-///
-/// Reproducing it by timing alone is luck: the collector needs ~15 ms (spawn,
-/// exit, collect) where the dispatch's trailing `save_state` is ~1 ms, so the
-/// real completion lands *after* the drain on an unloaded machine and the bug
-/// stays hidden. A slower state write, a loaded machine or an adapter that
-/// fails before spawning all flip it.
-///
-/// So the ordering is forced instead: a handler reacts to the real
-/// `agent:started` by emitting a *second* start for the same task with a
-/// different run id, immediately followed by that run's completion. The bus
-/// sends on the channel before dispatching handlers, so the drained batch is
-/// exactly `started(real)`, `started(synth)`, `completed(synth)` — the shape
-/// where the completion is already consumed. The real run's own completion
-/// arrives later with the *real* run id, so nothing else can end the wait.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_completion_already_in_the_drained_batch_ends_the_wait() {
-    let (_temp, engine) = project().await;
-    let task_id = doomed_task(&engine).await;
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("p")
+    }
 
-    let bus = Arc::clone(&engine.events);
-    let _synth = engine.events.on(OrchestratorEventType::AgentStarted, {
-        let bus = Arc::clone(&bus);
-        move |event| {
-            let OrchestratorEvent::AgentStarted {
-                task_id,
-                agent_id,
-                run_id,
-            } = event
-            else {
-                return;
-            };
-            // Only react to the *real* start: the synthetic one re-enters this
-            // handler, and reacting to it recurses until the stack is gone.
-            if run_id != "run_synthetic" {
-                bus.emit(OrchestratorEvent::AgentStarted {
-                    task_id: task_id.clone(),
-                    agent_id: agent_id.clone(),
-                    run_id: "run_synthetic".to_owned(),
-                });
-                bus.emit(OrchestratorEvent::AgentCompleted {
-                    run_id: "run_synthetic".to_owned(),
-                    agent_id: agent_id.clone(),
-                    success: true,
-                });
-            }
+    fn home(&self) -> PathBuf {
+        self.dir.path().join("home")
+    }
+
+    fn command(&self, daemon: Option<&TestDaemon>, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_orch"));
+        command
+            .env_clear()
+            .current_dir(self.root())
+            .env("HOME", self.home())
+            .env("PATH", "/usr/bin:/bin")
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                self.home().join("global.yml"),
+            )
+            .args(args)
+            .stdin(Stdio::null());
+        if let Some(daemon) = daemon {
+            daemon.apply(&mut command);
         }
-    });
+        command
+    }
 
-    let styles = orch_cli::output::Styles::plain();
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        orch_cli::commands::run::single(&engine, &styles, &task_id),
-    )
-    .await;
+    fn orch(&self, daemon: Option<&TestDaemon>, args: &[&str]) -> Output {
+        self.command(daemon, args).output().expect("run orch")
+    }
 
-    outcome
-        .expect("`run <id>` hung: it is waiting for a completion it already consumed")
-        .expect("run failed");
-
-    let _ = engine.orchestrator.stop().await;
+    fn json(&self, daemon: &TestDaemon, args: &[&str]) -> serde_json::Value {
+        let mut argv = vec!["--json"];
+        argv.extend(args);
+        let out = self.orch(Some(daemon), &argv);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        serde_json::from_slice(&out.stdout).expect("json output")
+    }
 }
 
-/// The ordinary path, as a guard against the fix breaking it: the completion
-/// arrives *after* the drain, so the wait is entered and ended normally.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_wait_still_ends_on_a_completion_that_arrives_later() {
-    let (_temp, engine) = project().await;
-    let task_id = doomed_task(&engine).await;
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
 
-    let styles = orch_cli::output::Styles::plain();
-    let code = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        orch_cli::commands::run::single(&engine, &styles, &task_id),
-    )
-    .await
-    .expect("`run <id>` never returned")
-    .expect("run failed");
+/// Run `command`, failing the test (and killing the child) if it is still
+/// running after `limit`: a hang must not stall the suite.
+fn bounded(mut command: Command, limit: Duration) -> Output {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orch");
+    let pid = child.id();
+    let deadline = Instant::now() + limit;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    loop {
+        if let Ok(output) = rx.try_recv() {
+            return output.expect("wait orch");
+        }
+        if Instant::now() >= deadline {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            panic!("`orch run <id>` did not return within {limit:?}: it hung after the run");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
-    // `exit 7` is a failed run, which is exit 1 — so the stream really was
-    // followed to its end rather than the command returning early.
-    assert_eq!(
-        format!("{code:?}"),
-        format!("{:?}", std::process::ExitCode::from(1))
+fn doomed_task(fx: &Fixture, daemon: &TestDaemon) -> String {
+    let agent = fx.json(
+        daemon,
+        &[
+            "agent",
+            "add",
+            "doomed",
+            "--adapter",
+            "shell",
+            "--command",
+            "exit 7",
+        ],
     );
-    let runs = engine.run_service.list_all().await.expect("list runs");
-    assert_eq!(runs.len(), 1, "expected one real run");
+    let agent_id = agent["id"].as_str().expect("agent id").to_owned();
+    let task = fx.json(
+        daemon,
+        &["task", "add", "doomed work", "--assignee", &agent_id],
+    );
+    task["id"].as_str().expect("task id").to_owned()
+}
 
-    let _ = engine.orchestrator.stop().await;
+fn task_status(fx: &Fixture, daemon: &TestDaemon, id: &str) -> String {
+    fx.json(daemon, &["task", "show", id])["status"]
+        .as_str()
+        .expect("status")
+        .to_owned()
+}
+
+/// `exit 7` is a failed run, which is exit 1 — so the stream really was
+/// followed to its end rather than the command returning early.
+#[test]
+fn run_id_follows_the_daemon_stream_to_the_failed_run_and_exits_1() {
+    let fx = Fixture::new();
+    let daemon = TestDaemon::start(&fx.root(), &fx.home());
+    let task_id = doomed_task(&fx, &daemon);
+
+    let out = bounded(
+        fx.command(Some(&daemon), &["run", &task_id]),
+        Duration::from_secs(60),
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert_ne!(task_status(&fx, &daemon, &task_id), "todo");
+    assert_ne!(task_status(&fx, &daemon, &task_id), "in_progress");
+    daemon.shutdown();
+}
+
+/// Without a daemon `run <id>` is refused with the uniform no-daemon exit
+/// code and never starts one (R4).
+#[test]
+fn run_id_without_a_daemon_is_refused_with_exit_7() {
+    let fx = Fixture::new();
+    let socket_dir = tempfile::Builder::new()
+        .prefix("otd-")
+        .tempdir_in("/tmp")
+        .expect("socket dir");
+    let socket: &Path = &socket_dir.path().join("s");
+    let mut command = fx.command(None, &["run", "tsk_missing"]);
+    daemon::apply_env(&mut command, socket, socket_dir.path());
+    let out = bounded(command, Duration::from_secs(20));
+    assert_eq!(out.status.code(), Some(7), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("orch daemon start"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !socket.exists(),
+        "a client must never bind or start a daemon"
+    );
 }

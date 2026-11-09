@@ -18,9 +18,9 @@
 mod mcp_common;
 
 use mcp_common::{
-    DESTRUCTIVE, EXPECTED, LEGACY_PROTOCOL_VERSION, McpServer, PROTOCOL_VERSION, READ_ONLY,
-    SHUTDOWN_TIMEOUT, TIMEOUT, empty_project, error_code, initialized_project,
-    initialized_project_named, orch_command, run_mcp, tool_text,
+    DESTRUCTIVE, EXPECTED, LEGACY_PROTOCOL_VERSION, McpServer, PROTOCOL_VERSION, ProjectDir,
+    READ_ONLY, SHUTDOWN_TIMEOUT, TIMEOUT, empty_project, error_code, initialized_project,
+    initialized_project_named, initialized_project_unowned, orch_command, run_mcp, tool_text,
 };
 use serde_json::{Value, json};
 
@@ -1391,7 +1391,7 @@ fn a_refused_resource_read_does_not_end_the_session() {
 /// entry, and two pending messages for `rx` — everything the entity
 /// resources project, built through the CLI before any server starts.
 struct Populated {
-    project: tempfile::TempDir,
+    project: ProjectDir,
     goal: String,
     task: String,
     agent: String,
@@ -1566,7 +1566,7 @@ fn reading_the_inbox_resource_twice_does_not_consume_the_messages() {
 /// peer is offline (nothing owns the project), which is the legitimate state
 /// of a cached snapshot and does not change what a qualified read returns.
 struct PeerFixture {
-    project: tempfile::TempDir,
+    project: ProjectDir,
     /// The peer's own id for the agent, without the alias.
     bare: String,
     /// `<bare>@w1`: the id every orch surface shows for it.
@@ -1574,7 +1574,9 @@ struct PeerFixture {
 }
 
 fn peer_project() -> PeerFixture {
-    let project = initialized_project();
+    // Unowned while the snapshot is hand-written: the daemon's peer runtime
+    // would otherwise link `w1` (refused) and rewrite `remotes/w1.json`.
+    let mut project = initialized_project_unowned("p");
     let path = project.path();
     cli_ok(path, &["remote", "add", "w1", "127.0.0.1:1"]);
     // Any well-formed agent record is a valid peer snapshot entry; borrow one
@@ -1617,6 +1619,7 @@ fn peer_project() -> PeerFixture {
         path,
         &["msg", "send", &qualified, "for the peer", "--from", "cli"],
     );
+    project.start_daemon();
     PeerFixture {
         project,
         bare,
@@ -1864,13 +1867,16 @@ fn orchestry_entries(project: &std::path::Path) -> Vec<String> {
 #[cfg(unix)]
 fn assert_signal_stops_cleanly(signal: nix::sys::signal::Signal) {
     let project = initialized_project();
+    // The project's explicit test daemon already owns `.orchestry` (its lock
+    // and run files are in this baseline); the MCP server must add nothing.
+    let baseline = orchestry_entries(project.path());
     let mut server = McpServer::spawn(project.path());
     server.initialize();
     status_ok(&mut server);
     let before = orchestry_entries(project.path());
-    assert!(
-        !before.iter().any(|name| name == "orchestry.lock"),
-        "a running server holds the project lock: {before:?}"
+    assert_eq!(
+        before, baseline,
+        "a running server created or took something in .orchestry (a lock?)"
     );
 
     server.signal(signal);
