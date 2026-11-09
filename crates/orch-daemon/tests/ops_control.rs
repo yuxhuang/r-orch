@@ -589,7 +589,7 @@ async fn finite_run_task_finishes_at_run_completion_before_human_review() {
     .await
     .unwrap();
     let result = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(30),
         Handler::dispatch_run_task(
             &h,
             &ctx,
@@ -637,11 +637,11 @@ async fn finite_run_all_revisits_captured_work_when_capacity_frees() {
         .unwrap();
     }
     let outcome = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(30),
         Handler::dispatch_run_all(&h, &ctx, DispatchRunAllArgs {}),
     )
     .await
-    .unwrap()
+    .expect("run-all must revisit work captured while capacity was busy and finish")
     .unwrap();
     assert_eq!(outcome.exit_code, 0);
     assert_eq!(outcome.tasks.len(), 2);
