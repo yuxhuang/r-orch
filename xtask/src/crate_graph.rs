@@ -41,9 +41,16 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("orch-engine", &["orch-core", "orch-domain", "orch-infra"]),
     // Transport composes the engine and concrete peer persistence; the engine
     // reaches it only through the network-independent bridge in orch-core.
+    // orch-proto supplies the shared bounded NDJSON framing only (design D10).
     (
         "orch-peer",
-        &["orch-core", "orch-domain", "orch-engine", "orch-infra"],
+        &[
+            "orch-core",
+            "orch-domain",
+            "orch-engine",
+            "orch-infra",
+            "orch-proto",
+        ],
     ),
     // **Tighter than ARCHITECTURE §3.1's diagram**, which has the TUI
     // depending on the engine. WP-6 inverted it: everything the dashboard

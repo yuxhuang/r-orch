@@ -46,7 +46,9 @@ pub(crate) fn log_path(root: &Path) -> PathBuf {
 pub(crate) fn open_log(root: &Path) -> Result<File, DaemonError> {
     let path = log_path(root);
     let open = || {
+        // Readable too: a failed start shows the child's last lines.
         OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .mode(0o600)
@@ -266,6 +268,23 @@ mod tests {
         let backup = temp.path().join(".orchestry").join(LOG_BACKUP);
         assert_eq!(std::fs::metadata(&backup).unwrap().len(), LOG_CAP + 1);
         assert_eq!(std::fs::metadata(&backup).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn failure_tail_shows_only_what_the_child_wrote() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let mut log = open_log(temp.path()).unwrap();
+        log.write_all(b"earlier run\n").unwrap();
+        let offset = log.seek(SeekFrom::End(0)).unwrap();
+        let mut child = log.try_clone().unwrap();
+        child
+            .write_all(b"error: orch daemon already running (PID 7)\n")
+            .unwrap();
+        assert_eq!(
+            log_tail(&mut log, offset),
+            b"error: orch daemon already running (PID 7)\n"
+        );
     }
 
     #[test]

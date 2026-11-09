@@ -15,7 +15,7 @@
 //! |---|---|
 //! | [`lifecycle`], `guard`, `discovery`, `listener`, `session`, [`testing`] | S1a-impl (senior-eng) |
 //! | [`coordinator`], [`ops`] handlers | S1b (senior-eng-2) |
-//! | dispatch hosting, peer runtime, NDJSON lift in orch-peer | S1d (senior-eng) |
+//! | [`dispatch`] loop, [`peer`] runtime, NDJSON lift in orch-peer | S1d (senior-eng) |
 
 // Stricter than the workspace lints, for library code only (integration tests are separate crates and
 // `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
@@ -29,12 +29,14 @@
 pub mod coordinator;
 mod detach;
 mod discovery;
+mod dispatch;
 mod env;
 mod error;
 mod guard;
 pub mod lifecycle;
 mod listener;
 pub mod ops;
+mod peer;
 mod session;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -42,8 +44,8 @@ pub mod testing;
 pub use discovery::select_project_root;
 pub use error::DaemonError;
 pub use lifecycle::{
-    DEVELOPMENTAL_BANNER, DaemonExit, DispatchMode, InitOptions, InitOutcome, StartOptions,
-    initialize, start,
+    DEVELOPMENTAL_BANNER, DaemonExit, DispatchMode, EnvironmentSnapshot, InitOptions, InitOutcome,
+    StartOptions, capture_environment, initialize, start,
 };
 
 /// The environment variable that must be `1` for `orch daemon start` in PR 1

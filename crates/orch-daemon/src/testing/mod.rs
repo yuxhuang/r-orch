@@ -52,6 +52,8 @@ pub struct HarnessBuilder {
     dispatch: DispatchMode,
     versions: Option<(u32, String)>,
     on_socket: bool,
+    listen: Option<String>,
+    peer_name: Option<String>,
 }
 
 /// The duplex buffer per direction: comfortably above one 1 MiB frame so a
@@ -93,6 +95,19 @@ impl HarnessBuilder {
     /// the skew matrix. Affects the handshake only.
     pub fn versions(mut self, protocol: u32, binary: impl Into<String>) -> Self {
         self.versions = Some((protocol, binary.into()));
+        self
+    }
+
+    /// Start the peer runtime listening on `addr` (`--listen`), e.g.
+    /// `127.0.0.1:0`.
+    pub fn listen(mut self, addr: impl Into<String>) -> Self {
+        self.listen = Some(addr.into());
+        self
+    }
+
+    /// The peer name (`--peer-name`).
+    pub fn peer_name(mut self, name: impl Into<String>) -> Self {
+        self.peer_name = Some(name.into());
         self
     }
 
@@ -160,13 +175,16 @@ impl HarnessBuilder {
             project_root: root.clone(),
             socket: socket.clone(),
             dispatch: self.dispatch,
-            listen: None,
+            listen: self.listen,
+            peer_name: self.peer_name,
             seams,
             processes: self.processes,
             versions: self.versions,
             snapshot: crate::env::capture(std::env::vars_os()),
         })
         .await?;
+        let mut running = running;
+        running.honour_stop_intent();
         Ok(DaemonHarness {
             project_root: root,
             socket,
@@ -439,8 +457,8 @@ mod tests {
         };
         let mut frame = serde_json::to_vec(&hello).unwrap();
         frame.push(b'\n');
-        // A stop intent is answered with the advertised versions; the
-        // harness is not stopped until its own shutdown runs.
+        // A stop intent is answered with the advertised versions, then
+        // stops the engine; the harness's shutdown stays idempotent.
         stream.get_mut().write_all(&frame).await.unwrap();
         let mut line = String::new();
         stream.read_line(&mut line).await.unwrap();

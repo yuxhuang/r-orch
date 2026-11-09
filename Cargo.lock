@@ -1843,6 +1843,7 @@ dependencies = [
  "orch-domain",
  "orch-engine",
  "orch-infra",
+ "orch-proto",
  "serde",
  "serde_json",
  "tempfile",

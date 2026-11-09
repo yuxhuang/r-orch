@@ -13,6 +13,7 @@ orch-domain.workspace = true
 orch-core.workspace = true
 orch-infra.workspace = true
 orch-engine.workspace = true
+orch-proto.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
