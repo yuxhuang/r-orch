@@ -558,12 +558,30 @@ pub struct TuiPane {
 
 impl TuiPane {
     pub fn launch(scene: &Scene, args: &str, extra_env: &[(&str, &str)]) -> TuiPane {
+        Self::launch_at(
+            &scene.root,
+            &scene.socket,
+            &scene.test_root,
+            args,
+            extra_env,
+        )
+    }
+
+    /// Like [`TuiPane::launch`] for a project that is not a [`Scene`] (a
+    /// running daemon's sandbox).
+    pub fn launch_at(
+        root: &Path,
+        socket: &Path,
+        test_root: &Path,
+        args: &str,
+        extra_env: &[(&str, &str)],
+    ) -> TuiPane {
         assert!(
             tmux_available(),
             "tmux is required for the TUI end-to-end tests and was not found on PATH \
              (macOS: brew install tmux; Linux: the distro's tmux package)"
         );
-        let dir = scene.test_root.clone();
+        let dir = test_root.to_path_buf();
         let name = format!("t2a{}", std::process::id());
         let exit_file = dir.join("tui.exit");
         let wrapper = dir.join("pane.sh");
@@ -580,8 +598,8 @@ impl TuiPane {
                  ORCH_SOCKET='{sock}' ORCH_TEST_SOCKET_ROOT='{dir}' ORCH_DAEMON_DEVELOPMENTAL=1{extra} \
                  '{exe}' {args}\nstatus=$?\necho $status > '{exit}.tmp' && mv '{exit}.tmp' '{exit}'\n\
                  exec sleep 600\n",
-                root = scene.root.display(),
-                sock = scene.socket.display(),
+                root = root.display(),
+                sock = socket.display(),
                 dir = dir.display(),
                 exe = env!("CARGO_BIN_EXE_orch"),
                 exit = exit_file.display(),
