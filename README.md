@@ -626,6 +626,15 @@ talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notic
 Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
 cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
 
+### Upgrading from v0.12.0
+
+v0.13.0 narrows what pausing a goal cancels: only the assignee's waiting (`todo` or `retrying`) autonomous
+tasks linked to the paused goal, no longer those in its other goals or linked to no goal. A workflow that relied
+on one pause clearing an agent's whole autonomous queue must now pause each goal. `orch mcp` lets a default-mode
+client pause a goal; `force: true` still needs `--allow-destructive`. Invalid-argument errors from `orch mcp` no
+longer quote the sent value, so a client that parsed it out of the message must read its own input instead.
+No file format changed, so downgrading to v0.12.0 needs no data migration. See [CHANGELOG 0.13.0](CHANGELOG.md).
+
 ### Upgrading from v0.9.4
 
 v0.10.0 adds the opt-in eco prompt mode and more effort levels; `normal` stays the default. orch refuses to add
@@ -675,7 +684,7 @@ while the main list has focus. Mouse capture now reports drags for text selectio
 back to the terminal. Roll back by installing v0.5.2: v0.6.0 writes nothing new to `.orchestry/` (editor
 drafts last only for the dashboard session).
 
-### Known gaps in v0.12.0
+### Known gaps in v0.13.0
 
 - Copy and mouse selection in a native terminal (Terminal.app, iTerm2) were not verified by hand before
   release; the automated tests cover the copy routing, and the web dashboard's browser copy.
