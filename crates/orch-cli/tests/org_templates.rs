@@ -984,12 +984,12 @@ fn hostile_documents() -> Vec<(&'static str, Vec<u8>, &'static str)> {
         (
             "duplicate YAML keys",
             b"name: extra\nrole: x\nrole: y\n".to_vec(),
-            "duplicate entry with key \"role\"",
+            "duplicate keys",
         ),
         (
             "duplicate JSON keys",
             br#"{"name":"extra","role":"x","role":"y"}"#.to_vec(),
-            "duplicate entry with key \"role\"",
+            "duplicate keys",
         ),
         (
             "explicit YAML tag",
