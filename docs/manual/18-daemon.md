@@ -82,7 +82,9 @@ ORCH_DAEMON_DEVELOPMENTAL=1 orch daemon start
 
 The daemon first checks the project and your user, takes ownership of the project, recovers the state a previous
 orchestrator left (the same reconciliation `orch serve` does at start, and a rebuild of any missing or corrupt
-`_index.json`), removes expired context entries, binds the socket and writes `.orchestry/daemon.json`. Only then
+`_index.json` of tasks, agents, runs, goals, teams and messages), removes expired context entries, binds the
+socket and writes `.orchestry/daemon.json`. The context index is the exception: start-up does not rebuild it
+(see [the recovery table](#recovery)); a failed context expiry does not stop the start. Only then
 does it print its readiness line, exactly `listening <socket>`, followed by its dispatch state. The banner on
 stderr says that the daemon is developmental and that legacy writers are not excluded.
 
@@ -303,7 +305,7 @@ client start, restart or repair a daemon; every recovery is something you do.
 | A detached daemon after logout or a reboot | No daemon answers. | Start it again. orch supplies no launchd job, watchdog or restart. | now |
 | You upgraded orch and the old daemon still runs | Version skew message, exit 7. | `orch daemon stop` (either binary), then start the new one. Running agents are stopped and reconciled; this is not a transparent upgrade. | now |
 | The daemon hangs, or its socket was removed | Commands time out or report no daemon; status never claims liveness from files. | Read the PID in `daemon.json` as an untrusted hint. Only if `ps -p <pid> -o command=` shows an orch daemon for this project, send `kill -TERM <pid>`. If you cannot verify the process, do not signal it. | now |
-| orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index, but cannot detect every stale one. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. | now |
+| orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index of tasks, agents, runs, goals, teams or messages, but cannot detect a stale index that is still valid. It does not rebuild the context index: start-up writes `context/_index.json` only when it removes an expired entry. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. For context, the removed (or corrupt) index stays as it is after the start; context reads then list the entry files themselves, so their results are correct, and the next context change (a set, a delete, or an expiry that removes an entry) writes the index again. Do not expect the file back after the start. Pending: the spec requires start-up to rebuild every missing or corrupt index (R15); the context gap awaits a fix or a decision (task tsk_mx9k_V_). | now |
 | Re-running `orch init` | It does not overwrite the project and prints how to start the daemon. It never starts one. | Start the daemon yourself. | now |
 | An agent loses the daemon mid-task | Exit 7 with the agent-context message. The outcome of a change whose reply was lost is unknown. | The agent stops and reports to you. Start the daemon, inspect the task, run and state, then decide on a retry. A restart does not resume the agent's conversation. | planned (PR 2) |
 | An MCP client's first call fails | The `initialize` error with the no-daemon message; the `orch mcp` process stays up. | Start the daemon, then reconnect, re-enable or restart the MCP session; not every MCP client retries by itself. | planned (PR 2) |
