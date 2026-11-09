@@ -46,7 +46,7 @@ fn files_are_private_under_any_umask_and_the_state_dir_is_not_chmodded() {
         sandbox.init_project();
         // Default endpoint (no ORCH_SOCKET): `<root>/.orchestry/run/orch.sock`.
         let state_mode = mode(&sandbox.state_dir());
-        fs::set_permissions(&sandbox.state_dir(), fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(sandbox.state_dir(), fs::Permissions::from_mode(0o750)).unwrap();
         let mut cmd = sandbox.start_cmd(&[]);
         cmd.env_remove("ORCH_SOCKET");
         let mut daemon =
@@ -103,7 +103,7 @@ fn a_writable_state_dir_is_refused_and_not_chmodded() {
     for bits in [0o770, 0o757] {
         let sandbox = Sandbox::new();
         sandbox.init_project();
-        fs::set_permissions(&sandbox.state_dir(), fs::Permissions::from_mode(bits)).unwrap();
+        fs::set_permissions(sandbox.state_dir(), fs::Permissions::from_mode(bits)).unwrap();
         let out = sandbox.run(&["daemon", "start"]);
         assert_eq!(
             out.status.code(),
@@ -115,7 +115,7 @@ fn a_writable_state_dir_is_refused_and_not_chmodded() {
         assert_eq!(mode(&sandbox.state_dir()), bits, "mode changed");
         assert!(!sandbox.state_dir().join("daemon.json").exists());
         assert!(!sandbox.socket().exists());
-        fs::set_permissions(&sandbox.state_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(sandbox.state_dir(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
 

@@ -5,7 +5,10 @@
 //! JSON values and read replies as plain JSON values. Nothing here sleeps;
 //! every wait is bounded by a deadline that only fires on a hang.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test crate uses a subset of the shared client"
+)]
 
 use orch_daemon::testing::{ClientStream, DaemonHarness};
 use serde_json::{Value, json};

@@ -645,3 +645,46 @@ fn a_stop_hello_is_accepted_across_skew_without_decoding_session_fields() {
         assert_eq!(serde_json::to_string(&state).unwrap(), text);
     }
 }
+
+// ---------------------------------------------------------------------------
+// paths on the wire (D4: lossless for non-UTF-8 roots, escaped for humans)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_non_utf8_path_round_trips_as_tagged_hex_and_a_utf8_path_as_text() {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xff\xfe/x");
+    let path = WirePath::new(raw).unwrap();
+    let json = serde_json::to_string(&path).unwrap();
+    assert!(json.starts_with(r#"{"hex":""#), "{json}");
+    let back: WirePath = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.as_path().as_os_str().as_bytes(), raw.as_bytes());
+
+    let text = serde_json::to_string(&WirePath::new("/tmp/ok").unwrap()).unwrap();
+    assert_eq!(text, r#"{"utf8":"/tmp/ok"}"#);
+    // Malformed hex and a NUL byte are refused, in either encoding.
+    assert!(serde_json::from_str::<WirePath>(r#"{"hex":"zz"}"#).is_err());
+    assert!(serde_json::from_str::<WirePath>(r#"{"hex":"abc"}"#).is_err());
+    assert!(serde_json::from_str::<WirePath>("{\"utf8\":\"/a\\u0000b\"}").is_err());
+    assert!(WirePath::new("/a\0b").is_err());
+    // 4096 bytes is the limit.
+    assert!(WirePath::new(format!("/{}", "a".repeat(4095))).is_ok());
+    assert!(WirePath::new(format!("/{}", "a".repeat(4096))).is_err());
+}
+
+#[test]
+fn paths_shown_to_a_human_have_their_control_characters_escaped() {
+    let hostile = WirePath::new("/tmp/\u{1b}[2Jevil\nname").unwrap();
+    let shown = hostile.display_escaped();
+    assert!(
+        !shown.contains('\u{1b}') && !shown.contains('\n'),
+        "{shown:?}"
+    );
+    assert!(shown.contains("evil"));
+    // The same escaping applies to the roots in connection failures.
+    let failure = ConnectFailure::no_daemon(
+        "/tmp/\u{1b}[2J/x",
+        orch_proto::error::NoDaemonDetail::NoSocket,
+    );
+    assert!(!failure.render(false).contains('\u{1b}'));
+}

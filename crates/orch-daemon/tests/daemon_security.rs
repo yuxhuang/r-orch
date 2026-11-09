@@ -72,7 +72,7 @@ async fn daemon_json_publishes_only_the_reviewed_fields() {
         .keys()
         .map(String::as_str)
         .collect();
-    keys.sort_unstable();
+    keys.sort();
     assert_eq!(
         keys,
         [
