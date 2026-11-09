@@ -146,6 +146,9 @@ struct Peer {
     bin: PathBuf,
     serial: Cell<usize>,
     owner: RefCell<Option<Process>>,
+    /// `RUST_LOG` for the next foreground owner: daemon diagnostics reach its
+    /// stderr only when asked for (the per-event log lines are retired).
+    owner_rust_log: RefCell<Option<String>>,
     /// A dispatch-off explicit daemon that serves the CLI between the
     /// fixture's own owners: every `orch` command is a daemon client, so the
     /// CLI seeding that used to precede `start()` needs one. `start()` stops
@@ -172,6 +175,7 @@ impl Peer {
             bin,
             serial: Cell::new(0),
             owner: RefCell::new(None),
+            owner_rust_log: RefCell::new(None),
             seed: RefCell::new(None),
             sockets: tempfile::Builder::new()
                 .prefix("otd-")
@@ -364,6 +368,9 @@ impl Peer {
         command.args(["serve", "--peer-name", &self.name]);
         if let Some(addr) = listen {
             command.args(["--listen", &addr.to_string()]);
+        }
+        if let Some(filter) = self.owner_rust_log.borrow().as_deref() {
+            command.env("RUST_LOG", filter);
         }
         let process = self.spawn(command, "owner");
         let pid = process.child.id();
@@ -1157,11 +1164,23 @@ fn s21_removing_link_releases_health_lease_while_controller_owner_stays_live() {
     assert!(!observed.online);
 }
 
+/// How many times the foreground daemon has logged a pending reconnect: the
+/// link-loss diagnostic that survives an unwritable status record.
+fn reconnects(peer: &Peer) -> usize {
+    let owner = peer.owner.borrow();
+    let owner = owner.as_ref().unwrap();
+    format!("{}{}", text(&owner.stdout), text(&owner.stderr))
+        .matches("Peer reconnect pending")
+        .count()
+}
+
 #[test]
-#[ignore = "the foreground daemon logs peer-status write failures and link loss only under RUST_LOG (stderr), where the in-process owner printed them by default; the test waits for 'Write peer status' / 'Peer w1 disconnected' without RUST_LOG. Lost operator diagnostics, tsk_MdWfPP2"]
 fn s19_failed_status_save_and_socket_loss_block_new_dispatch_until_recovery() {
     let worker = Peer::new("worker-status-failure");
     let controller = Peer::new("controller-status-failure");
+    // Socket loss is logged by the foreground daemon only under RUST_LOG
+    // (CHANGELOG [Unreleased]: no per-event log lines by default).
+    *controller.owner_rust_log.borrow_mut() = Some("orch_peer=debug".into());
     let agent = worker.add_agent("executor", "echo recovered", "shared");
     let local = controller.add_agent("local", "echo local-unaffected", "shared");
     let addr = port();
@@ -1180,14 +1199,12 @@ fn s19_failed_status_save_and_socket_loss_block_new_dispatch_until_recovery() {
         File::create(dir.join("write-probe")).is_err(),
         "fault injection must deny writes"
     );
+    // The per-event log lines are retired (CHANGELOG [Unreleased]); the
+    // operator-visible record is the daemon's live `remote status`.
     wait(
-        "status persistence failure visible without RUST_LOG",
+        "daemon reports the unwritable status as unavailable",
         &[&controller, &worker],
-        || {
-            let owner = controller.owner.borrow();
-            let owner = owner.as_ref().unwrap();
-            format!("{}{}", text(&owner.stdout), text(&owner.stderr)).contains("Write peer status")
-        },
+        || controller.json(&["remote", "status"])["remotes"][0]["online"] == false,
     );
     assert_eq!(
         controller.status("w1")["online"],
@@ -1197,16 +1214,16 @@ fn s19_failed_status_save_and_socket_loss_block_new_dispatch_until_recovery() {
     let status = controller.json(&["remote", "status"]);
     assert_eq!(status["remotes"][0]["online"], false);
     assert!(status["remotes"][0]["last_error"].is_string());
+    assert_eq!(
+        status["remotes"][0]["link_state"], "online",
+        "only the status write failed; the link itself is still up"
+    );
+    let reconnects_before = reconnects(&controller);
     worker.stop(Signal::SIGKILL);
     wait(
-        "socket loss visible without RUST_LOG",
+        "socket loss logged by the daemon under RUST_LOG",
         &[&controller, &worker],
-        || {
-            let owner = controller.owner.borrow();
-            let owner = owner.as_ref().unwrap();
-            format!("{}{}", text(&owner.stdout), text(&owner.stderr))
-                .contains("Peer w1 disconnected")
-        },
+        || reconnects(&controller) > reconnects_before,
     );
     let task = controller.task("wait for healthy link", Some(&remote_id(&agent, "w1")), &[]);
     let local_task = controller.task("local dispatch unaffected", Some(&local), &[]);
