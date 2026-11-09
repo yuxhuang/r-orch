@@ -124,20 +124,77 @@ dashboard of this build cannot become the orchestrator while it runs.
 gets that snapshot, the agent's configured environment and the project root and socket that orch sets for it;
 no request can add environment variables, a command or a working directory. Credentials therefore come from the
 shell you started the daemon in: after you refresh a token in your shell, stop the daemon and start it again.
-`orch daemon status` lists the names it removed, never their values.
+`orch --json daemon status` lists the names it removed, never their values.
 
 ## Check, toggle dispatch and stop
 
 ### Status
 
-`orch daemon status` asks the running daemon, never a file, so it cannot report a daemon that has died. It shows
-the daemon's PID, socket path, orch version and protocol version, its instance id, the executable it was started
-from and when, whether dispatch is on or off, the running tasks, the number of client sessions and the cap,
-whether it still owns the project's lock, and the environment names it removed.
-<!-- W4: replace with captured `orch daemon status` output from the frozen commit. -->
+`orch daemon status` asks the running daemon, never a file, so it cannot report a daemon that has died. The plain
+output shows the daemon's PID, whether dispatch is on or off, the executable it was started from and when, its orch
+and protocol versions, and the number of client sessions and the cap (executable path shortened):
 
-If the daemon has lost the orchestrator lock (its PID file was removed or replaced), status shows
-`ownership_lost` and the daemon turns dispatch off. It does not recreate the lock. Stop it and start it again.
+```console
+$ orch daemon status
+orch daemon PID 13566 · dispatch OFF
+  executable: /…/target/debug/orch
+  started: 2026-11-09T08:44:11.673Z
+  version: orch 0.13.0 protocol 1
+  sessions: 1/64
+```
+
+The plain output does **not** show the socket path, the instance id, the running tasks, whether the daemon still
+owns the project's lock, or the environment names it removed. Ask for JSON or YAML to see them, with the global
+flag before or after the command (`orch --json daemon status`, `orch daemon status --yaml`):
+
+```console
+$ orch --json daemon status
+{
+  "pid": 13566,
+  "project_root": {
+    "utf8": "/private/tmp/twn-v0vgwbe_/p"
+  },
+  "socket": {
+    "utf8": "/tmp/twn-v0vgwbe_/o.sock"
+  },
+  "protocol": 1,
+  "binary": "0.13.0",
+  "instance": "daemon_hPQDKpz",
+  "executable": {
+    "utf8": "/…/target/debug/orch"
+  },
+  "started_at": "2026-11-09T08:44:11.673Z",
+  "dispatch": {
+    "dispatch_on": false,
+    "batch_active": false
+  },
+  "running_tasks": [],
+  "sessions": 1,
+  "session_cap": 64,
+  "busy_rejections": 0,
+  "ownership": "held",
+  "removed_env": [
+    "DEBUG",
+    "ORCH_SOCKET"
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `socket`, `project_root`, `executable` | Paths, each as `{"utf8": "…"}`, or `{"hex": "…"}` for a path that is not valid UTF-8 |
+| `instance` | This daemon's id; a restarted daemon has a new one |
+| `running_tasks` | Ids of the tasks whose agents the daemon is running |
+| `busy_rejections` | Connections refused with `busy` since start, because the handshake or session capacity was full |
+| `ownership` | `held`, or `lost` when the daemon no longer owns the orchestrator lock |
+| `removed_env` | Names, never values, removed from the agents' environment |
+
+**Lost ownership.** The daemon re-checks the orchestrator lock (`.orchestry/orchestry.lock`) every 10 seconds,
+whether dispatch is on or off. If the file is gone or names another PID, the daemon sets `ownership` to `lost`,
+turns dispatch off and refuses `orch daemon dispatch on` with `daemon ownership was lost` (exit 1). It does not
+recreate the lock. The plain `orch daemon status` output looks the same as for a healthy daemon with dispatch
+off, so check ownership with `orch --json daemon status` (or `--yaml`, which prints `ownership: lost`). To
+recover, stop the daemon and start it again.
 
 ### Dispatch on and off
 
