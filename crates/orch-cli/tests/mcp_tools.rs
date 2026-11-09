@@ -27,8 +27,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use mcp_common::{
-    DESTRUCTIVE, EXPECTED, McpServer, READ_ONLY, Rendezvous, error_code, initialized_project,
-    initialized_project_named, orch_command, output_of, spawn_bounded, tool_text,
+    DESTRUCTIVE, EXPECTED, McpServer, ProjectDir, READ_ONLY, Rendezvous, error_code,
+    initialized_project, initialized_project_named, orch_command, output_of, spawn_bounded,
+    tool_text,
 };
 use serde_json::{Value, json};
 
@@ -38,7 +39,7 @@ use serde_json::{Value, json};
 struct Fx {
     // Declared first so the server is killed before its directory is removed.
     server: McpServer,
-    dir: tempfile::TempDir,
+    dir: ProjectDir,
 }
 
 impl Fx {
@@ -58,7 +59,7 @@ impl Fx {
 
     /// A server on an already prepared project, for tests whose identity must
     /// name an agent that has to exist before the server starts.
-    fn on(dir: tempfile::TempDir, args: &[&str], envs: &[(&str, Option<&str>)]) -> Self {
+    fn on(dir: ProjectDir, args: &[&str], envs: &[(&str, Option<&str>)]) -> Self {
         let mut server = McpServer::spawn_with(dir.path(), args, envs);
         server.initialize();
         Self { server, dir }
@@ -774,7 +775,7 @@ fn msg_send_delivers_one_message_with_the_same_shape_as_the_cli() {
 }
 
 /// A project with agents `me` and `rx` (ids returned), no server yet.
-fn project_with_sender_and_receiver() -> (tempfile::TempDir, String, String) {
+fn project_with_sender_and_receiver() -> (ProjectDir, String, String) {
     let dir = initialized_project();
     let make = |name: &str| {
         cli_json(
@@ -2435,7 +2436,7 @@ fn malformed_yaml_is_a_tool_error_and_changes_nothing() {
 
 /// A server whose working directory is `project/sub`, so a relative path means
 /// different files depending on what it is resolved against.
-fn server_in_subdirectory() -> (tempfile::TempDir, McpServer) {
+fn server_in_subdirectory() -> (ProjectDir, McpServer) {
     let dir = initialized_project();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).expect("subdir");
@@ -2720,7 +2721,7 @@ fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
 
 /// A project that also works as a git repository, so `worktree` and
 /// `isolated` workspaces can be created.
-fn git_project(name: &str) -> tempfile::TempDir {
+fn git_project(name: &str) -> ProjectDir {
     let dir = initialized_project_named(name);
     let git = |args: &[&str]| {
         // The fixture's own private HOME and the system directories only: no
