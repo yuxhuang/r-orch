@@ -6,7 +6,8 @@
 //! explicit start → agent-context / developmental gates → root, euid, endpoint
 //!  → owner guard → legacy PID lock → engine + recovery + index rebuild
 //!  → context expiry → private run/ dir → stale-socket check → bind (0600)
-//!  → daemon.json → `listening <socket>` → READY (dispatch OFF unless --dispatch on)
+//!  → runtime .gitignore entries → daemon.json → `listening <socket>`
+//!  → READY (dispatch OFF unless --dispatch on)
 //! stop intent / daemon.stop / TERM / INT / HUP → STOPPING: admission and
 //!  dispatch off, agents killed with grace and reconciled → sessions answer
 //!  and close → own socket and daemon.json removed → PID lock → guard LAST
@@ -524,6 +525,11 @@ impl Running {
             peer,
         };
         if let Some(path) = &spec.socket {
+            // Keep the runtime files out of a project that tracks parts of
+            // `.orchestry` (R2). Hygiene: its failure never blocks READY.
+            if let Err(error) = crate::gitignore::ensure_runtime_gitignore(&root) {
+                tracing::warn!(op = error.op, code = ?error.code, "runtime .gitignore entries not ensured");
+            }
             let record = orch_proto::discovery::DaemonRecord {
                 schema: orch_proto::discovery::DISCOVERY_SCHEMA,
                 project_root: wire(&root)?,

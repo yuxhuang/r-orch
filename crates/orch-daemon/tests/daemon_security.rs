@@ -14,7 +14,7 @@ mod support;
 
 use orch_daemon::testing::DaemonHarness;
 use serde_json::json;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use support::{Raw, ok};
 
 fn mode(path: &std::path::Path) -> u32 {
@@ -143,4 +143,71 @@ async fn shutdown_removes_only_its_own_files() {
     assert!(!socket.exists());
     assert!(!root.join(".orchestry/daemon.json").exists());
     assert_eq!(std::fs::read(&note).unwrap(), b"mine");
+}
+
+/// R2 / spec line 216: an explicit start keeps the daemon's runtime files out
+/// of git in a project initialized before the daemon existed. The legacy
+/// five-entry `.orchestry/.gitignore` gains each runtime entry exactly once,
+/// its own lines and mode untouched; a second start appends nothing; a
+/// symlinked `.gitignore` is not followed and start still reaches READY.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn init_ignores_runtime_metadata() {
+    const LEGACY: &str = "# Runtime state\nstate.json\n*.lock\n\n# Logs and runs\nruns/\nlogs/\n\n# Agent workspaces\nworkspaces/\n";
+    const RUNTIME: [&str; 4] = ["run/", "daemon.json", "daemon.log", "daemon.log.1"];
+    let project = |name: &str| {
+        let temp = tempfile::Builder::new().prefix(name).tempdir().unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(temp.path().join(".orchestry"))
+            .unwrap();
+        temp
+    };
+
+    let legacy = project("orch-gi-");
+    let gitignore = legacy.path().join(".orchestry/.gitignore");
+    std::fs::write(&gitignore, LEGACY).unwrap();
+    std::fs::set_permissions(&gitignore, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let daemon = DaemonHarness::builder()
+        .on_socket()
+        .start_in(legacy.path())
+        .await
+        .unwrap();
+    let after = std::fs::read_to_string(&gitignore).unwrap();
+    daemon.shutdown().await.unwrap();
+    assert!(after.starts_with(LEGACY), "{after}");
+    for entry in RUNTIME {
+        assert_eq!(
+            after.lines().filter(|line| *line == entry).count(),
+            1,
+            "{entry} in {after}"
+        );
+    }
+    assert_eq!(mode(&gitignore), 0o644, "mode untouched");
+
+    let daemon = DaemonHarness::builder()
+        .on_socket()
+        .start_in(legacy.path())
+        .await
+        .unwrap();
+    daemon.shutdown().await.unwrap();
+    assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), after);
+
+    let linked = project("orch-gl-");
+    let target = linked.path().join("tracked.gitignore");
+    std::fs::write(&target, LEGACY).unwrap();
+    let link = linked.path().join(".orchestry/.gitignore");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let daemon = DaemonHarness::builder()
+        .on_socket()
+        .start_in(linked.path())
+        .await
+        .expect("a hygiene failure never blocks READY");
+    assert!(
+        linked.path().join(".orchestry/daemon.json").exists(),
+        "published"
+    );
+    daemon.shutdown().await.unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), LEGACY);
 }

@@ -33,8 +33,8 @@ fn default_prompt_template() -> String {
     orch_infra::template::default_prompt_template()
 }
 
-/// `.orchestry/.gitignore`.
-const GITIGNORE: &str = "\
+/// `.orchestry/.gitignore` before the daemon's block.
+const GITIGNORE_LEGACY: &str = "\
 # Runtime state
 state.json
 *.lock
@@ -46,6 +46,21 @@ logs/
 # Agent workspaces
 workspaces/
 ";
+
+/// `.orchestry/.gitignore`: the legacy entries, then the daemon's runtime
+/// files from the one list `orch daemon start` also ensures (spec R2), so a
+/// fresh project needs no append.
+fn gitignore() -> String {
+    let mut content = format!(
+        "{GITIGNORE_LEGACY}\n{}\n",
+        orch_daemon::RUNTIME_GITIGNORE_HEADER
+    );
+    for entry in orch_daemon::RUNTIME_GITIGNORE_ENTRIES {
+        content.push_str(entry);
+        content.push('\n');
+    }
+    content
+}
 
 /// `.orchestry/workspace-exclude` — the rsync exclude list for `isolated`
 /// mode.
@@ -138,7 +153,7 @@ pub async fn run(styles: &Styles, project_root: &Path, args: &InitArgs) -> Resul
     // mode of the file as *first written* is the one that matters, because
     // nothing rewrites them until they are edited.
     write_yaml_with_mode(&paths.config_path(), &config, owner_only()).await?;
-    atomic_write(&paths.gitignore_path(), GITIGNORE).await?;
+    atomic_write(&paths.gitignore_path(), &gitignore()).await?;
     atomic_write(&paths.workspace_exclude_path(), WORKSPACE_EXCLUDE).await?;
     atomic_write(&paths.default_template_path(), &default_prompt_template()).await?;
     for agent in &agents {
@@ -596,7 +611,7 @@ mod tests {
             tokio::fs::read_to_string(paths.gitignore_path())
                 .await
                 .unwrap(),
-            "# Runtime state\nstate.json\n*.lock\n\n# Logs and runs\nruns/\nlogs/\n\n# Agent workspaces\nworkspaces/\n"
+            "# Runtime state\nstate.json\n*.lock\n\n# Logs and runs\nruns/\nlogs/\n\n# Agent workspaces\nworkspaces/\n\n# Daemon runtime\nrun/\ndaemon.json\ndaemon.log\ndaemon.log.1\n"
         );
         assert_eq!(
             tokio::fs::read_to_string(paths.workspace_exclude_path())
@@ -612,6 +627,24 @@ mod tests {
         );
         // The prompt template is a prompt input, so its size is pinned.
         assert_eq!(default_prompt_template().len(), 5113);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_init_ignores_the_daemon_runtime_files() {
+        let temp = tempfile::tempdir().unwrap();
+        init(temp.path(), shell_args()).await;
+        let content = tokio::fs::read_to_string(Paths::new(temp.path()).gitignore_path())
+            .await
+            .unwrap();
+        for entry in ["run/", "daemon.json", "daemon.log", "daemon.log.1"] {
+            assert_eq!(
+                content.lines().filter(|line| *line == entry).count(),
+                1,
+                "{entry} in {content}"
+            );
+        }
+        // Nothing for the daemon's first start to append.
+        assert_eq!(orch_daemon::ensure_runtime_gitignore(temp.path()), Ok(0));
     }
 
     #[tokio::test]
