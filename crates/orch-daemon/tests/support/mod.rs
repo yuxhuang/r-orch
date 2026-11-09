@@ -268,11 +268,16 @@ pub async fn running_pid(daemon: &DaemonHarness, task: &str) -> Option<u32> {
 #[macro_export]
 macro_rules! eventually {
     ($what:expr, $condition:expr) => {{
+        // Two hang guards: wall-clock (useless under paused time, where the
+        // clock only moves when the test moves it) and a poll budget.
         let wait = async {
+            let mut polls = 0u64;
             loop {
                 if $condition {
                     break;
                 }
+                polls += 1;
+                assert!(polls < 200_000, "gave up waiting for {}", $what);
                 tokio::task::yield_now().await;
             }
         };
