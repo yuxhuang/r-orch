@@ -135,11 +135,12 @@ fn is_initialized(cwd: &std::path::Path) -> bool {
     root.join(".orchestry").is_dir()
 }
 
-fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
+fn dispatch_parsed(mut cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     let styles = styles_for(&cli, env);
 
     // `orch mcp` owns its runtime: its shutdown must be bounded, and nothing
     // of the ordinary command path may write to stdout.
+    inherit_root_agent(&mut cli);
     if let Some(Command::Mcp(args)) = &cli.command {
         return mcp::run(args, &styles);
     }
@@ -857,6 +858,16 @@ async fn run_web(
     web::run(web_args, cwd.to_path_buf()).await
 }
 
+/// Root `--agent` is the caller identity for every client (over
+/// ORCH_AGENT_ID); `mcp --agent` is the more specific spelling and wins.
+fn inherit_root_agent(cli: &mut Cli) {
+    if let Some(Command::Mcp(args)) = &mut cli.command
+        && args.agent.is_none()
+    {
+        args.agent.clone_from(&cli.agent);
+    }
+}
+
 /// The version the dashboard reports, which is the one `--version` prints.
 fn version() -> &'static str {
     tree::VERSION
@@ -1031,6 +1042,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp_agent(argv: &[&str]) -> Option<String> {
+        let mut cli = Cli::try_parse_from(argv).expect("parses");
+        inherit_root_agent(&mut cli);
+        match cli.command {
+            Some(Command::Mcp(args)) => args.agent,
+            _ => panic!("mcp"),
+        }
+    }
+
+    #[test]
+    fn root_agent_reaches_mcp_and_the_mcp_flag_is_more_specific() {
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp"]).as_deref(),
+            Some("agt_r")
+        );
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp", "--agent", "agt_m"]).as_deref(),
+            Some("agt_m")
+        );
+        assert_eq!(mcp_agent(&["orch", "mcp"]), None);
+    }
 
     #[test]
     fn parse_int_rejects_a_non_numeric_value_with_exit_2() {
