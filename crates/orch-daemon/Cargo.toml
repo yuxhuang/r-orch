@@ -21,8 +21,10 @@ orch-engine.workspace = true
 orch-peer.workspace = true
 orch-proto.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 tempfile = { workspace = true, optional = true }
