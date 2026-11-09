@@ -1,14 +1,19 @@
-//! Task tools share authored-definition validation and use only light services.
-use crate::document_input::{self, MutationKind};
+//! Task tools: one daemon request each. Mutations return the task as the
+//! daemon committed it, inside the same operation.
+use crate::document_input;
 use crate::mcp::{
-    projections,
-    registry::{CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta},
+    projections::{self, id},
+    registry::{
+        CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolError, ToolMeta,
+        ToolResult, json, wire,
+    },
 };
-use orch_core::{Error, Result};
-use orch_domain::{CreateTaskInput, ReviewCriterion};
+use orch_core::Result;
+use orch_domain::ReviewCriterion;
+use orch_proto::ops::args::{self as rpc, MutationKind};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -221,7 +226,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
         ),
         assign,
     )?;
-    registry.add(meta("task_cancel", "Mark a task cancelled in storage (orch task cancel). Store-only; does not stop an orphan agent process when no live orchestrator owns the run; a live owner stops the run on reconciliation.", Class::Destructive, true, false, true), cancel)?;
+    registry.add(meta("task_cancel", "Cancel a task (orch task cancel). The daemon stops a running local agent before the task is cancelled.", Class::Destructive, true, false, true), cancel)?;
     registry.add(
         meta(
             "task_approve",
@@ -263,11 +268,27 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
 fn csv(raw: &str) -> Vec<String> {
     raw.split(',').map(|part| part.trim().to_owned()).collect()
 }
-async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> Result<Value> {
-    let review_criteria = args.review_criteria.as_deref().map(|raw| csv(raw).into_iter().map(|value| value.parse::<ReviewCriterion>().map_err(|()| Error::invalid_arguments(format!("Unknown review criterion: \"{value}\". Use test_pass, typecheck or lint.")))).collect::<Result<Vec<_>>>()).transpose()?;
-    // Relative paths name files under the project root, never the server's
-    // working directory (D12); absolute paths pass through. Resolve before
-    // creating anything, and reject paths that cannot be represented intact.
+async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> ToolResult {
+    let review_criteria = args
+        .review_criteria
+        .as_deref()
+        .map(|raw| {
+            csv(raw)
+                .into_iter()
+                .map(|value| {
+                    value.parse::<ReviewCriterion>().map_err(|()| {
+                        ToolError::Text(format!(
+                            "Unknown review criterion: \"{value}\". Use test_pass, typecheck or lint."
+                        ))
+                    })
+                })
+                .collect::<ToolResult<Vec<_>>>()
+        })
+        .transpose()?;
+    // Relative paths name files under the project root, never the bridge's
+    // working directory (D12); absolute paths pass through. The daemon reads
+    // them; resolve here, before creating anything, and reject paths that
+    // cannot be represented intact.
     let attachments = args
         .attach
         .as_deref()
@@ -281,88 +302,138 @@ async fn add(cx: Arc<CallContext>, args: TaskAddArgs) -> Result<Value> {
                         .into_os_string()
                         .into_string()
                         .map_err(|_| {
-                            Error::invalid_arguments(
-                                "project root is not valid UTF-8; attachments cannot be resolved",
+                            ToolError::Text(
+                                "project root is not valid UTF-8; attachments cannot be resolved"
+                                    .to_owned(),
                             )
                         })
                 })
-                .collect::<Result<Vec<_>>>()
+                .collect::<ToolResult<Vec<_>>>()
         })
         .transpose()?;
     let task = cx
-        .engine
-        .task_service
-        .create(CreateTaskInput {
-            title: args.title,
-            description: args.description,
-            priority: Some(args.priority),
-            assignee: args.assignee,
-            labels: args.labels.as_deref().map(csv),
-            depends_on: args.depends_on.as_deref().map(csv),
-            max_attempts: args.max_attempts,
-            workspace_mode: args.workspace_mode.map(Into::into),
-            review_criteria,
-            scope: args.scope.as_deref().map(csv),
-            goal_id: args.goal_id,
-            attachments,
+        .request(wire::<rpc::TaskCreateArgs>(json!({
+            "title": args.title,
+            "description": args.description,
+            "priority": args.priority,
+            "assignee": args.assignee,
+            "labels": args.labels.as_deref().map(csv),
+            "depends_on": args.depends_on.as_deref().map(csv),
+            "max_attempts": args.max_attempts,
+            "workspace_mode": args.workspace_mode.map(orch_domain::WorkspaceMode::from),
+            "review_criteria": review_criteria,
+            "scope": args.scope.as_deref().map(csv),
+            "goal_id": args.goal_id,
+            "attachments": attachments,
+        }))?)
+        .await?;
+    json(&task, "task")
+}
+async fn list(cx: Arc<CallContext>, args: TaskListArgs) -> ToolResult {
+    projections::tasks(&cx, args.status.map(Into::into)).await
+}
+async fn show(cx: Arc<CallContext>, args: TaskShowArgs) -> ToolResult {
+    projections::task(&cx, &args.id).await
+}
+async fn assign(cx: Arc<CallContext>, args: TaskAssignArgs) -> ToolResult {
+    let task = cx
+        .request(rpc::TaskAssignArgs {
+            id: id(&args.task_id)?,
+            agent_id: id(&args.agent_id)?,
         })
         .await?;
-    serde_json::to_value(task).map_err(|_| Error::other("serialize task"))
+    json(&task, "task")
 }
-async fn list(cx: Arc<CallContext>, args: TaskListArgs) -> Result<Value> {
-    projections::tasks(&cx.engine, args.status.map(Into::into)).await
+async fn cancel(cx: Arc<CallContext>, args: TaskCancelArgs) -> ToolResult {
+    json(
+        &cx.request(rpc::TaskCancelArgs { id: id(&args.id)? }).await?,
+        "task",
+    )
 }
-async fn show(cx: Arc<CallContext>, args: TaskShowArgs) -> Result<Value> {
-    projections::task(&cx.engine, &args.id).await
+async fn approve(cx: Arc<CallContext>, args: TaskApproveArgs) -> ToolResult {
+    json(
+        &cx.request(rpc::TaskApproveArgs { id: id(&args.id)? }).await?,
+        "task",
+    )
 }
-async fn assign(cx: Arc<CallContext>, args: TaskAssignArgs) -> Result<Value> {
+async fn reject(cx: Arc<CallContext>, args: TaskRejectArgs) -> ToolResult {
     let task = cx
-        .engine
-        .task_service
-        .assign(&args.task_id, &args.agent_id)
+        .request(wire::<rpc::TaskRejectArgs>(
+            json!({"id": args.id, "feedback": args.reason}),
+        )?)
         .await?;
-    serde_json::to_value(task).map_err(|_| Error::other("serialize task"))
+    json(&task, "task")
 }
-async fn reread(cx: &CallContext, id: &str) -> Result<Value> {
-    projections::task(&cx.engine, id).await.map_err(|err| {
-        Error::other(format!(
-            "Task mutation may already have committed; failed to re-read {id}: {err}"
-        ))
-    })
+async fn retry(cx: Arc<CallContext>, args: TaskRetryArgs) -> ToolResult {
+    json(
+        &cx.request(rpc::TaskRetryArgs { id: id(&args.id)? }).await?,
+        "task",
+    )
 }
-async fn cancel(cx: Arc<CallContext>, args: TaskCancelArgs) -> Result<Value> {
-    cx.engine.task_service.cancel(&args.id).await?;
-    reread(&cx, &args.id).await
+
+/// A definition file's document, read here and sent as JSON text. The daemon
+/// validates and applies it; its argument errors name the file, as the CLI's
+/// do.
+pub(crate) async fn definition_input(
+    cx: &CallContext,
+    file: &str,
+    format: Option<document_input::InputFormat>,
+    kind: MutationKind,
+) -> ToolResult<(std::path::PathBuf, rpc::DefinitionInput)> {
+    let path = cx.project_root.join(file);
+    let document = document_input::read_document(&path, format).await?;
+    let text = serde_json::to_string(&document)
+        .map_err(|_| ToolError::Text("serialize the definition".to_owned()))?;
+    // A document that would crowd the 1 MiB request frame travels as a
+    // transfer on this call's session instead (design D6).
+    let input = if text.len() > INLINE_DOCUMENT_BYTES {
+        let token = cx
+            .upload(rpc::TransferPurpose::Document, text.as_bytes())
+            .await
+            .map_err(|err| at_source(&path, err))?;
+        json!({"input": {"input_transfer": token, "format": "json"}, "kind": kind})
+    } else {
+        json!({"input": {"document": text, "format": "json"}, "kind": kind})
+    };
+    let input = wire(input).map_err(|err| at_source(&path, err))?;
+    Ok((path, input))
 }
-async fn approve(cx: Arc<CallContext>, args: TaskApproveArgs) -> Result<Value> {
-    cx.engine.task_service.approve(&args.id).await?;
-    reread(&cx, &args.id).await
-}
-async fn reject(cx: Arc<CallContext>, args: TaskRejectArgs) -> Result<Value> {
-    cx.engine.task_service.reject(&args.id, args.reason).await?;
-    reread(&cx, &args.id).await
-}
-async fn retry(cx: Arc<CallContext>, args: TaskRetryArgs) -> Result<Value> {
-    cx.engine.task_service.retry(&args.id).await?;
-    reread(&cx, &args.id).await
+
+/// Documents above this many bytes of JSON are uploaded, not inlined.
+const INLINE_DOCUMENT_BYTES: usize = 256 * 1024;
+
+/// `<file>: <reason>` for an argument error, as `document_input::at_source`.
+pub(crate) fn at_source(path: &std::path::Path, err: ToolError) -> ToolError {
+    use orch_client::ClientError;
+    use orch_proto::error::ErrorCode;
+    match err {
+        ToolError::Client(ClientError::Remote(body)) if body.code == ErrorCode::InvalidArguments => {
+            ToolError::Text(format!("{}: {}", path.display(), body.message.as_str()))
+        }
+        ToolError::Text(text) => ToolError::Text(format!("{}: {text}", path.display())),
+        other => other,
+    }
 }
 
 async fn definition(
     cx: Arc<CallContext>,
-    id: String,
+    task_id: String,
     file: String,
     input_format: Option<Format>,
     kind: MutationKind,
-) -> Result<Value> {
-    let file = cx.project_root.join(file);
-    let input = document_input::read_document(&file, input_format.map(Into::into)).await?;
-    let task = crate::commands::task::apply_definition(&cx.engine, &id, &input, kind, &|err| {
-        document_input::at_source(&file, err)
-    })
-    .await?;
-    serde_json::to_value(task).map_err(|_| Error::other("serialize task"))
+) -> ToolResult {
+    let (path, definition) =
+        definition_input(&cx, &file, input_format.map(Into::into), kind).await?;
+    let task = cx
+        .request(rpc::TaskDefinitionApplyArgs {
+            id: id(&task_id)?,
+            definition,
+        })
+        .await
+        .map_err(|err| at_source(&path, err))?;
+    json(&task, "task")
 }
-async fn update(cx: Arc<CallContext>, args: TaskUpdateArgs) -> Result<Value> {
+async fn update(cx: Arc<CallContext>, args: TaskUpdateArgs) -> ToolResult {
     definition(
         cx,
         args.id,
@@ -372,7 +443,7 @@ async fn update(cx: Arc<CallContext>, args: TaskUpdateArgs) -> Result<Value> {
     )
     .await
 }
-async fn patch(cx: Arc<CallContext>, args: TaskPatchArgs) -> Result<Value> {
+async fn patch(cx: Arc<CallContext>, args: TaskPatchArgs) -> ToolResult {
     definition(
         cx,
         args.id,
@@ -386,34 +457,17 @@ async fn patch(cx: Arc<CallContext>, args: TaskPatchArgs) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
         let args: A = serde_json::from_value(value).unwrap();
         args.validate(&Identity::of(Some("cli")), Mode::AllowDestructive)
             .unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(Some("cli")),
-            mode: Mode::AllowDestructive,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[cfg(unix)]
@@ -421,21 +475,25 @@ mod tests {
     async fn task_add_rejects_non_utf8_attachment_root_without_creating_a_task() {
         use std::os::unix::ffi::OsStrExt;
 
-        let (_dir, mut cx) = fixture().await;
-        Arc::get_mut(&mut cx).unwrap().project_root =
-            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff-project"));
+        let (fx, _) = fixture().await;
+        let cx = Arc::new(CallContext::new(
+            fx.connector(Mode::AllowDestructive, None),
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff-project")),
+            Identity::of(Some("cli")),
+            true,
+        ));
         let result = add(
             cx.clone(),
             args(json!({"title":"t", "attach":"relative.txt"})),
         )
         .await;
         let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            Error::Domain(orch_domain::DomainError::InvalidArguments(_))
-        ));
+        assert!(matches!(err, ToolError::Text(_)), "{err:?}");
         let message = err.to_string();
-        assert_eq!(crate::mcp::registry::encode(Err(err)).is_error, Some(true));
+        assert_eq!(
+            crate::mcp::registry::encode(Err(err), false).is_error,
+            Some(true)
+        );
         assert!(
             message.contains("project root is not valid UTF-8"),
             "{message}"
@@ -445,7 +503,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            cx.engine
+            fx.engine()
                 .tasks
                 .list(&Default::default())
                 .await
@@ -456,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_add_list_show_assign_preserve_cli_fields_and_defaults() {
-        let (_dir, cx) = fixture().await;
+        let (fx, cx) = fixture().await;
         let task=add(cx.clone(),args(json!({"title":"t","labels":"a,, b","scope":"src/**, docs/**","workspace_mode":"shared","review_criteria":"test_pass,lint","attach":", ,"}))).await.unwrap();
         let id = task["id"].as_str().unwrap();
         assert_eq!(task["priority"], 3);
@@ -482,8 +540,7 @@ mod tests {
                 .unwrap(),
             json!([])
         );
-        let agent = cx
-            .engine
+        let agent = fx.engine()
             .agent_service
             .create(orch_domain::CreateAgentInput {
                 name: "worker".into(),
@@ -516,30 +573,30 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn lifecycle_tools_return_reread_tasks_and_store_only_cancel_handles_running() {
-        let (_dir, cx) = fixture().await;
+    async fn lifecycle_tools_return_the_committed_task() {
+        let (fx, cx) = fixture().await;
         let task = add(cx.clone(), args(json!({"title":"running"})))
             .await
             .unwrap();
         let id = task["id"].as_str().unwrap();
-        cx.engine
+        fx.engine()
             .task_service
             .update_status(id, orch_domain::TaskStatus::InProgress)
             .await
             .unwrap();
         let cancelled = cancel(cx.clone(), args(json!({"id":id}))).await.unwrap();
         assert_eq!(cancelled["status"], "cancelled");
-        assert_eq!(cancelled, projections::task(&cx.engine, id).await.unwrap());
+        assert_eq!(cancelled, projections::task(&cx, id).await.unwrap());
         assert_eq!(
             retry(cx.clone(), args(json!({"id":id}))).await.unwrap()["status"],
             "todo"
         );
-        cx.engine
+        fx.engine()
             .task_service
             .update_status(id, orch_domain::TaskStatus::InProgress)
             .await
             .unwrap();
-        cx.engine
+        fx.engine()
             .task_service
             .update_status(id, orch_domain::TaskStatus::Review)
             .await
@@ -549,12 +606,12 @@ mod tests {
             .unwrap();
         assert_eq!(rejected["feedback"], "fix tests");
         assert_eq!(rejected["status"], "todo");
-        cx.engine
+        fx.engine()
             .task_service
             .update_status(id, orch_domain::TaskStatus::InProgress)
             .await
             .unwrap();
-        cx.engine
+        fx.engine()
             .task_service
             .update_status(id, orch_domain::TaskStatus::Review)
             .await
@@ -563,17 +620,12 @@ mod tests {
             approve(cx.clone(), args(json!({"id":id}))).await.unwrap()["status"],
             "done"
         );
-        assert!(cancel(cx.clone(), args(json!({"id":id}))).await.is_err());
-        cx.engine.tasks.delete(id).await.unwrap();
-        let err = reread(&cx, id).await.unwrap_err().to_string();
-        assert!(err.contains("may already have committed"));
-        assert!(err.contains(id));
-        // Light Engine has no owner/process lifecycle: cancelling never creates a PID lock.
-        assert!(!cx.engine.paths.lock_path().exists());
+        let done = cancel(cx.clone(), args(json!({"id":id}))).await.unwrap_err();
+        assert!(matches!(done, ToolError::Client(_)), "{done:?}");
     }
     #[tokio::test]
     async fn update_and_patch_use_fixed_project_relative_files_and_shared_validation() {
-        let (_dir, cx) = fixture().await;
+        let (fx, cx) = fixture().await;
         let task = add(
             cx.clone(),
             args(json!({"title":"old","description":"old","labels":"old"})),
@@ -614,7 +666,7 @@ mod tests {
         assert!(err.contains("read-only field"));
     }
     #[test]
-    fn definition_and_typed_argument_validation_runs_before_any_engine() {
+    fn definition_and_typed_argument_validation_runs_before_the_daemon_is_contacted() {
         for file in ["-", ""] {
             let update: TaskUpdateArgs =
                 serde_json::from_value(json!({"id":"t","file":file})).unwrap();
@@ -672,93 +724,6 @@ mod tests {
                     json!({"readOnlyHint": *class == Class::Read, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": open})
                 );
                 assert_eq!(value["inputSchema"]["additionalProperties"], false);
-            }
-        }
-    }
-    // Emulate another writer changing/removing the entity between save and read,
-    // without timing or a real second process. Returning the service snapshot
-    // instead of re-reading must fail these tests.
-    struct AfterSave {
-        inner: Arc<dyn orch_core::storage::TaskStore>,
-        remove: bool,
-    }
-    #[async_trait::async_trait]
-    impl orch_core::storage::TaskStore for AfterSave {
-        async fn list(
-            &self,
-            filter: &orch_core::storage::TaskFilter,
-        ) -> Result<Vec<orch_domain::Task>> {
-            self.inner.list(filter).await
-        }
-        async fn get(&self, id: &str) -> Result<Option<orch_domain::Task>> {
-            self.inner.get(id).await
-        }
-        async fn save(&self, task: &orch_domain::Task) -> Result<()> {
-            let mut changed = task.clone();
-            changed.description = "changed after service snapshot".into();
-            self.inner.save(&changed).await?;
-            if self.remove {
-                self.inner.delete(&task.id).await?;
-            }
-            Ok(())
-        }
-        async fn delete(&self, id: &str) -> Result<()> {
-            self.inner.delete(id).await
-        }
-    }
-    #[tokio::test]
-    async fn each_lifecycle_tool_rereads_and_discloses_postcommit_read_failure() {
-        for name in ["cancel", "approve", "reject", "retry"] {
-            for remove in [false, true] {
-                let (_dir, mut cx) = fixture().await;
-                let mut task = cx
-                    .engine
-                    .task_service
-                    .create(CreateTaskInput {
-                        title: "task".into(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-                task.status = match name {
-                    "approve" | "reject" => orch_domain::TaskStatus::Review,
-                    "retry" => orch_domain::TaskStatus::Cancelled,
-                    _ => orch_domain::TaskStatus::InProgress,
-                };
-                cx.engine.tasks.save(&task).await.unwrap();
-                let engine = Arc::get_mut(&mut Arc::get_mut(&mut cx).unwrap().engine).unwrap();
-                let store = Arc::new(AfterSave {
-                    inner: engine.tasks.clone(),
-                    remove,
-                });
-                engine.tasks = store.clone();
-                engine.task_service = Arc::new(orch_engine::task_service::TaskService::new(
-                    store,
-                    engine.agents.clone(),
-                    engine.events.clone(),
-                    engine.config.clone(),
-                    engine.clock.clone(),
-                    engine.ids.clone(),
-                    Some(engine.paths.clone()),
-                ));
-                let value = json!({"id":task.id});
-                let result = match name {
-                    "cancel" => cancel(cx.clone(), args(value)).await,
-                    "approve" => approve(cx.clone(), args(value)).await,
-                    "reject" => reject(cx.clone(), args(value)).await,
-                    _ => retry(cx.clone(), args(value)).await,
-                };
-                if remove {
-                    let err = result.unwrap_err().to_string();
-                    assert!(err.contains("may already have committed"), "{name}: {err}");
-                    assert!(cx.engine.tasks.get(&task.id).await.unwrap().is_none());
-                } else {
-                    assert_eq!(
-                        result.unwrap()["description"],
-                        "changed after service snapshot",
-                        "{name}"
-                    );
-                }
             }
         }
     }

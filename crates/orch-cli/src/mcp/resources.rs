@@ -7,14 +7,14 @@
 //! in the same alphabet. Percent escapes are refused outright rather than
 //! decoded inconsistently.
 
-use orch_core::error::Error;
-use orch_domain::DomainError;
-use orch_engine::Engine;
+use orch_client::ClientError;
+use orch_proto::error::ErrorCode;
 use rmcp::ErrorData;
 use rmcp::model::{Resource, ResourceTemplate};
 use serde_json::Value;
 
 use super::projections;
+use super::registry::{CallContext, ToolError};
 
 pub(crate) const MIME_JSON: &str = "application/json";
 
@@ -162,36 +162,46 @@ pub(crate) fn not_found(uri: &str) -> ErrorData {
 }
 
 /// Read a routed resource through the shared projections. A missing entity
-/// is not found; any other core failure is an internal error with the
-/// message and hint.
-pub(crate) async fn read(engine: &Engine, uri: &str, target: &Target) -> Result<Value, ErrorData> {
+/// is not found; no usable daemon is the uniform no-daemon error; any other
+/// failure is an internal error with the message and hint.
+pub(crate) async fn read(cx: &CallContext, uri: &str, target: &Target) -> Result<Value, ErrorData> {
     let result = match target {
-        Target::Status => projections::status(engine).await,
-        Target::Tasks => projections::tasks(engine, None).await,
-        Target::Task(id) => projections::task(engine, id).await,
-        Target::Goals => projections::goals(engine, None).await,
-        Target::Goal(id) => projections::goal(engine, id).await,
-        Target::Agents => projections::agents(engine).await,
-        Target::Agent(id) => match projections::find_agent(engine, id, false).await {
-            Ok(Some(value)) => Ok(value),
-            Ok(None) => return Err(not_found(uri)),
-            Err(err) => Err(err),
-        },
-        Target::Context => projections::context(engine).await,
-        Target::Inbox(agent) => projections::inbox(engine, agent).await,
+        Target::Status => projections::status(cx).await,
+        Target::Tasks => projections::tasks(cx, None).await,
+        Target::Task(id) => projections::task(cx, id).await,
+        Target::Goals => projections::goals(cx, None).await,
+        Target::Goal(id) => projections::goal(cx, id).await,
+        Target::Agents => projections::agents(cx).await,
+        Target::Agent(id) => projections::agent(cx, id, false).await,
+        Target::Context => projections::context(cx).await,
+        Target::Inbox(agent) => projections::inbox(cx, agent).await,
     };
-    result.map_err(|err| core_error(uri, &err))
+    result.map_err(|err| read_error(uri, target, &err, cx.agent_context))
 }
 
-/// A core failure while reading `uri`.
-pub(crate) fn core_error(uri: &str, err: &Error) -> ErrorData {
+/// A failure while reading `uri`.
+pub(crate) fn read_error(
+    uri: &str,
+    target: &Target,
+    err: &ToolError,
+    agent_context: bool,
+) -> ErrorData {
     match err {
-        Error::Domain(
-            DomainError::TaskNotFound(_)
-            | DomainError::GoalNotFound(_)
-            | DomainError::AgentNotFound(_),
-        ) => ErrorData::resource_not_found(format!("{err} ({uri})"), None),
-        _ => ErrorData::internal_error(super::registry::error_text(err), None),
+        ToolError::Client(ClientError::Remote(body)) if body.code == ErrorCode::NotFound => {
+            match target {
+                // An agent id may also name a remote snapshot; absent is
+                // simply "no such resource".
+                Target::Agent(_) => not_found(uri),
+                _ => ErrorData::resource_not_found(
+                    format!("{} ({uri})", body.message.as_str()),
+                    None,
+                ),
+            }
+        }
+        _ if err.exit_code() == orch_proto::error::exit::NO_DAEMON => {
+            super::server::unavailable(err, agent_context)
+        }
+        _ => ErrorData::internal_error(err.text(agent_context), None),
     }
 }
 
@@ -301,14 +311,37 @@ mod tests {
 
     #[test]
     fn a_missing_entity_is_not_found_and_other_failures_are_internal() {
-        let missing = Error::from(DomainError::TaskNotFound("tsk_x".into()));
-        assert_eq!(
-            core_error("orch://tasks/tsk_x", &missing).code,
-            ErrorCode::RESOURCE_NOT_FOUND
-        );
-        let other = Error::from(DomainError::NotInitialized);
-        let err = core_error("orch://status", &other);
+        use orch_domain::DomainError;
+        use orch_proto::error::{ErrorBody, Execution};
+        let daemon = |error: DomainError| {
+            ToolError::Client(ClientError::Remote(ErrorBody::from_domain(
+                &error,
+                Execution::NotExecuted,
+            )))
+        };
+        let task = Target::Task("tsk_x".into());
+        let missing = daemon(DomainError::TaskNotFound("tsk_x".into()));
+        let err = read_error("orch://tasks/tsk_x", &task, &missing, false);
+        assert_eq!(err.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert!(err.message.ends_with("(orch://tasks/tsk_x)"), "{}", err.message);
+
+        let agent = Target::Agent("agt_x".into());
+        let missing = daemon(DomainError::AgentNotFound("agt_x".into()));
+        let err = read_error("orch://agents/agt_x", &agent, &missing, false);
+        assert_eq!(err.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert_eq!(err.message, "Resource not found: orch://agents/agt_x");
+
+        let other = daemon(DomainError::NotInitialized);
+        let err = read_error("orch://status", &Target::Status, &other, false);
         assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
         assert_eq!(err.message, "Not initialized\nHint: Run: orch init");
+
+        let failure =
+            orch_client::NoDaemon::no_daemon("/p", orch_proto::error::NoDaemonDetail::NoSocket);
+        let gone = ToolError::Client(failure.clone().into());
+        let err = read_error("orch://status", &Target::Status, &gone, true);
+        assert_eq!(err.code, crate::mcp::server::DAEMON_UNAVAILABLE_CODE);
+        assert_eq!(err.message, failure.render(true));
+        assert_eq!(err.data, Some(serde_json::json!({"exit_code": 7})));
     }
 }

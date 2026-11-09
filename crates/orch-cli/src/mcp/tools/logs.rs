@@ -1,11 +1,15 @@
-//! Bounded stored-log projections, preserving CLI selector precedence.
+//! Bounded stored-log projections, preserving CLI selector precedence. The
+//! daemon returns the runs or events; the CLI's selection and windowing is
+//! applied here, exactly as before.
+use crate::mcp::projections::id;
 use crate::mcp::registry::{
-    CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta,
+    CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolError, ToolMeta,
+    ToolResult, json,
 };
-use orch_core::{Error, Result};
+use orch_core::Result;
+use orch_proto::ops::args as rpc;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
 use std::sync::Arc;
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -69,28 +73,27 @@ fn checked_duration(raw: &str, now: i64) -> std::result::Result<i64, rmcp::Error
 pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     registry.add(ToolMeta { name: "logs", description: "Read stored events or run summaries (orch logs). Precedence: run_id > task > agent > since. No follow stream; since is validated first.", class: Class::Read, execution: Execution::Store, destructive_hint: false, idempotent_hint: true, open_world_hint: false }, logs)
 }
-async fn logs(cx: Arc<CallContext>, args: LogsArgs) -> Result<Value> {
-    let now = cx.engine.clock.now_ms();
+async fn logs(cx: Arc<CallContext>, args: LogsArgs) -> ToolResult {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let invalid = |err: rmcp::ErrorData| ToolError::Text(err.message.to_string());
     let since = args
         .since
         .as_deref()
-        .map(|raw| {
-            checked_duration(raw, now)
-                .map_err(|err| Error::invalid_arguments(err.message.to_string()))?;
-            crate::logs::parse_duration(raw)
-        })
+        .map(|raw| checked_duration(raw, now).map_err(invalid))
         .transpose()?;
     let cutoff = since
         .map(|duration| {
-            now.checked_sub(duration)
-                .ok_or_else(|| Error::invalid_arguments("since exceeds the supported time range"))
+            now.checked_sub(duration).ok_or_else(|| {
+                ToolError::Text("since exceeds the supported time range".to_owned())
+            })
         })
         .transpose()?;
-    if let Some(id) = args.run_id {
+    if let Some(run_id) = args.run_id {
         let events = cx
-            .engine
-            .runs
-            .read_events_tail(&id, if since.is_some() { 500 } else { 50 })
+            .request(rpc::RunEventsTailArgs {
+                run_id: id(&run_id)?,
+                count: if since.is_some() { 500 } else { 50 },
+            })
             .await?;
         // CLI treats 0 as unfiltered, and retains malformed timestamps.
         let events: Vec<_> = events
@@ -102,22 +105,27 @@ async fn logs(cx: Arc<CallContext>, args: LogsArgs) -> Result<Value> {
                     })
             })
             .collect();
-        return serde_json::to_value(events).map_err(|_| Error::other("serialize events"));
+        return json(&events, "events");
     }
-    let runs = if let Some(id) = args.task {
-        let runs = cx.engine.runs.list_for_task(&id).await?;
+    // Every list arrives newest first, as the run store returns it.
+    let runs = |task_id, agent_id| rpc::RunListArgs {
+        task_id,
+        agent_id,
+        since_ms: None,
+        limit: None,
+    };
+    let runs = if let Some(task) = args.task {
+        let runs = cx.request(runs(Some(id(&task)?), None)).await?;
         if since.is_some() {
             last(runs, 20)
         } else {
             runs
         }
-    } else if let Some(id) = args.agent {
-        last(cx.engine.runs.list_for_agent(&id).await?, 5)
+    } else if let Some(agent) = args.agent {
+        last(cx.request(runs(None, Some(id(&agent)?))).await?, 5)
     } else if let Some(cutoff) = cutoff {
         // Match the CLI's overlap predicate: absent/bad finished_at means now.
-        cx.engine
-            .runs
-            .list_all()
+        cx.request(runs(None, None))
             .await?
             .into_iter()
             .filter(|run| {
@@ -132,11 +140,11 @@ async fn logs(cx: Arc<CallContext>, args: LogsArgs) -> Result<Value> {
             .take(20)
             .collect()
     } else {
-        return Err(Error::invalid_arguments(
-            "logs requires run_id, task, agent, or since",
+        return Err(ToolError::Text(
+            "logs requires run_id, task, agent, or since".to_owned(),
         ));
     };
-    serde_json::to_value(runs).map_err(|_| Error::other("serialize runs"))
+    json(&runs, "runs")
 }
 fn last<T>(items: Vec<T>, n: usize) -> Vec<T> {
     let skip = items.len().saturating_sub(n);
@@ -151,7 +159,7 @@ fn parse_time(raw: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use crate::mcp::registry::{Identity, Mode, ToolArgs};
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
@@ -159,27 +167,10 @@ mod tests {
         args.validate(&Identity::of(None), Mode::Default).unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(None),
-            mode: Mode::Default,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[test]
@@ -245,13 +236,13 @@ mod tests {
     }
     #[tokio::test]
     async fn logs_preserves_selector_precedence_counts_and_time_semantics() {
-        let (_dir, cx) = fixture().await;
+        let (fx, cx) = fixture().await;
         for index in 0..25 {
-            cx.engine.runs.save(&run(index)).await.unwrap();
+            fx.engine().runs.save(&run(index)).await.unwrap();
         }
-        let recent = cx.engine.clock.now_iso();
+        let recent = fx.engine().clock.now_iso();
         for index in 0..60 {
-            cx.engine
+            fx.engine()
                 .runs
                 .append_event(
                     "run_00",
@@ -324,7 +315,7 @@ mod tests {
         // An unfinished old run overlaps every window, exactly as the CLI.
         let mut unfinished = run(26);
         unfinished.finished_at = None;
-        cx.engine.runs.save(&unfinished).await.unwrap();
+        fx.engine().runs.save(&unfinished).await.unwrap();
         assert_eq!(
             logs(cx, args(json!({"since":"1s"}))).await.unwrap()[0]["id"],
             unfinished.id

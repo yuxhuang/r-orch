@@ -1,13 +1,17 @@
-//! Message tools resolve attribution explicitly; inbox reads never consume.
+//! Message tools resolve attribution here, before the request is built;
+//! inbox reads never consume.
 use crate::mcp::{
     projections,
-    registry::{CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta},
+    registry::{
+        CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolError, ToolMeta,
+        ToolResult, json, wire,
+    },
 };
-use orch_core::{Error, Result};
-use orch_domain::{CreateMessageInput, MessageChannel};
+use orch_core::Result;
+use orch_proto::ops::args as rpc;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -83,101 +87,74 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     Ok(())
 }
 
-fn identity_error(err: rmcp::ErrorData) -> Error {
-    Error::invalid_arguments(err.message.to_string())
+fn identity_error(err: rmcp::ErrorData) -> ToolError {
+    ToolError::Text(err.message.to_string())
 }
-async fn send(cx: Arc<CallContext>, args: MsgSendArgs) -> Result<Value> {
+async fn send(cx: Arc<CallContext>, args: MsgSendArgs) -> ToolResult {
     let from_agent_id = cx
         .identity
         .sender("from", args.from.as_deref())
         .map_err(identity_error)?;
     let messages = cx
-        .engine
-        .message_service
-        .send(CreateMessageInput {
-            channel: MessageChannel::Direct,
-            from_agent_id,
-            to_agent_id: Some(args.to_agent_id),
-            body: args.body,
-            subject: args.subject.unwrap_or_default(),
-            ttl_ms: args.ttl,
-            reply_to: args.reply_to,
-            team_id: None,
-        })
+        .request(wire::<rpc::MessageSendArgs>(json!({
+            "from_agent_id": from_agent_id,
+            "to_agent_id": args.to_agent_id,
+            "subject": args.subject.unwrap_or_default(),
+            "body": args.body,
+            "ttl_ms": args.ttl,
+            "reply_to": args.reply_to,
+        }))?)
         .await?;
-    serde_json::to_value(messages).map_err(|_| Error::other("serialize messages"))
+    json(&messages, "messages")
 }
-async fn broadcast(cx: Arc<CallContext>, args: MsgBroadcastArgs) -> Result<Value> {
+async fn broadcast(cx: Arc<CallContext>, args: MsgBroadcastArgs) -> ToolResult {
     let from_agent_id = cx
         .identity
         .sender("from", args.from.as_deref())
         .map_err(identity_error)?;
     let messages = cx
-        .engine
-        .message_service
-        .send(CreateMessageInput {
-            channel: MessageChannel::Broadcast,
-            from_agent_id,
-            to_agent_id: None,
-            body: args.body,
-            subject: args.subject.unwrap_or_default(),
-            ttl_ms: args.ttl,
-            reply_to: None,
-            team_id: args.team,
-        })
+        .request(wire::<rpc::MessageBroadcastArgs>(json!({
+            "from_agent_id": from_agent_id,
+            "subject": args.subject.unwrap_or_default(),
+            "body": args.body,
+            "ttl_ms": args.ttl,
+            "team_id": args.team,
+        }))?)
         .await?;
-    serde_json::to_value(messages).map_err(|_| Error::other("serialize messages"))
+    json(&messages, "messages")
 }
-async fn inbox(cx: Arc<CallContext>, args: MsgInboxArgs) -> Result<Value> {
+async fn inbox(cx: Arc<CallContext>, args: MsgInboxArgs) -> ToolResult {
     let agent = cx
         .identity
         .inbox_agent("agent_id", args.agent_id.as_deref())
         .map_err(identity_error)?;
-    projections::inbox(&cx.engine, &agent).await
+    projections::inbox(&cx, &agent).await
 }
-async fn list(cx: Arc<CallContext>, args: MsgListArgs) -> Result<Value> {
-    let messages = match args.agent {
-        Some(agent) => cx.engine.message_service.list_for_agent(&agent).await?,
-        None => cx.engine.message_service.list_all().await?,
-    };
-    serde_json::to_value(messages).map_err(|_| Error::other("serialize messages"))
+async fn list(cx: Arc<CallContext>, args: MsgListArgs) -> ToolResult {
+    let messages = cx
+        .request(wire::<rpc::MessageListArgs>(json!({"agent_id": args.agent}))?)
+        .await?;
+    json(&messages, "messages")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
         let args: A = serde_json::from_value(value).unwrap();
         args.validate(&Identity::of(Some("cli")), Mode::AllowDestructive)
             .unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(Some("cli")),
-            mode: Mode::AllowDestructive,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
-    async fn agent(cx: &CallContext, name: &str) -> String {
-        cx.engine
+    async fn agent(fx: &crate::mcp::testing::Fixture, name: &str) -> String {
+        fx.engine()
             .agent_service
             .create(orch_domain::CreateAgentInput {
                 name: name.into(),
@@ -191,11 +168,11 @@ mod tests {
     }
     #[tokio::test]
     async fn all_four_message_tools_validate_and_preserve_arrays_and_pending_state() {
-        let (_dir, cx) = fixture().await;
-        let sender = agent(&cx, "sender").await;
-        let receiver = agent(&cx, "receiver").await;
-        let disabled = agent(&cx, "disabled").await;
-        cx.engine.agent_service.disable(&disabled).await.unwrap();
+        let (fx, cx) = fixture().await;
+        let sender = agent(&fx, "sender").await;
+        let receiver = agent(&fx, "receiver").await;
+        let disabled = agent(&fx, "disabled").await;
+        fx.engine().agent_service.disable(&disabled).await.unwrap();
         let direct = send(
             cx.clone(),
             args(json!({"to_agent_id":receiver,"body":"hello","from":sender,"ttl":60000})),
@@ -239,7 +216,7 @@ mod tests {
             json!([])
         );
         // No identity filter is applied to msg_list; no registered agents is successful empty fan-out.
-        let (_empty_dir, empty) = fixture().await;
+        let (_fx_empty, empty) = fixture().await;
         assert_eq!(
             broadcast(empty.clone(), args(json!({"body":"empty"})))
                 .await

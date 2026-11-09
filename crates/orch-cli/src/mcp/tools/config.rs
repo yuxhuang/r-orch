@@ -1,9 +1,13 @@
-//! Project config tools retain the CLI's validation and definition lock paths.
-use crate::document_input::{self, MutationKind};
+//! Project config tools. Validation, the definition lock and the refresh of
+//! the daemon's own configuration all happen daemon-side.
+use crate::document_input;
 use crate::mcp::registry::{
-    CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta,
+    CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolError, ToolMeta,
+    ToolResult, json, wire,
 };
-use orch_core::{Error, Result};
+use crate::mcp::tools::task::{at_source, definition_input};
+use orch_core::Result;
+use orch_proto::ops::args::{self as rpc, MutationKind};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -76,7 +80,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
         ),
         get,
     )?;
-    registry.add(meta("config_set", "Set project config by dotted key (orch config set). value is a string parsed as JSON first. Existing CLI validation applies; invalid config may prevent subsequent Engine construction.", Class::Mutate), set)?;
+    registry.add(meta("config_set", "Set project config by dotted key (orch config set). value is a string parsed as JSON first. Existing CLI validation applies; the daemon applies the new config to later dispatch.", Class::Mutate), set)?;
     registry.add(
         meta(
             "config_update",
@@ -95,37 +99,37 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     )?;
     Ok(())
 }
-async fn get(cx: Arc<CallContext>, args: GetArgs) -> Result<Value> {
-    let mut object = serde_json::Map::new();
-    object.insert("key".into(), Value::String(args.key.clone()));
-    if let Some(stored) = cx.engine.config_store.get(&args.key).await? {
-        object.insert("value".into(), stored);
-    }
-    Ok(Value::Object(object))
+async fn get(cx: Arc<CallContext>, args: GetArgs) -> ToolResult {
+    // Raw: a value stored as `null` is `"value": null`, a missing key has no
+    // `value`, and the typed result cannot tell the two apart.
+    cx.request_json(wire::<rpc::ConfigGetArgs>(json!({"key": args.key}))?)
+        .await
 }
 
-async fn set(cx: Arc<CallContext>, args: SetArgs) -> Result<Value> {
-    crate::commands::config::set_value(&cx.engine, &args.key, &args.value).await?;
-    let value = cx.engine.config_store.get(&args.key).await.map_err(|err| {
-        Error::other(format!(
-            "Config mutation may already have committed; failed to re-read {}: {err}",
-            args.key
-        ))
-    })?;
-    Ok(json!({"key": args.key, "value": value}))
+async fn set(cx: Arc<CallContext>, args: SetArgs) -> ToolResult {
+    let value = cx
+        .request(wire::<rpc::ConfigSetArgs>(
+            json!({"key": args.key, "value": args.value}),
+        )?)
+        .await?;
+    // `value` is always present after a set, null included.
+    Ok(json!({"key": value.key, "value": value.value.unwrap_or(Value::Null)}))
 }
-async fn mutate(cx: Arc<CallContext>, args: FileArgs, kind: MutationKind) -> Result<Value> {
-    let path = cx.project_root.join(&args.file);
-    let input = document_input::read_document(&path, args.input_format.map(Into::into)).await?;
-    crate::commands::config::apply_definition(&cx.engine, &input, kind, &|err| {
-        document_input::at_source(&path, err)
-    })
-    .await
+async fn mutate(cx: Arc<CallContext>, args: FileArgs, kind: MutationKind) -> ToolResult {
+    let (path, definition) =
+        definition_input(&cx, &args.file, args.input_format.map(Into::into), kind).await?;
+    let applied = cx
+        .request(rpc::ConfigDefinitionApplyArgs { definition })
+        .await
+        .map_err(|err| at_source(&path, err))?;
+    serde_json::from_str(&applied.document)
+        .map_err(|_| ToolError::Text("the daemon returned an unreadable config".to_owned()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     use crate::mcp::registry::{Identity, Mode, ToolArgs};
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
@@ -133,27 +137,10 @@ mod tests {
         args.validate(&Identity::of(None), Mode::Default).unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(None),
-            mode: Mode::Default,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[test]
@@ -176,7 +163,7 @@ mod tests {
     }
     #[tokio::test]
     async fn all_four_config_tools_preserve_raw_values_and_missing_keys() {
-        let (_dir, cx) = fixture().await;
+        let (fx, cx) = fixture().await;
         assert_eq!(
             get(cx.clone(), args(json!({"key":"extension.missing"})))
                 .await
@@ -219,7 +206,7 @@ mod tests {
         assert_eq!(patched["project"]["name"], "changed");
         // A complete replacement uses the existing full validation contract.
         let replacement =
-            serde_json::to_value(cx.engine.config_store.read().await.unwrap()).unwrap();
+            serde_json::to_value(fx.engine().config_store.read().await.unwrap()).unwrap();
         tokio::fs::write(&path, serde_json::to_vec(&replacement).unwrap())
             .await
             .unwrap();
@@ -262,29 +249,23 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn config_set_retains_raw_branch_and_poison_breaks_the_next_engine() {
-        let (_dir, cx) = fixture().await;
-        // project is not prompt-affecting, so the historical raw set accepts it.
-        let result = set(cx.clone(), args(json!({"key":"project","value":"false"})))
+    async fn a_set_that_would_poison_the_config_is_refused_and_leaves_it_unchanged() {
+        let (_fx, cx) = fixture().await;
+        let before = get(cx.clone(), args(json!({"key":"project"})))
             .await
             .unwrap();
-        assert_eq!(result, json!({"key":"project","value":false}));
-        let rebuilt = orch_engine::build_light_with(
-            &cx.project_root,
-            orch_engine::EngineSeams {
-                global_config_path: Some(cx.project_root.join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await;
-        assert!(rebuilt.is_err());
-        // The process and the already-built context remain alive. Production
-        // dispatch builds per call and encodes the next build failure as isError.
+        // project is not prompt-affecting: the raw set branch applies, and the
+        // daemon refuses a value it could not load afterwards.
+        let err = set(cx.clone(), args(json!({"key":"project","value":"false"})))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().starts_with("config: "), "{err}");
         assert_eq!(
             get(cx.clone(), args(json!({"key":"project"})))
                 .await
                 .unwrap(),
-            result
+            before
         );
     }
     #[test]

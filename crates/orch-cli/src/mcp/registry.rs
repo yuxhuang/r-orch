@@ -13,10 +13,13 @@
 //!    and a failure is JSON-RPC `-32602` `Invalid arguments for <tool>: …`.
 //!    The SDK's own decoder would turn that into a tool result instead,
 //!    because its router rewrites messages that start with its own prefix;
-//! 3. [`ToolArgs::validate`] runs, still before any Engine exists;
-//! 4. the call is admitted to its lane, a fresh Engine is built, the handler
-//!    runs, and its `Result<Value>` becomes the tool result: the value as one
-//!    JSON text block, or a core error as `isError` text with its hint.
+//! 3. [`ToolArgs::validate`] runs, still before the daemon is contacted;
+//! 4. the call is admitted to its lane, the handler runs — its first request
+//!    opens this call's own daemon session — and its [`ToolResult`] becomes
+//!    the tool result: the value as one JSON text block, or the error as
+//!    `isError` text. A daemon error keeps its message and hint; a failure to
+//!    reach the daemon is the uniform no-daemon text plus
+//!    `structuredContent.exit_code` (7).
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -24,6 +27,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use orch_client::{Client, ClientError};
+use orch_proto::ops::Op;
 use rmcp::ErrorData;
 use rmcp::handler::server::common::schema_for_input;
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
@@ -34,10 +39,11 @@ use rmcp::model::{
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::{Mutex, OnceCell};
 
 pub(crate) use super::identity::Identity;
 pub(crate) use super::mode::{Class, Mode};
-use super::server::McpServer;
+use super::server::{Connector, McpServer};
 
 /// Which admission lane a tool runs in (design D8). Every tool is
 /// [`Execution::Store`] except `doctor`, the only [`Execution::Diagnostic`]
@@ -60,8 +66,8 @@ pub(crate) struct ToolMeta {
     pub(crate) open_world_hint: bool,
 }
 
-/// Argument-form validation that runs after decoding and before an Engine is
-/// built: cross-field forms, identity-dependent requirements, `file: "-"`,
+/// Argument-form validation that runs after decoding and before the daemon
+/// is contacted: cross-field forms, identity-dependent requirements, `file: "-"`,
 /// checked durations, mode-dependent argument gates. The default accepts.
 pub(crate) trait ToolArgs {
     fn validate(&self, _identity: &Identity, _mode: Mode) -> Result<(), ErrorData> {
@@ -76,14 +82,141 @@ pub(crate) struct EmptyArgs {}
 
 impl ToolArgs for EmptyArgs {}
 
-/// What a handler receives: a fresh light Engine built for this call alone,
-/// and the server's fixed launch settings.
-#[allow(dead_code, reason = "seam consumed by the B2 tool groups")]
+/// Why a tool call failed.
+#[derive(Debug)]
+pub(crate) enum ToolError {
+    /// The daemon refused or failed the request, or could not be reached.
+    Client(ClientError),
+    /// Bridge-side text ready for the caller: a local argument conversion, a
+    /// definition file that cannot be read, a refusal before admission.
+    Text(String),
+}
+
+impl From<ClientError> for ToolError {
+    fn from(error: ClientError) -> Self {
+        ToolError::Client(error)
+    }
+}
+
+impl From<orch_core::Error> for ToolError {
+    fn from(error: orch_core::Error) -> Self {
+        log_error_chain(&error);
+        ToolError::Text(error_text(&error))
+    }
+}
+
+impl ToolError {
+    /// The exit code the CLI would report for the same failure; 7 for every
+    /// form of "no usable daemon".
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            ToolError::Client(error) => error.exit_code(),
+            ToolError::Text(_) => 1,
+        }
+    }
+
+    /// The caller-facing text. A daemon error is its message and hint, as
+    /// the CLI prints a core error; a connection failure is the uniform
+    /// no-daemon message in its owner or agent variant.
+    pub(crate) fn text(&self, agent_context: bool) -> String {
+        match self {
+            ToolError::Client(ClientError::Connection(failure)) => failure.render(agent_context),
+            ToolError::Client(ClientError::Remote(body)) => match &body.hint {
+                Some(hint) => format!("{}\nHint: {}", body.message.as_str(), hint.as_str()),
+                None => body.message.as_str().to_owned(),
+            },
+            ToolError::Client(ClientError::InvalidArguments(text)) | ToolError::Text(text) => {
+                text.clone()
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ToolError {
+    /// The owner-variant text.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text(false))
+    }
+}
+
+/// A handler's outcome.
+pub(crate) type ToolResult<T = Value> = Result<T, ToolError>;
+
+/// Build a protocol argument DTO from the bridge's JSON rendering of a
+/// tool's arguments. The DTO's own bounds and closed shape apply here,
+/// before anything is sent.
+pub(crate) fn wire<A: DeserializeOwned>(value: Value) -> ToolResult<A> {
+    serde_json::from_value(value).map_err(|err| ToolError::Text(format!("Invalid arguments: {err}")))
+}
+
+/// A daemon result as JSON.
+pub(crate) fn json<T: serde::Serialize>(value: &T, what: &str) -> ToolResult {
+    serde_json::to_value(value).map_err(|_| ToolError::Text(format!("serialize {what}")))
+}
+
+/// What a handler receives: the server's fixed launch settings and this
+/// call's daemon session, opened by the first request and closed when the
+/// call ends. A session is never shared between calls, so a lost reply
+/// poisons only the call that lost it.
 pub(crate) struct CallContext {
-    pub(crate) engine: Arc<orch_engine::Engine>,
+    connector: Connector,
+    session: OnceCell<Mutex<Client>>,
     pub(crate) project_root: PathBuf,
     pub(crate) identity: Identity,
-    pub(crate) mode: Mode,
+    pub(crate) agent_context: bool,
+}
+
+impl CallContext {
+    pub(crate) fn new(
+        connector: Connector,
+        project_root: PathBuf,
+        identity: Identity,
+        agent_context: bool,
+    ) -> CallContext {
+        CallContext {
+            connector,
+            session: OnceCell::new(),
+            project_root,
+            identity,
+            agent_context,
+        }
+    }
+
+    async fn session(&self) -> ToolResult<&Mutex<Client>> {
+        Ok(self
+            .session
+            .get_or_try_init(|| async { (self.connector)().await.map(Mutex::new) })
+            .await?)
+    }
+
+    /// One typed request to the daemon. Never retried: an unknown outcome
+    /// is reported as such.
+    pub(crate) async fn request<A: Op>(&self, args: A) -> ToolResult<A::Output> {
+        Ok(self.session().await?.lock().await.request(args).await?)
+    }
+
+    /// [`CallContext::request`], keeping the daemon's JSON result as sent.
+    /// For results whose typed form cannot say "present and null" (a config
+    /// value stored as `null`).
+    pub(crate) async fn request_json<A: Op>(&self, args: A) -> ToolResult {
+        Ok(self
+            .session()
+            .await?
+            .lock()
+            .await
+            .call::<Value>(args.into_request())
+            .await?)
+    }
+
+    /// Upload `bytes` as a sealed transfer that a later request of this
+    /// same call consumes (a definition document too large to send inline).
+    pub(crate) async fn upload(
+        &self,
+        purpose: orch_proto::ops::args::TransferPurpose,
+        bytes: &[u8],
+    ) -> ToolResult<orch_proto::ops::args::TransferToken> {
+        Ok(self.session().await?.lock().await.upload(purpose, bytes).await?)
+    }
 }
 
 /// The tools of one server, filtered by its mode.
@@ -112,7 +245,7 @@ impl Registry {
     where
         A: ToolArgs + DeserializeOwned + JsonSchema + Send + 'static,
         F: Fn(Arc<CallContext>, A) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = orch_core::Result<Value>> + Send + 'static,
+        Fut: Future<Output = ToolResult> + Send + 'static,
     {
         if !self.names.insert(meta.name) {
             return Err(orch_core::Error::other(format!(
@@ -312,7 +445,7 @@ async fn dispatch<A, F, Fut>(
 where
     A: ToolArgs + DeserializeOwned + JsonSchema + Send + 'static,
     F: Fn(Arc<CallContext>, A) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = orch_core::Result<Value>> + Send + 'static,
+    Fut: Future<Output = ToolResult> + Send + 'static,
 {
     let server = call.service;
     // Stored mode filtering is the gate; this repeats it before execution.
@@ -325,20 +458,27 @@ where
     let outcome = server
         .run_call(meta.execution, &cancelled, move |cx| handler(cx, args))
         .await;
-    Ok(encode(outcome).into())
+    Ok(encode(outcome, server.agent_context()).into())
 }
 
 /// The tool result for a handler outcome: the value as compact JSON text, or
-/// the error's message and hint as `isError` text.
-pub(crate) fn encode(outcome: orch_core::Result<Value>) -> CallToolResult {
+/// the error's text as an `isError` result. A failure whose exit code is 7
+/// (no usable daemon, or a daemon that did not admit the request) also
+/// carries `structuredContent: {"exit_code": 7}`, so a client can tell it
+/// from an ordinary tool error without parsing text.
+pub(crate) fn encode(outcome: ToolResult, agent_context: bool) -> CallToolResult {
     match outcome {
         Ok(value) => match serde_json::to_string(&value) {
             Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             Err(err) => error_result(&format!("cannot serialize the result: {err}")),
         },
         Err(err) => {
-            log_error_chain(&err);
-            error_result(&error_text(&err))
+            let mut result = error_result(&err.text(agent_context));
+            let exit_code = err.exit_code();
+            if exit_code == orch_proto::error::exit::NO_DAEMON {
+                result.structured_content = Some(serde_json::json!({ "exit_code": exit_code }));
+            }
+            result
         }
     }
 }
@@ -510,7 +650,7 @@ mod tests {
         }
     }
 
-    async fn ok(_cx: Arc<CallContext>, _args: EmptyArgs) -> orch_core::Result<Value> {
+    async fn ok(_cx: Arc<CallContext>, _args: EmptyArgs) -> ToolResult {
         Ok(Value::Null)
     }
 
@@ -581,11 +721,39 @@ mod tests {
     fn errors_carry_their_hint() {
         let err = orch_core::Error::from(orch_domain::DomainError::NotInitialized);
         assert_eq!(error_text(&err), "Not initialized\nHint: Run: orch init");
-        let result = encode(Err(err));
+        let result = encode(Err(err.into()), false);
         assert_eq!(result.is_error, Some(true));
-        let result = encode(Ok(serde_json::json!([1, {"a": null}])));
+        assert!(result.structured_content.is_none());
+        let daemon = ToolError::Client(ClientError::Remote(
+            orch_proto::error::ErrorBody::from_domain(
+                &orch_domain::DomainError::NotInitialized,
+                orch_proto::error::Execution::NotExecuted,
+            ),
+        ));
+        assert_eq!(daemon.text(false), "Not initialized\nHint: Run: orch init");
+        let result = encode(Ok(serde_json::json!([1, {"a": null}])), false);
         assert_eq!(result.is_error, Some(false));
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["content"][0]["text"], "[1,{\"a\":null}]");
+    }
+
+    #[test]
+    fn no_daemon_is_the_uniform_text_with_exit_code_seven_in_both_variants() {
+        let failure = orch_client::NoDaemon::no_daemon(
+            "/p",
+            orch_proto::error::NoDaemonDetail::NoSocket,
+        );
+        for agent_context in [false, true] {
+            let result = encode(
+                Err(ToolError::Client(failure.clone().into())),
+                agent_context,
+            );
+            let json = serde_json::to_value(&result).unwrap();
+            assert_eq!(json["isError"], true);
+            assert_eq!(json["content"][0]["text"], failure.render(agent_context));
+            assert_eq!(json["structuredContent"], serde_json::json!({"exit_code": 7}));
+        }
+        assert!(failure.render(true).contains("Do not start it"));
+        assert!(failure.render(false).contains("orch daemon start"));
     }
 }
