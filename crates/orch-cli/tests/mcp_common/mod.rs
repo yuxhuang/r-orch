@@ -19,6 +19,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+// The one shared test-daemon helper (`tests/common/daemon.rs`), compiled into
+// this test crate. Every initialised project below owns an explicit daemon on
+// an isolated short socket; see that file for the socket-path scheme.
+#[path = "../common/daemon.rs"]
+pub mod daemon;
+use daemon::TestDaemon;
+
 /// Deadline for every single read from, and wait on, the server.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -366,14 +373,60 @@ pub fn empty_project() -> tempfile::TempDir {
     dir
 }
 
-/// `orch init` in a fresh directory, so the initialized-project cases have
-/// something to run against.
-pub fn initialized_project() -> tempfile::TempDir {
+/// An initialised project and the explicit test daemon that owns it. `path()`
+/// is the project root, as for a `TempDir`.
+pub struct ProjectDir {
+    // Declared first: the daemon is stopped (and the process table checked)
+    // before the directory it serves is removed.
+    daemon: Option<TestDaemon>,
+    dir: tempfile::TempDir,
+}
+
+impl ProjectDir {
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    pub fn daemon(&self) -> &TestDaemon {
+        self.daemon
+            .as_ref()
+            .expect("this project's daemon is not started")
+    }
+
+    /// Start the project's test daemon (for a project made by
+    /// [`initialized_project_unowned`]). Call it once the fixture's seeding is
+    /// done, so the daemon never races state the fixture writes by hand.
+    pub fn start_daemon(&mut self) {
+        assert!(self.daemon.is_none(), "daemon already started");
+        let daemon = TestDaemon::start(self.dir.path(), &self.dir.path().join(".test-home"));
+        daemon::register_project(self.dir.path(), &daemon);
+        self.daemon = Some(daemon);
+    }
+}
+
+impl Drop for ProjectDir {
+    fn drop(&mut self) {
+        daemon::unregister_project(self.dir.path());
+    }
+}
+
+/// `orch init` in a fresh directory, then an explicit test daemon, so the
+/// initialized-project cases have something to run against.
+pub fn initialized_project() -> ProjectDir {
     initialized_project_named("p")
 }
 
 /// [`initialized_project`] with a chosen project name, to tell two apart.
-pub fn initialized_project_named(name: &str) -> tempfile::TempDir {
+pub fn initialized_project_named(name: &str) -> ProjectDir {
+    let mut project = initialized_project_unowned(name);
+    project.start_daemon();
+    project
+}
+
+/// An initialised project with **no daemon yet**: for fixtures that write
+/// owner-managed state by hand (a cached peer snapshot) and must do so before
+/// the daemon exists, because a running daemon's peer runtime rewrites it.
+pub fn initialized_project_unowned(name: &str) -> ProjectDir {
     let dir = empty_project();
     let output =
         output_of(orch_command(dir.path()).args(["init", "--name", name, "--adapter", "shell"]));
@@ -382,7 +435,7 @@ pub fn initialized_project_named(name: &str) -> tempfile::TempDir {
         "`orch init` failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    dir
+    ProjectDir { daemon: None, dir }
 }
 
 /// The `orch` binary, isolated from the developer's machine: a private `HOME`,
@@ -401,6 +454,7 @@ pub fn orch_command(cwd: &Path) -> Command {
         .env("PATH", "/usr/bin:/bin")
         .env_remove("ORCHESTRY_DEBUG")
         .env_remove("ORCH_AGENT_ID");
+    daemon::apply_for(cwd, &mut command);
     command
 }
 

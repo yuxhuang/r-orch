@@ -27,8 +27,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use mcp_common::{
-    DESTRUCTIVE, EXPECTED, McpServer, READ_ONLY, Rendezvous, error_code, initialized_project,
-    initialized_project_named, orch_command, output_of, spawn_bounded, tool_text,
+    DESTRUCTIVE, EXPECTED, McpServer, ProjectDir, READ_ONLY, Rendezvous, error_code,
+    initialized_project, initialized_project_unowned, orch_command, output_of, spawn_bounded,
+    tool_text,
 };
 use serde_json::{Value, json};
 
@@ -38,7 +39,7 @@ use serde_json::{Value, json};
 struct Fx {
     // Declared first so the server is killed before its directory is removed.
     server: McpServer,
-    dir: tempfile::TempDir,
+    dir: ProjectDir,
 }
 
 impl Fx {
@@ -58,7 +59,7 @@ impl Fx {
 
     /// A server on an already prepared project, for tests whose identity must
     /// name an agent that has to exist before the server starts.
-    fn on(dir: tempfile::TempDir, args: &[&str], envs: &[(&str, Option<&str>)]) -> Self {
+    fn on(dir: ProjectDir, args: &[&str], envs: &[(&str, Option<&str>)]) -> Self {
         let mut server = McpServer::spawn_with(dir.path(), args, envs);
         server.initialize();
         Self { server, dir }
@@ -432,10 +433,19 @@ fn task_cancel_of_a_finished_task_is_a_tool_error_and_keeps_its_status() {
 fn task_cancel_never_starts_an_orchestrator_or_leaves_a_project_lock() {
     let mut fx = Fx::destructive();
     let id = fx.task("t");
-    fx.ok("task_cancel", json!({"id": id}));
     let lock = fx.root().join(".orchestry/orchestrator.lock");
-    assert!(!lock.exists(), "task_cancel must be store-only");
-    assert!(!fx.root().join(".orchestry/state.json").exists());
+    let state = fx.root().join(".orchestry/state.json");
+    let read = |path: &Path| std::fs::read(path).ok();
+    let (lock_before, state_before) = (read(&lock), read(&state));
+    fx.ok("task_cancel", json!({"id": id}));
+    // The project's test daemon owns the lock and state; the cancel must not
+    // touch either (it is store-only until the daemon-routed cancel lands).
+    assert_eq!(
+        read(&lock),
+        lock_before,
+        "task_cancel changed the project lock"
+    );
+    assert_eq!(read(&state), state_before, "task_cancel changed state.json");
 }
 
 #[test]
@@ -774,7 +784,7 @@ fn msg_send_delivers_one_message_with_the_same_shape_as_the_cli() {
 }
 
 /// A project with agents `me` and `rx` (ids returned), no server yet.
-fn project_with_sender_and_receiver() -> (tempfile::TempDir, String, String) {
+fn project_with_sender_and_receiver() -> (ProjectDir, String, String) {
     let dir = initialized_project();
     let make = |name: &str| {
         cli_json(
@@ -2435,7 +2445,7 @@ fn malformed_yaml_is_a_tool_error_and_changes_nothing() {
 
 /// A server whose working directory is `project/sub`, so a relative path means
 /// different files depending on what it is resolved against.
-fn server_in_subdirectory() -> (tempfile::TempDir, McpServer) {
+fn server_in_subdirectory() -> (ProjectDir, McpServer) {
     let dir = initialized_project();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).expect("subdir");
@@ -2720,8 +2730,14 @@ fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
 
 /// A project that also works as a git repository, so `worktree` and
 /// `isolated` workspaces can be created.
-fn git_project(name: &str) -> tempfile::TempDir {
-    let dir = initialized_project_named(name);
+///
+/// **No daemon yet (legacy `orch run <task>`).** Every user of this project
+/// runs a worker through `orch run`, which until S2a-cli is an in-process
+/// orchestrator that takes the PID lock a test daemon would already hold
+/// ("Orchestrator already running"). After the cutover `run <id>` is an RPC to
+/// the daemon: start one here with `dir.start_daemon()` and delete this note.
+fn git_project(name: &str) -> ProjectDir {
+    let dir = initialized_project_unowned(name);
     let git = |args: &[&str]| {
         // The fixture's own private HOME and the system directories only: no
         // developer-machine PATH entry, no inherited user git config.

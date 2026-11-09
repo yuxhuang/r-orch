@@ -63,9 +63,18 @@ impl Out {
     }
 }
 
+// The shared test-daemon helper (`tests/common/daemon.rs`).
+#[path = "../common/daemon.rs"]
+pub mod daemon;
+use daemon::TestDaemon;
+
 /// One disposable project plus its private home, fake-agent `PATH` and
 /// recording directory.
 pub struct Sandbox {
+    /// Dropped first: stopped, with a process-table check, before the project
+    /// directory it serves is removed. `None` for a sandbox that runs a legacy
+    /// in-process orchestrator (`orch run`) until S2a-cli; see [`Sandbox::new`].
+    daemon: Option<TestDaemon>,
     _parent: tempfile::TempDir,
     /// Always `<canonical tmp>/proj`, so the project name in a prompt is stable.
     pub project: PathBuf,
@@ -99,12 +108,18 @@ fn write_script(path: &Path, body: &str) {
 }
 
 impl Sandbox {
-    /// A fresh initialised project. `init` always runs with `init_reader`.
+    /// A fresh initialised project **without a daemon**. `init` always runs
+    /// with `init_reader`.
+    ///
+    /// Use this only where the test runs `orch run` / `orch serve`: until
+    /// S2a-cli those are in-process orchestrators that take the PID lock a
+    /// test daemon holds. Everything else uses [`Sandbox::new_owned`].
     pub fn new(init_reader: &Reader) -> Sandbox {
         let parent = tempfile::tempdir().unwrap();
         let project = parent.path().canonicalize().unwrap().join("proj");
         fs::create_dir(&project).unwrap();
         let sb = Sandbox {
+            daemon: None,
             _parent: parent,
             project,
             home: tempfile::tempdir().unwrap(),
@@ -114,6 +129,26 @@ impl Sandbox {
         sb.install_fakes();
         let out = sb.run(init_reader, &["init"], None);
         assert!(out.ok(), "init failed: {}", out.all());
+        sb
+    }
+
+    /// [`Sandbox::new`] plus an explicit test daemon on an isolated short
+    /// socket. The daemon gets the sandbox's fake-agent `PATH` and recording
+    /// directory, so an agent it spawns after the CLI cutover finds the same
+    /// fakes the CLI used to.
+    pub fn new_owned(init_reader: &Reader) -> Sandbox {
+        let mut sb = Sandbox::new(init_reader);
+        let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", sb.bin.path().display()));
+        let path = PathBuf::from(path);
+        sb.daemon = Some(TestDaemon::start_with_env(
+            &sb.project,
+            sb.home.path(),
+            &[
+                ("PATH", path.as_path()),
+                ("ORCH_T1_REC", sb.rec.path()),
+                ("ORCH_FAKE_VERSION", Path::new("2.1.2")),
+            ],
+        ));
         sb
     }
 
@@ -181,6 +216,9 @@ impl Sandbox {
             .env("NO_COLOR", "1")
             .env("EDITOR", "false")
             .env("ORCH_FAKE_VERSION", "2.1.2");
+        if let Some(daemon) = &self.daemon {
+            daemon.apply(&mut c);
+        }
         c
     }
 

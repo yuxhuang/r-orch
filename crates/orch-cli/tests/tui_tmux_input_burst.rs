@@ -11,6 +11,10 @@
 
 #![cfg(unix)]
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -153,19 +157,35 @@ fn orch(dir: &Path, args: &[&str]) {
     );
 }
 
-/// A shell project (no default AI agent) with no tasks, so the orchestrator
-/// the dashboard starts has nothing to run.
-fn project() -> tempfile::TempDir {
+/// A shell project (no default AI agent) with no tasks, so the test daemon
+/// (dispatch off) has nothing to run.
+fn project() -> Project {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
         dir.path(),
         &["init", "--name", "proj", "--adapter", "shell"],
     );
-    dir
+    let daemon = TestDaemon::start(dir.path(), &dir.path().join("home"));
+    Project { daemon, dir }
 }
 
-fn launch(dir: &Path, socket: String) -> Tmux {
+/// The throwaway project and its explicit test daemon (isolated short socket).
+struct Project {
+    // Dropped first: the daemon stops (process table checked) before its
+    // directory is removed.
+    daemon: TestDaemon,
+    dir: tempfile::TempDir,
+}
+
+impl Project {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn launch(project: &Project, socket: String) -> Tmux {
+    let dir = project.path();
     let mut tmux = Tmux {
         bin: tmux_binary(),
         socket,
@@ -180,7 +200,7 @@ fn launch(dir: &Path, socket: String) -> Tmux {
     let cwd = dir.display().to_string();
     let command = format!("'{}' tui", orch_binary().display());
     // The adapters' model probes find no AI CLI on this PATH.
-    tmux.run(&[
+    let mut args: Vec<String> = [
         "start-server",
         ";",
         "set-option",
@@ -204,8 +224,15 @@ fn launch(dir: &Path, socket: String) -> Tmux {
         &global,
         "-e",
         "PATH=/usr/bin:/bin",
-        &command,
-    ]);
+    ]
+    .map(String::from)
+    .into();
+    // Point the dashboard's shell at this project's test daemon.
+    for pair in project.daemon.env_pairs() {
+        args.extend(["-e".to_owned(), pair]);
+    }
+    args.push(command);
+    tmux.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
     let path = tmux.run(&["display-message", "-p", "-t", "dash", "#{socket_path}"]);
     tmux.socket_path = Some(PathBuf::from(
         String::from_utf8_lossy(&path.stdout).trim().to_string(),
@@ -224,7 +251,7 @@ fn cursor_row(screen: &str) -> Option<&str> {
 fn every_key_of_a_burst_is_handled_without_another_keystroke() {
     let dir = project();
     let tmux = launch(
-        dir.path(),
+        &dir,
         format!("orch-burst-{}-{}", std::process::id(), line!()),
     );
     tmux.wait_for("the dashboard", |s| s.contains("ORCH"));
