@@ -33,6 +33,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `update`/`patch` fails with `mutation lock timed out`, `read mutation input` or a `<stdin>:` error | [File mutations: update and patch failures](#file-mutations-update-and-patch-failures) |
 | `org deploy` failed half way, or a template will not load or change | [Organization templates: failures and recovery](#organization-templates-failures-and-recovery) |
 | A task stays `todo` with `configuration preflight` or the eco/custom-template message, or a run fails before start with `effort preparation failed` | [Prompt mode and effort failures](#prompt-mode-and-effort-failures) |
+| A goal was resumed but its checkpoint or continuation stays `cancelled` and the tasks after it never start | [A resumed goal leaves cancelled tasks cancelled](#a-resumed-goal-leaves-cancelled-tasks-cancelled) |
 | Data lost or overwritten while `orch mcp` clients and other writers shared a project | [Recovering after concurrent MCP writers](#recovering-after-concurrent-mcp-writers) |
 | Every `orch mcp` tool and resource call fails with a configuration error | [Restoring a configuration broken through the MCP server](#restoring-a-configuration-broken-through-the-mcp-server) |
 | No trace of what an `orch mcp` server did, or its client discards stderr | [Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics) |
@@ -787,6 +788,55 @@ refused command leaves the template unchanged; `deploy` is the only command that
 A change made while another tool writes the same template, or a hand edit during a command, is not covered by the
 lock: the last writer wins. If a command was interrupted, run `orch org template show` before repeating it, because
 a crash after the file was renamed has still saved the change.
+
+## A resumed goal leaves cancelled tasks cancelled
+
+**Symptom.** You paused a goal (`orch goal status <id> paused`, dashboard `P`, or the MCP `goal_status` tool) and
+resumed it, and the work does not pick up again: a checkpoint or continuation is `cancelled`, and the tasks that
+depend on it sit in `todo` and never start. A task can also end `cancelled` although it was already running when
+the pause happened.
+
+**Cause.** Pausing cancels the assignee's `todo`/`retrying` tasks that are labelled `autonomous` and linked to that
+goal. Resuming does not restore them, and a dependent stays blocked until each task it depends on is `done`. The
+pause is not an atomic barrier either: it lists the tasks and then cancels them, so a listed task that an
+orchestrator starts in between is cancelled anyway, and a live orchestrator then stops its run. See
+[what a pause cancels](manual/17-mcp-server.md#choose-a-mode) and
+[Pause, resume and finish a goal](manual/05-teams-and-goals.md#pause-resume-and-finish-a-goal).
+
+**Recovery.**
+
+1. Find the cancelled task. `orch goal show <goal-id>` lists the goal's tasks with their status:
+
+   ```text
+     Tasks (2)
+     ──────────────────────────────────────────
+     STATUS       ID           TITLE               AGENT
+     ○ todo       tsk_G5ggNHE  next step           agt_8EplcH4
+     ○ cancelled  tsk_IA7oEPK  [ateam] checkpoint  agt_8EplcH4
+   ```
+
+2. Confirm what waits on it: `orch --json task show <dependent-id>` shows the dependency in `depends_on`
+   (`orch task show` without `--json` does not list dependencies).
+3. Decide whether the cancelled task is still wanted. Retrying runs it again, so do not retry work that is no
+   longer needed or was already done another way.
+4. Retry that same task, which keeps its id and dependents and resets it to `todo` with a fresh attempt budget:
+
+   ```console
+   $ orch task retry tsk_IA7oEPK
+     ✓ Reset tsk_IA7oEPK to todo
+   ```
+
+   From an MCP client, call `task_retry` with `{"id": "tsk_IA7oEPK"}`; it works in the default mode.
+5. Wait for it to reach `done` (a running orchestrator such as `orch serve`, `orch run --watch` or the dashboard
+   dispatches it). Only then can its dependents start.
+
+Do not recreate the task graph, and do not wait for the resumed goal to seed a replacement. Resuming re-enables
+the assignee's `autonomous` flag, but a fresh `[auto]` task is seeded only for an agent with no unfinished task
+assigned, so a blocked dependent assigned to the same agent prevents it; and seeding never brings back a
+cancelled task.
+
+**Prevention.** None makes a pause atomic. After every resume, check the goal's tasks (step 1) before you expect
+work to continue.
 
 ## Recovering after concurrent MCP writers
 

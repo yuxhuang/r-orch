@@ -6,7 +6,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Changed
-- Pausing a goal (`orch goal status <id> paused`, the dashboard, or the MCP `goal_status` tool) now cancels only the assignee's waiting (`todo` or `retrying`) autonomous tasks linked to that goal. It used to cancel the assignee's waiting autonomous tasks in every goal, such as the checkpoints an `a-team` lead had queued for its other goals; those, and autonomous tasks linked to no goal, are now left alone.
+- Pausing a goal (`orch goal status <id> paused`, the dashboard, or the MCP `goal_status` tool) now cancels only the assignee's waiting (`todo` or `retrying`) autonomous tasks linked to that goal. It used to cancel the assignee's waiting autonomous tasks in every goal, such as the checkpoints an `a-team` lead had queued for its other goals; those, and autonomous tasks linked to no goal, are now left alone. Resuming the goal still does not restore the tasks a pause cancelled, and a pause is not an atomic barrier: a listed task that starts before its cancel lands is cancelled anyway. To bring a cancelled checkpoint back and unblock what depends on it, run `orch task retry <id>` (MCP `task_retry`); see [the runbook](docs/RUNBOOK.md#a-resumed-goal-leaves-cancelled-tasks-cancelled).
 - `orch mcp`: `goal_status` with `status: "paused"` now works in the default mode, so a lead client that pauses its goals no longer needs `--allow-destructive`. `force: true` still needs it.
 - `orch mcp`: an invalid-arguments error (`-32602`) names the argument and the type or form it expects but no longer quotes the value that was sent, in the response and in the server's stderr diagnostics (`RUST_LOG=warn`). This includes a malformed `logs` `since` duration.
 
