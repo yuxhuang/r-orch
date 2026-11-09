@@ -15,15 +15,17 @@
 //! here reads `~/.orchestry` or dials a daemon the harness did not start.
 
 use crate::DaemonError;
-use crate::lifecycle::{BringUp, DispatchMode, Running, internal_context};
-use crate::session::Peer;
+use crate::lifecycle::{BringUp, DaemonExit, DispatchMode, Running, internal_context};
+use crate::ops::ServiceHandler;
+use crate::session::{Peer, Server};
 use orch_core::{Clock, IdGenerator, ProcessManager};
 use orch_proto::ops::Request;
 use orch_proto::ops::args::DispatchTickArgs;
 use orch_proto::ops::results::TickResult;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
 
 /// A client's byte stream to a harness daemon: a duplex half, or a connected
 /// Unix stream when the harness runs [`HarnessBuilder::on_socket`]. The
@@ -183,16 +185,89 @@ impl HarnessBuilder {
             snapshot: crate::env::capture(std::env::vars_os()),
         })
         .await?;
-        let mut running = running;
-        running.honour_stop_intent();
         Ok(DaemonHarness {
             project_root: root,
             socket,
             engine: Arc::clone(&running.engine),
-            running: Some(running),
+            handler: running.handler.clone(),
+            server: Arc::clone(&running.server),
+            lifecycle: Some(Lifecycle::spawn(running)),
             _scratch: scratch,
             project,
         })
+    }
+}
+
+/// The harness's stand-in for [`crate::start`]'s wait: one task owns the
+/// daemon's stop, so a frozen stop intent, `daemon.stop` and
+/// [`DaemonHarness::shutdown`] all take the one clean path
+/// ([`Running::shutdown`]) exactly once, as in production.
+struct Lifecycle {
+    /// The daemon until a stop trigger takes it; `Drop` aborts what is left.
+    running: Arc<Mutex<Option<Running>>>,
+    shutdown: watch::Sender<bool>,
+    exit: watch::Receiver<Option<DaemonExit>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Lifecycle {
+    fn spawn(running: Running) -> Lifecycle {
+        let mut requested = running.server.stop.requested();
+        let mut stopped = running.handler.stopped();
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let (exit_tx, exit) = watch::channel(None);
+        let running = Arc::new(Mutex::new(Some(running)));
+        let slot = Arc::clone(&running);
+        let task = tokio::spawn(async move {
+            let reason = tokio::select! {
+                () = crate::session::until_set(&mut requested) => "stop intent",
+                _ = stopped.wait_for(Option::is_some) => "daemon.stop",
+                () = crate::session::until_set(&mut shutdown_rx) => "harness shutdown",
+            };
+            let taken = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(running) = taken {
+                tracing::info!(reason, "stopping");
+                exit_tx.send_replace(Some(running.shutdown().await));
+            }
+        });
+        Lifecycle {
+            running,
+            shutdown,
+            exit,
+            task,
+        }
+    }
+
+    /// Whether a stop trigger has begun (or finished) the teardown.
+    fn stopping(&self) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// Trigger the clean stop unless one already ran; idempotent.
+    async fn finish(mut self) -> Option<DaemonExit> {
+        self.shutdown.send_replace(true);
+        match self.exit.wait_for(Option::is_some).await {
+            Ok(exit) => *exit,
+            // The task ended without an exit: it panicked mid-shutdown.
+            Err(_) => None,
+        }
+    }
+}
+
+impl Drop for Lifecycle {
+    fn drop(&mut self) {
+        self.task.abort();
+        let taken = self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mut running) = taken {
+            running.abort();
+        }
     }
 }
 
@@ -202,7 +277,10 @@ pub struct DaemonHarness {
     project_root: PathBuf,
     socket: Option<PathBuf>,
     engine: Arc<orch_engine::FullEngine>,
-    running: Option<Running>,
+    handler: ServiceHandler,
+    server: Arc<Server>,
+    /// `None` once [`DaemonHarness::shutdown`] consumed it.
+    lifecycle: Option<Lifecycle>,
     _scratch: tempfile::TempDir,
     project: Option<tempfile::TempDir>,
 }
@@ -246,16 +324,20 @@ impl DaemonHarness {
         self.socket.as_deref()
     }
 
-    fn running(&self) -> Result<&Running, DaemonError> {
-        self.running
-            .as_ref()
-            .ok_or_else(|| DaemonError::InvalidArguments("the harness daemon has stopped".into()))
+    /// The daemon's handler while it serves; an error once a stop began.
+    fn running(&self) -> Result<&ServiceHandler, DaemonError> {
+        match &self.lifecycle {
+            Some(lifecycle) if !lifecycle.stopping() => Ok(&self.handler),
+            _ => Err(DaemonError::InvalidArguments(
+                "the harness daemon has stopped".into(),
+            )),
+        }
     }
 
     /// A new client connection (duplex, or the real socket when bound). The
     /// duplex peer is this process, as the kernel would report it.
     pub async fn connect(&self) -> Result<ClientEndpoint, DaemonError> {
-        let running = self.running()?;
+        self.running()?;
         if let Some(socket) = &self.socket {
             let stream = tokio::net::UnixStream::connect(socket)
                 .await
@@ -267,7 +349,7 @@ impl DaemonHarness {
             });
         }
         let (client, server) = tokio::io::duplex(DUPLEX_BYTES);
-        running.server.admit(
+        self.server.admit(
             server,
             Peer {
                 uid: Some(nix::unistd::geteuid().as_raw()),
@@ -289,7 +371,6 @@ impl DaemonHarness {
     pub async fn step_expiry(&self) -> Result<usize, DaemonError> {
         let removed = self
             .running()?
-            .handler
             .expire_context()
             .await
             .map_err(|error| DaemonError::Operation(Box::new(error)))?;
@@ -300,7 +381,6 @@ impl DaemonHarness {
     pub async fn step_dispatch(&self) -> Result<TickReport, DaemonError> {
         let committed = self
             .running()?
-            .handler
             .execute_request(
                 &internal_context(),
                 Request::DispatchTick(DispatchTickArgs {}),
@@ -317,14 +397,15 @@ impl DaemonHarness {
 
     /// The same clean path as SIGTERM: stop admission and dispatch, kill and
     /// reconcile agents, remove own endpoint/discovery, release ownership.
+    /// After a stop intent or `daemon.stop` already ran that path, this
+    /// reports its outcome instead of stopping twice.
     pub async fn shutdown(mut self) -> Result<(), DaemonError> {
-        let Some(running) = self.running.take() else {
+        let Some(lifecycle) = self.lifecycle.take() else {
             return Ok(());
         };
-        if running.shutdown().await.clean {
-            Ok(())
-        } else {
-            Err(DaemonError::StopIncomplete)
+        match lifecycle.finish().await {
+            Some(exit) if exit.clean => Ok(()),
+            _ => Err(DaemonError::StopIncomplete),
         }
     }
 
@@ -341,11 +422,11 @@ impl DaemonHarness {
     }
 }
 
+/// Dropping without [`DaemonHarness::shutdown`] aborts the daemon via
+/// [`Lifecycle`]'s `Drop`; a stop already tearing down is cancelled with it.
 impl Drop for DaemonHarness {
     fn drop(&mut self) {
-        if let Some(mut running) = self.running.take() {
-            running.abort();
-        }
+        drop(self.lifecycle.take());
     }
 }
 
@@ -353,7 +434,7 @@ impl Drop for DaemonHarness {
 mod tests {
     use super::*;
     use orch_proto::handshake::{
-        Caller, CallerKind, HandshakeReply, Hello, HelloFrame, SessionMode,
+        Caller, CallerKind, HandshakeReply, Hello, HelloFrame, SessionMode, StopState,
     };
     use orch_proto::path::WirePath;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -467,6 +548,102 @@ mod tests {
             .welcome
             .unwrap();
         assert_eq!((welcome.protocol, welcome.binary.as_str()), (7, "7.0.0"));
+        harness.shutdown().await.unwrap();
+    }
+
+    async fn read_reply(stream: &mut BufReader<Box<dyn ClientStream>>) -> HandshakeReply {
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            stream.read_line(&mut line),
+        )
+        .await
+        .expect("the daemon answers within the deadline")
+        .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// The live `orch daemon stop` against a harness socket: the stop intent
+    /// completes on its own (no harness `shutdown` running) with the full
+    /// production teardown, and the later `shutdown` is a clean no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frozen_stop_intent_tears_the_harness_down_and_shutdown_is_idempotent() {
+        let mut harness = DaemonHarness::builder().on_socket().start().await.unwrap();
+        let root = harness.project_root().to_path_buf();
+        let socket = harness.socket().unwrap().to_path_buf();
+        let stream = harness.connect().await.unwrap().into_stream();
+        let mut stream = BufReader::new(stream);
+        let (project_id, _) = crate::discovery::project_identity(&root).unwrap();
+        let hello = HelloFrame {
+            hello: Hello::stop(WirePath::new(&root).unwrap(), project_id),
+        };
+        let mut frame = serde_json::to_vec(&hello).unwrap();
+        frame.push(b'\n');
+        stream.get_mut().write_all(&frame).await.unwrap();
+        let accepted = read_reply(&mut stream).await.welcome.unwrap();
+        assert_eq!(accepted.stop_state, Some(StopState::Accepted));
+        let completed = read_reply(&mut stream).await.welcome.unwrap();
+        assert_eq!(completed.stop_state, Some(StopState::Completed));
+        assert_eq!(completed.instance, accepted.instance);
+
+        // Torn down before `shutdown` is called, as `start` would.
+        let state = root.join(".orchestry");
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while state.join("orchestry.lock").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("ownership is released after the stop");
+        assert!(!socket.exists());
+        assert!(!state.join("daemon.json").exists());
+        assert!(harness.connect().await.is_err());
+        assert!(harness.step_dispatch().await.is_err());
+
+        let held = harness.project.take();
+        harness.shutdown().await.unwrap();
+        let successor = DaemonHarness::builder().start_in(&root).await.unwrap();
+        successor.shutdown().await.unwrap();
+        drop(held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_stop_request_tears_the_harness_down() {
+        let harness = DaemonHarness::start().await.unwrap();
+        let root = harness.project_root().to_path_buf();
+        let stream = harness.connect().await.unwrap().into_stream();
+        let mut stream = BufReader::new(stream);
+        let (project_id, _) = crate::discovery::project_identity(&root).unwrap();
+        let hello = HelloFrame {
+            hello: Hello::session(
+                WirePath::new(&root).unwrap(),
+                project_id,
+                &Caller {
+                    kind: CallerKind::Cli,
+                    agent_id: None,
+                    pid: None,
+                },
+                SessionMode::Normal,
+            ),
+        };
+        let mut frame = serde_json::to_vec(&hello).unwrap();
+        frame.extend_from_slice(b"\n{\"id\":1,\"req\":{\"op\":\"daemon.stop\",\"args\":{}}}\n");
+        stream.get_mut().write_all(&frame).await.unwrap();
+        assert!(read_reply(&mut stream).await.welcome.unwrap().compatible);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["ok"]["clean"], true, "{reply}");
+
+        let lock = root.join(".orchestry/orchestry.lock");
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while lock.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("daemon.stop runs the full teardown");
+        assert!(harness.connect().await.is_err());
         harness.shutdown().await.unwrap();
     }
 }

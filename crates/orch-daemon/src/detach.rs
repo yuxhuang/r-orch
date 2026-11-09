@@ -199,6 +199,10 @@ fn child_args(options: &StartOptions) -> Vec<String> {
         args.push("--listen".to_owned());
         args.push(listen.clone());
     }
+    if let Some(name) = &options.peer_name {
+        // `=`: a name starting with `-` must not parse as a flag.
+        args.push(format!("--peer-name={name}"));
+    }
     args
 }
 
@@ -306,6 +310,7 @@ mod tests {
             dispatch: DispatchMode::On,
             from_agent: true,
             listen: Some("127.0.0.1:7000".into()),
+            peer_name: Some("-worker one".into()),
             detach: true,
             ..Default::default()
         };
@@ -318,7 +323,8 @@ mod tests {
                 "on",
                 "--from-agent",
                 "--listen",
-                "127.0.0.1:7000"
+                "127.0.0.1:7000",
+                "--peer-name=-worker one"
             ]
         );
     }

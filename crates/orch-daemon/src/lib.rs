@@ -4,9 +4,9 @@
 //! processes, dispatch, expiry and the peer runtime. Every other entry point
 //! is a client over the local socket using `orch-proto`.
 //!
-//! The public surface is deliberately narrow: [`start`], [`initialize`] and,
-//! behind the `testing` feature, [`testing::DaemonHarness`]. Nothing here
-//! re-exports a store implementation or an arbitrary execute closure.
+//! The public surface is deliberately narrow: [`prepare_start`] (and its
+//! async wrapper [`start`]), [`initialize`] and, behind the `testing`
+//! feature, [`testing::DaemonHarness`]. Nothing here re-exports a store implementation or an arbitrary execute closure.
 //!
 //! **PR 1 skeleton (S1a-api).** Signatures only; bodies return
 //! [`DaemonError::Unimplemented`] naming the task that fills them:
@@ -44,8 +44,8 @@ pub mod testing;
 pub use discovery::select_project_root;
 pub use error::DaemonError;
 pub use lifecycle::{
-    DEVELOPMENTAL_BANNER, DaemonExit, DispatchMode, EnvironmentSnapshot, InitOptions, InitOutcome,
-    StartOptions, capture_environment, initialize, start,
+    DEVELOPMENTAL_BANNER, DaemonExit, DispatchMode, InitOptions, InitOutcome, PreparedStart,
+    StartOptions, initialize, prepare_start, start,
 };
 
 /// The environment variable that must be `1` for `orch daemon start` in PR 1

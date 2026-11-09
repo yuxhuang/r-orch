@@ -66,26 +66,10 @@ pub struct StartOptions {
     /// `--peer-name <name>`: this instance's peer name, overriding
     /// `peer.name` in config.yml for this run only.
     pub peer_name: Option<String>,
-    /// The sanitized environment, captured with [`capture_environment`]
-    /// before the async runtime starts (D11). `None` captures it on entry to
-    /// [`start`], which is equivalent only while nothing has changed the
-    /// process environment since `main`.
-    pub environment: Option<EnvironmentSnapshot>,
     /// PR 1 developmental gate (SE-20): the caller read
     /// `ORCH_DAEMON_DEVELOPMENTAL=1`. Without it start refuses with exit 2;
     /// with it start prints the banner that legacy writers are not excluded.
     pub developmental: bool,
-}
-
-/// The environment agents inherit, minus the R21 denylist. Opaque: only
-/// [`capture_environment`] creates one.
-#[derive(Debug, Clone)]
-pub struct EnvironmentSnapshot(crate::env::Snapshot);
-
-/// Capture the sanitized environment. Call from `main` before building the
-/// tokio runtime (D11); the process environment is read, never written.
-pub fn capture_environment() -> EnvironmentSnapshot {
-    EnvironmentSnapshot(crate::env::capture(std::env::vars_os()))
 }
 
 /// How a daemon run ended. `code` is the process exit status for
@@ -117,7 +101,8 @@ const LOOP_DRAIN: Duration = Duration::from_secs(5);
 /// How long a stop already started by `daemon.stop` may take to report.
 const STOP_WAIT: Duration = Duration::from_secs(300);
 
-/// Run an explicitly started daemon until stop, SIGTERM, SIGINT or SIGHUP.
+/// Run an explicitly started daemon until stop, SIGTERM, SIGINT or SIGHUP:
+/// [`prepare_start`] then [`PreparedStart::run`].
 ///
 /// In the foreground this prints exactly `listening <socket>` once recovery,
 /// binding and discovery publication are done, then the dispatch state. With
@@ -126,20 +111,49 @@ const STOP_WAIT: Duration = Duration::from_secs(300);
 /// Fails with [`DaemonError::AlreadyRunning`] (exit 4) when another process
 /// owns the project and [`DaemonError::RefusedInAgentContext`] (exit 2) from
 /// an agent context without `from_agent`. Never called from a client path.
+///
+/// Called from inside a runtime, the environment snapshot is taken after
+/// the runtime exists; `main` should call [`prepare_start`] first (D11).
 pub async fn start(options: StartOptions) -> Result<DaemonExit, DaemonError> {
+    prepare_start(options)?.run().await
+}
+
+/// The synchronous half of an explicit start (D11): call it before building
+/// the tokio runtime. It captures the sanitized agent environment, enforces
+/// the agent-context and developmental gates, prints the banner and resolves
+/// the root, its ownership and the endpoint. The process environment is
+/// read, never written. Nothing is locked, bound or spawned until
+/// [`PreparedStart::run`].
+pub fn prepare_start(options: StartOptions) -> Result<PreparedStart, DaemonError> {
+    prepare(options, std::env::vars_os(), |name| std::env::var_os(name))
+}
+
+/// A start whose environment and gates were settled by [`prepare_start`].
+#[derive(Debug)]
+#[must_use = "a prepared start does nothing until run"]
+pub struct PreparedStart {
+    options: StartOptions,
+    root: PathBuf,
+    socket: PathBuf,
+    snapshot: crate::env::Snapshot,
+    detached_child: bool,
+}
+
+fn prepare(
+    options: StartOptions,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PreparedStart, DaemonError> {
     // R21: the agent environment is decided by what started the daemon, read
     // once and never written.
-    let snapshot = options
-        .environment
-        .clone()
-        .map_or_else(|| crate::env::capture(std::env::vars_os()), |env| env.0);
-    if in_agent_context(|name| std::env::var_os(name)) && !options.from_agent {
+    let snapshot = crate::env::capture(vars);
+    if in_agent_context(&var) && !options.from_agent {
         return Err(DaemonError::RefusedInAgentContext);
     }
     if !options.developmental {
         return Err(DaemonError::DevelopmentalGateClosed);
     }
-    let detached_child = std::env::var_os(crate::detach::DETACHED_CHILD_ENV).is_some();
+    let detached_child = var(crate::detach::DETACHED_CHILD_ENV).is_some();
     if detached_child {
         crate::detach::enter_own_session();
     }
@@ -155,51 +169,69 @@ pub async fn start(options: StartOptions) -> Result<DaemonExit, DaemonError> {
     let (_, meta) = discovery::project_identity(&root)?;
     discovery::check_state_dir_owner(&root, &meta)?;
     let socket = discovery::endpoint(&root, options.socket.as_deref(), &std::env::temp_dir())?;
-    if options.detach {
-        return crate::detach::spawn_detached(&options, &root).await;
-    }
-
-    let running = Running::bring_up(BringUp {
-        project_root: root.clone(),
-        socket: Some(socket.clone()),
-        dispatch: options.dispatch,
-        listen: options.listen.clone(),
-        peer_name: options.peer_name.clone(),
-        seams: EngineSeams::default(),
-        processes: None,
-        versions: None,
+    Ok(PreparedStart {
+        options,
+        root,
+        socket,
         snapshot,
+        detached_child,
     })
-    .await?;
+}
 
-    let mut signals = Signals::install()?;
-    {
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "listening {}", socket.display());
-        let _ = writeln!(
-            out,
-            "dispatch {}",
-            dispatch_word(running.handler.dispatch_state())
-        );
-        let _ = out.flush();
-    }
-    let (quit_log, quit_log_rx) = watch::channel(false);
-    let log_task = detached_child.then(|| {
-        crate::detach::release_readiness_pipe();
-        tokio::spawn(crate::detach::rotate_log_while_running(
-            root.clone(),
-            quit_log_rx,
-        ))
-    });
+impl PreparedStart {
+    /// Detach, or bring the daemon up in the foreground and serve until a
+    /// stop trigger; see [`start`].
+    pub async fn run(self) -> Result<DaemonExit, DaemonError> {
+        if self.options.detach {
+            return crate::detach::spawn_detached(&self.options, &self.root).await;
+        }
+        let (root, socket, detached_child) =
+            (self.root.clone(), self.socket.clone(), self.detached_child);
+        let running = Running::bring_up(self.bring_up()).await?;
 
-    let reason = running.wait_for_stop(Some(&mut signals)).await;
-    tracing::info!(reason, "stopping");
-    let exit = running.shutdown().await;
-    quit_log.send_replace(true);
-    if let Some(task) = log_task {
-        let _ = task.await;
+        let mut signals = Signals::install()?;
+        {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "listening {}", socket.display());
+            let _ = writeln!(
+                out,
+                "dispatch {}",
+                dispatch_word(running.handler.dispatch_state())
+            );
+            let _ = out.flush();
+        }
+        let (quit_log, quit_log_rx) = watch::channel(false);
+        let log_task = detached_child.then(|| {
+            crate::detach::release_readiness_pipe();
+            tokio::spawn(crate::detach::rotate_log_while_running(
+                root.clone(),
+                quit_log_rx,
+            ))
+        });
+
+        let reason = running.wait_for_stop(Some(&mut signals)).await;
+        tracing::info!(reason, "stopping");
+        let exit = running.shutdown().await;
+        quit_log.send_replace(true);
+        if let Some(task) = log_task {
+            let _ = task.await;
+        }
+        Ok(exit)
     }
-    Ok(exit)
+
+    fn bring_up(self) -> BringUp {
+        BringUp {
+            project_root: self.root,
+            socket: Some(self.socket),
+            dispatch: self.options.dispatch,
+            listen: self.options.listen,
+            peer_name: self.options.peer_name,
+            seams: EngineSeams::default(),
+            processes: None,
+            versions: None,
+            snapshot: self.snapshot,
+        }
+    }
 }
 
 /// R31: `ORCH_TASK_ID` or `ORCH_AGENT_ID` set (non-empty) is an agent
@@ -578,28 +610,29 @@ impl Running {
     }
 
     async fn stop_engine(&self) -> bool {
-        stop_engine(&self.handler).await
+        if self.handler.coordinator().is_stopping() {
+            // `daemon.stop` is already running the same handler.
+            let mut stopped = self.handler.stopped();
+            return match tokio::time::timeout(STOP_WAIT, stopped.wait_for(Option::is_some)).await {
+                Ok(Ok(value)) => value.unwrap_or(false),
+                _ => false,
+            };
+        }
+        match self
+            .handler
+            .execute_request(&internal_context(), Request::DaemonStop(DaemonStopArgs {}))
+            .await
+        {
+            Ok(committed) => serde_json::from_str::<StopOutcome>(committed.value.get())
+                .map(|outcome| outcome.clean)
+                .unwrap_or(false),
+            Err(error) => {
+                tracing::warn!(code = ?error.code, execution = ?error.execution, "shutdown cleanup failed");
+                false
+            }
+        }
     }
 
-    /// The harness's stand-in for [`start`]'s wait: a frozen stop intent
-    /// runs the engine stop and answers its caller, as in production. The
-    /// listener stays up until the harness's own (then idempotent)
-    /// `shutdown` finishes the teardown.
-    #[cfg(feature = "testing")]
-    pub(crate) fn honour_stop_intent(&mut self) {
-        let server = Arc::clone(&self.server);
-        let handler = self.handler.clone();
-        let mut quit = self.quit.subscribe();
-        self.loops.push(tokio::spawn(async move {
-            let mut requested = server.stop.requested();
-            tokio::select! {
-                () = crate::session::until_set(&mut quit) => return,
-                () = crate::session::until_set(&mut requested) => {}
-            }
-            let clean = stop_engine(&handler).await;
-            server.stop.finish(clean);
-        }));
-    }
     fn remove_endpoint(&mut self) {
         if let Some(endpoint) = self.endpoint.take()
             && let Err(error) =
@@ -627,30 +660,6 @@ impl Running {
         discovery::remove_own_record(&self.project_root, &self.instance);
         self.pid_lock.release();
         drop(self.guard.take());
-    }
-}
-
-/// Run `daemon.stop` once; a stop already in progress is awaited instead.
-async fn stop_engine(handler: &ServiceHandler) -> bool {
-    if handler.coordinator().is_stopping() {
-        // `daemon.stop` is already running the same handler.
-        let mut stopped = handler.stopped();
-        return match tokio::time::timeout(STOP_WAIT, stopped.wait_for(Option::is_some)).await {
-            Ok(Ok(value)) => value.unwrap_or(false),
-            _ => false,
-        };
-    }
-    match handler
-        .execute_request(&internal_context(), Request::DaemonStop(DaemonStopArgs {}))
-        .await
-    {
-        Ok(committed) => serde_json::from_str::<StopOutcome>(committed.value.get())
-            .map(|outcome| outcome.clean)
-            .unwrap_or(false),
-        Err(error) => {
-            tracing::warn!(code = ?error.code, execution = ?error.execution, "shutdown cleanup failed");
-            false
-        }
     }
 }
 
@@ -976,6 +985,94 @@ mod tests {
         assert_eq!(refused.exit_code(), 2);
         assert!(refused.to_string().contains("ORCH_DAEMON_DEVELOPMENTAL=1"));
         assert_eq!(DaemonError::RefusedInAgentContext.exit_code(), 2);
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).into(), (*value).into()))
+            .collect()
+    }
+
+    fn lookup(
+        pairs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// D11: preparation is synchronous (no runtime exists in this test) and
+    /// fixes the agent environment and start options before `run`.
+    #[test]
+    fn prepare_captures_the_snapshot_and_options_before_any_runtime() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let project = project();
+        let scratch = scratch();
+        let env = vars(&[("PATH", "/bin"), ("DEBUG", "1"), ("ORCH_TASK_ID", "tsk_x")]);
+        let prepared = prepare(
+            StartOptions {
+                project_root: project.path().to_path_buf(),
+                socket: Some(scratch.path().join("s")),
+                from_agent: true,
+                listen: Some("127.0.0.1:0".into()),
+                peer_name: Some("worker".into()),
+                developmental: true,
+                ..Default::default()
+            },
+            env.clone(),
+            lookup(env),
+        )
+        .unwrap();
+        assert!(!prepared.detached_child);
+        let spec = prepared.bring_up();
+        assert_eq!(spec.project_root, project.path().canonicalize().unwrap());
+        assert_eq!(spec.socket, Some(scratch.path().join("s")));
+        assert_eq!(spec.snapshot.removed, ["DEBUG", "ORCH_TASK_ID"]);
+        assert_eq!(spec.snapshot.base, vars(&[("PATH", "/bin")]));
+        assert_eq!(spec.peer_name.as_deref(), Some("worker"));
+        assert_eq!(spec.listen.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(spec.dispatch, DispatchMode::Off);
+    }
+
+    #[test]
+    fn prepare_enforces_the_gates_from_the_given_environment() {
+        let project = project();
+        let options = || StartOptions {
+            project_root: project.path().to_path_buf(),
+            developmental: true,
+            ..Default::default()
+        };
+        let agent = vars(&[("ORCH_AGENT_ID", "agt_1")]);
+        assert!(matches!(
+            prepare(options(), agent.clone(), lookup(agent)),
+            Err(DaemonError::RefusedInAgentContext)
+        ));
+        assert!(matches!(
+            prepare(
+                StartOptions {
+                    developmental: false,
+                    ..options()
+                },
+                Vec::new(),
+                lookup(Vec::new())
+            ),
+            Err(DaemonError::DevelopmentalGateClosed)
+        ));
+        assert!(matches!(
+            prepare(
+                StartOptions {
+                    project_root: project.path().join("missing"),
+                    ..options()
+                },
+                Vec::new(),
+                lookup(Vec::new())
+            ),
+            Err(DaemonError::NotInitialized)
+        ));
     }
 
     #[test]
