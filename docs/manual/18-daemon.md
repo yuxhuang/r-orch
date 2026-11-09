@@ -259,6 +259,18 @@ killed), records their runs as cancelled and settles their tasks' retries, remov
   command exits 7 (see [Reply lost](#when-no-daemon-answers)). `orch daemon stop` never kills, restarts or
   retries anything; run `orch daemon status` to see whether the daemon is still there.
 
+**After a timeout the daemon can still own the project.** The timeout ends only the wait, not the daemon. A
+daemon that is finishing an operation it already accepted, for example a `git worktree add` that hangs while it
+prepares a task's workspace, keeps the project until that call returns, then exits by itself. Until then:
+
+- `orch daemon status` reports `No orch daemon is running for <root> (connection refused)` and exits 7: the daemon
+  no longer answers, although its process, socket file and `daemon.json` are still there. Status cannot tell you
+  that the daemon is still running; check the PID from the stop message with `ps -p <pid> -o command=`.
+- `orch daemon start` exits 4 with `orch daemon already running (PID <pid>)`.
+- Another `kill -TERM <pid>` does nothing; the shutdown is already under way.
+
+Wait for the operation to finish, or end it as [Recovery](#recovery) describes.
+
 ## Exit codes
 
 orch's exit codes, with the one this work adds:
@@ -403,8 +415,9 @@ executable path and start time of the one that runs.
 ## Recovery
 
 This table follows the spec's
-[normative recovery table](../specs/2026-11-09-daemon-owned-state.md#normative-recovery-table). No row lets a
-client start, restart or repair a daemon; every recovery is something you do.
+[normative recovery table](../specs/2026-11-09-daemon-owned-state.md#normative-recovery-table) and adds one
+case, an `orch daemon stop` that timed out. No row lets a client start, restart or repair a daemon; every recovery
+is something you do.
 
 | Situation | What you see | What to do | Applies |
 |---|---|---|---|
@@ -413,7 +426,8 @@ client start, restart or repair a daemon; every recovery is something you do.
 | A detached daemon after a reboot (logout is untested) | No daemon answers. | Start it again. orch supplies no launchd job, watchdog or restart. | now |
 | Recovery at start cannot save a task, run or agent change | The start exits 1 and names the write that failed; `orch daemon status` exits 7. | Fix the cause (permissions, disk space), then start again; the state needed to finish the recovery is kept. | now |
 | You upgraded orch and the old daemon still runs | Version skew message, exit 7. | `orch daemon stop` (either binary), then start the new one. Running agents are stopped and reconciled; this is not a transparent upgrade. | now |
-| The daemon hangs, or its socket was removed | Commands time out or report no daemon; status never claims liveness from files. | Read the PID in `daemon.json` as an untrusted hint. Only if `ps -p <pid> -o command=` shows an orch daemon for this project, send `kill -TERM <pid>`. If you cannot verify the process, do not signal it. | now |
+| The daemon hangs, or its socket was removed | Commands time out or report no daemon; status never claims liveness from files. | Read the PID in `daemon.json` as an untrusted hint. Only if `ps -p <pid> -o command=` shows an orch daemon for this project, send `kill -TERM <pid>`. If you cannot verify the process, do not signal it. If `orch daemon stop` already timed out, SIGTERM does nothing: see the next row. | now |
+| `orch daemon stop` timed out (exit 7) and `orch daemon start` says `already running (PID <pid>)` | The daemon is still finishing an operation it accepted, such as a hung `git worktree add`, and owns the project until it returns. `orch daemon status` reports no daemon (exit 7) and `kill -TERM` does nothing. | Wait: the daemon exits by itself when the call returns. To end it now, check that `ps -p <pid> -o command=` shows an orch daemon, list its child processes with `pgrep -P <pid>`, then `kill -KILL <pid>`. The children are not killed with it: a stuck `git worktree add` kept running under PID 1. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited, before you start the daemon again; the crash row above then applies. | now |
 | orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index of tasks, agents, runs, goals, teams, messages or context, but cannot detect a stale index that is still valid. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. | now |
 | Re-running `orch init` | It does not overwrite the project and prints how to start the daemon. It never starts one. | Start the daemon yourself. | now |
 | An agent loses the daemon mid-task | Exit 7 with the agent-context message. The outcome of a change whose reply was lost is unknown. | The agent stops and reports to you. Start the daemon, inspect the task, run and state, then decide on a retry. A restart does not resume the agent's conversation. | planned (PR 2) |
