@@ -24,8 +24,8 @@
 //! [`TestDaemon::start`] spawns a **foreground** `orch daemon start` in its
 //! own process group (dispatch stays OFF, the daemon default), waits for its
 //! `listening <socket>` line, and fails fast if the child exits first.
-//! [`TestDaemon::shutdown`] (also run by `Drop`) runs `orch daemon stop`,
-//! falls back to SIGKILL of the process group, and then takes a **process
+//! [`TestDaemon::shutdown`] (also run by `Drop`) sends SIGTERM (the daemon's
+//! documented clean exit), falls back to SIGKILL of the process group, and then takes a **process
 //! table** snapshot: nothing in the daemon's group and nothing whose command
 //! line names the socket directory may survive. A survivor is killed and the
 //! teardown panics (unless the test is already unwinding).
@@ -88,6 +88,13 @@ impl TestDaemon {
     /// developer's global config. The environment is otherwise cleared, with a
     /// `PATH` that holds no agent CLI (dispatch is OFF, so none is run).
     pub fn start(root: &Path, home: &Path) -> TestDaemon {
+        Self::start_with_env(root, home, &[])
+    }
+
+    /// [`start`](Self::start) with extra daemon environment, applied last (so
+    /// it may override `PATH`): for fixtures whose agents are fakes on a
+    /// private `PATH`, which a daemon-spawned agent will need to find.
+    pub fn start_with_env(root: &Path, home: &Path, extra: &[(&str, &Path)]) -> TestDaemon {
         let root = root.canonicalize().expect("project root exists");
         fs::create_dir_all(home).expect("fixture HOME");
         let home = home.canonicalize().expect("fixture HOME exists");
@@ -116,6 +123,7 @@ impl TestDaemon {
             .env("ORCH_SOCKET", &socket)
             .env("ORCH_TEST_SOCKET_ROOT", short.path())
             .env(GATE_ENV, "1")
+            .envs(extra.iter().copied())
             .args(["daemon", "start"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -230,10 +238,13 @@ impl TestDaemon {
             return;
         }
         self.done = true;
-        // Polite stop first. Its exit status is not the verdict: a daemon that
-        // already died (a test that crashed it on purpose) is a valid end state.
+        // Polite stop first: SIGTERM is the documented clean exit (the same
+        // path as `daemon stop`, without that command's ~1 s client poll, which
+        // would add minutes to fixtures that start hundreds of daemons). A
+        // daemon that already died (a test that crashed it on purpose) is a
+        // valid end state; the process-table check below is the verdict.
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.try_control(&["daemon", "stop"]);
+            let _ = nix::sys::signal::kill(Pid::from_raw(self.pgid), Signal::SIGTERM);
         }
         if !self.wait_exit(WAIT) {
             self.kill_group();
