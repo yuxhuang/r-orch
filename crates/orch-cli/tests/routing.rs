@@ -92,9 +92,8 @@ fn initialized_project() -> ProjectDir {
     project
 }
 
-/// Initialised, **no daemon**: for the cases that run a legacy in-process
-/// orchestrator (`run --all`, `serve`), which takes the PID lock a daemon
-/// holds, until S2a-cli turns those into daemon RPCs.
+/// Initialised, **no daemon**: `orch init` only. For the cases about what a
+/// client does when nobody answers (every other command is a daemon client).
 fn initialized_project_unowned() -> ProjectDir {
     let dir = empty_project();
     orch(dir.path())
@@ -436,21 +435,70 @@ fn run_with_no_selector_exits_two() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         stderr_of(&output),
-        "  ✕ Specify a task ID, --all, or --watch\n"
+        "  ✕ Specify a task ID, --all, --once, or --watch\n"
     );
 }
 
 #[test]
-fn serve_with_an_unknown_log_format_exits_two() {
+fn serve_once_with_an_unknown_log_format_exits_two() {
     let dir = initialized_project();
     let output = orch(dir.path())
-        .args(["serve", "--log-format", "yaml"])
+        .args(["serve", "--once", "--log-format", "yaml"])
         .output()
         .expect("run");
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         stderr_of(&output),
         "  ✕ Unknown --log-format \"yaml\". Valid: json, text\n"
+    );
+}
+
+/// S2a-cli decision 2: a foreground `serve` / `run --watch` *is* the daemon,
+/// so the legacy logging and interval flags have nothing to apply to. They
+/// are rejected before any socket is dialled (the project has no daemon, and
+/// the exit is the usage code 2, not the no-daemon code 7), never ignored.
+#[test]
+fn foreground_serve_and_watch_reject_the_legacy_flags_before_dialling_the_daemon() {
+    let dir = initialized_project_unowned();
+    for (argv, flag) in [
+        (vec!["serve", "--tick-interval", "250"], "--tick-interval"),
+        (vec!["serve", "--log-file", "x.log"], "--log-file"),
+        (vec!["serve", "--verbose"], "--verbose"),
+        (vec!["serve", "--log-format", "text"], "--log-format"),
+        (
+            vec!["run", "--watch", "--tick-interval", "250"],
+            "--tick-interval",
+        ),
+        (vec!["run", "--watch", "--verbose"], "--verbose"),
+    ] {
+        let output = orch(dir.path()).args(&argv).output().expect("run");
+        let stderr = stderr_of(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "orch {}: {stderr}",
+            argv.join(" ")
+        );
+        assert!(
+            stderr.contains(flag),
+            "orch {}: the rejection must name the flag: {stderr}",
+            argv.join(" ")
+        );
+    }
+}
+
+#[test]
+fn serve_once_keeps_its_logging_flags_and_reports_no_daemon_when_nobody_answers() {
+    let dir = initialized_project_unowned();
+    let output = orch(dir.path())
+        .args(["serve", "--once", "--log-format", "text", "--verbose"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(7), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("orch daemon start"),
+        "{}",
+        stderr_of(&output)
     );
 }
 
@@ -519,9 +567,8 @@ fn every_declared_command_is_wired() {
     // command any more, so the assertion is that no command *claims* to be
     // unwired. `orch tui` was the last one, and it needs a TTY, so it is
     // checked for the message rather than for success.
-    // `run --all` is a legacy in-process orchestrator: no daemon (see
-    // `initialized_project_unowned`).
-    let dir = initialized_project_unowned();
+    // `run --all` is a daemon RPC since S2a-cli.
+    let dir = initialized_project();
     for argv in [vec!["tui"], vec!["run", "--all"], vec!["org", "list"]] {
         let output = orch(dir.path()).args(&argv).output().expect("run");
         let stderr = stderr_of(&output);
@@ -559,6 +606,153 @@ fn status_reports_the_project_and_emits_claimed_as_an_array() {
         "claimed must be an array, got {}",
         report["state"]["claimed"]
     );
+}
+
+// ── S2a-cli contracts: caller identity and the dashboard's flags ────────────
+
+/// Add a shell agent and return its id.
+fn add_agent(dir: &Path, name: &str) -> String {
+    let output = orch(dir)
+        .args([
+            "--json",
+            "agent",
+            "add",
+            name,
+            "--adapter",
+            "shell",
+            "--command",
+            "true",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("pure JSON");
+    value["id"].as_str().expect("an agent id").to_owned()
+}
+
+/// Send `body` to `to` with the given extra root args/env and return the
+/// sender the daemon recorded, read back from the recipient's inbox.
+fn sender_of_a_message(
+    dir: &Path,
+    to: &str,
+    root_args: &[&str],
+    agent_env: Option<&str>,
+) -> String {
+    let mut send = orch(dir);
+    send.args(root_args).args(["msg", "send", to, "hello"]);
+    match agent_env {
+        Some(id) => send.env("ORCH_AGENT_ID", id),
+        None => send.env_remove("ORCH_AGENT_ID"),
+    };
+    let sent = send.output().expect("run");
+    assert_eq!(sent.status.code(), Some(0), "{}", stderr_of(&sent));
+    let inbox = orch(dir)
+        .args(["--json", "msg", "inbox", to])
+        .output()
+        .expect("run");
+    assert_eq!(inbox.status.code(), Some(0), "{}", stderr_of(&inbox));
+    let messages: serde_json::Value = serde_json::from_str(&stdout_of(&inbox)).expect("pure JSON");
+    messages
+        .as_array()
+        .and_then(|all| all.last())
+        .and_then(|message| message["from_agent_id"].as_str())
+        .expect("a delivered message")
+        .to_owned()
+}
+
+#[test]
+fn root_agent_flag_before_the_command_is_the_senders_identity() {
+    let dir = initialized_project();
+    let caller = add_agent(dir.path(), "caller");
+    let target = add_agent(dir.path(), "target");
+
+    let sender = sender_of_a_message(dir.path(), &target, &["--agent", &caller], None);
+
+    assert_eq!(sender, caller);
+}
+
+#[test]
+fn root_agent_flag_wins_over_orch_agent_id() {
+    let dir = initialized_project();
+    let flagged = add_agent(dir.path(), "flagged");
+    let from_env = add_agent(dir.path(), "from-env");
+    let target = add_agent(dir.path(), "target");
+
+    let sender = sender_of_a_message(dir.path(), &target, &["--agent", &flagged], Some(&from_env));
+
+    assert_eq!(sender, flagged);
+}
+
+#[test]
+fn orch_agent_id_is_the_identity_when_no_flag_is_given() {
+    let dir = initialized_project();
+    let from_env = add_agent(dir.path(), "from-env");
+    let target = add_agent(dir.path(), "target");
+
+    let sender = sender_of_a_message(dir.path(), &target, &[], Some(&from_env));
+
+    assert_eq!(sender, from_env);
+}
+
+#[test]
+fn without_any_identity_a_message_is_sent_by_cli() {
+    let dir = initialized_project();
+    let target = add_agent(dir.path(), "target");
+
+    let sender = sender_of_a_message(dir.path(), &target, &[], None);
+
+    assert_eq!(sender, "cli");
+}
+
+#[test]
+fn msg_list_agent_still_filters_instead_of_naming_the_caller() {
+    // `--agent` after the command is the local filter, not an identity.
+    let dir = initialized_project();
+    let one = add_agent(dir.path(), "one");
+    let two = add_agent(dir.path(), "two");
+    for to in [&one, &two] {
+        let sent = orch(dir.path())
+            .args(["msg", "send", to, "for-me"])
+            .output()
+            .expect("run");
+        assert_eq!(sent.status.code(), Some(0), "{}", stderr_of(&sent));
+    }
+
+    let output = orch(dir.path())
+        .args(["--json", "msg", "list", "--agent", &one])
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let listed: serde_json::Value = serde_json::from_str(&stdout_of(&output)).expect("pure JSON");
+    let recipients: Vec<&str> = listed
+        .as_array()
+        .expect("an array")
+        .iter()
+        .filter_map(|message| message["to_agent_id"].as_str())
+        .collect();
+    assert_eq!(recipients, [one.as_str()]);
+}
+
+#[test]
+fn tui_no_longer_accepts_the_owner_only_flags() {
+    // The dashboard is a client: it neither observes instead of owning, nor
+    // listens for peers, nor names a peer. Those moved to `orch daemon start`.
+    let dir = initialized_project();
+    for (argv, flag) in [
+        (vec!["tui", "--observe"], "--observe"),
+        (vec!["tui", "--listen", "127.0.0.1:0"], "--listen"),
+        (vec!["tui", "--peer-name", "x"], "--peer-name"),
+    ] {
+        let output = orch(dir.path()).args(&argv).output().expect("run");
+        assert_eq!(output.status.code(), Some(1), "orch {}", argv.join(" "));
+        assert_eq!(
+            stderr_of(&output),
+            format!("error: unknown option '{flag}'\n"),
+            "orch {}",
+            argv.join(" ")
+        );
+    }
 }
 
 #[test]

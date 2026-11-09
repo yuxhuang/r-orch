@@ -157,8 +157,8 @@ fn orch(dir: &Path, args: &[&str]) {
     );
 }
 
-/// A shell project (no default AI agent) with no tasks, so the orchestrator
-/// the dashboard starts has nothing to run.
+/// A shell project (no default AI agent) with no tasks, so the test daemon
+/// (dispatch off) has nothing to run.
 fn project() -> Project {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");

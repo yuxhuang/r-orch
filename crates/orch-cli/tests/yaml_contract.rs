@@ -367,6 +367,9 @@ fn project(with_run: bool) -> Project {
             .args(["init", "--name", "contract", "--adapter", "shell"]),
     );
     seed_commit(p.dir.path(), &root);
+    // Every command (including `run <id>`) is a daemon client: the explicit
+    // test daemon runs before the first seeding command.
+    p.start_daemon();
     let agent = |p: &Project, name: &str, role: &str| {
         id_of(&parse_json(&success(p.orch().args([
             "agent",
@@ -405,12 +408,6 @@ fn project(with_run: bool) -> Project {
         let runs = p.json(&["logs", "--task", &p.task.clone()]);
         p.run = Some(id_of(&runs[0]));
     }
-    // The daemon starts last. Until S2a-cli converts `orch run <id>`, that
-    // command is a legacy in-process orchestrator that takes the PID lock the
-    // daemon holds ("Orchestrator already running"), so the one seeding `run`
-    // above has to precede it. After the cutover `run <id>` is an RPC to the
-    // daemon: move `start_daemon()` to right after `init` and drop this note.
-    p.start_daemon();
     p
 }
 
