@@ -585,8 +585,17 @@ pub fn tmux_available() -> bool {
 pub struct TuiPane {
     name: String,
     dir: PathBuf,
+    /// The tmux client's `HOME`: a `tmux-` entry that `harness_free` skips, so
+    /// whatever the tmux binary caches there (Rosetta's AOT cache under
+    /// `$HOME/.cache/rosetta` for an emulated x86_64 tmux on an aarch64 host)
+    /// is not read as the orch client touching the socket directory.
+    home: PathBuf,
     exit_file: PathBuf,
 }
+
+/// Directory name, inside the socket directory, of the tmux client's `HOME`.
+/// Must start with `tmux-` (see `harness_free`).
+const TMUX_HOME: &str = "tmux-home";
 
 impl TuiPane {
     pub fn launch(scene: &Scene, args: &str, extra_env: &[(&str, &str)]) -> TuiPane {
@@ -643,9 +652,12 @@ impl TuiPane {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
+        let home = dir.join(TMUX_HOME);
+        fs::create_dir_all(&home).unwrap();
         let pane = TuiPane {
             name,
             dir,
+            home,
             exit_file,
         };
         pane.run(&[
@@ -674,7 +686,7 @@ impl TuiPane {
         cmd.env_clear()
             .env("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
             .env("TMUX_TMPDIR", &self.dir)
-            .env("HOME", &self.dir)
+            .env("HOME", &self.home)
             .env("SHELL", "/bin/sh")
             .args(["-u", "-L", &self.name, "-f", "/dev/null"]);
         cmd
