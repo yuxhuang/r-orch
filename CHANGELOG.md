@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-09
+
+Goal-pause scope and MCP diagnostics release. No peer-protocol change, so 0.5.x through 0.13.0 peers can be mixed.
+
 ### Changed
 - Pausing a goal (`orch goal status <id> paused`, the dashboard, or the MCP `goal_status` tool) now cancels only the assignee's waiting (`todo` or `retrying`) autonomous tasks linked to that goal. It used to cancel the assignee's waiting autonomous tasks in every goal, such as the checkpoints an `a-team` lead had queued for its other goals; those, and autonomous tasks linked to no goal, are now left alone. Resuming the goal still does not restore the tasks a pause cancelled, and a pause is not an atomic barrier: a listed task that starts before its cancel lands is cancelled anyway. To bring a cancelled checkpoint back and unblock what depends on it, run `orch task retry <id>` (MCP `task_retry`); see [the runbook](docs/RUNBOOK.md#a-resumed-goal-leaves-cancelled-tasks-cancelled).
 - `orch mcp`: `goal_status` with `status: "paused"` now works in the default mode, so a lead client that pauses its goals no longer needs `--allow-destructive`. `force: true` still needs it.
@@ -288,7 +292,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/yuxhuang/r-orch/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/yuxhuang/r-orch/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/yuxhuang/r-orch/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/yuxhuang/r-orch/compare/v0.10.2...v0.11.0
