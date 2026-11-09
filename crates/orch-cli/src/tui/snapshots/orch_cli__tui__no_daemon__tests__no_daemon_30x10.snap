@@ -1,0 +1,13 @@
+---
+source: crates/orch-cli/src/tui/no_daemon.rs
+expression: text(&rows)
+---
+
+  ✕ No orch daemon is running
+    for
+    /Users/me/projects/demo
+    (no socket)
+    Start it with: orch daemon
+    start
+
+  r retry · q quit

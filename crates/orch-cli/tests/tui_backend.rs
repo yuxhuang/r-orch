@@ -12,10 +12,7 @@ mod tui_support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use orch_cli::context::{CliContext, EnvFlags};
-use orch_cli::output::Styles;
 use orch_cli::tui::DaemonBackend;
-use tui_support::{TestDaemon, on_draw_thread};
 use orch_core::clock::epoch_ms_from_iso;
 use orch_core::storage::ConfigStore;
 use orch_domain::{
@@ -30,6 +27,7 @@ use orch_tui::backend::{
     AgentFields, AgentOpts, CreateTaskOpts, GoalFields, HistoryEntry, MessageTarget, TaskFields,
     TuiBackend,
 };
+use tui_support::{TestDaemon, on_draw_thread};
 
 /// Serializes the cases that touch a `global.yml`. Each project keeps its own
 /// (inside the project directory), so this only guards against a future case
@@ -71,7 +69,12 @@ async fn launch(daemon: Arc<TestDaemon>) -> DaemonBackend {
 }
 
 /// Poll the backend until `ready` holds for something it returned, or fail.
-async fn poll_until<T, F, P>(mut backend: DaemonBackend, what: &str, poll: F, ready: P) -> (DaemonBackend, Vec<T>)
+async fn poll_until<T, F, P>(
+    mut backend: DaemonBackend,
+    what: &str,
+    poll: F,
+    ready: P,
+) -> (DaemonBackend, Vec<T>)
 where
     T: Send + 'static,
     F: Fn(&mut DaemonBackend) -> Vec<T> + Send + Sync + Copy + 'static,
@@ -112,7 +115,10 @@ async fn launch_reports_the_project_context_and_leaves_dispatch_alone() {
         .await
         .expect("a second client");
     let status = probe.status().await.expect("daemon status");
-    assert!(!status.dispatch.dispatch_on, "the dashboard turned dispatch on");
+    assert!(
+        !status.dispatch.dispatch_on,
+        "the dashboard turned dispatch on"
+    );
 
     drop(backend);
     drop(temp);
@@ -726,9 +732,11 @@ async fn a_broadcast_fans_out_to_every_enabled_agent() {
 /// The CLI and the on-disk format must not change: the same body sent through
 /// the dashboard and through `orch msg send` has to produce the same record.
 ///
-/// This drives `commands::msg::send` rather than the `orch` binary on purpose
-/// — it is the code path that builds the CLI's `CreateMessageInput`, so this
-/// compares the two inputs where they differ, with no process to spawn.
+/// The CLI side is the real `orch msg send` binary, a daemon client like the
+/// dashboard, pointed at this test's in-process daemon through the socket
+/// environment a fixture gives it (`ORCH_SOCKET`, refused outside
+/// `ORCH_TEST_SOCKET_ROOT`). It is a client process only: nothing it does can
+/// start a daemon.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tui_sent_message_is_byte_identical_on_disk_to_a_cli_sent_one() {
     let (temp, engine) = project().await;
@@ -743,28 +751,30 @@ async fn a_tui_sent_message_is_byte_identical_on_disk_to_a_cli_sent_one() {
     })
     .await;
 
-    orch_cli::commands::msg::send(
-        &engine,
-        &CliContext::new(
-            temp.path().to_path_buf(),
-            None,
-            true,
-            true,
-            false,
-            EnvFlags::default(),
-        ),
-        &Styles::plain(),
-        orch_cli::commands::msg::MsgSendArgs {
-            to_agent_id: &one.id,
-            body: "same body, same record",
-            subject: None,
-            from: None,
-            ttl_ms: None,
-            reply_to: None,
-        },
-    )
-    .await
-    .expect("cli send");
+    let socket = engine.harness().socket().expect("bound socket");
+    let home = tempfile::tempdir().expect("home");
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_orch"))
+        .args(["msg", "send", one.id.as_str(), "same body, same record"])
+        .current_dir(temp.path())
+        .env_remove("ORCH_AGENT_ID")
+        .env_remove("ORCH_AGENT_NAME")
+        .env_remove("ORCH_TASK_ID")
+        .env("HOME", home.path())
+        .env("ORCH_PROJECT_ROOT", temp.path())
+        .env("ORCH_SOCKET", socket)
+        .env(
+            "ORCH_TEST_SOCKET_ROOT",
+            socket.parent().expect("socket dir"),
+        )
+        .output()
+        .await
+        .expect("run orch msg send");
+    assert!(
+        output.status.success(),
+        "orch msg send failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stored = engine.message_service.list_all().await.expect("list");
     assert_eq!(stored.len(), 2, "one from each path");
@@ -945,10 +955,8 @@ async fn the_settings_writes_persist_where_the_next_launch_will_read_them() {
 
     // An unrecognized preset is refused by the daemon now (it was stored as
     // given when the dashboard wrote the file itself), and nothing changes.
-    let (_backend, refused) = on_draw_thread(backend, |backend| {
-        backend.save_activity_filter("nonsense")
-    })
-    .await;
+    let (_backend, refused) =
+        on_draw_thread(backend, |backend| backend.save_activity_filter("nonsense")).await;
     let error = refused.expect_err("an unknown preset is refused");
     assert!(error.contains("unknown preset"), "{error}");
     assert_eq!(
@@ -1159,7 +1167,8 @@ async fn a_refused_run_comes_back_to_the_caller() {
     // The dashboard has no renderer for `orchestrator:error`, so a refusal
     // that is knowable before any agent starts must be this call's result
     // (BACKEND.md §3).
-    let (backend, refused) = on_draw_thread(backend, |backend| backend.run_task("tsk_missing")).await;
+    let (backend, refused) =
+        on_draw_thread(backend, |backend| backend.run_task("tsk_missing")).await;
     let error = refused.expect_err("a missing task cannot run");
     assert!(error.contains("tsk_missing"), "{error}");
     // An ordinary refusal does not end the session.
@@ -1210,7 +1219,14 @@ async fn a_cancel_from_the_dashboard_kills_the_live_agent_process() {
     ran.expect("run the task");
     let mut pid = None;
     for _ in 0..500 {
-        if let Some(entry) = engine.state.read().await.expect("state").running.get(&task.id) {
+        if let Some(entry) = engine
+            .state
+            .read()
+            .await
+            .expect("state")
+            .running
+            .get(&task.id)
+        {
             pid = Some(entry.pid);
             break;
         }
@@ -1220,14 +1236,20 @@ async fn a_cancel_from_the_dashboard_kills_the_live_agent_process() {
     assert!(engine.processes.is_alive(pid), "the agent is running");
 
     let id = task.id.clone();
-    let (_backend, cancelled) = on_draw_thread(backend, move |backend| backend.cancel_task(&id)).await;
+    let (_backend, cancelled) =
+        on_draw_thread(backend, move |backend| backend.cancel_task(&id)).await;
     cancelled.expect("cancel");
     assert!(
         !engine.processes.is_alive(pid),
         "cancel answered while the agent process was still alive"
     );
     assert_eq!(
-        engine.task_service.get(&task.id).await.expect("read").status,
+        engine
+            .task_service
+            .get(&task.id)
+            .await
+            .expect("read")
+            .status,
         TaskStatus::Cancelled
     );
     drop(temp);
@@ -1287,13 +1309,19 @@ async fn the_daemon_going_away_ends_the_session_with_the_frozen_message() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(stop.load(std::sync::atomic::Ordering::SeqCst), "the draw loop was not stopped");
+    assert!(
+        stop.load(std::sync::atomic::Ordering::SeqCst),
+        "the draw loop was not stopped"
+    );
     let message = loss.failure().expect("the loss is recorded");
     assert!(
         message.starts_with(&format!("  ✕ No orch daemon is running for {root} (")),
         "{message}"
     );
-    assert!(message.ends_with("Start it with: orch daemon start"), "{message}");
+    assert!(
+        message.ends_with("Start it with: orch daemon start"),
+        "{message}"
+    );
 
     // Every later call fails fast without touching a socket.
     let (_backend, later) = on_draw_thread(backend, |backend| backend.refresh_goals()).await;
@@ -1504,16 +1532,12 @@ async fn task_start_times() {
 
     let backend = launch(Arc::clone(&engine)).await;
     let (backend, near) = on_draw_thread(backend, |backend| {
-        backend
-            .refresh_timings(&[], &[], None, 0)
-            .expect("timings")
+        backend.refresh_timings(&[], &[], None, 0).expect("timings")
     })
     .await;
     clock.set_ms(TIMING_BASE + 9_000_000);
     let (_backend, far) = on_draw_thread(backend, |backend| {
-        backend
-            .refresh_timings(&[], &[], None, 0)
-            .expect("timings")
+        backend.refresh_timings(&[], &[], None, 0).expect("timings")
     })
     .await;
     assert_eq!(near.sampled_at_ms, TIMING_BASE + 9_000);
@@ -1707,5 +1731,167 @@ async fn refresh_timings_reports_an_unreadable_run_store() {
     let error = error.expect("an unreadable run store is an error");
     assert!(error.contains("broken.json"), "{error}");
 
+    drop(temp);
+}
+
+// ---------------------------------------------------------------------------
+// `orch web`'s daemon preflight (plan Q0b): the page and the websocket answer
+// 503 with the frozen text while no daemon answers. Served over a real TCP
+// listener exactly as `orch web` serves it; the pty command is never reached.
+// ---------------------------------------------------------------------------
+
+const WEB_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+async fn serve_web(
+    auth: orch_cli::web::Auth,
+    connector: orch_cli::tui::Connector,
+) -> std::net::SocketAddr {
+    use orch_cli::web::{HostPolicy, SpawnSpec, WebState, router};
+    let state = Arc::new(WebState::new(
+        &auth,
+        HostPolicy::new(true, Vec::new()),
+        SpawnSpec {
+            program: "/nonexistent/never-run".into(),
+            args: Vec::new(),
+            cwd: std::env::temp_dir(),
+        },
+        connector,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let service = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, service).await;
+    });
+    addr
+}
+
+/// One HTTP/1.1 GET; the whole raw response.
+async fn web_get(addr: std::net::SocketAddr, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.expect("read");
+    raw
+}
+
+fn status_line(raw: &str) -> &str {
+    raw.lines().next().unwrap_or_default()
+}
+
+fn body(raw: &str) -> &str {
+    raw.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_without_a_daemon_answers_503_with_the_frozen_message() {
+    let temp = project_tree().await;
+    let scratch = tui_support::short_scratch();
+    let root = temp.path().canonicalize().expect("root");
+    let addr = serve_web(
+        orch_cli::web::Auth::Token(WEB_TOKEN.into()),
+        tui_support::absent_daemon_web_connector(&root, scratch.path()),
+    )
+    .await;
+
+    let raw = web_get(addr, &format!("/?token={WEB_TOKEN}")).await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+    assert!(
+        raw.to_ascii_lowercase()
+            .contains("content-type: text/plain; charset=utf-8"),
+        "{raw}"
+    );
+    assert_eq!(
+        body(&raw),
+        format!(
+            "  ✕ No orch daemon is running for {} (no socket)\n    Start it with: orch daemon start\n",
+            root.display()
+        )
+    );
+    // The websocket route is behind the same preflight.
+    let raw = web_get(addr, &format!("/ws?token={WEB_TOKEN}")).await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+
+    // Without the credential the answer is the credential failure: the
+    // project path is never shown to a request that did not authenticate.
+    let raw = web_get(addr, "/?token=wrong").await;
+    assert_eq!(status_line(&raw), "HTTP/1.1 401 Unauthorized", "{raw}");
+    assert!(!raw.contains(&root.display().to_string()), "{raw}");
+    // The static assets carry no state and stay reachable.
+    let raw = web_get(addr, "/xterm.css").await;
+    assert_eq!(status_line(&raw), "HTTP/1.1 200 OK");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_web_server_answers_503_without_naming_the_project() {
+    let temp = project_tree().await;
+    let scratch = tui_support::short_scratch();
+    let root = temp.path().canonicalize().expect("root");
+    let addr = serve_web(
+        orch_cli::web::Auth::Open,
+        tui_support::absent_daemon_web_connector(&root, scratch.path()),
+    )
+    .await;
+    let raw = web_get(addr, "/").await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+    assert_eq!(body(&raw), "orch daemon unavailable\n");
+    assert!(!raw.contains(&root.display().to_string()), "{raw}");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_serves_the_page_while_the_daemon_answers_and_503_once_it_stops() {
+    let (temp, daemon) = project().await;
+    let addr = serve_web(
+        orch_cli::web::Auth::Token(WEB_TOKEN.into()),
+        daemon.web_connector(),
+    )
+    .await;
+    let raw = web_get(addr, &format!("/?token={WEB_TOKEN}")).await;
+    assert_eq!(status_line(&raw), "HTTP/1.1 200 OK", "{raw}");
+
+    let socket_dir = daemon
+        .harness()
+        .socket()
+        .and_then(std::path::Path::parent)
+        .expect("socket dir")
+        .to_path_buf();
+    let daemon = Arc::try_unwrap(daemon).unwrap_or_else(|_| panic!("one owner"));
+    daemon.shutdown().await;
+    // The harness removes its private socket directory on stop; a real
+    // project's socket directory outlives its daemon, so put it back (empty)
+    // to leave exactly "the daemon went away".
+    std::fs::create_dir_all(&socket_dir).expect("recreate the socket dir");
+    let raw = web_get(addr, &format!("/?token={WEB_TOKEN}")).await;
+    assert_eq!(
+        status_line(&raw),
+        "HTTP/1.1 503 Service Unavailable",
+        "{raw}"
+    );
+    let text = body(&raw);
+    assert!(text.contains("No orch daemon is running for"), "{text}");
+    assert!(
+        text.trim_end()
+            .ends_with("Start it with: orch daemon start"),
+        "{text}"
+    );
+    std::fs::remove_dir(&socket_dir).expect("remove the recreated socket dir");
     drop(temp);
 }

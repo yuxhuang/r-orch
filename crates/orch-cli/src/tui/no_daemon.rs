@@ -99,7 +99,10 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     current_width += leading.len().min(width);
     let mut first_word = true;
     for word in body.split(' ') {
-        let word_width: usize = grapheme_segments(word).iter().map(|g| display_width(g)).sum();
+        let word_width: usize = grapheme_segments(word)
+            .iter()
+            .map(|g| display_width(g))
+            .sum();
         let sep = usize::from(!first_word);
         if current_width + sep + word_width <= width {
             if !first_word {
@@ -246,7 +249,10 @@ mod tests {
         insta::assert_snapshot!("no_daemon_80x24", text(&rows));
         let headline = rows.iter().find(|(role, _)| *role == Role::Headline);
         assert!(headline.is_some_and(|(_, t)| t.starts_with("  ✕ No orch daemon")));
-        let footer = rows.iter().filter(|(role, _)| *role == Role::Footer).count();
+        let footer = rows
+            .iter()
+            .filter(|(role, _)| *role == Role::Footer)
+            .count();
         assert_eq!(footer, 1);
     }
 
@@ -255,10 +261,16 @@ mod tests {
         let rows = render(MESSAGE, FOOTER, 30, 10);
         insta::assert_snapshot!("no_daemon_30x10", text(&rows));
         for (_, row) in &rows {
-            let width: usize = grapheme_segments(row).iter().map(|g| display_width(g)).sum();
+            let width: usize = grapheme_segments(row)
+                .iter()
+                .map(|g| display_width(g))
+                .sum();
             assert!(width <= 30, "{row:?} is {width} cells");
         }
-        assert!(rows.iter().any(|(role, t)| *role == Role::Footer && t.contains("q quit")));
+        assert!(
+            rows.iter()
+                .any(|(role, t)| *role == Role::Footer && t.contains("q quit"))
+        );
     }
 
     #[test]
@@ -273,7 +285,10 @@ mod tests {
         let message = "  ✕ No orch daemon is running for /tmp/プロジェクト🧪-名前 (no socket)\n    Start it with: orch daemon start";
         let rows = render(message, FOOTER, 24, 12);
         for (_, row) in &rows {
-            let width: usize = grapheme_segments(row).iter().map(|g| display_width(g)).sum();
+            let width: usize = grapheme_segments(row)
+                .iter()
+                .map(|g| display_width(g))
+                .sum();
             assert!(width <= 24, "{row:?} is {width} cells");
         }
         let joined: String = rows.iter().map(|(_, r)| r.trim()).collect();
@@ -291,6 +306,10 @@ mod tests {
             Some(Choice::Quit)
         );
         assert_eq!(choice_for(key(KeyCode::Enter)), None);
-        assert_eq!(choice_for(key(KeyCode::Char('s'))), None, "nothing starts a daemon");
+        assert_eq!(
+            choice_for(key(KeyCode::Char('s'))),
+            None,
+            "nothing starts a daemon"
+        );
     }
 }

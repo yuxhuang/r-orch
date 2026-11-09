@@ -17,7 +17,6 @@ use std::sync::Arc;
 use orch_core::storage::ConfigStore;
 use orch_domain::{CreateAgentInput, CreateTaskInput, TaskStatus, WorkspaceMode, default_config};
 use orch_infra::storage::{FileConfigStore, Paths};
-use orch_tui::backend::TuiBackend;
 use orch_tui::clock::TestClock;
 use orch_tui::state::ViewId;
 use orch_tui::{App, views};
@@ -137,7 +136,6 @@ async fn the_dashboard_renders_what_the_engine_has_on_disk() {
     assert!(header.contains("9.9.9"), "{header}");
     assert!(tasks.contains("Port the collector"), "{tasks}");
     assert!(agents.contains("builder"), "{agents}");
-
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -168,7 +166,6 @@ async fn creating_a_task_through_the_dashboard_reaches_the_store() {
     // went back through the facade and saw the write — the dashboard is not
     // merely rendering its own optimistic copy.
     assert!(frame_after.contains("TODO 1"), "{frame_after}");
-
 }
 
 #[tokio::test(flavor = "multi_thread")]

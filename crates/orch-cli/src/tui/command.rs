@@ -63,7 +63,14 @@ pub async fn first_run(
 /// `orch tui`. `observe` is the removed `--observe`, refused here so the
 /// command line and this entry point agree whichever lands first.
 pub async fn run(cwd: PathBuf, version: &str, observe: bool) -> Result<ExitCode> {
-    run_with_peer(cwd, version, observe, orch_domain::PeerConfig::default(), false).await
+    run_with_peer(
+        cwd,
+        version,
+        observe,
+        orch_domain::PeerConfig::default(),
+        false,
+    )
+    .await
 }
 
 /// The entry point `orch tui [--listen]` routes to. `cwd` is where discovery
@@ -88,7 +95,17 @@ pub async fn run_with_peer(
             "--listen is a daemon start option: orch daemon start --listen <addr>",
         ));
     }
-    let config = ClientConfig::from_env(cwd.clone()).map_err(client_error)?;
+    run_as_agent(cwd, version, None).await
+}
+
+/// `orch [--agent <id>] tui`: the dashboard as the caller `agent` names (the
+/// root `--agent`, design R8), or as the environment's caller
+/// (`ORCH_AGENT_ID`) when it is `None`. The identity only rides on the
+/// handshake; nothing in this process's environment is changed.
+pub async fn run_as_agent(cwd: PathBuf, version: &str, agent: Option<&str>) -> Result<ExitCode> {
+    let config = ClientConfig::from_env(cwd.clone())
+        .and_then(|config| config.with_agent(agent))
+        .map_err(client_error)?;
     let connector = Connector::from_config(config, CallerKind::Tui);
     run_dashboard(connector, cwd, version).await
 }
@@ -104,36 +121,32 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
 
     let mut screen: Option<Screen> = None;
     loop {
-        let failure = match DaemonBackend::launch(
-            connector.clone(),
-            version,
-            cwd.clone(),
-            Arc::clone(&stop),
-        )
-        .await
-        {
-            Ok(backend) => {
-                // Leave the screen before the dashboard enters its own.
-                drop(screen.take());
-                let loss = backend.session_loss();
-                let outcome = run_draw_loop(backend, Arc::clone(&stop)).await?;
-                if signalled.load(Ordering::SeqCst) {
-                    return Ok(ExitCode::SUCCESS);
-                }
-                match loss.failure() {
-                    // The session went away under the dashboard.
-                    Some(rendered) => {
-                        stop.store(false, Ordering::SeqCst);
-                        rendered
+        let failure =
+            match DaemonBackend::launch(connector.clone(), version, cwd.clone(), Arc::clone(&stop))
+                .await
+            {
+                Ok(backend) => {
+                    // Leave the screen before the dashboard enters its own.
+                    drop(screen.take());
+                    let loss = backend.session_loss();
+                    let outcome = run_draw_loop(backend, Arc::clone(&stop)).await?;
+                    if signalled.load(Ordering::SeqCst) {
+                        return Ok(ExitCode::SUCCESS);
                     }
-                    None => return Ok(outcome),
+                    match loss.failure() {
+                        // The session went away under the dashboard.
+                        Some(rendered) => {
+                            stop.store(false, Ordering::SeqCst);
+                            rendered
+                        }
+                        None => return Ok(outcome),
+                    }
                 }
-            }
-            Err(error) => match fatal(&error) {
-                Some(exit) => return exit,
-                None => error.render(connector.agent_context()),
-            },
-        };
+                Err(error) => match fatal(&error) {
+                    Some(exit) => return exit,
+                    None => error.render(connector.agent_context()),
+                },
+            };
 
         if signalled.load(Ordering::SeqCst) {
             eprintln!("{failure}");
@@ -147,9 +160,8 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
         }
         let mut active = match screen.take() {
             Some(active) => active,
-            None => Screen::open().map_err(|err| {
-                Error::other(format!("cannot show the no-daemon screen: {err}"))
-            })?,
+            None => Screen::open()
+                .map_err(|err| Error::other(format!("cannot show the no-daemon screen: {err}")))?,
         };
         // The key wait blocks, so it runs on the blocking pool; the screen
         // (and the terminal mode it holds) comes back with the answer.
@@ -186,9 +198,9 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
 /// and exit at once, as every other client does.
 fn fatal(error: &ClientError) -> Option<Result<ExitCode>> {
     match error {
-        ClientError::Connection(NoDaemon::NotInitialized) => Some(Err(Error::Domain(
-            orch_domain::DomainError::NotInitialized,
-        ))),
+        ClientError::Connection(NoDaemon::NotInitialized) => {
+            Some(Err(Error::Domain(orch_domain::DomainError::NotInitialized)))
+        }
         ClientError::InvalidArguments(message) => {
             Some(Err(Error::invalid_arguments(message.clone())))
         }
@@ -293,7 +305,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(observe.to_string().contains("--observe was removed"), "{observe}");
+        assert!(
+            observe.to_string().contains("--observe was removed"),
+            "{observe}"
+        );
 
         let listen = run_with_peer(
             PathBuf::from("/unused"),
@@ -307,6 +322,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(listen.to_string().contains("orch daemon start --listen"), "{listen}");
+        assert!(
+            listen.to_string().contains("orch daemon start --listen"),
+            "{listen}"
+        );
     }
 }

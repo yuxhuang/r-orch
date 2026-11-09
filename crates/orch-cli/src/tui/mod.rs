@@ -41,5 +41,5 @@ pub mod connect;
 pub mod no_daemon;
 
 pub use backend::DaemonBackend;
-pub use command::{first_run, run, run_dashboard, run_with_peer};
+pub use command::{first_run, run, run_as_agent, run_dashboard, run_with_peer};
 pub use connect::Connector;

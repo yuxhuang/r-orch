@@ -329,9 +329,8 @@ impl DaemonBackend {
         let handle = self.handle.clone();
         let client = &mut self.client;
         let root = client.project().root.clone();
-        let outcome = handle.block_on(async {
-            tokio::time::timeout(limit, client.request(args)).await
-        });
+        let outcome =
+            handle.block_on(async { tokio::time::timeout(limit, client.request(args)).await });
         match outcome {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(self.fail(error)),
@@ -472,7 +471,9 @@ impl DaemonBackend {
         self.tasks.push(task);
         let handle = self.handle.clone();
         let root = self.connector.project_root().to_path_buf();
-        match handle.block_on(async { tokio::time::timeout(LAUNCH_CONFIRM_TIMEOUT, confirmed).await }) {
+        match handle
+            .block_on(async { tokio::time::timeout(LAUNCH_CONFIRM_TIMEOUT, confirmed).await })
+        {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(error))) => Err(self.fail(error)),
             // The observer ended without a word: treat as unknown.
@@ -533,9 +534,7 @@ async fn observe_launch(
     let call = match request {
         LaunchRequest::Task(task_id) => {
             drain_launch(
-                client
-                    .start(args::DispatchRunTaskArgs { task_id })
-                    .await?,
+                client.start(args::DispatchRunTaskArgs { task_id }).await?,
                 confirm,
             )
             .await
@@ -779,7 +778,10 @@ impl TuiBackend for DaemonBackend {
         let attachments = opts.attachments.map(|a| self.wire_paths(a)).transpose()?;
         self.request(args::TaskCreateArgs {
             title: bounded(title, "title")?,
-            description: opts.description.map(|d| bounded(d, "description")).transpose()?,
+            description: opts
+                .description
+                .map(|d| bounded(d, "description"))
+                .transpose()?,
             priority: opts.priority,
             assignee: None,
             labels: None,
@@ -888,7 +890,9 @@ impl TuiBackend for DaemonBackend {
         let authored = self.request(args::AgentCreateArgs {
             name: bounded(name, "name")?,
             adapter: id_of(&adapter)?,
-            role: non_empty(opts.role).map(|r| bounded(r, "role")).transpose()?,
+            role: non_empty(opts.role)
+                .map(|r| bounded(r, "role"))
+                .transpose()?,
             command: non_empty(opts.command)
                 .map(|c| bounded(c, "command"))
                 .transpose()?,

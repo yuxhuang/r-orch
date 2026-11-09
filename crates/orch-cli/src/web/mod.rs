@@ -135,9 +135,11 @@ impl WebArgs {
     /// an empty `ORCH_WEB_PASSWORD` cannot silently change the mode.
     pub fn parse(options: WebOptions<'_>) -> std::result::Result<Self, String> {
         if options.observe {
-            return Err("orch web --observe was removed: every dashboard is a client of the \
+            return Err(
+                "orch web --observe was removed: every dashboard is a client of the \
                         project's daemon"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let bind: SocketAddr = options.bind.parse().map_err(|_| {
             format!(
@@ -402,6 +404,20 @@ impl WebState {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+}
+
+/// The command line of a session's `orch tui`: the root `--agent` goes before
+/// the command, as on the user's own command line. `agent` was validated by
+/// [`orch_client::ClientConfig::with_agent`] (a bounded id), and is passed as
+/// one argv element, never through a shell.
+fn tui_child_args(agent: Option<&str>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(agent) = agent {
+        args.push("--agent".into());
+        args.push(agent.into());
+    }
+    args.push("tui".into());
+    args
 }
 
 /// Why the daemon check failed.
@@ -865,20 +881,30 @@ async fn shutdown_signal() {
 /// Preflights the project's daemon first: with none answering it prints the
 /// frozen message and exits 7 without listening (plan Q0b).
 pub async fn run(args: WebArgs, cwd: PathBuf) -> Result<ExitCode> {
+    run_as_agent(args, cwd, None).await
+}
+
+/// `orch [--agent <id>] web`: [`run`] as the caller `agent` names (the root
+/// `--agent`, design R8). The preflight runs as that caller, and every
+/// session's `orch tui` gets the same `--agent` on its command line; nothing
+/// in this process's environment is changed.
+pub async fn run_as_agent(args: WebArgs, cwd: PathBuf, agent: Option<&str>) -> Result<ExitCode> {
     let program = std::env::current_exe()
         .map_err(|err| Error::io("locate the orch executable", &cwd, err))?;
     let config = orch_client::ClientConfig::from_env(cwd.clone())
+        .and_then(|config| config.with_agent(agent))
         .map_err(|err| Error::invalid_arguments(err.to_string()))?;
     let daemon = crate::tui::Connector::from_config(config, CallerKind::Web);
     // Every session's `orch tui` inherits this environment, so it reaches the
     // same daemon (ORCH_SOCKET / ORCH_PROJECT_ROOT) as the same caller
-    // (ORCH_AGENT_ID), exactly as before.
+    // (ORCH_AGENT_ID, or the `--agent` passed on), exactly as before.
+    let child_args = tui_child_args(agent);
     let state = Arc::new(WebState::new(
         &args.auth,
         HostPolicy::new(args.bind.ip().is_loopback(), args.allow_hosts.clone()),
         SpawnSpec {
             program,
-            args: vec!["tui".into()],
+            args: child_args,
             cwd: cwd.clone(),
         },
         daemon,
@@ -957,6 +983,17 @@ mod tests {
             bind,
             ..WebOptions::default()
         }
+    }
+
+    #[test]
+    fn a_session_tui_carries_the_root_agent_before_the_command() {
+        assert_eq!(tui_child_args(None), vec![std::ffi::OsString::from("tui")]);
+        assert_eq!(
+            tui_child_args(Some("agt_x")),
+            ["--agent", "agt_x", "tui"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
     }
 
     #[test]

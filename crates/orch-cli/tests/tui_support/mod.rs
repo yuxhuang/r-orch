@@ -12,7 +12,7 @@
 #![allow(dead_code, reason = "each test crate uses a subset of this module")]
 
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -68,6 +68,11 @@ impl TestDaemon {
         Connector::from_config(self.config.clone(), CallerKind::Tui)
     }
 
+    /// The connector `orch web`'s preflight uses for this daemon.
+    pub fn web_connector(&self) -> Connector {
+        Connector::from_config(self.config.clone(), CallerKind::Web)
+    }
+
     /// The client config a frontend would build for this project.
     pub fn client_config(&self) -> ClientConfig {
         self.config.clone()
@@ -114,22 +119,30 @@ pub fn client_config(harness: &DaemonHarness) -> ClientConfig {
 /// A connector for a project that has **no** daemon: the real dial path
 /// against a socket path nothing listens on.
 pub fn absent_daemon_connector(root: &Path, scratch: &Path) -> Connector {
-    let socket: PathBuf = scratch.join("s");
+    absent_daemon_connector_as(root, scratch, CallerKind::Tui)
+}
+
+/// [`absent_daemon_connector`] as `orch web`'s preflight opens it.
+pub fn absent_daemon_web_connector(root: &Path, scratch: &Path) -> Connector {
+    absent_daemon_connector_as(root, scratch, CallerKind::Web)
+}
+
+fn absent_daemon_connector_as(root: &Path, scratch: &Path, kind: CallerKind) -> Connector {
     Connector::from_config(
         ClientConfig {
             cwd: root.to_path_buf(),
             project_root: Some(root.to_path_buf()),
             test_socket_root: Some(scratch.to_path_buf()),
-            socket: Some(socket),
+            socket: Some(scratch.join("s")),
             caller: Caller {
-                kind: CallerKind::Tui,
+                kind,
                 agent_id: None,
                 pid: None,
             },
             mode: SessionMode::Normal,
             agent_context: false,
         },
-        CallerKind::Tui,
+        kind,
     )
 }
 
