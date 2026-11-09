@@ -174,7 +174,17 @@ impl Sandbox {
 /// An `orch` command with an explicit, cleared environment aimed at `socket`
 /// and confined to `test_root`. `root` also receives `HOME`.
 pub fn orch_command(root: &Path, socket: &Path, test_root: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_orch"));
+    orch_command_with(
+        Path::new(env!("CARGO_BIN_EXE_orch")),
+        root,
+        socket,
+        test_root,
+    )
+}
+
+/// [`orch_command`] for another `orch` executable (the two-binary skew test).
+pub fn orch_command_with(exe: &Path, root: &Path, socket: &Path, test_root: &Path) -> Command {
+    let mut cmd = Command::new(exe);
     cmd.env_clear()
         .current_dir(root)
         .env("HOME", root.join("home"))
