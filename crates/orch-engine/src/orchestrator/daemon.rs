@@ -273,6 +273,15 @@ impl Orchestrator {
                 {
                     return Ok(None);
                 }
+                // Its last attempt already failed before spawn; only the
+                // record is missing. Finish that instead of probing again.
+                if super::dispatch::final_failure_unrecorded(&task) {
+                    if self.finish_unrecorded_final_failure(state, task_id).await {
+                        self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+                        self.save_state(state).await?;
+                    }
+                    return Ok(None);
+                }
                 let agents = self.dispatch_agent_directory().await?;
                 let preparing = self.inner.preparing_agents.lock().await;
                 let at_capacity = state
@@ -917,9 +926,10 @@ impl Orchestrator {
                     .record_workspace_dispatch_failure(state, task_id, None, error)
                     .await
                 {
-                    // The task is saved `retrying`, but its back-off exists
-                    // only here until the save below. If the release or that
-                    // save fails, the next `load_state` must write this state
+                    // The task is saved `retrying` (on a final attempt: with
+                    // its record pending), but its back-off exists only here
+                    // until the save below. If the release or that save
+                    // fails, the next `load_state` must write this state
                     // rather than replace it, or the retry runs with no wait.
                     self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
                 }

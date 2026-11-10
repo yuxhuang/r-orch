@@ -22,6 +22,7 @@ mod mutex;
 mod parallel_race;
 mod pause_prelaunch;
 mod perf_opts;
+mod prelaunch_final_list_error;
 mod prelaunch_record_errors;
 mod resilience;
 mod retry_backoff;
