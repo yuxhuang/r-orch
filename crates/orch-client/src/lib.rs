@@ -242,20 +242,24 @@ impl Client {
                 handshake::MAX_HANDSHAKE_BYTES,
             )
             .await
-            .map_err(|_| {
-                project.failure(if intent == Intent::Stop {
-                    NoDaemonDetail::RequestOutcomeUnknown
-                } else {
-                    NoDaemonDetail::HandshakeFailed
-                })
-            })?;
-            read_reply(&mut io, &project, pid).await.map_err(|error| {
+            .map_err(|_| -> ClientError {
                 if intent == Intent::Stop {
-                    unknown_outcome(error, &project, NoDaemonDetail::RequestOutcomeUnknown)
+                    project
+                        .failure(NoDaemonDetail::RequestOutcomeUnknown)
+                        .into()
                 } else {
-                    error
+                    closed_before_reply(&project, pid)
                 }
-            })
+            })?;
+            read_reply(&mut io, &project, pid, intent)
+                .await
+                .map_err(|error| {
+                    if intent == Intent::Stop {
+                        unknown_outcome(error, &project, NoDaemonDetail::RequestOutcomeUnknown)
+                    } else {
+                        error
+                    }
+                })
         })
         .await
         .map_err(|_| {
@@ -354,13 +358,13 @@ pub async fn stop(config: &ClientConfig) -> Result<results::StopOutcome, ClientE
     // One deadline covers both the terminal frame and release of ownership.
     let deadline = tokio::time::Instant::now() + handshake::STOP_COMPLETION_TIMEOUT;
     let owner_pid = client.welcome.pid;
-    let completed =
-        tokio::time::timeout_at(deadline, read_reply(&mut client.io, &client.project, pid))
-            .await
-            .map_err(|_| stop_timeout(&client.project, owner_pid))?
-            .map_err(|error| {
-                unknown_outcome(error, &client.project, NoDaemonDetail::StopOutcomeUnknown)
-            })?;
+    let completed = tokio::time::timeout_at(
+        deadline,
+        read_reply(&mut client.io, &client.project, pid, Intent::Stop),
+    )
+    .await
+    .map_err(|_| stop_timeout(&client.project, owner_pid))?
+    .map_err(|error| unknown_outcome(error, &client.project, NoDaemonDetail::StopOutcomeUnknown))?;
     if completed.instance != client.welcome.instance
         || completed.pid != owner_pid
         || completed.stop_state != Some(StopState::Completed)
@@ -462,25 +466,52 @@ fn authenticate_peer(
     project: &Project,
     expected_uid: u32,
 ) -> Result<Option<u32>, ClientError> {
-    let cred = stream
-        .peer_cred()
-        .map_err(|_| project.failure(NoDaemonDetail::PermissionDenied))?;
+    check_peer(stream.peer_cred(), project, expected_uid)
+}
+
+fn check_peer(
+    cred: std::io::Result<tokio::net::unix::UCred>,
+    project: &Project,
+    expected_uid: u32,
+) -> Result<Option<u32>, ClientError> {
+    // macOS answers LOCAL_PEEREPID with ENOTCONN once the accepted peer has
+    // closed. Nothing has been sent, and absence is already ruled out.
+    let cred = cred.map_err(|_| closed_before_reply(project, None))?;
     if cred.uid() != expected_uid {
         return Err(project.failure(NoDaemonDetail::PermissionDenied).into());
     }
     Ok(cred.pid().and_then(|p| u32::try_from(p).ok()))
 }
 
+/// `connect` succeeded, so a listener was alive: a peer that closes before any
+/// handshake reply is capacity, never absence. The daemon drops connections
+/// beyond its pre-handshake budget without replying (SE-6), so the session
+/// count is unknown here.
+fn closed_before_reply(project: &Project, pid: Option<u32>) -> ClientError {
+    NoDaemon::Busy {
+        project_root: orch_proto::path::escape_controls(&project.root.to_string_lossy()),
+        pid,
+        sessions: 0,
+        cap: 0,
+    }
+    .into()
+}
+
 async fn read_reply(
     io: &mut Reader,
     project: &Project,
     pid: Option<u32>,
+    intent: Intent,
 ) -> Result<Welcome, ClientError> {
-    let reply: HandshakeReply = io
-        .read(handshake::MAX_HANDSHAKE_BYTES)
-        .await
-        .map_err(|_| project.failure(NoDaemonDetail::HandshakeFailed))?
-        .ok_or_else(|| project.failure(NoDaemonDetail::HandshakeFailed))?;
+    let reply: HandshakeReply = match io.read(handshake::MAX_HANDSHAKE_BYTES).await {
+        Ok(Some(reply)) => reply,
+        // A stop hello may already have been acted on; its callers classify
+        // this as an unknown outcome instead.
+        Ok(None) | Err(ndjson::CodecError::Io(_)) if intent == Intent::Session => {
+            return Err(closed_before_reply(project, pid));
+        }
+        Ok(None) | Err(_) => return Err(project.failure(NoDaemonDetail::HandshakeFailed).into()),
+    };
     match reply.into_reply() {
         Some(Reply::Welcome(welcome)) => {
             if welcome.project_id != project.id {
@@ -539,6 +570,24 @@ mod tests {
             server.try_read(&mut byte).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn lost_peer_credential_after_connect_is_busy_not_absence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+        let project = Project::discover(root.path(), None).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        let lost = std::io::Error::from(std::io::ErrorKind::NotConnected);
+        let error = check_peer(Err(lost), &project, uid).unwrap_err();
+        assert_eq!(error.exit_code(), 7);
+        for agent_context in [false, true] {
+            let text = error.render(agent_context);
+            assert!(text.contains("daemon_busy"), "{text}");
+            assert!(text.contains("PID unavailable"), "{text}");
+            assert!(!text.contains("No orch daemon is running"), "{text}");
+            assert!(!text.contains("permission denied"), "{text}");
+        }
     }
 }
 
