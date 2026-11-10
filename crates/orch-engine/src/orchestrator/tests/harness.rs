@@ -140,6 +140,11 @@ pub(crate) struct HarnessBuilder {
         reason = "test-only store wrappers; each signature is spelled out where it is used"
     )]
     wrap_agents: Option<Box<dyn FnOnce(Arc<FakeAgentStore>) -> Arc<dyn AgentStore>>>,
+    #[allow(
+        clippy::type_complexity,
+        reason = "test-only store wrappers; each signature is spelled out where it is used"
+    )]
+    wrap_runs: Option<Box<dyn FnOnce(Arc<FakeRunStore>) -> Arc<dyn RunStore>>>,
 }
 
 impl Default for HarnessBuilder {
@@ -169,6 +174,7 @@ impl HarnessBuilder {
             adapter_impl: None,
             wrap_tasks: None,
             wrap_agents: None,
+            wrap_runs: None,
         }
     }
 
@@ -189,6 +195,15 @@ impl HarnessBuilder {
         wrap: impl FnOnce(Arc<FakeAgentStore>) -> Arc<dyn AgentStore> + 'static,
     ) -> Self {
         self.wrap_agents = Some(Box::new(wrap));
+        self
+    }
+
+    /// The same, for the run store.
+    pub(crate) fn wrap_run_store(
+        mut self,
+        wrap: impl FnOnce(Arc<FakeRunStore>) -> Arc<dyn RunStore> + 'static,
+    ) -> Self {
+        self.wrap_runs = Some(Box::new(wrap));
         self
     }
 
@@ -302,6 +317,10 @@ impl HarnessBuilder {
             Some(wrap) => wrap(Arc::clone(&agents)),
             None => Arc::clone(&agents) as Arc<dyn AgentStore>,
         };
+        let run_store: Arc<dyn RunStore> = match self.wrap_runs {
+            Some(wrap) => wrap(Arc::clone(&runs)),
+            None => Arc::clone(&runs) as Arc<dyn RunStore>,
+        };
 
         let mut registry = AdapterRegistry::new();
         match self.adapter_impl {
@@ -337,7 +356,7 @@ impl HarnessBuilder {
             Arc::clone(&ids),
         ));
         let run_service = Arc::new(RunService::new(
-            Arc::clone(&runs) as Arc<dyn RunStore>,
+            Arc::clone(&run_store),
             Arc::clone(&bus),
             Arc::clone(&clock) as Arc<dyn Clock>,
             Arc::clone(&ids),
@@ -362,7 +381,7 @@ impl HarnessBuilder {
         let deps = OrchestratorDeps {
             task_store: Arc::clone(&task_store),
             agent_store: Arc::clone(&agent_store),
-            run_store: Arc::clone(&runs) as Arc<dyn RunStore>,
+            run_store,
             state_store: Arc::clone(&state) as Arc<dyn StateStore>,
             adapters: Arc::new(registry),
             workspace: Arc::clone(&workspace) as Arc<dyn orch_core::workspace::WorkspaceManager>,

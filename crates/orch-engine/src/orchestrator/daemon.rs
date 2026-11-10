@@ -913,8 +913,16 @@ impl Orchestrator {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                self.record_workspace_dispatch_failure(state, task_id, None, error)
-                    .await;
+                if self
+                    .record_workspace_dispatch_failure(state, task_id, None, error)
+                    .await
+                {
+                    // The task is saved `retrying`, but its back-off exists
+                    // only here until the save below. If the release or that
+                    // save fails, the next `load_state` must write this state
+                    // rather than replace it, or the retry runs with no wait.
+                    self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+                }
                 self.release_preparation_locked(state, task_id).await?;
                 self.save_state(state).await
             })
