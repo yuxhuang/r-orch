@@ -17,6 +17,7 @@ mod worker;
 use orch_core::error::{Error, Result};
 use orch_core::storage::MessageStore;
 use orch_domain::{Agent, Message, MessageChannel, MessageStatus};
+use orch_engine::container::commit::{CommitSource, CommitStore};
 use orch_engine::{EventBus, FullEngine};
 use orch_infra::storage::remote::{
     FileRemoteStore, default_peer_name, public_snapshot, validate_snapshot,
@@ -67,7 +68,7 @@ async fn expire_messages(messages: Arc<dyn MessageStore>, events: Arc<EventBus>,
         // commit sequence, instead of rewriting the store under one of them.
         let purged = events
             .operation_boundary()
-            .run(true, messages.purge_expired())
+            .run_from(CommitSource::Expiry, true, messages.purge_expired())
             .await
             .value;
         if let Err(error) = purged {
@@ -141,10 +142,17 @@ impl Context {
     /// phase reached from an operation that already holds the permit (the
     /// worker's [`handle_ordered`](worker::Worker)) reuses it.
     pub(crate) async fn ordered<T>(&self, mutation: bool, phase: impl Future<Output = T>) -> T {
-        self.engine
-            .events
-            .operation_boundary()
-            .run(mutation, phase)
+        let boundary = self.engine.events.operation_boundary();
+        let phase = Box::pin(phase);
+        boundary
+            .run_from(CommitSource::Peer, mutation, async {
+                // Peer phases also write concrete remote stores that bypass
+                // the engine adapters. Declare them before any possible write.
+                if mutation {
+                    boundary.note_store(CommitStore::Remote);
+                }
+                phase.await
+            })
             .await
             .value
     }
@@ -349,7 +357,8 @@ impl PeerRuntime {
         // ordered phase (design D2); binding and linking happen after it.
         let boundary = engine.events.operation_boundary();
         let (instance_id, name) = boundary
-            .run(true, async {
+            .run_from(CommitSource::Peer, true, async {
+                boundary.note_store(CommitStore::Remote);
                 Self::reset_published_state(&engine, &store).await?;
                 let name = engine
                     .config
@@ -420,10 +429,12 @@ impl PeerRuntime {
             }
         }
         self.tasks.clear();
-        self.engine
-            .events
-            .operation_boundary()
-            .run(true, async { clear_listener_status(&self.listener_status) })
+        let boundary = self.engine.events.operation_boundary();
+        boundary
+            .run_from(CommitSource::Peer, true, async {
+                boundary.note_store(CommitStore::Remote);
+                clear_listener_status(&self.listener_status);
+            })
             .await;
     }
 
@@ -480,9 +491,12 @@ impl PeerRuntime {
                 if let Err(error) = worker.listen(listener).await {
                     tracing::error!(%error, "Peer listener stopped");
                 }
-                events
-                    .operation_boundary()
-                    .run(true, async { clear_listener_status(&status) })
+                let boundary = events.operation_boundary();
+                boundary
+                    .run_from(CommitSource::Peer, true, async {
+                        boundary.note_store(CommitStore::Remote);
+                        clear_listener_status(&status);
+                    })
                     .await;
             })));
         }
@@ -640,6 +654,102 @@ mod tests {
         assert!(tokio::net::TcpStream::connect(addr).await.is_err());
     }
 
+    async fn metadata_context() -> (tempfile::TempDir, Context) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let engine = Arc::new(
+            orch_engine::build_full_with(
+                temp.path(),
+                orch_engine::EngineSeams {
+                    global_config_path: Some(temp.path().join("global.yml")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let ctx = Context {
+            stop: Shutdown::default(),
+            store: FileRemoteStore::new(engine.paths.clone()),
+            instance_id: "instance_test".into(),
+            name: "test".into(),
+            engine,
+        };
+        (temp, ctx)
+    }
+
+    fn capture_commits(
+        events: &EventBus,
+    ) -> Arc<std::sync::Mutex<Vec<orch_engine::container::commit::CommitRecord>>> {
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = records.clone();
+        events
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |p| {
+                if let orch_engine::container::commit::Publication::Commit(record) = p {
+                    sink.lock().unwrap().push(record.clone());
+                }
+            })));
+        records
+    }
+
+    #[tokio::test]
+    async fn peer_phase_records_source_and_remote_before_a_failed_write_phase() {
+        use orch_engine::container::commit::{CommitChange, CommitSource, CommitStore};
+        let (_temp, ctx) = metadata_context().await;
+        let records = capture_commits(&ctx.engine.events);
+        let status = orch_domain::InboundStatus {
+            controller_name: "controller".into(),
+            instance_id: "instance_controller".into(),
+            connected_since: ctx.engine.clock.now_iso(),
+            agents: vec![],
+            controller_version: None,
+        };
+        let result: Result<()> = ctx
+            .ordered(true, async {
+                ctx.store.write_inbound(&status).await?;
+                Err(Error::other("injected error after remote persistence"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(ctx.store.read_inbound().await.unwrap().is_some());
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, CommitSource::Peer);
+        assert!(!records[0].store_set_uncertain);
+        assert_eq!(
+            records[0].changes,
+            vec![CommitChange::store_wide(CommitStore::Remote)]
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_read_only_phase_produces_no_commit_and_nested_peer_reuses_tick() {
+        use orch_engine::container::commit::{CommitSource, CommitStore};
+        let (_temp, ctx) = metadata_context().await;
+        let records = capture_commits(&ctx.engine.events);
+        let boundary = ctx.engine.events.operation_boundary();
+        let before = boundary.current_commit_seq();
+        ctx.ordered(false, ctx.engine.agents.list()).await.unwrap();
+        assert!(records.lock().unwrap().is_empty());
+        assert_eq!(boundary.current_commit_seq(), before);
+        boundary
+            .run_from(CommitSource::Tick, true, async {
+                ctx.ordered(true, async {}).await;
+            })
+            .await;
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1, "nested peer phase is not a second commit");
+        assert_eq!(records[0].source, CommitSource::Tick);
+        assert!(
+            records[0]
+                .changes
+                .iter()
+                .any(|c| c.store == CommitStore::Remote),
+            "nested remote mutation must be declared"
+        );
+    }
+
     #[derive(Default)]
     struct ExpiryStore(AtomicUsize);
 
@@ -727,6 +837,7 @@ mod tests {
             })
         };
         entered.notified().await;
+        let records = capture_commits(&events);
         let seq = boundary.current_commit_seq();
         let cleanup = AbortOnDrop(tokio::spawn(expire_messages(
             store.clone(),
@@ -749,6 +860,10 @@ mod tests {
         }
         assert_eq!(store.0.load(Ordering::SeqCst), 2);
         assert_eq!(boundary.current_commit_seq(), seq + 1);
+        assert_eq!(
+            records.lock().unwrap()[0].source,
+            orch_engine::container::commit::CommitSource::Expiry
+        );
         drop(cleanup);
     }
 }

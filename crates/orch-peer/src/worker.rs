@@ -930,12 +930,8 @@ impl Worker {
             return self.handle(controller, name, frame).await;
         }
         self.ctx
-            .engine
-            .events
-            .operation_boundary()
-            .run(true, self.handle(controller, name, frame))
+            .ordered(true, Box::pin(self.handle(controller, name, frame)))
             .await
-            .value
     }
 
     async fn handle(&self, controller: &str, name: &str, frame: Frame) -> Result<Vec<Frame>> {
@@ -1305,10 +1301,7 @@ impl Worker {
         // here survives the status change, and a failure below still leaves
         // the explanation behind.
         self.ctx
-            .engine
-            .events
-            .operation_boundary()
-            .run(true, async {
+            .ordered(true, async {
                 let mut fresh = self
                     .ctx
                     .engine
@@ -1319,8 +1312,7 @@ impl Worker {
                 fresh.feedback = Some(reason);
                 self.ctx.engine.tasks.save(&fresh).await
             })
-            .await
-            .value?;
+            .await?;
         self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
         // `cancel_task` reports success even when its final status write
         // failed, because a refused transition usually means the task was
