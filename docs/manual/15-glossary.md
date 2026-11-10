@@ -178,7 +178,7 @@ Another machine running orch that your installation connects to. Also called a r
 
 **poll interval**
 The longest pause between the orchestrator's checks of the project (`scheduling.poll_interval_ms`, 10 seconds by
-default); a change to the project brings the next check forward. See
+default); a change to the project brings the next check forward [TODO-VERIFY V5]. See
 [Project settings](12-configuration-and-output.md#project-settings).
 
 **priority**

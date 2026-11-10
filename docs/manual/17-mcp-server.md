@@ -631,6 +631,7 @@ binary and replace these shapes.]
   Subscriptions end with the server process.
 
 All subscriptions of one server share one connection to the daemon, however many URIs they cover.
+[TODO-VERIFY V4: modes, URI mapping, coalescing, loss and restart behaviour on the integrated bridge.]
 
 ## A session by hand
 

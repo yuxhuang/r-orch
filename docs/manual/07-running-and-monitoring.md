@@ -257,7 +257,7 @@ warning logs none ([Warnings when a run starts](16-eco-mode-and-effort.md#warnin
 | `--listen [<ADDR>]`, `--peer-name <NAME>` | Without `--once`: start options of the daemon, as for `orch run --watch`. | |
 | `--from-agent` | Without `--once`: allows the start from an agent's environment, as for `orch run --watch`. With `--once`: rejected (exit 1). | Off |
 
-No option sets the interval. The daemon checks shortly after each change and at least every
+No option sets the interval. The daemon checks shortly after each change [TODO-VERIFY V5] and at least every
 `scheduling.poll_interval_ms`; change the interval with `orch config set scheduling.poll_interval_ms <ms>`, which a
 running daemon picks up at its next check.
 

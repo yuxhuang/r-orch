@@ -128,7 +128,7 @@ See [Update definitions from files](#update-definitions-from-files).
 | `defaults.agent.prompt_mode` | The prompt mode for agents that have no `config.prompt_mode` of their own: `normal` or `eco`. Read again at every run. See [Eco mode](16-eco-mode-and-effort.md). | `normal`, or `--prompt-mode` on `orch init` |
 | `defaults.task.max_attempts` | The attempt limit a new task gets. | `3` |
 | `defaults.task.priority` | Stored, but not used in orch 0.9.3: `orch task add` gives a new task priority 3 unless you pass `-p`. | `3` |
-| `scheduling.poll_interval_ms` | The longest pause between the orchestrator's checks of the project, in milliseconds; a change to the project brings the next check forward to about half a second after it. | `10000` |
+| `scheduling.poll_interval_ms` | The longest pause between the orchestrator's checks of the project, in milliseconds; a change to the project brings the next check forward to about half a second after it. [TODO-VERIFY V5] | `10000` |
 | `scheduling.max_concurrent_agents` | How many local runs may go at the same time. Remote runs do not count. | `6` |
 | `scheduling.retry_base_delay_ms` | The wait before the first retry of a failed task. Each later retry doubles it. | `10000` |
 | `scheduling.retry_max_delay_ms` | The longest wait between retries. | `300000` |

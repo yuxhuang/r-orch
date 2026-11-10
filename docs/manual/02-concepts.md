@@ -279,7 +279,7 @@ See [Agents](03-agents.md#autonomous-agents).
 
 The **orchestrator** is orch's scheduling loop. It checks the project about half a second after a change that may
 have made work ready (a new task, a finished run, an edit from any client) and on a timer (every 10 seconds by
-default) for work that becomes due with time, such as a retry. It starts ready tasks on idle agents, retries failures and stops stalled runs.
+default) for work that becomes due with time, such as a retry. [TODO-VERIFY V5] It starts ready tasks on idle agents, retries failures and stops stalled runs.
 
 The orchestrator runs inside the project's **daemon**: the one orch process that owns `.orchestry/`, starts and stops
 the agents and makes every change. Every other orch command, the dashboard, `orch web` and `orch mcp` is a
