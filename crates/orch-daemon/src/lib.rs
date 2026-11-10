@@ -29,6 +29,7 @@
 
 pub mod coordinator;
 mod detach;
+mod diagnostics;
 mod discovery;
 mod dispatch;
 mod env;
