@@ -213,13 +213,18 @@ the project until that call returns. Its shutdown is already under way, so **`ki
 The daemon pushes change notices to the dashboard (every `orch web` tab runs one) and to `orch mcp` for subscribed
 resources, and wakes its own scheduler about half a second after a change
 ([How clients follow changes](manual/18-daemon.md#how-clients-follow-changes)). No client polls.
-[TODO-VERIFY V6: symptoms below on the integrated binary.]
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | The dashboard re-reads every view at once, or an MCP client gets `notifications/resources/updated` for every subscribed resource | The client fell behind (more than 256 waiting notices on a subscription, or 4 MiB on its connection), a change failed part-way with the affected stores unknown, or the daemon stopped or restarted | Nothing, if reads work: the client is catching up. If they fail with the no-daemon message, start the daemon yourself; nothing restarts it. Frequent resyncs mean a client reads too slowly: close clients you do not need. |
 | `resources/subscribe` is refused for a valid URI | That `orch mcp` process already follows 256 distinct URIs | Unsubscribe from URIs the client no longer needs. |
 | With dispatch on, a new or unblocked task does not start within about a second | The task is not eligible: dispatch is off, its goal is paused, its agent is busy, disabled or at capacity, it waits out a retry delay, or a failed preparation is backing off. A long scheduling check can also delay the next one. | `orch daemon status` (dispatch ON?), `orch task show <id>`, `orch logs --task <id>`. The periodic check still runs every `scheduling.poll_interval_ms`; a wake never overrides these checks. |
+
+The engine's per-operation domain-event buffer is not capped: it holds the events of one operation until
+the operation releases the permit and grows with the number of events the operation emits. Commit metadata
+(256 entries / 64 KiB), subscription counts and staged output have separate limits; see
+[How clients follow changes](manual/18-daemon.md#how-clients-follow-changes). Follow-up R-evbuf covers an overflow
+design for in-process listeners.
 
 ## Corrupt lock file
 
@@ -929,9 +934,9 @@ failures take one of three paths:
 - **Configuration errors** (`configuration preflight` and the eco/custom-template message) stop the dispatch
   before any run exists. No run is recorded, the task stays `todo` with its attempts unchanged, and the agent
   stays idle. `orch run <id>` prints the error and exits without running the task. `orch serve` logs it as
-  `orchestrator:error` with `context=dispatch task <id>` and `fatal=false`, then tries again at every scheduling
-  check (at least every `scheduling.poll_interval_ms`, 10 s by default) until the file is fixed.
-  [TODO-VERIFY V12: whether a change-triggered check retries it too, and whether the pre-launch back-off applies.] `orch serve --once` does not finish
+  `orchestrator:error` with `context=dispatch task <id>` and `fatal=false`, then tries again at each periodic or change-triggered scheduling
+  check (the periodic interval is `scheduling.poll_interval_ms`, 10 s by default) until the file is fixed.
+  These configuration failures do not consume an attempt or enter the workspace-preparation retry back-off. `orch serve --once` does not finish
   while this repeats. There is nothing to retry by hand: once the file is fixed, the next tick dispatches the
   task.
 - **`effort preparation failed`** fails one run before the tool starts, through the normal failed-run path (the

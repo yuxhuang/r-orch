@@ -43,7 +43,7 @@ The server listens on `127.0.0.1:7681` by default. That address is reachable onl
 
 The token is new every time you start `orch web`. Keep the terminal open; the server stops when you close it.
 
-**Changes appear by themselves.** Each tab's dashboard follows the daemon's change notices like the terminal dashboard, so a change made anywhere, from the CLI, an agent or another tab, shows up without reloading the page ([How clients follow changes](18-daemon.md#how-clients-follow-changes)). The server itself keeps one connection to the daemon open, to know at once when the daemon goes away; it keeps no copy of the project's data and never polls the project's files. [TODO-VERIFY V11: browser update without reload and the parent connection, on the integrated binary.]
+**Changes appear by themselves.** Each tab's dashboard follows the daemon's change notices like the terminal dashboard, so a change made anywhere, from the CLI, an agent or another tab, shows up without reloading the page ([How clients follow changes](18-daemon.md#how-clients-follow-changes)). The server itself keeps one connection to the daemon open, to know at once when the daemon goes away; it keeps no copy of the project's data and never polls the project's files.
 
 **If the daemon goes away** while `orch web` runs, the server keeps running. A new page or tab gets HTTP 503 with the no-daemon message as plain text; with `--no-auth` it gets only `orch daemon unavailable`, without the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen (`r` retry, `q` quit). Nothing restarts the daemon: start it again yourself, then reload the page.
 

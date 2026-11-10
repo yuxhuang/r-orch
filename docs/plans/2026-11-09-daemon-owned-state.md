@@ -71,6 +71,12 @@ rejected alternatives. This section is the summary a builder needs to find the r
   itself. See the spec's
   [Push, gaps and snapshot ordering](../specs/2026-11-09-daemon-owned-state.md#push-gaps-and-snapshot-ordering) and
   [Commit-triggered dispatch wake](../specs/2026-11-09-daemon-owned-state.md#commit-triggered-dispatch-wake).
+- **PR 3 known limitations.** Commit metadata (256 entries / 64 KiB), 8 subscriptions/session,
+  256 events/subscription and 4 MiB staged output/session are bounded. The engine's per-operation domain-event
+  buffer is not capped: it holds one operation's events until release and grows with the number emitted.
+  R-evbuf needs an overflow design for in-process listeners; placement in PR 4 or after the goal remains a
+  checkpoint decision informed by security and resilience review. An idle worker's heartbeats emit no changes
+  or wakes; an idle controller still publishes Remote status about once per second and may wake dispatch.
 - **Rejected** (details in ADR 0012): a direct-store fallback; auto-start; a separate `orchd` binary; gRPC or
   tarpc; a second framing next to `orch-peer`'s; protocol-number-only skew checks; an RPC-only FIFO or a lock per
   save in place of the coordinator.
@@ -148,9 +154,9 @@ it. Task ids are in the tracker.
 |---|---|
 | Gate 1 (plan and design questions) | approved by the owner, 2026-11-09 |
 | Gate 2 (spec) | spec approved, ADR 0012 accepted, 2026-11-09 |
-| PR 1, `feature/daemon-core` | frozen at `811fc860`; draft PR [#74](https://github.com/yuxhuang/r-orch/pull/74) opened against `main`; a test-only CI fixture fix is in review |
-| PR 2, `feature/daemon-clients` | integration frozen at `b97fc59a`; board 2b (gate, code, security, resilience, facts, performance) in progress, and two fixes in progress; the PR is not open yet |
-| PR 3, `feature/daemon-push` | in build on `b97fc59a`: API-first SHA, hub and wake, dashboard, web, MCP, tests and docs in parallel worktrees; then integration, board 3 and QA pass 1 |
+| PR 1, `feature/daemon-core` | frozen at `051742bd`; draft PR [#74](https://github.com/yuxhuang/r-orch/pull/74) opened against `main`; the test-only CI fixture fix is included |
+| PR 2, `feature/daemon-clients` | integration frozen at `7fd1fa02`; board 2c and PR handoff are pending; this row does not certify Linux CI |
+| PR 3, `feature/daemon-push` | assembled candidate `69d16c83`, with six named push/web acceptance tests still red and unclassified; final tests and docs precede the green integration freeze, board 3 and QA pass 1 |
 | PR 4, `feature/daemon-enforce` | pending; starts when PR 3 is frozen |
 
 ## Test plan

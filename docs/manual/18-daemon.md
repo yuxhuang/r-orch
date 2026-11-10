@@ -500,7 +500,7 @@ The daemon checks for work about half a second after the first such change; chan
 join that check, so a burst of changes leads to one check, not one per change. A change that arrives while a check
 is running leads to at most one more check, about half a second after it ends. The checks the scheduler makes do
 not wake it again. Half a second is when the check is due, not a promise of when the agent starts: a long check or
-a busy machine can delay it. [TODO-VERIFY V5: wake bounds and sources on the integrated daemon.]
+a busy machine can delay it.
 
 The periodic check every `scheduling.poll_interval_ms` (10 s by default) still runs, for work that becomes due
 with time, such as a retry whose delay has passed. Change the interval with
@@ -573,11 +573,18 @@ project on a timer.
   retry, `q` to quit). `orch web` answers new pages with HTTP 503, and an open tab shows its dashboard's
   no-daemon screen. `orch mcp` tells its client that every subscribed resource changed, then answers each call with
   the no-daemon error. **Nothing restarts the daemon**, and no client starts one: you do. After you start it again,
-  the dashboard (`r`) and `orch mcp` (at its client's next request) subscribe to the new daemon and read
-  everything again; nothing is carried over from the old one and no change is sent twice.
+  the dashboard (`r`) and `orch mcp` (on a resource read, tool call or new resource subscription) subscribe to the new daemon and read
+  everything again; no mutation is replayed. Notifications remain hints and may repeat.
 
-[TODO-VERIFY V6: subscription limits, resync triggers and each client's behaviour on loss and restart, on the
-integrated binary.]
+**Limits and a known limitation.** Commit identity metadata holds at most 256 entries / 64 KiB; the
+subscription and session limits above bound staged output, including frames handed to the writer. The engine's
+per-operation domain-event buffer is not capped: it holds one operation's events until the operation releases
+the permit and grows with the number of events that operation emits. Follow-up R-evbuf needs an overflow design
+for in-process listeners.
+
+An idle worker linked to a controller emits no change notices or dispatch wakes for heartbeat frames. An idle
+controller with a linked peer still invalidates the Remote store about once per second for peer status; those
+commits can wake dispatch.
 
 ## Upgrading from orch 0.13.0
 

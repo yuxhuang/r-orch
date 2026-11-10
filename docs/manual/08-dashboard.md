@@ -52,8 +52,6 @@ re-read the project on a timer; only the clock-driven columns, such as Elapsed*,
 tells it that it fell behind, it reads every view again and keeps your selection where it can. After the daemon
 goes away and you start it again, `r` connects to the new daemon and reads everything afresh. See
 [How clients follow changes](18-daemon.md#how-clients-follow-changes).
-[TODO-VERIFY V10: no timed state reads, update without a key press, resync and `r` behaviour, in a tmux capture
-on the integrated binary.]
 
 `orch tui --observe`, `--listen` and `--peer-name` were removed: the dashboard never dispatches by itself, so there is nothing to observe instead, and only the daemon listens for other machines and names this one to them. Start the daemon with `--listen` and `--peer-name` ([Remote agents](11-remote-agents.md)).
 

@@ -188,7 +188,9 @@ authorize client recovery side effects, release or merge.
     the subscribe call's terminal `commit_seq`; (2) a change event's entity `id` is optional, and an event
     without one is an ordinary ordered store-wide change (`kind` updated) for singleton stores and for a known
     store whose changed entities are not known, while resync stays rare: `lagged`, plus one reason for a
-    failure that leaves the affected store set unknown [TODO-VERIFY V2, V3]. Wording:
+    failure that leaves the affected store set unknown. These bounds cover commit metadata and session
+    queues; the engine's per-operation domain-event buffer is not capped and holds one operation's events
+    until release, growing with the number emitted (follow-up R-evbuf). Wording:
     [spec, Protocol and service reference](../specs/2026-11-09-daemon-owned-state.md#protocol-and-service-reference-approved).
 
 12. **Security and tests are part of the boundary.** Validate every frame and operation before mutation;
