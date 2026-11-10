@@ -1115,11 +1115,8 @@ pub struct WebCmd {
         help = "Accept this Host header name (repeatable, exact match, no port). Needed behind a reverse proxy or DNS name"
     )]
     pub allow_host: Vec<String>,
-    #[arg(
-        long,
-        help = "Run each tab's dashboard with `orch tui --observe`: the orchestrator is not started. \
-                Not read-only: tasks and agents can still be changed and run from the page"
-    )]
+    /// Removed: parsed only so the refusal can say so, and hidden from help.
+    #[arg(long, hide = true)]
     pub observe: bool,
 }
 
@@ -1381,6 +1378,19 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["orch", "tui", "--observe"]).is_err());
         assert!(Cli::try_parse_from(["orch", "tui", "--listen"]).is_err());
+    }
+
+    /// `orch web --observe` still parses so `WebArgs::parse` can explain the
+    /// removal, but the help no longer offers it.
+    #[test]
+    fn web_observe_is_parsed_for_its_refusal_but_not_offered_in_help() {
+        let cli = Cli::try_parse_from(["orch", "web", "--observe"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebCmd { observe: true, .. }))
+        ));
+        let help = find("web").render_long_help().to_string();
+        assert!(!help.contains("--observe"), "{help}");
     }
 
     /// Walk to the clap subcommand a dotted path names.
