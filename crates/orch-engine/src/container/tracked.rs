@@ -391,9 +391,12 @@ impl MessageStore for Tracked<dyn MessageStore> {
     async fn purge_expired(&self) -> Result<usize> {
         self.boundary
             .store_write(async {
-                self.boundary
-                    .record_change(CommitChange::store_wide(CommitStore::Messages));
-                self.inner.purge_expired().await
+                let added = self.boundary.note_store(CommitStore::Messages);
+                let result = self.inner.purge_expired().await;
+                if added && matches!(result, Ok(0)) {
+                    self.boundary.discard_noop_store(CommitStore::Messages);
+                }
+                result
             })
             .await
             .value
@@ -505,5 +508,62 @@ impl GlobalConfigStore for Tracked<dyn GlobalConfigStore> {
             })
             .await
             .value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct FailedPurge;
+
+    #[async_trait]
+    impl MessageStore for FailedPurge {
+        async fn save(&self, _: &Message) -> Result<()> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> Result<Option<Message>> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<Message>> {
+            unreachable!()
+        }
+        async fn list_pending(&self, _: &str) -> Result<Vec<Message>> {
+            unreachable!()
+        }
+        async fn mark_delivered(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn purge_expired(&self) -> Result<usize> {
+            Err(orch_core::error::Error::other(
+                "injected partial purge failure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_purge_retains_the_known_messages_declaration() {
+        let boundary = Arc::new(OperationBoundary::new());
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        boundary.set_publisher(Some(Arc::new(move |publication| {
+            if let Publication::Commit(record) = publication {
+                sink.lock().unwrap().push(record.clone());
+            }
+        })));
+        let store = Tracked::<dyn MessageStore>::wrap(Arc::new(FailedPurge), boundary.clone());
+        assert!(store.purge_expired().await.is_err());
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].changes,
+            vec![CommitChange::store_wide(CommitStore::Messages)]
+        );
+        assert!(!records[0].store_set_uncertain);
+        assert_eq!(boundary.current_commit_seq(), 1);
     }
 }

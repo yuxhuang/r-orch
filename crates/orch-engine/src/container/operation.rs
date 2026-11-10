@@ -170,18 +170,23 @@ impl OperationBoundary {
         });
     }
 
-    /// Record a known store when exact entities are unavailable.
-    pub fn note_store(&self, store: CommitStore) {
-        let _ = OPERATION.try_with(|context| {
-            if context.boundary == self.identity() {
-                context.changed.store(true, Ordering::SeqCst);
-                context
-                    .metadata
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .note(store);
-            }
-        });
+    /// Record a known store when exact entities are unavailable. Returns true
+    /// only when this call added the note, allowing no-op maintenance to
+    /// retract its own declaration without erasing an earlier writer's note.
+    pub fn note_store(&self, store: CommitStore) -> bool {
+        OPERATION
+            .try_with(|context| {
+                if context.boundary == self.identity() {
+                    context.changed.store(true, Ordering::SeqCst);
+                    return context
+                        .metadata
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .note(store);
+                }
+                false
+            })
+            .unwrap_or(false)
     }
 
     /// Only explicit maintenance that proved it performed no writes may

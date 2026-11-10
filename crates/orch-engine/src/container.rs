@@ -70,9 +70,9 @@ impl ContextService {
             .with_source(
                 commit::CommitSource::Expiry,
                 self.boundary.store_write(async {
-                    self.boundary.note_store(commit::CommitStore::Context);
+                    let added = self.boundary.note_store(commit::CommitStore::Context);
                     let keys = self.store.expire_now().await?;
-                    if keys.is_empty() {
+                    if added && keys.is_empty() {
                         self.boundary
                             .discard_noop_store(commit::CommitStore::Context);
                     }
@@ -1161,6 +1161,24 @@ mod commit_store_tests {
         agent.id = "agent_matrix".into();
         goal.id = "goal_matrix".into();
         team.id = "team_matrix".into();
+        engine
+            .messages
+            .save(&orch_domain::Message {
+                id: "message_expired".into(),
+                channel: MessageChannel::Direct,
+                from_agent_id: "sender".into(),
+                to_agent_id: Some("recipient".into()),
+                subject: String::new(),
+                body: String::new(),
+                reply_to: None,
+                created_at: engine.clock.now_iso(),
+                expires_at: Some("2000-01-01T00:00:00.000Z".into()),
+                status: MessageStatus::Pending,
+                delivered_at: None,
+                team_id: None,
+            })
+            .await
+            .unwrap();
         let records = Arc::new(Mutex::new(Vec::new()));
         let sink = records.clone();
         engine
@@ -1294,6 +1312,14 @@ mod commit_store_tests {
             Deleted
         );
         mutation!(engine.messages.purge_expired(), Messages, None, Updated);
+        assert!(
+            engine
+                .messages
+                .get("message_expired")
+                .await
+                .unwrap()
+                .is_none()
+        );
         mutation!(
             engine.context.set("matrix", "private-canary", None),
             Context,
@@ -1561,5 +1587,68 @@ mod commit_store_tests {
             records.lock().unwrap().is_empty(),
             "idle maintenance must not make subscribers poll"
         );
+    }
+    #[tokio::test]
+    async fn zero_maintenance_retracts_only_its_own_declaration() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let boundary = engine.events.operation_boundary();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        boundary.set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                sink.lock().unwrap().push(record.clone());
+            }
+        })));
+        let before = boundary.current_commit_seq();
+        assert_eq!(engine.messages.purge_expired().await.unwrap(), 0);
+        assert_eq!(
+            boundary.current_commit_seq(),
+            before,
+            "zero purge is not a write"
+        );
+        for store in [CommitStore::Messages, CommitStore::Context] {
+            for recorded in [false, true] {
+                boundary
+                    .run(false, async {
+                        if recorded {
+                            boundary.record_change(CommitChange::store_wide(store));
+                        } else {
+                            boundary.note_store(store);
+                        }
+                        if store == CommitStore::Messages {
+                            assert_eq!(engine.messages.purge_expired().await.unwrap(), 0);
+                        } else {
+                            assert!(
+                                engine
+                                    .context_service
+                                    .expire_now()
+                                    .await
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                        }
+                    })
+                    .await;
+                let record = records
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .cloned()
+                    .expect("earlier declaration survives");
+                assert_eq!(record.changes, vec![CommitChange::store_wide(store)]);
+                assert!(!record.store_set_uncertain);
+            }
+        }
+        assert_eq!(records.lock().unwrap().len(), 4);
     }
 }

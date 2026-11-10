@@ -113,10 +113,12 @@ pub(super) struct PendingChanges {
 }
 
 impl PendingChanges {
-    pub(super) fn note(&mut self, store: CommitStore) {
-        if !self.stores.contains(&store) {
-            self.stores.push(store);
+    pub(super) fn note(&mut self, store: CommitStore) -> bool {
+        if self.stores.contains(&store) {
+            return false;
         }
+        self.stores.push(store);
+        true
     }
 
     pub(super) fn record(&mut self, change: CommitChange) {
