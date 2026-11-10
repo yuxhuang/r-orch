@@ -21,9 +21,10 @@ fn gate() -> &'static Arc<tokio::sync::Semaphore> {
 /// A Send reservation may cross awaits as an ordinary value. Its thread-local
 /// handoff exists only during `run`'s synchronous call, never across an await.
 pub struct SpawnReservation {
+    // Clear the completed stage before another permit owner can enter.
+    notice: Notice,
     #[cfg(target_os = "macos")]
     _permit: tokio::sync::OwnedSemaphorePermit,
-    notice: Notice,
 }
 
 thread_local! {

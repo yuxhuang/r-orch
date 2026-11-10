@@ -164,6 +164,7 @@ impl Notice {
             });
             self.stage = 1;
         }
+        registry().1.notify_one();
         if let Some(observer) = &self.observer {
             observer.observe(event);
         }
@@ -244,13 +245,62 @@ fn observe() {
         drop(state);
         // Never hold even the observation mutex across a potentially slow log sink.
         for (event, dispatch) in due {
-            tracing::dispatcher::with_default(&dispatch, || {
-                tracing::warn!(spawn_id = event.id, site = ?event.site, stage = ?event.stage,
-                    elapsed_ms = event.elapsed.as_millis() as u64, overflow,
-                    "process spawn pending");
-            });
+            emit(event, overflow, &dispatch);
         }
     }
+}
+
+// Dispatch directly to the captured private-log subscriber. Ambient macro
+// callsite/max-level caching is process-global; it must not decide whether an
+// independent observer's already-captured subscriber receives this event.
+struct SpawnLogSite;
+static LOG_SITE: SpawnLogSite = SpawnLogSite;
+static LOG_META: tracing::Metadata<'static> = tracing::Metadata::new(
+    "process spawn pending",
+    "orch_infra::process::spawn",
+    tracing::Level::WARN,
+    None,
+    None,
+    None,
+    tracing::field::FieldSet::new(
+        &[
+            "message",
+            "spawn_id",
+            "site",
+            "stage",
+            "elapsed_ms",
+            "overflow",
+        ],
+        tracing::callsite::Identifier(&LOG_SITE),
+    ),
+    tracing::metadata::Kind::EVENT,
+);
+impl tracing::callsite::Callsite for SpawnLogSite {
+    fn set_interest(&self, _: tracing::subscriber::Interest) {}
+    fn metadata(&self) -> &tracing::Metadata<'_> {
+        &LOG_META
+    }
+}
+fn emit(event: SpawnObservation, overflow: usize, dispatch: &tracing::Dispatch) {
+    if dispatch.register_callsite(&LOG_META).is_never() || !dispatch.enabled(&LOG_META) {
+        return;
+    }
+    let fields = LOG_META.fields();
+    let names: Vec<_> = fields.iter().collect();
+    let message = "process spawn pending";
+    let site = tracing::field::debug(event.site);
+    let stage = tracing::field::debug(event.stage);
+    let elapsed = event.elapsed.as_millis() as u64;
+    let values: [(&tracing::field::Field, Option<&dyn tracing::field::Value>); 6] = [
+        (&names[0], Some(&message)),
+        (&names[1], Some(&event.id)),
+        (&names[2], Some(&site)),
+        (&names[3], Some(&stage)),
+        (&names[4], Some(&elapsed)),
+        (&names[5], Some(&overflow)),
+    ];
+    let values = fields.value_set(&values);
+    dispatch.event(&tracing::Event::new(&LOG_META, &values));
 }
 
 #[cfg(test)]

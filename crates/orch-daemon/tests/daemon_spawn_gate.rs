@@ -399,10 +399,17 @@ async fn held_scenario(root: &Path) {
         "CONTROL: healthy final launch queued behind held diagnostic; checking read before release"
     );
     let read = owner.request(6, "task.get", json!({"id":queued})).await;
-    assert!(
-        read.get("ok").is_some(),
-        "independent control read failed before diagnostic holder release: {read}"
-    );
+    if read.get("ok").is_none() {
+        // Preserve the failed before-release oracle, then drain the real daemon
+        // before unwinding its runtime during a containment negative control.
+        release.0.take().unwrap().send(()).unwrap();
+        let drained = tokio::time::timeout(DEADLINE, daemon.shutdown()).await;
+        assert!(
+            drained.is_ok(),
+            "negative-control daemon did not drain: {read}"
+        );
+        panic!("independent control read failed before diagnostic holder release: {read}");
+    }
     let cancelled = owner.request(7, "task.cancel", json!({"id":queued})).await;
     assert_eq!(ok(&cancelled)["status"], "cancelled");
     let reply = tokio::time::timeout(DEADLINE, launch)

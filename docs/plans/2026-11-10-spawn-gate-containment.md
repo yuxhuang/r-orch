@@ -105,7 +105,9 @@ entered permit or advertises a clean stop with accepted work outstanding.
 
 A process-wide observer thread operates while records are live and exits when
 empty. It depends on neither polling workers nor the project boundary. It copies
-due records under its own short mutex and emits outside that lock. At most 128
+due records under its own short mutex and emits outside that lock directly to the
+captured, registered subscriber, respecting its filters without ambient macro
+callsite/max-level caching. Stage changes wake the observer for their first warning. At most 128
 individual records and two fixed overflow-stage aggregates are retained. Fields
 are generated numeric id, closed site/stage enums and monotonic elapsed time;
 no command/path/argv/prompt/env/output or caller identity is accepted.
