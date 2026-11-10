@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
 use orch_domain::{
-    Agent, AgentStatus, DomainError, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus,
-    RunningEntry, Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
+    Agent, AgentStatus, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry,
+    Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
 };
 
 use super::dispatch::{
@@ -370,12 +370,14 @@ impl Orchestrator {
                     // As in v0.13: a workspace that cannot be prepared costs an
                     // attempt and backs off. Released with no record, the task
                     // stays dispatchable and every tick repeats the failure.
-                    if matches!(error, Error::Domain(DomainError::Workspace { .. })) {
-                        self.daemon_record_workspace_failure(task_id, generation, &error)
-                            .await?;
-                    } else {
-                        self.daemon_release_preparation(task_id, generation).await?;
-                    }
+                    // That holds for every preparation error, not only the
+                    // workspace domain errors: a workspaces directory that
+                    // cannot be created is an I/O error and a failed isolated
+                    // copy a plain one. None of them means the preparation was
+                    // invalidated; the recorder checks that itself (generation,
+                    // and a terminal task under the dispatch gate).
+                    self.daemon_record_workspace_failure(task_id, generation, &error)
+                        .await?;
                     return Err(error);
                 }
             };

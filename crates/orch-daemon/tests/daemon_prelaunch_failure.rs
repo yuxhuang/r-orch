@@ -21,6 +21,10 @@ use tokio::sync::{Notify, oneshot};
 /// not a git repository, so workspace preparation fails before any run, prompt
 /// or process exists, exactly like a project whose `.git` went missing.
 async fn worktree_agent(raw: &mut Raw, daemon: &DaemonHarness) -> String {
+    workspace_agent(raw, daemon, "worktree").await
+}
+
+async fn workspace_agent(raw: &mut Raw, daemon: &DaemonHarness, mode: &str) -> String {
     let reply = raw
         .request(
             1_000_100,
@@ -29,7 +33,7 @@ async fn worktree_agent(raw: &mut Raw, daemon: &DaemonHarness) -> String {
                 "name": "needs-git",
                 "adapter": "shell",
                 "command": "exit 0",
-                "workspace_mode": "worktree",
+                "workspace_mode": mode,
                 "env": [
                     {"name": "HOME", "value": daemon.project_root().to_str().unwrap()},
                     {"name": "PATH", "value": "/usr/bin:/bin"},
@@ -611,5 +615,332 @@ async fn a_read_queued_during_a_failure_batch_is_served_before_the_batch_ends() 
          {commits}"
     );
     assert!(probes.state.lock().unwrap().unexpected.is_empty());
+    daemon.shutdown().await.unwrap();
+}
+
+/// A git repository as the workspace manager sees it, with no real command
+/// run: the repository probe succeeds, an isolated `git clone` fails and so
+/// does the `rsync` it falls back to, as on a full or read-only filesystem.
+/// Every spawn is logged as `command first-argument`, and an `rsync` can be
+/// parked until the test releases it.
+#[derive(Default)]
+struct Tools {
+    state: Mutex<ToolsState>,
+    entered: Notify,
+}
+
+#[derive(Default)]
+struct ToolsState {
+    log: Vec<String>,
+    park_rsync: bool,
+    parked: Option<ExitNotifier>,
+}
+
+const RSYNC_FAILED: ExitOutcome = ExitOutcome {
+    code: Some(23),
+    signal: None,
+};
+
+impl Tools {
+    fn log(&self) -> Vec<String> {
+        self.state.lock().unwrap().log.clone()
+    }
+
+    async fn rsync_parked(&self) {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let notified = self.entered.notified();
+                if self.state.lock().unwrap().parked.is_some() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("the preparation never reached rsync");
+    }
+
+    fn release(&self) {
+        let parked = self.state.lock().unwrap().parked.take();
+        if let Some(parked) = parked {
+            parked.notify(RSYNC_FAILED);
+        }
+    }
+}
+
+/// A failed assertion must not leave a preparation parked under the stop.
+struct Unblock(Arc<Tools>);
+
+impl Drop for Unblock {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[async_trait]
+impl ProcessManager for Tools {
+    fn is_alive(&self, _: u32) -> bool {
+        false
+    }
+    fn kill(&self, _: u32, _: Signal) {}
+    async fn kill_with_grace(&self, _: u32, _: Duration) {}
+    fn spawn(
+        &self,
+        command: &str,
+        args: &[String],
+        _: SpawnOptions,
+    ) -> orch_core::Result<SpawnedChild> {
+        let mut state = self.state.lock().unwrap();
+        let first = args.first().map(String::as_str).unwrap_or_default();
+        state.log.push(format!("{command} {first}"));
+        let code = match (command, first) {
+            ("git", "rev-parse") => 0,
+            ("git", "clone") => 128,
+            ("rsync", _) if state.park_rsync => {
+                let (notifier, exit) = ExitSignal::channel();
+                state.parked = Some(notifier);
+                drop(state);
+                self.entered.notify_waiters();
+                return Ok(child(exit));
+            }
+            ("rsync", _) => 23,
+            _ => return Err(orch_core::Error::other("no agent process may start")),
+        };
+        Ok(child(ExitSignal::resolved(ExitOutcome {
+            code: Some(code),
+            signal: None,
+        })))
+    }
+}
+
+fn child(exit: ExitSignal) -> SpawnedChild {
+    SpawnedChild {
+        pid: 987_655,
+        stdout: None,
+        stderr: None,
+        stdin: None,
+        exit,
+    }
+}
+
+fn due_at(ms_after_start: i64) -> Value {
+    json!(orch_core::clock::iso_from_epoch_ms(
+        support::TestClock::START_MS + ms_after_start
+    ))
+}
+
+/// The state after `attempts` failed preparations: that many attempts,
+/// `retrying`, one queued back-off due at `due` whose error names the
+/// cause, and nothing running.
+async fn assert_backed_off(
+    raw: &mut Raw,
+    daemon: &DaemonHarness,
+    id: &str,
+    attempts: u32,
+    due: Value,
+    cause: &str,
+) {
+    assert!(running_pid(daemon, id).await.is_none(), "a run started");
+    let record = task_record(raw, id).await;
+    assert_eq!(
+        record["attempts"], attempts,
+        "the failed preparation was not counted: {record}"
+    );
+    assert_eq!(record["status"], "retrying", "{record}");
+    let queue = retry_queue(daemon);
+    assert_eq!(queue.len(), 1, "no back-off was queued: {queue:?}");
+    assert_eq!(queue[0]["task_id"], json!(id));
+    assert_eq!(queue[0]["due_at"], due, "{queue:?}");
+    assert!(
+        queue[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(cause)),
+        "{queue:?}"
+    );
+}
+
+/// Board-2b code F3: a workspaces directory that cannot be created (here a
+/// regular file in its place; equally a read-only `.orchestry`) is an I/O
+/// error, not a workspace domain error, and was released with no record:
+/// the task stayed `todo` with no attempt and every tick prepared it again.
+/// It must cost an attempt and back off like any failed preparation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_workspaces_directory_counts_an_attempt_and_backs_off() {
+    let clock = support::TestClock::new();
+    let tools = Arc::new(Tools::default());
+    let daemon = DaemonHarness::builder()
+        .clock(clock.clone())
+        .maintenance_timer(false)
+        .processes(tools.clone())
+        .start()
+        .await
+        .unwrap();
+    let mut raw = Raw::session(&daemon, "cli", "normal").await;
+    let agent = worktree_agent(&mut raw, &daemon).await;
+    let id = task(&mut raw, "blocked workspaces", json!({"assignee": agent})).await;
+    let workspaces = daemon.project_root().join(".orchestry/workspaces");
+    if workspaces.is_dir() {
+        std::fs::remove_dir(&workspaces).unwrap();
+    }
+    std::fs::write(&workspaces, "not a directory").unwrap();
+
+    assert_eq!(
+        daemon.step_dispatch().await.unwrap().launched,
+        vec![id.clone()]
+    );
+    assert_backed_off(
+        &mut raw,
+        &daemon,
+        &id,
+        1,
+        due_at(10_000),
+        "creating the workspaces directory",
+    )
+    .await;
+    assert_eq!(tools.log(), ["git rev-parse"]);
+
+    // Inside the back-off: no preparation and no write.
+    let before = written(&daemon, &id);
+    assert!(daemon.step_dispatch().await.unwrap().launched.is_empty());
+    assert_eq!(
+        written(&daemon, &id),
+        before,
+        "a tick inside the back-off changed state.json or rewrote the task"
+    );
+
+    clock.advance_ms(10_001);
+    daemon.step_dispatch().await.unwrap();
+    assert_backed_off(
+        &mut raw,
+        &daemon,
+        &id,
+        2,
+        due_at(10_001 + 20_000),
+        "creating the workspaces directory",
+    )
+    .await;
+    // The positive repository probe is cached; nothing else may have run.
+    assert_eq!(tools.log(), ["git rev-parse"]);
+    daemon.shutdown().await.unwrap();
+}
+
+/// Board-2b code F3: an isolated workspace whose clone and rsync fallback
+/// both fail is a plain error, released with no record before the fix. It
+/// must cost an attempt and back off; the agent itself never starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_isolated_rsync_counts_an_attempt_and_backs_off() {
+    let clock = support::TestClock::new();
+    let tools = Arc::new(Tools::default());
+    let daemon = DaemonHarness::builder()
+        .clock(clock.clone())
+        .maintenance_timer(false)
+        .processes(tools.clone())
+        .start()
+        .await
+        .unwrap();
+    let mut raw = Raw::session(&daemon, "cli", "normal").await;
+    let agent = workspace_agent(&mut raw, &daemon, "isolated").await;
+    let id = task(&mut raw, "isolated copy", json!({"assignee": agent})).await;
+
+    assert_eq!(
+        daemon.step_dispatch().await.unwrap().launched,
+        vec![id.clone()]
+    );
+    assert_backed_off(
+        &mut raw,
+        &daemon,
+        &id,
+        1,
+        due_at(10_000),
+        "rsync failed with code 23",
+    )
+    .await;
+    assert_eq!(tools.log(), ["git rev-parse", "git clone", "rsync -a"]);
+
+    let before = written(&daemon, &id);
+    assert!(daemon.step_dispatch().await.unwrap().launched.is_empty());
+    assert_eq!(
+        written(&daemon, &id),
+        before,
+        "a tick inside the back-off changed state.json or rewrote the task"
+    );
+    assert_eq!(
+        tools.log(),
+        ["git rev-parse", "git clone", "rsync -a"],
+        "a tick inside the back-off prepared the workspace again"
+    );
+
+    clock.advance_ms(10_001);
+    daemon.step_dispatch().await.unwrap();
+    assert_backed_off(
+        &mut raw,
+        &daemon,
+        &id,
+        2,
+        due_at(10_001 + 20_000),
+        "rsync failed with code 23",
+    )
+    .await;
+    assert_eq!(
+        tools.log(),
+        [
+            "git rev-parse",
+            "git clone",
+            "rsync -a",
+            "git clone",
+            "rsync -a"
+        ]
+    );
+    daemon.shutdown().await.unwrap();
+}
+
+/// A cancel decided while the workspace is being prepared stands: the
+/// preparation that then fails is not charged to the cancelled task and
+/// queues no retry, and the task is never prepared again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_during_a_failing_rsync_keeps_the_task_cancelled() {
+    let clock = support::TestClock::new();
+    let tools = Arc::new(Tools::default());
+    tools.state.lock().unwrap().park_rsync = true;
+    let _unblock = Unblock(Arc::clone(&tools));
+    let daemon = DaemonHarness::builder()
+        .clock(clock.clone())
+        .maintenance_timer(false)
+        .processes(tools.clone())
+        .start()
+        .await
+        .unwrap();
+    let mut raw = Raw::session(&daemon, "cli", "normal").await;
+    let agent = workspace_agent(&mut raw, &daemon, "isolated").await;
+    let id = task(&mut raw, "cancelled copy", json!({"assignee": agent})).await;
+
+    let (tick, ()) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(daemon.step_dispatch(), async {
+            tools.rsync_parked().await;
+            let cancelled = raw
+                .request(1_000_105, "task.cancel", json!({"id": id}))
+                .await;
+            ok(&cancelled);
+            tools.release();
+        })
+    })
+    .await
+    .expect("the tick or the cancel hung");
+    tick.unwrap();
+
+    let record = task_record(&mut raw, &id).await;
+    assert_eq!(record["status"], "cancelled", "{record}");
+    assert_eq!(record["attempts"], 0, "{record}");
+    assert!(
+        retry_queue(&daemon).is_empty(),
+        "{:?}",
+        retry_queue(&daemon)
+    );
+    assert!(running_pid(&daemon, &id).await.is_none());
+
+    clock.advance_ms(60_000);
+    daemon.step_dispatch().await.unwrap();
+    assert_eq!(task_record(&mut raw, &id).await["status"], "cancelled");
+    assert_eq!(tools.log(), ["git rev-parse", "git clone", "rsync -a"]);
     daemon.shutdown().await.unwrap();
 }
