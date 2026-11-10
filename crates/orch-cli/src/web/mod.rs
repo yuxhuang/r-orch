@@ -433,9 +433,13 @@ pub struct DaemonDown {
 /// possible with `--no-auth`): no project path, no socket path (design D5).
 pub const DAEMON_UNAVAILABLE: &str = "orch daemon unavailable\n";
 
-/// The bound on one preflight: the client's own handshake deadline already
-/// bounds it; this is the outer guard for a socket that accepts and stalls.
-const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The bound on one preflight: the client's own deadlines already bound it
+/// (its busy wait, then one last dial and handshake); this is the outer guard
+/// for a socket that accepts and stalls. Shorter, it would cut the busy wait
+/// and report a busy daemon as absent.
+const PREFLIGHT_TIMEOUT: Duration = orch_client::BUSY_WAIT
+    .saturating_add(orch_proto::handshake::CONNECT_TIMEOUT)
+    .saturating_add(orch_proto::handshake::HANDSHAKE_TIMEOUT);
 
 /// A JSON text frame from the browser. Anything that does not parse, or has an
 /// out-of-range size, is ignored by [`parse_resize`].
