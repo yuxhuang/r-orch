@@ -17,6 +17,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | The daemon crashed or was killed | [After a daemon crash](#after-a-daemon-crash-or-kill--9) |
 | `daemon is orch … protocol …, this client is orch …`, or upgrading orch | [Version skew and upgrading](#version-skew-and-upgrading-orch) |
 | Commands time out, or `orch daemon stop` says the PID is still running | [A hung daemon](#a-hung-daemon) |
+| The dashboard or an MCP client re-reads everything at once, `resources/subscribe` is refused, or a new task does not start within a second | [Live updates and dispatch wake](#live-updates-and-dispatch-wake) |
 | `Orchestrator already running (PID: undefined)` and nothing is running | [Corrupt lock file](#corrupt-lock-file) |
 | `serve --once` never exits | [`serve --once` hangs on review](#serve---once-hangs-on-a-task-in-review) |
 | `task show <id>` works but `task list` omits the task | [Rebuilding an index](#rebuilding-an-index-after-a-lost-update) (legacy procedure) |
@@ -48,11 +49,6 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 ---
 
 ## The orch daemon
-
-<!-- W2 (PR 2, tsk_M9AsDfP): written to wave-c-brief.md "PR 2 contract" items 1-4 and 7, spec "Normative recovery
-table" and "Uniform failure contract" (R5, R6, R14, R18, R35), design D3/D5/D13 and ADR 0012. Refusal texts are
-from crates/orch-daemon/src/lifecycle.rs and crates/orch-proto/src/error.rs at the PR 1 frozen SHA 6a7a6481.
-The board-2 fact-check (tsk_eVo3agZ) checked the rest at run time at the PR 2 head f70fc707. -->
 
 Every orch command that reads or changes a project, the dashboard, `orch web` and `orch mcp` talk to the project's
 daemon. **Nothing starts the daemon but you.** The operator's reference is [manual chapter 18](manual/18-daemon.md);
@@ -107,7 +103,8 @@ retry it. A restart does not resume the agent's conversation. `orch daemon start
 `orch run --watch` refuse to start from such an environment (exit 2); each accepts `--from-agent` to override
 that on purpose.
 
-**Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within 10 s, for a session
+**Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within about 13 s, that is 10 s
+of waiting plus one last connection attempt, for a session
 or for the connection itself, so the count can read `1/64 sessions`: close clients and retry), `wrong_project` (the socket
 belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`), `Cannot confirm the orch request outcome`
 (the reply was lost: read the state before you retry; see
@@ -132,8 +129,6 @@ through them, and it cannot republish them.
 **Give each project its own socket.** A project is identified by the device and inode of its `.orchestry/`
 directory. On a file system that reuses inodes, two projects pointed at one `ORCH_SOCKET` path can, in a narrow
 window, have one daemon remove the other's socket. Set `ORCH_SOCKET` per project, or leave it unset.
-<!-- ADR 0012 decision 9 note (ruling 8.15, architect message): (dev,ino) weaker on inode-reusing filesystems;
-remove_if_same safe under the project guard; residual ABA = two projects sharing a misconfigured ORCH_SOCKET. -->
 
 ### After a daemon crash or `kill -9`
 
@@ -210,11 +205,21 @@ the project until that call returns. Its shutdown is already under way, so **`ki
 3. `kill -KILL <pid>`. Its children are not killed with it.
 4. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited.
 5. `orch daemon start`. The new daemon reconciles the killed one's work as after a crash.
-<!-- Symptom B: N1 06a4ae1e (manual 18 "After a timeout the daemon can still own the project" and the Recovery
-row); stop-timeout text crates/orch-proto/src/error.rs:278 at f70fc707; release-eng measured the extra SIGTERM
-at cd0fd4c0 (tech-writer-stop-timeout-n1-ba1c717.md). Not reproduced at f70fc707 (needs a hung git worktree add). -->
 
 ---
+
+### Live updates and dispatch wake
+
+The daemon pushes change notices to the dashboard (every `orch web` tab runs one) and to `orch mcp` for subscribed
+resources, and wakes its own scheduler about half a second after a change
+([How clients follow changes](manual/18-daemon.md#how-clients-follow-changes)). No client polls.
+[TODO-VERIFY V6: symptoms below on the integrated binary.]
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The dashboard re-reads every view at once, or an MCP client gets `notifications/resources/updated` for every subscribed resource | The client fell behind (more than 256 waiting notices on a subscription, or 4 MiB on its connection), a change failed part-way with the affected stores unknown, or the daemon stopped or restarted | Nothing, if reads work: the client is catching up. If they fail with the no-daemon message, start the daemon yourself; nothing restarts it. Frequent resyncs mean a client reads too slowly: close clients you do not need. |
+| `resources/subscribe` is refused for a valid URI | That `orch mcp` process already follows 256 distinct URIs | Unsubscribe from URIs the client no longer needs. |
+| With dispatch on, a new or unblocked task does not start within about a second | The task is not eligible: dispatch is off, its goal is paused, its agent is busy, disabled or at capacity, it waits out a retry delay, or a failed preparation is backing off. A long scheduling check can also delay the next one. | `orch daemon status` (dispatch ON?), `orch task show <id>`, `orch logs --task <id>`. The periodic check still runs every `scheduling.poll_interval_ms`; a wake never overrides these checks. |
 
 ## Corrupt lock file
 
@@ -305,8 +310,6 @@ fail it, which is the worse failure mode.
 > one that is stale and still valid. The procedure with a daemon: `orch daemon stop`, remove the affected
 > `_index.json`, `orch daemon start`; never remove an index while the daemon runs. The 0.13.0 text below is
 > removed in a later release.
-<!-- W2: spec recovery table row "Crash between entity/index writes"; dissent-log W0 Q3; PR 2 contract item 7
-(mark legacy; deletion is PR 4). -->
 
 **Symptom.** `orch task show <id>` returns the task, but `orch task list` and `orch status` do not show it,
 and the orchestrator never dispatches it. The entity's `.yml` file exists on disk.
@@ -926,8 +929,9 @@ failures take one of three paths:
 - **Configuration errors** (`configuration preflight` and the eco/custom-template message) stop the dispatch
   before any run exists. No run is recorded, the task stays `todo` with its attempts unchanged, and the agent
   stays idle. `orch run <id>` prints the error and exits without running the task. `orch serve` logs it as
-  `orchestrator:error` with `context=dispatch task <id>` and `fatal=false`, then tries again on every tick
-  (`scheduling.poll_interval_ms`, 10 s by default) until the file is fixed. `orch serve --once` does not finish
+  `orchestrator:error` with `context=dispatch task <id>` and `fatal=false`, then tries again at every scheduling
+  check (at least every `scheduling.poll_interval_ms`, 10 s by default) until the file is fixed.
+  [TODO-VERIFY V12: whether a change-triggered check retries it too, and whether the pre-launch back-off applies.] `orch serve --once` does not finish
   while this repeats. There is nothing to retry by hand: once the file is fixed, the next tick dispatches the
   task.
 - **`effort preparation failed`** fails one run before the tool starts, through the normal failed-run path (the
@@ -1031,7 +1035,6 @@ work to continue.
 > writer, so this hazard no longer arises between orch processes of this release
 > ([One writer: the daemon](manual/17-mcp-server.md#one-writer-the-daemon)). Use this entry only to repair a
 > project that orch 0.13.0 processes shared. The entry is removed in a later release.
-<!-- W2: goal row 9; ADR 0012 supersedes ADR 0011 decision 7 / D10; PR 2 contract item 7 (deletion is PR 4). -->
 
 Applies to projects that `orch mcp` clients share with other writers: `orch run --watch`, `orch serve`, the
 dashboard, other `orch mcp` processes and one-off `orch` commands of orch 0.13.0 (the 0.13.0 manual's "Concurrent
@@ -1114,10 +1117,6 @@ with `<file>: config.<key>: invalid field type`, and the file is left unchanged.
 
 **Prevention.** Change configuration with `orch config set` (or `config_set`) rather than by hand, and back up
 `.orchestry/config.yml` before a hand edit.
-<!-- Captured at f70fc707 (fact-check tsk_eVo3agZ evidence/mcp-badcfg.txt, mcp-handcfg.txt; tsk_J8tJF2x): CLI and MCP
-config_set "hello" rejected, file byte-identical; config_patch {scheduling: {poll_interval_ms: hello}} rejected
-`invalid field type`; hand-broken file: status/task list exit 1, agent/context/goal list and config get exit 0;
-config set of the broken key repairs it, of max_concurrent_agents exit 2; invalid YAML: status and config set exit 1. -->
 
 ## Capturing `orch mcp` diagnostics
 

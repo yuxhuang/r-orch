@@ -19,8 +19,6 @@ The web dashboard (`orch web`) shows the [dashboard](08-dashboard.md) in a brows
 ## Start it and open it
 
 Before you start: run the command inside a project (a directory with `.orchestry/`), and start the project's [daemon](18-daemon.md) (`orch daemon start --detach`). Outside a project `orch web` stops with `Not initialized`. Without a daemon it prints the [no-daemon message](18-daemon.md#when-no-daemon-answers) and exits 7; it never starts a daemon.
-<!-- W2 (PR 2, tsk_M9AsDfP): PR 2 contract items 1 and 3 (web preflight + HTTP 503, plan Q0b), spec R18, SE-17.
-Written ahead of S2c; checked at run time at f70fc707 (board-2 fact-check tsk_eVo3agZ, tsk_J8tJF2x). -->
 
 1. Start the server:
 
@@ -45,7 +43,9 @@ The server listens on `127.0.0.1:7681` by default. That address is reachable onl
 
 The token is new every time you start `orch web`. Keep the terminal open; the server stops when you close it.
 
-**If the daemon goes away** while `orch web` runs, the server keeps running. A new page or tab gets HTTP 503 with the no-daemon message as plain text; with `--no-auth` it gets only `orch daemon unavailable`, without the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen (`r` retry, `q` quit). Start the daemon again and reload the page.
+**Changes appear by themselves.** Each tab's dashboard follows the daemon's change notices like the terminal dashboard, so a change made anywhere, from the CLI, an agent or another tab, shows up without reloading the page ([How clients follow changes](18-daemon.md#how-clients-follow-changes)). The server itself keeps one connection to the daemon open, to know at once when the daemon goes away; it keeps no copy of the project's data and never polls the project's files. [TODO-VERIFY V11: browser update without reload and the parent connection, on the integrated binary.]
+
+**If the daemon goes away** while `orch web` runs, the server keeps running. A new page or tab gets HTTP 503 with the no-daemon message as plain text; with `--no-auth` it gets only `orch daemon unavailable`, without the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen (`r` retry, `q` quit). Nothing restarts the daemon: start it again yourself, then reload the page.
 
 ## Log in
 

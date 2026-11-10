@@ -177,7 +177,8 @@ Another machine running orch that your installation connects to. Also called a r
 [Remote agents](11-remote-agents.md).
 
 **poll interval**
-How often the orchestrator checks the project (`scheduling.poll_interval_ms`, 10 seconds by default). See
+The longest pause between the orchestrator's checks of the project (`scheduling.poll_interval_ms`, 10 seconds by
+default); a change to the project brings the next check forward. See
 [Project settings](12-configuration-and-output.md#project-settings).
 
 **priority**
