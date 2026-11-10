@@ -3,7 +3,6 @@
 Each entry says what a term means in orch and links to the section that explains it. Terms are in alphabetical
 order. Use it when a word in another chapter is unfamiliar.
 
-
 ## A
 
 **adapter**
@@ -177,8 +176,11 @@ Another machine running orch that your installation connects to. Also called a r
 [Remote agents](11-remote-agents.md).
 
 **poll interval**
-How often the orchestrator checks the project (`scheduling.poll_interval_ms`, 10 seconds by default). See
-[Project settings](12-configuration-and-output.md#project-settings).
+The configured periodic delay after a completed scheduling check (`scheduling.poll_interval_ms`, 10 seconds by
+default, with a 100 ms floor). Changes can schedule an earlier check. The interval and the fixed 500 ms wake
+deadline govern scheduling, not maximum elapsed time between checks or when a task starts. See
+[Project settings](12-configuration-and-output.md#project-settings) and
+[Dispatch follows changes](18-daemon.md#how-serve-run-and-the-dashboard-map-to-the-daemon).
 
 **priority**
 A task's urgency, from 1 to 4. orch starts lower numbers first. The default is 3. See

@@ -2,8 +2,6 @@
 
 Tasks do nothing until the orchestrator starts them, and the orchestrator runs inside the project's [daemon](18-daemon.md). Read this chapter to start work, to watch what happens, to stop safely, and to find the logs. It covers `orch run`, `orch serve`, `orch status`, `orch logs`, `orch doctor` and `orch update`.
 
-<!-- W2 (PR 2, tsk_M9AsDfP): command semantics follow design D8 and wave-c-brief.md "PR 2 contract" item 1, written
-ahead of S2a-cli; the board-2 fact-check (tsk_eVo3agZ) checked the samples at run time at f70fc707. -->
 Every command in this chapter needs a running daemon, except `orch update`, the daemon starts `orch run --watch` and
 `orch serve` (without `--once`), and the local checks of `orch doctor`. Without one it prints `No orch daemon is running for <project root>` and exits 7 ([When no daemon answers](18-daemon.md#when-no-daemon-answers)).
 
@@ -114,7 +112,7 @@ orch run --once
 
 `--once` asks the running daemon for one scheduling check, as dispatch would make it, prints that check's events and exits. It does not stop the daemon, and it does not turn dispatch on or off.
 
-`orch run` needs a task ID, `--all`, `--once` or `--watch`. With none of them it prints `✕ Specify a task ID, --all, --once, or --watch` and exits with 2. <!-- W2b: lib.rs Command::Run branch (Error::invalid_arguments, exit 2) at 6acc62db. --> If you combine them, `--watch` wins over `--all`, and `--all` wins over a task ID. So `orch run --all --watch` is the same as `orch run --watch`. Some commands, such as `orch org deploy`, print `Next: orch run --all --watch`. That starts the daemon with dispatch on, which also dispatches everything that waits; if a daemon already runs, use `orch daemon dispatch on` instead.
+`orch run` needs a task ID, `--all`, `--once` or `--watch`. With none of them it prints `✕ Specify a task ID, --all, --once, or --watch` and exits with 2. If you combine them, `--watch` wins over `--all`, and `--all` wins over a task ID. So `orch run --all --watch` is the same as `orch run --watch`. Some commands, such as `orch org deploy`, print `Next: orch run --all --watch`. That starts the daemon with dispatch on, which also dispatches everything that waits; if a daemon already runs, use `orch daemon dispatch on` instead.
 
 ### Options for `orch run`
 
@@ -136,8 +134,6 @@ If a daemon already runs for the project, `orch run --watch` refuses with exit 4
   ✕ orch daemon already running (PID 41235)
     Use: orch daemon dispatch on
 ```
-<!-- W2b (tsk_s5fpInN): text from orch-proto error.rs already_running() and commands/daemon.rs foreground() at
-6acc62db; PID illustrative. Not captured: that head does not compile (12 errors in orch-cli mcp/tui). -->
 
 `orch run` refuses two options of orch 0.13.0 with exit 2, before it contacts any daemon:
 
@@ -148,8 +144,6 @@ If a daemon already runs for the project, `orch run --watch` refuses with exit 4
 
 The message follows `✕`, as every error does. `orch run --help` no longer lists `--tick-interval`. See
 [Daemon logs and events](#daemon-logs-and-events) for what replaces both.
-<!-- W2b: messages verbatim from crates/orch-cli/src/tree.rs REJECT_TICK_INTERVAL / REJECT_VERBOSE and
-RunCmd::rejected_flag at 6acc62db; lib.rs dispatch_parsed refuses before any connect (exit 2). -->
 
 ## Keep the orchestrator running in your terminal
 
@@ -165,18 +159,19 @@ Once the daemon is ready it prints two lines, with your own socket path, and the
 listening /private/tmp/hello-orch/.orchestry/run/orch.sock
 dispatch on
 ```
-<!-- W2b: lines from crates/orch-daemon/src/lifecycle.rs (foreground readiness, `listening {}` / `dispatch {}`) at
-6acc62db; captured from a foreground `orch serve` at f70fc707 (tsk_J8tJF2x). The 0.13.0 status line (`orch · watching · …`) is gone. -->
 
 The command shows no status line and no agent output: it is the daemon, not a client. To watch what happens, run
 `orch logs --follow` in another terminal ([Daemon logs and events](#daemon-logs-and-events)).
 
-The pause between checks is `scheduling.poll_interval_ms`, 10 seconds by default. The daemon reads it again before
-every wait, so `orch config set scheduling.poll_interval_ms <ms>` takes effect from the next check without a
-restart; values under 100 ms count as 100 ms. The daemon checks only at that interval: a new task or a finished run
-waits for the next check.
-<!-- W2b: crates/orch-daemon/src/dispatch/mod.rs run_loop/poll_interval (read each round, MIN_POLL 100 ms,
-DEFAULT_POLL 10 s, plain sleep, no wake-up) at 6acc62db; s2a-cli-decisions §2 (R30). -->
+With dispatch on and the scheduler idle, the first change that may have made work ready, such as a new task
+or a finished run, schedules a check for 500 ms later; further changes coalesce without moving that deadline.
+Changes during a check schedule at most one follow-up, due 500 ms after it ends. After each completed check,
+the daemon schedules the next periodic check using `scheduling.poll_interval_ms`, 10 seconds by default.
+These are scheduling intervals, not maximum elapsed times between checks or promises of when a task starts:
+a long check, waiting for the coordinator or a busy machine can delay execution
+([Dispatch follows changes](18-daemon.md#how-serve-run-and-the-dashboard-map-to-the-daemon)). The daemon reads
+the interval again for the next scheduling round, so `orch config set scheduling.poll_interval_ms <ms>` takes
+effect without a restart; values under 100 ms count as 100 ms.
 
 Stop it with `Ctrl+C` ([Stop orch safely](#stop-orch-safely)). That stops the daemon, so every other client of the project then reports that no daemon runs.
 
@@ -205,8 +200,6 @@ exit 2, before it contacts any daemon, and prints the first that applies:
 
 `--log-format json`, the default, is accepted, so an existing `orch serve --log-format json` still starts. Nothing
 is ignored silently.
-<!-- W2b: messages verbatim from crates/orch-cli/src/tree.rs REJECT_* and ServeCmd::rejected_flag (order: interval,
-log-file, log-format, verbose) at 6acc62db; s2a-cli-decisions §2. -->
 
 ### Daemon logs and events
 
@@ -217,8 +210,6 @@ log-file, log-format, verbose) at 6acc62db; s2a-cli-decisions §2. -->
   only its two readiness lines.
 - **A detached daemon** (`orch daemon start --detach`) writes the same output to `.orchestry/daemon.log`
   ([Start the daemon](18-daemon.md#start-the-daemon)).
-<!-- W2b: crates/orch-cli/src/lib.rs init_tracing (stderr, RUST_LOG EnvFilter, ORCHESTRY_DEBUG=debug, else off);
-manual 18 --detach paragraph for daemon.log. -->
 
 ### Logs of `serve --once`
 
@@ -231,9 +222,6 @@ orch serve --once > serve.log 2>&1
 Each line is a JSON object, so tools such as `jq` can read it. For people, use `--log-format text`. The first
 record is `serve:started` with `mode` `once`; the last is `serve:finished` ([below](#use-serve---once-in-a-script)).
 In orch 0.13.0 `serve:started` also had `pid` and `poll_interval_ms`; it no longer has them.
-<!-- W2b: crates/orch-cli/src/commands/run.rs serve_once (serve:started mode=once only; serve:finished result,
-exit_code) and serve/logger.rs log() (ts, level, event, fields) at 6acc62db. The 0.13.0 samples were removed
-because their serve:started fields no longer match. -->
 
 **Start-up warnings.** Right after `serve:started`, and before the batch starts any work, `serve --once` logs
 one `serve:diagnostic` warning for each effort warning
@@ -258,10 +246,6 @@ In JSON the fields are `agentId`, `agentName` and `message`:
 
 If `serve --once` cannot read the warnings from the daemon, it logs one `serve:diagnostics_unavailable` warning
 with an `error` field and carries on. A foreground `orch serve` is the daemon and logs neither record.
-<!-- tsk_RP30qgK: crates/orch-cli/src/commands/run.rs log_startup_diagnostics (ui.bootstrap startup_warnings,
-agent split by exact "name (id): " prefix) at ecb5f1bd; warning set = orch-engine prompt_mode::startup_diagnostics
-(effort + eco-template), as in 0.13.0. Samples from `serve --once` and `--log-format text --log-file` with a binary
-built at cb4e0042 (contains ecb5f1bd), throwaway HOME, 2026-11-09. -->
 
 When a run starts
 for an agent with an effort, each effort warning for that run is logged once as an `orchestrator:error` warning
@@ -277,8 +261,10 @@ warning logs none ([Warnings when a run starts](16-eco-mode-and-effort.md#warnin
 | `--listen [<ADDR>]`, `--peer-name <NAME>` | Without `--once`: start options of the daemon, as for `orch run --watch`. | |
 | `--from-agent` | Without `--once`: allows the start from an agent's environment, as for `orch run --watch`. With `--once`: rejected (exit 1). | Off |
 
-No option sets the interval. The daemon checks every `scheduling.poll_interval_ms`; change it with
-`orch config set scheduling.poll_interval_ms <ms>`, which a running daemon picks up at its next check.
+No option sets the interval. `scheduling.poll_interval_ms` sets the periodic delay after a completed check;
+changes can schedule an earlier check, subject to the [scheduling-only qualification above](#keep-the-orchestrator-running-in-your-terminal).
+Change the interval with `orch config set scheduling.poll_interval_ms <ms>`, which a running daemon reads for
+its next scheduling round.
 
 ### Use `serve --once` in a script
 
@@ -291,7 +277,6 @@ No option sets the interval. The daemon checks every `scheduling.poll_interval_m
 In this run a failed task in the project gave `result=has_failed` and exit code 1. `--once` does not create tasks for autonomous agents.
 
 A later `orch daemon dispatch on` or `off`, from any terminal or the dashboard, ends the batch: `serve --once` reports `interrupted`, and the agents keep running. Stopping `serve --once` (`Ctrl+C`) also ends the batch and leaves its running agents running in the daemon; in orch 0.13.0 it stopped them. To run a batch from cron, start the daemon yourself first; see [Recovery](18-daemon.md#recovery) for a cron line that fails visibly.
-<!-- design D8 batch policy (RT5/G3); spec R13. -->
 
 > **Note:** `serve --once` waits while a task is in `review`. If a task needs your approval and nobody gives it, the command never exits. It stays up until you run `orch task approve` from another terminal. To avoid this in scripts, give the agents the approval policy `auto`, or give the tasks review criteria ([Add review checks to a task](04-tasks.md#add-review-checks-to-a-task)).
 
@@ -304,7 +289,6 @@ Stop the daemon with `orch daemon stop`, from any terminal. A daemon in the fore
 To stop dispatching new work but keep the daemon, and the agents that already run, use `orch daemon dispatch off`.
 
 `orch run <task-id>`, `orch run --all`, `orch run --once` and `orch serve --once` are clients of the daemon: stopping them with `Ctrl+C` stops following, not the agents they started. Cancel a task to stop its agent.
-<!-- design D8 (observer disconnect does not kill the run; serve --once disconnect leaves agents running). -->
 
 Avoid `kill -9` on the daemon. It cannot stop its agents or save its state; every client then reports that no daemon runs, and the next `orch daemon start` reconciles what it left ([After a daemon crash](../RUNBOOK.md#after-a-daemon-crash-or-kill--9)).
 
