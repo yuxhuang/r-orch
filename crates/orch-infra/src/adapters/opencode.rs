@@ -414,6 +414,7 @@ mod effort_tests {
         failure: Option<&'static str>,
         exits: Mutex<Vec<(ExitNotifier, ExitSignal)>>,
         killed: Mutex<Vec<u32>>,
+        spawned: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -485,7 +486,7 @@ mod effort_tests {
             } else {
                 Box::new(std::io::Cursor::new(out))
             };
-            Ok(SpawnedChild {
+            let child = SpawnedChild {
                 pid: if args.iter().any(|a| a == "--format") {
                     456
                 } else {
@@ -495,7 +496,9 @@ mod effort_tests {
                 stderr: Some(Box::new(std::io::Cursor::new(err))),
                 stdin: None,
                 exit,
-            })
+            };
+            self.spawned.notify_one();
+            Ok(child)
         }
     }
 
@@ -702,8 +705,8 @@ mod effort_tests {
         assert!(!build_args(&p).unwrap().join(" ").contains("#high#"));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn cancelled_probe_is_killed_and_reaped() {
+    #[tokio::test]
+    async fn already_cancelled_preparation_never_spawns_a_probe() {
         let pm = Arc::new(ProbeProcess {
             failure: Some("exit-timeout"),
             ..Default::default()
@@ -716,6 +719,45 @@ mod effort_tests {
                 .await
                 .is_err()
         );
+        assert!(pm.calls.lock().unwrap().is_empty());
+        assert!(pm.exits.lock().unwrap().is_empty());
+        assert!(pm.killed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_probe_is_killed_and_reaped() {
+        let pm = Arc::new(ProbeProcess {
+            failure: Some("exit-timeout"),
+            ..Default::default()
+        });
+        let adapter = OpenCodeAdapter::new(pm.clone());
+        let p = params(Some(E::Max));
+        #[cfg(target_os = "macos")]
+        let holder =
+            crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Discovery).await;
+        let mut preparation = Box::pin(adapter.prepare_effort(&p));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(futures::poll!(&mut preparation).is_pending());
+            assert!(pm.calls.lock().unwrap().is_empty());
+            assert!(pm.exits.lock().unwrap().is_empty());
+            drop(holder);
+        }
+        // Admission can yield before a child exists. Poll preparation through
+        // fake spawn before cancelling so the kill/reap oracle has a live child.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::select! {
+                biased;
+                result = &mut preparation => panic!("probe finished before child readiness: {result:?}"),
+                () = pm.spawned.notified() => {}
+            }
+        })
+        .await
+        .expect("probe is admitted and the fake child is ready");
+        assert_eq!(pm.exits.lock().unwrap().len(), 1);
+        assert!(pm.exits.lock().unwrap()[0].1.try_get().is_none());
+        p.cancel.cancel();
+        assert!(preparation.await.is_err());
         assert_eq!(*pm.killed.lock().unwrap(), [123]);
         assert!(
             pm.exits
@@ -733,8 +775,28 @@ mod effort_tests {
         });
         let adapter = OpenCodeAdapter::new(pm.clone());
         let p = params(Some(E::Max));
+        #[cfg(target_os = "macos")]
+        let holder =
+            crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Discovery).await;
         let mut preparation = Box::pin(adapter.prepare_effort(&p));
-        assert!(futures::poll!(&mut preparation).is_pending());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(futures::poll!(&mut preparation).is_pending());
+            assert!(pm.calls.lock().unwrap().is_empty());
+            assert!(pm.exits.lock().unwrap().is_empty());
+            drop(holder);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::select! {
+                biased;
+                result = &mut preparation => panic!("probe finished before child readiness: {result:?}"),
+                () = pm.spawned.notified() => {}
+            }
+        })
+        .await
+        .expect("probe is admitted and the fake child is ready");
+        assert_eq!(pm.exits.lock().unwrap().len(), 1);
+        assert!(pm.exits.lock().unwrap()[0].1.try_get().is_none());
         drop(preparation);
         assert_eq!(*pm.killed.lock().unwrap(), [123]);
         assert!(
