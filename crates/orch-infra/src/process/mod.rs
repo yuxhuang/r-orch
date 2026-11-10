@@ -1,7 +1,7 @@
 //! WP-2 — process spawning, the line readers, and the shared adapter spawn
 //! path.
 
-pub(crate) mod gate;
+pub mod gate;
 pub mod line_reader;
 pub mod manager;
 pub mod spawn;

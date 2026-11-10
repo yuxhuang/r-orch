@@ -20,10 +20,10 @@ thread_local! {
 // This probe is test-only and does not replace acquisition: production's
 // blocking lock immediately follows it. Only confirmed WouldBlock sends a
 // contention event; a poisoned but available mutex is not contention.
-pub(super) fn before_lock(gate: &Mutex<()>) {
+pub(super) fn before_lock(gate: &tokio::sync::Semaphore) {
     WAITER.with(|slot| {
         if let Some(tx) = slot.borrow_mut().take()
-            && matches!(gate.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+            && gate.available_permits() == 0
         {
             tx.send(Event::Blocked)
                 .expect("notify confirmed lock contention");
@@ -31,7 +31,7 @@ pub(super) fn before_lock(gate: &Mutex<()>) {
     });
 }
 
-pub(super) fn at_spawn() {
+pub(crate) fn at_spawn() {
     PARK.with(|slot| {
         if let Some((entered, release)) = slot.borrow_mut().take() {
             entered.send(()).expect("notify parked spawn");
@@ -40,6 +40,13 @@ pub(super) fn at_spawn() {
                 .expect("release parked spawn");
         }
     });
+}
+
+pub(crate) fn take_park() -> Option<(mpsc::Sender<()>, mpsc::Receiver<()>)> {
+    PARK.with(|slot| slot.borrow_mut().take())
+}
+pub(crate) fn install_park(park: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+    PARK.with(|slot| *slot.borrow_mut() = park);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -188,4 +195,26 @@ fn unwinding_spawn_releases_and_recovers_the_poisoned_gate() {
         .spawn("/usr/bin/true", &[], SpawnOptions::default())
         .unwrap();
     assert!(runtime.block_on(child.exit.wait()).success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asynchronous_admission_yields_and_cancellation_releases_waiting_record() {
+    let holder = super::reserve_spawn(super::SpawnSite::Discovery).await;
+    let waiter = tokio::spawn(async { super::reserve_spawn(super::SpawnSite::Launch).await });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "queued launch must wait for complete spawn"
+    );
+    tokio::time::timeout(DEADLINE, tokio::spawn(async { 42 }))
+        .await
+        .unwrap()
+        .unwrap();
+    waiter.abort();
+    assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
+    drop(holder);
+    let permit = tokio::time::timeout(DEADLINE, super::reserve_spawn(super::SpawnSite::Launch))
+        .await
+        .unwrap();
+    permit.run(|| super::with_spawn_gate(|| ()));
 }

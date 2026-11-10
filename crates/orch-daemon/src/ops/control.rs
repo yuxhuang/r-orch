@@ -535,7 +535,9 @@ impl ServiceHandler {
         _: &OpContext,
         _: DaemonStopArgs,
     ) -> OpResult<StopOutcome> {
+        let drain_deadline = tokio::time::Instant::now() + crate::lifecycle::SESSION_DRAIN;
         self.coordinator.stop_admission();
+        self.diagnostics.spawn_work().seal();
         self.control.dispatch_on.store(false, Ordering::SeqCst);
         self.end_batch();
         self.control
@@ -549,6 +551,20 @@ impl ServiceHandler {
             .daemon_stop()
             .await
             .map_err(service_error);
+        let result = match result {
+            Ok(()) => {
+                tokio::time::timeout_at(drain_deadline, self.diagnostics.spawn_work().wait_idle())
+                    .await
+                    .map_err(|_| {
+                        ErrorBody::new(
+                            ErrorCode::General,
+                            "Daemon shutdown incomplete; diagnostic spawn work remains",
+                            Execution::Unknown,
+                        )
+                    })
+            }
+            Err(error) => Err(error),
+        };
         self.control.stopped.send_replace(Some(result.is_ok()));
         result.map(|()| StopOutcome { clean: true })
     }

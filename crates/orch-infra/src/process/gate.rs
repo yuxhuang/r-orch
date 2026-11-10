@@ -1,39 +1,115 @@
-//! Serialize complete synchronous spawns on macOS, whose std pipe setup sets
-//! CLOEXEC after creating the descriptors. Another fork in that window could
-//! retain a handshake or captured-output writer until an unrelated child exits.
+//! Complete-spawn exclusion on macOS. Async callers reserve before taking any
+//! project/state lock; synchronous callers retain the same exclusion domain.
+
+mod observation;
+pub(crate) mod work;
+
+use std::cell::RefCell;
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, OnceLock};
+
+use observation::Notice;
+pub use observation::{SpawnObservation, SpawnObserver, SpawnSite, SpawnStage, pending_spawns};
+pub use work::SpawnWork;
 
 #[cfg(target_os = "macos")]
-use std::sync::{Mutex, PoisonError};
+fn gate() -> &'static Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+}
 
-#[cfg(target_os = "macos")]
-static SPAWN_GATE: Mutex<()> = Mutex::new(());
-
-/// The closure must end at `spawn()`: no await, output read or child wait.
-/// Linux creates these descriptors with atomic CLOEXEC and takes no lock.
-pub(crate) fn with_spawn_gate<T>(spawn: impl FnOnce() -> T) -> T {
+/// A Send reservation may cross awaits as an ordinary value. Its thread-local
+/// handoff exists only during `run`'s synchronous call, never across an await.
+pub struct SpawnReservation {
     #[cfg(target_os = "macos")]
-    let _guard = {
-        #[cfg(test)]
-        tests::before_lock(&SPAWN_GATE);
-        SPAWN_GATE.lock().unwrap_or_else(PoisonError::into_inner)
-    };
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    notice: Notice,
+}
+
+thread_local! {
+    static RESERVED: RefCell<Option<SpawnReservation>> = const { RefCell::new(None) };
+}
+
+impl SpawnReservation {
+    pub fn run<T>(self, call: impl FnOnce() -> T) -> T {
+        RESERVED.with(|slot| {
+            assert!(slot.borrow().is_none(), "nested spawn reservation");
+            *slot.borrow_mut() = Some(self);
+        });
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RESERVED.with(|slot| slot.borrow_mut().take());
+            }
+        }
+        let _restore = Restore;
+        call()
+    }
+}
+
+pub async fn reserve_spawn(site: SpawnSite) -> SpawnReservation {
+    reserve_observed(site, None).await
+}
+
+pub(crate) struct WaitingSpawn(Notice);
+
+pub(crate) fn observe_spawn(
+    site: SpawnSite,
+    observer: Option<std::sync::Arc<dyn SpawnObserver>>,
+) -> WaitingSpawn {
+    WaitingSpawn(Notice::new(site, observer))
+}
+
+impl WaitingSpawn {
+    pub(crate) async fn reserve(self) -> SpawnReservation {
+        #[cfg(all(test, target_os = "macos"))]
+        tests::before_lock(gate());
+        #[cfg(target_os = "macos")]
+        let permit = Arc::clone(gate())
+            .acquire_owned()
+            .await
+            .expect("spawn gate is never closed");
+        SpawnReservation {
+            #[cfg(target_os = "macos")]
+            _permit: permit,
+            notice: self.0,
+        }
+    }
+}
+
+pub(crate) async fn reserve_observed(
+    site: SpawnSite,
+    observer: Option<std::sync::Arc<dyn SpawnObserver>>,
+) -> SpawnReservation {
+    observe_spawn(site, observer).reserve().await
+}
+
+/// End the closure at spawn's actual return/error/unwind, before output or wait.
+/// Linux never acquires the macOS exclusion permit.
+pub(crate) fn with_spawn_gate<T>(spawn: impl FnOnce() -> T) -> T {
+    let reservation = RESERVED.with(|slot| slot.borrow_mut().take());
+    let mut reservation = reservation.unwrap_or_else(|| {
+        #[cfg(all(test, target_os = "macos"))]
+        tests::before_lock(gate());
+        futures::executor::block_on(reserve_spawn(SpawnSite::Synchronous))
+    });
+    // The permit stays in this stack frame even if an observer unwinds.
+    reservation.notice.enter();
     #[cfg(all(test, target_os = "macos"))]
     tests::at_spawn();
     spawn()
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod tests;
-
 #[cfg(test)]
 mod capture_tests;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod platform_tests {
     use super::with_spawn_gate;
     use std::sync::mpsc;
     use std::time::Duration;
-
     #[test]
     fn linux_helper_does_not_serialize_callers() {
         let (entered_tx, entered_rx) = mpsc::channel();

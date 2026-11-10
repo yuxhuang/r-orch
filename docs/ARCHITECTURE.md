@@ -85,6 +85,37 @@ whole-record saves, expiry under the index lock) is separate follow-up work. See
 the orchestrator and the dashboard do not take it, and agent and task records are still saved through their stores
 and indexes, one write each, so the hazard in this section is unchanged for everything else.
 
+### Daemon process admission
+
+Serving routes share one complete-spawn exclusion domain on macOS, from before
+pipe construction until spawn actually returns, errors or unwinds. Async workspace
+capture, version probes, diagnostics and final launches reserve admission before
+calling their synchronous process port. Final launch then takes the project
+boundary and state mutex, revalidates task/goal/config/generation/shutdown, and
+hands the reservation to the synchronous builder without another acquisition.
+The reservation's thread-local handoff spans no await. Hostname fallback is admitted
+during container construction before serving. Peer execution uses the same engine.
+Linux takes no macOS exclusion permit; diagnostic offload and ownership tracking
+are shared code and still require native Linux verification.
+
+Diagnostics submit blocking spawn jobs only after yielding admission. Their
+registry retains at most 32 job slots through output/late cleanup, including after
+an observer ends. Existing request and dispatch caps bound queued observers;
+manager exit observers retain the same ownership registry for their already
+admitted children. Sealing and registration share a mutex. Normal shutdown and
+Drop drainage kill registered groups first, then drain accepted requests, entered
+jobs/late children and collectors before releasing project ownership. A private-log
+observer runs independently of polling workers and the project boundary, with
+bounded records, fixed labels, and 1 s/5 s warning thresholds.
+
+This does not make a kernel spawn preemptible. A diagnostic held inside spawn
+leaves independent control available but causes incomplete stop with ownership
+retained until drainage. An actual final agent spawn can still retain the project
+boundary as before. The exclusion covers descriptors created inside these spawn
+calls; sockets accepted/created elsewhere on macOS retain their separate
+close-on-exec window. No immunity to crash transactionality or external writers
+is implied. See [process start diagnosis](RUNBOOK.md#a-process-is-waiting-to-start).
+
 ---
 
 ## 3. Crate layout

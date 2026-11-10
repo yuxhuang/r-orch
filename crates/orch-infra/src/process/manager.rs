@@ -129,7 +129,7 @@ impl ProcessManager for SystemProcessManager {
     }
 
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild> {
-        spawn_with(command, args, opts, None)
+        spawn_with(command, args, opts, None, None)
     }
 }
 
@@ -146,6 +146,7 @@ impl ProcessManager for SystemProcessManager {
 #[derive(Debug, Clone)]
 pub struct SnapshotEnvProcessManager {
     snapshot: Arc<EnvSnapshot>,
+    work: Option<Arc<super::gate::SpawnWork>>,
 }
 
 /// The environment a [`SnapshotEnvProcessManager`] spawns with.
@@ -161,7 +162,12 @@ impl SnapshotEnvProcessManager {
     pub fn new(snapshot: EnvSnapshot) -> Self {
         SnapshotEnvProcessManager {
             snapshot: Arc::new(snapshot),
+            work: None,
         }
+    }
+    pub fn with_spawn_work(mut self, work: Arc<super::gate::SpawnWork>) -> Self {
+        self.work = Some(work);
+        self
     }
 }
 
@@ -180,7 +186,13 @@ impl ProcessManager for SnapshotEnvProcessManager {
     }
 
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild> {
-        spawn_with(command, args, opts, Some(&self.snapshot))
+        spawn_with(
+            command,
+            args,
+            opts,
+            Some(&self.snapshot),
+            self.work.as_ref(),
+        )
     }
 }
 
@@ -190,7 +202,14 @@ fn spawn_with(
     args: &[String],
     opts: SpawnOptions,
     snapshot: Option<&EnvSnapshot>,
+    work: Option<&Arc<super::gate::SpawnWork>>,
 ) -> Result<SpawnedChild> {
+    let lease = work
+        .map(|work| {
+            work.track()
+                .ok_or_else(|| Error::other("spawn admission closed"))
+        })
+        .transpose()?;
     let mut child = super::gate::with_spawn_gate(|| {
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
@@ -265,6 +284,7 @@ fn spawn_with(
     // the child outlives us exactly as node's `proc.unref()` allows.
     let (notifier, exit) = ExitSignal::channel();
     tokio::spawn(async move {
+        let _lease = lease;
         let outcome = match child.wait().await {
             Ok(status) => ExitOutcome {
                 code: status.code(),

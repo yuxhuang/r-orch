@@ -43,6 +43,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Daemon: `orch daemon start` fails with exit 1, naming the failed write, when recovery cannot save a task, run or agent change, rather than become ready with the change lost.
 
 ### Fixed
+- On macOS, queued daemon launches now yield before taking the project boundary, so a held diagnostic spawn does not block reads, task cancellation or goal pause. Private-log warnings distinguish waiting from entered spawn; shutdown retains ownership through late diagnostic cleanup.
 - Removing a directory under `.orchestry/` (such as `context/` or `tasks/`) while the daemon runs no longer makes later writes into it fail until a restart: the daemon recreates the directory at its next write into it. In 0.13.0 every long-lived orch process (the orchestrator, the dashboard, `orch mcp`) could keep failing those writes until it restarted. The files that were in the removed directory are not brought back.
 
 ## [0.13.0] - 2026-11-09

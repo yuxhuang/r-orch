@@ -87,7 +87,7 @@ impl DaemonExit {
 }
 
 /// How long shutdown waits for sessions to deliver terminal frames.
-const SESSION_DRAIN: Duration = Duration::from_secs(10);
+pub(crate) const SESSION_DRAIN: Duration = Duration::from_secs(10);
 /// How long a stop already started by `daemon.stop` may take to report.
 const STOP_WAIT: Duration = Duration::from_secs(300);
 
@@ -365,9 +365,10 @@ impl Running {
         ));
         let command_runner = Arc::new(crate::ops::SnapshotCommandRunner(Arc::clone(&diagnostics)));
         let processes = spec.processes.unwrap_or_else(|| {
-            Arc::new(orch_infra::process::SnapshotEnvProcessManager::new(
-                child_env,
-            ))
+            Arc::new(
+                orch_infra::process::SnapshotEnvProcessManager::new(child_env)
+                    .with_spawn_work(Arc::clone(diagnostics.spawn_work())),
+            )
         });
         let peer = orch_domain::PeerConfig {
             name: spec.peer_name,
@@ -622,6 +623,7 @@ impl Running {
             self.loops.pop();
         }
         self.handler.drain_requests().await;
+        self.engine.orchestrator.wait_for_collectors().await;
         // Stop-intent callers get completion only after accepted work is gone.
         self.server.stop.finish(clean);
         if !self.server.wait_idle(SESSION_DRAIN).await {
@@ -709,6 +711,7 @@ impl Running {
                 let _ = task.await;
             }
             handler.drain_requests().await;
+            handler.engine.orchestrator.wait_for_collectors().await;
             pid_lock.release();
             drop(guard);
         });

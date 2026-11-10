@@ -238,7 +238,11 @@ pub async fn build_light_with(
     };
     let mut config = config_store.read().await?;
     if config.peer.name.is_none() {
-        config.peer.name = Some(orch_infra::storage::remote::default_peer_name());
+        let reservation = orch_infra::process::gate::reserve_spawn(
+            orch_infra::process::gate::SpawnSite::Hostname,
+        )
+        .await;
+        config.peer.name = Some(reservation.run(orch_infra::storage::remote::default_peer_name));
     }
     // The light tier does not read `global.yml`: `globalConfig` stays at its
     // default until the full tier loads it, and no read-only command

@@ -379,6 +379,11 @@ impl DaemonHarness {
         })
     }
 
+    /// Observe real diagnostic admission/entry from an isolated test only.
+    pub fn observe_spawns(&self, observer: Arc<dyn orch_infra::process::gate::SpawnObserver>) {
+        self.handler.observe_spawns(observer);
+    }
+
     /// The engine, for seeding and peeking from **test code only**.
     pub fn engine(&self) -> &orch_engine::FullEngine {
         &self.engine
