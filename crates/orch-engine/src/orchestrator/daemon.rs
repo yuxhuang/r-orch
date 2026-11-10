@@ -4,7 +4,7 @@ mod completion;
 mod shutdown;
 mod startup;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -364,8 +364,9 @@ impl Orchestrator {
                     if matches!(error, Error::Domain(DomainError::Workspace { .. })) {
                         self.daemon_record_workspace_failure(task_id, generation, &error)
                             .await?;
+                    } else {
+                        self.daemon_release_preparation(task_id, generation).await?;
                     }
-                    self.daemon_release_preparation(task_id, generation).await?;
                     return Err(error);
                 }
             };
@@ -765,12 +766,20 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Only dependencies and scope reservations need the other tasks. A
+        // backlog of independent tasks must not parse the whole index per
+        // candidate while holding the boundary.
+        let reserved = state
+            .running
+            .keys()
+            .chain(state.claimed.iter())
+            .any(|id| id != &task.id);
+        let scoped = task.scope.as_deref().is_some_and(|scope| !scope.is_empty());
+        if task.depends_on.is_empty() && !(scoped && reserved) {
+            return Ok(true);
+        }
         let tasks = self.deps().task_store.list(&Default::default()).await?;
-        let map: HashMap<String, Task> = tasks
-            .iter()
-            .map(|task| (task.id.clone(), task.clone()))
-            .collect();
-        if is_blocked(task, &map) {
+        if is_blocked(task, tasks.as_slice()) {
             return Ok(false);
         }
         if tasks.iter().any(|running| {
@@ -831,45 +840,63 @@ impl Orchestrator {
         Ok(true)
     }
 
+    /// Whether this generation still owns the task's preparation. A
+    /// generation is never reissued, so once false it stays false.
+    async fn owns_preparation(&self, task_id: &str, generation: u64) -> bool {
+        self.inner
+            .preparing_agents
+            .lock()
+            .await
+            .get(task_id)
+            .is_some_and(|(current, _)| *current == generation)
+    }
+
     async fn daemon_release_preparation(&self, task_id: &str, generation: u64) -> Result<()> {
+        // Already released (a workspace failure releases as it records): do
+        // not queue for the boundary only to commit nothing.
+        if !self.owns_preparation(task_id, generation).await {
+            return Ok(());
+        }
         self.deps()
             .events
             .operation_boundary()
             .run(true, async {
-                if self.is_shutting_down() {
-                    return Ok(());
-                }
-                if !self
-                    .inner
-                    .preparing_agents
-                    .lock()
-                    .await
-                    .get(task_id)
-                    .is_some_and(|(current, _)| *current == generation)
-                {
+                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                for run in self.deps().run_store.list_for_task(task_id).await? {
-                    if run.status == RunStatus::Preparing {
-                        self.deps()
-                            .run_service
-                            .finish(&run.id, RunStatus::Cancelled, None, None)
-                            .await?;
-                    }
-                }
-                state.claimed.shift_remove(task_id);
-                self.inner.preparing_agents.lock().await.remove(task_id);
-                self.drop_cancel(task_id).await;
+                self.release_preparation_locked(state, task_id).await?;
                 self.save_state(state).await
             })
             .await
             .value
     }
 
-    /// Account a workspace failure for the preparation this call still owns.
+    /// Cancel the preparing runs and drop the claim; the caller saves state.
+    async fn release_preparation_locked(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+    ) -> Result<()> {
+        for run in self.deps().run_store.list_for_task(task_id).await? {
+            if run.status == RunStatus::Preparing {
+                self.deps()
+                    .run_service
+                    .finish(&run.id, RunStatus::Cancelled, None, None)
+                    .await?;
+            }
+        }
+        state.claimed.shift_remove(task_id);
+        self.inner.preparing_agents.lock().await.remove(task_id);
+        self.drop_cancel(task_id).await;
+        Ok(())
+    }
+
+    /// Account a workspace failure for the preparation this call still owns
+    /// and release it in the same operation: one state write per failed
+    /// candidate, not one for the retry and another for the release.
     async fn daemon_record_workspace_failure(
         &self,
         task_id: &str,
@@ -880,24 +907,16 @@ impl Orchestrator {
             .events
             .operation_boundary()
             .run(true, async {
-                if self.is_shutting_down()
-                    || !self
-                        .inner
-                        .preparing_agents
-                        .lock()
-                        .await
-                        .get(task_id)
-                        .is_some_and(|(current, _)| *current == generation)
-                {
+                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                let tasks = self.deps().task_store.list(&Default::default()).await?;
-                self.record_workspace_dispatch_failure(state, task_id, &tasks, error)
+                self.record_workspace_dispatch_failure(state, task_id, None, error)
                     .await;
-                Ok(())
+                self.release_preparation_locked(state, task_id).await?;
+                self.save_state(state).await
             })
             .await
             .value

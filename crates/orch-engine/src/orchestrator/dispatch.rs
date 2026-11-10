@@ -164,9 +164,12 @@ impl Orchestrator {
                 continue;
             }
             if let Err(err) = self.dispatch_task_to(state, &task.id, remote_only).await {
-                if matches!(err, Error::Domain(DomainError::Workspace { .. })) {
-                    self.record_workspace_dispatch_failure(state, &task.id, &all_tasks, &err)
-                        .await;
+                if matches!(err, Error::Domain(DomainError::Workspace { .. }))
+                    && self
+                        .record_workspace_dispatch_failure(state, &task.id, Some(&all_tasks), &err)
+                        .await
+                {
+                    let _ = self.save_state(state).await;
                 }
                 self.emit_error(&err, format!("dispatch task {}", task.id));
             }
@@ -216,17 +219,21 @@ impl Orchestrator {
     /// swallowed: being unable to *record* a dispatch error must not stop the
     /// remaining dispatches. The daemon's phased launch records through it
     /// too, so both dispatch paths account a failed workspace the same way.
+    ///
+    /// `all_tasks` is only needed by the cascade; `None` lists the store when
+    /// (and only when) the attempt is the last. Returns whether a retry was
+    /// queued in `state`, which the caller persists.
     pub(super) async fn record_workspace_dispatch_failure(
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
-        all_tasks: &[Task],
+        all_tasks: Option<&[Task]>,
         err: &Error,
-    ) {
+    ) -> bool {
         let task = match self.deps().task_store.get(task_id).await {
             Ok(Some(task)) => task,
             // Gone: no attempt to account for.
-            Ok(None) => return,
+            Ok(None) => return false,
             // An unreadable task is not an absent one — see the same
             // distinction in `force_task_cancelled`. Silently skipping the
             // failure accounting would lose an attempt and leave the task
@@ -236,11 +243,11 @@ impl Orchestrator {
                     err,
                     format!("read task {task_id} after a workspace failure"),
                 );
-                return;
+                return false;
             }
         };
         if is_terminal(task.status) {
-            return;
+            return false;
         }
 
         let updated = Task {
@@ -253,8 +260,30 @@ impl Orchestrator {
             status: next_status,
             ..updated
         };
+        // Read before the save: a final attempt recorded without its cascade
+        // would leave the dependents blocked on a failed task.
+        let listed;
+        let all_tasks = match all_tasks {
+            Some(all_tasks) => all_tasks,
+            None if next_status == TaskStatus::Failed => {
+                match self.deps().task_store.list(&Default::default()).await {
+                    Ok(tasks) => {
+                        listed = tasks;
+                        &listed
+                    }
+                    Err(err) => {
+                        self.emit_error(
+                            err,
+                            format!("list tasks after a workspace failure of {task_id}"),
+                        );
+                        return false;
+                    }
+                }
+            }
+            None => &[],
+        };
         if self.deps().task_store.save(&updated).await.is_err() {
-            return;
+            return false;
         }
 
         if next_status == TaskStatus::Failed {
@@ -290,8 +319,9 @@ impl Orchestrator {
                 delay,
                 &err.to_string(),
             );
-            let _ = self.save_state(state).await;
+            return true;
         }
+        false
     }
 
     /// `orch run <id>`: dispatch exactly one task.
