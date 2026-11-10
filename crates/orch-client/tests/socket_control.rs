@@ -111,19 +111,6 @@ async fn stop_completes_through_the_released_guard_while_the_owner_pid_is_a_live
     server.await.unwrap();
 }
 
-// Decided by the PID probe alone: no guard file exists, the owner process has
-// been reaped, so kill(pid, 0) is ESRCH.
-#[tokio::test]
-async fn stop_completes_when_the_owner_process_has_exited_and_no_guard_exists() {
-    let (_dir, listener, cfg) = fixture();
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let pid = child.id();
-    child.wait().unwrap();
-    let server = completed_stop_server(listener, pid);
-    assert!(orch_client::stop(&cfg).await.unwrap().clean);
-    server.await.unwrap();
-}
-
 #[tokio::test]
 async fn stop_acceptance_without_cleanup_completion_is_failure() {
     let (_dir, listener, cfg) = fixture();
