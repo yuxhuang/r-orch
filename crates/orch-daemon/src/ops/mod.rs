@@ -99,6 +99,7 @@ pub struct ServiceHandler {
     control: Arc<control::ControlState>,
     transfers: Arc<Mutex<transport::Transfers>>,
     pub(crate) hub: Arc<crate::hub::Hub>,
+    pub(crate) wake: Arc<crate::dispatch::Wake>,
     observations: Arc<Mutex<Observations>>,
     requests: Arc<lifetime::Requests>,
 }
@@ -123,9 +124,12 @@ impl ServiceHandler {
         engine.orchestrator.enable_daemon_mode();
         let hub = Arc::new(crate::hub::Hub::default());
         let weak = Arc::downgrade(&hub);
+        let wake = Arc::new(crate::dispatch::Wake::default());
+        let wake_sink = Arc::clone(&wake);
         engine
             .operation_boundary()
             .set_publisher(Some(Arc::new(move |publication| {
+                wake_sink.publish(publication);
                 if let Some(hub) = weak.upgrade() {
                     hub.publish(publication);
                 }
@@ -137,6 +141,7 @@ impl ServiceHandler {
             control: Arc::new(control::ControlState::new(&engine)),
             transfers: Arc::new(Mutex::new(transport::Transfers::default())),
             hub,
+            wake,
             observations: Arc::new(Mutex::new(HashMap::new())),
             requests: Arc::default(),
         }

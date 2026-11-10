@@ -260,9 +260,8 @@ impl ServiceHandler {
             .operation_boundary()
             .with_source(
                 orch_engine::container::commit::CommitSource::Expiry,
-                self.coordinator.run_op(Lane::Internal, move |permit| {
+                self.coordinator.run_op(Lane::Internal, move |_| {
                     Box::pin(async move {
-                        permit.invalidate(Store::Context);
                         Ok(engine
                             .context_service
                             .expire_now()
