@@ -75,6 +75,16 @@ impl EventOutput {
         self.closed.subscribe()
     }
 
+    /// Stop subscriptions and release their reservations while accepted RPC
+    /// replies drain through the separate response queue. Overflow still uses
+    /// the closed signal to terminate an unhealthy session immediately.
+    pub(crate) fn begin_drain(&self) {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        state.subscriptions.clear();
+        self.ready.notify_one();
+    }
+
     pub(crate) fn close(&self) {
         let mut state = lock(&self.state);
         state.closed = true;
@@ -395,7 +405,7 @@ impl Hub {
     }
     pub(crate) fn disconnect(&self, session: u64) {
         if let Some(output) = lock(&self.sessions).remove(&session) {
-            output.close();
+            output.begin_drain();
         }
     }
     pub(crate) fn publish(&self, publication: &Publication) {
