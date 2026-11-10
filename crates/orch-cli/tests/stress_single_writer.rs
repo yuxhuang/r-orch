@@ -103,6 +103,8 @@ struct Shared {
     gate: PriorityGate,
     /// What the CLI creator is doing and since when (for a stuck-run report).
     creator_stage: Mutex<(String, Instant)>,
+    /// The same for the TUI driver: the step it is waiting for and since when.
+    tui_stage: Mutex<(String, Instant)>,
     /// `(n, sent, acked)` of the last acknowledged renewal of `live`: the
     /// renewal number and the instants it was sent and acknowledged.
     live_times: Mutex<Option<(u64, Instant, Instant)>>,
@@ -868,31 +870,63 @@ fn spawn_live_observer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<(u6
 
 fn spawn_tui_driver(pane: Arc<TuiPane>, shared: Arc<Shared>) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        pane.keys(&["t"]);
-        let mut n = 0_u64;
-        while !shared.stopped() {
-            n += 1;
-            let title = format!("tui-{n}");
-            let step = |ready: &dyn Fn(&str) -> bool, what: &str| pane.wait_screen(what, ready);
-            pane.keys(&["n"]);
-            step(&|s| s.contains("Task title"), "the title step");
-            pane.type_text(&title);
-            step(&|s| s.contains(&format!("> {title}")), "the typed title");
-            pane.keys(&["Enter"]);
-            step(&|s| s.contains("Priority"), "the priority step");
-            pane.keys(&["Enter"]);
-            step(&|s| s.contains("Assignee"), "the assignee step");
-            pane.keys(&["Enter"]);
-            step(&|s| s.contains("Description"), "the description step");
-            pane.keys(&["Tab"]);
-            step(
-                &|s| !s.contains("NEW TASK — step") && !s.contains("No orch daemon"),
-                "the wizard to close",
-            );
-            shared.created.lock().unwrap().tui_titles.push(title);
-            std::thread::sleep(Duration::from_millis(800));
+        // A panic here (a tmux call over its deadline, a screen that never
+        // came) must fail the run now, with the stage it died in, instead of
+        // surfacing 60 s later as "tui created a task: false".
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drive_tui(&pane, &shared);
+        }));
+        if let Err(payload) = outcome {
+            let (stage, since) = shared.tui_stage.lock().unwrap().clone();
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_default();
+            shared.fail(format!(
+                "tui driver died at `{stage}` after {}ms: {message}",
+                since.elapsed().as_millis()
+            ));
         }
     })
+}
+
+fn drive_tui(pane: &TuiPane, shared: &Shared) {
+    let stage = |what: String| *shared.tui_stage.lock().unwrap() = (what, Instant::now());
+    stage("sending t".into());
+    pane.keys(&["t"]);
+    let mut n = 0_u64;
+    while !shared.stopped() {
+        n += 1;
+        let title = format!("tui-{n}");
+        let wait = |ready: &dyn Fn(&str) -> bool, what: &str| {
+            stage(format!("#{n} waiting for {what}"));
+            pane.wait_screen(what, ready)
+        };
+        let send = |what: &str, keys: &[&str]| {
+            stage(format!("#{n} sending {what}"));
+            pane.keys(keys);
+        };
+        send("n", &["n"]);
+        wait(&|s| s.contains("Task title"), "the title step");
+        stage(format!("#{n} typing the title"));
+        pane.type_text(&title);
+        wait(&|s| s.contains(&format!("> {title}")), "the typed title");
+        send("Enter", &["Enter"]);
+        wait(&|s| s.contains("Priority"), "the priority step");
+        send("Enter", &["Enter"]);
+        wait(&|s| s.contains("Assignee"), "the assignee step");
+        send("Enter", &["Enter"]);
+        wait(&|s| s.contains("Description"), "the description step");
+        send("Tab", &["Tab"]);
+        wait(
+            &|s| !s.contains("NEW TASK — step") && !s.contains("No orch daemon"),
+            "the wizard to close",
+        );
+        shared.created.lock().unwrap().tui_titles.push(title);
+        stage(format!("#{n} created, pausing"));
+        std::thread::sleep(Duration::from_millis(800));
+    }
 }
 
 /// The least evidence a run must collect before it may end: hot-task reads by
@@ -956,14 +990,22 @@ fn wait_until_every_leg_works(
             Instant::now() < deadline,
             "after {LEGS_READY:?} not every leg was working (tui created a task: {tui}, \
              short key set: {short}, live renewed: {live}); TUI screen:\n{}\n\
-             CLI creator: {}; orch processes:\n{}\ndaemon log tail:\n{}",
+             CLI creator: {}; TUI driver: {}; orch processes:\n{}\ndaemon log tail:\n{}",
             pane.map_or_else(|| "(no TUI)".to_owned(), TuiPane::screen),
             {
                 let (stage, since) = &*shared.creator_stage.lock().unwrap();
                 format!("{stage} {}ms ago", since.elapsed().as_millis())
             },
-            orch_processes(&process_table())
+            {
+                let (stage, since) = &*shared.tui_stage.lock().unwrap();
+                format!("{stage} {}ms ago", since.elapsed().as_millis())
+            },
+            process_table()
                 .iter()
+                .filter(|p| {
+                    orch_processes(std::slice::from_ref(p)).len() == 1
+                        || (p.command.contains("tmux") && p.command.contains("-L t2a"))
+                })
                 .map(|p| format!("  pid {} ppid {} {}", p.pid, p.ppid, p.command))
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1241,6 +1283,7 @@ fn run_stress(fleet: Fleet) {
         live_checks: AtomicU64::new(0),
         gate: PriorityGate::default(),
         creator_stage: Mutex::new(("not started".into(), Instant::now())),
+        tui_stage: Mutex::new(("not started".into(), Instant::now())),
         live_times: Mutex::new(None),
         failures: Mutex::default(),
         created: Mutex::default(),

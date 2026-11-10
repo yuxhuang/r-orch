@@ -688,7 +688,11 @@ impl TuiPane {
             .env("TMUX_TMPDIR", &self.dir)
             .env("HOME", &self.home)
             .env("SHELL", "/bin/sh")
-            .args(["-u", "-L", &self.name, "-f", "/dev/null"]);
+            .args(["-u", "-L", &self.name, "-f", "/dev/null"])
+            // Its own process group, so `output_with_deadline` can kill a
+            // tmux client that hangs (`killpg` of a non-leader is ESRCH and
+            // the following `wait` would then hang with it).
+            .process_group(0);
         cmd
     }
 
