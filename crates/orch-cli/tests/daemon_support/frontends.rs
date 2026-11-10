@@ -754,8 +754,44 @@ impl TuiPane {
     }
 }
 
+impl TuiPane {
+    /// Kill the pane's whole process tree, then the tmux server. Idempotent,
+    /// and callable through a shared reference: a test that fails (panics)
+    /// while another thread still holds an `Arc<TuiPane>` never runs `Drop`,
+    /// and a surviving `orch tui` would fail later process-table assertions
+    /// of unrelated tests. The tree is collected BEFORE the server dies,
+    /// because `kill-server` only hangs the pane up and a TUI that keeps
+    /// running is re-parented to init, out of reach of a later lookup.
+    pub fn terminate(&self) {
+        let mut roots = Vec::new();
+        if let Ok(out) = self
+            .cmd()
+            .args(["list-panes", "-a", "-F", "#{pane_pid}"])
+            .output()
+        {
+            roots.extend(
+                text(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok()),
+            );
+        }
+        let table = process_table();
+        let mut doomed = roots;
+        let mut i = 0;
+        while i < doomed.len() {
+            let parent = doomed[i];
+            doomed.extend(table.iter().filter(|p| p.ppid == parent).map(|p| p.pid));
+            i += 1;
+        }
+        let _ = self.cmd().arg("kill-server").output();
+        for pid in doomed {
+            force_kill(pid);
+        }
+    }
+}
+
 impl Drop for TuiPane {
     fn drop(&mut self) {
-        let _ = self.cmd().arg("kill-server").output();
+        self.terminate();
     }
 }

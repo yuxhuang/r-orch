@@ -95,6 +95,12 @@ struct Shared {
     /// stopped: the renewer outlives `stop` so the renewed key's last
     /// renewal is as close to the stop as possible (see `judge`).
     renew_stop: AtomicBool,
+    /// Evidence counters the run waits on (see `evidence_missing`): hot-task
+    /// reads the observer finished and `live` reads that were judged.
+    reads: AtomicU64,
+    live_checks: AtomicU64,
+    /// The priority writer is paced by the observer (see `PriorityGate`).
+    gate: PriorityGate,
     /// What the CLI creator is doing and since when (for a stuck-run report).
     creator_stage: Mutex<(String, Instant)>,
     /// `(n, sent, acked)` of the last acknowledged renewal of `live`: the
@@ -136,6 +142,70 @@ impl Shared {
 
 fn priority_of(n: u64) -> u64 {
     1 + (n % 4)
+}
+
+/// May `observed` be the hot task's priority, given that write #`acked` of the
+/// (single, sequential) priority writer was acknowledged BEFORE the read began
+/// and write #`attempted` had been sent AT MOST by the time the read ended?
+///
+/// The read ran inside that interval, so the committed priority was the one of
+/// some write `k` with `acked <= k <= attempted` (write 0 is the seed). A
+/// window decided from `acked` alone is unsound: with the writer pacing at a
+/// few ms, writes `acked+1` and `acked+2` can both commit during one slow read
+/// (F-S2: "priority reads 4 after write #5 was acknowledged").
+fn priority_may_read(observed: u64, acked: u64, attempted: u64) -> bool {
+    (acked..=attempted.max(acked)).any(|k| priority_of(k) == observed)
+}
+
+/// Paces the priority writer by the observer so the window above stays at
+/// one write wide and the check carries information. `priority` cycles
+/// through only four values, so with a wider window (4+ writes) every value
+/// would be "allowed" and a lost update would pass.
+///
+/// After write #n is acknowledged the writer waits until the observer has
+/// COMPLETED a read that began after that acknowledgement; only then is #n+1
+/// sent. A read that loaded `acked == a` therefore ends before #a+2 is sent
+/// (`#a+2` waits for a read that began after `#a+1` was acknowledged, which is
+/// after this read's `acked` load, so a later read of the sequential
+/// observer).
+#[derive(Default)]
+struct PriorityGate {
+    /// Reads begun / finished by the observer.
+    begun: AtomicU64,
+    finished: AtomicU64,
+    /// 0: observer not started, 1: running, 2: gone.
+    observer: std::sync::atomic::AtomicU8,
+}
+
+impl PriorityGate {
+    /// The observer begins a read: call BEFORE loading the `acked` counters.
+    fn read_begins(&self) {
+        self.begun.fetch_add(1, Ordering::SeqCst);
+    }
+    /// The observer finished a read: call AFTER loading the `attempted`
+    /// counters.
+    fn read_ends(&self) {
+        self.finished.fetch_add(1, Ordering::SeqCst);
+    }
+    fn observer_running(&self) {
+        self.observer.store(1, Ordering::SeqCst);
+    }
+    fn observer_gone(&self) {
+        self.observer.store(2, Ordering::SeqCst);
+    }
+    /// Call right after write #n was acknowledged: the number of reads that
+    /// must be finished before the next write may go.
+    fn target_after_ack(&self) -> u64 {
+        self.begun.load(Ordering::SeqCst) + 1
+    }
+    /// May the next write go? `target` is `None` before the first write.
+    fn open(&self, target: Option<u64>) -> bool {
+        match self.observer.load(Ordering::SeqCst) {
+            0 => false,
+            1 => target.is_none_or(|t| self.finished.load(Ordering::SeqCst) >= t),
+            _ => true,
+        }
+    }
 }
 
 fn patch_for(client: &str, n: u64) -> Value {
@@ -292,7 +362,14 @@ fn spawn_mcp_priority_writer(
         let mut mcp = mcp_client(&sandbox);
         let file = patch_dir.join("priority.json");
         let mut n = 0_u64;
+        let mut target = None;
         while !shared.stopped() {
+            while !shared.gate.open(target) && !shared.stopped() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if shared.stopped() {
+                break;
+            }
             n += 1;
             fs::write(&file, patch_for("priority", n).to_string()).unwrap();
             shared.priority.attempted.store(n, Ordering::SeqCst);
@@ -307,7 +384,7 @@ fn spawn_mcp_priority_writer(
                     return;
                 }
             }
-            std::thread::sleep(Duration::from_millis(20));
+            target = Some(shared.gate.target_after_ack());
         }
         mcp.finish();
     })
@@ -443,7 +520,16 @@ fn spawn_client_field_writer(
     spawn_client_thread(sandbox, shared, field, move |client, shared| {
         Box::pin(async move {
             let mut n = 0_u64;
+            let mut target = None;
             while !shared.stopped() {
+                if field == "priority" {
+                    while !shared.gate.open(target) && !shared.stopped() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    if shared.stopped() {
+                        break;
+                    }
+                }
                 n += 1;
                 let mut args = TaskUpdateFieldsArgs {
                     id: Id::new(hot.clone()).unwrap(),
@@ -467,7 +553,11 @@ fn spawn_client_field_writer(
                 counter(shared).attempted.store(n, Ordering::SeqCst);
                 client.task_update_fields(args).await?;
                 counter(shared).acked.store(n, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(3)).await;
+                if field == "priority" {
+                    target = Some(shared.gate.target_after_ack());
+                } else {
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                }
             }
             Ok(())
         })
@@ -576,6 +666,9 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
 #[derive(Default)]
 struct ObserverReport {
     reads: u64,
+    /// Reads whose priority window was wider than one write: the priority
+    /// check could not tell a lost update from a legitimate value there.
+    priority_wide: u64,
     violations: Vec<String>,
     last_commit_seq: u64,
 }
@@ -606,7 +699,17 @@ fn spawn_observer(
             };
             let id = orch_proto::bounded::Id::new(hot).unwrap();
             let mut floor = (0_u64, 0_u64, 0_u64);
+            // However this ends, the priority writer must not wait for us.
+            struct Gone<'a>(&'a PriorityGate);
+            impl Drop for Gone<'_> {
+                fn drop(&mut self) {
+                    self.0.observer_gone();
+                }
+            }
+            let _gone = Gone(&shared.gate);
+            shared.gate.observer_running();
             while !shared.stopped() {
+                shared.gate.read_begins();
                 // What was already acknowledged BEFORE this read started.
                 let acked = (
                     shared.title.acked.load(Ordering::SeqCst),
@@ -624,7 +727,18 @@ fn spawn_observer(
                         return report;
                     }
                 };
+                // What can have been sent by the time this read ended: loaded
+                // AFTER the read, so every write that could have committed
+                // during it is inside [acked, attempted].
+                let attempted = (
+                    shared.title.attempted.load(Ordering::SeqCst),
+                    shared.description.attempted.load(Ordering::SeqCst),
+                    shared.labels.attempted.load(Ordering::SeqCst),
+                    shared.priority.attempted.load(Ordering::SeqCst),
+                );
+                shared.gate.read_ends();
                 report.reads += 1;
+                shared.reads.store(report.reads, Ordering::SeqCst);
                 let seq = client.last_commit_seq().unwrap_or(0);
                 if seq < report.last_commit_seq {
                     report.violations.push(format!(
@@ -637,11 +751,6 @@ fn spawn_observer(
                     parse_counter("c1-", &task.title),
                     parse_counter("c2-", &task.description),
                     task.labels.first().and_then(|l| parse_counter("c3-", l)),
-                );
-                let attempted = (
-                    shared.title.attempted.load(Ordering::SeqCst),
-                    shared.description.attempted.load(Ordering::SeqCst),
-                    shared.labels.attempted.load(Ordering::SeqCst),
                 );
                 for (name, seen, acked, attempted, floor) in [
                     ("title", seen.0, acked.0, attempted.0, &mut floor.0),
@@ -669,13 +778,19 @@ fn spawn_observer(
                     }
                     *floor = (*floor).max(seen);
                 }
-                let allowed = [priority_of(acked.3), priority_of(acked.3 + 1)];
                 let priority = u64::try_from(task.priority).unwrap_or(0);
-                if !allowed.contains(&priority) && !(acked.3 == 0 && priority == priority_of(0)) {
+                if attempted.3.saturating_sub(acked.3) > 1 {
+                    report.priority_wide += 1;
+                }
+                if !priority_may_read(priority, acked.3, attempted.3) {
+                    let allowed: Vec<_> = (acked.3..=attempted.3.max(acked.3))
+                        .map(priority_of)
+                        .collect();
                     report.violations.push(format!(
-                        "LOST UPDATE: priority reads {priority} after write #{} was acknowledged \
-                         (expected one of {allowed:?}, commit_seq {seq})",
-                        acked.3
+                        "LOST UPDATE: priority reads {priority}; write #{} was acknowledged before \
+                         the read and #{} had been sent by its end (expected one of {allowed:?}, \
+                         commit_seq {seq})",
+                        acked.3, attempted.3
                     ));
                 }
                 tokio::time::sleep(Duration::from_millis(15)).await;
@@ -721,6 +836,7 @@ fn spawn_live_observer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<(u6
                     && certainly_alive(sent, read_done)
                 {
                     checks += 1;
+                    shared.live_checks.store(checks, Ordering::SeqCst);
                     let age = read_done.saturating_duration_since(sent).as_millis();
                     let seq = client.last_commit_seq().unwrap_or(0);
                     match entry
@@ -777,6 +893,23 @@ fn spawn_tui_driver(pane: Arc<TuiPane>, shared: Arc<Shared>) -> JoinHandle<()> {
             std::thread::sleep(Duration::from_millis(800));
         }
     })
+}
+
+/// The least evidence a run must collect before it may end: hot-task reads by
+/// the observer (more than) and `live` reads judged inside its TTL.
+const MIN_READS: u64 = 20;
+const MIN_LIVE_CHECKS: u64 = 10;
+/// How far past `ORCH_STRESS_SECS` a run is extended to collect that evidence.
+const EXTENSION_CAP: Duration = Duration::from_secs(120);
+
+/// `None` when the observers have the evidence the assertions demand.
+fn evidence_missing(shared: &Shared) -> Option<String> {
+    let (reads, live) = (
+        shared.reads.load(Ordering::SeqCst),
+        shared.live_checks.load(Ordering::SeqCst),
+    );
+    (reads <= MIN_READS || live < MIN_LIVE_CHECKS)
+        .then(|| format!("{reads} reads, {live} judged live reads"))
 }
 
 /// How long a leg may take to get going before the run is declared broken.
@@ -1028,6 +1161,26 @@ fn fixtures(sandbox: &Sandbox) -> Fixtures {
     }
 }
 
+/// Whatever way `run_stress` ends, stop the client threads and kill the TUI
+/// leg. A failed assertion unwinds only the test thread: the TUI driver
+/// thread still holds the pane, so its `Drop` never runs and `orch tui`
+/// (with its pane script and tmux server) would outlive the test and fail
+/// the process-table assertions of unrelated tests (F-B2b-3).
+struct RunGuard {
+    shared: Arc<Shared>,
+    pane: Option<Arc<TuiPane>>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.renew_stop.store(true, Ordering::SeqCst);
+        if let Some(pane) = &self.pane {
+            pane.terminate();
+        }
+    }
+}
+
 fn run_stress(fleet: Fleet) {
     let sandbox = Arc::new(Sandbox::new());
     sandbox.init_project();
@@ -1043,6 +1196,9 @@ fn run_stress(fleet: Fleet) {
         priority: Writer::default(),
         live: Writer::default(),
         renew_stop: AtomicBool::new(false),
+        reads: AtomicU64::new(0),
+        live_checks: AtomicU64::new(0),
+        gate: PriorityGate::default(),
         creator_stage: Mutex::new(("not started".into(), Instant::now())),
         live_times: Mutex::new(None),
         failures: Mutex::default(),
@@ -1053,7 +1209,10 @@ fn run_stress(fleet: Fleet) {
 
     // ── launch every client ──
     let mut marks = Marks::new(Instant::now());
-    let mut pane = None;
+    let mut guard = RunGuard {
+        shared: shared.clone(),
+        pane: None,
+    };
     let mut threads = Vec::new();
     let renewer;
     match fleet {
@@ -1065,6 +1224,7 @@ fn run_stress(fleet: Fleet) {
                 "tui",
                 &[],
             ));
+            guard.pane = Some(tui.clone());
             tui.wait_screen("the dashboard", |s| {
                 s.contains("ORCH") && !s.contains("No orch daemon")
             });
@@ -1095,7 +1255,6 @@ fn run_stress(fleet: Fleet) {
             ));
             renewer = spawn_mcp_creator(sandbox.clone(), shared.clone());
             threads.push(spawn_tui_driver(tui.clone(), shared.clone()));
-            pane = Some(tui);
         }
         Fleet::InProcess => {
             for (field, counter) in [
@@ -1127,15 +1286,27 @@ fn run_stress(fleet: Fleet) {
     // a task, that a short key outlived its TTL and that `live` was renewed,
     // so the run is `duration` of ALL of them working, not of whoever was
     // ready first.
-    wait_until_every_leg_works(&shared, pane.as_deref(), fleet, &daemon);
+    wait_until_every_leg_works(&shared, guard.pane.as_deref(), fleet, &daemon);
     marks.note("legs_ready");
     let started = Instant::now();
     let observer = spawn_observer(&sandbox, shared.clone(), hot.clone());
     let live_observer = spawn_live_observer(&sandbox, shared.clone());
 
     // ── let them fight ──
+    // At least `duration`, and until the observers have the evidence the
+    // assertions below demand. How many reads fit in a second is the host's
+    // business (a read queues behind every durable write, and a loaded or
+    // emulated machine makes both slow); how many are JUDGED is the test's.
+    // So the run is extended, up to `EXTENSION_CAP`, rather than failed for
+    // being slow, and it still fails if the evidence never comes.
     let duration = stress_duration();
-    while started.elapsed() < duration && shared.failures.lock().unwrap().is_empty() {
+    while shared.failures.lock().unwrap().is_empty() {
+        let elapsed = started.elapsed();
+        if elapsed >= duration + EXTENSION_CAP
+            || (elapsed >= duration && evidence_missing(&shared).is_none())
+        {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     shared.stop.store(true, Ordering::SeqCst);
@@ -1151,7 +1322,7 @@ fn run_stress(fleet: Fleet) {
     marks.note("clients_joined");
 
     // The TUI survived the whole run on the daemon.
-    if let Some(pane) = &pane {
+    if let Some(pane) = &guard.pane {
         let screen = pane.screen();
         assert!(
             !screen.contains("No orch daemon"),
@@ -1192,9 +1363,13 @@ fn run_stress(fleet: Fleet) {
         "client operations failed: {failures:#?}"
     );
     assert!(
-        report.reads > 20,
-        "the observer barely ran: {} reads",
-        report.reads
+        report.reads > MIN_READS,
+        "the observer barely ran: {} reads in {}ms (needed more than {MIN_READS}; the run was \
+         extended to at most {}ms before giving up); {}",
+        report.reads,
+        started.elapsed().as_millis(),
+        (duration + EXTENSION_CAP).as_millis(),
+        marks.render()
     );
     assert!(
         report.violations.is_empty(),
@@ -1210,11 +1385,42 @@ fn run_stress(fleet: Fleet) {
         &live_violations[..live_violations.len().min(10)]
     );
     assert!(
-        live_checks >= 10,
-        "`live` was judged only {live_checks} times: the renewals never kept it provably alive"
+        live_checks >= MIN_LIVE_CHECKS,
+        "`live` was judged only {live_checks}/{MIN_LIVE_CHECKS} times in {}ms (the run was \
+         extended to at most {}ms): the renewals never kept it provably alive; \
+         last renewal #{}; {}",
+        started.elapsed().as_millis(),
+        (duration + EXTENSION_CAP).as_millis(),
+        shared.live.acked.load(Ordering::SeqCst),
+        marks.render()
+    );
+    // The priority check says something only where its window is one write
+    // wide; the gate makes that every read, so most reads must be.
+    assert!(
+        report.priority_wide * 5 <= report.reads,
+        "the priority check was blind: {} of {} reads had a window wider than one write",
+        report.priority_wide,
+        report.reads
     );
 
-    judge(&sandbox, &shared, &fixtures, duration, fleet, &marks);
+    let strong = judge(&sandbox, &shared, &fixtures, duration, fleet, &marks);
+    // Greppable run summary (`--nocapture`): the strong branch is the
+    // post-stop "renewed key present" assertion, which only applies when the
+    // stop was acknowledged inside the key's TTL; its rate over a batch of
+    // runs is the evidence that the assertion is not vacuous.
+    eprintln!(
+        "STRESS_SUMMARY fleet={} elapsed_ms={} reads={} priority_wide={} live_checks={} \
+         strong_branch={strong}",
+        if fleet == Fleet::Processes {
+            "processes"
+        } else {
+            "in-process"
+        },
+        started.elapsed().as_millis(),
+        report.reads,
+        report.priority_wide,
+        live_checks
+    );
     let log = daemon.stderr();
     let bad: Vec<_> = log
         .lines()
@@ -1233,7 +1439,7 @@ fn judge(
     duration: Duration,
     fleet: Fleet,
     marks: &Marks,
-) {
+) -> bool {
     let Fixtures {
         worker,
         parked,
@@ -1341,7 +1547,8 @@ fn judge(
         stop_acked.saturating_duration_since(live_sent).as_millis(),
         marks.render()
     );
-    if certainly_alive(live_sent, stop_acked) {
+    let strong = certainly_alive(live_sent, stop_acked);
+    if strong {
         assert_eq!(
             live_now,
             Some(json!(format!("live-{live_acked}"))),
@@ -1370,6 +1577,7 @@ fn judge(
     if duration >= Duration::from_secs(8) {
         assert!(!expired.is_empty(), "no short key was old enough to expire");
     }
+    strong
 }
 
 #[test]
@@ -1380,4 +1588,63 @@ fn tui_cli_and_mcp_clients_mutating_one_project_leave_files_equal_to_the_index_a
 #[test]
 fn daemon_client_writers_mutating_one_project_leave_files_equal_to_the_index_and_lose_nothing() {
     run_stress(Fleet::InProcess);
+}
+
+// ── the checker's own contract (pure, no daemon) ───────────────────────────
+
+#[test]
+fn priority_window_accepts_every_write_that_can_commit_during_the_read() {
+    // F-S2: write #5 acknowledged before the read, #6 and #7 committed while
+    // it ran. priority_of(7) = 4 is legitimate.
+    assert!(priority_may_read(priority_of(7), 5, 7));
+    assert!(priority_may_read(priority_of(5), 5, 7));
+    assert!(priority_may_read(priority_of(6), 5, 7));
+}
+
+#[test]
+fn priority_window_accepts_the_seed_before_any_write() {
+    assert!(priority_may_read(priority_of(0), 0, 0));
+    assert!(priority_may_read(priority_of(1), 0, 1));
+}
+
+#[test]
+fn priority_window_rejects_a_value_older_than_the_last_acknowledged_write() {
+    // Rolled back to write #4 after #5 was acknowledged and #6 sent.
+    assert!(!priority_may_read(priority_of(4), 5, 6));
+    // A value of a write never sent.
+    assert!(!priority_may_read(priority_of(6), 5, 5));
+}
+
+#[test]
+fn priority_window_is_blind_only_once_it_spans_a_full_cycle() {
+    let values = |acked, attempted| -> BTreeSet<u64> {
+        (1..=4)
+            .filter(|v| priority_may_read(*v, acked, attempted))
+            .collect()
+    };
+    assert_eq!(values(5, 5).len(), 1);
+    assert_eq!(values(5, 6).len(), 2);
+    assert_eq!(values(5, 8).len(), 4, "a 4-write window allows everything");
+}
+
+#[test]
+fn priority_gate_holds_the_writer_until_a_read_that_began_after_its_ack_finished() {
+    let gate = PriorityGate::default();
+    assert!(!gate.open(None), "no write before the observer runs");
+    gate.observer_running();
+    assert!(gate.open(None), "the first write needs no read");
+    gate.read_begins(); // read 1 is in flight when write #n is acknowledged
+    let target = Some(gate.target_after_ack());
+    assert!(!gate.open(target));
+    gate.read_ends(); // read 1 began before the ack: not enough
+    assert!(!gate.open(target));
+    gate.read_begins(); // read 2 began after the ack
+    assert!(!gate.open(target));
+    gate.read_ends();
+    assert!(gate.open(target));
+    gate.observer_gone();
+    assert!(
+        gate.open(Some(u64::MAX)),
+        "a dead observer never blocks the writer"
+    );
 }
