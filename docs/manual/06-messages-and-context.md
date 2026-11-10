@@ -57,9 +57,11 @@ The recipient must be an agent's ID. A name is refused:
 | `<to-agent-id>` | The recipient's agent ID. Required. A remote agent is written `<id>@<alias>`. | |
 | `<body>` | The text. Required. | |
 | `-s`, `--subject <subject>` | A subject line. | `(no subject)` |
-| `--from <agent-id>` | The sender shown to the recipient. | `cli` |
+| `--from <agent-id>` | The sender shown to the recipient. | The caller, else `cli` |
 | `--ttl <ms>` | How long the message stays valid, in milliseconds. From 1 to 604800000 (7 days). | 86400000 (24 hours) |
 | `--reply-to <msg-id>` | Marks the message as a reply to another message. | None |
+
+Without `--from`, `orch msg send` and `orch msg broadcast` send as the caller: the root `--agent` option, else `ORCH_AGENT_ID`, else `cli`. Inside an agent's task, where `ORCH_AGENT_ID` is set, a message therefore comes from that agent, and the command fails with `Sender agent not found` if that ID is not an agent of this project; pass `--from cli` to send as `cli`.
 
 ### Send a message to many agents
 
@@ -77,7 +79,7 @@ A broadcast creates one message per recipient. It skips the sender and every dis
 |---|---|---|
 | `<body>` | The text. Required. | |
 | `-s`, `--subject <subject>` | A subject line. | `(no subject)` |
-| `--from <agent-id>` | The sender. | `cli` |
+| `--from <agent-id>` | The sender. | The caller, else `cli` |
 | `--team <team-id>` | Sends only to the members of this team. | All agents |
 | `--ttl <ms>` | How long each message stays valid, in milliseconds. | 86400000 |
 

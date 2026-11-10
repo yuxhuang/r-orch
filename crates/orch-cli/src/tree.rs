@@ -689,7 +689,11 @@ pub enum MsgSub {
         body: String,
         #[arg(short, long, value_name = "subject", help = "Message subject")]
         subject: Option<String>,
-        #[arg(long, value_name = "agent-id", help = "Sender agent ID (default: cli)")]
+        #[arg(
+            long,
+            value_name = "agent-id",
+            help = "Sender agent ID (default: the caller: --agent, else ORCH_AGENT_ID, else cli)"
+        )]
         from: Option<String>,
         #[arg(long, value_name = "ms", help = "TTL in milliseconds")]
         ttl: Option<String>,
@@ -702,7 +706,11 @@ pub enum MsgSub {
         body: String,
         #[arg(short, long, value_name = "subject", help = "Message subject")]
         subject: Option<String>,
-        #[arg(long, value_name = "agent-id", help = "Sender agent ID (default: cli)")]
+        #[arg(
+            long,
+            value_name = "agent-id",
+            help = "Sender agent ID (default: the caller: --agent, else ORCH_AGENT_ID, else cli)"
+        )]
         from: Option<String>,
         #[arg(long, value_name = "team-id", help = "Limit broadcast to team members")]
         team: Option<String>,
