@@ -1,7 +1,8 @@
 //! Automatic dispatch hosted in the daemon (design D3, D8; spec R1, R13).
 //!
 //! This is `orch serve`'s watch loop as a daemon mode: one coordinated tick
-//! per configured poll interval while the global dispatch switch is on. The
+//! per configured poll interval, or after a coalesced commit wake, while the
+//! global dispatch switch is on. The
 //! switch itself, the manual entrances (`dispatch.tick`, `run_task`,
 //! `run_all`, `until_terminal`) and the `serve --once` batch policy are the
 //! `dispatch.*` handlers in [`crate::ops`]; every entrance, this loop
@@ -20,6 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+mod wake;
+pub(crate) use wake::Wake;
+
 /// Used when the configured interval cannot be read.
 const DEFAULT_POLL: Duration = Duration::from_secs(10);
 /// The floor for a configured `scheduling.poll_interval_ms`.
@@ -30,18 +34,34 @@ const MIN_POLL: Duration = Duration::from_millis(100);
 /// (R30). A tick with dispatch off, during a batch or while stopping is a
 /// no-op decided by [`ServiceHandler::automatic_tick`].
 pub(crate) async fn run_loop(handler: ServiceHandler, mut quit: watch::Receiver<bool>) {
+    let wake = &handler.wake;
+    let mut periodic = tokio::time::Instant::now() + poll_interval(&handler).await;
     loop {
-        let interval = poll_interval(&handler).await;
+        let deadline = wake.deadline().map_or(periodic, |due| due.min(periodic));
         tokio::select! {
+            biased;
             () = crate::session::until_set(&mut quit) => return,
-            () = tokio::time::sleep(interval) => {}
+            () = tokio::time::sleep_until(deadline) => {}
+            () = wake.ready.notified() => {
+                // OFF traffic is discarded, not replayed when dispatch is ON.
+                // The ON operation itself commits and re-arms the deadline.
+                if !handler.dispatch_state().dispatch_on {
+                    wake.take();
+                }
+                continue;
+            }
         }
         if handler.coordinator().is_stopping() {
             return;
         }
+        // The periodic tick may satisfy a pending wake. Only work committed
+        // after this high-water mark can request one follow-up tick.
+        wake.take();
         if let Err(error) = handler.automatic_tick().await {
             tracing::warn!(code = ?error.code, "dispatch tick failed");
         }
+        wake.after_tick();
+        periodic = tokio::time::Instant::now() + poll_interval(&handler).await;
     }
 }
 
@@ -70,3 +90,6 @@ async fn poll_interval(handler: &ServiceHandler) -> Duration {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod wake_tests;

@@ -494,33 +494,37 @@ impl ServiceHandler {
     pub(super) async fn subscribe(
         &self,
         ctx: &OpContext,
-        _: SubscribeArgs,
+        args: SubscribeArgs,
     ) -> OpResult<SubscribeAck> {
-        let mut subscriptions = self.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-        let entries = subscriptions.entry(ctx.session_id).or_default();
-        if entries.len() >= limits::MAX_SUBSCRIPTIONS_PER_SESSION {
-            return Err(ErrorBody::new(
-                ErrorCode::Overloaded,
-                "subscription limit reached",
-                Execution::NotExecuted,
-            ));
-        }
         let id = self
             .control
             .next_subscription
             .fetch_add(1, Ordering::Relaxed);
-        entries.push(id);
+        let instance = self.control.instance();
+        let wire_instance = orch_proto::bounded::Id::new(&instance)
+            .map_err(|_| invalid("invalid daemon instance"))?;
+        if !self.hub.register(
+            ctx.session_id,
+            ctx.event_output.clone(),
+            id,
+            wire_instance,
+            self.coordinator.current_commit_seq(),
+            args,
+        ) {
+            return Err(ErrorBody::new(
+                ErrorCode::Overloaded,
+                "subscription limit reached or session closed",
+                Execution::NotExecuted,
+            ));
+        }
         Ok(SubscribeAck {
             subscription: id,
-            instance: self.control.instance(),
-            seq: self.coordinator.current_commit_seq(),
+            instance,
+            seq: 0,
         })
     }
-    pub(super) async fn unsubscribe(&self, ctx: &OpContext, a: UnsubscribeArgs) -> OpResult<()> {
-        let mut subscriptions = self.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entries) = subscriptions.get_mut(&ctx.session_id) {
-            entries.retain(|id| *id != a.subscription);
-        }
+    pub(super) async fn unsubscribe(&self, ctx: &OpContext, args: UnsubscribeArgs) -> OpResult<()> {
+        self.hub.remove(ctx.session_id, args.subscription);
         Ok(())
     }
     pub(super) async fn request_cancel(

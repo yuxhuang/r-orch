@@ -373,12 +373,14 @@ pub struct UpdateInfo {
     pub instructions: String,
 }
 
-/// `subscribe`: sent before any event of the subscription.
+/// `subscribe`: sent before any event of the subscription. The terminal
+/// `ok.commit_seq` is the baseline commit ordinal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscribeAck {
     pub subscription: u64,
     pub instance: String,
-    /// The baseline commit ordinal; apply invalidations after it.
+    /// Cursor origin: always zero. The first pushed event has seq = 1.
     pub seq: u64,
 }
 

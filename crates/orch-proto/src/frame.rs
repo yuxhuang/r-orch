@@ -155,10 +155,12 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventBody {
     /// A committed store change. Identity and action only: never entity
-    /// contents, which may carry secrets. Coarsely invalidates a cache.
+    /// contents, which may carry secrets. An absent id invalidates the whole
+    /// store (including singleton stores). Membership projections are deliberately
+    /// omitted: consumers must conservatively invalidate related URI classes.
     Change {
         store: Store,
-        id: Id,
+        id: Option<Id>,
         kind: ChangeKind,
         commit_seq: u64,
     },
@@ -197,6 +199,8 @@ pub enum ChangeKind {
 pub enum ResyncReason {
     /// The subscriber's queue overflowed.
     Lagged,
+    /// A possible partial write left the affected store set unknown.
+    StoreSetUncertain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,7 +234,9 @@ impl TryFrom<EventWire> for Event {
     type Error = &'static str;
     fn try_from(w: EventWire) -> Result<Self, Self::Error> {
         let body = match (w.store, w.id, w.kind, w.commit_seq, w.bus, w.resync) {
-            (Some(store), Some(id), Some(kind), Some(commit_seq), None, None) => {
+            (Some(store), id, Some(kind), Some(commit_seq), None, None)
+                if id.is_some() || kind == ChangeKind::Updated =>
+            {
                 EventBody::Change {
                     store,
                     id,
@@ -274,7 +280,7 @@ impl From<Event> for EventWire {
                 commit_seq,
             } => {
                 w.store = Some(store);
-                w.id = Some(id);
+                w.id = id;
                 w.kind = Some(kind);
                 w.commit_seq = Some(commit_seq);
             }
@@ -369,7 +375,7 @@ mod tests {
             seq: 1,
             body: EventBody::Change {
                 store: Store::Tasks,
-                id: Id::new("tsk_1").unwrap(),
+                id: Some(Id::new("tsk_1").unwrap()),
                 kind: ChangeKind::Created,
                 commit_seq: 9,
             },

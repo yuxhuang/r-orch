@@ -11,6 +11,7 @@
 mod auto_review_approve;
 mod autonomous;
 mod bugfixes_2026_03;
+mod collector_publication;
 mod core;
 mod defensive_validation;
 mod dispatch_worktree;

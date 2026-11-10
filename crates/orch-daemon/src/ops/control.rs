@@ -256,18 +256,21 @@ impl ServiceHandler {
     pub async fn expire_context(&self) -> OpResult<u64> {
         let engine = Arc::clone(&self.engine);
         Ok(self
-            .coordinator
-            .run_op(Lane::Internal, move |permit| {
-                Box::pin(async move {
-                    permit.invalidate(Store::Context);
-                    Ok(engine
-                        .context_service
-                        .expire_now()
-                        .await
-                        .map_err(service_error)?
-                        .len() as u64)
-                })
-            })
+            .engine
+            .operation_boundary()
+            .with_source(
+                orch_engine::container::commit::CommitSource::Expiry,
+                self.coordinator.run_op(Lane::Internal, move |_| {
+                    Box::pin(async move {
+                        Ok(engine
+                            .context_service
+                            .expire_now()
+                            .await
+                            .map_err(service_error)?
+                            .len() as u64)
+                    })
+                }),
+            )
             .await?
             .value)
     }

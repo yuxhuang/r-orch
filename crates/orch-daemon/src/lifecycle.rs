@@ -384,6 +384,7 @@ impl Running {
             .await?,
         );
         let coordinator = Arc::new(ProjectCoordinator::new(engine.operation_boundary()));
+        crate::diagnostics::attach(&engine.events);
         // Startup recovery (claims, running entries, orphan runs) and the
         // index read/rebuild, before anything is served. Fatal on error.
         engine.daemon_initialize().await?;

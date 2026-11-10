@@ -11,7 +11,7 @@
 //! | `transfer.begin/chunk/finish` | [`Client::upload`] |
 //! | `request.cancel` | [`Call::cancel`] |
 //! | `daemon.status`, `dispatch.set`, `daemon.stop` | [`Client::status`], [`Client::dispatch`], [`Client::daemon_stop`] (bounded control deadline) |
-//! | `subscribe`, `unsubscribe` | not exposed before the push API (PR 3) |
+//! | `subscribe`, `unsubscribe` | [`Client::into_subscription`], [`crate::Subscription::unsubscribe`] |
 use crate::call::{Call, hex_sha256};
 use crate::{Client, ClientError};
 use base64::Engine as _;
@@ -29,8 +29,8 @@ const MULTI_FRAME: &[(&str, &str)] = &[
     ("transfer.chunk", "Client::upload"),
     ("transfer.finish", "Client::upload"),
     ("request.cancel", "Call::cancel"),
-    ("subscribe", "the push API (PR 3)"),
-    ("unsubscribe", "the push API (PR 3)"),
+    ("subscribe", "Client::into_subscription"),
+    ("unsubscribe", "Subscription::unsubscribe"),
 ];
 
 fn refuse_multi_frame(name: &str, allow_follow: bool) -> Result<(), ClientError> {

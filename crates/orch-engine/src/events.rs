@@ -150,6 +150,7 @@ impl EventBus {
     /// An event emitted with no subscribers is dropped.
     pub fn emit(&self, event: OrchestratorEvent) {
         if let Some(event) = crate::container::operation::buffer_event(self, event) {
+            self.operation.publish_bus(&event);
             self.emit_immediate(event);
         }
     }
