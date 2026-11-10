@@ -324,6 +324,39 @@ pub trait ProcessManager: Send + Sync {
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild>;
 }
 
+/// Yielding admission for a final local launch. Separate from the frozen
+/// process port, so assembly can inject it without changing process fakes.
+#[async_trait]
+pub trait SpawnAdmission: Send + Sync {
+    async fn reserve(&self) -> Box<dyn SpawnReservation>;
+}
+
+/// Send while queued/reserved. Enter only around a synchronous adapter call.
+pub trait SpawnReservation: Send {
+    fn enter(self: Box<Self>) -> Box<dyn SpawnScope>;
+}
+
+/// A synchronous RAII handoff. Deliberately not Send: never retain across await.
+pub trait SpawnScope {}
+
+/// Compatibility default for manually composed engines and process fakes.
+#[derive(Default)]
+pub struct NoopSpawnAdmission;
+struct NoopSpawnReservation;
+struct NoopSpawnScope;
+impl SpawnScope for NoopSpawnScope {}
+#[async_trait]
+impl SpawnAdmission for NoopSpawnAdmission {
+    async fn reserve(&self) -> Box<dyn SpawnReservation> {
+        Box::new(NoopSpawnReservation)
+    }
+}
+impl SpawnReservation for NoopSpawnReservation {
+    fn enter(self: Box<Self>) -> Box<dyn SpawnScope> {
+        Box::new(NoopSpawnScope)
+    }
+}
+
 /// The default grace period of `kill_with_grace`.
 pub const DEFAULT_KILL_GRACE: Duration = Duration::from_millis(10_000);
 

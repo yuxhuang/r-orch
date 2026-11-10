@@ -31,20 +31,39 @@ thread_local! {
     static RESERVED: RefCell<Option<SpawnReservation>> = const { RefCell::new(None) };
 }
 
+struct ReservationScope(std::marker::PhantomData<std::rc::Rc<()>>);
+impl orch_core::process::SpawnScope for ReservationScope {}
+impl Drop for ReservationScope {
+    fn drop(&mut self) {
+        RESERVED.with(|slot| slot.borrow_mut().take());
+    }
+}
 impl SpawnReservation {
-    pub fn run<T>(self, call: impl FnOnce() -> T) -> T {
+    fn enter_scope(self) -> ReservationScope {
         RESERVED.with(|slot| {
             assert!(slot.borrow().is_none(), "nested spawn reservation");
             *slot.borrow_mut() = Some(self);
         });
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                RESERVED.with(|slot| slot.borrow_mut().take());
-            }
-        }
-        let _restore = Restore;
+        ReservationScope(std::marker::PhantomData)
+    }
+    pub fn run<T>(self, call: impl FnOnce() -> T) -> T {
+        let _scope = self.enter_scope();
         call()
+    }
+}
+
+/// Assembly-only provider for the core final-launch admission port.
+#[derive(Default)]
+pub struct ProcessSpawnAdmission;
+#[async_trait::async_trait]
+impl orch_core::process::SpawnAdmission for ProcessSpawnAdmission {
+    async fn reserve(&self) -> Box<dyn orch_core::process::SpawnReservation> {
+        Box::new(reserve_spawn(SpawnSite::Launch).await)
+    }
+}
+impl orch_core::process::SpawnReservation for SpawnReservation {
+    fn enter(self: Box<Self>) -> Box<dyn orch_core::process::SpawnScope> {
+        Box::new(self.enter_scope())
     }
 }
 

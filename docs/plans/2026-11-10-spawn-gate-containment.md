@@ -32,7 +32,15 @@ semantics; it is outside the selected contract. Std spawn remains irreducible.
 
 ### Admission and lock order
 
-`process/gate.rs` owns a single macOS Tokio semaphore. `reserve_spawn(site)`
+`orch-core/process.rs` adds separate SpawnAdmission/SpawnReservation/SpawnScope
+ports without changing the frozen ProcessManager trait. Container assembly injects
+the infra provider into an additive orchestrator setter; the private constructor
+default is a no-op port for existing manually composed engines/fakes. This avoids
+a forbidden engine-service -> infra source-site edge (caught by crate-graph on
+7d85c1cc). Existing constructor signatures and deps literals stay unchanged.
+The acquired core reservation enters a non-Send RAII scope only around the
+synchronous execute call, so it cannot cross an await. `process/gate.rs` owns a
+single macOS Tokio semaphore. `reserve_spawn(site)`
 creates a safe waiting record and awaits its owned permit without blocking a
 polling worker or submitting a blocking job. Synchronous compatibility callers
 use the same domain. Linux never acquires this permit.

@@ -554,6 +554,7 @@ impl Orchestrator {
 
             // Admission precedes the project boundary and state mutex. A queued
             // launch owns no blocking worker and cannot outlive cancellation.
+            let admission = self.spawn_admission();
             let reservation = if agent.remote.is_none() {
                 tokio::select! {
                     biased;
@@ -561,7 +562,7 @@ impl Orchestrator {
                         self.daemon_release_preparation(task_id, generation).await?;
                         return Ok(());
                     }
-                    permit = orch_infra::process::gate::reserve_spawn(orch_infra::process::gate::SpawnSite::Launch) => Some(permit),
+                    permit = admission.reserve() => Some(permit),
                 }
             } else { None };
 
@@ -660,10 +661,13 @@ impl Orchestrator {
                         .await;
                         return Ok(true);
                     }
-                    let handle = match reservation.expect("local launch reservation").run(|| self.execute_prepared(
-                        adapter.as_ref().expect("local adapter resolved").as_ref(),
-                        params,
-                    )) {
+                    let execution = {
+                        let _scope = reservation.expect("local launch reservation").enter();
+                        self.execute_prepared(
+                            adapter.as_ref().expect("local adapter resolved").as_ref(), params,
+                        )
+                    };
+                    let handle = match execution {
                         Ok(handle) => handle,
                         Err(error) => {
                             self.fail_before_spawn(

@@ -484,6 +484,7 @@ async fn build_full_internal(
         goal_store: Some(Arc::clone(&engine.goals)),
         skill_loader: Some(Arc::clone(&skills)),
     }));
+    orchestrator.set_spawn_admission(Arc::new(orch_infra::process::gate::ProcessSpawnAdmission));
     orchestrator.set_config_store(Arc::clone(&engine.config_store));
     orchestrator.set_context_service(Arc::clone(&engine.context_service));
 
