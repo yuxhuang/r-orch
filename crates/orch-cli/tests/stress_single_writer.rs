@@ -1030,6 +1030,9 @@ fn wait_until_every_leg_works(
                 .filter(|p| {
                     orch_processes(std::slice::from_ref(p)).len() == 1
                         || (p.command.contains("tmux") && p.command.contains("-L t2a"))
+                        // A child forked by this test and not yet exec'd
+                        // shows as a copy of the test binary.
+                        || p.command.contains("stress_single_writer-")
                 })
                 .map(|p| format!("  pid {} ppid {} {}", p.pid, p.ppid, p.command))
                 .collect::<Vec<_>>()
