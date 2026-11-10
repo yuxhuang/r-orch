@@ -1106,6 +1106,329 @@ mod commit_store_tests {
             vec![CommitChange::store_wide(CommitStore::State)]
         );
     }
+    /// Exercise every mutation offered by the core store traits. Runs have
+    /// no delete method; config/state/global are singleton updates.
+    #[tokio::test]
+    async fn all_core_store_mutations_publish_identity_only_changes() {
+        use orch_domain::*;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut task = engine
+            .task_service
+            .create(CreateTaskInput {
+                title: "matrix".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut agent = engine
+            .agent_service
+            .create(CreateAgentInput {
+                name: "matrix".into(),
+                adapter: "shell".into(),
+                command: Some("exit 0".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut goal = engine
+            .goal_service
+            .create(CreateGoalInput {
+                title: "matrix".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut team = engine
+            .team_service
+            .create(CreateTeamInput {
+                name: "matrix".into(),
+                lead_agent_id: agent.id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        task.id = "task_matrix".into();
+        agent.id = "agent_matrix".into();
+        goal.id = "goal_matrix".into();
+        team.id = "team_matrix".into();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        engine
+            .events
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |p| {
+                if let Publication::Commit(record) = p {
+                    sink.lock().unwrap().push(record.clone());
+                }
+            })));
+        let mut expected = Vec::new();
+        macro_rules! mutation {
+            ($write:expr, $store:ident, $id:expr, $action:ident) => {{
+                $write.await.unwrap();
+                expected.push((CommitStore::$store, $id, CommitAction::$action));
+            }};
+        }
+        mutation!(
+            engine.tasks.save(&task),
+            Tasks,
+            Some("task_matrix"),
+            Created
+        );
+        task.title = "updated".into();
+        mutation!(
+            engine.tasks.save(&task),
+            Tasks,
+            Some("task_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.tasks.delete(&task.id),
+            Tasks,
+            Some("task_matrix"),
+            Deleted
+        );
+        mutation!(
+            engine.agents.save(&agent),
+            Agents,
+            Some("agent_matrix"),
+            Created
+        );
+        agent.name = "updated".into();
+        mutation!(
+            engine.agents.save(&agent),
+            Agents,
+            Some("agent_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.agents.delete(&agent.id),
+            Agents,
+            Some("agent_matrix"),
+            Deleted
+        );
+        mutation!(
+            engine.goals.save(&goal),
+            Goals,
+            Some("goal_matrix"),
+            Created
+        );
+        goal.title = "updated".into();
+        mutation!(
+            engine.goals.save(&goal),
+            Goals,
+            Some("goal_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.goals.delete(&goal.id),
+            Goals,
+            Some("goal_matrix"),
+            Deleted
+        );
+        mutation!(
+            engine.teams.save(&team),
+            Teams,
+            Some("team_matrix"),
+            Created
+        );
+        team.name = "updated".into();
+        mutation!(
+            engine.teams.save(&team),
+            Teams,
+            Some("team_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.teams.delete(&team.id),
+            Teams,
+            Some("team_matrix"),
+            Deleted
+        );
+        let mut message = Message {
+            id: "message_matrix".into(),
+            channel: MessageChannel::Direct,
+            from_agent_id: "sender_old".into(),
+            to_agent_id: Some("recipient_old".into()),
+            subject: "private-canary".into(),
+            body: "private-canary".into(),
+            created_at: engine.clock.now_iso(),
+            expires_at: None,
+            status: MessageStatus::Pending,
+            delivered_at: None,
+            team_id: None,
+            reply_to: None,
+        };
+        mutation!(
+            engine.messages.save(&message),
+            Messages,
+            Some("message_matrix"),
+            Created
+        );
+        message.to_agent_id = Some("recipient_new".into());
+        mutation!(
+            engine.messages.save(&message),
+            Messages,
+            Some("message_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.messages.mark_delivered(&message.id),
+            Messages,
+            Some("message_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.messages.delete(&message.id),
+            Messages,
+            Some("message_matrix"),
+            Deleted
+        );
+        mutation!(engine.messages.purge_expired(), Messages, None, Updated);
+        mutation!(
+            engine.context.set("matrix", "private-canary", None),
+            Context,
+            Some("matrix"),
+            Created
+        );
+        mutation!(
+            engine.context.set("matrix", "changed", None),
+            Context,
+            Some("matrix"),
+            Updated
+        );
+        mutation!(
+            engine.context.delete("matrix"),
+            Context,
+            Some("matrix"),
+            Deleted
+        );
+        let mut run = Run {
+            id: "run_matrix".into(),
+            task_id: "task_matrix".into(),
+            agent_id: "agent_old".into(),
+            attempt: 1,
+            status: RunStatus::Running,
+            started_at: engine.clock.now_iso(),
+            workspace_path: String::new(),
+            prompt: "private-canary".into(),
+            finished_at: None,
+            pid: None,
+            error: None,
+            error_kind: None,
+            tokens: None,
+        };
+        mutation!(engine.runs.save(&run), Runs, Some("run_matrix"), Created);
+        run.agent_id = "agent_new".into();
+        mutation!(engine.runs.save(&run), Runs, Some("run_matrix"), Updated);
+        mutation!(
+            engine.runs.append_event(
+                &run.id,
+                &RunEvent {
+                    timestamp: engine.clock.now_iso(),
+                    event_type: RunEventType::Done,
+                    data: serde_json::json!({}),
+                }
+            ),
+            Runs,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.state.write(&OrchestratorState::default()),
+            State,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.state.write(&OrchestratorState::default()),
+            State,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.config_store.write(&OrchestratorConfig::default()),
+            Config,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.config_store.set("concurrency", serde_json::json!(2)),
+            Config,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.global_config_store.write(&GlobalConfig::default()),
+            Config,
+            None,
+            Updated
+        );
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records.len(),
+            expected.len(),
+            "one commit per actual store mutation"
+        );
+        for (index, (record, (store, id, action))) in records.iter().zip(expected).enumerate() {
+            assert_eq!(record.commit_seq, records[0].commit_seq + index as u64);
+            assert!(!record.store_set_uncertain);
+            assert_eq!(record.source, CommitSource::Internal);
+            assert_eq!(record.changes.len(), 1);
+            let change = &record.changes[0];
+            assert_eq!(
+                (change.store, change.id.as_deref(), change.action),
+                (store, id, action)
+            );
+        }
+        assert_eq!(
+            records[13].changes[0]
+                .old
+                .as_ref()
+                .unwrap()
+                .recipient_id
+                .as_deref(),
+            Some("recipient_old")
+        );
+        assert_eq!(
+            records[13].changes[0]
+                .new
+                .as_ref()
+                .unwrap()
+                .recipient_id
+                .as_deref(),
+            Some("recipient_new")
+        );
+        assert_eq!(
+            records[21].changes[0]
+                .old
+                .as_ref()
+                .unwrap()
+                .agent_id
+                .as_deref(),
+            Some("agent_old")
+        );
+        assert_eq!(
+            records[21].changes[0]
+                .new
+                .as_ref()
+                .unwrap()
+                .agent_id
+                .as_deref(),
+            Some("agent_new")
+        );
+        assert!(!format!("{records:?}").contains("private-canary"));
+    }
+
     #[tokio::test]
     async fn partial_entity_write_still_publishes_its_known_store() {
         let temp = tempfile::tempdir().unwrap();

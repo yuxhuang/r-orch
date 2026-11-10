@@ -442,6 +442,379 @@ mod tests {
             .ev
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_status_publish_is_remote_store_wide_without_tasks_or_resync() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let mut engine = orch_engine::build_full_with(
+            temp.path(),
+            orch_engine::EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.engine.config.peer.listen = Some("127.0.0.1:0".into());
+        engine.orchestrator.enable_daemon_mode();
+        let engine = Arc::new(engine);
+        let mut runtime = orch_peer::PeerRuntime::prepare(engine.clone())
+            .await
+            .unwrap();
+        let boundary = engine.events.operation_boundary();
+        let output = output();
+        let baseline = boundary.current_commit_seq();
+        for (id, stores) in [
+            (1, r#"{"stores":["remote"]}"#),
+            (2, r#"{"stores":["tasks"]}"#),
+        ] {
+            assert!(output.register(id, Id::new("daemon_test").unwrap(), baseline, args(stores)));
+            output.activate(id);
+        }
+        let sink = output.clone();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        boundary.set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                lock(&captured).push(record.clone());
+            }
+            sink.publish(p);
+        })));
+        runtime.start_listener();
+        let path = engine.paths.remotes_dir().join("_listener.json");
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if let Some(addr) = value["listen_addr"].as_str() {
+                        break addr.to_owned();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener status published");
+        let socket = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // The listener publication itself is a real peer persistence phase.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(event) = output.pop() {
+                    break serde_json::from_slice::<EventFrame>(&event.bytes)
+                        .unwrap()
+                        .ev;
+                }
+                output.ready.notified().await;
+            }
+        })
+        .await
+        .expect("remote invalidation");
+        assert_eq!((event.subscription, event.seq), (1, 1));
+        let EventBody::Change {
+            store: Store::Remote,
+            id: None,
+            kind: ChangeKind::Updated,
+            commit_seq,
+        } = event.body
+        else {
+            panic!("expected remote store-wide change, got {:?}", event.body);
+        };
+        assert!(commit_seq > baseline);
+        assert!(lock(&records).iter().any(|r| r.commit_seq == commit_seq
+            && r.source == CommitSource::Peer
+            && !r.store_set_uncertain));
+        assert!(
+            output.pop().is_none(),
+            "tasks-only subscriber gets no remote event"
+        );
+        // Measure the unchanged idle worker cadence (fixture ruling section 26).
+        use orch_peer::codec::{read_frame, write_frame};
+        use orch_peer::protocol::{Frame, PROTOCOL};
+        let mut peer = tokio::io::BufReader::new(socket);
+        write_frame(
+            peer.get_mut(),
+            &Frame::Hello {
+                proto: PROTOCOL,
+                instance_id: "controller_test".into(),
+                name: "controller".into(),
+                os: "test".into(),
+                agents: vec![],
+                version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut peer).await.unwrap(),
+            Some(Frame::Welcome { .. })
+        ));
+        write_frame(peer.get_mut(), &Frame::Sync { active: vec![] })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match read_frame(&mut peer).await.unwrap().unwrap() {
+                    Frame::SyncState { .. } => break,
+                    Frame::Agents { .. } => {}
+                    Frame::Ping => write_frame(peer.get_mut(), &Frame::Pong).await.unwrap(),
+                    frame => panic!("unexpected peer reply: {frame:?}"),
+                }
+            }
+        })
+        .await
+        .expect("initial sync");
+        output.remove(1);
+        output.remove(2);
+        let baseline = boundary.current_commit_seq();
+        for (id, stores) in [
+            (1, r#"{"stores":["messages"]}"#),
+            (
+                2,
+                r#"{"stores":["tasks","goals","agents","messages","context","teams","runs","config","state","remote"]}"#,
+            ),
+        ] {
+            assert!(output.register(id, Id::new("daemon_test").unwrap(), baseline, args(stores)));
+            output.activate(id);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let mut counts = [0; 2];
+        let mut resyncs = 0;
+        while let Some(frame) = output.pop() {
+            let event = serde_json::from_slice::<EventFrame>(&frame.bytes)
+                .unwrap()
+                .ev;
+            counts[(event.subscription - 1) as usize] += 1;
+            resyncs += usize::from(matches!(event.body, EventBody::Resync { .. }));
+        }
+        eprintln!(
+            "idle linked peer over 5s: messages={} all={} resyncs={resyncs}",
+            counts[0], counts[1]
+        );
+        assert_eq!(resyncs, 0, "known peer writes do not require resync");
+        drop(peer);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tick_spawned_completion_publishes_collector_task_change() {
+        use crate::ops::Handler;
+        use orch_proto::ops::args::*;
+        let (_temp, root) = crate::dispatch::tests::project().await;
+        let running =
+            crate::lifecycle::Running::bring_up(crate::dispatch::tests::bring_up(&root, None))
+                .await
+                .unwrap();
+        let handler = running.handler.clone();
+        let ctx = crate::lifecycle::internal_context();
+        let agent = Handler::agent_create(&handler, &ctx, serde_json::from_value(serde_json::json!({
+            "name": "completion", "adapter": "shell", "command": "exit 0", "workspace_mode": "shared",
+            "env": [{"name":"HOME","value":root.to_str().unwrap()}, {"name":"PATH","value":"/usr/bin:/bin"}]
+        })).unwrap()).await.unwrap().agent;
+        let task = Handler::task_create(
+            &handler,
+            &ctx,
+            serde_json::from_value(serde_json::json!({
+                "title":"completion", "assignee": agent.id
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let output = output();
+        let boundary = running.engine.operation_boundary();
+        let baseline = boundary.current_commit_seq();
+        assert!(handler.hub.register(
+            999,
+            Some(output.clone()),
+            1,
+            Id::new("daemon_test").unwrap(),
+            baseline,
+            args(r#"{"stores":["tasks"]}"#)
+        ));
+        output.activate(1);
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        let hub = handler.hub.clone();
+        boundary.set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                lock(&sink).push(record.clone());
+            }
+            hub.publish(p);
+        })));
+        Handler::dispatch_tick(&handler, &ctx, DispatchTickArgs {})
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = running
+                    .engine
+                    .tasks
+                    .get(&task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status;
+                if matches!(state, TaskStatus::Done | TaskStatus::Review) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake shell completion");
+        // Storage returns before synchronous post-release publication finishes
+        // on the collector task, so wait for that publication explicitly.
+        let commit_seq = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(seq) = lock(&records)
+                    .iter()
+                    .find(|r| {
+                        r.source == CommitSource::Collector
+                            && r.changes.iter().any(|c| {
+                                c.store == CommitStore::Tasks
+                                    && c.id.as_deref() == Some(task.id.as_str())
+                            })
+                    })
+                    .map(|r| r.commit_seq)
+                {
+                    break seq;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("collector publication, distinct from tick provenance");
+        let mut matched = false;
+        while let Some(frame) = output.pop() {
+            let event = serde_json::from_slice::<EventFrame>(&frame.bytes)
+                .unwrap()
+                .ev;
+            matched |= matches!(event.body, EventBody::Change { store: Store::Tasks, id: Some(ref id), commit_seq: seq, .. }
+                if id.as_str() == task.id && seq == commit_seq);
+        }
+        assert!(
+            matched,
+            "real internal completion must reach task subscribers"
+        );
+        assert!(running.shutdown().await.clean);
+    }
+
+    #[test]
+    fn every_store_create_update_delete_preserves_matching_sequence() {
+        let output = output();
+        assert!(register(
+            &output,
+            1,
+            args(
+                r#"{"stores":["tasks","goals","agents","messages","context","teams","runs","config","state","remote"]}"#
+            )
+        ));
+        output.activate(1);
+        let mut seq = 0;
+        for store in CommitStore::ALL {
+            for (action, expected) in [
+                (CommitAction::Created, ChangeKind::Created),
+                (CommitAction::Updated, ChangeKind::Updated),
+                (CommitAction::Deleted, ChangeKind::Deleted),
+            ] {
+                output.publish(&publication(store, Some("entity_test"), action));
+                let event = next(&output);
+                seq += 1;
+                assert_eq!(event.seq, seq);
+                assert!(
+                    matches!(event.body, EventBody::Change { store: actual, id: Some(ref id), kind, .. }
+                    if actual == wire_store(store) && id.as_str() == "entity_test" && kind == expected)
+                );
+            }
+        }
+        assert!(output.pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_mutation_race_captures_baseline_and_buffers_until_ack() {
+        use crate::coordinator::{Lane, ProjectCoordinator};
+        let boundary = Arc::new(orch_engine::container::OperationBoundary::new());
+        let coordinator = Arc::new(ProjectCoordinator::new(boundary.clone()));
+        let hub = Arc::new(Hub::default());
+        let output = output();
+        let sink = hub.clone();
+        boundary.set_publisher(Some(Arc::new(move |p| sink.publish(p))));
+        boundary
+            .run(false, async {
+                boundary.note_store(CommitStore::Tasks);
+            })
+            .await;
+        let (registered, registration) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let registrar = {
+            let (coordinator, boundary, hub, output) = (
+                coordinator.clone(),
+                boundary.clone(),
+                hub.clone(),
+                output.clone(),
+            );
+            tokio::spawn(async move {
+                coordinator
+                    .run_op(Lane::Ordinary, move |_| {
+                        Box::pin(async move {
+                            let baseline = boundary.current_commit_seq();
+                            assert!(hub.register(
+                                1,
+                                Some(output),
+                                1,
+                                Id::new("daemon_test").unwrap(),
+                                baseline,
+                                args(r#"{"stores":["tasks"]}"#)
+                            ));
+                            registered.send(baseline).unwrap();
+                            released.await.unwrap();
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        let baseline = registration.await.unwrap();
+        assert_eq!(baseline, 1);
+        let mutation = {
+            let boundary = boundary.clone();
+            tokio::spawn(async move {
+                boundary
+                    .run(false, async {
+                        boundary.note_store(CommitStore::Tasks);
+                    })
+                    .await
+                    .commit_seq
+            })
+        };
+        assert!(output.pop().is_none());
+        release.send(()).unwrap();
+        let ack = registrar.await.unwrap();
+        assert_eq!(
+            ack.commit_seq, baseline,
+            "subscribe baseline excludes queued mutation"
+        );
+        let committed = mutation.await.unwrap();
+        assert!(committed > baseline);
+        assert!(
+            output.pop().is_none(),
+            "commit is buffered while terminal ack is not yet queued"
+        );
+        output.activate(1);
+        let event = next(&output);
+        assert_eq!(event.seq, 1);
+        assert!(
+            matches!(event.body, EventBody::Change { store: Store::Tasks, commit_seq, .. } if commit_seq == committed)
+        );
+        assert!(output.pop().is_none(), "no baseline event replay");
+        hub.disconnect(1);
+        assert_eq!(
+            output.budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+    }
+
     #[test]
     fn inactive_subscription_buffers_matching_events_until_ack_activation() {
         let output = output();
