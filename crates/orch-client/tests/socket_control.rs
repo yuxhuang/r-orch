@@ -34,23 +34,23 @@ fn fixture() -> (tempfile::TempDir, UnixListener, ClientConfig) {
     };
     (dir, listener, config)
 }
-fn welcome(hello: &HelloFrame, state: StopState) -> Welcome {
-    Welcome {
-        protocol: orch_proto::LOCAL_PROTOCOL + 1,
-        binary: BoundedString::new("future").unwrap(),
-        project_root: hello.hello.project_root.clone(),
-        project_id: hello.hello.project_id,
-        instance: Id::new("instance").unwrap(),
-        pid: 42,
-        compatible: false,
-        stop_state: Some(state),
-    }
+/// The owner guard as the real daemon leaves it once drained: an owned, 0600,
+/// unlocked regular file. `Project::owner_released` observes release through
+/// it whatever the Welcome PID is on this host.
+fn release_owner_guard(dir: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join(".orchestry/.daemon-owner.lock"))
+        .unwrap();
 }
 
-#[tokio::test]
-async fn frozen_stop_completes_across_binary_and_protocol_skew() {
-    let (_dir, listener, cfg) = fixture();
-    let server = tokio::spawn(async move {
+/// The fake daemon of a successful stop: accepted, completed, then it must
+/// see the client close its half so the drain can finish.
+fn completed_stop_server(listener: UnixListener, pid: u32) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut reader = FrameReader::new(BufReader::new(reader));
@@ -59,7 +59,7 @@ async fn frozen_stop_completes_across_binary_and_protocol_skew() {
         for state in [StopState::Accepted, StopState::Completed] {
             write_frame(
                 &mut writer,
-                &HandshakeReply::welcome(welcome(&hello, state)),
+                &HandshakeReply::welcome(welcome(&hello, state, pid)),
                 MAX_HANDSHAKE_BYTES,
             )
             .await
@@ -72,7 +72,41 @@ async fn frozen_stop_completes_across_binary_and_protocol_skew() {
                 .unwrap()
                 .is_none()
         );
-    });
+    })
+}
+
+fn welcome(hello: &HelloFrame, state: StopState, pid: u32) -> Welcome {
+    Welcome {
+        protocol: orch_proto::LOCAL_PROTOCOL + 1,
+        binary: BoundedString::new("future").unwrap(),
+        project_root: hello.hello.project_root.clone(),
+        project_id: hello.hello.project_id,
+        instance: Id::new("instance").unwrap(),
+        pid,
+        compatible: false,
+        stop_state: Some(state),
+    }
+}
+
+// Decided by the owner guard: the PID is alive (this process), so only the
+// unlocked 0600 guard can report release.
+#[tokio::test]
+async fn frozen_stop_completes_across_binary_and_protocol_skew() {
+    let (dir, listener, cfg) = fixture();
+    release_owner_guard(dir.path());
+    let server = completed_stop_server(listener, std::process::id());
+    assert!(orch_client::stop(&cfg).await.unwrap().clean);
+    server.await.unwrap();
+}
+
+// The GitHub ubuntu runner condition: the daemon's PID is a live process of
+// another user (kill(pid, 0) is EPERM, never ESRCH). PID 1 is alive on every
+// Unix host, container included. Release must come from the guard alone.
+#[tokio::test]
+async fn stop_completes_through_the_released_guard_while_the_owner_pid_is_a_live_foreign_process() {
+    let (dir, listener, cfg) = fixture();
+    release_owner_guard(dir.path());
+    let server = completed_stop_server(listener, 1);
     assert!(orch_client::stop(&cfg).await.unwrap().clean);
     server.await.unwrap();
 }
@@ -87,7 +121,7 @@ async fn stop_acceptance_without_cleanup_completion_is_failure() {
         let hello: HelloFrame = reader.read(MAX_HANDSHAKE_BYTES).await.unwrap().unwrap();
         write_frame(
             &mut writer,
-            &HandshakeReply::welcome(welcome(&hello, StopState::Accepted)),
+            &HandshakeReply::welcome(welcome(&hello, StopState::Accepted, std::process::id())),
             MAX_HANDSHAKE_BYTES,
         )
         .await
@@ -112,7 +146,7 @@ async fn failed_cleanup_reject_preserves_failure_instead_of_claiming_success() {
         let hello: HelloFrame = reader.read(MAX_HANDSHAKE_BYTES).await.unwrap().unwrap();
         write_frame(
             &mut writer,
-            &HandshakeReply::welcome(welcome(&hello, StopState::Accepted)),
+            &HandshakeReply::welcome(welcome(&hello, StopState::Accepted, std::process::id())),
             MAX_HANDSHAKE_BYTES,
         )
         .await
@@ -150,7 +184,7 @@ async fn accepted_stop_deadline_has_its_own_diagnosis() {
         let hello: HelloFrame = reader.read(MAX_HANDSHAKE_BYTES).await.unwrap().unwrap();
         write_frame(
             &mut writer,
-            &HandshakeReply::welcome(welcome(&hello, StopState::Accepted)),
+            &HandshakeReply::welcome(welcome(&hello, StopState::Accepted, std::process::id())),
             MAX_HANDSHAKE_BYTES,
         )
         .await
@@ -170,7 +204,10 @@ async fn accepted_stop_deadline_has_its_own_diagnosis() {
     assert_eq!(error.exit_code(), 7);
     let text = error.render(false);
     assert!(
-        text.contains("daemon accepted stop but PID 42 is still running after 30 s"),
+        text.contains(&format!(
+            "daemon accepted stop but PID {} is still running after 30 s",
+            std::process::id()
+        )),
         "{text}"
     );
     assert!(text.contains("inspect state before retrying"), "{text}");
@@ -199,8 +236,7 @@ async fn completed_reply_with_owner_guard_still_held_times_out() {
         let mut reader = FrameReader::new(BufReader::new(reader));
         let hello: HelloFrame = reader.read(MAX_HANDSHAKE_BYTES).await.unwrap().unwrap();
         for state in [StopState::Accepted, StopState::Completed] {
-            let mut reply = welcome(&hello, state);
-            reply.pid = std::process::id();
+            let reply = welcome(&hello, state, std::process::id());
             write_frame(
                 &mut writer,
                 &HandshakeReply::welcome(reply),
