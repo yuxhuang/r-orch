@@ -230,6 +230,12 @@ impl Orchestrator {
         all_tasks: Option<&[Task]>,
         err: &Error,
     ) -> bool {
+        // A goal pause holds only the dispatch gate while it cancels queued
+        // tasks, and this task is still queued. Read and save under the gate,
+        // or a save from a read made before the cancel undoes it. Callers hold
+        // `state`, never the gate; it is released before the cascade and the
+        // retry, which do not need it.
+        let dispatch = self.deps().task_service.dispatch_gate.lock().await;
         let task = match self.deps().task_store.get(task_id).await {
             Ok(Some(task)) => task,
             // Gone: no attempt to account for.
@@ -285,6 +291,7 @@ impl Orchestrator {
         if self.deps().task_store.save(&updated).await.is_err() {
             return false;
         }
+        drop(dispatch);
 
         if next_status == TaskStatus::Failed {
             // Patch the in-memory list rather than re-reading from disk: the

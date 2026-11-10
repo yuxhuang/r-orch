@@ -20,6 +20,7 @@ mod force_review;
 pub(crate) mod harness;
 mod mutex;
 mod parallel_race;
+mod pause_prelaunch;
 mod perf_opts;
 mod resilience;
 mod retry_backoff;
