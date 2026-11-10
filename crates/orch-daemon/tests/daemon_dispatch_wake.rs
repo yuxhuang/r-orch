@@ -54,6 +54,9 @@ const WAKE_BOUND: Duration = Duration::from_secs(5);
 struct Scripted {
     /// Children exit only when [`Scripted::release`] says so.
     hold: bool,
+    /// Refuse spawns that carry no task id (the `git` probes of workspace
+    /// preparation), as a machine without git would.
+    refuse_probes: bool,
     /// Block inside `spawn` until [`Scripted::open_gate`] (a tick in flight).
     gated: bool,
     gate: (Mutex<bool>, Condvar),
@@ -74,8 +77,27 @@ impl Scripted {
             .count()
     }
 
+    /// Task launches (spawns carrying a task id; adapter probes carry none).
     fn launches(&self) -> usize {
-        self.spawns.lock().unwrap().len()
+        self.spawns
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|task| !task.is_empty())
+            .count()
+    }
+
+    /// A kill ends the child: its exit signal fires, as a real reaper's would.
+    fn end(&self, pid: u32) {
+        self.alive.lock().unwrap().remove(&pid);
+        for (_, held_pid, notifier) in self.held.lock().unwrap().iter() {
+            if *held_pid == pid {
+                notifier.notify(ExitOutcome {
+                    code: None,
+                    signal: Some(15),
+                });
+            }
+        }
     }
 
     /// Let the held child of `task` exit successfully.
@@ -111,14 +133,17 @@ impl ProcessManager for Scripted {
         self.alive.lock().unwrap().contains(&pid)
     }
     fn kill(&self, pid: u32, _: Signal) {
-        self.alive.lock().unwrap().remove(&pid);
+        self.end(pid);
     }
     async fn kill_with_grace(&self, pid: u32, _: Duration) {
-        self.alive.lock().unwrap().remove(&pid);
+        self.end(pid);
     }
     fn spawn(&self, _: &str, _: &[String], opts: SpawnOptions) -> orch_core::Result<SpawnedChild> {
         let task = opts.env.get("ORCH_TASK_ID").cloned().unwrap_or_default();
         self.spawns.lock().unwrap().push(task.clone());
+        if self.refuse_probes && task.is_empty() {
+            return Err(orch_core::Error::other("no git in this test"));
+        }
         if self.gated {
             self.entered.notify_one();
             tokio::task::block_in_place(|| {
@@ -492,7 +517,14 @@ async fn a_pause_decided_before_the_wake_keeps_the_task_unlaunched_and_resume_wa
 /// wake: however many commits wake the scheduler, the injected clock decides.
 #[tokio::test(start_paused = true)]
 async fn wakes_do_not_evade_the_pre_launch_retry_backoff() {
-    let mut fx = fixture(DispatchMode::On, Scripted::default()).await;
+    let mut fx = fixture(
+        DispatchMode::On,
+        Scripted {
+            refuse_probes: true,
+            ..Default::default()
+        },
+    )
+    .await;
     // A worktree agent in a project that is not a git repository fails before
     // any run or process exists (see daemon_prelaunch_failure).
     let agent = fx.agent("needs-git", "worktree").await;
@@ -509,7 +541,11 @@ async fn wakes_do_not_evade_the_pre_launch_retry_backoff() {
         record["attempts"], 1,
         "the failed launch must count: {record}"
     );
-    assert_eq!(fx.pm.launches(), 0, "nothing may spawn without a workspace");
+    assert_eq!(
+        fx.pm.launches_of(&id),
+        0,
+        "nothing may spawn without a workspace"
+    );
 
     // Five more wakes with the back-off (10 s on the injected clock) not due.
     for n in 0..5 {

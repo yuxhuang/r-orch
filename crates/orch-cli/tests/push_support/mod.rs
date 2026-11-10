@@ -145,6 +145,9 @@ impl CountingProxy {
         let socket = dir.path().join("p");
         assert!(socket.as_os_str().len() <= 100, "socket path too long");
         let listener = UnixListener::bind(&socket).expect("bind the proxy socket");
+        // Clients refuse a socket that is not 0600 (the daemon makes its own so).
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod the proxy socket");
         let shared = Arc::new(Shared {
             upstream: Mutex::new(upstream.to_path_buf()),
             log: Mutex::default(),
