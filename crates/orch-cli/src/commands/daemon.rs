@@ -53,9 +53,20 @@ pub fn foreground(
 ) -> ExitCode {
     let result = run(cli, &foreground_command(peer, from_agent), cwd);
     if result == ExitCode::from(4) {
-        eprintln!("    Use: orch daemon dispatch on");
+        eprintln!("    {}", already_running_hint(peer));
     }
     result
+}
+
+/// What to do when a daemon already runs. Dispatch can be turned on in it,
+/// but peer options are start options: a listener is never added to a
+/// running daemon, so those need a restart.
+fn already_running_hint(peer: &crate::tree::PeerFlags) -> &'static str {
+    if peer.listen.is_some() || peer.peer_name.is_some() {
+        "Peer options apply only at start. Use: orch daemon stop, then run this command again"
+    } else {
+        "Use: orch daemon dispatch on"
+    }
 }
 
 fn foreground_command(peer: &crate::tree::PeerFlags, from_agent: bool) -> DaemonCmd {
@@ -282,6 +293,29 @@ mod tests {
             assert!(matches!(args.dispatch, Switch::On));
             assert_eq!(args.peer.listen, peer.listen);
             assert_eq!(args.peer.peer_name, peer.peer_name);
+        }
+    }
+
+    /// Against a running daemon, a plain foreground start points at dispatch,
+    /// one with peer options at a restart (it cannot add a listener).
+    #[test]
+    fn the_already_running_hint_asks_for_a_restart_only_for_peer_options() {
+        let peer = |listen: Option<&str>, peer_name: Option<&str>| PeerFlags {
+            listen: listen.map(str::to_owned),
+            peer_name: peer_name.map(str::to_owned),
+        };
+        assert_eq!(
+            already_running_hint(&peer(None, None)),
+            "Use: orch daemon dispatch on"
+        );
+        for flags in [
+            peer(Some("127.0.0.1:7690"), None),
+            peer(None, Some("n")),
+            peer(Some("127.0.0.1:7690"), Some("n")),
+        ] {
+            let hint = already_running_hint(&flags);
+            assert!(hint.contains("orch daemon stop"), "{hint}");
+            assert!(!hint.contains("dispatch on"), "{hint}");
         }
     }
 

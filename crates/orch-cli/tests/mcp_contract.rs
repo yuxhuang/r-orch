@@ -511,7 +511,7 @@ LEAF web
   --allow-host multi
   --bind default=127.0.0.1:7681
   --no-auth flag
-  --observe flag
+  --observe flag hidden
   --password
 LEAF mcp
   --agent
