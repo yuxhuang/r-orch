@@ -163,11 +163,15 @@ dispatch on
 The command shows no status line and no agent output: it is the daemon, not a client. To watch what happens, run
 `orch logs --follow` in another terminal ([Daemon logs and events](#daemon-logs-and-events)).
 
-The daemon checks for work about half a second after a change that may have made work ready, such as a new task
-or a finished run, and in any case every `scheduling.poll_interval_ms`, 10 seconds by default
-([Dispatch follows changes](18-daemon.md#how-serve-run-and-the-dashboard-map-to-the-daemon)). It reads the
-interval again before every wait, so `orch config set scheduling.poll_interval_ms <ms>` takes effect from the next
-check without a restart; values under 100 ms count as 100 ms.
+With dispatch on and the scheduler idle, the first change that may have made work ready, such as a new task
+or a finished run, schedules a check for 500 ms later; further changes coalesce without moving that deadline.
+Changes during a check schedule at most one follow-up, due 500 ms after it ends. After each completed check,
+the daemon schedules the next periodic check using `scheduling.poll_interval_ms`, 10 seconds by default.
+These are scheduling intervals, not maximum elapsed times between checks or promises of when a task starts:
+a long check, waiting for the coordinator or a busy machine can delay execution
+([Dispatch follows changes](18-daemon.md#how-serve-run-and-the-dashboard-map-to-the-daemon)). The daemon reads
+the interval again for the next scheduling round, so `orch config set scheduling.poll_interval_ms <ms>` takes
+effect without a restart; values under 100 ms count as 100 ms.
 
 Stop it with `Ctrl+C` ([Stop orch safely](#stop-orch-safely)). That stops the daemon, so every other client of the project then reports that no daemon runs.
 
@@ -257,9 +261,10 @@ warning logs none ([Warnings when a run starts](16-eco-mode-and-effort.md#warnin
 | `--listen [<ADDR>]`, `--peer-name <NAME>` | Without `--once`: start options of the daemon, as for `orch run --watch`. | |
 | `--from-agent` | Without `--once`: allows the start from an agent's environment, as for `orch run --watch`. With `--once`: rejected (exit 1). | Off |
 
-No option sets the interval. The daemon checks shortly after each change and at least every
-`scheduling.poll_interval_ms`; change the interval with `orch config set scheduling.poll_interval_ms <ms>`, which a
-running daemon picks up at its next check.
+No option sets the interval. `scheduling.poll_interval_ms` sets the periodic delay after a completed check;
+changes can schedule an earlier check, subject to the [scheduling-only qualification above](#keep-the-orchestrator-running-in-your-terminal).
+Change the interval with `orch config set scheduling.poll_interval_ms <ms>`, which a running daemon reads for
+its next scheduling round.
 
 ### Use `serve --once` in a script
 

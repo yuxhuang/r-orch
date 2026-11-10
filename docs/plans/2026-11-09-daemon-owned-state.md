@@ -67,8 +67,9 @@ rejected alternatives. This section is the summary a builder needs to find the r
   (origin 0, first event 1) and a baseline (the subscribe call's `commit_seq`). A change without an entity id
   invalidates its whole store; resync (`lagged`, or an uncertain store set) is rare. The dashboard and the web
   dashboard's sessions refresh only from push; `orch mcp` maps store events to at most 256 subscribed `orch://`
-  URIs over one observation session. A commit wakes dispatch within a 500 ms bound, and a tick never wakes
-  itself. See the spec's
+  URIs over one observation session. A commit schedules a dispatch wake within a 500 ms scheduling bound,
+  and a tick never wakes itself. This is not an execution or task-start guarantee: a slow tick, the operation
+  permit or the OS can delay execution. See the spec's
   [Push, gaps and snapshot ordering](../specs/2026-11-09-daemon-owned-state.md#push-gaps-and-snapshot-ordering) and
   [Commit-triggered dispatch wake](../specs/2026-11-09-daemon-owned-state.md#commit-triggered-dispatch-wake).
 - **PR 3 known limitations.** Commit metadata (256 entries / 64 KiB), 8 subscriptions/session,
@@ -132,7 +133,7 @@ rebase of a shared branch. Owners are roles; task ids live in the tracker, not i
 | S3-api | Freeze the subscription API in `orch-proto` and `orch-client` (cursor origin 0, baseline from `commit_seq`, optional change id, second resync reason, `LOCAL_PROTOCOL` 2); one buildable API-first SHA that every PR 3 consumer merges (senior-eng) | R16, R20, R32 | `crates/orch-proto/{src,tests}/**`, `crates/orch-client/{src,tests}/**` | PR 2 frozen | `cargo test -p orch-proto -p orch-client`; `cargo xtask crate-graph` | 3 |
 | IGN1 | Print start-up orchestrator errors once on the foreground daemon's stderr; un-ignore the two opencode legacy-ignore tests (senior-eng-2) | R20 | `crates/orch-daemon/src/**`, `crates/orch-cli/src/commands/daemon.rs`, `crates/orch-cli/tests/token_eco_opencode_wire_gate.rs` | PR 2 frozen | `cargo test -p orch-cli --test token_eco_opencode_wire_gate` | 3 |
 | S3c-1 | Subscription hub and typed commit metadata: register before read, ack before events, filters, store-wide changes, bounded queues, resync or close (senior-eng) | R16, R20 | `crates/orch-daemon/src/**`, `crates/orch-engine/src/**` | S3-api, IGN1 | `cargo test -p orch-daemon --features testing`; `cargo test -p orch-engine` | 3 |
-| S3c-2 | Commit-triggered dispatch wake: 500 ms bound, coalescing, no self-wake, OFF/pause/back-off rechecked (senior-eng) | R9, R13 | as S3c-1 | S3c-1 | `cargo test -p orch-daemon --features testing dispatch` | 3 |
+| S3c-2 | Commit-triggered dispatch wake: 500 ms scheduling bound, coalescing, no self-wake, OFF/pause/back-off rechecked (senior-eng) | R9, R13 | as S3c-1 | S3c-1 | `cargo test -p orch-daemon --features testing dispatch` | 3 |
 | S3a | Dashboard consumes push: subscribe before bootstrap, no periodic state read; delete `disk_observer` (frontend-eng) | R16, R18 | `crates/orch-cli/src/tui/**`, `crates/orch-tui/{src,tests}/**`, `crates/orch-cli/src/serve/{mod,disk_observer}.rs` | S3-api | `cargo test -p orch-tui`; `cargo test -p orch-cli --lib tui::` | 3 |
 | S3b | `orch web` parent holds an observation and liveness connection; sessions keep the PTY dashboard (frontend-eng-2) | R16, R18 | `crates/orch-cli/src/web/**` | S3-api | `cargo test -p orch-cli --lib web::`; `cargo test -p orch-cli --test web_bridge` | 3 |
 | S3m | `orch mcp` resource subscriptions: 256 URIs, one observation session, local URI mapping, coalesced `resources/updated` (senior-eng-2) | R17, R18 | `crates/orch-cli/src/mcp/**` | S3-api | `cargo test -p orch-cli --lib mcp::`; `cargo test -p orch-cli --test mcp_contract --test mcp_tools --test mcp_stdio` | 3 |
