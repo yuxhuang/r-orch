@@ -563,6 +563,7 @@ mod tests {
         })
         .await
         .expect("initial sync");
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         output.remove(1);
         output.remove(2);
         let baseline = boundary.current_commit_seq();
@@ -591,8 +592,267 @@ mod tests {
             counts[0], counts[1]
         );
         assert_eq!(resyncs, 0, "known peer writes do not require resync");
+        assert_eq!(counts, [0, 0], "idle worker produces no invalidations");
+        assert_eq!(boundary.current_commit_seq(), baseline);
+
+        // A message expiring on the idle link must still invalidate Messages.
+        let mut message = orch_domain::Message {
+            id: "msg_idle_expiry".into(),
+            channel: orch_domain::MessageChannel::Direct,
+            from_agent_id: "sender".into(),
+            to_agent_id: Some("recipient@controller".into()),
+            subject: String::new(),
+            body: String::new(),
+            reply_to: None,
+            created_at: engine.clock.now_iso(),
+            expires_at: Some(orch_core::clock::iso_from_epoch_ms(
+                engine.clock.now_ms() + 1200,
+            )),
+            status: orch_domain::MessageStatus::Pending,
+            delivered_at: None,
+            team_id: None,
+        };
+        engine.messages.save(&message).await.unwrap();
+        reset_peer_subscriptions(&output, boundary.current_commit_seq());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if engine.messages.get(&message.id).await.unwrap().is_none() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("outbox tick purges expired message");
+        // Entity rename/removal precedes index commit and permit release.
+        // Join the ordered path before asserting after-release publication.
+        boundary.run(false, async {}).await;
+        assert_peer_message_change(&output, &records, false);
+
+        // Read the pending frame from the real session, then send a rejecting
+        // MsgAck. The raw rejection store must reach a Messages subscriber.
+        message.id = "msg_ack_reject".into();
+        message.expires_at = None;
+        engine.messages.save(&message).await.unwrap();
+        reset_peer_subscriptions(&output, boundary.current_commit_seq());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match read_frame(&mut peer).await.unwrap().unwrap() {
+                    Frame::Msg { id, .. } if id == message.id => break,
+                    Frame::Ping => write_frame(peer.get_mut(), &Frame::Pong).await.unwrap(),
+                    Frame::Msg { .. } | Frame::Agents { .. } => {}
+                    frame => panic!("unexpected outbox frame: {frame:?}"),
+                }
+            }
+        })
+        .await
+        .expect("pending outbox delivered on next tick");
+        write_frame(
+            peer.get_mut(),
+            &Frame::MsgAck {
+                id: message.id.clone(),
+                reason: Some("unknown recipient".into()),
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_rejection(&engine, &message.id).await;
+        assert_peer_message_change(&output, &records, true);
+
+        message.id = "msg_local_oversize".into();
+        message.body = "x".repeat(orch_peer::codec::MAX_FRAME_BYTES + 1);
+        engine.messages.save(&message).await.unwrap();
+        reset_peer_subscriptions(&output, boundary.current_commit_seq());
+        wait_for_rejection(&engine, &message.id).await;
+        assert_peer_message_change(&output, &records, true);
         drop(peer);
         runtime.shutdown().await;
+    }
+
+    fn reset_peer_subscriptions(output: &EventOutput, baseline: u64) {
+        for (id, stores) in [
+            (1, r#"{"stores":["messages"]}"#),
+            (2, r#"{"stores":["remote"]}"#),
+            (3, r#"{"stores":["tasks"]}"#),
+        ] {
+            output.remove(id);
+            assert!(output.register(id, Id::new("daemon_test").unwrap(), baseline, args(stores)));
+            output.activate(id);
+        }
+    }
+
+    async fn wait_for_rejection(engine: &orch_engine::FullEngine, id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if engine
+                    .messages
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|m| m.subject.starts_with("[rejected]"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("message rejected durably");
+        engine
+            .events
+            .operation_boundary()
+            .run(false, async {})
+            .await;
+    }
+
+    fn assert_peer_message_change(
+        output: &EventOutput,
+        records: &Mutex<Vec<CommitRecord>>,
+        remote: bool,
+    ) {
+        let mut stores = Vec::new();
+        while let Some(frame) = output.pop() {
+            let event = serde_json::from_slice::<EventFrame>(&frame.bytes)
+                .unwrap()
+                .ev;
+            let EventBody::Change {
+                store, commit_seq, ..
+            } = event.body
+            else {
+                panic!("unexpected resync or bus event");
+            };
+            assert_ne!(store, Store::Tasks);
+            let records = lock(records);
+            let record = records.iter().find(|r| r.commit_seq == commit_seq).unwrap();
+            assert_eq!(record.source, CommitSource::Peer);
+            assert!(!record.store_set_uncertain);
+            stores.push(store);
+        }
+        assert!(
+            stores.contains(&Store::Messages),
+            "message write missed its subscriber"
+        );
+        assert_eq!(stores.contains(&Store::Remote), remote);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_controller_publishes_only_remote_heartbeats_over_five_seconds() {
+        async fn engine_at(
+            root: &std::path::Path,
+            name: &str,
+            listen: bool,
+        ) -> Arc<orch_engine::FullEngine> {
+            std::fs::create_dir(root.join(".orchestry")).unwrap();
+            let mut engine = orch_engine::build_full_with(
+                root,
+                orch_engine::EngineSeams {
+                    global_config_path: Some(root.join("global.yml")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            engine.engine.config.peer.name = Some(name.into());
+            engine.engine.config.peer.listen = listen.then(|| "127.0.0.1:0".into());
+            engine.orchestrator.enable_daemon_mode();
+            Arc::new(engine)
+        }
+        let worker_root = tempfile::tempdir().unwrap();
+        let worker = engine_at(worker_root.path(), "worker_idle", true).await;
+        let worker_runtime = orch_peer::PeerRuntime::start(worker.clone()).await.unwrap();
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) =
+                    tokio::fs::read(worker.paths.remotes_dir().join("_listener.json")).await
+                {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if let Some(addr) = value["listen_addr"].as_str() {
+                        break addr.to_owned();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let controller_root = tempfile::tempdir().unwrap();
+        let controller = engine_at(controller_root.path(), "controller_idle", false).await;
+        let store = orch_infra::storage::remote::FileRemoteStore::new(controller.paths.clone());
+        store
+            .add(orch_domain::RemoteConfig {
+                alias: "worker".into(),
+                addr,
+                added_at: controller.clock.now_iso(),
+            })
+            .await
+            .unwrap();
+        let runtime = orch_peer::PeerRuntime::start(controller.clone())
+            .await
+            .unwrap();
+        let status_path = controller.paths.remotes_dir().join("worker.json");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(bytes) = tokio::fs::read(&status_path).await {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if value["online"] == true {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("controller linked");
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let boundary = controller.events.operation_boundary();
+        let output = output();
+        let baseline = boundary.current_commit_seq();
+        for (id, stores) in [
+            (1, r#"{"stores":["messages"]}"#),
+            (2, r#"{"stores":["tasks"]}"#),
+            (3, r#"{"stores":["remote"]}"#),
+            (
+                4,
+                r#"{"stores":["tasks","goals","agents","messages","context","teams","runs","config","state","remote"]}"#,
+            ),
+        ] {
+            assert!(output.register(id, Id::new("daemon_test").unwrap(), baseline, args(stores)));
+            output.activate(id);
+        }
+        let sink = output.clone();
+        boundary.set_publisher(Some(Arc::new(move |p| sink.publish(p))));
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let mut counts = [0; 4];
+        let mut resyncs = 0;
+        while let Some(frame) = output.pop() {
+            let event = serde_json::from_slice::<EventFrame>(&frame.bytes)
+                .unwrap()
+                .ev;
+            counts[(event.subscription - 1) as usize] += 1;
+            resyncs += usize::from(matches!(event.body, EventBody::Resync { .. }));
+            assert!(
+                matches!(
+                    event.body,
+                    EventBody::Change {
+                        store: Store::Remote,
+                        ..
+                    }
+                ),
+                "idle controller changed another store"
+            );
+        }
+        eprintln!(
+            "idle controller over 5s: messages={} tasks={} remote={} all={} resyncs={resyncs}",
+            counts[0], counts[1], counts[2], counts[3]
+        );
+        assert_eq!((counts[0], counts[1], resyncs), (0, 0, 0));
+        assert!(
+            (4..=6).contains(&counts[2]),
+            "expected about 1Hz Remote heartbeat"
+        );
+        assert_eq!(counts[2], counts[3]);
+        runtime.shutdown().await;
+        worker_runtime.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
