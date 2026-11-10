@@ -400,6 +400,22 @@ fn spawn_mcp_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>) -> JoinHandle<(
         while shared.renewing() {
             n += 1;
             let result = (|| -> Result<(), String> {
+                // Renewed before AND after the other work: under load the
+                // task and key writes queue behind everyone else's, and one
+                // renewal per round leaves `live` provably alive for too
+                // little of the run.
+                let renew = |mcp: &mut Mcp| -> Result<(), String> {
+                    let renewal = shared.live.attempted.load(Ordering::SeqCst) + 1;
+                    shared.live.attempted.store(renewal, Ordering::SeqCst);
+                    let sent = Instant::now();
+                    mcp_ok(&mcp.call_tool(
+                        "context_set",
+                        json!({"key": "live", "value": format!("live-{renewal}"), "ttl": LIVE_TTL_MS}),
+                    ))?;
+                    shared.live_acked(renewal, sent);
+                    Ok(())
+                };
+                renew(&mut mcp)?;
                 let task = mcp_ok(&mcp.call_tool("task_add", json!({"title": format!("m2-{n}")})))?;
                 let id = task["id"]
                     .as_str()
@@ -409,13 +425,7 @@ fn spawn_mcp_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>) -> JoinHandle<(
                 mcp_ok(&mcp.call_tool("context_set", json!({"key": key, "value": "kept"})))?;
                 // The renewal under test: a TTL'd key re-set before each sweep
                 // could collect it.
-                shared.live.attempted.store(n, Ordering::SeqCst);
-                let sent = Instant::now();
-                mcp_ok(&mcp.call_tool(
-                    "context_set",
-                    json!({"key": "live", "value": format!("live-{n}"), "ttl": LIVE_TTL_MS}),
-                ))?;
-                shared.live_acked(n, sent);
+                renew(&mut mcp)?;
                 let mut created = shared.created.lock().unwrap();
                 created.tasks.insert(id);
                 created.context.insert(key);
@@ -621,6 +631,27 @@ fn spawn_client_creator(sandbox: &Sandbox, shared: Arc<Shared>, worker: String) 
     })
 }
 
+/// Renewal `attempted + 1` of `live`; only the renewer calls it.
+async fn renew_live(
+    client: &mut orch_client::Client,
+    shared: &Shared,
+) -> Result<(), orch_client::ClientError> {
+    use orch_proto::bounded::{Id, Text};
+    use orch_proto::ops::args::ContextSetArgs;
+    let renewal = shared.live.attempted.load(Ordering::SeqCst) + 1;
+    shared.live.attempted.store(renewal, Ordering::SeqCst);
+    let sent = Instant::now();
+    client
+        .context_set(ContextSetArgs {
+            key: Id::new("live").unwrap(),
+            value: Text::new(format!("live-{renewal}")).unwrap(),
+            ttl_ms: Some(LIVE_TTL_MS),
+        })
+        .await?;
+    shared.live_acked(renewal, sent);
+    Ok(())
+}
+
 fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()> {
     use orch_proto::bounded::{Id, Text};
     use orch_proto::ops::args::ContextSetArgs;
@@ -630,6 +661,9 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
             // Outlives `stop`: it renews until just before the daemon is stopped.
             while shared.renewing() {
                 n += 1;
+                // Renewed before AND after the other work (see the MCP
+                // renewer).
+                renew_live(client, shared).await?;
                 let task = client
                     .task_create(new_task(&format!("m2-{n}"), None))
                     .await?;
@@ -641,16 +675,7 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
                         ttl_ms: None,
                     })
                     .await?;
-                shared.live.attempted.store(n, Ordering::SeqCst);
-                let sent = Instant::now();
-                client
-                    .context_set(ContextSetArgs {
-                        key: Id::new("live").unwrap(),
-                        value: Text::new(format!("live-{n}")).unwrap(),
-                        ttl_ms: Some(LIVE_TTL_MS),
-                    })
-                    .await?;
-                shared.live_acked(n, sent);
+                renew_live(client, shared).await?;
                 {
                     let mut created = shared.created.lock().unwrap();
                     created.tasks.insert(task.id);
