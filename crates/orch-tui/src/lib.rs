@@ -37,6 +37,7 @@ pub mod mouse;
 pub mod msg;
 pub mod navigation;
 pub mod onboarding;
+pub mod refresh;
 pub mod runner;
 pub mod state;
 pub mod text;

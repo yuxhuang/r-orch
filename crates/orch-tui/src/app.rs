@@ -1,20 +1,27 @@
 //! The application: state plus a backend plus a clock.
 //!
 //! Owns everything that *acts* — event ingestion, refresh, the soft-delete
-//! sweep, notifications and wizard submission. Key dispatch lives in
+//! sweep, notifications and wizard submission.
+//!
+//! State is read when the daemon says it changed, never on a timer: the
+//! backend's pushed [`Observation`]s mark the views they touch dirty
+//! ([`crate::refresh`]), a 150 ms debounce collapses a burst into one read
+//! per view, and a resync reads every view before the next frame is drawn.
+//! A frame otherwise drains memory only. Key dispatch lives in
 //! [`crate::keys`] and command execution in [`crate::commands`], both as
 //! `impl` blocks on this type.
 
 use orch_domain::{Agent, Goal, GoalStatus, OrchestratorEvent, Task, TaskStatus, TuiPaletteName};
 
-use crate::backend::{ClipboardPaste, HistoryEntry, ModelCatalog, TuiBackend};
+use crate::backend::{ClipboardPaste, HistoryEntry, ModelCatalog, Observation, TuiBackend};
 use crate::clock::{Clock, SystemClock};
 use crate::format::parse_timestamp_ms;
 use crate::messages::{
-    ANIM_TICK_MS, MESSAGE_BATCH_MS, MsgType, OBSERVER_POLL_MS, PendingMessage, REFRESH_DEBOUNCE_MS,
-    WATCH_POLL_MS, format, format_event,
+    ANIM_TICK_MS, MESSAGE_BATCH_MS, MsgType, PendingMessage, REFRESH_DEBOUNCE_MS, format,
+    format_event,
 };
 use crate::onboarding::{COMPLETED_DISMISS_MS, OnboardingStep};
+use crate::refresh::{Freshness, View, ViewSet};
 use crate::state::{
     AppState, DetailPanel, EntityType, InputMode, PendingDeletion, TabFlash, ToastKind, ViewId,
 };
@@ -58,7 +65,13 @@ pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     /// which no interactive path uses).
     pub(crate) submitted_generation: u64,
     last_anim_at: i64,
-    last_refresh_at: i64,
+    /// Which cached views a pushed change has made stale, and the commit
+    /// ordinal each was last read at.
+    freshness: Freshness,
+    /// A resync arrived: every view is read before the next frame.
+    resync_pending: bool,
+    /// The last failure shown per view, so a repeated one is not repeated.
+    read_errors: Vec<(View, String)>,
 }
 
 impl<B: TuiBackend, C: Clock> App<B, C> {
@@ -79,14 +92,52 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         };
         state.log_type_filter = crate::messages::preset_types("all");
 
-        state.tasks = backend.refresh_tasks().unwrap_or_default();
-        state.agents = backend.refresh_agents().unwrap_or_default();
-        state.peer_status = backend.peer_status().unwrap_or_default();
-        state.goals = backend.refresh_goals().unwrap_or_default();
-        state.teams = backend.list_teams().unwrap_or_default();
-        if let Ok(orch_state) = backend.refresh_state() {
+        // The bootstrap: one read per view, each remembered with the commit
+        // ordinal it observed so a push the read already saw is not read
+        // again (brief D3). A failed read leaves its view stale.
+        let mut freshness = Freshness::default();
+        let mut bootstrap_errors = Vec::new();
+        let mut note =
+            |freshness: &mut Freshness, backend: &B, view: View, error: Option<&String>| {
+                if let Some(error) = error {
+                    freshness.read_failed(view);
+                    bootstrap_errors.push((view, error.clone()));
+                } else {
+                    freshness.read_ok(view, backend.last_read_seq());
+                }
+            };
+        let tasks = backend.refresh_tasks();
+        note(&mut freshness, &backend, View::Tasks, tasks.as_ref().err());
+        state.tasks = tasks.unwrap_or_default();
+        let agents = backend.refresh_agents();
+        note(
+            &mut freshness,
+            &backend,
+            View::Agents,
+            agents.as_ref().err(),
+        );
+        state.agents = agents.unwrap_or_default();
+        let peer = backend.peer_status();
+        note(&mut freshness, &backend, View::Peer, peer.as_ref().err());
+        state.peer_status = peer.unwrap_or_default();
+        let goals = backend.refresh_goals();
+        note(&mut freshness, &backend, View::Goals, goals.as_ref().err());
+        state.goals = goals.unwrap_or_default();
+        let teams = backend.list_teams();
+        note(&mut freshness, &backend, View::Teams, teams.as_ref().err());
+        state.teams = teams.unwrap_or_default();
+        let orch_state = backend.refresh_state();
+        note(
+            &mut freshness,
+            &backend,
+            View::State,
+            orch_state.as_ref().err(),
+        );
+        if let Ok(orch_state) = orch_state {
             state.orch_state = orch_state;
         }
+        // The prompt mode and the dispatch switch came with the launch
+        // context; their next read is the next config / state change.
         state.onboarding = OnboardingStep::initial(&state.orch_state, state.tasks.len());
 
         let now = clock.now_ms();
@@ -97,10 +148,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         let timing_failure = match timing {
             Ok(snapshot) => {
                 state.timings = snapshot;
+                freshness.read_ok(View::Timings, backend.last_read_seq());
                 None
             }
             Err(error) => {
                 state.timing_error = Some(error.clone());
+                freshness.read_failed(View::Timings);
                 Some(error)
             }
         };
@@ -114,8 +167,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             armed_broadcast: None,
             submitted_generation: 0,
             last_anim_at: now,
-            last_refresh_at: now,
+            freshness,
+            resync_pending: false,
+            read_errors: Vec::new(),
         };
+
+        // A failed initial read must not look like an empty store. Use the
+        // same per-view error state and deduplication as pushed refreshes.
+        for (view, error) in bootstrap_errors {
+            app.settle::<()>(view, Err(error));
+        }
 
         if let Some(error) = timing_failure {
             app.emit(
@@ -126,13 +187,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
 
         // Launch banner.
-        if app.state.observer_mode {
-            app.emit(
-                "Observer mode: watching external orchestrator via disk polling.",
-                Token::Amber,
-                MsgType::System,
-            );
-        } else if let Some(err) = app.backend.context().watch_error {
+        if let Some(err) = app.backend.context().watch_error {
             app.emit(
                 &format!("Watch mode failed: {err}. Tasks will not auto-dispatch."),
                 Token::Red,
@@ -191,6 +246,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         for event in self.backend.poll_events() {
             self.handle_event(&event);
         }
+        for observation in self.backend.poll_observations() {
+            self.observe(observation);
+        }
         for batch in self.backend.poll_history() {
             self.ingest_history(batch);
         }
@@ -214,22 +272,17 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         {
             self.state.flush_messages(now);
         }
-        if let Some(deadline) = self.state.refresh_at
+        // A resync is read at once, so the frame drawn after it is already
+        // synchronized; ordinary changes wait out the debounce together.
+        if self.resync_pending {
+            self.resync_pending = false;
+            self.state.refresh_at = None;
+            self.refresh_views(ViewSet::all());
+        } else if let Some(deadline) = self.state.refresh_at
             && now >= deadline
         {
             self.state.refresh_at = None;
-            self.refresh_all(false);
-        }
-
-        // Periodic disk poll — 3 s in observer mode (where no events arrive at
-        // all), 5 s otherwise, skipped while a refresh is already recent.
-        let poll_interval = if self.state.observer_mode {
-            OBSERVER_POLL_MS
-        } else {
-            WATCH_POLL_MS
-        };
-        if now - self.last_refresh_at >= poll_interval {
-            self.refresh_all(false);
+            self.refresh_views(self.freshness.dirty());
         }
 
         for deletion in self.state.take_expired_deletions(now) {
@@ -276,6 +329,23 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         }
     }
 
+    /// One pushed observation: mark what it made stale.
+    pub fn observe(&mut self, observation: Observation) {
+        match observation {
+            Observation::Changed {
+                store, commit_seq, ..
+            } => {
+                if self.freshness.changed(store, commit_seq) {
+                    self.schedule_refresh();
+                }
+            }
+            Observation::Resynced => {
+                self.freshness.invalidate_all();
+                self.resync_pending = true;
+            }
+        }
+    }
+
     // ── Events ─────────────────────────────────────────────────────────────
 
     pub fn handle_event(&mut self, event: &OrchestratorEvent) {
@@ -317,10 +387,8 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             self.notify_status_change(task_id, *to);
         }
 
-        // (e) debounced refresh.
-        if refresh_triggering(event) {
-            self.schedule_refresh();
-        }
+        // No refresh here: the store change behind the event arrives as its
+        // own pushed invalidation, which is what reads (brief D7).
     }
 
     fn notify_status_change(&mut self, task_id: &str, to: TaskStatus) {
@@ -449,56 +517,131 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
 
     // ── Refresh ────────────────────────────────────────────────────────────
 
-    /// Commit only what actually changed.
+    /// Read every view a local action may have changed, now.
+    ///
+    /// The views it reads are recorded with their ordinals, so the push the
+    /// action itself causes a moment later is not read a second time.
+    pub fn refresh_all(&mut self, include_teams: bool) {
+        let mut views = ViewSet::of(&[
+            View::Peer,
+            View::Tasks,
+            View::Agents,
+            View::Goals,
+            View::PromptMode,
+            View::State,
+            View::Timings,
+        ]);
+        if include_teams {
+            views.insert(View::Teams);
+        }
+        self.refresh_views(views);
+    }
+
+    /// Read `views` and commit only what actually changed.
     ///
     /// Every list keeps its selected entity across the refresh (D1): the
     /// selection is captured from the order on screen before anything is
     /// committed, then found again in the new order, sorted at a freshly
     /// sampled clock.
-    pub fn refresh_all(&mut self, include_teams: bool) {
+    pub fn refresh_views(&mut self, views: ViewSet) {
+        if views.is_empty() {
+            return;
+        }
         let now = self.now();
-        self.last_refresh_at = now;
         let can_create = self.can_create_task();
         let prior = self.state.capture_list_selection(can_create);
-        if let Ok(status) = self.backend.peer_status() {
-            self.state.peer_status = status;
+        if views.contains(View::Peer) {
+            let read = self.backend.peer_status();
+            if let Some(status) = self.settle(View::Peer, read) {
+                self.state.peer_status = status;
+            }
         }
-        if let Ok(tasks) = self.backend.refresh_tasks()
-            && tasks_changed(&self.state.tasks, &tasks)
-        {
-            self.state.tasks = tasks;
+        if views.contains(View::Tasks) {
+            let read = self.backend.refresh_tasks();
+            if let Some(tasks) = self.settle(View::Tasks, read)
+                && tasks_changed(&self.state.tasks, &tasks)
+            {
+                self.state.tasks = tasks;
+            }
         }
-        if let Ok(agents) = self.backend.refresh_agents()
-            && agents_changed(&self.state.agents, &agents)
-        {
-            self.state.agents = agents;
+        if views.contains(View::Agents) {
+            let read = self.backend.refresh_agents();
+            if let Some(agents) = self.settle(View::Agents, read)
+                && agents_changed(&self.state.agents, &agents)
+            {
+                self.state.agents = agents;
+            }
         }
-        if let Ok(goals) = self.backend.refresh_goals()
-            && goals_changed(&self.state.goals, &goals)
-        {
-            self.state.goals = goals;
+        if views.contains(View::Goals) {
+            let read = self.backend.refresh_goals();
+            if let Some(goals) = self.settle(View::Goals, read)
+                && goals_changed(&self.state.goals, &goals)
+            {
+                self.state.goals = goals;
+            }
         }
-        if include_teams && let Ok(teams) = self.backend.list_teams() {
-            self.state.teams = teams;
+        if views.contains(View::Teams) {
+            let read = self.backend.list_teams();
+            if let Some(teams) = self.settle(View::Teams, read) {
+                self.state.teams = teams;
+            }
         }
         // While a write is in flight its outcome decides the header; a read
-        // racing it could show the old value after the new one.
-        if !self.state.prompt_mode_pending
-            && let Ok(mode) = self.backend.project_prompt_mode()
-        {
-            self.state.prompt_mode = mode;
+        // racing it could show the old value after the new one. The view
+        // stays dirty for the read after it.
+        if views.contains(View::PromptMode) && !self.state.prompt_mode_pending {
+            let read = self.backend.project_prompt_mode();
+            if let Some(mode) = self.settle(View::PromptMode, read) {
+                self.state.prompt_mode = mode;
+            }
         }
         // State is always committed.
-        let state_read = match self.backend.refresh_state() {
-            Ok(orch_state) => {
+        if views.contains(View::State) {
+            let read = self.backend.refresh_state();
+            if let Some(orch_state) = self.settle(View::State, read) {
                 self.state.orch_state = orch_state;
-                true
             }
-            Err(_) => false,
-        };
-        self.refresh_timings(state_read, now);
+        }
+        if views.contains(View::Dispatch) {
+            let read = self.backend.refresh_dispatch();
+            if let Some(on) = self.settle(View::Dispatch, read) {
+                self.state.watch_active = on;
+            }
+        }
+        if views.contains(View::Timings) {
+            self.refresh_timings(!self.freshness.failed(View::State), now);
+        }
         self.state.reconcile_list_selection(&prior, now, can_create);
         self.state.clamp_all(can_create);
+    }
+
+    /// Record one view read: its ordinal on success; on failure, the view
+    /// stays stale and the error is shown once until a read succeeds.
+    fn settle<T>(&mut self, view: View, read: crate::backend::BackendResult<T>) -> Option<T> {
+        match read {
+            Ok(value) => {
+                self.freshness.read_ok(view, self.backend.last_read_seq());
+                self.read_errors.retain(|(v, _)| *v != view);
+                Some(value)
+            }
+            Err(error) => {
+                self.freshness.read_failed(view);
+                let shown = self
+                    .read_errors
+                    .iter()
+                    .any(|(v, e)| *v == view && *e == error);
+                if !shown {
+                    self.read_errors.retain(|(v, _)| *v != view);
+                    self.emit(
+                        &format!("{} may be out of date: {error}", view.label()),
+                        Token::Red,
+                        MsgType::Error,
+                    );
+                    self.read_errors.push((view, error));
+                }
+                None
+            }
+        }
     }
 
     /// Started/Elapsed for what this refresh committed. A failure is shown
@@ -511,10 +654,13 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             .refresh_timings(&self.state.tasks, &self.state.goals, orch_state, now)
         {
             Ok(snapshot) => {
+                self.freshness
+                    .read_ok(View::Timings, self.backend.last_read_seq());
                 self.state.timings = snapshot;
                 self.state.timing_error = None;
             }
             Err(error) => {
+                self.freshness.read_failed(View::Timings);
                 self.state.timings = crate::backend::TimingSnapshot {
                     sampled_at_ms: now,
                     ..Default::default()
@@ -1787,23 +1933,6 @@ pub fn parse_palette(value: &str) -> Option<TuiPaletteName> {
         .find(|p| p.as_str() == value)
 }
 
-/// Which events arm the debounced refresh.
-fn refresh_triggering(event: &OrchestratorEvent) -> bool {
-    matches!(
-        event,
-        OrchestratorEvent::TaskStatusChanged { .. }
-            | OrchestratorEvent::TaskCreated { .. }
-            | OrchestratorEvent::TaskAssigned { .. }
-            | OrchestratorEvent::AgentStarted { .. }
-            | OrchestratorEvent::AgentCompleted { .. }
-            | OrchestratorEvent::RunRetry { .. }
-            | OrchestratorEvent::GoalCreated { .. }
-            | OrchestratorEvent::GoalStatusChanged { .. }
-            | OrchestratorEvent::GoalUpdated { .. }
-            | OrchestratorEvent::GoalDeleted { .. }
-    )
-}
-
 /// Whether the list changed, for entities that carry `updated_at`.
 pub fn tasks_changed(prev: &[Task], next: &[Task]) -> bool {
     if prev.len() != next.len() {
@@ -1894,19 +2023,19 @@ mod tests {
     }
 
     #[test]
-    fn events_arm_the_150ms_refresh_debounce() {
+    fn events_never_arm_a_refresh_and_invalidations_do() {
         let mut app = app();
         app.handle_event(&OrchestratorEvent::TaskAssigned {
             task_id: "tsk_1".into(),
             agent_id: "agt_1".into(),
         });
-        assert_eq!(app.state.refresh_at, Some(REFRESH_DEBOUNCE_MS));
-        // A non-triggering event does not re-arm it.
-        app.state.refresh_at = None;
-        app.handle_event(&OrchestratorEvent::TeamDisbanded {
-            team_id: "t".into(),
+        assert_eq!(app.state.refresh_at, None, "the event alone reads nothing");
+        app.observe(Observation::Changed {
+            store: crate::backend::ObservedStore::Tasks,
+            id: Some("tsk_1".into()),
+            commit_seq: 1,
         });
-        assert_eq!(app.state.refresh_at, None);
+        assert_eq!(app.state.refresh_at, Some(REFRESH_DEBOUNCE_MS));
     }
 
     #[test]
@@ -2206,16 +2335,17 @@ mod tests {
     }
 
     #[test]
-    fn observer_mode_announces_itself_on_launch() {
+    fn no_launch_banner_claims_disk_polling() {
+        // Every dashboard is a daemon client fed by push; nothing polls.
         let mut backend = FakeBackend::new();
         backend.context.observer_mode = true;
         let mut app = App::new(backend, TestClock::new(0));
         app.state.flush_messages(0);
-        assert!(app.state.messages[0].text.starts_with("Observer mode:"));
+        assert!(app.state.messages.is_empty(), "{:?}", app.state.messages);
     }
 
     #[test]
-    fn a_watch_error_is_announced_when_not_in_observer_mode() {
+    fn a_watch_error_is_announced_on_launch() {
         let mut backend = FakeBackend::new();
         backend.context.watch_error = Some("lock held".into());
         let mut app = App::new(backend, TestClock::new(0));
