@@ -505,6 +505,8 @@ impl Orchestrator {
         }).await.value
     }
 
+    /// Never await a collector inside an operation: nested boundaries would
+    /// join it and buffer the whole stream under the project permit.
     #[allow(
         clippy::too_many_arguments,
         reason = "each argument is a separate id, handle or flag of one run; no params struct exists yet"

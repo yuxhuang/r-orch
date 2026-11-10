@@ -591,6 +591,9 @@ pub struct TuiPane {
     /// is not read as the orch client touching the socket directory.
     home: PathBuf,
     exit_file: PathBuf,
+    // Retain the server and pane process-group leader while tmux answers.
+    // Taking the record serialises RunGuard/Drop and makes cleanup idempotent.
+    owned: std::sync::Mutex<Option<Vec<u32>>>,
 }
 
 /// Directory name, inside the socket directory, of the tmux client's `HOME`.
@@ -623,7 +626,11 @@ impl TuiPane {
              (macOS: brew install tmux; Linux: the distro's tmux package)"
         );
         let dir = test_root.to_path_buf();
-        let name = format!("t2a{}", std::process::id());
+        let name = format!(
+            "t2a{}-{}",
+            std::process::id(),
+            dir.file_name().unwrap().to_string_lossy()
+        );
         let exit_file = dir.join("tui.exit");
         let wrapper = dir.join("pane.sh");
         let extra: String = extra_env
@@ -659,8 +666,9 @@ impl TuiPane {
             dir,
             home,
             exit_file,
+            owned: std::sync::Mutex::new(Some(Vec::new())),
         };
-        pane.run(&[
+        let ids = pane.run(&[
             "start-server",
             ";",
             "set-option",
@@ -669,6 +677,9 @@ impl TuiPane {
             "tmux-256color",
             ";",
             "new-session",
+            "-P",
+            "-F",
+            "#{pid} #{pane_pid}",
             "-d",
             "-s",
             "t",
@@ -678,6 +689,19 @@ impl TuiPane {
             "50",
             wrapper.to_str().unwrap(),
         ]);
+        *pane
+            .owned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            ids.split_whitespace()
+                .filter_map(|id| id.parse().ok())
+                .collect(),
+        );
+        assert_eq!(
+            ids.split_whitespace().count(),
+            2,
+            "tmux did not return its server and pane pids: {ids}"
+        );
         pane
     }
 
@@ -688,7 +712,11 @@ impl TuiPane {
             .env("TMUX_TMPDIR", &self.dir)
             .env("HOME", &self.home)
             .env("SHELL", "/bin/sh")
-            .args(["-u", "-L", &self.name, "-f", "/dev/null"]);
+            .args(["-u", "-L", &self.name, "-f", "/dev/null"])
+            // Its own process group, so `output_with_deadline` can kill a
+            // tmux client that hangs (`killpg` of a non-leader is ESRCH and
+            // the following `wait` would then hang with it).
+            .process_group(0);
         cmd
     }
 
@@ -754,8 +782,138 @@ impl TuiPane {
     }
 }
 
+/// Short cleanup budget, independent of the 30 s assertion/driver budget.
+const CLEANUP_CALL: Duration = Duration::from_secs(1);
+
+/// Best-effort collection for destructors: no assertions, no unbounded child
+/// wait, and no EOF wait. Regular temporary files avoid the inherited-pipe
+/// hazard documented in `output_and_pid` (including after a child has exited).
+pub fn cleanup_output(mut cmd: Command) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Seek};
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .spawn()?;
+    let deadline = Instant::now() + CLEANUP_CALL;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => {
+                if let Ok(pid) = i32::try_from(child.id()) {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pid),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                let _ = child.kill();
+                let reap = Instant::now() + Duration::from_millis(100);
+                while matches!(child.try_wait(), Ok(None)) && Instant::now() < reap {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Err(result.err().unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "cleanup command exceeded 1s")
+                }));
+            }
+        }
+    };
+    stdout.rewind()?;
+    stderr.rewind()?;
+    let mut out = std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout.take(1024 * 1024).read_to_end(&mut out.stdout)?;
+    stderr.take(1024 * 1024).read_to_end(&mut out.stderr)?;
+    Ok(out)
+}
+
+impl TuiPane {
+    /// Kill only this fixture's server and pane tree, even when tmux no longer
+    /// answers. At most three 1 s commands plus 100 ms reap grace per timeout.
+    /// This is called during unwinding, so errors must never become panics.
+    pub fn terminate(&self) {
+        let mut owned = self
+            .owned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut roots) = owned.take() else {
+            return;
+        };
+        let pane_group = roots.get(1).copied();
+        let mut list = self.cmd();
+        list.args(["list-panes", "-a", "-F", "#{pane_pid}"]);
+        if let Ok(out) = cleanup_output(list)
+            && out.status.success()
+        {
+            roots.extend(
+                text(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok()),
+            );
+        }
+        // A bounded, non-panicking ps also covers a partially completed launch.
+        let mut ps = Command::new("/bin/ps");
+        ps.args(["-axo", "pid=,ppid=,command="]).process_group(0);
+        let table: Vec<_> = cleanup_output(ps)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                text(&out.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        let pid = fields.next()?.parse::<u32>().ok()?;
+                        let parent = fields.next()?.parse::<u32>().ok()?;
+                        Some((pid, parent, fields.collect::<Vec<_>>().join(" ")))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let marker = format!("tmux -u -L {} ", self.name);
+        roots.extend(
+            table
+                .iter()
+                .filter(|(_, _, cmd)| cmd.starts_with(&marker))
+                .map(|(pid, _, _)| *pid),
+        );
+        let mut doomed = roots;
+        let mut i = 0;
+        while i < doomed.len() {
+            let parent = doomed[i];
+            let children: Vec<_> = table
+                .iter()
+                .filter(|(pid, ppid, _)| *ppid == parent && !doomed.contains(pid))
+                .map(|(pid, _, _)| *pid)
+                .collect();
+            doomed.extend(children);
+            i += 1;
+        }
+        let mut kill = self.cmd();
+        kill.arg("kill-server");
+        let _ = cleanup_output(kill);
+        // The wrapper's foreground TUI shares the pane's process group; keep
+        // this fallback even if ps failed or kill-server reparented the TUI.
+        if let Some(pid) = pane_group.and_then(|pid| i32::try_from(pid).ok()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        for pid in doomed.into_iter().rev() {
+            force_kill(pid);
+        }
+    }
+}
+
 impl Drop for TuiPane {
     fn drop(&mut self) {
-        let _ = self.cmd().arg("kill-server").output();
+        self.terminate();
     }
 }

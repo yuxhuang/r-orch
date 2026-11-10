@@ -14,7 +14,7 @@ orch task add --help
 > work outside a project, such as `orch org template` and `orch config global`. `orch --help`, `orch --version`,
 > `orch init` and `orch update` need neither, and `orch doctor` runs its local checks anywhere
 > ([Check your setup](07-running-and-monitoring.md#check-your-setup)). `orch <command> --help` needs a project but no
-> daemon, except for `init`, `update`, `doctor`, `daemon`, `mcp` and `org template`, whose help works anywhere. `orch mcp --project-root <path>` serves the project at `<path>` from
+> daemon, except for `init`, `update`, `doctor`, `daemon` and `mcp`, whose help works anywhere. `orch mcp --project-root <path>` serves the project at `<path>` from
 > any directory, through that project's daemon.
 
 How to read the usage column:

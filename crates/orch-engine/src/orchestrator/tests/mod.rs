@@ -11,6 +11,7 @@
 mod auto_review_approve;
 mod autonomous;
 mod bugfixes_2026_03;
+mod collector_publication;
 mod core;
 mod defensive_validation;
 mod dispatch_worktree;
@@ -20,7 +21,10 @@ mod force_review;
 pub(crate) mod harness;
 mod mutex;
 mod parallel_race;
+mod pause_prelaunch;
 mod perf_opts;
+mod prelaunch_final_list_error;
+mod prelaunch_record_errors;
 mod resilience;
 mod retry_backoff;
 mod retry_race;

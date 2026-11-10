@@ -9,7 +9,8 @@
 //!
 //! `orch web` is a daemon client too (plan Q0b): it checks for the project's
 //! daemon before it listens (none: the frozen NoDaemon message and exit 7),
-//! and again before every page and websocket it serves. When the daemon has
+//! and again before every page and websocket it serves. One held observation
+//! session also detects idle EOF/typed errors without a request. When the daemon has
 //! gone away meanwhile, those answer **HTTP 503** with the same message, so a
 //! browser tab that is already open learns why; a session that is already
 //! running shows the TUI's own no-daemon screen. Nothing here starts a daemon
@@ -40,7 +41,11 @@
 //! The static assets (xterm.js, the CSS, licences) carry no secret and need no
 //! credential, which is what lets a token-bearing `/` load them.
 
+mod observation;
 pub mod pty;
+
+#[cfg(all(test, debug_assertions))]
+mod observation_tests;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -329,6 +334,8 @@ pub struct WebState {
     /// Opens a session to the project's daemon: the preflight before every
     /// page and websocket.
     daemon: crate::tui::Connector,
+    /// Serializes request retries and owns exactly one observation task.
+    observation: tokio::sync::Mutex<Option<observation::Observation>>,
 }
 
 struct Secret {
@@ -372,27 +379,50 @@ impl WebState {
             slots: Arc::new(AtomicUsize::new(0)),
             shutdown: CancellationToken::new(),
             daemon,
+            observation: tokio::sync::Mutex::new(None),
         }
     }
 
     /// Is the project's daemon answering? `Err` carries the frozen text in
     /// this server's variant (owner or agent).
     pub async fn daemon_check(&self) -> std::result::Result<(), DaemonDown> {
-        match tokio::time::timeout(PREFLIGHT_TIMEOUT, self.daemon.connect()).await {
-            Ok(Ok(_session)) => Ok(()),
-            Ok(Err(error)) => Err(DaemonDown {
-                message: error.render(self.daemon.agent_context()),
-                exit_code: error.exit_code(),
-            }),
-            Err(_) => Err(DaemonDown {
-                message: orch_client::NoDaemon::no_daemon(
-                    &self.daemon.project_root().to_string_lossy(),
+        let check = async {
+            let mut observation = self.observation.lock().await;
+            let client = match self.daemon.connect().await {
+                Ok(client) => client,
+                Err(error) => {
+                    if let Some(old) = observation.take() {
+                        old.stop().await;
+                    }
+                    return Err(observation::client_down(&self.daemon, error));
+                }
+            };
+            if observation.as_ref().is_some_and(|held| {
+                held.status
+                    .borrow()
+                    .as_ref()
+                    .is_ok_and(|instance| *instance == client.welcome.instance)
+            }) {
+                return Ok(());
+            }
+            if let Some(old) = observation.take() {
+                old.stop().await;
+            }
+            *observation = Some(
+                observation::Observation::start(client, self.daemon.clone(), self.shutdown.clone())
+                    .await
+                    .map_err(|error| observation::client_down(&self.daemon, error))?,
+            );
+            Ok(())
+        };
+        tokio::time::timeout(PREFLIGHT_TIMEOUT, check)
+            .await
+            .unwrap_or_else(|_| {
+                Err(observation::down(
+                    &self.daemon,
                     orch_proto::error::NoDaemonDetail::Timeout,
-                )
-                .render(self.daemon.agent_context()),
-                exit_code: 7,
-            }),
-        }
+                ))
+            })
     }
 
     /// Sessions still running or shutting down.

@@ -520,14 +520,18 @@ impl Orchestrator {
                 .deps()
                 .events
                 .operation_boundary()
-                .run(true, async {
-                    let state = orchestrator.inner.state.lock().await;
-                    if let Some(state) = state.as_ref()
-                        && let Err(err) = orchestrator.save_state(state).await
-                    {
-                        orchestrator.emit_error(err, "debounced state save");
-                    }
-                })
+                .run_from(
+                    crate::container::commit::CommitSource::Collector,
+                    true,
+                    async {
+                        let state = orchestrator.inner.state.lock().await;
+                        if let Some(state) = state.as_ref()
+                            && let Err(err) = orchestrator.save_state(state).await
+                        {
+                            orchestrator.emit_error(err, "debounced state save");
+                        }
+                    },
+                )
                 .await;
         }));
     }

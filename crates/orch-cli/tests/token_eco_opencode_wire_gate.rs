@@ -15,9 +15,8 @@
 
 mod token_eco_support;
 
-use std::io::Read;
-use std::process::Stdio;
-use std::sync::mpsc;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -39,7 +38,15 @@ struct Dispatched {
 /// **Without a daemon**: `run --watch` (through [`watch_output`]) is itself a
 /// daemon start and must not find a second one already owning the project.
 fn seeded(effort: &str) -> Dispatched {
-    seeded_in(Sandbox::new(&new_reader()), effort)
+    let mut d = seeded_owned(effort, "2.1.2");
+    let configured = d.sb.run(
+        &new_reader(),
+        &["config", "set", "scheduling.poll_interval_ms", "100"],
+        None,
+    );
+    assert!(configured.ok(), "{}", configured.all());
+    d.sb.stop_daemon();
+    d
 }
 
 /// [`seeded`], with the project's own test daemon: for [`dispatch`], which
@@ -88,67 +95,95 @@ fn dispatch(version: &str, effort: &str) -> Dispatched {
     }
 }
 
-/// The operator's diagnostics surface (ruling 8): the bus `orchestrator:error`
-/// that `orch run --watch` prints as a `⚠ <context>: <note>` line. The single
-/// `orch run <task>` path does not render it. Runs the watch loop over the
-/// seeded task until the task's run reports completion, then stops it.
-///
-/// `run --watch` is itself a foreground daemon start since S2a-cli
-/// (`crate::commands::daemon::foreground`), on its own isolated socket so its
-/// `.orchestry`-relative default does not overflow macOS's `sun_path`; `d.sb`
-/// must stay daemon-less ([`seeded`]) so this is not a *second* owner.
+/// Reap the foreground owner even when a fixture assertion fails.
+struct Foreground {
+    child: Child,
+    reaped: bool,
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let pid = nix::unistd::Pid::from_raw(self.child.id().try_into().unwrap());
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// `run --watch` is a foreground daemon. Capture its stderr until the seeded
+/// task is done, then stop it cleanly so the count includes shutdown output.
 fn watch_output(d: &Dispatched, version: &str) -> String {
+    daemon_output(d, version, &["run", "--watch"])
+}
+
+fn daemon_output(d: &Dispatched, version: &str, args: &[&str]) -> String {
     let new = new_reader();
     let (short, socket) = daemon::short_socket();
+    let stderr_path = short.path().join("foreground.err");
     let mut cmd = d.sb.command(&new);
     daemon::apply_env(&mut cmd, &socket, short.path());
-    let mut child = cmd
-        .args(["run", "--watch"])
+    let child = cmd
+        .args(args)
         .env("ORCH_FAKE_VERSION", version)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
         .stdin(Stdio::null())
+        .process_group(0)
         .spawn()
-        .expect("spawn orch run --watch");
-    let (tx, rx) = mpsc::channel();
-    let stdout = child.stdout.take().unwrap();
-    // Raw chunks, not lines: the tick line is overwritten with `\r` and the
-    // completion marker follows it without a newline.
-    let reader = std::thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = stdout.read(&mut buf) {
-            if n == 0
-                || tx
-                    .send(String::from_utf8_lossy(&buf[..n]).into_owned())
-                    .is_err()
-            {
-                break;
-            }
-        }
-    });
-    // A deadline only bounds a hung child; nothing asserts on elapsed time.
+        .expect("spawn daemon owner");
+    let mut foreground = Foreground {
+        child,
+        reaped: false,
+    };
+    let detached = args.contains(&"--detach");
+    if detached {
+        let status = foreground.child.wait().unwrap();
+        foreground.reaped = true;
+        assert!(
+            status.success(),
+            "detached start failed: {}",
+            std::fs::read_to_string(&stderr_path).unwrap()
+        );
+    }
+    // Query through the same isolated endpoint; no direct state-file reads.
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut seen = String::new();
+    let mut done = false;
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(chunk) => {
-                seen.push_str(&chunk);
-                if seen.contains("DONE") {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        if !detached && foreground.child.try_wait().unwrap().is_some() {
+            break;
         }
+        let mut query = d.sb.command(&new);
+        daemon::apply_env(&mut query, &socket, short.path());
+        let out = query
+            .args(["--json", "task", "show", &d.task])
+            .output()
+            .unwrap();
+        if out.status.success()
+            && serde_json::from_slice::<Value>(&out.stdout).unwrap()["status"] == "done"
+        {
+            done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = reader.join();
-    // Whatever the reader had queued before the kill.
-    while let Ok(chunk) = rx.try_recv() {
-        seen.push_str(&chunk);
+    let mut stop = d.sb.command(&new);
+    daemon::apply_env(&mut stop, &socket, short.path());
+    let stopped = stop.args(["daemon", "stop"]).output().unwrap();
+    if !stopped.status.success() {
+        let _ = foreground.child.kill();
     }
+    let status = foreground.child.wait().unwrap();
+    foreground.reaped = true;
+    let seen = if detached {
+        std::fs::read_to_string(d.sb.root().join("daemon.log")).unwrap()
+    } else {
+        std::fs::read_to_string(stderr_path).unwrap()
+    };
+    assert!(done, "foreground task never completed: {status}: {seen}");
+    assert!(stopped.status.success(), "stop failed: {stopped:?}");
+    assert!(status.success(), "foreground exit {status}: {seen}");
+    assert_eq!(d.sb.recorded("opencode").len(), 1, "one model child");
     seen
 }
 
@@ -187,14 +222,6 @@ fn a_v1_install_keeps_the_original_model_and_never_receives_a_variant_suffix() {
 }
 
 #[test]
-#[ignore = "S2a-cli: `run --watch` is now `commands::daemon::foreground`, which \
-            (per crates/orch-daemon/src/lifecycle.rs) prints only `listening <socket>` \
-            to stdout and never renders the live OrchestratorEvent bus there (that \
-            rendering lived in the legacy in-process watch loop, which is gone); no \
-            client command in the current source replays `orchestrator:error` for an \
-            operator watching an interactive run. Needs a product decision on where \
-            (if anywhere) this diagnostic now surfaces — `orch tui`, a `logs --follow`, \
-            or daemon-side tracing — before this can be rewritten."]
 fn a_v1_install_surfaces_the_legacy_ignore_to_the_operator() {
     let d = seeded("high");
     let watched = watch_output(&d, "1.9.0");
@@ -259,11 +286,51 @@ fn the_legacy_ignore_is_never_stored_as_agent_output() {
 }
 
 #[test]
-#[ignore = "S2a-cli: same gap as a_v1_install_surfaces_the_legacy_ignore_to_the_operator — \
-            `run --watch`'s own stdout no longer renders live OrchestratorEvents, only \
-            `listening <socket>`; no replacement surface is specified yet."]
 fn the_legacy_ignore_is_surfaced_to_the_operator_exactly_once() {
     let d = seeded("high");
     let watched = watch_output(&d, "1.9.0");
     assert_eq!(watched.matches("legacy-ignored").count(), 1, "{watched}");
+}
+
+#[test]
+fn serve_and_explicit_start_surface_the_diagnostic_once() {
+    for args in [&["serve"][..], &["daemon", "start", "--dispatch", "on"][..]] {
+        let d = seeded("high");
+        let watched = daemon_output(&d, "1.9.0", args);
+        assert_eq!(
+            watched.matches("legacy-ignored").count(),
+            1,
+            "{args:?}: {watched}"
+        );
+    }
+}
+
+#[test]
+fn detached_start_writes_the_diagnostic_once_to_daemon_log() {
+    let d = seeded("high");
+    let logged = daemon_output(
+        &d,
+        "1.9.0",
+        &["daemon", "start", "--detach", "--dispatch", "on"],
+    );
+    assert_eq!(logged.matches("legacy-ignored").count(), 1, "{logged}");
+}
+
+#[test]
+fn startup_recovery_diagnostic_is_visible_with_dispatch_off_without_raw_payload() {
+    let sb = Sandbox::new(&new_reader());
+    let context = sb.root().join("context");
+    std::fs::create_dir_all(&context).unwrap();
+    std::fs::write(context.join("broken.json"), "{SECRET=startup-canary").unwrap();
+    let owner = daemon::TestDaemon::start(&sb.project, sb.home.path());
+    let seen = std::fs::read_to_string(owner.socket_dir().join("daemon.err")).unwrap();
+    owner.shutdown();
+    assert_eq!(
+        seen.matches("Context index rebuild skipped: invalid context entity")
+            .count(),
+        1,
+        "{seen}"
+    );
+    assert!(!seen.contains("SECRET"), "{seen}");
+    assert!(!seen.contains("startup-canary"), "{seen}");
 }

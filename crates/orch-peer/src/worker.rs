@@ -920,6 +920,7 @@ impl Worker {
     /// [`Self::cancel_mirror`], which enters the boundary for its feedback,
     /// and their reads (mirrors, the sync reply) are ordered phases of their
     /// own. Every other peer state phase goes through `Context::ordered`.
+    /// Ping/Pong are write-free but still take the same project permit.
     async fn handle_ordered(
         &self,
         controller: &str,
@@ -929,13 +930,10 @@ impl Worker {
         if matches!(frame, Frame::Sync { .. } | Frame::Cancel { .. }) {
             return self.handle(controller, name, frame).await;
         }
+        let mutation = !matches!(frame, Frame::Ping | Frame::Pong);
         self.ctx
-            .engine
-            .events
-            .operation_boundary()
-            .run(true, self.handle(controller, name, frame))
+            .ordered(mutation, Box::pin(self.handle(controller, name, frame)))
             .await
-            .value
     }
 
     async fn handle(&self, controller: &str, name: &str, frame: Frame) -> Result<Vec<Frame>> {
@@ -1248,6 +1246,8 @@ impl Worker {
                 self.ctx.msg_ack(name, &id, reason.as_deref()).await?;
                 Ok(vec![])
             }
+            // `handle_ordered` declares these two arms write-free. Adding a
+            // store write here requires changing that declaration as well.
             Frame::Ping => Ok(vec![Frame::Pong]),
             Frame::Pong => Ok(vec![]),
             _ => Err(Error::other("unexpected controller frame")),
@@ -1305,10 +1305,7 @@ impl Worker {
         // here survives the status change, and a failure below still leaves
         // the explanation behind.
         self.ctx
-            .engine
-            .events
-            .operation_boundary()
-            .run(true, async {
+            .ordered(true, async {
                 let mut fresh = self
                     .ctx
                     .engine
@@ -1319,8 +1316,7 @@ impl Worker {
                 fresh.feedback = Some(reason);
                 self.ctx.engine.tasks.save(&fresh).await
             })
-            .await
-            .value?;
+            .await?;
         self.ctx.engine.orchestrator.cancel_task(&task.id).await?;
         // `cancel_task` reports success even when its final status write
         // failed, because a refused transition usually means the task was
@@ -1679,6 +1675,125 @@ mod tests {
             name: "W1".into(),
         });
         (temp, worker, agent.id)
+    }
+
+    async fn heartbeat_has_no_publication(frame: Frame, reply: Vec<Frame>) {
+        let (_temp, worker, _agent) = fixture().await;
+        let boundary = worker.ctx.engine.operation_boundary();
+        let publications = Arc::new(Mutex::new(Vec::new()));
+        let captured = publications.clone();
+        boundary.set_publisher(Some(Arc::new(move |publication| {
+            captured.lock().unwrap().push(publication.clone());
+        })));
+        let seq = boundary.current_commit_seq();
+        let actual = worker
+            .handle_ordered("controller", "C1", frame)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(reply).unwrap()
+        );
+        assert_eq!(
+            boundary.current_commit_seq(),
+            seq,
+            "heartbeat must not commit"
+        );
+        assert!(
+            publications.lock().unwrap().is_empty(),
+            "no commit or bus publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_ping_replies_without_a_commit() {
+        heartbeat_has_no_publication(Frame::Ping, vec![Frame::Pong]).await;
+    }
+
+    #[tokio::test]
+    async fn ordered_pong_has_no_reply_or_commit() {
+        heartbeat_has_no_publication(Frame::Pong, vec![]).await;
+    }
+
+    #[tokio::test]
+    async fn ordered_submit_keeps_peer_remote_declaration_and_unexpected_frame_errors() {
+        use orch_engine::container::commit::{CommitSource, CommitStore, Publication};
+        let (_temp, worker, agent) = fixture().await;
+        let boundary = worker.ctx.engine.operation_boundary();
+        let publications = Arc::new(Mutex::new(Vec::new()));
+        let captured = publications.clone();
+        boundary.set_publisher(Some(Arc::new(move |publication| {
+            captured.lock().unwrap().push(publication.clone());
+        })));
+        let seq = boundary.current_commit_seq();
+        let reply = worker
+            .handle_ordered("controller", "C1", submit("heartbeat-control", &agent))
+            .await
+            .unwrap();
+        assert!(matches!(reply.first(), Some(Frame::Submitted { .. })));
+        assert_eq!(boundary.current_commit_seq(), seq + 1);
+        {
+            let publications = publications.lock().unwrap();
+            let commits: Vec<_> = publications
+                .iter()
+                .filter_map(|p| match p {
+                    Publication::Commit(record) => Some(record),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(commits.len(), 1);
+            assert_eq!(commits[0].source, CommitSource::Peer);
+            assert!(
+                commits[0]
+                    .changes
+                    .iter()
+                    .any(|c| c.store == CommitStore::Remote)
+            );
+        }
+        let error = worker
+            .handle_ordered(
+                "controller",
+                "C1",
+                Frame::Gap {
+                    exec_key: "unexpected".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unexpected controller frame"));
+    }
+
+    #[tokio::test]
+    async fn ordered_ping_waits_for_the_held_operation() {
+        let (_temp, worker, _agent) = fixture().await;
+        let boundary = worker.ctx.engine.operation_boundary();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let held = {
+            let boundary = boundary.clone();
+            tokio::spawn(async move {
+                boundary
+                    .run(false, async {
+                        entered.send(()).unwrap();
+                        released.await.unwrap();
+                    })
+                    .await;
+            })
+        };
+        ready.await.unwrap();
+        let seq = boundary.current_commit_seq();
+        let ping = worker.handle_ordered("controller", "C1", Frame::Ping);
+        tokio::pin!(ping);
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(ping.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "Ping answered while the permit was held"
+        );
+        release.send(()).unwrap();
+        held.await.unwrap();
+        assert!(matches!(ping.await.unwrap().as_slice(), [Frame::Pong]));
+        assert_eq!(boundary.current_commit_seq(), seq);
     }
 
     fn submit(key: &str, agent: &str) -> Frame {

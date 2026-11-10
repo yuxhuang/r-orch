@@ -25,6 +25,11 @@
 //! the daemon already has. Listing tools or resources, ping and negotiation
 //! take no permit.
 //!
+//! **Subscriptions.** `resources/subscribe` adds a URI to a bounded set
+//! served by one more daemon session, an observation session that only
+//! subscribes (see the `subscriptions` module). It takes a permit while it
+//! opens that session; updates are coalesced and never wait on the daemon.
+//!
 //! **Output.** stdout carries protocol frames only; diagnostics go to stderr
 //! through the CLI's tracing subscriber. A failed write to stdout is fatal:
 //! nothing can reach the client any more, so the bridge admits nothing new,
@@ -45,12 +50,12 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ErrorCode, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
-    ServerCapabilities, ServerConfig, Tool,
+    ServerCapabilities, ServerConfig, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::{RequestContext, ServerInitializeError};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +63,8 @@ use super::identity::Identity;
 use super::mode::Mode;
 use super::registry::{CallContext, Execution, Registry, ToolError, ToolResult};
 use super::resources;
+
+mod subscriptions;
 
 /// Tool calls and resource reads in flight at once.
 pub(crate) const STORE_PERMITS: usize = 16;
@@ -99,17 +106,22 @@ pub(crate) struct Settings {
 #[derive(Clone)]
 pub(crate) struct Seams {
     pub(crate) connector: Connector,
+    /// Opens the one observation session behind resource subscriptions: the
+    /// same connector in production, a scripted daemon in the unit tests.
+    pub(crate) observer: Connector,
     pub(crate) timer: Timer,
 }
 
 impl Seams {
     pub(crate) fn production(config: orch_client::ClientConfig) -> Seams {
         let config = Arc::new(config);
+        let connector: Connector = Arc::new(move || {
+            let config = Arc::clone(&config);
+            Box::pin(async move { Client::connect(&config).await })
+        });
         Seams {
-            connector: Arc::new(move || {
-                let config = Arc::clone(&config);
-                Box::pin(async move { Client::connect(&config).await })
-            }),
+            observer: Arc::clone(&connector),
+            connector,
             timer: Arc::new(|duration| Box::pin(tokio::time::sleep(duration))),
         }
     }
@@ -181,12 +193,23 @@ pub(crate) struct McpServer {
     /// Cancelled when a write to stdout fails. From then on nothing is
     /// admitted at all: its answer could not reach anyone.
     output_lost: CancellationToken,
+    /// Cancelled when stdin ends: tasks that hold the SDK peer let go of
+    /// it, so the SDK's shutdown drain is not left waiting for them.
+    input_closed: CancellationToken,
+    /// The subscribed resource URIs and their one observation session.
+    subscriptions: subscriptions::Subscriptions,
     router: ToolRouter<McpServer>,
 }
 
 impl McpServer {
     pub(crate) fn new(settings: Settings, seams: Seams, registry: Registry) -> McpServer {
+        let input_closed = CancellationToken::new();
         McpServer {
+            subscriptions: subscriptions::Subscriptions::new(
+                Arc::clone(&seams.observer),
+                input_closed.clone(),
+            ),
+            input_closed,
             settings,
             seams,
             store: Lane::new("store", STORE_PERMITS),
@@ -258,6 +281,7 @@ impl McpServer {
     {
         let refused = |reason: NotExecuted| ToolError::Text(reason.to_string());
         self.refuse_new_work(cancelled).map_err(refused)?;
+        self.subscriptions.revive();
         match execution {
             Execution::Store => {
                 let _permit = self.store.admit().map_err(refused)?;
@@ -346,6 +370,7 @@ impl ServerHandler for McpServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_resources_subscribe()
                 .build(),
         )
         .with_server_info(Implementation::new("orch", crate::tree::VERSION))
@@ -405,6 +430,7 @@ impl ServerHandler for McpServer {
             |reason: NotExecuted| ErrorData::new(NOT_EXECUTED_CODE, reason.to_string(), None);
         self.refuse_new_work(&context.ct).map_err(not_executed)?;
         let _permit = self.store.admit().map_err(not_executed)?;
+        self.subscriptions.revive();
         let value = resources::read(&self.context(), &request.uri, &target).await?;
         let text = serde_json::to_string(&value).map_err(|err| {
             ErrorData::internal_error(format!("cannot serialize the resource: {err}"), None)
@@ -413,6 +439,33 @@ impl ServerHandler for McpServer {
             ResourceContents::text(text, request.uri).with_mime_type(resources::MIME_JSON),
         ])
         .into())
+    }
+
+    // The initialize lifecycle's subscription methods; every protocol
+    // version this bridge negotiates through `initialize` uses them.
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        let target = resources::parse(&request.uri)?;
+        let not_executed =
+            |reason: NotExecuted| ErrorData::new(NOT_EXECUTED_CODE, reason.to_string(), None);
+        self.refuse_new_work(&context.ct).map_err(not_executed)?;
+        let _permit = self.store.admit().map_err(not_executed)?;
+        self.subscriptions
+            .subscribe(&request.uri, target, &context.peer, self.agent_context())
+            .await
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        resources::parse(&request.uri)?;
+        self.subscriptions.unsubscribe(&request.uri).await;
+        Ok(())
     }
 }
 
@@ -456,6 +509,27 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for OutputWatch<W> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let poll = Pin::new(&mut self.inner).poll_shutdown(cx);
         self.watch(poll)
+    }
+}
+
+/// stdin that cancels `closed` at EOF.
+struct InputWatch<R> {
+    inner: R,
+    closed: CancellationToken,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for InputWatch<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let (before, room) = (buf.filled().len(), buf.remaining() > 0);
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) && room && buf.filled().len() == before {
+            self.closed.cancel();
+        }
+        poll
     }
 }
 
@@ -577,7 +651,10 @@ where
     };
     // The SDK reads the request that found the daemon first, then the rest
     // of stdin, buffered bytes included.
-    let input = tokio::io::AsyncReadExt::chain(std::io::Cursor::new(first), reader);
+    let input = InputWatch {
+        inner: tokio::io::AsyncReadExt::chain(std::io::Cursor::new(first), reader),
+        closed: server.input_closed.clone(),
+    };
     match server.serve_with_ct((input, output), stop.clone()).await {
         Ok(running) => running
             .waiting()
@@ -763,6 +840,7 @@ mod tests {
         };
         let seams = Seams {
             connector: switch.connector(),
+            observer: no_daemon(fixture.root()),
             timer: ManualClock::default().timer(),
         };
         let server = McpServer::new(settings, seams, registry);
@@ -1020,6 +1098,7 @@ mod tests {
         };
         let seams = Seams {
             connector: no_daemon(std::path::Path::new("/nonexistent")),
+            observer: no_daemon(std::path::Path::new("/nonexistent")),
             timer: clock.timer(),
         };
         let server = McpServer::new(settings, seams, Registry::new(Mode::Default));

@@ -23,22 +23,32 @@
 //! So the draw loop runs on a plain `std::thread` holding a cloned
 //! [`tokio::runtime::Handle`], and every method that can fail is awaited (with
 //! a deadline) and returns the real error. Long-running work — the
-//! `logs.follow` feed, the history and model-catalogue loads, a prompt-mode
+//! observation pump, the history and model-catalogue loads, a prompt-mode
 //! write, and the observation of a `run` — happens on sessions of its own, so
 //! no frame waits on it.
 //!
-//! # PR 2 scope
+//! # Push, not polling (PR 3)
 //!
-//! Reads are RPCs on the dashboard's existing refresh tick (5 s, or after a
-//! local action); live events come from `logs.follow`. Push subscriptions
-//! replace the polling in PR 3. There is no observer mode: every dashboard is
-//! a client, and the header's WATCHING / IDLE chip is the daemon's dispatch
-//! switch as it was when the dashboard opened or last toggled it.
+//! The dashboard subscribes to every store and the event bus before its
+//! first read, on one dedicated observation session; the frame loop drains
+//! what that session pushed from memory and reads only the views a pushed
+//! change made stale. There is no periodic state read and no directory
+//! observer. A gap or a daemon resync subscribes again and then re-reads
+//! every view; a different daemon instance or an ended observation is a lost
+//! session and brings back the no-daemon screen, where `r` opens a new
+//! subscription and bootstrap with nothing carried over. There is no
+//! observer mode: every dashboard is a client, and the header's WATCHING /
+//! IDLE chip is the daemon's dispatch switch, read again on every pushed
+//! state change.
 
 pub mod backend;
 pub mod command;
 pub mod connect;
 pub mod no_daemon;
+
+// `orch_client::testing` exists only in debug builds (S3-api seam).
+#[cfg(all(test, debug_assertions))]
+mod push_tests;
 
 pub use backend::DaemonBackend;
 pub use command::{first_run, run, run_as_agent, run_dashboard, run_with_peer};

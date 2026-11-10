@@ -29,12 +29,14 @@
 
 pub mod coordinator;
 mod detach;
+mod diagnostics;
 mod discovery;
 mod dispatch;
 mod env;
 mod error;
 mod gitignore;
 mod guard;
+mod hub;
 pub mod lifecycle;
 mod listener;
 pub mod ops;

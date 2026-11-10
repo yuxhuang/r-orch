@@ -7,7 +7,9 @@ mod common;
 
 use common::Harness;
 use orch_domain::{AgentStatus, OrchestratorEvent, TaskStatus};
-use orch_tui::backend::{Call, FakeBackend, HistoryEntry, make_agent, make_task};
+use orch_tui::backend::{
+    Call, FakeBackend, HistoryEntry, Observation, ObservedStore, Read, make_agent, make_task,
+};
 use orch_tui::messages::{MAX_MESSAGES, MAX_TOASTS, MsgType};
 use orch_tui::state::ViewId;
 
@@ -187,16 +189,20 @@ fn l006_a_single_batch_larger_than_the_cap_keeps_only_the_tail() {
 
 #[test]
 fn l007_the_refresh_debounce_coalesces_to_one_refresh() {
+    // Pushed invalidations arm the debounce; events no longer do.
     let mut harness = event_harness();
-    for _ in 0..5 {
-        harness.app.handle_event(&OrchestratorEvent::TaskAssigned {
-            task_id: "tsk_1".into(),
-            agent_id: "agt_1".into(),
+    for seq in 1..=5 {
+        harness.app.observe(Observation::Changed {
+            store: ObservedStore::Tasks,
+            id: Some("tsk_1".into()),
+            commit_seq: seq,
         });
     }
     assert!(harness.app.state.refresh_at.is_some());
+    harness.app.backend.reads.clear();
     harness.advance(150);
     assert!(harness.app.state.refresh_at.is_none());
+    assert_eq!(harness.app.backend.read_count(Read::Tasks), 1);
 }
 
 #[test]
@@ -741,59 +747,31 @@ fn l045_a_ten_kilobyte_error_keeps_the_frame_small() {
     assert!(text.len() < 8_192, "frame was {} bytes", text.len());
 }
 
-// ── Periodic disk poll ─────────────────────────────────────────────────────
+// ── No periodic poll ───────────────────────────────────────────────────────
+//
+// The former 5 s / 3 s store polls are gone (PR 3): a change is read when the
+// daemon pushes it. `tests/push_refresh.rs` covers the push side.
 
 #[test]
-fn l046_watch_mode_polls_the_stores_every_five_seconds() {
-    // The poll refreshes rather than recording a call, so observe its effect: a
-    // store change becomes visible only once the interval has elapsed.
-    let mut harness = event_harness();
-    harness
-        .app
-        .backend
-        .tasks
-        .push(make_task("tsk_2", "Added", TaskStatus::Todo));
-    harness.advance(4_999);
-    assert_eq!(harness.app.state.tasks.len(), 1);
-    harness.advance(1);
-    assert_eq!(harness.app.state.tasks.len(), 2);
-}
-
-#[test]
-fn l047_observer_mode_polls_every_three_seconds() {
-    let mut backend =
-        FakeBackend::new().with_tasks(vec![make_task("tsk_1", "Shipping", TaskStatus::Todo)]);
-    backend.context.observer_mode = true;
-    let mut harness = Harness::with(backend);
-    harness
-        .app
-        .backend
-        .tasks
-        .push(make_task("tsk_2", "Added", TaskStatus::Todo));
-    harness.advance(2_999);
-    assert_eq!(harness.app.state.tasks.len(), 1);
-    harness.advance(1);
-    assert_eq!(harness.app.state.tasks.len(), 2);
-}
-
-#[test]
-fn l048_a_recent_refresh_postpones_the_periodic_poll() {
-    let mut harness = event_harness();
-    harness.advance(4_000);
-    harness.app.refresh_all(false);
-    harness
-        .app
-        .backend
-        .tasks
-        .push(make_task("tsk_2", "Added", TaskStatus::Todo));
-    harness.advance(1_500);
-    assert_eq!(
-        harness.app.state.tasks.len(),
-        1,
-        "the interval restarts from the last refresh"
-    );
-    harness.advance(3_500);
-    assert_eq!(harness.app.state.tasks.len(), 2);
+fn l046_l047_l048_no_interval_reads_the_stores() {
+    for observer_mode in [false, true] {
+        let mut backend =
+            FakeBackend::new().with_tasks(vec![make_task("tsk_1", "Shipping", TaskStatus::Todo)]);
+        backend.context.observer_mode = observer_mode;
+        let mut harness = Harness::with(backend);
+        harness
+            .app
+            .backend
+            .tasks
+            .push(make_task("tsk_2", "Added", TaskStatus::Todo));
+        harness.app.backend.reads.clear();
+        harness.advance(3_000).advance(2_000).advance(10_000);
+        assert_eq!(harness.app.state.tasks.len(), 1, "observer {observer_mode}");
+        assert!(
+            harness.app.backend.reads.is_empty(),
+            "observer {observer_mode}"
+        );
+    }
 }
 
 // ── History timestamps ─────────────────────────────────────────────────────

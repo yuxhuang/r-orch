@@ -4,15 +4,15 @@ mod completion;
 mod shutdown;
 mod startup;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
 use orch_domain::{
-    Agent, AgentStatus, DomainError, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus,
-    RunningEntry, Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
+    Agent, AgentStatus, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry,
+    Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
 };
 
 use super::dispatch::{
@@ -58,6 +58,21 @@ impl Orchestrator {
     }
 
     pub async fn daemon_tick_with_guard(
+        &self,
+        skip_autonomous_seeding: bool,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<()> {
+        self.deps()
+            .events
+            .operation_boundary()
+            .with_source(
+                crate::container::commit::CommitSource::Tick,
+                Box::pin(self.daemon_tick_with_guard_inner(skip_autonomous_seeding, cancelled)),
+            )
+            .await
+    }
+
+    async fn daemon_tick_with_guard_inner(
         &self,
         skip_autonomous_seeding: bool,
         cancelled: Arc<AtomicBool>,
@@ -273,6 +288,15 @@ impl Orchestrator {
                 {
                     return Ok(None);
                 }
+                // Its last attempt already failed before spawn; only the
+                // record is missing. Finish that instead of probing again.
+                if super::dispatch::final_failure_unrecorded(&task) {
+                    if self.finish_unrecorded_final_failure(state, task_id).await {
+                        self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+                        self.save_state(state).await?;
+                    }
+                    return Ok(None);
+                }
                 let agents = self.dispatch_agent_directory().await?;
                 let preparing = self.inner.preparing_agents.lock().await;
                 let at_capacity = state
@@ -361,11 +385,14 @@ impl Orchestrator {
                     // As in v0.13: a workspace that cannot be prepared costs an
                     // attempt and backs off. Released with no record, the task
                     // stays dispatchable and every tick repeats the failure.
-                    if matches!(error, Error::Domain(DomainError::Workspace { .. })) {
-                        self.daemon_record_workspace_failure(task_id, generation, &error)
-                            .await?;
-                    }
-                    self.daemon_release_preparation(task_id, generation).await?;
+                    // That holds for every preparation error, not only the
+                    // workspace domain errors: a workspaces directory that
+                    // cannot be created is an I/O error and a failed isolated
+                    // copy a plain one. None of them means the preparation was
+                    // invalidated; the recorder checks that itself (generation,
+                    // and a terminal task under the dispatch gate).
+                    self.daemon_record_workspace_failure(task_id, generation, &error)
+                        .await?;
                     return Err(error);
                 }
             };
@@ -765,12 +792,20 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Only dependencies and scope reservations need the other tasks. A
+        // backlog of independent tasks must not parse the whole index per
+        // candidate while holding the boundary.
+        let reserved = state
+            .running
+            .keys()
+            .chain(state.claimed.iter())
+            .any(|id| id != &task.id);
+        let scoped = task.scope.as_deref().is_some_and(|scope| !scope.is_empty());
+        if task.depends_on.is_empty() && !(scoped && reserved) {
+            return Ok(true);
+        }
         let tasks = self.deps().task_store.list(&Default::default()).await?;
-        let map: HashMap<String, Task> = tasks
-            .iter()
-            .map(|task| (task.id.clone(), task.clone()))
-            .collect();
-        if is_blocked(task, &map) {
+        if is_blocked(task, tasks.as_slice()) {
             return Ok(false);
         }
         if tasks.iter().any(|running| {
@@ -831,45 +866,63 @@ impl Orchestrator {
         Ok(true)
     }
 
+    /// Whether this generation still owns the task's preparation. A
+    /// generation is never reissued, so once false it stays false.
+    async fn owns_preparation(&self, task_id: &str, generation: u64) -> bool {
+        self.inner
+            .preparing_agents
+            .lock()
+            .await
+            .get(task_id)
+            .is_some_and(|(current, _)| *current == generation)
+    }
+
     async fn daemon_release_preparation(&self, task_id: &str, generation: u64) -> Result<()> {
+        // Already released (a workspace failure releases as it records): do
+        // not queue for the boundary only to commit nothing.
+        if !self.owns_preparation(task_id, generation).await {
+            return Ok(());
+        }
         self.deps()
             .events
             .operation_boundary()
             .run(true, async {
-                if self.is_shutting_down() {
-                    return Ok(());
-                }
-                if !self
-                    .inner
-                    .preparing_agents
-                    .lock()
-                    .await
-                    .get(task_id)
-                    .is_some_and(|(current, _)| *current == generation)
-                {
+                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                for run in self.deps().run_store.list_for_task(task_id).await? {
-                    if run.status == RunStatus::Preparing {
-                        self.deps()
-                            .run_service
-                            .finish(&run.id, RunStatus::Cancelled, None, None)
-                            .await?;
-                    }
-                }
-                state.claimed.shift_remove(task_id);
-                self.inner.preparing_agents.lock().await.remove(task_id);
-                self.drop_cancel(task_id).await;
+                self.release_preparation_locked(state, task_id).await?;
                 self.save_state(state).await
             })
             .await
             .value
     }
 
-    /// Account a workspace failure for the preparation this call still owns.
+    /// Cancel the preparing runs and drop the claim; the caller saves state.
+    async fn release_preparation_locked(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+    ) -> Result<()> {
+        for run in self.deps().run_store.list_for_task(task_id).await? {
+            if run.status == RunStatus::Preparing {
+                self.deps()
+                    .run_service
+                    .finish(&run.id, RunStatus::Cancelled, None, None)
+                    .await?;
+            }
+        }
+        state.claimed.shift_remove(task_id);
+        self.inner.preparing_agents.lock().await.remove(task_id);
+        self.drop_cancel(task_id).await;
+        Ok(())
+    }
+
+    /// Account a workspace failure for the preparation this call still owns
+    /// and release it in the same operation: one state write per failed
+    /// candidate, not one for the retry and another for the release.
     async fn daemon_record_workspace_failure(
         &self,
         task_id: &str,
@@ -880,24 +933,25 @@ impl Orchestrator {
             .events
             .operation_boundary()
             .run(true, async {
-                if self.is_shutting_down()
-                    || !self
-                        .inner
-                        .preparing_agents
-                        .lock()
-                        .await
-                        .get(task_id)
-                        .is_some_and(|(current, _)| *current == generation)
-                {
+                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                let tasks = self.deps().task_store.list(&Default::default()).await?;
-                self.record_workspace_dispatch_failure(state, task_id, &tasks, error)
-                    .await;
-                Ok(())
+                if self
+                    .record_workspace_dispatch_failure(state, task_id, None, error)
+                    .await
+                {
+                    // The task is saved `retrying` (on a final attempt: with
+                    // its record pending), but its back-off exists only here
+                    // until the save below. If the release or that save
+                    // fails, the next `load_state` must write this state
+                    // rather than replace it, or the retry runs with no wait.
+                    self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+                }
+                self.release_preparation_locked(state, task_id).await?;
+                self.save_state(state).await
             })
             .await
             .value
