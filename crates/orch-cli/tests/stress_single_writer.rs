@@ -1161,6 +1161,47 @@ fn fixtures(sandbox: &Sandbox) -> Fixtures {
     }
 }
 
+/// One more renewal of `live`, sent by the test thread itself.
+struct FinalRenewal {
+    runtime: tokio::runtime::Runtime,
+    client: Result<orch_client::Client, orch_client::ClientError>,
+}
+
+impl FinalRenewal {
+    fn connect(sandbox: &Sandbox) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = client_config(sandbox, orch_proto::handshake::CallerKind::Cli);
+        let client = runtime.block_on(orch_client::Client::connect(&config));
+        Self { runtime, client }
+    }
+
+    /// Renewal `acked + 1`, recorded exactly like the renewer's. Call only
+    /// once the renewer has been joined.
+    fn renew(&mut self, shared: &Shared) {
+        use orch_proto::bounded::{Id, Text};
+        use orch_proto::ops::args::ContextSetArgs;
+        let n = shared.live.acked.load(Ordering::SeqCst) + 1;
+        let client = match &mut self.client {
+            Ok(client) => client,
+            Err(err) => return shared.fail(format!("final renewal connect: {err:?}")),
+        };
+        shared.live.attempted.store(n, Ordering::SeqCst);
+        let sent = Instant::now();
+        let result = self.runtime.block_on(client.context_set(ContextSetArgs {
+            key: Id::new("live").unwrap(),
+            value: Text::new(format!("live-{n}")).unwrap(),
+            ttl_ms: Some(LIVE_TTL_MS),
+        }));
+        match result {
+            Ok(_) => shared.live_acked(n, sent),
+            Err(err) => shared.fail(format!("final renewal #{n}: {err:?}")),
+        }
+    }
+}
+
 /// Whatever way `run_stress` ends, stop the client threads and kill the TUI
 /// leg. A failed assertion unwinds only the test thread: the TUI driver
 /// thread still holds the pane, so its `Drop` never runs and `orch tui`
@@ -1340,12 +1381,19 @@ fn run_stress(fleet: Fleet) {
     marks.note("tui_quit");
 
     // The renewer ran through all of the above; stop it only now so `live`
-    // was renewed as close to the daemon stop as it can be.
+    // was renewed as close to the daemon stop as it can be. Its last renewal
+    // can be a full renewal period (and a slow join) older than the stop, so
+    // one more is sent from here, on a connection made beforehand, right
+    // before the stop: the post-stop assertion is only worth anything if the
+    // stop can be acknowledged inside the key's TTL.
+    let mut last = FinalRenewal::connect(&sandbox);
     shared.renew_stop.store(true, Ordering::SeqCst);
     if let Err(payload) = renewer.join() {
         panicked.push(format!("{payload:?}"));
     }
     marks.note("renewer_joined");
+    last.renew(&shared);
+    marks.note("final_renewal_acked");
 
     // ── stop the owner so every write is on disk, then judge offline ──
     marks.note("daemon_stop_sent");
