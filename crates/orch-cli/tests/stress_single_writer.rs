@@ -2201,6 +2201,33 @@ fn cleanup_output_times_out_and_reaps_an_unresponsive_command() {
     assert_cleanup_child(NAME, CHILD, 0);
 }
 
+// Regression: F-S1 / review F1 — guard the command used by run/keys and teardown.
+// std at 58cf8f9c, library/std/src/sys/process/unix/unix.rs:467-474, falls back
+// to fork when env_saw_path() && !program_is_path(). Require an absolute program
+// on the actual pane route: Command::get_envs cannot reveal env_clear by itself.
+#[test]
+fn private_tui_pane_command_avoids_the_f_s1_fork_handshake_precondition() {
+    let sandbox = Sandbox::new();
+    let pane = TuiPane::launch_at(
+        &sandbox.root(),
+        &sandbox.socket(),
+        sandbox.short_dir(),
+        "--help",
+        &[],
+    );
+    let cmd = pane.cmd();
+    assert!(
+        Path::new(cmd.get_program()).is_absolute(),
+        "F-S1: TuiPane::cmd must use an absolute program; PATH search with a changed \
+         or cleared child PATH selects std's fork fallback, whose exec-handshake read \
+         can wait on a writer inherited by a concurrent MCP child before CALL starts: \
+         program={:?}, PATH edit={:?}, current_dir={:?}",
+        cmd.get_program(),
+        cmd.get_envs().find(|(key, _)| *key == "PATH"),
+        cmd.get_current_dir(),
+    );
+}
+
 // Regression: F-S1 — the first send blocked inside Command::spawn, before CALL.
 // A resolved executable remains launchable with no tmux on the child's PATH.
 #[test]

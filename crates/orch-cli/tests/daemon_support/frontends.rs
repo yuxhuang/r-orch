@@ -726,7 +726,7 @@ impl TuiPane {
         pane
     }
 
-    fn cmd(&self) -> Command {
+    pub(crate) fn cmd(&self) -> Command {
         let mut cmd = tmux_command().expect("tmux was available when this private pane launched");
         cmd.env("TMUX_TMPDIR", &self.dir)
             .env("HOME", &self.home)
