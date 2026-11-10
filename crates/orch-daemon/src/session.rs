@@ -508,7 +508,19 @@ impl Server {
         }
         reading.abort();
         let _ = reading.await;
-        events.close();
+        self.finish_requests(session_id, events, inflight, outbox, writer)
+            .await;
+    }
+
+    async fn finish_requests(
+        &self,
+        session_id: u64,
+        events: Arc<crate::hub::EventOutput>,
+        mut inflight: tokio::task::JoinSet<()>,
+        outbox: Outbox,
+        writer: tokio::task::JoinHandle<()>,
+    ) {
+        events.begin_drain();
         // Cancel observations first so streams end; started writes finish and
         // their cleanup is ordered behind them by the handler.
         if let Err(error) = self.handler.disconnect(session_id).await {
@@ -529,6 +541,7 @@ impl Server {
             writer.abort();
             let _ = writer.await;
         }
+        events.close();
     }
 }
 
@@ -965,6 +978,180 @@ mod tests {
             Ok(Ok(n)) => Some(n),
             _ => None,
         }
+    }
+
+    async fn pending_reply_survives_drain(subscribed: bool) {
+        let daemon = start(false, None).await;
+        let (queue, queued) = mpsc::channel(64);
+        let outbox = Outbox {
+            queue,
+            budget: Arc::new(Semaphore::new(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION)),
+        };
+        let events = crate::hub::EventOutput::new(Arc::clone(&outbox.budget));
+        let session_id = OpContext::new(hello(&daemon).session_identity().unwrap()).session_id;
+        if subscribed {
+            assert!(daemon.running.handler.hub.register(
+                session_id,
+                Some(Arc::clone(&events)),
+                1,
+                orch_proto::bounded::Id::new("drain_test").unwrap(),
+                0,
+                serde_json::from_str(r#"{"stores":["context"]}"#).unwrap(),
+            ));
+            events.activate(1);
+            events.ready.notified().await;
+        }
+        let (client, write) = tokio::io::duplex(4096);
+        let mut client = BufReader::new(client);
+        let writer = tokio::spawn(write_loop(write, queued, Arc::clone(&events)));
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let mut inflight = tokio::task::JoinSet::new();
+        let response = outbox.clone();
+        inflight.spawn(async move {
+            pending.await.unwrap();
+            assert!(
+                response
+                    .send(b"{\"id\":1,\"ok\":null,\"commit_seq\":0}\n".to_vec())
+                    .await
+            );
+        });
+
+        // Force teardown to quiesce events BEFORE the accepted request can
+        // enqueue its terminal reply. This is the stop-watch interleaving,
+        // without depending on which Tokio task happens to win a race.
+        let drain_events = Arc::clone(&events);
+        let draining = drain_events.ready.notified();
+        tokio::pin!(draining);
+        draining.as_mut().enable();
+        let server = Arc::clone(&daemon.running.server);
+        let finishing = tokio::spawn(async move {
+            server
+                .finish_requests(session_id, events, inflight, outbox, writer)
+                .await;
+        });
+        draining.await;
+        release.send(()).unwrap();
+        let raw = line(&mut client)
+            .await
+            .expect("accepted request gets its terminal reply before EOF");
+        let reply: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reply["id"], 1);
+        assert!(reply.get("ok").is_some(), "{reply}");
+        assert!(eof(&mut client).await);
+        finishing.await.unwrap();
+        assert_eq!(daemon.running.shutdown().await.code, 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_preserves_pending_reply_without_subscriptions() {
+        pending_reply_survives_drain(false).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_preserves_pending_reply_with_subscription() {
+        pending_reply_survives_drain(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_socket_stop_replies_before_eof_with_and_without_subscription() {
+        for subscribed in [false, true] {
+            let daemon = start(true, None).await;
+            let socket = daemon.scratch.path().join("s");
+            let mut stream =
+                BufReader::new(tokio::net::UnixStream::connect(&socket).await.unwrap());
+            let hello = serde_json::to_vec(&HelloFrame {
+                hello: hello(&daemon),
+            })
+            .unwrap();
+            stream.get_mut().write_all(&hello).await.unwrap();
+            stream.get_mut().write_all(b"\n").await.unwrap();
+            let shutdown = tokio::spawn(async move {
+                daemon.running.wait_for_stop(None).await;
+                let exit = daemon.running.shutdown().await;
+                // Keep the project's temp directory alive through shutdown.
+                drop(daemon.project);
+                exit
+            });
+            let mut raw = String::new();
+            stream.read_line(&mut raw).await.unwrap();
+            assert!(
+                serde_json::from_str::<HandshakeReply>(&raw)
+                    .unwrap()
+                    .welcome
+                    .unwrap()
+                    .compatible
+            );
+            if subscribed {
+                stream.get_mut().write_all(b"{\"id\":1,\"req\":{\"op\":\"subscribe\",\"args\":{\"stores\":[\"context\"]}}}\n").await.unwrap();
+                raw.clear();
+                stream.read_line(&mut raw).await.unwrap();
+                let ack: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(ack["id"], 1);
+                assert!(ack.get("ok").is_some(), "{ack}");
+            }
+            stream
+                .get_mut()
+                .write_all(b"{\"id\":2,\"req\":{\"op\":\"daemon.stop\",\"args\":{}}}\n")
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    raw.clear();
+                    assert!(
+                        stream.read_line(&mut raw).await.unwrap() > 0,
+                        "ordinary stop terminal reply before EOF"
+                    );
+                    let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    if frame.get("ev").is_some() {
+                        assert!(subscribed, "unexpected event: {frame}");
+                        continue;
+                    }
+                    break frame;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(reply["id"], 2, "{reply}");
+            assert_eq!(reply["ok"]["clean"], true, "{reply}");
+            raw.clear();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), stream.read_line(&mut raw))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert_eq!(shutdown.await.unwrap(), crate::lifecycle::DaemonExit::CLEAN);
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_bounds_a_stalled_reply_writer() {
+        let daemon = start(false, None).await;
+        let (queue, queued) = mpsc::channel(64);
+        let outbox = Outbox {
+            queue,
+            budget: Arc::new(Semaphore::new(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION)),
+        };
+        let events = crate::hub::EventOutput::new(Arc::clone(&outbox.budget));
+        let (_unread, write) = tokio::io::duplex(1);
+        assert!(outbox.send(vec![b'x'; 4096]).await);
+        let writer = tokio::spawn(write_loop(write, queued, Arc::clone(&events)));
+        let budget = Arc::clone(&outbox.budget);
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        daemon
+            .running
+            .server
+            .finish_requests(0, events, tokio::task::JoinSet::new(), outbox, writer)
+            .await;
+        assert!(started.elapsed() <= DRAIN_TIMEOUT + WRITE_TIMEOUT);
+        assert_eq!(
+            budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+        tokio::time::resume();
+        assert_eq!(daemon.running.shutdown().await.code, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
