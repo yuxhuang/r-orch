@@ -28,6 +28,13 @@
 //!    started, never > what it had attempted, never decreasing, and the
 //!    daemon's `commit_seq` never decreases; the final value of each field is
 //!    its writer's last acknowledged write;
+//!    The hot task's priority (it cycles through four values, so a window
+//!    proves little) is judged EXACTLY in the in-process fleet: each read and
+//!    each priority acknowledgement carries the daemon's `commit_seq`, and a
+//!    read at sequence S must return the value of the latest priority write
+//!    acknowledged at a sequence <= S. The processes fleet's MCP writer cannot
+//!    get its `commit_seq`, so there the priority is judged by a one-write
+//!    window (see `priority_may_read` for what that can and cannot detect);
 //! 3. **nothing acknowledged is missing**: every id a client was told about
 //!    exists on disk, in the entity file and the index;
 //! 4. **no context key lost on renewal**: while the sweeps run, the renewed
@@ -99,8 +106,12 @@ struct Shared {
     /// reads the observer finished and `live` reads that were judged.
     reads: AtomicU64,
     live_checks: AtomicU64,
-    /// The priority writer is paced by the observer (see `PriorityGate`).
+    /// The MCP priority writer (processes fleet) is paced by the observer
+    /// (see `PriorityGate`).
     gate: PriorityGate,
+    /// `(n, commit_seq of the acknowledgement of write #n)` of the in-process
+    /// priority writer, in write order (see `exact_priority_violations`).
+    priority_acks: Mutex<Vec<(u64, u64)>>,
     /// What the CLI creator is doing and since when (for a stuck-run report).
     creator_stage: Mutex<(String, Instant)>,
     /// The same for the TUI driver: the step it is waiting for and since when.
@@ -155,8 +166,55 @@ fn priority_of(n: u64) -> u64 {
 /// window decided from `acked` alone is unsound: with the writer pacing at a
 /// few ms, writes `acked+1` and `acked+2` can both commit during one slow read
 /// (F-S2: "priority reads 4 after write #5 was acknowledged").
+///
+/// This is the check for the fleet whose writer cannot get its `commit_seq`
+/// (the MCP/CLI processes). With the writer paced to a one-write window
+/// (`PriorityGate`) it allows `priority_of(acked)` and `priority_of(acked+1)`:
+/// it catches a priority that went back by 1 or 2 writes (mod 4), and cannot
+/// catch one that went back by 3, or by 0 (mod 4), because those alias the two
+/// allowed values. See `exact_priority_violations` for the sound check.
 fn priority_may_read(observed: u64, acked: u64, attempted: u64) -> bool {
     (acked..=attempted.max(acked)).any(|k| priority_of(k) == observed)
+}
+
+/// The EXACT check, for the fleet where both sides of the comparison carry the
+/// daemon's `commit_seq` (the in-process `orch-client` writer and observer).
+///
+/// Every operation runs whole inside one project permit and is stamped with
+/// the commit sequence it left behind (`OperationGuard::finish`), so a read
+/// that returned sequence `S` saw exactly the writes whose acknowledgement
+/// carried a sequence `<= S`, and the value it returned must be the one of the
+/// LATEST of them, `k*`. No window, no pacing, and no dependence on when the
+/// reply happened to arrive: a write that is in flight during the read counts
+/// iff it committed before the read did.
+///
+/// `writes` is `(n, ack seq)` in write order (write 0 is the seed, implicit,
+/// sequence 0); `reads` is `(S, priority)`. Returns one message per violation.
+/// The only stale value this cannot tell from the right one is the value of
+/// a write exactly a multiple of four writes older (priority has four values).
+fn exact_priority_violations(writes: &[(u64, u64)], reads: &[(u64, u64)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for pair in writes.windows(2) {
+        if pair[1].0 != pair[0].0 + 1 || pair[1].1 <= pair[0].1 {
+            violations.push(format!(
+                "priority acknowledgements out of order: write #{} at commit_seq {}, then \
+                 write #{} at commit_seq {}",
+                pair[0].0, pair[0].1, pair[1].0, pair[1].1
+            ));
+        }
+    }
+    for &(seq, observed) in reads {
+        let committed = writes.partition_point(|&(_, ack)| ack <= seq);
+        let latest = committed.checked_sub(1).map_or(0, |i| writes[i].0);
+        if observed != priority_of(latest) {
+            violations.push(format!(
+                "LOST UPDATE: priority reads {observed} at commit_seq {seq}, but the latest \
+                 priority write committed at or before it is #{latest}, which sets {}",
+                priority_of(latest)
+            ));
+        }
+    }
+    violations
 }
 
 /// Paces the priority writer by the observer so the window above stays at
@@ -532,16 +590,7 @@ fn spawn_client_field_writer(
     spawn_client_thread(sandbox, shared, field, move |client, shared| {
         Box::pin(async move {
             let mut n = 0_u64;
-            let mut target = None;
             while !shared.stopped() {
-                if field == "priority" {
-                    while !shared.gate.open(target) && !shared.stopped() {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    if shared.stopped() {
-                        break;
-                    }
-                }
                 n += 1;
                 let mut args = TaskUpdateFieldsArgs {
                     id: Id::new(hot.clone()).unwrap(),
@@ -564,12 +613,17 @@ fn spawn_client_field_writer(
                 }
                 counter(shared).attempted.store(n, Ordering::SeqCst);
                 client.task_update_fields(args).await?;
-                counter(shared).acked.store(n, Ordering::SeqCst);
                 if field == "priority" {
-                    target = Some(shared.gate.target_after_ack());
-                } else {
-                    tokio::time::sleep(Duration::from_millis(3)).await;
+                    // The sequence of THIS acknowledgement (same connection,
+                    // no other call in between): the exact oracle's input.
+                    let Some(seq) = client.last_commit_seq() else {
+                        shared.fail("priority ack carried no commit_seq");
+                        break;
+                    };
+                    shared.priority_acks.lock().unwrap().push((n, seq));
                 }
+                counter(shared).acked.store(n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(3)).await;
             }
             Ok(())
         })
@@ -693,6 +747,8 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
 #[derive(Default)]
 struct ObserverReport {
     reads: u64,
+    /// `(commit_seq, priority)` of every read, for `exact_priority_violations`.
+    priority_reads: Vec<(u64, u64)>,
     /// Reads whose priority window was wider than one write: the priority
     /// check could not tell a lost update from a legitimate value there.
     priority_wide: u64,
@@ -708,6 +764,7 @@ fn spawn_observer(
     sandbox: &Sandbox,
     shared: Arc<Shared>,
     hot: String,
+    fleet: Fleet,
 ) -> JoinHandle<ObserverReport> {
     let config = client_config(sandbox, orch_proto::handshake::CallerKind::Web);
     std::thread::spawn(move || {
@@ -806,19 +863,25 @@ fn spawn_observer(
                     *floor = (*floor).max(seen);
                 }
                 let priority = u64::try_from(task.priority).unwrap_or(0);
-                if attempted.3.saturating_sub(acked.3) > 1 {
-                    report.priority_wide += 1;
-                }
-                if !priority_may_read(priority, acked.3, attempted.3) {
-                    let allowed: Vec<_> = (acked.3..=attempted.3.max(acked.3))
-                        .map(priority_of)
-                        .collect();
-                    report.violations.push(format!(
-                        "LOST UPDATE: priority reads {priority}; write #{} was acknowledged before \
-                         the read and #{} had been sent by its end (expected one of {allowed:?}, \
-                         commit_seq {seq})",
-                        acked.3, attempted.3
-                    ));
+                report.priority_reads.push((seq, priority));
+                // The processes fleet's writer cannot get its commit_seq, so
+                // its priority is judged by the (gated) window; the in-process
+                // fleet's is judged exactly, after the join.
+                if fleet == Fleet::Processes {
+                    if attempted.3.saturating_sub(acked.3) > 1 {
+                        report.priority_wide += 1;
+                    }
+                    if !priority_may_read(priority, acked.3, attempted.3) {
+                        let allowed: Vec<_> = (acked.3..=attempted.3.max(acked.3))
+                            .map(priority_of)
+                            .collect();
+                        report.violations.push(format!(
+                            "LOST UPDATE: priority reads {priority}; write #{} was acknowledged \
+                             before the read and #{} had been sent by its end (expected one of \
+                             {allowed:?}, commit_seq {seq})",
+                            acked.3, attempted.3
+                        ));
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
@@ -1310,6 +1373,7 @@ fn run_stress(fleet: Fleet) {
         reads: AtomicU64::new(0),
         live_checks: AtomicU64::new(0),
         gate: PriorityGate::default(),
+        priority_acks: Mutex::default(),
         creator_stage: Mutex::new(("not started".into(), Instant::now())),
         tui_stage: Mutex::new(("not started".into(), Instant::now())),
         live_times: Mutex::new(None),
@@ -1401,7 +1465,7 @@ fn run_stress(fleet: Fleet) {
     wait_until_every_leg_works(&shared, guard.pane.as_deref(), fleet, &daemon);
     marks.note("legs_ready");
     let started = Instant::now();
-    let observer = spawn_observer(&sandbox, shared.clone(), hot.clone());
+    let observer = spawn_observer(&sandbox, shared.clone(), hot.clone(), fleet);
     let live_observer = spawn_live_observer(&sandbox, shared.clone());
 
     // ── let them fight ──
@@ -1429,7 +1493,22 @@ fn run_stress(fleet: Fleet) {
             panicked.push(format!("{payload:?}"));
         }
     }
-    let report = observer.join().unwrap();
+    let mut report = observer.join().unwrap();
+    if fleet == Fleet::InProcess {
+        let writes = shared.priority_acks.lock().unwrap().clone();
+        // Every priority write sent was acknowledged: an unresolved send would
+        // leave a commit the oracle has no sequence for.
+        if writes.last().map_or(0, |w| w.0) != shared.priority.attempted.load(Ordering::SeqCst) {
+            report.violations.push(format!(
+                "priority write #{} was sent but never acknowledged (last acknowledged: #{})",
+                shared.priority.attempted.load(Ordering::SeqCst),
+                writes.last().map_or(0, |w| w.0)
+            ));
+        }
+        report
+            .violations
+            .extend(exact_priority_violations(&writes, &report.priority_reads));
+    }
     let (live_checks, live_violations) = live_observer.join().unwrap();
     marks.note("clients_joined");
 
@@ -1516,7 +1595,7 @@ fn run_stress(fleet: Fleet) {
     // The priority check says something only where its window is one write
     // wide; the gate makes that every read, so most reads must be.
     assert!(
-        report.priority_wide * 5 <= report.reads,
+        fleet == Fleet::InProcess || report.priority_wide * 5 <= report.reads,
         "the priority check was blind: {} of {} reads had a window wider than one write",
         report.priority_wide,
         report.reads
@@ -1528,8 +1607,8 @@ fn run_stress(fleet: Fleet) {
     // stop was acknowledged inside the key's TTL; its rate over a batch of
     // runs is the evidence that the assertion is not vacuous.
     eprintln!(
-        "STRESS_SUMMARY fleet={} elapsed_ms={} reads={} priority_wide={} live_checks={} \
-         strong_branch={strong}",
+        "STRESS_SUMMARY fleet={} elapsed_ms={} reads={} priority_wide={} priority_writes={} \
+         live_checks={} strong_branch={strong}",
         if fleet == Fleet::Processes {
             "processes"
         } else {
@@ -1538,6 +1617,7 @@ fn run_stress(fleet: Fleet) {
         started.elapsed().as_millis(),
         report.reads,
         report.priority_wide,
+        shared.priority.acked.load(Ordering::SeqCst),
         live_checks
     );
     let log = daemon.stderr();
@@ -1766,4 +1846,87 @@ fn priority_gate_holds_the_writer_until_a_read_that_began_after_its_ack_finished
         gate.open(Some(u64::MAX)),
         "a dead observer never blocks the writer"
     );
+}
+
+// ── the exact priority oracle's own contract (pure, no daemon) ─────────────
+
+#[test]
+fn exact_priority_oracle_accepts_the_f_s2_shape_two_writes_after_the_acked_one() {
+    // F-S2: #5 acknowledged at 60; #6 and #7 committed (64, 66) while a slow
+    // read ran and it returned at sequence 69 with priority_of(7) = 4.
+    let writes = [(5, 60), (6, 64), (7, 66)];
+    assert!(exact_priority_violations(&writes, &[(69, priority_of(7))]).is_empty());
+}
+
+#[test]
+fn exact_priority_oracle_rejects_a_stale_value_however_many_writes_came_after() {
+    let writes = [(5, 60), (6, 64), (7, 66)];
+    // At sequence 69 the latest committed write is #7 (4): #5's value (2) and
+    // #6's (3) are lost updates, even though both were acknowledged earlier.
+    assert_eq!(
+        exact_priority_violations(&writes, &[(69, priority_of(5)), (69, priority_of(6))]).len(),
+        2
+    );
+}
+
+#[test]
+fn exact_priority_oracle_counts_a_write_that_committed_before_the_read_but_was_acked_after() {
+    // #6 committed at 64; its reply reached the writer later than the read's
+    // reply, so no counter had it acknowledged. A read at sequence 65 must
+    // already show it (ack-lag form of the F-S2 hits).
+    let writes = [(5, 60), (6, 64)];
+    assert!(exact_priority_violations(&writes, &[(65, priority_of(6))]).is_empty());
+    assert_eq!(
+        exact_priority_violations(&writes, &[(65, priority_of(5))]).len(),
+        1
+    );
+}
+
+#[test]
+fn exact_priority_oracle_does_not_count_a_write_committed_after_the_read() {
+    // A read at sequence 63 predates #6 (64): it must still show #5.
+    let writes = [(5, 60), (6, 64)];
+    assert!(exact_priority_violations(&writes, &[(63, priority_of(5))]).is_empty());
+    assert_eq!(
+        exact_priority_violations(&writes, &[(63, priority_of(6))]).len(),
+        1
+    );
+}
+
+#[test]
+fn exact_priority_oracle_treats_a_read_at_a_writes_own_sequence_as_seeing_it() {
+    let writes = [(1, 40)];
+    assert!(exact_priority_violations(&writes, &[(40, priority_of(1))]).is_empty());
+    assert_eq!(
+        exact_priority_violations(&writes, &[(40, priority_of(0))]).len(),
+        1
+    );
+}
+
+#[test]
+fn exact_priority_oracle_expects_the_seed_before_any_write() {
+    assert!(exact_priority_violations(&[], &[(30, priority_of(0))]).is_empty());
+    assert_eq!(
+        exact_priority_violations(&[(1, 40)], &[(30, priority_of(1))]).len(),
+        1
+    );
+}
+
+#[test]
+fn exact_priority_oracle_stays_informative_when_many_writes_pile_up_between_reads() {
+    // The case the window cannot do: 12 writes between two reads. The second
+    // read must show #12, and #8 (same value as #12 mod 4) is the one stale
+    // value it cannot tell apart; #11 is caught.
+    let writes: Vec<_> = (1..=12).map(|n| (n, 100 + n)).collect();
+    assert!(exact_priority_violations(&writes, &[(112, priority_of(12))]).is_empty());
+    assert_eq!(
+        exact_priority_violations(&writes, &[(112, priority_of(11))]).len(),
+        1
+    );
+}
+
+#[test]
+fn exact_priority_oracle_rejects_acknowledgements_that_are_not_in_commit_order() {
+    assert_eq!(exact_priority_violations(&[(1, 40), (2, 40)], &[]).len(), 1);
+    assert_eq!(exact_priority_violations(&[(1, 40), (3, 50)], &[]).len(), 1);
 }
