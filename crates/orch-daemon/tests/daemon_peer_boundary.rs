@@ -44,6 +44,12 @@ struct Held {
 
 impl Held {
     async fn take(daemon: &DaemonHarness) -> Held {
+        Self::take_seeding(daemon, None).await
+    }
+
+    /// Save the optional seed inside the held operation before signalling entry.
+    async fn take_seeding(daemon: &DaemonHarness, seed: Option<Message>) -> Held {
+        let messages = daemon.engine().messages.clone();
         let boundary = daemon.engine().operation_boundary();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -54,6 +60,9 @@ impl Held {
             tokio::spawn(async move {
                 boundary
                     .run(false, async {
+                        if let Some(seed) = seed {
+                            messages.save(&seed).await.unwrap();
+                        }
                         entered.notify_one();
                         release.notified().await;
                     })
@@ -153,22 +162,26 @@ async fn queue(daemon: &DaemonHarness, id: &str, to: &str) {
     daemon
         .engine()
         .messages
-        .save(&Message {
-            id: id.into(),
-            channel: MessageChannel::Direct,
-            from_agent_id: "cli".into(),
-            to_agent_id: Some(to.into()),
-            subject: "outbound".into(),
-            body: "for the peer".into(),
-            created_at: "2026-11-09T00:00:00.000Z".into(),
-            expires_at: None,
-            status: MessageStatus::Pending,
-            delivered_at: None,
-            team_id: None,
-            reply_to: None,
-        })
+        .save(&queued_message(id, to))
         .await
         .unwrap();
+}
+
+fn queued_message(id: &str, to: &str) -> Message {
+    Message {
+        id: id.into(),
+        channel: MessageChannel::Direct,
+        from_agent_id: "cli".into(),
+        to_agent_id: Some(to.into()),
+        subject: "outbound".into(),
+        body: "for the peer".into(),
+        created_at: "2026-11-09T00:00:00.000Z".into(),
+        expires_at: None,
+        status: MessageStatus::Pending,
+        delivered_at: None,
+        team_id: None,
+        reply_to: None,
+    }
 }
 
 async fn status(daemon: &DaemonHarness, id: &str) -> Option<MessageStatus> {
@@ -333,8 +346,8 @@ async fn listener_addr(daemon: &DaemonHarness) -> String {
 }
 
 /// The worker's per-tick outbox phase (expiry, read, oversize rejection):
-/// a message queued for the connected controller is not read while another
-/// operation holds the permit, and is sent once it is free.
+/// the held operation queues a message for the connected controller; it is
+/// not read until that operation releases the permit, then it is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_outbox_tick_waits_for_the_held_operation() {
     let daemon = DaemonHarness::builder()
@@ -363,8 +376,12 @@ async fn a_worker_outbox_tick_waits_for_the_held_operation() {
         .await
         .expect("sync state");
 
-    let held = Held::take(&daemon).await;
-    queue(&daemon, "msg_worker_out", "agent@ctl").await;
+    let held =
+        Held::take_seeding(&daemon, Some(queued_message("msg_worker_out", "agent@ctl"))).await;
+    assert_eq!(
+        status(&daemon, "msg_worker_out").await,
+        Some(MessageStatus::Pending)
+    );
     let early = peer
         .next(HELD_FOR, |f| matches!(f, Frame::Msg { .. }))
         .await;
