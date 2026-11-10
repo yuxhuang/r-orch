@@ -182,24 +182,28 @@ async fn run_output(
     max_output_bytes: usize,
 ) -> Result<std::process::Output> {
     use std::process::Stdio;
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        // Its own group, so an abandoned probe's kill reaches what it forked.
-        .process_group(0);
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    if let Some(snapshot) = snapshot {
-        cmd.env_clear()
-            .envs(snapshot.base.iter().cloned())
-            .envs(snapshot.forced.iter().cloned());
-    }
     let capture = async {
-        let mut child = cmd.spawn().map_err(|source| Error::Io {
+        let mut child = crate::process::gate::with_spawn_gate(|| {
+            let mut cmd = tokio::process::Command::new(command);
+            cmd.args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                // Its own group, so an abandoned probe's kill reaches what it forked.
+                .process_group(0);
+            if let Some(cwd) = cwd {
+                cmd.current_dir(cwd);
+            }
+            if let Some(snapshot) = snapshot {
+                cmd.env_clear()
+                    .envs(snapshot.base.iter().cloned())
+                    .envs(snapshot.forced.iter().cloned());
+            }
+
+            cmd.spawn()
+        })
+        .map_err(|source| Error::Io {
             context: format!("Failed to spawn process: {command}"),
             path: Some(PathBuf::from(command)),
             source,

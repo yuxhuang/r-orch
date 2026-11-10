@@ -191,60 +191,63 @@ fn spawn_with(
     opts: SpawnOptions,
     snapshot: Option<&EnvSnapshot>,
 ) -> Result<SpawnedChild> {
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args)
-        .stdin(match opts.stdin {
-            StdioMode::Ignore => Stdio::null(),
-            StdioMode::Pipe => Stdio::piped(),
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut child = super::gate::with_spawn_gate(|| {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args)
+            .stdin(match opts.stdin {
+                StdioMode::Ignore => Stdio::null(),
+                StdioMode::Pipe => Stdio::piped(),
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-    if !opts.cwd.as_os_str().is_empty() {
-        cmd.current_dir(&opts.cwd);
-    }
-    match snapshot {
-        None => {
-            if opts.inherit_env == EnvInheritance::WithoutSecrets {
-                let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
-                for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
-                    cmd.env_remove(name);
+        if !opts.cwd.as_os_str().is_empty() {
+            cmd.current_dir(&opts.cwd);
+        }
+        match snapshot {
+            None => {
+                if opts.inherit_env == EnvInheritance::WithoutSecrets {
+                    let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
+                    for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
+                        cmd.env_remove(name);
+                    }
+                }
+            }
+            Some(snapshot) => {
+                cmd.env_clear();
+                let removed = if opts.inherit_env == EnvInheritance::WithoutSecrets {
+                    let passthrough = snapshot
+                        .base
+                        .iter()
+                        .find(|(name, _)| name == REMOTE_ENV_PASSTHROUGH)
+                        .map(|(_, value)| value.as_os_str());
+                    secret_env_names(snapshot.base.iter().cloned(), passthrough)
+                } else {
+                    Vec::new()
+                };
+                for (name, value) in &snapshot.base {
+                    if !removed.contains(name) {
+                        cmd.env(name, value);
+                    }
                 }
             }
         }
-        Some(snapshot) => {
-            cmd.env_clear();
-            let removed = if opts.inherit_env == EnvInheritance::WithoutSecrets {
-                let passthrough = snapshot
-                    .base
-                    .iter()
-                    .find(|(name, _)| name == REMOTE_ENV_PASSTHROUGH)
-                    .map(|(_, value)| value.as_os_str());
-                secret_env_names(snapshot.base.iter().cloned(), passthrough)
-            } else {
-                Vec::new()
-            };
-            for (name, value) in &snapshot.base {
-                if !removed.contains(name) {
-                    cmd.env(name, value);
-                }
-            }
-        }
-    }
-    for (key, value) in &opts.env {
-        cmd.env(key, value);
-    }
-    if let Some(snapshot) = snapshot {
-        for (key, value) in &snapshot.forced {
+        for (key, value) in &opts.env {
             cmd.env(key, value);
         }
-    }
+        if let Some(snapshot) = snapshot {
+            for (key, value) in &snapshot.forced {
+                cmd.env(key, value);
+            }
+        }
 
-    // node's `detached: true`: a new process group whose pgid is the
-    // child's pid, which is what makes `kill(-pid)` reach the whole tree.
-    cmd.process_group(0);
+        // node's `detached: true`: a new process group whose pgid is the
+        // child's pid, which is what makes `kill(-pid)` reach the whole tree.
+        cmd.process_group(0);
 
-    let mut child = cmd.spawn().map_err(|source| spawn_error(command, source))?;
+        cmd.spawn()
+    })
+    .map_err(|source| spawn_error(command, source))?;
     // A child with no pid is reported as `Failed to spawn process: <command>`;
     // here that case is the `Err` above, and
     // a successfully spawned child always has one until it is reaped.
