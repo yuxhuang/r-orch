@@ -46,9 +46,38 @@ every client, whether the request comes from the CLI, the dashboard, `orch web`,
 - Reads never delete expired context entries; `orch context get`, `orch context list` and the MCP context tools
   only hide them. The daemon removes expired entries itself: at start, and on a timer, also with dispatch off.
 
-What the daemon does **not** promise: two file writes (an entity and its `_index.json`) are still not one
-transaction if the daemon crashes between them ([Recovery](#recovery)); a request whose reply was lost has an
-unknown outcome; and another program that edits `.orchestry/` while the daemon runs is not kept out.
+What the daemon does **not** promise:
+
+- Two file writes (an entity and its `_index.json`) are still not one transaction if the daemon crashes between
+  them ([Recovery](#recovery)).
+- A request whose reply was lost has an unknown outcome.
+- Another program that edits `.orchestry/` while the daemon runs is not kept out.
+- **Read times that do not depend on writes.** Reads such as `orch task list` and `orch status` share a FIFO
+  operation boundary with failure-record writes: each read waits behind operations already queued to acquire
+  that boundary. This orders boundary acquisition, not every request's network arrival; some external operations
+  do work outside it. These store writes await file sync and attempt a best-effort parent-directory sync before
+  releasing the boundary. During a failure-recording burst, reads can take longer, depending in part on
+  durable-write latency. The measured finite burst below converged with working storage; this is not a bound
+  on a read whose storage operation hangs. Queueing alone needs no state recovery; storage errors and hung
+  operations need their own diagnosis. An ordinary request still waiting to acquire the boundary after 10 s is
+  refused without being run (`Overloaded`, `NotExecuted`, exit 7); this is not a completion deadline once work
+  starts. No sampled read was refused in the measurement below. What to do: [Commands are slow while many tasks fail to
+  start](../RUNBOOK.md#orch-commands-are-slow-while-many-tasks-fail-to-start).
+
+  Measured on an Apple M5 Max (macOS 27.2) with a release build of commit `a08fad1b`, on a shared machine at
+  load average 12.30–18.93: an isolated project of 500 tasks and six agents whose workspaces could not be
+  prepared made exactly 1,500 preparations, three attempts per task, then stopped retrying. While the tasks were
+  failing, all 792 `orch task list` reads and all 792 `orch status` reads succeeded; `task list` p99/max were
+  158/228 ms and `status` 129/209 ms. Afterwards, with the daemon restarted, at load 15.84–18.83 and 201 reads per
+  command, `task list` p95 was 27.61 ms against 30.84 ms for an idle project measured at the same time, and
+  `status` 21.00 ms against 20.05 ms. These are observations on one machine, not promised bounds.
+<!-- A6 (tsk_I57BLvA), decision-tsk_DKbRFg5-f1b-acceptance.md. Queue: crates/orch-engine/src/container/operation.rs:130
+(tokio Mutex, FIFO acquisition) and crates/orch-daemon/src/coordinator.rs:153 (non-external requests, reads included);
+10 s refusal coordinator.rs:163-164, exit 7 crates/orch-proto/src/error.rs:64; durable write
+crates/orch-infra/src/storage/fs_utils.rs:97 (awaited file sync),128-135 (best-effort directory sync);
+all at b97fc59a, unchanged at 8a4c9eb4. External operations: crates/orch-daemon/src/ops/mod.rs:234-256.
+Numbers only from the "Paragraph approved for
+documentation" of perf-eng-pr2b-f1b-reverdict-a08fad1b.md (tsk_KwZ1rOH). -->
 
 ## Command reference
 
@@ -496,7 +525,7 @@ other way of running work asks the running daemon:
 | Command | What it does now |
 |---|---|
 | `orch serve`, `orch run --watch` | Start the daemon in the foreground with dispatch **on**, like `orch daemon start --dispatch on`, with the same refusals. If a daemon already runs, exit 4 with `Use: orch daemon dispatch on`; a daemon that runs with dispatch off is not resumed for you. |
-| `orch serve --listen`, `orch run --watch --listen` | The same, with the peer-link listener on. Against a running daemon: exit 4, with the same `Use: orch daemon dispatch on` hint as without `--listen`; a listener is never added to a running daemon. To listen, `orch daemon stop`, then start again with `--listen`. |
+| `orch serve --listen`, `orch run --watch --listen` | The same, with the peer-link listener on. Against a running daemon: exit 4, with the hint `Peer options apply only at start. Use: orch daemon stop, then run this command again` (also for `--peer-name`); a listener is never added to a running daemon. To listen, `orch daemon stop`, then start again with `--listen`. |
 | `orch run --once` | One scheduling check in the running daemon, with that check's events; it does not stop the daemon or change dispatch. |
 | `orch run <task-id>` | Start that task in the running daemon and follow it until it ends. Disconnecting stops following, not the run. The usual eligibility, capacity and cancel checks apply, except that a `retrying` task starts at once instead of waiting out its retry delay, as in orch 0.13.0. A task that cannot start exits 1 with `task is not eligible for launch`. |
 | `orch run --all` | One finite batch of the currently eligible tasks in the running daemon, with the same results as before. |

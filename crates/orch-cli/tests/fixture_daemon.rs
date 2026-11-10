@@ -9,6 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use daemon::{TestDaemon, process_table};
 
@@ -171,10 +172,19 @@ fn teardown_fails_loudly_when_a_process_naming_the_socket_dir_survives() {
         .spawn()
         .expect("spawn leak");
     let leaked = catch_unwind(AssertUnwindSafe(|| daemon.shutdown()));
-    // Teardown must have killed the survivor itself, after reporting it. Check
-    // before cleaning up ourselves, and never block on a survivor that a
-    // broken teardown left alive.
-    let killed_by_teardown = leak.try_wait().expect("poll leak").is_some();
+    // SIGKILL takes effect asynchronously. Give teardown's kill a bounded
+    // window before cleaning up ourselves, so a broken teardown still fails
+    // without blocking on the live survivor.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let killed_by_teardown = loop {
+        if leak.try_wait().expect("poll leak").is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let _ = leak.kill();
     let _ = leak.wait();
     assert!(leaked.is_err(), "a survivor must fail the teardown");
