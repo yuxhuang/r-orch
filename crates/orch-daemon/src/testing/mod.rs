@@ -27,6 +27,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
+/// Exercise the detached child's real capped stderr writer in a fresh test
+/// process whose stderr already points at its private daemon.log.
+pub fn with_detached_stderr<T>(root: &Path, run: impl FnOnce() -> T) -> Result<T, DaemonError> {
+    let _log = crate::detach::DetachedLog::capture(root)?;
+    Ok(run())
+}
+
 /// A client's byte stream to a harness daemon: a duplex half, or a connected
 /// Unix stream when the harness runs [`HarnessBuilder::on_socket`]. The
 /// handshake has **not** been sent; the client (or test) speaks first.

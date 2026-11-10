@@ -89,7 +89,8 @@ and indexes, one write each, so the hazard in this section is unchanged for ever
 
 Serving routes share one complete-spawn exclusion domain on macOS, from before
 pipe construction until spawn actually returns, errors or unwinds. Async workspace
-capture, version probes, diagnostics and final launches reserve admission before
+capture, version probes (including OpenCode forwarded-effort compatibility),
+diagnostics and final launches reserve admission before
 calling their synchronous process port. Final launch then takes the project
 boundary and state mutex, revalidates task/goal/config/generation/shutdown, and
 hands the reservation to the synchronous builder without another acquisition.
@@ -106,7 +107,10 @@ admitted children. Sealing and registration share a mutex. Normal shutdown and
 Drop drainage kill registered groups first, then drain accepted requests, entered
 jobs/late children and collectors before releasing project ownership. A private-log
 observer runs independently of polling workers and the project boundary, with
-bounded records, fixed labels, and 1 s/5 s warning thresholds.
+bounded records, fixed labels, and 1 s/5 s warning thresholds. Parsed explicit
+daemon starts enable only the exact spawn warning target by default, through
+stderr or the existing capped detached log. Explicit logging filters and the
+independent SDK payload exclusion remain authoritative.
 
 This does not make a kernel spawn preemptible. A diagnostic held inside spawn
 leaves independent control available but causes incomplete stop with ownership

@@ -93,19 +93,25 @@ impl OpenCodeAdapter {
 
     async fn probe(&self, params: &ExecuteParams, args: &[&str]) -> Result<String, &'static str> {
         use tokio::io::AsyncReadExt;
-        let mut child = self
-            .process_manager
-            .spawn(
-                "opencode",
-                &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
-                SpawnOptions {
-                    cwd: params.workspace.clone(),
-                    env: params.env.clone(),
-                    stdin: StdioMode::Ignore,
-                    inherit_env: params.inherit_env,
-                },
-            )
-            .map_err(|_| "OpenCode syntax probe could not spawn")?;
+        let reservation = tokio::select! {
+            biased;
+            () = params.cancel.cancelled() => return Err("OpenCode syntax probe cancelled"),
+            reservation = crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Version) => reservation,
+        };
+        let mut child = reservation.run(|| {
+            self.process_manager
+                .spawn(
+                    "opencode",
+                    &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
+                    SpawnOptions {
+                        cwd: params.workspace.clone(),
+                        env: params.env.clone(),
+                        stdin: StdioMode::Ignore,
+                        inherit_env: params.inherit_env,
+                    },
+                )
+                .map_err(|_| "OpenCode syntax probe could not spawn")
+        })?;
         let mut guard = ProbeGuard {
             manager: Arc::clone(&self.process_manager),
             pid: child.pid,

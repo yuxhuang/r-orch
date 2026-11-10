@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 // Counts are deliberate: adding a second construction to an allowed file fails.
 const EXCEPTIONS: &[(&str, usize, &str)] = &[
     (
+        "orch-cli/src/lib.rs",
+        1,
+        "cfg(test) fresh-process production subscriber fixture",
+    ),
+    (
         "orch-cli/src/commands/init.rs",
         2,
         "explicit initialization client; never serves a daemon",

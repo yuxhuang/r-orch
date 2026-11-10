@@ -822,3 +822,173 @@ async fn paused_scenario(root: &Path) {
     diagnostic.abort();
     daemon.shutdown().await.unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn forwarded_effort_cancellation_drops_both_preparations_before_release() {
+    if let Some(root) = std::env::var_os(SCENARIO) {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(effort_scenario(Path::new(&root)));
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    for dir in [
+        root.path().join("home"),
+        root.path().join("bin"),
+        root.path().join("project/.orchestry"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let script = root.path().join("bin/opencode");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf invoked >> "$HOME/invoked"
+case "$*" in
+  *--version*) printf 'opencode v2.1.2\n'; exit 0 ;;
+  *--help*) printf '%s\n' '--model provider/model#variant'; exit 0 ;;
+esac
+printf started > "$HOME/$ORCH_TASK_ID.started"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    struct Owned(Option<std::process::Child>);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut()
+                && !matches!(child.try_wait(), Ok(Some(_)))
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "forwarded_effort_cancellation_drops_both_preparations_before_release",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env(SCENARIO, root.path())
+        .env("HOME", root.path().join("home"))
+        .env("PATH", root.path().join("bin"))
+        .env(
+            "ORCHESTRY_GLOBAL_CONFIG_PATH",
+            root.path().join("home/global.yml"),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut owned = Owned(Some(child));
+    let child = owned.0.as_mut().unwrap();
+    let deadline = Instant::now() + 3 * DEADLINE;
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let watchdog = child.try_wait().unwrap().is_none();
+    if watchdog {
+        child.kill().unwrap();
+    }
+    let output = owned.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        !watchdog && output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+async fn effort_scenario(root: &Path) {
+    use orch_infra::process::gate::{SpawnSite, SpawnStage, pending_spawns};
+    use std::sync::Arc;
+    let home = root.join("home");
+    let daemon = DaemonHarness::builder()
+        .on_socket()
+        .global_config_path(home.join("global.yml"))
+        .start_in(&root.join("project"))
+        .await
+        .unwrap();
+    let mut owner = Raw::session(&daemon, "cli", "normal").await;
+    let mut probe = Raw::session(&daemon, "cli", "normal").await;
+    let mut tasks = Vec::new();
+    for name in ["first effort", "second effort"] {
+        let a = owner
+            .request(
+                1,
+                "agent.create",
+                json!({"name":name,"adapter":"opencode",
+            "workspace_mode":"shared","approval_policy":"manual",
+            "model":"openrouter/anthropic/claude-opus-5.5","effort":"xhigh"}),
+            )
+            .await;
+        let agent = ok(&a)["agent"]["id"].as_str().unwrap().to_owned();
+        tasks.push(task(&mut owner, name, json!({"assignee":agent})).await);
+    }
+    let (send, receive) = std::sync::mpsc::channel();
+    let mut release = ReleaseSpawn(Some(send));
+    let observer = Arc::new(HeldSpawn {
+        entered: tokio::sync::Notify::new(),
+        release: std::sync::Mutex::new(Some(receive)),
+    });
+    daemon.observe_spawns(observer.clone());
+    let diagnostic = tokio::spawn(async move {
+        probe
+            .request(4, "models.catalog", json!({"adapters":["opencode"]}))
+            .await
+    });
+    tokio::time::timeout(DEADLINE, observer.entered.notified())
+        .await
+        .unwrap();
+    let launches: Vec<_> = tasks
+        .iter()
+        .map(|task| {
+            let orchestrator = daemon.engine().orchestrator.clone();
+            let task = task.clone();
+            tokio::spawn(async move { orchestrator.daemon_launch_task(&task).await })
+        })
+        .collect();
+    let result = async {
+        tokio::time::timeout(DEADLINE, async {
+            while pending_spawns().iter().filter(|r| r.site == SpawnSite::Version && r.stage == SpawnStage::Waiting).count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        }).await.map_err(|_| "two forwarded-effort preparations never reached admission")?;
+        for task in &tasks {
+            let read = owner.request(5, "task.get", json!({"id":task})).await;
+            if read.get("ok").is_none() { return Err("independent read failed before release"); }
+            let cancelled = owner.request(6, "task.cancel", json!({"id":task})).await;
+            if ok(&cancelled)["status"] != "cancelled" { return Err("cancel failed before release"); }
+        }
+        for launch in launches {
+            tokio::time::timeout(DEADLINE, launch).await.map_err(|_| "preparation cancellation blocked before release")?
+                .map_err(|_| "preparation panicked")?.map_err(|_| "preparation failed")?;
+        }
+        for task in &tasks {
+            let stored = daemon.engine().tasks.get(task).await.unwrap().unwrap();
+            if stored.attempts != 0 || daemon.engine().state.read().await.unwrap().claimed.contains(task) {
+                return Err("cancel consumed attempt or retained claim");
+            }
+        }
+        if home.join("invoked").exists() { return Err("queued effort executable entered before release"); }
+        eprintln!("EFFORT: two confirmed waiters, both controls/cancellations complete before release; attempts=0, no executable");
+        Ok(())
+    }.await;
+    release.0.take().unwrap().send(()).unwrap();
+    let _ = tokio::time::timeout(DEADLINE, diagnostic).await;
+    daemon.shutdown().await.unwrap();
+    for task in &tasks {
+        assert!(
+            !home.join(format!("{task}.started")).exists(),
+            "late model launch"
+        );
+    }
+    result.unwrap();
+}

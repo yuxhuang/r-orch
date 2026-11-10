@@ -230,6 +230,13 @@ record. These are warning thresholds, not execution timeouts. Records are bounde
 arguments, environment, prompt or process output. Records clear when that stage
 ends, including cancellation and spawn errors.
 
+With neither `RUST_LOG` nor `ORCHESTRY_DEBUG` set, explicit daemon starts
+(`daemon start`, detached starts, `serve`, and `run --watch`) enable these
+warnings alone. Foreground warnings go to stderr; detached warnings go to the
+existing private capped `.orchestry/daemon.log`. Other commands keep their quiet
+default. An explicit logging filter takes precedence, including `RUST_LOG=off`;
+SDK debug/trace payloads remain excluded even with a specific SDK directive.
+
 `Entered` means the actual synchronous spawn has begun. The OS call cannot be
 interrupted safely by dropping its caller. Stop first terminates registered agent
 groups; an unresolved entered diagnostic makes stop report incomplete and keeps

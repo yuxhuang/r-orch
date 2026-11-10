@@ -19,8 +19,9 @@ The initial concrete revision preceded production edits and was mirrored to the
 goal reports and Pensieve specs. This revision records the implemented wiring,
 including the manager exit-observer and collector drainage discovered during the
 lifetime audit. Acceptance remains at one committed SHA after all checks. No
-frozen trait/existing callable signature, manifest, dependency, wire/storage
-format, config/default, execution budget, skip or original assertion changes.
+frozen trait, manifest, dependency, wire/storage format, config, execution budget,
+skip or original assertion changes. R54a expressly permits only the daemon-only
+absent-variable spawn-target warning default described below.
 
 ## Chosen design and alternatives
 
@@ -65,6 +66,7 @@ Serving-route audit:
 |---|---|
 | Final adapter launch | Async reservation outside boundary, then revalidation and synchronous handoff |
 | Workspace preparation, capture, merge/cleanup | Async reservation in capture; daemon preparation/completion external phases are outside boundary |
+| OpenCode forwarded-effort compatibility | Await Version reservation in each actual probe outside boundary/state; select existing task cancellation while queued; hand off only across synchronous manager spawn; unchanged post-spawn 2 s collection budget and group guard |
 | Version probes / doctor | Async reservation before borrowed ProcessManager call; doctor uses track, not the operation permit |
 | Model/diagnostic/review commands | Owned blocking job after yielding admission; reviews run outside completion commit |
 | Hostname fallback | Reservation during container construction, before serving; full container fills peer.name and overrides only with Some, so peer startup's fallback is unreachable on this route |
@@ -126,6 +128,61 @@ cancellation and unwind. The additive internal observation port allows the daemo
 testing harness to synchronize at actual diagnostic entry; production entrypoints
 install no custom implementation and expose no environment/runtime injector.
 
+## R54 bounded correction, before-source revision
+
+Task tsk_Wr58vke; reviewed parent 7bcc96a6aaa770a7e52b3af91ee845fda926eca7.
+R54/R54a consolidated verification passed=true. Qualified fixture bytes stay frozen.
+The original plan is preserved in task evidence; this revision and mirrors precede code.
+
+- ACCEPT SG-C3: the constructor inventory missed a caller. Both OpenCode compatibility
+  probes must reserve asynchronously before synchronous spawn, with token cancellation
+  while waiting. Never reserve across output consumption. Preserve fallback, successful
+  forwarded model variant, args/env/cwd/inheritance, 64 KiB and post-spawn 2 s limits.
+- ACCEPT SG-S1/C4/SG-R2: the normal subscriber was off. Initialize tracing from parsed
+  commands before daemon construction/observer capture. Only absent RUST_LOG and absent
+  ORCHESTRY_DEBUG on daemon start (also detached child), serve without --once and
+  run --watch enable WARN for the exact orch_infra::process::spawn target. A separate
+  metadata predicate enforces exact target matching (EnvFilter target prefixes alone
+  are insufficient). Explicit filters/debug and independent SDK payload exclusion stay.
+  Use existing stderr and the actual capped detached sink, no public injection/config.
+- MODIFY prior code C4 and SRE SG-R1/2 global closure inference: retain their exercised
+  positive evidence, but caller and production subscriber integration need new proof.
+- ACCEPT and retain SG-C1/SG-R1 requirements, C1 exclusion, SG-C2/SG-R3 distinct live
+  stop, ownership and irreversible entered-spawn limitations. No other final finding
+  is rejected. All final reports remain immutable and are explicit predecessor inputs.
+
+Caller audit (raw searches and full mapping in task evidence): ProcessManager::spawn
+has four production call families: process/spawn.rs shared spawn_child (all eight
+adapters), util::probe_version (all adapter test methods), workspace::run and wrappers
+(manager/merge/cleanup), and OpenCode::probe. The final adapter execute route is admitted
+at daemon_launch_task_with_guard before boundary/state and revalidated under both.
+Legacy dispatch is not called by serving control/peer routes. Daemon peer worker uses
+that same daemon launch path. Doctor uses a tracked diagnostic request outside the
+project boundary with existing deadline/drop cancellation. Workspace preparation and
+completion/review external phases run outside boundary; commit/drain phases do not
+spawn. Registry injection distributes the same manager; test-only ProcessManager
+implementations/wrappers do not add production routes. Diagnostic CommandRunner uses
+SnapshotDiscoveryRuntime; generic ProcessCommandRunner is a non-daemon fallback.
+Container hostname admission precedes serving and supplies nonempty peer.name,
+preventing peer startup fallback on this route. Unknown serving caller/reverse edge
+is a blocker, not an allowlist exception. Keep the separate constructor guard.
+
+New causal oracles: two actual forwarded-effort preparations on two workers behind
+an actually parked diagnostic; confirmed waits, independent control and both cancelled
+preparations complete before release; no executable/attempt/late child, release/drain
+on unwind. Daemon preparation cancellation/pause and final revalidation remain covered.
+Fresh-process tests call real production tracing setup for parsed commands, exercise
+Waiting and Entered while parked, exact target/privacy/SDK/filter negatives, and the
+existing capped detached sink. Actual CLI explicit starts/aliases/detached child and
+ordinary controls retain their lifecycle/routing tests. No always-enabled subscriber
+or copied filter substitutes for absent-variable proof.
+
+C7 adds removal-only OpenCode admission and removal-only daemon default routing RED,
+then exact restoration GREEN, alongside original boundary/site/unknown/emission controls.
+C8 adds complete CLI suite and CLI all-target clippy to original changed crates at one
+final committed SHA. Record every required failure; do not loop until green. Freeze
+on publication. No automatic extra repair/review exchange after a further source block.
+
 ## Findings and proof map
 
 | Contract | Implementation / proof |
@@ -159,8 +216,8 @@ with fail-closed fake AI executables and an outer owned-workload watchdog:
 
 ```sh
 cargo fmt --all --check
-cargo clippy -p orch-core -p orch-infra -p orch-engine -p orch-daemon --all-targets --features orch-daemon/testing -- -D warnings
-cargo test -p orch-core -p orch-infra -p orch-engine -p orch-daemon --features orch-daemon/testing
+cargo clippy -p orch-core -p orch-infra -p orch-engine -p orch-daemon -p orch-cli --all-targets --features orch-daemon/testing -- -D warnings
+cargo test -p orch-core -p orch-infra -p orch-engine -p orch-daemon -p orch-cli --features orch-daemon/testing
 cargo xtask crate-graph
 ```
 
