@@ -1,9 +1,7 @@
 //! `orch serve` — headless daemon mode.
 //!
-//! The three pieces are independent and all three are built: the structured
-//! [`logger`], the `--once` terminal rule in [`once`], and the
-//! [`disk_observer`] (which `serve` itself never uses — `tui` falls back to it
-//! when another process holds the lock).
+//! The two pieces are independent and both are built: the structured
+//! [`logger`] and the `--once` terminal rule in [`once`].
 //!
 //! What is **not** here is the orchestrator: [`run_with`] takes one through
 //! [`once::ServeOrchestrator`], and [`run`] reports that WP-4 has not wired it
@@ -11,7 +9,6 @@
 //! that, in the caller, because validation comes before building
 //! anything.
 
-pub mod disk_observer;
 pub mod logger;
 pub mod once;
 pub(crate) mod peer;
