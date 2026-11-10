@@ -64,11 +64,11 @@ async fn expire_messages(messages: Arc<dyn MessageStore>, events: Arc<EventBus>,
             _ = interval.tick() => {}
         }
         // A purge is a complete state operation (design D2): it orders with
-        // every other reader and writer of the project and advances the
-        // commit sequence, instead of rewriting the store under one of them.
+        // every other reader and writer of the project. Tracked storage
+        // declares real or possibly partial writes; an empty purge is silent.
         let purged = events
             .operation_boundary()
-            .run_from(CommitSource::Expiry, true, messages.purge_expired())
+            .run_from(CommitSource::Expiry, false, messages.purge_expired())
             .await
             .value;
         if let Err(error) = purged {
@@ -140,7 +140,9 @@ impl Context {
     /// sequenced. Callers keep network writes, acknowledgement waits and
     /// process kills outside: the permit is never held across a peer. A
     /// phase reached from an operation that already holds the permit (the
-    /// worker's [`handle_ordered`](worker::Worker)) reuses it.
+    /// worker's [`handle_ordered`](worker::Worker)) reuses it. `mutation = false`
+    /// means there are no undeclared writes: tracked adapters or nested
+    /// mutating phases declare every write, while reads still take the permit.
     pub(crate) async fn ordered<T>(&self, mutation: bool, phase: impl Future<Output = T>) -> T {
         let boundary = self.engine.events.operation_boundary();
         let phase = Box::pin(phase);
@@ -235,7 +237,7 @@ impl Context {
     /// The frames to send `peer` now. Expiry, the read and oversize
     /// rejections are one ordered phase; the caller writes the frames after.
     pub(crate) async fn outbox(&self, peer: &str) -> Result<Vec<Frame>> {
-        self.ordered(true, self.outbox_phase(peer)).await
+        self.ordered(false, self.outbox_phase(peer)).await
     }
 
     async fn outbox_phase(&self, peer: &str) -> Result<Vec<Frame>> {
@@ -291,6 +293,10 @@ impl Context {
         let result = self
             .ordered(true, async {
                 if let Some(reason) = reason {
+                    self.engine
+                        .events
+                        .operation_boundary()
+                        .note_store(CommitStore::Messages);
                     let reason = orch_infra::storage::remote::metadata_text(reason, 256);
                     orch_infra::storage::message::FileMessageStore::new(
                         self.engine.paths.clone(),
@@ -750,6 +756,120 @@ mod tests {
         );
     }
 
+    fn queued_message(id: &str) -> Message {
+        Message {
+            id: id.into(),
+            channel: MessageChannel::Direct,
+            from_agent_id: "sender".into(),
+            to_agent_id: Some("recipient@controller".into()),
+            subject: String::new(),
+            body: String::new(),
+            reply_to: None,
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            expires_at: None,
+            status: MessageStatus::Pending,
+            delivered_at: None,
+            team_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_and_oversize_outbox_declare_messages_and_remote() {
+        let (_temp, ctx) = metadata_context().await;
+        let mut message = queued_message("msg_reject");
+        ctx.engine.messages.save(&message).await.unwrap();
+        let records = capture_commits(&ctx.engine.events);
+        ctx.msg_ack("controller", &message.id, Some("unknown recipient"))
+            .await
+            .unwrap();
+        {
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].source, CommitSource::Peer);
+            assert!(!records[0].store_set_uncertain);
+            for store in [CommitStore::Messages, CommitStore::Remote] {
+                assert!(
+                    records[0].changes.iter().any(|c| c.store == store),
+                    "rejection missed {store:?}"
+                );
+            }
+        }
+        message.id = "msg_oversize".into();
+        message.body = "x".repeat(codec::MAX_FRAME_BYTES + 1);
+        ctx.engine.messages.save(&message).await.unwrap();
+        records.lock().unwrap().clear();
+        assert!(ctx.outbox("controller").await.unwrap().is_empty());
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, CommitSource::Peer);
+        for store in [CommitStore::Messages, CommitStore::Remote] {
+            assert!(
+                records[0].changes.iter().any(|c| c.store == store),
+                "oversize missed {store:?}"
+            );
+        }
+        assert!(!records[0].store_set_uncertain);
+    }
+
+    #[tokio::test]
+    async fn real_expiry_sweep_invalidates_once_and_zero_sweep_is_silent() {
+        let (_temp, ctx) = metadata_context().await;
+        let mut message = queued_message("msg_expired");
+        message.expires_at = Some("2000-01-01T00:00:00.000Z".into());
+        ctx.engine.messages.save(&message).await.unwrap();
+        let records = capture_commits(&ctx.engine.events);
+        let boundary = ctx.engine.events.operation_boundary();
+        let mut commits = boundary.subscribe_commits();
+        let stop = Shutdown::default();
+        let cleanup = tokio::spawn(expire_messages(
+            ctx.engine.messages.clone(),
+            ctx.engine.events.clone(),
+            stop.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), commits.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stop.0.send_replace(true);
+        cleanup.await.unwrap();
+        assert!(
+            ctx.engine
+                .messages
+                .get(&message.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        {
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].source, CommitSource::Expiry);
+            assert_eq!(
+                records[0].changes,
+                vec![orch_engine::container::commit::CommitChange::store_wide(
+                    CommitStore::Messages
+                )]
+            );
+            assert!(!records[0].store_set_uncertain);
+        }
+        let before = boundary.current_commit_seq();
+        let stop = Shutdown::default();
+        let cleanup = tokio::spawn(expire_messages(
+            ctx.engine.messages.clone(),
+            ctx.engine.events.clone(),
+            stop.clone(),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), commits.recv())
+                .await
+                .is_err(),
+            "empty startup sweep committed"
+        );
+        stop.0.send_replace(true);
+        cleanup.await.unwrap();
+        assert_eq!(boundary.current_commit_seq(), before);
+    }
+
     #[derive(Default)]
     struct ExpiryStore(AtomicUsize);
 
@@ -813,14 +933,18 @@ mod tests {
         assert_eq!(store.0.load(Ordering::SeqCst), 3);
     }
 
-    /// The standalone sweep is a complete operation (design D2): it never
-    /// purges while another operation holds the project permit, and its purge
-    /// commits with an advanced sequence once the permit is free.
-    #[tokio::test(start_paused = true)]
+    /// The standalone sweep waits for the permit; a real expired record is
+    /// removed and committed only after the holder releases it.
+    #[tokio::test]
     async fn expiry_waits_for_a_held_operation_and_commits_after_it() {
-        let store = Arc::new(ExpiryStore(AtomicUsize::new(1)));
-        let events = Arc::new(EventBus::new());
-        let boundary = events.operation_boundary();
+        let (_temp, ctx) = metadata_context().await;
+        let mut message = queued_message("msg_held_expired");
+        message.expires_at = Some("2000-01-01T00:00:00.000Z".into());
+        ctx.engine.messages.save(&message).await.unwrap();
+        let boundary = ctx.engine.events.operation_boundary();
+        let records = capture_commits(&ctx.engine.events);
+        let seq = boundary.current_commit_seq();
+        let mut commits = boundary.subscribe_commits();
         let (entered, release) = (
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
@@ -837,33 +961,44 @@ mod tests {
             })
         };
         entered.notified().await;
-        let records = capture_commits(&events);
-        let seq = boundary.current_commit_seq();
-        let cleanup = AbortOnDrop(tokio::spawn(expire_messages(
-            store.clone(),
-            events,
-            Shutdown::default(),
-        )));
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            store.0.load(Ordering::SeqCst),
-            1,
-            "purged under a held permit"
+        let stop = Shutdown::default();
+        let cleanup = tokio::spawn(expire_messages(
+            ctx.engine.messages.clone(),
+            ctx.engine.events.clone(),
+            stop.clone(),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), commits.recv())
+                .await
+                .is_err(),
+            "purged under held permit"
+        );
+        assert!(
+            ctx.engine
+                .messages
+                .get(&message.id)
+                .await
+                .unwrap()
+                .is_some()
         );
         assert_eq!(boundary.current_commit_seq(), seq);
         release.notify_one();
         held.await.unwrap();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(store.0.load(Ordering::SeqCst), 2);
-        assert_eq!(boundary.current_commit_seq(), seq + 1);
-        assert_eq!(
-            records.lock().unwrap()[0].source,
-            orch_engine::container::commit::CommitSource::Expiry
+        tokio::time::timeout(Duration::from_secs(5), commits.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stop.0.send_replace(true);
+        cleanup.await.unwrap();
+        assert!(
+            ctx.engine
+                .messages
+                .get(&message.id)
+                .await
+                .unwrap()
+                .is_none()
         );
-        drop(cleanup);
+        assert_eq!(boundary.current_commit_seq(), seq + 1);
+        assert_eq!(records.lock().unwrap()[0].source, CommitSource::Expiry);
     }
 }
