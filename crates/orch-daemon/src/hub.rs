@@ -855,6 +855,109 @@ mod tests {
         worker_runtime.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn message_sweep_publishes_expiry_messages_without_tasks_or_resync() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let engine = orch_engine::build_full_with(
+            temp.path(),
+            orch_engine::EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.orchestrator.enable_daemon_mode();
+        engine
+            .messages
+            .save(&orch_domain::Message {
+                id: "msg_startup_expired".into(),
+                channel: orch_domain::MessageChannel::Direct,
+                from_agent_id: "sender".into(),
+                to_agent_id: Some("recipient@worker".into()),
+                subject: String::new(),
+                body: String::new(),
+                reply_to: None,
+                created_at: engine.clock.now_iso(),
+                expires_at: Some("2000-01-01T00:00:00.000Z".into()),
+                status: orch_domain::MessageStatus::Pending,
+                delivered_at: None,
+                team_id: None,
+            })
+            .await
+            .unwrap();
+        let engine = Arc::new(engine);
+        let boundary = engine.events.operation_boundary();
+        let output = output();
+        for (id, stores) in [
+            (1, r#"{"stores":["messages"]}"#),
+            (2, r#"{"stores":["tasks"]}"#),
+        ] {
+            assert!(output.register(
+                id,
+                Id::new("daemon_test").unwrap(),
+                boundary.current_commit_seq(),
+                args(stores)
+            ));
+            output.activate(id);
+        }
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let (sink, captured) = (output.clone(), records.clone());
+        boundary.set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                lock(&captured).push(record.clone());
+            }
+            sink.publish(p);
+        })));
+        assert_eq!(
+            boundary
+                .run_from(CommitSource::Expiry, false, engine.messages.purge_expired())
+                .await
+                .value
+                .unwrap(),
+            1
+        );
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(frame) = output.pop() {
+                    break frame;
+                }
+                output.ready.notified().await;
+            }
+        })
+        .await
+        .expect("startup sweep invalidation");
+        let event = serde_json::from_slice::<EventFrame>(&frame.bytes)
+            .unwrap()
+            .ev;
+        assert_eq!(event.subscription, 1);
+        let EventBody::Change {
+            store: Store::Messages,
+            id: None,
+            commit_seq,
+            ..
+        } = event.body
+        else {
+            panic!("expected known Messages invalidation");
+        };
+        assert!(lock(&records).iter().any(|r| r.commit_seq == commit_seq
+            && r.source == CommitSource::Expiry
+            && !r.store_set_uncertain));
+        assert!(output.pop().is_none(), "Tasks subscriber remains silent");
+        let before = boundary.current_commit_seq();
+        assert_eq!(
+            boundary
+                .run_from(CommitSource::Expiry, false, engine.messages.purge_expired())
+                .await
+                .value
+                .unwrap(),
+            0
+        );
+        assert_eq!(boundary.current_commit_seq(), before);
+        assert!(output.pop().is_none(), "zero sweep stays silent");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tick_spawned_completion_publishes_collector_task_change() {
         use crate::ops::Handler;
