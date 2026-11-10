@@ -194,7 +194,7 @@ pub enum MemberSub {
 }
 
 pub(crate) fn requires_initialized_project(_args: &[String]) -> bool {
-    false
+    true
 }
 
 pub(crate) async fn dispatch(
@@ -586,11 +586,11 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn template_preparse_allows_global_flags_before_the_subgroup_only() {
+    fn template_preparse_requires_a_project_even_with_global_flags() {
         for flag in ["--json", "--yaml", "--quiet", "--no-color", "--ascii"] {
             let args = vec![flag.to_owned(), "template".into(), "list".into()];
             assert!(
-                !crate::commands::org::requires_initialized_project(&args),
+                crate::commands::org::requires_initialized_project(&args),
                 "{flag}"
             );
         }
