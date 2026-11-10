@@ -283,3 +283,172 @@ fn an_exited_script_preserves_output_exit_and_unrelated_control() {
     drop(pm);
     control.assert_alive();
 }
+
+#[test]
+fn full_stderr_does_not_delay_final_owner_cleanup() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    const CHILD_SOCKET: &str = "FIXTURE_DROP_BACKPRESSURE_SOCKET";
+    if let Some(path) = std::env::var_os(CHILD_SOCKET) {
+        let Hanging {
+            pm,
+            child,
+            group,
+            descendant,
+            _dir,
+        } = hanging();
+        let mut connection = UnixStream::connect(path).unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        writeln!(connection, "{} {} {}", child.pid, group.pgid, descendant).unwrap();
+        let mut command = [0];
+        connection.read_exact(&mut command).unwrap();
+        assert_eq!(command, *b"G");
+        drop(pm);
+        writeln!(connection, "DONE").unwrap();
+        // Keep the helper and its independent safety net until the supervisor
+        // has recorded termination/control survival BEFORE draining stderr.
+        BufReader::new(connection)
+            .read_until(b'X', &mut Vec::new())
+            .unwrap();
+        drop(group);
+        return;
+    }
+
+    // Isolate fd 2 in a helper process; never redirect the test runner's global
+    // stderr. Python is already used by this target's readiness fixture.
+    let dir = tempfile::tempdir().unwrap();
+    let result = Command::new("/usr/bin/python3")
+        .args(["-c", FULL_STDERR_SUPERVISOR])
+        .arg(std::env::current_exe().unwrap())
+        .arg(dir.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", dir.path())
+        .env("TMPDIR", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env(
+            "ORCHESTRY_GLOBAL_CONFIG_PATH",
+            dir.path().join("global.yml"),
+        )
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&result.stdout));
+    assert!(
+        result.status.success(),
+        "full-stderr supervisor failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+// The pipe is filled to EAGAIN only after READY, then returned to blocking mode.
+// No reader drains it until DONE and the process-table/control observations.
+// Independently owned unreaped cats pin fixture/control PGIDs before assertions;
+// the finally block cleans/reaps them even in the deliberately blocked mutant.
+const FULL_STDERR_SUPERVISOR: &str = r#"
+import json, os, signal, socket, subprocess, sys
+from pathlib import Path
+root = Path(sys.argv[2])
+env = dict(os.environ, FIXTURE_DROP_BACKPRESSURE_SOCKET=str(root / 'drop.sock'))
+control = guard = helper = connection = None
+rd, wr = os.pipe()
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(env['FIXTURE_DROP_BACKPRESSURE_SOCKET'])
+server.listen(1)
+server.settimeout(3)
+event = {}
+
+def rows(groups):
+    text = subprocess.check_output(['/bin/ps', '-axo', 'pid=,ppid=,pgid=,stat=,comm='], env=env, text=True, timeout=3)
+    return [line for line in text.splitlines() if len(line.split()) >= 4 and int(line.split()[2]) in groups]
+
+def live(lines):
+    return [line for line in lines if not line.split()[3].startswith('Z')]
+
+def cat(group=0):
+    # This supervisor has no threads; setpgid runs before exec on Python 3.9 too.
+    return subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=lambda: os.setpgid(0, group))
+
+def kill_owned(member, group):
+    # No poll/try_wait before the final group signal: preserve pinned authority.
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # macOS can refuse repeat killpg when only dead members remain.
+        if live(rows({group})):
+            raise
+    member.wait(timeout=3)
+
+try:
+    control = cat()
+    helper = subprocess.Popen([sys.argv[1], '--exact', 'full_stderr_does_not_delay_final_owner_cleanup', '--nocapture'], stdout=subprocess.DEVNULL, stderr=wr, env=env, preexec_fn=lambda: os.setpgid(0, 0))
+    connection, _ = server.accept()
+    connection.settimeout(3)
+    reader = connection.makefile('rb', buffering=0)
+    shell, pgid, descendant = map(int, reader.readline().split())
+    guard = cat(pgid)
+    event.update(shell=shell, pgid=pgid, descendant=descendant, guard=guard.pid, control=control.pid, helper=helper.pid)
+    event['before'] = rows({pgid, control.pid})
+    os.set_blocking(wr, False)
+    filled = 0
+    # Fill any sub-PIPE_BUF remainder too: a refused atomic 4096-byte write
+    # alone does not prove there is no room for the short Drop diagnostic.
+    for size in (4096, 1):
+        try:
+            while True:
+                filled += os.write(wr, b'X' * size)
+        except BlockingIOError:
+            pass
+    os.set_blocking(wr, True)
+    event['prefilled_stderr_bytes'] = filled
+    connection.sendall(b'G')
+    try:
+        event['completion_before_drain'] = reader.readline().decode().strip()
+    except socket.timeout:
+        event['completion_before_drain'] = 'TIMED_OUT'
+    event['fixture_before_drain'] = rows({pgid})
+    event['control_before_drain'] = rows({control.pid})
+finally:
+    # Cleanup precedes all verdict assertions, including the causal RED case.
+    if guard is not None:
+        kill_owned(guard, pgid)
+    os.set_blocking(rd, False)
+    drained = 0
+    try:
+        while True:
+            data = os.read(rd, 65536)
+            if not data:
+                break
+            drained += len(data)
+    except BlockingIOError:
+        pass
+    event['drained_after_observation'] = drained
+    if connection is not None:
+        connection.sendall(b'X')
+    if helper is not None:
+        try:
+            event['helper_exit'] = helper.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            kill_owned(helper, helper.pid)
+            raise
+    if control is not None:
+        kill_owned(control, control.pid)
+    event['final_owned_rows'] = rows({event[k] for k in ('pgid', 'control', 'helper') if k in event})
+    os.close(rd)
+    os.close(wr)
+    if connection is not None:
+        connection.close()
+    server.close()
+    print(json.dumps(event, sort_keys=True), flush=True)
+
+assert event['prefilled_stderr_bytes'] > 0, event
+assert event['completion_before_drain'] == 'DONE', event
+assert not live(event['fixture_before_drain']), event
+assert any(int(line.split()[0]) == event['control'] for line in live(event['control_before_drain'])), event
+assert event['helper_exit'] == 0, event
+assert not event['final_owned_rows'], event
+"#;

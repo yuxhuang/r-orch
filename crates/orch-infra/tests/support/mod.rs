@@ -213,14 +213,7 @@ impl OwnedScript {
 
 impl Drop for OwnedScript {
     fn drop(&mut self) {
-        use std::io::Write as _;
-        // Keep attribution available under `--nocapture`, including failing
-        // adapter tests. Ignore a closed diagnostic stream during unwinding.
-        let _ = writeln!(
-            std::io::stderr(),
-            "scripted cleanup pgid={}",
-            self.anchor.id()
-        );
+        // Cleanup must not depend on progress of a diagnostic reader.
         self.signal(Signal::Kill);
         // Reap the anchor only AFTER signalling; never signal this PGID again.
         let _ = self.anchor.wait();
