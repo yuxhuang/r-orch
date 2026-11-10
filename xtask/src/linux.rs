@@ -157,6 +157,11 @@ const PLATFORM_SKIPS: &[(Quirk, &str, &str)] = &[
         "crates/orch-cli/tests/org_templates.rs",
     ),
     (
+        Quirk::ProcessWritesHome,
+        "template_commands_require_a_project_before_parsing_or_contacting_a_daemon",
+        "crates/orch-cli/tests/org_template_mutations.rs",
+    ),
+    (
         Quirk::SpawnStartsMissingBinary,
         "review_runner::tests::the_process_runner_reports_a_missing_binary_as_a_failure",
         "crates/orch-engine/src/review_runner.rs",
