@@ -1957,6 +1957,49 @@ fn missing_private_tmux_still_cleans_its_retained_pane_during_unwind() {
     assert_cleanup_child(NAME, CHILD, 101);
 }
 
+/// Shells may exec the wrapper (macOS) or keep a shell between the private
+/// server and the pane (Linux). Command text alone never establishes ownership.
+fn descends_from(table: &[Proc], mut pid: u32, ancestor: u32) -> bool {
+    let mut seen = BTreeSet::new();
+    while seen.insert(pid) {
+        let Some(process) = table.iter().find(|p| p.pid == pid) else {
+            return false;
+        };
+        if process.ppid == ancestor {
+            return true;
+        }
+        pid = process.ppid;
+    }
+    false
+}
+
+#[test]
+fn private_pane_readiness_accepts_descendants_at_any_depth_only_of_its_server() {
+    let process = |pid, ppid, command: &str| Proc {
+        pid,
+        ppid,
+        pgid: pid,
+        command: command.into(),
+    };
+    let table = vec![
+        process(10, 1, "tmux private"),
+        process(11, 10, "sleep 600"),
+        process(12, 10, "sh -c pane.sh"),
+        process(13, 12, "sh pane.sh"),
+        process(14, 13, "sleep 600"),
+        process(20, 1, "tmux other"),
+        process(21, 20, "sleep 600"),
+        process(30, 31, "sleep 600"),
+        process(31, 30, "cycle"),
+    ];
+    let owned: Vec<_> = table
+        .iter()
+        .filter(|p| p.command == "sleep 600" && descends_from(&table, p.pid, 10))
+        .map(|p| p.pid)
+        .collect();
+    assert_eq!(owned, vec![11, 14]);
+}
+
 fn fail_with_private_tmux(record: &std::ffi::OsStr, stop: bool) -> ! {
     let sandbox = Sandbox::new();
     sandbox.init_project();
@@ -1989,7 +2032,7 @@ fn fail_with_private_tmux(record: &std::ffi::OsStr, stop: bool) -> ! {
             })?;
             table
                 .iter()
-                .any(|p| p.ppid == server.pid && p.command == "sleep 600")
+                .any(|p| p.command == "sleep 600" && descends_from(&table, p.pid, server.pid))
                 .then_some(())
         });
     }
