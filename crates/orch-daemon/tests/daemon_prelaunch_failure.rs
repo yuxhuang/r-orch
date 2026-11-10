@@ -6,10 +6,16 @@
 
 mod support;
 
+use async_trait::async_trait;
+use orch_core::process::{ExitNotifier, ExitOutcome, ExitSignal, SpawnOptions, SpawnedChild};
+use orch_core::{ProcessManager, Signal};
 use orch_daemon::testing::DaemonHarness;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 use support::{DEADLINE, Raw, Reaper, ok, running_pid, task};
+use tokio::sync::{Notify, oneshot};
 
 /// A shell agent whose launch needs a git worktree. The harness project is
 /// not a git repository, so workspace preparation fails before any run, prompt
@@ -350,5 +356,260 @@ async fn a_running_scope_still_blocks_an_overlapping_candidate() {
     assert_eq!(tick.launched, vec![disjoint.clone()]);
     reaper.watch(running_pid(&daemon, &disjoint).await.unwrap());
     assert_eq!(support::task_status(&mut raw, &overlapping).await, "todo");
+    daemon.shutdown().await.unwrap();
+}
+
+/// The harness project is not a git repository, so every workspace probe
+/// (`git rev-parse --is-inside-work-tree`) answers 128, as git does. The test
+/// can park one probe: the batch then stops between two of its boundary
+/// operations, inside the external preparation step that runs without the
+/// boundary, so its progress is counted in operations, not in time.
+#[derive(Default)]
+struct Probes {
+    state: Mutex<ProbeState>,
+    entered: Notify,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    /// Probes answered or parked so far, one per candidate.
+    count: usize,
+    /// The 1-based probe to park when it arrives.
+    park: Option<usize>,
+    parked: Option<ExitNotifier>,
+    unexpected: Vec<String>,
+}
+
+const NOT_A_REPOSITORY: ExitOutcome = ExitOutcome {
+    code: Some(128),
+    signal: None,
+};
+
+impl Probes {
+    fn park(&self, probe: usize) {
+        self.state.lock().unwrap().park = Some(probe);
+    }
+
+    /// Wait until probe `probe` is parked.
+    async fn parked(&self, probe: usize) {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let notified = self.entered.notified();
+                {
+                    let state = self.state.lock().unwrap();
+                    if state.parked.is_some() && state.count == probe {
+                        return;
+                    }
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the batch never reached workspace probe {probe}"));
+    }
+
+    /// Answer the parked probe, and park probe `next` instead, if any.
+    fn release(&self, next: Option<usize>) {
+        let parked = {
+            let mut state = self.state.lock().unwrap();
+            state.park = next;
+            state.parked.take()
+        };
+        if let Some(parked) = parked {
+            parked.notify(NOT_A_REPOSITORY);
+        }
+    }
+}
+
+/// A failed assertion must not leave the batch parked under the daemon's stop.
+struct Unpark(Arc<Probes>);
+
+impl Drop for Unpark {
+    fn drop(&mut self) {
+        self.0.release(None);
+    }
+}
+
+#[async_trait]
+impl ProcessManager for Probes {
+    fn is_alive(&self, _: u32) -> bool {
+        false
+    }
+    fn kill(&self, _: u32, _: Signal) {}
+    async fn kill_with_grace(&self, _: u32, _: Duration) {}
+    fn spawn(
+        &self,
+        command: &str,
+        args: &[String],
+        _: SpawnOptions,
+    ) -> orch_core::Result<SpawnedChild> {
+        let mut state = self.state.lock().unwrap();
+        if command != "git" || args != ["rev-parse", "--is-inside-work-tree"] {
+            state
+                .unexpected
+                .push(format!("{command} {}", args.join(" ")));
+            return Err(orch_core::Error::other("only the workspace probe may run"));
+        }
+        state.count += 1;
+        let exit = if state.park == Some(state.count) {
+            let (notifier, exit) = ExitSignal::channel();
+            state.parked = Some(notifier);
+            drop(state);
+            self.entered.notify_waiters();
+            exit
+        } else {
+            ExitSignal::resolved(NOT_A_REPOSITORY)
+        };
+        Ok(SpawnedChild {
+            pid: 987_654,
+            stdout: None,
+            stderr: None,
+            stdin: None,
+            exit,
+        })
+    }
+}
+
+/// Board-2b perf F1b, amended acceptance A5: a client read queued while a
+/// batch of failing workspace preparations runs is served before the batch
+/// ends, after a bounded number of the batch's boundary operations, however
+/// many candidates the batch has left.
+///
+/// The bound: a failed candidate takes the boundary twice (selection, then
+/// the recording commit) and prepares its workspace between the two without
+/// it. The boundary is a FIFO lock, and the batch is one sequential task, so
+/// at most one batch operation is ever queued ahead of a read: a read that
+/// queues behind the batch is served after at most **one** batch commit. The
+/// socket read below cannot be timed to the moment it queues, so for it the
+/// test asserts the structural bound of **two** (the operations between two
+/// workspace probes; the next probe is parked); the FIFO bound of one is
+/// asserted on a waiter whose queueing the test controls. A batch that held
+/// the boundary across candidates would serve neither until it ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_queued_during_a_failure_batch_is_served_before_the_batch_ends() {
+    const CANDIDATES: usize = 8;
+    const PARK: usize = 3;
+    const READ: u64 = 1_000_104;
+    let probes = Arc::new(Probes::default());
+    let _unpark = Unpark(Arc::clone(&probes));
+    let daemon = DaemonHarness::builder()
+        .clock(support::TestClock::new())
+        .maintenance_timer(false)
+        .processes(probes.clone())
+        .start()
+        .await
+        .unwrap();
+    let mut raw = Raw::session(&daemon, "cli", "normal").await;
+    let agent = worktree_agent(&mut raw, &daemon).await;
+    let mut ids = Vec::new();
+    for n in 0..CANDIDATES {
+        ids.push(
+            task(
+                &mut raw,
+                &format!("candidate {n}"),
+                json!({"assignee": agent}),
+            )
+            .await,
+        );
+    }
+    let mut reader = Raw::session(&daemon, "cli", "normal").await;
+    let boundary = daemon.engine().operation_boundary();
+
+    probes.park(PARK);
+    let start = boundary.current_commit_seq();
+    let (tick, (at_park, witness, read, at_next_park)) =
+        tokio::join!(daemon.step_dispatch(), async {
+            probes.parked(PARK).await;
+            let at_park = boundary.current_commit_seq();
+
+            // Hold the boundary, so what the batch does next queues on it.
+            let (held_tx, held) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel::<()>();
+            let holder = tokio::spawn({
+                let boundary = Arc::clone(&boundary);
+                async move {
+                    boundary
+                        .run(false, async move {
+                            let _ = held_tx.send(());
+                            let _ = release_rx.await;
+                        })
+                        .await;
+                }
+            });
+            tokio::time::timeout(DEADLINE, held)
+                .await
+                .expect(
+                    "the boundary stayed taken while the batch prepared a workspace: the batch \
+                 holds it across candidates, so no read is served until the batch ends",
+                )
+                .unwrap();
+
+            reader
+                .send(&json!({"id": READ, "req": {"op": "task.list", "args": {}}}))
+                .await;
+            // The batch records the parked candidate (queued behind the holder),
+            // selects the next one and parks again at its probe.
+            probes.release(Some(PARK + 1));
+            let mut witness = std::pin::pin!(boundary.run(false, async {}));
+            std::future::poll_fn(|cx| {
+                assert!(
+                    witness.as_mut().poll(cx).is_pending(),
+                    "the boundary is held"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            release.send(()).unwrap();
+            holder.await.unwrap();
+            let witness = tokio::time::timeout(DEADLINE, witness)
+                .await
+                .expect("a queued boundary waiter starved behind the batch")
+                .commit_seq;
+            let read = reader.terminal(READ).await;
+            probes.parked(PARK + 1).await;
+            let at_next_park = boundary.current_commit_seq();
+            probes.release(None);
+            (at_park, witness, read, at_next_park)
+        });
+
+    let mut launched = tick.unwrap().launched;
+    launched.sort();
+    ids.sort();
+    assert_eq!(launched, ids, "every candidate was tried once");
+    let end = boundary.current_commit_seq();
+    let listed = ok(&read).as_array().unwrap();
+    assert_eq!(listed.len(), CANDIDATES, "{read}");
+    // What the read saw is the batch mid-way: the parked candidate recorded or
+    // not, every later one untried.
+    let tried = listed.iter().filter(|task| task["attempts"] == 1).count();
+    assert!(
+        (PARK - 1..=PARK).contains(&tried),
+        "the read saw {tried} of {CANDIDATES} candidates tried: {read}"
+    );
+    let served = read["commit_seq"].as_u64().unwrap();
+    let commits = format!(
+        "commits: start {start}, park {at_park}, witness {witness}, read {served}, \
+         next park {at_next_park}, end {end}"
+    );
+    // The tick's selection commit, then two per failed candidate.
+    assert_eq!(at_park - start, 2 * PARK as u64, "{commits}");
+    assert_eq!(end - start, 1 + 2 * CANDIDATES as u64, "{commits}");
+    assert_eq!(
+        at_next_park - at_park,
+        2,
+        "between two workspace probes a failed candidate commits its record and \
+         the next selection: {commits}"
+    );
+    assert!(
+        witness <= at_park + 1,
+        "a waiter queued behind the batch was overtaken by more than one batch \
+         commit, the boundary is not FIFO: {commits}"
+    );
+    assert!(
+        (at_park..=at_park + 2).contains(&served),
+        "the read was not served within the two batch commits after it was sent: \
+         {commits}"
+    );
+    assert!(probes.state.lock().unwrap().unexpected.is_empty());
     daemon.shutdown().await.unwrap();
 }
