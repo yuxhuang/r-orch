@@ -449,18 +449,15 @@ mod tests {
                 let holder = super::super::reserve_spawn(SpawnSite::Discovery).await;
                 let mut waiter = Box::pin(super::super::reserve_spawn(SpawnSite::Launch));
                 assert!(futures::poll!(&mut waiter).is_pending());
-                let id = pending_spawns()
-                    .iter()
-                    .find(|record| record.site == SpawnSite::Launch)
-                    .unwrap()
-                    .id;
                 let log = tokio::task::spawn_blocking(move || {
                     let deadline = Instant::now() + Duration::from_secs(20);
                     loop {
                         let line = receive
                             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                             .unwrap();
-                        if line.contains(&format!("spawn_id={id}")) {
+                        // The registry is shared with concurrently running tests;
+                        // only this subscriber identifies our queued reservation.
+                        if line.contains("site=Launch") && line.contains("stage=Waiting") {
                             break line;
                         }
                     }
@@ -468,6 +465,16 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(log.contains("stage=Waiting"), "{log}");
+                let id: u64 = log
+                    .split("spawn_id=")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(pending_spawns().iter().any(|record| record.id == id));
                 drop(waiter);
                 assert!(!pending_spawns().iter().any(|record| record.id == id));
                 drop(holder);
