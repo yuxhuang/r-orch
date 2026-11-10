@@ -96,30 +96,43 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         // ordinal it observed so a push the read already saw is not read
         // again (brief D3). A failed read leaves its view stale.
         let mut freshness = Freshness::default();
-        let note = |freshness: &mut Freshness, backend: &B, view: View, ok: bool| {
-            if ok {
-                freshness.read_ok(view, backend.last_read_seq());
-            } else {
-                freshness.read_failed(view);
-            }
-        };
+        let mut bootstrap_errors = Vec::new();
+        let mut note =
+            |freshness: &mut Freshness, backend: &B, view: View, error: Option<&String>| {
+                if let Some(error) = error {
+                    freshness.read_failed(view);
+                    bootstrap_errors.push((view, error.clone()));
+                } else {
+                    freshness.read_ok(view, backend.last_read_seq());
+                }
+            };
         let tasks = backend.refresh_tasks();
-        note(&mut freshness, &backend, View::Tasks, tasks.is_ok());
+        note(&mut freshness, &backend, View::Tasks, tasks.as_ref().err());
         state.tasks = tasks.unwrap_or_default();
         let agents = backend.refresh_agents();
-        note(&mut freshness, &backend, View::Agents, agents.is_ok());
+        note(
+            &mut freshness,
+            &backend,
+            View::Agents,
+            agents.as_ref().err(),
+        );
         state.agents = agents.unwrap_or_default();
         let peer = backend.peer_status();
-        note(&mut freshness, &backend, View::Peer, peer.is_ok());
+        note(&mut freshness, &backend, View::Peer, peer.as_ref().err());
         state.peer_status = peer.unwrap_or_default();
         let goals = backend.refresh_goals();
-        note(&mut freshness, &backend, View::Goals, goals.is_ok());
+        note(&mut freshness, &backend, View::Goals, goals.as_ref().err());
         state.goals = goals.unwrap_or_default();
         let teams = backend.list_teams();
-        note(&mut freshness, &backend, View::Teams, teams.is_ok());
+        note(&mut freshness, &backend, View::Teams, teams.as_ref().err());
         state.teams = teams.unwrap_or_default();
         let orch_state = backend.refresh_state();
-        note(&mut freshness, &backend, View::State, orch_state.is_ok());
+        note(
+            &mut freshness,
+            &backend,
+            View::State,
+            orch_state.as_ref().err(),
+        );
         if let Ok(orch_state) = orch_state {
             state.orch_state = orch_state;
         }
@@ -158,6 +171,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             resync_pending: false,
             read_errors: Vec::new(),
         };
+
+        // A failed initial read must not look like an empty store. Use the
+        // same per-view error state and deduplication as pushed refreshes.
+        for (view, error) in bootstrap_errors {
+            app.settle::<()>(view, Err(error));
+        }
 
         if let Some(error) = timing_failure {
             app.emit(

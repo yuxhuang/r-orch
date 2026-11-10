@@ -520,3 +520,41 @@ fn p021_the_launch_banner_no_longer_mentions_disk_polling() {
             .any(|m| m.text.contains("disk polling"))
     );
 }
+
+#[test]
+fn p022_a_bootstrap_read_failure_is_visible_and_recovers_on_push() {
+    for (read, store, label) in [
+        (Read::Tasks, ObservedStore::Tasks, "Tasks"),
+        (Read::Agents, ObservedStore::Agents, "Agents"),
+        (Read::Goals, ObservedStore::Goals, "Goals"),
+        (Read::Teams, ObservedStore::Teams, "Teams"),
+        (Read::State, ObservedStore::State, "Orchestrator state"),
+        (Read::PeerStatus, ObservedStore::Remote, "Peer status"),
+    ] {
+        let mut backend = backend();
+        backend.fail_read = Some((read, "bootstrap refused".into()));
+        let mut harness = Harness::with(backend);
+        harness.advance(1_000);
+        let errors: Vec<_> = harness
+            .app
+            .state
+            .messages
+            .iter()
+            .filter(|message| message.text.contains("bootstrap refused"))
+            .collect();
+        assert_eq!(errors.len(), 1, "{read:?} must show its bootstrap error");
+        assert!(errors[0].text.contains(label), "{}", errors[0].text);
+        harness.app.backend.reads.clear();
+        harness.advance(30_000);
+        assert_eq!(reads(&harness), Vec::<Read>::new());
+        // Even an ordinal already seen by other bootstrap reads must recover
+        // the failed view when its next invalidation arrives.
+        push(&mut harness, changed(store, 10));
+        harness.advance(0);
+        harness.advance(REFRESH_DEBOUNCE_MS);
+        assert_eq!(harness.app.backend.read_count(read), 1, "{read:?}");
+        if read == Read::Tasks {
+            assert_eq!(task_ids(&harness).len(), 3);
+        }
+    }
+}
