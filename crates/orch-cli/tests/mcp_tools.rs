@@ -1951,8 +1951,22 @@ fn config_update_and_patch_with_file_dash_are_invalid_params() {
 
 #[test]
 fn remote_list_and_status_equal_the_cli_for_a_registered_peer() {
-    let mut fx = Fx::new();
+    // The daemon advances a registered peer's link even with dispatch off.
+    // Park it before its first dial and await its publication, so both clients
+    // read one stable state, including every link field in remote_status.
+    let mut dir = initialized_project_unowned("p");
+    let block = dir.path().join("peer-block");
+    std::fs::write(&block, b"").expect("write the peer block file");
+    dir.start_daemon_with_env(&[("ORCH_TEST_PEER_BLOCK_FILE", &block)]);
+    let mut fx = Fx::on(dir, &[], &[]);
     fx.cli_plain(&["remote", "add", "peer", "127.0.0.1:9"]);
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || {
+            fx.ok("remote_status", json!({}))["remotes"][0]["last_error"]
+                == "Peer link blocked by test hook"
+        }),
+        "the daemon's link to the registered peer never parked on the test hook"
+    );
     let listed = fx.ok("remote_list", json!({}));
     assert_eq!(listed[0]["alias"], "peer");
     assert_eq!(listed, fx.cli(&["remote", "list"]));
