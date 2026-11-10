@@ -17,6 +17,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | The daemon crashed or was killed | [After a daemon crash](#after-a-daemon-crash-or-kill--9) |
 | `daemon is orch … protocol …, this client is orch …`, or upgrading orch | [Version skew and upgrading](#version-skew-and-upgrading-orch) |
 | Commands time out, or `orch daemon stop` says the PID is still running | [A hung daemon](#a-hung-daemon) |
+| `orch` commands, the dashboard or MCP tools are slow while many tasks fail to start | [Commands are slow while many tasks fail to start](#orch-commands-are-slow-while-many-tasks-fail-to-start) |
 | `Orchestrator already running (PID: undefined)` and nothing is running | [Corrupt lock file](#corrupt-lock-file) |
 | `serve --once` never exits | [`serve --once` hangs on review](#serve---once-hangs-on-a-task-in-review) |
 | `task show <id>` works but `task list` omits the task | [Rebuilding an index](#rebuilding-an-index-after-a-lost-update) (legacy procedure) |
@@ -213,6 +214,41 @@ the project until that call returns. Its shutdown is already under way, so **`ki
 <!-- Symptom B: N1 06a4ae1e (manual 18 "After a timeout the daemon can still own the project" and the Recovery
 row); stop-timeout text crates/orch-proto/src/error.rs:278 at f70fc707; release-eng measured the extra SIGTERM
 at cd0fd4c0 (tech-writer-stop-timeout-n1-ba1c717.md). Not reproduced at f70fc707 (needs a hung git worktree add). -->
+
+### `orch` commands are slow while many tasks fail to start
+
+**Symptom.** Dispatch is on and many tasks fail before their agent starts, for example because their workspace
+cannot be prepared. Meanwhile `orch task list`, `orch status`, the dashboard and MCP tools take noticeably longer
+than usual. They still succeed.
+
+**Cause.** The daemon records every failed start with writes that wait until the disk confirms them, and it
+serves reads and writes through one queue in arrival order, so each read waits for the writes ahead of it. This
+is a stated non-guarantee, not a fault: see
+[What the daemon does not promise](manual/18-daemon.md#why-a-daemon).
+
+**What to check.**
+
+1. `orch daemon status` answers and shows `dispatch ON`. If it does not answer, this is not the entry: see
+   [No orch daemon is running](#no-orch-daemon-is-running-for-project-root).
+2. `orch task list --status retrying` lists the tasks waiting for another attempt; `orch task show <id>` shows
+   how many they have used, for example `retrying · attempt 1/3`.
+3. Why they fail: `orch --json status` shows each waiting retry with its error in `state.retry_queue`, for
+   example `"error": "workspace_mode \"worktree\" requires a git repository"`. Once a task has used its last
+   attempt the reason is no longer shown anywhere (pending fix, task tsk_ajCzJGN), so read it while the tasks are
+   still `retrying`.
+
+**Fix.** None is needed for the slowness: it stops by itself. Each task makes its last attempt (`max_attempts`, 3
+unless set; [How orch retries by itself](manual/04-tasks.md#how-orch-retries-by-itself)) and is then `failed`;
+when every task in the burst has failed, the writes stop and read times return to normal. No state is lost and
+nothing needs recovery. To end the burst sooner, `orch daemon dispatch off` stops the daemon starting tasks,
+retries included. Fix the cause the errors name, then `orch task retry <id>` for each failed task and
+`orch daemon dispatch on`.
+
+If a command instead fails with exit 7 after about 10 s, the daemon could not start it in time and did not run
+it: retry it.
+<!-- A6 (tsk_I57BLvA). Queue and durable writes: see the comment under manual 18 "What the daemon does not promise".
+Steps 1-3 and the dispatch-off line run on a throwaway project with release a08fad1b (worktree agent in a non-git
+project); retry_queue error from orch --json status; reason gone after the last attempt: tsk_ajCzJGN. -->
 
 ---
 

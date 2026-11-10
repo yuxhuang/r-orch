@@ -46,9 +46,33 @@ every client, whether the request comes from the CLI, the dashboard, `orch web`,
 - Reads never delete expired context entries; `orch context get`, `orch context list` and the MCP context tools
   only hide them. The daemon removes expired entries itself: at start, and on a timer, also with dispatch off.
 
-What the daemon does **not** promise: two file writes (an entity and its `_index.json`) are still not one
-transaction if the daemon crashes between them ([Recovery](#recovery)); a request whose reply was lost has an
-unknown outcome; and another program that edits `.orchestry/` while the daemon runs is not kept out.
+What the daemon does **not** promise:
+
+- Two file writes (an entity and its `_index.json`) are still not one transaction if the daemon crashes between
+  them ([Recovery](#recovery)).
+- A request whose reply was lost has an unknown outcome.
+- Another program that edits `.orchestry/` while the daemon runs is not kept out.
+- **Read times that do not depend on writes.** Reads and writes go through one queue in the daemon, served in
+  the order they arrive, and every write waits until the disk confirms it is stored. So a read such as
+  `orch task list` or `orch status` waits for the writes queued ahead of it. During a burst of writes, for example
+  when many tasks fail before their agent starts and each failure is recorded, reads are slower until the burst
+  ends. The wait is per read and finite, and it grows with how long your disk takes to confirm a write. Nothing
+  is lost and nothing needs recovery. A request that cannot start within 10 s is refused without being run
+  (exit 7); none was in the measurement below. What to do: [Commands are slow while many tasks fail to
+  start](../RUNBOOK.md#orch-commands-are-slow-while-many-tasks-fail-to-start).
+
+  Measured on an Apple M5 Max (macOS 27.2) with a release build of commit `a08fad1b`, on a shared machine at
+  load average 12.30–18.93: an isolated project of 500 tasks and six agents whose workspaces could not be
+  prepared made exactly 1,500 preparations, three attempts per task, then stopped retrying. While the tasks were
+  failing, all 792 `orch task list` reads and all 792 `orch status` reads succeeded; `task list` p99/max were
+  158/228 ms and `status` 129/209 ms. Afterwards, with the daemon restarted, at load 15.84–18.83 and 201 reads per
+  command, `task list` p95 was 27.61 ms against 30.84 ms for an idle project measured at the same time, and
+  `status` 21.00 ms against 20.05 ms. These are observations on one machine, not promised bounds.
+<!-- A6 (tsk_I57BLvA), decision-tsk_DKbRFg5-f1b-acceptance.md. Queue: crates/orch-engine/src/container/operation.rs:130
+(tokio Mutex, FIFO) and crates/orch-daemon/src/coordinator.rs:153 (every non-external request, reads included);
+10 s refusal coordinator.rs:163-164, exit 7 crates/orch-proto/src/error.rs:64; durable write
+crates/orch-infra/src/storage/fs_utils.rs:97,134; all at b97fc59a. Numbers only from the "Paragraph approved for
+documentation" of perf-eng-pr2b-f1b-reverdict-a08fad1b.md (tsk_KwZ1rOH). -->
 
 ## Command reference
 
