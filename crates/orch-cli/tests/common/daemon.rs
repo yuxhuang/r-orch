@@ -563,12 +563,29 @@ pub struct Proc {
 }
 
 /// The whole process table (`ps` is the portable macOS/Linux reader).
+///
+/// Retried: an emulated x86_64 `ps` (Rosetta under `cargo xtask linux`) traps
+/// now and then while a process it is reading exits, about 1 in 750 scans
+/// under churn. A real failure fails every attempt and is reported with stderr.
 pub fn process_table() -> Vec<Proc> {
-    let out = Command::new("/bin/ps")
-        .args(["-axo", "pid=,pgid=,command="])
-        .output()
-        .expect("ps runs");
-    assert!(out.status.success(), "ps failed");
+    let mut attempt = 0;
+    let out = loop {
+        attempt += 1;
+        let out = Command::new("/bin/ps")
+            .args(["-axo", "pid=,pgid=,command="])
+            .output()
+            .expect("ps runs");
+        if out.status.success() || attempt == 3 {
+            break out;
+        }
+        std::thread::sleep(POLL);
+    };
+    assert!(
+        out.status.success(),
+        "ps failed {attempt} times, last {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
