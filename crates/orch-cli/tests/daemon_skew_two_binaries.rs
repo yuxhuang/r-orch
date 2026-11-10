@@ -1,6 +1,6 @@
 //! Two-executable version skew (T2a; spec R6, R32; design 8.20): two real
 //! `orch` binaries built from this one tree that differ ONLY in
-//! `LOCAL_PROTOCOL` (1 and 2), driven both ways.
+//! `LOCAL_PROTOCOL`, driven both ways.
 //!
 //! The in-process skew harness proves the daemon's side; this proves what an
 //! owner sees: an old binary's daemon and a new binary's clients (and the
@@ -11,10 +11,11 @@
 //! the printed restart advice.
 //!
 //! The second binary is built with the non-default `skew-seam` feature and
-//! `ORCH_SEAM_LOCAL_PROTOCOL=2` into a private target dir under
-//! `CARGO_TARGET_TMPDIR` (cached across runs). Without the feature the
-//! constant is 1 and the variable is ignored, so no shipped binary can
-//! differ.
+//! `ORCH_SEAM_LOCAL_PROTOCOL` set to `SEAM_PROTOCOL` into a private target
+//! dir under `CARGO_TARGET_TMPDIR` (cached across runs). Without the feature
+//! the normal protocol is used and the variable is ignored, so no shipped
+//! binary can differ. The seam is derived from the normal protocol so a
+//! protocol bump cannot silently turn these into equal-version vectors.
 
 mod daemon_support;
 
@@ -24,7 +25,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-const SEAM_PROTOCOL: u32 = 2;
+const NORMAL_PROTOCOL: u32 = orch_proto::LOCAL_PROTOCOL;
+const SEAM_PROTOCOL: u32 = NORMAL_PROTOCOL.wrapping_add(1);
 
 /// The process-table watch in `assert_clients_refuse` sees every `orch` process
 /// of the binary under test, including another test's daemon, so the vectors
@@ -34,8 +36,12 @@ fn serial() -> MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Build (once per run; incremental across runs) the protocol-2 binary.
+/// Build (once per run; incremental across runs) the different-protocol binary.
 fn skewed_binary() -> &'static Path {
+    assert_ne!(
+        SEAM_PROTOCOL, NORMAL_PROTOCOL,
+        "skew fixture requires different normal and seam protocols before any vector runs"
+    );
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     BUILT.get_or_init(|| {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -188,32 +194,32 @@ fn assert_clients_refuse(pair: &mut Pair, client: &Path, client_protocol: u32) {
 }
 
 #[test]
-fn protocol_2_clients_against_a_protocol_1_daemon_print_the_skew_message_and_change_nothing() {
+fn seam_clients_against_a_normal_daemon_print_the_skew_message_and_change_nothing() {
     let _serial = serial();
     let skewed = skewed_binary();
-    let mut pair = Pair::start(normal(), orch_proto::LOCAL_PROTOCOL);
+    let mut pair = Pair::start(normal(), NORMAL_PROTOCOL);
     assert_clients_refuse(&mut pair, skewed, SEAM_PROTOCOL);
 }
 
 #[test]
-fn protocol_1_clients_against_a_protocol_2_daemon_print_the_skew_message_and_change_nothing() {
+fn normal_clients_against_a_seam_daemon_print_the_skew_message_and_change_nothing() {
     let _serial = serial();
     let skewed = skewed_binary();
     let mut pair = Pair::start(skewed, SEAM_PROTOCOL);
-    assert_clients_refuse(&mut pair, normal(), orch_proto::LOCAL_PROTOCOL);
+    assert_clients_refuse(&mut pair, normal(), NORMAL_PROTOCOL);
 }
 
 #[test]
 fn the_other_binarys_daemon_stop_crosses_the_skew_so_the_printed_restart_advice_works() {
     let _serial = serial();
     let skewed = skewed_binary();
-    let mut pair = Pair::start(normal(), orch_proto::LOCAL_PROTOCOL);
-    // `orch daemon stop` of the NEWER binary stops the OLDER daemon...
+    let mut pair = Pair::start(normal(), NORMAL_PROTOCOL);
+    // `orch daemon stop` of the seam binary stops the normal daemon...
     let out = pair.client(skewed, &["daemon", "stop"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(pair.daemon.wait_exit(READY).code(), Some(0));
     assert!(!pair.sandbox.socket().exists(), "stop left the socket");
-    // ...and the explicit start of the new binary then serves it.
+    // ...and the explicit start of the seam binary then serves it.
     let mut cmd = orch_command_with(
         skewed,
         &pair.sandbox.root(),
@@ -225,7 +231,7 @@ fn the_other_binarys_daemon_stop_crosses_the_skew_so_the_printed_restart_advice_
     second.expect_ready(&pair.sandbox.socket());
     let status = pair.client(skewed, &["--json", "daemon", "status"]);
     assert!(status.status.success(), "{}", text(&status.stderr));
-    // Reverse: the old client now refuses the new daemon, exit 7.
+    // Reverse: the normal client now refuses the seam daemon, exit 7.
     let refused = pair.client(normal(), &["daemon", "status"]);
     assert_eq!(refused.status.code(), Some(7));
 }

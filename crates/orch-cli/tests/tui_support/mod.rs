@@ -26,6 +26,8 @@ use orch_proto::handshake::{Caller, CallerKind, SessionMode};
 pub struct TestDaemon {
     harness: DaemonHarness,
     config: ClientConfig,
+    // Keep diagnostic executables and their home alive until after the harness.
+    _diagnostics: tempfile::TempDir,
 }
 
 impl Deref for TestDaemon {
@@ -39,14 +41,51 @@ impl TestDaemon {
     /// Start a daemon over `root` (already initialised) with `builder`'s seams
     /// plus a bound socket and `global.yml` kept inside the project.
     pub async fn start(root: &Path, builder: HarnessBuilder) -> TestDaemon {
+        // A dashboard's first tick requests models.catalog. Its daemon must
+        // resolve those probes against test-owned programs, never the caller's
+        // PATH, HOME or CODEX_HOME. Replace the complete child environment;
+        // /usr/bin:/bin is fixed for shell-agent fixtures, not inherited.
+        let diagnostics = tempfile::tempdir().expect("diagnostic sandbox");
+        let bin = diagnostics.path().join("bin");
+        let home = diagnostics.path().join("home");
+        std::fs::create_dir_all(&bin).expect("diagnostic executables");
+        std::fs::create_dir_all(&home).expect("diagnostic HOME");
+        for name in [
+            "claude",
+            "codex",
+            "cursor",
+            "cursor-agent",
+            "agent",
+            "opencode",
+            "pi",
+            "grok",
+            "agy",
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = bin.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 127\n").expect("test-owned adapter");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("executable adapter");
+        }
+        let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+            .expect("diagnostic PATH");
         let harness = builder
+            .environment([
+                ("PATH".into(), path),
+                ("HOME".into(), home.clone().into_os_string()),
+                ("CODEX_HOME".into(), home.join(".codex").into_os_string()),
+            ])
             .global_config_path(root.join(".orchestry/global.yml"))
             .on_socket()
             .start_in(root)
             .await
             .expect("start the test daemon");
         let config = client_config(&harness);
-        TestDaemon { harness, config }
+        TestDaemon {
+            harness,
+            config,
+            _diagnostics: diagnostics,
+        }
     }
 
     /// The daemon's dispatch is OFF by default (design D8), as on a real
