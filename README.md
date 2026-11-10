@@ -673,7 +673,10 @@ What else changes
   the daemon's dispatch on or off. `orch tui --observe` and `orch tui --listen` are gone; listening is a daemon
   start option (`--listen`).
 - A cancel, from any client, stops the running agent; a goal pause, from any client, is ordered with dispatch.
-- `orch doctor` is a client too: without a daemon it reports the no-daemon message and exits 7.
+- `orch doctor` is a client too: without a daemon it runs its local checks, then reports the no-daemon message
+  and exits 7 (outside a project it exits 0).
+- `orch org template` now needs a project and its daemon, like every other command: outside a project it prints
+  `Not initialized` and exits 3. Run it inside a project after `orch daemon start`.
 - Agents get the agent variant of the message (`Do not start it; report this to the owner and stop.`), and
   `orch daemon start`, `orch serve` and `orch run --watch` refuse to start from an agent's environment (exit 2).
   All three take `--from-agent` to override that on purpose.

@@ -20,7 +20,7 @@ The web dashboard (`orch web`) shows the [dashboard](08-dashboard.md) in a brows
 
 Before you start: run the command inside a project (a directory with `.orchestry/`), and start the project's [daemon](18-daemon.md) (`orch daemon start --detach`). Outside a project `orch web` stops with `Not initialized`. Without a daemon it prints the [no-daemon message](18-daemon.md#when-no-daemon-answers) and exits 7; it never starts a daemon.
 <!-- W2 (PR 2, tsk_M9AsDfP): PR 2 contract items 1 and 3 (web preflight + HTTP 503, plan Q0b), spec R18, SE-17.
-Written ahead of S2c; I2 verifies. -->
+Written ahead of S2c; checked at run time at f70fc707 (board-2 fact-check tsk_eVo3agZ, tsk_J8tJF2x). -->
 
 1. Start the server:
 

@@ -3,7 +3,7 @@
 Tasks do nothing until the orchestrator starts them, and the orchestrator runs inside the project's [daemon](18-daemon.md). Read this chapter to start work, to watch what happens, to stop safely, and to find the logs. It covers `orch run`, `orch serve`, `orch status`, `orch logs`, `orch doctor` and `orch update`.
 
 <!-- W2 (PR 2, tsk_M9AsDfP): command semantics follow design D8 and wave-c-brief.md "PR 2 contract" item 1, written
-ahead of S2a-cli. Output samples below that predate PR 2 are marked in comments; I2 re-captures them. -->
+ahead of S2a-cli; the board-2 fact-check (tsk_eVo3agZ) checked the samples at run time at f70fc707. -->
 Every command in this chapter needs a running daemon, except `orch update`, the daemon starts `orch run --watch` and
 `orch serve` (without `--once`), and the local checks of `orch doctor`. Without one it prints `No orch daemon is running for <project root>` and exits 7 ([When no daemon answers](18-daemon.md#when-no-daemon-answers)).
 
@@ -166,7 +166,7 @@ listening /private/tmp/hello-orch/.orchestry/run/orch.sock
 dispatch on
 ```
 <!-- W2b: lines from crates/orch-daemon/src/lifecycle.rs (foreground readiness, `listening {}` / `dispatch {}`) at
-6acc62db; not captured, that head does not compile. The 0.13.0 status line (`orch · watching · …`) is gone. -->
+6acc62db; captured from a foreground `orch serve` at f70fc707 (tsk_J8tJF2x). The 0.13.0 status line (`orch · watching · …`) is gone. -->
 
 The command shows no status line and no agent output: it is the daemon, not a client. To watch what happens, run
 `orch logs --follow` in another terminal ([Daemon logs and events](#daemon-logs-and-events)).
@@ -233,7 +233,7 @@ record is `serve:started` with `mode` `once`; the last is `serve:finished` ([bel
 In orch 0.13.0 `serve:started` also had `pid` and `poll_interval_ms`; it no longer has them.
 <!-- W2b: crates/orch-cli/src/commands/run.rs serve_once (serve:started mode=once only; serve:finished result,
 exit_code) and serve/logger.rs log() (ts, level, event, fields) at 6acc62db. The 0.13.0 samples were removed
-because their serve:started fields no longer match; I2 captures a fresh sample. -->
+because their serve:started fields no longer match. -->
 
 **Start-up warnings.** Right after `serve:started`, and before the batch starts any work, `serve --once` logs
 one `serve:diagnostic` warning for each effort warning
