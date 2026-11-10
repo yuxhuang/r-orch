@@ -164,9 +164,12 @@ impl Orchestrator {
                 continue;
             }
             if let Err(err) = self.dispatch_task_to(state, &task.id, remote_only).await {
-                if matches!(err, Error::Domain(DomainError::Workspace { .. })) {
-                    self.record_workspace_dispatch_failure(state, &task.id, &all_tasks, &err)
-                        .await;
+                if matches!(err, Error::Domain(DomainError::Workspace { .. }))
+                    && self
+                        .record_workspace_dispatch_failure(state, &task.id, Some(&all_tasks), &err)
+                        .await
+                {
+                    let _ = self.save_state(state).await;
                 }
                 self.emit_error(&err, format!("dispatch task {}", task.id));
             }
@@ -216,17 +219,68 @@ impl Orchestrator {
     /// swallowed: being unable to *record* a dispatch error must not stop the
     /// remaining dispatches. The daemon's phased launch records through it
     /// too, so both dispatch paths account a failed workspace the same way.
+    ///
+    /// `all_tasks` is only needed by the cascade; `None` lists the store when
+    /// (and only when) the attempt is the last. Returns whether `state`
+    /// changed (a retry queued or dropped), which the caller persists.
+    ///
+    /// If that list fails, the attempt is still saved, with the task left
+    /// `retrying` and a back-off queued: the probe happened, but failing the
+    /// task without its cascade would strand the dependents.
+    /// [`Self::finish_unrecorded_final_failure`] completes it without another
+    /// probe.
     pub(super) async fn record_workspace_dispatch_failure(
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
-        all_tasks: &[Task],
+        all_tasks: Option<&[Task]>,
         err: &Error,
-    ) {
+    ) -> bool {
+        self.record_dispatch_failure(state, task_id, all_tasks, &err.to_string(), true)
+            .await
+    }
+
+    /// Record the failure of a final attempt that is counted but could not
+    /// be recorded (see [`final_failure_unrecorded`]): no probe, no attempt.
+    /// The cascade reason is the one the failed probe queued with its retry.
+    pub(super) async fn finish_unrecorded_final_failure(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+    ) -> bool {
+        let reason = state
+            .retry_queue
+            .iter()
+            .find(|retry| retry.task_id == task_id)
+            .map_or_else(
+                || "workspace preparation failed".to_owned(),
+                |retry| retry.error.clone(),
+            );
+        self.record_dispatch_failure(state, task_id, None, &reason, false)
+            .await
+    }
+
+    /// `probed`: a preparation just failed and costs an attempt. Without it
+    /// the attempt is already counted, and only a task still waiting for its
+    /// final failure to be recorded is touched.
+    async fn record_dispatch_failure(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        all_tasks: Option<&[Task]>,
+        err: &str,
+        probed: bool,
+    ) -> bool {
+        // A goal pause holds only the dispatch gate while it cancels queued
+        // tasks, and this task is still queued. Read and save under the gate,
+        // or a save from a read made before the cancel undoes it. Callers hold
+        // `state`, never the gate; it is released before the cascade and the
+        // retry, which do not need it.
+        let dispatch = self.deps().task_service.dispatch_gate.lock().await;
         let task = match self.deps().task_store.get(task_id).await {
             Ok(Some(task)) => task,
             // Gone: no attempt to account for.
-            Ok(None) => return,
+            Ok(None) => return false,
             // An unreadable task is not an absent one — see the same
             // distinction in `force_task_cancelled`. Silently skipping the
             // failure accounting would lose an attempt and leave the task
@@ -236,15 +290,15 @@ impl Orchestrator {
                     err,
                     format!("read task {task_id} after a workspace failure"),
                 );
-                return;
+                return false;
             }
         };
-        if is_terminal(task.status) {
-            return;
+        if is_terminal(task.status) || (!probed && !final_failure_unrecorded(&task)) {
+            return false;
         }
 
         let updated = Task {
-            attempts: task.attempts + 1,
+            attempts: task.attempts + u32::from(probed),
             updated_at: self.deps().clock.now_iso(),
             ..task
         };
@@ -253,9 +307,52 @@ impl Orchestrator {
             status: next_status,
             ..updated
         };
+        // Read before the save: a final attempt recorded without its cascade
+        // would leave the dependents blocked on a failed task.
+        let listed;
+        let all_tasks = match all_tasks {
+            Some(all_tasks) => all_tasks,
+            None if next_status == TaskStatus::Failed => {
+                match self.deps().task_store.list(&Default::default()).await {
+                    Ok(tasks) => {
+                        listed = tasks;
+                        &listed
+                    }
+                    Err(error) => {
+                        self.emit_error(
+                            error,
+                            format!("list tasks after a workspace failure of {task_id}"),
+                        );
+                        // Count the probe now; record the failure once the
+                        // store can be read, after a back-off, not by a new
+                        // probe (or a hot loop of reads).
+                        if probed {
+                            let pending = Task {
+                                status: TaskStatus::Retrying,
+                                ..updated
+                            };
+                            if self.deps().task_store.save(&pending).await.is_err() {
+                                return false;
+                            }
+                        }
+                        drop(dispatch);
+                        let delay = calculate_retry_delay(
+                            updated.attempts.saturating_sub(1),
+                            self.config().scheduling.retry_base_delay_ms,
+                            self.config().scheduling.retry_max_delay_ms,
+                        );
+                        state.retry_queue.retain(|retry| retry.task_id != task_id);
+                        self.enqueue_retry(state, task_id, updated.attempts, delay, err);
+                        return true;
+                    }
+                }
+            }
+            None => &[],
+        };
         if self.deps().task_store.save(&updated).await.is_err() {
-            return;
+            return false;
         }
+        drop(dispatch);
 
         if next_status == TaskStatus::Failed {
             // Patch the in-memory list rather than re-reading from disk: the
@@ -277,20 +374,18 @@ impl Orchestrator {
                 &format!("dependency {} failed: {err}", updated.id),
             )
             .await;
+            // A finished recording leaves its back-off behind.
+            let queued = state.retry_queue.len();
+            state.retry_queue.retain(|retry| retry.task_id != task_id);
+            state.retry_queue.len() != queued
         } else {
             let delay = calculate_retry_delay(
                 updated.attempts.saturating_sub(1),
                 self.config().scheduling.retry_base_delay_ms,
                 self.config().scheduling.retry_max_delay_ms,
             );
-            self.enqueue_retry(
-                state,
-                &updated.id,
-                updated.attempts,
-                delay,
-                &err.to_string(),
-            );
-            let _ = self.save_state(state).await;
+            self.enqueue_retry(state, &updated.id, updated.attempts, delay, err);
+            true
         }
     }
 
@@ -1267,6 +1362,14 @@ pub(super) fn mirror_controller(task: &Task) -> Option<&str> {
     task.labels
         .iter()
         .find_map(|label| label.strip_prefix("remote-ctl:"))
+}
+
+/// A `retrying` task with no attempt left: its final pre-launch failure is
+/// counted, but recording it (failing the task and its dependents) is still
+/// to do. Nothing else leaves a task there: a failure with no attempt left
+/// fails it, and `retry` resets the count.
+pub(super) fn final_failure_unrecorded(task: &Task) -> bool {
+    task.status == TaskStatus::Retrying && task.attempts >= task.max_attempts
 }
 
 /// Whether `task_id` has a retry queued that is not yet due. An entry whose
