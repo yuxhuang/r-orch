@@ -2501,29 +2501,51 @@ fn a_relative_attachment_path_resolves_against_the_project_root_not_the_server_c
 
 // ── remote agents in the agent tools ──────────────────────────────────────
 
-/// A registered peer `peer` with a stored snapshot holding one agent, which is
-/// a copy of the local agent `local` renamed. Returns the remote agent's id.
-fn project_with_remote_snapshot(fx: &Fx, local: &str) -> String {
+/// A local agent and a registered peer `peer` whose stored snapshot holds a
+/// renamed copy. Returns the fixture and the remote agent's id.
+fn project_with_remote_snapshot() -> (Fx, String) {
+    let fx = Fx::new();
+    let local = fx.agent("near");
     fx.cli_plain(&["remote", "add", "peer", "127.0.0.1:9"]);
-    let mut remote_agent = fx.cli(&["agent", "status", local]);
+    let mut remote_agent = fx.cli(&["agent", "status", &local]);
     remote_agent["id"] = json!("agt_remote1");
     remote_agent["name"] = json!("far-away");
     let mut status = fx.cli(&["remote", "status"])["remotes"][0].clone();
     status["agents"] = json!([remote_agent]);
-    std::fs::create_dir_all(fx.root().join(".orchestry/remotes")).expect("remotes dir");
+    // The link owns this file and republishes its cached status even while
+    // blocked by the test hook. Seed it with no daemon running, so the new
+    // link loads our agent before its first publication, then keep it offline.
+    let Fx { server, mut dir } = fx;
+    drop(server);
+    dir.stop_daemon();
+    std::fs::create_dir_all(dir.path().join(".orchestry/remotes")).expect("remotes dir");
     std::fs::write(
-        fx.root().join(".orchestry/remotes/peer.json"),
+        dir.path().join(".orchestry/remotes/peer.json"),
         status.to_string(),
     )
     .expect("write snapshot");
-    "agt_remote1".to_owned()
+    let block = dir.path().join("peer-block");
+    std::fs::write(&block, b"").expect("write the peer block file");
+    dir.start_daemon_with_env(&[("ORCH_TEST_PEER_BLOCK_FILE", &block)]);
+    let mut fx = Fx::on(dir, &[], &[]);
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || {
+            fx.ok("remote_status", json!({}))["remotes"][0]["last_error"]
+                == "Peer link blocked by test hook"
+        }),
+        "the daemon's link never republished the seeded snapshot on the test hook"
+    );
+    assert_eq!(
+        fx.cli(&["remote", "status"])["remotes"][0]["agents"][0]["id"],
+        "agt_remote1",
+        "the link must retain the seeded agent when it republishes status"
+    );
+    (fx, "agt_remote1".to_owned())
 }
 
 #[test]
 fn agent_list_includes_stored_remote_snapshots_exactly_as_the_cli_does() {
-    let mut fx = Fx::new();
-    let local = fx.agent("near");
-    project_with_remote_snapshot(&fx, &local);
+    let (mut fx, _) = project_with_remote_snapshot();
     let listed = fx.ok("agent_list", json!({}));
     assert_eq!(listed, fx.cli(&["agent", "list"]));
     assert_eq!(listed.as_array().expect("agents").len(), 2, "{listed}");
@@ -2531,9 +2553,7 @@ fn agent_list_includes_stored_remote_snapshots_exactly_as_the_cli_does() {
 
 #[test]
 fn agent_show_resolves_a_qualified_remote_agent_like_the_cli() {
-    let mut fx = Fx::new();
-    let local = fx.agent("near");
-    let remote = project_with_remote_snapshot(&fx, &local);
+    let (mut fx, remote) = project_with_remote_snapshot();
     let qualified = format!("{remote}@peer");
     assert_eq!(
         fx.ok("agent_show", json!({"id": qualified})),
@@ -2543,9 +2563,7 @@ fn agent_show_resolves_a_qualified_remote_agent_like_the_cli() {
 
 #[test]
 fn a_remote_agent_cannot_be_mutated_through_the_agent_tools() {
-    let mut fx = Fx::new();
-    let local = fx.agent("near");
-    let remote = project_with_remote_snapshot(&fx, &local);
+    let (mut fx, remote) = project_with_remote_snapshot();
     let qualified = format!("{remote}@peer");
     fx.tool_error("agent_enable", json!({"id": qualified}));
     fx.tool_error(
