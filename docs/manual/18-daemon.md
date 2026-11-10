@@ -52,13 +52,16 @@ What the daemon does **not** promise:
   them ([Recovery](#recovery)).
 - A request whose reply was lost has an unknown outcome.
 - Another program that edits `.orchestry/` while the daemon runs is not kept out.
-- **Read times that do not depend on writes.** Reads and writes go through one queue in the daemon, served in
-  the order they arrive, and every write waits until the disk confirms it is stored. So a read such as
-  `orch task list` or `orch status` waits for the writes queued ahead of it. During a burst of writes, for example
-  when many tasks fail before their agent starts and each failure is recorded, reads are slower until the burst
-  ends. The wait is per read and finite, and it grows with how long your disk takes to confirm a write. Nothing
-  is lost and nothing needs recovery. A request that cannot start within 10 s is refused without being run
-  (exit 7); none was in the measurement below. What to do: [Commands are slow while many tasks fail to
+- **Read times that do not depend on writes.** Reads such as `orch task list` and `orch status` share a FIFO
+  operation boundary with failure-record writes: each read waits behind operations already queued to acquire
+  that boundary. This orders boundary acquisition, not every request's network arrival; some external operations
+  do work outside it. These store writes await file sync and attempt a best-effort parent-directory sync before
+  releasing the boundary. During a failure-recording burst, reads can take longer, depending in part on
+  durable-write latency. The measured finite burst below converged with working storage; this is not a bound
+  on a read whose storage operation hangs. Queueing alone needs no state recovery; storage errors and hung
+  operations need their own diagnosis. An ordinary request still waiting to acquire the boundary after 10 s is
+  refused without being run (`Overloaded`, `NotExecuted`, exit 7); this is not a completion deadline once work
+  starts. No sampled read was refused in the measurement below. What to do: [Commands are slow while many tasks fail to
   start](../RUNBOOK.md#orch-commands-are-slow-while-many-tasks-fail-to-start).
 
   Measured on an Apple M5 Max (macOS 27.2) with a release build of commit `a08fad1b`, on a shared machine at
@@ -69,9 +72,11 @@ What the daemon does **not** promise:
   command, `task list` p95 was 27.61 ms against 30.84 ms for an idle project measured at the same time, and
   `status` 21.00 ms against 20.05 ms. These are observations on one machine, not promised bounds.
 <!-- A6 (tsk_I57BLvA), decision-tsk_DKbRFg5-f1b-acceptance.md. Queue: crates/orch-engine/src/container/operation.rs:130
-(tokio Mutex, FIFO) and crates/orch-daemon/src/coordinator.rs:153 (every non-external request, reads included);
+(tokio Mutex, FIFO acquisition) and crates/orch-daemon/src/coordinator.rs:153 (non-external requests, reads included);
 10 s refusal coordinator.rs:163-164, exit 7 crates/orch-proto/src/error.rs:64; durable write
-crates/orch-infra/src/storage/fs_utils.rs:97,134; all at b97fc59a. Numbers only from the "Paragraph approved for
+crates/orch-infra/src/storage/fs_utils.rs:97 (awaited file sync),128-135 (best-effort directory sync);
+all at b97fc59a, unchanged at 8a4c9eb4. External operations: crates/orch-daemon/src/ops/mod.rs:234-256.
+Numbers only from the "Paragraph approved for
 documentation" of perf-eng-pr2b-f1b-reverdict-a08fad1b.md (tsk_KwZ1rOH). -->
 
 ## Command reference

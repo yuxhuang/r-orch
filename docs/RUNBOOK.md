@@ -219,36 +219,56 @@ at cd0fd4c0 (tech-writer-stop-timeout-n1-ba1c717.md). Not reproduced at f70fc707
 
 **Symptom.** Dispatch is on and many tasks fail before their agent starts, for example because their workspace
 cannot be prepared. Meanwhile `orch task list`, `orch status`, the dashboard and MCP tools take noticeably longer
-than usual. They still succeed.
+than usual. In the [measured burst](manual/18-daemon.md#why-a-daemon), every sampled read succeeded; other requests
+can be refused at admission.
 
-**Cause.** The daemon records every failed start with writes that wait until the disk confirms them, and it
-serves reads and writes through one queue in arrival order, so each read waits for the writes ahead of it. This
-is a stated non-guarantee, not a fault: see
+**Cause.** Reads such as `orch task list` and `orch status` share a FIFO operation boundary with failure-record
+writes: each read waits behind operations already queued to acquire that boundary. This orders boundary
+acquisition, not every request's network arrival; some external operations do work outside it. These store
+writes await file sync and attempt a best-effort parent-directory sync before releasing the boundary. Read times
+depending on writes are a stated non-guarantee: see
 [What the daemon does not promise](manual/18-daemon.md#why-a-daemon).
 
 **What to check.**
 
 1. `orch daemon status` answers and shows `dispatch ON`. If it does not answer, this is not the entry: see
    [No orch daemon is running](#no-orch-daemon-is-running-for-project-root).
-2. `orch task list --status retrying` lists the tasks waiting for another attempt; `orch task show <id>` shows
-   how many they have used, for example `retrying · attempt 1/3`.
-3. Why they fail: `orch --json status` shows each waiting retry with its error in `state.retry_queue`, for
-   example `"error": "workspace_mode \"worktree\" requires a git repository"`. Once a task has used its last
-   attempt the reason is no longer shown anywhere (pending fix, task tsk_ajCzJGN), so read it while the tasks are
-   still `retrying`.
+2. `orch task list --status retrying` lists tasks waiting for another attempt and exhausted tasks awaiting
+   final-failure recording; `orch task show <id>` shows the attempts already used, for example
+   `retrying · attempt 1/3`.
+3. Why they fail: `orch --json status` shows each waiting retry's error in `state.retry_queue[].error`, for
+   example `"error": "workspace_mode \"worktree\" requires a git repository"`. Once terminal `failed` is recorded,
+   the failed task and status retry queue no longer retain its workspace failure reason (pending PR-4 fix,
+   task tsk_R3FGvVF, continuing tsk_ajCzJGN). An exhausted `retrying · attempt 3/3` can still carry the reason
+   while final-failure recording is pending, so read it while the task is still `retrying`.
 
-**Fix.** None is needed for the slowness: it stops by itself. Each task makes its last attempt (`max_attempts`, 3
-unless set; [How orch retries by itself](manual/04-tasks.md#how-orch-retries-by-itself)) and is then `failed`;
-when every task in the burst has failed, the writes stop and read times return to normal. No state is lost and
-nothing needs recovery. To end the burst sooner, `orch daemon dispatch off` stops the daemon starting tasks,
-retries included. Fix the cause the errors name, then `orch task retry <id>` for each failed task and
-`orch daemon dispatch on`.
+**Fix.** For a finite burst with working storage, preparations stop at each task's attempt limit (`max_attempts`,
+3 unless set; [How orch retries by itself](manual/04-tasks.md#how-orch-retries-by-itself)). After final-failure
+recording succeeds, those tasks are `failed` and the burst's writes cease. Queueing alone needs no state
+recovery. This does not promise convergence or normal read times with failed or hung storage. If a cascade-list
+read fails during final recording, a task can remain exhausted `retrying` with its error and back-off; subsequent
+back-offs retry the recording without another workspace preparation. Resolve storage errors first. Two
+consecutive preparation-release errors can retain an agent reservation; cancelling the task does not free it.
+After storage recovery, explicitly stop and start the daemon to clear the reservation; this recovery is
+code-audited, not an end-to-end fault-recovery test result.
 
-If a command instead fails with exit 7 after about 10 s, the daemon could not start it in time and did not run
-it: retry it.
+To stop future starts and retries sooner, use `orch daemon dispatch off`; it does not cancel a preparation
+already executing or free a retained reservation. Fix the cause the errors name, then `orch task retry <id>`
+for each failed task and `orch daemon dispatch on`.
+
+If the error is `daemon operation queue is full or admission timed out` (`Overloaded`, `NotExecuted`), the
+request was not run and can be retried. An ordinary request still waiting to acquire the boundary after 10 s
+is refused this way; this is not a completion deadline for work already started. If the error instead says
+`request outcome unknown`, inspect state before retrying: the request may have applied. Exit 7 or elapsed time
+alone does not establish that nothing ran.
 <!-- A6 (tsk_I57BLvA). Queue and durable writes: see the comment under manual 18 "What the daemon does not promise".
 Steps 1-3 and the dispatch-off line run on a throwaway project with release a08fad1b (worktree agent in a non-git
-project); retry_queue error from orch --json status; reason gone after the last attempt: tsk_ajCzJGN. -->
+project); retry_queue error from orch --json status; reason gone once terminal failed is recorded:
+tsk_ajCzJGN (PR-4 continuation tsk_R3FGvVF). Corrections at 8a4c9eb4: dispatch.rs:313-346 and daemon.rs:278-283
+keep exhausted retrying/back-off after a cascade-list read error, retrying only recording. Reservation:
+daemon.rs:167-169,889-905; daemon/shutdown.rs:98-114; recovery.rs:368-371. Safe retry:
+coordinator.rs:150-190; orch-client/src/call.rs:62-65; orch-proto/src/error.rs:250-254,292-307.
+Fact-check tsk_FUuRgp8 reused isolated runtime evidence; restart recovery is code-audited only. -->
 
 ---
 
