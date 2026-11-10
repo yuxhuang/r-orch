@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use orch_client::testing::{FakeServer, fake_transport};
@@ -73,21 +73,30 @@ impl FakeDaemon {
     }
 
     fn log(&self) -> Vec<String> {
-        self.log.lock().unwrap().clone()
+        self.log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn instance(&self) -> String {
-        self.instance.lock().unwrap().clone()
+        self.instance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Script the `n`th subscription (0-based).
     fn script(&self, n: usize, script: Script) {
-        let scripts = self.scripts.lock().unwrap();
+        let scripts = self.scripts.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(scripts[n].send(script).is_ok(), "subscription alive");
     }
 
     fn subscriptions(&self) -> usize {
-        self.scripts.lock().unwrap().len()
+        self.scripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -100,7 +109,7 @@ fn task(id: &str) -> Task {
 fn change(store: Store, id: Option<&str>, commit_seq: u64) -> EventBody {
     EventBody::Change {
         store,
-        id: id.map(|id| Id::new(id).unwrap()),
+        id: id.map(|id| Id::new(id).expect("scripted entity ID is valid")),
         kind: if id.is_some() {
             ChangeKind::Created
         } else {
@@ -111,7 +120,7 @@ fn change(store: Store, id: Option<&str>, commit_seq: u64) -> EventBody {
 }
 
 async fn ok<T: Serialize>(peer: &mut FakeServer, id: orch_proto::frame::RequestId, seq: u64, v: T) {
-    let ok = serde_json::value::to_raw_value(&v).unwrap();
+    let ok = serde_json::value::to_raw_value(&v).expect("scripted response serializes");
     let _ = peer
         .send(&OkFrame {
             id,
@@ -124,21 +133,32 @@ async fn ok<T: Serialize>(peer: &mut FakeServer, id: orch_proto::frame::RequestI
 async fn serve(mut peer: FakeServer, daemon: Arc<FakeDaemon>) {
     let instance = daemon.instance();
     if peer
-        .accept(Id::new(instance.clone()).unwrap())
+        .accept(Id::new(instance.clone()).expect("scripted instance ID is valid"))
         .await
         .is_err()
     {
         return;
     }
     while let Ok(Some(frame)) = peer.recv().await {
-        daemon.log.lock().unwrap().push(frame.req.name().to_owned());
+        daemon
+            .log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(frame.req.name().to_owned());
         let seq = daemon.commit_seq.load(Ordering::SeqCst);
         match frame.req {
             Request::Subscribe(args) => {
-                daemon.subscribes.lock().unwrap().push(args);
+                daemon
+                    .subscribes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(args);
                 let (tx, mut rx) = mpsc::unbounded_channel();
                 let subscription = {
-                    let mut scripts = daemon.scripts.lock().unwrap();
+                    let mut scripts = daemon
+                        .scripts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
                     scripts.push(tx);
                     scripts.len() as u64
                 };
@@ -154,9 +174,17 @@ async fn serve(mut peer: FakeServer, daemon: Arc<FakeDaemon>) {
                 )
                 .await;
                 if subscription == 1
-                    && let Some(body) = daemon.push_before_bootstrap.lock().unwrap().take()
+                    && let Some(body) = daemon
+                        .push_before_bootstrap
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
                 {
-                    let tx = daemon.scripts.lock().unwrap()[0].clone();
+                    let tx = daemon
+                        .scripts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)[0]
+                        .clone();
                     let _ = tx.send(Script::Event { seq: 1, body });
                 }
                 while let Some(script) = rx.recv().await {
@@ -164,7 +192,8 @@ async fn serve(mut peer: FakeServer, daemon: Arc<FakeDaemon>) {
                         Script::Event { seq, body } => {
                             let ev = Event {
                                 subscription,
-                                instance: Id::new(instance.clone()).unwrap(),
+                                instance: Id::new(instance.clone())
+                                    .expect("scripted instance ID is valid"),
                                 seq,
                                 body,
                             };
@@ -196,7 +225,11 @@ async fn serve(mut peer: FakeServer, daemon: Arc<FakeDaemon>) {
                 .await;
             }
             Request::TaskList(_) => {
-                let tasks = daemon.tasks.lock().unwrap().clone();
+                let tasks = daemon
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
                 ok(&mut peer, frame.id, seq, tasks).await;
             }
             Request::TaskCreate(_) => {
@@ -232,7 +265,9 @@ async fn serve(mut peer: FakeServer, daemon: Arc<FakeDaemon>) {
             Request::DaemonStatus(_) => {
                 use orch_proto::ops::results::{DaemonStatus, DispatchState, OwnershipStatus};
                 use orch_proto::path::WirePath;
-                let path = |p: &str| WirePath::new(PathBuf::from(p)).unwrap();
+                let path = |p: &str| {
+                    WirePath::new(PathBuf::from(p)).expect("scripted absolute path is valid")
+                };
                 let status = DaemonStatus {
                     pid: 1,
                     project_root: path("/fake"),
@@ -317,14 +352,14 @@ impl Fixture {
     }
 
     fn launch_with(daemon: Arc<FakeDaemon>) -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".orchestry")).unwrap();
+        let dir = tempfile::tempdir().expect("create isolated fake project");
+        std::fs::create_dir(dir.path().join(".orchestry")).expect("create fake project marker");
         let root = dir.path().to_path_buf();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .unwrap();
+            .expect("create fake daemon runtime");
         let connector = connector(&daemon, &root);
         let stop = Arc::new(AtomicBool::new(false));
         let backend = rt
@@ -345,7 +380,9 @@ impl Fixture {
     }
 
     fn backend(&mut self) -> &mut DaemonBackend {
-        self.backend.as_mut().unwrap()
+        self.backend
+            .as_mut()
+            .expect("fixture backend lives until drop")
     }
 
     /// Poll `f` against the backend until it yields, or fail after 5 s.
@@ -405,7 +442,12 @@ fn tui_subscribes_to_every_store_and_the_bus_before_its_first_read() {
         "subscribe must precede the bootstrap: {log:?}"
     );
     assert_eq!(log[0], "subscribe", "nothing is read before it: {log:?}");
-    let args = fixture.daemon.subscribes.lock().unwrap()[0].clone();
+    let args = fixture
+        .daemon
+        .subscribes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)[0]
+        .clone();
     let mut stores: Vec<_> = args.stores.iter().copied().collect();
     stores.sort_by_key(|s| format!("{s:?}"));
     let mut every = EVERY_STORE.to_vec();
@@ -463,7 +505,10 @@ fn tui_one_observation_feed_carries_changes_and_bus_and_no_logs_follow_opens() {
 #[test]
 fn tui_a_change_committed_between_subscribe_and_the_bootstrap_is_not_lost() {
     let daemon = FakeDaemon::new();
-    *daemon.push_before_bootstrap.lock().unwrap() = Some(change(Store::Tasks, Some("tsk_9"), 101));
+    *daemon
+        .push_before_bootstrap
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(change(Store::Tasks, Some("tsk_9"), 101));
     let mut fixture = Fixture::launch_with(daemon);
     let observed = fixture.wait_for("the early change", |b| {
         let got = b.poll_observations();
@@ -589,7 +634,11 @@ fn tui_a_new_daemon_instance_on_resubscribe_is_a_lost_session() {
     let mut fixture = Fixture::launch();
     fixture.wait_subscriptions(1);
     // The daemon was restarted: the next session welcomes another instance.
-    *fixture.daemon.instance.lock().unwrap() = "inst-b".into();
+    *fixture
+        .daemon
+        .instance
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = "inst-b".into();
     fixture.daemon.script(
         0,
         Script::Event {
@@ -645,8 +694,8 @@ fn drive_the_real_dashboard_loop_against_the_fake_daemon() {
         return;
     };
     let control = PathBuf::from(control);
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".orchestry")).unwrap();
+    let dir = tempfile::tempdir().expect("create isolated fake project");
+    std::fs::create_dir(dir.path().join(".orchestry")).expect("create fake project marker");
     let daemon = FakeDaemon::new();
     let connector = connector(&daemon, dir.path());
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -664,7 +713,11 @@ fn drive_the_real_dashboard_loop_against_the_fake_daemon() {
                 let seq = script.commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
                 let mut pushed = task("tsk_push");
                 pushed.title = "Pushed by another client — no poll".into();
-                script.tasks.lock().unwrap().push(pushed);
+                script
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(pushed);
                 let subscription = script.subscriptions() - 1;
                 script.script(
                     subscription,
