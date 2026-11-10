@@ -46,7 +46,8 @@ pub mod command;
 pub mod connect;
 pub mod no_daemon;
 
-#[cfg(test)]
+// `orch_client::testing` exists only in debug builds (S3-api seam).
+#[cfg(all(test, debug_assertions))]
 mod push_tests;
 
 pub use backend::DaemonBackend;
