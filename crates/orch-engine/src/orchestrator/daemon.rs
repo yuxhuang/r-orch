@@ -62,6 +62,21 @@ impl Orchestrator {
         skip_autonomous_seeding: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Result<()> {
+        self.deps()
+            .events
+            .operation_boundary()
+            .with_source(
+                crate::container::commit::CommitSource::Tick,
+                Box::pin(self.daemon_tick_with_guard_inner(skip_autonomous_seeding, cancelled)),
+            )
+            .await
+    }
+
+    async fn daemon_tick_with_guard_inner(
+        &self,
+        skip_autonomous_seeding: bool,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<()> {
         let candidates =
             self.deps()
                 .events

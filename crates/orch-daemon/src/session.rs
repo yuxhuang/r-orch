@@ -421,7 +421,10 @@ impl Server {
             queue,
             budget: Arc::new(Semaphore::new(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION)),
         };
-        let writer = tokio::spawn(write_loop(write, queued));
+        let events = crate::hub::EventOutput::new(Arc::clone(&outbox.budget));
+        base.event_output = Some(Arc::clone(&events));
+        let mut event_closed = events.closed();
+        let writer = tokio::spawn(write_loop(write, queued, Arc::clone(&events)));
         // The reader task owns partial-line state, so cancelling a select
         // never loses half a frame.
         let (lines, mut incoming) = mpsc::channel(1);
@@ -435,6 +438,7 @@ impl Server {
                 biased;
                 () = crate::session::until_set(&mut drain) => break,
                 () = outbox.queue.closed() => break,
+                () = until_set(&mut event_closed) => break,
                 next = incoming.recv() => next,
             };
             while inflight.try_join_next().is_some() {}
@@ -503,6 +507,8 @@ impl Server {
             ));
         }
         reading.abort();
+        let _ = reading.await;
+        events.close();
         // Cancel observations first so streams end; started writes finish and
         // their cleanup is ordered behind them by the handler.
         if let Err(error) = self.handler.disconnect(session_id).await {
@@ -515,7 +521,14 @@ impl Server {
         // Requests still running are daemon-owned; detach them.
         inflight.detach_all();
         drop(outbox);
-        let _ = tokio::time::timeout(DRAIN_TIMEOUT, writer).await;
+        let mut writer = writer;
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+            let _ = writer.await;
+        }
     }
 }
 
@@ -657,10 +670,48 @@ async fn read_loop<R: AsyncRead + Unpin>(
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut write: W, mut queued: mpsc::Receiver<Queued>) {
-    while let Some(frame) = queued.recv().await {
+enum Outbound {
+    Reply(Queued),
+    Event(crate::hub::QueuedEvent),
+}
+impl Outbound {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Reply(frame) => &frame.bytes,
+            Self::Event(frame) => &frame.bytes,
+        }
+    }
+}
+
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut write: W,
+    mut queued: mpsc::Receiver<Queued>,
+    events: Arc<crate::hub::EventOutput>,
+) {
+    let mut closed = events.closed();
+    loop {
+        if *closed.borrow() {
+            return;
+        }
+        // Register before inspecting queues: a concurrent publication cannot
+        // fall between the empty check and arming the wake.
+        let notified = events.ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let frame = if let Ok(frame) = queued.try_recv() {
+            Outbound::Reply(frame)
+        } else if let Some(frame) = events.pop() {
+            Outbound::Event(frame)
+        } else {
+            tokio::select! {
+                biased;
+                () = until_set(&mut closed) => return,
+                frame = queued.recv() => match frame { Some(frame) => Outbound::Reply(frame), None => break },
+                () = &mut notified => continue,
+            }
+        };
         let written = tokio::time::timeout(WRITE_TIMEOUT, async {
-            write.write_all(&frame.bytes).await?;
+            write.write_all(frame.bytes()).await?;
             write.flush().await
         })
         .await;
@@ -709,6 +760,15 @@ fn run_request(
         match result {
             Ok(committed) => {
                 tracing::debug!(op = name, id = id.0.get(), elapsed_ms, "ok");
+                let subscription = if name == "subscribe" {
+                    serde_json::from_str::<orch_proto::ops::results::SubscribeAck>(
+                        committed.value.get(),
+                    )
+                    .ok()
+                    .map(|ack| ack.subscription)
+                } else {
+                    None
+                };
                 send_ok(
                     &outbox,
                     id,
@@ -717,6 +777,13 @@ fn run_request(
                     next_part,
                 )
                 .await;
+                // The ack is in the writer queue before buffered events can
+                // become visible. The writer always takes responses first.
+                if let Some(subscription) = subscription
+                    && let Some(events) = &base.event_output
+                {
+                    events.activate(subscription);
+                }
             }
             Err(err) => {
                 tracing::debug!(op = name, id = id.0.get(), code = ?err.code, execution = ?err.execution, elapsed_ms, "err");
@@ -917,6 +984,105 @@ mod tests {
             send_hello(&mut stream, &hello(&daemon)).await;
             assert!(eof(&mut stream).await, "no byte may reach {peer:?}");
         }
+        assert_eq!(daemon.running.shutdown().await.code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_ack_then_snapshot_then_matching_change() {
+        let daemon = start(false, None).await;
+        let mut stream = session(&daemon).await;
+        send(
+            &mut stream,
+            r#"{"id":1,"req":{"op":"context.set","args":{"key":"before","value":"v"}}}"#,
+        )
+        .await;
+        assert!(line(&mut stream).await.unwrap().contains("commit_seq"));
+        send(
+            &mut stream,
+            r#"{"id":2,"req":{"op":"subscribe","args":{"stores":["context"]}}}"#,
+        )
+        .await;
+        let ack: serde_json::Value =
+            serde_json::from_str(&line(&mut stream).await.unwrap()).unwrap();
+        assert_eq!(
+            ack["ok"]["seq"], 0,
+            "ack is cursor origin, not the baseline"
+        );
+        let baseline = ack["commit_seq"].as_u64().unwrap();
+        assert!(baseline > 0);
+        send(
+            &mut stream,
+            r#"{"id":3,"req":{"op":"context.list","args":{}}}"#,
+        )
+        .await;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&line(&mut stream).await.unwrap()).unwrap();
+        assert_eq!(snapshot["id"], 3);
+        assert!(snapshot["commit_seq"].as_u64().unwrap() >= baseline);
+        send(
+            &mut stream,
+            r#"{"id":4,"req":{"op":"context.set","args":{"key":"after","value":"secret-canary"}}}"#,
+        )
+        .await;
+        let mut pushed = None;
+        for _ in 0..2 {
+            let raw = line(&mut stream).await.unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame.get("ev").is_some() {
+                assert!(
+                    !raw.contains("secret-canary"),
+                    "invalidations never carry entity contents"
+                );
+                pushed = Some(frame);
+            }
+        }
+        let pushed = pushed.expect("write delivered an invalidation");
+        assert_eq!(pushed["ev"]["seq"], 1);
+        assert_eq!(pushed["ev"]["store"], "context");
+        assert!(pushed["ev"]["commit_seq"].as_u64().unwrap() > baseline);
+        drop(stream);
+        assert_eq!(daemon.running.shutdown().await.code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_push_consumer_does_not_block_control() {
+        let daemon = start(false, None).await;
+        let (client, server_stream) = tokio::io::duplex(64);
+        daemon.running.server.admit(server_stream, me());
+        let mut stalled = BufReader::new(client);
+        send_hello(&mut stalled, &hello(&daemon)).await;
+        assert!(matches!(reply(&mut stalled).await, Reply::Welcome(_)));
+        send(
+            &mut stalled,
+            r#"{"id":1,"req":{"op":"subscribe","args":{"stores":["state"]}}}"#,
+        )
+        .await;
+        let ack: serde_json::Value =
+            serde_json::from_str(&line(&mut stalled).await.unwrap()).unwrap();
+        assert_eq!(ack["ok"]["seq"], 0);
+        let boundary = daemon.running.handler.engine.operation_boundary();
+        for _ in 0..600 {
+            boundary
+                .run(false, async {
+                    boundary.note_store(orch_engine::container::commit::CommitStore::State);
+                })
+                .await;
+        }
+        let mut control = session(&daemon).await;
+        send(
+            &mut control,
+            r#"{"id":2,"req":{"op":"dispatch.set","args":{"dispatch":"off"}}}"#,
+        )
+        .await;
+        let response = tokio::time::timeout(Duration::from_secs(2), line(&mut control))
+            .await
+            .expect("control remains responsive")
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 2);
+        assert!(response.get("ok").is_some(), "{response}");
+        drop(stalled);
+        drop(control);
         assert_eq!(daemon.running.shutdown().await.code, 0);
     }
 

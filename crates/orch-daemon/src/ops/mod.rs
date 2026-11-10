@@ -45,6 +45,7 @@ pub struct OpContext {
     pub request_id: Option<RequestId>,
     pub parts: Option<tokio::sync::mpsc::Sender<Part>>,
     pub cancelled: Arc<AtomicBool>,
+    pub(crate) event_output: Option<Arc<crate::hub::EventOutput>>,
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -59,6 +60,7 @@ impl OpContext {
             request_id: None,
             parts: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            event_output: None,
         }
     }
 
@@ -96,7 +98,7 @@ pub struct ServiceHandler {
     pub(crate) coordinator: Arc<ProjectCoordinator>,
     control: Arc<control::ControlState>,
     transfers: Arc<Mutex<transport::Transfers>>,
-    pub(crate) subscriptions: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
+    pub(crate) hub: Arc<crate::hub::Hub>,
     observations: Arc<Mutex<Observations>>,
     requests: Arc<lifetime::Requests>,
 }
@@ -119,13 +121,22 @@ impl ServiceHandler {
         diagnostics: Arc<orch_infra::models::SnapshotDiscoveryRuntime>,
     ) -> Self {
         engine.orchestrator.enable_daemon_mode();
+        let hub = Arc::new(crate::hub::Hub::default());
+        let weak = Arc::downgrade(&hub);
+        engine
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |publication| {
+                if let Some(hub) = weak.upgrade() {
+                    hub.publish(publication);
+                }
+            })));
         Self {
             engine: Arc::clone(&engine),
             diagnostics,
             coordinator,
             control: Arc::new(control::ControlState::new(&engine)),
             transfers: Arc::new(Mutex::new(transport::Transfers::default())),
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            hub,
             observations: Arc::new(Mutex::new(HashMap::new())),
             requests: Arc::default(),
         }
@@ -179,10 +190,7 @@ impl ServiceHandler {
     /// Session teardown discards transfers/observers; accepted state work is
     /// owned by the dispatcher task and is allowed to finish.
     pub async fn disconnect(&self, session_id: u64) -> OpResult<()> {
-        self.subscriptions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&session_id);
+        self.hub.disconnect(session_id);
         self.observations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -321,7 +329,10 @@ macro_rules! implement_handler {
                     tokio::spawn(async move {
                         let _lease = lease;
                         let _observation = observation;
-                        handler.execute_inner(context, request).await
+                        handler.engine.operation_boundary().with_source(
+                            orch_engine::container::commit::CommitSource::Rpc,
+                            Box::pin(handler.execute_inner(context, request)),
+                        ).await
                     }).await
                         .map_err(|_| ErrorBody::new(orch_proto::error::ErrorCode::General,
                             "daemon operation task failed", orch_proto::error::Execution::Unknown))?

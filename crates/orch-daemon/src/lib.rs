@@ -36,6 +36,7 @@ mod env;
 mod error;
 mod gitignore;
 mod guard;
+mod hub;
 pub mod lifecycle;
 mod listener;
 pub mod ops;
