@@ -22,7 +22,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const READY: Duration = Duration::from_secs(30);
@@ -219,18 +221,10 @@ pub fn output_and_pid(mut cmd: Command, within: Duration) -> (Output, u32) {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap();
     let pid = child.id();
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let err = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
+    let (out, err) = (
+        spawn_drain(child.stdout.take().unwrap()),
+        spawn_drain(child.stderr.take().unwrap()),
+    );
     let deadline = Instant::now() + within;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -246,14 +240,55 @@ pub fn output_and_pid(mut cmd: Command, within: Duration) -> (Output, u32) {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    // The child has exited, so everything it wrote is already in the pipe.
+    // EOF can still be withheld: a process spawned concurrently by another
+    // thread (an `orch mcp` bridge, a tmux server) may have inherited this
+    // pipe's write end between its creation and its close-on-exec flag (the
+    // pipe is not created atomically on macOS), and it holds it for as long
+    // as it lives. Wait for EOF only briefly, then take what was read.
+    let grace = Instant::now() + EOF_GRACE;
+    while !(out.done.load(Ordering::SeqCst) && err.done.load(Ordering::SeqCst))
+        && Instant::now() < grace
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
     (
         Output {
             status,
-            stdout: out.join().unwrap(),
-            stderr: err.join().unwrap(),
+            stdout: std::mem::take(&mut out.buf.lock().unwrap()),
+            stderr: std::mem::take(&mut err.buf.lock().unwrap()),
         },
         pid,
     )
+}
+
+/// How long a finished child's output pipes may stay open before the output
+/// read so far is taken as complete.
+const EOF_GRACE: Duration = Duration::from_secs(2);
+
+/// A pipe being read to EOF on its own thread; `buf` is readable at any time.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: Arc<AtomicBool>,
+}
+
+fn spawn_drain(mut pipe: impl Read + Send + 'static) -> Drain {
+    let drain = Drain {
+        buf: Arc::default(),
+        done: Arc::default(),
+    };
+    let (buf, done) = (drain.buf.clone(), drain.done.clone());
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        while let Ok(n) = pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.lock().unwrap().extend_from_slice(&chunk[..n]);
+        }
+        done.store(true, Ordering::SeqCst);
+    });
+    drain
 }
 
 /// Poll `probe` until it yields a value (an external effect with no push

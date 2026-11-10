@@ -30,8 +30,12 @@
 //!    its writer's last acknowledged write;
 //! 3. **nothing acknowledged is missing**: every id a client was told about
 //!    exists on disk, in the entity file and the index;
-//! 4. **no context key lost on renewal**: the renewed key survives every
-//!    sweep, while keys nobody renewed are gone (expiry really ran);
+//! 4. **no context key lost on renewal**: while the sweeps run, the renewed
+//!    key is readable whenever its last renewal is provably within its TTL
+//!    (judged live by the observer, and once more after the stop), while
+//!    keys nobody renewed are gone (expiry really ran). The clock starts only
+//!    when every leg (TUI, short key, renewer) has done its first piece of
+//!    work, and the renewer keeps renewing until just before the daemon stop;
 //! 5. **no swallowed errors**: no client operation failed and the daemon's
 //!    log carries no error line.
 
@@ -60,6 +64,16 @@ fn stress_duration() -> Duration {
 /// between renewals' lifetimes and must never be collected while renewed.
 const LIVE_TTL_MS: u64 = 1500;
 const SHORT_TTL_MS: u64 = 1000;
+/// Slack when deciding that a renewal is "certainly still alive".
+const LIVE_MARGIN: Duration = Duration::from_millis(250);
+
+/// A renewal sent at `sent` cannot have expired at `at`: the daemon stamps
+/// the expiry when it RECEIVES the request (>= `sent`) and removes a key
+/// only after that expiry, so `sent + TTL` is a lower bound of the expiry.
+/// Past this window a missing key is legitimate expiry, not a lost renewal.
+fn certainly_alive(sent: Instant, at: Instant) -> bool {
+    at.saturating_duration_since(sent) + LIVE_MARGIN < Duration::from_millis(LIVE_TTL_MS)
+}
 
 // ── shared bookkeeping ─────────────────────────────────────────────────────
 
@@ -77,6 +91,15 @@ struct Shared {
     labels: Writer,
     priority: Writer,
     live: Writer,
+    /// Set after the other clients have finished, just before the daemon is
+    /// stopped: the renewer outlives `stop` so the renewed key's last
+    /// renewal is as close to the stop as possible (see `judge`).
+    renew_stop: AtomicBool,
+    /// What the CLI creator is doing and since when (for a stuck-run report).
+    creator_stage: Mutex<(String, Instant)>,
+    /// `(n, sent, acked)` of the last acknowledged renewal of `live`: the
+    /// renewal number and the instants it was sent and acknowledged.
+    live_times: Mutex<Option<(u64, Instant, Instant)>>,
     failures: Mutex<Vec<String>>,
     created: Mutex<Created>,
 }
@@ -98,6 +121,16 @@ impl Shared {
     }
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+    fn renewing(&self) -> bool {
+        !self.renew_stop.load(Ordering::SeqCst)
+    }
+    /// Record that renewal `n`, sent at `sent`, has just been acknowledged.
+    /// The pair is published under one lock so a reader never combines
+    /// renewal `n`'s number with another renewal's send time.
+    fn live_acked(&self, n: u64, sent: Instant) {
+        *self.live_times.lock().unwrap() = Some((n, sent, Instant::now()));
+        self.live.acked.store(n, Ordering::SeqCst);
     }
 }
 
@@ -168,10 +201,13 @@ fn spawn_cli_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>, worker: String)
         while !shared.stopped() {
             n += 1;
             let step = |what: &str, result: Result<String, String>| -> Option<String> {
+                *shared.creator_stage.lock().unwrap() =
+                    (format!("#{n} after {what}"), Instant::now());
                 result
                     .map_err(|err| shared.fail(format!("cli creator {what} #{n}: {err}")))
                     .ok()
             };
+            *shared.creator_stage.lock().unwrap() = (format!("#{n} starting"), Instant::now());
             // Every third task is runnable by the worker, so the tick and
             // the collector write too.
             let title = format!("c4-{n}");
@@ -281,7 +317,8 @@ fn spawn_mcp_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>) -> JoinHandle<(
     std::thread::spawn(move || {
         let mut mcp = mcp_client(&sandbox);
         let mut n = 0_u64;
-        while !shared.stopped() {
+        // Outlives `stop`: it renews until just before the daemon is stopped.
+        while shared.renewing() {
             n += 1;
             let result = (|| -> Result<(), String> {
                 let task = mcp_ok(&mcp.call_tool("task_add", json!({"title": format!("m2-{n}")})))?;
@@ -294,11 +331,12 @@ fn spawn_mcp_creator(sandbox: Arc<Sandbox>, shared: Arc<Shared>) -> JoinHandle<(
                 // The renewal under test: a TTL'd key re-set before each sweep
                 // could collect it.
                 shared.live.attempted.store(n, Ordering::SeqCst);
+                let sent = Instant::now();
                 mcp_ok(&mcp.call_tool(
                     "context_set",
                     json!({"key": "live", "value": format!("live-{n}"), "ttl": LIVE_TTL_MS}),
                 ))?;
-                shared.live.acked.store(n, Ordering::SeqCst);
+                shared.live_acked(n, sent);
                 let mut created = shared.created.lock().unwrap();
                 created.tasks.insert(id);
                 created.context.insert(key);
@@ -497,7 +535,8 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
     spawn_client_thread(sandbox, shared, "renewer", move |client, shared| {
         Box::pin(async move {
             let mut n = 0_u64;
-            while !shared.stopped() {
+            // Outlives `stop`: it renews until just before the daemon is stopped.
+            while shared.renewing() {
                 n += 1;
                 let task = client
                     .task_create(new_task(&format!("m2-{n}"), None))
@@ -511,6 +550,7 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
                     })
                     .await?;
                 shared.live.attempted.store(n, Ordering::SeqCst);
+                let sent = Instant::now();
                 client
                     .context_set(ContextSetArgs {
                         key: Id::new("live").unwrap(),
@@ -518,7 +558,7 @@ fn spawn_client_renewer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<()
                         ttl_ms: Some(LIVE_TTL_MS),
                     })
                     .await?;
-                shared.live.acked.store(n, Ordering::SeqCst);
+                shared.live_acked(n, sent);
                 {
                     let mut created = shared.created.lock().unwrap();
                     created.tasks.insert(task.id);
@@ -645,6 +685,69 @@ fn spawn_observer(
     })
 }
 
+/// No context key lost on renewal, judged while the daemon's sweeps run:
+/// `live` is renewed far inside its TTL, so whenever the last acknowledged
+/// renewal is provably still alive the key must be readable, at that renewal
+/// or a newer one. Returns how many reads were judged and the violations.
+fn spawn_live_observer(sandbox: &Sandbox, shared: Arc<Shared>) -> JoinHandle<(u64, Vec<String>)> {
+    let config = client_config(sandbox, orch_proto::handshake::CallerKind::Web);
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (mut checks, mut violations) = (0_u64, Vec::new());
+            let mut client = match orch_client::Client::connect(&config).await {
+                Ok(client) => client,
+                Err(err) => return (checks, vec![format!("live observer connect: {err:?}")]),
+            };
+            while !shared.stopped() {
+                let renewal = *shared.live_times.lock().unwrap();
+                let read = client
+                    .context_get(orch_proto::ops::args::ContextGetArgs {
+                        key: orch_proto::bounded::Id::new("live").unwrap(),
+                    })
+                    .await;
+                let read_done = Instant::now();
+                let entry = match read {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        violations.push(format!("live observer read: {err:?}"));
+                        break;
+                    }
+                };
+                if let Some((n, sent, _)) = renewal
+                    && certainly_alive(sent, read_done)
+                {
+                    checks += 1;
+                    let age = read_done.saturating_duration_since(sent).as_millis();
+                    let seq = client.last_commit_seq().unwrap_or(0);
+                    match entry
+                        .as_ref()
+                        .and_then(|e| parse_counter("live-", &e.value))
+                    {
+                        None => violations.push(format!(
+                            "LOST RENEWAL: `live` reads {entry:?} {age}ms after renewal #{n} \
+                             was sent (ttl {LIVE_TTL_MS}ms, commit_seq {seq})"
+                        )),
+                        Some(m) if m < n => violations.push(format!(
+                            "LOST RENEWAL: `live` rolled back to live-{m} after renewal #{n} \
+                             was acknowledged (commit_seq {seq})"
+                        )),
+                        Some(m) if m > shared.live.attempted.load(Ordering::SeqCst) => {
+                            violations.push(format!("`live` reads live-{m}, a value never sent"));
+                        }
+                        Some(_) => {}
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            (checks, violations)
+        })
+    })
+}
+
 // ── the TUI client ─────────────────────────────────────────────────────────
 
 fn spawn_tui_driver(pane: Arc<TuiPane>, shared: Arc<Shared>) -> JoinHandle<()> {
@@ -674,6 +777,107 @@ fn spawn_tui_driver(pane: Arc<TuiPane>, shared: Arc<Shared>) -> JoinHandle<()> {
             std::thread::sleep(Duration::from_millis(800));
         }
     })
+}
+
+/// How long a leg may take to get going before the run is declared broken.
+const LEGS_READY: Duration = Duration::from_secs(60);
+
+/// Block until the run has evidence from every leg its assertions speak
+/// about: the TUI has created a task (processes fleet), a never-renewed short
+/// key has been set, and `live` has been renewed at least once.
+fn wait_until_every_leg_works(
+    shared: &Shared,
+    pane: Option<&TuiPane>,
+    fleet: Fleet,
+    daemon: &DaemonChild,
+) {
+    let deadline = Instant::now() + LEGS_READY;
+    loop {
+        let (tui, short, live) = {
+            let created = shared.created.lock().unwrap();
+            (
+                !created.tui_titles.is_empty(),
+                !created.short_keys.is_empty(),
+                shared.live_times.lock().unwrap().is_some(),
+            )
+        };
+        let tui = tui || fleet != Fleet::Processes;
+        if tui && short && live {
+            return;
+        }
+        let failures = shared.failures.lock().unwrap().clone();
+        assert!(
+            failures.is_empty(),
+            "a client failed before every leg was running: {failures:#?}"
+        );
+        if let Some(pane) = pane
+            && pane.has_exited()
+        {
+            panic!(
+                "the TUI exited with status {} before it created a task; screen:\n{}",
+                pane.exit_code(),
+                pane.screen()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after {LEGS_READY:?} not every leg was working (tui created a task: {tui}, \
+             short key set: {short}, live renewed: {live}); TUI screen:\n{}\n\
+             CLI creator: {}; orch processes:\n{}\ndaemon log tail:\n{}",
+            pane.map_or_else(|| "(no TUI)".to_owned(), TuiPane::screen),
+            {
+                let (stage, since) = &*shared.creator_stage.lock().unwrap();
+                format!("{stage} {}ms ago", since.elapsed().as_millis())
+            },
+            orch_processes(&process_table())
+                .iter()
+                .map(|p| format!("  pid {} ppid {} {}", p.pid, p.ppid, p.command))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            daemon
+                .stderr()
+                .lines()
+                .rev()
+                .take(30)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Named instants of one run, for the failure messages: a judgement that
+/// depends on elapsed time must say how much elapsed.
+struct Marks {
+    started: Instant,
+    marks: Vec<(&'static str, Instant)>,
+}
+
+impl Marks {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            marks: Vec::new(),
+        }
+    }
+    fn note(&mut self, name: &'static str) {
+        self.marks.push((name, Instant::now()));
+    }
+    fn at(&self, name: &str) -> Instant {
+        self.marks
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("mark {name} was never taken"))
+            .1
+    }
+    /// `name=+ms` since the clients started, in the order taken.
+    fn render(&self) -> String {
+        self.marks
+            .iter()
+            .map(|(name, at)| format!("{name}=+{}ms", at.duration_since(self.started).as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 // ── offline judgement ──────────────────────────────────────────────────────
@@ -828,11 +1032,8 @@ fn run_stress(fleet: Fleet) {
     let sandbox = Arc::new(Sandbox::new());
     sandbox.init_project();
     let mut daemon = start_ready(&sandbox, &["--dispatch", "on"], "owner");
-    let Fixtures {
-        worker,
-        parked,
-        hot,
-    } = fixtures(&sandbox);
+    let fixtures = fixtures(&sandbox);
+    let (worker, hot) = (fixtures.worker.clone(), fixtures.hot.clone());
 
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
@@ -841,6 +1042,9 @@ fn run_stress(fleet: Fleet) {
         labels: Writer::default(),
         priority: Writer::default(),
         live: Writer::default(),
+        renew_stop: AtomicBool::new(false),
+        creator_stage: Mutex::new(("not started".into(), Instant::now())),
+        live_times: Mutex::new(None),
         failures: Mutex::default(),
         created: Mutex::default(),
     });
@@ -848,8 +1052,10 @@ fn run_stress(fleet: Fleet) {
     fs::create_dir(&patch_dir).unwrap();
 
     // ── launch every client ──
+    let mut marks = Marks::new(Instant::now());
     let mut pane = None;
     let mut threads = Vec::new();
+    let renewer;
     match fleet {
         Fleet::Processes => {
             let tui = Arc::new(TuiPane::launch_at(
@@ -887,7 +1093,7 @@ fn run_stress(fleet: Fleet) {
                 patch_dir.clone(),
                 hot.clone(),
             ));
-            threads.push(spawn_mcp_creator(sandbox.clone(), shared.clone()));
+            renewer = spawn_mcp_creator(sandbox.clone(), shared.clone());
             threads.push(spawn_tui_driver(tui.clone(), shared.clone()));
             pane = Some(tui);
         }
@@ -911,11 +1117,21 @@ fn run_stress(fleet: Fleet) {
                 shared.clone(),
                 worker.clone(),
             ));
-            threads.push(spawn_client_renewer(&sandbox, shared.clone()));
+            renewer = spawn_client_renewer(&sandbox, shared.clone());
         }
     }
+
+    // ── the clock starts when every leg is really running ──
+    // A leg that is slow to start (a TUI in a cold tmux, an emulated CPU)
+    // must not eat the run: the assertions below claim that the TUI created
+    // a task, that a short key outlived its TTL and that `live` was renewed,
+    // so the run is `duration` of ALL of them working, not of whoever was
+    // ready first.
+    wait_until_every_leg_works(&shared, pane.as_deref(), fleet, &daemon);
+    marks.note("legs_ready");
     let started = Instant::now();
     let observer = spawn_observer(&sandbox, shared.clone(), hot.clone());
+    let live_observer = spawn_live_observer(&sandbox, shared.clone());
 
     // ── let them fight ──
     let duration = stress_duration();
@@ -923,6 +1139,7 @@ fn run_stress(fleet: Fleet) {
         std::thread::sleep(Duration::from_millis(100));
     }
     shared.stop.store(true, Ordering::SeqCst);
+    marks.note("stop_flag");
     let mut panicked = Vec::new();
     for thread in threads {
         if let Err(payload) = thread.join() {
@@ -930,6 +1147,8 @@ fn run_stress(fleet: Fleet) {
         }
     }
     let report = observer.join().unwrap();
+    let (live_checks, live_violations) = live_observer.join().unwrap();
+    marks.note("clients_joined");
 
     // The TUI survived the whole run on the daemon.
     if let Some(pane) = &pane {
@@ -947,10 +1166,23 @@ fn run_stress(fleet: Fleet) {
         );
     }
 
+    marks.note("tui_quit");
+
+    // The renewer ran through all of the above; stop it only now so `live`
+    // was renewed as close to the daemon stop as it can be.
+    shared.renew_stop.store(true, Ordering::SeqCst);
+    if let Err(payload) = renewer.join() {
+        panicked.push(format!("{payload:?}"));
+    }
+    marks.note("renewer_joined");
+
     // ── stop the owner so every write is on disk, then judge offline ──
+    marks.note("daemon_stop_sent");
     let stop = sandbox.run(&["daemon", "stop"]);
     assert!(stop.status.success(), "{}", text(&stop.stderr));
+    marks.note("daemon_stop_acked");
     let status = daemon.wait_exit(READY);
+    marks.note("daemon_exited");
     assert_eq!(status.code(), Some(0), "daemon: {}", daemon.stderr());
 
     let failures = shared.failures.lock().unwrap().clone();
@@ -971,8 +1203,18 @@ fn run_stress(fleet: Fleet) {
         report.reads,
         &report.violations[..report.violations.len().min(10)]
     );
+    assert!(
+        live_violations.is_empty(),
+        "{} lost renewals in {live_checks} judged reads, first: {:#?}",
+        live_violations.len(),
+        &live_violations[..live_violations.len().min(10)]
+    );
+    assert!(
+        live_checks >= 10,
+        "`live` was judged only {live_checks} times: the renewals never kept it provably alive"
+    );
 
-    judge(&sandbox, &shared, &hot, &worker, &parked, duration, fleet);
+    judge(&sandbox, &shared, &fixtures, duration, fleet, &marks);
     let log = daemon.stderr();
     let bad: Vec<_> = log
         .lines()
@@ -987,12 +1229,16 @@ fn run_stress(fleet: Fleet) {
 fn judge(
     sandbox: &Sandbox,
     shared: &Shared,
-    hot: &str,
-    worker: &str,
-    parked: &str,
+    fixtures: &Fixtures,
     duration: Duration,
     fleet: Fleet,
+    marks: &Marks,
 ) {
+    let Fixtures {
+        worker,
+        parked,
+        hot,
+    } = fixtures;
     let state = sandbox.state_dir();
     let tasks = assert_store_consistent(&state, "tasks", ".yml", "id");
     let goals = assert_store_consistent(&state, "goals", ".yml", "id");
@@ -1070,13 +1316,46 @@ fn judge(
     for key in &created.context {
         assert!(context.contains_key(key), "no-TTL key {key} lost");
     }
+    // `live` after the stop. The daemon's sweep stops when the stop is
+    // handled (before the stop command returns), so a renewal sent at `sent`
+    // is certain to be there only if the stop was acknowledged inside its TTL.
+    // Later than that it may legitimately have expired (a slow join, a slow
+    // emulated CPU): then it may be gone, but it must never be a value that
+    // is not the last acknowledged renewal. The in-run check in the observer
+    // is what proves no renewal is lost while the sweeps run.
     let live_acked = acked(&shared.live);
-    assert_eq!(
-        context.get("live").map(|record| record["value"].clone()),
-        Some(json!(format!("live-{live_acked}"))),
-        "the renewed key was lost or rolled back"
+    let (n, live_sent, live_ack_at) = shared
+        .live_times
+        .lock()
+        .unwrap()
+        .expect("live was never renewed");
+    assert_eq!(n, live_acked, "the renewal record and the counter disagree");
+    let rel = |at: Instant| at.duration_since(marks.started).as_millis();
+    let stop_acked = marks.at("daemon_stop_acked");
+    let live_now = context.get("live").map(|record| record["value"].clone());
+    let timeline = format!(
+        "last renewal live-{live_acked} sent +{}ms acked +{}ms (ttl {LIVE_TTL_MS}ms); \
+         stop acked {}ms after it was sent; {}",
+        rel(live_sent),
+        rel(live_ack_at),
+        stop_acked.saturating_duration_since(live_sent).as_millis(),
+        marks.render()
     );
-    let ended = Instant::now();
+    if certainly_alive(live_sent, stop_acked) {
+        assert_eq!(
+            live_now,
+            Some(json!(format!("live-{live_acked}"))),
+            "the renewed key was lost or rolled back inside its TTL: {timeline}"
+        );
+    } else if let Some(value) = live_now {
+        assert_eq!(
+            value,
+            json!(format!("live-{live_acked}")),
+            "the renewed key was rolled back: {timeline}"
+        );
+    }
+    // The sweep stopped when the daemon was stopped, not when we looked.
+    let ended = stop_acked;
     let expired: Vec<_> = created
         .short_keys
         .iter()
