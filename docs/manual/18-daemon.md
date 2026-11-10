@@ -496,7 +496,7 @@ other way of running work asks the running daemon:
 | Command | What it does now |
 |---|---|
 | `orch serve`, `orch run --watch` | Start the daemon in the foreground with dispatch **on**, like `orch daemon start --dispatch on`, with the same refusals. If a daemon already runs, exit 4 with `Use: orch daemon dispatch on`; a daemon that runs with dispatch off is not resumed for you. |
-| `orch serve --listen`, `orch run --watch --listen` | The same, with the peer-link listener on. Against a running daemon: exit 4, with the same `Use: orch daemon dispatch on` hint as without `--listen`; a listener is never added to a running daemon. To listen, `orch daemon stop`, then start again with `--listen`. |
+| `orch serve --listen`, `orch run --watch --listen` | The same, with the peer-link listener on. Against a running daemon: exit 4, with the hint `Peer options apply only at start. Use: orch daemon stop, then run this command again` (also for `--peer-name`); a listener is never added to a running daemon. To listen, `orch daemon stop`, then start again with `--listen`. |
 | `orch run --once` | One scheduling check in the running daemon, with that check's events; it does not stop the daemon or change dispatch. |
 | `orch run <task-id>` | Start that task in the running daemon and follow it until it ends. Disconnecting stops following, not the run. The usual eligibility, capacity and cancel checks apply, except that a `retrying` task starts at once instead of waiting out its retry delay, as in orch 0.13.0. A task that cannot start exits 1 with `task is not eligible for launch`. |
 | `orch run --all` | One finite batch of the currently eligible tasks in the running daemon, with the same results as before. |
