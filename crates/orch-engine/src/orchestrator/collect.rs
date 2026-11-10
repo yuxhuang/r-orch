@@ -78,6 +78,8 @@ pub(super) struct Collected {
 impl Orchestrator {
     /// Drain an adapter's event stream into the run log and the event bus,
     /// then hand off to the success or failure handler.
+    /// Never await a collector inside an operation: nested boundaries would
+    /// join it and buffer the whole stream under the project permit.
     pub(super) async fn collect_events(
         &self,
         mut events: BoxStream<'static, std::result::Result<AgentEvent, AdapterError>>,
@@ -183,6 +185,9 @@ impl Orchestrator {
         .await
     }
 
+    /// Handle one input in its own operation. Never call the surrounding
+    /// collector from inside an operation: nested boundaries would join it
+    /// and buffer the whole stream under the project permit.
     pub(super) async fn record_event(
         &self,
         collected: &mut Collected,

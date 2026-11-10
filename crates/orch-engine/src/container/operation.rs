@@ -357,6 +357,54 @@ mod metadata_tests {
     }
 
     #[tokio::test]
+    async fn one_operation_delivers_one_thousand_events_in_order_after_release() {
+        let bus = EventBus::new();
+        let boundary = bus.operation_boundary();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let weak = Arc::downgrade(&boundary);
+        let _listener = bus.on_any(move |event| {
+            if let OrchestratorEvent::AgentOutput { data, .. } = event {
+                let released = weak.upgrade().unwrap().gate.try_lock().is_ok();
+                sink.lock().unwrap().push((data.clone(), released));
+            }
+        });
+        let mut receiver = bus.subscribe();
+        boundary
+            .run(false, async {
+                for n in 0..1000 {
+                    bus.emit(OrchestratorEvent::AgentOutput {
+                        run_id: "run_many".into(),
+                        agent_id: "agent_many".into(),
+                        data: n.to_string(),
+                    });
+                }
+                assert!(
+                    observed.lock().unwrap().is_empty(),
+                    "listener ran under permit"
+                );
+                assert!(
+                    receiver.try_drain().is_empty(),
+                    "broadcast emitted under permit"
+                );
+            })
+            .await;
+        let observed = observed.lock().unwrap();
+        let broadcast = receiver.try_drain();
+        assert_eq!(broadcast.len(), 1000);
+        assert_eq!(observed.len(), 1000);
+        for (n, (data, released)) in observed.iter().enumerate() {
+            assert_eq!(data, &n.to_string());
+            assert!(released, "listener ran under permit");
+            let OrchestratorEvent::AgentOutput { data, .. } = broadcast[n].as_ref() else {
+                panic!("expected output");
+            };
+            assert_eq!(data, &n.to_string());
+        }
+        assert!(receiver.try_drain().is_empty(), "no duplicates");
+    }
+
+    #[tokio::test]
     async fn nested_metadata_is_published_once_after_release() {
         let boundary = Arc::new(OperationBoundary::new());
         let records = capture(&boundary);

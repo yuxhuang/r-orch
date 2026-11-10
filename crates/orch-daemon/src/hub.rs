@@ -959,6 +959,101 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_thousand_buffered_events_preserve_listeners_and_lag_without_blocking_control() {
+        use crate::ops::Handler;
+        use orch_proto::ops::args::DaemonStatusArgs;
+        let (_temp, root) = crate::dispatch::tests::project().await;
+        let running =
+            crate::lifecycle::Running::bring_up(crate::dispatch::tests::bring_up(&root, None))
+                .await
+                .unwrap();
+        let boundary = running.engine.operation_boundary();
+        let output = output();
+        assert!(running.handler.hub.register(
+            999,
+            Some(output.clone()),
+            1,
+            Id::new("daemon_test").unwrap(),
+            boundary.current_commit_seq(),
+            args(r#"{"stores":[],"bus":true}"#)
+        ));
+        output.activate(1);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let _listener = running.engine.events.on_any(move |event| {
+            if let OrchestratorEvent::AgentOutput { data, .. } = event {
+                lock(&sink).push(data.clone());
+            }
+        });
+        let (entered, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let producer = {
+            let (engine, entered, release) =
+                (running.engine.clone(), entered.clone(), release.clone());
+            tokio::spawn(async move {
+                engine
+                    .operation_boundary()
+                    .run(false, async {
+                        for n in 0..1000 {
+                            engine.events.emit(OrchestratorEvent::AgentOutput {
+                                run_id: "run_many".into(),
+                                agent_id: "agent_many".into(),
+                                data: n.to_string(),
+                            });
+                        }
+                        entered.notify_one();
+                        release.notified().await;
+                    })
+                    .await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            lock(&observed).is_empty(),
+            "no listener delivery under permit"
+        );
+        assert!(output.pop().is_none(), "no hub delivery under permit");
+        let ctx = crate::lifecycle::internal_context();
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), producer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *lock(&observed),
+            (0..1000).map(|n| n.to_string()).collect::<Vec<_>>(),
+            "exactly once in emit order"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            Handler::daemon_status(&running.handler, &ctx, DaemonStatusArgs {}),
+        )
+        .await
+        .expect("control while subscriber is stalled")
+        .unwrap();
+        let mut queued = 0;
+        let mut lagged = false;
+        while let Some(frame) = output.pop() {
+            queued += 1;
+            let event = serde_json::from_slice::<EventFrame>(&frame.bytes)
+                .unwrap()
+                .ev;
+            match event.body {
+                EventBody::Resync {
+                    reason: ResyncReason::Lagged,
+                } => lagged = true,
+                EventBody::Bus(_) => {}
+                other => panic!("unexpected body: {other:?}"),
+            }
+        }
+        assert!(lagged, "256-cap subscriber requires lag resync");
+        assert!(queued <= limits::MAX_QUEUED_EVENTS_PER_SUBSCRIPTION);
+        running.handler.hub.disconnect(999);
+        assert!(running.shutdown().await.clean);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tick_spawned_completion_publishes_collector_task_change() {
         use crate::ops::Handler;
         use orch_proto::ops::args::*;
