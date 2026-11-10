@@ -734,10 +734,59 @@ async fn linked_idle_peer_wake_ticks_over_ten_seconds() {
     })
     .await
     .unwrap();
+    // Forward the unchanged protocol between the two real runtimes. Count
+    // observed heartbeats rather than inferring them from elapsed time.
+    use orch_peer::codec::{read_frame, write_frame};
+    use orch_peer::protocol::Frame;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::BufReader;
+    use tokio::net::{TcpListener, TcpStream};
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap().to_string();
+    let heartbeats = Arc::new(std::array::from_fn::<_, 4, _>(|_| AtomicUsize::new(0)));
+    let synced = Arc::new(AtomicBool::new(false));
+    let proxy = {
+        let heartbeats = heartbeats.clone();
+        let synced = synced.clone();
+        tokio::spawn(async move {
+            let (controller, _) = proxy_listener.accept().await.unwrap();
+            // A reconnect cannot silently produce another measurement window.
+            drop(proxy_listener);
+            let worker = TcpStream::connect(addr).await.unwrap();
+            let (controller_read, controller_write) = controller.into_split();
+            let (worker_read, worker_write) = worker.into_split();
+            let relay = |read, mut write: tokio::net::tcp::OwnedWriteHalf, direction: usize| {
+                let heartbeats = heartbeats.clone();
+                let synced = synced.clone();
+                async move {
+                    let mut read = BufReader::new(read);
+                    while let Some(frame) = read_frame(&mut read).await.unwrap() {
+                        write_frame(&mut write, &frame).await.unwrap();
+                        match frame {
+                            Frame::Ping => {
+                                heartbeats[direction * 2].fetch_add(1, Ordering::SeqCst);
+                            }
+                            Frame::Pong => {
+                                heartbeats[direction * 2 + 1].fetch_add(1, Ordering::SeqCst);
+                            }
+                            Frame::SyncState { .. } => {
+                                synced.store(true, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            };
+            tokio::join!(
+                relay(controller_read, worker_write, 0),
+                relay(worker_read, controller_write, 1)
+            );
+        })
+    };
     orch_infra::storage::remote::FileRemoteStore::new(controller.engine.paths.clone())
         .add(orch_domain::RemoteConfig {
             alias: "worker".into(),
-            addr,
+            addr: proxy_addr,
             added_at: controller.engine.clock.now_iso(),
         })
         .await
@@ -765,7 +814,7 @@ async fn linked_idle_peer_wake_ticks_over_ten_seconds() {
                 tokio::fs::read(controller.engine.paths.remotes_dir().join("worker.json")).await
             {
                 let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                if value["online"] == true {
+                if value["online"] == true && synced.load(Ordering::SeqCst) {
                     break;
                 }
             }
@@ -774,8 +823,10 @@ async fn linked_idle_peer_wake_ticks_over_ten_seconds() {
     })
     .await
     .expect("linked controller");
-    // Let startup/ON commits and a full heartbeat window finish first.
-    tokio::time::sleep(Duration::from_millis(1600)).await;
+    // Sync has replied. Settle startup/ON and a full five-second heartbeat
+    // period before measuring another ten seconds on the same connection.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let before = heartbeats.each_ref().map(|n| n.load(Ordering::SeqCst));
     let mut worker_events = worker.engine.events.subscribe();
     let mut controller_events = controller.engine.events.subscribe();
     let worker_records = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -795,6 +846,17 @@ async fn linked_idle_peer_wake_ticks_over_ten_seconds() {
             })));
     }
     let worker_seq = worker.coordinator.current_commit_seq();
+    let output = crate::hub::EventOutput::new(Arc::new(tokio::sync::Semaphore::new(
+        orch_proto::frame::limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION,
+    )));
+    assert!(worker.hub.register(
+        99, Some(output.clone()), 1,
+        orch_proto::bounded::Id::new("idle-worker").unwrap(), worker_seq,
+        serde_json::from_value(serde_json::json!({
+            "stores": ["tasks", "goals", "agents", "messages", "context", "teams", "runs", "config", "state", "remote"]
+        })).unwrap(),
+    ));
+    output.activate(1);
     let started = std::time::Instant::now();
     tokio::time::sleep(Duration::from_secs(10)).await;
     let elapsed = started.elapsed();
@@ -811,21 +873,41 @@ async fn linked_idle_peer_wake_ticks_over_ten_seconds() {
         "idle_peer_wake: elapsed_ms={} controller_ticks={controller_ticks} worker_ticks={worker_ticks}",
         elapsed.as_millis()
     );
+    let observed: [usize; 4] =
+        std::array::from_fn(|i| heartbeats[i].load(Ordering::SeqCst) - before[i]);
+    println!(
+        "idle_peer_heartbeats: controller_ping={} controller_pong={} worker_ping={} worker_pong={}",
+        observed[0], observed[1], observed[2], observed[3]
+    );
     println!("idle_worker_commits: {:?}", worker_records.lock().unwrap());
+    assert!(
+        !proxy.is_finished(),
+        "one linked session throughout the window"
+    );
+    let exchanges = observed[0].min(observed[3]) + observed[2].min(observed[1]);
+    println!("idle_peer_heartbeat_exchanges: {exchanges}");
+    assert!(
+        exchanges >= 2,
+        "at least two real heartbeat exchanges: {observed:?}"
+    );
+    assert!(
+        worker_records.lock().unwrap().is_empty(),
+        "zero worker commits"
+    );
+    assert!(output.pop().is_none(), "zero all-stores events or resyncs");
+    println!("idle_worker_subscription: events=0 resyncs=0 commits=0");
     assert_eq!(worker_ticks, 0, "idle worker outbox/sweep must not wake");
     assert_eq!(
         worker.coordinator.current_commit_seq(),
         worker_seq,
         "idle worker must not commit"
     );
-    // This value is a measurement for CP7, not a release latency/count gate.
-    assert!(
-        controller_ticks > 0,
-        "real controller status commits remain eligible"
-    );
+    // The observed controller cost goes to CP7; keep only the ruled rate cap.
+    assert!(controller_ticks <= 1 + elapsed.as_millis().div_ceil(500) as usize);
     quit.send_replace(true);
     worker_loop.await.unwrap();
     controller_loop.await.unwrap();
     controller_runtime.shutdown().await;
     worker_runtime.shutdown().await;
+    proxy.abort();
 }

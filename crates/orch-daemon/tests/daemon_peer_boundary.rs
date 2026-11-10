@@ -494,3 +494,89 @@ async fn stop_joins_an_outbound_link_waiting_for_its_peer() {
     );
     drop(quiet);
 }
+
+/// Heartbeats keep the worker's ordered phase but publish no state change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_heartbeats_take_the_permit_without_subscriber_events() {
+    let daemon = DaemonHarness::builder()
+        .maintenance_timer(false)
+        .listen("127.0.0.1:0")
+        .peer_name("heartbeat-worker")
+        .start()
+        .await
+        .unwrap();
+    let mut peer = Peer::new(
+        TcpStream::connect(listener_addr(&daemon).await)
+            .await
+            .unwrap(),
+    );
+    peer.send(&Frame::Hello {
+        proto: PROTOCOL,
+        instance_id: "heartbeat-controller".into(),
+        name: "ctl".into(),
+        os: "test".into(),
+        agents: vec![],
+        version: None,
+    })
+    .await;
+    peer.next(DEADLINE, |f| matches!(f, Frame::Welcome { .. }))
+        .await
+        .expect("welcome");
+    peer.send(&Frame::Sync { active: vec![] }).await;
+    peer.next(DEADLINE, |f| matches!(f, Frame::SyncState { .. }))
+        .await
+        .expect("sync fence");
+    let mut subscriber = Raw::session(&daemon, "cli", "normal").await;
+    ok(&subscriber.request(1, "subscribe", json!({
+        "stores": ["tasks", "goals", "agents", "messages", "context", "teams", "runs", "config", "state", "remote"]
+    })).await);
+    let boundary = daemon.engine().operation_boundary();
+    let seq = boundary.current_commit_seq();
+    peer.send(&Frame::Ping).await;
+    peer.next(DEADLINE, |f| matches!(f, Frame::Pong))
+        .await
+        .expect("exact Pong reply");
+    assert_eq!(boundary.current_commit_seq(), seq, "Ping must not commit");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), subscriber.recv())
+            .await
+            .is_err(),
+        "Ping published an event or resync"
+    );
+    peer.send(&Frame::Pong).await;
+    // The following Sync reply fences processing of the preceding Pong.
+    peer.send(&Frame::Sync { active: vec![] }).await;
+    peer.next(DEADLINE, |f| matches!(f, Frame::SyncState { .. }))
+        .await
+        .expect("Pong fence");
+    assert_eq!(boundary.current_commit_seq(), seq, "Pong must not commit");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), subscriber.recv())
+            .await
+            .is_err(),
+        "Pong published an event or resync"
+    );
+
+    let held = Held::take(&daemon).await;
+    peer.send(&Frame::Ping).await;
+    assert!(
+        peer.next(HELD_FOR, |f| matches!(f, Frame::Pong))
+            .await
+            .is_none(),
+        "Ping answered under a held permit"
+    );
+    held.release().await;
+    peer.next(DEADLINE, |f| matches!(f, Frame::Pong))
+        .await
+        .expect("Pong after permit release");
+    assert_eq!(boundary.current_commit_seq(), seq);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), subscriber.recv())
+            .await
+            .is_err(),
+        "held Ping published an event or resync"
+    );
+    drop(peer);
+    drop(subscriber);
+    daemon.shutdown().await.unwrap();
+}
