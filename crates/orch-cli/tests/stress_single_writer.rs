@@ -2200,3 +2200,40 @@ fn cleanup_output_times_out_and_reaps_an_unresponsive_command() {
     }
     assert_cleanup_child(NAME, CHILD, 0);
 }
+
+// Regression: F-S1 — the first send blocked inside Command::spawn, before CALL.
+// A resolved executable remains launchable with no tmux on the child's PATH.
+#[test]
+fn private_tmux_commands_launch_without_searching_the_childs_path() {
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = tmux_command().expect("tmux is required for this regression");
+    cmd.arg("-V")
+        .env("PATH", home.path())
+        .env("HOME", home.path());
+    let output = output_with_deadline(cmd, Duration::from_secs(2));
+    assert!(
+        output.status.success() && text(&output.stdout).starts_with("tmux "),
+        "resolved tmux must launch with an empty child search path: {output:?}"
+    );
+}
+
+#[test]
+fn tui_driver_reports_a_first_send_error_with_its_stage_before_startup_can_pass() {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let pane = Arc::new(TuiPane::launch_at(
+        &sandbox.root(),
+        &sandbox.socket(),
+        sandbox.short_dir(),
+        "--help",
+        &[],
+    ));
+    pane.terminate();
+    let shared = stress_shared();
+    spawn_tui_driver(pane, shared.clone()).join().unwrap();
+    let failures = shared.failures.lock().unwrap();
+    assert!(
+        failures.len() == 1 && failures[0].contains("tui driver died at `sending t`"),
+        "a failed first send must fail the run with its exact stage: {failures:?}"
+    );
+}
