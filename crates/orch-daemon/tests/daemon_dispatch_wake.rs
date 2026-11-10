@@ -22,7 +22,6 @@
 //! the periodic tick still runs; and a collector/completion *spawned by a
 //! tick* wakes the scheduler (ruling 14.4).
 
-use orch_core::clock::Clock;
 use orch_core::process::{
     ExitNotifier, ExitOutcome, ExitSignal, ProcessManager, Signal, SpawnOptions, SpawnedChild,
 };
@@ -59,6 +58,8 @@ struct Scripted {
     refuse_probes: bool,
     /// Block inside `spawn` until [`Scripted::open_gate`] (a tick in flight).
     gated: bool,
+    /// Gate the external effort probe instead of the permit-held task spawn.
+    probe_gate: bool,
     gate: (Mutex<bool>, Condvar),
     entered: tokio::sync::Notify,
     spawns: Mutex<Vec<String>>,
@@ -138,13 +139,44 @@ impl ProcessManager for Scripted {
     async fn kill_with_grace(&self, pid: u32, _: Duration) {
         self.end(pid);
     }
-    fn spawn(&self, _: &str, _: &[String], opts: SpawnOptions) -> orch_core::Result<SpawnedChild> {
+    fn spawn(
+        &self,
+        command: &str,
+        args: &[String],
+        opts: SpawnOptions,
+    ) -> orch_core::Result<SpawnedChild> {
         let task = opts.env.get("ORCH_TASK_ID").cloned().unwrap_or_default();
+        let probe = command == "opencode" && (args == ["--version"] || args == ["run", "--help"]);
+        if self.probe_gate && probe {
+            if args == ["--version"] {
+                self.entered.notify_one();
+                tokio::task::block_in_place(|| {
+                    let mut open = self.gate.0.lock().unwrap();
+                    while !*open {
+                        open = self.gate.1.wait(open).unwrap();
+                    }
+                });
+            }
+            return Ok(SpawnedChild {
+                pid: 50_000 + self.pids.fetch_add(1, Ordering::SeqCst),
+                stdout: Some(Box::new(std::io::Cursor::new(if args == ["--version"] {
+                    b"opencode v2.1.2".to_vec()
+                } else {
+                    b"--model provider/model#variant".to_vec()
+                }))),
+                stderr: None,
+                stdin: None,
+                exit: ExitSignal::resolved(ExitOutcome {
+                    code: Some(0),
+                    signal: None,
+                }),
+            });
+        }
         self.spawns.lock().unwrap().push(task.clone());
         if self.refuse_probes && task.is_empty() {
             return Err(orch_core::Error::other("no git in this test"));
         }
-        if self.gated {
+        if self.gated && !self.probe_gate {
             self.entered.notify_one();
             tokio::task::block_in_place(|| {
                 let mut open = self.gate.0.lock().unwrap();
@@ -625,34 +657,84 @@ async fn a_collector_completion_spawned_by_a_tick_wakes_the_scheduler() {
 // Writes during an in-flight tick (real time: the tick must really be busy)
 // ---------------------------------------------------------------------------
 
-/// A tick held inside `spawn` is in flight while a client keeps writing. Those
-/// writes, and the completion of the launched agent, coalesce into at most one
-/// follow-up tick; afterwards the scheduler goes quiet again. Real time: the
-/// tick is blocked on a thread, so the paused clock cannot be used; every
-/// bound is an upper bound.
+/// The external preparation probe holds one tick in flight without holding
+/// the operation permit. All writers acknowledge before it is released. The
+/// no-output child stays alive until the write follow-up and its quiet window
+/// have completed, separating the collector's independently eligible commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_during_the_wake_tick_cause_at_most_one_follow_up_tick() {
+    // Unlike Fx::next_tick, do not drain already queued tick events: opening
+    // the probe may complete the in-flight tick before this future is polled.
+    async fn completed_tick(fx: &mut Fx, why: &str) -> Instant {
+        tokio::time::timeout(WAKE_BOUND, async {
+            loop {
+                if let Some(event) = fx.bus.recv().await
+                    && is_tick(&event)
+                {
+                    fx.seen += 1;
+                    return Instant::now();
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{why}: no tick within {WAKE_BOUND:?}"))
+    }
+
+    async fn quiet(fx: &mut Fx, why: &str) {
+        let before = fx.seen;
+        let extra = tokio::time::timeout(Duration::from_millis(1_500), async {
+            loop {
+                if let Some(event) = fx.bus.recv().await
+                    && is_tick(&event)
+                {
+                    fx.seen += 1;
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            extra.is_err(),
+            "{why}: at most one follow-up tick; saw an extra tick"
+        );
+        assert_eq!(fx.seen, before, "{why}: scheduler must remain quiet");
+    }
+
     let mut fx = fixture(
         DispatchMode::On,
         Scripted {
             gated: true,
+            probe_gate: true,
+            hold: true,
             ..Default::default()
         },
     )
     .await;
-    // The setup agent write arms a wake of its own; the gate is closed, but
-    // no task exists to launch so the tick passes through.
-    let agent = fx.agent("slow-spawn", "shared").await;
+    let agent = fx
+        .call(
+            "agent.create",
+            json!({
+                "name": "slow-preparation", "adapter": "opencode", "command": "fake-agent",
+                "model": "openrouter/anthropic/claude-opus-5.5", "effort": "high",
+                "approval_policy": "auto", "workspace_mode": "shared",
+                "env": [
+                    {"name": "HOME", "value": fx.daemon.project_root().to_str().unwrap()},
+                    {"name": "PATH", "value": "/usr/bin:/bin"}
+                ]
+            }),
+        )
+        .await["agent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let _open = OpenOnDrop(fx.pm.clone());
     fx.settle().await;
     let base = fx.ticks();
-
     let id = fx.task("slow to start", json!({"assignee": agent})).await;
     tokio::time::timeout(Duration::from_secs(10), fx.pm.entered.notified())
         .await
-        .expect("the wake tick never reached spawn (no wake within 10 s, poll is 60 s)");
+        .expect("the wake tick never reached external preparation within 10 s");
 
-    // The tick is now in flight, held in spawn. Write while it is.
     let mut writers = Vec::new();
     for n in 0..20 {
         let mut other = Raw::session(&fx.daemon, "cli", "normal").await;
@@ -660,27 +742,33 @@ async fn writes_during_the_wake_tick_cause_at_most_one_follow_up_tick() {
             support::task(&mut other, &format!("during the tick {n}"), json!({})).await;
         }));
     }
-    fx.pm.open_gate();
-    for writer in writers {
-        writer.await.unwrap();
-    }
-    assert_eq!(fx.pm.launches_of(&id), 1, "exactly one launch");
-
-    // Give the follow-up (if any) its window: two debounce windows of real time
-    // plus a margin. Then require quiet for another two.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    let after_follow_up = fx.ticks() - base;
-    assert!(
-        (1..=2).contains(&after_follow_up),
-        "20 writes plus a completion during one tick caused {after_follow_up} ticks, \
-         the bound is the wake tick plus one follow-up"
-    );
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for writer in writers {
+            writer.await.unwrap();
+        }
+    })
+    .await
+    .expect("writers cannot commit while the tick is held at the external probe");
     assert_eq!(
-        fx.ticks() - base,
-        after_follow_up,
-        "the scheduler kept ticking with nothing left to do"
+        fx.ticks(),
+        base,
+        "the first tick must remain in flight until all writers acknowledge"
     );
-    let _ = fx.clock.now_ms();
+    fx.pm.open_gate();
+    let completed = completed_tick(&mut fx, "in-flight tick completion").await;
+    assert_eq!(fx.pm.launches_of(&id), 1, "exactly one launch");
+    let follow_up = completed_tick(&mut fx, "one follow-up for in-flight commits").await;
+    println!("follow-up latency: {:?}", follow_up - completed);
+    assert_eq!(fx.seen - base, 2, "the wake tick and exactly one follow-up");
+    quiet(&mut fx, "in-flight commits").await;
+
+    fx.pm.release(&id);
+    completed_tick(&mut fx, "collector completion wake").await;
+    assert_eq!(
+        fx.seen - base,
+        3,
+        "one independent collector completion wake"
+    );
+    quiet(&mut fx, "collector completion").await;
     fx.finish().await;
 }

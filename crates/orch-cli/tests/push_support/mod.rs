@@ -144,18 +144,28 @@ impl CountingProxy {
             .expect("proxy directory");
         let socket = dir.path().join("p");
         assert!(socket.as_os_str().len() <= 100, "socket path too long");
-        let listener = UnixListener::bind(&socket).expect("bind the proxy socket");
-        // Clients refuse a socket that is not 0600 (the daemon makes its own so).
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod the proxy socket");
         let shared = Arc::new(Shared {
             upstream: Mutex::new(upstream.to_path_buf()),
             log: Mutex::default(),
             conns: Mutex::default(),
             stop: AtomicBool::new(false),
         });
-        let accepting = Arc::clone(&shared);
-        let accept = std::thread::spawn(move || {
+        let accept = Self::listen(&socket, &shared);
+        CountingProxy {
+            dir,
+            socket,
+            shared,
+            accept: Some(accept),
+        }
+    }
+
+    fn listen(socket: &Path, shared: &Arc<Shared>) -> JoinHandle<()> {
+        let listener = UnixListener::bind(socket).expect("bind the proxy socket");
+        // Clients refuse a socket that is not 0600 (the daemon makes its own so).
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod the proxy socket");
+        let accepting = Arc::clone(shared);
+        std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if accepting.stop.load(Ordering::SeqCst) {
                     return;
@@ -176,13 +186,24 @@ impl CountingProxy {
                 };
                 std::thread::spawn(move || relay(&shared, id, client));
             }
-        });
-        CountingProxy {
-            dir,
-            socket,
-            shared,
-            accept: Some(accept),
+        })
+    }
+
+    /// Make new dials observe the same absent endpoint as the stopped daemon.
+    /// Existing relays remain alive to forward the daemon's actual EOF.
+    pub fn suspend(&mut self) {
+        if let Some(accept) = self.accept.take() {
+            self.shared.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&self.socket);
+            accept.join().expect("proxy listener joined");
+            std::fs::remove_file(&self.socket).expect("remove proxy listener socket");
         }
+    }
+
+    pub fn resume(&mut self) {
+        assert!(self.accept.is_none(), "proxy listener already running");
+        self.shared.stop.store(false, Ordering::SeqCst);
+        self.accept = Some(Self::listen(&self.socket, &self.shared));
     }
 
     /// The path a frontend must dial (`ORCH_SOCKET`).
@@ -220,12 +241,7 @@ impl CountingProxy {
 
 impl Drop for CountingProxy {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::SeqCst);
-        // Unblock `accept` so the thread can notice the flag.
-        let _ = UnixStream::connect(&self.socket);
-        if let Some(accept) = self.accept.take() {
-            let _ = accept.join();
-        }
+        self.suspend();
     }
 }
 
@@ -419,6 +435,7 @@ impl Project {
             .take()
             .expect("the daemon is stopped")
             .shutdown();
+        self.proxy.suspend();
     }
 
     /// An explicit owner restart: a new daemon on a new socket; the proxy
@@ -427,6 +444,7 @@ impl Project {
         assert!(self.daemon.is_none(), "the daemon is running");
         let daemon = daemon::TestDaemon::start(self.dir.path(), &self.home);
         self.proxy.set_upstream(daemon.socket());
+        self.proxy.resume();
         self.daemon = Some(daemon);
     }
 }

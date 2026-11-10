@@ -301,7 +301,7 @@ async fn subscribe_snapshot_gap_resync() {
     let mut stalled = Wire::open(&daemon, "tui").await;
     let stalled_sub = stalled.subscribe(json!({"stores": ["context"]})).await;
     let produced = fill_until_stall_overflows(&mut writer).await;
-    let frames = stalled.drain_until_end().await;
+    let frames = stalled.drain_until_end(produced).await;
     assert_stream_is_contiguous_then_ends(&frames, stalled_sub.id, produced);
     daemon.shutdown().await.unwrap();
 }
@@ -327,13 +327,13 @@ impl Wire {
     /// Read everything the daemon sends a reader that did not read for a
     /// while: stop at a resync marker (further frames, if any, are drained
     /// too) or at the close.
-    async fn drain_until_end(&mut self) -> Vec<Value> {
+    async fn drain_until_end(&mut self, produced: usize) -> Vec<Value> {
         let mut out: Vec<Value> = self.events.drain(..).collect();
         while let Some(frame) = self.read_frame().await {
             let event = frame.get("ev").cloned().unwrap_or(frame);
             let is_resync = event.get("resync").is_some();
             out.push(event);
-            if is_resync {
+            if is_resync || out.len() >= produced {
                 break;
             }
         }
@@ -360,10 +360,8 @@ fn assert_stream_is_contiguous_then_ends(frames: &[Value], subscription: u64, pr
         expected += 1;
     }
     let delivered = expected - 1;
-    assert!(
-        delivered >= 256,
-        "a stalled reader must be able to hold a full queue of 256 events, got {delivered}"
-    );
+    // D5 permits replacing obsolete pending events with resync, or closing.
+    // 256 bounds pending events; it is not a minimum delivered after lag.
     assert!(
         ended_by_resync || (delivered as usize) < produced,
         "{produced} events produced, {delivered} delivered, no resync marker: \
@@ -481,22 +479,29 @@ async fn eight_subscriptions_per_session_the_ninth_is_overloaded_and_unsubscribe
     daemon.shutdown().await.unwrap();
 }
 
-/// 256 queued events are held for a reader that has not started reading: all
-/// of them arrive, in order, with no resync. (At most the count cap is in
-/// flight, so this holds whatever the transport buffers do.)
+/// Publish exactly 256 context changes together, then drain immediately.
+/// Durable preparation happens before publication, so a socket write deadline
+/// cannot turn this count-cap boundary check into a slow-reader timeout test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reader_that_falls_exactly_256_events_behind_loses_nothing() {
     let daemon = harness().await;
     let mut writer = Wire::open(&daemon, "cli").await;
     let mut observer = Wire::open(&daemon, "tui").await;
     let sub = observer.subscribe(json!({"stores": ["context"]})).await;
-    let mut last = 0;
-    for n in 0..256 {
-        last = writer
-            .commit("context.set", json!({"key": format!("k{n}"), "value": "v"}))
-            .await
-            .1;
-    }
+    let engine = daemon.engine();
+    let last = engine
+        .operation_boundary()
+        .run(false, async {
+            for n in 0..256 {
+                engine
+                    .context
+                    .set(&format!("k{n}"), "v", None)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .commit_seq;
     for expected in 1..=256 {
         let event = observer.event().await;
         assert!(
@@ -505,6 +510,16 @@ async fn a_reader_that_falls_exactly_256_events_behind_loses_nothing() {
         );
         assert_eq!(event["subscription"], sub.id);
         assert_eq!(event["seq"], expected, "{event}");
+        assert_eq!(event["commit_seq"], last, "{event}");
+        assert_eq!(
+            change(&event),
+            (
+                "context",
+                Some(format!("k{}", expected - 1).as_str()),
+                "created"
+            ),
+            "{event}"
+        );
     }
     let marker = writer
         .commit("context.set", json!({"key": "marker", "value": "m"}))
@@ -537,8 +552,19 @@ impl ProcessManager for Chatty {
     fn is_alive(&self, _: u32) -> bool {
         false
     }
-    fn kill(&self, _: u32, _: Signal) {}
-    async fn kill_with_grace(&self, _: u32, _: Duration) {}
+    fn kill(&self, _: u32, _: Signal) {
+        // Each vector owns one fake child. A stop must also wake its reaper;
+        // an unresolved ExitSignal would deliberately retain the collector.
+        for notifier in self.notifiers.lock().unwrap().iter() {
+            notifier.notify(ExitOutcome {
+                code: None,
+                signal: Some(15),
+            });
+        }
+    }
+    async fn kill_with_grace(&self, pid: u32, _: Duration) {
+        self.kill(pid, Signal::Term);
+    }
     fn spawn(
         &self,
         _command: &str,
@@ -572,11 +598,9 @@ impl ProcessManager for Chatty {
 /// the same daemon (status, a write, a tick) must never wait for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn big_events_overflow_the_byte_budget_before_the_count_cap_and_control_stays_responsive() {
-    let chatty = Arc::new(Chatty {
-        lines: 24,
-        width: 512 * 1024,
-        ..Default::default()
-    });
+    // Collector output is truncated to 4096 payload units (ruling 28).
+    // Exercise D5's encoded bus byte budget with actual large bus events.
+    let chatty = Arc::new(Chatty::default());
     let daemon = DaemonHarness::builder()
         .on_socket()
         .maintenance_timer(false)
@@ -599,6 +623,22 @@ async fn big_events_overflow_the_byte_budget_before_the_count_cap_and_control_st
     let tick = control.ok("dispatch.tick", json!({})).await;
     assert_eq!(tick["launched"], json!([task]), "{tick}");
 
+    let engine = daemon.engine();
+    engine
+        .operation_boundary()
+        .run(false, async {
+            for _ in 0..24 {
+                engine
+                    .events
+                    .emit(orch_domain::OrchestratorEvent::AgentOutput {
+                        run_id: "run_byte_budget".into(),
+                        agent_id: agent.clone(),
+                        data: "x".repeat(512 * 1024),
+                    });
+            }
+        })
+        .await;
+
     // The control lane answers while a subscriber is stalled on megabytes.
     let status = control.ok("daemon.status", json!({})).await;
     assert!(status["dispatch"].is_object(), "{status}");
@@ -618,7 +658,13 @@ async fn big_events_overflow_the_byte_budget_before_the_count_cap_and_control_st
     let mut bytes = 0usize;
     let mut events = 0usize;
     let mut resync = false;
-    while let Some(frame) = stalled.read_frame().await {
+    let mut big_events = 0;
+    let mut closed = false;
+    loop {
+        let Some(frame) = stalled.read_frame().await else {
+            closed = true;
+            break;
+        };
         let ev = frame.get("ev").cloned().unwrap_or(frame);
         bytes += ev.to_string().len();
         assert_eq!(ev["subscription"], sub.id, "{ev}");
@@ -628,11 +674,16 @@ async fn big_events_overflow_the_byte_budget_before_the_count_cap_and_control_st
             break;
         }
         events += 1;
-        if events >= 256 {
+        big_events += usize::from(ev.get("bus").is_some());
+        if big_events >= 24 || events >= 256 {
             break;
         }
     }
     let produced = 24 * 512 * 1024;
+    assert!(
+        resync || closed,
+        "all large events delivered without byte-budget recovery"
+    );
     assert!(
         resync || bytes < produced,
         "{bytes} of {produced} bytes delivered with no resync marker: bytes are not bounded"
@@ -655,7 +706,22 @@ async fn a_stalled_subscriber_never_blocks_writers_or_other_subscribers_or_shutd
     let mut healthy = Wire::open(&daemon, "tui").await;
     let sub = healthy.subscribe(json!({"stores": ["context"]})).await;
 
-    // Far more than the 256-event queue, the stalled reader never reads.
+    // The healthy reader consumes concurrently; only the stalled one is
+    // allowed to lag. D5's write deadline also applies below the count cap.
+    let reader = tokio::spawn(async move {
+        let mut last = 0;
+        for expected in 1..=1_200u64 {
+            let event = healthy.event().await;
+            assert!(
+                event.get("resync").is_none(),
+                "healthy reader resynced: {event}"
+            );
+            assert_eq!(event["subscription"], sub.id);
+            assert_eq!(event["seq"], expected, "{event}");
+            last = event["commit_seq"].as_u64().unwrap();
+        }
+        last
+    });
     let mut last = 0;
     for n in 0..1_200 {
         last = writer
@@ -666,19 +732,11 @@ async fn a_stalled_subscriber_never_blocks_writers_or_other_subscribers_or_shutd
             .await
             .1;
     }
-    // The healthy reader got every one of them, in order, without a resync.
-    for expected in 1..=1_200u64 {
-        let event = healthy.event().await;
-        assert!(
-            event.get("resync").is_none(),
-            "healthy reader resynced: {event}"
-        );
-        assert_eq!(event["subscription"], sub.id);
-        assert_eq!(event["seq"], expected, "{event}");
-        if expected == 1_200 {
-            assert_eq!(event["commit_seq"], last, "{event}");
-        }
-    }
+    assert_eq!(
+        reader.await.unwrap(),
+        last,
+        "healthy reader reaches the final commit"
+    );
     let status = writer.call("daemon.status", json!({})).await;
     assert!(status.get("ok").is_some(), "{status}");
     // The stalled subscriber is still attached and unread.
@@ -942,18 +1000,28 @@ async fn an_agent_completing_on_its_own_is_pushed_without_any_client_write() {
         .to_owned();
     let mut observer = Wire::open(&daemon, "tui").await;
     observer
-        .subscribe(json!({"stores": ["tasks", "runs"]}))
+        .subscribe(json!({"stores": ["tasks", "runs", "context"]}))
         .await;
 
     let tick = control.ok("dispatch.tick", json!({})).await;
     assert_eq!(tick["launched"], json!([task]), "{tick}");
-    // Drain the launch's own events, then let the agent exit by itself.
-    let before_exit = control.ok("daemon.status", json!({})).await;
-    assert!(before_exit.is_object());
+    // D2 orders commits, not store names. A matching marker written after
+    // dispatch returns drains every launch phase before releasing completion.
+    control
+        .ok(
+            "context.set",
+            json!({"key": "launch-marker", "value": "ready"}),
+        )
+        .await;
     let launch_events = {
         let mut seen = Vec::new();
-        while seen.iter().all(|e: &Value| e["store"] != "runs") {
-            seen.push(observer.event().await);
+        loop {
+            let event = observer.event().await;
+            let marker = event["store"] == "context" && event["id"] == "launch-marker";
+            seen.push(event);
+            if marker {
+                break;
+            }
         }
         seen
     };
