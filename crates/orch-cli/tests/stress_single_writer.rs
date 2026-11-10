@@ -1355,14 +1355,8 @@ impl Drop for RunGuard {
     }
 }
 
-fn run_stress(fleet: Fleet) {
-    let sandbox = Arc::new(Sandbox::new());
-    sandbox.init_project();
-    let mut daemon = start_ready(&sandbox, &["--dispatch", "on"], "owner");
-    let fixtures = fixtures(&sandbox);
-    let (worker, hot) = (fixtures.worker.clone(), fixtures.hot.clone());
-
-    let shared = Arc::new(Shared {
+fn stress_shared() -> Arc<Shared> {
+    Arc::new(Shared {
         stop: AtomicBool::new(false),
         title: Writer::default(),
         description: Writer::default(),
@@ -1379,7 +1373,17 @@ fn run_stress(fleet: Fleet) {
         live_times: Mutex::new(None),
         failures: Mutex::default(),
         created: Mutex::default(),
-    });
+    })
+}
+
+fn run_stress(fleet: Fleet) {
+    let sandbox = Arc::new(Sandbox::new());
+    sandbox.init_project();
+    let mut daemon = start_ready(&sandbox, &["--dispatch", "on"], "owner");
+    let fixtures = fixtures(&sandbox);
+    let (worker, hot) = (fixtures.worker.clone(), fixtures.hot.clone());
+
+    let shared = stress_shared();
     let patch_dir = sandbox.root().join("stress-patches");
     fs::create_dir(&patch_dir).unwrap();
 
@@ -1929,4 +1933,227 @@ fn exact_priority_oracle_stays_informative_when_many_writes_pile_up_between_read
 fn exact_priority_oracle_rejects_acknowledgements_that_are_not_in_commit_order() {
     assert_eq!(exact_priority_violations(&[(1, 40), (2, 40)], &[]).len(), 1);
     assert_eq!(exact_priority_violations(&[(1, 40), (3, 50)], &[]).len(), 1);
+}
+
+// A subprocess gives the regression a watchdog: the old Drop hangs forever,
+// and a panicking deadline helper would abort instead of preserving exit 101.
+#[test]
+fn stopped_private_tmux_is_cleaned_up_during_unwind_without_resuming_it() {
+    const CHILD: &str = "ORCH_TEST_STOPPED_TMUX_CHILD";
+    const NAME: &str = "stopped_private_tmux_is_cleaned_up_during_unwind_without_resuming_it";
+    if let Some(record) = std::env::var_os(CHILD) {
+        fail_with_private_tmux(&record, true);
+    }
+    assert_cleanup_child(NAME, CHILD, 101);
+}
+
+#[test]
+fn missing_private_tmux_still_cleans_its_retained_pane_during_unwind() {
+    const CHILD: &str = "ORCH_TEST_MISSING_TMUX_CHILD";
+    const NAME: &str = "missing_private_tmux_still_cleans_its_retained_pane_during_unwind";
+    if let Some(record) = std::env::var_os(CHILD) {
+        fail_with_private_tmux(&record, false);
+    }
+    assert_cleanup_child(NAME, CHILD, 101);
+}
+
+fn fail_with_private_tmux(record: &std::ffi::OsStr, stop: bool) -> ! {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let _daemon = start_ready(&sandbox, &[], "cleanup-owner");
+    let _mcp = mcp_client(&sandbox);
+    let pane = Arc::new(TuiPane::launch_at(
+        &sandbox.root(),
+        &sandbox.socket(),
+        sandbox.short_dir(),
+        if stop {
+            "tui"
+        } else {
+            "--help; trap '' HUP; exec sleep 600"
+        },
+        &[],
+    ));
+    if stop {
+        pane.wait_screen("the dashboard", |s| {
+            s.contains("ORCH") && !s.contains("No orch daemon")
+        });
+    } else {
+        // A stubborn pane stand-in survives server hangup. Otherwise the OS
+        // may clean it up itself, proving nothing about retained ownership.
+        wait_for(READY, "the HUP-ignoring pane", || {
+            let table = process_table();
+            let server = table.iter().find(|p| {
+                p.ppid == 1
+                    && p.command
+                        .contains(&format!("-L t2a{}-", std::process::id()))
+            })?;
+            table
+                .iter()
+                .any(|p| p.ppid == server.pid && p.command == "sleep 600")
+                .then_some(())
+        });
+    }
+    let _guard = RunGuard {
+        shared: stress_shared(),
+        pane: Some(pane.clone()),
+    };
+    let table = process_table();
+    let server = table
+        .iter()
+        .find(|p| {
+            p.command
+                .contains(&format!("-L t2a{}-", std::process::id()))
+                && p.ppid == 1
+        })
+        .expect("private tmux server");
+    let mut owned = vec![server.pid];
+    owned.extend(
+        table
+            .iter()
+            .filter(|p| {
+                p.ppid == std::process::id()
+                    || p.command.contains(sandbox.short_dir().to_str().unwrap())
+            })
+            .map(|p| p.pid),
+    );
+    let mut i = 0;
+    while i < owned.len() {
+        let parent = owned[i];
+        let children: Vec<_> = table
+            .iter()
+            .filter(|p| p.ppid == parent && !owned.contains(&p.pid))
+            .map(|p| p.pid)
+            .collect();
+        owned.extend(children);
+        i += 1;
+    }
+    fs::write(record, serde_json::to_vec(&owned).unwrap()).unwrap();
+    if stop {
+        signal(server.pid, nix::sys::signal::Signal::SIGSTOP);
+    } else {
+        force_kill(server.pid);
+        wait_dead(server.pid, "private tmux server");
+    }
+    panic!("intentional failure with an unresponsive private tmux server");
+}
+
+fn assert_cleanup_child(name: &str, child_env: &str, expected_code: i32) {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("owned.json");
+    let log = dir.path().join("child.log");
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args([name, "--exact", "--nocapture"])
+        .env(child_env, &record)
+        .env_remove("ORCH_AGENT_ID")
+        .env_remove("ORCH_AGENT_NAME")
+        .env_remove("ORCH_TASK_ID")
+        .stdout(fs::File::create(&log).unwrap())
+        .stderr(std::process::Stdio::from(
+            fs::File::create(dir.path().join("child.err")).unwrap(),
+        ));
+    let mut child = cmd.spawn().unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let owned: Vec<u32> = fs::read(&record)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let left = loop {
+        let left: Vec<_> = owned.iter().copied().filter(|p| is_alive(*p)).collect();
+        if left.is_empty() || Instant::now() >= deadline {
+            break left;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Watchdog cleanup also makes the RED run hermetic; never SIGCONT.
+    for pid in &left {
+        force_kill(*pid);
+    }
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    eprintln!(
+        "cleanup regression {name}: elapsed={:?} status={status:?} owned={owned:?} survivors={left:?}",
+        start.elapsed()
+    );
+    assert!(
+        status.is_some_and(|s| s.code() == Some(expected_code))
+            && !owned.is_empty()
+            && left.is_empty(),
+        "{name} must exit {expected_code} within 15s and leave no owned processes; elapsed={:?}, status={status:?}, owned={owned:?}, survivors={left:?}; stdout={} stderr={}",
+        start.elapsed(),
+        fs::read_to_string(log).unwrap_or_default(),
+        fs::read_to_string(dir.path().join("child.err")).unwrap_or_default()
+    );
+}
+
+#[test]
+fn cleanup_output_does_not_wait_for_eof_held_by_a_descendant() {
+    use std::os::unix::process::CommandExt;
+    const CHILD: &str = "ORCH_TEST_CLEANUP_EOF_CHILD";
+    const NAME: &str = "cleanup_output_does_not_wait_for_eof_held_by_a_descendant";
+    if let Some(record) = std::env::var_os(CHILD) {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 600 & printf '[%s]' $! > \"$1\"; printf done")
+            .arg("cleanup-holder")
+            .arg(&record)
+            .process_group(0);
+        let start = Instant::now();
+        let result = cleanup_output(cmd);
+        let pids: Vec<u32> = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        for pid in pids {
+            force_kill(pid);
+        }
+        let out = result.unwrap();
+        assert!(
+            out.status.success()
+                && out.stdout == b"done"
+                && start.elapsed() < Duration::from_secs(1),
+            "finished child output was delayed by its descendant: {out:?}"
+        );
+        return;
+    }
+    assert_cleanup_child(NAME, CHILD, 0);
+}
+
+#[test]
+fn cleanup_output_times_out_and_reaps_an_unresponsive_command() {
+    use std::os::unix::process::CommandExt;
+    const CHILD: &str = "ORCH_TEST_CLEANUP_TIMEOUT_CHILD";
+    const NAME: &str = "cleanup_output_times_out_and_reaps_an_unresponsive_command";
+    if let Some(record) = std::env::var_os(CHILD) {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("printf '[%s]' $$ > \"$1\"; exec sleep 600")
+            .arg("cleanup-timeout")
+            .arg(&record)
+            .process_group(0);
+        let start = Instant::now();
+        let result = cleanup_output(cmd);
+        let pids: Vec<u32> = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        let pid = pids[0];
+        let alive = is_alive(pid);
+        if alive {
+            force_kill(pid);
+        }
+        assert!(
+            result.is_err_and(|err| err.kind() == std::io::ErrorKind::TimedOut)
+                && !alive
+                && start.elapsed() < Duration::from_secs(2),
+            "timed-out cleanup command must be killed and reaped within 2s (alive={alive})"
+        );
+        return;
+    }
+    assert_cleanup_child(NAME, CHILD, 0);
 }
