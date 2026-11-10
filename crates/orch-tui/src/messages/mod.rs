@@ -59,7 +59,8 @@ pub const TASK_LIST_LIMIT: usize = 10;
 pub const UNDO_TIMEOUT_MS: i64 = 5_000;
 /// Message batch flush interval.
 pub const MESSAGE_BATCH_MS: i64 = 80;
-/// Event-driven refresh debounce.
+/// Debounce between a pushed store change and its read: a burst of
+/// changes collapses into one read per view.
 pub const REFRESH_DEBOUNCE_MS: i64 = 150;
 /// Animation tick.
 pub const ANIM_TICK_MS: i64 = 120;
@@ -67,10 +68,6 @@ pub const ANIM_TICK_MS: i64 = 120;
 pub const NOW_TICK_MS: i64 = 5_000;
 /// Same-agent gap that starts a new visual session in the logs view.
 pub const LOG_SESSION_GAP_MS: i64 = 30_000;
-/// Periodic disk poll in observer mode.
-pub const OBSERVER_POLL_MS: i64 = 3_000;
-/// Periodic disk poll in watch mode.
-pub const WATCH_POLL_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MsgType {
