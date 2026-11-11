@@ -930,9 +930,10 @@ impl Worker {
         if matches!(frame, Frame::Sync { .. } | Frame::Cancel { .. }) {
             return self.handle(controller, name, frame).await;
         }
-        let mutation = !matches!(frame, Frame::Ping | Frame::Pong);
+        // Each arm declares its writes at the write site, after read-only
+        // validation. In particular, admission to an arm is not a mutation.
         self.ctx
-            .ordered(mutation, Box::pin(self.handle(controller, name, frame)))
+            .ordered(false, Box::pin(self.handle(controller, name, frame)))
             .await
     }
 
@@ -1012,6 +1013,8 @@ impl Worker {
                 review_criteria,
                 goal_id,
             } => {
+                // Writes Tasks through task_service.create's tracked save,
+                // after validation. Duplicate/invalid submits write nothing.
                 // Rejected rather than skipped: without the duplicate check
                 // this request could create a second mirror for one key.
                 let tasks = match self.ctx.engine.tasks.list(&TaskFilter::default()).await {
@@ -1167,6 +1170,8 @@ impl Worker {
                 }
             }
             Frame::FinishedAck { exec_key } => {
+                // Only the guarded tracked Tasks save below declares a write.
+                // Missing, unfinished and already-acknowledged mirrors are reads.
                 // Not recording the ack costs one resend of the outcome on
                 // the next sync, so every fault here simply retries.
                 let mirrors = match self.mirrors(controller).await {
@@ -1197,6 +1202,7 @@ impl Worker {
                 exec_key,
                 after_seq,
             } => {
+                // Read-only: replaying the in-memory ring writes no store.
                 // A Gap alone is a valid answer: the controller re-attaches
                 // and the live event stream is unaffected.
                 let mirrors = self.mirrors(controller).await.unwrap_or_else(|error| {
@@ -1229,6 +1235,12 @@ impl Worker {
                 if let Err(error) = async {
                     if let Some(mut inbound) = self.ctx.store.read_inbound().await? {
                         inbound.agents = agents;
+                        // Raw Remote persistence: declare before the write,
+                        // retaining invalidation if it fails part way through.
+                        self.ctx
+                            .engine
+                            .operation_boundary()
+                            .note_store(orch_engine::container::commit::CommitStore::Remote);
                         self.ctx.store.write_inbound(&inbound).await?;
                     }
                     Ok::<(), Error>(())
@@ -1240,14 +1252,17 @@ impl Worker {
                 Ok(vec![])
             }
             frame @ Frame::Msg { .. } => {
+                // Ingest declares Messages at its tracked save; a duplicate
+                // or rejected message is write-free, including nested calls.
                 Ok(self.ctx.ingest(name, &frame).await?.into_iter().collect())
             }
             Frame::MsgAck { id, reason } => {
+                // msg_ack guards no-ops and predeclares only Messages writes.
                 self.ctx.msg_ack(name, &id, reason.as_deref()).await?;
                 Ok(vec![])
             }
-            // `handle_ordered` declares these two arms write-free. Adding a
-            // store write here requires changing that declaration as well.
+            // Heartbeats and unexpected frames write no stores. They still
+            // take the project permit; any future write needs a predeclaration.
             Frame::Ping => Ok(vec![Frame::Pong]),
             Frame::Pong => Ok(vec![]),
             _ => Err(Error::other("unexpected controller frame")),
@@ -1305,7 +1320,7 @@ impl Worker {
         // here survives the status change, and a failure below still leaves
         // the explanation behind.
         self.ctx
-            .ordered(true, async {
+            .ordered(false, async {
                 let mut fresh = self
                     .ctx
                     .engine
@@ -1716,7 +1731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_submit_keeps_peer_remote_declaration_and_unexpected_frame_errors() {
+    async fn ordered_submit_declares_tasks_and_unexpected_frame_errors() {
         use orch_engine::container::commit::{CommitSource, CommitStore, Publication};
         let (_temp, worker, agent) = fixture().await;
         let boundary = worker.ctx.engine.operation_boundary();
@@ -1747,7 +1762,7 @@ mod tests {
                 commits[0]
                     .changes
                     .iter()
-                    .any(|c| c.store == CommitStore::Remote)
+                    .all(|c| c.store == CommitStore::Tasks)
             );
         }
         let error = worker

@@ -141,8 +141,9 @@ impl Context {
     /// process kills outside: the permit is never held across a peer. A
     /// phase reached from an operation that already holds the permit (the
     /// worker's [`handle_ordered`](worker::Worker)) reuses it. `mutation = false`
-    /// means there are no undeclared writes: tracked adapters or nested
-    /// mutating phases declare every write, while reads still take the permit.
+    /// means there are no undeclared writes: tracked adapters or explicit
+    /// store declarations account for every possible write. Reads still take
+    /// the permit.
     pub(crate) async fn ordered<T>(&self, mutation: bool, phase: impl Future<Output = T>) -> T {
         let boundary = self.engine.events.operation_boundary();
         let phase = Box::pin(phase);
@@ -195,7 +196,7 @@ impl Context {
         // after the permit is released, and only once the message committed.
         let reason = match self
             .ordered(
-                true,
+                false,
                 self.engine.message_service.ingest_incoming(peer, message),
             )
             .await
@@ -291,8 +292,41 @@ impl Context {
 
     pub(crate) async fn msg_ack(&self, peer: &str, id: &str, reason: Option<&str>) -> Result<()> {
         let result = self
-            .ordered(true, async {
+            .ordered(false, async {
+                // Decide no-ops while holding the project permit. The raw
+                // rejection writer is idempotent and can also repair an index
+                // after an earlier partial write; neither case writes Remote.
+                let Some(message) = self.engine.messages.get(id).await? else {
+                    return Ok(());
+                };
+                if message
+                    .to_agent_id
+                    .as_deref()
+                    .and_then(|to| to.rsplit_once('@'))
+                    .is_none_or(|(_, alias)| alias != peer)
+                {
+                    return Ok(());
+                }
                 if let Some(reason) = reason {
+                    if message.status == MessageStatus::Delivered
+                        && message.body.starts_with(&format!("[rejected by {peer}: "))
+                    {
+                        // Match the store's already-rejected guard, but read
+                        // the existing index without rebuilding it. A missing,
+                        // corrupt or stale index must still reach the writer
+                        // below, with its repair declared BEFORE any I/O.
+                        let index = orch_infra::storage::index::IndexManager::<Message>::new(
+                            self.engine.paths.messages_dir(),
+                            orch_infra::storage::index::ItemFormat::Json,
+                        );
+                        let indexed: Result<Option<Vec<Message>>> =
+                            orch_infra::storage::fs_utils::read_json(&index.index_path()).await;
+                        if indexed
+                            .is_ok_and(|items| items.is_some_and(|items| items.contains(&message)))
+                        {
+                            return Ok(());
+                        }
+                    }
                     self.engine
                         .events
                         .operation_boundary()
@@ -304,13 +338,9 @@ impl Context {
                     )
                     .reject_remote_message(id, peer, &reason)
                     .await?;
-                } else if let Some(message) = self.engine.messages.get(id).await?
-                    && message
-                        .to_agent_id
-                        .as_deref()
-                        .and_then(|to| to.rsplit_once('@'))
-                        .is_some_and(|(_, alias)| alias == peer)
-                {
+                } else {
+                    // The tracked adapter declares Messages before delivery,
+                    // including a possible entity-only/index-failed write.
                     self.engine.messages.mark_delivered(id).await?;
                 }
                 Ok(())
@@ -774,7 +804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejection_and_oversize_outbox_declare_messages_and_remote() {
+    async fn rejection_and_oversize_outbox_declare_only_messages() {
         let (_temp, ctx) = metadata_context().await;
         let mut message = queued_message("msg_reject");
         ctx.engine.messages.save(&message).await.unwrap();
@@ -787,12 +817,12 @@ mod tests {
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].source, CommitSource::Peer);
             assert!(!records[0].store_set_uncertain);
-            for store in [CommitStore::Messages, CommitStore::Remote] {
-                assert!(
-                    records[0].changes.iter().any(|c| c.store == store),
-                    "rejection missed {store:?}"
-                );
-            }
+            assert_eq!(
+                records[0].changes,
+                vec![orch_engine::container::commit::CommitChange::store_wide(
+                    CommitStore::Messages
+                )]
+            );
         }
         message.id = "msg_oversize".into();
         message.body = "x".repeat(codec::MAX_FRAME_BYTES + 1);
@@ -802,13 +832,60 @@ mod tests {
         let records = records.lock().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].source, CommitSource::Peer);
-        for store in [CommitStore::Messages, CommitStore::Remote] {
+        assert_eq!(
+            records[0].changes,
+            vec![orch_engine::container::commit::CommitChange::store_wide(
+                CommitStore::Messages
+            )]
+        );
+        assert!(!records[0].store_set_uncertain);
+    }
+
+    #[tokio::test]
+    async fn rejection_noops_are_silent_but_stale_and_missing_indexes_are_repaired() {
+        let (_temp, ctx) = metadata_context().await;
+        let message = queued_message("msg_idempotent");
+        ctx.engine.messages.save(&message).await.unwrap();
+        let records = capture_commits(&ctx.engine.events);
+        for reason in [None, Some("no recipient")] {
+            for (peer, id) in [("controller", "absent"), ("other", "msg_idempotent")] {
+                ctx.msg_ack(peer, id, reason).await.unwrap();
+                assert!(records.lock().unwrap().is_empty(), "no-op ack {peer}/{id}");
+            }
+        }
+        ctx.msg_ack("controller", &message.id, Some("no recipient"))
+            .await
+            .unwrap();
+        assert_eq!(records.lock().unwrap().len(), 1);
+        records.lock().unwrap().clear();
+        ctx.msg_ack("controller", &message.id, Some("no recipient"))
+            .await
+            .unwrap();
+        assert!(
+            records.lock().unwrap().is_empty(),
+            "already rejected and indexed"
+        );
+        let index = ctx.engine.paths.messages_dir().join("_index.json");
+        for bytes in [Some(b"[]".as_slice()), None, Some(b"corrupt".as_slice())] {
+            if let Some(bytes) = bytes {
+                std::fs::write(&index, bytes).unwrap();
+            } else {
+                std::fs::remove_file(&index).unwrap();
+            }
+            records.lock().unwrap().clear();
+            ctx.msg_ack("controller", &message.id, Some("no recipient"))
+                .await
+                .unwrap();
+            let records = records.lock().unwrap();
+            assert_eq!(records.len(), 1, "index repair must be declared");
+            assert!(!records[0].store_set_uncertain);
             assert!(
-                records[0].changes.iter().any(|c| c.store == store),
-                "oversize missed {store:?}"
+                records[0]
+                    .changes
+                    .iter()
+                    .all(|c| c.store == CommitStore::Messages)
             );
         }
-        assert!(!records[0].store_set_uncertain);
     }
 
     #[tokio::test]
