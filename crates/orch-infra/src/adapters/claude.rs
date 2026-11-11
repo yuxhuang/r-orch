@@ -36,6 +36,7 @@ const INSTALL_HINT: &str = "Claude Code CLI not found. Install: npm i -g @anthro
 pub struct ClaudeAdapter {
     process_manager: Arc<dyn ProcessManager>,
     clock: Arc<dyn Clock>,
+    system_prompt_directory: Option<PathBuf>,
 }
 
 impl ClaudeAdapter {
@@ -43,7 +44,16 @@ impl ClaudeAdapter {
         ClaudeAdapter {
             process_manager,
             clock: system_clock(),
+            system_prompt_directory: None,
         }
+    }
+
+    /// Use a supplied private directory instead of the ambient runtime/temp
+    /// directory. It is validated at each write and never swept: its owner
+    /// controls its lifetime independently of the process-wide default sweep.
+    pub fn with_system_prompt_directory(mut self, directory: Option<PathBuf>) -> Self {
+        self.system_prompt_directory = directory;
+        self
     }
 
     /// Replace the timestamp source, so tests can assert on exact events.
@@ -259,17 +269,29 @@ fn sweep_stale_files(dir: &Path, now: SystemTime) {
 /// Write the system prompt to a fresh file in the private directory: random
 /// name, created exclusively with mode 0600. The directory is an absolute
 /// `$XDG_RUNTIME_DIR` subdirectory or one under the OS temp dir, never under
-/// the (possibly git-tracked) agent workspace. The returned guard deletes the file when
-/// dropped.
-fn write_system_prompt_file(system_prompt: &str) -> Result<TempPath, AdapterError> {
+/// the (possibly git-tracked) agent workspace, unless explicitly supplied at
+/// assembly. The returned guard deletes the file when dropped.
+fn write_system_prompt_file(
+    system_prompt: &str,
+    directory: Option<&Path>,
+) -> Result<TempPath, AdapterError> {
     static SWEEP: Once = Once::new();
 
-    let dir = resolve_private_dir(&private_dir_candidates(
-        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-        &std::env::temp_dir(),
-        nix::unistd::Uid::current().as_raw(),
-    ))?;
-    SWEEP.call_once(|| sweep_stale_files(&dir, SystemTime::now()));
+    let dir = match directory {
+        Some(dir) => {
+            ensure_private_dir(dir)?;
+            dir.to_owned()
+        }
+        None => {
+            let dir = resolve_private_dir(&private_dir_candidates(
+                std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                &std::env::temp_dir(),
+                nix::unistd::Uid::current().as_raw(),
+            ))?;
+            SWEEP.call_once(|| sweep_stale_files(&dir, SystemTime::now()));
+            dir
+        }
+    };
 
     let fail =
         |err: std::io::Error| io_failure("Failed to write the Claude system prompt file", &err);
@@ -365,7 +387,7 @@ impl Adapter for ClaudeAdapter {
         // Dropped (deleting the file) on any early return, including a failed
         // spawn.
         let system_prompt_file = effective_system_prompt(&params)
-            .map(write_system_prompt_file)
+            .map(|prompt| write_system_prompt_file(prompt, self.system_prompt_directory.as_deref()))
             .transpose()?;
         let args = build_args(&params, system_prompt_file.as_deref())?;
         let mut io = spawn_child(
@@ -413,6 +435,122 @@ impl Adapter for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_prompt_directory_and_once_sweep_preserve_production_behavior() {
+        const CHILD_ROOT: &str = "ORCH_CLAUDE_DIRECTORY_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let expected = if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
+                root.join("runtime/orch")
+            } else {
+                root.join(format!("tmp/orch-{}", nix::unistd::Uid::current()))
+            };
+            ensure_private_dir(&expected).unwrap();
+            let old = touch(
+                &expected,
+                "orch-claude-system-prompt-old.txt",
+                STALE_AFTER + Duration::from_secs(60),
+            );
+            let fresh = touch(
+                &expected,
+                "orch-claude-system-prompt-fresh.txt",
+                Duration::ZERO,
+            );
+            let unrelated = touch(
+                &expected,
+                "unrelated.txt",
+                STALE_AFTER + Duration::from_secs(60),
+            );
+            // A private harness directory must not consume the default sweep.
+            let supplied = root.join("supplied");
+            let private = write_system_prompt_file("private", Some(&supplied)).unwrap();
+            assert_eq!(private.parent(), Some(supplied.as_path()));
+            let first = write_system_prompt_file("production prompt", None).unwrap();
+            assert_eq!(first.parent(), Some(expected.as_path()));
+            assert_eq!(
+                std::fs::read_to_string(&first).unwrap(),
+                "production prompt"
+            );
+            let name = first.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with(SYSTEM_PROMPT_FILE_PREFIX) && name.ends_with(".txt"));
+            assert_eq!(
+                std::fs::metadata(&first).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+            assert!(!old.exists());
+            assert!(fresh.exists() && unrelated.exists());
+            let later = touch(
+                &expected,
+                "orch-claude-system-prompt-later.txt",
+                STALE_AFTER + Duration::from_secs(60),
+            );
+            let second = write_system_prompt_file("second", None).unwrap();
+            assert_eq!(second.parent(), Some(expected.as_path()));
+            assert_ne!(first.to_path_buf(), second.to_path_buf());
+            assert!(later.exists(), "default sweep runs only once per process");
+            let path = first.to_path_buf();
+            drop(first);
+            assert!(!path.exists(), "the prompt guard still removes its file");
+            return;
+        }
+        for xdg in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            for dir in ["home", "tmp", "runtime"] {
+                std::fs::create_dir(root.path().join(dir)).unwrap();
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.env_clear()
+                .args(["--exact", "adapters::claude::tests::default_prompt_directory_and_once_sweep_preserve_production_behavior", "--nocapture"])
+                .env(CHILD_ROOT, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("TMPDIR", root.path().join("tmp"));
+            if xdg {
+                command.env("XDG_RUNTIME_DIR", root.path().join("runtime"));
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "XDG={xdg}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn supplied_prompt_directory_is_private_and_is_not_swept() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("prompts");
+        ensure_private_dir(&dir).unwrap();
+        let old = touch(
+            &dir,
+            "orch-claude-system-prompt-old.txt",
+            STALE_AFTER + Duration::from_secs(60),
+        );
+        let prompt = write_system_prompt_file("private prompt", Some(&dir)).unwrap();
+        assert_eq!(prompt.parent(), Some(dir.as_path()));
+        assert!(old.exists());
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        let loose = root.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "untouched").unwrap();
+        for invalid in [&loose, &link, &file] {
+            assert!(write_system_prompt_file("refuse", Some(invalid)).is_err());
+        }
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "untouched");
+        assert_eq!(
+            std::fs::metadata(loose).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+    }
 
     fn touch(dir: &Path, name: &str, age: Duration) -> PathBuf {
         let path = dir.join(name);

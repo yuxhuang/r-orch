@@ -268,6 +268,7 @@ mod tests {
                 clock: Arc::new(orch_core::test_support::FixedClock::new()),
                 ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
                 global_config_path: None,
+                claude_prompt_directory: None,
             },
         )
         .await
@@ -339,6 +340,7 @@ mod tests {
                 clock: Arc::new(orch_core::test_support::FixedClock::new()),
                 ids: Arc::new(orch_core::test_support::SeqIdGenerator::new()),
                 global_config_path: None,
+                claude_prompt_directory: None,
             },
         )
         .await

@@ -402,6 +402,7 @@ impl Rig {
                 ids: Arc::new(SeqIdGenerator::new()),
                 // Never the developer's real global config.
                 global_config_path: Some(dir.path().join("global.yml")),
+                claude_prompt_directory: None,
             },
         )
         .await

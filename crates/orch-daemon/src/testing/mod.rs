@@ -247,6 +247,7 @@ impl HarnessBuilder {
             clock: self.clock.unwrap_or(defaults.clock),
             ids: self.ids.unwrap_or(defaults.ids),
             global_config_path: Some(global_config_path),
+            claude_prompt_directory: Some(scratch.path().join("claude-prompts")),
         };
         let mut running = Running::bring_up_with_spawn_domain(
             BringUp {

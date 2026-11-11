@@ -774,6 +774,7 @@ async fn paused_scenario(root: &Path) {
     let daemon = DaemonHarness::builder()
         .on_socket()
         .global_config_path(home.join("global.yml"))
+        .environment(scenario_environment(root))
         .start_in(&root.join("project"))
         .await
         .unwrap();
@@ -923,6 +924,7 @@ async fn effort_scenario(root: &Path) {
     let daemon = DaemonHarness::builder()
         .on_socket()
         .global_config_path(home.join("global.yml"))
+        .environment(scenario_environment(root))
         .start_in(&root.join("project"))
         .await
         .unwrap();

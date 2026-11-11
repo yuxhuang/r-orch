@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use support::{DEADLINE, Raw, ok};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
@@ -25,6 +25,10 @@ fn executable(path: &Path, text: &str) {
 // Hostile ambient values live only in a fresh process. Even the red control
 // can resolve only test-owned canaries, never an installed AI executable.
 fn hostile_process(name: &str, body: impl AsyncFnOnce(&Path)) {
+    hostile_process_with_runtime(name, false, body);
+}
+
+fn hostile_process_with_runtime(name: &str, xdg: bool, body: impl AsyncFnOnce(&Path)) {
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -35,7 +39,7 @@ fn hostile_process(name: &str, body: impl AsyncFnOnce(&Path)) {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    for dir in ["home/.codex", "bin", "tmp"] {
+    for dir in ["home/.codex", "bin", "tmp", "runtime"] {
         std::fs::create_dir_all(root.path().join(dir)).unwrap();
     }
     std::fs::write(root.path().join("home/launch-canary"), "ambient-home").unwrap();
@@ -59,9 +63,13 @@ fn hostile_process(name: &str, body: impl AsyncFnOnce(&Path)) {
             "#!/bin/sh\nprintf called >> \"$HOME/ambient-executed\"\nexit 0\n",
         );
     }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.env_clear();
+    if xdg {
+        command.env("XDG_RUNTIME_DIR", root.path().join("runtime"));
+    }
+    let mut child = command
         .args(["--exact", name, "--nocapture"])
-        .env_clear()
         .env(CHILD_ROOT, root.path())
         .env("HOME", root.path().join("home"))
         .env("PATH", root.path().join("bin"))
@@ -487,4 +495,161 @@ async fn synthetic_token_cannot_authorize_the_default_process_manager() {
     );
     assert_eq!(shell(&daemon, "printf recovered").await, "recovered");
     daemon.shutdown().await.unwrap();
+}
+
+// Record the native filesystem effect at the process boundary, before a fast
+// fake child lets the event stream drop its prompt-file guard.
+#[derive(Default)]
+struct PromptProcesses {
+    prompts: Mutex<Vec<(PathBuf, String, u32)>>,
+}
+
+#[async_trait::async_trait]
+impl orch_core::process::ProcessManager for PromptProcesses {
+    fn is_alive(&self, pid: u32) -> bool {
+        let _ = pid;
+        false
+    }
+    fn kill(&self, pid: u32, signal: orch_core::process::Signal) {
+        let _ = (pid, signal);
+    }
+    async fn kill_with_grace(&self, pid: u32, grace: Duration) {
+        let _ = (pid, grace);
+    }
+    fn spawn(
+        &self,
+        command: &str,
+        args: &[String],
+        opts: SpawnOptions,
+    ) -> orch_core::error::Result<SpawnedChild> {
+        if let Some(pair) = args
+            .windows(2)
+            .find(|pair| pair[0] == "--system-prompt-file")
+        {
+            let path = PathBuf::from(&pair[1]);
+            self.prompts.lock().unwrap().push((
+                path.clone(),
+                std::fs::read_to_string(&path).unwrap(),
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            ));
+        }
+        let _ = (command, opts);
+        Ok(SpawnedChild {
+            pid: 987654,
+            stdout: Some(Box::new(tokio::io::empty())),
+            stderr: Some(Box::new(tokio::io::empty())),
+            stdin: Some(Box::new(tokio::io::sink())),
+            exit: orch_core::process::ExitSignal::resolved(orch_core::process::ExitOutcome {
+                code: Some(0),
+                signal: None,
+            }),
+        })
+    }
+}
+
+async fn prompt_canary(root: &Path, xdg: bool, dispatch: bool) {
+    let ambient = if xdg {
+        root.join("runtime/orch")
+    } else {
+        std::env::temp_dir().join(format!("orch-{}", nix::unistd::Uid::current()))
+    };
+    assert!(ambient.starts_with(root), "canary must be test-owned");
+    std::fs::create_dir(&ambient).unwrap();
+    std::fs::set_permissions(&ambient, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stale = ambient.join("orch-claude-system-prompt-canary.txt");
+    std::fs::write(&stale, "ambient canary").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(90000))
+        .unwrap();
+    let processes = Arc::new(PromptProcesses::default());
+    let daemon = DaemonHarness::builder()
+        .on_socket()
+        .processes(processes.clone())
+        .isolated_fake_spawns()
+        .start()
+        .await
+        .unwrap();
+    let scratch = daemon.socket().unwrap().parent().unwrap().to_owned();
+    assert!(!ambient.starts_with(&scratch));
+    if dispatch {
+        let mut raw = Raw::session(&daemon, "cli", "normal").await;
+        let reply = raw.request(1, "agent.create", json!({"name":"prompt canary", "adapter":"claude", "workspace_mode":"shared", "approval_policy":"manual", "role":"private system prompt"})).await;
+        let agent = ok(&reply)["agent"]["id"].as_str().unwrap().to_owned();
+        let task = support::task(&mut raw, "prepare the prompt", json!({"assignee":agent})).await;
+        let reply = raw.request(2, "dispatch.tick", json!({})).await;
+        assert_eq!(ok(&reply)["launched"], json!([task]));
+    } else {
+        let handle = daemon
+            .engine()
+            .adapters
+            .get("claude")
+            .unwrap()
+            .execute(orch_core::adapter::ExecuteParams {
+                prompt: "test prompt".into(),
+                system_prompt: Some("private system prompt".into()),
+                workspace: daemon.project_root().into(),
+                env: Default::default(),
+                inherit_env: Default::default(),
+                config: Default::default(),
+                cancel: Default::default(),
+            })
+            .unwrap();
+        drop(handle);
+    }
+    let prompts = processes.prompts.lock().unwrap().clone();
+    daemon.shutdown().await.unwrap();
+    println!(
+        "prompt case XDG={xdg} dispatch={dispatch}: observations={} paths={:?}",
+        prompts.len(),
+        prompts.iter().map(|p| &p.0).collect::<Vec<_>>()
+    );
+    assert!(!prompts.is_empty(), "prompt launch must be observed");
+    assert_eq!(
+        std::fs::read_to_string(&stale).ok().as_deref(),
+        Some("ambient canary"),
+        "ambient stale prompt must remain untouched"
+    );
+    assert_eq!(
+        std::fs::read_dir(&ambient).unwrap().count(),
+        1,
+        "no ambient prompt may be written"
+    );
+    assert_eq!(prompts.len(), 1);
+    let (path, text, mode) = &prompts[0];
+    assert!(
+        path.starts_with(&scratch),
+        "prompt outside retained scratch: {path:?}"
+    );
+    assert!(text.contains("private system prompt"));
+    assert_eq!(*mode, 0o600);
+}
+
+#[test]
+fn claude_prompt_ignores_ambient_runtime_directory() {
+    hostile_process_with_runtime(
+        "claude_prompt_ignores_ambient_runtime_directory",
+        true,
+        async |root| prompt_canary(root, true, false).await,
+    );
+}
+
+#[test]
+fn claude_prompt_ignores_ambient_temp_directory() {
+    hostile_process_with_runtime(
+        "claude_prompt_ignores_ambient_temp_directory",
+        false,
+        async |root| prompt_canary(root, false, false).await,
+    );
+}
+
+#[test]
+fn dispatched_claude_prompt_stays_in_harness_scratch() {
+    hostile_process_with_runtime(
+        "dispatched_claude_prompt_stays_in_harness_scratch",
+        true,
+        async |root| prompt_canary(root, true, true).await,
+    );
 }

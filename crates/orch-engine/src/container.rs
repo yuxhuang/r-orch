@@ -39,7 +39,7 @@ use orch_core::storage::{
 use orch_core::template::TemplateEngine;
 use orch_core::workspace::WorkspaceManager;
 use orch_domain::{GlobalConfig, OrchestratorConfig, OrchestratorEvent};
-use orch_infra::adapters::registry::build_registry_with_clock_and_spawn_domain;
+use orch_infra::adapters::registry::build_registry_with_clock_spawn_domain_and_prompt_directory;
 use orch_infra::process::gate::SpawnDomain;
 use orch_infra::storage::{
     FileAgentStore, FileConfigStore, FileContextStore, FileGlobalConfigStore, FileGoalStore,
@@ -241,6 +241,9 @@ pub struct EngineSeams {
     /// with a cwd outside the repo, which reproduced the file byte for byte.
     /// A seam the test passes explicitly cannot be bypassed that way.
     pub global_config_path: Option<PathBuf>,
+    /// Private Claude prompt directory for full-tier adapters. `None` keeps
+    /// production runtime/temp resolution; the light tier does not use it.
+    pub claude_prompt_directory: Option<PathBuf>,
 }
 
 impl Default for EngineSeams {
@@ -249,6 +252,7 @@ impl Default for EngineSeams {
             clock: Arc::new(SystemClock::new()),
             ids: Arc::new(NanoIdGenerator::new()),
             global_config_path: None,
+            claude_prompt_directory: None,
         }
     }
 }
@@ -511,6 +515,7 @@ async fn build_full_internal(
     command_runner: Option<Arc<dyn CommandRunner>>,
     spawn_domain: SpawnDomain,
 ) -> Result<FullEngine> {
+    let claude_prompt_directory = seams.claude_prompt_directory.clone();
     let mut engine = build_light_with(project_root.clone(), seams).await?;
     if peer.name.is_some() {
         engine.config.peer.name = peer.name;
@@ -525,10 +530,11 @@ async fn build_full_internal(
     // Adapters stamp the events they parse out of a child's stdout, so they
     // get the injected clock too — otherwise the seam would reach every
     // timestamp except the ones the adapters actually read.
-    let adapters = Arc::new(build_registry_with_clock_and_spawn_domain(
+    let adapters = Arc::new(build_registry_with_clock_spawn_domain_and_prompt_directory(
         Arc::clone(&processes),
         Arc::clone(&engine.clock),
         spawn_domain.clone(),
+        claude_prompt_directory,
     ));
     let workspace: Arc<dyn WorkspaceManager> = Arc::new(
         GitWorkspaceManager::new(
@@ -636,6 +642,7 @@ mod tests {
             // light tier, which does not construct the global-config store.
             // Anything reading or writing `global.yml` must set it.
             global_config_path: None,
+            claude_prompt_directory: None,
         }
     }
 
