@@ -62,6 +62,8 @@ impl SpawnDomain {
                     .expect("synthetic spawn gate is never closed");
                 SpawnReservation {
                     notice,
+                    work: None,
+                    lease: None,
                     permit: Permit::Synthetic { _permit: permit },
                 }
             }
@@ -92,6 +94,8 @@ enum Permit {
 pub struct SpawnReservation {
     // Clear the completed stage before another permit owner can enter.
     notice: Notice,
+    work: Option<std::sync::Arc<SpawnWork>>,
+    lease: Option<work::WorkLease>,
     #[cfg(target_os = "macos")]
     permit: Permit,
 }
@@ -130,7 +134,55 @@ impl orch_core::process::SpawnAdmission for ProcessSpawnAdmission {
         Box::new(reserve_spawn(SpawnSite::Launch).await)
     }
 }
+/// A final launch shares shutdown ownership with diagnostics and preparation.
+/// Reservation of the process-wide gate still precedes project/state locks;
+/// tracker admission is decided inside the final operation before its writes.
+pub struct TrackedSpawnAdmission {
+    domain: SpawnDomain,
+    work: std::sync::Arc<SpawnWork>,
+}
+impl TrackedSpawnAdmission {
+    pub fn new(domain: SpawnDomain, work: std::sync::Arc<SpawnWork>) -> Self {
+        Self { domain, work }
+    }
+}
+#[async_trait::async_trait]
+impl orch_core::process::SpawnAdmission for TrackedSpawnAdmission {
+    async fn reserve(&self) -> Box<dyn orch_core::process::SpawnReservation> {
+        let mut reservation = self.domain.reserve(SpawnSite::Launch).await;
+        reservation.work = Some(self.work.clone());
+        Box::new(reservation)
+    }
+    fn is_closed(&self) -> bool {
+        self.work.is_sealed()
+    }
+}
+
+/// The handoff is single-use and tracker-specific. A second process call, or
+/// a different manager's tracker, must obtain a new admission in the usual way.
+pub(crate) fn take_admitted_work(work: &std::sync::Arc<SpawnWork>) -> Option<work::WorkLease> {
+    RESERVED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let reservation = slot.as_mut()?;
+        if reservation.lease.as_ref()?.belongs_to(work) {
+            reservation.lease.take()
+        } else {
+            None
+        }
+    })
+}
+
 impl orch_core::process::SpawnReservation for SpawnReservation {
+    fn try_admit(&mut self) -> bool {
+        let Some(work) = &self.work else {
+            return true;
+        };
+        if self.lease.is_none() {
+            self.lease = work.track();
+        }
+        self.lease.is_some()
+    }
+
     fn enter(self: Box<Self>) -> Box<dyn orch_core::process::SpawnScope> {
         Box::new(self.enter_scope())
     }
@@ -162,6 +214,8 @@ impl WaitingSpawn {
             #[cfg(target_os = "macos")]
             permit: Permit::Process { _permit: permit },
             notice: self.0,
+            work: None,
+            lease: None,
         }
     }
 }
@@ -233,3 +287,6 @@ mod platform_tests {
         });
     }
 }
+
+#[cfg(test)]
+mod tracked_tests;

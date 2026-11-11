@@ -387,6 +387,7 @@ impl Running {
             name: spec.peer_name,
             listen: spec.listen,
         };
+        let spawn_domain = spawn_domain.unwrap_or_default();
         let engine = Arc::new(
             orch_engine::container::build_full_with_children_and_spawn_domain(
                 root.clone(),
@@ -394,10 +395,16 @@ impl Running {
                 peer,
                 processes,
                 command_runner,
-                spawn_domain.unwrap_or_default(),
+                spawn_domain.clone(),
             )
             .await?,
         );
+        engine.orchestrator.set_spawn_admission(Arc::new(
+            orch_infra::process::gate::TrackedSpawnAdmission::new(
+                spawn_domain,
+                Arc::clone(diagnostics.spawn_work()),
+            ),
+        ));
         let coordinator = Arc::new(ProjectCoordinator::new(engine.operation_boundary()));
         crate::diagnostics::attach(&engine.events);
         // Startup recovery (claims, running entries, orphan runs) and the

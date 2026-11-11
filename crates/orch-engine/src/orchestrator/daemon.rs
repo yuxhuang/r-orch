@@ -20,7 +20,18 @@ use super::dispatch::{
 };
 use super::{CANCEL_KILL_GRACE, Orchestrator};
 
+/// Only preparation failures may be cancelled by an overlapping stop. Final
+/// execute errors always retain their existing failure accounting.
+enum PreparationFailureOutcome {
+    Failed,
+    Cancelled,
+}
+
 impl Orchestrator {
+    fn daemon_preparation_stopping(&self) -> bool {
+        self.is_shutting_down() || self.spawn_admission().is_closed()
+    }
+
     async fn daemon_launch_cancelled(
         &self,
         token: &tokio_util::sync::CancellationToken,
@@ -410,8 +421,11 @@ impl Orchestrator {
                     // copy a plain one. None of them means the preparation was
                     // invalidated; the recorder checks that itself (generation,
                     // and a terminal task under the dispatch gate).
-                    self.daemon_record_workspace_failure(task_id, generation, &error)
-                        .await?;
+                    if let PreparationFailureOutcome::Cancelled = self.daemon_record_workspace_failure(task_id, generation, &error)
+                        .await? {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
                     return Err(error);
                 }
             };
@@ -543,10 +557,13 @@ impl Orchestrator {
                 let preparation = match preparation {
                     Ok(preparation) => preparation,
                     Err(error) => {
-                        self.daemon_fail_preparation(
+                        if let PreparationFailureOutcome::Cancelled = self.daemon_fail_preparation(
                             &task, &agent, generation, &run.id, &error, &workspace,
                         )
-                        .await?;
+                        .await? {
+                            self.daemon_release_preparation(task_id, generation).await?;
+                            return Ok(());
+                        }
                         return Err(error.into());
                     }
                 };
@@ -556,10 +573,13 @@ impl Orchestrator {
                     match self.dispatch_effort_diagnostics(adapter.kind(), &params.config) {
                         Ok(planned) => diagnostics.extend(planned),
                         Err(error) => {
-                            self.daemon_fail_preparation(
+                            if let PreparationFailureOutcome::Cancelled = self.daemon_fail_preparation(
                                 &task, &agent, generation, &run.id, &error, &workspace,
                             )
-                            .await?;
+                            .await? {
+                                self.daemon_release_preparation(task_id, generation).await?;
+                                return Ok(());
+                            }
                             return Err(error.into());
                         }
                     }
@@ -570,7 +590,7 @@ impl Orchestrator {
             // Admission precedes the project boundary and state mutex. A queued
             // launch owns no blocking worker and cannot outlive cancellation.
             let admission = self.spawn_admission();
-            let reservation = if agent.remote.is_none() {
+            let mut reservation = if agent.remote.is_none() {
                 tokio::select! {
                     biased;
                     () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
@@ -589,7 +609,9 @@ impl Orchestrator {
                     let mut slot = self.inner.state.lock().await;
                     self.load_state(&mut slot).await?;
                     let state = slot.as_mut().expect("state loaded");
-                    if cancelled.load(Ordering::SeqCst)
+                    let admitted = reservation.as_mut().is_none_or(|permit| permit.try_admit());
+                    if !admitted
+                        || cancelled.load(Ordering::SeqCst)
                         || self.config() != launch_config
                         || cancel.is_cancelled()
                         || !self
@@ -968,13 +990,16 @@ impl Orchestrator {
         task_id: &str,
         generation: u64,
         error: &Error,
-    ) -> Result<()> {
+    ) -> Result<PreparationFailureOutcome> {
         self.deps()
             .events
             .operation_boundary()
             .run(false, async {
-                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
-                    return Ok(());
+                if self.daemon_preparation_stopping() {
+                    return Ok(PreparationFailureOutcome::Cancelled);
+                }
+                if !self.owns_preparation(task_id, generation).await {
+                    return Ok(PreparationFailureOutcome::Failed);
                 }
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
@@ -991,7 +1016,8 @@ impl Orchestrator {
                     self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
                 }
                 self.release_preparation_locked(state, task_id).await?;
-                self.save_state(state).await
+                self.save_state(state).await?;
+                Ok(PreparationFailureOutcome::Failed)
             })
             .await
             .value
@@ -1005,14 +1031,16 @@ impl Orchestrator {
         run_id: &str,
         error: &orch_core::adapter::AdapterError,
         workspace: &orch_core::workspace::PrepareResult,
-    ) -> Result<()> {
+    ) -> Result<PreparationFailureOutcome> {
         let mut owns_preparation = false;
+        let mut stopped = false;
         let result = self
             .deps()
             .events
             .operation_boundary()
             .run(false, async {
-                if self.is_shutting_down() {
+                if self.daemon_preparation_stopping() {
+                    stopped = true;
                     return Ok(());
                 }
 
@@ -1078,6 +1106,12 @@ impl Orchestrator {
             self.daemon_release_preparation(&task.id, generation)
                 .await?;
         }
-        result
+        result.map(|()| {
+            if stopped {
+                PreparationFailureOutcome::Cancelled
+            } else {
+                PreparationFailureOutcome::Failed
+            }
+        })
     }
 }

@@ -329,10 +329,21 @@ pub trait ProcessManager: Send + Sync {
 #[async_trait]
 pub trait SpawnAdmission: Send + Sync {
     async fn reserve(&self) -> Box<dyn SpawnReservation>;
+
+    /// Whether shutdown has permanently closed this provider's tracker.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// Send while queued/reserved. Enter only around a synchronous adapter call.
 pub trait SpawnReservation: Send {
+    /// Decide tracker admission before durable launch writes. On success the
+    /// reservation owns the admission until spawn consumes it or it is dropped.
+    fn try_admit(&mut self) -> bool {
+        true
+    }
+
     fn enter(self: Box<Self>) -> Box<dyn SpawnScope>;
 }
 

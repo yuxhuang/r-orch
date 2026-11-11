@@ -143,7 +143,7 @@ async fn explicit_stop_preserves_retry_until_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_stop_preserves_last_attempt_and_dependent() {
+async fn guard_explicit_stop_preserves_last_attempt_and_dependent() {
     tokio::time::timeout(DEADLINE, stop_launch(true, 1))
         .await
         .unwrap();
@@ -157,7 +157,7 @@ async fn signal_shutdown_preserves_retry_until_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn signal_shutdown_preserves_last_attempt_and_dependent() {
+async fn guard_signal_shutdown_preserves_last_attempt_and_dependent() {
     tokio::time::timeout(DEADLINE, stop_launch(false, 1))
         .await
         .unwrap();

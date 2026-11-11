@@ -540,6 +540,7 @@ impl ServiceHandler {
     ) -> OpResult<StopOutcome> {
         let drain_deadline = tokio::time::Instant::now() + crate::lifecycle::SESSION_DRAIN;
         self.coordinator.stop_admission();
+        self.diagnostics.spawn_work().seal();
         self.control.dispatch_on.store(false, Ordering::SeqCst);
         self.end_batch();
         self.control

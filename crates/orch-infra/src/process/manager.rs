@@ -175,7 +175,7 @@ mod sealed_launch_tests {
     }
 
     #[tokio::test]
-    async fn sealed_launch_never_enters_the_spawn_observer() {
+    async fn guard_sealed_launch_never_enters_the_spawn_observer() {
         let work = Arc::new(super::super::gate::SpawnWork::default());
         let manager =
             SnapshotEnvProcessManager::new(EnvSnapshot::default()).with_spawn_work(work.clone());
@@ -238,7 +238,8 @@ fn spawn_with(
 ) -> Result<SpawnedChild> {
     let lease = work
         .map(|work| {
-            work.track()
+            super::gate::take_admitted_work(work)
+                .or_else(|| work.track())
                 .ok_or_else(|| Error::other("spawn admission closed"))
         })
         .transpose()?;

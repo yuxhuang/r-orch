@@ -53,6 +53,54 @@ impl LaunchProcesses {
         )))
     }
 
+    pub(crate) fn shell_adapter_and_processes(
+        &self,
+        root: &std::path::Path,
+    ) -> (
+        Arc<dyn orch_core::adapter::Adapter>,
+        Arc<dyn orch_core::process::ProcessManager>,
+    ) {
+        let processes: Arc<dyn orch_core::process::ProcessManager> = Arc::new(
+            orch_infra::process::SnapshotEnvProcessManager::new(orch_infra::process::EnvSnapshot {
+                base: vec![
+                    ("HOME".into(), root.as_os_str().to_owned()),
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                ],
+                forced: vec![],
+            })
+            .with_spawn_work(self.work.clone()),
+        );
+        (
+            Arc::new(orch_infra::adapters::shell::ShellAdapter::new(
+                processes.clone(),
+            )),
+            processes,
+        )
+    }
+
+    pub(crate) fn workspace(
+        &self,
+        root: &std::path::Path,
+    ) -> Arc<dyn orch_core::workspace::WorkspaceManager> {
+        let (_, processes) = self.shell_adapter_and_processes(root);
+        Arc::new(orch_infra::workspace::GitWorkspaceManager::new(
+            root.to_owned(),
+            root.join(".orchestry"),
+            processes,
+        ))
+    }
+
+    pub(crate) fn admission(&self) -> Arc<dyn orch_core::process::SpawnAdmission> {
+        Arc::new(orch_infra::process::gate::TrackedSpawnAdmission::new(
+            orch_infra::process::gate::SpawnDomain::default(),
+            self.work.clone(),
+        ))
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.work.is_idle()
+    }
+
     pub(crate) fn seal(&self) {
         self.work.seal();
     }
@@ -185,6 +233,7 @@ pub(crate) struct HarnessBuilder {
         reason = "test-only store wrappers; each signature is spelled out where it is used"
     )]
     wrap_runs: Option<Box<dyn FnOnce(Arc<FakeRunStore>) -> Arc<dyn RunStore>>>,
+    workspace_impl: Option<Arc<dyn orch_core::workspace::WorkspaceManager>>,
 }
 
 impl Default for HarnessBuilder {
@@ -215,6 +264,7 @@ impl HarnessBuilder {
             wrap_tasks: None,
             wrap_agents: None,
             wrap_runs: None,
+            workspace_impl: None,
         }
     }
 
@@ -293,6 +343,14 @@ impl HarnessBuilder {
     /// for the cases that need a hand-written `execute`.
     pub(crate) fn adapter_impl(mut self, adapter: Arc<dyn orch_core::adapter::Adapter>) -> Self {
         self.adapter_impl = Some(adapter);
+        self
+    }
+
+    pub(crate) fn workspace_impl(
+        mut self,
+        workspace: Arc<dyn orch_core::workspace::WorkspaceManager>,
+    ) -> Self {
+        self.workspace_impl = Some(workspace);
         self
     }
 
@@ -427,7 +485,9 @@ impl HarnessBuilder {
             run_store,
             state_store: Arc::clone(&state) as Arc<dyn StateStore>,
             adapters: Arc::new(registry),
-            workspace: Arc::clone(&workspace) as Arc<dyn orch_core::workspace::WorkspaceManager>,
+            workspace: self.workspace_impl.unwrap_or_else(|| {
+                Arc::clone(&workspace) as Arc<dyn orch_core::workspace::WorkspaceManager>
+            }),
             templates: Arc::clone(&templates) as Arc<dyn orch_core::template::TemplateEngine>,
             processes: Arc::clone(&processes) as Arc<dyn orch_core::process::ProcessManager>,
             events: Arc::clone(&bus),

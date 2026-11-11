@@ -11,16 +11,16 @@ impl Orchestrator {
         self.daemon_stop_with_spawn_seal(|| {}).await
     }
 
-    /// Seal spawning in the same operation as the running-task snapshot.
-    /// A launch already inside its durable phase must reach spawn before the
-    /// seal; a launch still preparing observes shutdown without an attempt.
+    /// Close new admissions before any wait. An admitted launch that passed
+    /// its final checks owns its spawn through the running-task registration;
+    /// the stop snapshots and reconciles it in the next project operation.
     pub async fn daemon_stop_with_spawn_seal(&self, seal: impl FnOnce() + Send) -> Result<()> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
+        seal();
         self.inner.shutting_down.store(true, Ordering::SeqCst);
+        let _lifecycle = self.inner.lifecycle.lock().await;
         let boundary = self.deps().events.operation_boundary();
         let entries = boundary
             .run(false, async {
-                seal();
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");

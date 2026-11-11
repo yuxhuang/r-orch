@@ -159,10 +159,10 @@ impl ServiceHandler {
     /// Permanently reject new requests before releasing project ownership.
     pub(crate) fn seal_requests(&self) {
         self.requests.seal();
+        self.diagnostics.spawn_work().seal();
     }
 
-    /// The spawn seal shares the launch commit's project boundary. Request
-    /// admission may close synchronously, but may not split that commit.
+    /// Stop execution after synchronously closing new spawn admission.
     pub(crate) async fn stop_execution(&self) -> orch_core::error::Result<()> {
         self.engine
             .orchestrator
@@ -458,3 +458,6 @@ fn encode<T: serde::Serialize>(value: T) -> OpResult<Box<RawValue>> {
 pub struct UnimplementedHandler;
 
 impl Handler for UnimplementedHandler {}
+
+#[cfg(test)]
+mod stop_tests;

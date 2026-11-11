@@ -75,6 +75,7 @@ async fn stop_during_launch(max_attempts: u32) {
             branch: None,
         });
     h.orchestrator.daemon_initialize().await.unwrap();
+    h.orchestrator.set_spawn_admission(work.admission());
     barrier.armed.store(true, Ordering::SeqCst);
     let launch = h.orchestrator.daemon_tick(true);
     tokio::pin!(launch);
@@ -135,6 +136,15 @@ async fn stop_during_launch(max_attempts: u32) {
         errors.is_empty(),
         "a clean stop produced an orchestrator error: {errors:?}"
     );
+    assert_eq!(current.attempts, 1);
+    assert_eq!(
+        current.status,
+        if max_attempts == 1 {
+            TaskStatus::Failed
+        } else {
+            TaskStatus::Retrying
+        }
+    );
     assert!(runs.iter().all(|run| run.status == RunStatus::Cancelled));
     assert_eq!(current_agent.status, AgentStatus::Idle);
     assert_eq!(current_agent.stats.tasks_failed, agent.stats.tasks_failed);
@@ -147,14 +157,14 @@ async fn stop_during_launch(max_attempts: u32) {
 }
 
 #[tokio::test]
-async fn stop_during_launch_with_retries_does_not_record_failure() {
+async fn launch_committed_before_stop_consumes_attempt_and_retries() {
     tokio::time::timeout(std::time::Duration::from_secs(10), stop_during_launch(3))
         .await
         .unwrap();
 }
 
 #[tokio::test]
-async fn stop_during_launch_on_last_attempt_does_not_fail_dependents() {
+async fn last_attempt_committed_before_stop_fails_task_without_cascade() {
     tokio::time::timeout(std::time::Duration::from_secs(10), stop_during_launch(1))
         .await
         .unwrap();
@@ -259,7 +269,7 @@ async fn stop_winning_launch_preserves_retry_and_attempt() {
 }
 
 #[tokio::test]
-async fn stop_winning_last_attempt_preserves_task() {
+async fn guard_stop_winning_last_attempt_preserves_task() {
     tokio::time::timeout(std::time::Duration::from_secs(10), stop_before_launch(1))
         .await
         .unwrap();
@@ -356,4 +366,155 @@ async fn a_real_spawn_error_without_stop_consumes_the_attempt() {
 #[tokio::test]
 async fn a_tracker_refusal_without_stop_is_not_swallowed() {
     refused_without_stop(true).await;
+}
+
+#[tokio::test]
+async fn dropping_launch_during_first_write_releases_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let work = Arc::new(LaunchProcesses::default());
+    let barrier = Arc::new(Barrier::default());
+    let mut agent = make_agent();
+    agent.config.command = Some("true".into());
+    let task = make_task();
+    let h = Harness::builder()
+        .tasks([task.clone()])
+        .agents([agent])
+        .adapter_impl(work.shell_adapter(root.path()))
+        .wrap_task_store({
+            let barrier = barrier.clone();
+            move |inner| Arc::new(HeldWrite { inner, barrier })
+        })
+        .build();
+    h.orchestrator.set_spawn_admission(work.admission());
+    h.orchestrator.daemon_initialize().await.unwrap();
+    barrier.armed.store(true, Ordering::SeqCst);
+    let mut launch = Box::pin(h.orchestrator.daemon_launch_task(&task.id));
+    tokio::select! {
+        biased;
+        result = &mut launch => panic!("launch missed first write: {result:?}"),
+        () = barrier.entered.notified() => (),
+    }
+    assert!(!work.is_idle());
+    work.seal();
+    drop(launch);
+    assert!(work.is_idle());
+    tokio::time::timeout(std::time::Duration::from_secs(10), stop(&h, &work))
+        .await
+        .unwrap();
+    assert_eq!(h.task(&task.id), task);
+    assert!(
+        h.runs
+            .snapshot()
+            .iter()
+            .all(|run| run.status == RunStatus::Cancelled)
+    );
+    assert!(
+        h.events_of(OrchestratorEventType::OrchestratorError)
+            .is_empty()
+    );
+}
+
+struct CancelAfterAdmission {
+    inner: Arc<dyn orch_core::process::SpawnAdmission>,
+    guard: Arc<AtomicBool>,
+}
+struct CancellingReservation {
+    inner: Box<dyn orch_core::process::SpawnReservation>,
+    guard: Arc<AtomicBool>,
+}
+#[async_trait]
+impl orch_core::process::SpawnAdmission for CancelAfterAdmission {
+    async fn reserve(&self) -> Box<dyn orch_core::process::SpawnReservation> {
+        Box::new(CancellingReservation {
+            inner: self.inner.reserve().await,
+            guard: self.guard.clone(),
+        })
+    }
+}
+impl orch_core::process::SpawnReservation for CancellingReservation {
+    fn try_admit(&mut self) -> bool {
+        let admitted = self.inner.try_admit();
+        assert!(admitted);
+        self.guard.store(true, Ordering::SeqCst);
+        admitted
+    }
+    fn enter(self: Box<Self>) -> Box<dyn orch_core::process::SpawnScope> {
+        self.inner.enter()
+    }
+}
+
+#[tokio::test]
+async fn cancellation_at_final_checks_releases_admitted_launch() {
+    let work = Arc::new(LaunchProcesses::default());
+    let guard = Arc::new(AtomicBool::new(false));
+    let task = make_task();
+    let agent = make_agent();
+    let h = Harness::builder()
+        .tasks([task.clone()])
+        .agents([agent.clone()])
+        .build();
+    h.orchestrator
+        .set_spawn_admission(Arc::new(CancelAfterAdmission {
+            inner: work.admission(),
+            guard: guard.clone(),
+        }));
+    h.orchestrator.daemon_initialize().await.unwrap();
+    h.orchestrator
+        .daemon_launch_task_with_guard(&task.id, guard, false)
+        .await
+        .unwrap();
+    assert_eq!(h.task(&task.id), task);
+    assert_eq!(h.agent(&agent.id), agent);
+    assert!(
+        h.runs
+            .snapshot()
+            .iter()
+            .all(|run| run.status == RunStatus::Cancelled)
+    );
+    assert!(h.persisted_state().retry_queue.is_empty());
+    assert!(h.persisted_state().claimed.is_empty());
+    assert!(h.adapter.execute_calls.calls().is_empty());
+    assert!(work.is_idle());
+    assert!(
+        h.events_of(OrchestratorEventType::OrchestratorError)
+            .is_empty()
+    );
+}
+
+struct SealAtReservation(Arc<LaunchProcesses>);
+#[async_trait]
+impl orch_core::process::SpawnAdmission for SealAtReservation {
+    async fn reserve(&self) -> Box<dyn orch_core::process::SpawnReservation> {
+        let reservation = self.0.admission().reserve().await;
+        self.0.seal();
+        reservation
+    }
+}
+
+#[tokio::test]
+async fn sealed_tracker_refuses_final_admission_before_task_writes() {
+    let work = Arc::new(LaunchProcesses::default());
+    let task = make_task();
+    let agent = make_agent();
+    let h = Harness::builder()
+        .tasks([task.clone()])
+        .agents([agent.clone()])
+        .build();
+    h.orchestrator
+        .set_spawn_admission(Arc::new(SealAtReservation(work.clone())));
+    h.orchestrator.daemon_initialize().await.unwrap();
+    h.orchestrator.daemon_tick(true).await.unwrap();
+    assert!(!h.orchestrator.is_shutting_down());
+    assert_eq!(h.task(&task.id), task);
+    assert_eq!(h.agent(&agent.id), agent);
+    assert_eq!(h.runs.snapshot().len(), 1);
+    assert_eq!(h.runs.snapshot()[0].status, RunStatus::Cancelled);
+    assert!(h.persisted_state().retry_queue.is_empty());
+    assert!(h.persisted_state().claimed.is_empty());
+    assert!(h.adapter.execute_calls.calls().is_empty());
+    assert!(work.is_idle());
+    assert!(
+        h.events_of(OrchestratorEventType::OrchestratorError)
+            .is_empty()
+    );
 }
