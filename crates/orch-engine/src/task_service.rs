@@ -7,7 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+use tokio::sync::Mutex;
 
 use orch_core::clock::Clock;
 use orch_core::error::{Error, Result};
@@ -20,6 +22,7 @@ use orch_domain::{
 use orch_infra::storage::{Paths, fs_utils};
 
 use crate::events::EventBus;
+use crate::orchestrator::WeakOrchestrator;
 use orch_infra::storage::remote::RemoteAgentDirectory;
 
 /// Fields `task edit` may change. `None` leaves a field alone.
@@ -35,11 +38,13 @@ pub struct UpdateTaskFields {
 }
 
 pub struct TaskService {
+    pub(crate) dispatch_gate: Mutex<()>,
+    orchestrator: RwLock<Option<WeakOrchestrator>>,
     remote_directory: Option<RemoteAgentDirectory>,
     tasks: Arc<dyn TaskStore>,
     agents: Arc<dyn AgentStore>,
     events: Arc<EventBus>,
-    config: OrchestratorConfig,
+    config: RwLock<OrchestratorConfig>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
     /// `None` disables attachment handling, exactly as the optional `paths`
@@ -59,15 +64,28 @@ impl TaskService {
         paths: Option<Paths>,
     ) -> Self {
         TaskService {
+            dispatch_gate: Mutex::new(()),
+            orchestrator: RwLock::new(None),
             remote_directory: None,
             tasks,
             agents,
             events,
-            config,
+            config: RwLock::new(config),
             clock,
             ids,
             paths,
         }
+    }
+
+    pub fn refresh_config(&self, config: OrchestratorConfig) {
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    fn config(&self) -> OrchestratorConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn with_remote_directory(mut self, directory: RemoteAgentDirectory) -> Self {
@@ -80,7 +98,9 @@ impl TaskService {
             return Err(Error::invalid_arguments("Task title is required"));
         }
 
-        let priority = input.priority.unwrap_or(self.config.defaults.task.priority);
+        let priority = input
+            .priority
+            .unwrap_or(self.config().defaults.task.priority);
         if !(1..=4).contains(&priority) {
             return Err(Error::invalid_arguments(
                 "Priority must be an integer between 1 and 4",
@@ -132,7 +152,7 @@ impl TaskService {
             attempts: 0,
             max_attempts: input
                 .max_attempts
-                .unwrap_or(self.config.defaults.task.max_attempts),
+                .unwrap_or(self.config().defaults.task.max_attempts),
             workspace_mode: input.workspace_mode,
             workspace: None,
             proof: None,
@@ -231,9 +251,43 @@ impl TaskService {
         Ok(task)
     }
 
-    /// Cancel a non-terminal task. Killing any live process is the
-    /// orchestrator's job, not this one's.
+    pub(crate) fn set_orchestrator(&self, orchestrator: WeakOrchestrator) {
+        *self.orchestrator.write().unwrap_or_else(|e| e.into_inner()) = Some(orchestrator);
+    }
+
+    /// Cancel a task and stop its run when this service belongs to an orchestrator.
     pub async fn cancel(&self, id: &str) -> Result<Task> {
+        let orchestrator = self
+            .orchestrator
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(WeakOrchestrator::upgrade);
+        if let Some(orchestrator) = orchestrator {
+            match orchestrator.cancel_service_task(id).await {
+                Ok(()) => {
+                    return if orchestrator.is_daemon_mode() {
+                        self.events
+                            .operation_boundary()
+                            .run(false, self.get(id))
+                            .await
+                            .value
+                    } else {
+                        self.get(id).await
+                    };
+                }
+                // An observer has no process ownership. Preserve its existing
+                // record cancellation until clients move into the daemon.
+                Err(Error::Domain(DomainError::LockConflict(_))) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let _dispatch = self.dispatch_gate.lock().await;
+        self.cancel_record(id).await
+    }
+
+    // The caller already holds the dispatch gate or the orchestrator state lock.
+    pub(crate) async fn cancel_record(&self, id: &str) -> Result<Task> {
         let task = self.get(id).await?;
 
         if is_terminal(task.status) {

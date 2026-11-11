@@ -123,6 +123,22 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
         return mcp::run(args, &styles);
     }
 
+    // Explicit daemon startup captures its sanitized environment before any
+    // runtime worker exists. Legacy serve/run --watch retain their own path.
+    if let Some(Command::Daemon(args)) = &cli.command {
+        return match std::env::current_dir() {
+            Ok(cwd) => commands::daemon::run(&cli, args, &cwd),
+            Err(error) => {
+                print_error(
+                    &styles,
+                    &format!("cannot read the working directory: {error}"),
+                    None,
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
+
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -393,6 +409,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         Some(Command::Web(args)) => run_web(cli, env, &cwd, args).await,
 
         // Dispatched before the runtime is built, in `dispatch_parsed`.
+        Some(Command::Daemon(_)) => unreachable!("daemon dispatch precedes the runtime"),
         Some(Command::Mcp(_)) => unreachable!("orch mcp is dispatched before the runtime"),
 
         Some(Command::Remote(args)) => {

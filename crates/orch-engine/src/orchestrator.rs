@@ -32,8 +32,12 @@
 //! order so deadlock is impossible: **`state` → `active_collectors` →
 //! `finishing_collectors` → `cancels`**. `last_auto_seed_at` and
 //! `single_task_runs` are leaves and may be taken at any point.
+//! Dispatch additionally takes `TaskService::dispatch_gate` after `state`
+//! through spawning. Goal status changes take that gate without taking state;
+//! their queued-task cancellations use `cancel_record` to avoid re-entry.
 
 mod collect;
+mod daemon;
 mod dispatch;
 mod recovery;
 mod remote;
@@ -190,10 +194,12 @@ impl Drop for StopNotification {
 }
 
 struct Inner {
+    config: std::sync::RwLock<OrchestratorConfig>,
     deps: OrchestratorDeps,
 
     /// `stateMutex` **and** `this.state`. See the module docs.
     state: Mutex<Option<OrchestratorState>>,
+    context_service: std::sync::RwLock<Option<Arc<crate::container::ContextService>>>,
     /// Task ids whose `collect_events` task is still running. Reconcile skips
     /// the PID check for these, because the child may have exited cleanly
     /// while the success handler is still queued for the state lock; the
@@ -233,6 +239,14 @@ struct Inner {
     watch_start: Mutex<()>,
     /// Serializes startup with the selection of a stop owner.
     lifecycle: Mutex<()>,
+    daemon_mode: AtomicBool,
+    daemon_batch_active: AtomicBool,
+    preparing_agents: Mutex<HashMap<String, (u64, String)>>,
+    preparation_seq: std::sync::atomic::AtomicU64,
+    deferred_kills: Mutex<Vec<(String, orch_domain::RunningEntry, String)>>,
+    terminal_intents: Mutex<HashSet<String>>,
+    deferred_cleanups: Mutex<Vec<(String, String)>>,
+    cleanup_draining: Mutex<()>,
     lock_acquired: AtomicBool,
     shutting_down: AtomicBool,
     tick_in_progress: AtomicBool,
@@ -253,6 +267,14 @@ struct Inner {
     cached_tasks: CachedTaskStore,
     cached_agents: CachedAgentStore,
     cached_goals: Option<CachedGoalStore>,
+}
+
+pub(crate) struct WeakOrchestrator(std::sync::Weak<Inner>);
+
+impl WeakOrchestrator {
+    pub(crate) fn upgrade(&self) -> Option<Orchestrator> {
+        self.0.upgrade().map(|inner| Orchestrator { inner })
+    }
 }
 
 /// The core state machine.
@@ -283,7 +305,7 @@ impl Orchestrator {
             .map(|goals| CachedGoalStore::new(Arc::clone(goals)));
         let (stopped, _) = watch::channel(false);
 
-        Orchestrator {
+        let orchestrator = Orchestrator {
             inner: Arc::new(Inner {
                 remote_state_dirty: AtomicBool::new(false),
                 remote_bridge: std::sync::RwLock::new(Arc::new(
@@ -292,8 +314,10 @@ impl Orchestrator {
                 config_store: std::sync::RwLock::new(None),
                 event_tap: std::sync::RwLock::new(None),
                 inbound_controller: std::sync::RwLock::new(None),
+                config: std::sync::RwLock::new(deps.config.clone()),
                 deps,
                 state: Mutex::new(None),
+                context_service: std::sync::RwLock::new(None),
                 active_collectors: Mutex::new(HashSet::new()),
                 finishing_collectors: Mutex::new(HashSet::new()),
                 cancels: Mutex::new(HashMap::new()),
@@ -305,6 +329,14 @@ impl Orchestrator {
                 watch_task: Mutex::new(None),
                 watch_start: Mutex::new(()),
                 lifecycle: Mutex::new(()),
+                daemon_mode: AtomicBool::new(false),
+                daemon_batch_active: AtomicBool::new(false),
+                preparing_agents: Mutex::new(HashMap::new()),
+                preparation_seq: std::sync::atomic::AtomicU64::new(0),
+                deferred_kills: Mutex::new(Vec::new()),
+                terminal_intents: Mutex::new(HashSet::new()),
+                deferred_cleanups: Mutex::new(Vec::new()),
+                cleanup_draining: Mutex::new(()),
                 lock_acquired: AtomicBool::new(false),
                 shutting_down: AtomicBool::new(false),
                 tick_in_progress: AtomicBool::new(false),
@@ -317,15 +349,50 @@ impl Orchestrator {
                 cached_agents,
                 cached_goals,
             }),
+        };
+        orchestrator
+            .deps()
+            .task_service
+            .set_orchestrator(WeakOrchestrator(Arc::downgrade(&orchestrator.inner)));
+        orchestrator
+    }
+
+    /// Configure explicit context expiry on ticks, independently of reads.
+    pub fn set_context_service(&self, service: Arc<crate::container::ContextService>) {
+        *self
+            .inner
+            .context_service
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(service);
+    }
+
+    async fn expire_context(&self) -> Result<()> {
+        let service = self
+            .inner
+            .context_service
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(service) = service {
+            service.expire_now().await?;
         }
+        Ok(())
     }
 
     pub(crate) fn deps(&self) -> &OrchestratorDeps {
         &self.inner.deps
     }
 
-    fn config(&self) -> &OrchestratorConfig {
-        &self.inner.deps.config
+    fn config(&self) -> OrchestratorConfig {
+        self.inner
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn refresh_config(&self, config: OrchestratorConfig) {
+        *self.inner.config.write().unwrap_or_else(|e| e.into_inner()) = config;
     }
 
     /// Let dispatch re-read `defaults.agent.prompt_mode` from the project
@@ -404,6 +471,9 @@ impl Orchestrator {
     /// Replace the in-memory state from the store. Always called at the start
     /// of a critical section, never outside one.
     async fn load_state(&self, slot: &mut Option<OrchestratorState>) -> Result<()> {
+        if let Some(state) = slot.as_ref() {
+            self.flush_state_lazy(state).await;
+        }
         // Do not reload an old running entry after an outcome's final write
         // failed. Persist the in-memory removal before any tick can replace it.
         if self.inner.remote_state_dirty.load(Ordering::SeqCst)
@@ -446,12 +516,19 @@ impl Orchestrator {
             if !dirty {
                 return;
             }
-            let state = orchestrator.inner.state.lock().await;
-            if let Some(state) = state.as_ref()
-                && let Err(err) = orchestrator.save_state(state).await
-            {
-                orchestrator.emit_error(err, "debounced state save");
-            }
+            orchestrator
+                .deps()
+                .events
+                .operation_boundary()
+                .run(true, async {
+                    let state = orchestrator.inner.state.lock().await;
+                    if let Some(state) = state.as_ref()
+                        && let Err(err) = orchestrator.save_state(state).await
+                    {
+                        orchestrator.emit_error(err, "debounced state save");
+                    }
+                })
+                .await;
         }));
     }
 
@@ -930,19 +1007,44 @@ impl Orchestrator {
 
     /// Cancel a running task: abort, kill, finish the run, mark cancelled.
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
+        if self.is_daemon_mode() {
+            return self.daemon_cancel_task(task_id, false).await;
+        }
         if !self.is_owner() {
             return self
-                .with_temporary_lock(|| self.cancel_task_locked(task_id))
+                .with_temporary_lock(|| self.cancel_task_locked(task_id, false))
                 .await;
         }
-        self.cancel_task_locked(task_id).await
+        self.cancel_task_locked(task_id, false).await
     }
 
-    async fn cancel_task_locked(&self, task_id: &str) -> Result<()> {
+    pub(crate) async fn cancel_service_task(&self, task_id: &str) -> Result<()> {
+        if self.is_daemon_mode() {
+            return self.daemon_cancel_task(task_id, true).await;
+        }
+        if !self.is_owner() {
+            return self
+                .with_temporary_lock(|| self.cancel_task_locked(task_id, true))
+                .await;
+        }
+        self.cancel_task_locked(task_id, true).await
+    }
+
+    async fn cancel_task_locked(&self, task_id: &str, strict: bool) -> Result<()> {
         let mut slot = self.inner.state.lock().await;
         self.load_state(&mut slot).await?;
         let state = slot.as_mut().expect("state loaded");
 
+        if strict {
+            let task = self.deps().task_service.get(task_id).await?;
+            if orch_domain::is_terminal(task.status) {
+                return Err(Error::Domain(DomainError::InvalidTransition {
+                    task_id: task_id.to_owned(),
+                    from: task.status,
+                    to: orch_domain::TaskStatus::Cancelled,
+                }));
+            }
+        }
         let entry = state.running.get(task_id).cloned();
         if let Some(entry) = entry {
             if self.worker_signal_unverified(&entry).await {
@@ -989,7 +1091,10 @@ impl Orchestrator {
         // `cancel` refuses a terminal task; `update_status` refuses the same
         // transition, so both failing means it was already terminal and there
         // is nothing to do.
-        if self.deps().task_service.cancel(task_id).await.is_err() {
+        let cancelled = self.deps().task_service.cancel_record(task_id).await;
+        if strict {
+            cancelled?;
+        } else if cancelled.is_err() {
             let _ = self
                 .deps()
                 .task_service
@@ -1003,6 +1108,9 @@ impl Orchestrator {
     /// Force-stop one agent: kill each of its runs, fail their tasks, release
     /// the agent.
     pub async fn force_stop_agent(&self, agent_id: &str) -> Result<()> {
+        if self.is_daemon_mode() {
+            return self.daemon_force_stop_agent(agent_id).await;
+        }
         if !self.is_owner() {
             return self
                 .with_temporary_lock(|| self.force_stop_agent_locked(agent_id))

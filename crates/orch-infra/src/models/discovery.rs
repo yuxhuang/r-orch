@@ -24,6 +24,8 @@ use super::parsers::{
     parse_line_models, parse_pi_models, with_default,
 };
 
+use crate::process::line_reader::{DIAGNOSTIC_OUTPUT_BYTES, read_bounded_output};
+
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(15_000);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,39 +78,19 @@ impl DiscoveryRuntime for SystemDiscoveryRuntime {
     /// Pipe both streams, 15 s timeout, and a non-zero
     /// exit is a failure carrying the signal-or-code and stderr.
     async fn run_command(&self, command: &str, args: &[&str]) -> Result<CommandOutput> {
-        let mut cmd = tokio::process::Command::new(command);
-        // On timeout, dropping the handle SIGKILLs and reaps the child; the
-        // outcome is not observable beyond this function.
-        cmd.args(args).kill_on_drop(true);
-
-        let described = || format!("{command} {}", args.join(" "));
-        let output = match tokio::time::timeout(DISCOVERY_TIMEOUT, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(source)) => {
-                return Err(Error::Io {
-                    context: format!("Failed to spawn process: {command}"),
-                    path: Some(PathBuf::from(command)),
-                    source,
-                });
-            }
-            Err(_) => return Err(Error::other(format!("{} timed out", described()))),
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if !output.status.success() {
-            let reason = exit_reason(&output.status);
-            let suffix = if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(" {stderr}")
-            };
-            return Err(Error::other(format!(
-                "{} failed: {reason}{suffix}",
-                described()
-            )));
-        }
-        Ok(CommandOutput { stdout, stderr })
+        discovery_output(
+            command,
+            args,
+            run_output(
+                command,
+                args,
+                None,
+                DISCOVERY_TIMEOUT,
+                None,
+                DIAGNOSTIC_OUTPUT_BYTES,
+            )
+            .await?,
+        )
     }
 
     async fn read_text_file(&self, path: &Path) -> Result<String> {
@@ -123,6 +105,148 @@ impl DiscoveryRuntime for SystemDiscoveryRuntime {
         }
         dirs::home_dir().unwrap_or_default().join(".codex")
     }
+}
+
+/// Diagnostic runner for a daemon: the immutable start-time environment,
+/// with trusted routing applied last. No ambient variables are inherited.
+#[derive(Clone)]
+pub struct SnapshotDiscoveryRuntime {
+    snapshot: crate::process::EnvSnapshot,
+}
+
+impl SnapshotDiscoveryRuntime {
+    pub fn new(snapshot: crate::process::EnvSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    /// Bounded, concurrent capture shared by model discovery and the daemon's
+    /// doctor/review command runner. Retains `max_output_bytes` per stream,
+    /// drains excess, and returns details to callers without logging them.
+    pub async fn output(
+        &self,
+        command: &str,
+        args: &[&str],
+        cwd: &Path,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<std::process::Output> {
+        run_output(
+            command,
+            args,
+            Some(cwd),
+            timeout,
+            Some(&self.snapshot),
+            max_output_bytes,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl DiscoveryRuntime for SnapshotDiscoveryRuntime {
+    async fn run_command(&self, command: &str, args: &[&str]) -> Result<CommandOutput> {
+        let output = run_output(
+            command,
+            args,
+            None,
+            DISCOVERY_TIMEOUT,
+            Some(&self.snapshot),
+            DIAGNOSTIC_OUTPUT_BYTES,
+        )
+        .await?;
+        discovery_output(command, args, output)
+    }
+
+    async fn read_text_file(&self, path: &Path) -> Result<String> {
+        SystemDiscoveryRuntime.read_text_file(path).await
+    }
+
+    fn codex_home(&self) -> PathBuf {
+        let value = |key: &str| {
+            self.snapshot
+                .base
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| PathBuf::from(value))
+        };
+        value("CODEX_HOME").unwrap_or_else(|| value("HOME").unwrap_or_default().join(".codex"))
+    }
+}
+
+async fn run_output(
+    command: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    snapshot: Option<&crate::process::EnvSnapshot>,
+    max_output_bytes: usize,
+) -> Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    if let Some(snapshot) = snapshot {
+        cmd.env_clear()
+            .envs(snapshot.base.iter().cloned())
+            .envs(snapshot.forced.iter().cloned());
+    }
+    let capture = async {
+        let mut child = cmd.spawn().map_err(|source| Error::Io {
+            context: format!("Failed to spawn process: {command}"),
+            path: Some(PathBuf::from(command)),
+            source,
+        })?;
+        // Both pipes were requested above. Keep the child in this future so
+        // timeout/cancellation drops it with kill_on_drop, without detached tasks.
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_bounded_output(stdout, max_output_bytes),
+            read_bounded_output(stderr, max_output_bytes),
+            child.wait()
+        )
+        .map_err(|source| Error::Io {
+            context: "read diagnostic process output".into(),
+            path: None,
+            source,
+        })?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    tokio::time::timeout(timeout, capture)
+        .await
+        .map_err(|_| Error::other(format!("{command} {} timed out", args.join(" "))))?
+}
+
+fn discovery_output(
+    command: &str,
+    args: &[&str],
+    output: std::process::Output,
+) -> Result<CommandOutput> {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        let reason = exit_reason(&output.status);
+        let suffix = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" {stderr}")
+        };
+        return Err(Error::other(format!(
+            "{command} {} failed: {reason}{suffix}",
+            args.join(" ")
+        )));
+    }
+    Ok(CommandOutput { stdout, stderr })
 }
 
 /// The signal name if the process was killed by one, otherwise the exit code.
@@ -172,7 +296,11 @@ impl ModelDiscovery {
         match self.discover_inner(adapter).await {
             Ok(options) => options,
             Err(err) => {
-                tracing::debug!(%adapter, error = %err, "model discovery failed");
+                let error_kind = match err {
+                    Error::Io { .. } => "io",
+                    _ => "probe",
+                };
+                tracing::debug!(%adapter, error_kind, "model discovery failed");
                 Vec::new()
             }
         }
@@ -610,5 +738,22 @@ mod tests {
             err.to_string(),
             "Failed to spawn process: orch-definitely-not-a-binary"
         );
+    }
+    #[tokio::test]
+    async fn diagnostic_capture_bounds_both_streams_while_draining_them() {
+        let output = SystemDiscoveryRuntime.run_command("/bin/sh", &["-c",
+            "/usr/bin/yes stdout | /usr/bin/head -c 12582912; /usr/bin/yes stderr | /usr/bin/head -c 12582912 >&2"
+        ]).await.unwrap();
+        assert_eq!(output.stdout.len(), 64 * 1024);
+        assert_eq!(output.stderr.len(), 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_capture_keeps_bounded_error_detail_for_the_caller() {
+        let error = SystemDiscoveryRuntime.run_command("/bin/sh", &["-c",
+            "printf CALLER_STDERR_CANARY >&2; /usr/bin/yes stderr | /usr/bin/head -c 12582912 >&2; exit 2"
+        ]).await.unwrap_err().to_string();
+        assert!(error.contains("CALLER_STDERR_CANARY"));
+        assert!(error.len() < 66 * 1024, "captured {} bytes", error.len());
     }
 }

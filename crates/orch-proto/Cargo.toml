@@ -1,0 +1,26 @@
+[package]
+name = "orch-proto"
+description = "Local daemon protocol for orch: versions, frozen handshake, frames, typed operation DTOs, errors and discovery records."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Workspace dependency: orch-domain only (design D1). No stores, services,
+# filesystem or process execution live here.
+[dependencies]
+orch-domain.workspace = true
+serde.workspace = true
+# `raw_value` defers decoding of a response's `ok` payload and of the frozen
+# hello's session fields until the receiver knows their schema (design D6).
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
+
+[lints]
+workspace = true

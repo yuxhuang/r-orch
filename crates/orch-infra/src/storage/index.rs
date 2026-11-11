@@ -93,6 +93,14 @@ where
         self.rebuild_index().await
     }
 
+    /// Read or scan in memory without creating a directory or publishing an index.
+    pub async fn read_index_no_persist(&self) -> Result<Vec<T>> {
+        if let Ok(Some(items)) = read_json::<Vec<T>>(&self.index_path()).await {
+            return Ok(items);
+        }
+        self.scan_items_read_only().await
+    }
+
     /// Rebuild from the individual entity files and write the result back.
     ///
     /// Order comes from directory enumeration. Entity filenames embed random
@@ -108,6 +116,10 @@ where
 
     async fn scan_items(&self) -> Result<Vec<T>> {
         ensure_dir(&self.dir).await?;
+        self.scan_items_read_only().await
+    }
+
+    async fn scan_items_read_only(&self) -> Result<Vec<T>> {
         let ext = self.format.ext();
         let mut names = list_files(&self.dir, Some(ext)).await?;
         // `.json`-backed stores must not pull `_index.json` into the rebuild.
@@ -139,7 +151,7 @@ where
     /// Replace the index wholesale, serialized against every other index
     /// mutation.
     ///
-    /// Used by the context store's lazy expiry purge, which deletes a batch of
+    /// Used by the context store's explicit expiry step, which deletes a batch of
     /// files and then rewrites the index **once** rather than per entry.
     pub async fn write_index(&self, items: &[T]) -> Result<()> {
         let guard = self.lock_writer().await?;

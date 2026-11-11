@@ -2,7 +2,7 @@
 use crate::protocol::{MAX_REASON_BYTES, MAX_TASK_ID_BYTES, MAX_VERSION_BYTES};
 use crate::{
     AbortOnDrop, Context,
-    codec::{read_frame, write_frame},
+    codec::read_frame,
     protocol::{Frame, PROTOCOL},
 };
 use async_trait::async_trait;
@@ -538,7 +538,7 @@ impl SessionHealth {
     }
 }
 
-struct Links(BTreeMap<String, (RemoteConfig, AbortOnDrop)>);
+struct Links(BTreeMap<String, (RemoteConfig, crate::Shutdown, AbortOnDrop)>);
 
 pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
     let mut links = Links(BTreeMap::new());
@@ -547,22 +547,32 @@ pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
     let mut respawn: BTreeMap<String, (Instant, Backoff)> = BTreeMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
-        tick.tick().await;
-        let configs = match ctx.store.list().await {
+        tokio::select! {
+            biased;
+            () = ctx.stop.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+        let configs = match ctx.ordered(false, ctx.store.list()).await {
             Ok(configs) => configs,
             Err(error) => {
                 tracing::error!(%error,"Read peer registry");
                 continue;
             }
         };
+        if ctx.stop.is_stopping() {
+            break;
+        }
         let removed: Vec<_> = links
             .0
             .iter()
-            .filter(|(_, (old, _))| !configs.iter().any(|c| c == old))
+            .filter(|(_, (old, _, _))| !configs.iter().any(|c| c == old))
             .map(|(alias, _)| alias.clone())
             .collect();
         for alias in removed {
-            links.0.remove(&alias);
+            if let Some((_, stop, mut task)) = links.0.remove(&alias) {
+                stop.stop();
+                let _ = (&mut task.0).await;
+            }
             if !configs.iter().any(|config| config.alias == alias) {
                 hub.remove_alias(&alias);
             }
@@ -574,7 +584,7 @@ pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
             let stopped = links
                 .0
                 .get(&config.alias)
-                .is_some_and(|(_, task)| task.0.is_finished());
+                .is_some_and(|(_, _, task)| task.0.is_finished());
             if stopped {
                 let due = respawn
                     .entry(config.alias.clone())
@@ -600,10 +610,21 @@ pub(crate) async fn manage(ctx: Context, hub: Arc<LinkHub>) {
             }
             if stopped || !links.0.contains_key(&config.alias) {
                 let alias = config.alias.clone();
-                let task = tokio::spawn(run_link(ctx.clone(), hub.clone(), config.clone()));
-                links.0.insert(alias, (config, AbortOnDrop(task)));
+                let mut link_ctx = ctx.clone();
+                link_ctx.stop = crate::Shutdown::default();
+                let stop = link_ctx.stop.clone();
+                let task = tokio::spawn(run_link(link_ctx, hub.clone(), config.clone()));
+                links.0.insert(alias, (config, stop, AbortOnDrop(task)));
             }
         }
+    }
+    // Stop all links before waiting on any one: a stalled state phase must
+    // not keep the other aliases admitting work during the drain.
+    for (_, stop, _) in links.0.values() {
+        stop.stop();
+    }
+    for (_, _, mut task) in std::mem::take(&mut links.0).into_values() {
+        let _ = (&mut task.0).await;
     }
 }
 
@@ -620,8 +641,7 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
     // is aborted, panics, or is replaced by registry reconciliation.
     ctx.store = orch_infra::storage::remote::FileRemoteStore::new(ctx.engine.paths.clone());
     let mut status = ctx
-        .store
-        .read_status(&config.alias)
+        .ordered(false, ctx.store.read_status(&config.alias))
         .await
         .ok()
         .flatten()
@@ -645,11 +665,20 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
     let mut backoff = Backoff::default();
     let mut reported: Option<(String, Instant)> = None;
     loop {
+        if ctx.stop.is_stopping() {
+            return;
+        }
         while blocked().await {
+            if ctx.stop.is_stopping() {
+                return;
+            }
             status.online = false;
             status.last_error = Some("Peer link blocked by test hook".into());
             persist_status(&ctx, &config, &status).await;
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::select! {
+                () = ctx.stop.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
         }
         // Published before the dial, not after it: a link that is failing is
         // the one an operator asks about, and until the dial returns this is
@@ -662,6 +691,9 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
         let result = session(&ctx, &hub, &config, &mut status, &mut health).await;
         status.online = false;
         ctx.store.mark_link_offline(&config.alias);
+        if ctx.stop.is_stopping() {
+            return;
+        }
         status.last_error = Some(
             result
                 .err()
@@ -704,7 +736,10 @@ async fn run_link(mut ctx: Context, hub: Arc<LinkHub>, config: RemoteConfig) {
         ));
         persist_status(&ctx, &config, &status).await;
         tracing::debug!(alias=%config.alias,error=?status.last_error,?delay,healthy=health.healthy(),attempts=status.attempts,"Peer reconnect pending");
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            () = ctx.stop.cancelled() => return,
+            () = tokio::time::sleep(delay) => {}
+        }
     }
 }
 
@@ -713,7 +748,11 @@ async fn persist_status(ctx: &Context, config: &RemoteConfig, status: &RemoteSta
     // re-add with another address, revokes this link's publication and its
     // health, and the revocation is ordered against the command by the
     // registry lock. Revocation is expected; only real failures are reported.
-    if let Err(error) = ctx.store.publish_registered_status(config, status).await {
+    // The publication is a project write like any other (design D2).
+    let published = ctx
+        .ordered(true, ctx.store.publish_registered_status(config, status))
+        .await;
+    if let Err(error) = published {
         ctx.engine.events.emit(orch_domain::OrchestratorEvent::OrchestratorError {
             error: error.to_string(),
             context: format!("Write peer status for {}; remote dispatch unavailable. Check permissions and free space in {}", status.alias, ctx.engine.paths.remotes_dir().display()),
@@ -729,15 +768,18 @@ async fn session(
     status: &mut RemoteStatus,
     health: &mut SessionHealth,
 ) -> Result<()> {
-    let socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&config.addr))
-        .await
-        .map_err(|_| Error::other("Peer connect timed out"))?
-        .map_err(net_error)?;
+    let socket = tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.stop.io(TcpStream::connect(&config.addr)),
+    )
+    .await
+    .map_err(|_| Error::other("Peer connect timed out"))?
+    .map_err(net_error)?;
     socket.set_nodelay(true).map_err(net_error)?;
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
     let mut local = ctx.local_agents().await?;
-    write_frame(
+    ctx.write(
         &mut writer,
         &Frame::Hello {
             proto: PROTOCOL,
@@ -750,10 +792,11 @@ async fn session(
     )
     .await
     .map_err(net_error)?;
-    let welcome = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader))
-        .await
-        .map_err(|_| Error::other("Peer handshake timed out"))?
-        .map_err(net_error)?;
+    let welcome =
+        tokio::time::timeout(Duration::from_secs(5), ctx.stop.io(read_frame(&mut reader)))
+            .await
+            .map_err(|_| Error::other("Peer handshake timed out"))?
+            .map_err(net_error)?;
     match welcome {
         Some(Frame::Welcome {
             proto,
@@ -795,7 +838,7 @@ async fn session(
     }
     // Must be the first post-handshake frame. It also cancels orphan mirrors
     // after a controller restart, whose local recovery ran before this link.
-    write_frame(
+    ctx.write(
         &mut writer,
         &Frame::Sync {
             active: hub.active(&config.alias),
@@ -806,11 +849,11 @@ async fn session(
     // A v1 worker answers Ping only after writing every Sync reply. Wait
     // for that fence before sending new submits: sync_state may be chunked,
     // and a later unknown item must not race a just-attempted submission.
-    write_frame(&mut writer, &Frame::Ping)
+    ctx.write(&mut writer, &Frame::Ping)
         .await
         .map_err(net_error)?;
     for frame in hub.attachments(&config.alias) {
-        write_frame(&mut writer, &frame).await.map_err(net_error)?;
+        ctx.write(&mut writer, &frame).await.map_err(net_error)?;
     }
     status.online = true;
     status.link_state = LinkState::Online;
@@ -819,7 +862,7 @@ async fn session(
     status.last_seen = Some(ctx.engine.clock.now_iso());
     persist_status(ctx, config, status).await;
     let (tx, mut frames) = mpsc::channel(128);
-    let _reader = AbortOnDrop(tokio::spawn(async move {
+    let mut reader_task = AbortOnDrop(tokio::spawn(async move {
         loop {
             let result = read_frame(&mut reader).await;
             let stop = !matches!(result, Ok(Some(_)));
@@ -835,61 +878,71 @@ async fn session(
     let mut last_ping = Instant::now();
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    loop {
-        tokio::select! {
-            frame = frames.recv() => {
-                let frame = frame
-                    .ok_or_else(|| Error::other("Peer reader stopped"))?
-                    .map_err(net_error)?
-                    .ok_or_else(|| Error::other("Peer closed connection"))?;
-                last_frame = Instant::now();
-                if matches!(&frame, Frame::Pong) && !sync_fenced {
-                    sync_fenced = true;
-                    health.fenced_at = Some(Instant::now());
-                }
-                status.last_seen = Some(ctx.engine.clock.now_iso());
-                handle_frame(ctx, hub, config, status, frame, &mut writer, &mut synced).await?;
+    let result = async {
+        loop {
+            if ctx.stop.is_stopping() {
+                return Ok(());
             }
-            _ = async {
-                tokio::select! {
-                    _ = tick.tick() => {},
-                    _ = connected.wake.notified() => {},
-                }
-            } => {
-                if blocked().await {
-                    return Err(Error::other("Peer link blocked by test hook"));
-                }
-                if last_frame.elapsed() >= Duration::from_secs(15) {
-                    return Err(Error::other("Peer heartbeat timed out"));
-                }
-                if last_ping.elapsed() >= Duration::from_secs(5) {
-                    write_frame(&mut writer, &Frame::Ping).await.map_err(net_error)?;
-                    last_ping = Instant::now();
-                }
-                hub.flush(&config.alias);
-                if synced && sync_fenced {
-                    let frames = hub.commands(&config.alias).into_iter()
-                        .chain(hub.submits(&config.alias));
-                    for frame in frames {
-                        hub.mark_attempted(&config.alias, &frame);
-                        write_frame(&mut writer, &frame).await.map_err(net_error)?;
+            tokio::select! {
+                () = ctx.stop.cancelled() => return Ok(()),
+                frame = frames.recv() => {
+                    let frame = frame
+                        .ok_or_else(|| Error::other("Peer reader stopped"))?
+                        .map_err(net_error)?
+                        .ok_or_else(|| Error::other("Peer closed connection"))?;
+                    last_frame = Instant::now();
+                    if matches!(&frame, Frame::Pong) && !sync_fenced {
+                        sync_fenced = true;
+                        health.fenced_at = Some(Instant::now());
                     }
+                    status.last_seen = Some(ctx.engine.clock.now_iso());
+                    handle_frame(ctx, hub, config, status, frame, &mut writer, &mut synced).await?;
                 }
-                if last_poll.elapsed() >= Duration::from_secs(1) {
-                    let agents = ctx.local_agents().await?;
-                    if agents != local {
-                        local = agents.clone();
-                        write_frame(&mut writer, &Frame::Agents { agents }).await.map_err(net_error)?;
+                _ = async {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = connected.wake.notified() => {},
                     }
-                    for frame in ctx.outbox(&config.alias).await? {
-                        write_frame(&mut writer, &frame).await.map_err(net_error)?;
+                } => {
+                    if blocked().await {
+                        return Err(Error::other("Peer link blocked by test hook"));
                     }
-                    persist_status(ctx, config, status).await;
-                    last_poll = Instant::now();
+                    if last_frame.elapsed() >= Duration::from_secs(15) {
+                        return Err(Error::other("Peer heartbeat timed out"));
+                    }
+                    if last_ping.elapsed() >= Duration::from_secs(5) {
+                        ctx.write(&mut writer, &Frame::Ping).await.map_err(net_error)?;
+                        last_ping = Instant::now();
+                    }
+                    hub.flush(&config.alias);
+                    if synced && sync_fenced {
+                        let frames = hub.commands(&config.alias).into_iter()
+                            .chain(hub.submits(&config.alias));
+                        for frame in frames {
+                            hub.mark_attempted(&config.alias, &frame);
+                            ctx.write(&mut writer, &frame).await.map_err(net_error)?;
+                        }
+                    }
+                    if last_poll.elapsed() >= Duration::from_secs(1) {
+                        let agents = ctx.local_agents().await?;
+                        if agents != local {
+                            local = agents.clone();
+                            ctx.write(&mut writer, &Frame::Agents { agents }).await.map_err(net_error)?;
+                        }
+                        for frame in ctx.outbox(&config.alias).await? {
+                            ctx.write(&mut writer, &frame).await.map_err(net_error)?;
+                        }
+                        persist_status(ctx, config, status).await;
+                        last_poll = Instant::now();
+                    }
                 }
             }
         }
     }
+    .await;
+    reader_task.0.abort();
+    let _ = (&mut reader_task.0).await;
+    result
 }
 async fn handle_frame(
     ctx: &Context,
@@ -901,7 +954,7 @@ async fn handle_frame(
     synced: &mut bool,
 ) -> Result<()> {
     match frame {
-        Frame::Ping => write_frame(writer, &Frame::Pong).await.map_err(net_error)?,
+        Frame::Ping => ctx.write(writer, &Frame::Pong).await.map_err(net_error)?,
         Frame::Pong => {}
         Frame::Agents { agents } => {
             validate_snapshot(&agents)?;
@@ -927,7 +980,7 @@ async fn handle_frame(
                             &item.exec_key,
                             RemoteRunEvent::Finished(outcome),
                         ) {
-                            write_frame(
+                            ctx.write(
                                 writer,
                                 &Frame::FinishedAck {
                                     exec_key: item.exec_key,
@@ -984,7 +1037,7 @@ async fn handle_frame(
         Frame::Finished { exec_key, outcome } => {
             if !hub.terminal(&config.alias, &exec_key, RemoteRunEvent::Finished(outcome)) {
                 tracing::debug!(alias=%config.alias,%exec_key,"Acknowledge untracked remote outcome");
-                write_frame(writer, &Frame::FinishedAck { exec_key })
+                ctx.write(writer, &Frame::FinishedAck { exec_key })
                     .await
                     .map_err(net_error)?;
             }
@@ -1006,7 +1059,7 @@ async fn handle_frame(
         } => hub.event(&config.alias, &exec_key, seq, event),
         Frame::Msg { .. } => {
             if let Some(ack) = ctx.ingest(&config.alias, &frame).await? {
-                write_frame(writer, &ack).await.map_err(net_error)?;
+                ctx.write(writer, &ack).await.map_err(net_error)?;
             }
         }
         Frame::MsgAck { id, reason } => ctx.msg_ack(&config.alias, &id, reason.as_deref()).await?,
@@ -1076,6 +1129,7 @@ fn peer_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::write_frame;
     use crate::protocol::SyncItem;
     use futures::StreamExt;
     use orch_core::test_support::FakeMessageStore;
@@ -1110,6 +1164,7 @@ mod tests {
             .unwrap(),
         );
         let ctx = Context {
+            stop: crate::Shutdown::default(),
             store: FileRemoteStore::new(engine.paths.clone()),
             engine,
             instance_id: "controller-id".into(),

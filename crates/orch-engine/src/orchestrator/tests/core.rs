@@ -1454,3 +1454,110 @@ async fn an_immediate_dispatch_defers_while_a_tick_is_in_flight_then_runs() {
     assert!(h.state.written().len() > writes_before);
     h.orchestrator.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn service_cancel_kills_the_agent_and_marks_the_task_cancelled() {
+    let h = Harness::builder()
+        .tasks([Task {
+            id: "tsk_cancel".into(),
+            status: TaskStatus::InProgress,
+            attempts: 1,
+            ..make_task()
+        }])
+        .agents([make_agent()])
+        .state(state_running(
+            "tsk_cancel",
+            "agt_test1",
+            "run_cancel",
+            55555,
+            "2025-01-01T00:00:00Z",
+        ))
+        .build();
+    h.runs.seed(Run {
+        id: "run_cancel".into(),
+        task_id: "tsk_cancel".into(),
+        ..make_run()
+    });
+
+    h.own_lock();
+    h.orchestrator
+        .deps()
+        .task_service
+        .cancel("tsk_cancel")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        h.processes.killed_with_grace(),
+        vec![(55555, std::time::Duration::from_millis(3_000))]
+    );
+    assert_eq!(h.task("tsk_cancel").status, TaskStatus::Cancelled);
+    assert_eq!(h.agent("agt_test1").status, AgentStatus::Idle);
+    assert_eq!(
+        h.runs.peek("run_cancel").unwrap().status,
+        RunStatus::Cancelled
+    );
+    assert!(!h.persisted_state().running.contains_key("tsk_cancel"));
+}
+
+#[tokio::test]
+async fn a_paused_goal_cannot_dispatch_a_linked_task() {
+    let h = Harness::builder()
+        .tasks([Task {
+            goal_id: Some("goal_paused".into()),
+            ..make_task()
+        }])
+        .agents([make_agent()])
+        .goals([orch_domain::Goal {
+            id: "goal_paused".into(),
+            title: "Paused".into(),
+            description: String::new(),
+            status: orch_domain::GoalStatus::Paused,
+            assignee: None,
+            created_at: NOW_ISO.into(),
+            updated_at: None,
+        }])
+        .build();
+    h.own_lock();
+    h.tick().await.unwrap();
+    assert!(!h.was_dispatched("tsk_test1"));
+}
+
+#[tokio::test]
+async fn a_goal_pause_waits_for_the_dispatch_critical_section() {
+    use crate::goal_service::GoalService;
+    use orch_core::test_support::SeqIdGenerator;
+    use orch_domain::{Goal, GoalStatus};
+    let h = Harness::builder()
+        .goals([Goal {
+            id: "goal_wait".into(),
+            title: "Wait".into(),
+            description: String::new(),
+            status: GoalStatus::Active,
+            assignee: None,
+            created_at: NOW_ISO.into(),
+            updated_at: None,
+        }])
+        .build();
+    let deps = h.orchestrator.deps();
+    let goals = deps.goal_store.as_ref().unwrap();
+    let service = GoalService::new(
+        Arc::clone(goals),
+        Arc::clone(&h.bus),
+        Arc::clone(&deps.clock),
+        Arc::new(SeqIdGenerator::new()),
+        Some(Arc::clone(&deps.agent_service)),
+        Some(Arc::clone(&deps.task_service)),
+        None,
+    );
+    let guard = deps.task_service.dispatch_gate.lock().await;
+    let mut pause = Box::pin(service.update_status("goal_wait", GoalStatus::Paused, false));
+    // Poll once to establish that pause is blocked before it records a decision.
+    assert!(futures::poll!(&mut pause).is_pending());
+    assert_eq!(
+        goals.get("goal_wait").await.unwrap().unwrap().status,
+        GoalStatus::Active
+    );
+    drop(guard);
+    assert_eq!(pause.await.unwrap().status, GoalStatus::Paused);
+}

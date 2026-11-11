@@ -183,7 +183,8 @@ pub async fn deploy_bundle(
     goal: Option<&str>,
     validate_record: fn(&Agent) -> Result<()>,
 ) -> Result<Deployment> {
-    let inputs = resolve_inputs(bundle, &engine.config, adapter, model, validate_record)?;
+    let current_config = engine.config_store.read().await?;
+    let inputs = resolve_inputs(bundle, &current_config, adapter, model, validate_record)?;
     let lock = crate::prompt_mode::DefinitionLock::acquire(engine.paths.project_root()).await?;
     preflight(engine, &inputs).await?;
     if goal.is_some_and(|s| s.trim().is_empty()) {
@@ -201,7 +202,7 @@ pub async fn deploy_bundle(
         engine.agents.clone(),
         engine.state.clone(),
         engine.events.clone(),
-        engine.config.clone(),
+        current_config,
         allocated.clone(),
     );
     let team_service = crate::TeamService::new(

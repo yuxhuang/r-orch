@@ -213,6 +213,20 @@ impl Orchestrator {
     }
 
     pub(super) async fn cancel_remote(&self, remote: &RemoteRunRef) {
+        if self.is_daemon_mode() {
+            let bridge = self.remote_bridge();
+            let remote = remote.clone();
+            let owner = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = bridge.cancel(&remote.alias, &remote.exec_key).await {
+                    owner.emit_error(
+                        error,
+                        format!("cancel remote {}:{}", remote.alias, remote.exec_key),
+                    );
+                }
+            });
+            return;
+        }
         if let Err(err) = self
             .remote_bridge()
             .cancel(&remote.alias, &remote.exec_key)
@@ -340,72 +354,83 @@ impl Orchestrator {
     /// live mirror the controller forgot would be cancelled as an orphan —
     /// and a collector is waiting when the sync answers.
     pub async fn rehydrate_remote_runs(&self) -> Result<()> {
-        let entries: Vec<orch_domain::RunningEntry> = {
-            let slot = self.inner.state.lock().await;
-            match slot.as_ref() {
-                Some(state) => state
-                    .running
-                    .values()
-                    .filter(|entry| entry.remote.is_some())
-                    .cloned()
-                    .collect(),
-                None => Vec::new(),
-            }
-        };
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let directory = orch_infra::storage::remote::RemoteAgentDirectory::new(
-            orch_infra::storage::Paths::new(self.deps().project_root.clone()),
-        );
-        let agents = directory.list(Vec::new()).await.unwrap_or_default();
-        for entry in entries {
-            let remote = entry.remote.as_ref().expect("filtered on remote");
-            let handle = self
-                .remote_bridge()
-                .rehydrate(&remote.alias, &remote.exec_key);
-            if let Err(error) = &handle {
-                // Nothing is lost here: with no execution registered the next
-                // sync reports the key unknown and reconcile retires it.
-                self.emit_error(
-                    error.to_string(),
-                    format!("rehydrate remote execution {}", remote.exec_key),
-                );
-            }
-            // The worker's approval policy decides whether a successful
-            // outcome auto-approves, exactly as it did at dispatch. A read
-            // that fails here must not stop the owner from starting: the
-            // conservative answer leaves the outcome in review.
-            let autonomous = match self.deps().task_store.get(&entry.task_id).await {
-                Ok(task) => task.is_some_and(|task| task.is_autonomous()),
-                Err(error) => {
-                    self.emit_error(error, format!("rehydrate: read task {}", entry.task_id));
-                    false
+        self.deps()
+            .events
+            .operation_boundary()
+            .run(true, async {
+                let entries: Vec<orch_domain::RunningEntry> = {
+                    let slot = self.inner.state.lock().await;
+                    match slot.as_ref() {
+                        Some(state) => state
+                            .running
+                            .values()
+                            .filter(|entry| entry.remote.is_some())
+                            .cloned()
+                            .collect(),
+                        None => Vec::new(),
+                    }
+                };
+                if entries.is_empty() {
+                    return Ok(());
                 }
-            };
-            let auto_approve = autonomous
-                || agents.iter().any(|agent| {
-                    agent.id == entry.agent_id
-                        && agent.config.approval_policy == Some(orch_domain::ApprovalPolicy::Auto)
-                });
-            tracing::info!(
-                task_id = %entry.task_id,
-                alias = %remote.alias,
-                exec_key = %remote.exec_key,
-                "Rehydrated remote execution; awaiting the worker's sync"
-            );
-            let cancel = self.register_cancel(&entry.task_id).await;
-            self.spawn_remote_collector(
-                handle,
-                &entry.run_id,
-                &entry.task_id,
-                &entry.agent_id,
-                auto_approve,
-                cancel,
-            )
-            .await;
-        }
-        Ok(())
+                let directory = orch_infra::storage::remote::RemoteAgentDirectory::new(
+                    orch_infra::storage::Paths::new(self.deps().project_root.clone()),
+                );
+                let agents = directory.list(Vec::new()).await.unwrap_or_default();
+                for entry in entries {
+                    let remote = entry.remote.as_ref().expect("filtered on remote");
+                    let handle = self
+                        .remote_bridge()
+                        .rehydrate(&remote.alias, &remote.exec_key);
+                    if let Err(error) = &handle {
+                        // Nothing is lost here: with no execution registered the next
+                        // sync reports the key unknown and reconcile retires it.
+                        self.emit_error(
+                            error.to_string(),
+                            format!("rehydrate remote execution {}", remote.exec_key),
+                        );
+                    }
+                    // The worker's approval policy decides whether a successful
+                    // outcome auto-approves, exactly as it did at dispatch. A read
+                    // that fails here must not stop the owner from starting: the
+                    // conservative answer leaves the outcome in review.
+                    let autonomous = match self.deps().task_store.get(&entry.task_id).await {
+                        Ok(task) => task.is_some_and(|task| task.is_autonomous()),
+                        Err(error) => {
+                            self.emit_error(
+                                error,
+                                format!("rehydrate: read task {}", entry.task_id),
+                            );
+                            false
+                        }
+                    };
+                    let auto_approve = autonomous
+                        || agents.iter().any(|agent| {
+                            agent.id == entry.agent_id
+                                && agent.config.approval_policy
+                                    == Some(orch_domain::ApprovalPolicy::Auto)
+                        });
+                    tracing::info!(
+                        task_id = %entry.task_id,
+                        alias = %remote.alias,
+                        exec_key = %remote.exec_key,
+                        "Rehydrated remote execution; awaiting the worker's sync"
+                    );
+                    let cancel = self.register_cancel(&entry.task_id).await;
+                    self.spawn_remote_collector(
+                        handle,
+                        &entry.run_id,
+                        &entry.task_id,
+                        &entry.agent_id,
+                        auto_approve,
+                        cancel,
+                    )
+                    .await;
+                }
+                Ok(())
+            })
+            .await
+            .value
     }
 
     /// Record what the worker says about an execution that has not finished,
@@ -420,6 +445,7 @@ impl Orchestrator {
         run_id: &str,
         update: &RemotePhaseUpdate,
     ) -> Result<RemotePhase> {
+        self.deps().events.operation_boundary().run(true, async {
         let mut slot = self.inner.state.lock().await;
         let Some(state) = slot.as_mut() else {
             return Ok(update.phase);
@@ -476,6 +502,7 @@ impl Orchestrator {
         }
         self.save_remote_state(state).await?;
         Ok(phase)
+        }).await.value
     }
 
     #[allow(
@@ -589,21 +616,27 @@ impl Orchestrator {
                     // Sync is authoritative, but applying it still requires
                     // durable writes, exactly like a finished envelope.
                     loop {
-                        let result = {
-                            let mut slot = self.inner.state.lock().await;
-                            if let Some(state) = slot.as_mut() {
-                                let error = remote_unknown_error(
-                                    state
-                                        .running
-                                        .get(task_id)
-                                        .and_then(|entry| entry.remote.as_ref()),
-                                );
-                                self.persist_remote_unknown_locked(state, task_id, &error)
-                                    .await
-                            } else {
-                                Ok(())
-                            }
-                        };
+                        let result = self
+                            .deps()
+                            .events
+                            .operation_boundary()
+                            .run(true, async {
+                                let mut slot = self.inner.state.lock().await;
+                                if let Some(state) = slot.as_mut() {
+                                    let error = remote_unknown_error(
+                                        state
+                                            .running
+                                            .get(task_id)
+                                            .and_then(|entry| entry.remote.as_ref()),
+                                    );
+                                    self.persist_remote_unknown_locked(state, task_id, &error)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .await
+                            .value;
                         match result {
                             Ok(()) => break,
                             Err(error) => self.emit_error(
@@ -637,100 +670,104 @@ impl Orchestrator {
         outcome: RemoteOutcome,
         auto_approve: bool,
     ) -> Result<()> {
-        let mut slot = self.inner.state.lock().await;
-        let Some(state) = slot.as_mut() else {
-            return Ok(());
-        };
-        let Some(entry) = state
-            .running
-            .get(task_id)
-            .filter(|entry| entry.run_id == run_id)
-            .cloned()
-        else {
-            // A prior attempt may have removed the entry in memory and then
-            // failed its state write. Ack only after that removal is durable.
-            return self.save_remote_state(state).await;
-        };
-        let Some(remote) = entry.remote.as_ref() else {
-            return Ok(());
-        };
-        let Some(mut task) = self.deps().task_store.get(task_id).await? else {
-            self.cancel_remote(remote).await;
-            self.deps()
-                .run_service
-                .finish(
-                    run_id,
-                    RunStatus::Cancelled,
-                    None,
-                    Some("Task no longer exists".into()),
-                )
-                .await?;
-            state.running.shift_remove(task_id);
-            return self.save_remote_state(state).await;
-        };
-        // External cancellation may have reached the store before reconcile.
-        if orch_domain::is_terminal(task.status)
-            && !(task.status == TaskStatus::Failed
-                && matches!(outcome, RemoteOutcome::Failed { .. }))
-        {
-            self.cancel_remote(remote).await;
-            self.deps()
-                .run_service
-                .finish(
-                    run_id,
-                    RunStatus::Cancelled,
-                    None,
-                    Some("Task already terminal".into()),
-                )
-                .await?;
-            state.running.shift_remove(task_id);
-            return self.save_remote_state(state).await;
-        }
-        match outcome {
-            RemoteOutcome::Failed { error, error_kind } => {
-                return self
-                    .handle_run_failure_locked(state, task_id, &entry, &error, error_kind)
-                    .await;
-            }
-            RemoteOutcome::Cancelled { reason } => {
-                self.deps()
-                    .run_service
-                    .finish(run_id, RunStatus::Cancelled, None, Some(reason))
-                    .await?;
-                let previous_status = task.status;
-                task.status = TaskStatus::Cancelled;
-                task.updated_at = self.deps().clock.now_iso();
-                self.deps().task_store.save(&task).await?;
-                self.emit(OrchestratorEvent::TaskStatusChanged {
-                    task_id: task_id.to_owned(),
-                    from: previous_status,
-                    to: TaskStatus::Cancelled,
-                });
-            }
-            RemoteOutcome::Succeeded {
-                summary,
-                files_changed,
-                branch,
-                review_results,
-                tokens,
-            } => {
-                task.proof = Some(TaskProof {
-                    agent_summary: Some(
-                        summary.chars().take(super::MAX_AGENT_SUMMARY_LEN).collect(),
-                    ),
-                    files_changed,
-                    branch: branch.map(|branch| format!("{}:{branch}", remote.alias)),
-                    remote: Some(remote.alias.clone()),
-                    ..task.proof.unwrap_or_default()
-                });
-                task.review_results = review_results;
-                task.feedback = None;
-                let criteria_passed = task
-                    .review_criteria
-                    .as_ref()
-                    .is_some_and(|criteria| !criteria.is_empty())
-                    && task.review_results.as_ref().is_some_and(|results| {
-                        task.review_criteria
+        self.deps()
+            .events
+            .operation_boundary()
+            .run(true, async {
+                let mut slot = self.inner.state.lock().await;
+                let Some(state) = slot.as_mut() else {
+                    return Ok(());
+                };
+                let Some(entry) = state
+                    .running
+                    .get(task_id)
+                    .filter(|entry| entry.run_id == run_id)
+                    .cloned()
+                else {
+                    // A prior attempt may have removed the entry in memory and then
+                    // failed its state write. Ack only after that removal is durable.
+                    return self.save_remote_state(state).await;
+                };
+                let Some(remote) = entry.remote.as_ref() else {
+                    return Ok(());
+                };
+                let Some(mut task) = self.deps().task_store.get(task_id).await? else {
+                    self.cancel_remote(remote).await;
+                    self.deps()
+                        .run_service
+                        .finish(
+                            run_id,
+                            RunStatus::Cancelled,
+                            None,
+                            Some("Task no longer exists".into()),
+                        )
+                        .await?;
+                    state.running.shift_remove(task_id);
+                    return self.save_remote_state(state).await;
+                };
+                // External cancellation may have reached the store before reconcile.
+                if orch_domain::is_terminal(task.status)
+                    && !(task.status == TaskStatus::Failed
+                        && matches!(outcome, RemoteOutcome::Failed { .. }))
+                {
+                    self.cancel_remote(remote).await;
+                    self.deps()
+                        .run_service
+                        .finish(
+                            run_id,
+                            RunStatus::Cancelled,
+                            None,
+                            Some("Task already terminal".into()),
+                        )
+                        .await?;
+                    state.running.shift_remove(task_id);
+                    return self.save_remote_state(state).await;
+                }
+                match outcome {
+                    RemoteOutcome::Failed { error, error_kind } => {
+                        return self
+                            .handle_run_failure_locked(state, task_id, &entry, &error, error_kind)
+                            .await;
+                    }
+                    RemoteOutcome::Cancelled { reason } => {
+                        self.deps()
+                            .run_service
+                            .finish(run_id, RunStatus::Cancelled, None, Some(reason))
+                            .await?;
+                        let previous_status = task.status;
+                        task.status = TaskStatus::Cancelled;
+                        task.updated_at = self.deps().clock.now_iso();
+                        self.deps().task_store.save(&task).await?;
+                        self.emit(OrchestratorEvent::TaskStatusChanged {
+                            task_id: task_id.to_owned(),
+                            from: previous_status,
+                            to: TaskStatus::Cancelled,
+                        });
+                    }
+                    RemoteOutcome::Succeeded {
+                        summary,
+                        files_changed,
+                        branch,
+                        review_results,
+                        tokens,
+                    } => {
+                        task.proof = Some(TaskProof {
+                            agent_summary: Some(
+                                summary.chars().take(super::MAX_AGENT_SUMMARY_LEN).collect(),
+                            ),
+                            files_changed,
+                            branch: branch.map(|branch| format!("{}:{branch}", remote.alias)),
+                            remote: Some(remote.alias.clone()),
+                            ..task.proof.unwrap_or_default()
+                        });
+                        task.review_results = review_results;
+                        task.feedback = None;
+                        let criteria_passed =
+                            task.review_criteria
+                                .as_ref()
+                                .is_some_and(|criteria| !criteria.is_empty())
+                                && task.review_results.as_ref().is_some_and(|results| {
+                                    task.review_criteria
                             .as_ref()
                             .expect("review_criteria was checked to be Some on the line above")
                             .iter()
@@ -740,86 +777,89 @@ impl Orchestrator {
                                     .any(|r| r.criterion == *criterion && r.passed)
                             })
                             && results.iter().all(|r| r.passed)
-                    });
-                let previous_status = task.status;
-                task.status = TaskStatus::Review;
-                task.updated_at = self.deps().clock.now_iso();
-                self.deps()
-                    .run_service
-                    .finish(run_id, RunStatus::Succeeded, tokens, None)
-                    .await?;
-                self.deps().task_store.save(&task).await?;
-                self.emit(OrchestratorEvent::TaskStatusChanged {
-                    task_id: task_id.to_owned(),
-                    from: previous_status,
-                    to: TaskStatus::Review,
-                });
-                if auto_approve || criteria_passed {
-                    self.deps()
-                        .task_service
-                        .update_status(task_id, TaskStatus::Done)
+                                });
+                        let previous_status = task.status;
+                        task.status = TaskStatus::Review;
+                        task.updated_at = self.deps().clock.now_iso();
+                        self.deps()
+                            .run_service
+                            .finish(run_id, RunStatus::Succeeded, tokens, None)
+                            .await?;
+                        self.deps().task_store.save(&task).await?;
+                        self.emit(OrchestratorEvent::TaskStatusChanged {
+                            task_id: task_id.to_owned(),
+                            from: previous_status,
+                            to: TaskStatus::Review,
+                        });
+                        if auto_approve || criteria_passed {
+                            self.deps()
+                                .task_service
+                                .update_status(task_id, TaskStatus::Done)
+                                .await?;
+                        }
+                        state.stats.total_tasks_completed += 1;
+                        state.stats.total_runs += 1;
+                        state.stats.total_runtime_ms += self.runtime_ms(&entry).unwrap_or(0);
+                        if let Some(tokens) = tokens {
+                            let total = &mut state.stats.total_tokens;
+                            total.input += tokens.input;
+                            total.output += tokens.output;
+                            total.reasoning += tokens.reasoning;
+                            total.cache_read += tokens.cache_read;
+                            total.cache_write += tokens.cache_write;
+                            total.total = total.input + total.output + total.reasoning;
+                        }
+                    }
+                    RemoteOutcome::ReviewFailed {
+                        summary,
+                        review_results,
+                    } => {
+                        task.review_results = Some(review_results);
+                        task.proof = Some(TaskProof {
+                            remote: Some(remote.alias.clone()),
+                            agent_summary: Some(summary),
+                            ..task.proof.unwrap_or_default()
+                        });
+                        self.deps()
+                            .run_service
+                            .finish(run_id, RunStatus::Succeeded, None, None)
+                            .await?;
+                        self.force_task_to_review(
+                            state,
+                            task,
+                            &entry.agent_id,
+                            &format!("REMOTE REVIEW FAILED on {}", remote.alias),
+                        )
                         .await?;
+                    }
+                    RemoteOutcome::IntegrationFailed { summary, info } => {
+                        task.proof = Some(TaskProof {
+                            remote: Some(remote.alias.clone()),
+                            agent_summary: Some(summary),
+                            ..task.proof.unwrap_or_default()
+                        });
+                        self.deps()
+                            .run_service
+                            .finish(run_id, RunStatus::Succeeded, None, None)
+                            .await?;
+                        self.force_task_to_review(
+                            state,
+                            task,
+                            &entry.agent_id,
+                            &format!("REMOTE MERGE CONFLICT on {}: {info}", remote.alias),
+                        )
+                        .await?;
+                    }
                 }
-                state.stats.total_tasks_completed += 1;
-                state.stats.total_runs += 1;
-                state.stats.total_runtime_ms += self.runtime_ms(&entry).unwrap_or(0);
-                if let Some(tokens) = tokens {
-                    let total = &mut state.stats.total_tokens;
-                    total.input += tokens.input;
-                    total.output += tokens.output;
-                    total.reasoning += tokens.reasoning;
-                    total.cache_read += tokens.cache_read;
-                    total.cache_write += tokens.cache_write;
-                    total.total = total.input + total.output + total.reasoning;
-                }
-            }
-            RemoteOutcome::ReviewFailed {
-                summary,
-                review_results,
-            } => {
-                task.review_results = Some(review_results);
-                task.proof = Some(TaskProof {
-                    remote: Some(remote.alias.clone()),
-                    agent_summary: Some(summary),
-                    ..task.proof.unwrap_or_default()
-                });
-                self.deps()
-                    .run_service
-                    .finish(run_id, RunStatus::Succeeded, None, None)
-                    .await?;
-                self.force_task_to_review(
-                    state,
-                    task,
-                    &entry.agent_id,
-                    &format!("REMOTE REVIEW FAILED on {}", remote.alias),
-                )
-                .await?;
-            }
-            RemoteOutcome::IntegrationFailed { summary, info } => {
-                task.proof = Some(TaskProof {
-                    remote: Some(remote.alias.clone()),
-                    agent_summary: Some(summary),
-                    ..task.proof.unwrap_or_default()
-                });
-                self.deps()
-                    .run_service
-                    .finish(run_id, RunStatus::Succeeded, None, None)
-                    .await?;
-                self.force_task_to_review(
-                    state,
-                    task,
-                    &entry.agent_id,
-                    &format!("REMOTE MERGE CONFLICT on {}: {info}", remote.alias),
-                )
-                .await?;
-            }
-        }
-        self.drop_cancel(task_id).await;
-        state.running.shift_remove(task_id);
-        state.retry_queue.retain(|retry| retry.task_id != task_id);
-        self.save_remote_state(state).await?;
-        self.schedule_dispatch_after_run(task_id).await;
-        Ok(())
+                self.drop_cancel(task_id).await;
+                state.running.shift_remove(task_id);
+                state.retry_queue.retain(|retry| retry.task_id != task_id);
+                self.save_remote_state(state).await?;
+                self.schedule_dispatch_after_run(task_id).await;
+                Ok(())
+            })
+            .await
+            .value
     }
 }
 

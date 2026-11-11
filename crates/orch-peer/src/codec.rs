@@ -1,44 +1,46 @@
 //! Bounded NDJSON. Malformed incoming frames close the socket; local oversize
 //! data is bounded or rejected before it can interrupt the transport.
+//!
+//! The line framing itself (bounded `fill_buf` scan, one LF, the 1 MiB cap)
+//! is `orch_proto::ndjson`, shared with the local daemon protocol (design
+//! D10). Everything peer-specific stays here: the `Frame` schema, event and
+//! outcome truncation, `SyncState` splitting, and the rule that an oversize
+//! local frame is skipped rather than failing the session.
 use crate::protocol::Frame;
+use orch_proto::ndjson::{self, CodecError, FrameReader};
 use std::io;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = orch_proto::frame::MAX_FRAME_BYTES;
 
 /// Call from a dedicated reader task: dropping a partially read frame is a
 /// connection close. The allocation never grows beyond the frame limit.
+///
+/// Decoding is plain `serde_json` on purpose: the local protocol's depth
+/// check is not applied to peers, whose frames 0.5.x builds already send.
 pub async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Frame>> {
-    let mut line = Vec::new();
-    loop {
-        let bytes = reader.fill_buf().await?;
-        if bytes.is_empty() {
-            return if line.is_empty() {
-                Ok(None)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unterminated peer frame",
-                ))
-            };
+    let line = match FrameReader::new(reader).read_line(MAX_FRAME_BYTES).await {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(None),
+        Err(CodecError::Io(error)) => return Err(error),
+        Err(CodecError::Unterminated) => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unterminated peer frame",
+            ));
         }
-        let end = bytes.iter().position(|b| *b == b'\n');
-        let n = end.map_or(bytes.len(), |i| i + 1);
-        if line.len() + n > MAX_FRAME_BYTES + 1 {
+        Err(CodecError::Oversize { .. }) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "peer frame exceeds 1 MiB",
             ));
         }
-        line.extend_from_slice(&bytes[..n]);
-        reader.consume(n);
-        if end.is_some() {
-            line.pop();
-            return serde_json::from_slice(&line)
-                .map(Some)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
-        }
-    }
+        // An empty line is not JSON, exactly as before the lift.
+        Err(_) => Vec::new(),
+    };
+    serde_json::from_slice(&line)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Check the encoded size, including JSON escaping, before enqueueing data.
@@ -147,12 +149,15 @@ fn outbound_frames(frame: &Frame) -> Vec<Frame> {
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> io::Result<()> {
     for frame in outbound_frames(frame) {
-        let mut bytes = serde_json::to_vec(&frame).map_err(io::Error::other)?;
-        if bytes.len() > MAX_FRAME_BYTES {
-            tracing::warn!("Skip locally produced outbound frame with oversized envelope");
-            continue;
-        }
-        bytes.push(b'\n');
+        let bytes = match ndjson::encode(&frame, MAX_FRAME_BYTES) {
+            Ok(bytes) => bytes,
+            Err(CodecError::Oversize { .. }) => {
+                tracing::warn!("Skip locally produced outbound frame with oversized envelope");
+                continue;
+            }
+            Err(CodecError::Io(error)) => return Err(error),
+            Err(error) => return Err(io::Error::other(error)),
+        };
         // Only transport errors terminate a session, never local frame size.
         tokio::time::timeout(std::time::Duration::from_secs(5), writer.write_all(&bytes))
             .await
@@ -182,6 +187,66 @@ mod tests {
             Some(Frame::Pong)
         ));
         assert!(read_frame(&mut b).await.unwrap().is_none());
+    }
+
+    /// D10: the lift changes no byte on the wire in either direction. These
+    /// are the exact lines a 0.5.x peer writes and expects.
+    #[tokio::test]
+    async fn wire_bytes_are_unchanged_by_the_framing_lift() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &Frame::Ping).await.unwrap();
+        write_frame(
+            &mut bytes,
+            &Frame::Error {
+                msg: "bad \"frame\"".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bytes,
+            b"{\"t\":\"ping\"}\n{\"t\":\"error\",\"msg\":\"bad \\\"frame\\\"\"}\n"
+        );
+
+        // A 0.5.x hello omits every later additive field.
+        let old_hello = b"{\"t\":\"hello\",\"proto\":1,\"instance_id\":\"i\",\"name\":\"n\",\"os\":\"linux\",\"agents\":[]}\n";
+        assert!(matches!(
+            read_frame(&mut BufReader::new(&old_hello[..]))
+                .await
+                .unwrap(),
+            Some(Frame::Hello { .. })
+        ));
+
+        // Exactly 1 MiB of JSON plus its LF is accepted; one byte more is not.
+        let base = serde_json::to_vec(&Frame::Error { msg: String::new() })
+            .unwrap()
+            .len();
+        let mut line = serde_json::to_vec(&Frame::Error {
+            msg: "x".repeat(MAX_FRAME_BYTES - base + 1),
+        })
+        .unwrap();
+        line.push(b'\n');
+        let error = read_frame(&mut BufReader::new(line.as_slice()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "peer frame exceeds 1 MiB");
+        let error = read_frame(&mut BufReader::new(&b"{\"t\":\"ping\"}"[..]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        // Peers keep serde_json's own nesting limit, not the local protocol's.
+        let deep = format!(
+            "{{\"t\":\"error\",\"msg\":\"m\",\"x\":{}{}}}\n",
+            "[".repeat(80),
+            "]".repeat(80)
+        );
+        assert!(matches!(
+            read_frame(&mut BufReader::new(deep.as_bytes()))
+                .await
+                .unwrap(),
+            Some(Frame::Error { .. })
+        ));
     }
 
     #[tokio::test]

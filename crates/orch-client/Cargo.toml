@@ -1,0 +1,25 @@
+[package]
+name = "orch-client"
+description = "Discovery and local socket control plane for the orch daemon."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orch-domain.workspace = true
+orch-proto.workspace = true
+nix = { workspace = true, features = ["fs", "user", "signal"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

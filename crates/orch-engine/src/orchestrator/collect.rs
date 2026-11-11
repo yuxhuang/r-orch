@@ -135,9 +135,24 @@ impl Orchestrator {
                 None => {
                     if let Err(err) = self
                         .deps()
-                        .run_service
-                        .finish(run_id, RunStatus::Failed, None, Some(error.clone()))
+                        .events
+                        .operation_boundary()
+                        .run(true, async {
+                            let task = self.deps().task_store.get(task_id).await?;
+                            let run = self.deps().run_store.get(run_id).await?;
+                            if task.is_some_and(|task| task.status == TaskStatus::Cancelled)
+                                || run.is_some_and(|run| run.status == RunStatus::Cancelled)
+                            {
+                                return Ok(());
+                            }
+                            self.deps()
+                                .run_service
+                                .finish(run_id, RunStatus::Failed, None, Some(error.clone()))
+                                .await
+                                .map(|_| ())
+                        })
                         .await
+                        .value
                     {
                         self.emit_error(err, format!("finalize orphaned run {run_id}"));
                     }
@@ -172,139 +187,146 @@ impl Orchestrator {
         task_id: &str,
         agent_id: &str,
     ) -> Result<()> {
-        let tap = self
-            .inner
-            .event_tap
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(tap) = tap {
-            tap.record(task_id, run_id, &event);
-        }
-        match event.kind {
-            AgentEventKind::Done => {
-                if let Some(tokens) = event.tokens {
-                    collected.tokens = Some(create_token_usage(
-                        tokens.input,
-                        tokens.output,
-                        Some(TokenUsageOpts {
-                            reasoning: Some(tokens.reasoning),
-                            cache_read: Some(tokens.cache_read),
-                            cache_write: Some(tokens.cache_write),
-                        }),
-                    ));
-                }
-                if let Some(result) = event.data.get("result").and_then(|v| v.as_str()) {
-                    collected.result_text = Some(result.to_owned());
-                }
-            }
-            AgentEventKind::Output => {
-                // `text` is the canonical field; `message` is what a couple of
-                // adapters emit instead.
-                let text = event
-                    .data
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| event.data.get("message").and_then(|v| v.as_str()));
-                if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
-                    collected.last_agent_message = Some(text.to_owned());
-                }
-            }
-            AgentEventKind::FileChange => {
-                collected
-                    .files_changed
-                    .extend(file_change_paths(&event.data));
-            }
-            _ => {}
-        }
-
-        // Claude emits `tool_use` with the file path but no separate
-        // `file_change` event, so writes have to be recovered from the tool
-        // call — and only from the tools that actually write.
-        let tool_call_file_path = match event.kind {
-            AgentEventKind::ToolCall => write_tool_file_path(&event.data),
-            _ => None,
-        };
-        if let Some(path) = tool_call_file_path.as_deref() {
-            collected.files_changed.insert(path.to_owned());
-        }
-
-        let event_timestamp = if is_valid_iso_timestamp(&event.timestamp) {
-            event.timestamp.clone()
-        } else {
-            self.deps().clock.now_iso()
-        };
-
-        let file_change_path = match event.kind {
-            AgentEventKind::FileChange => Some(primary_file_change_path(&event.data)),
-            _ => None,
-        };
-
-        // Serialized once and reused: the JSONL write and the bus emit differ
-        // only in their cap.
-        let serialized = serialize_event_data(&event.data, MAX_EVENT_DATA_LEN);
         self.deps()
-            .run_service
-            .append_event(
-                run_id,
-                &orch_domain::RunEvent {
-                    timestamp: event_timestamp.clone(),
-                    event_type: event.kind.to_run_event_type(),
-                    data: serde_json::Value::String(serialized.clone()),
-                },
-            )
-            .await?;
-
-        // The stall clock advances per *emitted event*, not per stdout line.
-        {
-            let mut slot = self.inner.state.lock().await;
-            if let Some(entry) = slot
-                .as_mut()
-                .and_then(|state| state.running.get_mut(task_id))
-            {
-                entry.last_event_at = event_timestamp;
-            }
-        }
-        self.save_state_lazy().await;
-
-        let bus_data =
-            serialize_event_data(&serde_json::Value::String(serialized), MAX_BUS_DATA_LEN);
-        match event.kind {
-            AgentEventKind::Output | AgentEventKind::ToolCall => {
-                self.emit(OrchestratorEvent::AgentOutput {
-                    run_id: run_id.to_owned(),
-                    agent_id: agent_id.to_owned(),
-                    data: bus_data,
-                });
-                if let Some(path) = tool_call_file_path {
-                    self.emit(OrchestratorEvent::AgentFileChanged {
-                        run_id: run_id.to_owned(),
-                        agent_id: agent_id.to_owned(),
-                        path,
-                    });
+            .events
+            .operation_boundary()
+            .run(true, async {
+                let tap = self
+                    .inner
+                    .event_tap
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(tap) = tap {
+                    tap.record(task_id, run_id, &event);
                 }
-            }
-            AgentEventKind::FileChange => {
-                self.emit(OrchestratorEvent::AgentFileChanged {
-                    run_id: run_id.to_owned(),
-                    agent_id: agent_id.to_owned(),
-                    path: file_change_path.unwrap_or_default(),
-                });
-            }
-            AgentEventKind::Error => {
-                if let Some(kind) = event.error_kind {
-                    collected.last_error_kind = Some(kind);
+                match event.kind {
+                    AgentEventKind::Done => {
+                        if let Some(tokens) = event.tokens {
+                            collected.tokens = Some(create_token_usage(
+                                tokens.input,
+                                tokens.output,
+                                Some(TokenUsageOpts {
+                                    reasoning: Some(tokens.reasoning),
+                                    cache_read: Some(tokens.cache_read),
+                                    cache_write: Some(tokens.cache_write),
+                                }),
+                            ));
+                        }
+                        if let Some(result) = event.data.get("result").and_then(|v| v.as_str()) {
+                            collected.result_text = Some(result.to_owned());
+                        }
+                    }
+                    AgentEventKind::Output => {
+                        // `text` is the canonical field; `message` is what a couple of
+                        // adapters emit instead.
+                        let text = event
+                            .data
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| event.data.get("message").and_then(|v| v.as_str()));
+                        if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                            collected.last_agent_message = Some(text.to_owned());
+                        }
+                    }
+                    AgentEventKind::FileChange => {
+                        collected
+                            .files_changed
+                            .extend(file_change_paths(&event.data));
+                    }
+                    _ => {}
                 }
-                self.emit(OrchestratorEvent::AgentError {
-                    run_id: run_id.to_owned(),
-                    agent_id: agent_id.to_owned(),
-                    error: bus_data,
-                    error_kind: event.error_kind,
-                });
-            }
-            AgentEventKind::Command | AgentEventKind::Done => {}
-        }
-        Ok(())
+
+                // Claude emits `tool_use` with the file path but no separate
+                // `file_change` event, so writes have to be recovered from the tool
+                // call — and only from the tools that actually write.
+                let tool_call_file_path = match event.kind {
+                    AgentEventKind::ToolCall => write_tool_file_path(&event.data),
+                    _ => None,
+                };
+                if let Some(path) = tool_call_file_path.as_deref() {
+                    collected.files_changed.insert(path.to_owned());
+                }
+
+                let event_timestamp = if is_valid_iso_timestamp(&event.timestamp) {
+                    event.timestamp.clone()
+                } else {
+                    self.deps().clock.now_iso()
+                };
+
+                let file_change_path = match event.kind {
+                    AgentEventKind::FileChange => Some(primary_file_change_path(&event.data)),
+                    _ => None,
+                };
+
+                // Serialized once and reused: the JSONL write and the bus emit differ
+                // only in their cap.
+                let serialized = serialize_event_data(&event.data, MAX_EVENT_DATA_LEN);
+                self.deps()
+                    .run_service
+                    .append_event(
+                        run_id,
+                        &orch_domain::RunEvent {
+                            timestamp: event_timestamp.clone(),
+                            event_type: event.kind.to_run_event_type(),
+                            data: serde_json::Value::String(serialized.clone()),
+                        },
+                    )
+                    .await?;
+
+                // The stall clock advances per *emitted event*, not per stdout line.
+                {
+                    let mut slot = self.inner.state.lock().await;
+                    if let Some(entry) = slot
+                        .as_mut()
+                        .and_then(|state| state.running.get_mut(task_id))
+                    {
+                        entry.last_event_at = event_timestamp;
+                    }
+                }
+                self.save_state_lazy().await;
+
+                let bus_data =
+                    serialize_event_data(&serde_json::Value::String(serialized), MAX_BUS_DATA_LEN);
+                match event.kind {
+                    AgentEventKind::Output | AgentEventKind::ToolCall => {
+                        self.emit(OrchestratorEvent::AgentOutput {
+                            run_id: run_id.to_owned(),
+                            agent_id: agent_id.to_owned(),
+                            data: bus_data,
+                        });
+                        if let Some(path) = tool_call_file_path {
+                            self.emit(OrchestratorEvent::AgentFileChanged {
+                                run_id: run_id.to_owned(),
+                                agent_id: agent_id.to_owned(),
+                                path,
+                            });
+                        }
+                    }
+                    AgentEventKind::FileChange => {
+                        self.emit(OrchestratorEvent::AgentFileChanged {
+                            run_id: run_id.to_owned(),
+                            agent_id: agent_id.to_owned(),
+                            path: file_change_path.unwrap_or_default(),
+                        });
+                    }
+                    AgentEventKind::Error => {
+                        if let Some(kind) = event.error_kind {
+                            collected.last_error_kind = Some(kind);
+                        }
+                        self.emit(OrchestratorEvent::AgentError {
+                            run_id: run_id.to_owned(),
+                            agent_id: agent_id.to_owned(),
+                            error: bus_data,
+                            error_kind: event.error_kind,
+                        });
+                    }
+                    AgentEventKind::Command | AgentEventKind::Done => {}
+                }
+                Ok(())
+            })
+            .await
+            .value
     }
 
     // ── completion ───────────────────────────────────────────────────────
@@ -318,6 +340,18 @@ impl Orchestrator {
         result_text: Option<String>,
         files_changed: Vec<String>,
     ) -> Result<()> {
+        if self.is_daemon_mode() {
+            return self
+                .daemon_handle_success(
+                    task_id,
+                    run_id,
+                    agent_id,
+                    tokens,
+                    result_text,
+                    files_changed,
+                )
+                .await;
+        }
         let mut slot = self.inner.state.lock().await;
         let Some(state) = slot.as_mut() else {
             return Ok(());
@@ -557,12 +591,29 @@ impl Orchestrator {
         error: &str,
         error_kind: Option<AdapterErrorKind>,
     ) -> Result<()> {
-        let mut slot = self.inner.state.lock().await;
-        let Some(state) = slot.as_mut() else {
-            return Ok(());
-        };
-        self.handle_run_failure_locked(state, task_id, entry, error, error_kind)
+        let result = self
+            .deps()
+            .events
+            .operation_boundary()
+            .run(true, async {
+                let mut slot = self.inner.state.lock().await;
+                let Some(state) = slot.as_mut() else {
+                    return Ok(());
+                };
+                if !state
+                    .running
+                    .get(task_id)
+                    .is_some_and(|current| current.run_id == entry.run_id)
+                {
+                    return Ok(());
+                }
+                self.handle_run_failure_locked(state, task_id, entry, error, error_kind)
+                    .await
+            })
             .await
+            .value;
+        self.daemon_drain_cleanups().await;
+        result
     }
 
     pub(super) async fn handle_run_failure_locked(
@@ -699,9 +750,16 @@ impl Orchestrator {
 
         if entry.remote.is_none()
             && let Some(branch) = task.proof.as_ref().and_then(|p| p.branch.as_deref())
-            && let Err(err) = self.deps().workspace.cleanup(task_id, Some(branch)).await
         {
-            self.emit_error(err, format!("workspace cleanup for {task_id}"));
+            if self.is_daemon_mode() {
+                self.inner
+                    .deferred_cleanups
+                    .lock()
+                    .await
+                    .push((task_id.to_owned(), branch.to_owned()));
+            } else if let Err(err) = self.deps().workspace.cleanup(task_id, Some(branch)).await {
+                self.emit_error(err, format!("workspace cleanup for {task_id}"));
+            }
         }
 
         state.running.shift_remove(task_id);

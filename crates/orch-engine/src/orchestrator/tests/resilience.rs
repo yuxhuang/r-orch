@@ -40,6 +40,76 @@ fn errors_matching(h: &Harness, needle: &str) -> Vec<(String, String, bool)> {
 // ── Fix 1: the tick circuit breaker ──────────────────────────────────────
 
 #[tokio::test]
+async fn expiry_write_failure_does_not_skip_reconciliation() {
+    let h = Harness::builder().config(fast_poll(10)).build();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+    let engine = crate::container::build_light_with(
+        temp.path(),
+        crate::container::EngineSeams {
+            clock: h.clock.clone(),
+            global_config_path: Some(temp.path().join("global.yml")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    h.orchestrator
+        .set_context_service(engine.context_service.clone());
+    engine
+        .context
+        .set("expired", "value", Some(1))
+        .await
+        .unwrap();
+    h.start_watch().await.unwrap();
+
+    // Keep the valid index, but replace the entry with a directory so expiry's
+    // remove_file fails on every tick, independently of user permissions.
+    let entry = engine.paths.context_path("expired").unwrap();
+    std::fs::remove_file(&entry).unwrap();
+    std::fs::create_dir(&entry).unwrap();
+    let mut stale = make_agent();
+    stale.status = AgentStatus::Running;
+    h.agents.seed(stale.clone());
+    h.clock.advance_ms(2);
+
+    h.wait_for(|h| {
+        (errors_matching(h, "context expiry").len() >= 6
+            && h.events_of(OrchestratorEventType::OrchestratorTick).len() >= 7)
+            || h.orchestrator.is_shutting_down()
+    })
+    .await;
+    let status = h.agents.peek(&stale.id).unwrap().status;
+    let failures = h
+        .orchestrator
+        .inner
+        .consecutive_tick_failures
+        .load(Ordering::SeqCst);
+    let shutting_down = h.orchestrator.is_shutting_down();
+    let errors = errors_matching(&h, "context expiry");
+    let ticks = h.events_of(OrchestratorEventType::OrchestratorTick).len();
+    let tick_errors = errors_matching(&h, "tick");
+    h.orchestrator.stop().await.unwrap();
+
+    assert_eq!(
+        status,
+        AgentStatus::Idle,
+        "reconcile must clear stale agents"
+    );
+    assert_eq!(failures, 0, "maintenance must not feed the fatal breaker");
+    assert!(!shutting_down);
+    assert!(
+        errors.len() >= 6,
+        "persistent failure must remain non-fatal"
+    );
+    assert!(errors.iter().all(|(error, _, fatal)| {
+        error.contains("delete") && error.contains("expired.json") && !fatal
+    }));
+    assert!(ticks >= 7, "dispatch and tick completion must continue");
+    assert!(tick_errors.is_empty());
+}
+
+#[tokio::test]
 async fn a_successful_tick_leaves_the_failure_counter_at_zero() {
     let h = Harness::builder().config(fast_poll(20)).build();
     h.start_watch().await.unwrap();

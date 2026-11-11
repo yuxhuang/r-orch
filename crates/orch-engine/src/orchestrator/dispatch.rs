@@ -20,7 +20,36 @@ use orch_infra::template::{
 use super::tick::epoch_ms_from_iso;
 use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator};
 
+#[derive(Clone, Copy)]
+pub(super) enum MailboxMode {
+    Drain,
+    Snapshot,
+}
+
+pub(super) struct PreparedPrompt {
+    pub message_ids: Vec<String>,
+    pub prompt: String,
+    pub system_prompt: Option<String>,
+    pub captured_mode: Option<PromptMode>,
+}
+
 impl Orchestrator {
+    pub(super) async fn dispatch_agent_directory(&self) -> Result<Vec<orch_domain::Agent>> {
+        orch_infra::storage::remote::RemoteAgentDirectory::new(orch_infra::storage::Paths::new(
+            self.deps().project_root.clone(),
+        ))
+        .list(self.deps().agent_store.list().await?)
+        .await
+    }
+
+    pub(super) fn dispatch_effort_diagnostics(
+        &self,
+        kind: &str,
+        config: &AgentConfig,
+    ) -> std::result::Result<Vec<String>, orch_core::adapter::AdapterError> {
+        orch_infra::adapters::effort_diagnostics(kind, config)
+    }
+
     /// Invalidate → load → dispatch → save, under the state lock. Shared by
     /// `run_task`, `run_all` and the reactive dispatch.
     pub(super) async fn fresh_dispatch_all(&self) -> Result<()> {
@@ -134,10 +163,7 @@ impl Orchestrator {
                 });
                 continue;
             }
-            if let Err(err) = self
-                .dispatch_task_to(state, &task.id, None, remote_only)
-                .await
-            {
+            if let Err(err) = self.dispatch_task_to(state, &task.id, remote_only).await {
                 if matches!(err, Error::Domain(DomainError::Workspace { .. })) {
                     self.record_workspace_dispatch_failure(state, &task.id, &all_tasks, &err)
                         .await;
@@ -288,7 +314,7 @@ impl Orchestrator {
             }
         }
 
-        let result = self.dispatch_task(state, task_id, None).await;
+        let result = self.dispatch_task(state, task_id).await;
 
         state.claimed = original_claimed;
         if !state.running.contains_key(task_id) {
@@ -307,10 +333,8 @@ impl Orchestrator {
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
-        prefetched: Option<Task>,
     ) -> Result<()> {
-        self.dispatch_task_to(state, task_id, prefetched, false)
-            .await
+        self.dispatch_task_to(state, task_id, false).await
     }
 
     /// [`Self::dispatch_task`], optionally limited to remote agents: the
@@ -319,7 +343,6 @@ impl Orchestrator {
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
-        prefetched: Option<Task>,
         remote_only: bool,
     ) -> Result<()> {
         // After a standalone signal nothing new is claimed (ruling 19).
@@ -341,10 +364,19 @@ impl Orchestrator {
             return Ok(());
         }
 
-        let task = match prefetched {
-            Some(task) => task,
-            None => self.deps().task_service.get(task_id).await?,
-        };
+        // A prefetched candidate may predate a pause/cancel. Keep the gate
+        // through execute, and read current records after entering it.
+        let _dispatch = self.deps().task_service.dispatch_gate.lock().await;
+        let task = self.deps().task_service.get(task_id).await?;
+        if let (Some(goal_id), Some(goals)) =
+            (task.goal_id.as_deref(), self.deps().goal_store.as_ref())
+            && goals
+                .get(goal_id)
+                .await?
+                .is_some_and(|goal| goal.status == orch_domain::GoalStatus::Paused)
+        {
+            return Ok(());
+        }
         // It may have finished through another path while it sat in a queue.
         // A task held for the owner's approval waits like a blocked one.
         if !is_dispatchable(task.status) || task.awaits_approval() {
@@ -434,210 +466,26 @@ impl Orchestrator {
             let prepared = self
                 .deps()
                 .workspace
-                .prepare(&task, &agent, self.config())
+                .prepare(&task, &agent, &self.config())
                 .await?;
             (prepared.path, prepared.branch)
         };
 
         let attempt = task.attempts + 1;
-        let retry_context = if attempt > 1 {
-            match self
-                .deps()
-                .run_service
-                .get_last_failed_run_context(&task_id)
-                .await?
-            {
-                Some(context) => {
-                    // The source window is only vouched for when nothing can
-                    // still append to it: the failed run is terminal, and no
-                    // collector for this task is still draining its stream (a
-                    // run failed by reconcile while its child was still
-                    // writing). `dispatch_task_to` already waits for that
-                    // collector; this keeps eco safe should another path
-                    // dispatch. Otherwise eco keeps the full output.
-                    let window_stable =
-                        !self.inner.active_collectors.lock().await.contains(&task_id);
-                    Some(RetryContext {
-                        previous_error: context.error,
-                        previous_output: context.output,
-                        source_run_id: window_stable.then_some(context.run_id),
-                    })
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-
-        // Shared context, the mailbox drain and the goal are independent reads.
-        let (shared_context, pending_messages, goal) = futures::future::join3(
-            async {
-                match self.deps().context_store.as_ref() {
-                    Some(store) => store.get_all().await.ok(),
-                    None => None,
-                }
-            },
-            async {
-                if agent.remote.is_some() {
-                    return Vec::new();
-                }
-                match self.deps().message_service.as_ref() {
-                    Some(messages) => messages
-                        .drain_mailbox(&agent.id, &task_id)
-                        .await
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                }
-            },
-            async {
-                match (task.goal_id.as_deref(), self.inner.cached_goals.as_ref()) {
-                    (Some(goal_id), Some(goals)) => goals.get(goal_id).await.ok().flatten(),
-                    _ => None,
-                }
-            },
-        )
-        .await;
-
-        let goal_context = match goal {
-            Some(goal) => {
-                let goal_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
-                let progress = match self.deps().context_store.as_ref() {
-                    Some(store) => store
-                        .get(&format!("{}-progress", goal.id))
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|entry| entry.value),
-                    None => None,
-                };
-                let linked: Vec<&Task> = goal_tasks
-                    .iter()
-                    .filter(|t| t.goal_id.as_deref() == Some(goal.id.as_str()))
-                    .collect();
-                Some(GoalContext {
-                    task_names: linked
-                        .iter()
-                        .map(|t| format!("[{}] {}", t.status, t.title))
-                        .collect(),
-                    task_rows: linked
-                        .iter()
-                        .map(|t| GoalTaskRow {
-                            id: t.id.clone(),
-                            status: t.status,
-                            title: t.title.clone(),
-                        })
-                        .collect(),
-                    id: goal.id,
-                    title: goal.title,
-                    description: goal.description,
-                    status: goal.status,
-                    progress,
-                })
-            }
-            None => None,
-        };
-
-        // Split mode keeps the system half cacheable between runs; a
-        // user-supplied `prompt.template` opts out of the split entirely.
-        let mirror_peer = task
-            .labels
-            .iter()
-            .find_map(|label| label.strip_prefix("remote:"))
-            .filter(|_| mirror_controller(&task).is_some());
-
-        // One prompt mode per dispatch, captured here and used for both the
-        // render and the invocation config. Remote execution and mirrors
-        // bypass eco entirely and read nothing.
-        let captured_mode = if agent.remote.is_none() && mirror_peer.is_none() {
-            let project_mode = self.current_project_prompt_mode().await?;
-            let mode = agent.config.prompt_mode.unwrap_or(project_mode);
-            if mode == PromptMode::Eco {
-                // Hand-edited files bypass the mutation-time check.
-                let mut effective = self.config().clone();
-                effective.defaults.agent.prompt_mode = project_mode;
-                crate::prompt_mode::check_agent_candidate(
-                    &effective,
-                    &agent.id,
-                    &agent.name,
-                    &agent.config,
-                )?;
-            }
-            Some(mode)
-        } else {
-            None
-        };
-
-        let options = BuildPromptOptions {
-            all_agents: &all_agents,
-            retry_context,
-            shared_context: shared_context.as_ref(),
-            feedback: task.feedback.clone(),
-            messages: &pending_messages,
-            goal: goal_context,
-        };
-        let context = if captured_mode == Some(PromptMode::Eco) {
-            build_eco_prompt_context(
-                &task,
-                &agent,
-                attempt,
-                &workspace_path,
-                self.config(),
-                options,
-            )
-        } else {
-            build_prompt_context(
-                &task,
-                &agent,
-                attempt,
-                &workspace_path,
-                self.config(),
-                options,
-            )
-        };
-
-        let skills = match (
-            self.deps().skill_loader.as_ref(),
-            agent.config.skills.as_deref().filter(|s| !s.is_empty()),
-        ) {
-            (Some(loader), Some(skills)) => Some(loader.load_skills(skills).await?),
-            _ => None,
-        };
-
-        let RenderedPrompt {
+        let PreparedPrompt {
             prompt,
             system_prompt,
-        } = if let Some(controller) = mirror_peer {
-            let from = task
-                .labels
-                .iter()
-                .find_map(|label| label.strip_prefix("remote-from:"))
-                .unwrap_or("cli");
-            let mut system = format!(
-                "You are {}{}\n\n## Remote execution\nYou are executing a task delegated by `{controller}`.\nPaths refer to this machine; controller files are not available. If a required input is missing, fail and say so.\nDo not use `orch task add`, `orch goal`, or `orch context` here: they are not visible to the requester.\nTo ask the requester, run `orch msg send {from}@{controller} \"…\"`.\nPut your result in your final message.",
-                agent.name,
-                agent
-                    .role
-                    .as_ref()
-                    .map(|role| format!(" ({role})"))
-                    .unwrap_or_default()
-            );
-            if let Some(block) = skills.as_deref().filter(|block| !block.is_empty()) {
-                system.push_str("\n\n");
-                system.push_str(block);
-            }
-            RenderedPrompt {
-                prompt: task.description.clone(),
-                system_prompt: Some(system),
-            }
-        } else {
-            render_prompt(
-                self.deps().templates.as_ref(),
-                self.config().prompt.as_ref(),
-                &context,
-                skills.as_deref(),
+            captured_mode,
+            ..
+        } = self
+            .prepare_prompt(
+                &task,
+                &agent,
+                &all_agents,
+                &workspace_path,
+                MailboxMode::Drain,
             )
-            .await?
-        };
+            .await?;
 
         let run = self
             .deps()
@@ -867,7 +715,7 @@ impl Orchestrator {
         }
         self.report_effort_diagnostics(&run.id, &agent.id, &diagnostics);
 
-        let handle = match adapter.execute(params) {
+        let handle = match self.execute_prepared(adapter.as_ref(), params) {
             Ok(handle) => handle,
             Err(err) => {
                 self.fail_before_spawn(
@@ -947,6 +795,230 @@ impl Orchestrator {
     /// startup snapshot. A read or parse failure is a configuration error
     /// before any run exists — never a silent fall back to normal. Without a
     /// config store (unit tests), the startup config is used.
+    pub(super) async fn prepare_prompt(
+        &self,
+        task: &Task,
+        agent: &orch_domain::Agent,
+        all_agents: &[orch_domain::Agent],
+        workspace_path: &str,
+        mailbox: MailboxMode,
+    ) -> Result<PreparedPrompt> {
+        let task_id = task.id.clone();
+        let attempt = task.attempts + 1;
+        let retry_context = if attempt > 1 {
+            match self
+                .deps()
+                .run_service
+                .get_last_failed_run_context(&task_id)
+                .await?
+            {
+                Some(context) => {
+                    // The source window is only vouched for when nothing can
+                    // still append to it: the failed run is terminal, and no
+                    // collector for this task is still draining its stream (a
+                    // run failed by reconcile while its child was still
+                    // writing). `dispatch_task_to` already waits for that
+                    // collector; this keeps eco safe should another path
+                    // dispatch. Otherwise eco keeps the full output.
+                    let window_stable =
+                        !self.inner.active_collectors.lock().await.contains(&task_id);
+                    Some(RetryContext {
+                        previous_error: context.error,
+                        previous_output: context.output,
+                        source_run_id: window_stable.then_some(context.run_id),
+                    })
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // Shared context, the mailbox drain and the goal are independent reads.
+        let (shared_context, pending_messages, goal) = futures::future::join3(
+            async {
+                match self.deps().context_store.as_ref() {
+                    Some(store) => store.get_all().await.ok(),
+                    None => None,
+                }
+            },
+            async {
+                if agent.remote.is_some() {
+                    return Ok(Vec::new());
+                }
+                match (self.deps().message_service.as_ref(), mailbox) {
+                    (Some(messages), MailboxMode::Drain) => Ok(messages
+                        .drain_mailbox(&agent.id, &task_id)
+                        .await
+                        .unwrap_or_default()),
+                    (Some(messages), MailboxMode::Snapshot) => {
+                        messages.list_pending_for_agent(&agent.id).await
+                    }
+                    (None, _) => Ok(Vec::new()),
+                }
+            },
+            async {
+                match (task.goal_id.as_deref(), self.inner.cached_goals.as_ref()) {
+                    (Some(goal_id), Some(goals)) => goals.get(goal_id).await.ok().flatten(),
+                    _ => None,
+                }
+            },
+        )
+        .await;
+        let pending_messages = pending_messages?;
+
+        let goal_context = match goal {
+            Some(goal) => {
+                let goal_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
+                let progress = match self.deps().context_store.as_ref() {
+                    Some(store) => store
+                        .get(&format!("{}-progress", goal.id))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|entry| entry.value),
+                    None => None,
+                };
+                let linked: Vec<&Task> = goal_tasks
+                    .iter()
+                    .filter(|t| t.goal_id.as_deref() == Some(goal.id.as_str()))
+                    .collect();
+                Some(GoalContext {
+                    task_names: linked
+                        .iter()
+                        .map(|t| format!("[{}] {}", t.status, t.title))
+                        .collect(),
+                    task_rows: linked
+                        .iter()
+                        .map(|t| GoalTaskRow {
+                            id: t.id.clone(),
+                            status: t.status,
+                            title: t.title.clone(),
+                        })
+                        .collect(),
+                    id: goal.id,
+                    title: goal.title,
+                    description: goal.description,
+                    status: goal.status,
+                    progress,
+                })
+            }
+            None => None,
+        };
+
+        // Split mode keeps the system half cacheable between runs; a
+        // user-supplied `prompt.template` opts out of the split entirely.
+        let mirror_peer = task
+            .labels
+            .iter()
+            .find_map(|label| label.strip_prefix("remote:"))
+            .filter(|_| mirror_controller(task).is_some());
+
+        // One prompt mode per dispatch, captured here and used for both the
+        // render and the invocation config. Remote execution and mirrors
+        // bypass eco entirely and read nothing.
+        let captured_mode = if agent.remote.is_none() && mirror_peer.is_none() {
+            let project_mode = self.current_project_prompt_mode().await?;
+            let mode = agent.config.prompt_mode.unwrap_or(project_mode);
+            if mode == PromptMode::Eco {
+                // Hand-edited files bypass the mutation-time check.
+                let mut effective = self.config().clone();
+                effective.defaults.agent.prompt_mode = project_mode;
+                crate::prompt_mode::check_agent_candidate(
+                    &effective,
+                    &agent.id,
+                    &agent.name,
+                    &agent.config,
+                )?;
+            }
+            Some(mode)
+        } else {
+            None
+        };
+
+        let options = BuildPromptOptions {
+            all_agents,
+            retry_context,
+            shared_context: shared_context.as_ref(),
+            feedback: task.feedback.clone(),
+            messages: &pending_messages,
+            goal: goal_context,
+        };
+        let context = if captured_mode == Some(PromptMode::Eco) {
+            build_eco_prompt_context(
+                task,
+                agent,
+                attempt,
+                workspace_path,
+                &self.config(),
+                options,
+            )
+        } else {
+            build_prompt_context(
+                task,
+                agent,
+                attempt,
+                workspace_path,
+                &self.config(),
+                options,
+            )
+        };
+
+        let skills = match (
+            self.deps().skill_loader.as_ref(),
+            agent.config.skills.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            (Some(loader), Some(skills)) => Some(loader.load_skills(skills).await?),
+            _ => None,
+        };
+
+        let RenderedPrompt {
+            prompt,
+            system_prompt,
+        } = if let Some(controller) = mirror_peer {
+            let from = task
+                .labels
+                .iter()
+                .find_map(|label| label.strip_prefix("remote-from:"))
+                .unwrap_or("cli");
+            let mut system = format!(
+                "You are {}{}\n\n## Remote execution\nYou are executing a task delegated by `{controller}`.\nPaths refer to this machine; controller files are not available. If a required input is missing, fail and say so.\nDo not use `orch task add`, `orch goal`, or `orch context` here: they are not visible to the requester.\nTo ask the requester, run `orch msg send {from}@{controller} \"…\"`.\nPut your result in your final message.",
+                agent.name,
+                agent
+                    .role
+                    .as_ref()
+                    .map(|role| format!(" ({role})"))
+                    .unwrap_or_default()
+            );
+            if let Some(block) = skills.as_deref().filter(|block| !block.is_empty()) {
+                system.push_str("\n\n");
+                system.push_str(block);
+            }
+            RenderedPrompt {
+                prompt: task.description.clone(),
+                system_prompt: Some(system),
+            }
+        } else {
+            render_prompt(
+                self.deps().templates.as_ref(),
+                self.config().prompt.as_ref(),
+                &context,
+                skills.as_deref(),
+            )
+            .await?
+        };
+
+        Ok(PreparedPrompt {
+            message_ids: pending_messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect(),
+            prompt,
+            system_prompt,
+            captured_mode,
+        })
+    }
+
     async fn current_project_prompt_mode(&self) -> Result<PromptMode> {
         let Some(store) = self.config_store() else {
             return Ok(self.config().defaults.agent.prompt_mode);
@@ -965,7 +1037,16 @@ impl Orchestrator {
     /// handler as a run whose stream fails immediately: the run is recorded
     /// failed, the agent returns to idle with `last_error`, the task is
     /// retried or failed by the existing policy, and the slot is released.
-    async fn fail_before_spawn(
+    pub(super) fn execute_prepared(
+        &self,
+        adapter: &dyn orch_core::adapter::Adapter,
+        params: ExecuteParams,
+    ) -> std::result::Result<orch_core::adapter::ExecuteHandle, orch_core::adapter::AdapterError>
+    {
+        adapter.execute(params)
+    }
+
+    pub(super) async fn fail_before_spawn(
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
@@ -1020,7 +1101,12 @@ impl Orchestrator {
     /// `--log-file`); `run --watch` prints it as a ⚠ line.
     /// It is never a run event, so retry `previous_output`, the collector's
     /// `last_agent_message` and the task's `final_result` cannot see it.
-    fn report_effort_diagnostics(&self, run_id: &str, agent_id: &str, diagnostics: &[String]) {
+    pub(super) fn report_effort_diagnostics(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+        diagnostics: &[String],
+    ) {
         for diagnostic in diagnostics {
             self.emit_error(
                 diagnostic,
@@ -1150,13 +1236,13 @@ pub(crate) const EFFORT_DIAGNOSTIC_CONTEXT: &str = "effort preparation";
 /// Adapters whose `prepare_effort` returns the complete diagnostics for a
 /// dispatch (its wire check can change the plan), so the pure plan must not
 /// be consulted again for them.
-const PREPARATION_OWNS_EFFORT_DIAGNOSTICS: &[&str] = &["opencode"];
+pub(super) const PREPARATION_OWNS_EFFORT_DIAGNOSTICS: &[&str] = &["opencode"];
 
 /// Enforce the preparation contract at its only production caller: the
 /// prepared copy may differ from the invocation config only by a cleared
 /// generic effort (the legacy-ignore outcome). Anything else is a contract
 /// violation reported before the spawn, never silently executed.
-fn check_preparation(
+pub(super) fn check_preparation(
     invocation: &AgentConfig,
     prepared: orch_core::EffortPreparation,
 ) -> std::result::Result<orch_core::EffortPreparation, orch_core::AdapterError> {
@@ -1176,7 +1262,7 @@ fn check_preparation(
 /// Running entries that hold a local slot: everything except remote runs.
 /// The controller instance a mirror task belongs to, from its `remote-ctl:`
 /// label. `None` for ordinary local work.
-fn mirror_controller(task: &Task) -> Option<&str> {
+pub(super) fn mirror_controller(task: &Task) -> Option<&str> {
     task.labels
         .iter()
         .find_map(|label| label.strip_prefix("remote-ctl:"))

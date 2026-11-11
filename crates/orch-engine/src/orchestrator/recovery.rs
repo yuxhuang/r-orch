@@ -1,6 +1,6 @@
 //! Startup recovery and graceful shutdown.
 
-use orch_core::error::Result;
+use orch_core::error::{Error, Result};
 use orch_core::storage::TaskStore;
 use orch_domain::{
     AgentStatus, OrchestratorState, RunStatus, TaskStatus, is_terminal, resolve_failure_status,
@@ -190,7 +190,10 @@ impl Orchestrator {
         self.save_state(state).await
     }
 
-    async fn quarantine_worker_mirrors(&self, state: &mut OrchestratorState) -> Result<()> {
+    async fn quarantine_worker_mirrors(
+        &self,
+        state: &mut OrchestratorState,
+    ) -> Result<std::collections::HashSet<String>> {
         let tasks = self.deps().task_store.list(&Default::default()).await?;
         let runs = self.deps().run_store.list_all().await?;
         let mirrors: Vec<_> = tasks
@@ -208,7 +211,9 @@ impl Orchestrator {
                     })
             })
             .collect();
+        let mut mirrored = std::collections::HashSet::new();
         for task in mirrors {
+            mirrored.insert(task.id.clone());
             let run = runs
                 .iter()
                 .filter(|run| run.task_id == task.id)
@@ -234,7 +239,7 @@ impl Orchestrator {
                 self.emit_error(err, format!("worker recovery: task {}", task.id));
             }
         }
-        Ok(())
+        Ok(mirrored)
     }
 
     /// Clean up after a crashed or restarted process.
@@ -246,9 +251,13 @@ impl Orchestrator {
         &self,
         state: &mut OrchestratorState,
     ) -> Result<()> {
-        if let Err(err) = self.quarantine_worker_mirrors(state).await {
-            self.emit_error(err, "worker recovery: list mirrors");
-        }
+        let mirrored = match self.quarantine_worker_mirrors(state).await {
+            Ok(mirrored) => mirrored,
+            Err(err) => {
+                self.emit_error(err, "worker recovery: list mirrors");
+                Default::default()
+            }
+        };
         // A remote execution outlives this process: the worker owns it, and
         // cancelling the reservation here would discard an outcome that is
         // still on its way. So a remote entry whose peer is still registered
@@ -287,11 +296,43 @@ impl Orchestrator {
             .map(|(task_id, entry)| (task_id.clone(), entry.clone()))
             .collect();
 
+        // Daemon readiness requires all local recovery commits. Keep the
+        // durable reservation until every write succeeds, including the
+        // agent write: a failed startup must be retryable even if the task
+        // or run has already reached its terminal state.
+        if self.is_daemon_mode() {
+            for (task_id, entry) in dead
+                .iter()
+                .filter(|(task_id, entry)| entry.remote.is_none() && !mirrored.contains(task_id))
+            {
+                self.force_task_cancelled_required(task_id).await?;
+                self.deps()
+                    .run_service
+                    .finish(
+                        &entry.run_id,
+                        RunStatus::Cancelled,
+                        None,
+                        Some("Orchestrator restarted".to_owned()),
+                    )
+                    .await?;
+                self.deps()
+                    .agent_service
+                    .set_status(&entry.agent_id, AgentStatus::Idle)
+                    .await?;
+            }
+        }
+
         for (task_id, _) in &dead {
             state.running.shift_remove(task_id);
         }
 
+        let mirrored = &mirrored;
         futures::future::join_all(dead.iter().map(|(task_id, entry)| async move {
+            // Local entries were committed above. Retain the existing
+            // best-effort policy for legacy startup and removed peers.
+            if self.is_daemon_mode() && entry.remote.is_none() && !mirrored.contains(task_id) {
+                return;
+            }
             if entry.remote.is_none()
                 && let Err(err) = self
                     .deps()
@@ -334,24 +375,35 @@ impl Orchestrator {
         // it would be wrong.
         if !dead.is_empty() {
             let all_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
-            let orphaned: Vec<String> = all_tasks
+            let orphaned: Vec<orch_domain::Task> = all_tasks
                 .into_iter()
                 .filter(|task| {
                     task.status == TaskStatus::InProgress && !state.running.contains_key(&task.id)
                 })
-                .map(|task| task.id)
                 .collect();
-            futures::future::join_all(
-                orphaned
-                    .iter()
-                    .map(|task_id| self.force_task_cancelled(task_id)),
-            )
-            .await;
+            if self.is_daemon_mode() {
+                for task in &orphaned {
+                    if mirrored.contains(&task.id)
+                        || task.assignee.as_deref().is_some_and(|id| id.contains('@'))
+                    {
+                        self.force_task_cancelled(&task.id).await;
+                    } else {
+                        self.force_task_cancelled_required(&task.id).await?;
+                    }
+                }
+            } else {
+                futures::future::join_all(
+                    orphaned
+                        .iter()
+                        .map(|task| self.force_task_cancelled(&task.id)),
+                )
+                .await;
+            }
 
             let cancelled: std::collections::HashSet<&str> = dead
                 .iter()
                 .map(|(task_id, _)| task_id.as_str())
-                .chain(orphaned.iter().map(String::as_str))
+                .chain(orphaned.iter().map(|task| task.id.as_str()))
                 .collect();
             state
                 .retry_queue
@@ -359,7 +411,8 @@ impl Orchestrator {
             self.save_state(state).await?;
         }
 
-        self.cleanup_orphaned_preparing_runs(state).await;
+        self.cleanup_orphaned_preparing_runs(state, mirrored)
+            .await?;
         Ok(())
     }
 
@@ -367,12 +420,20 @@ impl Orchestrator {
     /// `run_service.create` and `run_service.start`. They have no running
     /// entry, so reconcile cannot see them and they would stay `preparing`
     /// forever.
-    async fn cleanup_orphaned_preparing_runs(&self, state: &OrchestratorState) {
+    async fn cleanup_orphaned_preparing_runs(
+        &self,
+        state: &OrchestratorState,
+        mirrored: &std::collections::HashSet<String>,
+    ) -> Result<()> {
         let all_runs = match self.deps().run_store.list_all().await {
             Ok(runs) => runs,
             Err(err) => {
-                self.emit_error(err, "startup cleanup: cleanupOrphanedPreparingRuns");
-                return;
+                self.emit_error(&err, "startup cleanup: cleanupOrphanedPreparingRuns");
+                return if self.is_daemon_mode() {
+                    Err(err)
+                } else {
+                    Ok(())
+                };
             }
         };
 
@@ -388,10 +449,10 @@ impl Orchestrator {
             .filter(|run| run.status == RunStatus::Preparing && !active.contains(run.id.as_str()))
             .collect();
         if orphaned.is_empty() {
-            return;
+            return Ok(());
         }
 
-        futures::future::join_all(orphaned.iter().map(|run| async move {
+        let results = futures::future::join_all(orphaned.iter().map(|run| async move {
             if let Err(err) = self
                 .deps()
                 .run_service
@@ -404,12 +465,23 @@ impl Orchestrator {
                 .await
             {
                 self.emit_error(
-                    err,
+                    &err,
                     format!("startup cleanup: finish orphaned preparing run {}", run.id),
                 );
+                if self.is_daemon_mode()
+                    && !mirrored.contains(&run.task_id)
+                    && !run.agent_id.contains('@')
+                {
+                    return Err(err);
+                }
             }
+            Ok(())
         }))
         .await;
+        for result in results {
+            result?;
+        }
+        Ok(())
     }
 
     /// Finalize runs that were started but whose running entry never reached
@@ -488,37 +560,68 @@ impl Orchestrator {
     /// transition is rejected. One of the recovery paths that deliberately
     /// bypasses the state machine.
     pub(super) async fn force_task_cancelled(&self, task_id: &str) {
-        if self
+        // The helper emits the same diagnostics in both modes; legacy
+        // callers deliberately continue after a failed recovery write.
+        let _ = self.force_task_cancelled_inner(task_id, false).await;
+    }
+
+    /// Required form for daemon startup. The legacy wrapper keeps recovery
+    /// best-effort; a daemon cannot publish readiness after a failed write.
+    async fn force_task_cancelled_required(&self, task_id: &str) -> Result<()> {
+        self.force_task_cancelled_inner(task_id, true).await
+    }
+
+    async fn force_task_cancelled_inner(&self, task_id: &str, required: bool) -> Result<()> {
+        match self
             .deps()
             .task_service
             .update_status(task_id, TaskStatus::Cancelled)
             .await
-            .is_ok()
         {
-            return;
+            Ok(_) => return Ok(()),
+            Err(Error::Domain(
+                orch_domain::DomainError::InvalidTransition { .. }
+                | orch_domain::DomainError::TaskNotFound(_),
+            )) => {}
+            // Only a rejected transition or an absent record permits the
+            // fallback in required recovery. An I/O error may follow an
+            // entity write but precede its index write; don't hide it just
+            // because the next read sees a terminal entity.
+            Err(err) if required => return Err(err),
+            Err(_) => {}
         }
         let mut task = match self.deps().task_store.get(task_id).await {
             Ok(Some(task)) => task,
             // Gone: there is nothing left to cancel.
-            Ok(None) => return,
+            Ok(None) => return Ok(()),
             // Unreadable is not the same as absent, and since WP-0's YAML
             // hardening it is not even the same as corrupt: a read can now
             // fail on an alias-expansion cap or a parse deadline, where the
             // file is intact and the next attempt would succeed. Returning
             // silently would leave the task non-terminal with nothing said.
             Err(err) => {
-                self.emit_error(err, format!("startup cleanup: read task {task_id}"));
-                return;
+                self.emit_error(&err, format!("startup cleanup: read task {task_id}"));
+                return Err(err);
             }
         };
         if is_terminal(task.status) {
-            return;
+            if required {
+                // A previous failed startup may have committed only the
+                // entity. Re-save it before dropping its retry reservation.
+                self.deps().task_store.save(&task).await?;
+            }
+            return Ok(());
         }
         task.status = TaskStatus::Cancelled;
         task.updated_at = self.deps().clock.now_iso();
         if let Err(err) = self.deps().task_store.save(&task).await {
-            self.emit_error(err, format!("startup cleanup: force-cancel task {task_id}"));
+            self.emit_error(
+                &err,
+                format!("startup cleanup: force-cancel task {task_id}"),
+            );
+            return Err(err);
         }
+        Ok(())
     }
 
     /// Called once after shutdown has enqueued all cancels and released the
@@ -657,5 +760,68 @@ impl Orchestrator {
             }
         }
         detached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::tests::harness::{Harness, NOW_ISO, state_running};
+    use orch_core::test_support::{make_run, make_task};
+
+    #[tokio::test]
+    async fn daemon_worker_quarantine_keeps_its_missing_agent_policy() {
+        for alive in [true, false] {
+            let h = Harness::builder()
+                .tasks([orch_domain::Task {
+                    id: "tsk_mirror".into(),
+                    status: TaskStatus::InProgress,
+                    labels: vec!["remote-ctl:controller".into()],
+                    ..make_task()
+                }])
+                .state(state_running(
+                    "tsk_mirror",
+                    "agt_missing",
+                    "run_mirror",
+                    4321,
+                    NOW_ISO,
+                ))
+                .build();
+            h.runs.seed(orch_domain::Run {
+                id: "run_mirror".into(),
+                task_id: "tsk_mirror".into(),
+                agent_id: "agt_missing".into(),
+                status: RunStatus::Running,
+                pid: Some(4321),
+                ..make_run()
+            });
+            if alive {
+                h.processes.set_alive(4321);
+            } else {
+                h.processes.set_dead(4321);
+            }
+
+            h.orchestrator.daemon_initialize().await.unwrap();
+
+            assert_eq!(
+                h.persisted_state().running.contains_key("tsk_mirror"),
+                alive
+            );
+            let task = h.task("tsk_mirror");
+            assert_eq!(task.status, TaskStatus::Cancelled);
+            assert!(
+                task.feedback
+                    .unwrap()
+                    .starts_with("Worker execution collector lost; outcome unknown")
+            );
+            assert!(
+                h.runs
+                    .peek("run_mirror")
+                    .unwrap()
+                    .error
+                    .unwrap()
+                    .starts_with("Worker execution collector lost; outcome unknown")
+            );
+        }
     }
 }
