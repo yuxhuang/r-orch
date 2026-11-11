@@ -67,13 +67,6 @@ What the daemon does **not** promise:
   158/228 ms and `status` 129/209 ms. Afterwards, with the daemon restarted, at load 15.84–18.83 and 201 reads per
   command, `task list` p95 was 27.61 ms against 30.84 ms for an idle project measured at the same time, and
   `status` 21.00 ms against 20.05 ms. These are observations on one machine, not promised bounds.
-<!-- A6 (tsk_I57BLvA), decision-tsk_DKbRFg5-f1b-acceptance.md. Queue: crates/orch-engine/src/container/operation.rs:130
-(tokio Mutex, FIFO acquisition) and crates/orch-daemon/src/coordinator.rs:153 (non-external requests, reads included);
-10 s refusal coordinator.rs:163-164, exit 7 crates/orch-proto/src/error.rs:64; durable write
-crates/orch-infra/src/storage/fs_utils.rs:97 (awaited file sync),128-135 (best-effort directory sync);
-all at b97fc59a, unchanged at 8a4c9eb4. External operations: crates/orch-daemon/src/ops/mod.rs:234-256.
-Numbers only from the "Paragraph approved for
-documentation" of perf-eng-pr2b-f1b-reverdict-a08fad1b.md (tsk_KwZ1rOH). -->
 
 ## Command reference
 
@@ -608,8 +601,8 @@ project on a timer.
 **Limits and a known limitation.** Commit identity metadata holds at most 256 entries / 64 KiB; the
 subscription and session limits above bound staged output, including frames handed to the writer. The engine's
 per-operation domain-event buffer is not capped: it holds one operation's events until the operation releases
-the permit and grows with the number of events that operation emits. Follow-up R-evbuf needs an overflow design
-for in-process listeners.
+the permit and grows with the number of events that operation emits. An overflow design for in-process
+listeners remains deferred.
 
 An idle worker linked to a controller emits no change notices or dispatch wakes for heartbeat frames. An idle
 controller with a linked peer still invalidates the Remote store about once per second for peer status; those

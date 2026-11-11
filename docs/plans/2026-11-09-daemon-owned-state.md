@@ -75,8 +75,8 @@ rejected alternatives. This section is the summary a builder needs to find the r
 - **PR 3 known limitations.** Commit metadata (256 entries / 64 KiB), 8 subscriptions/session,
   256 events/subscription and 4 MiB staged output/session are bounded. The engine's per-operation domain-event
   buffer is not capped: it holds one operation's events until release and grows with the number emitted.
-  R-evbuf needs an overflow design for in-process listeners; placement in PR 4 or after the goal remains a
-  checkpoint decision informed by security and resilience review. An idle worker's heartbeats emit no changes
+  PR 4 must supply a bounded lossless overflow design for in-process listeners or an explicit owner-approved
+  supported envelope; this obligation is not deferred beyond the goal. An idle worker's heartbeats emit no changes
   or wakes; an idle controller still publishes Remote status about once per second and may wake dispatch.
 - **Rejected** (details in ADR 0012): a direct-store fallback; auto-start; a separate `orchd` binary; gRPC or
   tarpc; a second framing next to `orch-peer`'s; protocol-number-only skew checks; an RPC-only FIFO or a lock per
@@ -137,19 +137,20 @@ rebase of a shared branch. Owners are roles; task ids live in the tracker, not i
 | S3a | Dashboard consumes push: subscribe before bootstrap, no periodic state read; delete `disk_observer` (frontend-eng) | R16, R18 | `crates/orch-cli/src/tui/**`, `crates/orch-tui/{src,tests}/**`, `crates/orch-cli/src/serve/{mod,disk_observer}.rs` | S3-api | `cargo test -p orch-tui`; `cargo test -p orch-cli --lib tui::` | 3 |
 | S3b | `orch web` parent holds an observation and liveness connection; sessions keep the PTY dashboard (frontend-eng-2) | R16, R18 | `crates/orch-cli/src/web/**` | S3-api | `cargo test -p orch-cli --lib web::`; `cargo test -p orch-cli --test web_bridge` | 3 |
 | S3m | `orch mcp` resource subscriptions: 256 URIs, one observation session, local URI mapping, coalesced `resources/updated` (senior-eng-2) | R17, R18 | `crates/orch-cli/src/mcp/**` | S3-api | `cargo test -p orch-cli --lib mcp::`; `cargo test -p orch-cli --test mcp_contract --test mcp_tools --test mcp_stdio` | 3 |
+| PR 3 scoped repairs | Writer activates after acknowledgement flush; dirty prompt-mode view rearms on asynchronous success/refusal; MCP owns one scheduled recovery, bounds retained URI strings, cancels/joins tasks and bounds output even at EOF | R16–R18, R20 | `crates/orch-daemon/src/{session,hub}.rs`, `crates/orch-tui/{src/app.rs,tests/push_refresh.rs}`, `crates/orch-cli/src/mcp/server{.rs,/subscriptions.rs}` | existing push API | Scoped exact-SHA reviews are qualified; integration must retain the causal controls and obtain independent code/security/resilience delta reviews at the new full SHA | 3 |
 | T3 | Independent push and wake acceptance tests, authored against the API and finished on the integrated candidate (test-engineer) | R16–R18, R9, R13 | `crates/orch-daemon/tests/{daemon_push,daemon_dispatch_wake}.rs`, `crates/orch-cli/tests/{daemon_push,tui_daemon,web_daemon}.rs`, `crates/orch-cli/tests/push_support/**` | S3-api | the spec's [PR 3 acceptance targets](../specs/2026-11-09-daemon-owned-state.md#pr-3-acceptance-targets) | 3 |
 | T3-port | Replace the ignored PR 2 cases (`yaml_bomb` health assertion, three registry tests) with active daemon-owned equivalents (test-eng-2) | R15, R19, R20 | `crates/orch-cli/tests/{yaml_bomb,remote_peers}.rs`, `crates/orch-daemon/tests/registry_store.rs` | PR 2 frozen | `cargo test -p orch-cli --test yaml_bomb --test remote_peers`; `cargo test -p orch-daemon --features testing --test registry_store` | 3 |
 | W3 | Spec wording, this plan, ADR 0012 clarification note, manual 02/07/08/09/12/15/17/18, RUNBOOK, CHANGELOG; drafted ahead of the code, verified on the integrated candidate (tech-writer) | R16–R18, R22, R23, R29 | `README.md`, `CHANGELOG.md`, `docs/**` | PR 2 frozen | `git diff --check`; examples re-run on an isolated integrated binary | 3 |
 | I3a, I3b | Assemble the candidate on `feature/daemon-push` by merge; then merge final tests and docs, gate and freeze (senior-eng-2) | R24, R29 | per merge | all PR 3 slices | the CI set; cold `./xtask/gate.sh`; Linux | 3 |
 | G3, QA1 | Board 3 at the frozen SHA: gate (release-eng), code (code-reviewer), security (sec-reviewer-codex), resilience (sre), facts (fact-checker), performance (perf-eng); then QA pass 1 on the owner's Mac (qa-engineer) | R24, R28 | per finding | I3b | reviewer verdicts; QA transcript | 3 |
 | S4 | Crate and source-site allowlist; remove client infra/engine dependencies, the MCP FIFO lane and dead cross-process code (senior-eng-2; release-eng co-signs the manifest); R39 pgid-derived stop/off acknowledgement and its test vectors (CP6 ruling 12.8) | R3, R39 | `xtask/**`, `crates/orch-cli/src/{serve,mcp}/**`, `crates/orch-cli/Cargo.toml`, `crates/orch-daemon/src/session.rs`, `crates/orch-daemon/src/ops/control.rs`, `crates/orch-daemon/tests/daemon_security.rs` | PR 3 frozen | `cargo xtask crate-graph` passes, and fails on a planted `orch_infra` import in a client file; planned `cargo test -p orch-daemon --features testing --test daemon_security agent_control_requires_explicit_override -- --exact` (R39) | 4 |
+| PR 4 retained hardening | Resolve uncapped per-operation events; adjudicate no-op peer commit/fan-out work; make the daemon harness hermetic by default; trace and independently measure no-op and collector `record_event` held-permit p50/p95 | R20, R21, R25 | scopes fixed at the qualified PR 4 base | PR 3 integration and explicit PR 4 handoff | Bounded lossless event-buffer design or owner-approved envelope; unchanged peer interoperability and causal controls; exact-base reviews and both held-permit distributions | 4 |
 | W4 | ARCHITECTURE §2; RUNBOOK; manual 17/18 sweep with captured output; spec Verification table; spec and plan `done`; Pensieve mirror (tech-writer) | R22, R35, R38 | `docs/**`, `README.md`, `CHANGELOG.md` | S4 | every example re-run at the frozen commit; fact-check | 4 |
 | I4, G4, QA2 | Integrate, board 4, QA pass 2 | R22, R24, R28 | per finding | S4, W4 | reviewer verdicts; QA transcript | 4 |
 
 ## Status
 
-Snapshot of goal `goal_zX0WXev` at 2026-11-10, rewritten for PR 3. Not updated automatically; later writers edit
-it. Task ids are in the tracker.
+Status at 2026-11-10, including scoped PR 3 repairs. This table does not certify a new integrated freeze.
 
 | Item | State |
 |---|---|
@@ -157,8 +158,35 @@ it. Task ids are in the tracker.
 | Gate 2 (spec) | spec approved, ADR 0012 accepted, 2026-11-09 |
 | PR 1, `feature/daemon-core` | frozen at `051742bd`; draft PR [#74](https://github.com/yuxhuang/r-orch/pull/74) opened against `main`; the test-only CI fixture fix is included |
 | PR 2, `feature/daemon-clients` | integration frozen at `7fd1fa02`; board 2c and PR handoff are pending; this row does not certify Linux CI |
-| PR 3, `feature/daemon-push` | assembled candidate `69d16c83`, with six named push/web acceptance tests still red and unclassified; final tests and docs precede the green integration freeze, board 3 and QA pass 1 |
+| PR 3, `feature/daemon-push` | original freeze `9277f832`; acknowledgement repair `17fe365d`, deferred-refresh repair `c1b7194d` and MCP lifecycle repair `28fbfddd` have scoped qualified reviews. Actual PR 2 production/test integration, separate containment lineage, I3 re-freeze and exact-SHA delta reviews remain required before gate release and QA pass 1. |
 | PR 4, `feature/daemon-enforce` | pending; starts when PR 3 is frozen |
+
+### Owner-amended performance acceptance and storage follow-up (2026-11-10)
+
+PR 3 performance is accepted **7/7 under the amended no-regression burst criterion** at
+`9277f832281d1c9734ce9ef03e8096389ae4ddc9`, comparator
+`b97fc59a5b1f32ec3f8d3fb1685a5cccb9bf9533`. Raw results remain 38/100 acknowledgements within 500 ms,
+100 eventually, last at 1318.192250 ms; comparator diagnostics reached 39–40/100. The owner accepts the spread
+as run-to-run noise. The original fixed-throughput failure remains unchanged: no remeasurement, statistical
+equivalence, faster storage or successful 100-in-500-ms/coalescing test is claimed. See the
+[spec's full acceptance qualification](../specs/2026-11-09-daemon-owned-state.md#pr-3-performance-acceptance-owner-amended-2026-11-10).
+
+Keep the other six contracts: launch 30 per side, continuous 60-second traffic, paired fan-out intervals
+containing zero, qualified RSS occupancy, live peer heartbeat and collector delivery/reconstruction (including
+its original failure and qualified offline reconstruction). Only no-op and `record_event` held-permit p50/p95
+are deferred to PR 4. The qualified containment source `67ee5017eee36af8dc665ecb9c00c92a51b7a51a` is a
+separate lineage; measurement and scoped repair acceptance do not certify integration or shipping.
+
+Defer the 100-successful-commits-in-500-ms storage objective to separate work **after this goal**. It is not
+a PR 3, PR 4 or push gate. That work must first design amortized/batched persistence and specify durability,
+error visibility, ordering, publication and crash recovery; attribution supports inherited sequential
+persistence latency but does not establish a safe minimal repair. No early acknowledgements, dropped syncs,
+changed formats or widened measurement window are authorized. The PR 4 hardening row remains required.
+
+The integration lead must preserve the PR 2 board/draft handoff, qualify the actual production and test deltas,
+integrate and re-freeze PR 3, and obtain independent exact-SHA delta reviews before releasing its direct gate.
+QA follows that qualified candidate. Draft shipping requires three complete green GitHub CI executions on the
+identified head/tree and the other applicable gates; the lead reports readiness and the owner merges.
 
 ## Test plan
 - The spec's [requirements table](../specs/2026-11-09-daemon-owned-state.md#requirements) names the acceptance
@@ -187,9 +215,13 @@ it. Task ids are in the tracker.
   each shown failing once against a deliberate break; QA pass 1 on the owner's Mac (R28) after board 3.
 - Hermeticity: no test touches a real project's daemon or `~/.orchestry`; sockets live under a per-test temp
   directory on a path of at most 100 bytes; fake shell agents only.
-- CI set on every PR: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
-  `cargo test --workspace`; `cargo xtask crate-graph`; `cargo deny check`; Linux CI. Cold `./xtask/gate.sh` on
-  macOS for each PR (process lifecycle, layering and security change in every one).
+- Owner-amended macOS gate: run `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask crate-graph` and
+  `cargo test --workspace --no-fail-fast` directly, with tmux on PATH and plain command timeouts.
+  Process snapshots are observations, not vetoes; custom test runners are retired from these gates.
+  Linux coverage comes from GitHub CI after a qualified draft push; no local Linux/Docker prerequisite.
+  CI retains its lockfile and cargo-deny checks. Each identified head/tree needs three complete green CI
+  executions; this supersedes the older cold-gate wording in the historical task tables above.
 
 ## Rollback / compatibility
 No on-disk format changes (R23): entity, index, `config.yml`, org-template and run-event files keep their format.
