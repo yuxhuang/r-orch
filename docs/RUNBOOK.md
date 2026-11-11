@@ -230,8 +230,8 @@ depending on writes are a stated non-guarantee: see
    `retrying · attempt 1/3`.
 3. Why they fail: `orch --json status` shows each waiting retry's error in `state.retry_queue[].error`, for
    example `"error": "workspace_mode \"worktree\" requires a git repository"`. Once terminal `failed` is recorded,
-   the failed task and status retry queue no longer retain its workspace failure reason (pending PR-4 fix,
-   task tsk_R3FGvVF, continuing tsk_ajCzJGN). An exhausted `retrying · attempt 3/3` can still carry the reason
+   the failed task and status retry queue no longer retain its workspace failure reason (pending fix).
+   An exhausted `retrying · attempt 3/3` can still carry the reason
    while final-failure recording is pending, so read it while the task is still `retrying`.
 
 **Fix.** For a finite burst with working storage, preparations stop at each task's attempt limit (`max_attempts`,
@@ -253,14 +253,6 @@ request was not run and can be retried. An ordinary request still waiting to acq
 is refused this way; this is not a completion deadline for work already started. If the error instead says
 `request outcome unknown`, inspect state before retrying: the request may have applied. Exit 7 or elapsed time
 alone does not establish that nothing ran.
-<!-- A6 (tsk_I57BLvA). Queue and durable writes: see the comment under manual 18 "What the daemon does not promise".
-Steps 1-3 and the dispatch-off line run on a throwaway project with release a08fad1b (worktree agent in a non-git
-project); retry_queue error from orch --json status; reason gone once terminal failed is recorded:
-tsk_ajCzJGN (PR-4 continuation tsk_R3FGvVF). Corrections at 8a4c9eb4: dispatch.rs:313-346 and daemon.rs:278-283
-keep exhausted retrying/back-off after a cascade-list read error, retrying only recording. Reservation:
-daemon.rs:167-169,889-905; daemon/shutdown.rs:98-114; recovery.rs:368-371. Safe retry:
-coordinator.rs:150-190; orch-client/src/call.rs:62-65; orch-proto/src/error.rs:250-254,292-307.
-Fact-check tsk_FUuRgp8 reused isolated runtime evidence; restart recovery is code-audited only. -->
 
 ---
 
@@ -279,8 +271,8 @@ resources, and wakes its own scheduler about half a second after a change
 The engine's per-operation domain-event buffer is not capped: it holds the events of one operation until
 the operation releases the permit and grows with the number of events the operation emits. Commit metadata
 (256 entries / 64 KiB), subscription counts and staged output have separate limits; see
-[How clients follow changes](manual/18-daemon.md#how-clients-follow-changes). Follow-up R-evbuf covers an overflow
-design for in-process listeners.
+[How clients follow changes](manual/18-daemon.md#how-clients-follow-changes). An overflow design for in-process
+listeners remains deferred.
 
 ## Corrupt lock file
 
