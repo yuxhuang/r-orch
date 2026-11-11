@@ -27,6 +27,46 @@ use crate::orchestrator::{Orchestrator, OrchestratorDeps, WatchOptions};
 use crate::run_service::RunService;
 use crate::task_service::TaskService;
 
+/// Real process assembly for launch/stop regressions. Tests drive the
+/// lifecycle and adapter ports while this fixture owns the shared tracker.
+#[derive(Default)]
+pub(crate) struct LaunchProcesses {
+    work: Arc<orch_infra::process::gate::SpawnWork>,
+}
+
+impl LaunchProcesses {
+    pub(crate) fn shell_adapter(
+        &self,
+        root: &std::path::Path,
+    ) -> Arc<dyn orch_core::adapter::Adapter> {
+        let processes =
+            orch_infra::process::SnapshotEnvProcessManager::new(orch_infra::process::EnvSnapshot {
+                base: vec![
+                    ("HOME".into(), root.as_os_str().to_owned()),
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                ],
+                forced: vec![],
+            })
+            .with_spawn_work(self.work.clone());
+        Arc::new(orch_infra::adapters::shell::ShellAdapter::new(Arc::new(
+            processes,
+        )))
+    }
+
+    pub(crate) fn seal(&self) {
+        self.work.seal();
+    }
+
+    pub(crate) async fn wait_idle(&self) {
+        self.work.wait_idle().await;
+    }
+}
+
+pub(crate) async fn reserve_process_launch() -> Box<dyn orch_core::process::SpawnReservation> {
+    orch_core::process::SpawnAdmission::reserve(&orch_infra::process::gate::ProcessSpawnAdmission)
+        .await
+}
+
 /// A command runner that answers every review criterion from one scripted
 /// outcome, so no unit test shells out to `npm`.
 pub(crate) struct ScriptedCommandRunner {

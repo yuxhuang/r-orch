@@ -159,7 +159,15 @@ impl ServiceHandler {
     /// Permanently reject new requests before releasing project ownership.
     pub(crate) fn seal_requests(&self) {
         self.requests.seal();
-        self.diagnostics.spawn_work().seal();
+    }
+
+    /// The spawn seal shares the launch commit's project boundary. Request
+    /// admission may close synchronously, but may not split that commit.
+    pub(crate) async fn stop_execution(&self) -> orch_core::error::Result<()> {
+        self.engine
+            .orchestrator
+            .daemon_stop_with_spawn_seal(|| self.diagnostics.spawn_work().seal())
+            .await
     }
 
     /// Includes detached operation tasks, not just their socket observers.

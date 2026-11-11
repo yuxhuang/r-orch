@@ -384,6 +384,7 @@ impl Orchestrator {
                 self.config().scheduling.retry_base_delay_ms,
                 self.config().scheduling.retry_max_delay_ms,
             );
+            state.retry_queue.retain(|retry| retry.task_id != task_id);
             self.enqueue_retry(state, &updated.id, updated.attempts, delay, err);
             true
         }

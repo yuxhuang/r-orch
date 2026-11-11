@@ -8,11 +8,19 @@ use super::super::Orchestrator;
 impl Orchestrator {
     /// Stop execution while leaving PID/guard ownership to the daemon lifecycle.
     pub async fn daemon_stop(&self) -> Result<()> {
+        self.daemon_stop_with_spawn_seal(|| {}).await
+    }
+
+    /// Seal spawning in the same operation as the running-task snapshot.
+    /// A launch already inside its durable phase must reach spawn before the
+    /// seal; a launch still preparing observes shutdown without an attempt.
+    pub async fn daemon_stop_with_spawn_seal(&self, seal: impl FnOnce() + Send) -> Result<()> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         let boundary = self.deps().events.operation_boundary();
         let entries = boundary
             .run(false, async {
+                seal();
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");

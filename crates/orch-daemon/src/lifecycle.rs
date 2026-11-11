@@ -721,7 +721,7 @@ impl Running {
         self.runtime.spawn(async move {
             #[cfg(feature = "testing")]
             let _directories = directories;
-            let _ = handler.engine.orchestrator.daemon_stop().await;
+            let _ = handler.stop_execution().await;
             for task in loops {
                 let _ = task.await;
             }

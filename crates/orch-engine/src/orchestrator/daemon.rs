@@ -356,10 +356,8 @@ impl Orchestrator {
                 };
                 drop(preparing);
                 state.claimed.insert(task_id.to_owned());
-                // Starting consumes the due retry, as in v0.13: `enqueue_retry`
-                // deduplicates by task id, so a leftover entry would swallow
-                // the back-off of a failure before spawn.
-                state.retry_queue.retain(|retry| retry.task_id != task_id);
+                // Only the final launch phase consumes the due retry. A stop
+                // during preparation must leave its back-off intact.
                 let generation = self.inner.preparation_seq.fetch_add(1, Ordering::SeqCst) + 1;
                 self.inner
                     .preparing_agents
@@ -1035,6 +1033,7 @@ impl Orchestrator {
                         .finish(run_id, RunStatus::Cancelled, None, None)
                         .await?;
                 } else {
+                    state.retry_queue.retain(|retry| retry.task_id != task.id);
                     self.deps()
                         .task_service
                         .update_status(&task.id, TaskStatus::InProgress)
