@@ -121,13 +121,18 @@ close-on-exec window. No immunity to crash transactionality or external writers
 is implied. See [process start diagnosis](RUNBOOK.md#a-process-is-waiting-to-start).
 
 Test-only assembly may explicitly opt a wholly non-forking fake process manager
-into one synthetic admission domain per harness, shared by launch, workspace
-preparation and OpenCode effort-wire probes. Default harnesses and real-process
-tests retain production admission. Covered crate-internal real builders reject a
-synthetic token before invoking their spawn closure; external direct-fork managers
-must never opt in. Doctor/version probes, merge, real discovery and hostname
-remain process-global. Linux creates no synthetic semaphore. This capability is
-library assembly data, never selected by environment, config, CLI or RPC.
+into one synthetic admission domain per harness, shared by launch, the
+`GitWorkspaceManager` git and rsync commands (workspace preparation, cleanup,
+changed-files listing) and OpenCode effort-wire probes. Merge remains
+process-wide. Default harnesses and real-process tests retain production
+admission. Covered crate-internal real builders reject a synthetic token before
+invoking their spawn closure; external direct-fork managers must never opt in.
+In an opted-in harness that rejection is a panic: it stops that harness's
+dispatch loop and can leave a task `in_progress` in the harness's temporary
+project. It is a test-configuration error, and no real child is started.
+Doctor/version probes, merge, real discovery and hostname remain process-global.
+Linux creates no synthetic semaphore. This capability is library assembly data,
+never selected by environment, config, CLI or RPC.
 
 ---
 

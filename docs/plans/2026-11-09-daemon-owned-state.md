@@ -159,19 +159,21 @@ features, dependencies, protocol, config or on-disk changes.
 
 | Step | Work | Prerequisite | Result / evidence |
 |---|---|---|---|
-| T1 | Demonstrate the deterministic foreign pre-body reservation regression at exact baseline, with Collector/Retry/Pause cause records and post-release controls | adopted design and Linux falsifier | unverified here; qualification retains baseline evidence |
-| B | Explicit per-harness synthetic domain, provenance rejection, additive plumbing through launch/workspace/OpenCode; document before code | required baseline red; final PR 2 merge | unverified |
-| T2 | Bind the two fake fixtures; add domain lifecycle/route controls, fail-closed negatives and exact opt-in source allow-list | B interfaces | unverified |
-| Q | Freeze SHA/tree and lineage; regression green/revert red/restored green; original ten-vector wake target N=30, default threading, first red stands; exclusion negative and standard checks | T2 | unverified |
-| QL | Native Linux regression companion, original wake and infra controls, one invocation each | Q; quiet host | unverified |
-| Reviews / checkpoint | Independent exact-SHA code, resilience and security review, then lead integration decision | QL | unverified |
+| T1 | Demonstrate the deterministic foreign pre-body reservation regression at exact baseline, with Collector/Retry/Pause cause records and post-release controls | adopted design and Linux falsifier | Done. Red at the baseline (`7eb7933f`, the regression on top of the pre-repair candidate): `daemon_spawn_gate_isolation` fails with "fake daemon completed its wake while the foreign pre-spawn reservation remained held". Landed as `b83dc12`. |
+| B | Explicit per-harness synthetic domain, provenance rejection, additive plumbing through launch/workspace/OpenCode; document before code | required baseline red; final PR 2 merge | Done: spec and plan `9e3f9cf`, code `6cf17f0`. |
+| T2 | Bind the two fake fixtures; add domain lifecycle/route controls, fail-closed negatives and exact opt-in source allow-list | B interfaces | Done: `fbe9e75`, `3dd0831`. The record-ID controls were then made independent of the 128-record observation registry: `a46b015`. |
+| Q | Freeze SHA/tree and lineage; regression green/revert red/restored green; original ten-vector wake target N=30, default threading, first red stands; exclusion negative and standard checks | T2 | Passed at `3dd0831e`, macOS: regression green at the repair, red with the repair reverted, green again once restored; real-spawn exclusion negative red when bypassed; `daemon_dispatch_wake` 30 of 30 consecutive default-threaded invocations `10 passed; 0 failed`; `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` (6427 passed / 0 failed / 7 ignored), `cargo xtask crate-graph` and `cargo deny check` green. N=30 is acceptance at the stated N, **not a reliability rate**. |
+| QL | Native Linux regression companion, original wake and infra controls, one invocation each | Q; quiet host | Passed at `3dd0831e`: companion 1/0, contract 1/0, `daemon_dispatch_wake` 10/0, `cargo test -p orch-infra` 953 passed / 0 failed / 4 ignored. One local Docker sequence (aarch64), **not Linux CI**. |
+| Reviews / checkpoint | Independent exact-SHA code, resilience and security review, then lead integration decision | QL | Done at `3dd0831e`: security pass, resilience pass, code pass with conditions. Test-only condition fixed at `a46b015f` and re-reviewed pass (20 of 20 runs of `cargo test -p orch-infra --lib process::gate::`, 27 tests each). The repair is accepted at `a46b015f`; the Q and QL results carry to it because it changes only a test module that is empty on Linux. The second condition, the harness route list, is documentation only and is recorded in the spec (R25) and ARCHITECTURE. |
 
 The unchanged-candidate Linux falsifier is done: one invocation, green 10/0,
-platform support only. It is not repair acceptance. Until Q, repair result and
-repair evidence remain **unverified**. Only Q and QL run the original wake oracle;
-no serialization, deadline change, drain change or rerun to green is allowed.
-The lead's document owner mirrors spec/plan to Pensieve at integration. Existing
-integration, CI, owner QA and reserved-consumer holds remain.
+platform support only. It is not repair acceptance. Only Q and QL ran the original
+wake oracle against the repair; no serialization, deadline change, drain change or
+rerun to green was allowed.
+
+Still pending, and not claimed: the integration candidate's macOS cold gate, Linux
+CI and owner QA. The existing integration, CI, owner QA and reserved-consumer
+holds remain.
 
 ## Status
 
