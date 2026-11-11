@@ -32,6 +32,11 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
         "cfg(test) child cleanup fixtures",
     ),
     (
+        "orch-infra/src/adapters/util.rs",
+        1,
+        "cfg(test) ETXTBSY-safe version-probe script writer",
+    ),
+    (
         "orch-infra/src/storage/message.rs",
         1,
         "cfg(test) cross-process append fixture",
