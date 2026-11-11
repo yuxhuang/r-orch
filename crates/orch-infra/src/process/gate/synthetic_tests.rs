@@ -12,7 +12,7 @@ use orch_core::workspace::WorkspaceManager;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BOUND: Duration = Duration::from_secs(4);
 const REJECTION: &str = "synthetic spawn reservation cannot authorize a real process";
@@ -27,8 +27,8 @@ async fn granted(domain: &SpawnDomain) -> SpawnReservation {
         .expect("domain admission was not released")
 }
 
-// Factory reservations intentionally have no injected observer. Capture their
-// own private diagnostic dispatch to identify records without a global count.
+// A queued factory reservation has no injectable observer. Capture its own
+// private diagnostic dispatch to identify its record without a global count.
 #[derive(Clone)]
 struct Records(mpsc::Sender<u64>);
 impl tracing::Subscriber for Records {
@@ -60,10 +60,18 @@ impl tracing::Subscriber for Records {
     }
 }
 
-async fn record_id(receive: mpsc::Receiver<u64>) -> u64 {
-    tokio::task::spawn_blocking(move || receive.recv_timeout(BOUND).expect("own diagnostic record"))
-        .await
-        .unwrap()
+// Overflow can discard this dispatch or report the aggregate id zero. Retry
+// only reservation SETUP until its own record is registered, never a lifecycle
+// assertion. Once registered, a live Notice keeps that record until its drop.
+async fn record_id(receive: mpsc::Receiver<u64>, deadline: Instant) -> Option<u64> {
+    tokio::task::spawn_blocking(move || {
+        receive
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+            .filter(|id| *id != 0)
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -85,12 +93,23 @@ async fn same_domain_queues_until_the_holder_is_dropped() {
 async fn dropping_a_queued_reservation_removes_its_own_record() {
     let domain = fresh();
     let holder = granted(&domain).await;
-    let (send, receive) = mpsc::channel();
-    let mut queued = Box::pin(domain.reserve(SpawnSite::Workspace));
-    let dispatch = tracing::subscriber::set_default(Records(send));
-    assert!(futures::poll!(&mut queued).is_pending());
-    drop(dispatch);
-    let id = record_id(receive).await;
+    let deadline = Instant::now() + BOUND;
+    let (queued, id) = loop {
+        assert!(
+            Instant::now() < deadline,
+            "queued reservation's own record was not registered before the setup deadline"
+        );
+        let (send, receive) = mpsc::channel();
+        let mut queued = Box::pin(domain.reserve(SpawnSite::Workspace));
+        let dispatch = tracing::subscriber::set_default(Records(send));
+        assert!(futures::poll!(&mut queued).is_pending());
+        drop(dispatch);
+        if let Some(id) = record_id(receive, deadline).await {
+            break (queued, id);
+        }
+        drop(queued);
+        tokio::task::yield_now().await;
+    };
     assert!(
         pending_spawns()
             .iter()
@@ -142,15 +161,57 @@ async fn unwinding_fake_scope_releases_its_permit_and_thread_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn synthetic_handoff_clears_the_previous_matching_record_before_next_grant() {
     let domain = fresh();
-    let (send, receive) = mpsc::channel();
-    let mut first = Box::pin(domain.reserve(SpawnSite::Launch));
-    let dispatch = tracing::subscriber::set_default(Records(send));
-    let first = match futures::poll!(&mut first) {
-        std::task::Poll::Ready(reservation) => reservation,
-        std::task::Poll::Pending => panic!("fresh synthetic domain was occupied"),
+    // The Notice exclusively owns an observer with the first queued probe.
+    // At observer destruction the outgoing permit must still be held. Polling
+    // that probe catches reversed field order without racing the successor.
+    struct Outgoing {
+        probe: Mutex<std::pin::Pin<Box<dyn std::future::Future<Output = SpawnReservation> + Send>>>,
+        events: Arc<Observations>,
+        permit_released: Arc<AtomicBool>,
+    }
+    impl SpawnObserver for Outgoing {
+        fn observe(&self, record: SpawnObservation) {
+            self.events.observe(record);
+        }
+    }
+    impl Drop for Outgoing {
+        fn drop(&mut self) {
+            self.permit_released.store(
+                futures::FutureExt::now_or_never(self.probe.get_mut().unwrap().as_mut()).is_some(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+    let permit_released = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + BOUND;
+    let (first, old_id) = loop {
+        assert!(
+            Instant::now() < deadline,
+            "outgoing reservation's own record was not registered before the setup deadline"
+        );
+        let mut first = granted(&domain).await;
+        let events = Arc::new(Observations::default());
+        let probe_domain = domain.clone();
+        let mut probe = Box::pin(async move { probe_domain.reserve(SpawnSite::Launch).await });
+        assert!(futures::poll!(&mut probe).is_pending());
+        first.notice = observe_spawn(
+            SpawnSite::Launch,
+            Some(Arc::new(Outgoing {
+                probe: Mutex::new(probe),
+                events: events.clone(),
+                permit_released: permit_released.clone(),
+            })),
+        )
+        .0;
+        let old_id = events.0.lock().unwrap()[0].id;
+        // Retry only setup after overflow; the record-removal assertion below
+        // always runs once on a Notice known to have a registered record.
+        if pending_spawns().iter().any(|r| r.id == old_id) {
+            break (first, old_id);
+        }
+        drop(first);
+        tokio::task::yield_now().await;
     };
-    drop(dispatch);
-    let old_id = record_id(receive).await;
     let next_domain = domain.clone();
     let mut next = Box::pin(async move { next_domain.reserve(SpawnSite::Launch).await });
     assert!(futures::poll!(&mut next).is_pending());
@@ -164,6 +225,10 @@ async fn synthetic_handoff_clears_the_previous_matching_record_before_next_grant
     });
     drop(first);
     job.await.unwrap();
+    assert!(
+        !permit_released.load(Ordering::SeqCst),
+        "handoff released the permit before destroying the outgoing Notice"
+    );
 }
 
 // This manager supplies bytes only; it cannot reach a Command builder. Version
@@ -568,9 +633,8 @@ fn discovery_enters_only_after_the_process_wide_holder_is_released() {
         // observer at actual entry supplies the decisive ordering assertion.
         let premature = receive.recv_timeout(Duration::from_millis(50)).ok();
         let absent = !marker.exists();
-        let own_waiting = pending_spawns()
-            .iter()
-            .any(|r| r.id == waiting.id && r.stage == SpawnStage::Waiting);
+        // The injected observer identifies this call even when its Notice
+        // overflowed the shared diagnostic registry. Waiting was checked above.
         released.store(true, Ordering::SeqCst);
         drop(holder);
         job.join().unwrap();
@@ -583,8 +647,8 @@ fn discovery_enters_only_after_the_process_wide_holder_is_released() {
             "Discovery entered before the Process holder was released"
         );
         assert!(
-            absent && own_waiting,
-            "Discovery did not wait on its own Process record"
+            absent,
+            "Discovery started before the Process holder was released"
         );
     });
     assert!(marker.exists());
