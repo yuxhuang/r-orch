@@ -25,6 +25,7 @@ async fn make_fake_harness(
         .maintenance_timer(false)
         .dispatch(DispatchMode::On)
         .processes(pm as Arc<dyn ProcessManager>)
+        .isolated_fake_spawns()
         .start_in(root)
         .await
         .unwrap()

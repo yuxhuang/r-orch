@@ -244,6 +244,7 @@ async fn fixture(dispatch: DispatchMode, pm: Scripted) -> Fx {
         .maintenance_timer(false)
         .dispatch(dispatch)
         .processes(pm.clone() as Arc<dyn ProcessManager>)
+        .isolated_fake_spawns()
         .start_in(&root)
         .await
         .unwrap();
