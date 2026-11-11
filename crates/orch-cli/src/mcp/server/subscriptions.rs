@@ -38,7 +38,7 @@ use orch_proto::ops::args::SubscribeArgs;
 use rmcp::model::ResourceUpdatedNotificationParam;
 use rmcp::{ErrorData, Peer, RoleServer};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::{Connector, NOT_EXECUTED_CODE, unavailable};
@@ -47,6 +47,34 @@ use crate::mcp::resources::Target;
 
 /// Distinct URIs one bridge tracks (ruling 14.3).
 pub(crate) const MAX_SUBSCRIBED_URIS: usize = 256;
+/// The longest supported spelling: `orch://agents/<id>@<alias>`.
+const MAX_SUBSCRIBED_URI_BYTES: usize =
+    "orch://agents/".len() + 2 * orch_proto::bounded::MAX_ID_BYTES + 1;
+
+/// Subscription-local bounds; ordinary transient resource reads keep their parser.
+pub(super) fn parse(uri: &str) -> Result<Target, ErrorData> {
+    if uri.len() > MAX_SUBSCRIBED_URI_BYTES {
+        return Err(ErrorData::invalid_params(
+            "resource subscription URI is too long",
+            None,
+        ));
+    }
+    let target = crate::mcp::resources::parse(uri)?;
+    let id = match &target {
+        Target::Task(id) | Target::Goal(id) | Target::Agent(id) | Target::Inbox(id) => Some(id),
+        _ => None,
+    };
+    if id.is_some_and(|id| {
+        id.split('@')
+            .any(|part| part.len() > orch_proto::bounded::MAX_ID_BYTES)
+    }) {
+        return Err(ErrorData::invalid_params(
+            "resource subscription id and alias must each be at most 256 bytes",
+            None,
+        ));
+    }
+    Ok(target)
+}
 
 /// The stores any resource reads; teams are not among them.
 const OBSERVED: [Store; 9] = [
@@ -120,17 +148,29 @@ struct State {
     dirty: BTreeSet<String>,
     link: Option<Link>,
     generation: u64,
-    writer: Option<JoinHandle<()>>,
+    writer: Option<AbortHandle>,
+    recovery: Option<Recovery>,
+    /// Includes completed readers until the next operation reaps them. Dropping
+    /// the set aborts all remaining tasks; async shutdown joins them as well.
+    tasks: JoinSet<()>,
 }
 
 /// The open observation session, owned by its reader task.
 struct Link {
     generation: u64,
     close: CancellationToken,
-    reader: JoinHandle<()>,
+}
+
+struct Recovery {
+    close: CancellationToken,
+    task: AbortHandle,
 }
 
 impl State {
+    fn reap(&mut self) {
+        while self.tasks.try_join_next().is_some() {}
+    }
+
     fn invalidate_all(&mut self) {
         self.dirty.extend(self.uris.keys().cloned());
     }
@@ -143,9 +183,29 @@ impl Shared {
 
     /// Open the observation session unless one is open. A reconnect
     /// (`for_subscribe` false) keeps no session once nothing is subscribed.
-    async fn connect(self: &Arc<Shared>, for_subscribe: bool) -> Result<(), ClientError> {
+    async fn connect(
+        self: &Arc<Shared>,
+        for_subscribe: bool,
+        close: &CancellationToken,
+    ) -> Result<(), ClientError> {
+        // Cancellation covers both mutex acquisition and connect/subscribe. A
+        // cancelled connect future drops the client rather than installing it.
+        tokio::select! {
+            biased;
+            () = self.stop.cancelled() => Ok(()),
+            () = self.input_closed.cancelled() => Ok(()),
+            () = close.cancelled() => Ok(()),
+            result = self.open(for_subscribe, close) => result,
+        }
+    }
+
+    async fn open(
+        self: &Arc<Shared>,
+        for_subscribe: bool,
+        close: &CancellationToken,
+    ) -> Result<(), ClientError> {
         let _connecting = self.connect.lock().await;
-        if self.stop.is_cancelled() || self.lock().link.is_some() {
+        if self.lock().link.is_some() {
             return Ok(());
         }
         let stores = BoundedVec::new(OBSERVED.to_vec())
@@ -159,24 +219,25 @@ impl Shared {
             })
             .await?;
         let mut state = self.lock();
-        if !for_subscribe && state.uris.is_empty() {
+        state.reap();
+        if self.stop.is_cancelled()
+            || self.input_closed.is_cancelled()
+            || close.is_cancelled()
+            || (!for_subscribe && state.uris.is_empty())
+        {
             // Everything was unsubscribed meanwhile; dropping closes it.
             return Ok(());
         }
         state.generation += 1;
         let generation = state.generation;
         let close = CancellationToken::new();
-        let reader = tokio::spawn(read(
+        state.tasks.spawn(read(
             Arc::clone(self),
             observation,
             generation,
             close.clone(),
         ));
-        state.link = Some(Link {
-            generation,
-            close,
-            reader,
-        });
+        state.link = Some(Link { generation, close });
         // Whatever changed before this session went unseen.
         if !state.uris.is_empty() {
             state.invalidate_all();
@@ -220,15 +281,26 @@ impl Subscriptions {
                 return Err(limit_reached());
             }
         }
-        self.shared.connect(true).await.map_err(|err| {
-            let err = ToolError::Client(err);
-            if err.exit_code() == orch_proto::error::exit::NO_DAEMON {
-                unavailable(&err, agent_context)
-            } else {
-                ErrorData::internal_error(err.text(agent_context), None)
-            }
-        })?;
+        self.shared
+            .connect(true, &self.shared.stop)
+            .await
+            .map_err(|err| {
+                let err = ToolError::Client(err);
+                if err.exit_code() == orch_proto::error::exit::NO_DAEMON {
+                    unavailable(&err, agent_context)
+                } else {
+                    ErrorData::internal_error(err.text(agent_context), None)
+                }
+            })?;
         let mut state = self.shared.lock();
+        state.reap();
+        if self.shared.stop.is_cancelled() || self.shared.input_closed.is_cancelled() {
+            return Err(ErrorData::new(
+                NOT_EXECUTED_CODE,
+                "Not executed: the server is shutting down",
+                None,
+            ));
+        }
         if !state.uris.contains_key(uri) {
             if state.uris.len() >= MAX_SUBSCRIBED_URIS {
                 return Err(limit_reached());
@@ -236,7 +308,11 @@ impl Subscriptions {
             state.uris.insert(uri.to_owned(), target);
         }
         if state.writer.is_none() {
-            state.writer = Some(tokio::spawn(write(Arc::clone(&self.shared), peer.clone())));
+            state.writer = Some(
+                state
+                    .tasks
+                    .spawn(write(Arc::clone(&self.shared), peer.clone())),
+            );
         }
         Ok(())
     }
@@ -248,28 +324,58 @@ impl Subscriptions {
         let mut state = self.shared.lock();
         state.uris.remove(uri);
         state.dirty.remove(uri);
-        if state.uris.is_empty()
-            && let Some(link) = state.link.take()
-        {
-            link.close.cancel();
+        state.reap();
+        if state.uris.is_empty() {
+            if let Some(link) = state.link.take() {
+                link.close.cancel();
+            }
+            if let Some(recovery) = &state.recovery {
+                recovery.close.cancel();
+            }
         }
     }
 
-    /// An explicit call: reopen a lost session in the background, without
-    /// delaying the call. Nothing else reconnects.
+    /// An explicit call: at most one owned recovery, including mutex waiters.
+    /// A completed failure may be retried by a later call, never autonomously.
     pub(super) fn revive(&self) {
+        let mut state = self.shared.lock();
+        state.reap();
+        if self.shared.stop.is_cancelled()
+            || self.shared.input_closed.is_cancelled()
+            || state.link.is_some()
+            || state.uris.is_empty()
+            || state
+                .recovery
+                .as_ref()
+                .is_some_and(|r| !r.task.is_finished())
         {
-            let state = self.shared.lock();
-            if state.link.is_some() || state.uris.is_empty() {
-                return;
-            }
+            return;
         }
         let shared = Arc::clone(&self.shared);
-        tokio::spawn(async move {
-            if let Err(err) = shared.connect(false).await {
+        let close = CancellationToken::new();
+        let cancelled = close.clone();
+        let task = state.tasks.spawn(async move {
+            if let Err(err) = shared.connect(false, &cancelled).await {
                 tracing::debug!(target: "orch::mcp", error = %err, "resource subscriptions not restored");
             }
         });
+        state.recovery = Some(Recovery { close, task });
+    }
+
+    /// Capture before moving the handler into the SDK; join after its drain.
+    pub(super) fn shutdown(&self) -> futures::future::BoxFuture<'static, ()> {
+        let shared = Arc::clone(&self.shared);
+        Box::pin(async move {
+            shared.stop.cancel();
+            let mut tasks = {
+                let mut state = shared.lock();
+                state.link = None;
+                state.recovery = None;
+                state.writer = None;
+                std::mem::take(&mut state.tasks)
+            };
+            while tasks.join_next().await.is_some() {}
+        })
     }
 }
 
@@ -277,13 +383,7 @@ impl Drop for Subscriptions {
     fn drop(&mut self) {
         self.shared.stop.cancel();
         let mut state = self.shared.lock();
-        if let Some(link) = state.link.take() {
-            link.close.cancel();
-            link.reader.abort();
-        }
-        if let Some(writer) = state.writer.take() {
-            writer.abort();
-        }
+        state.tasks.abort_all();
     }
 }
 
@@ -369,8 +469,13 @@ async fn write(shared: Arc<Shared>, peer: Peer<RoleServer>) {
                 break;
             };
             let update = ResourceUpdatedNotificationParam::new(uri);
-            if peer.notify_resource_updated(update).await.is_err() {
-                return;
+            tokio::select! {
+                biased;
+                () = shared.stop.cancelled() => return,
+                () = shared.input_closed.cancelled() => return,
+                result = peer.notify_resource_updated(update) => {
+                    if result.is_err() { return; }
+                }
             }
         }
     }
@@ -544,7 +649,42 @@ mod tests {
         /// The `initialize` result.
         init: Value,
         next_id: u64,
+        output_stalls: Arc<AtomicUsize>,
+        lifetime: std::sync::Weak<super::Shared>,
+        output_lifetime: std::sync::Weak<()>,
         server: tokio::task::JoinHandle<orch_core::error::Result<()>>,
+    }
+
+    struct PendingOutput<W> {
+        inner: W,
+        stalls: Arc<AtomicUsize>,
+        _lifetime: Arc<()>,
+    }
+
+    impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PendingOutput<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes);
+            if poll.is_pending() {
+                self.stalls.fetch_add(1, Ordering::SeqCst);
+            }
+            poll
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
     }
 
     async fn bridge(mode: Mode, stdio_buffer: usize) -> Bridge {
@@ -573,8 +713,17 @@ mod tests {
         };
         let registry = crate::mcp::build_registry(mode).unwrap();
         let server = McpServer::new(settings, seams, registry);
+        let lifetime = Arc::downgrade(&server.subscriptions.shared);
         let (client, server_io) = tokio::io::duplex(stdio_buffer);
         let (input, output) = tokio::io::split(server_io);
+        let output_stalls = Arc::new(AtomicUsize::new(0));
+        let output_owner = Arc::new(());
+        let output_lifetime = Arc::downgrade(&output_owner);
+        let output = PendingOutput {
+            inner: output,
+            stalls: output_stalls.clone(),
+            _lifetime: output_owner,
+        };
         let server = tokio::spawn(serve_transport(
             server,
             input,
@@ -590,6 +739,9 @@ mod tests {
             pending: VecDeque::new(),
             init: Value::Null,
             next_id: 1,
+            output_stalls,
+            lifetime,
+            output_lifetime,
             server,
         };
         let init = bridge
@@ -709,6 +861,419 @@ mod tests {
 
     fn set(uris: &[&str]) -> BTreeSet<String> {
         uris.iter().map(|uri| (*uri).to_owned()).collect()
+    }
+
+    // The connector stays pending so Arc ownership includes every scheduled
+    // recovery, even tasks waiting for the connection mutex rather than dialing.
+    #[tokio::test]
+    async fn recovery_is_coalesced_before_spawn_including_refused_calls() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let observer: Connector = Arc::new(move || {
+            let notify = notify.clone();
+            Box::pin(async move {
+                notify.notify_one();
+                std::future::pending().await
+            })
+        });
+        let subscriptions = super::Subscriptions::new(observer, CancellationToken::new());
+        subscriptions.shared.lock().uris.insert(
+            "orch://status".into(),
+            crate::mcp::resources::Target::Status,
+        );
+        subscriptions.revive();
+        tokio::time::timeout(WAIT, entered.notified())
+            .await
+            .unwrap();
+        let mut server = McpServer::new(
+            Settings {
+                project_root: "/unused".into(),
+                identity: Identity::of(None),
+                mode: Mode::ReadOnly,
+                agent_context: false,
+            },
+            Seams {
+                connector: no_daemon(Path::new("/unused")),
+                observer: no_daemon(Path::new("/unused")),
+                timer: Arc::new(|duration| Box::pin(tokio::time::sleep(duration))),
+            },
+            crate::mcp::build_registry(Mode::ReadOnly).unwrap(),
+        );
+        server.subscriptions = subscriptions;
+        let _permits = server
+            .store
+            .permits
+            .clone()
+            .acquire_many_owned(16)
+            .await
+            .unwrap();
+        let server = Arc::new(server);
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let server = server.clone();
+            calls.spawn(async move {
+                for _ in 0..512 {
+                    server.subscriptions.revive();
+                    let result = server
+                        .run_call(
+                            crate::mcp::registry::Execution::Store,
+                            &CancellationToken::new(),
+                            |_| async { panic!("refused request executed") },
+                        )
+                        .await;
+                    assert!(result.is_err());
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        while let Some(result) = calls.join_next().await {
+            result.unwrap();
+        }
+        // One owner and one scheduled worker; a connection counter alone would
+        // miss the old implementation's thousands of mutex waiters.
+        assert_eq!(Arc::strong_count(&server.subscriptions.shared), 2);
+    }
+
+    #[tokio::test]
+    async fn dropping_subscriptions_releases_a_pending_recovery() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let observer: Connector = Arc::new(move || {
+            let notify = notify.clone();
+            Box::pin(async move {
+                notify.notify_one();
+                std::future::pending().await
+            })
+        });
+        let subscriptions = super::Subscriptions::new(observer, CancellationToken::new());
+        subscriptions.shared.lock().uris.insert(
+            "orch://status".into(),
+            crate::mcp::resources::Target::Status,
+        );
+        let weak = Arc::downgrade(&subscriptions.shared);
+        subscriptions.revive();
+        tokio::time::timeout(WAIT, entered.notified())
+            .await
+            .unwrap();
+        drop(subscriptions);
+        let ended = tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "pending recovery outlived its owner");
+    }
+
+    #[tokio::test]
+    async fn subscription_identifier_bytes_are_bounded_before_retention() {
+        let mut b = bridge(Mode::ReadOnly, 1 << 20).await;
+        let exact = format!("orch://tasks/{}", "x".repeat(256));
+        b.subscribed(&exact).await;
+        let oversized = format!("{exact}x");
+        let reply = b.subscribe(&oversized).await;
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        let qualified = format!("orch://agents/{}@{}", "a".repeat(256), "b".repeat(256));
+        b.subscribed(&qualified).await;
+        for uri in [
+            format!("{qualified}b"),
+            format!("orch://inbox/{}@peer", "a".repeat(257)),
+            format!("orch://tasks/{}", "é".repeat(129)),
+        ] {
+            let reply = b.subscribe(&uri).await;
+            assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        }
+        b.unsubscribe(&exact).await;
+        b.subscribed(&exact).await;
+        b.server.abort();
+        let _ = b.server.await;
+    }
+
+    #[tokio::test]
+    async fn unread_stdout_does_not_keep_eof_teardown_alive() {
+        let mut b = bridge(Mode::ReadOnly, 64).await;
+        b.subscribed("orch://status").await;
+        let mut o = b.daemon.session().await;
+        let before = b.output_stalls.load(Ordering::SeqCst);
+        o.change(Store::State, None, ChangeKind::Updated).await;
+        tokio::time::timeout(WAIT, async {
+            while b.output_stalls.load(Ordering::SeqCst) == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notification reached a pending transport write");
+        b.writer.take().unwrap().shutdown().await.unwrap();
+        // Keep b.lines alive and unread throughout, including server shutdown.
+        let ended = tokio::time::timeout(Duration::from_secs(8), &mut b.server).await;
+        if ended.is_err() {
+            b.server.abort();
+        }
+        assert!(ended.is_ok(), "EOF teardown waited for stdout progress");
+        assert!(
+            ended.unwrap().unwrap().is_err(),
+            "output deadline must be reported"
+        );
+        assert!(
+            b.lifetime.upgrade().is_none(),
+            "subscription tasks still own bridge"
+        );
+        assert!(
+            b.output_lifetime.upgrade().is_none(),
+            "SDK still owns output"
+        );
+        o.closed().await;
+    }
+
+    #[tokio::test]
+    async fn pending_recovery_is_cancelled_on_eof_last_unsubscribe_and_mutex_wait() {
+        for cause in ["eof", "unsubscribe", "mutex"] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let notify = entered.clone();
+            let observer: Connector = Arc::new(move || {
+                let notify = notify.clone();
+                Box::pin(async move {
+                    notify.notify_one();
+                    std::future::pending().await
+                })
+            });
+            let closed = CancellationToken::new();
+            let subscriptions = super::Subscriptions::new(observer, closed.clone());
+            subscriptions.shared.lock().uris.insert(
+                "orch://status".into(),
+                crate::mcp::resources::Target::Status,
+            );
+            let mutex = if cause == "mutex" {
+                Some(subscriptions.shared.connect.lock().await)
+            } else {
+                None
+            };
+            subscriptions.revive();
+            if cause != "mutex" {
+                tokio::time::timeout(WAIT, entered.notified())
+                    .await
+                    .unwrap();
+            } else {
+                tokio::task::yield_now().await;
+            }
+            if cause == "unsubscribe" {
+                subscriptions.unsubscribe("orch://status").await;
+            } else {
+                closed.cancel();
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let finished = subscriptions
+                        .shared
+                        .lock()
+                        .recovery
+                        .as_ref()
+                        .unwrap()
+                        .task
+                        .is_finished();
+                    if finished {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("recovery cancellation covers acquisition and active connector");
+            for _ in 0..1024 {
+                subscriptions.revive();
+            }
+            assert!(
+                subscriptions
+                    .shared
+                    .lock()
+                    .recovery
+                    .as_ref()
+                    .unwrap()
+                    .task
+                    .is_finished()
+            );
+            tokio::time::timeout(WAIT, subscriptions.shutdown())
+                .await
+                .unwrap();
+            assert!(subscriptions.shared.lock().tasks.is_empty());
+            drop(mutex);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_cancellation_closes_an_unacknowledged_subscribe() {
+        for cause in ["eof", "unsubscribe", "drop"] {
+            let fixture = Fixture::start().await;
+            let (stream, mut peer) = fake_transport();
+            let (send, mut receive) = mpsc::unbounded_channel();
+            let daemon = tokio::spawn(async move {
+                peer.accept(Id::new("held-subscribe").unwrap())
+                    .await
+                    .unwrap();
+                let request = peer.recv().await.unwrap().unwrap();
+                assert!(matches!(request.req, Request::Subscribe(_)));
+                send.send(peer).unwrap();
+            });
+            let stream = Arc::new(std::sync::Mutex::new(Some(stream)));
+            let root = fixture.root().to_path_buf();
+            let observer: Connector = Arc::new(move || {
+                let stream = stream.lock().unwrap().take().expect("one recovery");
+                let root = root.clone();
+                Box::pin(async move {
+                    Client::from_stream(
+                        Project::discover(&root, None)?,
+                        stream,
+                        Caller {
+                            kind: CallerKind::Mcp,
+                            agent_id: None,
+                            pid: None,
+                        },
+                        SessionMode::ReadOnly,
+                    )
+                    .await
+                })
+            });
+            let closed = CancellationToken::new();
+            let subscriptions = super::Subscriptions::new(observer, closed.clone());
+            subscriptions.shared.lock().uris.insert(
+                "orch://status".into(),
+                crate::mcp::resources::Target::Status,
+            );
+            subscriptions.revive();
+            let mut peer = tokio::time::timeout(WAIT, receive.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            daemon.await.unwrap();
+            // Handshake finished and subscribe is waiting for its acknowledgement.
+            match cause {
+                "eof" => {
+                    closed.cancel();
+                    tokio::time::timeout(WAIT, subscriptions.shutdown())
+                        .await
+                        .unwrap();
+                }
+                "unsubscribe" => {
+                    subscriptions.unsubscribe("orch://status").await;
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while !subscriptions
+                            .shared
+                            .lock()
+                            .recovery
+                            .as_ref()
+                            .unwrap()
+                            .task
+                            .is_finished()
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("last unsubscribe cancelled the pending subscribe");
+                    tokio::time::timeout(WAIT, subscriptions.shutdown())
+                        .await
+                        .unwrap();
+                }
+                _ => drop(subscriptions),
+            }
+            let frame = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+                .await
+                .expect("cancelled subscribe retained the daemon connection");
+            assert!(
+                matches!(frame, Ok(None) | Err(_)),
+                "no replay or other request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_failure_waits_for_an_explicit_call_before_retry() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let observer: Connector = Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(orch_client::ClientError::InvalidArguments(
+                    "fixture unavailable".into(),
+                ))
+            })
+        });
+        let subscriptions = super::Subscriptions::new(observer, CancellationToken::new());
+        subscriptions.shared.lock().uris.insert(
+            "orch://status".into(),
+            crate::mcp::resources::Target::Status,
+        );
+        for attempt in 1..=2 {
+            subscriptions.revive();
+            tokio::time::timeout(WAIT, async {
+                while !subscriptions
+                    .shared
+                    .lock()
+                    .recovery
+                    .as_ref()
+                    .unwrap()
+                    .task
+                    .is_finished()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), attempt);
+        }
+        subscriptions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn healthy_eof_drains_an_already_received_response() {
+        let mut b = bridge(Mode::ReadOnly, 1 << 20).await;
+        b.subscribed("orch://status").await;
+        let mut o = b.daemon.session().await;
+        b.send(json!({"jsonrpc":"2.0","id":99,"method":"tools/call", "params":{"name":"status"}}))
+            .await;
+        b.writer.take().unwrap().shutdown().await.unwrap();
+        let response = b.frame().await;
+        assert_eq!(response["id"], 99);
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        tokio::time::timeout(WAIT, &mut b.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(b.lifetime.upgrade().is_none());
+        assert!(b.output_lifetime.upgrade().is_none());
+        o.closed().await;
+    }
+
+    #[tokio::test]
+    async fn unread_stdout_with_unsubscribe_ends_without_draining() {
+        let mut b = bridge(Mode::ReadOnly, 64).await;
+        b.subscribed("orch://status").await;
+        let mut o = b.daemon.session().await;
+        let before = b.output_stalls.load(Ordering::SeqCst);
+        o.change(Store::State, None, ChangeKind::Updated).await;
+        tokio::time::timeout(WAIT, async {
+            while b.output_stalls.load(Ordering::SeqCst) == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        b.send(json!({"jsonrpc":"2.0","id":99,"method":"resources/unsubscribe", "params":{"uri":"orch://status"}})).await;
+        let ended = tokio::time::timeout(Duration::from_secs(8), &mut b.server).await;
+        if ended.is_err() {
+            b.server.abort();
+        }
+        assert!(ended.is_ok(), "unsubscribe remained behind unread stdout");
+        assert!(ended.unwrap().unwrap().is_err());
+        assert!(b.lifetime.upgrade().is_none());
+        assert!(b.output_lifetime.upgrade().is_none());
+        o.closed().await;
+        // b.writer and b.lines stay open: output failure alone ends the bridge.
     }
 
     #[tokio::test]
