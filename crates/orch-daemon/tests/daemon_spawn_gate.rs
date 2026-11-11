@@ -12,6 +12,13 @@ use support::{DEADLINE, Raw, Reaper, ok, running_pid, task};
 
 const SCENARIO: &str = "ORCH_TEST_SPAWN_GATE_ROOT";
 
+fn scenario_environment(root: &Path) -> [(std::ffi::OsString, std::ffi::OsString); 2] {
+    [
+        ("HOME".into(), root.join("home").into_os_string()),
+        ("PATH".into(), root.join("bin").into_os_string()),
+    ]
+}
+
 #[test]
 fn cancel_and_stop_survive_overlapping_bare_name_diagnostics() {
     if let Some(root) = std::env::var_os(SCENARIO) {
@@ -126,6 +133,7 @@ async fn scenario(root: &Path) {
     let daemon = DaemonHarness::builder()
         .on_socket()
         .global_config_path(home.join("global.yml"))
+        .environment(scenario_environment(root))
         .start_in(&root.join("project"))
         .await
         .unwrap();
@@ -354,6 +362,7 @@ async fn held_scenario(root: &Path) {
     let daemon = DaemonHarness::builder()
         .on_socket()
         .global_config_path(home.join("global.yml"))
+        .environment(scenario_environment(root))
         .start_in(&root.join("project"))
         .await
         .unwrap();
@@ -600,6 +609,7 @@ async fn live_stop_scenario(root: &Path) {
     let daemon = DaemonHarness::builder()
         .on_socket()
         .global_config_path(home.join("global.yml"))
+        .environment(scenario_environment(root))
         .start_in(&root.join("project"))
         .await
         .unwrap();
