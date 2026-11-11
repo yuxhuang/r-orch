@@ -302,7 +302,7 @@ impl MessageService {
     ) -> Result<()> {
         self.events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 let selected: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
                 for message in self.messages.list_pending(agent_id).await? {
                     if selected.contains(message.id.as_str()) {

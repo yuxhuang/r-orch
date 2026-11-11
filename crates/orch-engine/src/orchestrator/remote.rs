@@ -357,7 +357,7 @@ impl Orchestrator {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 let entries: Vec<orch_domain::RunningEntry> = {
                     let slot = self.inner.state.lock().await;
                     match slot.as_ref() {
@@ -445,7 +445,7 @@ impl Orchestrator {
         run_id: &str,
         update: &RemotePhaseUpdate,
     ) -> Result<RemotePhase> {
-        self.deps().events.operation_boundary().run(true, async {
+        self.deps().events.operation_boundary().run(false, async {
         let mut slot = self.inner.state.lock().await;
         let Some(state) = slot.as_mut() else {
             return Ok(update.phase);
@@ -622,7 +622,7 @@ impl Orchestrator {
                             .deps()
                             .events
                             .operation_boundary()
-                            .run(true, async {
+                            .run(false, async {
                                 let mut slot = self.inner.state.lock().await;
                                 if let Some(state) = slot.as_mut() {
                                     let error = remote_unknown_error(
@@ -675,7 +675,7 @@ impl Orchestrator {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 let Some(state) = slot.as_mut() else {
                     return Ok(());

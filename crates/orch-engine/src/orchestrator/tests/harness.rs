@@ -321,6 +321,9 @@ impl HarnessBuilder {
             Some(wrap) => wrap(Arc::clone(&runs)),
             None => Arc::clone(&runs) as Arc<dyn RunStore>,
         };
+        // Exercise the same write accounting as the container, including
+        // collector tests that observe ordinals with otherwise fake stores.
+        let run_store = crate::container::tracked_test_runs(run_store, bus.operation_boundary());
 
         let mut registry = AdapterRegistry::new();
         match self.adapter_impl {

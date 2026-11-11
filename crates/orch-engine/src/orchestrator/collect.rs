@@ -141,7 +141,7 @@ impl Orchestrator {
                         .operation_boundary()
                         .run_from(
                             crate::container::commit::CommitSource::Collector,
-                            true,
+                            false,
                             async {
                                 let task = self.deps().task_store.get(task_id).await?;
                                 let run = self.deps().run_store.get(run_id).await?;
@@ -201,7 +201,7 @@ impl Orchestrator {
             .operation_boundary()
             .run_from(
                 crate::container::commit::CommitSource::Collector,
-                true,
+                false,
                 async {
                     let tap = self
                         .inner
@@ -613,7 +613,7 @@ impl Orchestrator {
             .operation_boundary()
             .run_from(
                 crate::container::commit::CommitSource::Collector,
-                true,
+                false,
                 async {
                     let mut slot = self.inner.state.lock().await;
                     let Some(state) = slot.as_mut() else {

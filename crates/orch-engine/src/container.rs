@@ -15,6 +15,14 @@ pub mod operation;
 mod tracked;
 pub use operation::{OperationBoundary, OperationOutcome};
 
+#[cfg(test)]
+pub(crate) fn tracked_test_runs(
+    store: std::sync::Arc<dyn orch_core::storage::RunStore>,
+    boundary: std::sync::Arc<OperationBoundary>,
+) -> std::sync::Arc<dyn orch_core::storage::RunStore> {
+    tracked::Tracked::wrap(store, boundary)
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

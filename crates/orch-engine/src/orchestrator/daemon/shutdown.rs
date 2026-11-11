@@ -12,7 +12,7 @@ impl Orchestrator {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         let boundary = self.deps().events.operation_boundary();
         let entries = boundary
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
@@ -45,7 +45,7 @@ impl Orchestrator {
             }
         }
         boundary
-            .run(true, async {
+            .run(false, async {
                 self.cancel_lazy_save().await;
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;

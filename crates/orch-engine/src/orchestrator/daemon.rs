@@ -54,7 +54,7 @@ impl Orchestrator {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
@@ -96,7 +96,7 @@ impl Orchestrator {
             self.deps()
                 .events
                 .operation_boundary()
-                .run(true, async {
+                .run(false, async {
                     if cancelled.load(Ordering::SeqCst) || self.is_shutting_down() {
                         return Ok(Vec::new());
                     }
@@ -177,7 +177,7 @@ impl Orchestrator {
 
     pub(super) async fn daemon_cancel_task(&self, task_id: &str, strict: bool) -> Result<()> {
         let boundary = self.deps().events.operation_boundary();
-        let (entry, preparing_runs) = boundary.run(true, async {
+        let (entry, preparing_runs) = boundary.run(false, async {
             let mut slot = self.inner.state.lock().await;
             self.load_state(&mut slot).await?;
             let state = slot.as_mut().expect("state loaded");
@@ -224,7 +224,7 @@ impl Orchestrator {
             }
         }
         boundary
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
@@ -281,8 +281,10 @@ impl Orchestrator {
         override_retry_wait: bool,
     ) -> Result<()> {
         let boundary = self.deps().events.operation_boundary();
+        // Selection can reject every candidate without touching a store.
+        // Tracked writers declare changes before I/O, including failed writes.
         let selected = boundary
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
@@ -456,7 +458,7 @@ impl Orchestrator {
                 }
             };
             let run = boundary
-                .run(true, async {
+                .run(false, async {
                     if cancelled.load(Ordering::SeqCst)
                         || self.config() != launch_config
                         || cancel.is_cancelled()
@@ -582,7 +584,7 @@ impl Orchestrator {
             } else { None };
 
             let launched = boundary
-                .run(true, async {
+                .run(false, async {
                     if self.is_shutting_down() {
                         return Ok(false);
                     }
@@ -926,7 +928,7 @@ impl Orchestrator {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
@@ -972,7 +974,7 @@ impl Orchestrator {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
@@ -1011,7 +1013,7 @@ impl Orchestrator {
             .deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 if self.is_shutting_down() {
                     return Ok(());
                 }

@@ -225,6 +225,138 @@ async fn create_agent(wire: &mut Wire, name: &str) -> String {
         .to_owned()
 }
 
+async fn ordinary_through_marker(observer: &mut Wire, writer: &mut Wire, key: &str) {
+    let (_, ordinal) = writer
+        .commit("context.set", json!({"key": key, "value": "later"}))
+        .await;
+    loop {
+        let event = observer.event().await;
+        assert!(
+            event.get("resync").is_none(),
+            "healthy no-write phase resynchronized: {event}"
+        );
+        if event["store"] == "context" && event["id"] == key {
+            assert_eq!(event["commit_seq"], ordinal);
+            break;
+        }
+    }
+}
+
+fn completed_ticks(
+    daemon: &DaemonHarness,
+) -> (
+    orch_engine::events::Unsubscribe,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    let (send, recv) = tokio::sync::mpsc::unbounded_channel();
+    let listener = daemon.engine().events.on_any(move |event| {
+        if matches!(
+            event,
+            orch_domain::OrchestratorEvent::OrchestratorTick { .. }
+        ) {
+            let _ = send.send(());
+        }
+    });
+    (listener, recv)
+}
+
+async fn await_tick(ticks: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
+    tokio::time::timeout(GUARD, ticks.recv())
+        .await
+        .expect("commit must wake a full tick")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn occupied_agent_with_two_queued_tasks_keeps_the_subscription_observed() {
+    let chatty = Arc::new(Chatty::default());
+    let daemon = DaemonHarness::builder()
+        .on_socket()
+        .maintenance_timer(false)
+        .processes(chatty.clone())
+        .start()
+        .await
+        .unwrap();
+    let mut control = Wire::open(&daemon, "cli").await;
+    let agent = create_agent(&mut control, "held").await;
+    for title in ["held open", "queued one", "queued two"] {
+        create_task(&mut control, title, json!({"assignee": agent})).await;
+    }
+    let mut observer = Wire::open(&daemon, "mcp").await;
+    observer
+        .subscribe(json!({"stores": ["tasks", "state", "context"]}))
+        .await;
+    let (_listener, mut ticks) = completed_ticks(&daemon);
+    control.ok("dispatch.set", json!({"dispatch": "on"})).await;
+    await_tick(&mut ticks).await;
+    control.ok("dispatch.set", json!({"dispatch": "off"})).await;
+    assert_eq!(
+        chatty.spawned.lock().unwrap().len(),
+        1,
+        "one held child, two blocked candidates"
+    );
+    ordinary_through_marker(&mut observer, &mut control, "after-occupied-tick").await;
+    daemon.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_assignee_keeps_observing_after_client_and_peer_wake_ticks() {
+    use orch_engine::container::commit::{CommitSource, CommitStore};
+    let daemon = harness().await;
+    let mut control = Wire::open(&daemon, "cli").await;
+    let agent = create_agent(&mut control, "removed").await;
+    create_task(
+        &mut control,
+        "dangling assignee",
+        json!({"assignee": agent}),
+    )
+    .await;
+    control.ok("agent.remove", json!({"id": agent})).await;
+    control
+        .ok(
+            "config.set",
+            json!({"key": "scheduling.poll_interval_ms", "value": "60000"}),
+        )
+        .await;
+    let mut observer = Wire::open(&daemon, "mcp").await;
+    observer
+        .subscribe(json!({"stores": ["tasks", "state", "context", "remote"]}))
+        .await;
+    let (_listener, mut ticks) = completed_ticks(&daemon);
+    control.ok("dispatch.set", json!({"dispatch": "on"})).await;
+    await_tick(&mut ticks).await;
+    ordinary_through_marker(&mut observer, &mut control, "after-client-wake").await;
+    // Consume the marker's follow-up wake before isolating the Peer source.
+    await_tick(&mut ticks).await;
+    let boundary = daemon.engine().operation_boundary();
+    boundary
+        .run_from(CommitSource::Peer, false, async {
+            boundary.note_store(CommitStore::Remote);
+        })
+        .await;
+    await_tick(&mut ticks).await;
+    control.ok("dispatch.set", json!({"dispatch": "off"})).await;
+    ordinary_through_marker(&mut observer, &mut control, "after-peer-wake").await;
+    daemon.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_stop_sends_no_uncertain_resync() {
+    let daemon = harness().await;
+    let mut observer = Wire::open(&daemon, "mcp").await;
+    observer.subscribe(json!({"stores": ["state"]})).await;
+    let stop = tokio::spawn(daemon.shutdown());
+    while let Some(frame) = observer.read_frame().await {
+        if let Some(event) = frame.get("ev") {
+            assert!(
+                event.get("resync").is_none(),
+                "clean stop must not announce uncertainty: {event}"
+            );
+        }
+    }
+    stop.await.unwrap().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // The headline: snapshot ordering, cursor, gap and resync
 // ---------------------------------------------------------------------------

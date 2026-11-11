@@ -146,7 +146,7 @@ impl GoalService {
     ) -> Result<Goal> {
         self.events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 // Lock order: orchestrator state -> dispatch gate. Pause never takes state.
                 let _dispatch = match &self.task_service {
                     Some(tasks) => Some(tasks.dispatch_gate.lock().await),
@@ -201,7 +201,7 @@ impl GoalService {
     pub async fn update(&self, id: &str, fields: &UpdateGoalFields) -> Result<Goal> {
         self.events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 let _dispatch = match &self.task_service {
                     Some(tasks) => Some(tasks.dispatch_gate.lock().await),
                     None => None,

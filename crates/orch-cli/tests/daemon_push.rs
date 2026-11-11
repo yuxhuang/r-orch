@@ -126,6 +126,62 @@ fn a_read_only_mcp_bridge_receives_resource_updates() {
     expect_updated(&mut session, &["orch://tasks"]);
 }
 
+#[test]
+fn two_idle_mcp_bridges_keep_observing_after_an_occupied_agent_tick() {
+    let project = Project::start();
+    let added = project.owner(&[
+        "agent",
+        "add",
+        "held",
+        "--adapter",
+        "shell",
+        "--command",
+        "sleep 600",
+        "--workspace-mode",
+        "shared",
+        "--json",
+    ]);
+    let agent: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    let agent = agent["id"].as_str().unwrap();
+    for title in ["held open", "queued one", "queued two"] {
+        project.owner(&["task", "add", title, "--assignee", agent]);
+    }
+    let mut bridges = [mcp(&project, &[]), mcp(&project, &["--read-only"])];
+    for bridge in &mut bridges {
+        subscribe(bridge, "orch://goals");
+    }
+    project.owner(&["daemon", "dispatch", "on"]);
+    // The terminal reply is a barrier after every candidate selection.
+    project.owner(&["run", "--once"]);
+    project.owner(&["daemon", "dispatch", "off"]);
+    // Only goals are observed, so launch events cannot satisfy these probes.
+    // The first probe also consumes the all-resource wave if a bad tick sent
+    // resync. The second must then arrive without any bridge request/revival.
+    for title in ["after tick barrier", "later external mutation"] {
+        project.owner(&["goal", "add", title]);
+        for bridge in &mut bridges {
+            expect_updated(bridge, &["orch://goals"]);
+        }
+    }
+    let observation_connections: BTreeSet<_> = project
+        .proxy
+        .all_ops()
+        .into_iter()
+        .filter(|op| op.op == "subscribe")
+        .map(|op| op.conn)
+        .collect();
+    assert_eq!(observation_connections.len(), 2);
+    assert!(
+        project
+            .proxy
+            .conns()
+            .iter()
+            .filter(|c| observation_connections.contains(&c.id))
+            .all(|c| !c.client_closed && !c.upstream_closed),
+        "both observation sessions must remain open"
+    );
+}
+
 /// 256 distinct canonical URIs per bridge, duplicates free, the 257th refused
 /// with an explicit JSON-RPC error (ruling 14.3), never a silent drop.
 #[test]

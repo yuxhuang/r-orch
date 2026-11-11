@@ -526,7 +526,7 @@ impl Orchestrator {
                 .operation_boundary()
                 .run_from(
                     crate::container::commit::CommitSource::Collector,
-                    true,
+                    false,
                     async {
                         let state = orchestrator.inner.state.lock().await;
                         if let Some(state) = state.as_ref()
