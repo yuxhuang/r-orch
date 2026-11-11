@@ -148,6 +148,31 @@ rebase of a shared branch. Owners are roles; task ids live in the tracker, not i
 | W4 | ARCHITECTURE §2; RUNBOOK; manual 17/18 sweep with captured output; spec Verification table; spec and plan `done`; Pensieve mirror (tech-writer) | R22, R35, R38 | `docs/**`, `README.md`, `CHANGELOG.md` | S4 | every example re-run at the frozen commit; fact-check | 4 |
 | I4, G4, QA2 | Integrate, board 4, QA pass 2 | R22, R24, R28 | per finding | S4, W4 | reviewer verdicts; QA transcript | 4 |
 
+### Bounded synthetic spawn-admission repair
+
+Build a new repair branch from `e5b46febad614baa645e2bdeee297d7cd306e464`;
+first merge final PR 2 head `c49d47830091a812613dd86764343a58d1dad7bb`,
+which includes the required ETXTBSY base
+`33ebc8839fbb6ff439b214b8af74f6ce9c0b038b`. Preserve all existing public
+signatures, Process defaults and real macOS complete-spawn exclusion. No new
+features, dependencies, protocol, config or on-disk changes.
+
+| Step | Work | Prerequisite | Result / evidence |
+|---|---|---|---|
+| T1 | Demonstrate the deterministic foreign pre-body reservation regression at exact baseline, with Collector/Retry/Pause cause records and post-release controls | adopted design and Linux falsifier | unverified here; qualification retains baseline evidence |
+| B | Explicit per-harness synthetic domain, provenance rejection, additive plumbing through launch/workspace/OpenCode; document before code | required baseline red; final PR 2 merge | unverified |
+| T2 | Bind the two fake fixtures; add domain lifecycle/route controls, fail-closed negatives and exact opt-in source allow-list | B interfaces | unverified |
+| Q | Freeze SHA/tree and lineage; regression green/revert red/restored green; original ten-vector wake target N=30, default threading, first red stands; exclusion negative and standard checks | T2 | unverified |
+| QL | Native Linux regression companion, original wake and infra controls, one invocation each | Q; quiet host | unverified |
+| Reviews / checkpoint | Independent exact-SHA code, resilience and security review, then lead integration decision | QL | unverified |
+
+The unchanged-candidate Linux falsifier is done: one invocation, green 10/0,
+platform support only. It is not repair acceptance. Until Q, repair result and
+repair evidence remain **unverified**. Only Q and QL run the original wake oracle;
+no serialization, deadline change, drain change or rerun to green is allowed.
+The lead's document owner mirrors spec/plan to Pensieve at integration. Existing
+integration, CI, owner QA and reserved-consumer holds remain.
+
 ## Status
 
 Status at 2026-11-10, including scoped PR 3 repairs. This table does not certify a new integrated freeze.
