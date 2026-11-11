@@ -8,7 +8,8 @@ use orch_core::workspace::{MergeResult, PrepareResult, WorkspaceManager};
 use orch_core::{Error, Result};
 use orch_domain::{Agent, DomainError, OrchestratorConfig, Task, WorkspaceMode};
 
-use super::{MergeStrategy, run, run_for_code};
+use super::{MergeStrategy, run_for_code, run_for_code_with_spawn_domain, run_with_spawn_domain};
+use crate::process::gate::SpawnDomain;
 
 const NOT_A_GIT_REPO_HINT: &str = "Run: git init && git add -A && git commit -m \"Initial commit\"\n         Or set workspace_mode: shared in .orchestry/config.yml";
 const WORKTREE_ADD_HINT: &str =
@@ -20,6 +21,7 @@ pub struct GitWorkspaceManager {
     orchestry_dir: PathBuf,
     process_manager: Arc<dyn ProcessManager>,
     merge_strategy: MergeStrategy,
+    spawn_domain: SpawnDomain,
     /// Only a positive probe is cached: the user may `git init` later.
     git_repo_confirmed: AtomicBool,
 }
@@ -36,8 +38,17 @@ impl GitWorkspaceManager {
             orchestry_dir,
             process_manager,
             merge_strategy,
+            spawn_domain: SpawnDomain::default(),
             git_repo_confirmed: AtomicBool::new(false),
         }
+    }
+
+    /// Scope preparation admission only for a ProcessManager that never forks.
+    /// The fail-closed check covers crate-internal real builders only; external
+    /// direct Command builders must never opt in. Merge remains process-wide.
+    pub fn with_spawn_domain(mut self, domain: SpawnDomain) -> Self {
+        self.spawn_domain = domain;
+        self
     }
 
     fn resolve_mode(task: &Task, agent: &Agent, config: &OrchestratorConfig) -> WorkspaceMode {
@@ -54,7 +65,18 @@ impl GitWorkspaceManager {
     }
 
     async fn code(&self, command: &str, args: &[&str]) -> i32 {
-        let code = run_for_code(&*self.process_manager, &self.project_root, command, args).await;
+        let code = if self.spawn_domain.is_process() {
+            run_for_code(&*self.process_manager, &self.project_root, command, args).await
+        } else {
+            run_for_code_with_spawn_domain(
+                &*self.process_manager,
+                &self.project_root,
+                command,
+                args,
+                &self.spawn_domain,
+            )
+            .await
+        };
         tracing::debug!(command, ?args, code, "workspace command finished");
         code
     }
@@ -229,11 +251,12 @@ impl WorkspaceManager for GitWorkspaceManager {
             "HEAD".to_owned(),
             branch.to_owned(),
         ];
-        let Ok(base) = run(
+        let Ok(base) = run_with_spawn_domain(
             &*self.process_manager,
             &self.project_root,
             "git",
             &base_args,
+            &self.spawn_domain,
         )
         .await
         else {
@@ -248,11 +271,12 @@ impl WorkspaceManager for GitWorkspaceManager {
             "--name-only".to_owned(),
             format!("{merge_base}...{branch}"),
         ];
-        let Ok(diff) = run(
+        let Ok(diff) = run_with_spawn_domain(
             &*self.process_manager,
             &self.project_root,
             "git",
             &diff_args,
+            &self.spawn_domain,
         )
         .await
         else {

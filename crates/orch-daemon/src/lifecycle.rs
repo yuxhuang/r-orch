@@ -315,6 +315,17 @@ impl Running {
         spec: BringUp,
         maintenance_timer: bool,
     ) -> Result<Running, DaemonError> {
+        Self::bring_up_with_spawn_domain(spec, maintenance_timer, None).await
+    }
+
+    /// Synthetic domains require a ProcessManager that never forks. The
+    /// fail-closed check covers crate-internal real builders only; external
+    /// direct Command builders must never opt in.
+    pub(crate) async fn bring_up_with_spawn_domain(
+        spec: BringUp,
+        maintenance_timer: bool,
+        spawn_domain: Option<orch_infra::process::gate::SpawnDomain>,
+    ) -> Result<Running, DaemonError> {
         let root = spec.project_root.clone();
         let state_dir = root.join(".orchestry");
         let (project_id, meta) = discovery::project_identity(&root)?;
@@ -333,6 +344,7 @@ impl Running {
             spec,
             Arc::clone(&pid_lock),
             maintenance_timer,
+            spawn_domain,
         )
         .await
         {
@@ -355,6 +367,7 @@ impl Running {
         spec: BringUp,
         pid_lock: Arc<PidLock>,
         maintenance_timer: bool,
+        spawn_domain: Option<orch_infra::process::gate::SpawnDomain>,
     ) -> Result<Running, DaemonError> {
         let child_env = orch_infra::process::EnvSnapshot {
             base: spec.snapshot.base.clone(),
@@ -375,12 +388,13 @@ impl Running {
             listen: spec.listen,
         };
         let engine = Arc::new(
-            orch_engine::container::build_full_with_children(
+            orch_engine::container::build_full_with_children_and_spawn_domain(
                 root.clone(),
                 spec.seams,
                 peer,
                 processes,
                 command_runner,
+                spawn_domain.unwrap_or_default(),
             )
             .await?,
         );

@@ -58,6 +58,7 @@ pub struct HarnessBuilder {
     maintenance_timer: Option<bool>,
     ids: Option<Arc<dyn IdGenerator>>,
     processes: Option<Arc<dyn ProcessManager>>,
+    isolated_fake_spawns: bool,
     global_config_path: Option<PathBuf>,
     environment: Option<crate::env::Snapshot>,
     dispatch: DispatchMode,
@@ -95,6 +96,16 @@ impl HarnessBuilder {
     /// Inject the process manager (scripted agents for dispatch/cancel).
     pub fn processes(mut self, processes: Arc<dyn ProcessManager>) -> Self {
         self.processes = Some(processes);
+        self
+    }
+
+    /// Isolate launch, workspace preparation and OpenCode effort probes within
+    /// this harness. Requires `.processes(...)` with a manager that never forks.
+    /// The fail-closed check covers crate-internal real builders only; external
+    /// direct Command builders must never opt in. Doctor, merge, discovery and
+    /// hostname retain process-wide admission. Linux admission is unchanged.
+    pub fn isolated_fake_spawns(mut self) -> Self {
+        self.isolated_fake_spawns = true;
         self
     }
 
@@ -184,6 +195,14 @@ impl HarnessBuilder {
         root: PathBuf,
         project: Option<tempfile::TempDir>,
     ) -> Result<DaemonHarness, DaemonError> {
+        if self.isolated_fake_spawns && self.processes.is_none() {
+            return Err(DaemonError::InvalidArguments(
+                "isolated fake spawns require a supplied process manager".into(),
+            ));
+        }
+        let spawn_domain = self
+            .isolated_fake_spawns
+            .then(orch_infra::process::gate::SpawnDomain::for_synthetic_processes);
         // Short, private and harness-owned: the socket (when bound) and the
         // default global.yml.
         let scratch = tempfile::Builder::new()
@@ -203,7 +222,7 @@ impl HarnessBuilder {
                     .unwrap_or_else(|| scratch.path().join("global.yml")),
             ),
         };
-        let mut running = Running::bring_up_with_maintenance_timer(
+        let mut running = Running::bring_up_with_spawn_domain(
             BringUp {
                 project_root: root.clone(),
                 socket: socket.clone(),
@@ -218,6 +237,7 @@ impl HarnessBuilder {
                     .unwrap_or_else(|| crate::env::capture(std::env::vars_os())),
             },
             self.maintenance_timer.unwrap_or(true),
+            spawn_domain,
         )
         .await?;
         let scratch = Arc::new(scratch);

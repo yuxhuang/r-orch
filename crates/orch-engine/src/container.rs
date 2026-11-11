@@ -31,7 +31,8 @@ use orch_core::storage::{
 use orch_core::template::TemplateEngine;
 use orch_core::workspace::WorkspaceManager;
 use orch_domain::{GlobalConfig, OrchestratorConfig, OrchestratorEvent};
-use orch_infra::adapters::build_registry_with_clock;
+use orch_infra::adapters::registry::build_registry_with_clock_and_spawn_domain;
+use orch_infra::process::gate::SpawnDomain;
 use orch_infra::storage::{
     FileAgentStore, FileConfigStore, FileContextStore, FileGlobalConfigStore, FileGoalStore,
     FileMessageStore, FileRunStore, FileStateStore, FileTaskStore, FileTeamStore, Paths,
@@ -410,6 +411,7 @@ pub async fn build_full_with(
         orch_domain::PeerConfig::default(),
         None,
         None,
+        SpawnDomain::default(),
     )
     .await
 }
@@ -424,6 +426,7 @@ pub async fn build_full_with_peer(
         peer,
         None,
         None,
+        SpawnDomain::default(),
     )
     .await
 }
@@ -438,7 +441,15 @@ pub async fn build_full_with_processes(
     peer: orch_domain::PeerConfig,
     processes: Arc<dyn ProcessManager>,
 ) -> Result<FullEngine> {
-    build_full_internal(project_root.into(), seams, peer, Some(processes), None).await
+    build_full_internal(
+        project_root.into(),
+        seams,
+        peer,
+        Some(processes),
+        None,
+        SpawnDomain::default(),
+    )
+    .await
 }
 
 /// The daemon also supplies its command runner for doctor and automatic
@@ -450,12 +461,36 @@ pub async fn build_full_with_children(
     processes: Arc<dyn ProcessManager>,
     command_runner: Arc<dyn CommandRunner>,
 ) -> Result<FullEngine> {
+    build_full_with_children_and_spawn_domain(
+        project_root,
+        seams,
+        peer,
+        processes,
+        command_runner,
+        SpawnDomain::default(),
+    )
+    .await
+}
+
+/// Assemble synthetic admission only with a ProcessManager that never forks.
+/// The fail-closed check covers crate-internal real builders only; external
+/// direct Command builders must never opt in. Launch, workspace preparation and
+/// OpenCode effort probes share this domain; other real builders remain global.
+pub async fn build_full_with_children_and_spawn_domain(
+    project_root: impl Into<PathBuf>,
+    seams: EngineSeams,
+    peer: orch_domain::PeerConfig,
+    processes: Arc<dyn ProcessManager>,
+    command_runner: Arc<dyn CommandRunner>,
+    spawn_domain: SpawnDomain,
+) -> Result<FullEngine> {
     build_full_internal(
         project_root.into(),
         seams,
         peer,
         Some(processes),
         Some(command_runner),
+        spawn_domain,
     )
     .await
 }
@@ -466,6 +501,7 @@ async fn build_full_internal(
     peer: orch_domain::PeerConfig,
     processes: Option<Arc<dyn ProcessManager>>,
     command_runner: Option<Arc<dyn CommandRunner>>,
+    spawn_domain: SpawnDomain,
 ) -> Result<FullEngine> {
     let mut engine = build_light_with(project_root.clone(), seams).await?;
     if peer.name.is_some() {
@@ -481,15 +517,19 @@ async fn build_full_internal(
     // Adapters stamp the events they parse out of a child's stdout, so they
     // get the injected clock too — otherwise the seam would reach every
     // timestamp except the ones the adapters actually read.
-    let adapters = Arc::new(build_registry_with_clock(
+    let adapters = Arc::new(build_registry_with_clock_and_spawn_domain(
         Arc::clone(&processes),
         Arc::clone(&engine.clock),
+        spawn_domain.clone(),
     ));
-    let workspace: Arc<dyn WorkspaceManager> = Arc::new(GitWorkspaceManager::new(
-        project_root.clone(),
-        engine.paths.root(),
-        Arc::clone(&processes),
-    ));
+    let workspace: Arc<dyn WorkspaceManager> = Arc::new(
+        GitWorkspaceManager::new(
+            project_root.clone(),
+            engine.paths.root(),
+            Arc::clone(&processes),
+        )
+        .with_spawn_domain(spawn_domain.clone()),
+    );
     let templates: Arc<dyn TemplateEngine> = Arc::new(LiquidTemplateEngine::new());
     let skills: Arc<dyn SkillLoader> = Arc::new(orch_infra::skills::FileSkillLoader::new());
     let lock: Arc<dyn ProjectLock> = Arc::new(FileLock::new(engine.paths.lock_path()));
@@ -524,7 +564,12 @@ async fn build_full_internal(
         goal_store: Some(Arc::clone(&engine.goals)),
         skill_loader: Some(Arc::clone(&skills)),
     }));
-    orchestrator.set_spawn_admission(Arc::new(orch_infra::process::gate::ProcessSpawnAdmission));
+    if spawn_domain.is_process() {
+        orchestrator
+            .set_spawn_admission(Arc::new(orch_infra::process::gate::ProcessSpawnAdmission));
+    } else {
+        orchestrator.set_spawn_admission(Arc::new(spawn_domain));
+    }
     orchestrator.set_config_store(Arc::clone(&engine.config_store));
     orchestrator.set_context_service(Arc::clone(&engine.context_service));
 

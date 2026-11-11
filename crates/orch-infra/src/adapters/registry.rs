@@ -45,6 +45,18 @@ pub fn build_registry_with_clock(
     process_manager: Arc<dyn ProcessManager>,
     clock: Arc<dyn Clock>,
 ) -> AdapterRegistry {
+    build_registry_with_clock_and_spawn_domain(process_manager, clock, Default::default())
+}
+
+/// Assemble adapters with synthetic admission only for a ProcessManager that
+/// never forks. The fail-closed check covers crate-internal real builders only;
+/// external direct Command builders must never opt in. Only OpenCode effort
+/// probes use the supplied domain; doctor/version probes remain process-wide.
+pub fn build_registry_with_clock_and_spawn_domain(
+    process_manager: Arc<dyn ProcessManager>,
+    clock: Arc<dyn Clock>,
+    domain: crate::process::gate::SpawnDomain,
+) -> AdapterRegistry {
     let pm = || Arc::clone(&process_manager);
     let tick = || Arc::clone(&clock);
 
@@ -53,7 +65,11 @@ pub fn build_registry_with_clock(
     registry.register(Arc::new(CodexAdapter::new(pm()).with_clock(tick())));
     registry.register(Arc::new(CursorAdapter::new(pm()).with_clock(tick())));
     registry.register(Arc::new(ShellAdapter::new(pm()).with_clock(tick())));
-    registry.register(Arc::new(OpenCodeAdapter::new(pm()).with_clock(tick())));
+    registry.register(Arc::new(
+        OpenCodeAdapter::new(pm())
+            .with_clock(tick())
+            .with_spawn_domain(domain),
+    ));
     registry.register(Arc::new(PiAdapter::new(pm()).with_clock(tick())));
     registry.register(Arc::new(GrokAdapter::new(pm()).with_clock(tick())));
     registry.register(Arc::new(

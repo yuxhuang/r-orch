@@ -18,13 +18,82 @@ fn gate() -> &'static Arc<tokio::sync::Semaphore> {
     GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
 }
 
+/// Spawn admission for library assembly. Defaults to process-wide admission.
+#[derive(Clone, Default)]
+pub struct SpawnDomain(Domain);
+
+#[derive(Clone, Default)]
+enum Domain {
+    #[default]
+    Process,
+    #[cfg(target_os = "macos")]
+    Synthetic(Arc<tokio::sync::Semaphore>),
+}
+
+impl SpawnDomain {
+    /// Isolate admission only for ProcessManagers that never fork. The
+    /// fail-closed check covers crate-internal real builders only; external
+    /// direct Command builders must never opt in. Linux keeps Process admission.
+    pub fn for_synthetic_processes() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self(Domain::Synthetic(Arc::new(tokio::sync::Semaphore::new(1))))
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self::default()
+    }
+
+    /// Whether assembly should retain the production admission provider.
+    pub fn is_process(&self) -> bool {
+        matches!(self.0, Domain::Process)
+    }
+
+    /// Reserve before taking any project/state lock. A synthetic reservation
+    /// must only reach non-forking ProcessManagers.
+    pub async fn reserve(&self, site: SpawnSite) -> SpawnReservation {
+        match &self.0 {
+            Domain::Process => reserve_spawn(site).await,
+            #[cfg(target_os = "macos")]
+            Domain::Synthetic(gate) => {
+                let notice = Notice::new(site, None);
+                let permit = Arc::clone(gate)
+                    .acquire_owned()
+                    .await
+                    .expect("synthetic spawn gate is never closed");
+                SpawnReservation {
+                    notice,
+                    permit: Permit::Synthetic { _permit: permit },
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl orch_core::process::SpawnAdmission for SpawnDomain {
+    async fn reserve(&self) -> Box<dyn orch_core::process::SpawnReservation> {
+        Box::new(self.reserve(SpawnSite::Launch).await)
+    }
+}
+
+// Provenance is private: a local permit cannot prove process-wide exclusion.
+#[cfg(target_os = "macos")]
+enum Permit {
+    Process {
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Synthetic {
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
+}
+
 /// A Send reservation may cross awaits as an ordinary value. Its thread-local
 /// handoff exists only during `run`'s synchronous call, never across an await.
 pub struct SpawnReservation {
     // Clear the completed stage before another permit owner can enter.
     notice: Notice,
     #[cfg(target_os = "macos")]
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    permit: Permit,
 }
 
 thread_local! {
@@ -91,7 +160,7 @@ impl WaitingSpawn {
             .expect("spawn gate is never closed");
         SpawnReservation {
             #[cfg(target_os = "macos")]
-            _permit: permit,
+            permit: Permit::Process { _permit: permit },
             notice: self.0,
         }
     }
@@ -113,6 +182,11 @@ pub(crate) fn with_spawn_gate<T>(spawn: impl FnOnce() -> T) -> T {
         tests::before_lock(gate());
         futures::executor::block_on(reserve_spawn(SpawnSite::Synchronous))
     });
+    #[cfg(target_os = "macos")]
+    assert!(
+        matches!(reservation.permit, Permit::Process { .. }),
+        "synthetic spawn reservation cannot authorize a real process"
+    );
     // The permit stays in this stack frame even if an observer unwinds.
     reservation.notice.enter();
     #[cfg(all(test, target_os = "macos"))]
@@ -122,6 +196,8 @@ pub(crate) fn with_spawn_gate<T>(spawn: impl FnOnce() -> T) -> T {
 
 #[cfg(test)]
 mod capture_tests;
+#[cfg(test)]
+mod synthetic_tests;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod tests;
 
