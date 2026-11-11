@@ -570,13 +570,34 @@ pub fn assert_mcp_exit_code_7(who: &str, response: &Value) {
 
 // ── TUI in a private tmux ──────────────────────────────────────────────────
 
-pub fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
+const TMUX_PATH: &str = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin";
+
+/// Resolve before changing PATH: a bare program plus a changed PATH makes
+/// Rust use fork/exec instead of posix_spawn. On macOS a concurrent MCP spawn
+/// can inherit that fork's non-atomically CLOEXEC-marked exec-handshake pipe,
+/// keeping Command::spawn blocked before our child deadline even exists.
+/// The executable is fixed here; the child still gets the hermetic PATH.
+pub fn tmux_command() -> Option<Command> {
+    let bin = std::env::split_paths(std::ffi::OsStr::new(TMUX_PATH))
+        .map(|dir| dir.join("tmux"))
+        .find(|path| {
+            path.is_file()
+                && path.metadata().is_ok_and(|meta| {
+                    std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0
+                })
+        })?;
+    let mut cmd = Command::new(bin);
+    // Keep the private-server marker used by teardown even with an absolute executable.
+    cmd.arg0("tmux")
         .env_clear()
-        .env("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
-        .output()
-        .is_ok_and(|out| out.status.success())
+        .env("PATH", TMUX_PATH)
+        .process_group(0);
+    Some(cmd)
+}
+
+pub fn tmux_available() -> bool {
+    tmux_command()
+        .is_some_and(|mut cmd| cmd.arg("-V").output().is_ok_and(|out| out.status.success()))
 }
 
 /// A private tmux server with `orch <args>` (e.g. `tui`) in one pane. The
@@ -705,11 +726,9 @@ impl TuiPane {
         pane
     }
 
-    fn cmd(&self) -> Command {
-        let mut cmd = Command::new("tmux");
-        cmd.env_clear()
-            .env("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
-            .env("TMUX_TMPDIR", &self.dir)
+    pub(crate) fn cmd(&self) -> Command {
+        let mut cmd = tmux_command().expect("tmux was available when this private pane launched");
+        cmd.env("TMUX_TMPDIR", &self.dir)
             .env("HOME", &self.home)
             .env("SHELL", "/bin/sh")
             .args(["-u", "-L", &self.name, "-f", "/dev/null"])

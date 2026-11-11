@@ -88,6 +88,7 @@ impl DiscoveryRuntime for SystemDiscoveryRuntime {
                 DISCOVERY_TIMEOUT,
                 None,
                 DIAGNOSTIC_OUTPUT_BYTES,
+                (Arc::default(), None),
             )
             .await?,
         )
@@ -112,11 +113,25 @@ impl DiscoveryRuntime for SystemDiscoveryRuntime {
 #[derive(Clone)]
 pub struct SnapshotDiscoveryRuntime {
     snapshot: crate::process::EnvSnapshot,
+    work: Arc<crate::process::gate::SpawnWork>,
+    observer: ObserverSlot,
 }
 
 impl SnapshotDiscoveryRuntime {
     pub fn new(snapshot: crate::process::EnvSnapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            work: Arc::default(),
+            observer: Arc::default(),
+        }
+    }
+
+    pub fn set_spawn_observer(&self, observer: Arc<dyn crate::process::gate::SpawnObserver>) {
+        *self.observer.write().unwrap_or_else(|e| e.into_inner()) = Some(observer);
+    }
+
+    pub fn spawn_work(&self) -> &Arc<crate::process::gate::SpawnWork> {
+        &self.work
     }
 
     /// Bounded, concurrent capture shared by model discovery and the daemon's
@@ -130,6 +145,11 @@ impl SnapshotDiscoveryRuntime {
         timeout: Duration,
         max_output_bytes: usize,
     ) -> Result<std::process::Output> {
+        let observer = self
+            .observer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         run_output(
             command,
             args,
@@ -137,6 +157,7 @@ impl SnapshotDiscoveryRuntime {
             timeout,
             Some(&self.snapshot),
             max_output_bytes,
+            (Arc::clone(&self.work), observer),
         )
         .await
     }
@@ -145,6 +166,11 @@ impl SnapshotDiscoveryRuntime {
 #[async_trait]
 impl DiscoveryRuntime for SnapshotDiscoveryRuntime {
     async fn run_command(&self, command: &str, args: &[&str]) -> Result<CommandOutput> {
+        let observer = self
+            .observer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let output = run_output(
             command,
             args,
@@ -152,6 +178,7 @@ impl DiscoveryRuntime for SnapshotDiscoveryRuntime {
             DISCOVERY_TIMEOUT,
             Some(&self.snapshot),
             DIAGNOSTIC_OUTPUT_BYTES,
+            (Arc::clone(&self.work), observer),
         )
         .await?;
         discovery_output(command, args, output)
@@ -173,6 +200,12 @@ impl DiscoveryRuntime for SnapshotDiscoveryRuntime {
     }
 }
 
+type DiagnosticAdmission = (
+    Arc<crate::process::gate::SpawnWork>,
+    Option<Arc<dyn crate::process::gate::SpawnObserver>>,
+);
+type ObserverSlot = Arc<std::sync::RwLock<Option<Arc<dyn crate::process::gate::SpawnObserver>>>>;
+
 async fn run_output(
     command: &str,
     args: &[&str],
@@ -180,30 +213,77 @@ async fn run_output(
     timeout: Duration,
     snapshot: Option<&crate::process::EnvSnapshot>,
     max_output_bytes: usize,
+    admission: DiagnosticAdmission,
 ) -> Result<std::process::Output> {
     use std::process::Stdio;
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        // Its own group, so an abandoned probe's kill reaches what it forked.
-        .process_group(0);
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    if let Some(snapshot) = snapshot {
-        cmd.env_clear()
-            .envs(snapshot.base.iter().cloned())
-            .envs(snapshot.forced.iter().cloned());
-    }
+    let (work, observer) = admission;
     let capture = async {
-        let mut child = cmd.spawn().map_err(|source| Error::Io {
-            context: format!("Failed to spawn process: {command}"),
-            path: Some(PathBuf::from(command)),
-            source,
-        })?;
+        let waiting = crate::process::gate::observe_spawn(
+            crate::process::gate::SpawnSite::Discovery,
+            observer,
+        );
+        let lease = work
+            .enter()
+            .await
+            .ok_or_else(|| Error::other("diagnostic spawn admission closed"))?;
+        let reservation = waiting.reserve().await;
+        #[cfg(all(test, target_os = "macos"))]
+        let park = crate::process::gate::tests::take_park();
+        let command_owned = command.to_owned();
+        let arguments: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        let directory = cwd.map(Path::to_path_buf);
+        let environment = snapshot.cloned();
+        let runtime = tokio::runtime::Handle::current();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        // The lease exists before submission and survives the observer's timeout.
+        tokio::task::spawn_blocking(move || {
+            let _runtime = runtime.enter();
+            #[cfg(all(test, target_os = "macos"))]
+            crate::process::gate::tests::install_park(park);
+            let command = &command_owned;
+            let args = &arguments;
+            let cwd = directory.as_deref();
+            let snapshot = environment.as_ref();
+            let result = reservation
+                .run(|| {
+                    crate::process::gate::with_spawn_gate(|| {
+                        let mut cmd = tokio::process::Command::new(command);
+                        cmd.args(args)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .kill_on_drop(true)
+                            // Its own group, so an abandoned probe's kill reaches what it forked.
+                            .process_group(0);
+                        if let Some(cwd) = cwd {
+                            cmd.current_dir(cwd);
+                        }
+                        if let Some(snapshot) = snapshot {
+                            cmd.env_clear()
+                                .envs(snapshot.base.iter().cloned())
+                                .envs(snapshot.forced.iter().cloned());
+                        }
+
+                        cmd.spawn()
+                    })
+                })
+                .map(|child| DiagnosticChild {
+                    child: Some(child),
+                    lease: Some(lease),
+                    runtime: runtime.clone(),
+                });
+            // A failed delivery drops DiagnosticChild and starts owned cleanup.
+            let _ = send.send(result);
+        });
+        let mut owned = receive
+            .await
+            .map_err(|_| Error::other("diagnostic spawn job failed"))?
+            .map_err(|source| Error::Io {
+                context: format!("Failed to spawn process: {command}"),
+                path: Some(PathBuf::from(command)),
+                source,
+            })?;
+        let child = owned.child.as_mut().expect("diagnostic child retained");
         // Both pipes were requested above. Keep the child in this future so
         // timeout/cancellation drops it with kill_on_drop, without detached
         // tasks; the guard takes the rest of its group too.
@@ -225,15 +305,44 @@ async fn run_output(
         if let Some(guard) = guard.as_mut() {
             guard.disarm();
         }
+        owned.child.take();
+        owned.lease.take();
         Ok(std::process::Output {
             status,
             stdout,
             stderr,
         })
     };
-    tokio::time::timeout(timeout, capture)
-        .await
-        .map_err(|_| Error::other(format!("{command} {} timed out", args.join(" "))))?
+    tokio::select! {
+        output = tokio::time::timeout(timeout, capture) => output
+            .map_err(|_| Error::other(format!("{command} {} timed out", args.join(" "))))?,
+        () = work.cancelled() => Err(Error::other("diagnostic cancelled")),
+    }
+}
+
+struct DiagnosticChild {
+    child: Option<tokio::process::Child>,
+    lease: Option<crate::process::gate::work::WorkLease>,
+    runtime: tokio::runtime::Handle,
+}
+impl Drop for DiagnosticChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let lease = self.lease.take();
+        // The group signal precedes reaping and ownership release, including a
+        // late return after the request's diagnostic future was cancelled.
+        let guard = child.id().map(|pid| {
+            crate::process::GroupKillGuard::new(&crate::process::SystemProcessManager, pid)
+        });
+        drop(guard);
+        let _ = child.start_kill();
+        self.runtime.spawn(async move {
+            let _lease = lease;
+            let _ = child.wait().await;
+        });
+    }
 }
 
 fn discovery_output(

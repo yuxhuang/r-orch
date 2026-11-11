@@ -207,6 +207,37 @@ the project until that call returns. Its shutdown is already under way, so **`ki
 4. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited.
 5. `orch daemon start`. The new daemon reconciles the killed one's work as after a crash.
 
+### A process is waiting to start
+
+On macOS the daemon admits complete process spawns one at a time. A diagnostic
+waiting or stuck in spawn does not make a queued agent launch hold the project
+operation boundary. Reads, queued task cancellation and goal pause can still
+complete. A task cancelled or paused while queued is checked again before launch.
+
+The private daemon log reports `process spawn pending` with `stage=Waiting` or
+`stage=Entered`, a generated `spawn_id`, fixed `site`, and monotonic `elapsed_ms`.
+The first warning is after 1 s; persistent warnings are at least 5 s apart per
+record. These are warning thresholds, not execution timeouts. Records are bounded
+(128 individual entries plus fixed overflow counts); the log includes no command,
+arguments, environment, prompt or process output. Records clear when that stage
+ends, including cancellation and spawn errors.
+
+With neither `RUST_LOG` nor `ORCHESTRY_DEBUG` set, explicit daemon starts
+(`daemon start`, detached starts, `serve`, and `run --watch`) enable these
+warnings alone. Foreground warnings go to stderr; detached warnings go to the
+existing private capped `.orchestry/daemon.log`. Other commands keep their quiet
+default. An explicit logging filter takes precedence, including `RUST_LOG=off`;
+SDK debug/trace payloads remain excluded even with a specific SDK directive.
+
+`Entered` means the actual synchronous spawn has begun. The OS call cannot be
+interrupted safely by dropping its caller. Stop first terminates registered agent
+groups; an unresolved entered diagnostic makes stop report incomplete and keeps
+project ownership until the late child has been killed/reaped and accepted work
+has drained. Do not start a second daemon while ownership is retained. An actual
+agent already inside spawn can still hold the final project boundary; this is
+separate from waiting behind an unrelated diagnostic. Use [A hung daemon](#a-hung-daemon)
+for owner-directed recovery.
+
 ### `orch` commands are slow while many tasks fail to start
 
 **Symptom.** Dispatch is on and many tasks fail before their agent starts, for example because their workspace

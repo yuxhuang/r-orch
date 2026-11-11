@@ -243,6 +243,7 @@ struct Inner {
     daemon_batch_active: AtomicBool,
     preparing_agents: Mutex<HashMap<String, (u64, String)>>,
     preparation_seq: std::sync::atomic::AtomicU64,
+    spawn_admission: std::sync::RwLock<Arc<dyn orch_core::process::SpawnAdmission>>,
     deferred_kills: Mutex<Vec<(String, orch_domain::RunningEntry, String)>>,
     terminal_intents: Mutex<HashSet<String>>,
     deferred_cleanups: Mutex<Vec<(String, String)>>,
@@ -333,6 +334,9 @@ impl Orchestrator {
                 daemon_batch_active: AtomicBool::new(false),
                 preparing_agents: Mutex::new(HashMap::new()),
                 preparation_seq: std::sync::atomic::AtomicU64::new(0),
+                spawn_admission: std::sync::RwLock::new(Arc::new(
+                    orch_core::process::NoopSpawnAdmission,
+                )),
                 deferred_kills: Mutex::new(Vec::new()),
                 terminal_intents: Mutex::new(HashSet::new()),
                 deferred_cleanups: Mutex::new(Vec::new()),
@@ -766,6 +770,22 @@ impl Orchestrator {
     ///
     /// Polled rather than awaited: the collectors are detached, and a 25 ms
     /// poll on a set that is almost always empty costs nothing next to a run.
+    pub fn set_spawn_admission(&self, admission: Arc<dyn orch_core::process::SpawnAdmission>) {
+        *self
+            .inner
+            .spawn_admission
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = admission;
+    }
+
+    fn spawn_admission(&self) -> Arc<dyn orch_core::process::SpawnAdmission> {
+        self.inner
+            .spawn_admission
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub async fn wait_for_collectors(&self) {
         loop {
             if self.inner.active_collectors.lock().await.is_empty() {

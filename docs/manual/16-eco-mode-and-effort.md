@@ -342,7 +342,11 @@ JSON and YAML output never contains a warning, so a script can parse standard ou
 the warnings share standard output with the table or confirmation, so `2>/dev/null` does not hide them.
 
 > **Note:** The `orch serve` and `orch run --watch` output in this section, and its samples, is orch 0.13.0's. A
-> foreground `orch serve` or `orch run --watch` is now the daemon and prints no events or warnings
+> foreground `orch serve` or `orch run --watch` is now the daemon; it does not print the structured event
+> records shown below. With `RUST_LOG` and `ORCHESTRY_DEBUG` unset, its tracing output is limited to payload-free
+> process-spawn warnings on standard error. Explicit `RUST_LOG` or `ORCHESTRY_DEBUG` settings control tracing
+> instead; `RUST_LOG=off` suppresses these tracing warnings. To follow orchestrator events, including effort
+> warnings, run `orch logs --follow` in another terminal
 > ([Daemon logs and events](07-running-and-monitoring.md#daemon-logs-and-events)). `orch run` with a task ID,
 > `--all` or `--once` still prints the start-up warnings on standard error, and `orch serve --once` logs the
 > `serve:diagnostic` records described next.

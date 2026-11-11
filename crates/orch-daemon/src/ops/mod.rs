@@ -147,6 +147,11 @@ impl ServiceHandler {
         }
     }
 
+    #[cfg(feature = "testing")]
+    pub fn observe_spawns(&self, observer: Arc<dyn orch_infra::process::gate::SpawnObserver>) {
+        self.diagnostics.set_spawn_observer(observer);
+    }
+
     pub fn coordinator(&self) -> &Arc<ProjectCoordinator> {
         &self.coordinator
     }
@@ -154,11 +159,13 @@ impl ServiceHandler {
     /// Permanently reject new requests before releasing project ownership.
     pub(crate) fn seal_requests(&self) {
         self.requests.seal();
+        self.diagnostics.spawn_work().seal();
     }
 
     /// Includes detached operation tasks, not just their socket observers.
     pub(crate) async fn drain_requests(&self) {
         self.requests.wait_idle().await;
+        self.diagnostics.spawn_work().wait_idle().await;
     }
 
     /// Run a probe under its deadline, and end it as soon as nobody waits

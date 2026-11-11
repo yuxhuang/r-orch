@@ -1957,6 +1957,49 @@ fn missing_private_tmux_still_cleans_its_retained_pane_during_unwind() {
     assert_cleanup_child(NAME, CHILD, 101);
 }
 
+/// Shells may exec the wrapper (macOS) or keep a shell between the private
+/// server and the pane (Linux). Command text alone never establishes ownership.
+fn descends_from(table: &[Proc], mut pid: u32, ancestor: u32) -> bool {
+    let mut seen = BTreeSet::new();
+    while seen.insert(pid) {
+        let Some(process) = table.iter().find(|p| p.pid == pid) else {
+            return false;
+        };
+        if process.ppid == ancestor {
+            return true;
+        }
+        pid = process.ppid;
+    }
+    false
+}
+
+#[test]
+fn private_pane_readiness_accepts_descendants_at_any_depth_only_of_its_server() {
+    let process = |pid, ppid, command: &str| Proc {
+        pid,
+        ppid,
+        pgid: pid,
+        command: command.into(),
+    };
+    let table = vec![
+        process(10, 1, "tmux private"),
+        process(11, 10, "sleep 600"),
+        process(12, 10, "sh -c pane.sh"),
+        process(13, 12, "sh pane.sh"),
+        process(14, 13, "sleep 600"),
+        process(20, 1, "tmux other"),
+        process(21, 20, "sleep 600"),
+        process(30, 31, "sleep 600"),
+        process(31, 30, "cycle"),
+    ];
+    let owned: Vec<_> = table
+        .iter()
+        .filter(|p| p.command == "sleep 600" && descends_from(&table, p.pid, 10))
+        .map(|p| p.pid)
+        .collect();
+    assert_eq!(owned, vec![11, 14]);
+}
+
 fn fail_with_private_tmux(record: &std::ffi::OsStr, stop: bool) -> ! {
     let sandbox = Sandbox::new();
     sandbox.init_project();
@@ -1989,7 +2032,7 @@ fn fail_with_private_tmux(record: &std::ffi::OsStr, stop: bool) -> ! {
             })?;
             table
                 .iter()
-                .any(|p| p.ppid == server.pid && p.command == "sleep 600")
+                .any(|p| p.command == "sleep 600" && descends_from(&table, p.pid, server.pid))
                 .then_some(())
         });
     }
@@ -2156,4 +2199,68 @@ fn cleanup_output_times_out_and_reaps_an_unresponsive_command() {
         return;
     }
     assert_cleanup_child(NAME, CHILD, 0);
+}
+
+// Regression: F-S1 / review F1 — guard the command used by run/keys and teardown.
+// std at 58cf8f9c, library/std/src/sys/process/unix/unix.rs:467-474, falls back
+// to fork when env_saw_path() && !program_is_path(). Require an absolute program
+// on the actual pane route: Command::get_envs cannot reveal env_clear by itself.
+#[test]
+fn private_tui_pane_command_avoids_the_f_s1_fork_handshake_precondition() {
+    let sandbox = Sandbox::new();
+    let pane = TuiPane::launch_at(
+        &sandbox.root(),
+        &sandbox.socket(),
+        sandbox.short_dir(),
+        "--help",
+        &[],
+    );
+    let cmd = pane.cmd();
+    assert!(
+        Path::new(cmd.get_program()).is_absolute(),
+        "F-S1: TuiPane::cmd must use an absolute program; PATH search with a changed \
+         or cleared child PATH selects std's fork fallback, whose exec-handshake read \
+         can wait on a writer inherited by a concurrent MCP child before CALL starts: \
+         program={:?}, PATH edit={:?}, current_dir={:?}",
+        cmd.get_program(),
+        cmd.get_envs().find(|(key, _)| *key == "PATH"),
+        cmd.get_current_dir(),
+    );
+}
+
+// Regression: F-S1 — the first send blocked inside Command::spawn, before CALL.
+// A resolved executable remains launchable with no tmux on the child's PATH.
+#[test]
+fn private_tmux_commands_launch_without_searching_the_childs_path() {
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = tmux_command().expect("tmux is required for this regression");
+    cmd.arg("-V")
+        .env("PATH", home.path())
+        .env("HOME", home.path());
+    let output = output_with_deadline(cmd, Duration::from_secs(2));
+    assert!(
+        output.status.success() && text(&output.stdout).starts_with("tmux "),
+        "resolved tmux must launch with an empty child search path: {output:?}"
+    );
+}
+
+#[test]
+fn tui_driver_reports_a_first_send_error_with_its_stage_before_startup_can_pass() {
+    let sandbox = Sandbox::new();
+    sandbox.init_project();
+    let pane = Arc::new(TuiPane::launch_at(
+        &sandbox.root(),
+        &sandbox.socket(),
+        sandbox.short_dir(),
+        "--help",
+        &[],
+    ));
+    pane.terminate();
+    let shared = stress_shared();
+    spawn_tui_driver(pane, shared.clone()).join().unwrap();
+    let failures = shared.failures.lock().unwrap();
+    assert!(
+        failures.len() == 1 && failures[0].contains("tui driver died at `sending t`"),
+        "a failed first send must fail the run with its exact stage: {failures:?}"
+    );
 }

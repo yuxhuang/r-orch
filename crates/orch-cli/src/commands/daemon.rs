@@ -265,6 +265,12 @@ fn code(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn with_test_detached_stderr(root: &std::path::Path, run: impl FnOnce()) {
+    orch_daemon::testing::with_detached_stderr(root, run)
+        .expect("capture the real detached stderr sink");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

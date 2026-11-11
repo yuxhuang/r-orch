@@ -21,6 +21,21 @@ use super::dispatch::{
 use super::{CANCEL_KILL_GRACE, Orchestrator};
 
 impl Orchestrator {
+    async fn daemon_launch_cancelled(
+        &self,
+        token: &tokio_util::sync::CancellationToken,
+        guard: &AtomicBool,
+    ) {
+        tokio::select! {
+            () = token.cancelled() => (),
+            () = async {
+                while !guard.load(Ordering::SeqCst) && !self.is_shutting_down() {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            } => (),
+        }
+    }
+
     pub fn enable_daemon_mode(&self) {
         self.inner.daemon_mode.store(true, Ordering::SeqCst);
     }
@@ -374,10 +389,14 @@ impl Orchestrator {
                     branch: None,
                 })
             } else {
-                self.deps()
-                    .workspace
-                    .prepare(&task, &agent, &launch_config)
-                    .await
+                tokio::select! {
+                    biased;
+                    () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
+                    prepared = self.deps().workspace.prepare(&task, &agent, &launch_config) => prepared,
+                }
             };
             let workspace = match prepared {
                 Ok(workspace) => workspace,
@@ -505,17 +524,21 @@ impl Orchestrator {
             // Network/probe preparation cannot block task edits, goal pause, cancel,
             // expiry, or agent-run client requests.
             let preparation = if agent.remote.is_none() {
-                Some(
-                    adapter
+                let prepare = async { adapter
                         .as_ref()
                         .expect("local adapter resolved")
                         .prepare_effort(&params)
-                        .await
-                        .and_then(|prepared| check_preparation(&params.config, prepared)),
-                )
-            } else {
-                None
-            };
+                        .await };
+                let prepared = tokio::select! {
+                    biased;
+                    () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
+                    prepared = prepare => prepared,
+                };
+                Some(prepared.and_then(|prepared| check_preparation(&params.config, prepared)))
+            } else { None };
             if let (Some(preparation), Some(adapter)) = (preparation, adapter.as_ref()) {
                 let preparation = match preparation {
                     Ok(preparation) => preparation,
@@ -543,6 +566,20 @@ impl Orchestrator {
                 }
                 self.report_effort_diagnostics(&run.id, &agent.id, &diagnostics);
             }
+
+            // Admission precedes the project boundary and state mutex. A queued
+            // launch owns no blocking worker and cannot outlive cancellation.
+            let admission = self.spawn_admission();
+            let reservation = if agent.remote.is_none() {
+                tokio::select! {
+                    biased;
+                    () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
+                    permit = admission.reserve() => Some(permit),
+                }
+            } else { None };
 
             let launched = boundary
                 .run(true, async {
@@ -639,10 +676,13 @@ impl Orchestrator {
                         .await;
                         return Ok(true);
                     }
-                    let handle = match self.execute_prepared(
-                        adapter.as_ref().expect("local adapter resolved").as_ref(),
-                        params,
-                    ) {
+                    let execution = {
+                        let _scope = reservation.expect("local launch reservation").enter();
+                        self.execute_prepared(
+                            adapter.as_ref().expect("local adapter resolved").as_ref(), params,
+                        )
+                    };
+                    let handle = match execution {
                         Ok(handle) => handle,
                         Err(error) => {
                             self.fail_before_spawn(
