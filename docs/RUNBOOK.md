@@ -948,7 +948,8 @@ correction for a resize received together with a keypress; heading state-machine
 - `logs --follow` prints a text banner and then live events; `serve --once` writes JSON Lines
   (`--log-format json`, the default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl`
   logs. A foreground `serve` is the daemon: it prints `listening <socket>` and `dispatch on`, no event lines, and
-  its diagnostics go to stderr only with `RUST_LOG` (to `.orchestry/daemon.log` when detached).
+  its operator diagnostics go to stderr regardless of `RUST_LOG` (to `.orchestry/daemon.log` when detached).
+  Arbitrary error details are omitted there; use `orch logs --follow` for the live error text and context.
 - A failing command prints its error as text on stderr under every output flag; stdout is empty.
 
 **Fix.** For `doctor`, drop the leading header lines before parsing: `orch --json doctor | sed '1,2d'`. For
@@ -981,8 +982,11 @@ failures take one of three paths:
 
 - **Configuration errors** (`configuration preflight` and the eco/custom-template message) stop the dispatch
   before any run exists. No run is recorded, the task stays `todo` with its attempts unchanged, and the agent
-  stays idle. `orch run <id>` prints the error and exits without running the task. `orch serve` logs it as
-  `orchestrator:error` with `context=dispatch task <id>` and `fatal=false`, then tries again at each periodic or change-triggered scheduling
+  stays idle. `orch run <id>` prints the error and exits without running the task. Foreground `orch serve`
+  writes only `⚠ orchestrator:error (details omitted from daemon stderr; use orch logs --follow)` to stderr.
+  In another terminal, start `orch logs --follow` to see the task context and full error text from subsequent
+  scheduling checks. The underlying live `orchestrator:error` event carries `context=dispatch task <id>` and
+  `fatal=false`; the daemon's stderr omits those fields. Dispatch tries again at each periodic or change-triggered scheduling
   check (the periodic interval is `scheduling.poll_interval_ms`, 10 s by default) until the file is fixed.
   These configuration failures do not consume an attempt or enter the workspace-preparation retry back-off. `orch serve --once` does not finish
   while this repeats. There is nothing to retry by hand: once the file is fixed, the next tick dispatches the
@@ -993,11 +997,11 @@ failures take one of three paths:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `orch serve` logs `orchestrator:error error=configuration preflight: cannot read defaults.agent.prompt_mode: …` every tick; the task stays `todo` | `.orchestry/config.yml` became unreadable or invalid while `serve` was running. orch reads only the prompt mode again before each dispatch; other settings come from start-up. Commands that load the config, such as `orch run` and `orch task show`, refuse to start with the parse error itself. | Repair `.orchestry/config.yml`. The next tick reads it again and dispatches the task. |
-| `eco prompt mode is incompatible with custom templates (…)` from `orch run` (exit code 2), or as an `orchestrator:error` in the `serve` log every tick; the task stays `todo` | A hand-edited file combines eco with a custom prompt template. | `orch agent update <id> --prompt-mode normal` for each listed agent, or `orch config set defaults.agent.prompt_mode normal`. A running `serve` picks either up on the next tick. Removing the template instead needs a `serve` restart, because `serve` reads the `prompt` settings only at start-up. |
+| `orch logs --follow` shows `configuration preflight: cannot read defaults.agent.prompt_mode: …` on scheduling checks; foreground `orch serve` prints the redacted diagnostic above; the task stays `todo` | `.orchestry/config.yml` became unreadable or invalid while `serve` was running. orch reads only the prompt mode again before each dispatch; other settings come from start-up. Commands that load the config, such as `orch run` and `orch task show`, refuse to start with the parse error itself. | Repair `.orchestry/config.yml`. The next tick reads it again and dispatches the task. |
+| `eco prompt mode is incompatible with custom templates (…)` from `orch run` (exit code 2), or in `orch logs --follow` on scheduling checks; foreground `orch serve` prints the redacted diagnostic above; the task stays `todo` | A hand-edited file combines eco with a custom prompt template. | `orch agent update <id> --prompt-mode normal` for each listed agent, or `orch config set defaults.agent.prompt_mode normal`. A running `serve` picks either up on the next tick. Removing the template instead needs a `serve` restart, because `serve` reads the `prompt` settings only at start-up. |
 | Run fails: `effort preparation failed: … the installed opencode did not prove provider/model#variant support …` | OpenCode agent with an effort newer than 0.9.4's, and the `opencode` on `PATH` is not version 2 (or the check timed out after 2 s or produced more than 64 KiB). | Install OpenCode 2, or `orch agent update <id> --effort default`. A stored `low`/`medium`/`high` never fails this way: it is dropped with a `legacy-ignored` warning. |
-| `legacy-ignored`, `capability-unknown` and other effort warnings at `orch run` start, or `serve:diagnostic` records in the `serve` log | Stored efforts that this adapter or model cannot take, or that orch cannot check. Not an error. | Review with `orch agent list`; clear with `--effort default` or set a model. |
-| `orchestrator:error` warnings with context `effort preparation for run … (agent …)` and `fatal: false` in the `serve` log, or `⚠ effort preparation for run …` lines in `orch run --watch` | Each effort warning for that run, once: the same statuses as the start-up warnings, after the OpenCode version check where there is one. An agent with no warning logs none. Not an error; the run goes ahead. | Treat it as in the row above. |
+| `legacy-ignored`, `capability-unknown` and other effort warnings at `orch run` start, or `serve:diagnostic` records in `orch serve --once` output | Stored efforts that this adapter or model cannot take, or that orch cannot check. Not an error. | Review with `orch agent list`; clear with `--effort default` or set a model. |
+| `⚠ effort preparation: …` on foreground `orch serve` or `orch run --watch` stderr; `orch logs --follow` shows the full warning and `effort preparation for run … (agent …)` context | Each effort warning for that run, once: the same statuses as the start-up warnings, after the OpenCode version check where there is one. An agent with no warning logs none. Not an error; the run goes ahead. | Treat it as in the row above. |
 | v0.9.4 fails every agent command with `parse …/agents/agt_….yml` | A newer effort value in that file. | Clear it with the newer binary, or restore the file from a backup. Do not hand-map `max`/`ultra` to `high`. |
 
 The OpenCode check runs `opencode --version` and `opencode run --help` in the agent's workspace with the agent's
