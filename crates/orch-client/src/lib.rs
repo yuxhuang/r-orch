@@ -527,7 +527,16 @@ fn authenticate_peer(
     project: &Project,
     expected_uid: u32,
 ) -> Result<Option<u32>, ClientError> {
-    check_peer(stream.peer_cred(), project, expected_uid)
+    let cred = stream.peer_cred();
+    // A closed macOS peer loses its pid credentials while its uid remains
+    // available. Reject a known foreign uid before classifying it as busy.
+    #[cfg(target_os = "macos")]
+    if cred.is_err()
+        && nix::unistd::getpeereid(stream).is_ok_and(|(uid, _)| uid.as_raw() != expected_uid)
+    {
+        return Err(project.failure(NoDaemonDetail::PermissionDenied).into());
+    }
+    check_peer(cred, project, expected_uid)
 }
 
 fn check_peer(
@@ -614,6 +623,60 @@ async fn read_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    async fn closed_peer() -> (tempfile::TempDir, Project, UnixStream) {
+        use tokio::io::AsyncReadExt;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+        let project = Project::discover(root.path(), None).unwrap();
+        let listener = tokio::net::UnixListener::bind(root.path().join("s")).unwrap();
+        let mut client = UnixStream::connect(root.path().join("s")).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            server.try_read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(server);
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        // Closing the accepted peer makes the pid lookup fail, but the
+        // kernel still has its uid for the independent uid-only lookup.
+        assert_eq!(
+            client.peer_cred().unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        assert_eq!(
+            nix::unistd::getpeereid(&client).unwrap().0,
+            nix::unistd::geteuid()
+        );
+        (root, project, client)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_closed_peer_uid_mismatch_is_permission_denied() {
+        let (_root, project, client) = closed_peer().await;
+        // Inject the expected uid, as in the live-peer test below: the
+        // kernel's real peer uid is foreign relative to this caller.
+        let expected_uid = nix::unistd::geteuid().as_raw().wrapping_add(1);
+        let error = authenticate_peer(&client, &project, expected_uid).unwrap_err();
+        assert_eq!(error.exit_code(), 7);
+        assert!(error.to_string().contains("permission denied"), "{error}");
+        assert!(!error.to_string().contains("daemon_busy"), "{error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_closed_peer_with_matching_uid_stays_busy() {
+        let (_root, project, client) = closed_peer().await;
+        let error =
+            authenticate_peer(&client, &project, nix::unistd::geteuid().as_raw()).unwrap_err();
+        assert_eq!(error.exit_code(), 7);
+        assert!(error.to_string().contains("daemon_busy"), "{error}");
+        assert!(!error.to_string().contains("permission denied"), "{error}");
+    }
 
     #[tokio::test]
     async fn kernel_uid_mismatch_is_rejected_before_any_bytes() {
