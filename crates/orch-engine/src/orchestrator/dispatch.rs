@@ -1260,22 +1260,21 @@ impl Orchestrator {
 
         let mut queue: Vec<String> = vec![failed_task_id.to_owned()];
         let mut head = 0;
-        let mut visited: HashSet<String> = HashSet::new();
+        let mut visited = HashSet::from([failed_task_id.to_owned()]);
         let mut cascaded_any = false;
 
         while head < queue.len() {
             let parent = queue[head].clone();
             head += 1;
-            if !visited.insert(parent.clone()) {
-                continue;
-            }
             let Some(dependents) = reverse.get(parent.as_str()) else {
                 continue;
             };
 
             let mut to_fail: Vec<(Task, TaskStatus)> = Vec::new();
             for task in dependents {
-                if is_terminal(task.status) || visited.contains(&task.id) {
+                // Mark on discovery: another parent can reach this task
+                // before it is dequeued, including through a repeated edge.
+                if is_terminal(task.status) || !visited.insert(task.id.clone()) {
                     continue;
                 }
                 to_fail.push(((*task).clone(), task.status));
@@ -1293,8 +1292,7 @@ impl Orchestrator {
             // `_index.json`, whose entry order is observable and is the order
             // the saves *complete* in. Concurrent saves would race on that
             // order — `join_all` on a multi-threaded runtime genuinely
-            // interleaves — so awaiting in order keeps it deterministic. The
-            // cost is nothing: a cascade is a handful of tasks.
+            // interleaves — so awaiting in order keeps it deterministic.
             for (task, _) in &to_fail {
                 let failed = Task {
                     status: TaskStatus::Failed,
